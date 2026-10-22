@@ -487,6 +487,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx1250(
     launch_metadata=kda_records_launch_metadata,
     do_not_specialize=[
         "MIXED_ROW_STRIDE",
+        "ORIGINAL_QKV_ROW_STRIDE",
         "CONV_POOL_PAGE_STRIDE",
         "GATE_ROW_STRIDE",
         "BETA_ROW_STRIDE",
@@ -506,6 +507,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx1250(
 )
 def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     mixed_qkv: tl.const,
+    original_qkv,
     conv_weights: tl.const,
     conv_pool: tl.const,
     raw_g: tl.const,
@@ -534,6 +536,7 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
     TOKENS_PER_SEQUENCE: gl.constexpr,
     VALUE_SPLITS: gl.constexpr,
     MIXED_ROW_STRIDE,
+    ORIGINAL_QKV_ROW_STRIDE,
     CONV_WEIGHT_ROW_STRIDE: gl.constexpr,
     CONV_WEIGHT_COL_STRIDE: gl.constexpr,
     CONV_POOL_PAGE_STRIDE,
@@ -651,11 +654,21 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
 
     for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
         token_idx = token_base + token_offset
-        qkv_input = gl.load(
+        qkv_input_raw = gl.load(
             mixed_qkv + token_idx * MIXED_ROW_STRIDE + qkv_channel,
             mask=token_offset < token_count,
             other=0.0,
-        ).to(gl.float32)
+        )
+        if original_qkv is not None:
+            # One value split retains the pre-convolution bytes for commit.
+            gl.store(
+                original_qkv + token_idx * ORIGINAL_QKV_ROW_STRIDE + qkv_channel,
+                qkv_input_raw,
+                mask=(value_split_idx == 0)
+                & (slot_id != 3)
+                & (token_offset < token_count),
+            )
+        qkv_input = qkv_input_raw.to(gl.float32)
         qkv_value = _kda_conv_step(
             qkv_history0,
             qkv_history1,
@@ -924,17 +937,40 @@ def gluon_kda_fused_replay_gfx1250(
 
     a_value = gl.exp(gl.load(a_log + head_idx).to(gl.float32))
     bias = gl.load(dt_bias + head_idx * D + key_offsets).to(gl.float32)
+    # Stage accepted records once for key normalization and state updates.
+    record_layout: gl.constexpr = gl.BlockedLayout([1], [32], [8], [0])
+    correction_offsets = gl.arange(0, D, layout=record_layout)
+    key_gate_offsets = gl.arange(0, 2 * D, layout=record_layout)
+    correction_shared = gl.allocate_shared_memory(
+        gl.float32, [T, D], gl.SwizzledSharedLayout(1, 1, 1, order=[0])
+    )
+    key_gate_shared = gl.allocate_shared_memory(
+        activation_ref.dtype.element_ty,
+        [T, 2 * D],
+        gl.SwizzledSharedLayout(1, 1, 1, order=[0]),
+    )
+    for token_offset in gl.static_range(T):
+        record_row = slot * CAPACITY + (start + token_offset) % CAPACITY
+        correction_value = gl.load(
+            correction + record_row * u_stride + head_idx * D + correction_offsets,
+            mask=token_offset < replay_steps,
+            other=0.0,
+        )
+        correction_shared.index(token_offset).store(correction_value)
+        record_base = key_gate + record_row * kg_stride + head_idx * 2 * D
+        key_gate_value = gl.load(
+            record_base + key_gate_offsets,
+            mask=token_offset < replay_steps,
+            other=0.0,
+        )
+        key_gate_shared.index(token_offset).store(key_gate_value)
+
     k_values = ()
     decay_values = ()
     for token_offset in gl.static_range(T):
-        record_row = slot * CAPACITY + (start + token_offset) % CAPACITY
-        record_base = key_gate + record_row * kg_stride + head_idx * 2 * D
-        k_value = gl.load(
-            record_base + key_offsets, mask=token_offset < replay_steps, other=0.0
-        ).to(gl.float32)
-        raw_gate = gl.load(
-            record_base + D + key_offsets, mask=token_offset < replay_steps, other=0.0
-        ).to(gl.float32)
+        vectors = key_gate_shared.index(token_offset)
+        k_value = vectors.slice(0, D, dim=0).load(key_layout).to(gl.float32)
+        raw_gate = vectors.slice(D, D, dim=0).load(key_layout).to(gl.float32)
         k_value *= gl.rsqrt(gl.sum(k_value * k_value, axis=0) + 1e-6)
         decay = _kda_decay(raw_gate, bias, a_value, BOUNDED, lower_bound)
         k_values += (k_value,)
@@ -944,15 +980,13 @@ def gluon_kda_fused_replay_gfx1250(
         panel_offsets = off_pipe[0]
         running = raw_pipe[0]
         for token_offset in gl.static_range(T):
+            # Inactive rows are initialized; unconditional reads share one barrier.
+            delta = (
+                correction_shared.index(token_offset)
+                .slice(panel_idx * 16, 16, dim=0)
+                .load(value_layout)
+            )
             if token_offset < replay_steps:
-                record_row = slot * CAPACITY + (start + token_offset) % CAPACITY
-                delta = gl.load(
-                    correction
-                    + record_row * u_stride
-                    + head_idx * D
-                    + panel_idx * 16
-                    + panel_value_offsets,
-                )
                 running *= decay_values[token_offset][None, :]
                 running += delta[:, None] * k_values[token_offset][None, :]
         write_base = write_idx * state_stride + head_idx * D * D
@@ -1236,6 +1270,7 @@ def gluon_kda_fused_decode_gfx1250(
 def gluon_kda_fused_verify_gfx1250(
     *,
     mixed_qkv: torch.Tensor,
+    original_qkv: torch.Tensor | None,
     conv_weights: torch.Tensor,
     conv_pool: torch.Tensor,
     raw_g: torch.Tensor,
@@ -1256,6 +1291,9 @@ def gluon_kda_fused_verify_gfx1250(
 ) -> torch.Tensor:
     """Produce attention output and records without changing committed state.
 
+    original_qkv is an optional separate destination for live pre-convolution
+    rows, in packed input order. None leaves retention to the caller. Commit
+    uses fixed-width windows, so serving supplies dense query boundaries.
     mixed_qkv contains activation-dtype pre-convolution Q/K/V rows; raw_g and
     beta_logits are projected gate inputs. state_pool is FP32 [page, head, V, K].
     read_indices selects checkpoint pages; nonpositive pages are padding.
@@ -1269,6 +1307,7 @@ def gluon_kda_fused_verify_gfx1250(
     """
     validate_kda_records_verify(
         mixed_qkv,
+        original_qkv,
         raw_g,
         beta_logits,
         state_pool,
@@ -1283,6 +1322,8 @@ def gluon_kda_fused_verify_gfx1250(
         num_heads,
         head_dim,
         draft_token_num,
+        f_a_out=None,
+        f_b_weight=None,
     )
     batch = read_indices.numel()
     output = torch.empty(
@@ -1308,6 +1349,7 @@ def gluon_kda_fused_verify_gfx1250(
         (num_heads * value_splits, batch)
     ](
         mixed_qkv,
+        original_qkv,
         conv_weights,
         conv_pool,
         raw_g,
@@ -1336,6 +1378,7 @@ def gluon_kda_fused_verify_gfx1250(
         TOKENS_PER_SEQUENCE=draft_token_num,
         VALUE_SPLITS=value_splits,
         MIXED_ROW_STRIDE=mixed_qkv.stride(0),
+        ORIGINAL_QKV_ROW_STRIDE=(0 if original_qkv is None else original_qkv.stride(0)),
         CONV_WEIGHT_ROW_STRIDE=conv_weights.stride(0),
         CONV_WEIGHT_COL_STRIDE=conv_weights.stride(1),
         CONV_POOL_PAGE_STRIDE=conv_pool.stride(0),

@@ -89,6 +89,7 @@ def kda_record_interval(
 
 def validate_kda_records_verify(
     conv_qkv,
+    original_qkv,
     raw_g,
     beta,
     state,
@@ -103,18 +104,60 @@ def validate_kda_records_verify(
     heads,
     dim,
     window,
+    *,
+    f_a_out,
+    f_b_weight,
 ):
     """Check the shared records layout before a pointer-based verify launch."""
     import torch
 
     batch, tokens = reads.numel(), conv_qkv.shape[0]
+    if raw_g is None:
+        if f_a_out is None or f_b_weight is None:
+            raise ValueError(
+                "KDA verify requires either a raw gate or both projection inputs"
+            )
+        if (
+            f_a_out.shape != (tokens, dim)
+            or f_b_weight.shape != (heads * dim, dim)
+            or not f_b_weight.is_contiguous()
+        ):
+            raise ValueError(
+                "KDA gate projection requires [tokens, D] and [heads * D, D]"
+            )
+        gate_inputs = (f_a_out, f_b_weight)
+    else:
+        if f_a_out is not None or f_b_weight is not None:
+            raise ValueError("A supplied raw gate excludes projection inputs")
+        if raw_g.shape != (tokens, heads * dim):
+            raise ValueError("KDA raw gate shape does not match the head geometry")
+        gate_inputs = (raw_g,)
+
+    if original_qkv is not None:
+        if (
+            original_qkv.shape != conv_qkv.shape
+            or original_qkv.dtype != conv_qkv.dtype
+            or original_qkv.device != conv_qkv.device
+            or original_qkv.stride(-1) != 1
+            or original_qkv.stride(0) < original_qkv.shape[-1]
+        ):
+            raise ValueError("Original QKV destination must match the input rows")
+        destination = original_qkv.untyped_storage()
+        begin, end = (
+            destination.data_ptr(),
+            destination.data_ptr() + destination.nbytes(),
+        )
+        for source in (conv_qkv, beta, *gate_inputs):
+            storage = source.untyped_storage()
+            if (
+                begin < storage.data_ptr() + storage.nbytes()
+                and storage.data_ptr() < end
+            ):
+                raise ValueError("Original QKV destination must not overlap producers")
+
     if dim != 128 or window <= 0 or tokens > batch * window:
         raise ValueError("KDA verify needs D=128 and a positive bounded window")
-    if (
-        conv_qkv.shape != (tokens, 3 * heads * dim)
-        or raw_g.shape != (tokens, heads * dim)
-        or beta.shape != (tokens, heads)
-    ):
+    if conv_qkv.shape != (tokens, 3 * heads * dim) or beta.shape != (tokens, heads):
         raise ValueError("KDA verify producer shapes do not match the head geometry")
     if (
         state.ndim != 4
@@ -142,12 +185,14 @@ def validate_kda_records_verify(
             "KDA records must cover the runtime batch and candidate window"
         )
     if conv_qkv.dtype not in (torch.bfloat16, torch.float16) or any(
-        x.dtype != conv_qkv.dtype for x in (raw_g, beta, key_gate)
+        x.dtype != conv_qkv.dtype for x in (*gate_inputs, beta, key_gate)
     ):
         raise ValueError(
             "KDA producers and K/raw-g records must use the activation dtype"
         )
-    if any(x.stride(-1) != 1 for x in (conv_qkv, raw_g, beta, correction, key_gate)):
+    if any(
+        x.stride(-1) != 1 for x in (conv_qkv, *gate_inputs, beta, correction, key_gate)
+    ):
         raise ValueError("KDA producers and records need contiguous channels")
     if query_start_loc.shape != (batch + 1,) or reads.shape != (batch,):
         raise ValueError(
@@ -168,7 +213,7 @@ def validate_kda_records_verify(
     if any(
         x.device != conv_qkv.device
         for x in (
-            raw_g,
+            *gate_inputs,
             beta,
             state,
             reads,

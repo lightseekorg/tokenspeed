@@ -950,11 +950,11 @@ def prepare_kda_fused_paged_verify(
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
     record_payload = None
-    raw_qkv = None
     if records:
         metadata = torch.zeros((batch, 3), dtype=torch.int64, device="cuda")
         metadata[:, 0] = torch.arange(batch, device="cuda")
         record_payload = kda_ops.KdaReplayRecords(
+            original_qkv=torch.empty_like(mixed_qkv),
             correction=torch.empty(
                 batch,
                 draft_token_num,
@@ -978,7 +978,6 @@ def prepare_kda_fused_paged_verify(
             query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
             * draft_token_num,
         )
-        raw_qkv = torch.empty_like(mixed_qkv)
     conv_scratch = conv_pool
     state_scratch = None
     if store_states:
@@ -995,10 +994,11 @@ def prepare_kda_fused_paged_verify(
     def invoke() -> object:
         producers = {}
         if records:
-            raw_qkv.copy_(mixed_qkv)
             producers = {
-                "g_raw": torch.nn.functional.linear(
-                    projection.f_a_out, weights.f_b_weight
+                "g_raw": (
+                    torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
+                    if split_producers
+                    else None
                 ),
                 "conv_qkv": (
                     kda_ops.kda_verify_conv_update(
@@ -1128,8 +1128,8 @@ def prepare_kda_replay_commit(
         )
         layer_tensors.append((weights, conv_pool, state_pool))
         projection = _fused_projection(rows, profile, dtype=dtype, generator=generator)
-        payload_qkv[layer].copy_(projection.mixed_qkv)
         record_payload = kda_ops.KdaReplayRecords(
+            original_qkv=payload_qkv[layer],
             correction=payload_f_a[layer]
             .view(batch, draft_token_num, profile.heads, profile.head_dim)
             .transpose(1, 2),
@@ -1141,8 +1141,15 @@ def prepare_kda_replay_commit(
             query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
             * draft_token_num,
         )
+        split_producers = kda_ops.kda_fused_paged_verify_uses_split_producers(
+            dtype,
+            store_states=False,
+            recurrent_layout=common["recurrent_layout"],
+            num_heads=profile.heads,
+            head_dim=profile.head_dim,
+        )
         output = kda_ops.try_kda_fused_paged_verify(
-            payload_qkv[layer],
+            projection.mixed_qkv,
             weights.conv_weights,
             conv_pool,
             conv_pool,
@@ -1162,10 +1169,14 @@ def prepare_kda_replay_commit(
             recurrent_layout=common["recurrent_layout"],
             store_states=False,
             replay_records=record_payload,
-            g_raw=torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight),
+            g_raw=(
+                torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
+                if split_producers
+                else None
+            ),
             conv_qkv=(
                 kda_ops.kda_verify_conv_update(
-                    payload_qkv[layer],
+                    projection.mixed_qkv,
                     weights.conv_weights,
                     conv_pool,
                     read_pages,
@@ -1175,13 +1186,7 @@ def prepare_kda_replay_commit(
                     recurrent_layout=common["recurrent_layout"],
                     bias=None,
                 )
-                if kda_ops.kda_fused_paged_verify_uses_split_producers(
-                    dtype,
-                    store_states=False,
-                    recurrent_layout=common["recurrent_layout"],
-                    num_heads=profile.heads,
-                    head_dim=profile.head_dim,
-                )
+                if split_producers
                 else None
             ),
         )

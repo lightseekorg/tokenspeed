@@ -119,8 +119,12 @@ class KdaReplayRecords:
     Position i maps to i % capacity. PR1 allocates one slot per batch row
     and assigns a new generation on each metadata refresh.
     query_start_loc maps packed tokens to request rows.
+    original_qkv is an optional destination for live pre-convolution rows in
+    packed input order. None leaves retention to the caller. A destination
+    must use separate storage from the projection inputs.
     """
 
+    original_qkv: torch.Tensor | None
     correction: torch.Tensor
     metadata: torch.Tensor
     stamps: torch.Tensor

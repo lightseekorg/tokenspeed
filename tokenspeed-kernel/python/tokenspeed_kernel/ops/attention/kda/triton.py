@@ -397,6 +397,28 @@ def triton_nvidia_kda_fused_paged_verify_split(
 
         if conv_qkv is None or g_raw is None:
             raise ValueError("record verify requires precomputed conv and gates")
+        if replay_records.original_qkv is not None:
+            destination = replay_records.original_qkv
+            if (
+                destination.shape != mixed_qkv.shape
+                or destination.dtype != mixed_qkv.dtype
+                or destination.device != mixed_qkv.device
+                or destination.stride(-1) != 1
+                or destination.stride(0) < destination.shape[-1]
+            ):
+                raise ValueError("Original QKV destination must match the input rows")
+            storage = destination.untyped_storage()
+            begin, end = storage.data_ptr(), storage.data_ptr() + storage.nbytes()
+            for source in (mixed_qkv, g_raw, beta_logits):
+                source_storage = source.untyped_storage()
+                if (
+                    begin < source_storage.data_ptr() + source_storage.nbytes()
+                    and source_storage.data_ptr() < end
+                ):
+                    raise ValueError(
+                        "Original QKV destination must not overlap producers"
+                    )
+            destination.copy_(mixed_qkv)
         q, k, v = (
             part.view(1, -1, num_heads, head_dim) for part in conv_qkv.chunk(3, dim=-1)
         )

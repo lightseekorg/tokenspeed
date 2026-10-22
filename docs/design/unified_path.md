@@ -1147,10 +1147,13 @@ Its cache recipe reserves the record workspace for this case before sizing
 the arena. Replay capability determines this reservation even without a drafter;
 prefill-only engines do not reserve decode records. NVIDIA target verification and
 commit use saved corrections for both BF16 and FP16 activations; the same
-batched recovery also handles a layer subset. AMD retains its registered
-batched raw-g replay. A missing batched binding is an error, not a reason to
-recompute each layer through a second commit path. Since forward mode is
-derived from the extend count, zero means decode at this entry. Hybrid
+batched recovery also handles a layer subset. AMD uses its registered
+batched recovery over saved records. Fused convolution verification retains
+original QKV in its records workspace. The registered backend owns the gate
+projection when the model does not supply a gate. Split producers retain QKV before
+convolution on the producer stream. A missing batched binding is an error,
+not a reason to recompute each layer through a second commit path. Since forward
+mode is derived from the extend count, zero means decode at this entry. Hybrid
 delegates to the recurrent child.
 A mixed batch gives prefill and decode rows their existing metadata and
 forwards; only the decode suffix enters the acceptance commit. The

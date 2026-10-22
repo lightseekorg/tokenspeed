@@ -1136,11 +1136,26 @@ HBM bound: it reads the state once and writes it once per destination.
 
 Standard target decode is a one-token verify window. Both standard and
 speculative decode follow verify, acceptance, and commit. Verify retains
-the Gluon fused convolution, LDS vectors, 16-row state panels and batched
-value-split selection. It leaves committed FP32 state unchanged and saves
-FP32 correction U plus unnormalized K and raw gate in the activation dtype.
+the Gluon fused convolution, LDS vectors and batched value-split selection.
+GFX950 uses 32-row state panels for one-token windows with a bounded gate
+and no value split. Other cases use 16-row panels. Verify preserves committed
+FP32 state. It saves correction U in FP32, and unnormalized K and raw gate in
+the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
-the same K as verify. The current AMD registration supports BF16.
+the same K as verify. The current AMD registration supports BF16. Verify can
+also retain original QKV in a separate caller-owned buffer, which commit
+reads for conv history.
+A null destination leaves retention to the caller. Padding pages do not write
+retained rows. When the caller supplies low-rank gate inputs, GFX950 projects
+inside verify for up to 64 total input rows and uses a separate GEMM above that.
+MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
+A supplied raw gate is used directly. GFX1250 retains the separate gate producer.
+Both save the gate used by verify. For one-token windows, each GFX950 value split
+starts its first checkpoint-panel load before preparing the token vectors.
+Without value splits, one-token verify keeps 64 state rows in flight after
+preparation.
+GFX950 recovery uses 64-row panels for one-token windows with a bounded gate.
+Other windows keep 16-row panels, with two in flight for one-token softplus.
 
 Records use slot/head/ring-position/channel order. INT64 metadata supplies the
 slot, generation, and absolute start; position/generation stamps guard against
@@ -1155,10 +1170,12 @@ address checks out of the state-update loop.
 Batched descriptors use the shared ten-column table: original QKV (0), conv
 history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
 The remaining columns are reserved. Recovery retains one program per head,
-request and layer with the eight-panel state pipeline. It also commits that
-head's convolution history after loading all old taps, including when source
-and destination alias. History retains its bound pool dtype; original QKV
-is converted on commit.
+request and layer. It stages accepted
+U, K and raw gate once in LDS, then applies the same updates per value panel.
+It commits each head's convolution history after loading all old taps,
+including when source and destination alias. History retains its bound pool
+dtype; original QKV is converted on commit.
+
 
 ## Transform
 

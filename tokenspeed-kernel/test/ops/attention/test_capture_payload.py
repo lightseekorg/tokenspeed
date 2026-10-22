@@ -90,6 +90,7 @@ def _capture(sources, key_gate, correction, rows):
     conv_qkv[:, 2 * DIM :].copy_(value.view(tokens, DIM))
     reads = torch.ones(rows, device="cuda", dtype=torch.int32)
     records = KdaReplayRecords(
+        original_qkv=None,
         correction=correction,
         key_gate=key_gate,
         metadata=metadata,

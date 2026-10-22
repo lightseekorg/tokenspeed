@@ -767,6 +767,7 @@ def test_verify_derived_records_with_serving_producers(
             recurrent_layout="v_major",
             store_states=False,
             replay_records=KdaReplayRecords(
+                original_qkv=None,
                 correction=correction,
                 key_gate=key_gate,
                 metadata=metadata,

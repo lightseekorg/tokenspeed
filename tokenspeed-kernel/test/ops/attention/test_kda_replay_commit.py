@@ -80,7 +80,7 @@ def _window(n, t, pages=32, seed=0, num_heads=HV):
     )
 
 
-def _prepare_records(x, t):
+def _prepare_records(x, t, *, raw_gate, original_qkv=None):
     """Produce BF16 K/raw-gate and FP32 U through the registered serving path."""
     from tokenspeed_kernel.ops.attention.kda import (
         KdaReplayRecords,
@@ -109,7 +109,8 @@ def _prepare_records(x, t):
             bias=None,
             recurrent_layout="v_major",
         )
-    raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    if raw_gate is None and "conv_qkv" in producers:
+        raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
     x["correction"] = torch.empty(n, t, heads, V, device=DEV, dtype=torch.float32)
     x["key_gate"] = torch.empty(n, t, heads, 2 * K, device=DEV, dtype=torch.bfloat16)
     x["metadata"] = torch.zeros(n, 3, device=DEV, dtype=torch.int64)
@@ -119,6 +120,7 @@ def _prepare_records(x, t):
     x["metadata"][:, 2] = 2**33 + 1
     x["stamps"] = torch.full((n, t, 2), -1, device=DEV, dtype=torch.int64)
     records = KdaReplayRecords(
+        original_qkv=original_qkv,
         correction=x["correction"].transpose(1, 2),
         key_gate=x["key_gate"].transpose(1, 2),
         metadata=x["metadata"],
@@ -165,9 +167,19 @@ def _records_commit(xs, groups, reads, writes, accepted, t, *, corrupt=False):
     verifies = []
     for x, group in zip(xs, groups, strict=True):
         x["read_indices"] = reads[group]
-        verifies.append(_prepare_records(x, t))
+        x["retained_qkv"] = torch.full_like(x["qkv_raw"], float("nan"))
+        verifies.append(
+            _prepare_records(
+                x,
+                t,
+                raw_gate=torch.mm(x["f_a"], x["w_fb"].t()),
+                original_qkv=x["retained_qkv"],
+            )
+        )
+        torch.testing.assert_close(x["retained_qkv"], x["qkv_raw"], atol=0, rtol=0)
     addresses = _batched_descriptor(xs)
     for layer, x in enumerate(xs):
+        addresses[layer, 0] = x["retained_qkv"].data_ptr()
         addresses[layer, 3] = x["correction"].data_ptr()
         addresses[layer, 5] = x["key_gate"].data_ptr()
     if corrupt:
@@ -477,6 +489,60 @@ def test_gluon_batched_replay_uneven_groups_match_per_layer_launches(t, graph):
     with assert_no_triton_compile(verify_kernel, commit_kernel):
         _records_commit([wider], [0], next_reads, next_writes, next_accepted, t)
     _check_against_reference(original, wider, next_writes[0], 3, t, next_accepted)
+
+    # Check automatic gate production below and above the gfx950 GEMM cutoff.
+    # Dyadic inputs make the FP32 reduction exact, isolating projection indexing
+    # from BF16 midpoint differences between otherwise valid reduction orders.
+    for batch in (3, 17):
+        projected = _window(batch, t, pages=2 * batch + 2, seed=740 + batch)
+        projected["f_a"].round_()
+        projected["w_fb"].mul_(32).round_().div_(8)
+        raw_gate = torch.mm(projected["f_a"], projected["w_fb"].t())
+        activation = projected["f_a"].clone()
+        rows, width = projected["qkv_raw"].shape
+        for padding in (7, 16):
+            projected["f_a"] = torch.empty_strided(
+                activation.shape,
+                (D_FA + padding, 1),
+                device=DEV,
+                dtype=torch.bfloat16,
+            )
+            projected["f_a"].copy_(activation)
+            destination = torch.full(
+                (rows, width + padding), float("nan"), device=DEV, dtype=torch.bfloat16
+            )
+            retained = destination[:, :width]
+            if padding == 7:
+                _prepare_records(projected, t, raw_gate=None, original_qkv=retained)
+            with assert_no_triton_compile(verify_kernel):
+                verify = _prepare_records(
+                    projected, t, raw_gate=None, original_qkv=retained
+                )
+                if graph:
+                    capture = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(capture):
+                        verify()
+                    retained.fill_(float("nan"))
+                    capture.replay()
+            torch.testing.assert_close(retained, projected["qkv_raw"], atol=0, rtol=0)
+            assert torch.isnan(destination[:, width:]).all()
+            actual = {
+                name: projected[name].clone()
+                for name in ("verify_output", "correction", "key_gate")
+            }
+            _prepare_records(projected, t, raw_gate=raw_gate)
+            torch.testing.assert_close(
+                actual["verify_output"],
+                projected["verify_output"],
+                atol=1.6e-2,
+                rtol=1e-2,
+            )
+            torch.testing.assert_close(
+                actual["correction"], projected["correction"], atol=2e-6, rtol=2e-5
+            )
+            torch.testing.assert_close(
+                actual["key_gate"], projected["key_gate"], atol=0, rtol=0
+            )
 
 
 @pytest.mark.parametrize(
