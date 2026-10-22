@@ -38,7 +38,7 @@ Each multimodal item fills one placeholder row per embedding, in order:
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 
 import torch
 from tokenspeed_kernel.ops.activation import relu2
@@ -51,13 +51,18 @@ from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
 from tokenspeed.runtime.models.nemotron_h import NemotronHForCausalLM
+from tokenspeed.runtime.models.nemotron_h_nextn import NemotronHForCausalLMNextN
 from tokenspeed.runtime.models.parakeet import ParakeetEncoder
-from tokenspeed.runtime.models.radio import RadioVisionModel
+from tokenspeed.runtime.models.radio import (
+    RadioEncoderCudaGraphAdapter,
+    RadioVisionModel,
+)
 from tokenspeed.runtime.multimodal.embedder import (
     EncoderSpec,
     MultimodalEmbedder,
     pad_input_tokens,
 )
+from tokenspeed.runtime.multimodal.encoder_cudagraph import EncoderForwardStepRunner
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -66,16 +71,29 @@ from tokenspeed.runtime.multimodal.inputs import (
 )
 
 _RADIO_PREFIX = "vision_model.radio_model.model."
+_VISION_NORM_PREFIX = "vision_projector.vision_final_layernorm."
 _PARAKEET_PREFIX = "sound_encoder.encoder."
-# Pixel normalization and log-mel buffers; the gateway preprocesses media.
-_PREPROCESSING_PREFIXES = (
+# Media preprocessing buffers (the gateway's job) and RADIO summary-token indices.
+_UNUSED_PREFIXES = (
     "vision_model.radio_model.input_conditioner.",
     "sound_encoder.encoder.feature_extractor.",
+    "vision_model.summary_idxs",
 )
 # Encoder and projector tensors, skipped when the encoders are disabled.
-_ENCODER_PREFIXES = (_RADIO_PREFIX, "mlp1.", _PARAKEET_PREFIX, "sound_projection.")
+_ENCODER_PREFIXES = (
+    _RADIO_PREFIX,
+    _VISION_NORM_PREFIX,
+    "mlp1.",
+    _PARAKEET_PREFIX,
+    "sound_projection.",
+)
 # The vision projector's checkpoint indices into its nn.Sequential.
 _MLP1_NAMES = {"0": "norm", "1": "linear1", "3": "linear2"}
+
+
+def _language_model_names(scales: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """The language model's KV-cache scales under its own checkpoint names."""
+    return {name.removeprefix("language_model."): t for name, t in scales.items()}
 
 
 class NemotronOmniProjector(nn.Module):
@@ -130,10 +148,14 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         self.omni_config = config
         self.is_multimodal_active = is_multimodal_active
         self.visual: RadioVisionModel | None = None
+        self.vision_final_norm: nn.LayerNorm | None = None
         self.vision_projector: NemotronOmniProjector | None = None
         self.audio_tower: ParakeetEncoder | None = None
         self.audio_projector: NemotronOmniProjector | None = None
         self.multimodal_embedder: MultimodalEmbedder | None = None
+        self.image_encoder: (
+            Callable[[list[MultimodalDataItem]], torch.Tensor] | None
+        ) = None
         if not is_multimodal_active:
             return
 
@@ -145,6 +167,14 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
             mm_attention_backend=mm_attention_backend,
             prefix="visual",
         )
+        if config.vision_final_layernorm:
+            if vision.final_norm:
+                raise NotImplementedError(
+                    "C-RADIO with both its own final norm and the projector's"
+                )
+            self.vision_final_norm = nn.LayerNorm(
+                vision.hidden_size, eps=vision.layer_norm_eps
+            )
         merge = round(1 / config.downsample_ratio)
         if merge != 2:
             raise NotImplementedError(f"Nemotron-H Omni {merge}x{merge} pixel shuffle")
@@ -166,6 +196,7 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
                 eps=sound.projection_eps,
             )
         self.multimodal_embedder = MultimodalEmbedder(encoder_mapping=mapping.vision)
+        self.image_encoder = self.get_image_feature
 
     def pad_input_ids(
         self, input_ids: list[int], mm_inputs: MultimodalInputs
@@ -175,6 +206,8 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
     def _project_vision(
         self, features: torch.Tensor, grids: list[tuple[int, int]]
     ) -> torch.Tensor:
+        if self.vision_final_norm is not None:
+            features = self.vision_final_norm(features)
         shuffled = []
         start = 0
         for rows, cols in grids:
@@ -247,12 +280,34 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
             )
         ]
 
+    def make_encoder_cudagraph_wrappers(
+        self, mapping: Mapping
+    ) -> dict[str, EncoderForwardStepRunner]:
+        vision = self.omni_config.vision_config
+        prefix = vision.num_prefix_tokens
+        smallest = vision.image_patch_floor + prefix
+        adapter = RadioEncoderCudaGraphAdapter(
+            tower=self.visual,
+            post_encode=self._project_vision,
+            max_image_tokens=vision.image_patch_budget + prefix,
+            capture_tp_size=mapping.vision.tp_size,
+            capture_tp_group=mapping.vision.tp_group,
+        )
+        # Budgets double from one smallest image to 32 of them, a prefill chunk.
+        return {
+            "image_encoder": EncoderForwardStepRunner(
+                adapter=adapter,
+                budget_range=(smallest, 32 * smallest),
+                max_metadata_sequences_per_batch=32,
+            )
+        }
+
     def get_multimodal_encoder_specs(self) -> dict[Modality, EncoderSpec]:
         if self.visual is None:
             return {}
         specs = {
             Modality.IMAGE: EncoderSpec(
-                self.get_image_feature, make_warmup_items=self.make_image_warmup_items
+                self.image_encoder, make_warmup_items=self.make_image_warmup_items
             ),
             Modality.VIDEO: EncoderSpec(
                 self.get_video_feature, make_warmup_items=self.make_video_warmup_items
@@ -308,6 +363,9 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         super().load_weights(self._route_encoder_weights(weights))
 
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        super().load_kv_cache_scales(_language_model_names(scales))
+
     def _route_encoder_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
@@ -315,12 +373,20 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
         for name, loaded in weights:
             if name.startswith("language_model."):
                 yield name.removeprefix("language_model."), loaded
-            elif name.startswith(_PREPROCESSING_PREFIXES) or (
+            elif name.startswith(_UNUSED_PREFIXES) or (
                 self.visual is None and name.startswith(_ENCODER_PREFIXES)
             ):
                 continue
             elif name.startswith(_RADIO_PREFIX):
                 self.visual.load_weight(name.removeprefix(_RADIO_PREFIX), loaded)
+            elif (
+                name.startswith(_VISION_NORM_PREFIX)
+                and self.vision_final_norm is not None
+            ):
+                suffix = name.removeprefix(_VISION_NORM_PREFIX)
+                default_weight_loader(
+                    self.vision_final_norm.get_parameter(suffix), loaded
+                )
             elif name.startswith("mlp1."):
                 index, suffix = name.removeprefix("mlp1.").split(".", 1)
                 self.vision_projector.load_weight(
@@ -338,4 +404,41 @@ class NemotronH_Nano_Omni_Reasoning_V3(NemotronHForCausalLM):  # noqa: N801
                 raise KeyError(f"Nemotron-H Omni has no tensor {name!r}")
 
 
-EntryClass = [NemotronH_Nano_Omni_Reasoning_V3]
+class NemotronH_Omni_Reasoning_V3(NemotronH_Nano_Omni_Reasoning_V3):  # noqa: N801
+    """The same model under the architecture name of later checkpoints."""
+
+
+class NemotronH_Omni_Reasoning_V3NextN(NemotronHForCausalLMNextN):  # noqa: N801
+    """The checkpoint's MTP head as the draft model; the checkpoint names the
+    language model, its MTP head and their quantization ``language_model.``."""
+
+    quant_module_name_replacements = (("language_model.", ""),)
+
+    def __init__(
+        self,
+        config: NemotronHOmniConfig,
+        mapping: Mapping,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(config.text_config, mapping, quant_config, prefix)
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        return name.startswith("language_model.mtp.")
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        super().load_weights(
+            (name.removeprefix("language_model."), loaded)
+            for name, loaded in weights
+            if name.startswith("language_model.")
+        )
+
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        super().load_kv_cache_scales(_language_model_names(scales))
+
+
+EntryClass = [
+    NemotronH_Nano_Omni_Reasoning_V3,
+    NemotronH_Omni_Reasoning_V3,
+    NemotronH_Omni_Reasoning_V3NextN,
+]

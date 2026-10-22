@@ -25,6 +25,8 @@ from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine import event_loop as event_loop_module  # noqa: E402
 from tokenspeed.runtime.engine.event_loop import EventLoop  # noqa: E402
 from tokenspeed.runtime.engine.l3_cache_hooks import L3CacheHooks  # noqa: E402
+from tokenspeed.runtime.metrics.service import MetricsService  # noqa: E402
+from tokenspeed.runtime.utils.server_args import PortArgs  # noqa: E402
 
 
 class _PauseHarness:
@@ -37,23 +39,77 @@ class _PauseHarness:
         self._trace.append("pause_finish")
 
 
+def test_device_shutdown_failure_still_retires_l3_resources() -> None:
+    from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+    from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+
+    class HostAllocation:
+        """Substitute only the GPU-pinned allocation, not storage I/O."""
+
+        def __init__(self) -> None:
+            self.host_buffer = bytearray(b"data")
+
+    class FailedDevice:
+        def shutdown_cache(self) -> None:
+            raise RuntimeError("Device copy failed")
+
+    class ControlResource:
+        def close(self) -> None:
+            pass
+
+    host = HostAllocation()
+    backend = MemoryKvStore()
+    backend.batch_put_from(("live",), host.host_buffer, (0,), (4,))
+    executor = L3Executor(
+        backend,
+        host,
+        key_prefix="close",
+        rank=0,
+        ownership=None,
+        config=StorageRuntimeConfig.from_extra_config(
+            None, host_blocks=16, prefix_granularity=2
+        ),
+        prefix_for_weight_version=None,
+    )
+    workers = tuple(executor._threads)
+    executor.submit(StorageJob(1, "query", ("live",), (), ()))
+    # Model/device and network construction are the only substituted owners.
+    loop = EventLoop.__new__(EventLoop)
+    loop.load_reporter = ControlResource()
+    loop._eplb_hooks = ControlResource()
+    loop.send_to_tokenizer = None
+    loop.kv_transfer = None
+    loop._device = FailedDevice()
+    loop._l3 = executor
+    try:
+        with pytest.raises(RuntimeError, match="Device copy failed"):
+            loop.close()
+        assert all(not worker.is_alive() for worker in workers)
+        assert backend.batch_exists(("live",)) == [False]
+    finally:
+        executor.close(timeout_s=5)
+
+
 class _SchedulerHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
     def next_execution_plan(self):
         self._trace.append("next_plan")
-        return SimpleNamespace(pages_to_zero=(), cache=(), aborts=())
+        return SimpleNamespace(
+            pages_to_zero=(), pages_to_copy_arrays=dict, cache=(), aborts=()
+        )
 
 
 class _DeviceHarness:
     def __init__(self, trace: list[str]) -> None:
         self._trace = trace
 
-    def execute(self, execution_plan, planned):
+    def execute(self, execution_plan, planned, *, cache_ops):
         # The harness plans no device work and no batch; trace anything that
         # does appear rather than fail on a missing attr.
-        if execution_plan.pages_to_zero or execution_plan.cache or planned:
+        if execution_plan.pages_to_zero or cache_ops or planned:
             self._trace.append("execute")
         return None
 
@@ -69,6 +125,7 @@ class _EventLoopHarness:
         self._pause = _PauseHarness(self.trace)
         self.scheduler = _SchedulerHarness(self.trace)
         self._device = _DeviceHarness(self.trace)
+        self._l3 = None
         self._l3_hooks = L3CacheHooks(
             self.scheduler,
             None,
@@ -76,6 +133,8 @@ class _EventLoopHarness:
             attn_tp_cpu_group=None,
             pp_size=1,
             pp_cpu_group=None,
+            config=None,
+            metrics=None,
         )
         self.output_processor = SimpleNamespace(
             rid_to_state={}, finish_scheduler_aborted_requests=lambda aborts: None
@@ -88,7 +147,7 @@ class _EventLoopHarness:
         )
         self._cache_hooks = SimpleNamespace(
             poll_ready_events=lambda: (self.trace.append("poll_cache"), [])[1],
-            count_plan_ops=lambda _plan: self.trace.append("count_cache"),
+            count_ops=lambda _plan: self.trace.append("count_cache"),
         )
         self._pd_hooks = SimpleNamespace(
             poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
@@ -178,6 +237,16 @@ def test_abort_uses_the_output_marker() -> None:
     )
     loop = SimpleNamespace(
         output_processor=output,
+        _l3_hooks=L3CacheHooks(
+            None,
+            None,
+            config=None,
+            attn_tp_size=1,
+            attn_tp_cpu_group=None,
+            pp_size=1,
+            pp_cpu_group=None,
+            metrics=None,
+        ),
     )
 
     EventLoop._request_abort_or_mark(
@@ -188,6 +257,56 @@ def test_abort_uses_the_output_marker() -> None:
     )
 
     assert calls == [("request-0", {"notify_client": True})]
+
+
+def test_cancelled_waiter_releases_features_without_a_future_forward() -> None:
+    from multiprocessing import shared_memory
+
+    import torch
+
+    from tokenspeed.runtime.engine.generation_output_processor import (
+        OutputProcesser,
+        RequestState,
+    )
+    from tokenspeed.runtime.metrics.collector import EngineMetrics
+    from tokenspeed.runtime.multimodal.inputs import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+    from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+    handle = ShmTensorHandle.publish(torch.tensor([1.0, 2.0]))
+    inputs = MultimodalInputs(
+        mm_items=[MultimodalDataItem(modality=Modality.IMAGE, feature_shm=handle)]
+    )
+    state = RequestState(
+        [1, 2],
+        SamplingParams(max_new_tokens=1, ignore_eos=True),
+        False,
+        None,
+        computes_prompt_logprobs=False,
+        multimodal_inputs=inputs,
+    )
+    messages = []
+    output = OutputProcesser(
+        send_to_tokenizer=messages.append,
+        metrics=EngineMetrics(labels={}, enabled=False, reporters=[]),
+    )
+    try:
+        output.register("waiting", state)
+        output.mark_abort("waiting")
+        # L3 cancellation finishes an unadmitted request without another
+        # forward to consume its features or run commit-side cleanup.
+        output.reap_finished_orphan("waiting", state)
+        assert "waiting" not in output.rid_to_state
+        assert not inputs.has_pending_shm_features()
+        assert messages == []
+        with pytest.raises(FileNotFoundError):
+            shared_memory.SharedMemory(name=handle.shm_name)
+    finally:
+        handle.release()
 
 
 @pytest.mark.parametrize("exit_kind", ["sigterm", "return", "system_exit"])
@@ -264,9 +383,13 @@ def test_run_event_loop_reports_exit_and_finally_closes(
     class _PipeWriter:
         def __init__(self) -> None:
             self.messages: list[object] = []
+            self.closed = False
 
         def send(self, message: object) -> None:
             self.messages.append(message)
+
+        def close(self) -> None:
+            self.closed = True
 
     mapping = Mapping(rank=0)
     server_args = SimpleNamespace(
@@ -274,12 +397,24 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         device="cpu",
         base_gpu_id=0,
         disaggregation_mode="decode",
+        enable_metrics=False,
         max_num_seqs=8,
         chunked_prefill_size=128,
+    )
+    port_args = PortArgs(
+        tokenizer_ipc_name="unused",
+        scheduler_input_ipc_name="unused",
+        nccl_port=0,
+        dist_init_addr="localhost:0",
+        rpc_ipc_name="unused",
+        metrics_ipc_name="unused",
+        tokenizer_worker_ipc_name=None,
     )
     pipe_writer = _PipeWriter()
 
     monkeypatch.setenv("TOKENSPEED_DATA_PLANE_SYNC_DEBUG", "default")
+    # Each case models a fresh worker process with its own metrics lifecycle.
+    monkeypatch.setattr(event_loop_module, "metrics_service", MetricsService())
     monkeypatch.setattr(event_loop_module, "EventLoop", _FakeEventLoop)
     monkeypatch.setattr(event_loop_module.psutil, "Process", _Process)
     monkeypatch.setattr(
@@ -302,12 +437,12 @@ def test_run_event_loop_reports_exit_and_finally_closes(
 
     if exit_kind == "system_exit":
         with pytest.raises(SystemExit) as raised:
-            event_loop_module.run_event_loop(server_args, object(), pipe_writer)
+            event_loop_module.run_event_loop(server_args, port_args, pipe_writer)
         assert raised.value.code == 0
         assert trace == ["construct", "freeze_gc", "loop_enter", "close"]
         assert exit_logs[0][1][0] is SystemExit
     else:
-        event_loop_module.run_event_loop(server_args, object(), pipe_writer)
+        event_loop_module.run_event_loop(server_args, port_args, pipe_writer)
         assert trace == [
             "construct",
             "freeze_gc",
@@ -324,7 +459,9 @@ def test_run_event_loop_reports_exit_and_finally_closes(
         else "shutdown_requested=False signal=None"
     ) in exit_logs[0][0]
     assert parent_signals == []
+    assert pipe_writer.closed
     assert len(pipe_writer.messages) == 1
+    assert pipe_writer.closed
     assert pipe_writer.messages[0]["status"] == "ready"
     assert signal_calls[0][0] == signal.SIGTERM
     assert callable(signal_calls[0][1])

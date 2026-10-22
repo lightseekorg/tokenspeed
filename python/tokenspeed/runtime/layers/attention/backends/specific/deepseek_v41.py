@@ -42,13 +42,16 @@ from the replay start, and never write the global/index rows the hit already
 holds (``V41Metadata.global_write_floor``).
 """
 
+import logging
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import normalize_dcp_partials
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
+from tokenspeed.runtime.distributed.comm_ops import all_gather
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 from tokenspeed.runtime.layers.attention.backends.base import (
@@ -58,6 +61,14 @@ from tokenspeed.runtime.layers.attention.backends.base import (
 from tokenspeed.runtime.layers.attention.backends.support import CudaGraphSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import DeepseekV41Config
+from tokenspeed.runtime.layers.attention.dcp.comm import (
+    combine_attention_partials,
+    gather_query_heads,
+)
+from tokenspeed.runtime.layers.attention.dcp.placement import (
+    CachePlacement,
+    resolve_cache_slots,
+)
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_COMPRESSOR_TAIL_GROUP_ID,
     V41_GLOBAL_R1_GROUP_ID,
@@ -67,12 +78,25 @@ from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
     V41_SWA_GROUP_ID,
     v41_table_widths,
 )
+from tokenspeed.runtime.layers.attention.deepseek_v41_kvp import (
+    gather_decode_history,
+    gather_paged_history,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
 from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
     DeepseekV41CachePool,
 )
+from tokenspeed.runtime.layers.attention.prefill_head_exchange import (
+    selected_prefill_with_head_exchange,
+    should_exchange_prefill_heads,
+)
+from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
 from tokenspeed.runtime.layers.attention.registry import register_backend
 from tokenspeed.runtime.utils.host_sync import allow_host_sync
+
+# Initial long-prefill thresholds; tune with query count and visible history.
+_INDEXER_PARTITION_MIN_QUERIES = 4096
+_INDEXER_PARTITION_MIN_HISTORY = 8192
 
 
 class V41CompressorPlan(NamedTuple):
@@ -205,6 +229,19 @@ class V41SWAQueryPlan:
     requests: tuple[V41PrefillRequestPlan, ...]
 
 
+@dataclass
+class V41IndexGeometry:
+    # positions, request_indices and source_table are never read back: they
+    # pin the tensors whose id()s key the per-invocation geometry cache, so a
+    # freed tensor's id cannot be reused for a false hit while the entry lives.
+    positions: torch.Tensor
+    request_indices: torch.Tensor
+    source_table: torch.Tensor
+    table: torch.Tensor
+    lengths: torch.Tensor
+    kernel_metadata: object | None
+
+
 class DeepseekV41AttentionBackend(AttentionBackend):
     # Decode uses fixed-capacity rows and refresh-time history validation. The
     # CED decoder runs on a per-request tail of the prefill rows, so the model
@@ -218,6 +255,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
     def __init__(self, config: AttnConfig, spec: DeepseekV41Config) -> None:
         super().__init__(config, spec)
+        self._attention_exchange_layers: set[int] = set()
+        self.kvp_size = config.kvp_size
+        self.kvp_rank = config.kvp_rank
+        self.kvp_group = config.kvp_group
+        if self.kvp_size > 1:
+            self.cuda_graph_support = CudaGraphSupport(
+                decode_graph=True, prefill_graph=False
+            )
+        self._kvp_tables_cpu: Mapping[str, torch.Tensor] = {}
         if config.is_draft:
             raise NotImplementedError("V4.1 FlatKV implements target attention only")
         if config.kernel_page_size not in (None, 64):
@@ -262,6 +308,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             tuple[int, int], tuple[torch.Tensor, torch.Tensor | None, object]
         ] = {}
         self._prepared_selections: dict[tuple, tuple] = {}
+        self._index_geometry: dict[tuple, V41IndexGeometry] = {}
+        self._in_model_forward = False
+        self._local_decode_selections: dict[tuple, tuple] = {}
+        self._partitioned_index_layers: set[int] = set()
 
     def validate_cache_pool(self, cache_pool: CachePool) -> None:
         super().validate_cache_pool(cache_pool)
@@ -274,6 +324,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 specs[gid].entry_stride_tokens,
             ) != (rows, stride):
                 raise ValueError(f"V4.1 pool is missing the {gid} row geometry")
+        for gid, group_spec in specs.items():
+            expected = (
+                self.kvp_size
+                if gid in (V41_GLOBAL_R1_GROUP_ID, V41_GLOBAL_R2_GROUP_ID)
+                else 1
+            )
+            if group_spec.shard_count != expected:
+                raise ValueError(f"V4.1 {gid} requires shard_count={expected}")
         # The write mask and SWA truncation assume these two groups are private
         # to the request: regenerated by replay over their whole retention
         # window, never shared through a hit.
@@ -283,6 +341,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         super()._publish_cache_pool(cache_pool)
+        self._kvp_tables_cpu = {}
         self.forward_metadata = None
         self.forward_prefill_metadata = None
         self.forward_decode_metadata = None
@@ -294,7 +353,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         self._decoder_view = None
         self._decode_schedule_keepalive.clear()
         self._decode_schedules.clear()
+        self._local_decode_selections.clear()
         self._prepared_selections.clear()
+        self._index_geometry.clear()
 
     def init_cuda_graph_state(
         self,
@@ -391,6 +452,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         for_graph_replay: bool,
         **kwargs,
     ) -> None:
+        if self.kvp_size > 1 and kwargs.get("num_extends", 0):
+            raise NotImplementedError("V4.1 KVP does not support mixed decode batches")
         # The target runner omits num_extends on pure decode; mixed/draft
         # refresh callers can name the leading extend window explicitly.
         num_extends = kwargs.pop("num_extends", 0)
@@ -400,7 +463,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             raise ValueError("V4.1 num_tokens must equal batch size times verify width")
         del for_graph_replay, kwargs
         self._prepared_selections.clear()
+        self._index_geometry.clear()
         self._decode_schedules.clear()
+        self._local_decode_selections.clear()
         if not forward_mode.is_decode_or_idle():
             raise ValueError("V4.1 refresh requires decode or idle mode")
         if not 0 <= num_extends <= actual_bs <= bs:
@@ -554,13 +619,29 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "DeepseekV41AttentionBackend")
+        if self.kvp_size > 1:
+            if (
+                not forward_mode.is_extend()
+                or forward_mode.is_mixed()
+                or num_extends != bs
+            ):
+                raise NotImplementedError("V4.1 KVP requires a pure prefill batch")
+            tables_cpu = kwargs.get("block_tables_cpu")
+            if tables_cpu is None:
+                raise ValueError("V4.1 KVP requires host block tables")
+            self._check_tables(tables_cpu, bs)
+            if any(t.device.type != "cpu" for t in tables_cpu.values()):
+                raise ValueError("V4.1 KVP planning requires CPU block tables")
+            self._kvp_tables_cpu = tables_cpu
         del extend_with_prefix
         if forward_mode.is_decode():
             raise ValueError("V4.1 decode metadata must use refresh_decode_metadata")
         self._check_tables(block_tables, bs)
         self._swa_plans.clear()
         self._prepared_selections.clear()
+        self._index_geometry.clear()
         self._decode_schedules.clear()
+        self._local_decode_selections.clear()
         if not 0 <= num_extends <= bs:
             raise ValueError("V4.1 invalid extend/decode batch sizes")
         width = self.spec_num_tokens
@@ -828,6 +909,31 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             else V41_GLOBAL_R1_GROUP_ID
         )
 
+    def _kvp_placement(self, group_id: str) -> CachePlacement | None:
+        if self.kvp_size == 1 or group_id not in (
+            V41_GLOBAL_R1_GROUP_ID,
+            V41_GLOBAL_R2_GROUP_ID,
+        ):
+            return None
+        return CachePlacement(
+            block_granularity=64,
+            virtual_block_count=self.cache_pool.arena.runtime_contract.virtual_block_counts[
+                group_id
+            ],
+            group=self.kvp_group,
+            rank=self.kvp_rank,
+        )
+
+    def _gather_kvp_history(self, cache, owner, request, rows, forward_mode):
+        gid = self._owner_group(owner)
+        return gather_paged_history(
+            cache,
+            self.query_metadata(forward_mode).block_tables[gid][request],
+            self._kvp_tables_cpu[gid][request],
+            rows=rows,
+            placement=self._kvp_placement(gid),
+        )
+
     def cache_slots(
         self,
         group_id: str,
@@ -848,15 +954,24 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             bounded_group_slots,
         )
 
-        return bounded_group_slots(
+        placement = self._kvp_placement(group_id)
+        slots = bounded_group_slots(
             positions,
             request_indices,
             meta.block_tables[group_id],
             rows,
             stride,
             1,
-            self.cache_pool.arena.cache_group_page_counts[group_id],
+            (
+                placement.virtual_block_count
+                if placement is not None
+                else self.cache_pool.arena.cache_group_page_counts[group_id]
+            ),
         )
+        if placement is not None:
+            slots, owned = resolve_cache_slots(slots, placement)
+            slots = slots.masked_fill(~owned, -1)
+        return slots
 
     def write_locations(self, layer, forward_mode: ForwardMode) -> torch.Tensor:
         return self.query_metadata(forward_mode).swa_write_slots
@@ -869,7 +984,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         request_indices: torch.Tensor,
         forward_mode: ForwardMode,
     ) -> torch.Tensor:
-        """Map request-local global row IDs to owner's slots with per-query causality."""
+        """Resolve causal global selections; KVP prefill keeps virtual read slots.
+
+        Remote selections are valid: materialized history is addressed by the
+        logical IDs, not these virtual slots. Writes use local cache_slots.
+        """
         gid = self._owner_group(owner)
         ratio = self.spec.compress_ratios[owner]
         from tokenspeed_kernel.ops.attention.dsv41 import global_slots
@@ -880,7 +999,11 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             request_indices,
             self.query_metadata(forward_mode).block_tables[gid],
             ratio,
-            self.cache_pool.arena.cache_group_page_counts[gid],
+            (
+                self.cache_pool.arena.runtime_contract.virtual_block_counts[gid]
+                if self.kvp_size > 1
+                else self.cache_pool.arena.cache_group_page_counts[gid]
+            ),
         )
 
     def _lookup_rows(
@@ -1022,12 +1145,23 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         return pooled, pair_positions, pair_requests
 
     def write_global(
-        self, owner, main_kv, index_k, positions, request_indices, forward_mode
+        self,
+        owner,
+        main_kv,
+        index_k,
+        positions,
+        request_indices,
+        forward_mode,
+        main_rope_cache,
     ) -> None:
-        """Store both post-RoPE owner fields, including memory-only positions.
+        """Store both owner fields, including memory-only positions.
 
         main_kv is BF16/FP32 [rows,512], index_k [rows,128]. Positions name
         global row STARTS (j*ratio), not pair ends; ratio-1 uses token positions.
+        main_rope_cache is None for post-RoPE main rows, or the FP32 RoPE table
+        for BF16 pre-RoPE main rows written through the fused global FP4 codec.
+        index_k is post-RoPE, or IndexKeyInput for a fused norm/RoPE/cache write.
+        Neither path modifies the input rows.
         Both writes are enqueued on the model stream before returning; later
         attention on that stream observes both fields, without a host sync.
         """
@@ -1035,7 +1169,10 @@ class DeepseekV41AttentionBackend(AttentionBackend):
 
         gid = self._owner_group(owner)
         ratio = self.spec.compress_ratios[owner]
-        if main_kv.shape != (positions.numel(), 512) or index_k.shape != (
+        index_values = (
+            index_k.values if isinstance(index_k, dsv41.IndexKeyInput) else index_k
+        )
+        if main_kv.shape != (positions.numel(), 512) or index_values.shape != (
             positions.numel(),
             128,
         ):
@@ -1053,9 +1190,41 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 positions + (ratio - 1) < floor[request_indices.clamp_min(0)]
             )
             slots = slots.masked_fill(below, -1)
-        dsv41.cache_scatter(
-            main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
-        )
+        if main_rope_cache is None:
+            dsv41.cache_scatter(
+                main_kv, self.cache_pool.global_kv(owner), slots, self.global_format
+            )
+        else:
+            if self.global_format != "global":
+                raise ValueError(
+                    "Fused global RoPE requires the global FP4 cache format"
+                )
+            dsv41.global_rope_scatter(
+                main_kv,
+                positions,
+                main_rope_cache,
+                self.cache_pool.global_kv(owner),
+                slots,
+            )
+        if isinstance(index_k, dsv41.IndexKeyInput):
+            if self.index_format == "index":
+                dsv41.index_key_norm_rope_scatter(
+                    index_k.values,
+                    index_k.norm_weight,
+                    positions,
+                    index_k.cos_sin_cache,
+                    index_k.norm_eps,
+                    self.cache_pool.index_k(owner),
+                    slots,
+                )
+                return
+            index_k = dsv41.index_key_norm_rope(
+                index_k.values,
+                index_k.norm_weight,
+                positions,
+                index_k.cos_sin_cache,
+                index_k.norm_eps,
+            )
         dsv41.cache_scatter(
             index_k, self.cache_pool.index_k(owner), slots, self.index_format
         )
@@ -1072,6 +1241,40 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             record.positions, record.request_indices, positions, requests
         )
 
+    def plan_indexer_queries(
+        self, layer_id, positions, requests, forward_mode, index_process_group
+    ) -> InterleavedQueryPlan | None:
+        """Plan encoder indexer QCP rows before projection using shared host metadata."""
+        owner = self.spec.kv_owners[layer_id]
+        source = self.spec.index_sources[layer_id]
+        group = self.spec.indexer_query_group
+        total = positions.numel()
+        if (
+            forward_mode.is_mixed()
+            or not forward_mode.is_extend()
+            or not positions.is_cuda
+            or index_process_group is not None
+            or owner < 0
+            or source != owner
+            or layer_id != source
+            or layer_id >= self.spec.candidate_source
+            or len(group) <= 1
+            or total < max(_INDEXER_PARTITION_MIN_QUERIES, len(group))
+        ):
+            return None
+        window = self._window(positions, requests, forward_mode)
+        if window is None:
+            return None
+        ratio = self.spec.compress_ratios[owner]
+        visible = max(
+            ((span.prefix + span.count) // ratio for span in window[1]), default=0
+        )
+        if visible < _INDEXER_PARTITION_MIN_HISTORY:
+            return None
+        return InterleavedQueryPlan(
+            total_rows=total, rank=self.spec.indexer_query_rank, size=len(group)
+        )
+
     def select_global(
         self,
         layer_id,
@@ -1081,13 +1284,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         request_indices,
         forward_mode,
         index_process_group,
+        *,
+        projected_partition: InterleavedQueryPlan | None = None,
     ):
         """Select/reuse request-local global rows; return (physical slots, lengths).
 
-        Index Q is post-RoPE BF16 [T,Hindex,128]; weights are already scaled as
-        in the model reference. Supply both only at an index source, otherwise
-        None. A sharded indexer must supply its head-reduction process group;
-        replicated indexer heads supply None. Candidates survive Reindex updates.
+        Index Q is post-RoPE BF16 [T,Hindex,128] with already-scaled weights,
+        or IndexQueryInput containing pre-RoPE BF16 values, paired with
+        unscaled BF16 weights. Preprocessing applies its weight_scale once.
+        Sources may omit both when indexer_needs_scores is false; Reuse layers
+        always supply None. A sharded indexer must supply its head-reduction
+        process group; replicated indexer heads supply None. Candidates survive
+        Reindex updates.
         Decode graph Full sources use the refresh's full query window; consumers
         may reorder/subset it. A subset Reindex and its Reuse consumers share the
         same window tensors. Other source windows retain eager coverage validation.
@@ -1138,7 +1346,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 ),
                 lens,
             )
-        if index_q is None or index_weights is None:
+        history_bound = self._index_history_bound(
+            positions, request_indices, forward_mode
+        )
+        selection_kind = self._index_selection_kind(layer_id, history_bound)
+        if (index_q is None) != (index_weights is None):
+            raise ValueError("V4.1 index_q and index_weights must be supplied together")
+        if index_q is None and selection_kind != "all":
             raise ValueError("V4.1 index sources require index_q and index_weights")
         candidates = (
             record.candidates if record is not None and record.owner == owner else None
@@ -1157,14 +1371,31 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         )
         produce_candidates = layer_id == self.spec.candidate_source
         metadata = self.query_metadata(forward_mode)
-        table = metadata.block_tables[self._owner_group(owner)]
+        source_table = metadata.block_tables[self._owner_group(owner)]
+        table = source_table
         ratio = self.spec.compress_ratios[owner]
+        if history_bound is not None:
+            table = table[:, : max(1, (history_bound // ratio + 63) // 64)]
         window = (
             self._window(positions, request_indices, forward_mode)
             if forward_mode.is_extend()
             else None
         )
         spans = window[1] if window is not None else ()
+        kvp_decode = self.kvp_size > 1 and forward_mode.is_decode()
+        if kvp_decode:
+            if (
+                positions is not metadata.positions
+                or request_indices is not metadata.request_indices
+            ):
+                raise NotImplementedError(
+                    "V4.1 KVP decode requires canonical query rows"
+                )
+            width = self.spec_num_tokens
+            spans = tuple(
+                V41PrefillSpan(i, i * width, 0, width, 0)
+                for i in range(metadata.seq_lens.numel())
+            )
         if window is not None:
             visible_bound = max(
                 ((span.prefix + span.count) // ratio for span in spans),
@@ -1172,22 +1403,65 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
             table = table[:, : max(1, (visible_bound + 63) // 64)]
         index_cache = self.cache_pool.index_k(owner)
+        if self.kvp_size > 1 and window is None and not kvp_decode:
+            raise NotImplementedError(
+                "V4.1 KVP selection requires canonical prefill or decode queries"
+            )
         # Full-history residency bounds logical pages. Trim replicated table
         # scratch; the kernel separately bounds work by device-visible lengths.
-        table = table[:, : max(0, index_cache.shape[0] - 1)]
+        if self.kvp_size == 1:
+            table = table[:, : max(0, index_cache.shape[0] - 1)]
         candidate_capacity = min(self.spec.candidate_topk, table.shape[1] * 8)
         n = positions.numel()
-        rows = torch.full(
-            (n, self.spec.index_topk), -1, dtype=torch.int32, device=self.device
+        partition = self.plan_indexer_queries(
+            layer_id, positions, request_indices, forward_mode, index_process_group
         )
-        lens = torch.zeros(n, dtype=torch.int32, device=self.device)
-        blocks = torch.full(
+        scoring_positions = positions
+        scoring_requests = request_indices
+        query_group = self.spec.indexer_query_group
+        if projected_partition is not None and projected_partition != partition:
+            raise ValueError("Projected indexer rows disagree with the query plan")
+        expected_rows = (
+            projected_partition.local_rows if projected_partition is not None else n
+        )
+        index_values = (
+            index_q.values if isinstance(index_q, dsv41.IndexQueryInput) else index_q
+        )
+        if index_values is not None and (
+            index_values.shape[0] != expected_rows
+            or index_weights.shape[0] != expected_rows
+        ):
+            raise ValueError(
+                "Indexer projection row count disagrees with its query plan"
+            )
+        if partition is not None:
+            if projected_partition is None:
+                index_q = index_q[partition.local_slice]
+                index_weights = index_weights[partition.local_slice].contiguous()
+            scoring_positions = positions[partition.local_slice].contiguous()
+            scoring_requests = request_indices[partition.local_slice].contiguous()
+            n = partition.local_rows
+            if layer_id not in self._partitioned_index_layers:
+                self._partitioned_index_layers.add(layer_id)
+                if self.spec.indexer_query_rank == 0:
+                    logging.getLogger(__name__).info(
+                        f"V4.1 indexer QCP: layer={layer_id}, "
+                        f"layout=interleave, size={partition.size}, "
+                        f"global_rows={partition.total_rows}, local_rows={n}, "
+                        f"local_projection={projected_partition is not None}"
+                    )
+        # The windows below partition all n query rows, and index_topk fully
+        # writes each window's IDs and lengths, including empty/padded history.
+        rows = torch.empty(
+            (n, self.spec.index_topk), dtype=torch.int32, device=self.device
+        )
+        lens = torch.empty(n, dtype=torch.int32, device=self.device)
+        blocks = torch.empty(
             (n, candidate_capacity if produce_candidates else 0),
-            -1,
             dtype=torch.int32,
             device=self.device,
         )
-        block_lens = torch.zeros(n, dtype=torch.int32, device=self.device)
+        block_lens = torch.empty(n, dtype=torch.int32, device=self.device)
         # Query tiling bounds both score scratch and replicated table rows. Do
         # not index_select the table for the entire prefill (T * context pages).
         canonical_prefill = window is not None
@@ -1198,29 +1472,102 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 for span in spans
                 if span.count
             ]
-            if canonical_prefill
+            if canonical_prefill or kvp_decode
             else [
                 (start, min(start + query_tile, n), None)
                 for start in range(0, n, query_tile)
             ]
         )
+        if partition is not None:
+            windows = [
+                (*partition.local_bounds(start, stop), span)
+                for start, stop, span in windows
+            ]
+        # Candidate-source Full passes still gather history for block maxima.
+        # Ordinary Full and Reindex exchange only local row candidates.
+        local_index_available = (
+            kvp_decode
+            and not produce_candidates
+            and (not reindex or candidate_capacity == self.spec.candidate_topk)
+            and index_process_group is None
+            and dsv41.local_index_supported(
+                index_q, index_cache, candidates.block_ids if reindex else None
+            )
+        )
         for start, stop, span in windows:
-            if span is not None:
-                visible = (
-                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+            selection_kind = self._index_selection_kind(
+                layer_id,
+                span.prefix + span.count if canonical_prefill else history_bound,
+            )
+            local_index = local_index_available and selection_kind != "all"
+            scoring_cache = index_cache
+            if kvp_decode and not local_index:
+                scoring_cache = gather_decode_history(
+                    index_cache,
+                    table[span.request],
+                    metadata.seq_lens[span.request] // ratio,
+                    placement=self._kvp_placement(self._owner_group(owner)),
                 )
-                width = max(1, ((span.prefix + span.count) // ratio + 63) // 64)
-                row = table[span.request : span.request + 1, :width]
-                row = row.masked_fill(row <= 0, -1)
+            elif self.kvp_size > 1 and not local_index:
+                # All owners gather, including ranks with no queries in this request.
+                scoring_cache = self._gather_kvp_history(
+                    index_cache,
+                    owner,
+                    span.request,
+                    (span.prefix + span.count) // ratio,
+                    forward_mode,
+                )
+            if start == stop:
+                del scoring_cache
+                continue
+            if self.kvp_size > 1:
+                visible = (
+                    ((scoring_positions[start:stop] + 1) // ratio)
+                    .clamp_min(0)
+                    .to(torch.int32)
+                )
+                width = (
+                    table.shape[1]
+                    if kvp_decode
+                    else max(1, ((span.prefix + span.count) // ratio + 63) // 64)
+                )
+                if local_index:
+                    slots, owned = resolve_cache_slots(
+                        table[span.request : span.request + 1].long() * 64,
+                        self._kvp_placement(self._owner_group(owner)),
+                    )
+                    row = (slots // 64).to(torch.int32).masked_fill(~owned, -1)
+                else:
+                    row = torch.arange(
+                        1, width + 1, device=self.device, dtype=table.dtype
+                    )[None, :]
                 tile_table = row.expand(stop - start, -1)
+                if kvp_decode:
+                    # Broadcast tables select dense scoring; decode/verify needs
+                    # paged Full and candidate-only sparse Reindex scoring.
+                    tile_table = tile_table.contiguous()
+                geometry = V41IndexGeometry(
+                    scoring_positions,
+                    scoring_requests,
+                    source_table,
+                    tile_table,
+                    visible,
+                    dsv41.new_index_metadata(tile_table, visible),
+                )
             else:
-                from tokenspeed_kernel.ops.attention.dsv41 import selection_table
-
-                tile_table, visible = selection_table(
-                    positions[start:stop], request_indices[start:stop], table, ratio
+                geometry = self._selection_geometry(
+                    scoring_positions,
+                    scoring_requests,
+                    source_table,
+                    table,
+                    ratio,
+                    start,
+                    stop,
+                    span,
+                    forward_mode,
                 )
             cb = None
-            if reindex:
+            if reindex and selection_kind == "candidates":
                 if same_candidate_rows:
                     cb = candidates.block_ids[start:stop]
                 else:
@@ -1228,12 +1575,40 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     cb = candidates.block_ids[ci.clamp_min(0)].masked_fill(
                         ci[:, None] < 0, -1
                     )
+            outputs = (
+                rows[start:stop],
+                lens[start:stop],
+                blocks[start:stop],
+                block_lens[start:stop],
+            )
+            if selection_kind == "all":
+                dsv41.index_select_all(
+                    geometry.table,
+                    geometry.lengths,
+                    scoring_cache.shape[0],
+                    self.spec.candidate_block_size,
+                    outputs,
+                )
+                continue
+            if local_index:
+                packed = dsv41.index_candidates(
+                    index_q[start:stop],
+                    index_weights[start:stop],
+                    index_cache,
+                    tile_table,
+                    visible,
+                    cb,
+                    self.spec.index_topk,
+                )
+                packed = all_gather(packed, self.kvp_group, dim=1)
+                dsv41.merge_index_candidates(packed, rows[start:stop], lens[start:stop])
+                continue
             dsv41.index_topk(
                 index_q[start:stop],
                 index_weights[start:stop],
-                index_cache,
-                tile_table,
-                visible,
+                scoring_cache,
+                geometry.table,
+                geometry.lengths,
                 cb,
                 self.spec.index_topk,
                 candidate_capacity if produce_candidates else 0,
@@ -1241,14 +1616,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 query_tile,
                 256,
                 index_process_group,
-                (
-                    rows[start:stop],
-                    lens[start:stop],
-                    blocks[start:stop],
-                    block_lens[start:stop],
-                ),
+                outputs,
                 None,
+                geometry.kernel_metadata,
             )
+            del scoring_cache
+        if partition is not None:
+            rows, lens = partition.gather_selection(rows, lens, query_group)
         if produce_candidates:
             candidates = V41Candidates(positions, request_indices, blocks, block_lens)
         slots = self.global_read_slots(
@@ -1279,6 +1653,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         requests,
         forward_mode,
         index_process_group,
+        *,
+        projected_partition: InterleavedQueryPlan | None = None,
     ):
         """Prepare source selection on the caller's stream for this one forward."""
         result = self.select_global(
@@ -1289,6 +1665,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             requests,
             forward_mode,
             index_process_group,
+            projected_partition=projected_partition,
         )
         key = (layer_id, forward_mode, id(positions), id(requests))
         self._prepared_selections[key] = (positions, requests, result)
@@ -1398,6 +1775,36 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         return plan.history_slots[ratio]
 
+    def _local_decode_selection(self, owner, slots, lengths, swa_lengths):
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        # Reuse only identical selection tensors within this forward. Subset
+        # windows and Reindex results have their own tensors and cannot alias.
+        key = (owner, id(slots), id(lengths), id(swa_lengths))
+        entry = self._local_decode_selections.get(key)
+        if entry is not None:
+            return entry[3:]
+        local_slots, owned = resolve_cache_slots(
+            slots, self._kvp_placement(self._owner_group(owner))
+        )
+        local_slots, local_counts = dsv41.compact_slots(
+            local_slots.masked_fill(~owned, -1), lengths
+        )
+        local_swa_lengths = (
+            swa_lengths if self.kvp_rank == 0 else torch.zeros_like(swa_lengths)
+        )
+        # Retain the source tensors so their identities cannot be recycled.
+        entry = (
+            slots,
+            lengths,
+            swa_lengths,
+            local_slots,
+            local_counts,
+            local_swa_lengths,
+        )
+        self._local_decode_selections[key] = entry
+        return entry[3:]
+
     def _decode_schedule(self, swa_lens, global_lens):
         from tokenspeed_kernel.ops.attention import dsv41
 
@@ -1432,10 +1839,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         softmax_scale: float,
         index_process_group,
         swa_rope_cache,
+        swa_norm_weight,
+        swa_norm_eps,
+        out_rope_cache=None,
     ) -> torch.Tensor:
-        """Joint SWA/global attention; returns BF16 [T,Hlocal,512], BEFORE inverse RoPE.
+        """Joint SWA/global attention; returns BF16 [T,Hlocal,512].
 
-        q and swa_kv are post-RoPE [T,Hlocal,512] / [T,512]. Each SWA input
+        The output is BEFORE inverse RoPE unless out_rope_cache (the inverse
+        FP32 [positions,64] table) is given; then it is rotated with it.
+
+        q and swa_kv are [T,Hlocal,512] / [T,512]. q is post-RoPE; SWA can
+        defer RMSNorm and RoPE using swa_norm_weight/eps and swa_rope_cache.
+        Each SWA input
         corresponds to the explicit query positions/requests. Global memory is
         written separately by write_global; index inputs follow select_global.
         Prefill SWA writes follow all old-prefix reads, using only LCM-retained
@@ -1457,6 +1872,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             )
         if not 0 <= layer_id < len(self.spec.kv_owners):
             raise ValueError("V4.1 layer_id is outside the backbone")
+        if swa_norm_weight is not None and swa_rope_cache is None:
+            # Only the fused RoPE writers apply the deferred SWA norm.
+            raise ValueError("A deferred SWA norm requires the SWA RoPE cache")
         if forward_mode.is_mixed():
             meta = self.query_metadata(forward_mode)
             view = self._decoder_view
@@ -1515,6 +1933,9 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     softmax_scale=softmax_scale,
                     index_process_group=index_process_group,
                     swa_rope_cache=swa_rope_cache,
+                    swa_norm_weight=swa_norm_weight,
+                    swa_norm_eps=swa_norm_eps,
+                    out_rope_cache=out_rope_cache,
                 )
             return out
         if n == 0:
@@ -1531,6 +1952,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 request_indices,
                 forward_mode,
                 index_process_group,
+                projected_partition=None,
             )
         else:
             global_slots, global_lens = prepared[2]
@@ -1540,6 +1962,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         metadata = self.query_metadata(forward_mode)
         window = self._window(positions, request_indices, forward_mode)
         canonical = window is not None
+        if self.kvp_size > 1 and (
+            not canonical or not (forward_mode.is_extend() or forward_mode.is_decode())
+        ):
+            raise NotImplementedError(
+                "V4.1 KVP attention requires canonical prefill or decode queries"
+            )
         locations = (
             window[0].swa_write_slots
             if canonical
@@ -1561,12 +1989,71 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     locations,
                     self.swa_format,
                     None,
+                    swa_norm_weight,
+                    swa_norm_eps,
                 )
             swa_slots, swa_lens = (
                 (metadata.swa_read_slots, metadata.swa_read_lens)
                 if canonical
                 else self.window_slots(V41_SWA_GROUP_ID, positions, request_indices)
             )
+            if self.kvp_size > 1 and owner >= 0:
+                # Indexer selections remain global; only KV reads are owner-local.
+                local_slots, local_counts, local_swa_lens = (
+                    self._local_decode_selection(
+                        owner, global_slots, global_lens, swa_lens
+                    )
+                )
+                # rope_pad_query pads decode heads; never communicate padding.
+                heads = self.spec.num_attention_heads // self.spec.attn_tp_size
+                query = gather_query_heads(q[:, :heads], self.kvp_group)
+                lse = torch.empty(query.shape[:2], dtype=torch.float32, device=q.device)
+                partial = dsv41.selected_attention(
+                    query,
+                    cache,
+                    swa_slots,
+                    local_swa_lens,
+                    global_cache,
+                    local_slots,
+                    local_counts,
+                    None,
+                    softmax_scale,
+                    None,
+                    256,
+                    self._decode_schedule(local_swa_lens, local_counts),
+                    None,
+                    None,
+                    lse=lse,
+                )
+                partial, lse = normalize_dcp_partials(
+                    partial, lse, local_swa_lens, local_counts
+                )
+                out = combine_attention_partials(
+                    partial,
+                    lse,
+                    group=self.kvp_group,
+                    rank=self.kvp_rank,
+                    sink=attn_sink[:heads],
+                    keep_all_heads=False,
+                )
+                if out_rope_cache is not None:
+                    dsv41.rope_inplace(out, positions, out_rope_cache, None)
+                return out
+            if out_rope_cache is not None:
+                return dsv41.selected_attention_rope(
+                    q,
+                    cache,
+                    swa_slots,
+                    swa_lens,
+                    global_cache,
+                    global_slots,
+                    global_lens,
+                    attn_sink,
+                    softmax_scale,
+                    self._decode_schedule(swa_lens, global_lens),
+                    positions,
+                    out_rope_cache,
+                )
             return dsv41.selected_attention(
                 q,
                 cache,
@@ -1582,6 +2069,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 self._decode_schedule(swa_lens, global_lens),
                 None,
                 None,
+                lse=None,
             )
         plan = self._swa_query_plan(positions, request_indices, forward_mode)
         # Quantize current rows exactly as cache storage, without publishing them
@@ -1604,6 +2092,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 locations,
                 self.swa_format,
                 current,
+                swa_norm_weight,
+                swa_norm_eps,
             )
         logical_rows = None
         if owner >= 0:
@@ -1626,21 +2116,41 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             swa_count = prefix_count + current_rows.shape[0]
             history_slots = (
                 self._prefill_global_history(request_plan, owner, forward_mode)
-                if owner >= 0
+                if owner >= 0 and self.kvp_size == 1
                 else None
             )
-            history_count = history_slots.numel() if history_slots is not None else 0
+            history_count = (
+                (request_plan.last_position + 1) // self.spec.compress_ratios[owner]
+                if owner >= 0 and self.kvp_size > 1
+                else (history_slots.numel() if history_slots is not None else 0)
+            )
             workspace = current.new_empty((swa_count + history_count, 512))
             workspace[:prefix_count].copy_(prefix)
             workspace[prefix_count:swa_count].copy_(current_rows)
             indices = request_plan.swa_indices
             if owner >= 0:
-                dsv41.cache_gather(
-                    global_cache,
-                    history_slots,
-                    self.global_format,
-                    workspace[swa_count:],
-                )
+                if self.kvp_size > 1:
+                    packed = self._gather_kvp_history(
+                        global_cache,
+                        owner,
+                        request_plan.request,
+                        history_count,
+                        forward_mode,
+                    )
+                    compact_slots = torch.arange(
+                        64, 64 + history_count, device=self.device, dtype=torch.int64
+                    )
+                    dsv41.cache_gather(
+                        packed, compact_slots, self.global_format, workspace[swa_count:]
+                    )
+                    del packed, compact_slots
+                else:
+                    dsv41.cache_gather(
+                        global_cache,
+                        history_slots,
+                        self.global_format,
+                        workspace[swa_count:],
+                    )
                 selected = logical_rows[rows]
                 compressed_indices = torch.where(
                     (selected >= 0) & (global_slots[rows] >= 0),
@@ -1653,27 +2163,65 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             # Advanced request subsets do not provide a writable output view;
             # copy their compact result back explicitly after native execution.
             output = out[rows] if isinstance(rows, slice) else None
-            result = dsv41.selected_attention(
-                q[rows].contiguous(),
-                cache,
-                None,
-                None,
-                global_cache,
-                None,
-                None,
-                attn_sink,
-                softmax_scale,
-                output,
-                V41_PREFILL_QUERY_TILE,
-                None,
-                workspace[:, None, :],
-                indices.contiguous(),
-            )
+            request_q = q[rows].contiguous()
+            group = self.spec.attention_query_group
+            if (
+                canonical
+                and q.is_cuda
+                and index_process_group is None
+                and should_exchange_prefill_heads(
+                    num_queries=request_q.shape[0],
+                    local_heads=request_q.shape[1],
+                    group_size=len(group),
+                    min_queries=self.spec.attention_query_min_tokens,
+                    swa_min_queries=self.spec.attention_query_swa_min_tokens,
+                    has_global=owner >= 0,
+                )
+            ):
+                if layer_id not in self._attention_exchange_layers:
+                    logging.getLogger(__name__).info(
+                        f"V4.1 prefill attention QCP: layer={layer_id}, "
+                        f"size={len(group)}, rows={request_q.shape[0]}, "
+                        f"local_heads={request_q.shape[1]}"
+                    )
+                    self._attention_exchange_layers.add(layer_id)
+                result = selected_prefill_with_head_exchange(
+                    request_q,
+                    workspace[:, None, :],
+                    indices,
+                    attn_sink,
+                    softmax_scale=softmax_scale,
+                    query_chunk_size=V41_PREFILL_QUERY_TILE,
+                    group=group,
+                    rank=self.spec.attention_query_rank,
+                )
+                if output is not None:
+                    output.copy_(result)
+            else:
+                result = dsv41.selected_attention(
+                    request_q,
+                    cache,
+                    None,
+                    None,
+                    global_cache,
+                    None,
+                    None,
+                    attn_sink,
+                    softmax_scale,
+                    output,
+                    V41_PREFILL_QUERY_TILE,
+                    None,
+                    workspace[:, None, :],
+                    indices.contiguous(),
+                    lse=None,
+                )
             if output is None:
                 out[rows] = result
             del workspace, current_rows, indices
         if swa_rope_cache is None:
             dsv41.cache_scatter(swa_kv, cache, locations, self.swa_format)
+        if out_rope_cache is not None:
+            dsv41.rope_inplace(out, positions, out_rope_cache, None)
         return out
 
     def forward_decode(self, *args, **kwargs):
@@ -1685,6 +2233,113 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         raise NotImplementedError(
             "V4.1 model layers call forward_v41 with explicit positions"
         )
+
+    def _index_history_bound(self, positions, requests, mode) -> int | None:
+        if mode.is_decode_or_idle() or mode.is_mixed():
+            # Decode records one fixed indexer path, including eager execution.
+            # Live GPU lengths may short-circuit work inside kernels, never
+            # choose a different Python branch or a different captured graph.
+            return None
+        window = self._window(positions, requests, mode)
+        if window is not None:
+            return max((span.prefix + span.count for span in window[1]), default=0)
+        return (
+            self.query_metadata(mode).block_tables[V41_GLOBAL_R1_GROUP_ID].shape[1] * 64
+        )
+
+    def _index_selection_kind(self, layer_id: int, bound: int | None) -> str:
+        owner = self.spec.kv_owners[layer_id]
+        ratio = self.spec.compress_ratios[owner]
+        reindex = self.spec.index_sources[layer_id] != owner
+        if reindex and (
+            bound is None
+            or bound // ratio
+            > self.spec.candidate_topk * self.spec.candidate_block_size
+        ):
+            return "candidates"
+        if (
+            bound is not None
+            and bound // ratio <= self.spec.index_topk
+            and (
+                layer_id != self.spec.candidate_source
+                or bound // ratio
+                <= self.spec.candidate_topk * self.spec.candidate_block_size
+            )
+        ):
+            return "all"
+        return "full"
+
+    def indexer_needs_scores(self, layer_id, positions, requests, mode) -> bool:
+        """Whether this source needs Q/weight projections for its query window."""
+        return (
+            self._index_selection_kind(
+                layer_id, self._index_history_bound(positions, requests, mode)
+            )
+            != "all"
+        )
+
+    def begin_indexer_forward(self) -> None:
+        """Start fresh geometry shared across this forward's stages.
+
+        Successful calls pair with end_indexer_forward; failures stop the engine.
+        """
+        self._index_geometry.clear()
+        self._in_model_forward = True
+
+    def end_indexer_forward(self) -> None:
+        """Release shared scratch when the full model forward finishes."""
+        self._in_model_forward = False
+        self._index_geometry.clear()
+
+    def begin_indexer_stage(self) -> None:
+        """Clear scratch only when the stage runs outside a full model forward."""
+        if not self._in_model_forward:
+            self._index_geometry.clear()
+
+    def _selection_geometry(
+        self, positions, requests, source_table, table, ratio, start, stop, span, mode
+    ):
+        from tokenspeed_kernel.ops.attention import dsv41
+
+        key = (
+            mode,
+            id(positions),
+            id(requests),
+            id(source_table),
+            ratio,
+            table.shape[1],
+            start,
+            stop,
+            span,
+        )
+        geometry = self._index_geometry.get(key)
+        if geometry is None:
+            if span is not None:
+                visible = (
+                    ((positions[start:stop] + 1) // ratio).clamp_min(0).to(torch.int32)
+                )
+                width = max(1, ((span.prefix + span.count) // ratio + 63) // 64)
+                row = table[span.request : span.request + 1, :width]
+                row = row.masked_fill(row <= 0, -1)
+                tile_table = row.expand(stop - start, -1)
+            else:
+                tile_table, visible = dsv41.selection_table(
+                    positions[start:stop], requests[start:stop], table, ratio
+                )
+            # Arbitrary prefill windows may cover a whole prompt. Retaining
+            # every replicated table would defeat query tiling's memory bound.
+            cacheable = mode.is_decode() or span is not None
+            geometry = V41IndexGeometry(
+                positions,
+                requests,
+                source_table,
+                tile_table,
+                visible,
+                dsv41.new_index_metadata(tile_table, visible) if cacheable else None,
+            )
+            if cacheable:
+                self._index_geometry[key] = geometry
+        return geometry
 
 
 register_backend("deepseek_v41", {AttentionArch.MLA}, DeepseekV41AttentionBackend)

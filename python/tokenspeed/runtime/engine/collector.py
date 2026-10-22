@@ -22,24 +22,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from typing import Any
 
 # Streaming merge policy for the logprob meta_info fields. These are the UNION
 # of both dialects' per-position list keys; only one dialect is present per
 # request (the renderer emits one), so the union is harmless.
 #
-# Each value is a per-position list that GROWS as frames arrive, so it must be
-# appended rather than overwritten -- hence merged by ``_extend_sequence``. That
-# helper is dict-safe: its prefix check (``_is_prefix``) compares elements only
-# with ``==``, which both ``dict`` and the ``Logprob`` dataclass support, so the
-# entries never need to be hashed or ordered.
+# Under streaming each frame carries only its own positions (the output
+# processor renders every streamed frame into a fresh dict), so each value is
+# appended rather than overwritten -- hence merged by ``_extend_sequence``.
+# Equal entries in two frames (the same token twice) are two positions.
 #
-# ``cumulative_logprob`` is a scalar handled separately (see _SUM_META_KEYS):
-# under streaming each frame recomputes it from a fresh dict, so each frame's
-# value is the sum of only that frame's positions (a delta). Since the
-# per-position ``logprobs`` are appended across frames, the scalar must be
-# *summed* (not overwritten) to stay consistent with the appended list.
+# ``cumulative_logprob`` covers the whole request up to each frame, so the
+# latest value wins, independently of which frames the consumer has taken.
 _APPEND_META_KEYS = {
     # vLLM dialect
     "logprobs",
@@ -50,11 +45,6 @@ _APPEND_META_KEYS = {
     "output_top_logprobs",
     "input_token_ids_logprobs",
     "output_token_ids_logprobs",
-}
-
-# Scalar logprob metadata accumulated by addition across coalesced frames.
-_SUM_META_KEYS = {
-    "cumulative_logprob",
 }
 
 
@@ -80,7 +70,16 @@ class RequestOutputCollector:
         self._pending_owned = False
         return output
 
-    def put(self, output: dict[str, Any], *, stream: bool) -> None:
+    def put(self, output: dict[str, Any], *, stream: bool, cumulative: bool) -> None:
+        """Queue ``output`` for the next ``take``.
+
+        Args:
+            output: The payload of one output frame.
+            stream: Merge into the pending output instead of replacing it.
+            cumulative: ``output_ids`` and ``output_multi_ids`` hold every id
+                generated so far, not only this frame's, so a merge replaces
+                them instead of appending.
+        """
         if self._pending is None or not stream:
             self._pending = output
             self._pending_owned = False
@@ -88,9 +87,9 @@ class RequestOutputCollector:
         if not self._pending_owned:
             self._pending = self._clone_for_merge(self._pending)
             self._pending_owned = True
-        self._merge_into_pending(output)
+        self._merge_into_pending(output, cumulative)
 
-    def _merge_into_pending(self, output: dict[str, Any]) -> None:
+    def _merge_into_pending(self, output: dict[str, Any], cumulative: bool) -> None:
         pending = self._pending
         if pending is None:
             raise RuntimeError("Cannot merge output without a pending value.")
@@ -113,12 +112,11 @@ class RequestOutputCollector:
         if output_kind == "text" and "text" in output:
             pending["text"] = output["text"]
 
-        self._extend_sequence(pending, "output_ids", output.get("output_ids"))
+        merge_ids = self._replace_sequence if cumulative else self._extend_sequence
+        merge_ids(pending, "output_ids", output.get("output_ids"))
 
         if "output_multi_ids" in pending or "output_multi_ids" in output:
-            self._extend_sequence(
-                pending, "output_multi_ids", output.get("output_multi_ids")
-            )
+            merge_ids(pending, "output_multi_ids", output.get("output_multi_ids"))
 
         if "output_extra_info" in output:
             pending["output_extra_info"] = output["output_extra_info"]
@@ -139,10 +137,6 @@ class RequestOutputCollector:
             if key in _APPEND_META_KEYS:
                 self._extend_sequence(pending, key, value)
                 continue
-            if key in _SUM_META_KEYS:
-                if value is not None:
-                    pending[key] = (pending.get(key) or 0.0) + value
-                continue
             pending[key] = value
 
     def _extend_sequence(self, container: dict[str, Any], key: str, value: Any) -> None:
@@ -161,11 +155,16 @@ class RequestOutputCollector:
         if not existing:
             container[key] = list(value)
             return
-        if self._is_prefix(existing, value):
-            # Cumulative producer: extend with just the tail of `value`.
-            existing.extend(value[len(existing) :])
-        else:
-            existing.extend(value)
+        # Always append: a frame that starts with the pending ids (the same
+        # token twice in a row) is new output, not a resend.
+        existing.extend(value)
+
+    def _replace_sequence(
+        self, container: dict[str, Any], key: str, value: Any
+    ) -> None:
+        if value is not None:
+            # An owned copy, as in _extend_sequence.
+            container[key] = list(value)
 
     def _clone_for_merge(self, pending: dict[str, Any]) -> dict[str, Any]:
         cloned: dict[str, Any] = dict(pending)
@@ -189,12 +188,3 @@ class RequestOutputCollector:
         if "text" in output:
             return "text"
         return "tokens"
-
-    def _is_prefix(self, pending: Sequence[Any], output: Sequence[Any]) -> bool:
-        pending_len = len(pending)
-        if pending_len > len(output):
-            return False
-        for index in range(pending_len):
-            if output[index] != pending[index]:
-                return False
-        return True

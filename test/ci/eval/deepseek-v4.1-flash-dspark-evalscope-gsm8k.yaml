@@ -15,7 +15,7 @@ install:
 server:
   command: >-
     ts serve
-    --model deepseek-ai/DeepSeek-V4.1-Flash
+    --model deepseek-ai/DeepSeek-V4.1-Flash-1017
     --speculative-algorithm DSPARK
     --tensor-parallel-size 4
     --enable-expert-parallel
@@ -28,7 +28,6 @@ server:
     --disable-kvstore
     --trust-remote-code
     --max-cudagraph-capture-size 32
-    --reasoning-parser deepseek_v31
     --host 127.0.0.1
     --port 8000
   ready:
@@ -41,7 +40,7 @@ eval:
   command: >-
     HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
     /tmp/evalscope-perf/bin/evalscope eval
-    --model deepseek-ai/DeepSeek-V4.1-Flash
+    --model deepseek-ai/DeepSeek-V4.1-Flash-1017
     --api-url http://127.0.0.1:8000/v1
     --api-key EMPTY_TOKEN
     --datasets gsm8k

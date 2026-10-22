@@ -33,10 +33,13 @@ from tokenspeed.runtime.execution.model_executor import (
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
+from tokenspeed.runtime.layers.logits_processor import (
+    should_apply_lm_head_quant_method,
+)
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 if TYPE_CHECKING:
@@ -109,8 +112,28 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
         if head is None:
             raise ValueError("Draft model requires the target's lm_head weight.")
         draft_model.set_embed_and_head(embed, head)
+        _refuse_aliased_quantized_head(model_runner.model, draft_model, head)
     if embed is None:
         _require_draft_embedding(draft_model)
+
+
+def _refuse_aliased_quantized_head(target_model, draft_model, head) -> None:
+    """Fail loudly when a draft aliased a quantized target head's weight alone.
+
+    A quantized head computes logits through its quant method and scales, so the
+    draft would read the quantized weight as a plain one. A draft that keeps its
+    own head (an EAGLE3 draft not loading the target's) reports another weight.
+    """
+    target_head = target_model.lm_head
+    if not should_apply_lm_head_quant_method(target_head, target_head.quant_method):
+        return
+    if draft_model.get_embed_and_head()[1] is head:
+        raise ValueError(
+            f"The target's lm_head is quantized "
+            f"({type(target_head.quant_method).__name__}); "
+            f"{type(draft_model).__name__} aliases only its weight and must "
+            "share the complete module (set_embed_and_head_module)."
+        )
 
 
 def _require_draft_embedding(draft_model) -> None:
@@ -190,7 +213,7 @@ def configure_draft_target(
         )
     if DrafterImpl.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
-    if server_args.speculative_algorithm == "EAGLE3" and hasattr(
+    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS and hasattr(
         model_runner.model, "set_eagle3_layers_to_capture"
     ):
         # capture the layers the draft was trained on, not the default

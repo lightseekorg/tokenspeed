@@ -20,9 +20,8 @@
 
 """Dense16 Gluon GEMM kernels for gfx950.
 
-The public entry point computes ``A @ B.T`` for supported 16-bit floating-point
-dense inputs and returns ``None`` when the generic caller should use its torch
-fallback.
+The launchers compute ``A @ B.T`` (or batched ``A @ B``) for 16-bit
+floating-point inputs; ``tokenspeed-kernel`` selects among them by shape.
 """
 
 from __future__ import annotations
@@ -31,9 +30,8 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
     _dense16_mm_launch_metadata,
-    _supports_largem_shape,
-    launch_gluon_mm_a16w16_prefill_gfx950,
 )
+from tokenspeed_kernel_amd.ops.gfx950.gemm.splitk import check_splitk_counters
 
 cdna4 = gl.amd.cdna4
 async_copy = gl.amd.cdna4.async_copy
@@ -41,8 +39,6 @@ async_copy = gl.amd.cdna4.async_copy
 DENSE16_BLOCK_M = 16
 DENSE16_BLOCK_N = 128
 DENSE16_BLOCK_K = 64
-WARP_REDUCE_OUTPUTS = 1
-WARP_REDUCE_BLOCK_K = 1024
 BMM_M1_BLOCK_N = 32
 BMM_M1_NUM_WARPS = 4
 CDNA_WAVEFRONT_SIZE = 64
@@ -53,11 +49,9 @@ MFMA_LDS_REDUCE_M = 4
 MFMA_LDS_SPLIT_K = 8
 GROUP_SIZE_M = 2
 MAX_M = 1024
-LARGEM_DISPATCH_MIN_M = 2048
 
 _SUPPORTED_DTYPES = {torch.float16, torch.bfloat16}
 _partial_cache: dict[tuple[int, int, int, int, int], torch.Tensor] = {}
-_counter_cache: dict[tuple[int, int, int], torch.Tensor] = {}
 
 
 def _dense16_bmm_launch_metadata(grid, kernel, args):
@@ -164,7 +158,9 @@ def _mfma_lds_gload_layout_a(block_m: int, block_k: int, _num_warps: int):
             block_bases=[],
             shape=[block_m, block_k],
         )
-    if block_m <= 16:
+    # Each warp writes whole BLOCK_K rows, so its direct-to-LDS copies stay
+    # contiguous in the K-major padded shared layout.
+    if block_m <= 64 or block_k >= 128:
         if block_k >= 512:
             return gl.BlockedLayout([1, 8], [1, 64], [4, 1], [1, 0])
         if block_k >= 256:
@@ -172,67 +168,7 @@ def _mfma_lds_gload_layout_a(block_m: int, block_k: int, _num_warps: int):
         if block_k >= 128:
             return gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
         return gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
-    if block_m <= 32:
-        if block_k >= 512:
-            return gl.BlockedLayout([1, 8], [1, 64], [4, 1], [1, 0])
-        if block_k >= 256:
-            return gl.BlockedLayout([1, 8], [2, 32], [4, 1], [1, 0])
-        if block_k >= 128:
-            return gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
-        return gl.BlockedLayout([1, 8], [8, 8], [4, 1], [1, 0])
-    if block_m <= 64:
-        return gl.BlockedLayout([1, 8], [16, 4], [4, 1], [1, 0])
-    if block_k >= 1024:
-        return gl.DistributedLinearLayout(
-            reg_bases=[
-                [0, 1],
-                [0, 2],
-                [0, 4],
-                [0, 64],
-                [0, 128],
-                [0, 256],
-                [0, 512],
-                [4, 0],
-                [8, 0],
-            ],
-            lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
-            warp_bases=[[1, 0], [2, 0]],
-            block_bases=[],
-            shape=[block_m, block_k],
-        )
-    if block_k >= 512:
-        return gl.DistributedLinearLayout(
-            reg_bases=[
-                [0, 1],
-                [0, 2],
-                [0, 4],
-                [0, 64],
-                [0, 128],
-                [0, 256],
-                [4, 0],
-                [8, 0],
-            ],
-            lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
-            warp_bases=[[1, 0], [2, 0]],
-            block_bases=[],
-            shape=[block_m, block_k],
-        )
-    if block_k >= 256:
-        return gl.DistributedLinearLayout(
-            reg_bases=[[0, 1], [0, 2], [0, 4], [0, 64], [0, 128], [4, 0], [8, 0]],
-            lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
-            warp_bases=[[1, 0], [2, 0]],
-            block_bases=[],
-            shape=[block_m, block_k],
-        )
-    if block_k >= 128:
-        return gl.DistributedLinearLayout(
-            reg_bases=[[0, 1], [0, 2], [0, 4], [0, 64], [4, 0], [8, 0]],
-            lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
-            warp_bases=[[1, 0], [2, 0]],
-            block_bases=[],
-            shape=[block_m, block_k],
-        )
+    # 128-wide BLOCK_K=64 tiles.
     return gl.DistributedLinearLayout(
         reg_bases=[[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]],
         lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
@@ -252,7 +188,7 @@ def _mfma_lds_gload_layout_b(block_n: int, block_k: int, _num_warps: int):
             block_bases=[],
             shape=[block_k, block_n],
         )
-    if block_n <= 16:
+    if block_n <= 64 or block_k >= 128:
         if block_k >= 512:
             return gl.BlockedLayout([8, 1], [64, 1], [1, 4], [0, 1])
         if block_k >= 256:
@@ -260,67 +196,7 @@ def _mfma_lds_gload_layout_b(block_n: int, block_k: int, _num_warps: int):
         if block_k >= 128:
             return gl.BlockedLayout([8, 1], [16, 4], [1, 4], [0, 1])
         return gl.BlockedLayout([8, 1], [8, 8], [1, 4], [0, 1])
-    if block_n <= 32:
-        if block_k >= 512:
-            return gl.BlockedLayout([8, 1], [64, 1], [1, 4], [0, 1])
-        if block_k >= 256:
-            return gl.BlockedLayout([8, 1], [32, 2], [1, 4], [0, 1])
-        if block_k >= 128:
-            return gl.BlockedLayout([8, 1], [16, 4], [1, 4], [0, 1])
-        return gl.BlockedLayout([8, 1], [8, 8], [1, 4], [0, 1])
-    if block_n <= 64:
-        return gl.BlockedLayout([8, 1], [4, 16], [1, 4], [0, 1])
-    if block_k >= 1024:
-        return gl.DistributedLinearLayout(
-            reg_bases=[
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [64, 0],
-                [128, 0],
-                [256, 0],
-                [512, 0],
-                [0, 4],
-                [0, 8],
-            ],
-            lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
-            warp_bases=[[0, 1], [0, 2]],
-            block_bases=[],
-            shape=[block_k, block_n],
-        )
-    if block_k >= 512:
-        return gl.DistributedLinearLayout(
-            reg_bases=[
-                [1, 0],
-                [2, 0],
-                [4, 0],
-                [64, 0],
-                [128, 0],
-                [256, 0],
-                [0, 4],
-                [0, 8],
-            ],
-            lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
-            warp_bases=[[0, 1], [0, 2]],
-            block_bases=[],
-            shape=[block_k, block_n],
-        )
-    if block_k >= 256:
-        return gl.DistributedLinearLayout(
-            reg_bases=[[1, 0], [2, 0], [4, 0], [64, 0], [128, 0], [0, 4], [0, 8]],
-            lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
-            warp_bases=[[0, 1], [0, 2]],
-            block_bases=[],
-            shape=[block_k, block_n],
-        )
-    if block_k >= 128:
-        return gl.DistributedLinearLayout(
-            reg_bases=[[1, 0], [2, 0], [4, 0], [64, 0], [0, 4], [0, 8]],
-            lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
-            warp_bases=[[0, 1], [0, 2]],
-            block_bases=[],
-            shape=[block_k, block_n],
-        )
+    # 128-wide BLOCK_K=64 tiles.
     return gl.DistributedLinearLayout(
         reg_bases=[[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]],
         lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
@@ -328,6 +204,22 @@ def _mfma_lds_gload_layout_b(block_n: int, block_k: int, _num_warps: int):
         block_bases=[],
         shape=[block_k, block_n],
     )
+
+
+@gluon.constexpr_function
+def _use_coalesced_store(block_m: int, block_n: int, num_warps: int):
+    # Only when every lane owns a distinct 8-wide row segment of the tile;
+    # smaller decode tiles keep the MFMA layout.
+    if block_n < 8:
+        return False
+    lanes_n = min(block_n // 8, 64)
+    return (64 // lanes_n) * num_warps <= block_m
+
+
+@gluon.constexpr_function
+def _coalesced_store_layout(block_m: int, block_n: int, num_warps: int):
+    lanes_n = min(block_n // 8, 64)
+    return gl.BlockedLayout([1, 8], [64 // lanes_n, lanes_n], [num_warps, 1], [1, 0])
 
 
 @gluon.constexpr_function
@@ -394,7 +286,7 @@ def _mfma_lds_manual_shared_layout_b(block_n: int, block_k: int):
 
 @gluon.constexpr_function
 def _mfma_lds_shared_layout_a(dot_layout_a, block_m: int, block_k: int, dtype):
-    if block_m <= 64:
+    if block_m <= 64 or block_k >= 128:
         return _mfma_lds_manual_shared_layout_a(block_m, block_k)
     layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
         dot_layout_a,
@@ -409,7 +301,7 @@ def _mfma_lds_shared_layout_a(dot_layout_a, block_m: int, block_k: int, dtype):
 
 @gluon.constexpr_function
 def _mfma_lds_shared_layout_b(dot_layout_b, block_n: int, block_k: int, dtype):
-    if block_n <= 64:
+    if block_n <= 64 or block_k >= 128:
         return _mfma_lds_manual_shared_layout_b(block_n, block_k)
     layout = gl.amd.cdna4.compute_efficient_padded_shared_layout(
         dot_layout_b,
@@ -420,70 +312,6 @@ def _mfma_lds_shared_layout_b(dot_layout_b, block_n: int, block_k: int, dtype):
     if layout is not None:
         return layout
     return _mfma_lds_manual_shared_layout_b(block_n, block_k)
-
-
-@gluon.jit(launch_metadata=_dense16_mm_launch_metadata)
-def gluon_mm_a16w16_warp_gfx950(
-    a_ptr,
-    b_ptr,
-    c_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bk,
-    stride_bn,
-    stride_cm,
-    stride_cn,
-    BLOCK_OUT: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-):
-    """Warp-reduce dense16 GEMM for very small-M low/medium-K decode tiles."""
-    pid = gl.program_id(axis=0)
-    layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1],
-        [1, 64],
-        [BLOCK_OUT, 1],
-        [1, 0],
-    )
-    out_layout: gl.constexpr = gl.SliceLayout(1, layout)
-    k_layout: gl.constexpr = gl.SliceLayout(0, layout)
-
-    lane_out = gl.arange(0, BLOCK_OUT, out_layout)
-    offs_k = gl.arange(0, BLOCK_K, k_layout)
-    out_idx = pid * BLOCK_OUT + lane_out
-    n = out_idx // M
-    m = out_idx - n * M
-    valid_out = out_idx < (M * N)
-
-    acc = gl.zeros((BLOCK_OUT,), gl.float32, out_layout)
-    for kt in range(0, gl.cdiv(K, BLOCK_K)):
-        k = kt * BLOCK_K + offs_k
-        a_offsets = (m[:, None] * stride_am + k[None, :] * stride_ak).to(gl.int32)
-        b_offsets = (n[:, None] * stride_bn + k[None, :] * stride_bk).to(gl.int32)
-        k_valid = k < K
-        a = cdna4.buffer_load(
-            ptr=a_ptr,
-            offsets=a_offsets,
-            mask=valid_out[:, None] & k_valid[None, :],
-            other=0.0,
-        ).to(gl.float32)
-        b = cdna4.buffer_load(
-            ptr=b_ptr,
-            offsets=b_offsets,
-            mask=valid_out[:, None] & k_valid[None, :],
-            other=0.0,
-        ).to(gl.float32)
-        acc += gl.sum(a * b, axis=1)
-
-    c_offsets = (m * stride_cm + n * stride_cn).to(gl.int32)
-    cdna4.buffer_store(
-        ptr=c_ptr,
-        offsets=c_offsets,
-        stored_value=acc.to(c_ptr.dtype.element_ty),
-        mask=valid_out,
-    )
 
 
 @gluon.jit(launch_metadata=_dense16_bmm_launch_metadata)
@@ -821,8 +649,25 @@ def gluon_mm_a16w16_medium_gfx950(
     SPLIT_K: gl.constexpr,
     NUM_XCDS: gl.constexpr,
     PID_OFFSET: gl.constexpr = 0,
+    GROUPS: gl.constexpr = 1,
+    STRIDE_AG: gl.constexpr = 0,
+    STRIDE_BG: gl.constexpr = 0,
+    STRIDE_CG: gl.constexpr = 0,
+    scale_ptr=None,
+    STRIDE_SM: gl.constexpr = 0,
+    STRIDE_SG: gl.constexpr = 0,
+    QUANT_OUT: gl.constexpr = False,
 ):
     """MFMA/LDS dense16 GEMM for selected M <= 128 decode and middle-M tiles.
+
+    ``GROUPS > 1`` runs that many independent GEMMs in one launch: group g
+    reads A, B and writes C at element offsets g * STRIDE_AG/BG/CG and owns
+    its own split-K partials and counters.
+
+    ``QUANT_OUT`` stores C as group-32 E4M3 codes of the BF16-rounded result
+    (requires BLOCK_N % 32 == 0) and their UE8M0 scales at
+    ``scale_ptr + row * STRIDE_SM + group * STRIDE_SG + column // 32``, rounded
+    like gluon_quantize_fp8_group32_ue8m0_gfx950.
 
     With ``SPLIT_K > 1`` each output tile is computed by ``SPLIT_K`` programs
     over disjoint K slices. Each stores its FP32 partial to ``partial_ptr`` and
@@ -836,6 +681,17 @@ def gluon_mm_a16w16_medium_gfx950(
     pid = gl.program_id(axis=0) - PID_OFFSET
     num_pid_m = gl.cdiv(M, BLOCK_M)
     num_pid_n = gl.cdiv(N, BLOCK_N)
+    if GROUPS > 1:
+        group_programs = num_pid_m * num_pid_n * SPLIT_K
+        group = pid // group_programs
+        pid = pid % group_programs
+        a_ptr += group * STRIDE_AG
+        b_ptr += group * STRIDE_BG
+        c_ptr += group * STRIDE_CG
+        if QUANT_OUT:
+            scale_ptr += group * STRIDE_SG
+        partial_ptr += group * group_programs * (BLOCK_M * BLOCK_N)
+        counter_ptr += group * num_pid_m * num_pid_n
     if NUM_XCDS > 1:
         pid = _remap_xcd(pid, num_pid_m * num_pid_n * SPLIT_K, NUM_XCDS)
     if SPLIT_K == 1:
@@ -864,8 +720,8 @@ def gluon_mm_a16w16_medium_gfx950(
         "tiled MFMA GEMM expects BLOCK_K in {64, 128, 256, 512, 1024}",
     )
     gl.static_assert(
-        NUM_BUFFERS == 1 or NUM_BUFFERS == 2 or NUM_BUFFERS == 3,
-        "tiled MFMA GEMM uses a one-, two-, or three-buffer LDS pipeline",
+        NUM_BUFFERS >= 1 and NUM_BUFFERS <= 8,
+        "tiled MFMA GEMM uses one to eight LDS buffers",
     )
 
     NUM_WARPS: gl.constexpr = WARPS_M * WARPS_N
@@ -951,9 +807,14 @@ def gluon_mm_a16w16_medium_gfx950(
         gl.static_assert(
             k_tiles >= 2, "two-buffer tiled MFMA GEMM needs at least two K tiles"
         )
-    else:
+    elif NUM_BUFFERS == 3:
         gl.static_assert(
             k_tiles >= 3, "three-buffer tiled MFMA GEMM needs at least three K tiles"
+        )
+    else:
+        gl.static_assert(
+            k_tiles == NUM_BUFFERS,
+            "more than three LDS buffers hold every K tile of the program",
         )
 
     acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfmaLayout)
@@ -967,6 +828,26 @@ def gluon_mm_a16w16_medium_gfx950(
         a = async_copy.load_shared_relaxed(smemA.index(0), dotOpLayoutA)
         b = async_copy.load_shared_relaxed(smemB.index(0), dotOpLayoutB)
         acc = cdna4.mfma(a, b, acc)
+
+    elif NUM_BUFFERS > 3:
+        # Short reductions: issue every K tile at once so the program waits on
+        # one memory round trip instead of one per refilled buffer.
+        for t in gl.static_range(NUM_BUFFERS):
+            async_copy.buffer_load_to_shared(
+                smemA.index(t),
+                a_ptr,
+                (a_offs0 + t * BLOCK_K * stride_ak).to(gl.int32),
+                mask=a_mask,
+            )
+            async_copy.buffer_load_to_shared(
+                smemB.index(t), b_ptr, (b_offs0 + t * BLOCK_K * stride_bk).to(gl.int32)
+            )
+            async_copy.commit_group()
+        for t in gl.static_range(NUM_BUFFERS):
+            async_copy.wait_group(NUM_BUFFERS - 1 - t)
+            a = async_copy.load_shared_relaxed(smemA.index(t), dotOpLayoutA)
+            b = async_copy.load_shared_relaxed(smemB.index(t), dotOpLayoutB)
+            acc = cdna4.mfma(a, b, acc)
 
     elif NUM_BUFFERS == 2:
         async_copy.buffer_load_to_shared(smemA.index(0), a_ptr, a_offs0, mask=a_mask)
@@ -1225,13 +1106,66 @@ def gluon_mm_a16w16_medium_gfx950(
             mask=c_mask,
             other=0.0,
         )
+    if QUANT_OUT:
+        gl.static_assert(BLOCK_N % 32 == 0, "quantized output needs BLOCK_N % 32")
+        quant_layout: gl.constexpr = _coalesced_store_layout(
+            BLOCK_M, BLOCK_N, NUM_WARPS
+        )
+        values = gl.convert_layout(
+            acc_store.to(gl.bfloat16).to(gl.float32), layout=quant_layout
+        )
+        groups = gl.reshape(values, [BLOCK_M, BLOCK_N // 32, 32])
+        amax = gl.maximum(gl.max(gl.abs(groups), 2), 1.0e-4)
+        bits = (amax * (1.0 / 448.0)).to(gl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+        inverse = 1.0 / (exponent << 23).to(gl.float32, bitcast=True)
+        codes = gl.reshape(
+            (groups * gl.expand_dims(inverse, 2)).to(gl.float8e4nv),
+            [BLOCK_M, BLOCK_N],
+        )
+        codes = gl.convert_layout(codes, layout=quant_layout)
+        qm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, quant_layout))
+        qn = pid_n * BLOCK_N + gl.arange(0, BLOCK_N, gl.SliceLayout(0, quant_layout))
+        gl.store(
+            c_ptr + qm[:, None] * stride_cm + qn[None, :] * stride_cn,
+            codes,
+            mask=(qm[:, None] < M) & (qn[None, :] < N),
+        )
+        scale_layout: gl.constexpr = gl.SliceLayout(2, groups.type.layout)
+        sm = pid_m * BLOCK_M + gl.arange(0, BLOCK_M, gl.SliceLayout(1, scale_layout))
+        sg = pid_n * (BLOCK_N // 32) + gl.arange(
+            0, BLOCK_N // 32, gl.SliceLayout(0, scale_layout)
+        )
+        gl.store(
+            scale_ptr + sm[:, None] * STRIDE_SM + sg[None, :],
+            exponent.to(gl.uint8),
+            mask=(sm[:, None] < M) & (sg[None, :] < N // 32),
+        )
+        return
     c_base = c_ptr + pid_m * BLOCK_M * stride_cm + pid_n * BLOCK_N * stride_cn
-    cdna4.buffer_store(
-        ptr=c_base,
-        offsets=c_offsets,
-        stored_value=acc_store.to(c_ptr.dtype.element_ty),
-        mask=c_mask,
-    )
+    if _use_coalesced_store(BLOCK_M, BLOCK_N, NUM_WARPS):
+        # Rows of 8 contiguous outputs per lane store 16 bytes at a time; the
+        # MFMA layout would scatter 4-element column pieces instead.
+        storeLayout: gl.constexpr = _coalesced_store_layout(BLOCK_M, BLOCK_N, NUM_WARPS)
+        offs_sm = gl.arange(0, BLOCK_M, gl.SliceLayout(1, storeLayout))
+        offs_sn = gl.arange(0, BLOCK_N, gl.SliceLayout(0, storeLayout))
+        sm = pid_m * BLOCK_M + offs_sm
+        sn = pid_n * BLOCK_N + offs_sn
+        cdna4.buffer_store(
+            ptr=c_base,
+            offsets=offs_sm[:, None] * stride_cm + offs_sn[None, :] * stride_cn,
+            stored_value=gl.convert_layout(
+                acc_store.to(c_ptr.dtype.element_ty), layout=storeLayout
+            ),
+            mask=(sm[:, None] < M) & (sn[None, :] < N),
+        )
+    else:
+        cdna4.buffer_store(
+            ptr=c_base,
+            offsets=c_offsets,
+            stored_value=acc_store.to(c_ptr.dtype.element_ty),
+            mask=c_mask,
+        )
 
 
 def _allocate_partial_scratch(
@@ -1317,10 +1251,6 @@ def _resolve_output(
     return out
 
 
-def _use_warp_reduce_smallm(M: int, _N: int, K: int) -> bool:
-    return (M in (1, 2) and K <= 2048) or (M == 4 and K <= 1024)
-
-
 def _choose_mfma_lds_split_k(K: int) -> int:
     k_tiles = K // MFMA_LDS_BLOCK_K
     for split_k in (MFMA_LDS_SPLIT_K, 7, 6, 5, 4, 3, 2):
@@ -1337,12 +1267,6 @@ def _supports_mfma_lds_smallm(M: int, N: int, K: int) -> bool:
         and K % MFMA_LDS_BLOCK_K == 0
         and _choose_mfma_lds_split_k(K) > 1
     )
-
-
-def _use_mfma_lds_smallm(_M: int, _N: int, _K: int) -> bool:
-    # Keep the split-K kernels available for direct experiments, but do not
-    # route them by default until they are consistently faster than torch.mm.
-    return False
 
 
 def _choose_mfma_lds_mediumm_config(
@@ -1390,85 +1314,6 @@ def _choose_mfma_lds_mediumm_config(
         if M == 128 and N == 4096 and K == 4096:
             return 16, 128, DENSE16_BLOCK_K, 1, 4, 3
     return None
-
-
-def _use_mfma_lds_mediumm(M: int, N: int, K: int) -> bool:
-    return _choose_mfma_lds_mediumm_config(M, N, K) is not None
-
-
-def _use_mfma_lds_largem(M: int, N: int, K: int) -> bool:
-    return M >= LARGEM_DISPATCH_MIN_M and _supports_largem_shape(M, N, K)
-
-
-def launch_gluon_mm_a16w16_warp_gfx950(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    out_dtype: torch.dtype,
-    *,
-    alpha: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Compute small-M dense ``A @ B.T`` with one warp per output.
-
-    Intended for very small decode tiles: ``M`` in ``{1, 2}`` with ``K <= 2048``
-    or ``M == 4`` with ``K <= 1024``.
-    """
-    if A.ndim != 2 or B.ndim != 2:
-        raise ValueError(
-            f"small-M dense16 warp-reduce GEMM expects 2D inputs, got {A.ndim=} {B.ndim=}"
-        )
-    if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(
-            "small-M dense16 warp-reduce GEMM expects fp16/bf16 inputs, got "
-            f"{A.dtype=} {B.dtype=}"
-        )
-    if A.dtype != B.dtype:
-        raise TypeError(
-            "small-M dense16 warp-reduce GEMM expects matching input dtypes, got "
-            f"{A.dtype=} {B.dtype=}"
-        )
-    if out_dtype not in _SUPPORTED_DTYPES:
-        raise TypeError(
-            f"small-M dense16 warp-reduce GEMM expects fp16/bf16 output, got {out_dtype=}"
-        )
-    if not A.is_cuda or not B.is_cuda:
-        raise ValueError("small-M dense16 warp-reduce GEMM requires CUDA/HIP tensors")
-
-    M, K = A.shape
-    N, K_b = B.shape
-    if M > 4:
-        raise ValueError(f"small-M warp-reduce GEMM requires M <= 4; got M={M}")
-    if K_b != K:
-        raise ValueError(
-            "small-M dense16 warp-reduce GEMM K mismatch: "
-            f"A={tuple(A.shape)} B={tuple(B.shape)}"
-        )
-    _check_supported_dense16_shape(M, N, K)
-
-    C = _resolve_output(A, (M, N), out_dtype, out, "small-M dense16 warp-reduce GEMM")
-    total_outputs = M * N
-    grid = (triton.cdiv(total_outputs, WARP_REDUCE_OUTPUTS),)
-    gluon_mm_a16w16_warp_gfx950[grid](
-        A,
-        B,
-        C,
-        M,
-        N,
-        K,
-        A.stride(0),
-        A.stride(1),
-        B.stride(1),
-        B.stride(0),
-        C.stride(0),
-        C.stride(1),
-        BLOCK_OUT=WARP_REDUCE_OUTPUTS,
-        BLOCK_K=WARP_REDUCE_BLOCK_K,
-        num_warps=WARP_REDUCE_OUTPUTS,
-    )
-
-    if alpha is not None:
-        C.mul_(alpha.to(device=C.device, dtype=C.dtype))
-    return C
 
 
 def launch_gluon_bmm_a16w16_gfx950(
@@ -1730,16 +1575,31 @@ def launch_gluon_mm_a16w16_medium_gfx950(
     return C
 
 
-# Cold-cache rocprofv3 sweeps on gfx950 at Kimi K3 TP8 decode shapes, keyed
-# by (N, K) and then by M bucket: a call uses the config of the smallest bucket
-# covering its M, so M stays a runtime argument within a bucket. A config is
-# (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M, WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS).
-# Only buckets that beat torch.mm by at least 4% are listed; the rest keep the
-# torch path.
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4 and Qwen3.8-Flash-Next TP2
+# decode shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
+# uses the config of the smallest bucket covering its M, so M stays a runtime
+# argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
+# WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every
+# K tile of a program. Only buckets that beat torch.mm by at least 4% are
+# listed; the rest keep the torch path.
 DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
 ] = {
+    # Muse attention output and MoE post-expert projection. One single-pass tile covers all
+    # buckets, so the usual M=2/16 warmup also covers intermediate row counts.
+    (8192, 2048): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
+    (8192, 4096): {
+        4: (32, 32, 256, 2, 2, 3, 1, 8),
+        8: (32, 32, 256, 2, 2, 3, 1, 8),
+        16: (32, 32, 256, 2, 2, 3, 1, 8),
+        32: (32, 32, 256, 2, 2, 3, 1, 8),
+    },
     # o_proj
     (7168, 1536): {
         4: (16, 16, 512, 1, 4, 2, 1, 8),
@@ -1831,6 +1691,43 @@ _DECODE_CONFIGS: dict[
         32: (32, 32, 256, 2, 2, 3, 2, 1),
         64: (32, 32, 256, 2, 2, 3, 1, 8),
     },
+    # Qwen3.8-Flash-Next TP2 per-rank projections. Its hyper-connection mix
+    # GEMMs run inside gluon_hyperconnection_mix_gfx950 at decode sizes.
+    # Gated DeltaNet out_proj and attention o_proj.
+    (2560, 3072): {
+        16: (16, 64, 256, 1, 4, 3, 4, 1),
+        32: (32, 32, 64, 2, 2, 6, 8, 1),
+    },
+    # MTP embedding and hidden-state fc.
+    (2560, 2560): {
+        16: (16, 64, 256, 1, 4, 2, 5, 8),
+        32: (32, 32, 64, 2, 2, 8, 5, 1),
+        64: (32, 32, 256, 2, 2, 3, 1, 1),
+    },
+    # MoE router gate.
+    (512, 2560): {
+        4: (16, 64, 64, 1, 4, 5, 8, 8),
+        8: (16, 64, 256, 1, 4, 2, 5, 1),
+        16: (16, 64, 64, 1, 4, 5, 8, 8),
+        32: (32, 32, 64, 2, 2, 8, 5, 1),
+        64: (64, 16, 256, 4, 1, 2, 5, 1),
+    },
+    # DeepSeek V4.1 MoE router gate (FP32 output), any TP.
+    (384, 5120): {
+        4: (16, 64, 256, 1, 4, 2, 10, 1),
+        8: (16, 64, 256, 1, 4, 2, 10, 1),
+        16: (16, 64, 256, 1, 4, 2, 10, 1),
+        32: (32, 32, 512, 2, 2, 2, 5, 1),
+        64: (32, 32, 512, 2, 2, 2, 5, 8),
+    },
+    # QSA indexer query/key projection.
+    (640, 2560): {
+        4: (16, 64, 128, 1, 4, 4, 5, 8),
+        8: (16, 64, 64, 1, 4, 5, 8, 1),
+        16: (16, 64, 256, 1, 4, 2, 5, 1),
+        32: (32, 32, 64, 2, 2, 8, 5, 8),
+        64: (32, 32, 64, 2, 2, 8, 5, 1),
+    },
 }
 DECODE_MIN_M = 2
 
@@ -1849,25 +1746,12 @@ def supports_gluon_mm_a16w16_decode_gfx950(M: int, N: int, K: int) -> bool:
     return _choose_decode_config(M, N, K) is not None
 
 
-def _get_splitk_counters(device: torch.device, num_tiles: int) -> torch.Tensor:
-    """Return stream-local zeroed per-tile arrival counters.
-
-    The last program of each tile resets its counter, so the buffer is zero
-    again whenever a launch completes and same-stream launches can share it.
-    """
-    if torch.cuda.is_current_stream_capturing():
-        # Keep captured launches on graph-private counters; never bake the
-        # shared eager buffer into a graph.
-        return torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-
-    device_index = torch.cuda.current_device() if device.index is None else device.index
-    stream_id = torch.cuda.current_stream(device_index).cuda_stream
-    key = (device_index, stream_id, num_tiles)
-    counters = _counter_cache.get(key)
-    if counters is None:
-        counters = torch.zeros((num_tiles,), dtype=torch.int32, device=device)
-        _counter_cache[key] = counters
-    return counters
+def gluon_mm_a16w16_decode_num_counters_gfx950(M: int, N: int, K: int) -> int:
+    """Split-K arrival counters a decode GEMM launch needs; 0 without split-K."""
+    config = _choose_decode_config(M, N, K)
+    if config is None or config[6] == 1:
+        return 0
+    return triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
 
 
 def launch_gluon_mm_a16w16_decode_gfx950(
@@ -1875,6 +1759,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     B: torch.Tensor,
     out_dtype: torch.dtype,
     *,
+    counters: torch.Tensor,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute decode-sized dense ``A @ B.T`` with measured split-K tiling.
@@ -1883,6 +1768,9 @@ def launch_gluon_mm_a16w16_decode_gfx950(
         A: Contiguous fp16/bf16 activation ``[M, K]``.
         B: Contiguous weight ``[N, K]`` with ``A``'s dtype.
         out_dtype: Output dtype: ``A``'s dtype or fp32.
+        counters: Zeroed int32 split-K arrival counters, at least
+            ``gluon_mm_a16w16_decode_num_counters_gfx950(M, N, K)`` of them;
+            the launch leaves them zeroed (see ``splitk.py``).
         out: Optional ``[M, N]`` destination with unit inner stride.
 
     Returns:
@@ -1921,8 +1809,10 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     C = _resolve_output(A, (M, N), out_dtype, out, "decode dense16 GEMM")
     num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
     if split_k > 1:
+        check_splitk_counters(
+            counters, num_tiles, A.device, "gfx950 decode dense16 GEMM"
+        )
         partial = _get_partial_scratch(A.device, num_tiles, split_k, block_n, block_m)
-        counters = _get_splitk_counters(A.device, num_tiles)
     else:
         partial = counters = C
     gluon_mm_a16w16_medium_gfx950[(num_tiles * split_k,)](
@@ -1960,6 +1850,166 @@ def launch_gluon_mm_a16w16_decode_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
+
+
+_GROUPED_M_BUCKETS = DECODE_M_BUCKETS + (128,)
+# Grouped decode GEMMs keyed by (groups, N, K), then M bucket; same tuple
+# layout as _DECODE_CONFIGS. Swept under graph replay on MI350X.
+_GROUPED_DECODE_CONFIGS: dict[
+    tuple[int, int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
+] = {
+    # DeepSeek V4.1 wo_a at TP4: two 1024x4096 groups.
+    (2, 1024, 4096): {
+        4: (16, 64, 256, 1, 4, 3, 4, 1),
+        8: (16, 64, 256, 1, 4, 3, 4, 1),
+        16: (16, 64, 256, 1, 4, 3, 4, 1),
+        32: (32, 32, 512, 2, 2, 2, 4, 1),
+        64: (32, 32, 512, 2, 2, 2, 2, 8),
+        128: (32, 32, 64, 2, 2, 3, 4, 8),
+    },
+}
+
+
+def _choose_grouped_decode_config(
+    M: int, G: int, N: int, K: int
+) -> tuple[int, int, int, int, int, int, int, int] | None:
+    if M < 1 or M > _GROUPED_M_BUCKETS[-1]:
+        return None
+    bucket = next(bound for bound in _GROUPED_M_BUCKETS if M <= bound)
+    return _GROUPED_DECODE_CONFIGS.get((G, N, K), {}).get(bucket)
+
+
+def supports_gluon_grouped_mm_a16w16_decode_gfx950(
+    M: int, G: int, N: int, K: int
+) -> bool:
+    """Whether the grouped decode GEMM has a measured config here."""
+    return _choose_grouped_decode_config(M, G, N, K) is not None
+
+
+def gluon_grouped_mm_a16w16_decode_num_counters_gfx950(
+    M: int, G: int, N: int, K: int
+) -> int:
+    """Split-K arrival counters a grouped decode launch needs; 0 without split-K."""
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None or config[6] == 1:
+        return 0
+    return G * triton.cdiv(M, config[0]) * triton.cdiv(N, config[1])
+
+
+def launch_gluon_grouped_mm_a16w16_decode_gfx950(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    counters: torch.Tensor,
+    quantize: bool,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``out[:, g] = x[:, g] @ weight[g].T`` for every group in one launch.
+
+    With ``quantize``, return instead the group-32 E4M3 codes ``[M, G * N]``
+    and uint8 UE8M0 scales ``[M, G * N / 32]`` of the BF16 result (``out``
+    must be None).
+
+    Args:
+        x: BF16/FP16 ``[M, G, K]`` with unit inner stride; token and group
+            strides are free (e.g. a slice of padded attention heads).
+        weight: Contiguous ``[G, N, K]`` weight in ``x``'s dtype.
+        counters: Zeroed int32 split-K counters, at least
+            ``gluon_grouped_mm_a16w16_decode_num_counters_gfx950`` of them; the
+            launch leaves them zeroed.
+        out: Optional contiguous ``[M, G, N]`` destination.
+
+    Returns:
+        ``[M, G, N]`` in ``x``'s dtype, or (codes, scales) with ``quantize``.
+    """
+    if x.ndim != 3 or weight.ndim != 3:
+        raise ValueError("grouped decode GEMM expects [M, G, K] and [G, N, K]")
+    M, G, K = x.shape
+    if weight.shape[0] != G or weight.shape[2] != K:
+        raise ValueError("grouped decode GEMM group/K mismatch")
+    N = weight.shape[1]
+    if x.dtype not in _SUPPORTED_DTYPES or weight.dtype != x.dtype:
+        raise TypeError("grouped decode GEMM expects matching fp16/bf16 operands")
+    if not x.is_cuda or weight.device != x.device:
+        raise ValueError("grouped decode GEMM requires colocated GPU tensors")
+    if (
+        x.stride(2) != 1
+        or x.stride(0) % 8
+        or x.stride(1) % 8
+        or x.data_ptr() % 16
+        or not weight.is_contiguous()
+    ):
+        raise ValueError("grouped decode GEMM needs 16-byte aligned rows")
+    config = _choose_grouped_decode_config(M, G, N, K)
+    if config is None:
+        raise ValueError(
+            f"grouped decode GEMM has no config for M={M} G={G} N={N} K={K}"
+        )
+    block_m, block_n, block_k, warps_m, warps_n, num_buffers, split_k, num_xcds = config
+    scales = None
+    if quantize:
+        if out is not None or N % block_n or block_n % 32:
+            raise ValueError(
+                "quantized grouped decode GEMM needs whole 32-column tiles"
+            )
+        out = torch.empty((M, G, N), dtype=torch.float8_e4m3fn, device=x.device)
+        scales = torch.empty((M, G * N // 32), dtype=torch.uint8, device=x.device)
+    elif out is None:
+        out = torch.empty((M, G, N), dtype=x.dtype, device=x.device)
+    elif out.shape != (M, G, N) or out.dtype != x.dtype or not out.is_contiguous():
+        raise ValueError("grouped decode GEMM out must be contiguous [M, G, N]")
+    num_tiles = triton.cdiv(M, block_m) * triton.cdiv(N, block_n)
+    if split_k > 1:
+        check_splitk_counters(
+            counters, G * num_tiles, x.device, "gfx950 grouped decode GEMM"
+        )
+        partial = _get_partial_scratch(
+            x.device, G * num_tiles, split_k, block_n, block_m
+        )
+    else:
+        partial = counters = out
+    gluon_mm_a16w16_medium_gfx950[(G * num_tiles * split_k,)](
+        x,
+        weight,
+        out,
+        out,
+        out,
+        partial,
+        counters,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(2),
+        weight.stride(2),
+        weight.stride(1),
+        out.stride(0),
+        out.stride(2),
+        0,
+        0,
+        0,
+        0,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        WARPS_M=warps_m,
+        WARPS_N=warps_n,
+        NUM_BUFFERS=num_buffers,
+        GROUP_SIZE_M=GROUP_SIZE_M,
+        ADD3=False,
+        SPLIT_K=split_k,
+        NUM_XCDS=num_xcds,
+        GROUPS=G,
+        STRIDE_AG=x.stride(1),
+        STRIDE_BG=weight.stride(0),
+        STRIDE_CG=out.stride(1),
+        scale_ptr=scales,
+        STRIDE_SM=G * N // 32,
+        STRIDE_SG=N // 32,
+        QUANT_OUT=quantize,
+        num_warps=warps_m * warps_n,
+        llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
+    )
+    return (out.view(M, G * N), scales) if quantize else out
 
 
 def supports_gluon_mm_a16w16_decode_add3_gfx950(M: int, N: int, K: int) -> bool:
@@ -2068,85 +2118,3 @@ def launch_gluon_mm_a16w16_decode_add3_gfx950(
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
     )
     return C
-
-
-def gluon_mm_a16w16_gfx950(
-    A: torch.Tensor,
-    B: torch.Tensor,
-    out_dtype: torch.dtype,
-    *,
-    alpha: torch.Tensor | None = None,
-    out: torch.Tensor | None = None,
-) -> torch.Tensor | None:
-    """Compute dense16 GEMM ``A @ B.T`` on gfx950 when supported.
-
-    Dispatches among warp-reduce small-M, tuned medium-M, and large-M paths.
-    Returns ``None`` for unsupported or disabled dense16 shapes so the generic
-    GEMM caller can use its torch fallback.
-
-    Args:
-        A: Activation matrix with shape ``[M, K]``.
-        B: Weight matrix with shape ``[N, K]``.
-        out_dtype: Output dtype, either fp16 or bf16.
-        alpha: Optional post-GEMM scale.
-
-    Returns:
-        Tensor with shape ``[M, N]`` when a Gluon path is selected; otherwise
-        ``None``.
-    """
-    if A.ndim != 2 or B.ndim != 2:
-        return None
-    if A.dtype not in _SUPPORTED_DTYPES or B.dtype not in _SUPPORTED_DTYPES:
-        return None
-    if A.dtype != B.dtype:
-        return None
-    if out_dtype not in _SUPPORTED_DTYPES:
-        return None
-    if not A.is_cuda or not B.is_cuda:
-        return None
-
-    M, K = A.shape
-    N, K_b = B.shape
-    if K_b != K:
-        return None
-    if M <= 0 or N <= 0 or K <= 0:
-        return None
-    if N % DENSE16_BLOCK_N != 0 or K % DENSE16_BLOCK_K != 0:
-        return None
-
-    if _use_mfma_lds_largem(M, N, K):
-        return launch_gluon_mm_a16w16_prefill_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    if M > MAX_M:
-        return None
-
-    if _use_warp_reduce_smallm(M, N, K):
-        return launch_gluon_mm_a16w16_warp_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    if _use_mfma_lds_smallm(M, N, K):
-        return launch_gluon_mm_a16w16_splitk_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    if _use_mfma_lds_mediumm(M, N, K):
-        return launch_gluon_mm_a16w16_medium_gfx950(
-            A,
-            B,
-            out_dtype,
-            alpha=alpha,
-            out=out,
-        )
-    return None

@@ -155,17 +155,25 @@ def _accumulate_counts_inplace_kernel(
     # Per-step token count; runtime so every batch shape shares one binary.
     total,
     counts_row_stride: tl.constexpr,
+    counts_col_stride: tl.constexpr,
+    pool_idx_stride: tl.constexpr,
+    tokens_stride: tl.constexpr,
+    weights_stride: tl.constexpr,
     vocab_size: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     offs = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < total
-    weights = tl.load(weights_ptr + offs, mask=mask, other=0).to(tl.int32)
-    pool_idx = tl.load(pool_idx_ptr + offs, mask=mask, other=0).to(tl.int64)
-    tokens = tl.load(tokens_ptr + offs, mask=mask, other=0).to(tl.int64)
+    weights = tl.load(weights_ptr + offs * weights_stride, mask=mask, other=0).to(
+        tl.int32
+    )
+    pool_idx = tl.load(pool_idx_ptr + offs * pool_idx_stride, mask=mask, other=0).to(
+        tl.int64
+    )
+    tokens = tl.load(tokens_ptr + offs * tokens_stride, mask=mask, other=0).to(tl.int64)
     valid = mask & (weights != 0) & (tokens >= 0) & (tokens < vocab_size)
     tl.atomic_add(
-        counts_ptr + pool_idx * counts_row_stride + tokens,
+        counts_ptr + pool_idx * counts_row_stride + tokens * counts_col_stride,
         weights,
         sem="relaxed",
         mask=valid,
@@ -199,13 +207,20 @@ def accumulate_counts_inplace(
     if total == 0:
         return
 
+    pool_idx = pool_idx.reshape(-1)
+    tokens = tokens.reshape(-1)
+    weights = weights.reshape(-1)
     _accumulate_counts_inplace_kernel[(triton.cdiv(total, 256),)](
         counts,
-        pool_idx.reshape(-1),
-        tokens.reshape(-1),
-        weights.reshape(-1),
+        pool_idx,
+        tokens,
+        weights,
         total=total,
         counts_row_stride=counts.stride(0),
+        counts_col_stride=counts.stride(1),
+        pool_idx_stride=pool_idx.stride(0),
+        tokens_stride=tokens.stride(0),
+        weights_stride=weights.stride(0),
         vocab_size=counts.shape[1],
         BLOCK_SIZE=256,
         num_warps=4,

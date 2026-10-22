@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: pr-commit-trailers-${{ github.event.pull_request.number }}
@@ -17,9 +18,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
+      # Use the PR merge commit so older branches inherit the check scripts.
+      # The checks below still inspect the original PR head commits.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -31,14 +33,14 @@ jobs:
           set -euo pipefail
           commits="$RUNNER_TEMP/pr-commits.txt"
           message="$RUNNER_TEMP/pr-commit-message.txt"
-          forbidden='^[[:space:]]*Co-authored-by:.*(Codex|Claude[[:space:]]+Code|noreply@anthropic\.com)'
+          forbidden='^[[:space:]]*Co-authored-by:.*(Codex|Claude[[:space:]]+Code|noreply@anthropic\.com|\bCursor\b|\bCopilot\b)'
           git rev-list "refs/remotes/origin/$BASE_REF..$HEAD_SHA" > "$commits"
 
           failed=false
           while IFS= read -r commit; do
             git log -1 --format=%B "$commit" > "$message"
             if grep -qiE "$forbidden" "$message"; then
-              echo "::error::Commit $commit has a forbidden Codex or Claude Code Co-authored-by trailer."
+              echo "::error::Commit $commit has a Co-authored-by trailer blocked by the attribution policy."
               failed=true
             fi
           done < "$commits"
@@ -48,3 +50,13 @@ jobs:
             exit 1
           fi
           echo "Commit trailers comply with the attribution policy."
+
+      - name: Test commit attribution check
+        run: node --test .github/scripts/check-commit-attribution.test.js
+
+      - name: Check commit email attribution
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const check = require('./.github/scripts/check-commit-attribution.js');
+            await check({ github, core, context });

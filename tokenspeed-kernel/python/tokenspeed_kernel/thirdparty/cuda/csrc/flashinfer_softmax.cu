@@ -4,6 +4,8 @@
  * Vendored from flashinfer/sampling.cuh (Apache-2.0), with the kernel
  * template split on input vs output dtype so bf16/fp16 input folds the
  * upcast into the kernel's load. Output is always fp32.
+ * Local change: at a few rows the map-reduce normalize runs one block per (row, slice).
+ * Local change: an optional per-row top-k skips greedy rows (top-k 1).
  */
 
 #include <flashinfer/allocator.h>
@@ -30,13 +32,15 @@ template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DTypeIn,
           typename DTypeOut, bool CACHE_INPUT>
 __global__ void OnlineSoftmaxFusedKernel(DTypeIn* logits, DTypeOut* output,
                                          float* temperature_arr, float temperature_val,
-                                         uint32_t d) {
+                                         const int32_t* skip_top_ks, uint32_t d) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   // The preceding PDL producer may still be writing per-request temperatures.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  // Greedy rows (top-k 1) leave their output row unwritten; read after the wait.
+  if (skip_top_ks != nullptr && skip_top_ks[bx] == 1) return;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -162,7 +166,8 @@ template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DTypeIn>
 __global__ void OnlineSoftmaxMapKernel(DTypeIn* logits,
                                        PartialSoftmaxResult* partial_results,
                                        float* temperature_arr, float temperature_val,
-                                       uint32_t d, uint32_t num_slices) {
+                                       const int32_t* skip_top_ks, uint32_t d,
+                                       uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
   const uint32_t by = blockIdx.y;  // slice index
   const uint32_t tx = threadIdx.x;
@@ -170,6 +175,8 @@ __global__ void OnlineSoftmaxMapKernel(DTypeIn* logits,
   // Acquire producer writes before loading temperature, not only logits.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  // Greedy rows (top-k 1) leave their output row unwritten; read after the wait.
+  if (skip_top_ks != nullptr && skip_top_ks[bx] == 1) return;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -240,13 +247,17 @@ template <uint32_t BLOCK_THREADS, uint32_t VEC_SIZE, typename DTypeIn, typename 
 __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
                                           PartialSoftmaxResult* partial_results,
                                           float* temperature_arr, float temperature_val,
-                                          uint32_t d, uint32_t num_slices) {
+                                          const int32_t* skip_top_ks, uint32_t d,
+                                          uint32_t num_slices) {
   const uint32_t bx = blockIdx.x;
+  const uint32_t by = blockIdx.y;  // write slice: every slice block combines the same partials
   const uint32_t tx = threadIdx.x;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
   // All dependent inputs, including temperature, must follow the acquire.
   asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  // Greedy rows (top-k 1) leave their output row unwritten; read after the wait.
+  if (skip_top_ks != nullptr && skip_top_ks[bx] == 1) return;
   float temperature = temperature_arr == nullptr ? temperature_val : temperature_arr[bx];
   const float inv_temp = (temperature == 0.f) ? 0.f : 1.f / temperature;
 
@@ -275,15 +286,21 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
   const float final_max = temp_storage.shared_state.max_val;
   const float inv_denominator = 1.0f / temp_storage.shared_state.denominator;
 
+  const uint32_t vec_alignment_elems = alignof(vec_t<DTypeIn, VEC_SIZE>) / sizeof(DTypeIn);
+  const uint32_t slice_stride = round_up(ceil_div(d, gridDim.y), vec_alignment_elems);
+  const uint32_t slice_start = by * slice_stride;
+  const uint32_t slice_size = slice_start < d ? min((by + 1) * slice_stride, d) - slice_start : 0;
+  const uint32_t offset = bx * d + slice_start;
+
   vec_t<DTypeIn, VEC_SIZE> in_vec;
   vec_t<DTypeOut, VEC_SIZE> prob_vec;
   float scaled[VEC_SIZE];
 
-  for (uint32_t i = 0; i < ceil_div(d, BLOCK_THREADS * VEC_SIZE); ++i) {
+  for (uint32_t i = 0; i < ceil_div(slice_size, BLOCK_THREADS * VEC_SIZE); ++i) {
     in_vec.fill(-cuda::std::numeric_limits<DTypeIn>::infinity());
-    bool in_bounds = (i * BLOCK_THREADS + tx) * VEC_SIZE < d;
+    bool in_bounds = (i * BLOCK_THREADS + tx) * VEC_SIZE < slice_size;
     if (in_bounds) {
-      in_vec.cast_load(logits + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      in_vec.cast_load(logits + offset + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
 
 #pragma unroll
@@ -294,7 +311,7 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
     }
 
     if (in_bounds) {
-      prob_vec.cast_store(output + bx * d + (i * BLOCK_THREADS + tx) * VEC_SIZE);
+      prob_vec.cast_store(output + offset + (i * BLOCK_THREADS + tx) * VEC_SIZE);
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -304,7 +321,8 @@ __global__ void OnlineSoftmaxReduceKernel(DTypeIn* logits, DTypeOut* output,
 
 template <typename DTypeIn, typename DTypeOut>
 cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size, uint32_t d,
-                          float* temperature_arr, float temperature_val, void* workspace_buffer,
+                          float* temperature_arr, float temperature_val,
+                          const int32_t* skip_top_ks, void* workspace_buffer,
                           size_t workspace_buffer_size_in_bytes, bool enable_pdl,
                           cudaStream_t stream = 0) {
   constexpr uint32_t SMALL_BATCH_THRESHOLD = 128;
@@ -344,16 +362,23 @@ cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size
             cudaLaunchConfig_t config{
                 phase1_nblks, phase1_nthrs, smem_size, stream, attribute, 1};
             FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase1_kernel, logits, partial_results,
-                                                    temperature_arr, temperature_val, d,
-                                                    num_slices));
+                                                    temperature_arr, temperature_val, skip_top_ks,
+                                                    d, num_slices));
           } else {
             void* args[] = {&logits, &partial_results, &temperature_arr,
-                            &temperature_val, &d, &num_slices};
+                            &temperature_val, &skip_top_ks, &d, &num_slices};
             FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase1_kernel, phase1_nblks, phase1_nthrs,
                                                   args, smem_size, stream));
           }
 
-          dim3 phase2_nblks(batch_size);
+          // Slices fill the SMs at a few rows; once the rows alone fill a third, whole rows win.
+          int device, num_sms;
+          FLASHINFER_CUDA_CALL(cudaGetDevice(&device));
+          FLASHINFER_CUDA_CALL(
+              cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, device));
+          const uint32_t write_slices =
+              batch_size * 3 <= static_cast<uint32_t>(num_sms) ? num_slices : 1;
+          dim3 phase2_nblks(batch_size, write_slices);
           dim3 phase2_nthrs(BLOCK_THREADS);
           auto phase2_kernel = OnlineSoftmaxReduceKernel<BLOCK_THREADS, VEC_SIZE, DTypeIn, DTypeOut>;
           FLASHINFER_CUDA_CALL(cudaFuncSetAttribute(
@@ -366,10 +391,10 @@ cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size
                 phase2_nblks, phase2_nthrs, smem_size, stream, attribute, 1};
             FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, phase2_kernel, logits, output,
                                                     partial_results, temperature_arr,
-                                                    temperature_val, d, num_slices));
+                                                    temperature_val, skip_top_ks, d, num_slices));
           } else {
             void* args[] = {&logits, &output, &partial_results, &temperature_arr,
-                            &temperature_val, &d, &num_slices};
+                            &temperature_val, &skip_top_ks, &d, &num_slices};
             FLASHINFER_CUDA_CALL(cudaLaunchKernel((void*)phase2_kernel, phase2_nblks, phase2_nthrs,
                                                   args, smem_size, stream));
           }
@@ -404,9 +429,11 @@ cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size
               attribute[0].val.programmaticStreamSerializationAllowed = 1;
               cudaLaunchConfig_t config{nblks, nthrs, smem_size, stream, attribute, 1};
               FLASHINFER_CUDA_CALL(cudaLaunchKernelEx(&config, kernel, logits, output,
-                                                      temperature_arr, temperature_val, d));
+                                                      temperature_arr, temperature_val,
+                                                      skip_top_ks, d));
             } else {
-              void* args[] = {&logits, &output, &temperature_arr, &temperature_val, &d};
+              void* args[] = {&logits, &output, &temperature_arr, &temperature_val,
+                              &skip_top_ks, &d};
               FLASHINFER_CUDA_CALL(
                   cudaLaunchKernel((void*)kernel, nblks, nthrs, args, smem_size, stream));
             }
@@ -420,7 +447,7 @@ cudaError_t OnlineSoftmax(DTypeIn* logits, DTypeOut* output, uint32_t batch_size
 
 void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
              Optional<TensorView> maybe_temperature_arr, double temperature_val,
-             bool enable_pdl) {
+             Optional<TensorView> maybe_skip_top_ks, bool enable_pdl) {
   CHECK_INPUT(workspace_buffer);
   CHECK_INPUT(logits);
   CHECK_INPUT(output);
@@ -436,6 +463,11 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
     CHECK_INPUT(maybe_temperature_arr.value());
     TVM_FFI_ICHECK(maybe_temperature_arr.value().dtype() == dl_float32)
         << "temperature tensor must be fp32";
+  }
+  if (maybe_skip_top_ks.has_value()) {
+    CHECK_INPUT(maybe_skip_top_ks.value());
+    TVM_FFI_ICHECK(maybe_skip_top_ks.value().dtype() == dl_int32)
+        << "skip_top_ks tensor must be int32";
   }
 
   unsigned int batch_size = logits.size(0);
@@ -454,6 +486,9 @@ void softmax(TensorView workspace_buffer, TensorView logits, TensorView output,
             ? static_cast<float*>(maybe_temperature_arr.value().data_ptr())
             : nullptr,
         static_cast<float>(temperature_val),
+        maybe_skip_top_ks.has_value()
+            ? static_cast<const int32_t*>(maybe_skip_top_ks.value().data_ptr())
+            : nullptr,
         workspace_buffer.data_ptr(),
         get_element_size(workspace_buffer) * workspace_buffer.size(0),
         enable_pdl,

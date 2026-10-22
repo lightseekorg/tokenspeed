@@ -59,6 +59,8 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/core/cache_block_ref.cpp
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
+    csrc/cache/tier/storage_manager.cpp
+    csrc/scheduler/operations/storage.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -110,13 +112,15 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_prefix_index.cpp
+        tests/cpp/test_tail_table.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_group.cpp
         tests/cpp/test_swa_group.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
-        tests/cpp/test_state_eviction.cpp
+        tests/cpp/test_storage_query.cpp
+        tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_prefill_chunk.cpp
@@ -125,6 +129,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_kv_cache_lifecycle.cpp
         tests/cpp/test_cache_scenarios.cpp
         tests/cpp/test_scheduler_plan.cpp
+        tests/cpp/test_token_level_hits.cpp
         tests/cpp/test_outside_event_handler.cpp
         tests/cpp/test_cache_operations.cpp
         tests/cpp/test_req_pool_allocator.cpp

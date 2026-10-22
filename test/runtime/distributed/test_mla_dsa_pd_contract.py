@@ -134,7 +134,7 @@ def _make_mla_pool(pd_enabled: bool):
     from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
 
     plan, specs = _plan_and_specs("mla", pd_enabled)
-    from cache_pool_test_utils import make_pool
+    from test.runtime.cache_pool_test_utils import make_pool
 
     _, pool = make_pool(
         MLATokenToKVPool,
@@ -157,7 +157,7 @@ def _make_dsa_pool(pd_enabled: bool):
     from tokenspeed.runtime.layers.attention.kv_cache.dsa import DSATokenToKVPool
 
     plan, specs = _plan_and_specs("dsa", pd_enabled)
-    from cache_pool_test_utils import make_pool
+    from test.runtime.cache_pool_test_utils import make_pool
 
     _, pool = make_pool(
         DSATokenToKVPool,

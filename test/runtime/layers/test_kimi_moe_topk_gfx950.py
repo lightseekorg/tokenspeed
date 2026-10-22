@@ -22,11 +22,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-from tokenspeed_kernel.ops.moe.gluon import sigmoid_topk as routing_module  # noqa: E402
-from tokenspeed_kernel.ops.moe.triton import (  # noqa: E402
-    decode_sigmoid_topk as decode_topk_module,
-)
-from tokenspeed_kernel.ops.moe.triton.minimax_topk import (  # noqa: E402
+import tokenspeed_kernel.ops.moe.gluon as routing_module  # noqa: E402
+import tokenspeed_kernel.ops.moe.triton as decode_topk_module  # noqa: E402
+from tokenspeed_kernel.ops.moe._triton.minimax_topk import (  # noqa: E402
     minimax_biased_grouped_topk,
 )
 
@@ -81,9 +79,9 @@ def test_generic_topk_uses_k3_decode_or_prefill_gluon_route(
     )
     route_calls = 0
     if num_tokens == 1:
-        original_route = decode_topk_module._decode_sigmoid_bias_topk
+        original_route = decode_topk_module.decode_sigmoid_bias_topk
         patch_target = decode_topk_module
-        patch_name = "_decode_sigmoid_bias_topk"
+        patch_name = "decode_sigmoid_bias_topk"
     else:
         original_route = routing_module.invoke_sigmoid_bias_topk_route_prefill_gluon
         patch_target = routing_module

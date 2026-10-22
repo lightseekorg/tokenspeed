@@ -690,7 +690,9 @@ def test_ordinary_mla_kvp_capacity_and_token_limit(degree, token_limit):
     )
     setup = prepare_cache_setup(
         family="mla",
-        server_args=SimpleNamespace(max_total_tokens=token_limit),
+        server_args=SimpleNamespace(
+            max_total_tokens=token_limit, kv_offload_config=None
+        ),
         model_config=SimpleNamespace(
             num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
@@ -751,7 +753,7 @@ def test_pure_dsa_kvp_shards_index_and_latent_capacity(degree):
             replace(config, is_draft=True, draft_block_decode=True)
     setup = prepare_cache_setup(
         family="dsa",
-        server_args=SimpleNamespace(max_total_tokens=None),
+        server_args=SimpleNamespace(max_total_tokens=None, kv_offload_config=None),
         model_config=SimpleNamespace(
             num_attention_layers=2, hf_config=SimpleNamespace(), model_profile=None
         ),
@@ -781,6 +783,8 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = 64
     backend.kernel_solution = None
+    backend.prefill_kernel_plan = None
+    backend.decode_kernel_plan = None
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
     backend.kv_lora_rank = 128

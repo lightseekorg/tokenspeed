@@ -10,12 +10,12 @@ numerical check would notice, so it is asserted here.
 from __future__ import annotations
 
 import pytest
+import tokenspeed_kernel.ops.moe.deep_ep as deepep_fp8
 import torch
 from tokenspeed_kernel.ops.moe import moe_apply
-from tokenspeed_kernel.ops.moe.deep_gemm import deepep_fp8
 
 pytestmark = pytest.mark.skipif(
-    not hasattr(deepep_fp8, "_apply_low_latency"),
+    not hasattr(deepep_fp8, "_deep_gemm_fp8_apply_low_latency"),
     reason="DeepEP FP8 MoE path needs an NVIDIA platform with DeepGEMM",
 )
 
@@ -103,7 +103,7 @@ def stub_compute(monkeypatch):
 
 
 def _run_low_latency(calls: list[str], overlap_fn, *, enable_pdl: bool = False) -> None:
-    deepep_fp8._apply_low_latency(
+    deepep_fp8._deep_gemm_fp8_apply_low_latency(
         _RecordingDispatcher(calls),
         torch.zeros((1, HIDDEN), dtype=torch.bfloat16),
         _weights(),
@@ -187,26 +187,20 @@ def test_routing_metadata_is_canonicalized_once() -> None:
     assert got_ids.is_contiguous()
 
 
-def test_overlap_only_reaches_all_to_all_plans(monkeypatch) -> None:
+def test_overlap_only_reaches_all_to_all_plans() -> None:
     """Plans that own no dispatch legs must not see the window argument."""
     seen: dict = {}
 
-    def fake_select_kernel(*args, **kwargs):
-        del args, kwargs
+    def kernel(**kw):
+        seen.update(kw)
 
-        def kernel(**kw):
-            seen.update(kw)
-
-        return kernel
-
-    monkeypatch.setattr("tokenspeed_kernel.ops.moe.select_kernel", fake_select_kernel)
     x = torch.zeros((1, HIDDEN), dtype=torch.bfloat16)
 
     def overlap_fn() -> None:
         return None
 
     moe_apply(
-        {"apply_kernel_name": None, "a2a_backend": "deepep"},
+        {"apply_kernel": kernel, "features": frozenset(), "a2a_backend": "deepep"},
         x,
         _weights(),
         torch.zeros((1, NUM_LOCAL_EXPERTS)),
@@ -216,7 +210,7 @@ def test_overlap_only_reaches_all_to_all_plans(monkeypatch) -> None:
 
     seen.clear()
     moe_apply(
-        {"apply_kernel_name": None, "a2a_backend": None},
+        {"apply_kernel": kernel, "features": frozenset(), "a2a_backend": None},
         x,
         _weights(),
         torch.zeros((1, NUM_LOCAL_EXPERTS)),

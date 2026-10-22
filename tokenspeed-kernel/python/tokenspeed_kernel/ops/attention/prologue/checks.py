@@ -33,7 +33,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     KVCacheFormat,
     LatentKVCache,
     MLAExpandedKV,
-    PerTokenHeadPlanes,
+    MXFP8Scales,
     Rotary,
 )
 
@@ -94,9 +94,9 @@ def _cache_key(cache: HeadKVCache | LatentKVCache) -> tuple:
     if isinstance(cache, HeadKVCache):
         scales = cache.scales
         planes = (
-            None
-            if scales is None
-            else (_layout(scales.k), _layout(scales.v), scales.page_tokens)
+            (_layout(scales.k), _layout(scales.v), scales.page_tokens)
+            if isinstance(scales, MXFP8Scales)
+            else type(scales)
         )
         return (
             _layout(cache.k_cache),
@@ -329,8 +329,13 @@ def _check_gqa_request(
         if rotary.rotary_dim > head_dim:
             raise ValueError(f"rotary width {rotary.rotary_dim} exceeds the head")
     _check_slots(cache, num_tokens)
-    if cache.scales is not None:
+    if isinstance(cache.scales, MXFP8Scales):
         _check_mxfp8_scales(cache, num_kv_heads, head_dim)
+    if (
+        cache.format is KVCacheFormat.FP8_PER_TENSOR
+        and cache.k_cache.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("per-tensor KV scales apply to an FP8 cache only")
     if cache.format is KVCacheFormat.NATIVE and cache.k_cache.dtype not in (
         q.dtype,
         torch.bfloat16,
@@ -470,11 +475,13 @@ def _check_latent_cache(
     else:
         rows = ((cache.kv_cache, kv_lora_rank + rope_dim),)
         malformed = (
-            f"latent cache rows are not dense [slots, 1, {kv_lora_rank} + {rope_dim}]"
+            f"latent cache rows require [slots, 1, {kv_lora_rank + rope_dim}] "
+            "or [pages, page_size, 1, width]"
         )
+    cache_dims = (3,) if cache.format is KVCacheFormat.FP8_PER_TOKEN_HEAD else (3, 4)
     if any(
-        p.dim() != 3
-        or p.shape[1] != 1
+        p.dim() not in cache_dims
+        or p.shape[-2] != 1
         or p.shape[-1] != channels
         or p.stride(-1) != 1
         or _overlapping(p)

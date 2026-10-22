@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "NoKernelFoundError",
     "SelectedKernel",
+    "KernelPlan",
     "SelectionStrategy",
     "ScoreBreakdown",
     "SelectionOracle",
@@ -72,8 +73,157 @@ class SelectedKernel:
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.impl(*args, **kwargs)
 
+    # Two selections of the same registered kernel are interchangeable, so the
+    # plans that hold them (KernelPlan, the moe_plan dict) compare by value.
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, SelectedKernel):
+            return NotImplemented
+        return (self.name, self.impl) == (other.name, other.impl)
+
+    def __hash__(self) -> int:
+        return hash((self.name, self.impl))
+
     def __repr__(self) -> str:
         return f"SelectedKernel(name={self.name!r})"
+
+
+@dataclass(frozen=True)
+class KernelPlan:
+    """An initialization-time selection reused without consulting the registry.
+
+    Static traits describe the call site's geometry and semantics. Variable
+    traits may change at execution, but cannot restrict the selected leaf's
+    applicability. The provider owns invariance across those varying inputs.
+    """
+
+    family: str
+    mode: str
+    signature: FormatSignature
+    static_traits: tuple[tuple[str, Any], ...]
+    spec: KernelSpec
+    kernel: SelectedKernel
+
+    @classmethod
+    def select(
+        cls,
+        family: str,
+        mode: str,
+        signature: FormatSignature,
+        *,
+        features: frozenset[str],
+        static_traits: dict[str, Any],
+        variable_traits: frozenset[str],
+        declared_traits: frozenset[str],
+        solution: str | None,
+        ignore_layout: bool,
+        platform: PlatformInfo | None = None,
+    ) -> KernelPlan:
+        """Select once using static inputs; never tune on a representative batch.
+
+        Variable dimensions must be unrestricted by the leaf. A bounded provider
+        needs a separate, explicitly validated deployment domain before it can be
+        planned here. declared_traits names semantic promises (such as slot
+        order) that must be explicit rather than inferred from an absent trait.
+        Name breaks equal-priority ties independently of import order.
+        """
+        if not declared_traits <= static_traits.keys():
+            raise ValueError("Declared traits must also have static requirements")
+        if variable_traits.intersection(static_traits):
+            raise ValueError("A planning trait cannot be both static and variable")
+        platform = platform or current_platform()
+        registry = KernelRegistry.get()
+        candidates = registry.get_for_operator(
+            family,
+            mode,
+            features=features,
+            platform=platform,
+            format_signature=signature,
+            solution=solution,
+            ignore_layout=ignore_layout,
+        )
+        candidates = [
+            spec
+            for spec in candidates
+            if not any(
+                variable in spec.traits
+                or any(
+                    f"{variable}{suffix}" in spec.traits
+                    for suffix, _ in _BOUND_SUFFIXES
+                )
+                for variable in variable_traits
+            )
+        ]
+        candidates = [
+            spec
+            for spec in _filter_by_traits(candidates, static_traits)
+            if declared_traits <= spec.traits.keys()
+        ]
+        override = resolve_kernel_override(family, mode, None)
+        if override is not None:
+            candidates = [
+                spec for spec in candidates if override in (spec.name, spec.solution)
+            ]
+        if not candidates:
+            raise NoKernelFoundError(
+                f"No initialization-time kernel for {family}.{mode} with features "
+                f"{sorted(features)}, static traits {static_traits} and unrestricted "
+                f"variable traits {sorted(variable_traits)} on {platform.device_name}"
+            )
+        scored = _rank(
+            sorted(candidates, key=lambda spec: spec.name), platform, static_traits
+        )
+        winner = scored[0][0]
+        _log_selection(family, mode, signature, winner, scored, platform)
+        return cls(
+            family,
+            mode,
+            signature,
+            tuple(static_traits.items()),
+            winner,
+            SelectedKernel(winner.name, registry.get_impl(winner.name)),
+        )
+
+    def validate(
+        self,
+        family: str,
+        mode: str,
+        signature: FormatSignature,
+        traits: dict[str, Any] | None,
+        features: frozenset[str] | None,
+        solution: str | None,
+        override: str | None,
+    ) -> None:
+        """Check inputs against the saved choice, without consulting the registry."""
+        override = resolve_kernel_override(family, mode, override)
+        if (family, mode, signature) != (self.family, self.mode, self.signature):
+            raise ValueError(
+                f"Input contract changed for planned kernel {self.kernel.name}"
+            )
+        if solution is not None and solution != self.spec.solution:
+            raise ValueError("A kernel plan cannot change solution during execution")
+        if override is not None and override not in (
+            self.spec.name,
+            self.spec.solution,
+        ):
+            raise ValueError("A kernel plan cannot change override during execution")
+        if features and not features <= self.spec.features:
+            raise ValueError("Planned kernel does not provide the requested features")
+        actual = traits or {}
+        for name, value in self.static_traits:
+            if not (
+                _trait_value_matches(value, actual.get(name))
+                if isinstance(value, frozenset)
+                else actual.get(name) == value
+            ):
+                raise ValueError(
+                    f"Planned kernel {self.kernel.name}: static trait {name} changed"
+                )
+        if not spec_matches_traits(self.spec, actual) or not spec_matches_shape_traits(
+            self.spec, actual
+        ):
+            raise ValueError(
+                f"Input is outside planned kernel {self.kernel.name}'s domain"
+            )
 
 
 class SelectionStrategy(Enum):
@@ -177,6 +327,7 @@ def _make_cache_key(
     features: frozenset[str] | None,
     traits: dict[str, Any] | None,
     solution: str | None = None,
+    ignore_layout: bool = False,
 ) -> tuple:
     """Build a hashable cache key including selection-relevant traits."""
     traits_key = tuple(sorted(traits.items())) if traits else ()
@@ -189,6 +340,7 @@ def _make_cache_key(
         mods_key,
         traits_key,
         solution,
+        ignore_layout,
     )
 
 
@@ -533,6 +685,7 @@ def select_kernel(
     traits: dict[str, Any] | None = None,
     solution: str | None = None,
     override: str | None = None,
+    ignore_layout: bool = False,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
@@ -553,6 +706,8 @@ def select_kernel(
         override: Force a specific kernel name or solution string, skipping
             platform, format-signature and trait matching but still refusing
             a kernel that lacks a required feature.
+        ignore_layout: Ignore only storage layouts when choosing preprocessing
+            at initialization. Execution uses the default layout-aware matching.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -576,6 +731,7 @@ def select_kernel(
         features,
         traits,
         solution,
+        ignore_layout,
     )
     if override is None:
         cached = registry.cache_get(cache_key)
@@ -599,6 +755,7 @@ def select_kernel(
         platform=platform,
         format_signature=format_signature,
         solution=solution,
+        ignore_layout=ignore_layout,
     )
 
     solution_clause = f" with solution {solution!r}" if solution else ""

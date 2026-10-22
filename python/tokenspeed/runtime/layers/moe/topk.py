@@ -30,8 +30,9 @@ from tokenspeed_kernel.ops.moe import (
     dispatch_topk_ids,
     moe_topk,
 )
-from tokenspeed_kernel.ops.moe.sigmoid_topk import minimax_biased_grouped_topk
-from tokenspeed_kernel.ops.moe.triton.inkling_topk import inkling_topk
+from tokenspeed_kernel.ops.moe import torch_softmax_bias_topk as torch_router_topk
+from tokenspeed_kernel.ops.moe._triton.inkling_topk import inkling_topk
+from tokenspeed_kernel.ops.moe._triton.minimax_topk import minimax_biased_grouped_topk
 from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flash
 
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
@@ -293,42 +294,6 @@ def torch_native_fused_topk(
     return topk_weights, topk_ids
 
 
-def torch_router_topk(
-    router_logits: torch.Tensor,
-    correction_bias: torch.Tensor,
-    top_k: int,
-    num_real_experts: int,
-    routed_scaling_factor: float,
-    indices_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Correction-bias routing in the trainer's torch order (``--router-topk torch``).
-
-    fp32 ``torch.softmax`` keeps every probability bit; ``torch.topk`` on the
-    biased probabilities with ``sorted=True`` gives PyTorch's tie order; the
-    weights are the UNBIASED probabilities times ``routed_scaling_factor``.
-    Zero experts (ids past the real experts) become ``-1`` and keep their
-    weight so the model can apply its identity residual.
-
-    Args:
-        router_logits: ``[tokens, num_candidates]`` router logits (any float
-            dtype); candidates are the real experts followed by zero experts.
-        correction_bias: ``[num_candidates]`` fp32 selection bias.
-        top_k: Experts selected per token.
-        num_real_experts: Candidates below this id are real experts.
-        routed_scaling_factor: Multiplier on the selected probabilities.
-        indices_dtype: dtype of the returned ids.
-
-    Returns:
-        ``(weights, ids)`` with shapes ``[tokens, top_k]``; weights fp32, ids
-        in ``indices_dtype`` with ``-1`` for zero experts.
-    """
-    probs = torch.softmax(router_logits, dim=-1, dtype=torch.float32)
-    _, ids = torch.topk(probs + correction_bias, k=top_k, dim=-1, sorted=True)
-    weights = probs.gather(1, ids) * routed_scaling_factor
-    ids = ids.masked_fill(ids >= num_real_experts, -1).to(indices_dtype)
-    return weights, ids
-
-
 def grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -568,6 +533,7 @@ class TopK(torch.nn.Module):
         output_format: TopKOutputFormat | None = None,
         num_token_non_padded: torch.Tensor | None = None,
         expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+        out: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> TopKOutput:
         output_format = (
             output_format or self.topk_config.output_format or TopKOutputFormat.STANDARD
@@ -576,6 +542,8 @@ class TopK(torch.nn.Module):
             router_logits = simulated_router_logits(router_logits)
 
         if output_format == TopKOutputFormat.BYPASSED:
+            if out is not None:
+                raise ValueError("Bypassed routing does not accept output buffers")
             return BypassedTopKOutput(
                 hidden_states=hidden_states,
                 router_logits=router_logits,
@@ -591,6 +559,7 @@ class TopK(torch.nn.Module):
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+                out=out,
             )
 
     def empty_topk_output(
@@ -651,6 +620,7 @@ def select_experts(
     *,
     num_token_non_padded: torch.Tensor | None = None,
     expert_location_dispatch_info: ExpertLocationDispatchInfo | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> StandardTopKOutput:
 
     top_k = topk_config.top_k
@@ -752,8 +722,14 @@ def select_experts(
                     correction_bias=correction_bias,
                     logical_to_physical_map=logical_to_physical_map,
                     topk_weights_dtype=topk_config.topk_weights_dtype,
+                    topk_indices_dtype=out[1].dtype if out is not None else torch.int32,
+                    out=out,
                 )
             else:
+                if out is not None:
+                    raise ValueError(
+                        "Selected routing configuration cannot write output buffers"
+                    )
                 topk_weights, topk_ids = minimax_biased_grouped_topk(
                     hidden_states,
                     router_logits,

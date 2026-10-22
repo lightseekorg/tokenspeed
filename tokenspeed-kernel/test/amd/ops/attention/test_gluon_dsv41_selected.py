@@ -34,24 +34,32 @@ pytest.importorskip("tokenspeed_triton")
 pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
 
 
-def _selected_name() -> str:
+def _selected_name(op: str, traits: dict) -> str:
     kernel = select_kernel(
         "attention",
-        "dsv41_selected_attention",
+        op,
         format_signature(x=dense_tensor_format(torch.bfloat16)),
-        traits={"flashmla_eligible": False},
+        traits=traits,
     )
     return kernel.name
 
 
-def test_fused_gluon_is_selected_on_supported_amd():
+@pytest.mark.parametrize(
+    ("op", "traits"),
+    [
+        ("dsv41_selected_attention", {"flashmla_eligible": False}),
+        ("dsv41_selected_attention_rope", {}),
+    ],
+)
+def test_fused_gluon_is_selected_on_supported_amd(op, traits):
     platform = current_platform()
     if platform.is_cdna4:
-        assert _selected_name() == "gluon_dsv41_selected_attention_gfx950"
+        arch = "gfx950"
     elif platform.is_cdna5:
-        assert _selected_name() == "gluon_dsv41_selected_attention_gfx1250"
+        arch = "gfx1250"
     else:
         pytest.skip("AMD fused selected attention")
+    assert _selected_name(op, traits) == f"gluon_{op}_{arch}"
 
 
 def _make_cache(x, fmt):
@@ -127,6 +135,7 @@ def test_fused_selected_attention_matches_gather_softmax(heads, with_global):
         None,
         None,
         None,
+        lse=None,
     )
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
     assert torch.count_nonzero(out[[1, 4]]).item() == 0
@@ -199,15 +208,27 @@ def _padded_query(tokens, real_heads, heads, device, seed):
 
 @pytest.mark.parametrize(
     ("tokens", "real_heads", "heads"),
-    [(6, 16, 64), (6, 64, 64), (192, 16, 64), (192, 64, 64), (6, 16, 128)],
+    [
+        (6, 16, 64),
+        (6, 64, 64),
+        (24, 16, 64),
+        (48, 16, 64),
+        (192, 16, 64),
+        (192, 64, 64),
+        (6, 16, 128),
+    ],
 )
-def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
-    """Split (6 rows) and single-workgroup (192 rows) paths at decode widths.
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads, with_rope):
+    """Split (6, 24, 48 rows) and single-workgroup (192 rows) decode paths.
+
+    On gfx1250 the 6/24/48-row cases launch one, two and four 16-head groups
+    per workgroup, and 192 rows launch four groups without a split.
 
     Padded zero-query heads take the row-sum shortcut and must still match the
-    softmax over their (all-zero) scores. 128 heads span two head blocks, so
-    the split reduce maps active groups per block and both blocks write the
-    shared row sum.
+    softmax over their (all-zero) scores. 128 heads span several head blocks,
+    so the split reduce maps active groups per block and every block writes
+    the shared row sum.
     """
     platform = current_platform()
     if not (platform.is_cdna4 or platform.is_cdna5):
@@ -232,23 +253,79 @@ def test_fused_selected_attention_decode_shapes(tokens, real_heads, heads):
         None,
         None,
         None,
+        lse=None,
     )
+    if with_rope:
+        positions = torch.arange(tokens, dtype=torch.int64, device=device) - 1
+        angles = torch.arange(tokens * 32, dtype=torch.float32, device=device)
+        angles = angles.reshape(tokens, 32) * 0.03125
+        cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
+        unrotated = out.clone()
+        expected_rope = dsv41.rope_inplace(out, positions, cos_sin, None)
+        out = dsv41.selected_attention_rope(
+            q,
+            swa,
+            swa_slots,
+            swa_lens,
+            glob,
+            global_slots,
+            global_lens,
+            sink,
+            512**-0.5,
+            None,
+            positions,
+            cos_sin,
+        )
+        torch.testing.assert_close(out[..., :-64], unrotated[..., :-64], rtol=0, atol=0)
+        torch.testing.assert_close(
+            out[..., -64:], expected_rope[..., -64:], rtol=0.008, atol=0.0005
+        )
+        expected = dsv41.rope_inplace(expected, positions, cos_sin, None)
     torch.testing.assert_close(out, expected, rtol=0.008, atol=0.004)
 
 
-def test_fused_selected_attention_gfx950_no_recompile_across_rows():
-    """Row count changes the grid and split count, never a compile key."""
-    if not current_platform().is_cdna4:
-        pytest.skip("gfx950 kernel")
-    from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+@pytest.mark.parametrize("with_rope", [False, True])
+def test_fused_selected_attention_no_recompile_across_rows(with_rope):
+    """Row count changes the grid and split count without recompiling.
+
+    On gfx1250 it also picks one of three head-group widths, all compiled by
+    the warmup rows.
+    """
+    platform = current_platform()
+    if platform.is_cdna4:
+        from tokenspeed_kernel_amd.ops.gfx950.attention.dsv41 import selected
+
+        launch = selected.launch_gluon_dsv41_selected_attention_gfx950
+        kernels = (
+            selected.gluon_dsv41_selected_attention_gfx950,
+            selected.gluon_dsv41_selected_attention_reduce_gfx950,
+        )
+    elif platform.is_cdna5:
+        from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import selected
+
+        launch = selected.launch_gluon_dsv41_selected_attention_gfx1250
+        kernels = (
+            selected.gluon_dsv41_selected_attention_gfx1250,
+            selected.gluon_dsv41_selected_attention_reduce_gfx1250,
+        )
+    else:
+        pytest.skip("AMD fused selected attention")
 
     device = torch.device("cuda:0")
     segments = _decode_inputs(192, device, 3)
     (swa, swa_slots, swa_lens, _), (glob, global_slots, global_lens, _) = segments
     q, sink = _padded_query(192, 16, 64, device, 5)
+    positions = torch.arange(192, dtype=torch.int64, device=device)
+    angles = torch.randn((192, 32), dtype=torch.float32, device=device)
+    cos_sin = torch.cat((angles.cos(), -angles.sin()), dim=1)
 
     def run(tokens):
-        selected.launch_gluon_dsv41_selected_attention_gfx950(
+        rope = (
+            {"rope_positions": positions[:tokens], "rope_cos_sin": cos_sin}
+            if with_rope
+            else {}
+        )
+        launch(
             q[:tokens],
             swa,
             swa_slots[:tokens],
@@ -263,14 +340,12 @@ def test_fused_selected_attention_gfx950_no_recompile_across_rows():
             None,
             None,
             None,
+            **rope,
         )
 
-    for tokens in (1, 192):
+    for tokens in (1, 24, 96, 192):
         run(tokens)
-    with assert_no_triton_compile(
-        selected.gluon_dsv41_selected_attention_gfx950,
-        selected.gluon_dsv41_selected_attention_reduce_gfx950,
-    ):
-        for tokens in (2, 5, 33, 96, 150, 191):
+    with assert_no_triton_compile(*kernels):
+        for tokens in (2, 5, 16, 17, 32, 33, 64, 150, 191):
             run(tokens)
     torch.cuda.synchronize()

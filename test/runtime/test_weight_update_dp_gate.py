@@ -30,10 +30,11 @@ already carries flush intent. These tests drive ``RequestHandler`` with a fake
 
 from __future__ import annotations
 
-import unittest
+import sys
 from collections import deque
 from unittest import mock
 
+import pytest
 import torch
 
 from tokenspeed.runtime.engine.io_struct import (
@@ -152,8 +153,10 @@ def _handler(*, dp_size: int = 1):
     handler._pending_internal_ops = deque()
     handler._internal_op_completer = None
     handler._device = mock.Mock()
-    handler._device.delete_l3_namespace.return_value = True
+    handler._l3 = mock.Mock()
+    handler._l3.delete_namespace.return_value = True
     handler._device.update_weights.return_value = (True, "ok")
+    handler.memory_controller = None
     return handler
 
 
@@ -161,7 +164,7 @@ def _replies(handler) -> list:
     return [call.args[0] for call in handler.send_func.send_pyobj.call_args_list]
 
 
-class TestSameRoundGate(unittest.TestCase):
+class TestSameRoundGate:
     def test_op_waits_until_every_dp_rank_holds_one(self):
         handler = _handler(dp_size=2)
         peer = _DpPeer(head=None)
@@ -173,10 +176,10 @@ class TestSameRoundGate(unittest.TestCase):
         handler._device.update_weights.assert_not_called()
         handler.can_clear_cache_fn.assert_not_called()
         handler.send_func.send_pyobj.assert_not_called()
-        self.assertEqual(list(handler._pending_weight_ops), [req])
+        assert (list(handler._pending_weight_ops)) == ([req])
         # Only the gate itself was reduced; no flush collectives.
-        self.assertEqual(peer.calls, [("dp", MAX)])
-        self.assertEqual(peer.gate_vectors, [[0, -1, 2, -2, 0, 0, 0]])
+        assert (peer.calls) == ([("dp", MAX)])
+        assert (peer.gate_vectors) == ([[0, -1, 2, -2, 0, 0, 0]])
 
     def test_ready_op_flushes_updates_and_replies_once(self):
         handler = _handler(dp_size=2)
@@ -188,20 +191,17 @@ class TestSameRoundGate(unittest.TestCase):
 
         # The head's flush_cache enters the flush collectives without any
         # standalone intent on the gate vector.
-        self.assertEqual(peer.gate_vectors[0][0], 0)
-        self.assertEqual(
-            peer.calls,
-            [("dp", MAX), ("dp", MIN), ("dp", MIN), ("dp", MIN)],
-        )
+        assert (peer.gate_vectors[0][0]) == (0)
+        assert (peer.calls) == ([("dp", MAX), ("dp", MIN), ("dp", MIN), ("dp", MIN)])
         handler.can_clear_cache_fn.assert_called_once_with()
         handler.clear_cache_fn.assert_called_once_with()
         handler._device.update_weights.assert_called_once_with(req)
-        handler._device.set_l3_weight_version.assert_called_once_with("v2")
+        handler._l3.set_weight_version.assert_called_once_with("v2")
         replies = _replies(handler)
-        self.assertEqual(len(replies), 1)
-        self.assertIsInstance(replies[0], UpdateWeightsFromDistributedReqOutput)
-        self.assertTrue(replies[0].success)
-        self.assertEqual(handler._pending_weight_ops, deque())
+        assert (len(replies)) == (1)
+        assert isinstance((replies[0]), (UpdateWeightsFromDistributedReqOutput))
+        assert replies[0].success
+        assert (handler._pending_weight_ops) == (deque())
 
     def test_queued_op_completes_in_a_later_round(self):
         handler = _handler(dp_size=2)
@@ -216,7 +216,27 @@ class TestSameRoundGate(unittest.TestCase):
             handler.process_requests([])
 
         handler._device.update_weights.assert_called_once_with(req)
-        self.assertEqual(len(_replies(handler)), 1)
+        assert (len(_replies(handler))) == (1)
+
+    def test_disk_update_is_a_gated_load(self):
+        handler = _handler(dp_size=2)
+        req = UpdateWeightFromDiskReqInput(model_path="/m", weight_version="v2")
+        waiting = _DpPeer(head=None)
+        with mock.patch.object(torch.distributed, "all_reduce", waiting.all_reduce):
+            handler.process_requests([req])
+        handler._device.update_weights.assert_not_called()
+        assert (list(handler._pending_weight_ops)) == ([req])
+
+        arrived = _DpPeer(head=UpdateWeightFromDiskReqInput)
+        with mock.patch.object(torch.distributed, "all_reduce", arrived.all_reduce):
+            handler.process_requests([])
+
+        handler.clear_cache_fn.assert_called_once_with()
+        handler._device.update_weights.assert_called_once_with(req)
+        handler._l3.set_weight_version.assert_called_once_with("v2")
+        (reply,) = _replies(handler)
+        assert isinstance((reply), (UpdateWeightFromDiskReqOutput))
+        assert reply.success
 
     def test_one_op_per_round(self):
         handler = _handler(dp_size=2)
@@ -229,14 +249,14 @@ class TestSameRoundGate(unittest.TestCase):
             handler.process_requests([first, second])
 
         handler._device.update_weights.assert_called_once_with(first)
-        self.assertEqual(list(handler._pending_weight_ops), [second])
+        assert (list(handler._pending_weight_ops)) == ([second])
 
     def test_mismatched_head_types_raise(self):
         handler = _handler(dp_size=2)
         peer = _DpPeer(head=InitWeightsUpdateGroupReqInput)
 
         with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
-            with self.assertRaisesRegex(RuntimeError, "different weight-update"):
+            with pytest.raises((RuntimeError), match=("different weight-update")):
                 handler.process_requests([_distributed()])
 
         handler._device.update_weights.assert_not_called()
@@ -260,18 +280,18 @@ class TestSameRoundGate(unittest.TestCase):
             handler.process_requests([req])
 
         handler._device.update_weights.assert_called_once_with(req)
-        handler._device.set_l3_weight_version.assert_not_called()
-        self.assertEqual(handler.server_args.weight_version, "v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
         reply = _replies(handler)[0]
-        self.assertFalse(reply.success)
-        self.assertIn("another rank", reply.message)
+        assert not (reply.success)
+        assert ("another rank") in (reply.message)
 
-    def test_init_and_destroy_are_gated(self):
+    def test_init_and_destroy_are_gated(self, subtests):
         for req_type, out_type in (
             (InitWeightsUpdateGroupReqInput, InitWeightsUpdateGroupReqOutput),
             (DestroyWeightsUpdateGroupReqInput, DestroyWeightsUpdateGroupReqOutput),
         ):
-            with self.subTest(op=req_type.__name__):
+            with subtests.test(op=req_type.__name__):
                 req = (
                     req_type(
                         master_address="h", master_port=1, rank_offset=0, world_size=2
@@ -295,11 +315,11 @@ class TestSameRoundGate(unittest.TestCase):
                     handler.process_requests([])
                 handler._device.update_weights.assert_called_once_with(req)
                 # Gate MAX, then the result MIN; no flush collectives.
-                self.assertEqual(ready.calls, [("dp", MAX), ("dp", MIN)])
+                assert (ready.calls) == ([("dp", MAX), ("dp", MIN)])
                 handler.can_clear_cache_fn.assert_not_called()
                 reply = _replies(handler)[0]
-                self.assertIsInstance(reply, out_type)
-                self.assertTrue(reply.success)
+                assert isinstance((reply), (out_type))
+                assert reply.success
 
     def test_standalone_flush_and_waiting_op_share_the_gate(self):
         handler = _handler(dp_size=2)
@@ -311,10 +331,10 @@ class TestSameRoundGate(unittest.TestCase):
         # The peer's standalone flush runs here; the load stays queued.
         handler.clear_cache_fn.assert_called_once_with()
         handler._device.update_weights.assert_not_called()
-        self.assertEqual(len(handler._pending_weight_ops), 1)
+        assert (len(handler._pending_weight_ops)) == (1)
         replies = _replies(handler)
-        self.assertEqual(len(replies), 1)
-        self.assertTrue(replies[0].success)
+        assert (len(replies)) == (1)
+        assert replies[0].success
 
 
 class _Completer:
@@ -339,7 +359,7 @@ def _with_internal_ops(handler) -> _Completer:
     return completer
 
 
-class TestInternalOpGate(unittest.TestCase):
+class TestInternalOpGate:
     """Internal ops (the expert rebalance) ride the same gate from a second FIFO."""
 
     def test_internal_op_waits_until_every_dp_rank_holds_one(self):
@@ -351,18 +371,18 @@ class TestInternalOpGate(unittest.TestCase):
         with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
             handler.process_requests([])
 
-        self.assertEqual(completer.completed, [])
-        self.assertEqual(list(handler._pending_internal_ops), [EplbSnapshot()])
-        self.assertEqual(peer.gate_vectors, [[0, 0, 0, 0, -1, 1, -1]])
+        assert (completer.completed) == ([])
+        assert (list(handler._pending_internal_ops)) == ([EplbSnapshot()])
+        assert (peer.gate_vectors) == ([[0, 0, 0, 0, -1, 1, -1]])
 
         arrived = _DpPeer(head=None, internal=EplbSnapshot)
         with mock.patch.object(torch.distributed, "all_reduce", arrived.all_reduce):
             handler.process_requests([])
-        self.assertEqual(completer.completed, [EplbSnapshot()])
-        self.assertEqual(handler._pending_internal_ops, deque())
+        assert (completer.completed) == ([EplbSnapshot()])
+        assert (handler._pending_internal_ops) == (deque())
         # No reply and no flush collectives for an internal op.
         handler.send_func.send_pyobj.assert_not_called()
-        self.assertEqual(arrived.calls, [("dp", MAX)])
+        assert (arrived.calls) == ([("dp", MAX)])
 
     def test_frontend_op_arriving_later_on_a_peer_does_not_trip_the_gate(self):
         # Rank A holds an internal op and receives a frontend op; the peer
@@ -377,8 +397,8 @@ class TestInternalOpGate(unittest.TestCase):
         with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
             handler.process_requests([req])
 
-        self.assertEqual(completer.completed, [EplbCommit()])
-        self.assertEqual(list(handler._pending_weight_ops), [req])
+        assert (completer.completed) == ([EplbCommit()])
+        assert (list(handler._pending_weight_ops)) == ([req])
         handler._device.update_weights.assert_not_called()
 
     def test_frontend_op_takes_precedence_and_internal_waits_a_round(self):
@@ -396,13 +416,13 @@ class TestInternalOpGate(unittest.TestCase):
 
         # One blocking device call per round: the frontend op this round.
         handler._device.update_weights.assert_called_once_with(req)
-        self.assertEqual(completer.completed, [])
-        self.assertEqual(list(handler._pending_internal_ops), [chunk])
+        assert (completer.completed) == ([])
+        assert (list(handler._pending_internal_ops)) == ([chunk])
 
         with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
             handler.process_requests([])
-        self.assertEqual(completer.completed, [chunk])
-        self.assertEqual(handler._pending_internal_ops, deque())
+        assert (completer.completed) == ([chunk])
+        assert (handler._pending_internal_ops) == (deque())
 
     def test_one_internal_op_per_round_in_enqueue_order(self):
         handler = _handler(dp_size=2)
@@ -416,8 +436,8 @@ class TestInternalOpGate(unittest.TestCase):
             peer = _DpPeer(head=None, internal=internal)
             with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
                 handler.process_requests([])
-            self.assertEqual(completer.completed[-1], expected)
-        self.assertEqual(completer.completed, ops)
+            assert (completer.completed[-1]) == (expected)
+        assert (completer.completed) == (ops)
 
     def test_mismatched_internal_heads_raise(self):
         handler = _handler(dp_size=2)
@@ -425,17 +445,17 @@ class TestInternalOpGate(unittest.TestCase):
         handler.enqueue_internal_op(EplbSnapshot())
         peer = _DpPeer(head=None, internal=EplbCommit)
         with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
-            with self.assertRaisesRegex(RuntimeError, "internal control"):
+            with pytest.raises((RuntimeError), match=("internal control")):
                 handler.process_requests([])
 
     def test_enqueue_requires_a_completer_and_an_internal_kind(self):
         handler = _handler()
-        with self.assertRaisesRegex(RuntimeError, "completer"):
+        with pytest.raises((RuntimeError), match=("completer")):
             handler.enqueue_internal_op(EplbSnapshot())
         _with_internal_ops(handler)
-        with self.assertRaisesRegex(TypeError, "not an internal"):
+        with pytest.raises((TypeError), match=("not an internal")):
             handler.enqueue_internal_op(_distributed())
-        with self.assertRaisesRegex(RuntimeError, "already installed"):
+        with pytest.raises((RuntimeError), match=("already installed")):
             handler.set_internal_op_completer(_Completer())
 
     def test_manual_trigger_rides_the_frontend_fifo_and_replies(self):
@@ -444,13 +464,13 @@ class TestInternalOpGate(unittest.TestCase):
         peer = _DpPeer(head=RebalanceExpertsReqInput)
         with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
             handler.process_requests([RebalanceExpertsReqInput()])
-        self.assertEqual(completer.manual_calls, 1)
+        assert (completer.manual_calls) == (1)
         handler._device.update_weights.assert_not_called()
         # Gate MAX, then the replica MIN on the decision; no flush.
-        self.assertEqual(peer.calls, [("dp", MAX), ("dp", MIN)])
+        assert (peer.calls) == ([("dp", MAX), ("dp", MIN)])
         reply = _replies(handler)[0]
-        self.assertIsInstance(reply, RebalanceExpertsReqOutput)
-        self.assertTrue(reply.success)
+        assert isinstance((reply), (RebalanceExpertsReqOutput))
+        assert reply.success
 
         # A peer that refused fails the trigger everywhere.
         handler = _handler(dp_size=2)
@@ -459,19 +479,19 @@ class TestInternalOpGate(unittest.TestCase):
         with mock.patch.object(torch.distributed, "all_reduce", peer.all_reduce):
             handler.process_requests([RebalanceExpertsReqInput()])
         reply = _replies(handler)[0]
-        self.assertFalse(reply.success)
-        self.assertIn("another rank", reply.message)
+        assert not (reply.success)
+        assert ("another rank") in (reply.message)
 
     def test_manual_trigger_without_eplb_is_refused(self):
         handler = _handler()
         handler.process_requests([RebalanceExpertsReqInput()])
         reply = _replies(handler)[0]
-        self.assertIsInstance(reply, RebalanceExpertsReqOutput)
-        self.assertFalse(reply.success)
-        self.assertIn("--enable-eplb", reply.message)
+        assert isinstance((reply), (RebalanceExpertsReqOutput))
+        assert not (reply.success)
+        assert ("--enable-eplb") in (reply.message)
 
 
-class TestSingleReplicaUnchanged(unittest.TestCase):
+class TestSingleReplicaUnchanged:
     def test_init_completes_in_the_same_round(self):
         handler = _handler()
         req = InitWeightsUpdateGroupReqInput(
@@ -482,9 +502,9 @@ class TestSingleReplicaUnchanged(unittest.TestCase):
 
         handler._device.update_weights.assert_called_once_with(req)
         reply = _replies(handler)[0]
-        self.assertIsInstance(reply, InitWeightsUpdateGroupReqOutput)
-        self.assertTrue(reply.success)
-        self.assertEqual(handler._pending_weight_ops, deque())
+        assert isinstance((reply), (InitWeightsUpdateGroupReqOutput))
+        assert reply.success
+        assert (handler._pending_weight_ops) == (deque())
 
     def test_no_collectives_without_dp(self):
         handler = _handler()
@@ -496,7 +516,7 @@ class TestSingleReplicaUnchanged(unittest.TestCase):
             handler.process_requests([_distributed()])
         handler._device.update_weights.assert_called_once()
 
-    def test_tensor_and_disk_updates_reply_unsupported(self):
+    def test_tensor_update_replies_unsupported(self):
         handler = _handler()
 
         handler.process_requests(
@@ -504,20 +524,17 @@ class TestSingleReplicaUnchanged(unittest.TestCase):
                 UpdateWeightsFromTensorReqInput(
                     serialized_named_tensors=[b""], load_format=None, flush_cache=True
                 ),
-                UpdateWeightFromDiskReqInput(model_path="/m"),
             ]
         )
 
         handler._device.update_weights.assert_not_called()
-        replies = _replies(handler)
-        self.assertIsInstance(replies[0], UpdateWeightsFromTensorReqOutput)
-        self.assertIsInstance(replies[1], UpdateWeightFromDiskReqOutput)
-        for reply in replies:
-            self.assertFalse(reply.success)
-            self.assertIn("not supported on this engine", reply.message)
+        (reply,) = _replies(handler)
+        assert isinstance((reply), (UpdateWeightsFromTensorReqOutput))
+        assert not (reply.success)
+        assert ("not supported on this engine") in (reply.message)
 
 
-class TestMooncakeOp(unittest.TestCase):
+class TestMooncakeOp:
     def test_flushed_load_publishes_the_version_as_namespace(self):
         handler = _handler()
         handler._device.update_weights.return_value = (True, "applied")
@@ -527,14 +544,14 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler.clear_cache_fn.assert_called_once_with()
         handler._device.update_weights.assert_called_once_with(req)
-        handler._device.set_l3_weight_version.assert_called_once_with("12")
-        self.assertEqual(handler.server_args.weight_version, "12")
+        handler._l3.set_weight_version.assert_called_once_with("12")
+        assert handler.server_args.weight_version == "12"
         # The default is resolved at the point of use; the request is not
         # rewritten on its way to the device.
-        self.assertIsNone(req.weight_version)
+        assert (req.weight_version) is None
         reply = _replies(handler)[0]
-        self.assertIsInstance(reply, UpdateWeightsFromMooncakeReqOutput)
-        self.assertTrue(reply.success)
+        assert isinstance((reply), (UpdateWeightsFromMooncakeReqOutput))
+        assert reply.success
 
     def test_flushed_load_default_satisfies_the_l3_identity_rule(self):
         handler = _handler()
@@ -544,8 +561,8 @@ class TestMooncakeOp(unittest.TestCase):
         handler.process_requests([req])
 
         handler._device.update_weights.assert_called_once_with(req)
-        handler._device.set_l3_weight_version.assert_called_once_with("12")
-        self.assertIsNone(req.weight_version)
+        handler._l3.set_weight_version.assert_called_once_with("12")
+        assert req.weight_version is None
 
     def test_explicit_weight_version_wins(self):
         handler = _handler()
@@ -553,7 +570,7 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler.process_requests([req])
 
-        handler._device.set_l3_weight_version.assert_called_once_with("ckpt-12")
+        handler._l3.set_weight_version.assert_called_once_with("ckpt-12")
 
     def test_unflushed_load_keeps_the_namespace(self):
         handler = _handler()
@@ -563,8 +580,8 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler.clear_cache_fn.assert_not_called()
         handler._device.update_weights.assert_called_once_with(req)
-        handler._device.set_l3_weight_version.assert_not_called()
-        self.assertEqual(handler.server_args.weight_version, "v1")
+        handler._l3.set_weight_version.assert_not_called()
+        assert handler.server_args.weight_version == "v1"
 
     def test_l3_rejects_unflushed_version_switch(self):
         handler = _handler()
@@ -575,9 +592,9 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler._device.update_weights.assert_not_called()
         reply = _replies(handler)[0]
-        self.assertIsInstance(reply, UpdateWeightsFromMooncakeReqOutput)
-        self.assertFalse(reply.success)
-        self.assertIn("cannot change without flush_cache", reply.message)
+        assert isinstance((reply), (UpdateWeightsFromMooncakeReqOutput))
+        assert not (reply.success)
+        assert ("cannot change without flush_cache") in (reply.message)
 
     def test_failed_flush_skips_the_load(self):
         handler = _handler()
@@ -587,13 +604,161 @@ class TestMooncakeOp(unittest.TestCase):
 
         handler._device.update_weights.assert_not_called()
         reply = _replies(handler)[0]
-        self.assertFalse(reply.success)
-        self.assertIn("cache flush failed", reply.message)
+        assert not (reply.success)
+        assert ("cache flush failed") in (reply.message)
 
 
-class TestCombinedWeightUpdateOutput(unittest.TestCase):
+class TestReleasedMemory:
+    """A load must not write unmapped weights or run on suspended NCCL."""
+
+    @staticmethod
+    def _released(tags):
+        from tokenspeed.runtime.engine.io_struct import (
+            ReleaseMemoryOccupationReqInput,
+            ResumeMemoryOccupationReqInput,
+        )
+        from tokenspeed.runtime.engine.memory_occupation import (
+            VALID_TAGS,
+            MemoryOccupationController,
+            MemoryRegion,
+        )
+        from tokenspeed.runtime.engine.pause import PauseController
+
+        class _Drained:
+            def waiting_size(self):
+                return 0
+
+            def decoding_size(self):
+                return 0
+
+            def prefilling_size(self):
+                return 0
+
+        sender = mock.Mock()
+        pause = PauseController(sender)
+        controller = MemoryOccupationController(
+            send_func=sender,
+            pause_controller=pause,
+            regions={
+                tag: MemoryRegion(release=lambda: None, resume=lambda: None)
+                for tag in VALID_TAGS
+            },
+            enabled=True,
+            reset_caches_fn=lambda: True,
+            transfers_idle_fn=lambda: True,
+            release_refusal_fn=lambda: None,
+            weights_busy_fn=lambda: False,
+        )
+        controller.handle_release(ReleaseMemoryOccupationReqInput(tags=None))
+        pause.maybe_finish_drain(_Drained())
+        resumed = [tag for tag in VALID_TAGS if tag not in tags]
+        controller.handle_resume(ResumeMemoryOccupationReqInput(tags=resumed))
+        return controller
+
+    def test_release_waits_for_every_queued_dp_weight_update(self):
+        from tokenspeed.runtime.engine.io_struct import ReleaseMemoryOccupationReqInput
+        from tokenspeed.runtime.engine.memory_occupation import (
+            MemoryOccupationController,
+            MemoryRegion,
+        )
+        from tokenspeed.runtime.engine.pause import PauseController, PauseHooks
+
+        class DrainedLoop:
+            def __init__(self, handler):
+                self.request_handler = handler
+                self._eplb = None
+                self.kv_transfer = None
+                self.scheduler = self
+
+            def waiting_size(self):
+                return 0
+
+            def decoding_size(self):
+                return 0
+
+            def prefilling_size(self):
+                return 0
+
+            def bootstrapping_size(self):
+                return 0
+
+            def pd_transfer_size(self):
+                return 0
+
+        handler = _handler(dp_size=2)
+        trace = []
+
+        def update(_request):
+            assert "release" not in trace
+            trace.append("update")
+            return True, "applied"
+
+        handler._device.update_weights.side_effect = update
+        pause = PauseController(handler.send_func)
+        loop = DrainedLoop(handler)
+        hooks = PauseHooks(loop, pause, handler._device)
+        memory = MemoryOccupationController(
+            send_func=handler.send_func,
+            pause_controller=pause,
+            regions={
+                "weights": MemoryRegion(
+                    release=lambda: trace.append("release"), resume=lambda: None
+                )
+            },
+            enabled=True,
+            reset_caches_fn=lambda: True,
+            transfers_idle_fn=hooks.transfers_idle_for_release,
+            release_refusal_fn=hooks.memory_release_refusal,
+            weights_busy_fn=hooks.weights_busy_for_release,
+        )
+        handler.memory_controller = memory
+        req = _distributed(flush_cache=False, weight_version=None)
+        waiting = _DpPeer(head=None)
+        with mock.patch.object(torch.distributed, "all_reduce", waiting.all_reduce):
+            handler.process_requests([req, req])
+        memory.handle_release(ReleaseMemoryOccupationReqInput(tags=["weights"]))
+        pause.maybe_finish_drain(loop.scheduler)
+        assert pause.is_drain_pending and trace == []
+
+        arrived = _DpPeer(head=type(req))
+        with mock.patch.object(torch.distributed, "all_reduce", arrived.all_reduce):
+            handler.process_requests([])
+            pause.maybe_finish_drain(loop.scheduler)
+            assert pause.is_drain_pending and trace == ["update"]
+            handler.process_requests([])
+            pause.maybe_finish_drain(loop.scheduler)
+        assert trace == ["update", "update", "release"]
+        assert pause.released and not pause.is_drain_pending
+        assert all(reply.success for reply in _replies(handler))
+
+    @pytest.mark.parametrize("released", [["weights"], ["nccl"]])
+    def test_load_is_refused_before_the_gate(self, released):
+        handler = _handler()
+        handler.memory_controller = self._released(released)
+
+        handler.process_requests([_mooncake(version=12)])
+
+        handler._device.update_weights.assert_not_called()
+        handler.clear_cache_fn.assert_not_called()
+        reply = _replies(handler)[0]
+        assert isinstance(reply, UpdateWeightsFromMooncakeReqOutput)
+        assert not reply.success
+        assert released[0] in reply.message
+
+    def test_load_runs_while_only_the_cache_and_graphs_are_released(self):
+        handler = _handler()
+        handler.memory_controller = self._released(["kv_cache", "cuda_graph"])
+        handler._device.update_weights.return_value = (True, "applied")
+
+        handler.process_requests([_mooncake(version=12)])
+
+        handler._device.update_weights.assert_called_once()
+        assert _replies(handler)[0].success
+
+
+class TestCombinedWeightUpdateOutput:
     def test_empty_is_failure(self):
-        self.assertEqual(combined_weight_update_output([]), (False, ""))
+        assert (combined_weight_update_output([])) == ((False, ""))
 
     def test_ands_success_and_keeps_distinct_messages_once(self):
         ok, message = combined_weight_update_output(
@@ -603,16 +768,15 @@ class TestCombinedWeightUpdateOutput(unittest.TestCase):
                 UpdateWeightsFromDistributedReqOutput(success=True, message="ok"),
             ]
         )
-        self.assertFalse(ok)
-        self.assertEqual(message, "ok | nccl")
+        assert not (ok)
+        assert (message) == ("ok | nccl")
 
     def test_single_replica_message_is_unchanged(self):
-        self.assertEqual(
+        assert (
             combined_weight_update_output(
                 [InitWeightsUpdateGroupReqOutput(success=True, message="joined")]
-            ),
-            (True, "joined"),
-        )
+            )
+        ) == ((True, "joined"))
 
 
 class _Lock:
@@ -626,7 +790,8 @@ class _Lock:
         return False
 
 
-class TestSchedulerControlClientFanIn(unittest.IsolatedAsyncioTestCase):
+@pytest.mark.asyncio
+class TestSchedulerControlClientFanIn:
     def _client(self, replies):
         client = SchedulerControlClient.__new__(SchedulerControlClient)
         client.server_args = mock.Mock()
@@ -659,12 +824,12 @@ class TestSchedulerControlClientFanIn(unittest.IsolatedAsyncioTestCase):
             client, req
         )
 
-        self.assertFalse(ok)
-        self.assertEqual(message, "ok | bad")
-        self.assertEqual(sent, [req])
-        self.assertEqual(client.model_update_lock.writer_lock.entered, 1)
+        assert not (ok)
+        assert (message) == ("ok | bad")
+        assert (sent) == ([req])
+        assert (client.model_update_lock.writer_lock.entered) == (1)
 
-    async def test_init_destroy_and_mooncake_fan_in(self):
+    async def test_init_destroy_and_mooncake_fan_in(self, subtests):
         # Only the loads rewrite weights; group init/teardown must not wait
         # for in-flight generation behind the writer lock.
         for method, req, out, takes_writer_lock in (
@@ -689,19 +854,18 @@ class TestSchedulerControlClientFanIn(unittest.IsolatedAsyncioTestCase):
                 True,
             ),
         ):
-            with self.subTest(op=type(req).__name__):
+            with subtests.test(op=type(req).__name__):
                 client, _ = self._client(
                     [
                         out(success=True, message="done"),
                         out(success=True, message="done"),
                     ]
                 )
-                self.assertEqual(await method(client, req), (True, "done"))
-                self.assertEqual(
-                    client.model_update_lock.writer_lock.entered,
-                    1 if takes_writer_lock else 0,
+                assert (await method(client, req)) == ((True, "done"))
+                assert (client.model_update_lock.writer_lock.entered) == (
+                    1 if takes_writer_lock else 0
                 )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

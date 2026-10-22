@@ -22,7 +22,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from utils import is_cdna5
+from tokenspeed_kernel.numerics.torch.moe import torch_latent_input
+from utils import assert_no_triton_compile, is_cdna5
 
 pytest.importorskip(
     "tokenspeed_kernel_amd.ops.gfx1250.moe.fp16",
@@ -32,8 +33,8 @@ pytest.importorskip(
 from tokenspeed_kernel.ops.moe import latent_moe_input_projections  # noqa: E402
 from tokenspeed_kernel_amd._triton import triton  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx1250.moe.fp16.latent_input_decode import (  # noqa: E402
-    gluon_latent_input_decode_epilogue_gfx1250,
     gluon_latent_input_decode_gfx1250,
+    gluon_latent_input_decode_nosplit_gfx1250,
     launch_gluon_latent_input_decode_gfx1250,
 )
 
@@ -53,16 +54,14 @@ def _weights():
 
 
 def _reference(hidden, views):
-    router = torch.nn.functional.linear(hidden.float(), views[0].float())
-    routed = torch.nn.functional.linear(hidden, views[1])
-    gate, up = torch.nn.functional.linear(hidden, views[2]).chunk(2, dim=-1)
-    shared = (
-        GATE_CLAMP
-        * torch.tanh(gate.float() / GATE_CLAMP)
-        * torch.sigmoid(gate.float())
-        * (UP_CLAMP * torch.tanh(up.float() / UP_CLAMP))
-    ).to(hidden.dtype)
-    return router, routed, shared
+    return torch_latent_input(
+        hidden_states=hidden,
+        router_weight=views[0],
+        routed_weight=views[1],
+        shared_gate_up_weight=views[2],
+        gate_clamp=GATE_CLAMP,
+        up_clamp=UP_CLAMP,
+    )
 
 
 def _project(hidden, views, override):
@@ -75,9 +74,10 @@ def _project(hidden, views, override):
     )
 
 
-# 7 and 17 straddle the split-k change at sixteen tokens and leave a partial
-# row tile; 32 is the top of the registered range.
-@pytest.mark.parametrize("tokens", [1, 7, 16, 17, 32])
+# 7 leaves a partial row tile in the small-batch kernel; 16 and 17 straddle
+# the change to the whole-reduction kernel; 33 leaves a partial row tile past
+# its row-tile change; 64 is the top of the registered range.
+@pytest.mark.parametrize("tokens", [1, 7, 16, 17, 32, 33, 64])
 def test_decode_matches_reference(tokens: int) -> None:
     _packed, views = _weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -87,25 +87,48 @@ def test_decode_matches_reference(tokens: int) -> None:
         torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
 
 
-def test_decode_replays_in_a_graph() -> None:
+def test_decode_batch_sizes_share_binaries() -> None:
+    """Only the row-tile bucket specializes the decode kernels. Warm each
+    bucket and integer class once; every other batch size reuses them."""
     _packed, views = _weights()
-    hidden = torch.randn(1, HIDDEN, dtype=torch.bfloat16, device="cuda")
+    hidden = torch.randn(64, HIDDEN, dtype=torch.bfloat16, device="cuda")
+
+    def run(tokens):
+        return _project(hidden[:tokens], views, "gluon_latent_input_decode_gfx1250")
+
+    for tokens in (1, 2, 16, 17, 32, 33, 48):
+        run(tokens)
+    with assert_no_triton_compile(
+        gluon_latent_input_decode_gfx1250, gluon_latent_input_decode_nosplit_gfx1250
+    ):
+        for tokens in (3, 4, 8, 15, 20, 31, 40, 63, 64):
+            run(tokens)
+
+
+def test_decode_replays_in_a_graph() -> None:
+    """Replays reuse the arrival counters, so each launch must leave them
+    rearmed; repeated replays agreeing bit for bit with eager runs shows that
+    every tile was reduced exactly once."""
+    _packed, views = _weights()
+    hidden = torch.randn(4, HIDDEN, dtype=torch.bfloat16, device="cuda")
 
     def run():
         return _project(hidden, views, "gluon_latent_input_decode_gfx1250")
 
+    run()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured = run()
-    hidden.copy_(torch.randn_like(hidden))
-    graph.replay()
-    for output, reference in zip(captured, run(), strict=True):
-        torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+    for _ in range(3):
+        hidden.copy_(torch.randn_like(hidden))
+        graph.replay()
+        for output, reference in zip(captured, run(), strict=True):
+            torch.testing.assert_close(output, reference, atol=0.0, rtol=0.0)
 
 
 # 2000 is not a multiple of the 256-row tile, so it exercises the clamped
 # descriptor and the masked store that a whole number of tiles never reaches.
-@pytest.mark.parametrize("tokens", [1536, 2000, 8192])
+@pytest.mark.parametrize("tokens", [1025, 2000, 8192])
 def test_prefill_matches_reference(tokens: int) -> None:
     _packed, views = _weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -119,7 +142,8 @@ def test_prefill_matches_reference(tokens: int) -> None:
     ("tokens", "expected"),
     [
         (1, "gluon_latent_input_decode_gfx1250"),
-        (32, "gluon_latent_input_decode_gfx1250"),
+        (64, "gluon_latent_input_decode_gfx1250"),
+        (1025, "gluon_latent_input_largem_gfx1250"),
         (8192, "gluon_latent_input_largem_gfx1250"),
     ],
 )
@@ -156,88 +180,130 @@ def test_launcher_rejects_a_packed_weight_that_is_not_the_views(
         )
 
 
-@pytest.mark.parametrize(
-    ("router_n", "latent_n", "shared_n", "k", "split_k"),
-    [
-        pytest.param(WIDTHS[0], WIDTHS[1], WIDTHS[2] // 2, HIDDEN, 8, id="k3"),
-        pytest.param(64, 128, 64, 256, 2, id="sim"),
-    ],
-)
-def test_decode_pipeline(
-    router_n: int, latent_n: int, shared_n: int, k: int, split_k: int
+def _expected(hidden, packed, router_n, latent_n, shared_n, beta, linear_beta):
+    router, routed, shared = packed.split((router_n, latent_n, 2 * shared_n))
+    return torch_latent_input(
+        hidden_states=hidden,
+        router_weight=router,
+        routed_weight=routed,
+        shared_gate_up_weight=shared,
+        gate_clamp=beta,
+        up_clamp=linear_beta,
+    )
+
+
+# The launcher pins the K3 shape, so these bypass it and set the dimensions
+# themselves. That is what lets the sim cases exist: the same pipelines,
+# region routing and SiTU over about a five-hundredth of the data, which is
+# what the MI450 simulator affords.
+_PIPELINE_SHAPES = [
+    pytest.param(WIDTHS[0], WIDTHS[1], WIDTHS[2] // 2, HIDDEN, id="k3"),
+    pytest.param(64, 128, 64, 512, id="sim"),
+]
+
+
+@pytest.mark.parametrize(("router_n", "latent_n", "shared_n", "k"), _PIPELINE_SHAPES)
+def test_decode_small_batch_pipeline(
+    router_n: int, latent_n: int, shared_n: int, k: int
 ) -> None:
-    """The launcher pins the K3 shape, so these bypass it and set the
-    dimensions themselves. That is what lets the sim case exist: the same
-    split reduction, WMMA pipeline, region routing and SiTU over about a
-    five-hundredth of the data, which is what the MI450 simulator affords."""
-    total_n = router_n + latent_n + 2 * shared_n
-    tokens, block_m, block_n = 4, 16, 64
+    tokens, block_m, block_n, shared_split = 4, 16, 16, 2
     beta, linear_beta = 4.0, 25.0
+    total_n = router_n + latent_n + 2 * shared_n
+    blocks = shared_n // block_n
 
     hidden = torch.randn(tokens, k, dtype=torch.bfloat16, device="cuda")
     packed = torch.randn(total_n, k, dtype=torch.bfloat16, device="cuda")
-    partials = torch.empty(split_k, tokens, total_n, dtype=torch.float32, device="cuda")
+    partials = torch.empty(
+        blocks * 2 * shared_split * block_m * block_n,
+        dtype=torch.float32,
+        device="cuda",
+    )
+    counters = torch.zeros(blocks, dtype=torch.int32, device="cuda")
     router = torch.empty(tokens, router_n, dtype=torch.float32, device="cuda")
     routed = torch.empty(tokens, latent_n, dtype=torch.bfloat16, device="cuda")
     shared = torch.empty(tokens, shared_n, dtype=torch.bfloat16, device="cuda")
 
-    grid = (split_k * (total_n // block_n), triton.cdiv(tokens, block_m))
-    gluon_latent_input_decode_gfx1250[grid](
+    grid = blocks * 2 * shared_split + (router_n + latent_n) // block_n
+    gluon_latent_input_decode_gfx1250[(grid,)](
         hidden,
         packed,
         partials,
-        hidden.stride(0),
-        hidden.stride(1),
-        packed.stride(0),
-        packed.stride(1),
-        tokens * total_n,
-        tokens,
-        BLOCK_N=block_n,
-        BLOCK_K=128,
-        NUM_BUFFERS=3,
-        SPLIT_K=split_k,
-        TOTAL_N=total_n,
-        K=k,
-        num_warps=4,
-        num_stages=1,
-        waves_per_eu=0,
-    )
-    gluon_latent_input_decode_epilogue_gfx1250[
-        (tokens, triton.cdiv(router_n + latent_n + shared_n, block_n))
-    ](
-        partials,
+        counters,
         router,
         routed,
         shared,
         beta,
         linear_beta,
-        tokens * total_n,
-        SPLIT_K=split_k,
-        TOTAL_N=total_n,
+        hidden.stride(0),
+        packed.stride(0),
+        tokens,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=128,
+        NUM_BUFFERS=2,
+        SHARED_SPLIT=shared_split,
         ROUTER_N=router_n,
         LATENT_N=latent_n,
         SHARED_N=shared_n,
         HAS_LINEAR_BETA=True,
-        BLOCK_N=block_n,
-        num_warps=4,
+        K=k,
+        num_warps=1,
+        num_stages=1,
+        waves_per_eu=0,
     )
 
-    acc = hidden.float() @ packed.float().T
-    gate = acc[:, router_n + latent_n : router_n + latent_n + shared_n]
-    up = acc[:, router_n + latent_n + shared_n :]
-    gate = gate.to(torch.bfloat16).float()
-    up = up.to(torch.bfloat16).float()
-    expected_shared = (
-        beta
-        * torch.tanh(gate / beta)
-        * torch.sigmoid(gate)
-        * (linear_beta * torch.tanh(up / linear_beta))
-    ).to(torch.bfloat16)
-    torch.testing.assert_close(router, acc[:, :router_n], atol=2e-2, rtol=2e-2)
-    torch.testing.assert_close(
-        routed,
-        acc[:, router_n : router_n + latent_n].to(torch.bfloat16),
-        atol=2e-2,
-        rtol=2e-2,
+    expected = _expected(
+        hidden, packed, router_n, latent_n, shared_n, beta, linear_beta
     )
-    torch.testing.assert_close(shared, expected_shared, atol=2e-2, rtol=2e-2)
+    for output, reference in zip((router, routed, shared), expected, strict=True):
+        torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
+    # The last arrival of every shared block rearms its counter.
+    assert not counters.any()
+
+
+@pytest.mark.parametrize(("router_n", "latent_n", "shared_n", "k"), _PIPELINE_SHAPES)
+def test_decode_nosplit_pipeline(
+    router_n: int, latent_n: int, shared_n: int, k: int
+) -> None:
+    tokens, block_m, half_n = 20, 32, 16
+    beta, linear_beta = 4.0, 25.0
+    total_n = router_n + latent_n + 2 * shared_n
+
+    hidden = torch.randn(tokens, k, dtype=torch.bfloat16, device="cuda")
+    packed = torch.randn(total_n, k, dtype=torch.bfloat16, device="cuda")
+    router = torch.empty(tokens, router_n, dtype=torch.float32, device="cuda")
+    routed = torch.empty(tokens, latent_n, dtype=torch.bfloat16, device="cuda")
+    shared = torch.empty(tokens, shared_n, dtype=torch.bfloat16, device="cuda")
+
+    tiles = (router_n + latent_n) // (2 * half_n) + shared_n // half_n
+    gluon_latent_input_decode_nosplit_gfx1250[(tiles, triton.cdiv(tokens, block_m))](
+        hidden,
+        packed,
+        router,
+        routed,
+        shared,
+        beta,
+        linear_beta,
+        hidden.stride(0),
+        packed.stride(0),
+        tokens,
+        BLOCK_M=block_m,
+        HALF_N=half_n,
+        BLOCK_K=128,
+        NUM_BUFFERS=2,
+        WARP_BASES=((1, 0),),
+        ROUTER_N=router_n,
+        LATENT_N=latent_n,
+        SHARED_N=shared_n,
+        HAS_LINEAR_BETA=True,
+        K=k,
+        num_warps=2,
+        num_stages=1,
+        waves_per_eu=0,
+    )
+
+    expected = _expected(
+        hidden, packed, router_n, latent_n, shared_n, beta, linear_beta
+    )
+    for output, reference in zip((router, routed, shared), expected, strict=True):
+        torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)

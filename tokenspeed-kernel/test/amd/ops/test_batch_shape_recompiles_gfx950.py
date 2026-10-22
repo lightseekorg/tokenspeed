@@ -188,7 +188,8 @@ def test_mxfp4_moe_sorting_route_count():
                 128,
                 torch.bfloat16,
                 block,
-                compact_route_programs=False,
+                use_minimum_route_chunks=False,
+                runtime_rows=False,
             )
         )
         assert int(valid[1]) == tokens
@@ -244,15 +245,20 @@ def test_moe_topk_row_count():
 
 
 def test_iris_allreduce_sizes():
-    pytest.importorskip("iris")
+    pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
     from tokenspeed_kernel._triton import gl
     from tokenspeed_kernel.ops.communication._iris import all_reduce as comm
 
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
-    common = dict(RANK=0, WORLD_SIZE=8, SUBGROUP_SIZE=64, WORDS_PER_LANE=2)
-    common.update(ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
+    policy = comm.iris_cache_policy()
+    common = dict(RANK=0, WORLD_SIZE=8)
+    common.update(WORDS_PER_LANE=2, ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
+    common.update(
+        PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+        PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
+    )
 
     # Compile only: the allreduce itself needs the symmetric heap of every rank.
     def two_stage(words):
@@ -374,9 +380,6 @@ def test_kda_fused_decode_batch_size():
             beta_logits=rows[:, 4 * width + head_dim :],
             A_log=torch.zeros(heads, device=DEVICE),
             dt_bias=torch.zeros(width, device=DEVICE),
-            output_gate=rows[:, 3 * width : 4 * width],
-            norm_weight=torch.ones(head_dim, device=DEVICE).bfloat16(),
-            norm_eps=1e-6,
             state_pool=state_pool,
             read_indices=torch.arange(batch, device=DEVICE, dtype=torch.int32),
             write_indices=torch.arange(

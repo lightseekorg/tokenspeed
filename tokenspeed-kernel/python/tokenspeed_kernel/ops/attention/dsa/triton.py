@@ -251,7 +251,10 @@ def _dsa_dense_kv_kernel(
     head_dim: tl.constexpr,
     kv_lora_rank: tl.constexpr,
     qk_rope_head_dim: tl.constexpr,
-    kv_dim: tl.constexpr,
+    page_stride,
+    token_stride,
+    channel_stride,
+    PAGE_SIZE: tl.constexpr,
     topk: tl.constexpr,
     softmax_scale,
     NUM_SPLITS: tl.constexpr,
@@ -288,10 +291,13 @@ def _dsa_dense_kv_kernel(
         cols = block_start + tl.arange(0, BLOCK_N)
         slots = tl.load(topk_indices + token * topk + cols, mask=cols < end, other=-1)
         valid = slots >= 0
-        kv_rows = slots.to(tl.int64) * kv_dim
+        slots = slots.to(tl.int64)
+        kv_rows = (slots // PAGE_SIZE) * page_stride + (
+            slots % PAGE_SIZE
+        ) * token_stride
         # Gather the rows once; the latent tile serves as both keys and values.
         latent = tl.load(
-            kv + kv_rows[:, None] + dims[None, :],
+            kv + kv_rows[:, None] + dims[None, :] * channel_stride,
             mask=valid[:, None],
             other=0.0,
         )
@@ -305,7 +311,9 @@ def _dsa_dense_kv_kernel(
         latent = latent_hi
         if qk_rope_head_dim > 0:
             k_rope = tl.load(
-                kv + kv_rows[:, None] + kv_lora_rank + rope_dims[None, :],
+                kv
+                + kv_rows[:, None]
+                + (kv_lora_rank + rope_dims[None, :]) * channel_stride,
                 mask=valid[:, None] & rope_mask[None, :],
                 other=0.0,
             )
@@ -391,7 +399,7 @@ def _launch_dsa_kernel(
     kernel: triton.JITFunction,
     q: torch.Tensor,
     kv_args: tuple[torch.Tensor, ...],
-    kv_row_stride: int,
+    kv_layout_args: tuple[int, ...],
     topk_indices: torch.Tensor,
     topk_lens: torch.Tensor,
     *,
@@ -440,7 +448,7 @@ def _launch_dsa_kernel(
         head_dim,
         kv_lora_rank,
         qk_rope_head_dim,
-        kv_row_stride,
+        *kv_layout_args,
         topk,
         float(softmax_scale),
         NUM_SPLITS=num_splits,
@@ -486,7 +494,7 @@ def _run_packed_kv(
             packed_kv.view(torch.float32),
             packed_kv.view(torch.bfloat16),
         ),
-        int(packed_kv.shape[1]),
+        (int(packed_kv.shape[1]),),
         topk_indices,
         topk_lens,
         softmax_scale=softmax_scale,
@@ -507,11 +515,22 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
     return_lse: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if kv_cache.dim() == 4:
+        kv_cache = (
+            kv_cache.squeeze(1) if kv_cache.shape[1] == 1 else kv_cache.squeeze(2)
+        )
+    elif kv_cache.dim() == 3 and kv_cache.shape[1] == 1:
+        kv_cache = kv_cache.squeeze(1)
     return _launch_dsa_kernel(
         _dsa_dense_kv_kernel,
         q,
         (kv_cache,),
-        int(kv_lora_rank) + int(qk_rope_head_dim),
+        (
+            kv_cache.stride(0),
+            kv_cache.stride(-2),
+            kv_cache.stride(-1),
+            kv_cache.shape[1] if kv_cache.dim() == 3 else 1,
+        ),
         topk_indices,
         topk_lens,
         softmax_scale=softmax_scale,
@@ -525,16 +544,6 @@ def _flatten_packed_kv_cache(packed_kv_cache: torch.Tensor) -> torch.Tensor:
     if packed_kv_cache.dim() == 2:
         return packed_kv_cache
     return packed_kv_cache.reshape(-1, packed_kv_cache.shape[-1])
-
-
-def _flatten_dense_kv_cache(kv_cache: torch.Tensor) -> torch.Tensor:
-    if kv_cache.dim() == 2:
-        return kv_cache
-    if kv_cache.dim() == 3:
-        return kv_cache.squeeze(1)
-    if kv_cache.shape[1] == 1:
-        kv_cache = kv_cache.permute(0, 2, 1, 3)
-    return kv_cache.reshape(-1, kv_cache.shape[-1])
 
 
 def _flatten_query(q: torch.Tensor) -> torch.Tensor:
@@ -582,7 +591,7 @@ def _run_dsa(
     else:
         result, lse = _run_dense_kv(
             q,
-            _flatten_dense_kv_cache(kv_cache).contiguous(),
+            kv_cache,
             topk_slots,
             topk_lens,
             softmax_scale=softmax_scale,

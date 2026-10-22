@@ -555,6 +555,7 @@ def prepare_dsv41_index_topk(
             _SCORE_CHUNK_SIZE,
             None,
             out,
+            index_metadata=None,
         )
 
     return PreparedBenchmark(

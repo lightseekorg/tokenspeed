@@ -97,6 +97,7 @@ def _plan(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "triton_fp8_block_precomputed_moe_apply"
     return plan
@@ -126,6 +127,7 @@ def test_triton_fp8_moe_matches_torch(
     )
     topk_ids = _topk_ids(num_tokens, num_experts, top_k, generator)
     topk_ids[0, 1] = -1
+    topk_ids[1, 0] = num_experts
     topk_weights = torch.rand(
         num_tokens, top_k, device="cuda", dtype=torch.float32, generator=generator
     )
@@ -169,7 +171,8 @@ def test_triton_fp8_moe_matches_torch(
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_triton_fp8_moe_token_count():
     _skip_unless_supported()
-    from tokenspeed_kernel.ops.moe.triton import _common, fp8
+    from tokenspeed_kernel.ops.moe._triton import common as _common
+    from tokenspeed_kernel.ops.moe._triton import fp8
 
     num_experts, top_k, hidden_size, intermediate_size = 4, 2, 256, 128
     max_tokens = 1500

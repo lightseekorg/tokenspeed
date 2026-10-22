@@ -48,7 +48,9 @@ __all__ = [
 ]
 
 #: Algorithms the in-tree resolution below serves.
-_IN_TREE_ALGORITHMS = frozenset({"EAGLE3", "MTP", "DFLASH", "DSPARK"})
+_IN_TREE_ALGORITHMS = frozenset(
+    {"EAGLE3", "EAGLE4", "MTP", "DFLASH", "DSPARK", "DUMMY"}
+)
 
 
 @dataclass
@@ -197,12 +199,14 @@ def require_plugin_draft_checkpoint(server_args: ServerArgs) -> None:
     )
 
 
-def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter]:
+def get_drafter_impl(
+    spec_algo: str, model: torch.nn.Module | None
+) -> type[BaseDrafter]:
     """Resolve the drafter class for ``spec_algo`` and a loaded draft model.
 
     Args:
         spec_algo: The speculative algorithm name from server args.
-        model: The loaded draft model; some algorithms route on its class.
+        model: The loaded draft model; None for model-free DUMMY drafting.
 
     Returns:
         The ``BaseDrafter`` subclass to instantiate (not an instance).
@@ -221,16 +225,20 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
     # and this package init must stay importable from lightweight contexts.
     from tokenspeed.runtime.execution.drafter.dflash import DFlash
     from tokenspeed.runtime.execution.drafter.dspark import DSpark
+    from tokenspeed.runtime.execution.drafter.dummy import DummyDrafter
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
+    from tokenspeed.runtime.execution.drafter.eagle_harness.drafter import Eagle4
     from tokenspeed.runtime.models.inkling_nextn import (
         InklingForConditionalGenerationNextN,
     )
 
     DRAFTER_MAPPING = {
         "EAGLE3": Eagle,
+        "EAGLE4": Eagle4,
         "MTP": Eagle,
         "DFLASH": DFlash,
         "DSPARK": DSpark,
+        "DUMMY": DummyDrafter,
     }
 
     if spec_algo == "DFLASH":
@@ -244,14 +252,8 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
     # (1) Eagle-like MTP (e.g. DeepSeek) stays on Eagle in eagle.py;
     # (2) Vanilla MTP (e.g. Inkling) with multi-layer weights stays on Mtp in mtp.py.
     if spec_algo == "DSPARK":
-        from tokenspeed.runtime.execution.drafter.deepseek_v4_dspark import (
-            DeepseekV4DSpark,
-        )
         from tokenspeed.runtime.execution.drafter.deepseek_v41_dspark import (
             DeepseekV41DSpark,
-        )
-        from tokenspeed.runtime.models.deepseek_v4_dspark import (
-            DeepseekV4ForCausalLMDSpark,
         )
         from tokenspeed.runtime.models.deepseek_v41_dspark import (
             DeepseekV41ForCausalLMDSpark,
@@ -259,8 +261,6 @@ def get_drafter_impl(spec_algo: str, model: torch.nn.Module) -> type[BaseDrafter
 
         if isinstance(model, DeepseekV41ForCausalLMDSpark):
             return DeepseekV41DSpark
-        if isinstance(model, DeepseekV4ForCausalLMDSpark):
-            return DeepseekV4DSpark
     if spec_algo == "MTP" and isinstance(model, InklingForConditionalGenerationNextN):
         from tokenspeed.runtime.execution.drafter.mtp import Mtp
 

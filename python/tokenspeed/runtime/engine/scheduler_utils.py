@@ -20,7 +20,6 @@
 
 """Helper functions for constructing scheduler specs and events."""
 
-import math
 import os
 import weakref
 from collections.abc import Mapping, Sequence
@@ -32,18 +31,16 @@ import torch
 from tokenspeed_scheduler import (
     Cache,
     CacheGroupConfig,
-    CacheGroupFamily,
     ExecutionEvent,
     ForwardEvent,
     RequestSpec,
     SchedulerConfig,
+    StorageConfig,
 )
 
 from tokenspeed.runtime.cache.transfer.ops import (
     CacheTransfer,
     HostTier,
-    PrefetchOp,
-    PrefetchRow,
     RestoreOp,
     SnapshotOp,
 )
@@ -61,14 +58,13 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 )
 
 # The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
-# load-back ticket, an L3 prefetch (with the prefix pages it landed), a
+# load-back ticket, a
 # retraction image's snapshot store, a restore. The hooks carry them across
 # ranks as ``(kind, op_id)`` payloads and rebuild the binding event from the
 # payload.
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
-    "PrefetchDoneEvent": Cache.PrefetchDoneEvent,
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
@@ -144,6 +140,10 @@ def input_logprob_plan_for_forward(
     prompt token) are read on the device from the scheduler's shifted input
     ids, which cover the chunk boundary, so nothing per row crosses here.
 
+    The plan's ``top_k`` is the largest ``top_logprobs_num`` among the
+    planned slots: every gathered row returns that many alternatives, and the
+    commit path keeps each request's own count.
+
     Returns:
         The plan, or None when no row of the batch needs a prompt logprob.
     """
@@ -153,6 +153,7 @@ def input_logprob_plan_for_forward(
     row_starts: list[int] = []
     counts: list[int] = []
     position_starts: list[int] = []
+    top_k = 0
     row_offset = 0
     for i in range(num_extends):
         state = rid_to_state[forward_op.request_ids[i]]
@@ -172,6 +173,7 @@ def input_logprob_plan_for_forward(
             row_starts.append(row_offset + lo - chunk_start)
             counts.append(hi - lo)
             position_starts.append(lo)
+            top_k = max(top_k, state.top_logprobs_num)
         row_offset += chunk_len
     if not any(counts):
         return None
@@ -179,7 +181,29 @@ def input_logprob_plan_for_forward(
         row_starts=tuple(row_starts),
         counts=tuple(counts),
         position_starts=tuple(position_starts),
+        top_k=top_k,
     )
+
+
+def sampled_top_k_for_forward(forward_op, rid_to_state: Mapping) -> int:
+    """How many alternatives this forward's prefill samples are reported with.
+
+    The largest ``top_logprobs_num`` among the extend slots of requests that
+    return logprobs; 0 when none asks, which leaves the forward as it was.
+    The ingress takes a top-k request only when each of its tokens is sampled
+    in a prefill (``max_new_tokens <= 1``), so decode rows never need one.
+    """
+    num_extends = forward_op.num_extends()
+    if num_extends == 0:
+        return 0
+    # One read: each read of the binding's ``request_ids`` builds a new list.
+    request_ids = forward_op.request_ids
+    top_k = 0
+    for i in range(num_extends):
+        state = rid_to_state.get(request_ids[i])
+        if state is not None and state.return_logprob:
+            top_k = max(top_k, state.top_logprobs_num)
+    return top_k
 
 
 class RequestHistoryRows:
@@ -283,52 +307,6 @@ def scheduler_cache_geometry_from_pool(pool: Any) -> SchedulerCacheGeometry:
     )
 
 
-def aligned_max_scheduled_tokens(
-    max_scheduled_tokens: int,
-    cache_groups,
-) -> int:
-    """Floor ``max_scheduled_tokens`` to the state-snapshot grain, if any.
-
-    Recurrent-state groups (family=State, the C++ ``AttnKind::kMambaState``
-    kind) register their state snapshot only when a prefill chunk ends
-    exactly on a CacheBlock boundary (``RegistersAlignedFinalPageOnly``);
-    interior boundaries never received a state write. A chunk size that is
-    not a multiple of every such group's CacheBlock token span therefore
-    never registers a state block. Since the admission probe takes the
-    minimum hit across groups, prefix-cache reuse silently degrades to zero
-    for the whole model.
-
-    Args:
-        max_scheduled_tokens: Requested per-step token budget
-            (``--chunked-prefill-size``).
-        cache_groups: Scheduler ``CacheGroupConfig`` sequence, or
-            None/empty when the model declares no cache groups.
-    Returns:
-        ``max_scheduled_tokens`` floored to the LCM of the state groups'
-        CacheBlock token spans. Returned unchanged when no such group exists
-        or the value is already aligned.
-
-    Raises:
-        ValueError: If the configured budget is smaller than one state CacheBlock.
-            Raising is safer than increasing a limit that may already have
-            sized executor buffers.
-    """
-    require_positive_int("max_scheduled_tokens", max_scheduled_tokens)
-    grain = 1
-    for group in cache_groups or ():
-        if group.family != CacheGroupFamily.State:
-            continue
-        grain = math.lcm(grain, int(group.block_granularity))
-    if grain == 1:
-        return max_scheduled_tokens
-    if max_scheduled_tokens < grain:
-        raise ValueError(
-            "chunked_prefill_size must be at least one recurrent-state CacheBlock: "
-            f"got {max_scheduled_tokens}, minimum {grain}"
-        )
-    return max_scheduled_tokens - max_scheduled_tokens % grain
-
-
 # "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
 UNBOUNDED_CACHED_PREFIX_TOKENS = 2**31 - 1
 
@@ -371,7 +349,7 @@ def make_config(
     *,
     num_snapshot_pages: int,
     max_retracted_requests: int,
-    l3_prefetch_min_pages: int,
+    storage_config: StorageConfig | None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -405,10 +383,7 @@ def make_config(
             requests suspended at once; positive exactly when a pool exists.
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
-        l3_prefetch_min_pages: ``--kvstore-prefetch-min-pages``: the shortest
-            L3 prefix, in prefix pages, worth a pre-admission prefetch
-            (``Cache.PrefetchOp``); a shorter L3 hit is simply computed.
-            Required with L3 storage, 0 without it.
+        storage_config: Explicit asynchronous L3 budgets, or None without L3.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -437,12 +412,8 @@ def make_config(
             f"num_snapshot_pages={num_snapshot_pages}, "
             f"max_retracted_requests={max_retracted_requests}."
         )
-    if (l3_prefetch_min_pages > 0) != enable_l3_storage or l3_prefetch_min_pages < 0:
-        raise ValueError(
-            "l3_prefetch_min_pages is the L3 prefetch threshold: positive exactly "
-            f"with L3 storage; got {l3_prefetch_min_pages} with "
-            f"enable_l3_storage={enable_l3_storage}."
-        )
+    if (storage_config is not None) != enable_l3_storage:
+        raise ValueError("storage_config is required exactly when L3 is enabled")
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
@@ -453,7 +424,7 @@ def make_config(
     cfg.num_snapshot_pages = num_snapshot_pages
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
-    cfg.l3_prefetch_min_pages = l3_prefetch_min_pages
+    cfg.storage_config = storage_config
     cfg.enable_l3_storage = enable_l3_storage
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
@@ -657,15 +628,16 @@ def advance_scheduler(scheduler, events: list) -> None:
     ec = ExecutionEvent()
     for event in events:
         ec.add_event(event)
-    scheduler.advance(ec)
+    # nanobind calls emit no Python-tracer or Kineto events, so without this
+    # annotation the C++ time is an unlabeled gap in the profiler timeline.
+    with torch.profiler.record_function("scheduler.advance"):
+        scheduler.advance(ec)
 
 
 def cache_event_to_payload(event) -> dict:
     """A cache ACK as the rank-synchronizing payload the hooks gather.
 
-    ``(kind, op_id)`` identifies the ACK; a ``PrefetchDoneEvent`` adds the
-    pages it landed, identical on every rank because the hooks converged it
-    before the ACK was produced.
+    ``(kind, op_id)`` identifies a completed Host copy.
     """
     kind = type(event).__name__
     if kind not in _CACHE_EVENT_TYPES:
@@ -674,8 +646,6 @@ def cache_event_to_payload(event) -> dict:
         "kind": kind,
         "op_id": int(event.op_id),
     }
-    if kind == "PrefetchDoneEvent":
-        payload["landed_pages"] = int(event.landed_pages)
     return payload
 
 
@@ -685,10 +655,6 @@ def cache_event_from_payload(payload: dict):
         raise ValueError(f"Unsupported cache event type: {kind}")
     if kind == "LoadBackDoneEvent":
         return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]))
-    if kind == "PrefetchDoneEvent":
-        return _CACHE_EVENT_TYPES[kind](
-            int(payload["op_id"]), int(payload["landed_pages"])
-        )
     event = _CACHE_EVENT_TYPES[kind]()
     event.op_id = int(payload["op_id"])
     return event
@@ -801,86 +767,59 @@ def restore_ops_from_wire(op) -> list[RestoreOp]:
     return ops
 
 
-def prefetch_ops_from_wire(op) -> list[PrefetchOp]:
-    """One ``PrefetchOp`` per request of a ``Cache.PrefetchOp`` batch."""
-    rows = _check_batch_rows(
-        op,
-        (
-            op.op_ids,
-            op.request_ids,
-            op.first_pages,
-            op.num_pages,
-            op.group_ids,
-            op.host_pages,
-            op.content_hashes,
-            op.page_offsets,
-            op.page_indices,
-        ),
+def is_device_cache_op(operation) -> bool:
+    """Whether an adapted operation belongs to the GPU copy executor."""
+    return isinstance(
+        operation, (Cache.WriteBackOp, Cache.LoadBackOp, SnapshotOp, RestoreOp)
     )
-    ops = []
-    for i in range(rows):
-        groups = op.group_ids[i]
-        pages = op.host_pages[i]
-        hashes = op.content_hashes[i]
-        offsets = op.page_offsets[i]
-        indices = op.page_indices[i]
-        if not (
-            len(groups) == len(pages) == len(hashes) == len(offsets) == len(indices)
-        ):
-            raise ValueError(f"ragged cache operation {op.op_ids[i]}")
-        ops.append(
-            PrefetchOp(
-                op_id=int(op.op_ids[i]),
-                request_id=str(op.request_ids[i]),
-                first_page=int(op.first_pages[i]),
-                num_pages=int(op.num_pages[i]),
-                rows=tuple(
-                    PrefetchRow(
-                        group_id=int(group),
-                        host_page=int(page),
-                        content_hash=str(content_hash),
-                        page_offset=int(page_offset),
-                        page_index=int(page_index),
-                    )
-                    for group, page, content_hash, page_offset, page_index in zip(
-                        groups, pages, hashes, offsets, indices
-                    )
-                ),
-            )
-        )
-    return ops
 
 
-def cache_ops_from_plan(execution_plan) -> list:
-    """The plan's cache ops as the runtime consumes them, in plan order.
+class CacheOperations(NamedTuple):
+    """One validated plan snapshot, partitioned by its execution owner.
 
-    The one adapter between the scheduler's wire batches and the Host cache
-    executor. An L2 ``Cache.WriteBackOp`` / ``Cache.LoadBackOp`` batch passes
-    through: the executor consumes its lists-of-lists as one ticket per
-    ``op_ids`` entry. A ``Cache.SnapshotOp`` / ``Cache.RestoreOp`` /
-    ``Cache.PrefetchOp`` batch becomes one ``SnapshotOp`` / ``RestoreOp`` /
-    ``PrefetchOp`` per request (``cache/transfer/ops.py``): the executor
-    exports or imports one slot, or runs one prefetch job, per request, so
-    the per-request op is its unit of work and its ACK. Each consumer
-    evaluates it once per plan: the binding copies the ops out of C++ on
-    every read of ``plan.cache``.
-
-    Raises:
-        TypeError: The plan carries a cache op kind the runtime cannot run.
+    Each tuple keeps the plan's order. It defines no ordering between Host
+    storage I/O and Device copies; tickets and completions express dependencies.
     """
-    ops: list = []
+
+    device: tuple[Cache.WriteBackOp | Cache.LoadBackOp | SnapshotOp | RestoreOp, ...]
+    storage: tuple[
+        Cache.StorageQueryOp
+        | Cache.StorageGetOp
+        | Cache.StoragePutOp
+        | Cache.StorageCancelOp,
+        ...,
+    ]
+
+
+def cache_ops_from_plan(execution_plan) -> CacheOperations:
+    """Read and validate every cache op once before any owner submits work.
+
+    L2 wire batches pass through; snapshot/restore batches become per-request
+    operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
+    tuple. Unknown kinds fail the whole conversion without partial submission.
+    """
+    device: list = []
+    storage: list = []
     for op in execution_plan.cache:
         if isinstance(op, (Cache.WriteBackOp, Cache.LoadBackOp)):
-            ops.append(op)
+            device.append(op)
         elif isinstance(op, Cache.SnapshotOp):
-            ops.extend(snapshot_ops_from_wire(op))
+            device.extend(snapshot_ops_from_wire(op))
         elif isinstance(op, Cache.RestoreOp):
-            ops.extend(restore_ops_from_wire(op))
-        elif isinstance(op, Cache.PrefetchOp):
-            ops.extend(prefetch_ops_from_wire(op))
+            device.extend(restore_ops_from_wire(op))
+        elif isinstance(
+            op,
+            (
+                Cache.StorageQueryOp,
+                Cache.StorageGetOp,
+                Cache.StoragePutOp,
+                Cache.StorageCancelOp,
+            ),
+        ):
+            storage.append(op)
         else:
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
-    return ops
+    return CacheOperations(tuple(device), tuple(storage))
 
 
 def cache_event_key(payload: dict) -> tuple[str, int]:

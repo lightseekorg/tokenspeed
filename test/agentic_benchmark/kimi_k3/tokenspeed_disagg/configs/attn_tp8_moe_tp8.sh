@@ -1,0 +1,40 @@
+#!/usr/bin/bash
+
+set -euo pipefail
+
+# --grpc runs the engine behind a separately launched P/D gateway.
+if [[ "${1:-}" == "--grpc" ]]; then
+    shift
+    SERVER_CMD=(python3 -m smg_grpc_servicer.tokenspeed)
+else
+    SERVER_CMD=(ts serve
+        --disable-health-check
+        --reasoning-parser passthrough
+        --tool-call-parser passthrough
+        --engine-startup-timeout 7200
+    )
+fi
+
+exec "${SERVER_CMD[@]}" \
+    --model nvidia/Kimi-K3-NVFP4 \
+    --attn-tp-size 8 \
+    --moe-tp-size 8 \
+    --max-model-len 80000 \
+    --max-num-seqs 64 \
+    --gpu-memory-utilization 0.9 \
+    --disable-cuda-graph-padding \
+    --trust-remote-code \
+    --attention-backend tokenspeed_mla \
+    --kda-backend cutedsl_kda \
+    --moe-backend flashinfer_trtllm \
+    --kv-cache-dtype fp8 \
+    --speculative-algorithm EAGLE3 \
+    --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla \
+    --speculative-num-steps 3 \
+    --speculative-num-draft-tokens 4 \
+    --speculative-eagle-topk 1 \
+    --drafter-attention-backend tokenspeed_mla \
+    --mm-encoder-tp-mode data \
+    --host 0.0.0.0 \
+    --port 8000 \
+    "$@"

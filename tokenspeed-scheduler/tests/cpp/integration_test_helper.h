@@ -69,8 +69,7 @@ protected:
             .group_id = "full_attention",
             .block_granularity = cfg.prefix_granularity,
             .total_pages = cfg.device_allocator.total_pages,
-            .retention = CacheGroupConfig::Retention::FullHistory,
-            .family = CacheGroupFamily::History,
+            .attn_kind = AttnKind::kFull,
         });
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -143,25 +142,6 @@ protected:
         ExecutionEvent event;
         event.With(cache::LoadBackDone{.op_id = op_id});
         scheduler_->Advance(std::move(event));
-    }
-
-    // A pre-admission L3 prefetch finished with its first landed_pages prefix
-    // pages fetched.
-    void SendPrefetchDone(std::uint32_t op_id, std::int32_t landed_pages) {
-        ExecutionEvent event;
-        event.With(cache::PrefetchDone(op_id, landed_pages));
-        scheduler_->Advance(std::move(event));
-    }
-
-    static const PrefetchBatch* FindPrefetch(const ExecutionPlan& plan) {
-        for (const auto& op : plan.Operations()) {
-            if (const auto* cache_op = std::get_if<CacheOperation>(&op)) {
-                if (const auto* prefetch = std::get_if<PrefetchBatch>(cache_op)) {
-                    return prefetch;
-                }
-            }
-        }
-        return nullptr;
     }
 
     // Send ExtendResult to the scheduler: the forward landed. `tokens` are
@@ -312,10 +292,9 @@ protected:
         for (std::size_t i = 0; i < GroupIds().size(); ++i) {
             CacheGroupConfig group;
             group.group_id = GroupIds()[i];
-            group.block_granularity = cfg.prefix_granularity;
+            group.attn_kind = i == 0 ? AttnKind::kFull : AttnKind::kState;
+            group.block_granularity = i == 0 ? cfg.prefix_granularity : 0;
             group.total_pages = cfg.device_allocator.total_pages;
-            group.retention = CacheGroupConfig::Retention::FullHistory;
-            group.family = i == 0 ? CacheGroupFamily::History : CacheGroupFamily::State;
             cfg.cache_groups.push_back(std::move(group));
         }
         SetTestSnapshotPool(cfg);

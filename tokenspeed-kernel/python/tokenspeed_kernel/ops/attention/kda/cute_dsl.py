@@ -97,7 +97,6 @@ def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
     # facade. Only native host planning receives the larger synthetic bounds;
     # device boundaries continue to identify the real packed token ranges.
     capacity = kwargs.pop("capacity", None)
-    inputs_packed = kwargs.pop("inputs_packed", False)
     if (
         capacity is not None
         and kwargs["q"].is_cuda
@@ -120,7 +119,6 @@ def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
             kwargs["g_raw"],
             kwargs["beta_logits"],
             kwargs["cu_seqlens"],
-            inputs_packed,
         )
         out, state = cutedsl_kda_forward_with_prepared_plan(
             q,

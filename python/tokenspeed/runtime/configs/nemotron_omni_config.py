@@ -21,10 +21,10 @@
 """Nemotron-H Omni configuration: a Nemotron-H language model with a C-RADIO
 vision encoder and a Parakeet audio encoder.
 
-The checkpoint ``config.json`` (``model_type: NemotronH_Nano_Omni_Reasoning_V3``)
-loads unmodified: ``llm_config`` becomes TokenSpeed's ``NemotronHConfig`` as
-``text_config``, and the text-model attributes generic engine code reads are
-forwarded to it.
+The checkpoint ``config.json`` (``model_type`` ``NemotronH_Nano_Omni_Reasoning_V3``
+or ``nemotron_h_omni``) loads unmodified: ``llm_config`` becomes TokenSpeed's
+``NemotronHConfig`` as ``text_config``, and the text-model attributes generic
+engine code reads are forwarded to it.
 """
 
 from __future__ import annotations
@@ -50,6 +50,20 @@ _RADIO_FIXED_ARGS = {
     "norm_type": "layer_norm",
 }
 
+# The ViT shape a transformers-format RADIO config states beside ``args``.
+_RADIO_SHAPE_FIELDS = (
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "mlp_ratio",
+    "hidden_act",
+    "qkv_bias",
+    "use_swiglu_ffn",
+    "layerscale_value",
+    "num_cls_tokens",
+    "num_registers",
+)
+
 
 class RadioVisionConfig(PretrainedConfig):
     """C-RADIO ViT geometry, read from the checkpoint's RADIO ``args``."""
@@ -72,10 +86,47 @@ class RadioVisionConfig(PretrainedConfig):
                     f"C-RADIO args.{name}={self.args[name]!r} is not supported; "
                     f"the encoder implements {value!r}"
                 )
+        if "layer_norm_eps" in kwargs:
+            eps = kwargs.pop("layer_norm_eps")
+            if self.args.setdefault("layer_norm_eps", eps) != eps:
+                raise ValueError(
+                    f"C-RADIO layer_norm_eps={eps} disagrees with "
+                    f"args.layer_norm_eps={self.args['layer_norm_eps']}"
+                )
+        stated = {
+            name: kwargs.pop(name) for name in _RADIO_SHAPE_FIELDS if name in kwargs
+        }
         self.patch_size = patch_size
         self.video_temporal_patch_size = video_temporal_patch_size
         self.separate_video_embedder = separate_video_embedder
         super().__init__(**kwargs)
+        if stated:
+            shape = self.shape_from_args()
+            mismatched = {
+                name: value for name, value in stated.items() if value != shape[name]
+            }
+            if mismatched:
+                raise ValueError(
+                    f"C-RADIO vision_config {mismatched} disagrees with the "
+                    f"{self.args['model']} encoder, which has {shape}"
+                )
+
+    def shape_from_args(self) -> dict[str, Any]:
+        """The ViT shape ``args`` describes, in the transformers RADIO config's fields."""
+        hidden_size, num_layers, num_heads, mlp_size = self.vit_dims
+        return {
+            "hidden_size": hidden_size,
+            "num_hidden_layers": num_layers,
+            "num_attention_heads": num_heads,
+            "mlp_ratio": mlp_size / hidden_size,
+            "hidden_act": "gelu",
+            "qkv_bias": True,
+            "use_swiglu_ffn": False,
+            # LayerScale left at identity: checkpoints carry no scale tensors.
+            "layerscale_value": 1.0,
+            "num_cls_tokens": self.num_cls_tokens,
+            "num_registers": self.num_registers,
+        }
 
     @property
     def vit_dims(self) -> tuple[int, int, int, int]:
@@ -106,15 +157,22 @@ class RadioVisionConfig(PretrainedConfig):
         return self.args["cpe_max_size"] // self.patch_size
 
     @property
-    def num_prefix_tokens(self) -> int:
-        """Class tokens (one per distinct teacher) plus registers, prepended to every image."""
+    def num_cls_tokens(self) -> int:
+        """One class token per distinct teacher, or a single one."""
         if self.args["cls_token_per_teacher"]:
-            num_cls = len({teacher["name"] for teacher in self.args["teachers"]})
-        else:
-            num_cls = 1
+            return len({teacher["name"] for teacher in self.args["teachers"]})
+        return 1
+
+    @property
+    def num_registers(self) -> int:
         multiple = self.args["register_multiple"]
         # C-RADIO pads to the next multiple, adding a full multiple when already aligned.
-        return num_cls + (multiple - num_cls % multiple if multiple else 0)
+        return multiple - self.num_cls_tokens % multiple if multiple else 0
+
+    @property
+    def num_prefix_tokens(self) -> int:
+        """Class tokens plus registers, prepended to every image."""
+        return self.num_cls_tokens + self.num_registers
 
     @property
     def image_patch_budget(self) -> int:
@@ -122,8 +180,14 @@ class RadioVisionConfig(PretrainedConfig):
         return self.args["max_num_patches"]
 
     @property
+    def image_patch_floor(self) -> int:
+        """The dynamic-resolution planner's per-image patch minimum."""
+        return self.args["min_num_patches"]
+
+    @property
     def final_norm(self) -> bool:
-        return self.args["model_norm"]
+        # A transformers-format config has no ``model_norm``: its ViT ends without a norm.
+        return self.args.get("model_norm", False)
 
     @property
     def layer_norm_eps(self) -> float:
@@ -264,6 +328,15 @@ class NemotronHOmniConfig(PretrainedConfig):
         output["sound_context_token_id"] = output.pop("audio_token_id")
         del output["video_token_id"]
         return output
+
+    @property
+    def vision_final_layernorm(self) -> bool:
+        """Whether a LayerNorm runs on the ViT output ahead of the projector.
+
+        Checkpoints whose language model has MTP layers carry it: their trainer
+        builds every block stack, the vision tower's too, with a final LayerNorm.
+        """
+        return self.text_config.num_nextn_predict_layers > 0
 
     @property
     def cache_layer_types(self) -> list[str]:

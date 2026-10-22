@@ -6,8 +6,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import tokenspeed_kernel.ops.gemm as kimi3_module
 import torch
-from tokenspeed_kernel.ops.gemm import kimi3 as kimi3_module
 from tokenspeed_kernel.ops.gemm import (
     kimi3_latent_projection,
     kimi3_mla_qkv_gate_projection,
@@ -16,9 +16,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_down_projection,
     kimi3_shared_situ_projection,
 )
-from tokenspeed_kernel.ops.moe.sigmoid_topk import (
-    _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk,
-)
+from tokenspeed_kernel.ops.moe import _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk
 
 
 def test_sigmoid_bias_topk_torch_is_byte_exact() -> None:

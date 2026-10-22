@@ -36,11 +36,17 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
+    prompt_ends_in_reasoning,
+    reasoning_block_markers,
     structural_tag_for_reasoning_json_schema,
 )
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
 from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
+
+# Most alternatives a top-k logprob request may ask for per position (the
+# OpenAI chat API's bound; legacy completions ask for at most 5).
+MAX_TOP_LOGPROBS = 20
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -56,8 +62,31 @@ class InputProcessor:
 
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
+        # Token ids of the reasoning block's opener and closer, used to tell
+        # whether a prompt ends inside an open block. None when the server
+        # wraps no reasoning or the markers are not single tokens.
+        self._reasoning_marker_ids: tuple[int, int] | None = (
+            self._find_reasoning_marker_ids()
+        )
 
-    def _maybe_wrap_json_schema_for_reasoning(self, sampling: dict) -> None:
+    def _find_reasoning_marker_ids(self) -> tuple[int, int] | None:
+        reasoning_parser = self.engine.server_args.reasoning_parser
+        tokenizer = self.engine.tokenizer
+        if not reasoning_parser or tokenizer is None:
+            return None
+        markers = reasoning_block_markers(reasoning_parser)
+        if markers is None:
+            return None
+        ids = [tokenizer.convert_tokens_to_ids(marker) for marker in markers]
+        if not all(isinstance(i, int) for i in ids):
+            return None
+        if list(tokenizer.convert_ids_to_tokens(ids)) != list(markers):
+            return None
+        return ids[0], ids[1]
+
+    def _maybe_wrap_json_schema_for_reasoning(
+        self, sampling: dict, input_ids: list[int] | None
+    ) -> None:
         # Without this, xgrammar locks onto ``{`` at token 0 and the
         # model can't emit ``<think>…</think>`` before the JSON.
         if "json_schema" not in sampling:
@@ -69,7 +98,20 @@ class InputProcessor:
             schema = sampling["json_schema"]
             if isinstance(schema, str):
                 schema = json.loads(schema)
-            wrapped = structural_tag_for_reasoning_json_schema(reasoning_parser, schema)
+            # The reply either continues a reasoning block that the prompt
+            # opened or may open one itself. Without marker ids or prompt
+            # ids, assume the prompt opened it, as before.
+            marker_ids = self._reasoning_marker_ids
+            prompt_opens_reasoning = (
+                marker_ids is None
+                or input_ids is None
+                or prompt_ends_in_reasoning(input_ids, *marker_ids)
+            )
+            wrapped = structural_tag_for_reasoning_json_schema(
+                reasoning_parser,
+                schema,
+                prompt_opens_reasoning=prompt_opens_reasoning,
+            )
         except Exception as exc:
             self.engine.logger.warning(
                 f"reasoning-parser={reasoning_parser!s}: failed to wrap json_schema ("
@@ -208,6 +250,49 @@ class InputProcessor:
                 f"[0, {vocab_size}); input_ids contains one outside it."
             )
 
+    def _verify_top_logprobs_servable(
+        self, top_logprobs_num: int, sampling_params: SamplingParams
+    ) -> int:
+        """Refuse a top-k logprob request this engine cannot serve; return k.
+
+        The top-k alternatives are computed where a forward runs eagerly: at
+        the prompt rows (``logprob_start_len``) and at the token a prefill
+        samples. A request whose every token is sampled in its prefill
+        (``max_new_tokens`` 0 or 1, as a teacher-forcing ``echo`` asks) is
+        served; a later token is sampled by a captured decode step, which
+        computes no alternatives, so a longer generation is refused rather
+        than answered with positions missing. The alternatives are torch's
+        log-softmax (the sampled token's logprob order), computed on the one
+        stage that holds logits, of a request this node completes.
+        """
+        server_args = self.engine.server_args
+        if not 0 < top_logprobs_num <= MAX_TOP_LOGPROBS:
+            raise ValueError(
+                f"top_logprobs_num must be between 1 and {MAX_TOP_LOGPROBS}, "
+                f"got {top_logprobs_num}."
+            )
+        if (sampling_params.max_new_tokens or 0) > 1:
+            raise ValueError(
+                "top_logprobs_num > 0 needs max_new_tokens <= 1: top-k logprobs "
+                "are computed for the prompt and the token a prefill samples, "
+                "not for decode steps."
+            )
+        if server_args.logprob_order != "torch":
+            raise ValueError(
+                "top_logprobs_num > 0 needs --logprob-order torch, not "
+                f"{server_args.logprob_order}."
+            )
+        if server_args.mapping is not None and server_args.mapping.has_pp:
+            raise ValueError(
+                "top_logprobs_num > 0 is not supported with pipeline parallelism."
+            )
+        if server_args.disaggregation_mode != "null":
+            raise ValueError(
+                "top_logprobs_num > 0 is not supported with disaggregated "
+                "prefill and decode."
+            )
+        return top_logprobs_num
+
     async def tokenize_batch(
         self,
         objs: list[GenerateReqInput | EmbeddingReqInput],
@@ -340,7 +425,7 @@ class InputProcessor:
             )
             obj.sampling_params.update({"max_new_tokens": adjusted_max_new_tokens})
 
-        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params)
+        self._maybe_wrap_json_schema_for_reasoning(obj.sampling_params, input_ids)
 
         sampling_params = SamplingParams(**obj.sampling_params)
         sampling_params.resolve_seed(obj.rid)
@@ -374,9 +459,8 @@ class InputProcessor:
             # vLLM top-k / full-vocab are gated in SamplingParams.verify(); gate
             # the SGLang capability knobs here for parity.
             if obj.top_logprobs_num:
-                raise ValueError(
-                    "top_logprobs_num > 0 (output top-k logprobs) is not supported "
-                    "yet; use top_logprobs_num=0 (the sampled token's logprob)."
+                top_logprobs_num = self._verify_top_logprobs_servable(
+                    obj.top_logprobs_num, sampling_params
                 )
             if obj.token_ids_logprob:
                 raise ValueError("token_ids_logprob is not supported yet.")

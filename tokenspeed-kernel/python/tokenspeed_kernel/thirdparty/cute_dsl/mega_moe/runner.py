@@ -57,10 +57,11 @@ _TACTICS = tuple(
         (128, 256),
         (512, 1024),
         ("static", "atomic_counter"),
-        ("epi_warps", "reuse_dispatch_warps"),
+        # Exclude reuse_dispatch_warps to avoid allocating its large
+        # FC2 staging buffer in the fixed workspace.
+        ("epi_warps",),
         (1, 4, 8),
     )
-    if tile_n == 256 or token_back == "epi_warps"
 )
 
 
@@ -151,7 +152,7 @@ class MegaMoEWorkspace:
         sf_cols = ((hidden // 16 + 3) // 4) * 4
         layouts = [
             ((capacity, hidden // 2), torch.uint8),
-            ((capacity, sf_cols), torch.float8_e4m3fn),
+            (((capacity + 15) // 16 * 16, sf_cols), torch.float8_e4m3fn),
             ((capacity, top_k), torch.float32),
             ((sizes["shared"],), torch.uint8),
         ]
@@ -257,6 +258,47 @@ class MegaMoEWorkspace:
             kernel.shared_zero_i32_count = leading[1] // 4
         return kernel
 
+    def input_buffers(
+        self, tokens: int, capacity: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not 0 <= tokens <= capacity <= self.capacity:
+            raise ValueError("MegaMoE token count exceeds workspace capacity")
+        return (
+            self.x[:tokens],
+            self.scales[: (tokens + 15) // 16 * 16].view(torch.uint8),
+            self.topk_ids[:tokens],
+            self.topk_weights[:tokens],
+        )
+
+    def stage_inputs(
+        self,
+        x: tuple[torch.Tensor, torch.Tensor],
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+        capacity: int,
+    ) -> None:
+        """Stage external inputs and invalidate unused expert-ID rows."""
+        tokens = x[0].shape[0]
+        if not 0 <= tokens <= capacity <= self.capacity:
+            raise ValueError("MegaMoE token count exceeds workspace capacity")
+        for target, source in (
+            (self.x[:tokens], x[0]),
+            (
+                self.scales[:tokens, : self.hidden // 16].view(torch.uint8),
+                x[1][:tokens].view(torch.uint8),
+            ),
+            (self.topk_ids[:tokens], topk_ids),
+            (self.topk_weights[:tokens], topk_weights),
+        ):
+            # Producers can write into these views. External inputs still stage.
+            if not (
+                target.data_ptr() == source.data_ptr()
+                and target.dtype == source.dtype
+                and target.stride() == source.stride()
+            ):
+                target.copy_(source)
+        self.topk_ids[tokens:capacity].fill_(-1)
+
     def run(
         self,
         x: tuple[torch.Tensor, torch.Tensor],
@@ -270,13 +312,7 @@ class MegaMoEWorkspace:
         if not tokens <= capacity <= self.capacity:
             raise ValueError("MegaMoE token count exceeds workspace capacity")
         kernel = self._kernel(capacity, tactic)
-        self.x[:tokens].copy_(x[0])
-        self.scales[:tokens, : self.hidden // 16].view(torch.uint8).copy_(
-            x[1].view(torch.uint8)
-        )
-        self.topk_ids[:tokens].copy_(topk_ids)
-        self.topk_ids[tokens:capacity].fill_(-1)
-        self.topk_weights[:tokens].copy_(topk_weights)
+        self.stage_inputs(x, topk_ids, topk_weights, capacity)
         profiling = is_in_profile_measurement()
         key = (capacity, tactic, *[t.data_ptr() for t in weights], output.data_ptr())
         # Do not retain temporary profiling clones through cached DLPack views.
@@ -363,7 +399,7 @@ class MegaMoERunner(TunableRunner):
         self.max_capacity = max_capacity
         self.tactic_autotune = os.environ.get("MEGAMOE_TACTIC_AUTOTUNE", "0") == "1"
         self._extras = (
-            "nvfp4_situ_bf16_graph_fixed_workspace_v3",
+            "nvfp4_situ_bf16_graph_fixed_workspace_epi_only_v4",
             self.world,
             num_experts,
             hidden,
@@ -427,7 +463,7 @@ class MegaMoERunner(TunableRunner):
                     256,
                     512,
                     "atomic_counter" if capacity >= 16384 else "static",
-                    "reuse_dispatch_warps",
+                    "epi_warps",
                     8,
                 )
         else:
@@ -441,10 +477,7 @@ class MegaMoERunner(TunableRunner):
             tactic,
         )
 
-    def run(self, x, topk_ids, topk_weights, weights, max_tokens: int):
-        capacity = _token_capacity(max_tokens)
-        if capacity > self.max_capacity:
-            raise ValueError("MegaMoE token count exceeds the configured maximum")
+    def _ensure_workspace(self) -> MegaMoEWorkspace:
         if self.workspace is None:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(
@@ -460,13 +493,28 @@ class MegaMoERunner(TunableRunner):
                 self.situ_beta,
                 self.situ_linear_beta,
             )
+        return self.workspace
+
+    def input_buffers(
+        self, tokens: int, max_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        capacity = _token_capacity(max_tokens)
+        if capacity > self.max_capacity:
+            raise ValueError("MegaMoE token count exceeds the configured maximum")
+        return self._ensure_workspace().input_buffers(tokens, capacity)
+
+    def run(self, x, topk_ids, topk_weights, weights, max_tokens: int):
+        capacity = _token_capacity(max_tokens)
+        if capacity > self.max_capacity:
+            raise ValueError("MegaMoE token count exceeds the configured maximum")
+        workspace = self._ensure_workspace()
         # All ranks use the same capacity, including ranks with no local tokens.
         inputs = [
             *x,
             topk_ids,
             topk_weights,
             *weights,
-            self.workspace.output[:capacity],
+            workspace.output[:capacity],
         ]
         if not self.tactic_autotune:
             return self.forward(inputs, tactic=-1)
@@ -479,16 +527,15 @@ class MegaMoERunner(TunableRunner):
         return chosen(inputs=inputs, tactic=tactic)
 
 
-def get_runner(
-    group,
-    num_experts: int,
-    hidden: int,
-    intermediate: int,
-    top_k: int,
-    situ_beta: float,
-    situ_linear_beta: float,
-) -> MegaMoERunner:
-    """Return the cached tuning/launch adapter for one EP group and expert geometry."""
+def get_runner(plan: dict, w: torch.nn.Module) -> MegaMoERunner:
+    """Return the shared runner for the plan's EP group and module's geometry."""
+    group = plan["process_group"]
+    num_experts = w.num_experts
+    hidden = w.hidden_size
+    intermediate = w.intermediate_size
+    top_k = w.top_k
+    situ_beta = w.activation_situ_beta
+    situ_linear_beta = w.activation_situ_linear_beta
     max_capacity = _token_capacity(get_autotune_max_num_tokens())
     key = (
         id(group),

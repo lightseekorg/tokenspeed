@@ -25,6 +25,8 @@
 """Constrained decoding with xgrammar backend."""
 
 import json
+from collections.abc import Iterable
+from typing import Any
 
 import torch
 from xgrammar import (
@@ -48,6 +50,49 @@ logger = get_colorful_logger(__name__)
 
 MAX_ROLLBACK_TOKENS = 200
 
+# The matcher methods called from Python. tvm-ffi releases the GIL around
+# every call by default, and each release lets another thread take the GIL
+# for up to a switch interval (5 ms). Each call takes microseconds, so they
+# keep it.
+GIL_HOLDING_MATCHER_METHODS = frozenset(
+    (
+        "accept_token",
+        "fill_next_token_bitmask",
+        "traverse_draft_tree",
+        "rollback",
+        "is_terminated",
+    )
+)
+
+
+def keep_gil_in_matcher_calls() -> None:
+    """Make GIL_HOLDING_MATCHER_METHODS keep the GIL, for the whole process."""
+    from xgrammar.base import _core
+
+    for method in _core.GrammarMatcher.__tvm_ffi_type_info__.methods:
+        if method.name in GIL_HOLDING_MATCHER_METHODS:
+            method.func.release_gil = False
+
+
+# The matcher methods the capturable grammar's host node calls, in its order.
+HOST_NODE_MATCHER_METHODS = (
+    "accept_token",
+    "fill_next_token_bitmask",
+    "traverse_draft_tree",
+    "is_terminated",
+)
+
+
+def matcher_method_handles() -> list[int]:
+    """Addresses of the tvm-ffi functions behind HOST_NODE_MATCHER_METHODS."""
+    from xgrammar.base import _core
+
+    methods = {
+        method.name: method.func
+        for method in _core.GrammarMatcher.__tvm_ffi_type_info__.methods
+    }
+    return [methods[name].__chandle__() for name in HOST_NODE_MATCHER_METHODS]
+
 
 class XGrammarGrammar(BaseGrammarObject):
     def __init__(
@@ -64,12 +109,29 @@ class XGrammarGrammar(BaseGrammarObject):
         self.ctx = ctx
         self.override_stop_tokens = override_stop_tokens
 
+        # Accepting one of these ends the grammar.
+        self.stop_token_ids = frozenset(matcher.stop_token_ids)
+
         self.finished = False
         self.accepted_tokens: list[int] = []
+
+        # The capturable grammar's C++ reference to ``matcher``, made on first use.
+        self._native_matcher: Any | None = None
 
     def is_terminated(self):
 
         return self.matcher.is_terminated()
+
+    def native_matcher(self) -> Any:
+        """``matcher`` for the capturable grammar's host node, which calls it
+        without the GIL; it holds the matcher and its stop tokens."""
+        if self._native_matcher is None:
+            from tokenspeed.runtime.grammar.grammar_host import load_grammar_host_ext
+
+            self._native_matcher = load_grammar_host_ext().Matcher(
+                self.matcher._handle.__chandle__(), sorted(self.stop_token_ids)
+            )
+        return self._native_matcher
 
     def accept_token(self, token: int):
 
@@ -129,6 +191,13 @@ class XGrammarGrammar(BaseGrammarObject):
             matcher, self.vocab_size, self.ctx, self.override_stop_tokens
         )
 
+    @property
+    def memory_size_bytes(self) -> int:
+
+        # The compiled grammar (xgrammar's estimate) and this object's
+        # matcher, mostly a token bitset of the vocabulary size.
+        return self.ctx.memory_size_bytes + self.vocab_size // 8
+
 
 class XGrammarGrammarBackend(BaseGrammarBackend):
     def __init__(
@@ -136,15 +205,38 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         tokenizer,
         vocab_size: int,
         disable_any_whitespace: bool = False,
+        stop_token_ids: Iterable[int] | None = None,
     ) -> None:
 
         super().__init__()
 
+        keep_gil_in_matcher_calls()
+
+        # The matcher ends a grammar on the tokens the engine stops on, the
+        # model's end-of-sequence ids with the tokenizer's own EOS and extra
+        # stop ids, rather than on the tokenizer's one EOS only: a grammar that
+        # may end there then takes any of them as its end.
+        if stop_token_ids:
+            stop_token_ids = set(stop_token_ids)
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+            if eos_token_id is not None:
+                stop_token_ids.add(eos_token_id)
+            extra = getattr(tokenizer, "additional_stop_token_ids", None)
+            stop_token_ids.update(extra or ())
+            stop_token_ids = sorted(stop_token_ids)
+        else:
+            stop_token_ids = None
         tokenizer_info = TokenizerInfo.from_huggingface(
-            tokenizer, vocab_size=vocab_size
+            tokenizer, vocab_size=vocab_size, stop_token_ids=stop_token_ids
         )
 
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        # BaseGrammarBackend keeps the compiled grammars that requests reuse,
+        # within RETAINED_GRAMMAR_LIMIT_BYTES. xgrammar's own cache is off:
+        # its heap keeps growing past cache_limit_bytes as distinct schemas
+        # arrive, and clear_cache() does not free all of it.
+        self.grammar_compiler = GrammarCompiler(
+            tokenizer_info=tokenizer_info, cache_enabled=False
+        )
 
         self.vocab_size = vocab_size
         self.override_stop_tokens = None
@@ -209,4 +301,5 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     def reset(self):
 
+        super().reset()
         self.grammar_compiler and self.grammar_compiler.clear_cache()

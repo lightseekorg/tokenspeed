@@ -27,6 +27,7 @@ from collections.abc import Sequence
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
     grouped_gemma_rmsnorm,
@@ -39,7 +40,7 @@ from tokenspeed_kernel.ops.residual import (
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.registry import KernelRegistry
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, is_cdna4
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="a CUDA/ROCm device is required"
@@ -187,25 +188,21 @@ def _mix_reference(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # The reference runs on the host. Otherwise the two float64 GEMMs trigger
     # high execution time on simulator-based flows.
-    device = normalized.device
-    x = normalized.cpu().double()
-    projected = x @ projection.cpu().double().T
-    down = torch.nn.functional.silu(projected[:, :LOWRANK] * projection_scale)
-    gate = down @ up.cpu().double().T
-    mixed = (
-        torch.sigmoid(gate).unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
-        * x.unflatten(-1, (HC_COUNT, HIDDEN_SIZE))
-    ).mean(dim=-2)
-    inject = (
-        (projected[:, LOWRANK:] * projection_scale).to(
-            device=device, dtype=normalized.dtype
-        )
-        if projection.shape[0] > LOWRANK
-        else None
+    mixed, inject = torch_hyperconnection_mix(
+        normalized.cpu(),
+        projection.cpu(),
+        up.cpu(),
+        HC_COUNT,
+        HIDDEN_SIZE,
+        LOWRANK,
+        projection.shape[0],
+        projection_scale,
+        True,
     )
+    device, dtype = normalized.device, normalized.dtype
     return (
-        mixed.to(device=device, dtype=normalized.dtype),
-        inject,
+        mixed.to(device=device, dtype=dtype),
+        None if inject is None else inject.to(device=device, dtype=dtype),
     )
 
 
@@ -802,9 +799,12 @@ def test_general_fallback_supports_deterministic_mode() -> None:
 def test_hc_mix_has_only_fused_and_general_implementations() -> None:
     from tokenspeed_kernel.ops.residual import cute_fused
 
-    expected = {"triton_hyperconnection_mix"}
+    # The torch reference is the ground truth tests compare against.
+    expected = {"triton_hyperconnection_mix", "torch_hyperconnection_mix"}
     if cute_fused._AVAILABLE:
         expected.add("cute_fused_hyperconnection_mix")
+    if current_platform().is_amd:
+        expected.add("gluon_hyperconnection_mix_gfx950")
     kernels = KernelRegistry.get().list_kernels("residual", "hyperconnection_mix")
     assert {kernel.name for kernel in kernels} == expected
 
@@ -826,7 +826,14 @@ def test_unsupported_fused_contract_uses_general_fallback(monkeypatch, reason) -
     capture = ShapeCapture.get()
     capture.enabled = True
     actual = _mix(values, override=None, projection_scale=1.0, weights_independent=True)
-    assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
+    # GFX950 serves contiguous 16-bit decode batches with its own two-launch
+    # mix; every other platform or contract takes the GEMM-plus-epilogue path.
+    gfx950_mix = reason in ("capacity", "unavailable") and is_cdna4()
+    assert capture._records[-1].kernel_name == (
+        "gluon_hyperconnection_mix_gfx950"
+        if gfx950_mix
+        else "triton_hyperconnection_mix"
+    )
     _assert_mix_close(actual, values, 1.0, 0.04)
 
 

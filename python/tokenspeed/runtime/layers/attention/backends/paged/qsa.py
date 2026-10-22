@@ -26,7 +26,11 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
+from tokenspeed_kernel.ops.attention.qsa import (
+    QSASparseMetadata,
+    QSAWorkspace,
+    qsa_sparse_attention,
+)
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -34,7 +38,11 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.mha import MHAAttnBackend
-from tokenspeed.runtime.layers.attention.qsa.metadata import decode_query_lengths
+from tokenspeed.runtime.layers.attention.qsa.metadata import (
+    QSALayout,
+    QSASelection,
+    decode_query_lengths,
+)
 from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
@@ -60,10 +68,20 @@ class QSAAttnBackend(MHAAttnBackend):
             dataclasses.replace(spec, backend_name="mha"),
             kernel_page_size=kernel_page_size,
         )
+        self._metadata_capacity_rows = 0
+        self._qsa_workspace = QSAWorkspace()
+
+    def _publish_cache_pool(self, cache_pool: CachePool) -> None:
+        super()._publish_cache_pool(cache_pool)
+        self._qsa_workspace.clear()
 
     def init_cuda_graph_state(self, max_bs: int) -> None:
         super().init_cuda_graph_state(max_bs)
         self._metadata_capacity_rows = max_bs * self.spec_num_tokens
+
+    def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
+        # The sparse kernel reads an FP8 cache at unit scale.
+        return False
 
     def _sparse_attention(
         self,
@@ -87,6 +105,39 @@ class QSAAttnBackend(MHAAttnBackend):
             q.shape[0],
             force_uniform=ctx.draft_narrowing is not None,
         )
+        sparse_metadata = None
+        selection = ctx.attn_backend.sparse_topk.qsa_selection
+        if selection is not None:
+            if not isinstance(selection, QSASelection):
+                raise RuntimeError("invalid QSA logical selection memo")
+            rows = q.shape[0]
+            # Draft step zero may narrow target-aligned physical slots without
+            # carrying their logical rows. Direct-slot kernels handle that case.
+            if selection.selected_slots.shape[0] == rows:
+                layout = ctx.attn_backend.sparse_topk.qsa_metadata
+                if not isinstance(layout, QSALayout):
+                    raise RuntimeError("QSA selection requires the current row layout")
+                if max_seqlen_q is None:
+                    metadata = self.forward_extend_metadata
+                    if metadata is None:
+                        raise RuntimeError("QSA ragged queries require extend metadata")
+                    offsets = tuple(metadata.cu_extend_seq_lens_cpu)
+                else:
+                    offsets = tuple(range(0, rows + 1, max_seqlen_q))
+                # Graph breaks may copy physical slots into a stable buffer;
+                # logical candidates stay in the same per-forward memo.
+                sparse_metadata = QSASparseMetadata(
+                    selected_blocks=selection.selected_blocks[:rows],
+                    block_table=layout.full_page_table,
+                    token_to_request=layout.request_indices[:rows].to(torch.int32),
+                    query_positions=layout.logical_positions[:rows],
+                    query_start_loc=offsets,
+                    page_size=layout.full_kernel_page_size,
+                    block_size=selection.block_size,
+                    workspace=self._qsa_workspace,
+                )
+            elif ctx.draft_narrowing is None:
+                raise RuntimeError("QSA selection must have one row per query")
         output = qsa_sparse_attention(
             q,
             k_cache,
@@ -99,6 +150,7 @@ class QSAAttnBackend(MHAAttnBackend):
             v_scale=1.0 if v_cache.dtype == torch.float8_e4m3fn else None,
             override=None,
             solution=None,
+            sparse_metadata=sparse_metadata,
         )
         return output.reshape(q.shape[0], -1)
 

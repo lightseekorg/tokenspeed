@@ -31,7 +31,7 @@ namespace {
 void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroupConfig& group) {
     group.ValidateCapacityInputs();
     const std::string where = "Cache group '" + group.group_id + "': ";
-    if (config.prefix_granularity % group.block_granularity != 0) {
+    if (group.attn_kind != AttnKind::kState && config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
     }
     if (config.role == Role::kFused) {
@@ -40,7 +40,7 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
     // A group's transfer policy is dictated by the destination layout the
     // scheduler builds for it, so it cannot be chosen independently.
     const CacheTransferPolicy expected =
-        group.Kind() == AttnKind::kMambaState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
+        group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;
     if (group.transfer_policy == CacheTransferPolicy::Unspecified) {
         throw std::invalid_argument(where + "PD cache requires an explicit transfer_policy");
     }
@@ -62,28 +62,18 @@ void SchedulerConfig::Validate() const {
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
-    if (enable_l3_storage && !HasHostCache()) {
-        throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
-    }
-    if (enable_l3_storage && l3_prefetch_min_pages < 1) {
-        throw std::invalid_argument(
-            "Scheduler: L3 storage requires l3_prefetch_min_pages >= 1 (the L3 prefetch threshold, in prefix pages)");
-    }
-    if (!enable_l3_storage && l3_prefetch_min_pages != 0) {
-        throw std::invalid_argument(
-            "Scheduler: l3_prefetch_min_pages is an L3 setting; it must be 0 without L3 storage");
+    if (!enable_l3_storage && storage_config) {
+        throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }
     if (enable_l3_storage) {
-        // A Host copy keeps its Device block's residue, but an L3 prefetch
-        // allocates its Host page before any Device destination exists.
-        for (const CacheGroupConfig& group : cache_groups) {
-            if (group.shard_count > 1) {
-                throw std::invalid_argument(
-                    "Scheduler: L3 storage is not supported for page-cyclic sharded cache "
-                    "groups (group '" +
-                    group.group_id + "')");
-            }
+        if (!storage_config) throw std::invalid_argument("L3 requires an explicit StorageConfig");
+        storage_config->Validate();
+        if (storage_config->max_host_blocks > host_allocator.NumUsableBlocks()) {
+            throw std::invalid_argument("L3 Host credits must not exceed usable Host parents");
         }
+    }
+    if (enable_l3_storage && !HasHostCache()) {
+        throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
     // The snapshot pool is stated explicitly on every role: the null page
     // alone (and no slots) says "never retract", anything more needs slots.
@@ -143,31 +133,18 @@ void SchedulerConfig::ValidateCapacityInputs() const {
     std::int32_t replay_window_tokens = 0;
     for (const CacheGroupConfig& group : cache_groups) {
         validateGroupCapacityInputs(*this, group);
-        // A recurrent state advances one whole checkpoint at a time, so a chunk
-        // must be able to cover one cache block.
-        if (group.Kind() == AttnKind::kMambaState && max_scheduled_tokens < prefix_granularity) {
-            throw std::invalid_argument("Scheduler: Mamba max_scheduled_tokens must cover one cache block");
-        }
         if (group.replayable) {
             replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
         }
     }
     if (replay_window_tokens > 0) {
-        // A prefix hit re-feeds up to one replay window and must still advance:
-        // by every new token when fewer than a window remain, or by one prefix
-        // page when a promotion boundary aligns the chunk.
+        // A prefix hit re-feeds up to one replay window and must still carry
+        // the prompt's final window whole, or at least a prefix page of new
+        // tokens when the window is smaller than a page.
         if (max_scheduled_tokens < replay_window_tokens + std::max(replay_window_tokens, prefix_granularity)) {
             throw std::invalid_argument(
                 "Scheduler: max_scheduled_tokens must cover the replayable groups' largest sliding_window_tokens "
                 "plus max(that window, prefix_granularity)");
-        }
-        // The final-chunk window rule and the state-checkpoint chunk alignment
-        // would each reshape the other's chunk; no model needs both.
-        for (const CacheGroupConfig& group : cache_groups) {
-            if (group.Kind() == AttnKind::kMambaState) {
-                throw std::invalid_argument(
-                    "Scheduler: bounded-replay cache groups cannot be combined with snapshot-state groups");
-            }
         }
     }
 }

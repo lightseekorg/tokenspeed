@@ -59,6 +59,9 @@ def _publish_after_release(source, target, rows, BLOCK: tl.constexpr):
         pytest.param(4, 4096, id="fused-cached"),
         pytest.param(129, 65536, id="fused-uncached"),
         pytest.param(4, 32768, id="map-reduce"),
+        pytest.param(3, 40001, id="map-reduce-ragged"),
+        # Rows that alone fill the SMs normalize whole rows.
+        pytest.param(120, 40001, id="map-reduce-whole-rows"),
     ],
 )
 @pytest.mark.parametrize("graph_replay", [False, True])
@@ -95,3 +98,64 @@ def test_softmax_waits_for_temperature(
     stream.synchronize()
     assert torch.isfinite(actual).all()
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab",
+    [
+        pytest.param(6, 4096, id="fused-cached"),
+        pytest.param(130, 65536, id="fused-uncached"),
+        pytest.param(16, 151936, id="map-reduce"),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype,graph_replay", [(torch.float32, False), (torch.bfloat16, True)]
+)
+def test_softmax_skips_greedy_rows(
+    rows: int, vocab: int, dtype: torch.dtype, graph_replay: bool, device: str
+) -> None:
+    """Rows whose top-k is 1 leave their output rows untouched; the others
+    match the call without skips bit for bit. The top-ks are published by a
+    PDL producer after the softmax has launched."""
+    generator = torch.Generator(device=device).manual_seed(rows)
+    logits = torch.randn(rows, vocab, device=device, generator=generator) * 3.0
+    logits = logits.to(dtype)
+    temperature = torch.linspace(0.5, 1.5, rows, device=device)
+    published = torch.where(torch.arange(rows, device=device) % 3 == 1, 1, 20).int()
+    computed = published != 1
+    expected = softmax(logits, temperature=temperature)
+    top_ks = torch.empty_like(published)
+    out = torch.empty(rows, vocab, device=device)
+
+    def run() -> torch.Tensor:
+        top_ks.fill_(1)  # Visible only to a read before the wait: skips every row.
+        out.fill_(7.0)
+        _publish_after_release[(1,)](
+            published,
+            top_ks,
+            rows,
+            BLOCK=triton.next_power_of_2(rows),
+            launch_pdl=True,
+        )
+        return softmax(
+            logits,
+            temperature=temperature,
+            enable_pdl=True,
+            skip_greedy_top_ks=top_ks,
+            out=out,
+        )
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        run()  # Compile and load both kernels before the checked run.
+        if graph_replay:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                actual = run()
+            graph.replay()
+        else:
+            actual = run()
+    stream.synchronize()
+    assert torch.equal(actual[computed], expected[computed])
+    assert (actual[~computed] == 7.0).all()

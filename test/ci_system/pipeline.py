@@ -1281,15 +1281,19 @@ def check_eval_score_threshold(
     }
 
 
-PERF_CSV_HEADER = (
-    "config,Conc.,Latency (tps/user),Throughput (tps/gpu),"
-    "Approx Cache Hit,Decoded Tok/Iter"
+PERF_THROUGHPUT_METRICS = (
+    "Throughput (tps/gpu)",
+    "Output Throughput (tok/min/gpu)",
 )
-PERF_REFERENCE_METRICS = ("Latency (tps/user)", "Throughput (tps/gpu)")
+PERF_CSV_HEADERS = tuple(
+    f"config,Conc.,Latency (tps/user),{metric},Approx Cache Hit,Decoded Tok/Iter"
+    for metric in PERF_THROUGHPUT_METRICS
+)
 
 
 def extract_perf_summary_rows(output: str) -> List[Dict[str, str]] | None:
-    idx = output.find(PERF_CSV_HEADER)
+    positions = [output.find(header) for header in PERF_CSV_HEADERS]
+    idx = min((position for position in positions if position >= 0), default=-1)
     if idx < 0:
         return None
     block = output[idx:]
@@ -1350,7 +1354,7 @@ def check_perf_reference(
             ) from exc
         if not isinstance(ref_pair, list) or len(ref_pair) != 2:
             raise ValueError(
-                f"perf_reference[{conc_key}] must be [tps_user, tps_gpu]; "
+                f"perf_reference[{conc_key}] must be [tps_user, throughput_per_gpu]; "
                 f"got {ref_pair!r}"
             )
         match = next((r for r in rows if int(r["Conc."]) == conc), None)
@@ -1358,7 +1362,10 @@ def check_perf_reference(
             failures.append(f"conc={conc}: no matching row in perf summary")
             continue
         entry: Dict[str, Any] = {"conc": conc}
-        for metric, ref in zip(PERF_REFERENCE_METRICS, ref_pair):
+        throughput_metric = next(
+            metric for metric in PERF_THROUGHPUT_METRICS if metric in match
+        )
+        for metric, ref in zip(("Latency (tps/user)", throughput_metric), ref_pair):
             ref_v = float(ref)
             actual = float(match[metric])
             floor = ref_v * threshold
@@ -1417,7 +1424,11 @@ def format_perf_reference_table(checks: List[Dict[str, Any]]) -> List[str]:
     lines = [header, rule]
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
-        thru = entry.get("Throughput (tps/gpu)") or {}
+        thru = (
+            entry.get("Throughput (tps/gpu)")
+            or entry.get("Output Throughput (tok/min/gpu)")
+            or {}
+        )
         lines.append(
             f"{entry['conc']:>4}  "
             f"{lat.get('actual', 0):>10.2f} "
@@ -1447,7 +1458,11 @@ def format_perf_reference_markdown_table(checks: List[Dict[str, Any]]) -> List[s
     ]
     for entry in checks:
         lat = entry.get("Latency (tps/user)") or {}
-        thru = entry.get("Throughput (tps/gpu)") or {}
+        thru = (
+            entry.get("Throughput (tps/gpu)")
+            or entry.get("Output Throughput (tok/min/gpu)")
+            or {}
+        )
         lines.append(
             f"| {entry['conc']} "
             f"| {lat.get('actual', 0):.2f} "

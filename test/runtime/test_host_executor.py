@@ -2,17 +2,15 @@
 
 from __future__ import annotations
 
-import inspect
 import os
 import sys
 import threading
-import time
-import unittest
-from concurrent.futures import Future
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from importlib import import_module, util
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
+
+import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -95,6 +93,9 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.HostTransferLane = Mock
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
+    lanes.host_memory_share = Mock(return_value=10**12)
+    lanes.largest_pinned_fit = Mock(side_effect=lambda room_bytes: max(room_bytes, 0))
+    lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
     scheduler = ModuleType("tokenspeed_scheduler")
@@ -124,7 +125,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     scheduler.Cache = Cache
     layerwise_load = ModuleType("tokenspeed.runtime.cache.l2.layerwise_load")
     layerwise_load.LayerwiseLoadTracker = Mock
-    storage = ModuleType("tokenspeed.runtime.cache.l2.storage")
+    storage = ModuleType("tokenspeed.runtime.cache.host_storage")
     storage.HostCacheStorage = Mock
     storage.compute_host_lcm_block_bytes = Mock(return_value=1)
     layout = ModuleType("tokenspeed.runtime.cache.transfer.layout")
@@ -140,7 +141,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
         "tokenspeed_kernel.ops.kvcache.host_transfer": host_transfer,
         "tokenspeed_scheduler": scheduler,
         "tokenspeed.runtime.cache.l2.layerwise_load": layerwise_load,
-        "tokenspeed.runtime.cache.l2.storage": storage,
+        "tokenspeed.runtime.cache.host_storage": storage,
         "tokenspeed.runtime.cache.transfer.lanes": lanes,
         "tokenspeed.runtime.cache.transfer.layout": layout,
         "tokenspeed.runtime.cache.transfer.ownership": ownership,
@@ -169,8 +170,8 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     return executor_module
 
 
-class CacheEventPayloadTest(unittest.TestCase):
-    def setUp(self):
+class TestCacheEventPayloadTest:
+    def setup_method(self):
         try:
             from tokenspeed_scheduler import Cache
 
@@ -180,7 +181,7 @@ class CacheEventPayloadTest(unittest.TestCase):
                 pop_common_cache_event_payloads,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
         self.Cache = Cache
         self.from_payload = cache_event_from_payload
         self.to_payload = cache_event_to_payload
@@ -190,31 +191,15 @@ class CacheEventPayloadTest(unittest.TestCase):
         write_back = self.Cache.WriteBackDoneEvent()
         write_back.op_id = 7
         write_payload = self.to_payload(write_back)
-        self.assertEqual(write_payload, {"kind": "WriteBackDoneEvent", "op_id": 7})
+        assert (write_payload) == ({"kind": "WriteBackDoneEvent", "op_id": 7})
 
         # A load-back lands or does not happen: the ACK carries no outcome.
         load_back = self.Cache.LoadBackDoneEvent(8)
         load_payload = self.to_payload(load_back)
-        self.assertEqual(load_payload, {"kind": "LoadBackDoneEvent", "op_id": 8})
+        assert (load_payload) == ({"kind": "LoadBackDoneEvent", "op_id": 8})
         restored = self.from_payload(load_payload)
-        self.assertIsInstance(restored, self.Cache.LoadBackDoneEvent)
-        self.assertEqual(int(restored.op_id), 8)
-
-        # An L3 prefetch's ACK carries the pages it landed, replica-converged.
-        prefetch = self.Cache.PrefetchDoneEvent(9, 3)
-        prefetch_payload = self.to_payload(prefetch)
-        self.assertEqual(
-            prefetch_payload,
-            {"kind": "PrefetchDoneEvent", "op_id": 9, "landed_pages": 3},
-        )
-        restored = self.from_payload(prefetch_payload)
-        self.assertIsInstance(restored, self.Cache.PrefetchDoneEvent)
-        self.assertEqual((int(restored.op_id), int(restored.landed_pages)), (9, 3))
-        with self.assertRaises(KeyError):
-            self.from_payload({"kind": "PrefetchDoneEvent", "op_id": 9})
-        self.assertEqual(
-            self.pop_common([[load_payload], [dict(load_payload)]]), [load_payload]
-        )
+        assert isinstance((restored), (self.Cache.LoadBackDoneEvent))
+        assert (int(restored.op_id)) == (8)
 
 
 def _lanes_module():
@@ -234,12 +219,12 @@ def _identity_owners(num_groups=1, bound=64):
     )
 
 
-class GroupAwareWireTest(unittest.TestCase):
+class TestGroupAwareWireTest:
     def _executor_module(self):
         try:
             return _load_executor_module_without_triton()
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
 
     def _make_load_executor(
         self,
@@ -259,13 +244,6 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._ready_load_acks = []
         executor._completions = _lanes_module().CompletionQueue()
         executor._load_poisoned = False
-        executor.l3_store = None
-        executor._l3_prefetch_lane = None
-        executor._prefetch_jobs = {}
-        executor._prefetch_acks = []
-        executor._l3_prefetch_timeout_base_s = 10.0
-        executor._l3_prefetch_timeout_per_page_s = 0.0
-        executor._l3_prefetch_batch_pages = 2
         executor.load_stream = object() if load_stream is None else load_stream
         executor.transfer_backend = backend
         device = SimpleNamespace(type="cuda")
@@ -289,7 +267,7 @@ class GroupAwareWireTest(unittest.TestCase):
         executor._load_workspaces = (workspace,)
         return executor_module, executor, device, geometry, workspace
 
-    def test_hybrid_state_access_waits_for_layer_load(self):
+    def test_hybrid_state_access_waits_for_layer_load(self, subtests):
         try:
             from tokenspeed.runtime.layers.attention.kv_cache.hybrid_kda import (
                 HybridKDATokenToKVPool,
@@ -298,10 +276,10 @@ class GroupAwareWireTest(unittest.TestCase):
                 HybridMHATokenToKVPool,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
 
         for pool_type in (HybridMHATokenToKVPool, HybridKDATokenToKVPool):
-            with self.subTest(pool_type=pool_type.__name__):
+            with subtests.test(pool_type=pool_type.__name__):
                 tracker = Mock()
                 pool = pool_type.__new__(pool_type)
                 pool.layerwise_load_tracker = tracker
@@ -309,14 +287,14 @@ class GroupAwareWireTest(unittest.TestCase):
                 if pool_type is HybridMHATokenToKVPool:
                     pool._state_layer_ids = (3,)
 
-                self.assertEqual(pool.get_component(3, "conv_state"), "conv")
+                assert (pool.get_component(3, "conv_state")) == ("conv")
                 tracker.wait_for_layer.assert_called_once_with(3)
 
     def test_pool_transfer_layout_matches_scheduler_group_order(self):
         try:
-            from cache_pool_test_utils import MinimalCacheView
+            from test.runtime.cache_pool_test_utils import MinimalCacheView
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
 
         pool = MinimalCacheView.__new__(MinimalCacheView)
         pool.layer_num = 2
@@ -371,10 +349,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
         layout = pool.cache_transfer_layout()
 
-        self.assertEqual(
-            tuple(group.group_id for group in layout.groups),
-            ("state", "full"),
-        )
+        assert (tuple(group.group_id for group in layout.groups)) == (("state", "full"))
 
     def test_submit_load_backs_clears_layerwise_waits_without_load(self):
         HostCacheExecutor = self._executor_module().HostCacheExecutor
@@ -389,184 +364,6 @@ class GroupAwareWireTest(unittest.TestCase):
         executor.submit_load_backs([], prerequisite_stream=object())
 
         tracker.set_consumers.assert_called_once_with(-1)
-
-    def _prefetch_executor(self, *, batch_pages=2, timeout_base_s=10.0, rank=0):
-        """A bare executor with the prefetch lane's state and a mock L3 store."""
-        module = _load_executor_module_without_triton(force_isolated=True)
-        executor = module.HostCacheExecutor.__new__(module.HostCacheExecutor)
-        executor.attn_tp_rank = 0
-        executor._ack_lock = threading.Lock()
-        executor._ready_load_acks = []
-        executor._completions = _lanes_module().CompletionQueue()
-        executor._backup_futures = []
-        executor._backup_poll_failed = False
-        executor._l3_workers = None
-        executor.l3_store = Mock()
-        executor._l3_prefetch_lane = None
-        executor._prefetch_jobs = {}
-        executor._prefetch_acks = []
-        executor._l3_prefetch_timeout_base_s = timeout_base_s
-        executor._l3_prefetch_timeout_per_page_s = 0.0
-        executor._l3_prefetch_batch_pages = batch_pages
-        executor.block_owners = _identity_owners(num_groups=2)
-        return module, executor
-
-    @staticmethod
-    def _prefetch_op(module, op_id, pages, *, groups=(0,)):
-        """One prefetch op of ``pages`` prefix pages, page-major, one row per group."""
-        ops_module = import_module("tokenspeed.runtime.cache.transfer.ops")
-        rows = []
-        for page in range(pages):
-            for group in groups:
-                rows.append(
-                    ops_module.PrefetchRow(
-                        group_id=group,
-                        host_page=1 + page * len(groups) + groups.index(group),
-                        content_hash=f"h{page}",
-                        page_offset=page,
-                        page_index=page,
-                    )
-                )
-        return ops_module.PrefetchOp(
-            op_id=op_id,
-            request_id=f"r{op_id}",
-            first_page=0,
-            num_pages=pages,
-            rows=tuple(rows),
-        )
-
-    @staticmethod
-    def _settle(executor, op_id):
-        for _ in range(200):
-            progress = executor.l3_prefetch_progress()
-            if progress[op_id][0]:
-                return progress[op_id][1]
-            time.sleep(0.01)
-        raise AssertionError("prefetch lane did not finish")
-
-    def test_prefetch_lane_lands_the_prefix_before_the_first_missing_page(self):
-        """The lane fetches in prefix order, a batch at a time, and stops at
-        the first page with a missing object (in any group); the landed count
-        is a prefix length and the op is acknowledged once, with the count
-        the hooks converged, never before they did."""
-        module, executor = self._prefetch_executor(batch_pages=2)
-        fetched = []
-
-        def prefetch(pages):
-            fetched.append([page[2] for page in pages])
-            # Page 2's second group is missing: pages 0 and 1 land.
-            return [not (page[2] == "h2" and page[0] == 1) for page in pages]
-
-        executor.l3_store.prefetch.side_effect = prefetch
-        op = self._prefetch_op(module, 5, 4, groups=(0, 1))
-        executor.submit_prefetches([op, SimpleNamespace()])
-        landed = self._settle(executor, 5)
-
-        self.assertEqual(landed, 2)
-        # Batches of two pages (four rows); the fetch stopped after the batch
-        # holding the miss, so pages 3 were never requested.
-        self.assertEqual(fetched, [["h0", "h0", "h1", "h1"], ["h2", "h2", "h3", "h3"]])
-        self.assertEqual(executor.poll_results(), [])
-        executor.complete_l3_prefetch(5, 1)  # the replica's common prefix
-        (ack,) = executor.poll_results()
-        self.assertEqual(
-            (type(ack).__name__, ack.op_id, ack.landed_pages),
-            ("PrefetchDoneEvent", 5, 1),
-        )
-        self.assertEqual(executor.poll_results(), [])
-        self.assertEqual(executor.l3_prefetch_progress(), {})
-        with self.assertRaises(KeyError):
-            executor.complete_l3_prefetch(5, 1)
-
-    def test_prefetch_lane_stops_at_the_deadline_and_on_a_backend_fault(self):
-        module, executor = self._prefetch_executor(batch_pages=1, timeout_base_s=1.0)
-        # The lane reads the clock once for the deadline and once before each
-        # batch: the first batch is on time, the second past the deadline.
-        clock = iter([0.0, 0.0] + [10.0] * 100)
-        executor.l3_store.prefetch.side_effect = lambda pages: [True] * len(pages)
-        with patch.object(module.time, "monotonic", side_effect=lambda: next(clock)):
-            executor.submit_prefetches([self._prefetch_op(module, 1, 3)])
-            self.assertEqual(self._settle(executor, 1), 1)
-        self.assertEqual(executor.l3_store.prefetch.call_count, 1)
-
-        executor.l3_store.prefetch.side_effect = [[True], RuntimeError("rpc")]
-        executor.submit_prefetches([self._prefetch_op(module, 2, 3)])
-        self.assertEqual(self._settle(executor, 2), 1)
-        with self.assertRaises(ValueError):
-            executor.complete_l3_prefetch(2, 4)  # more than the op has
-        executor.complete_l3_prefetch(1, 1)
-        executor.complete_l3_prefetch(2, 0)
-        self.assertEqual(
-            [(ack.op_id, ack.landed_pages) for ack in executor.poll_results()],
-            [(1, 1), (2, 0)],
-        )
-
-    def test_prefetch_submission_validates_the_plan_before_starting_any_job(self):
-        module, executor = self._prefetch_executor()
-        ops_module = import_module("tokenspeed.runtime.cache.transfer.ops")
-        with self.assertRaisesRegex(ValueError, "duplicate prefetch op id"):
-            executor.submit_prefetches(
-                [self._prefetch_op(module, 1, 1), self._prefetch_op(module, 1, 2)]
-            )
-        with self.assertRaisesRegex(ValueError, "carries no pages"):
-            executor.submit_prefetches(
-                [
-                    ops_module.PrefetchOp(
-                        op_id=3, request_id="r", first_page=0, num_pages=0, rows=()
-                    )
-                ]
-            )
-        # Rows must stay inside [first_page, first_page + num_pages) and in order.
-        op = self._prefetch_op(module, 5, 2)
-        bad = ops_module.PrefetchOp(
-            op_id=5, request_id="r5", first_page=1, num_pages=2, rows=op.rows
-        )
-        with self.assertRaisesRegex(ValueError, "outside .* or out of order"):
-            executor.submit_prefetches([bad])
-        executor.l3_store = None
-        with self.assertRaisesRegex(RuntimeError, "no storage backend"):
-            executor.submit_prefetches([self._prefetch_op(module, 4, 1)])
-        self.assertEqual(executor._prefetch_jobs, {})
-
-    def test_a_prefetch_that_raised_lands_nothing_and_is_logged_once(self):
-        """The hooks poll progress every round until the replica converges;
-        a failed lane job is an error once, not a traceback per round."""
-        module, executor = self._prefetch_executor(batch_pages=1)
-        executor._l3_prefetch_batch_pages = 0  # range(..., 0): the job raises
-        module.logger.error.reset_mock()  # the isolated module's logger is a Mock
-        executor.submit_prefetches([self._prefetch_op(module, 9, 2)])
-        self.assertEqual(self._settle(executor, 9), 0)
-        for _ in range(3):
-            self.assertEqual(executor.l3_prefetch_progress(), {9: (True, 0)})
-        module.logger.error.assert_called_once()
-        self.assertIn("prefetch 9 (r9) raised", module.logger.error.call_args.args[0])
-        # Draining never re-raises a failed job: it has left the lane.
-        executor._wait_l3_prefetches()
-        executor.complete_l3_prefetch(9, 0)
-
-    def test_the_weight_version_swap_drains_in_flight_prefetches(self):
-        """A prefetch gets under the key prefix, so the prefix is not swapped
-        while one is on the lane -- the backups were already drained; the
-        prefetches are too, a failed one included."""
-        module, executor = self._prefetch_executor()
-        executor._l3_prefix_for_weight_version = lambda version: f"prefix/{version}"
-        pending, failed = Future(), Future()
-        executor._prefetch_jobs = {
-            1: module._PrefetchJob(request_id="r1", num_pages=2, future=pending),
-            2: module._PrefetchJob(request_id="r2", num_pages=2, future=failed),
-        }
-        failed.set_exception(RuntimeError("rpc"))
-        swapped = threading.Event()
-        executor.l3_store.set_key_prefix.side_effect = lambda prefix: swapped.set()
-        worker = threading.Thread(
-            target=executor.set_l3_weight_version, args=("v2",), daemon=True
-        )
-        worker.start()
-        self.assertFalse(swapped.wait(0.05), "swapped while a prefetch was in flight")
-        pending.set_result(2)
-        self.assertTrue(swapped.wait(5.0))
-        worker.join(5.0)
-        executor.l3_store.set_key_prefix.assert_called_once_with("prefix/v2")
 
     def _owner_executor(self, *, num_groups=2):
         """An executor with replicated (identity) owner translations only."""
@@ -594,10 +391,12 @@ class GroupAwareWireTest(unittest.TestCase):
             source_is_device=True,
             tier=HostTier.L2,
         )
-        self.assertEqual(op_ids, [7])
-        self.assertEqual(transfers, [(0, 5, 9), (1, 5, 9)])
+        assert (op_ids) == ([7])
+        assert (transfers) == ([(0, 5, 9), (1, 5, 9)])
 
-    def test_sharded_rows_keep_only_this_ranks_owned_blocks_on_both_ends(self):
+    def test_sharded_rows_keep_only_this_ranks_owned_blocks_on_both_ends(
+        self, subtests
+    ):
         # A group dealt to two owners: rank r keeps the rows whose Device AND
         # Host block have residue r, in local ids; the op is collected even
         # when every row belongs to the other rank.
@@ -606,7 +405,7 @@ class GroupAwareWireTest(unittest.TestCase):
 
         executor_module = self._executor_module()
         for rank, expected in ((0, [(0, 1, 2), (0, 2, 3)]), (1, [(0, 1, 1)])):
-            with self.subTest(rank=rank):
+            with subtests.test(rank=rank):
                 executor = executor_module.HostCacheExecutor.__new__(
                     executor_module.HostCacheExecutor
                 )
@@ -628,9 +427,9 @@ class GroupAwareWireTest(unittest.TestCase):
                     source_is_device=True,
                     tier=HostTier.L2,
                 )
-                self.assertEqual(op_ids, [7])
-                self.assertEqual(transfers, expected)
-        with self.assertRaisesRegex(ValueError, "residue class"):
+                assert (op_ids) == ([7])
+                assert (transfers) == (expected)
+        with pytest.raises((ValueError), match=("residue class")):
             executor._append_transfers(
                 [8],
                 [[0]],
@@ -672,7 +471,7 @@ class GroupAwareWireTest(unittest.TestCase):
         )
         return executor, device
 
-    def test_writeback_rides_the_write_stream_ordered_after_the_caller(self):
+    def test_writeback_rides_the_write_stream_ordered_after_the_caller(self, subtests):
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
         executor, device = self._make_write_executor(executor_module)
@@ -701,7 +500,6 @@ class GroupAwareWireTest(unittest.TestCase):
             fence = executor._start_writing(
                 [7],
                 [(0, 5, 9)],
-                backup_pages=[],
                 lane=lane,
                 prerequisite_stream=prerequisite_stream,
             )
@@ -710,7 +508,7 @@ class GroupAwareWireTest(unittest.TestCase):
         # caller named (the forwards that wrote the pages). The completion
         # event is handed back so a stream-ordered submission can fence the
         # caller's fence stream on it; a pinned one simply drops it.
-        self.assertIs(fence, finish)
+        assert (fence) is (finish)
         executor.write_stream.wait_stream.assert_called_once_with(prerequisite_stream)
         # The address tables and the metadata H2D are enqueued on the write
         # stream too: the payload kernel reads them from that stream, and a
@@ -740,13 +538,13 @@ class GroupAwareWireTest(unittest.TestCase):
         finish.record.assert_called_once_with(executor.write_stream)
         metadata_done.record.assert_called_once_with(executor.write_stream)
         metadata_done.synchronize.assert_not_called()
-        self.assertIsNone(executor._ordered_write_lane.metadata_done)
+        assert (executor._ordered_write_lane.metadata_done) is None
 
         # Refill must wait for metadata, but must never wait for payload ACK;
         # the upload and its retirement event sit inside the write-stream
         # context, the payload launch names the stream explicitly.
         for ready in (False, True):
-            with self.subTest(metadata_ready=ready):
+            with subtests.test(metadata_ready=ready):
                 metadata_done.reset_mock()
                 metadata_done.query.return_value = ready
                 order = Mock()
@@ -767,13 +565,11 @@ class GroupAwareWireTest(unittest.TestCase):
                     executor._start_writing(
                         [8],
                         [(0, 6, 10)],
-                        backup_pages=[],
                         lane=lane,
                         prerequisite_stream=prerequisite_stream,
                     )
                 names = [call[0] for call in order.mock_calls]
-                self.assertEqual(
-                    names,
+                assert (names) == (
                     ([] if ready else ["retire"])
                     + [
                         "refill",
@@ -783,7 +579,7 @@ class GroupAwareWireTest(unittest.TestCase):
                         "record",
                         "stream().__exit__",
                         "payload",
-                    ],
+                    ]
                 )
                 finish.synchronize.assert_not_called()
 
@@ -846,129 +642,19 @@ class GroupAwareWireTest(unittest.TestCase):
         pinned_lane.workspace.load_block_transfers.assert_called_once_with(
             [(0, 1, 5), (0, 3, 7)], geometry=executor._transfer_geometry
         )
-        self.assertEqual(
-            [call.args[4] for call in transfer.call_args_list],
-            [ordered_lane.workspace, pinned_lane.workspace],
+        assert ([call.args[4] for call in transfer.call_args_list]) == (
+            [ordered_lane.workspace, pinned_lane.workspace]
         )
         fence_stream.wait_event.assert_called_once_with(ordered_finish)
         pending = executor._completions._pending
-        self.assertEqual(
-            [(finish, ack.kind, ack.op_ids) for finish, ack in pending],
-            [
-                (ordered_finish, executor_module._AckKind.WRITE_BACK, [12]),
-                (pinned_finish, executor_module._AckKind.WRITE_BACK, [11, 13]),
-            ],
-        )
-        self.assertEqual(
-            [ack.backup_pages for _, ack in pending],
-            [[(0, 6, "ordered", 1)], [(0, 5, "pinned-a", 0), (0, 7, "pinned-b", 2)]],
-        )
-        self.assertEqual(
-            executor.write_stream.wait_stream.call_args_list,
-            [call(prerequisite), call(prerequisite)],
-            "both launches order behind the prerequisite stream the caller named",
-        )
+        assert [(finish, ack.kind, ack.op_ids) for finish, ack in pending] == [
+            (ordered_finish, executor_module._AckKind.WRITE_BACK, [12]),
+            (pinned_finish, executor_module._AckKind.WRITE_BACK, [11, 13]),
+        ]
 
-    def test_mixed_write_lanes_ack_only_their_completed_l3_put(self):
-        executor_module = self._executor_module()
-        lanes_module = _lanes_module()
-        executor, _ = self._make_write_executor(executor_module)
-        executor._ready_load_acks = []
-        executor._prefetch_acks = []
-        executor._backup_futures = []
-        executor._l3_workers = None
-        executor.l3_store = Mock()
-        executor._write_done = lambda op_id: op_id
-        started = [threading.Event(), threading.Event()]
-        release = [threading.Event(), threading.Event()]
-        ordered_pages = [(0, 6, "ordered", 0)]
-        pinned_pages = [(0, 5, "pinned", 0)]
-
-        def backup(pages):
-            index = 0 if pages == ordered_pages else 1
-            self.assertEqual(pages, [ordered_pages, pinned_pages][index])
-            started[index].set()
-            if not release[index].wait(timeout=10):
-                raise TimeoutError("mixed-lane PUT gate was not released")
-            return [True]
-
-        executor.l3_store.backup.side_effect = backup
-        ordered_finish = Mock()
-        pinned_finish = Mock()
-        ordered_finish.query.return_value = False
-        pinned_finish.query.return_value = False
-        events = iter([Mock(), ordered_finish, Mock(), pinned_finish])
-
-        class WriteBackOp:
-            def __init__(self):
-                self.op_ids = [11, 12]
-                self.group_ids = [[0], [0]]
-                self.src_pages = [[1], [2]]
-                self.dst_pages = [[5], [6]]
-                self.source_pinned = [True, False]
-                self.content_hashes = [["pinned"], ["ordered"]]
-                self.page_offsets = [[0], [0]]
-
-        def poll_until_ready():
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                ready = executor.poll_results()
-                if ready:
-                    return ready
-                time.sleep(0.001)
-            self.fail("completed L3 PUT did not produce its ACK")
-
-        try:
-            with (
-                patch.object(executor_module.Cache, "WriteBackOp", WriteBackOp),
-                patch.object(lanes_module.device_module, "current_stream"),
-                patch.object(
-                    lanes_module.device_module,
-                    "stream",
-                    return_value=nullcontext(),
-                ),
-                patch.object(
-                    lanes_module.device_module,
-                    "Event",
-                    side_effect=lambda: next(events),
-                ),
-                patch.object(lanes_module, "transfer_cache_blocks"),
-            ):
-                executor.submit_write_backs(
-                    [WriteBackOp()],
-                    prerequisite_stream=object(),
-                    fence_stream=Mock(),
-                )
-
-            self.assertEqual(executor.poll_results(), [])
-            executor.l3_store.backup.assert_not_called()
-            ordered_finish.query.return_value = True
-            pinned_finish.query.return_value = True
-            self.assertEqual(executor.poll_results(), [])
-            self.assertTrue(started[0].wait(timeout=10))
-            self.assertFalse(started[1].is_set())
-            self.assertEqual(executor.poll_results(), [])
-
-            release[0].set()
-            self.assertTrue(started[1].wait(timeout=10))
-            self.assertEqual(poll_until_ready(), [12])
-            self.assertEqual(executor.poll_results(), [])
-            self.assertEqual(
-                [op_ids for _, op_ids, _ in executor._backup_futures], [[11]]
-            )
-
-            release[1].set()
-            self.assertEqual(poll_until_ready(), [11])
-            self.assertEqual(executor.poll_results(), [])
-            self.assertEqual(executor._backup_futures, [])
-            executor.l3_store.backup.assert_has_calls(
-                [call(ordered_pages), call(pinned_pages)]
-            )
-        finally:
-            for gate in release:
-                gate.set()
-            if executor._l3_workers is not None:
-                executor._l3_workers.shutdown(wait=True)
+        assert (executor.write_stream.wait_stream.call_args_list) == (
+            [call(prerequisite), call(prerequisite)]
+        ), "both launches order behind the prerequisite stream the caller named"
 
     def test_submit_write_backs_without_stream_ordered_ops_fences_nothing(self):
         executor_module = self._executor_module()
@@ -1022,14 +708,14 @@ class GroupAwareWireTest(unittest.TestCase):
         with patch.object(
             executor_module.Cache, "WriteBackOp", WriteBackOp, create=True
         ):
-            with self.assertRaises(ValueError):
+            with pytest.raises((ValueError)):
                 executor.submit_write_backs(
                     [WriteBackOp()],
                     prerequisite_stream=prerequisite,
                     fence_stream=object(),
                 )
 
-    def test_cache_operation_without_transfers_is_refused(self):
+    def test_cache_operation_without_transfers_is_refused(self, subtests):
         # An op is acknowledged by its copy's completion event, so one with
         # nothing to copy could never be acknowledged; the scheduler never
         # emits one, and the runtime refuses rather than inventing an ack.
@@ -1037,10 +723,10 @@ class GroupAwareWireTest(unittest.TestCase):
 
         _, executor = self._owner_executor()
         for source_is_device in (True, False):
-            with self.subTest(source_is_device=source_is_device):
+            with subtests.test(source_is_device=source_is_device):
                 op_ids: list[int] = []
                 transfers: list[tuple[int, int, int]] = []
-                with self.assertRaisesRegex(ValueError, "operation 11 carries no"):
+                with pytest.raises((ValueError), match=("operation 11 carries no")):
                     executor._append_transfers(
                         [7, 11],
                         [[0], []],
@@ -1096,9 +782,11 @@ class GroupAwareWireTest(unittest.TestCase):
         load_events.start_event.record.assert_called_once_with(prerequisite_stream)
         load_events.start_event.wait.assert_called_once_with(executor.load_stream)
 
-    def test_resolved_transport_selects_events_even_with_device_geometry(self):
+    def test_resolved_transport_selects_events_even_with_device_geometry(
+        self, subtests
+    ):
         for uses_device_tables in (False, True):
-            with self.subTest(uses_device_tables=uses_device_tables):
+            with subtests.test(uses_device_tables=uses_device_tables):
                 module, executor, _, _, workspace = self._make_load_executor(
                     consumers=(("first",), ("second",)),
                     layer_slices=((0, 1), (1, 1)),
@@ -1125,15 +813,13 @@ class GroupAwareWireTest(unittest.TestCase):
                     executor._start_loading(
                         [9], [(0, 1, 1)], prerequisite_stream=object()
                     )
-                self.assertEqual(
-                    workspace.commit_block_transfers.call_count, int(uses_device_tables)
+                assert (workspace.commit_block_transfers.call_count) == (
+                    int(uses_device_tables)
                 )
                 workspace.prepare_layer_ready.assert_not_called()
-                self.assertIsNone(events.layer_ready_flags)
-                self.assertEqual(transfer.call_count, 2)
-                self.assertTrue(
-                    all(event is not None for event in events.layer_done_events)
-                )
+                assert (events.layer_ready_flags) is None
+                assert (transfer.call_count) == (2)
+                assert all(event is not None for event in events.layer_done_events)
 
     def test_kernel_init_builds_consumer_ordered_static_geometry_once(self):
         executor_module = self._executor_module()
@@ -1237,7 +923,14 @@ class GroupAwareWireTest(unittest.TestCase):
             patch.object(
                 executor_module, "LayerwiseLoadTracker", side_effect=make_tracker
             ),
-            patch.object(executor_module, "new_cache_stream", return_value="load"),
+            patch.object(
+                executor_module,
+                "new_cache_stream",
+                side_effect=lambda _priority: Mock(),
+            ),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
+            ),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
@@ -1257,6 +950,8 @@ class GroupAwareWireTest(unittest.TestCase):
                 io_backend="kernel",
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
 
         build_geometry.assert_called_once_with(
@@ -1273,10 +968,10 @@ class GroupAwareWireTest(unittest.TestCase):
             num_device_buffers=2,
         )
         unbound_geometry.bind.assert_called_once_with(device, non_blocking=False)
-        self.assertIs(executor._transfer_geometry, bound_geometry)
-        self.assertEqual([count for count, _ in trackers], [3, 1])
+        assert (executor._transfer_geometry) is (bound_geometry)
+        assert ([count for count, _ in trackers]) == ([3, 1])
 
-    def test_direct_and_npu_init_keep_geometry_on_the_host(self):
+    def test_direct_and_npu_init_keep_geometry_on_the_host(self, subtests):
         executor_module = self._executor_module()
         lanes_module = _lanes_module()
         HostCacheExecutor = executor_module.HostCacheExecutor
@@ -1309,7 +1004,14 @@ class GroupAwareWireTest(unittest.TestCase):
                 return_value=SimpleNamespace(available=10**12),
             ),
             patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
-            patch.object(executor_module, "new_cache_stream", return_value="load"),
+            patch.object(
+                executor_module,
+                "new_cache_stream",
+                side_effect=lambda _priority: Mock(),
+            ),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
+            ),
             patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
             patch.object(
@@ -1322,7 +1024,7 @@ class GroupAwareWireTest(unittest.TestCase):
             ) as build_geometry,
         ):
             for io_backend, device_type in (("direct", "cuda"), ("kernel", "npu")):
-                with self.subTest(io_backend=io_backend, device_type=device_type):
+                with subtests.test(io_backend=io_backend, device_type=device_type):
                     field = SimpleNamespace(
                         field_id="field",
                         device_buffer_index=0,
@@ -1355,18 +1057,20 @@ class GroupAwareWireTest(unittest.TestCase):
                         io_backend=io_backend,
                         attn_tp_rank=0,
                         kvp_rank=0,
+                        nprocs_per_node=1,
+                        world_cpu_group=None,
                     )
-                    self.assertIsNone(executor._transfer_geometry.device_rows)
+                    assert (executor._transfer_geometry.device_rows) is None
                     executor._transfer_geometry.bind.assert_not_called()
 
-        self.assertEqual(build_geometry.call_count, 2)
+        assert (build_geometry.call_count) == (2)
 
     def test_optional_dependency_shim_restores_existing_modules(self):
         protected_names = (
             "tokenspeed_kernel.ops.kvcache.host_transfer",
             "tokenspeed_scheduler",
             "tokenspeed.runtime.cache.l2.layerwise_load",
-            "tokenspeed.runtime.cache.l2.storage",
+            "tokenspeed.runtime.cache.host_storage",
             "tokenspeed.runtime.cache.transfer.lanes",
             "tokenspeed.runtime.cache.transfer.layout",
             "tokenspeed.runtime.cache.transfer.ownership",
@@ -1379,9 +1083,9 @@ class GroupAwareWireTest(unittest.TestCase):
         with patch.dict(sys.modules, sentinels, clear=False):
             isolated = _load_executor_module_without_triton(force_isolated=True)
 
-            self.assertIsNot(isolated, sentinels[protected_names[-1]])
+            assert (isolated) is not (sentinels[protected_names[-1]])
             for name, sentinel in sentinels.items():
-                self.assertIs(sys.modules[name], sentinel)
+                assert (sys.modules[name]) is (sentinel)
 
     def test_two_isolated_loads_preserve_imported_real_modules(self):
         # psutil is a real dependency of the shared lane module; the isolated
@@ -1389,13 +1093,13 @@ class GroupAwareWireTest(unittest.TestCase):
         # restore cannot drop it again.
         first = _load_executor_module_without_triton(force_isolated=True)
         first_psutil = sys.modules["psutil"]
-        self.assertIs(_lanes_module().psutil, first_psutil)
+        assert (_lanes_module().psutil) is (first_psutil)
 
         second = _load_executor_module_without_triton(force_isolated=True)
 
-        self.assertIsNot(first, second)
-        self.assertIs(sys.modules["psutil"], first_psutil)
-        self.assertIs(_lanes_module().psutil, first_psutil)
+        assert (first) is not (second)
+        assert (sys.modules["psutil"]) is (first_psutil)
+        assert (_lanes_module().psutil) is (first_psutil)
 
     def test_loadback_commits_block_ids_once_and_launches_one_flagged_kernel(self):
         executor_module, executor, device, geometry, workspace = (
@@ -1458,14 +1162,12 @@ class GroupAwareWireTest(unittest.TestCase):
             grid_cap=None,
         )
         finish.record.assert_called_once_with(executor.load_stream)
-        self.assertEqual(load_events.layer_done_events, [finish, finish, finish])
-        self.assertIs(load_events.layer_ready_flags, flags)
-        self.assertIs(load_events.wait_layer_ready, executor_module.wait_layer_ready)
+        assert (load_events.layer_done_events) == ([finish, finish, finish])
+        assert (load_events.layer_ready_flags) is (flags)
+        assert (load_events.wait_layer_ready) is (executor_module.wait_layer_ready)
         ((pending_finish, ack),) = executor._completions._pending
-        self.assertIs(pending_finish, finish)
-        self.assertEqual(
-            (ack.kind, ack.op_ids), (executor_module._AckKind.LOAD_BACK, [9])
-        )
+        assert (pending_finish) is (finish)
+        assert ((ack.kind, ack.op_ids)) == ((executor_module._AckKind.LOAD_BACK, [9]))
 
     def test_loadback_launch_failure_retires_all_target_and_draft_events(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
@@ -1511,18 +1213,15 @@ class GroupAwareWireTest(unittest.TestCase):
                 side_effect=RuntimeError("layer launch failed"),
             ) as transfer,
         ):
-            with self.assertRaisesRegex(RuntimeError, "layer launch failed"):
+            with pytest.raises((RuntimeError), match=("layer launch failed")):
                 executor._start_loading([9], [(0, 2, 1)], prerequisite_stream=object())
 
-        self.assertEqual(transfer.call_count, 1)
+        assert (transfer.call_count) == (1)
         retirement.record.assert_called_once_with(executor.load_stream)
-        self.assertEqual(
-            target_events.layer_done_events,
-            [retirement, retirement],
-        )
-        self.assertEqual(draft_events.layer_done_events, [retirement])
+        assert (target_events.layer_done_events) == ([retirement, retirement])
+        assert (draft_events.layer_done_events) == ([retirement])
         executor.load_stream.synchronize.assert_not_called()
-        self.assertEqual(executor._completions._pending, [])
+        assert (executor._completions._pending) == ([])
 
     def test_failed_retirement_sync_poisons_executor_and_preserves_original_error(self):
         executor_module, executor, _, _, _ = self._make_load_executor(
@@ -1565,231 +1264,254 @@ class GroupAwareWireTest(unittest.TestCase):
                 side_effect=original_error,
             ),
         ):
-            with self.assertRaises(RuntimeError) as raised:
+            with pytest.raises((RuntimeError)) as raised:
                 executor._start_loading([9], [(0, 2, 1)], prerequisite_stream=object())
 
-            self.assertIs(raised.exception, original_error)
-            self.assertEqual(str(raised.exception), "original layer launch failed")
-            self.assertTrue(executor._load_poisoned)
-            notes = getattr(raised.exception, "__notes__", ())
-            self.assertTrue(any("retirement record failed" in note for note in notes))
-            self.assertTrue(any("retirement sync failed" in note for note in notes))
+            assert (raised.value) is (original_error)
+            assert (str(raised.value)) == ("original layer launch failed")
+            assert executor._load_poisoned
+            notes = getattr(raised.value, "__notes__", ())
+            assert any("retirement record failed" in note for note in notes)
+            assert any("retirement sync failed" in note for note in notes)
 
             executor.load_stream.synchronize.side_effect = None
-            with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            with pytest.raises((RuntimeError), match=("poisoned")):
                 executor._start_loading([10], [(0, 3, 2)], prerequisite_stream=object())
 
         tracker.begin_load.assert_called_once_with()
 
 
-class L3FlatKvExecutorTest(unittest.TestCase):
-    def test_wait_l3_backups_snapshots_under_lock_and_waits_outside(self):
-        module = _load_executor_module_without_triton(force_isolated=True)
-        lock = threading.Lock()
-        observed = []
+class TestHostMemoryShareTest:
+    """The ranks of a node pin their Host tiers at once: each sizes them
+    against an equal share of the Host memory the node has available, every
+    buffer at the power of two its pinned allocation rounds up to."""
 
-        class PendingBackups(list):
-            def __iter__(self):
-                self_test.assertTrue(lock.locked())
-                return super().__iter__()
+    GB = 10**9
+    BLOCK_BYTES = 10**6  # one Host LCM block
+    # --kvstore-ratio 2 over a ~139 GB Device KV: 277.95 GB of L2 per rank.
+    LARGE_POOL_BLOCKS = 138_975
 
-        def completed():
-            self.assertFalse(lock.locked())
-            observed.append("done")
-
-        self_test = self
-        future = Mock()
-        future.result.side_effect = completed
-        executor = SimpleNamespace(
-            _ack_lock=lock,
-            _backup_futures=PendingBackups([(future, [7], [(0, 1, "h0", 0)])]),
-        )
-        module.HostCacheExecutor._wait_l3_backups(executor)
-        self.assertEqual(observed, ["done"])
-        future.result.side_effect = RuntimeError("backup failed")
-        with self.assertRaisesRegex(RuntimeError, "backup failed"):
-            module.HostCacheExecutor._wait_l3_backups(executor)
-        self.assertFalse(lock.locked())
-
-    def test_storage_pages_list_the_kept_hashed_rows_by_local_host_id(self):
+    def setup_method(self):
         try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+            self.executor_module = import_module("tokenspeed.runtime.cache.l2.executor")
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
+        self.headroom = self.executor_module._HOST_MEM_HEADROOM_BYTES
 
-        operation = SimpleNamespace(
-            content_hashes=[["h0", "h1", ""]],
-            page_offsets=[[0, 1, 0]],
-            group_ids=[[0, 1, 0]],
-            src_pages=[[3, 4, 9]],
-            dst_pages=[[7, 8, 10]],
+    def _fitting_blocks(self, available_gb, nprocs_per_node):
+        """The L2 blocks in the largest power of two of a rank's share."""
+        share = int(available_gb * self.GB) // nprocs_per_node - self.headroom
+        return (1 << (share.bit_length() - 1)) // self.BLOCK_BYTES
+
+    def _build(
+        self,
+        *,
+        available_gb,
+        nprocs_per_node,
+        device_lcm_blocks,
+        host_size_gb=0,
+        world_cpu_group=None,
+    ):
+        """An L2-only executor at --kvstore-ratio 2 and its mocked logger."""
+        executor_module = self.executor_module
+        lanes_module = _lanes_module()
+        field = SimpleNamespace(
+            field_id="field",
+            device_buffer_index=0,
+            device_block_zero_offset_bytes=0,
+            block_stride_bytes=16,
+            payload_bytes=16,
         )
-        # The kept rows name the Host end by local id (the destination a
-        # write-back wrote); an unkeyed row (no content hash) is not backed up.
-        write_pages = HostCacheExecutor._storage_pages(
-            operation, kept_rows=[(0, [(0, 7), (1, 8), (2, 10)])]
-        )
-        self.assertEqual(write_pages, [(0, 7, "h0", 0), (1, 8, "h1", 1)])
-        # Only the rows this rank kept are listed: a KVP peer's row is not.
-        self.assertEqual(
-            HostCacheExecutor._storage_pages(operation, kept_rows=[(0, [(1, 2)])]),
-            [(1, 2, "h1", 1)],
-        )
-
-    def test_ack_requires_backup_pages(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import (
-                HostCacheExecutor,
-                _Ack,
-                _AckKind,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(_Ack)
-        self.assertIs(
-            signature.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            _Ack(_AckKind.WRITE_BACK, [1])
-        start_writing = inspect.signature(HostCacheExecutor._start_writing)
-        self.assertIs(
-            start_writing.parameters["backup_pages"].default, inspect.Parameter.empty
-        )
-        with self.assertRaises(TypeError):
-            HostCacheExecutor._start_writing(object(), [7], [(0, 1, 1)])
-
-    def test_l2_constructor_does_not_attach_l3_from_optional_storage(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        signature = inspect.signature(HostCacheExecutor.__init__)
-        self.assertNotIn("storage_backend", signature.parameters)
-        self.assertNotIn("storage_key_prefix", signature.parameters)
-        self.assertNotIn("storage_rank", signature.parameters)
-        self.assertIs(
-            signature.parameters["attn_tp_rank"].default, inspect.Parameter.empty
-        )
-
-    def test_poll_results_backs_up_host_pages_asynchronously(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import (
-                HostCacheExecutor,
-                _Ack,
-                _AckKind,
-            )
-            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        started = threading.Event()
-        release = threading.Event()
-
-        def backup(pages):
-            del pages
-            started.set()
-            if not release.wait(timeout=2):
-                raise TimeoutError("L3 backup was not released")
-            return [True]
-
-        executor = HostCacheExecutor.__new__(HostCacheExecutor)
-        executor._ack_lock = threading.Lock()
-        executor._completions = CompletionQueue()
-        executor._ready_load_acks = []
-        executor._prefetch_acks = []
-        executor._backup_futures = []
-        executor._l3_workers = None
-        executor.l3_store = Mock()
-        executor.l3_store.backup.side_effect = backup
-        finish = Mock()
-        finish.query.return_value = True
-        executor._completions.push(
-            finish,
-            _Ack(
-                kind=_AckKind.WRITE_BACK,
-                op_ids=[7],
-                backup_pages=[(0, 1, "h0", 0)],
+        pool = Mock()
+        pool.cache_transfer_layout.return_value = SimpleNamespace(
+            num_lcm_blocks=device_lcm_blocks,
+            buffers=(SimpleNamespace(device=SimpleNamespace(type="cuda")),),
+            groups=(
+                SimpleNamespace(
+                    group_id="group", cache_blocks_per_lcm_block=1, fields=(field,)
+                ),
             ),
+            consumers=(("field",),),
         )
-
-        first = executor.poll_results()
-        self.assertEqual(first, [])
-        self.assertTrue(started.wait(timeout=2))
-        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
-        release.set()
-        deadline = time.monotonic() + 2
-        second = []
-        try:
-            while time.monotonic() < deadline:
-                second = executor.poll_results()
-                if second:
-                    break
-                time.sleep(0.01)
-            self.assertEqual(len(second), 1)
-            self.assertEqual(int(second[0].op_id), 7)
-        finally:
-            workers = executor._l3_workers
-            if workers is not None:
-                workers.shutdown(wait=True)
-
-    def test_backup_failure_does_not_ack_writeback(self):
-        try:
-            from tokenspeed.runtime.cache.l2.executor import (
-                HostCacheExecutor,
-                _Ack,
-                _AckKind,
-            )
-            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
-
-        executor = HostCacheExecutor.__new__(HostCacheExecutor)
-        executor._ack_lock = threading.Lock()
-        executor._completions = CompletionQueue()
-        executor._ready_load_acks = []
-        executor._prefetch_acks = []
-        executor._backup_futures = []
-        executor._backup_poll_failed = False
-        executor._l3_workers = None
-        executor.l3_store = Mock()
-        executor.l3_store.backup.return_value = [False]
-        finish = Mock()
-        finish.query.return_value = True
-        executor._completions.push(
-            finish,
-            _Ack(
-                kind=_AckKind.WRITE_BACK,
-                op_ids=[7],
-                backup_pages=[(0, 1, "h0", 0)],
+        pool.arena.runtime_contract = SimpleNamespace(
+            group_specs=(SimpleNamespace(group_id="group", shard_count=1),),
+            virtual_block_counts={"group": 1 + device_lcm_blocks},
+        )
+        storage = SimpleNamespace(
+            host_cache_block_bytes=(self.BLOCK_BYTES,),
+            host_field_offsets=((0,),),
+            host_lcm_block_bytes=self.BLOCK_BYTES,
+            num_host_lcm_blocks=0,
+            host_buffer="host",
+        )
+        tracker = Mock()
+        tracker.event_sets = [object()]
+        logger = Mock()
+        available = SimpleNamespace(available=int(available_gb * self.GB))
+        with (
+            patch.object(
+                executor_module,
+                "compute_host_lcm_block_bytes",
+                return_value=self.BLOCK_BYTES,
             ),
-        )
+            patch.object(executor_module, "HostCacheStorage", return_value=storage),
+            patch.object(lanes_module.psutil, "virtual_memory", return_value=available),
+            patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
+            patch.object(
+                executor_module,
+                "new_cache_stream",
+                side_effect=lambda _priority: Mock(),
+            ),
+            patch.object(
+                executor_module.device_module, "stream", return_value=nullcontext()
+            ),
+            patch.object(executor_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(lanes_module, "HostTransferWorkspace", side_effect=Mock),
+            patch.object(
+                lanes_module,
+                "build_host_transfer_geometry",
+                return_value=SimpleNamespace(device_rows=None, bind=Mock()),
+            ),
+            patch.object(executor_module, "logger", logger),
+        ):
+            executor = executor_module.HostCacheExecutor(
+                pool,
+                l2_tier=True,
+                host_ratio=2.0,
+                host_size_gb=host_size_gb,
+                snapshot_pool=NO_POOL,
+                slot_state_exporters=None,
+                io_backend="direct",
+                attn_tp_rank=0,
+                kvp_rank=0,
+                nprocs_per_node=nprocs_per_node,
+                world_cpu_group=world_cpu_group,
+            )
+        return executor, logger
 
-        first = None
-        failed = False
-        try:
-            first = executor.poll_results()
-            self.assertEqual(first, [])
-            failed = executor.consume_backup_poll_failure()
-            deadline = time.monotonic() + 2
-            while not failed and time.monotonic() < deadline:
-                self.assertEqual(executor.poll_results(), [])
-                failed = executor.consume_backup_poll_failure()
-                if not failed:
-                    time.sleep(0.01)
-        finally:
-            workers = executor._l3_workers
-            if workers is not None:
-                workers.shutdown(wait=True)
-        self.assertTrue(failed)
+    def test_four_ranks_cap_an_over_committed_ratio_l2_to_the_node(self):
+        # 4 x 277.95 GB of L2 does not fit a node with 956 GB available, and
+        # neither does an L2 of the whole 228.26 GB share: it pins 274.88 GB.
+        executor, logger = self._build(
+            available_gb=956,
+            nprocs_per_node=4,
+            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+        )
+        l2_blocks = executor.num_host_pages - 1
+        assert (l2_blocks) == (self._fitting_blocks(956, 4))
+        assert (l2_blocks) == (2**37 // self.BLOCK_BYTES)
+        pinned = _lanes_module().pinned_host_bytes(l2_blocks * self.BLOCK_BYTES)
+        assert (4 * (pinned + self.headroom)) <= (956 * self.GB)
+        logger.warning.assert_called_once()
+        message = logger.warning.call_args.args[0]
+        assert ("from 277.95 GB to 137.44 GB") in (message)
+        assert ("--kvstore-ratio 2.0") in (message)
+
+    def test_an_explicit_size_that_does_not_fit_the_node_is_refused(self, subtests):
+        # 278 GB and 200 GB pin 549.76 GB and 274.88 GB: neither fits the
+        # 228.26 GB share of 4 ranks on 956 GB.
+        for host_size_gb in (278, 200):
+            with (
+                subtests.test(host_size_gb=host_size_gb),
+                pytest.raises((ValueError), match=("Not enough Host memory")),
+            ):
+                self._build(
+                    available_gb=956,
+                    nprocs_per_node=4,
+                    device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                    host_size_gb=host_size_gb,
+                )
+        # One whose pinned size fits the node's share is kept as asked.
+        executor, logger = self._build(
+            available_gb=956,
+            nprocs_per_node=4,
+            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+            host_size_gb=128,
+        )
+        assert (executor.num_host_pages - 1) == (128_000)
+        logger.warning.assert_not_called()
+
+    def test_a_single_rank_and_a_small_pool_keep_the_ratio_size(self, subtests):
+        for nprocs_per_node, device_lcm_blocks in (
+            (1, self.LARGE_POOL_BLOCKS),  # 277.95 GB pins 549.76 GB of 956
+            (4, 50_760),  # 4 x 101.52 GB pin 4 x 137.44 GB
+        ):
+            with subtests.test(nprocs_per_node=nprocs_per_node):
+                executor, logger = self._build(
+                    available_gb=956,
+                    nprocs_per_node=nprocs_per_node,
+                    device_lcm_blocks=device_lcm_blocks,
+                )
+                assert (executor.num_host_pages - 1) == (2 * device_lcm_blocks)
+                logger.warning.assert_not_called()
+
+    def test_no_room_for_one_block_is_refused_not_capped_to_nothing(self):
+        with pytest.raises((ValueError), match=("Not enough Host memory")):
+            self._build(
+                available_gb=4 * self.headroom / self.GB,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+            )
+
+    def test_every_rank_takes_the_l2_size_the_smallest_share_holds(self):
+        # A peer node has 500 GB available: every rank takes what it holds,
+        # and the agreement runs before any rank pins, explicit size or not.
+        torch = import_module("torch")
+        group = object()
+        peer_blocks = self._fitting_blocks(500, 4)
+        assert (peer_blocks) < (self._fitting_blocks(956, 4))
+
+        def all_reduce(tensor, *, op, group):
+            assert (op) is (torch.distributed.ReduceOp.MIN)
+            tensor.fill_(min(int(tensor.item()), peer_blocks))
+
+        with patch.object(
+            torch.distributed, "all_reduce", side_effect=all_reduce
+        ) as reduce:
+            executor, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                world_cpu_group=group,
+            )
+            assert (executor.num_host_pages - 1) == (peer_blocks)
+            explicit, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                host_size_gb=128,
+                world_cpu_group=group,
+            )
+            assert (explicit.num_host_pages - 1) == (128_000)
+        assert (reduce.call_count) == (2)
+        assert all(c.kwargs["group"] is group for c in reduce.call_args_list)
+
+    def test_a_pinned_buffer_takes_the_power_of_two_it_rounds_up_to(self):
+        lanes_module = _lanes_module()
+        pinned = lanes_module.pinned_host_bytes
+        fit = lanes_module.largest_pinned_fit
+        assert (pinned(0)) == (0)
+        assert (pinned(1)) == (1)
+        assert (pinned(2**37)) == (2**37)
+        assert (pinned(2**37 + 1)) == (2**38)
+        assert (pinned(228_260 * self.BLOCK_BYTES)) == (2**38)
+        assert (fit(-1)) == (0)
+        assert (fit(0)) == (0)
+        assert (fit(2**38 - 1)) == (2**37)
+        assert (fit(2**38)) == (2**38)
+        for room in (1, 3, 2**37 - 1, 228_260 * self.BLOCK_BYTES):
+            assert (pinned(fit(room))) <= (room)
+            assert (pinned(fit(room) + 1)) > (room)
+
+
+class TestL3FlatKvExecutorTest:
 
     def test_load_with_every_row_owned_elsewhere_acks_without_h2d(self):
         try:
             from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
             from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
 
         # A KVP rank that owns none of a load's rows copies nothing, arms no
         # layer fence and still acknowledges the op (the hooks' replica
@@ -1797,70 +1519,24 @@ class L3FlatKvExecutorTest(unittest.TestCase):
         executor = HostCacheExecutor.__new__(HostCacheExecutor)
         executor._ack_lock = threading.Lock()
         executor._ready_load_acks = []
-        executor._prefetch_acks = []
         executor._load_poisoned = False
         executor._completions = CompletionQueue()
-        executor._backup_futures = []
         executor._load_trackers = [(Mock(), 1)]
-        executor.l3_store = None
-        self.assertIsNone(
-            executor._start_loading([9], [], prerequisite_stream=object())
-        )
+        assert executor._start_loading([9], [], prerequisite_stream=object()) is None
         executor._load_trackers[0][0].begin_load.assert_not_called()
         events = executor.poll_results()
-        self.assertEqual(
-            [(type(e).__name__, int(e.op_id)) for e in events],
-            [("LoadBackDoneEvent", 9)],
+        assert ([(type(e).__name__, int(e.op_id)) for e in events]) == (
+            [("LoadBackDoneEvent", 9)]
         )
 
-    def test_shutdown_persists_completed_d2h_before_closing_l3(self):
-        try:
-            import tokenspeed.runtime.cache.l2.executor as executor_module
-            from tokenspeed.runtime.cache.l2.executor import (
-                HostCacheExecutor,
-                _Ack,
-                _AckKind,
-            )
-            from tokenspeed.runtime.cache.transfer.lanes import CompletionQueue
-        except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
 
-        executor = HostCacheExecutor.__new__(HostCacheExecutor)
-        executor._ack_lock = threading.Lock()
-        executor._completions = CompletionQueue()
-        executor._completions.push(
-            Mock(),
-            _Ack(
-                kind=_AckKind.WRITE_BACK,
-                op_ids=[7],
-                backup_pages=[(0, 1, "h0", 0)],
-            ),
-        )
-        executor._backup_futures = []
-        executor._l3_workers = None
-        executor._l3_prefetch_lane = None
-        executor._prefetch_jobs = {}
-        executor._prefetch_acks = []
-        executor.load_stream = Mock()
-        executor.write_stream = Mock()
-        executor.l3_store = Mock()
-        executor.l3_store.backup.return_value = [True]
-        default_stream = Mock()
-        with patch.object(
-            executor_module.device_module,
-            "synchronize",
-            side_effect=default_stream.synchronize,
-        ):
-            executor.shutdown()
+class TestCompactLayoutRoundTripTest:
+    @pytest.fixture(autouse=True)
+    def _executor_cleanup(self):
+        with ExitStack() as self.executor_cleanup:
+            yield
 
-        default_stream.synchronize.assert_called_once_with()
-        executor.l3_store.backup.assert_called_once_with([(0, 1, "h0", 0)])
-        executor.l3_store.close.assert_called_once_with()
-        self.assertEqual(executor._completions._pending, [])
-
-
-class CompactLayoutRoundTripTest(unittest.TestCase):
-    def setUp(self):
+    def setup_method(self):
         try:
             import torch
 
@@ -1871,9 +1547,9 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 CacheTransferLayout,
             )
         except (ImportError, ModuleNotFoundError) as exc:
-            self.skipTest(f"needs runtime dependencies: {exc}")
+            pytest.skip(f"needs runtime dependencies: {exc}")
         if not torch.cuda.is_available():
-            self.skipTest("needs a CUDA device")
+            pytest.skip("needs a CUDA device")
         self.torch = torch
         self.executor_module = executor_module
         self.CacheField = CacheField
@@ -1899,8 +1575,10 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 io_backend=io_backend,
                 attn_tp_rank=0,
                 kvp_rank=0,
+                nprocs_per_node=1,
+                world_cpu_group=None,
             )
-        self.addCleanup(executor.shutdown)
+        self.executor_cleanup.callback(executor.shutdown)
         return executor, pool, draft_pool
 
     def _single_group_layout(self, buffer, *fields):
@@ -1958,13 +1636,12 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1), (0, 4, 4), (1, 3, 3)],
-            backup_pages=[],
             lane=executor._pinned_write_lane,  # pylint: disable=protected-access
             prerequisite_stream=torch.cuda.current_stream(),
         )
         executor.write_stream.synchronize()
         write_results = executor.poll_results()
-        self.assertEqual([int(event.op_id) for event in write_results], [7])
+        assert ([int(event.op_id) for event in write_results]) == ([7])
 
         # Destroy every Device byte so stale cache contents cannot make the
         # H2D half of the round trip pass accidentally.
@@ -1977,13 +1654,13 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             [(0, 2, 1), (0, 5, 4), (1, 4, 3)],
             prerequisite_stream=torch.cuda.current_stream(),
         )
-        self.assertIsNotNone(load_index)
+        assert (load_index) is not None
         pool.load_tracker.set_consumers(load_index)
         pool.load_tracker.wait_for_layer(0)
         pool.load_tracker.wait_for_layer(1)
         torch.cuda.synchronize()
         load_results = executor.poll_results()
-        self.assertEqual([int(event.op_id) for event in load_results], [9])
+        assert ([int(event.op_id) for event in load_results]) == ([9])
         # Hand-derived destination ranges for blocks (full: 2, 5; state: 4).
         expected_first = torch.full((128,), 0xEE, dtype=torch.uint8)
         expected_second = torch.full((128,), 0xEE, dtype=torch.uint8)
@@ -1992,8 +1669,8 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         expected_first[48:52].copy_(full_k_four)
         expected_second[76:82].copy_(full_v_four)
         expected_first[104:109].copy_(state_three)
-        self.assertTrue(torch.equal(first.cpu(), expected_first))
-        self.assertTrue(torch.equal(second.cpu(), expected_second))
+        assert torch.equal(first.cpu(), expected_first)
+        assert torch.equal(second.cpu(), expected_second)
 
     def test_async_write_metadata_reuse_keeps_batches_distinct(self):
         torch = self.torch
@@ -2016,7 +1693,6 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
                 executor._start_writing(
                     [block],
                     [(0, block, block)],
-                    backup_pages=[],
                     lane=executor._pinned_write_lane,
                     prerequisite_stream=torch.cuda.current_stream(),
                 )
@@ -2034,13 +1710,11 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             torch.cuda.current_stream().synchronize()
             for block in range(1, 4):
                 offset = 8 + block * 8
-                self.assertEqual(
-                    device[offset : offset + 4].tolist(),
-                    [generation * 16 + block] * 4,
+                assert (device[offset : offset + 4].tolist()) == (
+                    [generation * 16 + block] * 4
                 )
-            self.assertEqual(
-                sorted(int(event.op_id) for event in executor.poll_results()),
-                [1, 2, 3, 9],
+            assert (sorted(int(event.op_id) for event in executor.poll_results())) == (
+                [1, 2, 3, 9]
             )
 
     def test_real_transfer_restores_merged_owner_draft_subset_once(self):
@@ -2053,7 +1727,9 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         target_layout = self._single_group_layout(device, *target_fields)
         draft_layout = self._single_group_layout(device, target_fields[1])
         executor, target_pool, draft_pool = self._make_executor(
-            target_layout, draft_layout=draft_layout, io_backend="kernel"
+            target_layout,
+            draft_layout=draft_layout,
+            io_backend="kernel",
         )
 
         device[16:20].fill_(0x11)
@@ -2062,12 +1738,11 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
         executor._start_writing(  # pylint: disable=protected-access
             [7],
             [(0, 1, 1)],
-            backup_pages=[],
             lane=executor._pinned_write_lane,
             prerequisite_stream=torch.cuda.current_stream(),
         )
         torch.cuda.synchronize()
-        self.assertEqual([int(event.op_id) for event in executor.poll_results()], [7])
+        assert ([int(event.op_id) for event in executor.poll_results()]) == ([7])
 
         device.fill_(0xEE)
         torch.cuda.synchronize()
@@ -2076,17 +1751,17 @@ class CompactLayoutRoundTripTest(unittest.TestCase):
             [(0, 2, 1)],
             prerequisite_stream=torch.cuda.current_stream(),
         )
-        self.assertIsNotNone(load_index)
+        assert (load_index) is not None
         target_pool.load_tracker.set_consumers(load_index)
         draft_pool.load_tracker.set_consumers(load_index)
         target_pool.load_tracker.wait_for_layer(0)
         target_pool.load_tracker.wait_for_layer(1)
         draft_pool.load_tracker.wait_for_layer(0)
         torch.cuda.synchronize()
-        self.assertEqual([int(event.op_id) for event in executor.poll_results()], [9])
-        self.assertEqual(device[24:28].tolist(), [0x11] * 4)
-        self.assertEqual(device[64:68].tolist(), [0x12] * 4)
+        assert ([int(event.op_id) for event in executor.poll_results()]) == ([9])
+        assert (device[24:28].tolist()) == ([0x11] * 4)
+        assert (device[64:68].tolist()) == ([0x12] * 4)
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

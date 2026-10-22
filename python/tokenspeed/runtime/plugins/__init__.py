@@ -30,6 +30,11 @@ Every process that builds a ``ModelConfig`` calls :func:`ensure_loaded` first,
 so the frontend, the scheduler and the encode loop all resolve plugin
 architectures the same way. Loading also runs the kernel package's own plugin
 discovery, which registers plugin kernels before any model selects one.
+
+At worker startup, ``global_server_args_dict_update`` publishes the resolved
+``disaggregation_mode`` before model construction and warmup. Model plugins
+use that role to prepare topology-specific resources; a prefill worker must
+not infer a decode role from graph settings or missing metadata.
 """
 
 from __future__ import annotations

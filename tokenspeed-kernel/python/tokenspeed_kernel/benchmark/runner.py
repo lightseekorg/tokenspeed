@@ -229,7 +229,7 @@ class BenchmarkRunner:
         dtype_role: str | Iterable[str],
         generator: Any,
     ) -> tuple[bool | None, float | None, float | None]:
-        if spec.solution == "reference":
+        if spec.solution == "torch":
             return None, None, None
 
         registry = KernelRegistry.get()
@@ -241,7 +241,7 @@ class BenchmarkRunner:
             spec.family,
             spec.mode,
             format_signature=signature,
-            solution="reference",
+            solution="torch",
         )
         if not ref_specs:
             return None, None, None

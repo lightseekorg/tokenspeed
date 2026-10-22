@@ -65,6 +65,15 @@ def decode_query_lengths(
 
 
 @dataclass(frozen=True)
+class QSASelection:
+    """One indexer layer's equivalent logical-block and physical-slot selections."""
+
+    selected_slots: torch.Tensor
+    selected_blocks: torch.Tensor
+    block_size: int
+
+
+@dataclass(frozen=True)
 class QSALayout:
     """Layer-invariant cache geometry for one QSA model forward."""
 
@@ -74,6 +83,7 @@ class QSALayout:
     qsa_locs: torch.Tensor
     recent_locs: torch.Tensor
     complete_blocks: torch.Tensor
+    queries_per_request: int | None
     qsa_page_table: torch.Tensor
     full_page_table: torch.Tensor
     full_kernel_page_size: int
@@ -116,10 +126,14 @@ def qsa_forward_layout(
         total_tokens,
         force_uniform=False,
     )
+    queries_per_request = query_lengths
     if query_lengths is None:
         if metadata.extend_seq_lens is None:
             raise RuntimeError("QSA extend metadata requires query lengths")
         query_lengths = metadata.extend_seq_lens[: ctx.bs]
+        queries_per_request = metadata.queries_per_request
+    if queries_per_request is not None and queries_per_request * ctx.bs != total_tokens:
+        raise RuntimeError("QSA uniform query width does not match the current rows")
     full = backend.full_attn_backend.group_view(FULL_ATTENTION, ctx.bs)
     qsa_page_table = metadata.qsa_block_table
     recent_page_table = metadata.recent_block_table
@@ -145,6 +159,7 @@ def qsa_forward_layout(
         qsa_locs=qsa_locs,
         recent_locs=recent_locs,
         complete_blocks=complete_blocks,
+        queries_per_request=queries_per_request,
         qsa_page_table=qsa_page_table,
         full_page_table=full.page_table,
         full_kernel_page_size=full.kernel_page_size,

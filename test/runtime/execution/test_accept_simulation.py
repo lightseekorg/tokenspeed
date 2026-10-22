@@ -155,6 +155,7 @@ def _executor(pool_indices: list[int], cache_lengths: torch.Tensor) -> ModelExec
     req_pool_indices[: len(pool_indices)] = torch.tensor(pool_indices)
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=req_pool_indices,
+        input_lengths_buf=torch.ones(8, dtype=torch.int32),
         force_single_token_verify_buf=torch.zeros(8, dtype=torch.bool),
     )
     executor.runtime_states = SimpleNamespace(valid_cache_lengths=cache_lengths)
@@ -171,10 +172,11 @@ def test_decode_verify_keeps_simulated_widths_and_drafts_in_the_sampler_buffers(
         num_extends=0,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(0, 0, 3, VERIFY_WIDTH),
+        sampled_top_k=0,
     )
     candidates = _candidates(3)
 
-    tokens, lengths = executor._run_sampling(object(), object(), ctx, candidates)
+    tokens, lengths = executor._sample_and_verify(object(), object(), ctx, candidates)
     expected = simulated_accept_lengths(cache_lengths[pool], _scaled("2.7")).tolist()
     assert expected == [3, 3, 1]
     assert lengths.tolist() == expected
@@ -185,7 +187,7 @@ def test_decode_verify_keeps_simulated_widths_and_drafts_in_the_sampler_buffers(
     # Rows the scheduler forces to one token keep verify's token.
     executor.input_buffers.force_single_token_verify_buf[1] = True
     ctx.decode_input_ids = [-1, 9, -1]
-    tokens, lengths = executor._run_sampling(object(), object(), ctx, candidates)
+    tokens, lengths = executor._sample_and_verify(object(), object(), ctx, candidates)
     forced = [expected[0], 1, expected[2]]
     assert lengths.tolist() == forced
     assert _emitted(tokens, forced) == _accepted_drafts(candidates, forced)
@@ -200,12 +202,13 @@ def test_mixed_round_simulates_only_its_decode_rows():
         num_extends=2,
         decode_input_ids=None,
         output_layout=ForwardOutputLayout(2, 2, 2, VERIFY_WIDTH),
+        sampled_top_k=0,
     )
     logits = LogitsProcessorOutput(next_token_logits=torch.zeros(2 + 2 * 4, 16))
     info = SamplingBatchInfo(req_pool_indices=torch.tensor(pool), device="cpu")
     candidates = _candidates(2)
 
-    tokens, lengths = executor._run_sampling(logits, info, ctx, candidates)
+    tokens, lengths = executor._sample_and_verify(logits, info, ctx, candidates)
     decode = simulated_accept_lengths(cache_lengths[pool[2:]], _scaled("2.7")).tolist()
     assert decode == [3, 2]
     assert lengths.tolist() == [1, 1, *decode]

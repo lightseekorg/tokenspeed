@@ -38,7 +38,7 @@ Covered:
   weight sharding are what is tested.
 
 The GPU test the stubs stand in for: a head-TP + ``--tp-batch-invariant attn``
-decode engine must produce the TP1 replicated engine's bits under the aok
+decode engine must produce the TP1 replicated engine's bits under the batch-invariant
 GEMMs (``--numerics rl-bitwise``).
 """
 
@@ -46,19 +46,19 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import replace
-from types import SimpleNamespace
-
-import pytest
-import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from _tp_layout_fakes import (
+from test.runtime.distributed._tp_layout_fakes import (
     HIDDEN,
     NUM_HEADS,
     attention_weights,
     build_attention,
     init_gloo,
 )
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from tokenspeed.runtime.distributed.comm_manager import (
     CommManager,

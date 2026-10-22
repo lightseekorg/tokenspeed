@@ -1,4 +1,6 @@
-# GDN FlashInfer PDL adapters
+# GDN kernels
+
+## FlashInfer PDL adapters
 
 The FlashInfer adapter retains the upstream launch geometry and runtime ABI,
 while wrapping device bodies with PDL synchronization. Adapted functions and
@@ -20,6 +22,13 @@ cache, invalidation after source changes, and both launch orders. Runtime GDN
 tests additionally check CUDA Graph dependency edges and exact replay results
 for decode, MTP, BF16 state, and prefill.
 
+## Chain verification
+
+ReplaySSM chains use chunked verification on Blackwell for 13–16 tokens and
+at least 24 (request, value-head) states. Other shapes and platforms retain
+step-by-step verification. `test/runtime/test_gdn_verify_policy.py` checks this
+selection and its boundaries without launching device kernels.
+
 ## Variable prefill lengths
 
 The Triton L2-normalization fallback uses a runtime token count. The launch
@@ -29,15 +38,20 @@ one compiled kernel across different token counts instead of compiling a new
 variant for each length. Tests compare irregular lengths around the usual
 prefill graph buckets against an independent PyTorch result.
 
-The checkpoint output inverse gather also keeps body, tail, and output token
-counts as runtime values. Breakable graphs run recurrent-state scans at eager
-attention breaks, where those counts change with each grouped prefill batch.
-The gather still specializes on feature geometry and strides, but it reuses the
-same compiled kernel across different token splits and output lengths. Tests
-cover irregular splits, padded output rows, and strided scan outputs.
-
 Compilation guards warm these kernels, then sweep token counts (and PLE
 request counts) without allowing new Triton specializations. PLE covers
-transitions between single-request, uniform multi-request and ragged indexing
+transitions between single-request, uniform multi-request, and ragged indexing
 within one compiled kernel. Those selections use runtime values so startup
 warmup also covers batch layouts first seen during serving.
+
+## Accepted-prefix replay
+
+`triton_gdn_replay_commit` commits accepted prefixes for all layers in one
+portable Gluon launch. Each CTA owns a layer, request, value head, and V tile.
+Keys and gates are prepared in fixed chunks, with K/V staged in shared memory.
+
+State updates stay in FP32 until the final write, and rejected tokens are
+masked during loading. Aligned state accesses are vectorized, with fallbacks
+for unaligned rows and arbitrary row strides. Batch size, window length, and
+payload layer stride remain runtime scalars, so serving shape changes reuse
+the compiled kernel.

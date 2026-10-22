@@ -20,6 +20,9 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.dsv41 import (
+    torch_dsv41_block_maxima,
+)
 from tokenspeed_kernel.ops.attention.dsv41 import deep_gemm as impl
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _block_maxima_kernel,
@@ -40,20 +43,6 @@ requires_hopper_selector = pytest.mark.skipif(
 )
 
 
-def reference(logits, visible):
-    rows, width = logits.shape
-    if width % 8:
-        logits = torch.nn.functional.pad(logits, (0, (-width) % 8), value=-float("inf"))
-    result = logits.reshape(rows, (width + 7) // 8, 8).amax(-1)
-    newest = ((visible.to(torch.int64) - 1) // 8).clamp(0, result.shape[1] - 1)
-    row = torch.arange(rows, device=logits.device)
-    current = result[row, newest]
-    result[row, newest] = torch.where(
-        current > -float("inf"), torch.full_like(current, float("inf")), current
-    )
-    return result
-
-
 @pytest.mark.parametrize("width", [1, 7, 8, 9, 1023, 1024, 1025, 16384, 65537])
 @pytest.mark.parametrize("strided", [False, True])
 def test_block_maxima(width, strided):
@@ -70,7 +59,11 @@ def test_block_maxima(width, strided):
     x[3, -1] = float("nan")
     x[4].fill_(-float("inf"))
     torch.testing.assert_close(
-        block_maxima(x, visible), reference(x, visible), atol=0, rtol=0, equal_nan=True
+        block_maxima(x, visible),
+        torch_dsv41_block_maxima(x, visible),
+        atol=0,
+        rtol=0,
+        equal_nan=True,
     )
 
 
@@ -85,7 +78,9 @@ def test_graph_refresh():
         x.normal_()
         visible.fill_(length)
         graph.replay()
-        torch.testing.assert_close(output, reference(x, visible), atol=0, rtol=0)
+        torch.testing.assert_close(
+            output, torch_dsv41_block_maxima(x, visible), atol=0, rtol=0
+        )
 
 
 def test_empty_rows():
@@ -99,7 +94,10 @@ def test_capacity_does_not_recompile():
         x = torch.randn((rows, width), device="cuda")
         visible = torch.full((rows,), width, dtype=torch.int32, device="cuda")
         torch.testing.assert_close(
-            block_maxima(x, visible), reference(x, visible), atol=0, rtol=0
+            block_maxima(x, visible),
+            torch_dsv41_block_maxima(x, visible),
+            atol=0,
+            rtol=0,
         )
 
     for width in [1024, 1025, 1032]:

@@ -27,7 +27,6 @@ from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _index_gather_heads,
     _index_topk_outputs,
     cache_pack,
-    index_q_quantize,
 )
 
 _MFMA_HEADS = 32
@@ -53,9 +52,7 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
     scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
     pad = _MFMA_HEADS - heads
     if pad < 0:
-        raise ValueError(
-            f"GFX950 CSA2 MFMA indexer supports at most {_MFMA_HEADS} heads"
-        )
+        raise ValueError(f"AMD CSA2 MXFP4 indexer supports at most {_MFMA_HEADS} heads")
     if pad:
         values = torch.nn.functional.pad(values, (0, 0, 0, pad))
         scales = torch.nn.functional.pad(scales, (0, pad))
@@ -63,37 +60,6 @@ def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
     else:
         weights = weights.float()
     return values.contiguous(), scales.contiguous(), weights.contiguous()
-
-
-def _pad_query(q: torch.Tensor, weights: torch.Tensor):
-    q = index_q_quantize(q.contiguous(), "index", None)
-    tokens, heads, _ = q.shape
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(f"GFX1250 CSA2 indexer supports at most {_MFMA_HEADS} heads")
-    if pad:
-        q = torch.nn.functional.pad(q, (0, 0, 0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return q.contiguous(), weights.contiguous()
-
-
-def _select_sorted(scores: torch.Tensor, k: int, out: torch.Tensor, lens: torch.Tensor):
-    out.fill_(-1)
-    lens.zero_()
-    width = scores.shape[1]
-    take = min(int(k), width)
-    if not scores.shape[0] or take < 1:
-        return
-    values, indices = scores.topk(take, dim=1, sorted=False)
-    valid = values > -torch.inf
-    ordered = (
-        indices.masked_fill(~valid, torch.iinfo(torch.int64).max).sort(dim=1).values
-    )
-    ordered = ordered.masked_fill(ordered == torch.iinfo(torch.int64).max, -1)
-    out[:, :take].copy_(ordered.to(out.dtype))
-    lens.copy_(valid.sum(dim=1).to(lens.dtype))
 
 
 def _logical_from_scan(columns: torch.Tensor, candidate_blocks: torch.Tensor | None):
@@ -117,6 +83,10 @@ def select_rows_torch(logits, candidates, live_widths, topk, row_out, row_lens):
     """
     width = logits.shape[1]
     values_topk, columns = logits.topk(min(int(topk), width), dim=1, sorted=False)
+    _write_selected_rows(values_topk, columns, candidates, row_out, row_lens)
+
+
+def _write_selected_rows(values_topk, columns, candidates, row_out, row_lens):
     logical = _logical_from_scan(columns, candidates)
     packed = torch.where(
         values_topk > -torch.inf,
@@ -145,14 +115,18 @@ def run_dsv41_csa2_index_topk(
     score_chunk_size,
     process_group,
     out,
+    index_metadata,
     launch_logits,
     select_rows,
+    select_blocks,
 ):
     """Gather, score, and select CSA2 rows with shape-bounded, graph-safe scratch.
 
     ``launch_logits`` scores a query tile into -inf-initialized FP32 logits;
-    ``select_rows`` has the ``select_rows_torch`` contract.
+    ``select_rows`` has the ``select_rows_torch`` contract and
+    ``select_blocks`` the ``index_block_select`` contract.
     """
+    del index_metadata
     out = _index_topk_outputs(
         index_q,
         weights,
@@ -253,24 +227,9 @@ def run_dsv41_csa2_index_topk(
                 row_lens[output_begin:output_end],
             )
             if make_blocks:
-                n_blocks = width // 8
-                block_scores = (
-                    logits[:, : n_blocks * 8]
-                    .reshape(tile_queries, n_blocks, 8)
-                    .amax(-1)
-                )
-                latest = (tile_visible.to(torch.int64) - 1) // 8
-                live = (tile_visible > 0) & (latest < n_blocks)
-                latest = latest.clamp(0, n_blocks - 1)
-                rows = torch.arange(tile_queries, device=q.device)
-                current = block_scores[rows, latest]
-                block_scores[rows, latest] = torch.where(
-                    live & (current > -torch.inf),
-                    torch.full_like(current, float("inf")),
-                    current,
-                )
-                _select_sorted(
-                    block_scores,
+                select_blocks(
+                    logits,
+                    tile_visible,
                     int(candidate_topk),
                     block_out[output_begin:output_end],
                     block_lens[output_begin:output_end],
@@ -306,9 +265,10 @@ def launch_gfx1250_logits(
         dsv41_index_logits_gfx1250,
     )
 
-    q, w = _pad_query(q, w)
+    values, scales, w = _pack_index_q(q, w)
     dsv41_index_logits_gfx1250(
-        q,
+        values,
+        scales,
         w,
         cache_2d,
         table,
@@ -325,5 +285,15 @@ def select_rows_gfx950(logits, candidates, live_widths, topk, row_out, row_lens)
     )
 
     launch_gluon_dsv41_index_topk_select_gfx950(
+        logits, candidates, live_widths, topk, row_out, row_lens
+    )
+
+
+def select_rows_gfx1250(logits, candidates, live_widths, topk, row_out, row_lens):
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.dsv41 import (
+        launch_gluon_dsv41_index_topk_select_gfx1250,
+    )
+
+    launch_gluon_dsv41_index_topk_select_gfx1250(
         logits, candidates, live_widths, topk, row_out, row_lens
     )

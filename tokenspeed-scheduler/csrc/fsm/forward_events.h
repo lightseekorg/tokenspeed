@@ -39,6 +39,7 @@
 // (RemotePrefilling, PrefillAwaitingResult), so the forward events name them
 // in their transition signatures.
 #include "fsm/pd_states.h"
+#include "fsm/storage_states.h"
 #include "utils.h"
 
 namespace tokenspeed::fsm {
@@ -115,25 +116,41 @@ private:
     std::int32_t decode_input_tokens_{};
 };
 
+// The request is done. A page-holding request parks in Finishing with its
+// pages: the scheduler publishes its frontier and releases them
+// (ReleaseEvent) once every forward out against them has landed.
 struct FinishEvent : InvalidTransitionHandler<FinishEvent> {
     using InvalidTransitionHandler<FinishEvent>::operator();
 
     explicit FinishEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
 
-    Finished operator()(PrefillDone&& state);
-    Finished operator()(PrefillAwaitingResult&& state);
-    Finished operator()(Decoding&& state);
+    Finishing operator()(PrefillDone&& state);
+    Finishing operator()(PrefillAwaitingResult&& state);
+    Finishing operator()(Decoding&& state);
     // A suspended request's image dies with the state: its Host L2 pins drop
     // (the entries stay published, now evictable), its snapshot-pool blocks
     // and blob slot return.
     Finished operator()(Retracted&& state);
+    // The restore's copies are still filling the pages: nothing of the
+    // frontier is on Device to publish, so the pages go straight back.
     Finished operator()(Restoring&& state);
+    Finishing operator()(Finishing&& state) { return std::move(state); }
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
-    template <typename State>
-    Finished finish(State&& state);
+    CacheCoordinator* coordinator_{};
+};
 
+// A Finishing request with no forward in flight: its frontier was published;
+// its pages return to the pool.
+struct ReleaseEvent : InvalidTransitionHandler<ReleaseEvent> {
+    using InvalidTransitionHandler<ReleaseEvent>::operator();
+
+    explicit ReleaseEvent(CacheCoordinator* coordinator) : coordinator_{coordinator} {}
+
+    Finished operator()(Finishing&& state);
+
+private:
     CacheCoordinator* coordinator_{};
 };
 
@@ -144,9 +161,9 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
 
     Finished operator()(Bootstrapping&&);
     Finished operator()(Submitted&&);
+    Finished operator()(Prefetching&&);
     // The op in flight keeps the Host blocks until its ACK; only the
     // request's own pins drop here.
-    Finished operator()(Prefetching&&);
     Finished operator()(Prefilling&& state);
     Finished operator()(RemotePrefilling&& state);
     Finished operator()(PrefillDone&& state);
@@ -154,6 +171,8 @@ struct AbortEvent : InvalidTransitionHandler<AbortEvent> {
     Finished operator()(Decoding&& state);
     Finished operator()(Retracted&& state);
     Finished operator()(Restoring&& state);
+    // Nothing of an aborted request is published, finished or not.
+    Finished operator()(Finishing&& state);
     Finished operator()(Finished&& state) { return std::move(state); }
 
 private:
@@ -204,55 +223,6 @@ private:
     RetractionImage image_;
     std::shared_ptr<SnapshotSlotIndex> blob_slot_;
     std::vector<std::uint32_t> pending_store_ops_;
-};
-
-// A Submitted request's L3 prefetch was issued: it waits for the fill before
-// it can be admitted as a Host hit, pinning the blocks being filled.
-struct SchedulePrefetchEvent : InvalidTransitionHandler<SchedulePrefetchEvent> {
-    using InvalidTransitionHandler<SchedulePrefetchEvent>::operator();
-
-    SchedulePrefetchEvent(std::vector<CacheBlockRef> host_blocks, std::uint32_t prefetch_op)
-        : host_blocks_{std::move(host_blocks)}, prefetch_op_{prefetch_op} {}
-
-    Prefetching operator()(Submitted&& state) {
-        // The entries an earlier prefetch landed stay pinned through this one:
-        // the admission after it claims both.
-        std::vector<CacheBlockRef> host_blocks = state.TakePrefetchedHostEntries();
-        host_blocks.insert(host_blocks.end(), std::make_move_iterator(host_blocks_.begin()),
-                           std::make_move_iterator(host_blocks_.end()));
-        return Prefetching{state.TokenContainerPtr(), state.PrefixGranularity(), std::move(host_blocks), prefetch_op_};
-    }
-
-private:
-    std::vector<CacheBlockRef> host_blocks_;
-    std::uint32_t prefetch_op_{0};
-};
-
-// The prefetch finished: the request is Submitted again, at its original
-// queue position, holding the Host entries that landed (published by the
-// scheduler before this event) until its admission claims them.
-struct PrefetchDoneEvent : InvalidTransitionHandler<PrefetchDoneEvent> {
-    using InvalidTransitionHandler<PrefetchDoneEvent>::operator();
-
-    explicit PrefetchDoneEvent(std::vector<CacheBlockRef> published) : published_{std::move(published)} {}
-
-    Submitted operator()(Prefetching&& state) {
-        // Entries an earlier prefetch landed (carried in host_blocks beside the
-        // blocks this op filled) stay pinned together with the new ones. The
-        // blocks this op did not land were let go by its completion, so the
-        // reference here is their last and they return now; the ones it did
-        // land are already in `published_`.
-        std::vector<CacheBlockRef> pinned = std::move(published_);
-        for (CacheBlockRef& block : state.host_blocks) {
-            if (block && !block.unique() && std::ranges::find(pinned, block) == pinned.end()) {
-                pinned.push_back(std::move(block));
-            }
-        }
-        return Submitted{state.token_container, state.prefix_granularity, std::move(pinned)};
-    }
-
-private:
-    std::vector<CacheBlockRef> published_;
 };
 
 // One of the image's store ops was acknowledged (WriteBackDone for the L2

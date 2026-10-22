@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.mla import torch_mla_kv_pack
 from tokenspeed_kernel.ops.attention.mla.tokenspeed_mla import (
     mla_kv_pack_quantize_fp8,
 )
@@ -62,13 +63,7 @@ def _make_kv_slice_inputs(device: str, dtype: torch.dtype = torch.bfloat16):
 
 
 def _reference(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype):
-    """Pure-PyTorch reference: broadcast k_pe across heads, cat, scale, cast."""
-    k_pe_2d = k_pe.squeeze(1) if k_pe.dim() == 3 else k_pe
-    k_pe_full = k_pe_2d.unsqueeze(1).expand(-1, k_nope.shape[1], -1)
-    k_bf16 = torch.cat([k_nope, k_pe_full], dim=-1)
-    k_fp8 = (k_bf16.float() * k_scale_inv).to(fp8_dtype)
-    v_fp8 = (v.float() * v_scale_inv).to(fp8_dtype)
-    return k_fp8, v_fp8
+    return torch_mla_kv_pack(k_nope, k_pe, v, k_scale_inv, v_scale_inv, fp8_dtype)
 
 
 def test_pure_cast_strided_inputs(device: str) -> None:

@@ -93,7 +93,7 @@ def test_cuda_install_requires_include_runtime_dependencies(monkeypatch) -> None
     assert {"tokenspeed-kernel-amd", "tokenspeed-iris"}.isdisjoint(requirements)
     assert "tokenspeed-triton-kernels" not in requirements
     assert requirements["nvidia-cutlass-dsl"].extras == {"cu13"}
-    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.30.0"
+    assert str(requirements["nvidia-cudnn-frontend"].specifier) == "==1.31.0"
 
 
 def test_cuda_thirdparty_requirements_are_exactly_pinned() -> None:
@@ -145,6 +145,30 @@ def test_rocm_install_requires_exclude_cuda_dependencies(monkeypatch) -> None:
         "tokenspeed-trtllm-kernel",
         "tokenspeed-triton-kernels",
     }.isdisjoint(requirements)
+
+
+def test_npu_install_requires_use_ascend_provider(monkeypatch) -> None:
+    install_requires = _capture_install_requires(monkeypatch, "npu")
+    assert install_requires == _expected_install_requires("npu")
+    requirements = _requirements_by_name(install_requires)
+    assert {"torch", "triton-ascend", "apache-tvm-ffi"} <= requirements.keys()
+    assert str(requirements["triton-ascend"].specifier) == "==3.2.1"
+    assert not any(
+        name.startswith("nvidia-")
+        or name
+        in {"tokenspeed-triton", "tokenspeed-proton", "flashinfer-python", "triton"}
+        for name in requirements
+    )
+    kwargs = _capture_setup_kwargs(monkeypatch, "npu")
+    from setuptools import Distribution
+
+    command = kwargs["cmdclass"]["build_ext"](Distribution())
+    monkeypatch.setattr(
+        subprocess,
+        "check_call",
+        lambda *args, **kwargs: pytest.fail("unexpected build"),
+    )
+    command.run()
 
 
 def test_gluon_petit_runtime_assets_are_packaged(monkeypatch) -> None:

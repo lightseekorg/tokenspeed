@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.context import (
     report_collective_sizing,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.configs.base import resolve_cache_layer_types
 from tokenspeed.runtime.layers.common import concat
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -46,6 +47,7 @@ from tokenspeed.runtime.layers.linear import (
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+from tokenspeed.runtime.layers.paged_attention import hf_sliding_window_to_window_left
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -66,6 +68,21 @@ logger = get_colorful_logger(__name__)
 # ---------------------------------------------------------------------------
 # Attention
 # ---------------------------------------------------------------------------
+
+
+def _draft_window_left(config: LlamaConfig) -> int:
+    """``window_left`` of the draft layer from the labels its cache plan reads: -1 unless sliding."""
+    layer_types = resolve_cache_layer_types(
+        config,
+        num_layers=config.num_hidden_layers,
+        is_draft=True,
+        draft_block_decode=False,
+    ) or ("full_attention",)
+    if layer_types[0] == "full_attention":
+        return -1
+    if layer_types[0] == "sliding_attention":
+        return hf_sliding_window_to_window_left(config.sliding_window)
+    raise ValueError(f"unsupported draft layer type {layer_types[0]!r}")
 
 
 class LlamaAttention(BaseLlamaAttention):
@@ -144,8 +161,14 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.gateup_unquanted = quant_config is None
 
-    def forward(self, x, block_scale=None):
-
+    def forward(
+        self,
+        x: torch.Tensor,
+        block_scale: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """This rank's partial MLP output; ``block_scale`` and ``ctx`` are
+        unused (an EAGLE-4 draft's MoE takes the same arguments)."""
         if x.shape[0] == 0:
             return x
         gate_up, _ = self.gate_up_proj(x)
@@ -207,6 +230,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             quant_config=self._eagle3_quant_config,
             prefix=add_prefix("self_attn", prefix),
             qkv_input_size=2 * config.hidden_size,
+            sliding_window_size=_draft_window_left(config),
         )
 
     def resolve_mlp(self, prefix: str) -> nn.Module:
@@ -226,6 +250,13 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             self._eagle3_quant_config,
             prefix=f"{prefix}.mlp",
         )
+
+    def _fuse_input(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The attention input and residual from ``[norm(embeds) || norm(hidden)]``
+        and the incoming hidden; an EAGLE-4 draft may merge them first."""
+        return hidden_states, residual
 
     def _maybe_narrow_residual(
         self,
@@ -278,6 +309,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                     output_kv_a=fused_norm_out[..., h:],
                 )
             hidden_states = fused_norm_out
+        hidden_states, residual = self._fuse_input(hidden_states, residual)
 
         # Attention
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
@@ -300,7 +332,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             )
         )
 
-        hidden_states = self.mlp(hidden_states, block_scale)
+        hidden_states = self.mlp(hidden_states, block_scale, ctx)
 
         # Fused final allreduce + norm (uses dense tp group)
         hidden_states, residual, *_ = final_norm.forward_with_allreduce_fusion(
@@ -356,6 +388,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 output_kv_a=fused_norm_out[..., h:],
             )
         hidden_states = fused_norm_out
+        hidden_states, residual = self._fuse_input(hidden_states, residual)
 
         # Attention
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
@@ -373,7 +406,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
 
         # MLP
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, None, ctx)
         hidden_states, residual = self.comm_manager.post_mlp_comm(
             hidden_states, residual, ctx
         )

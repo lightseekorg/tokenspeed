@@ -44,7 +44,7 @@ payload packing).
 
 Node `i` of a request's verify window has RoPE position `vc + depth[i]` and KV
 slot `write_locations[b * N + i]`. Only positions change for a tree:
-`TreeSpec.depth_positions` shifts the window's `vc + i` to `vc + depth` before
+`TreeSpec.load_step` shifts the window's `vc + i` to `vc + depth` before
 the forward, and `TreeSpec.compact_rows` shifts them back after the forward
 (row `i` then holds the path node at depth `i`).
 
@@ -64,6 +64,12 @@ prefix tail it missed and its masked window) and merges both in one Triton
 kernel. Verify runs it with `R = W = N`. Draft lanes run it with `R = K`
 over the `(S - 1) * K`-key lane window (below). There is no size-dependent
 second path.
+
+Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
+sliding-window draft layer see in every lane row the window frozen at the
+round's prefix end: each row decodes the prefix alone (`q_len = 1` at the
+prefix's last key) and the window kernel attends the tree window only
+(`causal_prefix=False`).
 
 An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
 structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
@@ -87,8 +93,11 @@ state after its parent, not after node `t - 1`: `mamba2_verify_scan` takes
 `parent_indices` and `gdn_decode_mtp` the tree's ancestor mask (the one tree
 attention reads), and both reload the parent's state at branch points (a chain
 never reloads). `causal_conv1d_update` with `parent_indices` rebuilds each
-node's window from its ancestors' inputs and the initial window. The commit
-copies the scratch row of the
+node's window from its ancestors' inputs and the initial window. Where the
+selected GDN verify kernel takes a separate destination pool
+(`gdn_decode_mtp(output_state=...)`), roots read the committed recurrent state
+in place and only the node states go to the scratch, so the scratch is never
+seeded with a copy of the committed state. The commit copies the scratch row of the
 last accepted node, `1 + path[accept_len - 1]`, which for a chain is the
 familiar `accept_len`. The fused KDA verify kernel follows a chain and refuses
 trees.
@@ -99,7 +108,9 @@ per node). Under ReplaySSM the verify
 never writes the state pool. The verify runs a GDN tree of 8 to 16 nodes
 (`GDN_TREE_VERIFY_CHUNKED_MIN_NODES`, `GDN_TREE_VERIFY_CHUNKED_MAX_NODES`) in
 the chunked form of the delta rule, every node at once with the ancestor mask
-in place of the causal one, and keeps no node states. In other
+in place of the causal one, and keeps no node states; it also writes each
+node's replay payload row (`[k | v | a | b]`) as it reads them, so that verify
+skips the q/k/v split. In other
 trees the state of every branch point (a node with a child other than the next
 node) goes to one workspace shared by all layers
 (`gdn_decode_mtp(intermediate_states_buffer=...)`, one layer's worth per node),
@@ -124,13 +135,20 @@ chain's draft steps (`(S - 1) * K <= N`, checked in `server_args`). Their K/V
 are valid only while the round drafts its tree. The target's verify overwrites
 the window.
 
-Known limitation, shared with the chain drafter: the decode reservation
-guarantees pages only through the verify window (`vc + N`), and draft writes
-reach past it (lanes up to `frontier + (S - 1) * K - 1`, chain steps up to
-`frontier + S - 2`). A position past the allocated extent resolves to the
-dummy slot, and attention reads it through page 0. This costs draft acceptance
-only. The next verify rewrites target KV. The fix is a draft headroom in the
-scheduler's decode reservation.
+Draft writes reach past the verify window: lanes up to
+`frontier + (S - 1) * K - 1`, chain steps up to `frontier + S - 2`. Both stay
+inside the next verify window (`(S - 1) * K <= N` and `S - 1 <= N`), so a
+speculative decode on a decoding role reserves one more verify window behind
+its own, from the first decode on (the prefill role hands off before drafting
+past its first window). That window stops at the request's token limit (prompt
+plus `max_new_tokens`), which admission may have prepaid in full, so it never
+demands a page past that limit. A request without a declared budget reserves
+no such window: admission validated only its first verify window. Known
+limitation: within `N` tokens of the
+limit some draft writes (chain steps, block drafters and tree lanes alike)
+still land past it. A position past the allocated extent resolves to the dummy
+slot, and attention reads it through page 0. This costs draft acceptance
+only. The next verify rewrites target KV.
 
 Lane attention is the same cascade with `R = K` over the draft paged cache:
 every lane row sees the accepted frontier and, inside the window, only its
@@ -142,6 +160,14 @@ and writes within the round: lengths once per round, masks by
 refresh-only draft metadata contract of `unified_path.md`. It is graph-safe
 because the runtime binds the buffers once at fixed addresses and in-graph ops
 write them before the lane forward reads them.
+
+### A drafter may finish its round in the next forward
+
+A drafter may leave its round pending past the forward (`BaseDrafter.finish_round`)
+and write the next round's tree in the next forward's settle (`complete_round`,
+`event-loop.md`), which runs before that forward's draft refresh, so its lanes
+read the tables they started on. EAGLE-Harness does, and lists where it departs
+from this document in `drafter/eagle_harness/__init__.py`.
 
 ### The drafter scores, the tree selects
 
@@ -168,24 +194,28 @@ lanes and nodes are always fully written.
 
 ### Sampled verify keys noise by position
 
-The triton sampling backend draws a verify row's target token by Gumbel-max
-keyed by `(seed, position)`. For a tree the key is the node's position
-`vc + depth`, never its row: each node row samples with its request's
+The `triton` sampling backend draws a verify row's target token by Gumbel-max
+keyed by `(seed, position)`. For a tree the key is the position predicted by the node
+(`vc + depth + 1`, with `vc` the pre-forward input frontier), never its row: each node row samples with its request's
 parameters and its offset advanced by its depth, so the token accepted at every
 position is the one plain decoding samples there. Acceptance is the greedy tree
 walk over those draws, accepting a child when it equals its parent's draw.
-Backends that cannot do this keep `supports_tree_verify = False` and the
+The flashinfer backend instead accepts every tree by recursive rejection
+sampling (`TreeRejectionSampler`), against the draft q that drew a sampled
+node's children (`RuntimeStates.future_draft_q`), exact in distribution rather
+than the plain-decoding draw.
+Backends that can do neither keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 
 ## Scope
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
-drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
+drafter refuses trees at startup) and EAGLE4; `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
 attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
-attention data parallelism, no sliding window or attention sinks in the target
+attention data parallelism, no sliding window in target layers (draft lanes take a frozen window), no attention sinks in the target
 or draft layers, no target or draft that reads request token history or
 n-gram (Engram) input history, and separate target and draft attention backends.
 
@@ -195,8 +225,9 @@ Each attention backend node declares its own part through `tree_support()`
 through `child_backends()` once at startup, before any bind, and reports every
 blocker together. Composites never forward the question, so a new composite
 cannot silently skip a child. Sliding window and attention sinks are the named
-exception: they are per layer and per call, so the trtllm and tokenspeed_mla
-forwards refuse them (trtllm_mla takes no sliding window at all).
+exception: they are per layer and per call, so the `trtllm` and `tokenspeed_mla`
+forwards refuse them (`trtllm_mla` takes no sliding window at all), except a
+sliding window in the `trtllm` draft lanes.
 
 ## Not scheduler or cache state
 
@@ -204,7 +235,7 @@ The only per-request fact that crosses steps is the next round's `parent[N]`,
 an attribute of the candidate block `future_input_map` already carries on the
 executor side. Lane K/V are round-local: they live in the request's draft
 window until the next verify overwrites it (never prefix-matched,
-transferred or freed with blocks), and the per-node GDN states live in
+transferred, or freed with blocks), and the per-node GDN states live in
 verify-time workspaces (the verify scratch, or the ReplaySSM node-state
 workspace), so nothing here is a cache group for the C++ scheduler to own.
 
@@ -222,7 +253,7 @@ workspace), so nothing here is a cache group for the C++ scheduler to own.
   64 nodes, short prefixes, non-finite unseen slots), tree verify and KV-row
   compaction (`test_compact_window_rows_moves_every_buffer`, bf16 and fp8).
 * `test/runtime/test_tree_attention_cascade.py` — verify and lanes through the
-  trtllm, trtllm_mla and tokenspeed_mla leaves (each leaf's prefix decode plus
+  `trtllm`, `trtllm_mla`, and `tokenspeed_mla` leaves (each leaf's prefix decode plus
   the window kernel) against fp32.
 * `test/runtime/test_draft_tree.py` — tree construction against a per-request
   EAGLE-2 reference, depth-first order, strided roots, NaN scores.

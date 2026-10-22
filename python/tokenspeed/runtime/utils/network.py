@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
 import socket
@@ -55,17 +56,26 @@ def get_free_port():
             return s.getsockname()[1]
 
 
-def set_uvicorn_logging_configs():
-    from uvicorn.config import LOGGING_CONFIG
+def is_valid_ipv6_address(address: str) -> bool:
+    try:
+        ipaddress.IPv6Address(address)
+        return True
+    except ValueError:
+        return False
 
-    LOGGING_CONFIG["formatters"]["default"][
-        "fmt"
-    ] = "[%(asctime)s] %(levelprefix)s %(message)s"
-    LOGGING_CONFIG["formatters"]["default"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
-    LOGGING_CONFIG["formatters"]["access"][
-        "fmt"
-    ] = '[%(asctime)s] %(levelprefix)s %(client_addr)s - "%(request_line)s" %(status_code)s'
-    LOGGING_CONFIG["formatters"]["access"]["datefmt"] = "%Y-%m-%d %H:%M:%S"
+
+def join_host_port(host: str, port: int | str) -> str:
+    """Join ``host`` and ``port`` for a URL or a ZMQ TCP endpoint.
+
+    An IPv6 literal is bracketed (``[::1]:80``) so its colons do not read as
+    the port separator. IPv4 addresses, hostnames and already-bracketed hosts
+    are kept as given. A link-local literal keeps its zone ID inside the
+    brackets (``[fe80::1%eth0]:80``), the form libzmq accepts. ``port`` may
+    also be ZMQ's ``*`` wildcard.
+    """
+    if is_valid_ipv6_address(host):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
 
 
 def get_local_ip_by_remote() -> str | None:

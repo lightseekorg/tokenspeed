@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import torch
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     MoEConfig,
@@ -28,16 +29,386 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     _enforce_wave_uniform_i32,
     _situ_gfx1250,
     _swiglu_gfx1250,
-    compute_offsets,
     compute_pids,
-    create_descriptor,
     get_blocked_layout,
     get_scaled_dot_format_string,
     get_tdm_gather_scatter_idx_layout,
+    partial_tdm_warp_hint,
+    reverse_tdm_warp_used_hint,
 )
+
+# Reduction length from which the decode tile streams 256-byte weight rows.
+_DECODE_LONG_K = 2048
+
+
+def decode_tile_config(k: int) -> dict[str, int]:
+    """Return the decode tile for a projection with reduction length ``k``.
+
+    Decode streams each touched expert's weights once, so the tile is chosen
+    for HBM streaming rather than reuse. 128-column tiles give a single-token
+    step enough programs to occupy the device. A long K reads 256-byte MXFP4
+    row segments (``block_k=512``), which keeps more bytes in flight per TDM
+    operation. A short K uses ``block_k=128`` so the three buffers hold the
+    whole reduction in a small LDS footprint, letting more programs stay
+    resident to hide each program's fixed latency.
+    """
+    return {
+        "block_n": 128,
+        "block_k": 512 if k >= _DECODE_LONG_K else 128,
+        "num_buffers": 3,
+        "num_warps": 4,
+    }
+
+
+def _decode_launch_metadata(grid, kernel, args):
+    """Report routed-row work and modeled traffic to Proton.
+
+    The number of distinct experts is only known on the device, so the weight
+    traffic assumes every routed row selects its own expert, capped at the
+    expert count. That bound is exact for a single-token step and an
+    over-estimate once rows share experts.
+    """
+    m, n, k = args["M"], args["N"], args["K"]
+    experts = min(m, args["N_EXPTS_TOT"])
+
+    def row_bytes(values, scales):
+        # uint8 operands pack two e2m1 values per byte; E8M0 scales add one
+        # byte per SCALE_BLOCK values.
+        packed = values.dtype == torch.uint8
+        data = k // 2 if packed else k * values.element_size()
+        return data + (k // args["SCALE_BLOCK"] if scales is not None else 0)
+
+    w_bytes = n * row_bytes(args["W"], args["WMxScale"])
+    x_bytes = m * row_bytes(args["X"], args["XMxScale"])
+    y_bytes = m * (n // args["ACTIVATION_REDUCTION_N"]) * args["Y"].element_size()
+    return {
+        "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
+        "flops8": 2 * m * n * k,
+        "bytes": experts * w_bytes + x_bytes * args["grid_n"] + y_bytes,
+    }
+
+
+@gluon.constexpr_function
+def _tdm_index_layout(num_indices, num_warps):
+    """Layout of the row indices a TDM gather or scatter consumes."""
+    IDX_BASE_LAYOUT = get_tdm_gather_scatter_idx_layout(num_indices, num_warps)
+    return gl.SliceLayout(0, IDX_BASE_LAYOUT)
 
 
 @gluon.jit
+def _create_w_descriptor(
+    cfg: MoEConfig,
+    w_ptr,
+    w_scale_ptr,
+    w_offs,
+    w_scale_offs,
+    N,
+    K,
+    stride_wk,
+    stride_wn,
+    stride_w_scale_n,
+    stride_w_scale_k,
+):
+    gl.static_assert(cfg.W_TRANSPOSE, "decode kernel expects N-major weights")
+    w_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=w_ptr + w_offs,
+        shape=(N, K // cfg.DIV_FACTOR_W),
+        strides=(stride_wn, stride_wk),
+        block_shape=(cfg.BLOCK_N, cfg.BLOCK_K // cfg.DIV_FACTOR_W),
+        layout=cfg.shared_layout_w,
+    )
+    if cfg.WITH_W_MX_SCALE:
+        PRESHUFFLE_FACTOR: gl.constexpr = cfg.PRESHUFFLE_FACTOR
+        SCALE_BLOCK: gl.constexpr = cfg.SCALE_BLOCK
+        SCALE_KWIDTH: gl.constexpr = cfg.SCALE_KWIDTH
+        # The padded shape makes TDM load all of the preshuffled scales.
+        N_PADDED = (N + PRESHUFFLE_FACTOR - 1) // PRESHUFFLE_FACTOR * PRESHUFFLE_FACTOR
+        K_SCALE = (K + SCALE_BLOCK - 1) // SCALE_BLOCK
+        K_SCALE_PADDED = (K_SCALE + SCALE_KWIDTH - 1) // SCALE_KWIDTH * SCALE_KWIDTH
+        w_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=w_scale_ptr + w_scale_offs,
+            shape=(N_PADDED // PRESHUFFLE_FACTOR, K_SCALE_PADDED * PRESHUFFLE_FACTOR),
+            strides=(stride_w_scale_n, stride_w_scale_k),
+            block_shape=(cfg.BLOCK_N_PRESHUFFLED, cfg.BLOCK_K_SCALE_PRESHUFFLED),
+            layout=cfg.shared_layout_w_scale,
+        )
+    else:
+        w_scale_desc = gl.constexpr(0)
+    return w_desc, w_scale_desc
+
+
+@gluon.jit
+def _create_x_descriptor(
+    cfg: MoEConfig,
+    x_ptr,
+    x_scale_ptr,
+    off_m,
+    M,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_x_scale_m,
+    stride_x_scale_k,
+    GatherIndx,
+    start_m,
+):
+    SCALE_BLOCK: gl.constexpr = cfg.SCALE_BLOCK
+    if cfg.USE_GATHER:
+        IDX_LAYOUT: gl.constexpr = _tdm_index_layout(cfg.BLOCK_M, cfg.NUM_WARPS)
+        offs_m_gather = off_m + gl.arange(0, cfg.BLOCK_M, IDX_LAYOUT)
+        gathered_m = gl.load(
+            GatherIndx + start_m + offs_m_gather,
+            mask=start_m + offs_m_gather < M,
+            other=0,
+        ).to(cfg.index_type)
+        x_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=x_ptr,
+            shape=(M, K // cfg.DIV_FACTOR_X),
+            strides=(stride_xm, stride_xk),
+            block_shape=(cfg.BLOCK_M, cfg.BLOCK_K // cfg.DIV_FACTOR_X),
+            layout=cfg.shared_layout_x,
+        )
+        if cfg.WITH_X_MX_SCALE:
+            x_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+                base=x_scale_ptr,
+                shape=(M, K // SCALE_BLOCK),
+                strides=(stride_x_scale_m, stride_x_scale_k),
+                block_shape=(cfg.BLOCK_M, cfg.BLOCK_K // SCALE_BLOCK),
+                layout=cfg.shared_layout_x_scale,
+            )
+        else:
+            x_scale_desc = gl.constexpr(0)
+    else:
+        gathered_m = gl.constexpr(0)
+        x_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=x_ptr + off_m * stride_xm,
+            shape=(M, K // cfg.DIV_FACTOR_X),
+            strides=(stride_xm, stride_xk),
+            block_shape=(cfg.BLOCK_M, cfg.BLOCK_K // cfg.DIV_FACTOR_X),
+            layout=cfg.shared_layout_x,
+        )
+        if cfg.WITH_X_MX_SCALE:
+            x_scale_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+                base=x_scale_ptr + off_m * stride_x_scale_m,
+                shape=(M, K // SCALE_BLOCK),
+                strides=(stride_x_scale_m, stride_x_scale_k),
+                block_shape=(cfg.BLOCK_M, cfg.BLOCK_K // SCALE_BLOCK),
+                layout=cfg.shared_layout_x_scale,
+            )
+        else:
+            x_scale_desc = gl.constexpr(0)
+    return x_desc, x_scale_desc, gathered_m
+
+
+@gluon.jit
+def _allocate_w_buffers(cfg: MoEConfig, w_desc):
+    w_buffer = gl.allocate_shared_memory(
+        w_desc.dtype,
+        shape=[cfg.NUM_BUFFERS, cfg.BLOCK_N, cfg.BLOCK_K // cfg.DIV_FACTOR_W],
+        layout=cfg.shared_layout_w,
+    )
+    if cfg.WITH_W_MX_SCALE:
+        w_scale_buffer = gl.allocate_shared_memory(
+            gl.uint8,
+            shape=[
+                cfg.NUM_BUFFERS,
+                cfg.BLOCK_N_PRESHUFFLED,
+                cfg.BLOCK_K_SCALE_PRESHUFFLED,
+            ],
+            layout=cfg.shared_layout_w_scale,
+        )
+    else:
+        w_scale_buffer = gl.constexpr(0)
+    return w_buffer, w_scale_buffer
+
+
+@gluon.jit
+def _allocate_x_buffers(cfg: MoEConfig, x_desc):
+    x_buffer = gl.allocate_shared_memory(
+        x_desc.dtype,
+        shape=[cfg.NUM_BUFFERS, cfg.BLOCK_M, cfg.BLOCK_K // cfg.DIV_FACTOR_X],
+        layout=cfg.shared_layout_x,
+    )
+    if cfg.WITH_X_MX_SCALE:
+        x_scale_buffer = gl.allocate_shared_memory(
+            gl.uint8,
+            shape=[cfg.NUM_BUFFERS, cfg.BLOCK_M, cfg.BLOCK_K // cfg.SCALE_BLOCK],
+            layout=cfg.shared_layout_x_scale,
+        )
+    else:
+        x_scale_buffer = gl.constexpr(0)
+    return x_buffer, x_scale_buffer
+
+
+@gluon.constexpr_function
+def _reversed_partial_tdm_hint(num_warps):
+    return reverse_tdm_warp_used_hint(partial_tdm_warp_hint(num_warps), num_warps)
+
+
+@gluon.jit
+def _issue_w_loads(
+    cfg: MoEConfig, w_desc, w_scale_desc, w_buffer, w_scale_buffer, load_idx, pred
+):
+    buf = load_idx % cfg.NUM_BUFFERS
+    w_offsets = [0, load_idx * (cfg.BLOCK_K // cfg.DIV_FACTOR_W)]
+    w_scale_offsets = [0, load_idx * cfg.BLOCK_K_SCALE_PRESHUFFLED]
+    # Decode issues the weights before the activation rows are known, so
+    # partial TDM pairs each weight load with its scale load: half the warps
+    # carry each, as one fused operation.
+    FUSE: gl.constexpr = cfg.FUSE_X_W or cfg.FUSE_W_W_SCALE
+    if FUSE:
+        W_HINT: gl.constexpr = partial_tdm_warp_hint(cfg.NUM_WARPS)
+        W_SCALE_HINT: gl.constexpr = _reversed_partial_tdm_hint(cfg.NUM_WARPS)
+        gl.amd.cdna5.tdm.async_load_fused(
+            [
+                (
+                    gl.amd.cdna5.tdm.update_tensor_descriptor(
+                        w_desc, add_offsets=w_offsets, pred=pred, clamp_bounds=True
+                    ),
+                    w_buffer.index(buf),
+                    W_HINT,
+                ),
+                (
+                    gl.amd.cdna5.tdm.update_tensor_descriptor(
+                        w_scale_desc,
+                        add_offsets=w_scale_offsets,
+                        pred=pred,
+                        clamp_bounds=True,
+                    ),
+                    w_scale_buffer.index(buf),
+                    W_SCALE_HINT,
+                ),
+            ]
+        )
+    else:
+        gl.amd.cdna5.tdm.async_load(w_desc, w_offsets, w_buffer.index(buf), pred=pred)
+        if cfg.WITH_W_MX_SCALE:
+            gl.amd.cdna5.tdm.async_load(
+                w_scale_desc, w_scale_offsets, w_scale_buffer.index(buf), pred=pred
+            )
+
+
+@gluon.jit
+def _issue_x_loads(
+    cfg: MoEConfig,
+    x_desc,
+    x_scale_desc,
+    x_buffer,
+    x_scale_buffer,
+    gathered_m,
+    load_idx,
+    pred,
+):
+    buf = load_idx % cfg.NUM_BUFFERS
+    BLOCK_K_PACKED_X: gl.constexpr = cfg.BLOCK_K // cfg.DIV_FACTOR_X
+    if cfg.USE_GATHER:
+        x_desc_k = gl.amd.cdna5.tdm.update_tensor_descriptor(
+            x_desc,
+            add_offsets=[0, load_idx * BLOCK_K_PACKED_X],
+            pred=pred,
+            clamp_bounds=True,
+        )
+        gl.amd.cdna5.tdm.async_gather(x_desc_k, gathered_m, x_buffer.index(buf))
+    else:
+        gl.amd.cdna5.tdm.async_load(
+            x_desc, [0, load_idx * BLOCK_K_PACKED_X], x_buffer.index(buf), pred=pred
+        )
+    if cfg.WITH_X_MX_SCALE:
+        if cfg.USE_GATHER:
+            x_scale_desc_k = gl.amd.cdna5.tdm.update_tensor_descriptor(
+                x_scale_desc,
+                add_offsets=[0, load_idx * (cfg.BLOCK_K // cfg.SCALE_BLOCK)],
+                pred=pred,
+                clamp_bounds=True,
+            )
+            gl.amd.cdna5.tdm.async_gather(
+                x_scale_desc_k, gathered_m, x_scale_buffer.index(buf)
+            )
+        else:
+            gl.amd.cdna5.tdm.async_load(
+                x_scale_desc,
+                [0, load_idx * (cfg.BLOCK_K // cfg.SCALE_BLOCK)],
+                x_scale_buffer.index(buf),
+                pred=pred,
+            )
+
+
+@gluon.jit
+def _decode_pipeline(pgm: MoEPipelinedProgram, K):
+    """Run the K loop after the prologue issued every weight load first.
+
+    The prologue issues W(0..NB-2) and then X(0..NB-2); each loop iteration
+    issues X then W for NB-1 steps ahead. Only the first NB-2 iterations see a
+    different number of later TDM operations, so they are peeled with their
+    own wait counts.
+    """
+    cfg = pgm.cfg
+    NB: gl.constexpr = cfg.NUM_BUFFERS
+    NX: gl.constexpr = 2 if cfg.WITH_X_MX_SCALE else 1
+    # Partial TDM fuses each weight load with its scale load.
+    FUSE_W: gl.constexpr = cfg.FUSE_X_W or cfg.FUSE_W_W_SCALE
+    NW: gl.constexpr = 1 if FUSE_W or not cfg.WITH_W_MX_SCALE else 2
+    LOADS: gl.constexpr = NX + NW
+
+    accumulator = gl.zeros(
+        (cfg.BLOCK_M, cfg.BLOCK_N), dtype=gl.float32, layout=cfg.acc_layout
+    )
+    loop_ub = gl.cdiv(K, cfg.BLOCK_K)
+    gl.assume(loop_ub > 0)
+    for i in gl.static_range(NB - 2):
+        if i < loop_ub:
+            pred = (i + NB - 1 < loop_ub).to(gl.int32)
+            _issue_x_loads(
+                cfg,
+                pgm.x_desc,
+                pgm.x_scale_desc,
+                pgm.x_buffer,
+                pgm.x_scale_buffer,
+                pgm.gathered_m,
+                i + NB - 1,
+                pred,
+            )
+            _issue_w_loads(
+                cfg,
+                pgm.w_desc,
+                pgm.w_scale_desc,
+                pgm.w_buffer,
+                pgm.w_scale_buffer,
+                i + NB - 1,
+                pred,
+            )
+            gl.amd.cdna5.tdm.async_wait((NB - 2 - i) * NX + (i + 1) * LOADS)
+            x, w, scale_x, scale_w = pgm.issue_local_loads(i)
+            accumulator = pgm.wmma(x, scale_x, w, scale_w, accumulator)
+    LOOP_START: gl.constexpr = NB - 2 if NB > 2 else 0
+    for i in range(LOOP_START, loop_ub):
+        pred = (i + NB - 1 < loop_ub).to(gl.int32)
+        _issue_x_loads(
+            cfg,
+            pgm.x_desc,
+            pgm.x_scale_desc,
+            pgm.x_buffer,
+            pgm.x_scale_buffer,
+            pgm.gathered_m,
+            i + NB - 1,
+            pred,
+        )
+        _issue_w_loads(
+            cfg,
+            pgm.w_desc,
+            pgm.w_scale_desc,
+            pgm.w_buffer,
+            pgm.w_scale_buffer,
+            i + NB - 1,
+            pred,
+        )
+        gl.amd.cdna5.tdm.async_wait((NB - 1) * LOADS)
+        x, w, scale_x, scale_w = pgm.issue_local_loads(i)
+        accumulator = pgm.wmma(x, scale_x, w, scale_w, accumulator)
+    return accumulator
+
+
+@gluon.jit(launch_metadata=_decode_launch_metadata)
 def _matmul_decode(
     Y,
     stride_y_k,
@@ -133,6 +504,10 @@ def _matmul_decode(
         _W_SLICE_SIZES_DIVISIBILITY is None,
         "decode kernel does not support K-ragged weights",
     )
+    gl.static_assert(
+        not PARTIAL_TDM or WMxScale is not None,
+        "decode partial TDM fuses weight loads with their scale loads",
+    )
     SPLIT_K: gl.constexpr = 1
 
     DTYPE_X: gl.constexpr = get_scaled_dot_format_string(X.dtype.element_ty)
@@ -171,60 +546,58 @@ def _matmul_decode(
         NUM_WARPS=NUM_WARPS,
     )
 
-    PACKED_BLOCK_K_W: gl.constexpr = BLOCK_K // cfg.DIV_FACTOR_W
-
-    W_SLICE_SIZES_DIVISIBILITY: gl.constexpr = 1
-
     OUT_BLOCK_N: gl.constexpr = BLOCK_N // ACTIVATION_REDUCTION_N
     yN = N // ACTIVATION_REDUCTION_N
 
     pid = gl.program_id(0)
-    padding_m = grid_m - gl.load(XBlockOffs + N_EXPTS_TOT)
-
-    unpadded_m = grid_m - padding_m
-    gl.assume(unpadded_m >= 0)
-    total_actual_tiles = unpadded_m * grid_n * SPLIT_K
-
-    if padding_m > 0 and pid >= total_actual_tiles:
+    # Map over the padded grid so the tile does not wait on the active block
+    # count; padding blocks carry a -1 schedule entry and exit here.
+    _, pid_m, pid_n, _ = compute_pids(
+        pid, grid_m, grid_n, grid_m * grid_n, XCD_SWIZZLE, GROUP_M, SPLIT_K
+    )
+    block_schedule = gl.load(XBlockSchedule + pid_m)
+    if block_schedule == -1:
         return
-
-    _, pid_m, pid_n, pid_k = compute_pids(
-        pid, unpadded_m, grid_n, total_actual_tiles, XCD_SWIZZLE, GROUP_M, SPLIT_K
-    )
-
-    expt_id, _, _, start_m, _, off_m, off_k_x, _ = compute_offsets(
-        0,
-        pid_m,
-        pid_k,
-        XBlockSchedule,
-        XSliceOffs,
-        XBlockOffs,
-        X_SLICE_SIZES_DIVISIBILITY,
-        WBlockSchedule,
-        WSliceOffs,
-        W_SLICE_SIZES_DIVISIBILITY,
-        RAGGED_DIMENSION,
-        BLOCK_M,
-        BLOCK_K,
-        PACKED_BLOCK_K_W,
-        SPLIT_K,
-    )
-    if X_SLICE_SIZES_DIVISIBILITY is not None:
-        off_k_x = off_k_x // X_SLICE_SIZES_DIVISIBILITY * X_SLICE_SIZES_DIVISIBILITY
-
-    eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
+    expt_id = block_schedule & 0x0000FFFF
+    off_m = BLOCK_M * (block_schedule >> 16)
 
     expt_id, off_m = expt_id.to(address_index_type), off_m.to(address_index_type)
-    start_m = start_m.to(address_index_type)
-    pid_n, pid_k = pid_n.to(address_index_type), pid_k.to(address_index_type)
+    pid_n = pid_n.to(address_index_type)
+
+    # The weight tiles depend only on the expert, so start streaming them
+    # before the row metadata and gather indices arrive.
+    W_ptr = W + expt_id * stride_w_e
+    w_offs = pid_n * BLOCK_N * stride_w_n
+    if cfg.WITH_W_MX_SCALE:
+        WMxScale_ptr = WMxScale + expt_id * stride_w_mx_e
+        w_scale_offs = pid_n * cfg.BLOCK_N_PRESHUFFLED * stride_w_mx_n
+    else:
+        WMxScale_ptr = WMxScale
+        w_scale_offs = 0
+    w_desc, w_scale_desc = _create_w_descriptor(
+        cfg,
+        W_ptr,
+        WMxScale_ptr,
+        w_offs,
+        w_scale_offs,
+        # The weight descriptors start at this N tile, so their bounds must too.
+        (N - pid_n * BLOCK_N).to(gl.int32),
+        K,
+        stride_w_k,
+        stride_w_n,
+        stride_w_mx_n,
+        stride_w_mx_k,
+    )
+    w_buffer, w_scale_buffer = _allocate_w_buffers(cfg, w_desc)
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        _issue_w_loads(cfg, w_desc, w_scale_desc, w_buffer, w_scale_buffer, i, 1)
+
+    start_m = gl.load(XSliceOffs + expt_id).to(address_index_type)
+    eM = gl.multiple_of(gl.load(XSliceSizes + expt_id), X_SLICE_SIZES_DIVISIBILITY)
 
     X_ptr = X
     if not cfg.USE_GATHER:
         X_ptr += start_m * stride_x_m
-
-    W_ptr = W + expt_id * stride_w_e
-    w_offs = pid_n * BLOCK_N * stride_w_n
-
     if cfg.WITH_X_MX_SCALE:
         XMxScale_ptr = XMxScale
         if not cfg.USE_GATHER:
@@ -232,57 +605,59 @@ def _matmul_decode(
     else:
         XMxScale_ptr = XMxScale
 
-    if cfg.WITH_W_MX_SCALE:
-        WMxScale_ptr = WMxScale + expt_id * stride_w_mx_e
-        w_scale_offs = pid_n * cfg.BLOCK_N_PRESHUFFLED * stride_w_mx_n
-    else:
-        WMxScale_ptr = WMxScale
-        w_scale_offs = 0
-
     descriptor_m = M
     if not cfg.USE_GATHER:
         # Rows left in this expert fit i32 even when the weight slab needs the
         # wide index type.
         descriptor_m = (eM - off_m).to(gl.int32)
-    x_desc, w_desc, x_scale_desc, w_scale_desc, gathered_m = create_descriptor(
+    x_desc, x_scale_desc, gathered_m = _create_x_descriptor(
         cfg,
         X_ptr,
-        W_ptr,
         XMxScale_ptr,
-        WMxScale_ptr,
         off_m,
-        off_k_x,
-        w_offs,
-        w_scale_offs,
         descriptor_m,
-        N,
         K,
         stride_x_m,
         stride_x_k,
-        stride_w_k,
-        stride_w_n,
         stride_x_mx_m,
         stride_x_mx_k,
-        stride_w_mx_n,
-        stride_w_mx_k,
         GatherIndx,
         start_m,
     )
+    x_buffer, x_scale_buffer = _allocate_x_buffers(cfg, x_desc)
+    for i in gl.static_range(NUM_BUFFERS - 1):
+        _issue_x_loads(
+            cfg, x_desc, x_scale_desc, x_buffer, x_scale_buffer, gathered_m, i, 1
+        )
 
-    Y_ptr = Y
+    if WriteBackIndx is not None:
+        # Fetch the scatter rows now; their latency hides behind the K loop.
+        IDX_LAYOUT: gl.constexpr = _tdm_index_layout(BLOCK_M, cfg.NUM_WARPS)
+        idx_offs = gl.arange(0, BLOCK_M, IDX_LAYOUT)
+        idx_mask = (off_m + idx_offs < eM) & (
+            start_m + off_m + idx_offs < writeback_size
+        )
+        dst_row_indices = gl.load(
+            WriteBackIndx + start_m + off_m + idx_offs,
+            mask=idx_mask,
+            other=writeback_size,
+        ).to(cfg.index_type)
 
-    pgm = MoEPipelinedProgram.initialize(
+    pgm = MoEPipelinedProgram(
         cfg,
+        x_buffer,
+        w_buffer,
+        x_scale_buffer,
+        w_scale_buffer,
         x_desc,
         w_desc,
         x_scale_desc,
         w_scale_desc,
         gathered_m,
-        off_k_x // cfg.DIV_FACTOR_X,
+        gl.to_tensor(0),
     )
-
-    loop_k = K - off_k_x
-    acc = pgm.pipeline(loop_k)
+    acc = _decode_pipeline(pgm, K)
+    Y_ptr = Y
     if XGlobalScale is not None and not cfg.WITH_X_MX_SCALE:
         acc *= gl.load(XGlobalScale).to(gl.float32)
 
@@ -342,22 +717,6 @@ def _matmul_decode(
     out_smem.store(out)
 
     if WriteBackIndx is not None:
-        WriteBackIndx += start_m
-
-        IDX_BASE_LAYOUT: gl.constexpr = get_tdm_gather_scatter_idx_layout(
-            BLOCK_M, cfg.NUM_WARPS
-        )
-        IDX_LAYOUT: gl.constexpr = gl.SliceLayout(0, IDX_BASE_LAYOUT)
-
-        idx_offs = gl.arange(0, BLOCK_M, IDX_LAYOUT)
-        idx_mask = (off_m + idx_offs < eM) & (
-            start_m + off_m + idx_offs < writeback_size
-        )
-        dst_row_indices = gl.load(
-            WriteBackIndx + off_m + idx_offs, mask=idx_mask, other=writeback_size
-        )
-        dst_row_indices = dst_row_indices.to(cfg.index_type)
-
         y_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=Y_ptr,
             shape=(writeback_size, yN),

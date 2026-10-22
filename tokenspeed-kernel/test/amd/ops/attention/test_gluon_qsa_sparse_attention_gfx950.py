@@ -24,17 +24,15 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.attention.qsa import (
+    torch_qsa_selected_attention,
+)
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
 import tokenspeed_kernel.ops.attention.qsa  # noqa: E402,F401
-from tokenspeed_kernel.selection import select_kernel  # noqa: E402
-from tokenspeed_kernel.signature import (  # noqa: E402
-    dense_tensor_format,
-    format_signature,
-)
 from tokenspeed_kernel_amd.ops.gfx950.attention.qsa.sparse_attention import (  # noqa: E402
     gluon_qsa_sparse_attention_gfx950,
     gluon_qsa_sparse_attention_merge_gfx950,
@@ -46,22 +44,9 @@ _WIDTH = 2051
 
 
 def _reference(q, k_cache, v_cache, selected_slots, scale):
-    output = torch.zeros(
-        (q.shape[0], q.shape[1], v_cache.shape[-1]),
-        dtype=torch.float32,
-        device=q.device,
+    return torch_qsa_selected_attention(
+        q, k_cache, v_cache, selected_slots, scale, 1.0, 1.0
     )
-    group = q.shape[1] // k_cache.shape[1]
-    for row in range(q.shape[0]):
-        slots = selected_slots[row][selected_slots[row] > 0].long()
-        if slots.numel() == 0:
-            continue
-        for head in range(q.shape[1]):
-            keys = k_cache[slots, head // group].float()
-            values = v_cache[slots, head // group].float()
-            scores = q[row, head].float() @ keys.T
-            output[row, head] = torch.softmax(scores * scale, dim=-1) @ values
-    return output.to(q.dtype)
 
 
 def _inputs(rows, num_heads, num_kv_heads, cache_dtype, seed=0):
@@ -90,31 +75,6 @@ def _inputs(rows, num_heads, num_kv_heads, cache_dtype, seed=0):
     selected[0, 20:] = -1
     selected[-1] = -1
     return q, k_cache, v_cache, selected.int()
-
-
-def test_gluon_is_selected_on_gfx950():
-    signature = format_signature(
-        q=dense_tensor_format(torch.bfloat16),
-        k_cache=dense_tensor_format(torch.bfloat16),
-        v_cache=dense_tensor_format(torch.bfloat16),
-    )
-    for is_decode in (True, False):
-        kernel = select_kernel(
-            "attention",
-            "qsa_sparse_attention",
-            signature,
-            traits={
-                "batch_size": 16,
-                "q_len": 4 if is_decode else 1,
-                "num_q_heads": 12,
-                "num_kv_heads": 1,
-                "head_dim": 256,
-                "value_head_dim": 256,
-                "selected_width": _WIDTH,
-                "is_decode": is_decode,
-            },
-        )
-        assert kernel.name == "gluon_qsa_sparse_attention_gfx950"
 
 
 @pytest.mark.parametrize("cache_dtype", [torch.bfloat16, torch.float8_e4m3fn])

@@ -28,6 +28,8 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.ops.gemm import plan_dense_gemm
 from torch.nn.parameter import Parameter, UninitializedParameter
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
@@ -57,10 +59,18 @@ _FLOAT8_DTYPES = tuple(
     )
     if (dtype := getattr(torch, name, None)) is not None
 )
+# Weight dtypes the fused vocab-shard gather kernel is registered for.
+_FUSED_GATHER_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 class UnquantizedEmbeddingMethod(QuantizeMethodBase):
     """Unquantized method for embeddings."""
+
+    def __init__(self):
+        from tokenspeed.runtime.utils.env import global_server_args_dict
+
+        self.batch_invariant = global_server_args_dict["numerics"] in BITWISE_ENVELOPES
+        self.kernel_plan = None
 
     def create_weights(
         self,
@@ -84,6 +94,15 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         set_weight_attrs(weight, {"input_dim": 1, "output_dim": 0})
         layer.register_parameter("weight", weight)
         set_weight_attrs(weight, extra_weight_attrs)
+        if self.batch_invariant:
+            self.kernel_plan = plan_dense_gemm(
+                mode="mm",
+                input_size=input_size_per_partition,
+                output_size=sum(output_partition_sizes),
+                dtype=params_dtype,
+                batch_size=None,
+                batch_invariant=True,
+            )
 
     def apply(
         self,
@@ -91,14 +110,12 @@ class UnquantizedEmbeddingMethod(QuantizeMethodBase):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        from tokenspeed.runtime.utils.env import global_server_args_dict
-
-        if global_server_args_dict["numerics"] in BITWISE_ENVELOPES:
-            # Bitwise envelopes: the logits GEMM must be batch-invariant like
-            # every other row-parallel projection (see layers/dense/unquant).
-            from tokenspeed_kernel.ops.gemm import mm as kernel_mm
-
-            return kernel_mm(x, layer.weight, bias=bias, override="aok")
+        if self.batch_invariant:
+            if self.kernel_plan is None:
+                raise RuntimeError(
+                    "Batch-invariant LM head requires a plan before execution"
+                )
+            return kernel_mm(x, layer.weight, bias=bias, plan=self.kernel_plan)
         return F.linear(x, layer.weight, bias)
 
     def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
@@ -482,7 +499,11 @@ class VocabParallelEmbedding(torch.nn.Module):
         # If parameter does not have output dim, then it should
         # be copied onto all gpus (e.g. g_idx for act_order gptq).
         if output_dim is None:
-            if getattr(param, "needs_scalar_to_array", False):
+            # A per-tensor scale may be stored as a scalar (an FP8 LM head's).
+            if (
+                getattr(param, "needs_scalar_to_array", False)
+                or loaded_weight.dim() == 0
+            ):
                 loaded_weight = loaded_weight.reshape(param.data.shape)
             assert param.data.shape == loaded_weight.shape
             param.data.copy_(loaded_weight)
@@ -527,7 +548,9 @@ class VocabParallelEmbedding(torch.nn.Module):
         return (
             input_.is_cuda
             and type(self.quant_method) is UnquantizedEmbeddingMethod
-            and self.weight.dtype not in _FLOAT8_DTYPES
+            # The gather kernel's dtypes (no FP8) and its unit-column-stride reads.
+            and self.weight.dtype in _FUSED_GATHER_DTYPES
+            and self.weight.stride(-1) == 1
             and self.weight.is_cuda
         )
 
@@ -578,24 +601,16 @@ class VocabParallelEmbedding(torch.nn.Module):
             return token_reduce_scatter(
                 self._partial_lookup(ids), self.tp_group, counts
             )
-        if self.tp_size > 1:
-            output_parallel = self._partial_lookup(input_)
-            if reduce_results:
-                return all_reduce(output_parallel, self.tp_group)
-            return output_parallel
-        # Single-rank (DP / replicated) path has no shard mask, so an
-        # out-of-range id (e.g. CUDA-graph capture warmup where the drafter
-        # feeds argmax over uninitialized logits) hits F.embedding OOB.
-        # Clamp here for parity with the tp_size>1 mask path; under normal
-        # inference upstream guarantees id < num_embeddings_padded so this
-        # is a no-op.
-        masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
-        return self.quant_method.embedding(self, masked_input)
+        output_parallel = self._partial_lookup(input_)
+        if self.tp_size > 1 and reduce_results:
+            return all_reduce(output_parallel, self.tp_group)
+        return output_parallel
 
     def _partial_lookup(self, input_: torch.Tensor) -> torch.Tensor:
         """This rank's vocab shard's contribution to every row of ``input_``:
         the embedding of ids inside the shard, zero rows for the others. The
-        sum over the TP group is the full embedding."""
+        sum over the TP group is the full embedding; a single rank's shard is
+        the whole table."""
         if self._fused_shard_gather(input_):
             # One gather resolves the shard mask, the local index and the
             # zeroing of other ranks' rows.
@@ -614,6 +629,10 @@ class VocabParallelEmbedding(torch.nn.Module):
                     self.shard_indices.added_vocab_end_index,
                 ),
             )
+        if self.tp_size == 1:
+            # No shard mask here: clamp the out-of-range ids CUDA-graph capture warmup can feed.
+            masked_input = input_.clamp(min=0, max=self.num_embeddings_padded - 1)
+            return self.quant_method.embedding(self, masked_input)
         # Build the mask.
         masked_input, input_mask = get_masked_input_and_mask(
             input_,

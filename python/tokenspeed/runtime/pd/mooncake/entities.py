@@ -227,5 +227,5 @@ class KVManagerArgs:
     enable_dp_attention: bool
 
     served_model_name: str
-    app_key: str
-    metrics_reporters: str
+    app_key: str | None
+    metrics_reporters: list[str] | None

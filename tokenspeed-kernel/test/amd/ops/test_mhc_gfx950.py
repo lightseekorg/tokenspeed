@@ -23,41 +23,12 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
+from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required for the mHC test", allow_module_level=True)
-
-
-def _reference(
-    residual: torch.Tensor,
-    fn: torch.Tensor,
-    hc_scale: torch.Tensor,
-    hc_base: torch.Tensor,
-    rms_eps: float,
-    hc_eps: float,
-    sinkhorn_iters: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_tokens, hc_mult, hidden_size = residual.shape
-    flat = residual.float().view(num_tokens, hc_mult * hidden_size)
-    inv_rms = torch.rsqrt(flat.square().mean(dim=-1, keepdim=True) + rms_eps)
-    mixes = F.linear(flat, fn) * inv_rms
-    pre_raw, post_raw, comb_raw = torch.split(mixes, [4, 4, 16], dim=-1)
-    pre = torch.sigmoid(pre_raw * hc_scale[0] + hc_base[:4]) + hc_eps
-    post = torch.sigmoid(post_raw * hc_scale[1] + hc_base[4:8]) * 2.0
-    comb = torch.softmax(
-        comb_raw.view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
-        + hc_base[8:].view(1, hc_mult, hc_mult),
-        dim=-1,
-    )
-    comb = comb + hc_eps
-    comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-    for _ in range(1, sinkhorn_iters):
-        comb = comb / (comb.sum(dim=-1, keepdim=True) + hc_eps)
-        comb = comb / (comb.sum(dim=-2, keepdim=True) + hc_eps)
-    layer_input = (pre.unsqueeze(-1) * residual.float()).sum(dim=1)
-    return layer_input.to(torch.bfloat16), post.unsqueeze(-1), comb
 
 
 @pytest.mark.parametrize("num_tokens", [8, 16, 32, 64])
@@ -92,7 +63,7 @@ def test_gluon_mhc_pre_multitoken_matches_reference(
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20)
 
     actual = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
-    expected = _reference(*args)
+    expected = torch_mhc_pre(*args, None, None)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(
@@ -133,7 +104,7 @@ def test_glm5_next_mhc_pre_graph_shape_replays_changed_input() -> None:
         graph_output = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
 
     residual.copy_(torch.randn(residual.shape, device="cuda", dtype=residual.dtype))
-    expected = _reference(*args)
+    expected = torch_mhc_pre(*args, None, None)
     graph.replay()
     torch.cuda.synchronize()
 
@@ -181,7 +152,7 @@ def test_gluon_mhc_large_prefill_matches_reference(
 ) -> None:
     args = _prefill_args(num_tokens, hidden_size)
     actual = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
-    expected = _reference(*args)
+    expected = torch_mhc_pre(*args, None, None)
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(
             actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
@@ -262,7 +233,7 @@ def test_gluon_mhc_prefill_output_normalization(
         norm_weight=norm_weight,
         norm_eps=1e-5,
     )
-    layer, post, comb = _reference(*args)
+    layer, post, comb = torch_mhc_pre(*args, None, None)
     layer = F.rms_norm(layer, (hidden_size,), norm_weight, 1e-5)
     for result, expected in zip(actual, (layer, post, comb), strict=True):
         torch.testing.assert_close(
@@ -288,7 +259,7 @@ def test_gluon_mhc_prefill_graph_changes_all_inputs(normalize) -> None:
     bias.add_(0.1)
     if normalize:
         norm_weight.mul_(0.8)
-    expected = list(_reference(*args))
+    expected = list(torch_mhc_pre(*args, None, None))
     if normalize:
         expected[0] = F.rms_norm(expected[0], (7168,), norm_weight, norm_eps)
     graph.replay()

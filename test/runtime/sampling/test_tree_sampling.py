@@ -31,6 +31,7 @@ import torch
 from tokenspeed.runtime.execution.tree_spec import TreeSpec, TreeSpecConfig
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
 from tokenspeed.runtime.sampling.backends.base import SamplingBackendConfig
+from tokenspeed.runtime.sampling.backends.flashinfer import FlashInferSamplingBackend
 from tokenspeed.runtime.sampling.backends.greedy import GreedySamplingBackend
 from tokenspeed.runtime.sampling.backends.triton import TritonSamplingBackend
 from tokenspeed.runtime.sampling.sampling_batch_info import SamplingBatchInfo
@@ -50,6 +51,7 @@ PARAMS = {
 
 def _config(logprobs: bool) -> SamplingBackendConfig:
     return SamplingBackendConfig(
+        synthetic_acceptance_length=None,
         max_bs=BS,
         max_draft_tokens_per_req=N,
         max_req_pool_size=POOL,
@@ -63,9 +65,11 @@ def _config(logprobs: bool) -> SamplingBackendConfig:
 
 
 def _backend(
-    route: str, logprobs: bool = False
-) -> tuple[TritonSamplingBackend, torch.Tensor]:
-    backend = TritonSamplingBackend(_config(logprobs))
+    route: str,
+    cls: type[TritonSamplingBackend | FlashInferSamplingBackend],
+    logprobs: bool = False,
+) -> tuple[TritonSamplingBackend | FlashInferSamplingBackend, torch.Tensor]:
+    backend = cls(_config(logprobs))
     params = []
     for i in range(BS):
         sp = SamplingParams(**PARAMS[route])
@@ -82,10 +86,12 @@ def _backend(
     return backend, torch.tensor(pool, dtype=torch.int64, device="cuda")
 
 
-def _info(req, offsets) -> SamplingBatchInfo:
+def _info(req, target_positions) -> SamplingBatchInfo:
+    # Internal draw helpers consume target positions; runtime metadata carries
+    # the preceding input frontier and derives the target position at sampling.
     return SamplingBatchInfo(
         req_pool_indices=req,
-        valid_cache_lengths=offsets,
+        valid_cache_lengths=target_positions - 1,
         vocab_size=VOCAB,
         device="cuda",
     )
@@ -100,12 +106,16 @@ def _tree(parent: list[int], req: torch.Tensor) -> TreeSpec:
     parent_map = torch.tensor(parent, dtype=torch.int32, device="cuda").repeat(
         POOL + 1, 1
     )
-    spec.load_step(BS, req, parent_map)
+    spec.load_step(
+        BS, req, parent_map, torch.zeros(BS * N, dtype=torch.int64, device="cuda")
+    )
     return spec
 
 
 def _batch(tree: TreeSpec) -> TreeVerifyBatch:
-    return TreeVerifyBatch(parents=tree.parent_buf[:BS], depths=tree.depth_buf[:BS])
+    return TreeVerifyBatch(
+        parents=tree.parent_buf[:BS], depths=tree.depth_buf[:BS], draft_q=None
+    )
 
 
 @pytest.mark.parametrize("route", list(PARAMS))
@@ -114,7 +124,7 @@ def test_chain_shaped_tree_verifies_like_chain(route):
     offsets = torch.arange(50, 50 + POOL + 1, dtype=torch.int32, device="cuda")
     logits = torch.randn(BS * N, VOCAB, device="cuda") * 3
 
-    backend, req = _backend(route)
+    backend, req = _backend(route, TritonSamplingBackend)
     probe = backend._sample_verify_targets(
         logits,
         req.int(),
@@ -165,7 +175,7 @@ def test_nodes_sample_the_chain_draw_at_their_depth(route):
     torch.manual_seed(1)
     offsets = torch.arange(70, 70 + POOL + 1, dtype=torch.int32, device="cuda")
     by_depth = torch.randn(BS, N, VOCAB, device="cuda") * 3
-    backend, req = _backend(route)
+    backend, req = _backend(route, TritonSamplingBackend)
     chain = (
         backend._sample_verify_targets(
             by_depth.view(BS * N, VOCAB),
@@ -196,7 +206,7 @@ def test_nodes_sample_the_chain_draw_at_their_depth(route):
     assert torch.equal(picks, torch.gather(chain, 1, depth))
 
 
-@pytest.mark.parametrize("backend_name", ["greedy", "triton"])
+@pytest.mark.parametrize("backend_name", ["greedy", "triton", "flashinfer"])
 def test_greedy_tree_verify_walks_the_argmax_with_logprobs(backend_name):
     torch.manual_seed(2)
     offsets = torch.arange(30, 30 + POOL + 1, dtype=torch.int32, device="cuda")
@@ -206,7 +216,12 @@ def test_greedy_tree_verify_walks_the_argmax_with_logprobs(backend_name):
         backend = GreedySamplingBackend(_config(True))
         req = torch.tensor([2, 5, 7], dtype=torch.int64, device="cuda")
     else:
-        backend, req = _backend("greedy", logprobs=True)
+        cls = (
+            FlashInferSamplingBackend
+            if backend_name == "flashinfer"
+            else TritonSamplingBackend
+        )
+        backend, req = _backend("greedy", cls, logprobs=True)
 
     # Node 1 misses, node 2 (its sibling) matches, node 3 under node 2 matches for request 0 only.
     parent = [-1, 0, 0, 2]

@@ -31,12 +31,49 @@ import contextlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
+from math import ceil
 from typing import Any, Protocol
 
 import torch
+from tokenspeed_kernel.workspace import capture_session
 
 from tokenspeed.runtime.multimodal.encoder_batching import pack_encoder_batches
 from tokenspeed.runtime.utils import logger
+
+# Longest sequence the padding rows of a budget graph run as, which bounds their attention cost.
+PADDING_SEQUENCE_ROWS = 256
+
+
+def pad_cu_seqlens(
+    cu_seqlens: torch.Tensor,
+    real_rows: int,
+    budget_rows: int,
+    metadata_sequence_budget: int,
+    modality_name: str,
+) -> torch.Tensor:
+    """Extend a batch's offsets over the rows it leaves in its budget graph.
+
+    The result always holds ``metadata_sequence_budget + 1 +
+    ceil(budget_rows / PADDING_SEQUENCE_ROWS)`` offsets, the graph's fixed shape.
+    """
+    if cu_seqlens.shape[0] > metadata_sequence_budget + 1:
+        raise RuntimeError(
+            f"{modality_name} encoder cudagraph needs {cu_seqlens.shape[0] - 1} "
+            f"metadata sequences, but the configured limit is "
+            f"{metadata_sequence_budget}"
+        )
+    # Attention never writes rows outside every sequence yet reads them past a sequence's end, so padding rows run as sequences too.
+    padding = list(range(real_rows, budget_rows, PADDING_SEQUENCE_ROWS))[1:]
+    if real_rows < budget_rows:
+        padding.append(budget_rows)
+    cu = torch.cat(
+        [
+            cu_seqlens,
+            torch.tensor(padding, dtype=cu_seqlens.dtype, device=cu_seqlens.device),
+        ]
+    )
+    target = metadata_sequence_budget + 1 + ceil(budget_rows / PADDING_SEQUENCE_ROWS)
+    return torch.cat([cu, cu[-1:].expand(target - cu.shape[0])])
 
 
 @dataclass
@@ -209,21 +246,6 @@ class VisionEncoderCudaGraphAdapter:
         b = units // a
         return [[1, a * self.merge, b * self.merge]]
 
-    def pad_cu_seqlens(
-        self, metadata: dict[str, Any], metadata_sequence_budget: int
-    ) -> None:
-        cu = metadata["cu_seqlens"]
-        target = metadata_sequence_budget + 1
-        if cu.shape[0] > target:
-            raise RuntimeError(
-                f"{self.modality_name} encoder cudagraph needs {cu.shape[0] - 1} "
-                f"metadata sequences, but the configured limit is "
-                f"{metadata_sequence_budget}"
-            )
-        pad = target - cu.shape[0]
-        if pad > 0:
-            metadata["cu_seqlens"] = torch.cat([cu, cu[-1:].expand(pad)])
-
     def batch_from_items(self, items: list[Any]) -> VisionEncoderBatch:
         tokens, grid = self.pre_encode(items)
         return VisionEncoderBatch(tokens, grid, self.out_div)
@@ -261,10 +283,17 @@ class VisionEncoderCudaGraphAdapter:
             )
         metadata = dict(self.tower.prepare_metadata(batch.grid))
         if encoder_output_token_budget is not None:
-            self.pad_cu_seqlens(metadata, metadata_sequence_budget)
+            budget_rows = encoder_output_token_budget * self.out_div
+            metadata["cu_seqlens"] = pad_cu_seqlens(
+                metadata["cu_seqlens"],
+                batch.tokens.shape[0],
+                budget_rows,
+                metadata_sequence_budget,
+                self.modality_name,
+            )
             # Non-tensor scalar gets baked at capture. Use the per-budget worst
             # case so replay never exceeds the captured attention max seqlen.
-            metadata["max_seqlen"] = encoder_output_token_budget * self.out_div
+            metadata["max_seqlen"] = budget_rows
         return metadata
 
     def forward(
@@ -418,7 +447,9 @@ class EncoderForwardStepRunner:
         # No pool= argument: each budget graph gets its own private pool. A
         # shared pool collided IPC registrations across budgets.
         graph = torch.cuda.CUDAGraph()
-        with torch.inference_mode(), ar_ctx, torch.cuda.graph(graph):
+        with capture_session(graph), torch.inference_mode(), ar_ctx, torch.cuda.graph(
+            graph
+        ):
             output = self.adapter.forward(input_buffers, metadata)
             output_buffer.copy_(output)
 

@@ -39,6 +39,7 @@ def gluon_sqrt_softplus_topk_gfx950(
     topk_weights,
     topk_ids,
     output_scores,
+    stride_ls,
     stride_lm,
     stride_le,
     stride_be,
@@ -58,6 +59,8 @@ def gluon_sqrt_softplus_topk_gfx950(
     HASH_ROUTING: gl.constexpr,
     RENORMALIZE: gl.constexpr,
     NEED_SCORES: gl.constexpr,
+    SCALE: gl.constexpr,
+    SPLIT: gl.constexpr,
 ):
     token = gl.program_id(0)
     expert_layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
@@ -71,6 +74,14 @@ def gluon_sqrt_softplus_topk_gfx950(
         mask=expert_mask,
         other=0.0,
     ).to(gl.float32)
+    # Split-K router partials: add them in order, so the sum is batch invariant.
+    for split in gl.static_range(1, SPLIT):
+        logits += cdna4.buffer_load(
+            router_logits,
+            (split * stride_ls + token * stride_lm + expert * stride_le).to(gl.int32),
+            mask=expert_mask,
+            other=0.0,
+        )
     exp_neg_abs = gl.exp(-gl.abs(logits))
     # Gluon has no log1p; use its convergent series where 1 + x would round to 1.
     log1p_series = exp_neg_abs * (
@@ -134,6 +145,8 @@ def gluon_sqrt_softplus_topk_gfx950(
         denominator = gl.sum(selected_weights, axis=0)
         denominator = gl.maximum(denominator, 1.1754943508222875e-38)
         selected_weights = selected_weights / denominator
+    if SCALE != 1.0:
+        selected_weights = selected_weights * SCALE
 
     topk_mask = topk_lane < TOPK
     cdna4.buffer_store(
@@ -165,11 +178,14 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
     hash_indices_table: torch.Tensor | None = None,
     input_ids: torch.Tensor | None = None,
     need_scores: bool = True,
+    routed_scaling_factor: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Select DeepSeek V4 experts with one GFX950 Gluon kernel launch.
 
     Args:
-        router_logits: FP16, BF16, or FP32 logits shaped ``[tokens, experts]``.
+        router_logits: FP16, BF16, or FP32 logits shaped ``[tokens, experts]``,
+            or FP32 split-K partials shaped ``[splits, tokens, experts]`` that
+            sum to the logits in order.
         top_k: Number of experts to select. This specialization requires six.
         renormalize: Whether to normalize selected unbiased scores per token.
         correction_bias: Optional selection-only bias shaped ``[experts]``.
@@ -177,12 +193,21 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
             ``[vocabulary, top_k]``.
         input_ids: Token ids corresponding to rows of ``router_logits``.
         need_scores: Whether to materialize all FP32 sqrt-softplus scores.
+        routed_scaling_factor: Multiplier applied to the final weights.
 
     Returns:
         FP32 weights, INT32 expert ids, and FP32 scores. When ``need_scores`` is
         false, ``router_logits`` is returned as the ignored third output.
     """
-    if router_logits.ndim != 2:
+    split = router_logits.shape[0] if router_logits.ndim == 3 else 1
+    if router_logits.ndim == 3:
+        if router_logits.dtype != torch.float32:
+            raise ValueError("router logit partials must be float32")
+        split_stride = router_logits.stride(0)
+        router_logits = router_logits[0]
+    elif router_logits.ndim == 2:
+        split_stride = 0
+    else:
         raise ValueError("router_logits must have shape [tokens, experts]")
     if not router_logits.is_cuda:
         raise ValueError("router_logits must be a CUDA/HIP tensor")
@@ -270,6 +295,7 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
         topk_weights,
         topk_ids,
         scores,
+        split_stride,
         router_logits.stride(0),
         router_logits.stride(1),
         bias.stride(0),
@@ -289,6 +315,8 @@ def launch_gluon_sqrt_softplus_topk_gfx950(
         HASH_ROUTING=hash_routing,
         RENORMALIZE=renormalize,
         NEED_SCORES=need_scores,
+        SCALE=float(routed_scaling_factor),
+        SPLIT=split,
         num_warps=1,
     )
     return topk_weights, topk_ids, scores

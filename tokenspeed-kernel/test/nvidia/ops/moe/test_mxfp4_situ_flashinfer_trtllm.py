@@ -22,16 +22,17 @@
 
 Exercises the full in-repo chain -- the weight preprocessor (concatenated
 [gate|up] loader layout -> shuffled TRTLLM [up|gate]) and the registered
-apply -- against ``mxfp4_moe_reference`` on the same MXFP4 weights.
+apply -- against ``mxfp4_situ_moe_experts`` on the same MXFP4 weights.
 """
 
 from __future__ import annotations
 
 import pytest
 import torch
-from kimi3_reference import mxfp4_moe_reference
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
 from utils import make_mxfp4_moe_weights
 
 NUM_EXPERTS = 8
@@ -98,7 +99,7 @@ def _kernel_routing_case(seed: int, num_tokens: int):
 
 
 def _prepare_kernel_routing_weights(raw, correction_bias):
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_weights,
     )
 
@@ -117,7 +118,7 @@ def _prepare_kernel_routing_weights(raw, correction_bias):
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_apply,
     )
 
@@ -125,7 +126,7 @@ def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260825, num_tokens)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -150,14 +151,14 @@ def test_flashinfer_situ_kernel_routing_matches_portable_reference() -> None:
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_apply,
     )
 
     raw, hidden_states, router_logits, bias, topk_ids, topk_weights = (
         _kernel_routing_case(20260827, 16)
     )
-    expected = mxfp4_moe_reference(
+    expected = mxfp4_situ_moe_experts(
         hidden_states,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -187,7 +188,7 @@ def test_flashinfer_situ_precomputed_routing_matches_portable_reference() -> Non
 
 @requires_flashinfer_situ
 def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_mxfp4 import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_mxfp4_situ_moe_apply,
     )
 
@@ -230,6 +231,138 @@ def test_flashinfer_situ_kernel_routing_deferred_matches_finalized() -> None:
 
 
 @requires_flashinfer_situ
+@pytest.mark.parametrize("num_tokens", [0, 4, 1025])
+@pytest.mark.parametrize("precomputed", [False, True])
+def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
+    from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
+    from tokenspeed_kernel.platform import pdl_enabled
+
+    raw, x, logits, _, ids, weights = _kernel_routing_case(31, num_tokens)
+    w = _MoEWeights(raw).cuda()
+    plan = kernel_moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=1,
+        ispp=ISPP,
+        internal_activation_dtype="input",
+        solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+    )
+    assert plan["supports_deferred_finalize"]
+    assert plan["topk_weights_dtype"] == torch.bfloat16
+    kernel_moe_process_weights(plan, w)
+    x, logits = x.cuda(), logits.cuda()
+    routes = (
+        dict(topk_weights=weights.cuda(), topk_ids=ids.cuda()) if precomputed else {}
+    )
+    from tokenspeed_kernel.ops.moe import flashinfer as flashinfer_moe
+
+    # Compare CuTe and CUDA quantization through the expert kernels.
+    with monkeypatch.context() as context:
+        context.setattr(flashinfer_moe, "is_cute_dsl_available", lambda: False)
+        expected = kernel_moe_apply(plan, x, w, logits, do_finalize=True, **routes)
+    seen = []
+    original_quantizer = flashinfer_moe.mxfp8_quantize
+
+    def observe_quantizer(*args, **kwargs):
+        seen.append(kwargs["backend"])
+        return original_quantizer(*args, **kwargs)
+
+    with monkeypatch.context() as context:
+        context.setattr(flashinfer_moe, "mxfp8_quantize", observe_quantizer)
+        actual_finalized = kernel_moe_apply(
+            plan, x, w, logits, do_finalize=True, **routes
+        )
+    expected_backend = "cute-dsl" if flashinfer_moe.is_cute_dsl_available() else "cuda"
+    assert seen == ([expected_backend] if num_tokens else [])
+    torch.testing.assert_close(actual_finalized, expected, rtol=0, atol=0)
+    if precomputed:
+        bf16_routes = dict(
+            topk_weights=routes["topk_weights"].bfloat16(), topk_ids=routes["topk_ids"]
+        )
+        bf16_result = kernel_moe_apply(
+            plan, x, w, logits, do_finalize=True, **bf16_routes
+        )
+        torch.testing.assert_close(bf16_result, expected, rtol=0, atol=0)
+    gemm, weights, idx = kernel_moe_apply(
+        plan, x, w, logits, do_finalize=False, **routes
+    )
+    assert weights.shape == (num_tokens, TOP_K)
+    assert weights.dtype == torch.bfloat16
+    assert idx.shape == (num_tokens * TOP_K,)
+    shared = torch.randn_like(expected)
+
+    def finalize_reference(expert_output, row_indices, route_weights):
+        acc = torch.zeros(num_tokens, HIDDEN, device="cuda", dtype=torch.float32)
+        for k in range(TOP_K):
+            rows = row_indices.view(num_tokens, TOP_K)[:, k].long()
+            values = expert_output[rows.clamp_min(0)].double()
+            weight = torch.where(rows >= 0, route_weights[:, k], 0).double()
+            acc = (acc.double() + weight[:, None] * values).float()
+        return (acc + shared.float()).bfloat16()
+
+    actual = moe_finalize_fuse_shared(
+        gemm,
+        idx,
+        weights,
+        shared,
+        top_k=TOP_K,
+        enable_pdl=pdl_enabled(),
+        hidden_dim=HIDDEN,
+    )
+    torch.testing.assert_close(
+        actual, finalize_reference(gemm, idx, weights), atol=0, rtol=0
+    )
+    routed_only = moe_finalize_fuse_shared(
+        gemm,
+        idx,
+        weights,
+        None,
+        top_k=TOP_K,
+        enable_pdl=pdl_enabled(),
+        hidden_dim=HIDDEN,
+    )
+    torch.testing.assert_close(routed_only, expected, atol=2e-3, rtol=8e-3)
+    if num_tokens:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = kernel_moe_apply(plan, x, w, logits, do_finalize=True, **routes)
+            gemm, route_weights, row_map = kernel_moe_apply(
+                plan, x, w, logits, do_finalize=False, **routes
+            )
+            captured_fused = moe_finalize_fuse_shared(
+                gemm,
+                row_map,
+                route_weights,
+                shared,
+                top_k=TOP_K,
+                enable_pdl=pdl_enabled(),
+                hidden_dim=HIDDEN,
+            )
+        x.normal_()
+        with monkeypatch.context() as context:
+            context.setattr(flashinfer_moe, "is_cute_dsl_available", lambda: False)
+            expected_replay = kernel_moe_apply(
+                plan, x, w, logits, do_finalize=True, **routes
+            )
+        graph.replay()
+        torch.testing.assert_close(captured, expected_replay, atol=0, rtol=0)
+        torch.testing.assert_close(
+            captured_fused,
+            finalize_reference(gemm, row_map, route_weights),
+            atol=0,
+            rtol=0,
+        )
+
+
+@requires_flashinfer_situ
 def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
 
     plan = kernel_moe_plan(
@@ -246,10 +379,70 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
     assert plan["supports_precomputed_topk"] is True
+
+
+@requires_flashinfer_situ
+def test_swiglu_quantizer_keeps_native_padding(monkeypatch) -> None:
+    from tokenspeed_kernel.ops.moe import flashinfer as flashinfer_moe
+
+    raw, x, logits, _, ids, weights = _kernel_routing_case(37, 4)
+    w = _MoEWeights(raw).cuda()
+    plan = kernel_moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="swiglu",
+        ep_size=1,
+        ispp=ISPP,
+        internal_activation_dtype="input",
+        solution="flashinfer_trtllm",
+        hidden=None,
+        swiglu_form="standard",
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+    )
+    kernel_moe_process_weights(plan, w)
+    original_hidden = HIDDEN - 32
+    w.hidden_size_original = original_hidden
+    x = x[:, :original_hidden].cuda().contiguous()
+    logits, ids, weights = logits.cuda(), ids.cuda(), weights.cuda()
+    padded = torch.nn.functional.pad(x, (0, HIDDEN - original_hidden))
+    expected = kernel_moe_apply(
+        plan,
+        padded,
+        w,
+        logits,
+        topk_weights=weights,
+        topk_ids=ids,
+        do_finalize=True,
+    )
+    seen = []
+    original_quantizer = flashinfer_moe.mxfp8_quantize
+
+    def observe_quantizer(*args, **kwargs):
+        seen.append(kwargs["backend"])
+        return original_quantizer(*args, **kwargs)
+
+    monkeypatch.setattr(flashinfer_moe, "mxfp8_quantize", observe_quantizer)
+    actual = kernel_moe_apply(
+        plan,
+        x,
+        w,
+        logits,
+        topk_weights=weights,
+        topk_ids=ids,
+        do_finalize=True,
+    )
+    assert seen == ["cuda"]
+    assert actual.shape == (4, original_hidden)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 @requires_flashinfer_situ
@@ -282,6 +475,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
         with_bias=False,

@@ -22,7 +22,7 @@
 
 ``CacheGroupRouter`` is the runner-facing attention backend for every model
 whose attention is paged KV. It holds one ``PagedAttentionBackend`` leaf per
-attention (history-family) cache group and is the only object between the
+attention (history) cache group and is the only object between the
 scheduler bridge and the kernels that expands raw group tables:
 
 * it learns each group's block granularity from the pool's published specs
@@ -213,13 +213,13 @@ class CacheGroupRouter(AttentionBackend):
         if not group_ids:
             raise ValueError(
                 f"{type(self).__name__}: the bound pool view has no paged "
-                "(history-family) cache groups to route"
+                "(history) cache groups to route"
             )
         for gid in group_ids:
-            if geometry.families.get(gid, "history") != "history":
+            if geometry.attn_kinds[gid] == "state":
                 raise ValueError(
-                    f"cache group {gid!r} is family {geometry.families[gid]!r}; "
-                    "the router serves paged history groups only"
+                    f"cache group {gid!r} is a state group; the router serves "
+                    "paged history groups only"
                 )
 
     def _derive(
@@ -474,9 +474,9 @@ class CacheGroupRouter(AttentionBackend):
     def tree_support(self) -> TreeSupport:
         unsupported = []
         for gid in self.group_ids:
-            retention, _ = self.geometry.retentions[gid]
+            attn_kind = self.geometry.attn_kinds[gid]
             _, entry_stride_tokens = self.geometry.row_geometry[gid]
-            if retention != "full_history" or entry_stride_tokens not in (None, 1):
+            if attn_kind != "full_history" or entry_stride_tokens not in (None, 1):
                 unsupported.append(gid)
         if not unsupported:
             return TreeSupport(verify_blocker=None, draft_blocker=None)
@@ -779,15 +779,43 @@ class CacheGroupRouter(AttentionBackend):
         self._refresh_decode_locations(bs, seq_lens)
         if num_extends and self._extend_write_locations is not None:
             self._append_decode_rows(bs, num_extends)
-        for gid, leaf in self.leaves.items():
-            leaf.refresh_decode_metadata(
-                bs,
-                actual_bs,
-                seq_lens,
-                self.stacks.table(gid, bs),
-                num_extends=num_extends,
-                for_graph_replay=for_graph_replay,
+        targets = {
+            gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
+        }
+        batched = [gid for gid, pair in targets.items() if pair is not None]
+        if batched:
+            # One launch fills every such leaf (plus one clamp per seq_lens
+            # floor); two stream copies per leaf cost ~4 us each at bs=1.
+            floored = {}
+            for gid in batched:
+                floor = self.leaves[gid].decode_seq_lens_floor
+                if floor not in floored:
+                    floored[floor] = (
+                        seq_lens[:bs] if floor <= 1 else seq_lens[:bs].clamp_min(floor)
+                    )
+            torch._foreach_copy_(
+                [buf for gid in batched for buf in targets[gid]],
+                [
+                    src
+                    for gid in batched
+                    for src in (
+                        floored[self.leaves[gid].decode_seq_lens_floor],
+                        self.stacks.table(gid, bs),
+                    )
+                ],
             )
+        for gid, leaf in self.leaves.items():
+            if targets[gid] is None:
+                leaf.refresh_decode_metadata(
+                    bs,
+                    actual_bs,
+                    seq_lens,
+                    self.stacks.table(gid, bs),
+                    num_extends=num_extends,
+                    for_graph_replay=for_graph_replay,
+                )
+            else:
+                leaf.publish_decode_metadata(bs, seq_lens, num_extends=num_extends)
             leaf.set_request_slots(req_pool_indices[:bs])
 
     def init_forward_metadata_capture_cuda_graph(
@@ -915,9 +943,8 @@ class CacheGroupRouter(AttentionBackend):
         block drafters hand it to their fused prep kernels).
         """
         bs = cache_start.shape[0]
-        # Window positions run cache_start .. cache_start+n-1; the decode
-        # kernel derives them as end-n .. end-1, so feed end = start + n.
-        self.stacks.compute_decode_locations(bs, cache_start + num_tokens, num_tokens)
+        # Window positions run cache_start .. cache_start+n-1.
+        self.stacks.compute_window_locations(bs, cache_start, num_tokens)
         self._decode_request_offset = 0
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()
@@ -961,6 +988,9 @@ class CacheGroupRouter(AttentionBackend):
 
     def cache_placement(self, layer):
         return self._leaf_for(layer).cache_placement(layer)
+
+    def reads_fp8_kv_scales(self, layer):
+        return self._leaf_for(layer).reads_fp8_kv_scales(layer)
 
     @break_point
     def forward(

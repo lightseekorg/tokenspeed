@@ -8,7 +8,7 @@ tokens, so its weights have to be replicated instead.
 
 from __future__ import annotations
 
-import unittest
+import sys
 from unittest import mock
 
 import pytest
@@ -42,21 +42,21 @@ def _mlp(world_size: int, replicate: bool) -> Qwen3_5MoeMLP:
     )
 
 
-class TestSharedExpertReplication(unittest.TestCase):
+class TestSharedExpertReplication:
     def test_tensor_parallel_by_default(self):
         mlp = _mlp(world_size=4, replicate=False)
-        self.assertIsInstance(mlp.gate_up_proj, MergedColumnParallelLinear)
-        self.assertIsInstance(mlp.down_proj, RowParallelLinear)
+        assert isinstance((mlp.gate_up_proj), (MergedColumnParallelLinear))
+        assert isinstance((mlp.down_proj), (RowParallelLinear))
         # Sharded: each rank holds 1/4 of the intermediate dimension.
-        self.assertEqual(mlp.gate_up_proj.weight.shape, (2 * INTERMEDIATE // 4, HIDDEN))
-        self.assertEqual(mlp.down_proj.weight.shape, (HIDDEN, INTERMEDIATE // 4))
+        assert (mlp.gate_up_proj.weight.shape) == ((2 * INTERMEDIATE // 4, HIDDEN))
+        assert (mlp.down_proj.weight.shape) == ((HIDDEN, INTERMEDIATE // 4))
 
     def test_replicated_keeps_full_weights(self):
         mlp = _mlp(world_size=4, replicate=True)
-        self.assertIsInstance(mlp.gate_up_proj, ReplicatedLinear)
-        self.assertIsInstance(mlp.down_proj, ReplicatedLinear)
-        self.assertEqual(mlp.gate_up_proj.weight.shape, (2 * INTERMEDIATE, HIDDEN))
-        self.assertEqual(mlp.down_proj.weight.shape, (HIDDEN, INTERMEDIATE))
+        assert isinstance((mlp.gate_up_proj), (ReplicatedLinear))
+        assert isinstance((mlp.down_proj), (ReplicatedLinear))
+        assert (mlp.gate_up_proj.weight.shape) == ((2 * INTERMEDIATE, HIDDEN))
+        assert (mlp.down_proj.weight.shape) == ((HIDDEN, INTERMEDIATE))
 
     def test_replication_lifts_the_block_quant_shard_floor(self):
         """Replicated weights make the dense TP degree irrelevant.
@@ -68,7 +68,7 @@ class TestSharedExpertReplication(unittest.TestCase):
         """
         for world_size in (4, 8, 16):
             mlp = _mlp(world_size=world_size, replicate=True)
-            self.assertEqual(mlp.gate_up_proj.weight.shape, (2 * INTERMEDIATE, HIDDEN))
+            assert (mlp.gate_up_proj.weight.shape) == ((2 * INTERMEDIATE, HIDDEN))
 
     def test_replicated_deep_gemm_fuses_swiglu_quant(self):
         class FakeGateUp(nn.Module):
@@ -119,10 +119,10 @@ class TestSharedExpertReplication(unittest.TestCase):
             output = mlp(torch.randn((3, HIDDEN), dtype=torch.bfloat16))
 
         fused.assert_called_once_with(gate_up.output)
-        self.assertIs(down.call[0], quantized)
-        self.assertIs(down.call[1], scales)
-        self.assertIs(down.call[2], torch.bfloat16)
-        self.assertEqual(output.shape, (3, HIDDEN))
+        assert (down.call[0]) is (quantized)
+        assert (down.call[1]) is (scales)
+        assert (down.call[2]) is (torch.bfloat16)
+        assert (output.shape) == ((3, HIDDEN))
 
 
 @pytest.mark.parametrize("moe_tp,moe_ep", [(4, 1), (1, 4), (2, 2)])
@@ -194,4 +194,4 @@ def test_dense_dp_and_deepep_shared_still_replicate(scope, replicate):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

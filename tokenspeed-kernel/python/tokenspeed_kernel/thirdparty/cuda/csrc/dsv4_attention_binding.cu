@@ -46,13 +46,9 @@ void dsv4_gather_paged_indexer_mxfp4_cache(TensorView kv_cache,
                                                   TensorView cu_seq_lens,
                                                   int64_t cache_block_size);
 
-void dsv4_persistent_topk(TensorView logits,
-                                 TensorView lengths,
-                                 TensorView output,
-                                 TensorView workspace,
-                                 int64_t k,
-                                 int64_t max_seq_len,
-                                 int64_t q_len_per_req);
+void dsv4_persistent_topk(TensorView logits, TensorView lengths,
+                          TensorView output, int64_t k, int64_t max_seq_len,
+                          int64_t q_len_per_req, bool enable_pdl);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(fused_dsv4_qnorm_rope_kv_rope_quant_insert,
                               fused_dsv4_qnorm_rope_kv_rope_quant_insert);

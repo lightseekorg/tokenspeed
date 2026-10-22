@@ -64,16 +64,19 @@ class _KdaModelProfile:
     head_dim: int
     projection_width: int
     beta_offset: int
-    # Output-gate and decay-gate (f_a) columns, set when the projection feeds
-    # the fused pre-convolution kernels.
-    gate_offset: int | None = None
+    # Decay-gate (f_a) column, set when the projection feeds the fused
+    # pre-convolution kernels.
     f_a_offset: int | None = None
 
 
 _MODEL_PROFILES = {
-    # Rows are [q | k | v | beta | f_a | f_b].
+    # Rows are [q | k | v | beta | f_a | g_a].
     "glm53_flash_tp4": _KdaModelProfile(
-        heads=16, head_dim=128, projection_width=6416, beta_offset=6144
+        heads=16,
+        head_dim=128,
+        projection_width=6416,
+        beta_offset=6144,
+        f_a_offset=6160,
     ),
     # KimiKDAMergedProj rows are [q | k | v | g | f_a | beta | pad].
     "kimi_k3_tp8": _KdaModelProfile(
@@ -81,7 +84,6 @@ _MODEL_PROFILES = {
         head_dim=128,
         projection_width=6288,
         beta_offset=6272,
-        gate_offset=4608,
         f_a_offset=6144,
     ),
 }
@@ -429,7 +431,6 @@ def prepare_kda_paged_prefill(
             cu_seqlens=kernel_cu_seqlens,
             cu_seqlens_cpu=cu_seqlens_cpu,
             capacity=None,
-            inputs_packed=False,
             lower_bound=lower_bound,
             override=request.registration,
             solution=request.solution,
@@ -622,7 +623,7 @@ def _bool_parameter(parameters: dict[str, Any], name: str) -> bool:
 
 def _fused_profile(model_profile: str) -> _KdaModelProfile:
     profile = _MODEL_PROFILES[model_profile]
-    if profile.gate_offset is None or profile.f_a_offset is None:
+    if profile.f_a_offset is None:
         raise BenchmarkCaseError(
             BenchmarkStatus.INVALID_CASE,
             f"KDA {model_profile} does not project inputs for the fused kernels",
@@ -635,7 +636,6 @@ class _FusedProjection:
     """Strided views of one packed KDA input projection."""
 
     mixed_qkv: torch.Tensor
-    output_gate: torch.Tensor
     f_a_out: torch.Tensor
     beta_logits: torch.Tensor
 
@@ -659,7 +659,6 @@ def _fused_projection(
 
     return _FusedProjection(
         mixed_qkv=columns(0, 3 * width),
-        output_gate=columns(profile.gate_offset, width),
         f_a_out=columns(profile.f_a_offset, profile.head_dim),
         beta_logits=columns(profile.beta_offset, profile.heads),
     )
@@ -809,7 +808,7 @@ def prepare_kda_fused_paged_decode(
     """Prepare fused single-token KDA decode from the packed input projection.
 
     One call runs the short convolution, decay-gate projection, recurrent
-    update and gated output RMSNorm against paged state.
+    update against paged state.
     """
 
     common = _fused_common(request)
@@ -817,7 +816,6 @@ def prepare_kda_fused_paged_decode(
     batch = common["batch"]
     dtype = common["dtype"]
     state_page_relation = _parse_state_page_relation(request.parameters)
-    norm_eps = float(request.parameters["norm_eps"])
     write_page_offset = (
         _DISTINCT_WRITE_PAGE_OFFSET if state_page_relation == "distinct" else 0
     )
@@ -826,7 +824,6 @@ def prepare_kda_fused_paged_decode(
         "num_heads": profile.heads,
         "head_dim": profile.head_dim,
         "conv_kernel_size": common["conv_kernel_size"],
-        "fused_output_norm": True,
         "paged_state": True,
         "recurrent_layout": common["recurrent_layout"],
     }
@@ -840,7 +837,6 @@ def prepare_kda_fused_paged_decode(
     weights = _fused_layer_weights(
         profile, common["conv_kernel_size"], dtype=dtype, generator=generator
     )
-    norm_weight = _randn((profile.head_dim,), dtype=dtype, generator=generator)
     conv_pool, state_pool = _state_arena(
         common["state_pages"],
         common["state_page_bytes"],
@@ -877,9 +873,6 @@ def prepare_kda_fused_paged_decode(
             head_dim=profile.head_dim,
             cu_seqlens=cu_seqlens,
             lower_bound=common["lower_bound"],
-            output_gate=projection.output_gate,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
             recurrent_layout=common["recurrent_layout"],
             override=request.registration,
             solution=request.solution,
@@ -891,7 +884,6 @@ def prepare_kda_fused_paged_decode(
         parameters={
             **common["normalized"],
             "state_page_relation": state_page_relation,
-            "norm_eps": norm_eps,
             "projection_row_stride": projection.mixed_qkv.stride(0),
         },
         validation=None,

@@ -12,7 +12,7 @@ Requires the grouped-cache tokenspeed_scheduler extension.
 
 Usage:
     cd test/runtime
-    python3 -m unittest test_slab_capacity_prefix_hits -v
+    python3 -m pytest test_slab_capacity_prefix_hits.py -v
 """
 
 import math
@@ -20,8 +20,8 @@ import os
 import shutil
 import sys
 import tempfile
-import unittest
 
+import pytest
 import torch
 
 # Repository root on sys.path so ``test.runners`` resolves.
@@ -214,18 +214,19 @@ def _measure_arm(engine: Engine, num_prompts: int, tag: str) -> tuple:
     return cached1 / prompt1, cached2 / prompt2
 
 
-@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
-class TestSlabCapacityPrefixHits(unittest.TestCase):
+@pytest.mark.skipif(not (torch.cuda.is_available()), reason=("CUDA is required"))
+class TestSlabCapacityPrefixHits:
     """Same commit, same byte budget, same workload: the slab arm keeps the
     working set cached; the legacy arm's halved pool LRU-cycles it."""
 
-    def setUp(self):
-        try:
-            import tokenspeed_scheduler
-        except ImportError:
-            self.skipTest("tokenspeed_scheduler ext is not installed")
+    def setup_method(self):
+        pytest.importorskip(
+            "tokenspeed_scheduler",
+            reason="tokenspeed_scheduler ext is not installed",
+            exc_type=ImportError,
+        )
         if os.environ.get("TOKENSPEED_CI_SMALL_KV_SIZE"):
-            self.skipTest(
+            pytest.skip(
                 "TOKENSPEED_CI_SMALL_KV_SIZE pins the token pool for both "
                 "layouts, erasing the capacity contrast under test"
             )
@@ -239,7 +240,7 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
                 _TARGET_POOL_FILL * slab_capacity / _APPROX_CACHED_TOKENS
             )
             if not _NUM_PROMPTS_MIN <= num_prompts <= _NUM_PROMPTS_MAX:
-                self.skipTest(
+                pytest.skip(
                     f"measured slab pool ({slab_capacity} tokens) needs "
                     f"K={num_prompts} prompts, outside "
                     f"[{_NUM_PROMPTS_MIN}, {_NUM_PROMPTS_MAX}]; free GPU "
@@ -251,17 +252,19 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
             engine.shutdown()
         # Prompts are distinct from the first sentence on, so no page-aligned
         # prefix can match cold: this pins cached_tokens to real cache reuse.
-        self.assertEqual(
-            r1_slab, 0, f"slab round 1 must be cold, got ratio {r1_slab:.3f}"
-        )
+        _pytest_first_1 = r1_slab
+        _pytest_second_2 = 0
+        _pytest_msg_3 = f"slab round 1 must be cold, got ratio {r1_slab:.3f}"
+        assert _pytest_first_1 == _pytest_second_2, _pytest_msg_3
         # Expected ~0.99 (M9 cap: 2048 of ~2074 tokens); 0.9 leaves margin
         # for tokenizer drift within the guarded band.
-        self.assertGreaterEqual(
-            r2_slab,
-            0.9,
+        _pytest_a_4 = r2_slab
+        _pytest_b_5 = 0.9
+        _pytest_msg_6 = (
             f"slab layout: round-2 hit ratio {r2_slab:.3f} below 0.9 -- "
-            "working set no longer resident, capacity gain regressed",
+            "working set no longer resident, capacity gain regressed"
         )
+        assert _pytest_a_4 >= _pytest_b_5, _pytest_msg_6
 
         # --- Arm 2: legacy layout forced on the same commit ---
         tmpdir = tempfile.mkdtemp(prefix="ts_legacy_kv_site_")
@@ -281,13 +284,14 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
                 cap_ratio = slab_capacity / legacy_capacity
                 # gpt-oss pairs 12 sliding with 12 full layers -> exactly 2x;
                 # the band tolerates free-memory drift between the two boots.
-                self.assertTrue(
-                    1.9 <= cap_ratio <= 2.1,
+                _pytest_expr_13 = 1.9 <= cap_ratio <= 2.1
+                _pytest_msg_14 = (
                     f"slab/legacy capacity ratio {cap_ratio:.3f} "
                     f"({slab_capacity}/{legacy_capacity}) outside [1.9, 2.1] "
                     "-- either the slab sizing regressed or the legacy "
-                    "forcing did not reach the engine subprocesses",
+                    "forcing did not reach the engine subprocesses"
                 )
+                assert _pytest_expr_13, _pytest_msg_14
                 r1_leg, r2_leg = _measure_arm(engine, num_prompts, "legacy layout")
             finally:
                 engine.shutdown()
@@ -301,18 +305,20 @@ class TestSlabCapacityPrefixHits(unittest.TestCase):
             else:
                 os.environ["TOKENSPEED_FORCE_LEGACY_KV_LAYOUT"] = old_flag
             shutil.rmtree(tmpdir, ignore_errors=True)
-        self.assertEqual(
-            r1_leg, 0, f"legacy round 1 must be cold, got ratio {r1_leg:.3f}"
-        )
+        _pytest_first_7 = r1_leg
+        _pytest_second_8 = 0
+        _pytest_msg_9 = f"legacy round 1 must be cold, got ratio {r1_leg:.3f}"
+        assert _pytest_first_7 == _pytest_second_8, _pytest_msg_9
         # ~1.44x the halved pool + same-order revisit recycles every cached
         # prefix before reuse; 0.2 is the collapse bound (expected ~0).
-        self.assertLessEqual(
-            r2_leg,
-            0.2,
+        _pytest_a_10 = r2_leg
+        _pytest_b_11 = 0.2
+        _pytest_msg_12 = (
             f"legacy layout: round-2 hit ratio {r2_leg:.3f} above 0.2 -- "
-            "the halved pool unexpectedly held the working set",
+            "the halved pool unexpectedly held the working set"
         )
+        assert _pytest_a_10 <= _pytest_b_11, _pytest_msg_12
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))

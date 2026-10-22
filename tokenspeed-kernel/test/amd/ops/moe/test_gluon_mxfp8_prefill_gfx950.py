@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from kimi3_reference import dequantize_mxfp4, mxfp4_moe_reference
+from tokenspeed_kernel.numerics.torch.moe import mxfp4_situ_moe_experts
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from utils import is_cdna4
 
 if not is_cdna4():
@@ -54,7 +55,6 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.expert_mesh import (  # noqa: E4
 )
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.mxfp8_gemm import (  # noqa: E402
     _A,
-    _MMA,
     _SHARED,
     _a_offsets,
     _assemble_fragment,
@@ -122,6 +122,7 @@ def _plan(policy: str):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
 
 
@@ -1259,7 +1260,7 @@ def test_n16_joint_decode_retains_raw_bank_arithmetic(joint_bank, m):
         shared.view(torch.int16), expected[1].view(torch.int16), atol=0, rtol=0
     )
     local_ids = torch.where(ids >= 112, ids - 112, -1)
-    oracle = mxfp4_moe_reference(
+    oracle = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],
@@ -1288,10 +1289,6 @@ def test_n16_joint_decode_retains_raw_bank_arithmetic(joint_bank, m):
 )
 def test_n16_a16_cell_tiles_tails_and_strided_output(m, d, i):
     module, raw = _module(2, d, i, 4)
-    if i == 128:
-        with pytest.raises(ValueError, match="D and I divisible by 256"):
-            preprocess_n16_mxfp4_weights(module)
-        return
     preprocess_n16_mxfp4_weights(module)
     generator = torch.Generator(device="cuda").manual_seed(853)
     x = (
@@ -1319,6 +1316,11 @@ def test_n16_a16_cell_tiles_tails_and_strided_output(m, d, i):
             routed_out=out,
         )
 
+    if i == 128:
+        # The N16 bank accepts I % 64; the SiTU decode tiles I by 256.
+        with pytest.raises(ValueError, match="divisible by 256"):
+            decode(_bank(module), output)
+        return
     actual = decode(_bank(module), output)
     assert actual is output
     # The unchanged linear path cannot upcast its minimum packed-K128 tile.
@@ -1328,7 +1330,7 @@ def test_n16_a16_cell_tiles_tails_and_strided_output(m, d, i):
         torch.testing.assert_close(
             actual.view(torch.int16), expected.view(torch.int16), atol=0, rtol=0
         )
-    oracle = mxfp4_moe_reference(
+    oracle = mxfp4_situ_moe_experts(
         x,
         raw["w13_weight"],
         raw["w13_scale"],

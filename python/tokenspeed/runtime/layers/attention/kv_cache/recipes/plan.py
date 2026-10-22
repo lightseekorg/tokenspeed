@@ -671,9 +671,12 @@ def _solve_packing(fields):
 
 def _packing_by_group_ratio(raw_by_group):
     largest_payload = max(raw_by_group.values())
+    # Parent bytes must be divisible by every packing count. Powers of two
+    # keep unconstrained byte ratios from inflating that alignment via LCM;
+    # exact page strides and recipe pins are applied by the caller afterward.
     return {
-        group_id: max(1, largest_payload // raw_by_group[group_id])
-        for group_id in raw_by_group
+        group_id: 1 << ((largest_payload // payload).bit_length() - 1)
+        for group_id, payload in raw_by_group.items()
     }
 
 
@@ -912,23 +915,22 @@ def pack(
 
     _check_exact_page_strides(ordered_fields, plane_bytes, packing)
 
-    parent_alignment = alignment
-    for count in packing.values():
-        parent_alignment = parent_alignment // math.gcd(parent_alignment, count) * count
-    lcm_block_bytes = _align_up(sum(plane_bytes.values()), parent_alignment)
+    # The arena lays planes out one after another and every page stride is
+    # its plane's bytes over the group's packing, so a parent is exactly its
+    # planes. Each plane is already a multiple of every tenant's packing;
+    # rounding the parent up to the LCM of all the packings as well would add
+    # bytes no field addresses, and multiplies with the packings: coprime
+    # side-cache packings (Qwen4-Exp's PLE and QSA planes) pad a 255 MB parent
+    # to 54 GB.
+    lcm_block_bytes = _align_up(sum(plane_bytes.values()), alignment)
     if lcm_block_bytes > _MAX_LCM_BLOCK_BYTES:
         raise ValueError(
             f"LCM block size {lcm_block_bytes} exceeds limit {_MAX_LCM_BLOCK_BYTES}"
         )
 
     for group_id in ordered_group_ids:
-        count = packing[group_id]
-        if lcm_block_bytes % count:
-            raise ValueError(
-                f"cache group {group_id!r}: packing {count} does not partition "
-                f"LCM block size {lcm_block_bytes}"
-            )
-        stride = lcm_block_bytes // count
+        # A group's share of the parent, against the bytes its block holds.
+        stride = lcm_block_bytes / packing[group_id]
         padding_fraction = (stride - raw_by_group[group_id]) / raw_by_group[group_id]
         if padding_fraction > max_padding_fraction:
             raise ValueError(

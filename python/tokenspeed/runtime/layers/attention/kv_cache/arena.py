@@ -22,12 +22,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache import zero_byte_ranges
-from tokenspeed_kernel.ops.kvcache.triton import zero_page_fields
+from tokenspeed_kernel.ops.kvcache.triton import copy_page_fields, zero_page_fields
 
 from tokenspeed.runtime.layers.attention.kv_cache.offload import SparseKVOffload
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -45,6 +45,29 @@ from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = get_colorful_logger(__name__)
+
+
+def _copy_waves(pairs: np.ndarray) -> list[np.ndarray]:
+    """Order ``(source, destination)`` pairs so a block is read before it is
+    overwritten: a pair runs in the wave after every pair that still reads
+    its destination. A destination is a block granted fresh this plan and a
+    source one published before it, so the pairs never form a cycle.
+
+    Raises:
+        ValueError: The pairs copy blocks in a cycle.
+    """
+    waves: list[np.ndarray] = []
+    remaining = pairs
+    while remaining.shape[0]:
+        ready = ~np.isin(remaining[:, 1], remaining[:, 0])
+        if not ready.any():
+            raise ValueError(
+                f"block pairs copy in a cycle: {remaining.tolist()}; no order "
+                "reads every block before it is overwritten"
+            )
+        waves.append(remaining[ready])
+        remaining = remaining[~ready]
+    return waves
 
 
 class CacheArena:
@@ -78,9 +101,10 @@ class CacheArena:
         self.plan = plan
         self.device = device
         # Materialize immutable byte geometry at setup, not on first hand-out.
-        # zero_blocks ships only page ids per call; each group's field table
-        # (page-0 offset, page stride, payload bytes) lives on the device.
-        # The kernel trusts these ranges, so their bound is checked once here.
+        # zero_blocks and copy_blocks ship only page ids per call; each group's
+        # field table (page-0 offset, page stride, payload bytes) lives on the
+        # device. The kernels trust these ranges, so their bound is checked
+        # once here.
         # A group may have no fields on this rank: pipeline parallelism keeps
         # every group but drops the fields of layers another stage owns.
         self._zero_field_tables: dict[str, tuple[int, torch.Tensor, int]] = {}
@@ -122,11 +146,12 @@ class CacheArena:
         )
         if self.storage_plan != expected_storage:
             raise ValueError("cache physical binding does not match its memory plan")
-        if enable_memory_saver and not self.storage_plan.monolithic:
-            raise ValueError("mixed host/device cache does not support sleep/wake")
         self.offload_config = self.storage_plan.offload
         self.offload: SparseKVOffload | None = None
         self.regions: dict[str, torch.Tensor] = {}
+        # Only device regions live in the memory saver's pool; pinned Host
+        # regions (sparse offload history) are ordinary Host allocations and
+        # stay mapped across sleep. Wake zeroes both (clear()).
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             for region in self.storage_plan.regions:
                 host = region.placement == "host"
@@ -264,7 +289,7 @@ class CacheArena:
             and field.field_id in self.offload_config.field_ids
         ):
             token_rows = spec.rows_per_page
-        if spec.family == "state" or field.shape[0] != token_rows:
+        if spec.attn_kind == "state" or field.shape[0] != token_rows:
             return pages
         return pages.view(-1, *field.shape[1:])
 
@@ -341,6 +366,50 @@ class CacheArena:
     def field_block_byte_offset(self, field_id: str, block_id: int) -> int:
         return self.plan.field_page_byte_offset(field_id, block_id)
 
+    def _validate_block_ids(
+        self, group_id: str, ids: np.ndarray, *, expected_ndim: int
+    ) -> bool:
+        """Check one group's local block ids; False when this rank holds no bytes."""
+        page_count, fields, _ = self._zero_field_tables[group_id]
+        if (
+            not isinstance(ids, np.ndarray)
+            or ids.ndim != expected_ndim
+            or ids.dtype.kind not in "iu"
+        ):
+            raise TypeError(
+                f"block IDs for group {group_id!r} must be a {expected_ndim}-D "
+                "integer array"
+            )
+        if ids.size == 0:
+            return False
+        low, high = int(ids.min()), int(ids.max())
+        if low < 0 or high >= page_count:
+            raise IndexError(
+                f"local block ID {low if low < 0 else high} outside "
+                f"[0, {page_count}) for group {group_id!r}"
+            )
+        # Validated, but this rank may hold none of the group's bytes.
+        return fields.shape[0] > 0
+
+    def _upload_block_ids(
+        self, arrays: Sequence[np.ndarray], *, columns: int
+    ) -> tuple[torch.Tensor, list[int]]:
+        """Stage every group's ids through one pinned copy, 16-byte aligned spans."""
+        spans: list[int] = []
+        total = 0
+        for ids in arrays:
+            spans.append(total)
+            # Each group's span starts 16-byte aligned, as the kernels require
+            # of the pointer they receive.
+            total += -(-ids.shape[0] * columns // 4) * 4
+        # The caching host allocator tracks the pinned block's pending copy,
+        # so the next call cannot overwrite it early.
+        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
+        host = staging.numpy()
+        for start, ids in zip(spans, arrays, strict=True):
+            host[start : start + ids.size] = ids.reshape(-1)
+        return staging.to(self.buffer.device, non_blocking=True), spans
+
     def zero_blocks(self, block_ids_by_group: Mapping[str, np.ndarray]) -> None:
         """Clear local physical blocks after validating every group's IDs.
 
@@ -358,63 +427,130 @@ class CacheArena:
             IndexError: A block ID is outside its group's physical range.
             TypeError: A group's IDs are not a 1-D integer array.
         """
-        spans: list[tuple[str, int, int]] = []
+        groups: list[str] = []
         arrays: list[np.ndarray] = []
-        total = 0
         for group_id, ids in block_ids_by_group.items():
-            page_count, fields, _ = self._zero_field_tables[group_id]
-            if (
-                not isinstance(ids, np.ndarray)
-                or ids.ndim != 1
-                or ids.dtype.kind not in "iu"
-            ):
-                raise TypeError(
-                    f"block IDs for group {group_id!r} must be a 1-D integer array"
-                )
-            if ids.size == 0:
-                continue
-            low, high = int(ids.min()), int(ids.max())
-            if low < 0 or high >= page_count:
-                raise IndexError(
-                    f"local block ID {low if low < 0 else high} outside "
-                    f"[0, {page_count}) for group {group_id!r}"
-                )
-            if fields.shape[0] == 0:
-                # Validated, but this rank holds none of the group's bytes.
-                continue
-            spans.append((group_id, total, ids.size))
-            arrays.append(ids)
-            # Each group's span starts 16-byte aligned, as the kernel requires
-            # of the pointer it receives.
-            total += -(-ids.size // 4) * 4
-        if total == 0:
+            if self._validate_block_ids(group_id, ids, expected_ndim=1):
+                groups.append(group_id)
+                arrays.append(ids)
+        if not arrays:
             return
         if not self.storage_plan.monolithic:
             # Mixed regions use physical bindings; Host clears run on the
             # execution stream through the CuTeDSL kernel boundary.
             segments = [
                 segment
-                for group_id, block_ids in block_ids_by_group.items()
-                for segment in self.block_byte_segments(group_id, block_ids.tolist())
+                for group_id, ids in zip(groups, arrays, strict=True)
+                for segment in self.block_byte_segments(group_id, ids.tolist())
             ]
             for region_id, ranges in self.storage_plan.split_ranges(segments).items():
                 zero_byte_ranges(self.regions[region_id], ranges, device=self.device)
             return
-        # The caching host allocator tracks the pinned block's pending copy,
-        # so the next call cannot overwrite it early.
-        staging = torch.empty(total, dtype=torch.int32, pin_memory=True)
-        host = staging.numpy()
-        for (_, start, count), ids in zip(spans, arrays, strict=True):
-            host[start : start + count] = ids
-        pages = staging.to(self.buffer.device, non_blocking=True)
-        for group_id, start, count in spans:
+        pages, spans = self._upload_block_ids(arrays, columns=1)
+        for group_id, start, ids in zip(groups, spans, arrays, strict=True):
             _, fields, max_field_bytes = self._zero_field_tables[group_id]
             zero_page_fields(
                 self.buffer,
-                pages[start : start + count],
+                pages[start : start + ids.size],
                 fields,
                 max_field_bytes=max_field_bytes,
             )
+
+    def copy_blocks(self, block_pairs_by_group: Mapping[str, np.ndarray]) -> None:
+        """Copy local physical blocks whole onto other blocks of their group.
+
+        The same O(pages) path as :meth:`zero_blocks`: one pinned upload of
+        the ``(source, destination)`` pairs, one page x field expansion per
+        group and wave in the kernel. Every source is read as it was before
+        any of the plan's copies: a block the plan both reads and overwrites
+        (a published tail some hitter copies, evicted and re-granted as a
+        copy-in's destination in the same plan) is read in an earlier wave
+        than it is written. Pairs of one wave copy in parallel.
+
+        Args:
+            block_pairs_by_group: Local ``[n, 2]`` integer arrays per group of
+                ``(source, destination)`` block IDs, each in
+                [0, group.page_count).
+
+        Raises:
+            IndexError: A block ID is outside its group's physical range.
+            TypeError: A group's pairs are not an ``[n, 2]`` integer array.
+            ValueError: A pair copies a block onto itself or two pairs share
+                a destination.
+        """
+        groups: list[str] = []
+        arrays: list[np.ndarray] = []
+        for group_id, pairs in block_pairs_by_group.items():
+            if not self._validate_block_ids(group_id, pairs, expected_ndim=2):
+                continue
+            if pairs.shape[1] != 2:
+                raise TypeError(
+                    f"block pairs for group {group_id!r} must be an [n, 2] array"
+                )
+            destinations = pairs[:, 1]
+            if (pairs[:, 0] == destinations).any():
+                raise ValueError(
+                    f"block pairs for group {group_id!r} copy a block onto itself"
+                )
+            if np.unique(destinations).size != destinations.size:
+                raise ValueError(
+                    f"block pairs for group {group_id!r} write one destination "
+                    "twice; the copies of a wave run in parallel"
+                )
+            for wave in _copy_waves(pairs):
+                groups.append(group_id)
+                arrays.append(wave)
+        if not arrays:
+            return
+        if not self.storage_plan.monolithic:
+            self._copy_block_byte_ranges(groups, arrays)
+            return
+        pairs, spans = self._upload_block_ids(arrays, columns=2)
+        for group_id, start, ids in zip(groups, spans, arrays, strict=True):
+            _, fields, max_field_bytes = self._zero_field_tables[group_id]
+            copy_page_fields(
+                self.buffer,
+                pairs[start : start + ids.size].view(-1, 2),
+                fields,
+                max_field_bytes=max_field_bytes,
+            )
+
+    def _copy_block_byte_ranges(
+        self, groups: list[str], waves: list[np.ndarray]
+    ) -> None:
+        """Copy blocks of a region-backed cache field by field, in wave order.
+
+        A device region copies on the current stream. A Host region is pinned
+        memory that GPU kernels write on that stream, so the stream drains
+        once before the first host copy; the copies themselves are host
+        memcpys that complete before the thread enqueues the next forward.
+        Block copies are rare (a tail hit, an owner's move off a published
+        block), so the per-field Python here is affordable.
+        """
+        drained = False
+        for group_id, pairs in zip(groups, waves, strict=True):
+            for source, destination in pairs.tolist():
+                source_ranges = self.storage_plan.split_ranges(
+                    self.block_byte_segments(group_id, [source])
+                )
+                destination_ranges = self.storage_plan.split_ranges(
+                    self.block_byte_segments(group_id, [destination])
+                )
+                for region_id, region in self.regions.items():
+                    ranges = zip(
+                        source_ranges[region_id],
+                        destination_ranges[region_id],
+                        strict=True,
+                    )
+                    if (
+                        region.device.type == "cpu"
+                        and not drained
+                        and source_ranges[region_id]
+                    ):
+                        torch.cuda.current_stream(self.device).synchronize()
+                        drained = True
+                    for (src, size), (dst, _) in ranges:
+                        region[dst : dst + size].copy_(region[src : src + size])
 
     def block_byte_segments(
         self, group_id: str, block_ids: list[int]
@@ -438,12 +574,23 @@ class CacheArena:
             )
         return self.buffer
 
+    def synchronize(self) -> None:
+        """Wait for the arena's own copy streams (sparse KV offload).
+
+        A sleep release calls this before the device regions are unmapped, so
+        no prefetch or writeback still reads or writes them.
+        """
+        if self.offload is not None:
+            self.offload.synchronize()
+
     @torch.no_grad()
     def clear(self) -> None:
         """Zero the arena after sleep/wake remaps its storage.
 
         Exactly one owner, so callers may fan this out over every compute
-        view without double-clearing or needing a "views skip" rule.
+        view without double-clearing or needing a "views skip" rule. The
+        sparse offload's hot-pool tags and replacement state are reset with
+        it, and its Host history is zeroed like any other region.
         """
         if self.offload is not None:
             self.offload.synchronize()

@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL registration for the B200/B300 QSA sparse-attention specialization."""
+"""CuTe DSL registration for Blackwell QSA selection and sparse attention."""
 
 from __future__ import annotations
 
@@ -39,9 +39,188 @@ if _IS_NVIDIA_BLACKWELL:
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
         kernel as _cute_dsl_qsa_sparse_attention,
     )
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
+        _configuration,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
+        kernel as _cute_dsl_qsa_stream_block_topk,
+    )
 
 _HEAD_DIM = 256
 _SELECTED_WIDTH = 2051
+
+
+def can_use_cute_dsl_qwen4_exp_qsa_block_topk(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+    queries_per_request: int | None,
+    max_partial_bytes: int,
+) -> bool:
+    """Return whether a tuned Blackwell MMA specialization should be used.
+
+    The selector excludes other layouts before ranking registered kernels.
+
+    Args:
+        query: Candidate BF16 query tensor shaped ``[rows, 4, 128]``.
+        key_cache: Candidate contiguous BF16 key cache shaped
+            ``[slots, 1, 128]``.
+        page_table: Candidate int32 page table with contiguous columns.
+        request_indices: Candidate contiguous request id per query row.
+        complete_blocks: Candidate contiguous valid-block count per query row.
+        page_size: Number of compressed blocks per cache page.
+        block_topk: Number of logical blocks to select per row.
+        queries_per_request: Uniform consecutive query-run width, or ``None``
+            for a ragged layout.
+        max_partial_bytes: Caller budget for global selection scratch,
+            excluding the output. Grouped streaming needs no global scratch.
+
+    Returns:
+        Whether the tensors satisfy a tuned MMA specialization's contract.
+    """
+
+    if not _IS_NVIDIA_BLACKWELL:
+        return False
+    if query.ndim != 3 or key_cache.ndim != 3 or page_table.ndim != 2:
+        return False
+    rows = query.shape[0]
+    if rows == 0:
+        return False
+    if queries_per_request is not None and (
+        queries_per_request < 1 or rows % queries_per_request
+    ):
+        return False
+    if (
+        query.shape[1:] != (4, 128)
+        or key_cache.shape[0] < 64
+        or key_cache.shape[0] % 64
+        or key_cache.shape[1:] != (1, 128)
+    ):
+        return False
+    if page_size != 64 or block_topk != 512:
+        return False
+    if (
+        _configuration(
+            rows,
+            page_table.shape[1] * page_size,
+            queries_per_request,
+            max_partial_bytes,
+        )
+        is None
+    ):
+        return False
+    if query.dtype is not torch.bfloat16 or key_cache.dtype is not torch.bfloat16:
+        return False
+    if page_table.dtype is not torch.int32:
+        return False
+    if request_indices.dtype not in (torch.int32, torch.int64):
+        return False
+    if complete_blocks.dtype is not torch.int32:
+        return False
+    if request_indices.shape != (rows,) or complete_blocks.shape != (rows,):
+        return False
+    tensors = (query, key_cache, page_table, request_indices, complete_blocks)
+    if not query.is_cuda or any(tensor.device != query.device for tensor in tensors):
+        return False
+    if query.stride(2) != 1 or query.stride(0) % 8 or query.stride(1) % 8:
+        return False
+    if query.data_ptr() % 16 or not key_cache.is_contiguous():
+        return False
+    if key_cache.data_ptr() % 16:
+        return False
+    if page_table.stride(1) != 1 or page_table.stride(0) < page_table.shape[1]:
+        return False
+    if page_table.data_ptr() % 16:
+        return False
+    return all(
+        tensor.is_contiguous() and tensor.data_ptr() % 16 == 0
+        for tensor in (request_indices, complete_blocks)
+    )
+
+
+def cute_dsl_qwen4_exp_qsa_block_topk(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+    queries_per_request: int | None,
+    max_partial_bytes: int,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    """Run the registered Blackwell QSA streaming specialization.
+
+    Args:
+        query: Aligned BF16 queries shaped ``[rows, 4, 128]``.
+        key_cache: Contiguous BF16 keys shaped ``[slots, 1, 128]``.
+        page_table: Aligned int32 physical pages shaped ``[requests, max_pages]``
+            with contiguous columns and a runtime row stride.
+        request_indices: Int32 or int64 request id per query row.
+        complete_blocks: Contiguous int32 valid-block count per query row.
+        page_size: Number of compressed blocks per page; must be 64.
+        block_topk: Number of selected blocks; must be 512.
+        queries_per_request: Uniform consecutive query-run width, or ``None``
+            for ragged rows; required for grouped scoring optimizations.
+        max_partial_bytes: Budget for global scratch, excluding the output.
+        enable_pdl: Whether to use programmatic dependent launch ordering.
+
+    Returns:
+        Int32 logical block ids shaped ``[rows, block_topk]``, padded with ``-1``.
+    """
+
+    if not _IS_NVIDIA_BLACKWELL:
+        raise RuntimeError("CuTe DSL QSA stream top-k requires NVIDIA Blackwell")
+    return _cute_dsl_qsa_stream_block_topk(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+        queries_per_request=queries_per_request,
+        max_partial_bytes=max_partial_bytes,
+        enable_pdl=enable_pdl,
+    )
+
+
+if _IS_NVIDIA_BLACKWELL:
+    register_kernel(
+        "attention",
+        "qsa_block_topk_stream",
+        name="cute_dsl_qwen4_exp_qsa_block_topk",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    query=dense_tensor_format(torch.bfloat16),
+                    key_cache=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        traits={
+            "num_q_heads": frozenset({4}),
+            "head_dim": frozenset({128}),
+            "page_size": frozenset({64}),
+            "block_topk": frozenset({512}),
+            "supported_layout": frozenset({True}),
+        },
+        priority=Priority.SPECIALIZED,
+        features=frozenset({"stream"}),
+    )(cute_dsl_qwen4_exp_qsa_block_topk)
 
 
 def cute_dsl_blackwell_qsa_sparse_attention(
@@ -56,51 +235,42 @@ def cute_dsl_blackwell_qsa_sparse_attention(
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
 ) -> torch.Tensor:
-    """Run the adaptive workspace-free B200/B300 QSA specialization.
+    """Run Blackwell QSA with exact query-prefix and KV operand reuse.
 
     Args:
-        q: BF16 query tensor shaped ``[tokens, query_heads, 256]``, with 6,
-            12 or 24 query heads. The count must be divisible by ``kv_heads``.
-        k_cache: BF16 or FP8 E4M3 key cache shaped
-            ``[cache_slots, kv_heads, 256]``, with 1, 2 or 4 KV heads.
-        v_cache: BF16 or FP8 E4M3 value cache shaped
-            ``[cache_slots, kv_heads, 256]``. Its dtype must match ``k_cache``.
-        selected_slots: Physical cache slots shaped ``[tokens, 2051]``;
-            non-positive values are ignored.
+        q: BF16 query tensor shaped [tokens, query_heads, 256], with 6,
+            12 or 24 query heads, divisible by the KV-head count.
+        k_cache: BF16 or FP8 E4M3 key cache shaped [slots, kv_heads, 256],
+            with 1, 2 or 4 KV heads.
+        v_cache: Value cache with the same shape and dtype as k_cache.
+        selected_slots: Int32 physical slots shaped [tokens, 2051];
+            non-positive entries are masked.
         scale: Softmax scale applied to query-key scores.
-        max_seqlen_q: Uniform query-token count per request; 1 for decode and
-            ``spec_num_tokens`` for compact speculative decode.
-        metadata_capacity_rows: Ignored because this implementation is
-            workspace-free.
-        k_scale: Scalar key-cache descale, folded into ``scale``.
+        max_seqlen_q: Uniform query-token count per request, including
+            speculative decode. Query groups never cross request boundaries.
+        metadata_capacity_rows: Capacity for stateful fallback plans, unused
+            by this implementation's call-owned prefix flags.
+        k_scale: Scalar key-cache descale, folded into scale.
         v_scale: Scalar value-cache descale, applied to the output.
 
     Returns:
-        BF16 attention output shaped ``[tokens, query_heads, 256]``.
+        BF16 attention output with q's shape.
 
-    Each KV head owns a contiguous group of query heads, divided into tiles
-    of up to eight heads. A CTA or split cluster handles consecutive query
-    rows for one KV/head tile. Every row retains its own selected slots and
-    softmax state; query grouping reuses the CTA workspace and TMEM allocation.
-    It does not widen the per-query MMA atom.
+    Twelve BF16 query heads share one sixteen-head tile. Larger batches group
+    consecutive queries only when their complete ordered 2048-entry prefixes
+    match; each query keeps separate softmax state and three private tail slots.
+    A distinct prefix retains one query per CTA. The measured head geometry
+    selects query-group size, operand stages and warp/register allocation.
 
-    The launch policy counts independent query/head outputs and queries the
-    device SM count before jointly choosing query rows per CTA, KV splits and
-    operand stages. Large BF16 launches use one split and three asynchronous
-    K-or-V slots; sufficiently large outputs group two or four query rows per
-    CTA. Intermediate BF16 launches use two or four splits with three slots.
-    Smaller launches retain the sixteen/eight/four split policy, subject to
-    the device's wide-cluster capacity. Actual compiled-kernel occupancy must
-    be queried separately from these measured scheduling thresholds.
-
-    Each BF16 operand slot holds 128x256 values in shared memory. Asynchronous
-    barrier arrivals publish copy completion while the producer can fill the
-    next free slot. An unsplit CTA merges each head and its three tail slots
-    within one warp; split clusters use the existing head-owning DSM combine.
-    FP8 retains the gather/conversion pipeline with operands in TMEM.
+    Two-query groups and six-head geometries detect equality inside attention.
+    Larger twelve-head groups refresh prefix flags in one preparation kernel
+    before attention. Both launches are included in full-call benchmarks. KV
+    data is gathered directly from the cache with 64-bit offsets; preparation
+    neither copies KV nor caches decisions across calls or graph replays.
+    FP8 retains its gather/conversion and split-cluster path.
     """
 
-    del metadata_capacity_rows  # The workspace-free specialization has no metadata.
+    del metadata_capacity_rows  # This backend does not use fallback plan storage.
     return _cute_dsl_qsa_sparse_attention(
         q,
         k_cache,
@@ -149,6 +319,10 @@ if _IS_NVIDIA_BLACKWELL:
         },
         priority=Priority.SPECIALIZED + 2,
     )(cute_dsl_blackwell_qsa_sparse_attention)
-    __all__ = ["cute_dsl_blackwell_qsa_sparse_attention"]
+    __all__ = [
+        "can_use_cute_dsl_qwen4_exp_qsa_block_topk",
+        "cute_dsl_qwen4_exp_qsa_block_topk",
+        "cute_dsl_blackwell_qsa_sparse_attention",
+    ]
 else:
     __all__ = []

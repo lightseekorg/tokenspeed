@@ -23,10 +23,10 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -44,6 +44,28 @@ MXFP8_ATTENTION_BLOCK_SCALE = MXFP8_BLOCK_SCALE
 def _attention_format_signature(**roles: torch.Tensor):
     return format_signature(
         **{role: dense_tensor_format(tensor.dtype) for role, tensor in roles.items()}
+    )
+
+
+def dsa_interleave_rope(
+    tensor: torch.Tensor,
+    positions: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    *,
+    rope_dim: int,
+) -> torch.Tensor:
+    """Apply the indexer's interleaved RoPE through its selected device kernel."""
+    kernel = select_kernel(
+        "attention",
+        "dsa_interleave_rope",
+        _attention_format_signature(tensor=tensor),
+        traits={"rope_dim": int(rope_dim)},
+    )
+    return kernel(
+        tensor=tensor,
+        positions=positions,
+        cos_sin_cache=cos_sin_cache,
+        rope_dim=rope_dim,
     )
 
 
@@ -168,7 +190,12 @@ def _index_k_plane_traits(index_k_cache: torch.Tensor, head_dim: int) -> dict:
     )
 
 
-def _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu: torch.Tensor | None) -> dict:
+def _candidate_lens_cpu_kwargs(
+    kernel,
+    candidate_lens_cpu: torch.Tensor | None,
+    *,
+    kernel_plan: KernelPlan | None = None,
+) -> dict:
     """The ``candidate_lens_cpu`` kwarg for a selected top-k leaf, or nothing.
 
     Only a leaf registered with ``CANDIDATE_LENS_CPU_FEATURE`` takes the
@@ -177,7 +204,11 @@ def _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu: torch.Tensor | None) 
     """
     if candidate_lens_cpu is None:
         return {}
-    spec = KernelRegistry.get().get_by_name(kernel.name)
+    spec = (
+        kernel_plan.spec
+        if kernel_plan is not None
+        else KernelRegistry.get().get_by_name(kernel.name)
+    )
     if spec is None or CANDIDATE_LENS_CPU_FEATURE not in spec.features:
         return {}
     return {"candidate_lens_cpu": candidate_lens_cpu}
@@ -338,7 +369,9 @@ def select_dsa_prefill_topk_for_rows(
     ).name
 
 
-def _slot_order_kwargs(kernel, slot_order: str, *, role: str) -> dict:
+def _slot_order_kwargs(
+    kernel, slot_order: str, *, role: str, kernel_plan: KernelPlan | None = None
+) -> dict:
     """The ``slot_order`` kwarg for a selected leaf or core, refusing what it cannot do.
 
     A kernel declaring the trait was already matched on it and takes the
@@ -350,7 +383,11 @@ def _slot_order_kwargs(kernel, slot_order: str, *, role: str) -> dict:
         raise ValueError(
             f"slot_order must be one of {list(SLOT_ORDERS)}, got {slot_order!r}"
         )
-    spec = KernelRegistry.get().get_by_name(kernel.name)
+    spec = (
+        kernel_plan.spec
+        if kernel_plan is not None
+        else KernelRegistry.get().get_by_name(kernel.name)
+    )
     declared = None if spec is None else spec.traits.get("slot_order")
     if declared is None:
         if slot_order == "sorted":
@@ -395,6 +432,7 @@ def dsa_decode(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
 
@@ -424,6 +462,7 @@ def dsa_decode(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        kernel_plan: Initialization-time choice; inputs are validated without reselection.
         slot_order: The order the selected slots are reduced in, one of
             ``SLOT_ORDERS``: ``"selection"`` (as the top-k leaf emitted them;
             every kernel) or ``"sorted"`` (the ascending position order the
@@ -460,15 +499,29 @@ def dsa_decode(
         "slot_order": slot_order,
     }
     signature = _attention_format_signature(q=q)
-    kernel = select_kernel(
-        "attention",
-        "dsa_decode",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
+    if kernel_plan is not None:
+        kernel_plan.validate(
+            "attention",
+            "dsa_decode",
+            signature,
+            traits=traits,
+            features=None,
+            solution=solution,
+            override=override,
+        )
+        kernel = kernel_plan.kernel
+    else:
+        kernel = select_kernel(
+            "attention",
+            "dsa_decode",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    slot_order_kwargs = _slot_order_kwargs(
+        kernel, slot_order, role="core", kernel_plan=kernel_plan
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,
@@ -529,6 +582,7 @@ def dsa_prefill(
     kv_seq_lens: torch.Tensor | None = None,
     *,
     slot_order: str,
+    kernel_plan: KernelPlan | None = None,
 ) -> AttentionResult:
     """Sparse DSA prefill over selected global KV slots.
 
@@ -556,6 +610,7 @@ def dsa_prefill(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        kernel_plan: Initialization-time choice; inputs are validated without reselection.
         slot_order: The order the selected slots are reduced in, as for
             :func:`dsa_decode`. Required keyword.
 
@@ -585,15 +640,29 @@ def dsa_prefill(
         "slot_order": slot_order,
     }
     signature = _attention_format_signature(q=q)
-    kernel = select_kernel(
-        "attention",
-        "dsa_prefill",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
+    if kernel_plan is not None:
+        kernel_plan.validate(
+            "attention",
+            "dsa_prefill",
+            signature,
+            traits=traits,
+            features=None,
+            solution=solution,
+            override=override,
+        )
+        kernel = kernel_plan.kernel
+    else:
+        kernel = select_kernel(
+            "attention",
+            "dsa_prefill",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
+    slot_order_kwargs = _slot_order_kwargs(
+        kernel, slot_order, role="core", kernel_plan=kernel_plan
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="core")
     shape_params = {
         "batch_size": batch_size,
         "q_len": q_len,
@@ -711,6 +780,68 @@ def dsa_index_candidates(
         )
 
 
+def plan_dsa_topk(
+    *,
+    mode: str,
+    index_heads: int,
+    head_dim: int,
+    topk: int,
+    page_size: int,
+    q_dtype: torch.dtype,
+    weights_dtype: torch.dtype,
+    index_k_format: str,
+    slot_order: str,
+    forced_initial_local: bool,
+    q_lens: frozenset[int],
+    workspace_rows: bool,
+) -> KernelPlan:
+    """Bind a batch-invariant indexer using static model/cache geometry.
+
+    q_lens is the supported decode width domain; prefill uses an empty domain.
+    workspace_rows requires prefill support for gathered index keys in addition
+    to a paged plane. Request counts and history lengths never choose a provider.
+    """
+    if mode not in ("dsa_prefill_topk", "dsa_decode_topk"):
+        raise ValueError(f"Unsupported DSA top-k mode: {mode}")
+    if (mode == "dsa_decode_topk") != bool(q_lens):
+        raise ValueError("Only decode top-k requires a nonempty q_lens domain")
+    features = {"batch_invariant"}
+    if forced_initial_local:
+        features.add("forced_initial_local")
+    if workspace_rows:
+        if mode != "dsa_prefill_topk":
+            raise ValueError("Workspace rows are a prefill top-k input")
+        features.add(INDEX_K_WORKSPACE_ROWS_FEATURE)
+    traits = dict(
+        index_heads=index_heads,
+        head_dim=head_dim,
+        topk=topk,
+        page_size=page_size,
+        index_k_format=index_k_format,
+        index_k_layout="packed",
+        slot_order=slot_order,
+    )
+    if q_lens:
+        traits["q_len"] = q_lens
+    return KernelPlan.select(
+        "attention",
+        mode,
+        format_signature(
+            q=dense_tensor_format(q_dtype), weights=dense_tensor_format(weights_dtype)
+        ),
+        features=frozenset(features),
+        static_traits=traits,
+        variable_traits=frozenset(
+            {"tokens", "batch_size", "max_pages", "workspace_rows"}
+        ),
+        declared_traits=(
+            frozenset({"slot_order"}) if slot_order == "sorted" else frozenset()
+        ),
+        solution=None,
+        ignore_layout=False,
+    )
+
+
 def dsa_prefill_topk(
     q: torch.Tensor,
     weights: torch.Tensor,
@@ -736,6 +867,7 @@ def dsa_prefill_topk(
     slot_order: str,
     override: str | None = None,
     solution: str | None = None,
+    kernel_plan: KernelPlan | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DSA prefill top-k over packed workspace rows.
 
@@ -802,6 +934,7 @@ def dsa_prefill_topk(
             keyword -- the sparse core then reduces in that order). Required
             keyword.
         override: Optional exact kernel override name.
+        kernel_plan: Optional initialization-time provider, validated without reselection.
         solution: Optional kernel solution to force through normal selection.
 
     Implementations may accept a strided outer weight dimension, including the
@@ -882,23 +1015,40 @@ def dsa_prefill_topk(
     if has_workspace_rows:
         required_features.add(INDEX_K_WORKSPACE_ROWS_FEATURE)
     signature = _attention_format_signature(q=q, weights=weights)
-    kernel = select_kernel(
-        "attention",
-        "dsa_prefill_topk",
-        signature,
-        traits=traits,
-        features=frozenset(required_features) if required_features else None,
-        solution=solution,
-        override=override,
+    if kernel_plan is None:
+        kernel = select_kernel(
+            "attention",
+            "dsa_prefill_topk",
+            signature,
+            traits=traits,
+            features=frozenset(required_features) if required_features else None,
+            solution=solution,
+            override=override,
+        )
+    else:
+        traits["slot_order"] = slot_order
+        kernel_plan.validate(
+            "attention",
+            "dsa_prefill_topk",
+            signature,
+            traits=traits,
+            features=frozenset(required_features),
+            solution=solution,
+            override=override,
+        )
+        kernel = kernel_plan.kernel
+    candidate_lens_cpu_kwargs = _candidate_lens_cpu_kwargs(
+        kernel, candidate_lens_cpu, kernel_plan=kernel_plan
     )
-    candidate_lens_cpu_kwargs = _candidate_lens_cpu_kwargs(kernel, candidate_lens_cpu)
     index_k_rows_kwargs = _index_k_rows_kwargs(
         kernel,
         index_k_fp8=index_k_fp8,
         index_k_scale=index_k_scale,
         index_k_bf16=index_k_bf16,
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="top-k")
+    slot_order_kwargs = _slot_order_kwargs(
+        kernel, slot_order, role="top-k", kernel_plan=kernel_plan
+    )
     shape_params = {
         "tokens": q.shape[0],
         "workspace_rows": kv_workspace_slots.numel(),
@@ -967,6 +1117,7 @@ def dsa_decode_topk(
     slot_order: str,
     override: str | None = None,
     solution: str | None = None,
+    kernel_plan: KernelPlan | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DSA decode top-k over a paged KV cache.
 
@@ -1018,6 +1169,7 @@ def dsa_decode_topk(
         slot_order: The order the leaf emits each row's selection in, as for
             :func:`dsa_prefill_topk`. Required keyword.
         override: Optional exact kernel override name.
+        kernel_plan: Optional initialization-time provider, validated without reselection.
         solution: Optional kernel solution to force through normal selection.
 
     Implementations may accept a strided outer weight dimension, including the
@@ -1091,16 +1243,31 @@ def dsa_decode_topk(
     if batch_invariant:
         required_features.add("batch_invariant")
     signature = _attention_format_signature(q=q, weights=weights)
-    kernel = select_kernel(
-        "attention",
-        "dsa_decode_topk",
-        signature,
-        traits=traits,
-        features=frozenset(required_features) if required_features else None,
-        solution=solution,
-        override=override,
+    if kernel_plan is None:
+        kernel = select_kernel(
+            "attention",
+            "dsa_decode_topk",
+            signature,
+            traits=traits,
+            features=frozenset(required_features) if required_features else None,
+            solution=solution,
+            override=override,
+        )
+    else:
+        traits["slot_order"] = slot_order
+        kernel_plan.validate(
+            "attention",
+            "dsa_decode_topk",
+            signature,
+            traits=traits,
+            features=frozenset(required_features),
+            solution=solution,
+            override=override,
+        )
+        kernel = kernel_plan.kernel
+    slot_order_kwargs = _slot_order_kwargs(
+        kernel, slot_order, role="top-k", kernel_plan=kernel_plan
     )
-    slot_order_kwargs = _slot_order_kwargs(kernel, slot_order, role="top-k")
     shape_params = {
         "tokens": q.shape[0],
         "max_pages": block_table.shape[1],
@@ -1217,6 +1384,9 @@ import tokenspeed_kernel.ops.attention.dsa.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsa.gluon  # noqa: E402,F401
 
+if current_platform().is_npu:
+    import tokenspeed_kernel.ops.attention.dsa.ascend  # noqa: E402,F401
+
 # isort: on
 
 __all__ = [
@@ -1224,9 +1394,11 @@ __all__ = [
     "INDEX_K_WORKSPACE_ROWS_FEATURE",
     "SLOT_ORDERS",
     "dsa_decode",
+    "dsa_interleave_rope",
     "dsa_prefill",
     "dsa_prefill_topk",
     "dsa_decode_topk",
     "dsa_plan",
+    "plan_dsa_topk",
     "select_dsa_prefill_topk_for_rows",
 ]

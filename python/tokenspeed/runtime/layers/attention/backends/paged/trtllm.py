@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.base import (
 )
 from tokenspeed.runtime.layers.attention.backends.paged.tree_verify import (
     TreeCascadeRows,
+    TreeDraftInputs,
 )
 from tokenspeed.runtime.layers.attention.backends.support import TreeSupport
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
@@ -137,6 +138,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # FlashInfer's own allocation. It is pool-independent, so a rebind
         # keeps it.
         self._kv_counter_buffer = None
+        self._max_bs = config.max_bs
         if torch.device(config.device).type == "cuda":
             self._sm_count = torch.cuda.get_device_properties(
                 config.device
@@ -224,7 +226,17 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         # extend_seq_lens_cpu holds those new-token counts in either case.
         max_seq_len_q = int(extend_seq_lens_cpu[:prefill_bs].max().item())
 
-        if extend_with_prefix and bool(extend_prefix_lens_cpu[:prefill_bs].any()):
+        if prefill_bs > num_extends:
+            # A target MIXED round: each decode request after the extend
+            # requests queries only its spec_num_tokens new rows (1 without
+            # speculation) at the end of its cache, as in a decode step.
+            q_lens = seq_lens.new_full((prefill_bs,), self.spec_num_tokens)
+            q_lens[:num_extends] = extend_seq_lens[:num_extends]
+            cu_seqlens_q = torch.nn.functional.pad(
+                torch.cumsum(q_lens, dim=0, dtype=torch.int32), (1, 0)
+            )
+            max_seq_len_q = max(max_seq_len_q, self.spec_num_tokens)
+        elif extend_with_prefix and bool(extend_prefix_lens_cpu[:prefill_bs].any()):
             extend_lens = seq_lens[:prefill_bs] - extend_prefix_lens[:prefill_bs]
             cu_seqlens_q = torch.nn.functional.pad(
                 torch.cumsum(extend_lens, dim=0, dtype=torch.int32), (1, 0)
@@ -326,6 +338,18 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
 
         self.seq_lens_buf[:bs].copy_(seq_lens[:bs])
         self.page_table_buf[:bs].copy_(page_table[:bs])
+        self.publish_decode_metadata(bs, seq_lens, num_extends=num_extends)
+
+    def decode_buffer_targets(
+        self, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.block_decode_active:
+            return None
+        return self.seq_lens_buf[:bs], self.page_table_buf[:bs]
+
+    def publish_decode_metadata(
+        self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
+    ) -> None:
         self.forward_decode_metadata = self._decode_views(bs)
         # Pure verify (and the draft's multi-token step 1) reads the prefill
         # slot. An extend/mixed draft refresh only seeds later decode steps and
@@ -353,6 +377,19 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         """
         (buf,) = self._workspace_pool.allocate(((self._workspace_nbytes,), torch.uint8))
         return buf
+
+    def bind_tree_draft(self, inputs: TreeDraftInputs) -> None:
+        super().bind_tree_draft(inputs)
+        if self._kv_counter_buffer is None:
+            return
+        # A sliding-window draft decodes each lane row as its own request.
+        needed = get_trtllm_gen_multi_ctas_kv_counter_bytes(
+            self._max_bs * inputs.topk, self.tp_q_head_num, self._sm_count
+        )
+        if needed > self._kv_counter_buffer.numel():
+            self._kv_counter_buffer = torch.zeros(
+                needed, dtype=torch.uint8, device=self._kv_counter_buffer.device
+            )
 
     def _kv_counter_buffer_for(
         self, batch_size: int, num_qo_heads: int
@@ -485,26 +522,37 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
         ``rows``-token decode over the committed prefix, then the tree window
         and the prefix tail merged into it (``tree_window_attention``).
 
+        A sliding-window draft layer sees the window frozen at the round's
+        prefix end: each lane row decodes the prefix alone (its query placed at
+        the prefix's last key), so no prefix tail remains for the window kernel.
+
         ``q`` is unquantized: trtllm-gen takes it cast like any decode query,
         and the window kernel takes it as is, widening an FP8 cache's K/V."""
-        if layer.sliding_window_size >= 0 or sinks is not None:
+        causal_prefix = layer.sliding_window_size < 0
+        # Only lane rows (their own tables) decode a sliding window.
+        if sinks is not None or (not causal_prefix and tree.row_page_table is None):
             raise NotImplementedError(
                 "draft trees have no sliding-window or attention-sink path yet"
             )
         k_cache, v_cache = self._get_kv_cache_permuted(layer, token_to_kv_pool)
         # trtllm-gen also loads the key right after the prefix: the window's first slot, written this forward.
+        q_len = tree.rows if causal_prefix else 1
         prefix_out, prefix_lse = trtllm_batch_decode_with_kv_cache(
             query=self._prepare_q(q, layer),
             kv_cache=(k_cache, v_cache),
             workspace_buffer=self.workspace_buffer,
-            block_tables=tree.page_table,
-            seq_lens=tree.prefix_lens,
+            block_tables=tree.page_table if causal_prefix else tree.row_page_table,
+            seq_lens=tree.prefix_lens if causal_prefix else tree.row_prefix_lens,
             max_seq_len=self.max_context_len,
             bmm1_scale=layer.scaling,
             bmm2_scale=1.0,
             out_dtype=self.dtype,
-            q_len_per_req=tree.rows,
+            q_len_per_req=q_len,
+            window_left=layer.sliding_window_size,
             return_lse=True,
+            multi_ctas_kv_counter_buffer=self._kv_counter_buffer_for(
+                q.shape[0] // q_len, layer.tp_q_head_num
+            ),
         )
         kv_heads, dim = layer.tp_k_head_num, layer.head_dim
         k_rows, v_rows = token_to_kv_pool.get_kv_buffer(layer.layer_id)
@@ -519,6 +567,7 @@ class TRTLLMMHAAttnBackend(PagedAttentionBackend):
             prefix_lse,
             rows_per_req=tree.rows,
             window=tree.window,
+            causal_prefix=causal_prefix,
             page_size=self.kernel_page_size,
             sm_scale=layer.scaling,
         )

@@ -32,7 +32,7 @@ from collections.abc import Iterable
 
 import torch
 from tokenspeed_kernel.ops.activation import relu2
-from tokenspeed_kernel.ops.gemm.ll_bf16 import (
+from tokenspeed_kernel.ops.gemm.cute_dsl import (
     cute_dsl_ll_bf16_router,
     ll_bf16_router_supported,
 )
@@ -73,10 +73,12 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import (
+    KV_CACHE_SCALE_SUFFIXES,
     default_weight_loader,
     sharded_weight_loader,
 )
 from tokenspeed.runtime.models.base import BaseCausalLM
+from tokenspeed.runtime.models.base.decoder_layer import capture_layer_input
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.utils import set_weight_attrs
 from tokenspeed.runtime.utils.cuda_stream import StreamFork
@@ -809,6 +811,8 @@ class NemotronHModel(nn.Module):
             mapping,
             config.num_hidden_layers,
         )
+        # Ascending blocks whose input a draft reads; num_hidden_layers means the final norm's.
+        self.layers_to_capture: list[int] = []
 
     def forward(
         self,
@@ -816,17 +820,31 @@ class NemotronHModel(nn.Module):
         positions: torch.Tensor,
         ctx: ForwardContext,
         input_embeds: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, None]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         del positions
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
+        aux_hidden_states = [] if self.layers_to_capture else None
         previous: MixerOutput = (hidden_states, None)
         residual = None
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             previous, residual = layer(previous, residual, ctx)
-        hidden_states, _, _ = self.norm.add_norm(previous, residual, None, ctx)
-        return hidden_states, None
+            # After the norm's TP all-reduce and add, residual is this block's full input.
+            capture_layer_input(
+                layer.norm.comm_manager,
+                residual,
+                ctx,
+                aux_hidden_states if index in self.layers_to_capture else None,
+            )
+        hidden_states, _, residual = self.norm.add_norm(previous, residual, None, ctx)
+        capture_layer_input(
+            self.norm.comm_manager,
+            residual,
+            ctx,
+            aux_hidden_states if len(self.layers) in self.layers_to_capture else None,
+        )
+        return hidden_states, aux_hidden_states
 
 
 class NemotronHForCausalLM(BaseCausalLM):
@@ -843,8 +861,8 @@ class NemotronHForCausalLM(BaseCausalLM):
                 if name.startswith(old):
                     name = new + name[len(old) :]
                     break
-            if name.endswith((".k_scale", ".v_scale")):
-                # The loader already required unit KV scales; the cache uses no scale.
+            if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+                # Only the startup load takes them (load_kv_cache_scales).
                 continue
             if ".mixer.in_proj." in name:
                 block = self.model.layers[int(name.split(".")[2])]
@@ -852,6 +870,16 @@ class NemotronHForCausalLM(BaseCausalLM):
                 continue
             name = name.replace(".mixer.conv1d.", ".mixer.conv_")
             load_weight(params, expert_loader, name, loaded)
+
+    def load_kv_cache_scales(self, scales: dict[str, torch.Tensor]) -> None:
+        for checkpoint_name, scale in scales.items():
+            if checkpoint_name.startswith("mtp."):
+                # The MTP head's; its draft model takes them.
+                continue
+            # backbone.layers.N.mixer.{k,v}_proj.{k,v}_scale
+            layer = checkpoint_name.removeprefix("backbone.layers.").split(".")[0]
+            block = self.model.layers[int(layer)]
+            block.mixer.attn.load_kv_cache_scale(checkpoint_name, scale)
 
 
 EntryClass = NemotronHForCausalLM

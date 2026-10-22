@@ -20,20 +20,21 @@
 
 from __future__ import annotations
 
-import ast
-import inspect
+import ctypes
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
+import time
 import types
-import unittest
 from contextlib import contextmanager
-from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from tokenspeed.runtime.cache.l3.backend import (
-    L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     L3_RUNTIME_COMPAT,
     MemoryKvStore,
     _ext_def_file_from_yaml_text,
@@ -42,15 +43,16 @@ from tokenspeed.runtime.cache.l3.backend import (
     l3_checkpoint_id,
     resolve_l3_weight_version,
     share_l3_checkpoint_ids,
+    storage_deployment_id,
     storage_key_prefix,
     storage_object_key,
 )
-from tokenspeed.runtime.cache.l3.executor import L3HostStore
-from tokenspeed.runtime.cache.l3.factory import create_kvstore_storage_backend
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig, parse_extra_config
+from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+from tokenspeed.runtime.cache.l3.factory import create_storage_backend
 from tokenspeed.runtime.cache.l3.mooncake import (
     MooncakeKvStore,
     MooncakeStoreConfig,
-    parse_extra_config,
 )
 
 
@@ -76,264 +78,236 @@ class _FakeHost:
         return offset, self._payload_size
 
 
-class FakeHostTest(unittest.TestCase):
-    def test_fake_host_requires_buffer_size(self):
-        param = inspect.signature(_FakeHost.__init__).parameters["size"]
-        self.assertIs(param.default, inspect.Parameter.empty)
+class TestMinimalL3ExecutorTest:
+    def test_roundtrip_without_site_packages(self):
+        # Only the scheduler native package is needed; no inference dependencies.
+        import tokenspeed_scheduler
+        import tokenspeed_scheduler.tokenspeed_scheduler_ext as scheduler_ext
+
+        source = textwrap.dedent("""
+            import importlib.util
+            import os
+            import sys
+            import time
+
+            # ``python -S`` skips the editable-install finder that maps the
+            # scheduler's compiled extension, so register it from the path the
+            # parent resolved before the package import looks for it.
+            spec = importlib.util.spec_from_file_location(
+                "tokenspeed_scheduler.tokenspeed_scheduler_ext",
+                os.environ["_L3_TEST_SCHEDULER_EXT"],
+            )
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = module
+            spec.loader.exec_module(module)
+
+            from tokenspeed.runtime.cache.l3.backend import MemoryKvStore
+            from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+            from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+
+            class Host:
+                def __init__(self):
+                    self.host_buffer = bytearray(b"tail")
+
+                def host_block_range(self, group_id, block_id):
+                    return 0, 4
+
+            host = Host()
+            executor = L3Executor(
+                MemoryKvStore(), host, key_prefix="minimal", rank=0, ownership=None,
+                config=StorageRuntimeConfig.from_extra_config(
+                    None, host_blocks=8, prefix_granularity=2
+                ),
+                prefix_for_weight_version=None,
+            )
+            def run(op_id, kind):
+                keys, offsets, sizes = executor._page_ranges([(0, 1, "prefix", 0)])
+                executor.submit(StorageJob(op_id, kind, tuple(keys), tuple(offsets), tuple(sizes)))
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    facts = executor.poll().completions
+                    if facts:
+                        assert len(facts) == 1
+                        assert facts[0].retired and facts[0].success == (True,)
+                        return
+                    time.sleep(0.001)
+                raise AssertionError("L3 operation did not finish")
+            try:
+                run(1, "put")
+                host.host_buffer[:] = bytes(4)
+                run(2, "get")
+                assert host.host_buffer == b"tail"
+            finally:
+                executor.close(timeout_s=3)
+            """)
+        result = subprocess.run(
+            [sys.executable, "-S", "-c", source],
+            env={
+                **os.environ,
+                "_L3_TEST_SCHEDULER_EXT": scheduler_ext.__file__,
+                "PYTHONPATH": os.pathsep.join(
+                    [
+                        os.path.abspath(
+                            os.path.join(os.path.dirname(__file__), "..", "python")
+                        ),
+                        os.path.dirname(os.path.dirname(tokenspeed_scheduler.__file__)),
+                    ]
+                ),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
 
 
-class StorageKeyTest(unittest.TestCase):
+def _deployment_facts():
+    return {
+        "model_name": "org/model",
+        "revision": "abc",
+        "model_overrides": {},
+        "cache_signature": "layout",
+        "pipeline_rank": 0,
+        "attn_tp_size": 1,
+        "draft_model": "",
+        "draft_revision": "",
+        "cache_quantization": "",
+        "runtime_compat": L3_RUNTIME_COMPAT,
+        "attention_backend": "mha",
+        "draft_attention_backend": "",
+        "skip_softmax_threshold": 0.0,
+        "eagle3_layers_to_capture": [],
+        "kv_producer": {"numerics": "resolved", "attn_kvp_size": 1},
+    }
+
+
+class TestStorageKeyTest:
     def test_object_key_includes_group_offset_and_rank(self):
         # The trailing ``|c0`` is the retired context-parallel shard id, kept
         # literal so objects written before its removal stay addressable.
-        self.assertEqual(
-            storage_object_key("abc", 1, 2, prefix="model", rank=3),
-            "model_abc|g1|o2|r3|c0",
+        assert (storage_object_key("abc", 1, 2, prefix="model", rank=3)) == (
+            "model_abc|g1|o2|r3|c0"
         )
-        self.assertEqual(
-            storage_object_key("abc", 0, 0, prefix="", rank=0),
-            "abc|g0|o0|r0|c0",
+        assert (storage_object_key("abc", 0, 0, prefix="", rank=0)) == (
+            "abc|g0|o0|r0|c0"
         )
-        self.assertNotEqual(
-            storage_object_key("abc", 0, 0, prefix="", rank=0),
-            storage_object_key("abc", 0, 0, prefix="", rank=1),
+        assert (storage_object_key("abc", 0, 0, prefix="", rank=0)) != (
+            storage_object_key("abc", 0, 0, prefix="", rank=1)
         )
-
-    def test_attention_build_exports_resolved_backend_names(self):
-        # Exercise the real build-result expressions without constructing GPU
-        # backends. In particular the hybrid wrapper name must not erase its
-        # user's full-attention sub-backend, and auto choices must resolve.
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "python/tokenspeed/runtime/layers/attention/registry.py"
-        )
-        tree = ast.parse(path.read_text())
-        build = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "create_attn_components"
-        )
-        result = next(node for node in build.body if isinstance(node, ast.Return))
-        fields = {keyword.arg: keyword.value for keyword in result.value.keywords}
-        expression = ast.Expression(
-            ast.Tuple(
-                elts=[
-                    fields["attention_backend_name"],
-                    fields["draft_attention_backend_name"],
-                ],
-                ctx=ast.Load(),
-            )
-        )
-        ast.fix_missing_locations(expression)
-        arch = SimpleNamespace(MHA="mha", MLA="mla", DSA="dsa", MSA="msa")
-
-        class MSAConfig:
-            def __init__(self, full_attn_backend_name):
-                self.full_attn_backend_name = full_attn_backend_name
-
-        namespace = {"AttentionArch": arch, "MSAConfig": MSAConfig}
-        helpers = [
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef)
-            and node.name in {"_get_default_backend_name", "_cache_backend_name"}
-        ]
-        exec(
-            compile(ast.Module(body=helpers, type_ignores=[]), str(path), "exec"),
-            namespace,
-        )
-        cases = [
-            (None, None, True, ("mha", "mla")),
-            ("fa3", "fa4", True, ("fa3", "fa4")),
-            ("tokenspeed_mla", "flashinfer", True, ("tokenspeed_mla", "flashinfer")),
-            ("fa3", "fa4", False, ("fa3", "")),
-        ]
-        for target_name, draft_name, has_draft, expected in cases:
-            with self.subTest(
-                target=target_name, draft=draft_name, has_draft=has_draft
-            ):
-                namespace.update(
-                    target_full_attn_backend_name=target_name,
-                    draft_full_attn_backend_name=draft_name,
-                    softmax_attn=object(),
-                    draft_softmax_attn=object(),
-                    model_config=SimpleNamespace(attention_arch=arch.MHA),
-                    draft_model_config=SimpleNamespace(attention_arch=arch.MLA),
-                    draft_attn_backend=object() if has_draft else None,
-                )
-                self.assertEqual(
-                    eval(compile(expression, str(path), "eval"), namespace), expected
-                )
-
-        # Outer MSA names stay identical while its dense implementations
-        # differ. Both target and draft identities must retain that choice.
-        for target_dense, draft_dense in (
-            ("trtllm", "fa3"),
-            ("fa3", "trtllm"),
-            (None, None),
-        ):
-            with self.subTest(target_dense=target_dense, draft_dense=draft_dense):
-                namespace.update(
-                    target_full_attn_backend_name="msa",
-                    draft_full_attn_backend_name="msa",
-                    softmax_attn=MSAConfig(target_dense),
-                    draft_softmax_attn=MSAConfig(draft_dense),
-                    model_config=SimpleNamespace(attention_arch=arch.MSA),
-                    draft_model_config=SimpleNamespace(attention_arch=arch.MSA),
-                    draft_attn_backend=object(),
-                )
-                self.assertEqual(
-                    eval(compile(expression, str(path), "eval"), namespace),
-                    (f"msa:{target_dense or 'mha'}", f"msa:{draft_dense or 'mha'}"),
-                )
-
-    def test_weight_version_factory_preserves_resolved_backend_identity(self):
-        # Execute the actual prefix closure with startup facts, so weight
-        # updates cannot silently drop the backend dimensions.
-        path = (
-            Path(__file__).resolve().parents[1]
-            / "python/tokenspeed/runtime/execution/device.py"
-        )
-        tree = ast.parse(path.read_text())
-        factory = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef)
-            and node.name == "prefix_for_weight_version"
-        )
-        capture = mock.Mock(return_value="prefix")
-        namespace = dict(
-            storage_key_prefix=capture,
-            server_args=SimpleNamespace(model="org/model", skip_softmax_threshold=0.0),
-            model_config=SimpleNamespace(model_override_args={}),
-            checkpoint_id="checkpoint",
-            cache_signature="layout",
-            pipeline_rank=0,
-            attn_tp_size=1,
-            draft_model="org/draft",
-            draft_revision="draft-checkpoint",
-            cache_quantization="",
-            L3_RUNTIME_COMPAT=L3_RUNTIME_COMPAT,
-            attention_backend_name="fa3",
-            draft_attention_backend_name="fa4",
-            eagle3_layers_to_capture=[],
-        )
-        exec(
-            compile(ast.Module(body=[factory], type_ignores=[]), str(path), "exec"),
-            namespace,
-        )
-        for version in ("v1", "v2"):
-            self.assertEqual(namespace["prefix_for_weight_version"](version), "prefix")
-            values = capture.call_args.kwargs
-            self.assertEqual(values["weight_version"], version)
-            self.assertEqual(values["attention_backend"], "fa3")
-            self.assertEqual(values["draft_attention_backend"], "fa4")
 
     def test_prefix_is_stable_and_separates_incompatible_cache_objects(self):
         def prefix(**overrides):
-            values = {
-                "model_name": "org/model",
-                "revision": "abc",
-                "weight_version": "v1",
-                "model_overrides": {},
-                "cache_signature": "layout",
-                "pipeline_rank": 0,
-                "attn_tp_size": 1,
-                "draft_model": "",
-                "draft_revision": "",
-                "draft_weight_version": "",
-                "cache_quantization": "",
-                "runtime_compat": L3_RUNTIME_COMPAT,
-                "attention_backend": "mha",
-                "draft_attention_backend": "",
-                "skip_softmax_threshold": 0.0,
-                "eagle3_layers_to_capture": [],
-            }
+            values = _deployment_facts()
+            values.update(weight_version="v1", draft_weight_version="")
             values.update(overrides)
-            return storage_key_prefix(**values)
+            weight_version = values.pop("weight_version")
+            draft_weight_version = values.pop("draft_weight_version")
+            return storage_key_prefix(
+                storage_deployment_id(**values),
+                weight_version=weight_version,
+                draft_weight_version=draft_weight_version,
+            )
 
         base = prefix()
-        self.assertEqual(base, prefix())
-        self.assertTrue(base.startswith("tsl3v1-"))
-        self.assertNotEqual(base, prefix(model_name="org_model"))
-        self.assertNotEqual(base, prefix(revision="def"))
-        self.assertNotEqual(base, prefix(weight_version="v2"))
-        self.assertNotEqual(base, prefix(cache_signature="other"))
-        self.assertNotEqual(base, prefix(pipeline_rank=1))
-        self.assertNotEqual(base, prefix(attn_tp_size=8))
-        self.assertNotEqual(prefix(attn_tp_size=8), prefix(attn_tp_size=16))
-        self.assertNotEqual(base, prefix(draft_model="org/draft"))
-        self.assertNotEqual(base, prefix(cache_quantization='{"quantization":"fp8"}'))
-        self.assertNotEqual(base, prefix(model_overrides={"rope_theta": 10000.0}))
-        self.assertNotEqual(
-            prefix(model_overrides={"rope_theta": 10000.0}),
-            prefix(model_overrides={"rope_scaling": {"type": "linear"}}),
+        assert base == prefix()
+        assert base.startswith("tsl3-")
+        assert base != prefix(kv_producer={"numerics": "different"})
+        assert base != prefix(model_name="org_model")
+        assert base != prefix(revision="def")
+        assert base != prefix(weight_version="v2")
+        assert base != prefix(cache_signature="other")
+        assert base != prefix(pipeline_rank=1)
+        assert base != prefix(attn_tp_size=8)
+        assert prefix(attn_tp_size=8) != prefix(attn_tp_size=16)
+        assert base != prefix(draft_model="org/draft")
+        assert base != prefix(cache_quantization='{"quantization":"fp8"}')
+        assert base != prefix(model_overrides={"rope_theta": 10000.0})
+        assert prefix(model_overrides={"rope_theta": 10000.0}) != prefix(
+            model_overrides={"rope_scaling": {"type": "linear"}}
         )
-        self.assertEqual(
-            prefix(model_overrides={"b": 2, "a": 1}),
-            prefix(model_overrides={"a": 1, "b": 2}),
+        assert prefix(model_overrides={"b": 2, "a": 1}) == prefix(
+            model_overrides={"a": 1, "b": 2}
         )
-        self.assertNotEqual(base, prefix(attention_backend="fa3"))
-        self.assertNotEqual(
-            prefix(attention_backend="fa3"), prefix(attention_backend="fa4")
+        assert (prefix(model_overrides={"b": 2, "a": 1})) == (
+            prefix(model_overrides={"a": 1, "b": 2})
         )
-        self.assertNotEqual(base, prefix(draft_attention_backend="mha"))
-        self.assertNotEqual(
-            prefix(attention_backend="msa:trtllm"), prefix(attention_backend="msa:fa3")
+        assert (base) != (prefix(attention_backend="fa3"))
+        assert (prefix(attention_backend="fa3")) != (prefix(attention_backend="fa4"))
+        assert (base) != (prefix(draft_attention_backend="mha"))
+        assert (prefix(attention_backend="msa:trtllm")) != (
+            prefix(attention_backend="msa:fa3")
         )
-        self.assertNotEqual(
-            prefix(draft_attention_backend="msa:trtllm"),
-            prefix(draft_attention_backend="msa:fa3"),
+        assert (prefix(draft_attention_backend="msa:trtllm")) != (
+            prefix(draft_attention_backend="msa:fa3")
         )
-        self.assertNotEqual(
-            prefix(draft_attention_backend="fa3"), prefix(draft_attention_backend="fa4")
+        assert (prefix(draft_attention_backend="fa3")) != (
+            prefix(draft_attention_backend="fa4")
         )
-        self.assertNotEqual(base, prefix(runtime_compat="2"))
-        self.assertEqual(prefix(runtime_compat="1"), prefix(runtime_compat="1"))
-        self.assertNotEqual(base, prefix(skip_softmax_threshold=1e-2))
-        self.assertEqual(
-            prefix(skip_softmax_threshold=0.0), prefix(skip_softmax_threshold=0.0)
+        assert base != prefix(runtime_compat="previous-epoch")
+        assert base == prefix(runtime_compat="2")
+        assert base != prefix(runtime_compat="1")
+        assert base != prefix(runtime_compat="3")
+        assert base != prefix(runtime_compat="4")
+        assert prefix(runtime_compat="1") == prefix(runtime_compat="1")
+        assert base != prefix(skip_softmax_threshold=0.01)
+        assert prefix(skip_softmax_threshold=0.0) == prefix(skip_softmax_threshold=0.0)
+        assert (base) != (prefix(eagle3_layers_to_capture=[2, 16, 29]))
+        assert (prefix(eagle3_layers_to_capture=[2, 16, 29])) != (
+            prefix(eagle3_layers_to_capture=[1, 16, 29])
         )
-        self.assertNotEqual(base, prefix(eagle3_layers_to_capture=[2, 16, 29]))
-        self.assertNotEqual(
-            prefix(eagle3_layers_to_capture=[2, 16, 29]),
-            prefix(eagle3_layers_to_capture=[1, 16, 29]),
+        assert (prefix(eagle3_layers_to_capture=[2, 16, 29])) == (
+            prefix(eagle3_layers_to_capture=[2, 16, 29])
         )
-        self.assertEqual(
-            prefix(eagle3_layers_to_capture=[2, 16, 29]),
-            prefix(eagle3_layers_to_capture=[2, 16, 29]),
-        )
-        with self.assertRaises(TypeError):
+        with pytest.raises((TypeError)):
             prefix(eagle3_layers_to_capture="2,16,29")
-        with self.assertRaises(TypeError):
-            storage_key_prefix("org/model")
-        with self.assertRaises(TypeError):
+        with pytest.raises((TypeError)):
             prefix(model_overrides=["rope_theta"])
-        signature = inspect.signature(storage_key_prefix)
-        for name in ("attention_backend", "draft_attention_backend"):
-            self.assertIs(signature.parameters[name].default, inspect.Parameter.empty)
-        self.assertIs(
-            signature.parameters["cache_quantization"].default, inspect.Parameter.empty
+        with pytest.raises(ValueError):
+            prefix(kv_producer={})
+
+    def test_deployment_snapshot_does_not_retain_mutable_inputs(self):
+        facts = _deployment_facts()
+        deployment = storage_deployment_id(**facts)
+        before = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version=""
         )
-        self.assertIs(signature.parameters["revision"].default, inspect.Parameter.empty)
-        self.assertIs(
-            signature.parameters["model_overrides"].default, inspect.Parameter.empty
+        facts["model_overrides"]["rope_theta"] = 10000.0
+        facts["kv_producer"]["numerics"] = "different"
+        facts["eagle3_layers_to_capture"].append(4)
+        assert (
+            storage_key_prefix(deployment, weight_version="v1", draft_weight_version="")
+            == before
         )
-        self.assertIs(
-            signature.parameters["attn_tp_size"].default, inspect.Parameter.empty
+        updated = storage_deployment_id(**facts)
+        assert updated != deployment
+        assert (
+            storage_key_prefix(updated, weight_version="v1", draft_weight_version="")
+            != before
         )
-        self.assertIs(
-            signature.parameters["runtime_compat"].default, inspect.Parameter.empty
+
+    def test_target_and_draft_weight_generations_are_independent(self):
+        facts = _deployment_facts()
+        facts.update(draft_model="org/draft", draft_revision="draft-abc")
+        deployment = storage_deployment_id(**facts)
+        base = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version="draft-v1"
         )
-        self.assertIs(
-            signature.parameters["skip_softmax_threshold"].default,
-            inspect.Parameter.empty,
+        target = storage_key_prefix(
+            deployment, weight_version="v2", draft_weight_version="draft-v1"
         )
-        self.assertIs(
-            signature.parameters["eagle3_layers_to_capture"].default,
-            inspect.Parameter.empty,
+        draft = storage_key_prefix(
+            deployment, weight_version="v1", draft_weight_version="draft-v2"
         )
+        assert len({base, target, draft}) == 3
+
+    def test_structured_producer_facts_have_canonical_order(self):
+        facts = _deployment_facts()
+        forward = storage_deployment_id(**facts)
+        facts["kv_producer"] = {"attn_kvp_size": 1, "numerics": "resolved"}
+        assert storage_deployment_id(**facts) == forward
+        facts["kv_producer"]["attn_kvp_size"] = 2
+        assert storage_deployment_id(**facts) != forward
 
     def _checkpoint_id(self, model_path, *, load_format, hf_config, revision):
         return l3_checkpoint_id(
@@ -348,42 +322,43 @@ class StorageKeyTest(unittest.TestCase):
     def test_checkpoint_id_prefers_loaded_commit_over_moving_branch(self):
         commit = "a" * 40
         other = "b" * 40
-        self.assertEqual(
+        assert (
             self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=commit),
                 revision="main",
                 load_format="auto",
-            ),
-            f"{commit}:auto",
-        )
-        self.assertNotEqual(
+            )
+        ) == (f"{commit}:auto")
+        assert (
             self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=commit),
                 revision="main",
                 load_format="auto",
-            ),
+            )
+        ) != (
             self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=other),
                 revision="main",
                 load_format="auto",
-            ),
+            )
         )
-        self.assertNotEqual(
+        assert (
             self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=commit),
                 revision="main",
                 load_format="auto",
-            ),
+            )
+        ) != (
             self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash=commit),
                 revision="main",
                 load_format="pt",
-            ),
+            )
         )
 
     def test_checkpoint_id_uses_snapshot_directory_commit(self):
@@ -395,15 +370,14 @@ class StorageKeyTest(unittest.TestCase):
             os.makedirs(snapshot)
             with open(os.path.join(snapshot, "config.json"), "w") as handle:
                 handle.write("{}")
-            self.assertEqual(
+            assert (
                 self._checkpoint_id(
                     snapshot,
                     hf_config=SimpleNamespace(),
                     revision="main",
                     load_format="safetensors",
-                ),
-                f"{commit}:safetensors",
-            )
+                )
+            ) == (f"{commit}:safetensors")
 
     def test_checkpoint_id_does_not_trust_hub_snapshots_without_refs(self):
         commit = "f" * 40
@@ -421,12 +395,15 @@ class StorageKeyTest(unittest.TestCase):
                 hf_config=SimpleNamespace(),
                 revision="",
             )
-            self.assertTrue(checkpoint_id.startswith("local-"))
-            self.assertNotEqual(checkpoint_id, f"{commit}:auto")
+            assert checkpoint_id.startswith("local-")
+            assert (checkpoint_id) != (f"{commit}:auto")
 
     def test_checkpoint_id_does_not_trust_snapshots_dir_outside_hf_hub_cache(self):
         commit = "e" * 40
-        with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+        with (
+            tempfile.TemporaryDirectory() as first_root,
+            tempfile.TemporaryDirectory() as second_root,
+        ):
             first = os.path.join(first_root, "models", "snapshots", commit)
             second = os.path.join(second_root, "models", "snapshots", commit)
             os.makedirs(first)
@@ -448,50 +425,51 @@ class StorageKeyTest(unittest.TestCase):
                 hf_config=SimpleNamespace(),
                 revision="",
             )
-            self.assertTrue(first_id.startswith("local-"))
-            self.assertTrue(second_id.startswith("local-"))
-            self.assertNotEqual(first_id, second_id)
-            self.assertNotEqual(first_id, f"{commit}:auto")
+            assert first_id.startswith("local-")
+            assert second_id.startswith("local-")
+            assert (first_id) != (second_id)
+            assert (first_id) != (f"{commit}:auto")
 
     def test_checkpoint_id_fingerprints_local_weight_bytes(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
                 with open(os.path.join(directory, "model.safetensors"), "wb") as handle:
                     handle.write(payload)
-            self.assertEqual(
-                os.path.getsize(os.path.join(first, "model.safetensors")), 3
-            )
-            self.assertEqual(
-                os.path.getsize(os.path.join(second, "model.safetensors")), 3
-            )
-            self.assertNotEqual(
+            assert (os.path.getsize(os.path.join(first, "model.safetensors"))) == (3)
+            assert (os.path.getsize(os.path.join(second, "model.safetensors"))) == (3)
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) != (
                 self._checkpoint_id(
                     second,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
-            self.assertTrue(
-                self._checkpoint_id(
-                    first,
-                    load_format="auto",
-                    hf_config=SimpleNamespace(),
-                    revision="",
-                ).startswith("local-")
-            )
+            assert self._checkpoint_id(
+                first,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            ).startswith("local-")
 
     def test_checkpoint_id_does_not_trust_hex_basename_outside_hf_snapshots(self):
         commit = "d" * 40
-        with tempfile.TemporaryDirectory() as first_root, tempfile.TemporaryDirectory() as second_root:
+        with (
+            tempfile.TemporaryDirectory() as first_root,
+            tempfile.TemporaryDirectory() as second_root,
+        ):
             first = os.path.join(first_root, commit)
             second = os.path.join(second_root, commit)
             os.makedirs(first)
@@ -513,14 +491,17 @@ class StorageKeyTest(unittest.TestCase):
                 hf_config=SimpleNamespace(),
                 revision="",
             )
-            self.assertTrue(first_id.startswith("local-"))
-            self.assertTrue(second_id.startswith("local-"))
-            self.assertNotEqual(first_id, second_id)
-            self.assertNotEqual(first_id, f"{commit}:auto")
+            assert first_id.startswith("local-")
+            assert second_id.startswith("local-")
+            assert (first_id) != (second_id)
+            assert (first_id) != (f"{commit}:auto")
 
     def test_checkpoint_id_ignores_inherited_commit_on_local_dir(self):
         inherited = "a" * 40
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, payload in ((first, b"aaa"), (second, b"bbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
@@ -538,12 +519,15 @@ class StorageKeyTest(unittest.TestCase):
                 revision="",
                 load_format="auto",
             )
-            self.assertNotEqual(first_id, second_id)
-            self.assertFalse(first_id.startswith(inherited))
-            self.assertTrue(first_id.startswith("local-"))
+            assert (first_id) != (second_id)
+            assert not (first_id.startswith(inherited))
+            assert first_id.startswith("local-")
 
     def test_checkpoint_id_fingerprints_local_hf_quant_config(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, kv_algo in ((first, "FP8"), (second, "INT8")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write('{"model_type":"x"}')
@@ -556,23 +540,27 @@ class StorageKeyTest(unittest.TestCase):
                         '{"quantization":{"quant_algo":"NVFP4",'
                         f'"kv_cache_quant_algo":"{kv_algo}"}}'
                     )
-            self.assertNotEqual(
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) != (
                 self._checkpoint_id(
                     second,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
 
     def test_checkpoint_id_fingerprints_local_config_code(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, source in (
                 (first, "class Config: rope_theta = 10000\n"),
                 (second, "class Config: rope_theta = 500000\n"),
@@ -585,23 +573,27 @@ class StorageKeyTest(unittest.TestCase):
                     handle.write(b"weights")
                 with open(os.path.join(directory, "configuration.py"), "w") as handle:
                     handle.write(source)
-            self.assertNotEqual(
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) != (
                 self._checkpoint_id(
                     second,
                     load_format="auto",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
 
     def test_checkpoint_id_fingerprints_imported_custom_code_subdirectories(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, helper in (
                 (first, "def rotary_dim():\n    return 64\n"),
                 (second, "def rotary_dim():\n    return 128\n"),
@@ -632,9 +624,9 @@ class StorageKeyTest(unittest.TestCase):
                 hf_config=SimpleNamespace(),
                 revision="",
             )
-            self.assertTrue(first_id.startswith("local-"))
-            self.assertTrue(second_id.startswith("local-"))
-            self.assertNotEqual(first_id, second_id)
+            assert first_id.startswith("local-")
+            assert second_id.startswith("local-")
+            assert (first_id) != (second_id)
 
     def test_checkpoint_id_fingerprints_symlinked_custom_code_packages(self):
         with tempfile.TemporaryDirectory() as root:
@@ -679,22 +671,20 @@ class StorageKeyTest(unittest.TestCase):
                 hf_config=SimpleNamespace(),
                 revision="",
             )
-            self.assertTrue(first_id.startswith("local-"))
-            self.assertTrue(second_id.startswith("local-"))
-            self.assertNotEqual(first_id, second_id)
+            assert first_id.startswith("local-")
+            assert second_id.startswith("local-")
+            assert (first_id) != (second_id)
             cycle = os.path.join(root, "cycle")
             os.makedirs(cycle)
             with open(os.path.join(cycle, "config.json"), "w") as handle:
                 handle.write("{}")
             os.symlink(cycle, os.path.join(cycle, "loop"))
-            self.assertTrue(
-                self._checkpoint_id(
-                    cycle,
-                    load_format="auto",
-                    hf_config=SimpleNamespace(),
-                    revision="",
-                ).startswith("local-")
-            )
+            assert self._checkpoint_id(
+                cycle,
+                load_format="auto",
+                hf_config=SimpleNamespace(),
+                revision="",
+            ).startswith("local-")
 
     def test_checkpoint_id_uses_selected_load_format_weight_files(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -730,15 +720,18 @@ class StorageKeyTest(unittest.TestCase):
                 hf_config=SimpleNamespace(),
                 revision="",
             )
-            self.assertNotEqual(safetensors_id, bin_id)
-            self.assertNotEqual(safetensors_id, pt_id)
-            self.assertNotEqual(bin_id, pt_id)
-            self.assertNotEqual(auto_id, safetensors_id)
-            self.assertTrue(safetensors_id.endswith(":safetensors"))
-            self.assertTrue(auto_id.endswith(":auto"))
+            assert (safetensors_id) != (bin_id)
+            assert (safetensors_id) != (pt_id)
+            assert (bin_id) != (pt_id)
+            assert (auto_id) != (safetensors_id)
+            assert safetensors_id.endswith(":safetensors")
+            assert auto_id.endswith(":auto")
 
     def test_checkpoint_id_ignores_unselected_weight_files(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, leftover in ((first, b"aaa"), (second, b"bbb")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
@@ -746,37 +739,42 @@ class StorageKeyTest(unittest.TestCase):
                     handle.write(b"same-safe")
                 with open(os.path.join(directory, "pytorch_model.bin"), "wb") as handle:
                     handle.write(leftover)
-            self.assertEqual(
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="safetensors",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) == (
                 self._checkpoint_id(
                     second,
                     load_format="safetensors",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
-            self.assertNotEqual(
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="npcache",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) != (
                 self._checkpoint_id(
                     second,
                     load_format="npcache",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
 
     def test_checkpoint_id_fingerprints_sharded_state_weight_files(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, payload in ((first, b"rank0-a"), (second, b"rank0-b")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
@@ -785,19 +783,20 @@ class StorageKeyTest(unittest.TestCase):
                     "wb",
                 ) as handle:
                     handle.write(payload)
-            self.assertNotEqual(
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="sharded_state",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) != (
                 self._checkpoint_id(
                     second,
                     load_format="sharded_state",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
 
     def test_checkpoint_id_fingerprints_sharded_state_pattern_files(self):
@@ -831,12 +830,11 @@ class StorageKeyTest(unittest.TestCase):
                 model_loader_extra_config=extra,
                 ext_yaml="",
             )
-            self.assertNotEqual(default_id, alt_id)
+            assert (default_id) != (alt_id)
             with open(default_shard, "wb") as handle:
                 handle.write(b"default-shard-changed")
             l3_backend._local_checkpoint_fingerprint.cache_clear()
-            self.assertEqual(
-                alt_id,
+            assert (alt_id) == (
                 l3_checkpoint_id(
                     directory,
                     hf_config=SimpleNamespace(),
@@ -844,13 +842,12 @@ class StorageKeyTest(unittest.TestCase):
                     load_format="sharded_state",
                     model_loader_extra_config=extra,
                     ext_yaml="",
-                ),
+                )
             )
             with open(alt_shard, "wb") as handle:
                 handle.write(b"alt-shard-b")
             l3_backend._local_checkpoint_fingerprint.cache_clear()
-            self.assertNotEqual(
-                alt_id,
+            assert (alt_id) != (
                 l3_checkpoint_id(
                     directory,
                     hf_config=SimpleNamespace(),
@@ -858,13 +855,16 @@ class StorageKeyTest(unittest.TestCase):
                     load_format="sharded_state",
                     model_loader_extra_config=extra,
                     ext_yaml="",
-                ),
+                )
             )
 
     def test_checkpoint_id_fingerprints_npcache_numpy_files(self):
         """When np/ exists, npcache loads it and must not hash only *.bin."""
 
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, np_payload in ((first, b"np-a"), (second, b"np-b")):
                 with open(os.path.join(directory, "config.json"), "w") as handle:
                     handle.write("{}")
@@ -878,23 +878,27 @@ class StorageKeyTest(unittest.TestCase):
                     handle.write('["w"]')
                 with open(os.path.join(directory, "np", "w"), "wb") as handle:
                     handle.write(np_payload)
-            self.assertNotEqual(
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="npcache",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) != (
                 self._checkpoint_id(
                     second,
                     load_format="npcache",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
 
     def test_checkpoint_id_fingerprints_mistral_shard_index(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             for directory, mapped in (
                 (first, "consolidated.00.safetensors"),
                 (second, "consolidated.01.safetensors"),
@@ -916,26 +920,27 @@ class StorageKeyTest(unittest.TestCase):
                     "w",
                 ) as handle:
                     handle.write(f'{{"weight_map":{{"w":"{mapped}"}}}}')
-            self.assertNotEqual(
+            assert (
                 self._checkpoint_id(
                     first,
                     load_format="mistral",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
+            ) != (
                 self._checkpoint_id(
                     second,
                     load_format="mistral",
                     hf_config=SimpleNamespace(),
                     revision="",
-                ),
+                )
             )
 
     def test_checkpoint_id_rejects_unsupported_load_format(self):
         with tempfile.TemporaryDirectory() as directory:
             with open(os.path.join(directory, "config.json"), "w") as handle:
                 handle.write("{}")
-            with self.assertRaises(ValueError):
+            with pytest.raises((ValueError)):
                 self._checkpoint_id(
                     directory,
                     load_format="unknown-loader",
@@ -944,40 +949,27 @@ class StorageKeyTest(unittest.TestCase):
                 )
 
     def test_ext_def_file_parses_loader_yaml_forms(self):
-        self.assertEqual(
-            _ext_def_file_from_yaml_text("ext_def_file: ext.py\n"),
-            "ext.py",
+        assert (_ext_def_file_from_yaml_text("ext_def_file: ext.py\n")) == ("ext.py")
+        assert (_ext_def_file_from_yaml_text("ext_def_file : ext.py\n")) == ("ext.py")
+        assert (_ext_def_file_from_yaml_text('"ext_def_file": ext.py\n')) == ("ext.py")
+        assert (_ext_def_file_from_yaml_text("'ext_def_file': 'ext.py'\n")) == (
+            "ext.py"
         )
-        self.assertEqual(
-            _ext_def_file_from_yaml_text("ext_def_file : ext.py\n"),
-            "ext.py",
+        assert (
+            _ext_def_file_from_yaml_text("{ext_def_file: ext.py, context: {}}\n")
+        ) == ("ext.py")
+        assert (_ext_def_file_from_yaml_text('{"ext_def_file": "ext.py"}\n')) == (
+            "ext.py"
         )
-        self.assertEqual(
-            _ext_def_file_from_yaml_text('"ext_def_file": ext.py\n'),
-            "ext.py",
+        assert (_ext_def_file_from_yaml_text("---\n{ext_def_file: ext.py}\n")) == (
+            "ext.py"
         )
-        self.assertEqual(
-            _ext_def_file_from_yaml_text("'ext_def_file': 'ext.py'\n"),
-            "ext.py",
-        )
-        self.assertEqual(
-            _ext_def_file_from_yaml_text("{ext_def_file: ext.py, context: {}}\n"),
-            "ext.py",
-        )
-        self.assertEqual(
-            _ext_def_file_from_yaml_text('{"ext_def_file": "ext.py"}\n'),
-            "ext.py",
-        )
-        self.assertEqual(
-            _ext_def_file_from_yaml_text("---\n{ext_def_file: ext.py}\n"),
-            "ext.py",
-        )
-        self.assertIsNone(
+        assert (
             _ext_def_file_from_yaml_text("context:\n  ext_def_file: nested.py\n")
-        )
-        self.assertIsNone(
+        ) is None
+        assert (
             _ext_def_file_from_yaml_text("{context: {ext_def_file: nested.py}}\n")
-        )
+        ) is None
 
     def test_checkpoint_id_hashes_extensible_yaml_and_extension_code(self):
         commit = "d" * 40
@@ -1020,19 +1012,19 @@ class StorageKeyTest(unittest.TestCase):
 
             id_a = extensible_id(yaml_a)
             id_b = extensible_id(yaml_b)
-            self.assertTrue(id_a.startswith(f"{commit}:extensible:ext-"))
-            self.assertNotEqual(id_a, f"{commit}:extensible")
-            self.assertNotEqual(id_a, id_b)
-            self.assertEqual(id_a, extensible_id(yaml_a_copy))
+            assert id_a.startswith(f"{commit}:extensible:ext-")
+            assert (id_a) != (f"{commit}:extensible")
+            assert (id_a) != (id_b)
+            assert (id_a) == (extensible_id(yaml_a_copy))
             quoted_yaml = os.path.join(root, "quoted.yaml")
             with open(quoted_yaml, "w", encoding="utf-8") as handle:
                 handle.write(f'ext_def_file: "{os.path.join(root, "a.py")}"\n')
             quoted_id = extensible_id(quoted_yaml)
-            self.assertNotEqual(quoted_id, id_a)
+            assert (quoted_id) != (id_a)
             write_ext_def("a.py", "PROCESSOR = 'a-changed'\n")
-            self.assertNotEqual(id_a, extensible_id(yaml_a))
-            self.assertNotEqual(quoted_id, extensible_id(quoted_yaml))
-            with self.assertRaises(ValueError):
+            assert (id_a) != (extensible_id(yaml_a))
+            assert (quoted_id) != (extensible_id(quoted_yaml))
+            with pytest.raises((ValueError)):
                 extensible_id("")
 
     def test_checkpoint_id_hashes_extension_code_for_quoted_key_and_flow_yaml(self):
@@ -1072,17 +1064,20 @@ class StorageKeyTest(unittest.TestCase):
             quoted_id = extensible_id(quoted_key)
             spaced_id = extensible_id(spaced)
             flow_id = extensible_id(flow)
-            self.assertTrue(quoted_id.startswith(f"{commit}:extensible:ext-"))
-            self.assertTrue(spaced_id.startswith(f"{commit}:extensible:ext-"))
-            self.assertTrue(flow_id.startswith(f"{commit}:extensible:ext-"))
+            assert quoted_id.startswith(f"{commit}:extensible:ext-")
+            assert spaced_id.startswith(f"{commit}:extensible:ext-")
+            assert flow_id.startswith(f"{commit}:extensible:ext-")
             with open(ext_path, "w", encoding="utf-8") as handle:
                 handle.write("PROCESSOR = 'v2'\n")
-            self.assertNotEqual(quoted_id, extensible_id(quoted_key))
-            self.assertNotEqual(spaced_id, extensible_id(spaced))
-            self.assertNotEqual(flow_id, extensible_id(flow))
+            assert (quoted_id) != (extensible_id(quoted_key))
+            assert (spaced_id) != (extensible_id(spaced))
+            assert (flow_id) != (extensible_id(flow))
 
     def test_checkpoint_id_fingerprints_extensible_local_weights_and_yaml(self):
-        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+        with (
+            tempfile.TemporaryDirectory() as first,
+            tempfile.TemporaryDirectory() as second,
+        ):
             yaml_path = os.path.join(first, "ext.yaml")
             ext_def = os.path.join(first, "ext.py")
             with open(ext_def, "w", encoding="utf-8") as handle:
@@ -1110,8 +1105,8 @@ class StorageKeyTest(unittest.TestCase):
                 model_loader_extra_config={},
                 ext_yaml=yaml_path,
             )
-            self.assertTrue(first_id.startswith("local-"))
-            self.assertNotEqual(first_id, second_id)
+            assert first_id.startswith("local-")
+            assert (first_id) != (second_id)
             other_yaml = os.path.join(second, "other.yaml")
             with open(other_yaml, "w", encoding="utf-8") as handle:
                 handle.write(f"ext_def_file: {ext_def}\ncontext: {{}}\n")
@@ -1123,11 +1118,14 @@ class StorageKeyTest(unittest.TestCase):
                 model_loader_extra_config={},
                 ext_yaml=other_yaml,
             )
-            self.assertNotEqual(first_id, other_id)
+            assert (first_id) != (other_id)
 
     def test_checkpoint_id_resolves_ext_def_file_from_cwd_like_loader(self):
         commit = "e" * 40
-        with tempfile.TemporaryDirectory() as yaml_dir, tempfile.TemporaryDirectory() as cwd_dir:
+        with (
+            tempfile.TemporaryDirectory() as yaml_dir,
+            tempfile.TemporaryDirectory() as cwd_dir,
+        ):
             repo = os.path.join(yaml_dir, "hub", "models--org--model")
             snapshot = os.path.join(repo, "snapshots", commit)
             os.makedirs(os.path.join(repo, "refs"))
@@ -1160,10 +1158,10 @@ class StorageKeyTest(unittest.TestCase):
                 id_cwd = extensible_id()
                 with open(yaml_ext, "w", encoding="utf-8") as handle:
                     handle.write("PROCESSOR = 'yaml-dir-changed'\n")
-                self.assertEqual(id_cwd, extensible_id())
+                assert (id_cwd) == (extensible_id())
                 with open(cwd_ext, "w", encoding="utf-8") as handle:
                     handle.write("PROCESSOR = 'cwd-changed'\n")
-                self.assertNotEqual(id_cwd, extensible_id())
+                assert (id_cwd) != (extensible_id())
 
     def test_checkpoint_id_hashes_imported_extension_helpers(self):
         commit = "f" * 40
@@ -1214,18 +1212,18 @@ class StorageKeyTest(unittest.TestCase):
                     os.path.join(cwd_dir, "unused.py"), "w", encoding="utf-8"
                 ) as handle:
                     handle.write("VALUE = 2\n")
-                self.assertEqual(id_base, extensible_id())
+                assert (id_base) == (extensible_id())
                 with open(
                     os.path.join(cwd_dir, "helper.py"), "w", encoding="utf-8"
                 ) as handle:
                     handle.write("VALUE = 2\n")
                 id_helper = extensible_id()
-                self.assertNotEqual(id_base, id_helper)
+                assert (id_base) != (id_helper)
                 with open(
                     os.path.join(pkg, "inner.py"), "w", encoding="utf-8"
                 ) as handle:
                     handle.write("VALUE = 2\n")
-                self.assertNotEqual(id_helper, extensible_id())
+                assert (id_helper) != (extensible_id())
 
     def test_checkpoint_id_hashes_package_relative_extension_imports(self):
         commit = "1" * 40
@@ -1272,12 +1270,12 @@ class StorageKeyTest(unittest.TestCase):
                     os.path.join(cwd_dir, "helper.py"), "w", encoding="utf-8"
                 ) as handle:
                     handle.write("VALUE = 'parent-changed'\n")
-                self.assertEqual(id_base, extensible_id())
+                assert (id_base) == (extensible_id())
                 with open(
                     os.path.join(pkg, "helper.py"), "w", encoding="utf-8"
                 ) as handle:
                     handle.write("VALUE = 2\n")
-                self.assertNotEqual(id_base, extensible_id())
+                assert (id_base) != (extensible_id())
 
     def test_checkpoint_id_ignores_ext_yaml_unless_extensible(self):
         commit = "a" * 40
@@ -1301,34 +1299,11 @@ class StorageKeyTest(unittest.TestCase):
                 model_loader_extra_config={},
                 ext_yaml=yaml_path,
             )
-            self.assertEqual(without_yaml, with_yaml)
-            self.assertEqual(without_yaml, f"{commit}:auto")
+            assert (without_yaml) == (with_yaml)
+            assert (without_yaml) == (f"{commit}:auto")
 
-    def test_checkpoint_id_requires_load_format(self):
-        signature = inspect.signature(l3_checkpoint_id)
-        self.assertIs(
-            signature.parameters["load_format"].default, inspect.Parameter.empty
-        )
-        self.assertIs(
-            signature.parameters["model_loader_extra_config"].default,
-            inspect.Parameter.empty,
-        )
-        self.assertIs(signature.parameters["ext_yaml"].default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            l3_checkpoint_id(
-                "org/model",
-                hf_config=SimpleNamespace(_commit_hash="a" * 40),
-                revision="main",
-            )
-        with self.assertRaises(TypeError):
-            l3_checkpoint_id(
-                "org/model",
-                hf_config=SimpleNamespace(_commit_hash="a" * 40),
-                revision="main",
-                load_format="auto",
-                model_loader_extra_config={},
-            )
-        with self.assertRaises(ValueError):
+    def test_checkpoint_id_rejects_blank_load_format(self):
+        with pytest.raises((ValueError)):
             self._checkpoint_id(
                 "org/model",
                 hf_config=SimpleNamespace(_commit_hash="a" * 40),
@@ -1362,8 +1337,8 @@ class StorageKeyTest(unittest.TestCase):
                     hf_config=SimpleNamespace(),
                     revision="",
                 )
-            self.assertEqual(first, second)
-            self.assertEqual(digest.call_count, 2)
+            assert (first) == (second)
+            assert (digest.call_count) == (2)
 
     def test_share_l3_checkpoint_ids_combines_rank_local_digests(self):
         seen = []
@@ -1376,33 +1351,23 @@ class StorageKeyTest(unittest.TestCase):
             return gather
 
         shared = ["local-aaa:sharded_state", ""]
-        self.assertEqual(
+        assert (
             share_l3_checkpoint_ids(
                 shared,
                 rank=0,
                 world_size=1,
                 gather=gather_from([shared]),
-            ),
-            shared,
-        )
-        self.assertEqual(seen, [])
-        self.assertEqual(
+            )
+        ) == (shared)
+        assert (seen) == ([])
+        assert (
             share_l3_checkpoint_ids(
                 shared,
                 rank=1,
                 world_size=2,
                 gather=gather_from([shared, shared]),
-            ),
-            shared,
-        )
-        signature = inspect.signature(share_l3_checkpoint_ids)
-        self.assertIs(signature.parameters["gather"].default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            share_l3_checkpoint_ids(
-                shared,
-                rank=0,
-                world_size=2,
             )
+        ) == (shared)
         rank0 = ["local-rank0:sharded_state", ""]
         rank1_a = ["local-rank1a:sharded_state", ""]
         rank1_b = ["local-rank1b:sharded_state", ""]
@@ -1418,12 +1383,12 @@ class StorageKeyTest(unittest.TestCase):
             world_size=2,
             gather=gather_from([rank0, rank1_b]),
         )
-        self.assertTrue(combined_a[0].startswith("local-"))
-        self.assertNotEqual(combined_a[0], rank0[0])
-        self.assertNotEqual(combined_a, combined_b)
-        self.assertEqual(combined_a[1], "")
-        self.assertEqual(combined_b[1], "")
-        with self.assertRaises(ValueError):
+        assert combined_a[0].startswith("local-")
+        assert (combined_a[0]) != (rank0[0])
+        assert (combined_a) != (combined_b)
+        assert (combined_a[1]) == ("")
+        assert (combined_b[1]) == ("")
+        with pytest.raises((ValueError)):
             share_l3_checkpoint_ids(
                 rank0,
                 rank=0,
@@ -1432,7 +1397,7 @@ class StorageKeyTest(unittest.TestCase):
             )
 
     def test_checkpoint_id_rejects_unpinned_remote_without_commit(self) -> None:
-        with self.assertRaises(ValueError):
+        with pytest.raises((ValueError)):
             l3_checkpoint_id(
                 "org/unpinned-model",
                 hf_config=SimpleNamespace(),
@@ -1458,87 +1423,39 @@ class StorageKeyTest(unittest.TestCase):
                 quantization_param_path=first,
                 draft_quantization="",
             )
-            self.assertNotEqual(
-                first_id,
+            assert (first_id) != (
                 l3_cache_quantization_id(
                     quantization="fp8",
                     quantization_param_path=second,
                     draft_quantization="",
-                ),
+                )
             )
-            self.assertEqual(
-                first_id,
+            assert (first_id) == (
                 l3_cache_quantization_id(
                     quantization="fp8",
                     quantization_param_path=same_copy,
                     draft_quantization="",
-                ),
+                )
             )
-            self.assertNotEqual(
-                first_id,
+            assert (first_id) != (
                 l3_cache_quantization_id(
                     quantization="",
                     quantization_param_path="",
                     draft_quantization="",
-                ),
+                )
             )
-            self.assertNotEqual(
-                first_id,
+            assert (first_id) != (
                 l3_cache_quantization_id(
                     quantization="fp8",
                     quantization_param_path=first,
                     draft_quantization="fp8",
-                ),
-            )
-            signature = inspect.signature(l3_cache_quantization_id)
-            self.assertIs(
-                signature.parameters["quantization_param_path"].default,
-                inspect.Parameter.empty,
-            )
-            self.assertIs(
-                signature.parameters["draft_quantization"].default,
-                inspect.Parameter.empty,
-            )
-            with self.assertRaises(TypeError):
-                l3_cache_quantization_id(
-                    quantization="fp8", quantization_param_path=first
                 )
+            )
 
-    def test_resolve_l3_weight_version_does_not_mint_a_successor(self):
-        self.assertIsNone(
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=True,
-                storage_backend="memory",
-            )
-        )
-        self.assertIsNone(
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=True,
-                storage_backend=None,
-            )
-        )
-        self.assertIsNone(
-            resolve_l3_weight_version(
-                "v1",
-                None,
-                flush_cache=False,
-                storage_backend="memory",
-            )
-        )
-        self.assertEqual(
-            resolve_l3_weight_version(
-                "v1",
-                "explicit",
-                flush_cache=True,
-                storage_backend="memory",
-            ),
-            "explicit",
-        )
-        self.assertIn("require weight_version", L3_FLUSH_REQUIRES_WEIGHT_VERSION)
+    def test_resolve_l3_weight_version_preserves_requested_identity(self):
+        assert resolve_l3_weight_version(None) is None
+        assert resolve_l3_weight_version("explicit") == "explicit"
+        assert resolve_l3_weight_version(12) == "12"
 
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(
@@ -1556,10 +1473,8 @@ class StorageKeyTest(unittest.TestCase):
             )
         )
         fp16 = cache_layout_signature(layout, cache_dtype="float16")
-        self.assertEqual(fp16, cache_layout_signature(layout, cache_dtype="float16"))
-        self.assertNotEqual(
-            fp16, cache_layout_signature(layout, cache_dtype="bfloat16")
-        )
+        assert (fp16) == (cache_layout_signature(layout, cache_dtype="float16"))
+        assert (fp16) != (cache_layout_signature(layout, cache_dtype="bfloat16"))
         changed = SimpleNamespace(
             groups=(
                 SimpleNamespace(
@@ -1569,9 +1484,7 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
         )
-        self.assertNotEqual(
-            fp16, cache_layout_signature(changed, cache_dtype="float16")
-        )
+        assert (fp16) != (cache_layout_signature(changed, cache_dtype="float16"))
         strided = SimpleNamespace(
             groups=(
                 SimpleNamespace(
@@ -1583,9 +1496,7 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
         )
-        self.assertNotEqual(
-            fp16, cache_layout_signature(strided, cache_dtype="float16")
-        )
+        assert (fp16) != (cache_layout_signature(strided, cache_dtype="float16"))
         shifted = SimpleNamespace(
             groups=(
                 SimpleNamespace(
@@ -1603,140 +1514,139 @@ class StorageKeyTest(unittest.TestCase):
                 ),
             )
         )
-        self.assertEqual(fp16, cache_layout_signature(shifted, cache_dtype="float16"))
+        assert (fp16) == (cache_layout_signature(shifted, cache_dtype="float16"))
 
 
-class MemoryKvStoreTest(unittest.TestCase):
+class TestMemoryKvStoreTest:
     def test_round_trips_host_bytes(self):
         store = MemoryKvStore()
         host = bytearray(b"\x00" * 16)
         host[4:8] = b"kvkv"
-        self.assertEqual(store.batch_put_from(["k"], host, [4], [4]), [True])
-        self.assertEqual(store.batch_exists(["k", "missing"]), [True, False])
+        assert (store.batch_put_from(["k"], host, [4], [4])) == ([True])
+        assert (store.batch_exists(["k", "missing"])) == ([True, False])
         dest = bytearray(b"\xff" * 16)
-        self.assertEqual(store.batch_get_into(["k"], dest, [8], [4]), [True])
-        self.assertEqual(dest[8:12], b"kvkv")
+        assert (store.batch_get_into(["k"], dest, [8], [4])) == ([True])
+        assert (dest[8:12]) == (b"kvkv")
         host[4:8] = b"xxxx"
-        self.assertEqual(store.batch_put_from(["k"], host, [4], [4]), [True])
+        assert (store.batch_put_from(["k"], host, [4], [4])) == ([True])
         dest2 = bytearray(16)
         store.batch_get_into(["k"], dest2, [0], [4])
-        self.assertEqual(dest2[:4], b"kvkv")
+        assert (dest2[:4]) == (b"kvkv")
         store.close()
-        self.assertEqual(store.batch_exists(["k"]), [False])
+        assert (store.batch_exists(["k"])) == ([False])
 
 
-class L3HostStoreTest(unittest.TestCase):
-    def test_backups_and_prefetches_packed_pages(self):
+class TestL3NamespaceTest:
+    @contextmanager
+    def executor(self, backend, host, *, prefix, rank):
+        executor = L3Executor(
+            backend,
+            host,
+            key_prefix=prefix,
+            rank=rank,
+            ownership=None,
+            config=StorageRuntimeConfig.from_extra_config(
+                None, host_blocks=32, prefix_granularity=2
+            ),
+            prefix_for_weight_version=lambda version: version,
+        )
+        try:
+            yield executor
+        finally:
+            executor.close(timeout_s=2)
+
+    def test_resolves_packed_pages_for_byte_store_roundtrip(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        pages = [(0, 1, "h0", 0)]
-        self.assertEqual(l3.backup(pages), [True])
-        self.assertEqual(l3.exists(pages), [True])
-        host.host_buffer[:8] = b"\x00" * 8
-        self.assertEqual(l3.prefetch(pages), [True])
-        self.assertEqual(host.host_buffer[:8], b"abcdefgh")
-        groups, hashes, offsets = l3.present_keys(
-            [0, 0], ["h0", "miss"], [0, 0], exists=None
-        )
-        self.assertEqual(groups, [0])
-        self.assertEqual(hashes, ["h0"])
-        self.assertEqual(offsets, [0])
-        self.assertEqual(
-            l3.present_keys([0], ["h0"], [0], exists=[False]), ([], [], [])
-        )
-        l3.close()
-
-    def test_present_keys_requires_exists_mask(self):
-        backend = MemoryKvStore()
-        host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        signature = inspect.signature(l3.present_keys)
-        self.assertIs(signature.parameters["exists"].default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            l3.present_keys([0], ["h0"], [0])
-        l3.close()
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert backend.batch_exists(keys) == [True]
+            host.host_buffer[:8] = bytes(8)
+            assert backend.batch_get_into_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert host.host_buffer[:8] == b"abcdefgh"
+            assert backend.batch_exists(
+                [keys[0], executor._object_key("miss", 0, 0)]
+            ) == [True, False]
 
     def test_namespace_clear_deletes_objects_without_changing_the_prefix(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="m", rank=1)
-        pages = [(0, 1, "h0", 0)]
-        self.assertEqual(l3.backup(pages), [True])
-        old_key = l3.object_key("h0", 0, 0)
-        l3.rotate_namespace()
-        self.assertEqual(old_key, l3.object_key("h0", 0, 0))
-        self.assertEqual(l3.exists(pages), [False])
-        restarted = L3HostStore(backend, host, key_prefix="m", rank=1)
-        self.assertEqual(restarted.object_key("h0", 0, 0), old_key)
-        self.assertEqual(restarted.exists(pages), [False])
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = executor._object_key("h0", 0, 0)
+            assert executor.delete_namespace()
+            assert old_key == executor._object_key("h0", 0, 0)
+            assert backend.batch_exists(keys) == [False]
+            with self.executor(backend, host, prefix="m", rank=1) as restarted:
+                assert restarted._object_key("h0", 0, 0) == old_key
+                assert backend.batch_exists([old_key]) == [False]
 
-    def test_clear_returns_false_when_remote_delete_fails_and_keeps_the_prefix(self):
-        backend = mock.Mock()
-        backend.remove_by_prefix.return_value = False
-        l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
-        )
-        old_key = l3.object_key("h0", 0, 0)
+    @pytest.mark.parametrize("raises", [False, True])
+    def test_clear_failure_keeps_the_namespace(self, raises):
+        class DeleteFailure(MemoryKvStore):
+            def remove_by_prefix(self, prefix):
+                if raises:
+                    raise RuntimeError("delete failed")
+                return False
 
-        self.assertFalse(l3.rotate_namespace())
+        backend = DeleteFailure()
+        host = _FakeHost(b"abcdefgh", size=64)
+        with self.executor(backend, host, prefix="m", rank=1) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = keys[0]
+            assert not executor.delete_namespace()
+            assert executor._object_key("h0", 0, 0) == old_key
+            assert backend.batch_exists([old_key]) == [True]
 
-        self.assertEqual(old_key, l3.object_key("h0", 0, 0))
-
-    def test_clear_returns_false_when_remote_delete_raises(self):
-        backend = mock.Mock()
-        backend.remove_by_prefix.side_effect = RuntimeError("delete failed")
-        l3 = L3HostStore(
-            backend, _FakeHost(b"abcdefgh", size=64), key_prefix="m", rank=1
-        )
-        old_key = l3.object_key("h0", 0, 0)
-
-        self.assertFalse(l3.rotate_namespace())
-
-        self.assertEqual(old_key, l3.object_key("h0", 0, 0))
-
-    def test_set_key_prefix_republishes_under_the_new_namespace(self):
+    def test_weight_version_republishes_under_the_new_namespace(self):
         backend = MemoryKvStore()
         host = _FakeHost(b"abcdefgh", size=64)
-        l3 = L3HostStore(backend, host, key_prefix="v1", rank=0)
-        pages = [(0, 1, "h0", 0)]
-        self.assertEqual(l3.backup(pages), [True])
-        old_key = l3.object_key("h0", 0, 0)
-        l3.rotate_namespace()
-        l3.set_key_prefix("v2")
-        self.assertNotEqual(old_key, l3.object_key("h0", 0, 0))
-        self.assertEqual(l3.exists(pages), [False])
-        self.assertEqual(l3.backup(pages), [True])
-        self.assertTrue(l3.object_key("h0", 0, 0).startswith("v2_"))
-        self.assertEqual(backend.batch_exists([old_key]), [False])
+        with self.executor(backend, host, prefix="v1", rank=0) as executor:
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            old_key = keys[0]
+            assert executor.delete_namespace()
+            executor.set_weight_version("v2")
+            keys, offsets, sizes = executor._page_ranges([(0, 1, "h0", 0)])
+            assert keys[0] != old_key and keys[0].startswith("v2_")
+            assert backend.batch_exists(keys) == [False]
+            assert backend.batch_put_from_result(
+                keys, host.host_buffer, offsets, sizes
+            ).success == (True,)
+            assert backend.batch_exists([old_key]) == [False]
 
 
-class FactoryTest(unittest.TestCase):
+class TestFactoryTest:
     def test_memory_and_unknown_backend(self):
-        backend = create_kvstore_storage_backend(
+        backend = create_storage_backend(
             "memory", None, host_buffer=object(), tp_size=1, pp_size=1
         )
-        self.assertIsInstance(backend, MemoryKvStore)
-        self.assertIsNone(
-            create_kvstore_storage_backend(
+        assert isinstance((backend), (MemoryKvStore))
+        assert (
+            create_storage_backend(
                 None, None, host_buffer=object(), tp_size=1, pp_size=1
             )
-        )
-        with self.assertRaisesRegex(ValueError, "unsupported"):
-            create_kvstore_storage_backend(
+        ) is None
+        with pytest.raises((ValueError), match=("unsupported")):
+            create_storage_backend(
                 "nfs", None, host_buffer=object(), tp_size=1, pp_size=1
             )
 
-    def test_pp_size_has_no_default(self):
-        param = inspect.signature(create_kvstore_storage_backend).parameters["pp_size"]
-        self.assertIs(param.default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            create_kvstore_storage_backend(
-                "memory", None, host_buffer=object(), tp_size=1
-            )
 
-
-class MooncakeConfigTest(unittest.TestCase):
+class TestMooncakeConfigTest:
     def test_from_mapping_and_size_suffixes(self):
         saved = {
             key: os.environ.pop(key)
@@ -1744,7 +1654,7 @@ class MooncakeConfigTest(unittest.TestCase):
             if key in os.environ
         }
         try:
-            with self.assertRaisesRegex(ValueError, "master_server_address"):
+            with pytest.raises((ValueError), match=("master_server_address")):
                 MooncakeStoreConfig.from_mapping({})
             config = MooncakeStoreConfig.from_mapping(
                 {
@@ -1754,13 +1664,13 @@ class MooncakeConfigTest(unittest.TestCase):
                     "tenant_id": "ts",
                 }
             )
-            self.assertEqual(config.master_server_address, "127.0.0.1:50051")
-            self.assertEqual(config.global_segment_size, 2 * 1024 * 1024 * 1024)
-            self.assertEqual(config.protocol, "rdma")
-            self.assertEqual(config.tenant_id, "ts")
+            assert (config.master_server_address) == ("127.0.0.1:50051")
+            assert (config.global_segment_size) == (2 * 1024 * 1024 * 1024)
+            assert (config.protocol) == ("rdma")
+            assert (config.tenant_id) == ("ts")
             parsed = parse_extra_config('{"master_server_address": "host:1"}')
-            self.assertEqual(parsed["master_server_address"], "host:1")
-            with self.assertRaisesRegex(ValueError, "JSON object"):
+            assert (parsed["master_server_address"]) == ("host:1")
+            with pytest.raises((ValueError), match=("JSON object")):
                 parse_extra_config("[]")
         finally:
             os.environ.update(saved)
@@ -1774,7 +1684,7 @@ class MooncakeConfigTest(unittest.TestCase):
         os.environ["MOONCAKE_MASTER"] = "env-master:50051"
         try:
             config = MooncakeStoreConfig.from_mapping(None)
-            self.assertEqual(config.master_server_address, "env-master:50051")
+            assert (config.master_server_address) == ("env-master:50051")
         finally:
             os.environ.pop("MOONCAKE_MASTER", None)
             os.environ.update(saved)
@@ -1785,39 +1695,60 @@ class MooncakeConfigTest(unittest.TestCase):
             config = MooncakeStoreConfig.from_mapping(
                 {"master_server_address": "127.0.0.1:50051"}
             )
-            self.assertEqual(config.global_segment_size, 4 * 1024**3)
-            self.assertEqual(config.tenant_id, "default")
+            assert (config.global_segment_size) == (4 * 1024**3)
+            assert (config.tenant_id) == ("default")
         finally:
             if saved is not None:
                 os.environ["MOONCAKE_GLOBAL_SEGMENT_SIZE"] = saved
 
-    def test_tenant_id_has_no_constructor_default(self):
-        signature = inspect.signature(MooncakeStoreConfig)
-        self.assertIs(
-            signature.parameters["tenant_id"].default, inspect.Parameter.empty
+
+class TestMooncakeKvStoreTest:
+    @pytest.mark.parametrize("failure", ["permanent", "hard", "truncated"])
+    def test_capacity_pressure_keeps_unsaved_pages_unacknowledged(self, failure):
+        class Store:
+            def __init__(self):
+                self.objects = {"existing": b"original"}
+                self.capacity_failures = 0
+
+            def batch_is_exist(self, keys):
+                return [int(key in self.objects) for key in keys]
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                results = []
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    if key in self.objects:
+                        raise AssertionError(
+                            "successful immutable pages must not be rewritten"
+                        )
+                    if key == "pressure":
+                        self.capacity_failures += 1
+                        results.append(-1 if failure == "hard" else -200)
+                    else:
+                        self.objects[key] = ctypes.string_at(ptr, size)
+                        results.append(0)
+                return results[:-1] if failure == "truncated" else results
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = Store()
+
+        class Host(bytearray):
+            def data_ptr(self):
+                return ctypes.addressof((ctypes.c_char * len(self)).from_buffer(self))
+
+        host = Host(b"00000000abcdefgh12345678")
+        result = adapter.batch_put_from(
+            ["existing", "saved", "pressure"], host, [0, 8, 16], [8, 8, 8]
         )
-        with self.assertRaises(TypeError):
-            MooncakeStoreConfig(
-                "localhost",
-                "P2PHANDSHAKE",
-                4 * 1024**3,
-                "tcp",
-                "",
-                "127.0.0.1:50051",
-                "",
-            )
-
-
-class MooncakeKvStoreTest(unittest.TestCase):
-    def test_extra_config_has_no_default(self):
-        param = inspect.signature(MooncakeKvStore.__init__).parameters["extra_config"]
-        self.assertIs(param.default, inspect.Parameter.empty)
-        pp_param = inspect.signature(MooncakeKvStore.__init__).parameters["pp_size"]
-        self.assertIs(pp_param.default, inspect.Parameter.empty)
-        with self.assertRaises(TypeError):
-            MooncakeKvStore(host_buffer=object(), tp_size=1, pp_size=1)
-        with self.assertRaises(TypeError):
-            MooncakeKvStore(None, host_buffer=object(), tp_size=1)
+        if failure == "truncated":
+            assert result == [False, False, False]
+        else:
+            assert result == [True, True, False]
+            assert "pressure" not in adapter.store.objects
+        assert adapter.store.objects["existing"] == b"original"
+        assert adapter.store.objects["saved"] == b"abcdefgh"
+        # A negative result leaves the page unacknowledged on the first
+        # attempt; the async protocol retries nothing inside the adapter.
+        assert adapter.store.capacity_failures == 1
 
     def test_non_default_tenant_is_never_silently_dropped(self):
         class _Store:
@@ -1837,7 +1768,7 @@ class MooncakeKvStoreTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules, {"mooncake": package, "mooncake.store": store_module}
         ):
-            with self.assertRaisesRegex(RuntimeError, "does not support tenant_id"):
+            with pytest.raises((RuntimeError), match=("does not support tenant_id")):
                 MooncakeKvStore(
                     {
                         "master_server_address": "127.0.0.1:50051",
@@ -1859,12 +1790,114 @@ class MooncakeKvStoreTest(unittest.TestCase):
 
             def batch_put_from(self, keys, ptrs, sizes):
                 del ptrs, sizes
-                return [-1] * len(keys)
+                return [-705] * len(keys)
 
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = _Store()
         host = SimpleNamespace(data_ptr=lambda: 100)
-        self.assertEqual(adapter.batch_put_from(["k"], host, [0], [8]), [True])
+        assert (adapter.batch_put_from(["k"], host, [0], [8])) == ([True])
+
+    def test_failed_put_cannot_be_retired_by_an_exists_recheck(self):
+        calls = []
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: calls.append("exists") or [0] * len(keys),
+            batch_put_from=lambda keys, ptrs, sizes: [-800] * len(keys),
+        )
+        result = adapter.batch_put_from_result(
+            ["k"], SimpleNamespace(data_ptr=lambda: 100), [0], [8]
+        )
+        assert result.success == (False,)
+        assert not result.retired
+        assert calls == ["exists"]
+
+    def test_capacity_pressure_put_retires_as_a_per_page_failure(self):
+        # NO_AVAILABLE_HANDLE (-200) is the master's allocation rejection
+        # before any source transfer: retired, not a quarantine.
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [0] * len(keys),
+            batch_put_from=lambda keys, ptrs, sizes: [-200, 0],
+        )
+        result = adapter.batch_put_from_result(
+            ["pressure", "saved"],
+            SimpleNamespace(data_ptr=lambda: 100),
+            [0, 8],
+            [8, 8],
+        )
+        assert result.success == (False, True)
+        assert result.retired
+        assert result.object_failures == (False, False)
+
+    def test_capacity_pressure_put_keeps_the_executor_in_service(self):
+        class Buffer(bytearray):
+            def data_ptr(self):
+                return ctypes.addressof((ctypes.c_char * len(self)).from_buffer(self))
+
+        class Store:
+            def __init__(self):
+                self.objects = {}
+
+            def batch_is_exist(self, keys):
+                return [int(key in self.objects) for key in keys]
+
+            def batch_put_from(self, keys, ptrs, sizes):
+                results = []
+                for key, ptr, size in zip(keys, ptrs, sizes):
+                    if key == "pressure":
+                        results.append(-200)
+                    else:
+                        self.objects[key] = ctypes.string_at(ptr, size)
+                        results.append(0)
+                return results
+
+        class Host:
+            def __init__(self):
+                self.host_buffer = Buffer(b"abcdefgh")
+
+            def host_block_range(self, group_index, block_id):
+                del group_index, block_id
+                return 0, 4
+
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = Store()
+        adapter.failures_retire = False
+        executor = L3Executor(
+            adapter,
+            Host(),
+            key_prefix="m",
+            rank=0,
+            ownership=None,
+            config=StorageRuntimeConfig.from_extra_config(
+                None, host_blocks=32, prefix_granularity=2
+            ),
+            prefix_for_weight_version=None,
+        )
+
+        def run(op_id, keys, offsets):
+            executor.submit(StorageJob(op_id, "put", keys, offsets, (4,) * len(keys)))
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                completions = executor.poll().completions
+                if completions:
+                    assert len(completions) == 1
+                    return completions[0]
+                time.sleep(0.001)
+            raise AssertionError("L3 operation did not finish")
+
+        try:
+            pressured = run(1, ("pressure", "saved"), (0, 4))
+            assert pressured.success == (False, True)
+            assert pressured.retired
+            assert adapter.store.objects == {"saved": b"efgh"}
+            # Capacity pressure must neither quarantine the executor nor open
+            # its health circuit: the scheduler re-offers the unacknowledged
+            # page on a later round.
+            assert executor.snapshot().health.state == "healthy"
+            assert run(2, ("retry",), (0,)).success == (True,)
+            assert adapter.store.objects["retry"] == b"abcd"
+        finally:
+            executor.close(timeout_s=3)
 
     def test_truncated_exists_does_not_ack_unuploaded_keys(self):
         class _Store:
@@ -1879,15 +1912,14 @@ class MooncakeKvStoreTest(unittest.TestCase):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = _Store()
         host = SimpleNamespace(data_ptr=lambda: 100)
-        self.assertEqual(
-            adapter.batch_put_from(["k0", "k1"], host, [0, 8], [8, 8]),
-            [False, False],
+        assert (adapter.batch_put_from(["k0", "k1"], host, [0, 8], [8, 8])) == (
+            [False, False]
         )
 
     def test_truncated_exists_probe_is_rejected(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = SimpleNamespace(batch_is_exist=lambda keys: [1])
-        with self.assertRaisesRegex(ValueError, "batch_is_exist returned 1"):
+        with pytest.raises((ValueError), match=("batch_is_exist returned 1")):
             adapter.batch_exists(["k0", "k1"])
 
     def test_truncated_put_results_do_not_ack_unuploaded_keys(self):
@@ -1902,16 +1934,36 @@ class MooncakeKvStoreTest(unittest.TestCase):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = _Store()
         host = SimpleNamespace(data_ptr=lambda: 100)
-        self.assertEqual(
-            adapter.batch_put_from(["k0", "k1"], host, [0, 8], [8, 8]),
-            [False, False],
+        assert (adapter.batch_put_from(["k0", "k1"], host, [0, 8], [8, 8])) == (
+            [False, False]
         )
+
+    def test_object_evicted_after_exists_is_a_retired_miss(self):
+        adapter = object.__new__(MooncakeKvStore)
+        adapter.store = SimpleNamespace(
+            batch_is_exist=lambda keys: [1] * len(keys),
+            batch_get_into=lambda keys, ptrs, sizes: [-704, 8],
+        )
+        host = SimpleNamespace(data_ptr=lambda: 100)
+        assert adapter.batch_exists(["evicted", "resident"]) == [True, True]
+        result = adapter.batch_get_into_result(
+            ["evicted", "resident"], host, [0, 8], [8, 8]
+        )
+        assert result.success == (False, True)
+        assert result.retired
+        assert result.object_failures == (True, False)
+        adapter.store.batch_get_into = lambda keys, ptrs, sizes: [-704, -800]
+        result = adapter.batch_get_into_result(
+            ["evicted", "unknown"], host, [0, 8], [8, 8]
+        )
+        assert not result.retired
+        assert result.object_failures == (True, False)
 
     def test_truncated_get_into_is_rejected(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = SimpleNamespace(batch_get_into=lambda keys, ptrs, sizes: [1])
         host = SimpleNamespace(data_ptr=lambda: 100)
-        with self.assertRaisesRegex(ValueError, "batch_get_into returned 1"):
+        with pytest.raises((ValueError), match=("batch_get_into returned 1")):
             adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8])
 
     def test_short_get_into_is_a_failed_prefetch(self):
@@ -1920,16 +1972,17 @@ class MooncakeKvStoreTest(unittest.TestCase):
             batch_get_into=lambda keys, ptrs, sizes: [int(sizes[0]) // 2, int(sizes[1])]
         )
         host = SimpleNamespace(data_ptr=lambda: 100)
-        self.assertEqual(
-            adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8]),
-            [False, True],
+        assert (adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8])) == (
+            [False, True]
         )
+        result = adapter.batch_get_into_result(["k0", "k1"], host, [0, 8], [8, 8])
+        assert result.retired
+        assert result.object_failures == (True, False)
         adapter.store = SimpleNamespace(
             batch_get_into=lambda keys, ptrs, sizes: [0, -1]
         )
-        self.assertEqual(
-            adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8]),
-            [False, False],
+        assert (adapter.batch_get_into(["k0", "k1"], host, [0, 8], [8, 8])) == (
+            [False, False]
         )
 
     def test_namespace_clear_uses_anchored_escaped_regex(self):
@@ -1938,20 +1991,20 @@ class MooncakeKvStoreTest(unittest.TestCase):
         adapter.store = store
         store.remove_by_regex.return_value = 0
 
-        self.assertTrue(adapter.remove_by_prefix("model.v1_"))
+        assert adapter.remove_by_prefix("model.v1_")
 
         store.remove_by_regex.assert_called_once_with(r"^model\.v1_.*", True)
 
     def test_namespace_clear_without_remove_by_regex_is_failure(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = object()
-        self.assertFalse(adapter.remove_by_prefix("model_"))
+        assert not (adapter.remove_by_prefix("model_"))
 
     def test_namespace_clear_failure_is_not_reported_as_success(self):
         adapter = object.__new__(MooncakeKvStore)
         adapter.store = mock.Mock()
         adapter.store.remove_by_regex.return_value = -1
-        self.assertFalse(adapter.remove_by_prefix("model_"))
+        assert not (adapter.remove_by_prefix("model_"))
 
     def test_segment_is_divided_across_tp_and_pp_ranks(self):
         captured = {}
@@ -1985,7 +2038,7 @@ class MooncakeKvStoreTest(unittest.TestCase):
                 tp_size=4,
                 pp_size=2,
             )
-        self.assertEqual(captured["segment"], 1 * 1024**3)
+        assert (captured["segment"]) == (1 * 1024**3)
         with mock.patch.dict(
             sys.modules, {"mooncake": package, "mooncake.store": store_module}
         ):
@@ -1995,8 +2048,26 @@ class MooncakeKvStoreTest(unittest.TestCase):
                 tp_size=4,
                 pp_size=1,
             )
-        self.assertEqual(captured["segment"], 2 * 1024**3)
+        assert captured["segment"] == 2 * 1024**3
+        with mock.patch.dict(
+            sys.modules, {"mooncake": package, "mooncake.store": store_module}
+        ):
+            MooncakeKvStore(
+                dict(extra, global_segment_size=0),
+                host_buffer=host,
+                tp_size=8,
+                pp_size=1,
+            )
+            assert captured["segment"] == 0
+            for size in (-1, 1):
+                with pytest.raises(ValueError, match="too small"):
+                    MooncakeKvStore(
+                        dict(extra, global_segment_size=size),
+                        host_buffer=host,
+                        tp_size=8,
+                        pp_size=1,
+                    )
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

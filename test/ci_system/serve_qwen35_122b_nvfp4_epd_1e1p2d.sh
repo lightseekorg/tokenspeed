@@ -26,10 +26,12 @@ ENCODE_WS=${ENCODE_WS:-1}
 PREFILL_WS=${PREFILL_WS:-1}
 DECODE0_WS=${DECODE0_WS:-1}
 DECODE1_WS=${DECODE1_WS:-1}
-ENCODE_PORT=${ENCODE_PORT:-50104}
-PREFILL_PORT=${PREFILL_PORT:-50101}
-DECODE0_PORT=${DECODE0_PORT:-50111}
-DECODE1_PORT=${DECODE1_PORT:-50112}
+# Stay below Linux's default ephemeral range: outbound connections can claim
+# these ports while the workers load their models, before gRPC binds them.
+ENCODE_PORT=${ENCODE_PORT:-15004}
+PREFILL_PORT=${PREFILL_PORT:-15001}
+DECODE0_PORT=${DECODE0_PORT:-15011}
+DECODE1_PORT=${DECODE1_PORT:-15012}
 ENCODE_BOOTSTRAP_PORT=${ENCODE_BOOTSTRAP_PORT:-18995}
 PREFILL_BOOTSTRAP_PORT=${PREFILL_BOOTSTRAP_PORT:-19311}
 ENCODE_DIST_PORT=${ENCODE_DIST_PORT:-25000}
@@ -96,6 +98,7 @@ echo "[epd-1e1p2d] encode=gpu${ENCODE_GPUS}/${ENCODE_PORT} prefill=gpu${PREFILL_
 echo "[epd-1e1p2d] encode_routing=$ENCODE_ROUTING_POLICY enable_mtp=$ENABLE_MTP moe=$MOE_BACKEND attn=$ATTENTION_BACKEND"
 
 pids=()
+logs=()
 cleanup() {
   local code=$?
   trap - EXIT INT TERM
@@ -206,6 +209,7 @@ start_worker() {
       --port "$port"
   ) >"$log" 2>&1 &
   pids+=("$!")
+  logs+=("$log")
 }
 
 # Encode is LM-free (vision tower only); pixels reach it inline over gRPC.
@@ -244,8 +248,13 @@ python3 -m smg launch \
   --prometheus-port "$PROMETHEUS_PORT" \
   >"$LOG_DIR/gateway.log" 2>&1 &
 pids+=("$!")
+logs+=("$LOG_DIR/gateway.log")
 
 wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" "$startup_deadline"
 echo "[epd-1e1p2d] serving on http://127.0.0.1:${LB_PORT}/v1"
 
-wait -n "${pids[@]}"
+# A worker's failure status must not end the script (set -e) before the
+# report names it; the cleanup trap then exits with that status.
+wait -n "${pids[@]}" || status=$?
+report_exited_workers "epd-1e1p2d" logs pids
+exit "${status:-0}"

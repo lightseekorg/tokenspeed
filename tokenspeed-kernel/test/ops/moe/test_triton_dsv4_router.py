@@ -25,16 +25,64 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from kimi3_reference import dequantize_mxfp4
+from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, moe_topk
+from tokenspeed_kernel.selection import NoKernelFoundError
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
+def test_router_reuses_compilation_across_token_counts(
+    weights_dtype: torch.dtype,
+) -> None:
+    from tokenspeed_kernel.ops.moe._triton import sqrt_softplus_topk
+    from utils import assert_no_triton_compile
+
+    def run(tokens):
+        logits = (torch.arange(256, device="cuda", dtype=torch.float32) / 256).repeat(
+            tokens, 1
+        )
+        weights, ids = moe_topk(
+            logits,
+            top_k=6,
+            score_function="sqrt_softplus",
+            selection_method="topk",
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            topk_weights_dtype=weights_dtype,
+            override="triton_sqrt_softplus_topk",
+        )
+        scores = F.softplus(logits).sqrt()
+        expected_weights, expected_ids = scores.topk(6, dim=-1)
+        expected_weights = (
+            expected_weights / expected_weights.sum(dim=-1, keepdim=True) * 2.5
+        ).to(weights_dtype)
+        torch.testing.assert_close(ids.long(), expected_ids, atol=0, rtol=0)
+        torch.testing.assert_close(
+            weights,
+            expected_weights,
+            atol=1e-6,
+            rtol=8e-3 if weights_dtype == torch.bfloat16 else 2e-6,
+        )
+
+    run(1)
+    with assert_no_triton_compile(sqrt_softplus_topk._sqrt_softplus_topk_kernel):
+        for tokens in (2, 17, 32, 65):
+            run(tokens)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("kind", ["plain", "bias", "hash"])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("renormalize", [False, True])
+@pytest.mark.parametrize("scaling_factor", [1.0, 2.5])
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
 def test_router_matches_reference(
-    kind: str, dtype: torch.dtype, renormalize: bool
+    kind: str,
+    dtype: torch.dtype,
+    renormalize: bool,
+    scaling_factor: float,
+    weights_dtype: torch.dtype,
 ) -> None:
     generator = torch.Generator(device="cuda").manual_seed(35)
     # Non-contiguous logits also cover a prefill batch beyond the gfx950 specialization.
@@ -68,7 +116,8 @@ def test_router_matches_reference(
         score_function="sqrt_softplus",
         selection_method="hash" if kind == "hash" else "topk",
         renormalize=renormalize,
-        routed_scaling_factor=1.0,
+        routed_scaling_factor=scaling_factor,
+        topk_weights_dtype=weights_dtype,
         correction_bias=bias,
         hash_indices_table=table,
         input_ids=input_ids,
@@ -88,11 +137,43 @@ def test_router_matches_reference(
             torch.finfo(torch.float32).tiny
         )
     torch.testing.assert_close(ids.long(), expected_ids)
-    torch.testing.assert_close(weights, expected_weights, atol=1e-6, rtol=2e-6)
+    expected_weights = (expected_weights * scaling_factor).to(weights_dtype)
+    torch.testing.assert_close(
+        weights,
+        expected_weights,
+        atol=1e-6,
+        rtol=8e-3 if weights_dtype == torch.bfloat16 else 2e-6,
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_router_ties_and_graph_replay() -> None:
+@pytest.mark.parametrize("experts", [256, 384])
+@pytest.mark.parametrize("tokens", [1, 16, 17])
+def test_fused_router_matches_logits_path(experts: int, tokens: int) -> None:
+    torch.manual_seed(experts + tokens)
+    x = torch.randn(tokens, 4096, device="cuda").bfloat16()
+    gate = (torch.randn(experts, 4096, device="cuda") * 0.05).bfloat16()
+    bias = torch.randn(experts, device="cuda")
+    args = dict(
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.5,
+        correction_bias=bias,
+    )
+    try:
+        weights, ids = moe_topk(None, hidden_states=x, gate_weight=gate, **args)
+    except NoKernelFoundError:
+        pytest.skip("no fused router kernel on this platform")
+    expected_weights, expected_ids = moe_topk(x.float() @ gate.float().T, **args)
+    torch.testing.assert_close(ids, expected_ids, atol=0, rtol=0)
+    torch.testing.assert_close(weights, expected_weights, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("weights_dtype", [torch.float32, torch.bfloat16])
+def test_router_ties_and_graph_replay(weights_dtype: torch.dtype) -> None:
     logits = torch.zeros((2, 256), device="cuda", dtype=torch.float32)
 
     def run():
@@ -103,6 +184,7 @@ def test_router_ties_and_graph_replay() -> None:
             selection_method="topk",
             renormalize=True,
             routed_scaling_factor=1.0,
+            topk_weights_dtype=weights_dtype,
             override="triton_sqrt_softplus_topk",
         )
 
@@ -231,6 +313,7 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "triton_mxfp4_precomputed_moe_apply"
     moe_process_weights(plan, weights)

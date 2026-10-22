@@ -1,5 +1,5 @@
 import inspect
-import unittest
+import sys
 from types import SimpleNamespace
 from unittest import mock
 
@@ -45,12 +45,14 @@ def test_mtp_index_sharing_rides_the_draft_backend_share() -> None:
     share = drafter.attn_backend.sparse_topk
     first_step_topk = (object(), object())
     share.qsa_metadata = object()
+    share.qsa_selection = object()
 
     drafter._attach_dsa_topk(first_step_topk)
 
     assert share.prefill is first_step_topk[0]
     assert share.decode is first_step_topk[1]
     assert share.qsa_metadata is None
+    assert share.qsa_selection is None
     assert drafter._extract_dsa_topk((None, None)) == first_step_topk
 
     # The target's last indexer layer leaves its selection on the target
@@ -68,9 +70,11 @@ def test_mtp_index_sharing_rides_the_draft_backend_share() -> None:
     model.index_share_for_mtp_iteration = False
     fallback = (object(), object())
     share.qsa_metadata = object()
+    share.qsa_selection = object()
     drafter._attach_dsa_topk(fallback)
     assert share.prefill is None and share.decode is None
     assert share.qsa_metadata is None
+    assert share.qsa_selection is None
     assert drafter._extract_dsa_topk(fallback) == fallback
     assert drafter._target_dsa_topk(base_ctx) == (None, None)
 
@@ -158,6 +162,9 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
     target_calls: list[ForwardMode] = []
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cpu"
+    executor.device_module = torch.get_device_module(executor.device)
+    executor.default_stream = executor.device_module.current_stream()
+    executor.execution_stream = executor.device_module.Stream()
     executor.input_buffers = SimpleNamespace(
         req_pool_indices_buf=torch.zeros(4, dtype=torch.int64)
     )
@@ -177,6 +184,7 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
         DpForwardMetadata(
             global_num_tokens=[0, 8],
             global_batch_size=[0, 2],
+            global_num_decodes=[0, 2],
             global_forward_mode=[ForwardMode.IDLE, ForwardMode.DECODE],
             all_decode_or_idle=True,
             all_extend=False,
@@ -186,7 +194,7 @@ def _run_idle_round(drafter) -> list[ForwardMode]:
     return target_calls
 
 
-class TestDrafterAcceptIndexing(unittest.TestCase):
+class TestDrafterAcceptIndexing:
     def test_mtp_stash_uses_request_pool_capacity(self):
         request_pool_rows = 18
         spec_num_tokens = 4
@@ -195,13 +203,11 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             spec_num_tokens=spec_num_tokens, request_pool_rows=request_pool_rows
         )
 
-        self.assertEqual(
-            list(drafter._stash_tokens_buf.shape),
-            [request_pool_rows, spec_num_tokens - 1],
+        assert (list(drafter._stash_tokens_buf.shape)) == (
+            [request_pool_rows, spec_num_tokens - 1]
         )
-        self.assertEqual(
-            list(drafter._stash_hidden_buf.shape),
-            [request_pool_rows, spec_num_tokens - 1, 8],
+        assert (list(drafter._stash_hidden_buf.shape)) == (
+            [request_pool_rows, spec_num_tokens - 1, 8]
         )
 
     def test_mtp_refuses_a_draft_forward_without_spec_step_idx(self):
@@ -211,7 +217,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         def eagle_shaped_forward(ctx, input_ids, positions, **kwargs):
             pass
 
-        with self.assertRaisesRegex(TypeError, "spec_step_idx"):
+        with pytest.raises((TypeError), match=("spec_step_idx")):
             _make_mtp(model_forward=eagle_shaped_forward)
 
     def test_mtp_refuses_more_steps_than_the_draft_has_depths(self):
@@ -219,7 +225,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # step count past the depth count would wrap onto plane 0 and
         # overwrite it, so construction refuses it; equal or more depths
         # are fine.
-        with self.assertRaisesRegex(ValueError, "2 MTP depth layer"):
+        with pytest.raises((ValueError), match=("2 MTP depth layer")):
             _make_mtp(spec_num_steps=3, num_mtp_layers=2)
 
         _make_mtp(spec_num_steps=3, num_mtp_layers=3)
@@ -236,11 +242,13 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         global_num_tokens = [8, 0, 12, 4]
         global_bs = [2, 0, 3, 1]
 
-        steps = drafter.idle_forward_global_num_tokens(global_num_tokens, global_bs)
+        steps = drafter.idle_forward_global_num_tokens(
+            global_num_tokens, global_bs, global_num_decodes=global_bs
+        )
 
-        self.assertEqual(len(steps), 3)
+        assert (len(steps)) == (3)
         for step in steps:
-            self.assertIs(step, global_num_tokens)
+            assert (step) is (global_num_tokens)
 
     def test_mtp_idle_rank_runs_one_empty_idle_forward_per_depth(self):
         # An idle DP rank's round: the executor runs the drafter's depth loop
@@ -254,17 +262,15 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         target_calls = _run_idle_round(drafter)
 
-        self.assertEqual(target_calls, [ForwardMode.IDLE])
-        self.assertEqual([c["step"] for c in calls], [0, 1, 2])
+        assert (target_calls) == ([ForwardMode.IDLE])
+        assert ([c["step"] for c in calls]) == ([0, 1, 2])
         for call in calls:
-            self.assertEqual(call["mode"], ForwardMode.IDLE)
-            self.assertEqual(
-                (call["bs"], call["input_num_tokens"], call["rows"]), (0, 0, 0)
-            )
-            self.assertEqual(call["global_num_tokens"], [0, 8])
-            self.assertEqual(call["global_bs"], [0, 2])
+            assert (call["mode"]) == (ForwardMode.IDLE)
+            assert ((call["bs"], call["input_num_tokens"], call["rows"])) == ((0, 0, 0))
+            assert (call["global_num_tokens"]) == ([0, 8])
+            assert (call["global_bs"]) == ([0, 2])
             # No request-token-history view: Mtp drafts do not read one.
-            self.assertEqual(call["kwargs"], {})
+            assert (call["kwargs"]) == ({})
 
     def test_idle_round_follows_a_drafter_subclass_idle_hook(self):
         # The executor iterates whatever the drafter's hook lists — one IDLE
@@ -272,7 +278,9 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # (here a block drafter's single step) shapes the round, not the
         # base class's Eagle default.
         class _BlockShaped(BaseDrafter):
-            def idle_forward_global_num_tokens(self, global_num_tokens, global_bs):
+            def idle_forward_global_num_tokens(
+                self, global_num_tokens, global_bs, *, global_num_decodes
+            ):
                 return [global_bs]
 
             def run(self, *args, **kwargs):
@@ -294,10 +302,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         target_calls = _run_idle_round(drafter)
 
-        self.assertEqual(target_calls, [ForwardMode.IDLE])
-        self.assertEqual(
-            [(c["step"], c["global_num_tokens"]) for c in calls], [(0, [0, 2])]
-        )
+        assert (target_calls) == ([ForwardMode.IDLE])
+        assert ([(c["step"], c["global_num_tokens"]) for c in calls]) == ([(0, [0, 2])])
 
     def test_dsa_leaf_mtp_frontier_re_expands_the_k_row_indexer_metadata(self):
         # The DSA leaf's k-row top-k reads one context length per query row
@@ -336,21 +342,17 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # The re-anchor: seq_lens and every per-token row carry the frontier,
         # same storage (in-graph), and the plan is refreshed in place over
         # the k-row view at the leaf's kernel page size.
-        self.assertEqual(seq_lens_k.tolist(), [8, 4])  # last edit = advance
-        self.assertIs(metadata._dsa_seq_lens_2d, rows_before)
-        self.assertEqual(
-            metadata._dsa_seq_lens_2d.view(bs, k).tolist(), [[7] * k, [3] * k]
-        )
-        self.assertIs(plans[0]["seq_lens_2d"], metadata._dsa_seq_lens_2d)
-        self.assertIs(plans[0]["out"], metadata._dsa_plan)
-        self.assertEqual(plans[0]["page_size"], 64)
+        assert (seq_lens_k.tolist()) == ([8, 4])  # last edit = advance
+        assert (metadata._dsa_seq_lens_2d) is (rows_before)
+        assert (metadata._dsa_seq_lens_2d.view(bs, k).tolist()) == ([[7] * k, [3] * k])
+        assert (plans[0]["seq_lens_2d"]) is (metadata._dsa_seq_lens_2d)
+        assert (plans[0]["out"]) is (metadata._dsa_plan)
+        assert (plans[0]["page_size"]) == (64)
         # The Eagle advance plans [bs, 1] rows and leaves the per-token rows
         # as the round's refresh published them.
-        self.assertEqual(tuple(plans[1]["seq_lens_2d"].shape), (bs, 1))
-        self.assertEqual(plans[1]["seq_lens_2d"].view(-1).tolist(), [8, 4])
-        self.assertEqual(
-            metadata._dsa_seq_lens_2d.view(bs, k).tolist(), [[7] * k, [3] * k]
-        )
+        assert (tuple(plans[1]["seq_lens_2d"].shape)) == ((bs, 1))
+        assert (plans[1]["seq_lens_2d"].view(-1).tolist()) == ([8, 4])
+        assert (metadata._dsa_seq_lens_2d.view(bs, k).tolist()) == ([[7] * k, [3] * k])
 
     def test_dsa_leaf_mtp_frontier_rejects_a_stale_k_row_layout(self):
         from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_mod
@@ -365,7 +367,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         )
         backend._dense_backend = SimpleNamespace(forward_decode_metadata=metadata)
 
-        with self.assertRaisesRegex(RuntimeError, "per-token rows"):
+        with pytest.raises((RuntimeError), match=("per-token rows")):
             backend.update_draft_forward_metadata(
                 torch.tensor([7, 3], dtype=torch.int32)
             )
@@ -373,13 +375,13 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         # Rows never published (no refresh ran at this bs): the re-anchor
         # must not allocate them itself.
         metadata._dsa_seq_lens_2d = None
-        with self.assertRaisesRegex(RuntimeError, "not published"):
+        with pytest.raises((RuntimeError), match=("not published")):
             backend.update_draft_forward_metadata(
                 torch.tensor([7, 3], dtype=torch.int32)
             )
 
         backend._dense_backend = SimpleNamespace(forward_decode_metadata=None)
-        with self.assertRaisesRegex(RuntimeError, "not initialized"):
+        with pytest.raises((RuntimeError), match=("not initialized")):
             backend.update_draft_forward_metadata(
                 torch.tensor([7, 3], dtype=torch.int32)
             )
@@ -403,8 +405,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         metadata = TRTLLMMLADecodeMetadata(
             seq_lens_k=torch.zeros(bs, dtype=torch.int32)
         )
-        self.assertIsNone(metadata._dsa_seq_lens_2d)
-        self.assertIsNone(metadata._dsa_plan)
+        assert (metadata._dsa_seq_lens_2d) is None
+        assert (metadata._dsa_plan) is None
         backend._dense_backend = SimpleNamespace(
             forward_decode_metadata=metadata,
             refresh_decode_metadata=lambda *args, **kwargs: None,
@@ -429,14 +431,14 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
                 torch.tensor([7, 3, 99], dtype=torch.int32)
             )
 
-        self.assertIs(metadata._dsa_seq_lens_2d, rows)
-        self.assertIs(metadata._dsa_plan, plan)
-        self.assertEqual(rows.view(bs, k).tolist(), [[7] * k, [3] * k])
-        self.assertEqual(metadata.seq_lens_k.tolist(), [7, 3])
-        self.assertEqual([p.get("out") for p in plans], [None, plan, plan])
+        assert (metadata._dsa_seq_lens_2d) is (rows)
+        assert (metadata._dsa_plan) is (plan)
+        assert (rows.view(bs, k).tolist()) == ([[7] * k, [3] * k])
+        assert (metadata.seq_lens_k.tolist()) == ([7, 3])
+        assert ([p.get("out") for p in plans]) == ([None, plan, plan])
         for p in plans:
-            self.assertIs(p["seq_lens_2d"], rows)
-            self.assertEqual(p["page_size"], 64)
+            assert (p["seq_lens_2d"]) is (rows)
+            assert (p["page_size"]) == (64)
 
     def test_substitute_mm_pad_rewrites_media_ids_in_place(self):
         image = MultimodalDataItem(modality=Modality.IMAGE, hash=123)
@@ -449,20 +451,19 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         out = substitute_mm_pad_(input_ids, {Modality.IMAGE: 10, Modality.AUDIO: 20})
 
-        self.assertIs(out, input_ids)
-        self.assertEqual(input_ids.tolist(), [7, 10, 20, 42])
+        assert (out) is (input_ids)
+        assert (input_ids.tolist()) == ([7, 10, 20, 42])
 
     def test_input_buffers_validate_modality_specific_mm_substitutes(self):
         buffers = InputBuffers.__new__(InputBuffers)
         buffers.set_mm_pad_substitute_ids(
             {Modality.IMAGE: 10, Modality.AUDIO: 20}, vocab_size=256
         )
-        self.assertEqual(
-            buffers.mm_pad_substitute_ids,
-            {Modality.IMAGE: 10, Modality.AUDIO: 20},
+        assert (buffers.mm_pad_substitute_ids) == (
+            {Modality.IMAGE: 10, Modality.AUDIO: 20}
         )
 
-        with self.assertRaisesRegex(ValueError, "inside the target"):
+        with pytest.raises((ValueError), match=("inside the target")):
             buffers.set_mm_pad_substitute_ids({Modality.IMAGE: 256}, vocab_size=256)
 
     def test_eagle_decode_first_step_gathers_last_accepted_output(self):
@@ -483,8 +484,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             input_num_tokens=12,
         )
 
-        self.assertIs(input_ids, output_tokens)
-        self.assertEqual(gather_ids.tolist(), [0, 5, 11])
+        assert (input_ids) is (output_tokens)
+        assert (gather_ids.tolist()) == ([0, 5, 11])
 
     def test_eagle_mixed_first_step_keeps_decode_gather_ids_in_range(self):
         drafter = _make_eagle(spec_num_tokens=4)
@@ -508,8 +509,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             input_num_tokens=10,
         )
 
-        self.assertEqual(gather_ids.tolist(), [1, 3, 9])
-        self.assertEqual(input_ids[2:].tolist(), output_tokens[1:].tolist())
+        assert (gather_ids.tolist()) == ([1, 3, 9])
+        assert (input_ids[2:].tolist()) == (output_tokens[1:].tolist())
 
     def test_extend_depth_shifted_ids_shifts_within_each_request(self):
         # Request A: 5 prefill rows, shift-1 ids [t1..t4, S_A] (S_A = the
@@ -525,8 +526,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         depth1 = _extend_depth_shifted_ids_from(pre, next_tokens, 1)
         depth2 = _extend_depth_shifted_ids_from(pre, next_tokens, 2)
 
-        self.assertEqual(depth1.tolist(), [12, 13, 14, 500, 501, 22, 600, 601])
-        self.assertEqual(depth2.tolist(), [13, 14, 500, 501, 502, 600, 601, 602])
+        assert (depth1.tolist()) == ([12, 13, 14, 500, 501, 22, 600, 601])
+        assert (depth2.tolist()) == ([13, 14, 500, 501, 502, 600, 601, 602])
 
     def test_extend_depth_shifted_ids_single_request_tail_uses_drafts(self):
         shift1_ids = torch.tensor([11, 12, 700])
@@ -538,7 +539,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         # With P=3 and depth 3 every row overshoots the shift-1 ids: local
         # row i consumes t_{i+4}, i.e. drafts d_1..d_3.
-        self.assertEqual(depth3.tolist(), [701, 702, 703])
+        assert (depth3.tolist()) == ([701, 702, 703])
 
     def test_frontier_shifted_ids_reads_stash_and_verify(self):
         # k=4. Request A accepts 2 of [v0..v3]; request B accepts all 4.
@@ -550,9 +551,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         depth0 = _frontier_shifted_ids(v, accept, stash)
 
         # src = accept - 4 + j, all rows committed (stash/verify).
-        self.assertEqual(
-            depth0.view(2, 4).tolist(),
-            [[42, 43, 500, 501], [600, 601, 602, 603]],
+        assert (depth0.view(2, 4).tolist()) == (
+            [[42, 43, 500, 501], [600, 601, 602, 603]]
         )
 
     def test_frontier_window_rolls_left_into_drafts(self):
@@ -564,14 +564,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         depth1 = torch.cat([window0[:, 1:], drafts[:, 0:1]], 1)
         depth2 = torch.cat([depth1[:, 1:], drafts[:, 1:2]], 1)
 
-        self.assertEqual(
-            depth1.tolist(),
-            [[43, 500, 501, 51], [601, 602, 603, 61]],
-        )
-        self.assertEqual(
-            depth2.tolist(),
-            [[500, 501, 51, 52], [602, 603, 61, 62]],
-        )
+        assert (depth1.tolist()) == ([[43, 500, 501, 51], [601, 602, 603, 61]])
+        assert (depth2.tolist()) == ([[500, 501, 51, 52], [602, 603, 61, 62]])
 
     def test_frontier_hidden_splice_gathers_at_accept_boundary(self):
         # H=1; stash rows are the hiddens at positions vc-3..vc-1, fresh
@@ -585,9 +579,8 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
         spliced = _frontier_hidden_splice(stash, fresh, accept)
 
         # accept=2: window rows at vc-2..vc+1; accept=4: rows at vc..vc+3.
-        self.assertEqual(
-            spliced.view(2, 4).tolist(),
-            [[-2.0, -1.0, 0.0, 1.0], [10.0, 11.0, 12.0, 13.0]],
+        assert (spliced.view(2, 4).tolist()) == (
+            [[-2.0, -1.0, 0.0, 1.0], [10.0, 11.0, 12.0, 13.0]]
         )
 
     def test_frontier_ids_and_stash_track_positions_over_rounds(self):
@@ -616,12 +609,12 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
                 for j in range(k):
                     consumed = (frontier - k + j) + d + 1
                     if consumed <= frontier:
-                        self.assertEqual(ids[0, j].item(), 1000 + consumed)
+                        assert (ids[0, j].item()) == (1000 + consumed)
                     else:
-                        self.assertEqual(ids[0, j].item(), 7000 + consumed - frontier)
+                        assert (ids[0, j].item()) == (7000 + consumed - frontier)
             stash = depth0[:, 1:]
             vc = frontier
-            self.assertEqual(stash.tolist(), [[1000 + vc - 2 + i for i in range(3)]])
+            assert (stash.tolist()) == ([[1000 + vc - 2 + i for i in range(3)]])
 
     def test_frontier_hidden_splice_tracks_positions_over_rounds(self):
         # Same oracle for the hidden side: the target hidden of position p
@@ -640,15 +633,12 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
             spliced = _frontier_hidden_splice(stash, fresh, a)
 
-            self.assertEqual(
-                spliced.view(k).tolist(),
-                [float(frontier - k + j) for j in range(k)],
+            assert (spliced.view(k).tolist()) == (
+                [float(frontier - k + j) for j in range(k)]
             )
             stash = spliced.view(1, k, 1)[:, 1:]
             vc = frontier
-            self.assertEqual(
-                stash.view(3).tolist(), [float(vc - 3 + i) for i in range(3)]
-            )
+            assert (stash.view(3).tolist()) == ([float(vc - 3 + i) for i in range(3)])
 
     def test_ragged_tail_rows_borrows_old_tail_on_short_chunks(self):
         flat = torch.arange(6) + 100  # request A rows 0..4, request B row 5
@@ -657,7 +647,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
 
         updated = _ragged_tail_rows(flat, lengths, old_tail, 2)
 
-        self.assertEqual(updated.tolist(), [[103, 104], [4, 105]])
+        assert (updated.tolist()) == ([[103, 104], [4, 105]])
 
     def test_dflash_current_tokens_gather_last_accepted_per_row(self):
         output_tokens = torch.arange(12, dtype=torch.int32)
@@ -669,7 +659,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             spec_num_tokens=4,
         )
 
-        self.assertEqual(current.tolist(), [0, 5, 11])
+        assert (current.tolist()) == ([0, 5, 11])
 
     def test_dflash_mixed_current_tokens_do_not_cross_decode_rows(self):
         output_tokens = torch.tensor(
@@ -684,7 +674,7 @@ class TestDrafterAcceptIndexing(unittest.TestCase):
             spec_num_tokens=4,
         )
 
-        self.assertEqual(current.tolist(), [100, 11, 23])
+        assert (current.tolist()) == ([100, 11, 23])
 
 
 # ---------------------------------------------------------------------------
@@ -728,6 +718,7 @@ def _draft_sampler(monkeypatch, *, top_k_rows, temperatures, vocab_map=None):
     pools = SpeculativeSamplingPools(
         temperature=torch.tensor(temperatures, dtype=torch.float32),
         top_k=torch.tensor(top_k_rows, dtype=torch.int32),
+        top_p=torch.ones(POOL + 1),
         seed=torch.arange(POOL + 1, dtype=torch.int64) * 11,
     )
     monkeypatch.setattr(
@@ -1050,6 +1041,7 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
     pools = SpeculativeSamplingPools(
         temperature=torch.ones(POOL + 1),
         top_k=torch.ones(POOL + 1, dtype=torch.int32),
+        top_p=torch.ones(POOL + 1),
         seed=torch.zeros(POOL + 1, dtype=torch.int64),
     )
     backend = SimpleNamespace(speculative_sampling_pools=lambda: pools)
@@ -1124,4 +1116,4 @@ def test_bind_refuses_block_drafters_and_arms_chain_drafters(monkeypatch):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

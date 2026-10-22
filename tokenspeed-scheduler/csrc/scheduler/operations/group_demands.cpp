@@ -26,32 +26,41 @@
 
 namespace tokenspeed {
 
-std::vector<GroupDemand> MakeGroupDemands(std::vector<BlockTable>& tables, GroupDemand prototype) {
+std::vector<GroupDemand> MakeGroupDemands(std::vector<BlockTable>& tables,
+                                          std::span<const CacheGroupConfig> cache_groups, GroupDemand prototype,
+                                          StateStep state_step) {
+    _assert(tables.size() == cache_groups.size(), "tables/cache groups size mismatch");
     std::vector<GroupDemand> demands;
     demands.reserve(tables.size());
-    for (BlockTable& table : tables) {
-        prototype.table = &table;
-        demands.push_back(prototype);
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        GroupDemand demand = prototype;
+        demand.table = &tables[i];
+        if (cache_groups[i].attn_kind == AttnKind::kState) {
+            demand.extent = state_step;
+            demand.reserve_tokens = 0;
+        }
+        demands.push_back(demand);
     }
     return demands;
-}
-
-std::int64_t SnapshotStateReserveTokens(std::int64_t block_granularity, std::int64_t decode_tokens) {
-    return std::max(block_granularity, decode_tokens);
 }
 
 namespace {
 
 std::int32_t groupReserveTokens(const CacheGroupConfig& group, const PrefillReserve& reserve) {
-    if (group.Kind() == AttnKind::kMambaState) {
-        if (!reserve.reserve_snapshot_state_growth) {
-            return 0;
-        }
-        return static_cast<std::int32_t>(
-            SnapshotStateReserveTokens(group.block_granularity, reserve.decode_input_tokens));
+    if (group.attn_kind == AttnKind::kState) {
+        return 0;
     }
-    if (group.Kind() == AttnKind::kSlidingWindow) {
-        return reserve.DecodeTokens();
+    if (group.attn_kind == AttnKind::kSlidingWindow) {
+        // Prepay the growth recycling cannot fund, at most the lookback a token
+        // reads (window - 1). A replayable group holds no shared hit page, and
+        // once the prompt's own tokens after the hit reach the lookback plus
+        // one block, every hit page slides out before the first decode.
+        const std::int32_t lookback = std::max(group.sliding_window_tokens.value_or(0) - 1, 0);
+        const bool hit_counts =
+            !group.replayable && reserve.swa_prompt_after_hit_tokens < lookback + group.block_granularity;
+        const std::int32_t unrecycled =
+            std::min(std::max(hit_counts ? reserve.swa_hit_tokens : 0, reserve.swa_later_chunk_tokens), lookback);
+        return std::max(reserve.DecodeTokens(), std::min(reserve.prompt_headroom_tokens, unrecycled));
     }
     return std::max(reserve.DecodeTokens(), reserve.prompt_headroom_tokens);
 }
@@ -66,38 +75,6 @@ void ReservePrefillDemands(std::span<GroupDemand> demands, std::span<const Cache
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].reserve_tokens == 0, "a prefill demand's reserve is decided here and nowhere else");
         demands[i].reserve_tokens = groupReserveTokens(cache_groups[i], reserve);
-    }
-}
-
-std::int32_t StateCheckpointMaterializationStart(std::int32_t before_tokens, std::int32_t after_tokens,
-                                                 std::int32_t prefix_granularity) {
-    _assert(before_tokens >= 0 && after_tokens > before_tokens, "state checkpoint extent must advance");
-    _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
-    const std::int32_t completed_boundary = after_tokens - after_tokens % prefix_granularity;
-    return completed_boundary > before_tokens ? completed_boundary : after_tokens;
-}
-
-void MakeSnapshotStatePrefillSparse(std::span<GroupDemand> demands, std::span<const CacheGroupConfig> cache_groups,
-                                    const CacheCoordinator& coordinator, std::int32_t before_tokens,
-                                    std::int32_t after_tokens) {
-    _assert(demands.size() == cache_groups.size(), "demands/cache groups size mismatch");
-    _assert(before_tokens >= 0 && after_tokens > before_tokens,
-            "snapshot-state prefill requires a positive advancing extent");
-    for (std::size_t i = 0; i < demands.size(); ++i) {
-        if (cache_groups[i].Kind() != AttnKind::kMambaState) {
-            continue;
-        }
-        const std::int32_t block_granularity = coordinator.GroupBlockGranularity(static_cast<std::int32_t>(i));
-        // A completing prefill may end off a prefix boundary. Materialize the
-        // last completed checkpoint as well as the final continuation state:
-        // the runtime writes both from this one model forward. Earlier slots
-        // remain holes, preserving absolute block-table positions.
-        const std::int32_t first_materialized_token =
-            StateCheckpointMaterializationStart(before_tokens, after_tokens, coordinator.PrefixGranularity());
-        demands[i].extent = SparseSuffix{
-            .extent_tokens = after_tokens,
-            .first_block = (first_materialized_token - 1) / block_granularity,
-        };
     }
 }
 

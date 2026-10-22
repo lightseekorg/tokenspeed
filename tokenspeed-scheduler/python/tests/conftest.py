@@ -17,10 +17,9 @@ K3_GROUP_IDS = (K3_HISTORY_GROUP,) + K3_STATE_GROUPS
 
 def _make_k3_config() -> "ts.SchedulerConfig":
     """Kimi-K3-shaped 4-group config: one full-attention History group plus
-    three linear-attention State groups with FullHistory retention --
-    MakeSpecsFromConfig maps State+FullHistory to AttnKind::kMambaState ->
-    MambaStateManager (SwaManager window=2), i.e. one page per
-    state-snapshot slot, exactly the production ratio."""
+    three linear-attention State groups. A State group has no token span
+    (block_granularity 0): its table is two slots, the input checkpoint and
+    the live state, each one page -- exactly the production ratio."""
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = PAGE
     cfg.num_device_pages = 33  # page 0 = null sentinel, 32 usable
@@ -34,13 +33,12 @@ def _make_k3_config() -> "ts.SchedulerConfig":
     cfg.cache_groups = [
         ts.CacheGroupConfig(
             group_id=group_id,
-            block_granularity=cfg.prefix_granularity,
+            block_granularity=(
+                cfg.prefix_granularity if group_id == K3_HISTORY_GROUP else 0
+            ),
             total_pages=cfg.num_device_pages,
-            retention=ts.CacheRetention.FullHistory,
-            family=(
-                ts.CacheGroupFamily.History
-                if group_id == K3_HISTORY_GROUP
-                else ts.CacheGroupFamily.State
+            attn_kind=(
+                ts.AttnKind.Full if group_id == K3_HISTORY_GROUP else ts.AttnKind.State
             ),
         )
         for group_id in K3_GROUP_IDS
@@ -81,3 +79,16 @@ def _find_forward_op(plan):
 
 def _positive(row) -> list[int]:
     return [page for page in row if page > 0]
+
+
+def storage_ops(plan):
+    """The Host-only commands in a scheduler's unified cache plan."""
+    Cache = ts.Cache
+
+    types = (
+        Cache.StorageQueryOp,
+        Cache.StorageGetOp,
+        Cache.StoragePutOp,
+        Cache.StorageCancelOp,
+    )
+    return [operation for operation in plan.cache if isinstance(operation, types)]

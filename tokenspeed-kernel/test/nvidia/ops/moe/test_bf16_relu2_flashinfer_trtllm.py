@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.activation import torch_relu2
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 
 HIDDEN = 256
@@ -36,7 +38,7 @@ ISPP = 256
 def _runtime_reason() -> str | None:
     if not torch.cuda.is_available():
         return "requires CUDA"
-    import tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant  # noqa: F401
+    import tokenspeed_kernel.ops.moe.flashinfer  # noqa: F401
     from tokenspeed_kernel.platform import current_platform
     from tokenspeed_kernel.registry import KernelRegistry
 
@@ -75,13 +77,20 @@ def _make_weights(generator: torch.Generator, num_experts: int):
 
 
 def _reference_moe(x, w13, w2, topk_ids, topk_weights):
-    x = x.float()
-    out = torch.zeros_like(x)
-    for e in topk_ids.unique().tolist():
-        act = torch.relu(x @ w13[e].float().t()).square().bfloat16().float()
-        weight = torch.where(topk_ids == e, topk_weights.float(), 0.0).sum(dim=-1)
-        out += weight[:, None] * (act @ w2[e].float().t())
-    return out
+    return torch_moe_experts(
+        x,
+        w13,
+        w2,
+        topk_ids,
+        topk_weights,
+        activation=torch_relu2,
+        w13_bias=None,
+        w2_bias=None,
+        quantize_input=None,
+        quantize_intermediate=torch.Tensor.bfloat16,
+        round_expert_output=None,
+        first_expert=0,
+    )
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
@@ -91,7 +100,7 @@ def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
 @requires_relu2
 @pytest.mark.parametrize("num_tokens", [1, 37])
 def test_bf16_relu2_routed_moe_matches_reference(num_tokens):
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_unquant_relu2_moe_weights,
         flashinfer_trtllm_unquant_relu2_routed_moe_apply,
     )
@@ -128,7 +137,7 @@ def test_bf16_relu2_routed_moe_matches_reference(num_tokens):
 def test_bf16_relu2_kernel_routing_matches_sigmoid_bias_top22(num_tokens):
     """Nemotron-H routing: 512 experts, sigmoid + correction bias, one group, top-22, scale 5."""
     from flashinfer.fused_moe import RoutingMethodType
-    from tokenspeed_kernel.ops.moe.flashinfer.trtllm_unquant import (
+    from tokenspeed_kernel.ops.moe.flashinfer import (
         flashinfer_trtllm_unquant_relu2_moe_apply,
         flashinfer_trtllm_unquant_relu2_moe_weights,
     )
@@ -178,6 +187,7 @@ def test_moe_plan_selects_the_bf16_relu2_kernels(routing_mode):
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     expected = {
         None: "flashinfer_trtllm_unquant_relu2_moe_apply",

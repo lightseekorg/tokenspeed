@@ -76,6 +76,8 @@ def _backend(
     backend = object.__new__(dsa.DSABackend)
     backend.kernel_page_size = PAGE
     backend.kernel_solution = None
+    backend.prefill_kernel_plan = None
+    backend.decode_kernel_plan = None
     backend.slot_order = "selection"
     backend.data_type = torch.bfloat16
     backend.q_data_type = torch.bfloat16
@@ -637,10 +639,10 @@ def _router(leaf: dsa.DSABackend, *, is_draft: bool):
     router.bind(
         CacheGroupGeometry(
             granularities={"full": PAGE},
-            families={"full": "history"},
+            attn_kinds={"full": "full_history"},
             full_history_group_id="full",
             row_geometry={"full": (PAGE, 1)},
-            retentions={"full": ("full_history", None)},
+            windows={"full": None},
         ),
         {"full": leaf},
     )

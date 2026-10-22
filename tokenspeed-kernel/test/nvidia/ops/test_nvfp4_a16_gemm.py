@@ -22,6 +22,10 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.quantization import (
+    dequantize_nvfp4_blocks,
+    quantize_nvfp4_blocks,
+)
 from tokenspeed_kernel.ops.gemm import (
     has_flashinfer_cute_dsl_nvfp4_a16 as kernel_has_flashinfer_cute_dsl_nvfp4_a16,
 )
@@ -32,8 +36,6 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.thirdparty.msa.cute.quantize import (
     swizzle_nvfp4_scale_to_128x4,
 )
-
-_E2M1_MAGNITUDES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
 def _requires_flashinfer_nvfp4_a16() -> str | None:
@@ -56,40 +58,11 @@ requires_flashinfer_nvfp4_a16 = pytest.mark.skipif(
 def _quantize_nvfp4_torch(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Quantize to packed E2M1 with float8 block-16 scales using only torch."""
+    """Packed E2M1 codes, 128x4-swizzled and linear float8 block-16 scales."""
+    packed, scales = quantize_nvfp4_blocks(weight)
     n, k = weight.shape
-    assert k % 16 == 0
-    blocks = weight.float().reshape(n, k // 16, 16)
-    scales = (blocks.abs().amax(dim=-1) / 6.0).clamp_min(2**-9)
-    scales = scales.to(torch.float8_e4m3fn)
-    normalized = blocks / scales.float().unsqueeze(-1)
-
-    magnitudes = torch.tensor(
-        _E2M1_MAGNITUDES, dtype=torch.float32, device=weight.device
-    )
-    codes = (
-        (normalized.abs().unsqueeze(-1) - magnitudes.view(1, 1, 1, -1))
-        .abs()
-        .argmin(dim=-1)
-        .to(torch.uint8)
-    )
-    codes |= (normalized < 0).to(torch.uint8) << 3
-    codes = codes.reshape(n, k)
-    packed = codes[:, 0::2] | (codes[:, 1::2] << 4)
     swizzled = swizzle_nvfp4_scale_to_128x4(scales, rows=n, cols=k // 16)
-    return packed.contiguous(), swizzled, scales
-
-
-def _dequantize_nvfp4(packed: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
-    values = torch.tensor(
-        _E2M1_MAGNITUDES + tuple(-value for value in _E2M1_MAGNITUDES),
-        dtype=torch.float32,
-        device=packed.device,
-    )
-    low = values[(packed & 0x0F).long()]
-    high = values[(packed >> 4).long()]
-    weight = torch.stack((low, high), dim=-1).reshape(packed.shape[0], -1)
-    return weight * scales.float().repeat_interleave(16, dim=1)
+    return packed, swizzled, scales
 
 
 @requires_flashinfer_nvfp4_a16
@@ -113,7 +86,7 @@ def test_flashinfer_nvfp4_a16_matches_dequantized_reference(m: int) -> None:
         out_dtype=torch.bfloat16,
         quant="nvfp4_a16",
     )
-    expected = (activation.float() @ _dequantize_nvfp4(packed, scales).T).to(
+    expected = (activation.float() @ dequantize_nvfp4_blocks(packed, scales).T).to(
         torch.bfloat16
     )
 

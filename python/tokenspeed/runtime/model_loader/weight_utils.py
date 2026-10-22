@@ -50,22 +50,23 @@ from tqdm.auto import tqdm
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.hf_hub_retry import call_with_hf_rate_limit_retry
 from tokenspeed.runtime.layers.quantization import (
     QuantizationConfig,
     get_quantization_config,
 )
+from tokenspeed.runtime.layers.quantization.modelopt_mixed import normalize_quant_algo
 from tokenspeed.runtime.utils import get_colorful_logger
 
 logger = get_colorful_logger(__name__)
 
-_KV_SCALE_SUFFIXES = (
-    ".k_scale",
-    ".v_scale",
+# Checkpoint tensors holding a layer's key, value, or shared KV-cache scale.
+K_CACHE_SCALE_SUFFIXES = (".k_scale", "_k_scale", ".k_proj.output_scale")
+V_CACHE_SCALE_SUFFIXES = (".v_scale", "_v_scale", ".v_proj.output_scale")
+KV_CACHE_SCALE_SUFFIXES = (
+    *K_CACHE_SCALE_SUFFIXES,
+    *V_CACHE_SCALE_SUFFIXES,
     ".kv_scale",
-    "_k_scale",
-    "_v_scale",
-    ".k_proj.output_scale",
-    ".v_proj.output_scale",
 )
 
 _AUXILIARY_SAFETENSORS_FILES = {"input_scales.safetensors"}
@@ -106,6 +107,60 @@ def get_lock(
     return filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
 
 
+def _json_folder(model_config: ModelConfig, load_config: LoadConfig) -> str:
+    """Return the checkpoint folder holding its JSON files, fetched if remote."""
+    model_name_or_path = model_config.model_path
+    if os.path.isdir(model_name_or_path):
+        return model_name_or_path
+
+    def download_config_files() -> str:
+        return snapshot_download(
+            model_name_or_path,
+            revision=model_config.revision,
+            allow_patterns="*.json",
+            cache_dir=load_config.download_dir,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            tqdm_class=DisabledTqdm,
+        )
+
+    # Download the config files.
+    with get_lock(model_name_or_path, load_config.download_dir):
+        return call_with_hf_rate_limit_retry(
+            f"downloading config files of {model_name_or_path}",
+            download_config_files,
+        )
+
+
+def with_hf_quant_layers(quant_cfg: dict, hf_quant: dict) -> dict:
+    """Complete a per-layer ``quantization_config`` from ``hf_quant_config.json``.
+
+    ModelOpt writes both; a config.json copy can lack entries the export file
+    has (Nemotron 3.5 Super VL's leaves out its MTP experts), which would load
+    those modules as unquantized. Algorithms must agree after alias normalization.
+    """
+    layers = dict(quant_cfg["quantized_layers"])
+    missing = {}
+    for name, entry in hf_quant.get("quantized_layers", {}).items():
+        if name not in layers:
+            missing[name] = entry
+        elif normalize_quant_algo(
+            str(layers[name].get("quant_algo")).upper()
+        ) != normalize_quant_algo(str(entry.get("quant_algo")).upper()):
+            raise ValueError(
+                f"config.json quantizes {name} as {layers[name]}, "
+                f"hf_quant_config.json as {entry}"
+            )
+    if not missing:
+        return quant_cfg
+    logger.warning(
+        f"config.json's quantization_config lacks {len(missing)} quantized "
+        f"layers that hf_quant_config.json lists (e.g. {next(iter(missing))}); "
+        "taking them from hf_quant_config.json"
+    )
+    layers.update(missing)
+    return {**quant_cfg, "quantized_layers": layers}
+
+
 def get_quant_config(
     model_config: ModelConfig, load_config: LoadConfig
 ) -> QuantizationConfig:
@@ -121,22 +176,16 @@ def get_quant_config(
         # compressed-tensors uses a compressions_config
         hf_quant_config = getattr(model_config.hf_config, "compression_config", None)
     if hf_quant_config is not None:
-        return quant_cls.from_config(hf_quant_config)
-    model_name_or_path = model_config.model_path
-    is_local = os.path.isdir(model_name_or_path)
-    if not is_local:
-        # Download the config files.
-        with get_lock(model_name_or_path, load_config.download_dir):
-            hf_folder = snapshot_download(
-                model_name_or_path,
-                revision=model_config.revision,
-                allow_patterns="*.json",
-                cache_dir=load_config.download_dir,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                tqdm_class=DisabledTqdm,
+        if "quantized_layers" in hf_quant_config:
+            hf_quant_path = os.path.join(
+                _json_folder(model_config, load_config), "hf_quant_config.json"
             )
-    else:
-        hf_folder = model_name_or_path
+            if os.path.isfile(hf_quant_path):
+                with open(hf_quant_path, encoding="utf-8") as f:
+                    hf_quant = json.load(f).get("quantization", {})
+                hf_quant_config = with_hf_quant_layers(hf_quant_config, hf_quant)
+        return quant_cls.from_config(hf_quant_config)
+    hf_folder = _json_folder(model_config, load_config)
 
     possible_config_filenames = quant_cls.get_config_filenames()
 
@@ -202,7 +251,10 @@ def download_weights_from_hf(
     if not huggingface_hub.constants.HF_HUB_OFFLINE:
         # Before we download we look at that is available:
         fs = HfFileSystem()
-        file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+        file_list = call_with_hf_rate_limit_retry(
+            f"listing weight files of {model_name_or_path}",
+            lambda: fs.ls(model_name_or_path, detail=False, revision=revision),
+        )
 
         # depending on what is available we download different things
         for pattern in allow_patterns:
@@ -212,10 +264,9 @@ def download_weights_from_hf(
                 break
 
     logger.info(f"Using model weights format {allow_patterns!s}")
-    # Use file lock to prevent multiple processes from
-    # downloading the same model weights at the same time.
-    with get_lock(model_name_or_path, cache_dir):
-        hf_folder = snapshot_download(
+
+    def download_weights() -> str:
+        return snapshot_download(
             model_name_or_path,
             allow_patterns=allow_patterns,
             ignore_patterns=ignore_patterns,
@@ -223,6 +274,14 @@ def download_weights_from_hf(
             tqdm_class=DisabledTqdm,
             revision=revision,
             local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
+    # Use file lock to prevent multiple processes from
+    # downloading the same model weights at the same time.
+    with get_lock(model_name_or_path, cache_dir):
+        hf_folder = call_with_hf_rate_limit_retry(
+            f"downloading weights of {model_name_or_path}",
+            download_weights,
         )
     return hf_folder
 
@@ -241,17 +300,24 @@ def download_safetensors_index_file_from_hf(
             weights. If None, will use HF defaults.
         revision (Optional[str]): The revision of the model.
     """
+
+    def download_index_file() -> str:
+        return hf_hub_download(
+            repo_id=model_name_or_path,
+            filename=index_file,
+            cache_dir=cache_dir,
+            revision=revision,
+            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+        )
+
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
     with get_lock(model_name_or_path, cache_dir):
         try:
             # Download the safetensors index file.
-            hf_hub_download(
-                repo_id=model_name_or_path,
-                filename=index_file,
-                cache_dir=cache_dir,
-                revision=revision,
-                local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
+            call_with_hf_rate_limit_retry(
+                f"downloading {index_file} of {model_name_or_path}",
+                download_index_file,
             )
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
@@ -788,6 +854,41 @@ def _find_sub_byte_dtype(hf_weights_files: list[str]) -> str | None:
     return None
 
 
+def safetensors_tensor_shapes(
+    hf_weights_files: list[str],
+) -> dict[str, tuple[int, ...]]:
+    """Return each tensor's shape as the shards' headers declare it.
+
+    Reads only each shard's length-prefixed JSON header, never tensor data,
+    so a caller can refuse a checkpoint before loading any of it. A shard
+    whose header will not parse, or whose file is shorter than the data its
+    header declares (truncated, or still being written), raises ``ValueError``.
+    """
+    shapes: dict[str, tuple[int, ...]] = {}
+    for path in hf_weights_files:
+        try:
+            with open(path, "rb") as f:
+                (header_len,) = struct.unpack("<Q", f.read(8))
+                if header_len > _MAX_SAFETENSORS_HEADER_BYTES:
+                    raise ValueError(f"header claims {header_len} bytes")
+                header = json.loads(f.read(header_len))
+            if not isinstance(header, dict):
+                raise ValueError("header is not a JSON object")
+            data_end = 0
+            for name, meta in header.items():
+                if name == "__metadata__":
+                    continue
+                shapes[name] = tuple(int(dim) for dim in meta["shape"])
+                data_end = max(data_end, int(meta["data_offsets"][1]))
+            declared = 8 + header_len + data_end
+            on_disk = os.path.getsize(path)
+            if on_disk < declared:
+                raise ValueError(f"{on_disk} bytes on disk, header declares {declared}")
+        except (OSError, ValueError, LookupError, TypeError, struct.error) as e:
+            raise ValueError(f"{path}: unreadable safetensors shard ({e})") from e
+    return shapes
+
+
 def instanttensor_weights_iterator(
     hf_weights_files: list[str],
     *,
@@ -979,14 +1080,15 @@ def initialize_dummy_integer_weights(model: torch.nn.Module, seed: int = 1234) -
     They are zeroed, which is valid for all three. A parameter can set
     ``dummy_initializer(param, generator)`` when zero is valid but
     unrepresentative, such as an expert-id table that would send every token
-    to one expert.
+    to one expert. A floating-point parameter that post-processing checks,
+    such as a scale that starts as NaN until the checkpoint fills it, can set
+    one too; other floating-point parameters are left as they are.
     """
     for param in model.parameters():
-        if torch.is_floating_point(param):
-            continue
         initializer = getattr(param, "dummy_initializer", None)
         if initializer is None:
-            param.data.zero_()
+            if not torch.is_floating_point(param):
+                param.data.zero_()
             continue
         generator = torch.Generator(device=param.data.device)
         generator.manual_seed(seed)
@@ -996,11 +1098,27 @@ def initialize_dummy_integer_weights(model: torch.nn.Module, seed: int = 1234) -
 def record_non_unit_kv_scales(
     weights: Iterable[tuple[str, torch.Tensor]], rejected: list[str]
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Pass weights through, appending each KV-cache scale other than one to
-    ``rejected``; KV caches are written and read at unit scale."""
+    """Pass weights through without their KV-cache scales, appending each one
+    other than one to ``rejected``: a weight update never changes the scales
+    an FP8 KV cache was loaded with."""
     for name, tensor in weights:
-        if name.endswith(_KV_SCALE_SUFFIXES) and not bool(torch.all(tensor == 1)):
-            rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
+        if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+            if not bool(torch.all(tensor == 1)):
+                rejected.append(f"{name}={tensor.flatten()[:4].tolist()}")
+            continue
+        yield name, tensor
+
+
+def split_kv_cache_scales(
+    weights: Iterable[tuple[str, torch.Tensor]], scales: dict[str, torch.Tensor]
+) -> Generator[tuple[str, torch.Tensor], None, None]:
+    """Pass checkpoint weights through without their KV-cache scales,
+    collecting each one other than one into ``scales`` by checkpoint name."""
+    for name, tensor in weights:
+        if name.endswith(KV_CACHE_SCALE_SUFFIXES):
+            if not bool(torch.all(tensor == 1)):
+                scales[name] = tensor
+            continue
         yield name, tensor
 
 
@@ -1009,17 +1127,6 @@ def non_unit_kv_scale_message(rejected: list[str]) -> str:
         f"checkpoint KV-cache scales {', '.join(rejected)}; "
         "only unit KV-cache scales are supported"
     )
-
-
-def require_unit_kv_scales(
-    weights: Iterable[tuple[str, torch.Tensor]],
-) -> Generator[tuple[str, torch.Tensor], None, None]:
-    """Pass checkpoint weights through, raising once the stream is drained if
-    a KV-cache scale is not one."""
-    rejected: list[str] = []
-    yield from record_non_unit_kv_scales(weights, rejected)
-    if rejected:
-        raise ValueError(non_unit_kv_scale_message(rejected))
 
 
 def require_unit_kv_scale_file(path: str) -> None:

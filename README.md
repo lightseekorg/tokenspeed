@@ -23,10 +23,14 @@ TokenSpeed takes a fundamentally different architectural approach from existing 
 >
 > TokenSpeed also treats kernels as a first-class, modular subsystem, separating them from the core engine through a portable public API, centralized registry and selection model, and an extensible plugin mechanism for heterogeneous accelerators.
 
-More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors like NVIDIA and AMD.
+More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference engines: neutral because it's backed by the non-profit [LightSeek Foundation](https://lightseek.org/) rather than a commercial company, with **serious hardware and engineering support** from vendors such as NVIDIA and AMD.
 
 ## News
 
+- [2026/10] [EAGLE-4](https://blog.eagle.ai/blog/introducing-eagle-4) training and serving with TorchSpec and TokenSpeed. [[blog](https://lightseek.org/blog/eagle-4.html)]
+- [2026/10] Reflection's [Beam](https://developers.reflection.ai/deployment-overview) at day 0: 501B MoE serving in NVFP4 on NVIDIA GB200 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-reflection-beam.html)]
+- [2026/10] 🔥 [TokenSpeed MLA 2](https://github.com/lightseekorg/tokenspeed/tree/main/tokenspeed-mla#mla-2-decode-benchmarks) for [NVIDIA Vera Rubin](https://www.nvidia.com/en-us/data-center/technologies/rubin/). [[blog](https://lightseek.org/blog/tokenspeed-mla-2.html)]
+- [2026/10] 🔥 685 tokens/s per user: serving Qwen3.8-Flash-Next on NVIDIA GB300 with TokenSpeed. [[blog](https://lightseek.org/blog/tokenspeed-qwen3-8-flash-next.html)]
 - [2026/10] 🔥 Advancing Kimi K3 inference on AMD Instinct MI355X GPUs with TokenSpeed. [[AMD blog](https://www.amd.com/en/developer/resources/technical-articles/2026/kimi-k3-on-amd-instinct-gpus-with-tokenspeed.html)]
 - [2026/09] Kimi K3 Optimization on GB300 — Part I. [[blog](https://lightseek.org/blog/kimi-k3-optimization-gb300-part-i.html)]
 - [2026/08] [Qwen3.8 Flash Next](https://developer.nvidia.com/blog/experiment-with-qwen3-8-flash-next-176b-model-on-nvidia-gb300-nvl72-for-agentic-coding/) at Day 0 and [GLM 5.3 Flash](https://huggingface.co/zai-org/GLM-5.3-Flash#serve-glm-53-flash-locally) at Day 0.
@@ -36,11 +40,12 @@ More importantly, TokenSpeed is the **Switzerland** of open-source LLM inference
 - [2026/07] [TML Inkling](https://thinkingmachines.ai/news/introducing-inkling/) at Day 0: FP4 Inference on NVIDIA and [AMD](https://huggingface.co/lightseekorg/Inkling-MXFP4) with [TokenSpeed](https://thinkingmachines.ai/news/introducing-inkling/#inkling-availability). [[blog](https://lightseek.org/blog/tokenspeed-inkling.html)]
 - [2026/06] Deep dive into the design and optimization of TokenSpeed-Kernel. [[PyTorch blog](https://pytorch.org/blog/lightseek-tokenspeed-kernel/)]
 - [2026/05] 🚀 TokenSpeed hits 580 TPS on Qwen3.5-397B-A17B for agentic workloads. [[PyTorch blog](https://pytorch.org/blog/up-to-580tps-new-speed-record-of-qwen3-5-397b-a17b-on-gpu-for-agentic-workloads-with-tokenspeed/)]
+- [2026/05] 🚀 TokenSpeed is a **brand new** inference engine purpose-built for speed-of-light agentic workloads. [[NVIDIA AI X](https://x.com/NVIDIAAI/status/2052061195381911806)]
 - [2026/05] TokenSpeed announced — a speed-of-light LLM inference engine for agentic workloads. [[blog](https://lightseek.org/blog/lightseek-tokenspeed.html)]
 
 ## Blogs and talks
 
-For technical blogs, conference talks, and engineering articles from LightSeek Foundation, visit the [LightSeek Blog](https://lightseek.org/blog/).
+For technical blogs, conference talks, and engineering articles from the LightSeek Foundation, visit the [LightSeek Blog](https://lightseek.org/blog/).
 
 ## Sponsors and partners
 

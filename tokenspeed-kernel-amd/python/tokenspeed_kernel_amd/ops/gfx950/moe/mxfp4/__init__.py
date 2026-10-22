@@ -32,40 +32,8 @@ quantization, and the model-facing dispatch policy). See ``README.md`` for
 how the staged files here and ``fused/`` relate.
 """
 
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage1 import (
-    invoke_stage1_mxfp4_mfma_decode_gluon,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_stage2 import (
-    invoke_stage2_mxfp4_mfma_decode_gluon,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.latent_shared_decode import (
-    gluon_latent_expert_shared_decode_gfx950,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage1 import (
-    invoke_gluon_mxfp4_moe_stage1,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_stage2 import (
-    invoke_gluon_mxfp4_moe_stage2_1x2,
-)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.preprocess import (
     attach_prefill_aliases,
 )
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.routing import (
-    invoke_sigmoid_bias_topk_route_gluon,
-    invoke_softmax_topk_route_gluon,
-)
-from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale import (
-    gather_package_cdna4_scale,
-)
 
-__all__ = [
-    "attach_prefill_aliases",
-    "gather_package_cdna4_scale",
-    "gluon_latent_expert_shared_decode_gfx950",
-    "invoke_gluon_mxfp4_moe_stage1",
-    "invoke_gluon_mxfp4_moe_stage2_1x2",
-    "invoke_sigmoid_bias_topk_route_gluon",
-    "invoke_softmax_topk_route_gluon",
-    "invoke_stage1_mxfp4_mfma_decode_gluon",
-    "invoke_stage2_mxfp4_mfma_decode_gluon",
-]
+__all__ = ["attach_prefill_aliases"]

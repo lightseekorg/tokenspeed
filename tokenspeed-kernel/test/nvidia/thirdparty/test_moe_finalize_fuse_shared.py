@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel.numerics.torch.moe import torch_moe_finalize
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
 from tokenspeed_kernel.ops.moe import moe_process_weights as kernel_moe_process_weights
@@ -49,22 +50,6 @@ def _make_inputs(num_tokens, hidden, top_k, num_experts, ew_dtype, num_shared):
     return gemm2_out, expanded_idx, weights
 
 
-def _reference(gemm2_out, expanded_idx, weights, shared, top_k):
-    num_tokens = weights.shape[0]
-    idx = expanded_idx.view(num_tokens, top_k).long()
-    valid = idx >= 0
-    rows = gemm2_out.float()[idx.clamp(min=0)]  # [T, K, H]
-    rows = rows * valid.unsqueeze(-1)
-    out = (rows * weights.float()[:, :top_k, None]).sum(dim=1)
-    if shared is not None:
-        if shared.dim() == 2:
-            out = out + shared.float()
-        else:
-            gammas = weights.float()[:, top_k:]  # [T, S]
-            out = out + torch.einsum("sth,ts->th", shared.float(), gammas)
-    return out.to(torch.bfloat16)
-
-
 # num_tokens 4 exercises the general kernel; 4096 the vectorized one
 # (dispatch flips at numBlocksX * numBlocksY >= 1184).
 @pytest.mark.parametrize("num_tokens", [4, 4096])
@@ -77,8 +62,10 @@ def test_finalize_verbatim_shared_add(num_tokens, ew_dtype):
     )
     shared = torch.randn(num_tokens, hidden, dtype=torch.bfloat16, device="cuda")
 
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, shared, top_k)
-    ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
+    )
+    ref = torch_moe_finalize(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -96,16 +83,35 @@ def test_finalize_weighted_shared_sink(num_tokens, ew_dtype, num_shared, top_k):
         num_shared, num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
     )
 
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, shared, top_k)
-    ref = _reference(gemm2_out, expanded_idx, weights, shared, top_k)
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, shared, top_k, hidden_dim=hidden
+    )
+    ref = torch_moe_finalize(gemm2_out, expanded_idx, weights, shared, top_k)
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
-def test_finalize_no_shared():
-    """shared_output=None still works (plain weighted finalize)."""
-    gemm2_out, expanded_idx, weights = _make_inputs(64, 512, 8, 32, torch.float32, 0)
-    out = moe_finalize_fuse_shared(gemm2_out, expanded_idx, weights, None, 8)
-    ref = _reference(gemm2_out, expanded_idx, weights, None, 8)
+@pytest.mark.parametrize(
+    ("num_tokens", "hidden", "hidden_padded"),
+    [
+        (4, 510, 544),  # Small batch: general kernel.
+        (4096, 512, 544),  # Large aligned batch: vectorized kernel.
+        (4096, 510, 544),  # Large unaligned batch: general-kernel fallback.
+    ],
+)
+@pytest.mark.parametrize("ew_dtype", [torch.float32, torch.bfloat16])
+def test_finalize_no_shared_with_padded_input(
+    num_tokens, hidden, hidden_padded, ew_dtype
+):
+    """shared_output=None trims padded expert output on every dispatch path."""
+    gemm2_out, expanded_idx, weights = _make_inputs(
+        num_tokens, hidden_padded, 8, 32, ew_dtype, 0
+    )
+    out = moe_finalize_fuse_shared(
+        gemm2_out, expanded_idx, weights, None, 8, hidden_dim=hidden
+    )
+    ref = torch_moe_finalize(gemm2_out, expanded_idx, weights, None, 8)[:, :hidden]
+    assert out.shape == (num_tokens, hidden)
+    assert out.is_contiguous()
     torch.testing.assert_close(out, ref, atol=2e-2, rtol=2e-2)
 
 
@@ -122,7 +128,7 @@ def test_routed_deferred_finalize_matches_finalized(
     """trtllm routed unquant MoE: do_finalize=False + our fused finalize must
     reproduce do_finalize=True. Also proves the deferred gemm2 rows are
     un-weighted (the finalize applies the only weighting)."""
-    from tokenspeed_kernel.ops.moe.flashinfer import trtllm_unquant
+    import tokenspeed_kernel.ops.moe.flashinfer as trtllm_unquant
 
     monkeypatch.setattr("tokenspeed_kernel.ops.moe.pdl_enabled", lambda: enable_pdl)
 
@@ -144,6 +150,7 @@ def test_routed_deferred_finalize_matches_finalized(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_unquant_routed_moe_apply"
     assert plan["supports_deferred_finalize"] is True
@@ -221,7 +228,7 @@ def test_routed_deferred_finalize_matches_finalized(
         num_shared, num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
     )
     fused = moe_finalize_fuse_shared(
-        gemm2_out, expanded_idx, full_weights, shared, top_k
+        gemm2_out, expanded_idx, full_weights, shared, top_k, hidden_dim=hidden
     )
     gammas = full_weights[:, top_k:]
     expected = finalized.float() + torch.einsum(

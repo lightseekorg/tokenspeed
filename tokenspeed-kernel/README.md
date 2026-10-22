@@ -3,13 +3,26 @@
 TokenSpeed-kernel aims to provide a collection of the best portable and
 performant kernels for multi-silicon AI inference. It features:
 
-* A clean layered API for maximal structured flexibility
-* Kernel registration and selection logic to decouple complexity and increase reuse
-* Plugin mechanism for multi-silicon extensibility
-* A minimal list of curated dependencies for fast iteration
+- A clean layered API for maximal structured flexibility
+- Kernel registration and selection logic to decouple complexity and increase reuse
+- A plugin mechanism for multi-silicon extensibility
+- A minimal list of curated dependencies for fast iteration
 
 TokenSpeed-kernel is pip-installable on its own. Others can use it
 directly.
+
+## Ascend source installation
+
+Select the NPU dependency set explicitly when installing from source:
+
+```bash
+TOKENSPEED_KERNEL_BACKEND=npu pip install --no-build-isolation ./python
+```
+
+This installs the Python registry and Ascend Triton provider and skips CUDA
+compilation. Install a compatible Torch/TorchNPU stack first. The
+`tokenspeed-kernel-npu` package and its native operator dependencies are separate
+installations.
 
 ## Nightly installation
 
@@ -36,16 +49,16 @@ Historical nightlies are retained. Automatic cleanup is deferred.
 
 TokenSpeed-kernel is designed with these functionality goals in mind:
 
-* Support various kernels in AI models (such as attention and MoE)
-* Support multiple silicon vendors and generations
-* Marry default portability and performance solutions
+- Support various kernels in AI models (such as attention and MoE)
+- Support multiple silicon vendors and generations
+- Marry default portability and performance solutions
 
 Additional goals target a better devflow for fast iteration:
 
-* Provide unified infra to verify and debug kernel numerics standalone
-* Provide unified infra to run and benchmark kernels standalone
-* Support tracing shapes and profiling workloads at runtime
-* Stay forward-looking, with guardrails for agentic devflow
+- Provide unified infra to verify and debug kernel numerics standalone
+- Provide unified infra to run and benchmark kernels standalone
+- Support tracing shapes and profiling workloads at runtime
+- Stay forward-looking, with guardrails for agentic devflow
 
 ## Overall design
 
@@ -85,6 +98,13 @@ preceding goals (still evolving; subject to change):
   priority, and returns a callable. Selection supports per-call `solution=`
   and `override=` plus config-file overrides for development.
 
+For call sites requiring batch invariance, `KernelPlan.select()` selects from declared
+capabilities at initialization using static geometry. Execution reuses that
+plan and validates its input contract without re-ranking by batch size. This
+is opt-in; ordinary auto-selection keeps its existing policy. A planned leaf
+that can be recorded into a CUDA graph also declares the `cuda_graph` feature;
+callers that plan their leaves capture only through leaves declaring it.
+
 ### Directory structure
 
 ```
@@ -92,6 +112,7 @@ tokenspeed_kernel/
   __init__.py            # Public API re-exports
   platform.py            # PlatformInfo, capability detection
   signature.py           # TensorFormat, ScaleFormat, FormatSignature
+  weights.py             # Weak storage-layout tracking and tensor replacement
   registry.py            # KernelRegistry, register_kernel, Priority bands
   selection.py           # select_kernel, oracles, overrides
   profiling.py           # ShapeCapture, kernel_scope, Proton bootstrap
@@ -104,7 +125,7 @@ tokenspeed_kernel/
     ...
 
   numerics/              # Reference impls + tolerance + comparison + CLI
-    reference/           # PyTorch ground-truth kernels
+    torch/               # PyTorch ground truth, laid out like ops/
   benchmark/             # Unified runner, throughput model, report, CLI
   plugins/               # Out-of-tree backend discovery
   thirdparty/            # Vendored / wrapped third-party kernel sources
@@ -113,10 +134,39 @@ tokenspeed_kernel/
 Each `ops/<family>/` directory groups implementations by operator variant and
 then solution. For example, attention uses `attention/<variant>/<solution>.py`
 such as `attention/mha/triton.py`. A solution is either an in-tree JIT kernel
-(Triton/Gluon/CuteDSL), or a thin wrapper around an external library.
+(Triton/Gluon/CuteDSL) or a thin wrapper around an external library.
 All of them register through the same decorator, and the same selection
 logic scores them, so adding a backend is one new file in the right family
 folder.
+
+On Ascend, `_triton.py` supplies import-only `gluon.jit` decorators so shared
+registration modules do not require the GPU Gluon package. Calling or launching
+one of these kernels raises an error. Kernel capability declarations still
+exclude Ascend from GPU implementations; CUDA and ROCm use native Gluon.
+
+### Weight preprocessing
+
+Some kernels need loaded weights converted into a representation suited to their
+computation. During model initialization, the layer chooses a compatible
+preprocessor. A shared weight broker installs the transformed weights and tracks
+their storage layout, making that representation visible to kernel selection.
+
+At execution, the registry matches the prepared weights to kernels that support
+their layout alongside the operation's other requirements. This lets preparation
+and execution remain separate while different kernels can share prepared weights.
+
+### Kernel state and graph capture
+
+Some kernels keep device state that must start at zero and that every launch
+restores to zero, such as split-K arrival counters. Such kernels take the state
+as an argument and report how much they need; the registered op gets it from
+`tokenspeed_kernel.workspace.zeroed_state`. Eager launches share one buffer per
+stream. A graph captured inside `capture_session` gets buffers of its own,
+zeroed once after capture outside the graph and kept alive as long as the
+graph, so replays carry no zeroing node. The runtime opens a session around
+every graph it captures.
+Prepared plans can use `retain_for_capture` in that session to keep their
+allocations alive until the graph owner is released.
 
 ### Solution choices
 
@@ -129,8 +179,11 @@ folder.
   for decode
 - **Vendor libraries** — wrapped (such as FlashAttention and TRT-LLM);
   no in-tree C++ build
-- **PyTorch reference** — under `numerics/reference/`; never auto-selects
-  over a real backend but always available as ground truth
+- **PyTorch reference** — under `numerics/torch/`, one module per
+  `ops/` family (`attention/<variant>.py` for attention), registered with
+  `solution="torch"`; never auto-selects over a real backend but always
+  available as ground truth. Kernel tests compare against these references
+  instead of writing their own.
 
 TokenSpeed-kernel carefully curates external dependencies and actively
 re-evaluates their inclusion to maintain minimal dependencies and enable
@@ -140,7 +193,7 @@ faster iteration.
 
 - `python -m tokenspeed_kernel.numerics` — dtype-aware tolerances, standard
   input generators, and a comparison/bisect flow that pits any registered
-  kernel against the reference impl.
+  kernel against the reference implementation.
 - `python -m tokenspeed_kernel.benchmark` — unified timing, throughput
   (FLOPs / bytes) per op family, tabular reports, and Proton integration.
 - `KernelBenchmarkHarness` — registration-level device timing through warmed

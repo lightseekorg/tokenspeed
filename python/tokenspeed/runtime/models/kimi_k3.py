@@ -89,7 +89,8 @@ from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
 )
-from tokenspeed_kernel.ops.moe.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
 from tokenspeed_kernel.ops.residual import attn_res_fwd, attn_res_fwd_available
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
@@ -398,6 +399,10 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
         self.qkv_parallel = qkv_parallel
         self.output_parallel = output_parallel
         self.use_output_gate = config.mla_use_output_gate
+        # Fused gated-layout row widths; _make_qkv_a_projection (invoked from
+        # super().__init__) fills them only for the gated layout.
+        self._qkv_a_width: int | None = None
+        self._gate_width: int | None = None
         # Without Q-LoRA the parent skips the factory that builds the gate.
         if self.use_output_gate and q_lora_rank is None:
             raise ValueError("Gated MLA requires Q-LoRA (q_lora_rank must not be None)")
@@ -738,12 +743,20 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             # Finish any O collective after QKV, without local attention work.
             if self.output_parallel is None:
                 return hidden_states
-            empty = hidden_states.new_empty((0, self.num_local_heads * self.v_head_dim))
-            return self.o_proj(empty, ctx=ctx)[0]
+            width = self.num_local_heads * self.v_head_dim
+            # Ordinary collectives require empty owners to match peers' format.
+            if self.use_output_gate and self.o_proj.supports_fp8_group128_input:
+                empty = hidden_states.new_empty((0, width), dtype=torch.float8_e4m3fn)
+                scales = hidden_states.new_empty((0, width // 128), dtype=torch.float32)
+            else:
+                empty = hidden_states.new_empty((0, width))
+                scales = None
+            return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
         fuse_value_gate = (
             gate is not None
             and ctx.num_extends == 0
             and ctx.attn_backend.supports_mla_projected_value_decode
+            and not self.o_proj.supports_fp8_group128_input
         )
         expanded = self._prefill_prologue_before_break(positions, q, latent_cache, ctx)
         attn_output = self._attn(
@@ -756,8 +769,15 @@ class KimiLinearMLAAttention(DeepseekV3AttentionMLA):
             absorbed_query=absorbed_query,
         )
         if gate is not None and not fuse_value_gate:
-            # Fused in-place fp32 sigmoid+mul; the gate shard matches the
-            # head-sharded attn_output.
+            if self.o_proj.supports_fp8_group128_input:
+                values, scales = quantize_fp8_with_gate(
+                    attn_output,
+                    gate,
+                    norm_weight=None,
+                    eps=0.0,
+                    enable_pdl=pdl_enabled(),
+                )
+                return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
             attn_output = sigmoid_mul(attn_output, gate)
         if projection_out is not None:
             # K3AttnComm supplies this only for the unbiased BF16 TP shard.
@@ -1532,7 +1552,14 @@ class KimiLinearKDA(nn.Module):
             # Empty owners participate in QKV above and O below, but own no
             # convolution, recurrent-state update, gate or norm work.
             if self.output_parallel is not None:
-                return self.o_proj(h.new_empty((0, hn * hd)), ctx=ctx)[0]
+                # Match the prequantized format used by token-bearing owners.
+                if self.o_proj.supports_fp8_group128_input:
+                    empty = h.new_empty((0, hn * hd), dtype=torch.float8_e4m3fn)
+                    scales = h.new_empty((0, hn * hd // 128), dtype=torch.float32)
+                else:
+                    empty = h.new_empty((0, hn * hd))
+                    scales = None
+                return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
             return h
         # Prefill consumes compact QKV; perform this copy in the captured
         # projection segment rather than inside the eager attention break.
@@ -1542,7 +1569,6 @@ class KimiLinearKDA(nn.Module):
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
         conv_weights = self.conv_weights
-        fuse_decode_output_norm = ctx.forward_mode.is_decode() and num_tokens == ctx.bs
 
         core_out = ctx.attn_backend.forward(
             q=None,
@@ -1567,26 +1593,29 @@ class KimiLinearKDA(nn.Module):
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             lower_bound=self.gate_lower_bound,
-            output_gate=out_gate if fuse_decode_output_norm else None,
-            norm_weight=self.o_norm.weight if fuse_decode_output_norm else None,
-            norm_eps=self.o_norm.variance_epsilon if fuse_decode_output_norm else None,
             layer_id=self.layer_id,
             seq_len=num_tokens,
         )
 
         core_out = core_out.reshape(num_tokens, hn * hd)
-        if not fuse_decode_output_norm:
-            # Decode kernels may fuse this epilogue; prefill retains the shared
-            # per-head norm implementation.
-            core_out = rmsnorm_gated_sigmoid(
-                core_out.contiguous(),
+        if self.o_proj.supports_fp8_group128_input:
+            values, scales = quantize_fp8_with_gate(
+                core_out,
                 out_gate,
-                self.o_norm.weight,
-                self.o_norm.variance_epsilon,
-                hn,
-                hd,
+                norm_weight=self.o_norm.weight,
+                eps=self.o_norm.variance_epsilon,
                 enable_pdl=pdl_enabled(),
             )
+            return self.o_proj(values, scale=scales, ctx=ctx, out=projection_out)[0]
+        core_out = rmsnorm_gated_sigmoid(
+            core_out.contiguous(),
+            out_gate,
+            self.o_norm.weight,
+            self.o_norm.variance_epsilon,
+            hn,
+            hd,
+            enable_pdl=pdl_enabled(),
+        )
         if projection_out is not None:
             return mm(core_out, self.o_proj.weight, bias=None, out=projection_out)
         output, _ = self.o_proj(core_out, ctx=ctx)
@@ -1909,7 +1938,7 @@ class KimiLinearMoE(nn.Module):
             if moe_backend.is_gluon_petit()
             else All2AllBackend.NONE
         )
-        if self.execution_plan.use_mega_moe and (
+        if self.execution_plan.owns_ep_communication and (
             mapping.attn.dp_size <= 1 or all2all_backend is not fused_all2all_backend
         ):
             raise ValueError(
@@ -1936,7 +1965,11 @@ class KimiLinearMoE(nn.Module):
         # AUTO intentionally requests the flashinfer-backed SiTU plan when it was
         # registered at import time; AUTO cannot override MoELayer per model.
         plan = self.execution_plan
-        if not plan.use_mega_moe and not plan.use_native and not plan.use_marlin:
+        if (
+            not plan.owns_ep_communication
+            and not plan.use_native
+            and not plan.use_marlin
+        ):
             if not plan.use_trtllm:
                 raise RuntimeError(
                     "Kimi-K3 MXFP4 SiTU MoE requires the native, FlashInfer "
@@ -1999,7 +2032,7 @@ class KimiLinearMoE(nn.Module):
                 )
             expected_a2a = (
                 fused_all2all_backend.value
-                if self.execution_plan.use_mega_moe
+                if self.execution_plan.owns_ep_communication
                 else "none"
             )
             if self.experts.plan.get("a2a_backend") not in (None, expected_a2a):
@@ -2029,7 +2062,7 @@ class KimiLinearMoE(nn.Module):
             # without a cast. This setting is unused by kernel-routing plans.
             topk_weights_dtype=(
                 torch.bfloat16
-                if plan.use_trtllm or plan.use_mega_moe
+                if plan.use_trtllm or plan.owns_ep_communication
                 else torch.float32
             ),
         )
@@ -2054,6 +2087,7 @@ class KimiLinearMoE(nn.Module):
                 model_scope=model_scope,
                 # The gate itself, so mailbox and gather meet by construction.
                 max_m=DOWN_MAILBOX_MAX_TOKENS,
+                publish_gemm=None,
             )
             # The mailbox and both producers are bf16; another activation dtype
             # keeps the replica rather than failing at the first forward.
@@ -2133,7 +2167,7 @@ class KimiLinearMoE(nn.Module):
 
         if mapping.attn.dp_size > 1:
             self.moe_alltoall = None
-            if self.execution_plan.use_mega_moe:
+            if self.execution_plan.owns_ep_communication:
                 if layer_index == config.first_k_dense_replace:
                     logger.info(
                         f"K3 routed MoE: {moe_backend.value} SiTU MegaMoE (EP={mapping.moe.ep_size})",
@@ -2308,7 +2342,10 @@ class KimiLinearMoE(nn.Module):
         """Run the selected SiTU MoE (kernel-routing or precomputed-TopK)."""
         plan = self.execution_plan
         if not (
-            plan.use_mega_moe or plan.use_native or plan.use_trtllm or plan.use_marlin
+            plan.owns_ep_communication
+            or plan.use_native
+            or plan.use_trtllm
+            or plan.use_marlin
         ):
             raise RuntimeError(
                 "Kimi-K3 has no portable SiTU Triton fallback; use the native, "
@@ -2554,6 +2591,18 @@ class KimiLinearMoE(nn.Module):
         if max_tokens == 0:
             return prefix_sum
 
+        quant_out = None
+        routing_out = None
+        if self.execution_plan.use_mega_moe:
+            from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe import runner
+
+            moe_runner = runner.get_runner(self.experts.plan, self.experts)
+            activation, scales, ids, weights = moe_runner.input_buffers(
+                num_tokens, max_tokens
+            )
+            quant_out = (activation, scales)
+            routing_out = (weights, ids)
+
         shared_communication = None
         if self.shared_experts.shared_parallel is not None:
             shared_communication = self.shared_experts.shared_communication
@@ -2584,22 +2633,26 @@ class KimiLinearMoE(nn.Module):
                     output_format=TopKOutputFormat.STANDARD,
                     num_token_non_padded=None,
                     expert_location_dispatch_info=None,
+                    out=routing_out,
                 )
                 routed_input, _ = self.routed_expert_down_proj(hidden_states)
                 topk_ids = topk.topk_ids
                 topk_weights = topk.topk_weights
             else:
                 routed_input = hidden_states.new_empty((0, self.routed_hidden))
-                topk_ids = torch.empty(
-                    (0, self.top_k),
-                    dtype=self.topk.topk_config.topk_indices_dtype,
-                    device=hidden_states.device,
-                )
-                topk_weights = torch.empty(
-                    (0, self.top_k),
-                    dtype=self.topk.topk_config.topk_weights_dtype,
-                    device=hidden_states.device,
-                )
+                if routing_out is not None:
+                    topk_weights, topk_ids = routing_out
+                else:
+                    topk_ids = torch.empty(
+                        (0, self.top_k),
+                        dtype=self.topk.topk_config.topk_indices_dtype,
+                        device=hidden_states.device,
+                    )
+                    topk_weights = torch.empty(
+                        (0, self.top_k),
+                        dtype=self.topk.topk_config.topk_weights_dtype,
+                        device=hidden_states.device,
+                    )
 
             if self.experts.plan["weight_dtype"] == "nvfp4":
                 if num_tokens > 0:
@@ -2608,15 +2661,20 @@ class KimiLinearMoE(nn.Module):
                         self.experts.w13_input_scale_quant,
                         is_sf_swizzled_layout=False,
                         enable_pdl=pdl_enabled(),
+                        out=quant_out,
                     )
                 else:
                     routed_input = (
-                        hidden_states.new_empty(
-                            (0, self.routed_hidden // 2), dtype=torch.uint8
-                        ),
-                        hidden_states.new_empty(
-                            (0, self.routed_hidden // 16), dtype=torch.uint8
-                        ),
+                        quant_out
+                        if quant_out is not None
+                        else (
+                            hidden_states.new_empty(
+                                (0, self.routed_hidden // 2), dtype=torch.uint8
+                            ),
+                            hidden_states.new_empty(
+                                (0, self.routed_hidden // 16), dtype=torch.uint8
+                            ),
+                        )
                     )
 
             if shared_communication is not None:
@@ -2624,7 +2682,7 @@ class KimiLinearMoE(nn.Module):
                 # the all-gather fallback and ranks with no local tokens.
                 fork.join_checkpoint()
 
-            if self.execution_plan.use_mega_moe:
+            if self.execution_plan.owns_ep_communication:
                 pass
             elif self.moe_alltoall is not None:
                 routed_input, topk_ids, topk_weights, combine_offset = (
@@ -2663,7 +2721,7 @@ class KimiLinearMoE(nn.Module):
                     shared_output = shared_communication.reduce_outputs(
                         shared_output, num_tokens
                     )
-                if self.execution_plan.use_mega_moe:
+                if self.execution_plan.owns_ep_communication:
                     # MegaMoE owns dispatch/combine inside the expert call;
                     # its communication cannot overlap the shared collective.
                     fork.join()
@@ -2687,7 +2745,7 @@ class KimiLinearMoE(nn.Module):
                 # concurrently: combine starts only after shared RS completes.
                 fork.join()
 
-            if self.execution_plan.use_mega_moe:
+            if self.execution_plan.owns_ep_communication:
                 pass
             elif self.moe_alltoall is not None:
                 routed_output = self.moe_alltoall.combine(
@@ -3499,6 +3557,9 @@ class KimiLinearModel(nn.Module):
         shared_parallel = validate_shared_expert_settings(mapping, shared_size)
         if shared_parallel is not None:
             initialize_shared_expert_group(shared_parallel)
+            logger.info(
+                f"K3 shared-expert TP enabled: tp_size={shared_parallel.tp_size}, num_groups={shared_parallel.dp_size}"
+            )
 
         qkv_parallel, output_parallel = validate_projection_settings(
             mapping,
