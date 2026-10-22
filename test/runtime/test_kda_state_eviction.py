@@ -23,7 +23,7 @@
 The small three-group pool and KDA kernels come from the existing numerical
 harness. Every block id and prefix hit comes from the real C++ scheduler
 through the runtime contract bridge: a state group's row is its two slots, an
-interior chunk end's block is recycled once the next chunk has consumed it,
+complete-page chunk ends become reusable checkpoints that can later be evicted,
 and the prompt-end checkpoint is the one a later prompt resumes from. This is
 not a model or MLA numerical test: history blocks participate in scheduling
 and matching, while the GPU computations exercise convolution and recurrent
@@ -296,8 +296,8 @@ class _ScheduledKDA:
                 previous = self.previous_tables.get(group, [])
                 # Each chunk reads the previous chunk's block from slot 0 and
                 # writes a fresh slot 1; the block that left the row was the
-                # zeroed block the first chunk read or an interior chunk end
-                # nobody published.
+                # zeroed block the first chunk read or an older checkpoint.
+                # The cache can retain the latter after the request releases it.
                 self.released[group] |= set(previous) - set(row) - {0}
                 if state_block in self.released[group]:
                     self.reused_outputs[group].add(state_block)
@@ -350,7 +350,7 @@ def _assert_steps_match(actual: _Step, reference: _Step):
 
 @requires_cuda
 @requires_fla
-def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
+def test_scheduler_recycles_cached_state_without_changing_kda_or_resume():
     """Recycled scheduler blocks cannot change continuation or cached-prefix state."""
     active = _ScheduledKDA(seed=91)
     source_tokens = list(range(_PROMPT_TOKENS + 5))
@@ -360,31 +360,25 @@ def test_scheduler_recycles_unpublished_state_without_changing_kda_or_resume():
     reference = _NumericalReference(active.kernel, source_streams)
     active.submit("source", source_tokens, _PROMPT_TOKENS)
 
-    steps = 0
+    previous_tables = None
     while active.computed["source"] < _PROMPT_TOKENS:
+        previous_state = (
+            active.snapshot(previous_tables, STATE_LIVE_SLOT)
+            if previous_tables is not None
+            else None
+        )
         actual = active.step("source", source_streams)
         _assert_steps_match(actual, reference.step(actual.begin, actual.end))
-        steps += 1
-        assert active.scheduler.empty_lcm_blocks() > 0
-        if steps == 3:
-            # Packing is one block per parent. An interior chunk end is not a
-            # publication point, so the zeroed block the first chunk read and
-            # the first chunk's own block are back in the pool once the chunk
-            # after each has read what it needed.
-            materialized = sum(
-                block > 0
-                for rows in actual.tables.values()
-                for row in rows
-                for block in row
-            )
-            assert active.scheduler.empty_lcm_blocks() == (
-                _USABLE_BLOCKS - materialized
-            )
-            assert all(len(active.released[group]) == 2 for group in KIMI_STATE_GROUPS)
+        if previous_state is not None:
+            # The next forward reads this checkpoint. Even under allocation
+            # pressure, only older, unreferenced cache entries may be recycled.
+            for key, value in active.snapshot(previous_tables, STATE_LIVE_SLOT).items():
+                assert torch.equal(value, previous_state[key])
+        previous_tables = actual.tables
 
     # The released parents cycle through the allocator and become real GPU
-    # output destinations again. Unpublished working state returns directly
-    # to the pool, keeping the entire prefill below capacity.
+    # output destinations again after older checkpoints are evicted, keeping
+    # the entire prefill below capacity without rewriting a live input.
     assert all(active.reused_outputs[group] for group in KIMI_STATE_GROUPS)
 
     # The prompt-end state is the live block of the final chunk; the first

@@ -84,17 +84,33 @@ arithmetic kept out of the planner: how a chunk is cut lives in
 entry both prefill paths call), what each group demands for it in
 `scheduler/operations/group_demands.h`.
 
-**Junction cut.** A chunk is never shortened to a page boundary: a prompt
-end publishes its partial page as a tail (§1.2), so a chunk ending mid-page
-costs nothing. The one cut is the *junction* of a hybrid hit: when the KV
+**Reusable state checkpoints.** With prefix caching and State groups, an
+intermediate prefill chunk ends on a complete prefix page when the budget
+reaches one. The last complete page before the final prompt token is also a
+chunk boundary, even for a page-aligned prompt. Admission must recompute the
+last token for logits, so an identical prompt cannot use its exact prompt-end
+state. A subsequent chat turn can also retokenize the generation-prefix tail.
+Keeping an earlier checkpoint prevents either case from discarding an
+otherwise cached prompt. Every such complete-page
+chunk publishes all State groups together with its KV (§1.2). A sub-page
+budget still advances without publishing a checkpoint. Bounded replay keeps
+its entire final window together, so the last checkpoint precedes that window
+instead. Models without State groups, and requests with prefix caching off,
+keep their ordinary budget-sized chunks. This may add one final tail forward;
+the tradeoff is reusable state without extra backend-private buffers or
+interior kernel snapshots.
+
+**Junction cut.** A prompt end still publishes its partial page as a tail
+(§1.2). The *junction* of a hybrid hit is another chunk boundary: when the KV
 groups' hit `T` reaches past the longest state checkpoint `T_s`
 (`AdmissionResult::junction_tokens`, kept in `CacheProgress::junction_tokens`
 until a chunk passes it), the first chunk after `T_s` ends exactly at `T`, so
 the natural checkpoint it leaves coincides with KV already cached and the next
 prompt sharing that prefix resumes at `T` in every group. A chunk that ends at
 the junction publishes like a prompt end (`PublicationPoint::kOwnerContinues`:
-KV tail and state) and moves off the published blocks; every other chunk end
-publishes only its completed full pages. The move-off needs fresh blocks the
+KV tail and state) and moves off the published blocks. Other chunk ends
+publish their completed full pages and, at complete-page boundaries, State
+checkpoints. The move-off needs fresh blocks the
 completing chunk did not reserve, so it is best effort: when the pool cannot
 fund the copies the admission replans without the tail and the owner keeps
 its partial block private, publishing nothing at that point beyond its full
@@ -218,10 +234,11 @@ admission states what the pair does through the group's `StateStep`
 **Natural checkpoints.** A state is published only at a point where its owner
 stops writing it — the same `PublicationPoint` that publishes the KV tail
 (§1): a fused prompt end (the first decode's admission publishes slot 1 under
-the prompt's key before rotating it into slot 0), a chunk end that falls on a
-junction (§1), and a finish or retraction on every role (`kFinal`: the P's
-transferred prompt, the D's and the fused engine's last decoded state). An
-ordinary chunk end or decode step publishes nothing for a State group
+the prompt's key before rotating it into slot 0), a complete-page prefill
+chunk end or an exact junction (§1), and a finish or retraction on every role
+(`kFinal`: the P's transferred prompt, the D's and the fused engine's last
+decoded state). An unaligned chunk end that is not a junction, or a later
+decode step, publishes nothing for a State group
 (`CompletedPages::publish_state` is false). The key is the key of the exact
 token count `T`: the chain hash of the last page when `T` is a page multiple,
 otherwise the tail hash `hash@T` the KV groups use — so one key names a
@@ -268,9 +285,10 @@ claimed cache block (a Host checkpoint is loaded into a fresh slot 0 like any
 Host hit). When the KV groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. No alignment is
-ever imposed on a chunk for the state's sake, and no checkpoint is produced
-inside a forward: a chunk's state output is its own natural checkpoint.
+shares the prefix resumes at the KV boundary in every group. The complete-page
+prefill boundaries above also leave checkpoints before a changed prompt tail
+and at earlier branches. No checkpoint is produced inside a forward: a
+chunk's state output is its own natural checkpoint.
 `CacheProgress::junction_tokens` is the only progress a State group adds to
 the request; the backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).

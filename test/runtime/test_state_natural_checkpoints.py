@@ -80,16 +80,22 @@ def _state_row(batch) -> list[int]:
 @pytest.mark.parametrize("disable_prefix_cache", [False, True])
 @pytest.mark.parametrize("with_state", [False, True])
 @pytest.mark.parametrize(
-    "token_budget, lengths", [(1024, [868]), (768, [768, 100]), (300, [300, 300, 268])]
+    "token_budget, lengths, checkpoint_lengths",
+    [
+        (1024, [868], [768, 100]),
+        (768, [768, 100], [768, 100]),
+        (300, [300, 300, 268], [256, 256, 256, 100]),
+    ],
 )
-def test_chunks_follow_the_budget_alone(
+def test_chunks_follow_the_budget_and_reusable_state_boundaries(
     disable_prefix_cache: bool,
     with_state: bool,
     token_budget: int,
     lengths: list[int],
+    checkpoint_lengths: list[int],
 ) -> None:
-    """A state group does not shape the prefill chunk: chunks end where the
-    token budget says, on a page boundary or not, and decode follows."""
+    """Cached State groups retain page checkpoints before the prompt tail;
+    history-only models and disabled caches keep budget-sized chunks."""
     scheduler = _scheduler(
         token_budget=token_budget,
         with_state=with_state,
@@ -102,7 +108,10 @@ def test_chunks_follow_the_budget_alone(
     scheduler.submit_requests([request])
 
     before = 0
-    for length in lengths:
+    expected = (
+        checkpoint_lengths if with_state and not disable_prefix_cache else lengths
+    )
+    for length in expected:
         plan = scheduler.next_execution_plan()
         forwards = [op for op in plan.forward if op.request_ids]
         assert len(forwards) == 1
@@ -148,11 +157,12 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
     scheduler.submit_requests([request])
 
     rows = []
-    for computed in (300, 600, 700):
+    boundaries = (300, 600, 700) if disable_prefix_cache else (256, 512, 640, 700)
+    for computed in boundaries:
         plan = scheduler.next_execution_plan()
         (batch,) = [op for op in plan.forward if op.request_ids]
         rows.append(_state_row(batch))
-        if computed == 300:
+        if computed == boundaries[0]:
             assert all(block in plan.pages_to_zero["state"] for block in rows[0])
         result = ts.ForwardEvent.ExtendResult()
         result.request_id = "r"
@@ -160,18 +170,20 @@ def test_state_rows_rotate_between_chunks_and_into_the_first_decode(
         event = ts.ExecutionEvent()
         event.add_event(result)
         scheduler.advance(event)
-    first, second, third = rows
+    first = rows[0]
     assert first[0] > 0 and first[1] > 0 and first[0] != first[1]
-    assert second[0] == first[1] and second[1] > 0 and second[1] != second[0]
-    assert third[0] == second[1] and third[1] > 0 and third[1] != third[0]
+    for previous, current in zip(rows, rows[1:], strict=False):
+        assert current[0] == previous[1]
+        assert current[1] > 0 and current[1] != current[0]
+    last = rows[-1]
 
     plan = scheduler.next_execution_plan()
     (decode,) = [op for op in plan.forward if op.request_ids]
     decode_row = _state_row(decode)
     if disable_prefix_cache:
-        assert decode_row == [0, third[1]]
+        assert decode_row == [0, last[1]]
     else:
-        assert decode_row[0] == third[1] and decode_row[1] > 0
+        assert decode_row[0] == last[1] and decode_row[1] > 0
         assert decode_row[1] != decode_row[0]
     # A state block is never copied; the prompt-end copy-in is the KV page's.
     assert plan.pages_to_copy_arrays()["state"].shape == (0, 2)

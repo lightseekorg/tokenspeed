@@ -281,25 +281,34 @@ def test_cold_reader_restores_actual_published_unaligned_checkpoint(
     query = submit(writer, tokens=list(range(5)))
     plan = read(writer, query, [0] * len(query.keys))
     assert list(plan.forward[0].extend_prefix_lens) == [0]
+    remote = set()
+
+    def backup(current):
+        for op in current.cache:
+            if isinstance(op, ts.Cache.WriteBackOp):
+                for op_id in op.op_ids:
+                    ack = ts.Cache.WriteBackDoneEvent()
+                    ack.op_id = op_id
+                    event(writer, ack)
+        for op in storage_ops(current):
+            if op.kind == ts.StorageKind.Put:
+                remote.update(tuple(key) for key in op.keys)
+                done(writer, op, [1] * len(op.keys), retired=True)
+
+    # State groups can publish a complete-page checkpoint before the final
+    # unaligned chunk; acknowledge its transfers as well as the final tail's.
+    while plan.forward[0].extend_prefix_lens[0] + plan.forward[0].input_lengths[0] < 5:
+        _advance(writer, "r", [])
+        plan = writer.next_execution_plan()
+        backup(plan)
     _advance(writer, "r", [77])
     _finish(writer, "r")
     plan = writer.next_execution_plan()
     writes = [op for op in plan.cache if isinstance(op, ts.Cache.WriteBackOp)]
     assert writes
-    for op in writes:
-        for op_id in op.op_ids:
-            ack = ts.Cache.WriteBackDoneEvent()
-            ack.op_id = op_id
-            event(writer, ack)
-    puts = [
-        op
-        for op in storage_ops(writer.next_execution_plan())
-        if op.kind == ts.StorageKind.Put
-    ]
-    remote = {tuple(key) for op in puts for key in op.keys}
+    backup(plan)
+    backup(writer.next_execution_plan())
     assert remote
-    for op in puts:
-        done(writer, op, [1] * len(op.keys), retired=True)
 
     # A separate scheduler has no local TailTable or Host/Device cache state.
     reader = start(config(groups=groups))
@@ -318,5 +327,6 @@ def test_cold_reader_restores_actual_published_unaligned_checkpoint(
     assert reader.host_pool_cached_blocks() == 0
     plan = acknowledge_get(reader, plan)
     assert list(plan.forward[0].extend_prefix_lens) == [5]
-    assert list(plan.forward[0].input_lengths) == [suffix_tokens]
+    expected = 3 if "state" in kinds and suffix_tokens == 4 else suffix_tokens
+    assert list(plan.forward[0].input_lengths) == [expected]
     assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)

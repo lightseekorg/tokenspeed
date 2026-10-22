@@ -77,6 +77,27 @@ def _find_forward_op(plan):
     return None
 
 
+def _final_prefill_plan(scheduler, request_id: str):
+    """Complete local intermediate chunks without sampling a token.
+
+    Transfer-aware tests drive their own plans so every cache operation is
+    acknowledged; this helper is for schedulers without a Host tier.
+    """
+    for _ in range(4096):
+        plan = scheduler.next_execution_plan()
+        batch = _find_forward_op(plan)
+        assert batch is not None
+        row = list(batch.request_ids).index(request_id)
+        assert row < batch.num_extends()
+        if (
+            batch.extend_prefix_lens[row] + batch.input_lengths[row]
+            == batch.prefill_lengths[row]
+        ):
+            return plan
+        _advance(scheduler, request_id, [])
+    raise AssertionError(f"prefill did not complete for {request_id}")
+
+
 def _positive(row) -> list[int]:
     return [page for page in row if page > 0]
 

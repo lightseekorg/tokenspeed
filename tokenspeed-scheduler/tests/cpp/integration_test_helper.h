@@ -39,6 +39,8 @@
 
 namespace tokenspeed::test {
 
+inline const ForwardBatch* FindForwardBatch(const ExecutionPlan& plan);
+
 // Retraction capacity for a test config that does not exercise image-fit
 // refusals: a snapshot pool as large as the Device pool and one blob slot per
 // request slot on the retracting roles, so any resident request can be
@@ -95,6 +97,32 @@ protected:
     void Submit(const std::vector<RequestSpec>& specs) { scheduler_->SubmitRequests(specs); }
 
     ExecutionPlan PlanOnce() { return scheduler_->NextExecutionPlan(); }
+
+    // Drive intermediate chunks without sampling, leaving the final prefill
+    // forward in flight for the caller to inspect and complete.
+    ExecutionPlan PlanFinalPrefill(const std::string& id) {
+        for (int step = 0; step < 4096; ++step) {
+            ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            if (batch == nullptr) {
+                ADD_FAILURE() << "no prefill batch for " << id;
+                return plan;
+            }
+            const auto it = std::ranges::find(batch->request_ids, id);
+            const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+            if (row >= batch->NumExtends()) {
+                ADD_FAILURE() << "no prefill row for " << id;
+                return plan;
+            }
+            if (batch->extend_prefix_lens[row] + batch->input_lengths[row] == batch->prefill_lengths[row]) {
+                return plan;
+            }
+            AckWriteBacks(plan);
+            SendForwardDone(id);
+        }
+        ADD_FAILURE() << "prefill did not finish for " << id;
+        return {};
+    }
 
     static std::vector<CacheOperation> ExtractCacheOps(const ExecutionPlan& plan) {
         std::vector<CacheOperation> result;

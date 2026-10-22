@@ -38,7 +38,8 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 }
 
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
-                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens) {
+                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
+                                bool enable_prefix_cache) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     // The re-fed window of a hit rides in the same forward, so it comes out of
     // the budget before any new token; with nothing left the request waits.
@@ -52,15 +53,30 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
         prefill_tokens = std::min(prefill_tokens, junction_tokens - first_pos);
     }
     const std::int32_t window = coordinator.ReplayWindowTokens();
-    const std::int32_t kept = ChunkKeepingFinalWindow(prefill_tokens, unscheduled, window);
-    if (kept > 0 || prefill_tokens == plain) {
-        return kept;
+    const bool cache_state = enable_prefix_cache && coordinator.HasStateGroups();
+    const std::int32_t grain = coordinator.PrefixGranularity();
+    if (cache_state) {
+        // A later turn can retokenize the generation-prefix tail. Keep a
+        // checkpoint before that tail, even when the prompt ends on a page.
+        // Bounded replay must still carry its entire final window together.
+        const std::int32_t checkpoint = std::max(0, first_pos + unscheduled - std::max(1, window)) / grain * grain;
+        if (checkpoint > first_pos) {
+            prefill_tokens = std::min(prefill_tokens, checkpoint - first_pos);
+        }
     }
-    // The junction lies inside the prompt's final window, where no chunk end
-    // satisfies both rules and the request would wait forever. The junction
-    // is a reuse opportunity, not an invariant: pass it and size the chunk
-    // from the plain budget under the window rule alone.
-    return ChunkKeepingFinalWindow(plain, unscheduled, window);
+    std::int32_t kept = ChunkKeepingFinalWindow(prefill_tokens, unscheduled, window);
+    if (kept == 0 && prefill_tokens != plain) {
+        // A junction inside the final replay window yields to that window;
+        // waiting for a boundary satisfying both rules would never progress.
+        kept = ChunkKeepingFinalWindow(plain, unscheduled, window);
+    }
+    if (cache_state && kept > 0 && kept < unscheduled && first_pos + kept != junction_tokens) {
+        const std::int32_t aligned_end = (first_pos + kept) / grain * grain;
+        if (aligned_end > first_pos) {
+            kept = aligned_end - first_pos;
+        }
+    }
+    return kept;
 }
 
 std::int32_t MinPrefillChunkTokens(const CacheCoordinator& coordinator) {

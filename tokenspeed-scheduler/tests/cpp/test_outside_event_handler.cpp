@@ -147,8 +147,8 @@ protected:
 
 TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesAndTheFinalKdaStates) {
     Submit(MakeRequestSpec("r0", /*num_pages=*/2, /*start=*/1));
-    const ExecutionPlan prefill = PlanOnce();
-    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(prefill).empty());
+    const ExecutionPlan prefill = PlanFinalPrefill("r0");
+    AckWriteBacks(prefill);
     SendForwardDone("r0", {42});
 
     const ExecutionPlan after_prefill = PlanOnce();
@@ -156,10 +156,10 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesAndTheFinal
     ASSERT_EQ(prefill_stores.size(), 1u);
     const auto& prefill_write_back = std::get<WriteBackBatch>(prefill_stores.front());
     ASSERT_EQ(prefill_write_back.group_ids.size(), 1u);
-    EXPECT_EQ(prefill_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0, 1, 2, 3}))
-        << "the prompt end streams every MLA page plus the prompt-end state of each of three KDA groups";
+    EXPECT_EQ(prefill_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 1, 2, 3}))
+        << "the prompt end streams its remaining MLA page and each KDA state; the earlier checkpoint is cached";
     SendWriteBackDone(prefill_write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 5);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
 
     SendForwardDone("r0", {43});
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
@@ -175,7 +175,7 @@ TEST_F(FinishOnlyHybridWriteBackTestSuite, FinishStoresDecodeMlaPagesAndTheFinal
     EXPECT_EQ(finish_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0, 1, 2, 3}))
         << "finish writes the decode MLA page, the MLA tail and each KDA group's final state";
     SendWriteBackDone(finish_write_back.op_ids.front());
-    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 10);
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 13);
 }
 
 class LoadBackDoneTestSuite : public SchedulerTestSuite {

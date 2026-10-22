@@ -85,6 +85,10 @@ public:
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
     bool GroupIsState(std::size_t i) const;
+    bool HasStateGroups() const {
+        return std::ranges::any_of(groups_,
+                                   [](const CacheGroup& group) { return group.Spec().attn_kind == AttnKind::kState; });
+    }
     // Group blocks one boundary's content hash expands to: the blocks of a
     // prefix page for a History group, one state for a State group.
     std::int32_t BlocksPerBoundary(std::int32_t i) const;

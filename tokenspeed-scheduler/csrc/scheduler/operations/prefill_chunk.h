@@ -27,8 +27,9 @@
 namespace tokenspeed {
 
 // How a local prefill chunk is cut. A chunk is min(budget, unscheduled)
-// shaped by what the cache groups need: a junction cut when a hit's KV
-// coverage reached further than its state checkpoint; for replayable groups
+// shaped by what the cache groups need: reusable State checkpoints before
+// the prompt tail, and a junction cut when a hit's KV coverage reached further
+// than its state checkpoint; for replayable groups
 // the re-fed window is debited from a hit chunk's budget and a prompt's final
 // chunk is never shorter than the window (ChunkKeepingFinalWindow). Every
 // function here is pure token arithmetic on the coordinator's facts; the
@@ -52,9 +53,14 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 // (CacheCoordinator::ReplayTokens) comes out of the budget before any new
 // token. A junction inside the prompt's final replay window yields to the
 // window rule: the chunk passes the junction rather than waiting for a chunk
-// end that satisfies both. Returns 0 when no chunk fits this round's budget.
+// end that satisfies both. With prefix caching and State groups, chunks also
+// stop at complete prefix pages, including the last page before the prompt's
+// final token/window, so changing the generation-prefix tail does not discard
+// the prompt's only checkpoint. Sub-page budgets still make progress.
+// Returns 0 when no chunk fits this round's budget.
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
-                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens);
+                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
+                                bool enable_prefix_cache);
 
 // Budget a fused mixed-mode decode batch leaves untouched so a pending local
 // prefill can still advance: for replayable groups the replay window plus the

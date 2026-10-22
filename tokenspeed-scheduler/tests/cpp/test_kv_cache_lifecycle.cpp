@@ -240,7 +240,7 @@ TEST_F(KimiFourGroupSuite, FinishAndAbortRestoreAllUsablePages) {
     ASSERT_EQ(before, 32u);
 
     Submit(MakeRequestSpec("finished", /*num_pages=*/2));
-    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    ASSERT_NE(FindForwardBatch(PlanFinalPrefill("finished")), nullptr);
     SendForwardDone("finished", {42});
     SendFinish("finished");
     PlanOnce();

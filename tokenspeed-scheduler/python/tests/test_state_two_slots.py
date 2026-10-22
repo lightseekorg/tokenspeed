@@ -36,7 +36,7 @@ per admitted request, four requests fill the pool.
 from __future__ import annotations
 
 import pytest
-from conftest import K3_STATE_GROUPS, _make_k3_config
+from conftest import K3_STATE_GROUPS, _final_prefill_plan, _make_k3_config
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -176,6 +176,12 @@ class TestFusedStateTwoSlots:
             assert slot0 > 0 and slot1 > 0 and slot0 != slot1, (group, slot0, slot1)
             assert slot0 in zeroed[group] and slot1 in zeroed[group], group
 
+        _advance(scheduler, "r0", [])
+        [final_prefill] = _dispatched(_final_prefill_plan(scheduler, "r0"))
+        final_rows = _state_rows(final_prefill, "r0")
+        for group, row in final_rows.items():
+            assert row[0] == prefill_rows[group][1]
+        prefill_rows = final_rows
         _advance(scheduler, "r0", [201])
         plan = scheduler.next_execution_plan()
         [decode1] = _dispatched(plan)
@@ -199,7 +205,7 @@ class TestFusedStateTwoSlots:
         prompt extending the same tokens claims it as slot 0 and skips the prefix."""
         scheduler = ts.Scheduler(_fused_config(decode_input_tokens=1))
         scheduler.submit_requests([_spec("seed", [1, 2, 3, 4], MAX_NEW_TOKENS)])
-        [prefill] = _dispatched(scheduler.next_execution_plan())
+        [prefill] = _dispatched(_final_prefill_plan(scheduler, "seed"))
         _advance(scheduler, "seed", [201])
         [decode1] = _dispatched(scheduler.next_execution_plan())
         checkpoints = {g: row[0] for g, row in _state_rows(decode1, "seed").items()}

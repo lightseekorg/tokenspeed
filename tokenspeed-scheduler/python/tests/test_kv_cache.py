@@ -18,6 +18,7 @@ from conftest import (
 )
 from conftest import _advance as _advance_tokens
 from conftest import (
+    _final_prefill_plan,
     _find_forward_op,
     _finish,
     _make_k3_config,
@@ -199,6 +200,8 @@ def test_k3_finish_restores_all_usable_pages() -> None:
     assert _find_forward_op(scheduler.next_execution_plan()) is not None
     assert scheduler.active_lcm_blocks() > 0
     assert scheduler.empty_lcm_blocks() + scheduler.active_lcm_blocks() == before
+    _advance_tokens(scheduler, "r1", [])
+    _final_prefill_plan(scheduler, "r1")
     _advance_tokens(scheduler, "r1", [42])
     _finish(scheduler, "r1")
     scheduler.next_execution_plan()
@@ -363,7 +366,7 @@ def test_state_checkpoints_are_published_at_prompt_end_and_finish(
     request = _spec("r", list(range(1, prompt_tokens + 1)))
     request.max_new_tokens = 30
     scheduler.submit_requests([request])
-    assert _find_forward_op(scheduler.next_execution_plan()) is not None
+    assert _find_forward_op(_final_prefill_plan(scheduler, "r")) is not None
     _advance_tokens(scheduler, "r", [prompt_tokens + 1])
     assert _find_forward_op(scheduler.next_execution_plan()) is not None
     next_token = prompt_tokens + 2

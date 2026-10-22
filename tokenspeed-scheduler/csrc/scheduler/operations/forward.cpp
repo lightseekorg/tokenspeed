@@ -306,10 +306,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     // A remote landing completes the prompt in one transfer; no junction cut
     // can shorten it.
-    const std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                               ? unscheduled
-                                               : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                                    unscheduled, remaining, junction_tokens);
+    const std::int32_t tokens_this_round =
+        source == fsm::PrefillSource::kRemote
+            ? unscheduled
+            : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
+                                 junction_tokens, !config_.disable_prefix_cache);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -425,8 +426,9 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    const std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                           remaining, cache_progress.junction_tokens);
+    const std::int32_t prefill_tokens =
+        PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled, remaining,
+                           cache_progress.junction_tokens, !config_.disable_prefix_cache);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
@@ -439,17 +441,19 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
         .completes_prefill = completes_prefill,
         .prompt_headroom_tokens = 0,
     };
-    // The chunk that ended at the junction publishes its natural checkpoint
-    // (KV tail and state) and moves off the published blocks; every other
-    // chunk end publishes only its completed full pages.
+    // Publish State groups with their KV at complete-page chunk boundaries,
+    // not just the exact prompt end: a later turn may change the prompt tail.
+    // An unaligned junction still publishes its exact tail as before.
     const bool ends_at_junction = cache_progress.junction_tokens > 0 && first_pos == cache_progress.junction_tokens;
+    const bool state_checkpoint = !config_.disable_prefix_cache && coordinator_.HasStateGroups() && first_pos > 0 &&
+                                  first_pos % coordinator_.PrefixGranularity() == 0;
     if (first_pos >= cache_progress.junction_tokens) {
         cache_progress.junction_tokens = 0;
     }
-    const RequestProgress progress =
-        AdvanceRequestProgress(*request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
-                               config_.StreamsDeviceCacheToHost(),
-                               ends_at_junction ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
+    const RequestProgress progress = AdvanceRequestProgress(
+        *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
+        config_.StreamsDeviceCacheToHost(),
+        ends_at_junction || state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
@@ -503,7 +507,7 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // The first decode on the fused role is the owner's prompt end: the
     // partial page and the state are published and the owner moves to fresh
     // blocks (the state by rotation: the first decode reads slot 0 and writes
-    // the fresh slot 1). The P and D roles publish at finish only -- the P
+    // the fresh slot 1). The P and D roles publish the prompt end at finish -- the P
     // never writes again, the D's prompt-end state arrived by transfer or was
     // claimed. Every later decode writes slot 1 in place and lets slot 0 go.
     const bool first_decode = request->Is<fsm::PrefillDone>();

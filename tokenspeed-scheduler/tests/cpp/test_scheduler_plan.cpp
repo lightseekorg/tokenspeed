@@ -651,16 +651,16 @@ protected:
     }
 };
 
-// The seed publishes KV and state at its prompt end (11) only. The second
+// The seed publishes state at its last complete page (10) and prompt end (11). The second
 // request shares the first 8 tokens: KV reaches 8, no state does, so its first
 // chunk is cut at the junction and publishes a state checkpoint there. The
 // third request then resumes from 8 in both families.
 TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint) {
     Submit(MakeHybridRequest("seed", 100));
-    const ExecutionPlan seed_plan = PlanOnce();
+    const ExecutionPlan seed_plan = PlanFinalPrefill("seed");
     const ForwardBatch* seed = FindForwardBatch(seed_plan);
     ASSERT_NE(seed, nullptr);
-    EXPECT_EQ(seed->input_lengths, std::vector<std::int32_t>{11});
+    EXPECT_EQ(seed->input_lengths, std::vector<std::int32_t>{1});
     SendForwardDone("seed", {900});
     PlanOnce();
     SendFinish("seed");
@@ -672,10 +672,11 @@ TEST_F(HybridJunctionCutTestSuite, ThirdRequestResumesFromTheJunctionCheckpoint)
     ASSERT_NE(junction, nullptr);
     ASSERT_EQ(junction->request_ids, std::vector<std::string>{"junction"});
     EXPECT_EQ(junction->input_lengths, std::vector<std::int32_t>{8});
-    const ExecutionPlan remainder_plan = PlanOnce();
+    SendForwardDone("junction");
+    const ExecutionPlan remainder_plan = PlanFinalPrefill("junction");
     const ForwardBatch* remainder = FindForwardBatch(remainder_plan);
     ASSERT_NE(remainder, nullptr);
-    EXPECT_EQ(remainder->input_lengths, std::vector<std::int32_t>{3});
+    EXPECT_EQ(remainder->input_lengths, std::vector<std::int32_t>{1});
     SendForwardDone("junction", {901});
     PlanOnce();
     SendFinish("junction");

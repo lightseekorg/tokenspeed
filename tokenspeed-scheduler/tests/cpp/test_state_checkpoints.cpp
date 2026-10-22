@@ -139,6 +139,82 @@ protected:
     }
 };
 
+class HybridPrefixReuseSuite : public StateCheckpointSuite {
+protected:
+    std::vector<ForwardBatch> CompletePrompt(const std::string& id, std::vector<std::int32_t> tokens) {
+        Submit(RequestSpec{.request_id = id, .tokens = std::move(tokens), .max_new_tokens = 1});
+        std::vector<ForwardBatch> batches;
+        for (int step = 0; step < 100; ++step) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_TRUE_OR_RETURN(batch != nullptr, {});
+            ASSERT_TRUE_OR_RETURN(batch->request_ids == std::vector<std::string>{id}, {});
+            batches.push_back(*batch);
+            const bool complete = batch->extend_prefix_lens[0] + batch->input_lengths[0] == batch->prefill_lengths[0];
+            SendForwardDone(id, complete ? std::vector<std::int32_t>{101} : std::vector<std::int32_t>{});
+            if (complete) {
+                SendFinish(id);
+                AckWriteBacks(PlanOnce());
+                return batches;
+            }
+        }
+        ADD_FAILURE() << "prefill did not finish";
+        return {};
+    }
+};
+
+TEST_F(HybridPrefixReuseSuite, AChangedGenerationPrefixTailReusesTheLastCompletePage) {
+    for (const bool host_cache : {false, true}) {
+        SCOPED_TRACE(host_cache);
+        Reset(host_cache, /*decode_width=*/4);
+        const auto batches = CompletePrompt("previous", MakeTokens(31));
+        ASSERT_FALSE(batches.empty());
+        auto next = MakeTokens(31);
+        next.back() = 1001;
+        next.push_back(1002);
+        const Resume resume = Probe("next", next);
+        EXPECT_EQ(resume.prefix_tokens, 28);
+        EXPECT_GT(resume.state_row.at(0), 0);
+    }
+}
+
+TEST_F(HybridPrefixReuseSuite, AnAlignedPromptAlsoRetainsACheckpointBeforeItsLastToken) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    ASSERT_FALSE(CompletePrompt("previous", MakeTokens(32)).empty());
+    auto next = MakeTokens(32);
+    next.back() = 1001;
+    next.push_back(1002);
+    EXPECT_EQ(Probe("next", next).prefix_tokens, 28);
+}
+
+TEST_F(HybridPrefixReuseSuite, AnIdenticalPromptReusesStateBeforeItsLogitsReplayToken) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    ASSERT_FALSE(CompletePrompt("previous", MakeTokens(31)).empty());
+    // Admission recomputes the last prompt token to obtain logits, so the
+    // exact prompt-end checkpoint alone cannot serve this identical prompt.
+    EXPECT_EQ(Probe("identical", MakeTokens(31)).prefix_tokens, 28);
+}
+
+TEST_F(HybridPrefixReuseSuite, ABranchInsideThePromptReusesAnOrdinaryChunkCheckpoint) {
+    Reset(/*host_cache=*/false, /*decode_width=*/1);
+    ASSERT_FALSE(CompletePrompt("previous", MakeTokens(31)).empty());
+    auto branch = MakeTokens(17);
+    branch.back() = 1001;
+    branch.push_back(1002);
+    EXPECT_EQ(Probe("branch", branch).prefix_tokens, 16);
+}
+
+TEST_F(HybridPrefixReuseSuite, DisablingPrefixCachingDoesNotSplitAPromptForCheckpoints) {
+    config_ = MakeConfig();
+    config_.disable_prefix_cache = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const auto batches = CompletePrompt("previous", MakeTokens(7));
+    ASSERT_EQ(batches.size(), 1u);
+    EXPECT_EQ(batches.front().input_lengths, std::vector<std::int32_t>{7});
+    EXPECT_EQ(Probe("next", {1, 2, 3, 4, 5, 6, 1001, 1002}).prefix_tokens, 0);
+}
+
 TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDecodes) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     // A 10-token prompt under an 8-token chunk: chunk [0, 8), chunk [8, 10),
@@ -187,14 +263,14 @@ TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDe
     SendForwardDone("r", {104});
 
     // Another prompt sharing the ten prompt tokens resumes at the published
-    // prompt-end state; one sharing only the first chunk finds no
-    // checkpoint at 8 and starts over (with the junction at 8).
+    // prompt-end state; one sharing only the first chunk resumes
+    // from that chunk checkpoint at 8.
     const Resume at_prompt_end = Probe("hit", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 77, 78});
     EXPECT_EQ(at_prompt_end.prefix_tokens, 10);
     EXPECT_EQ(at_prompt_end.state_row.at(0), decode1[0]) << "resumes from the published checkpoint";
     const Resume at_chunk_end = Probe("miss", {1, 2, 3, 4, 5, 6, 7, 8, 77, 78, 79, 80});
-    EXPECT_EQ(at_chunk_end.prefix_tokens, 0);
-    EXPECT_NE(at_chunk_end.state_row.at(0), decode1[0]) << "a fresh zero state, not a checkpoint";
+    EXPECT_EQ(at_chunk_end.prefix_tokens, 8);
+    EXPECT_EQ(at_chunk_end.state_row.at(0), chunk1[1]) << "the first chunk checkpoint";
 
     // The two probes above each planned a decode of r; both land before the
     // finish, which publishes the frontier (15 computed tokens: the prompt
@@ -211,14 +287,14 @@ TEST_F(StateCheckpointSuite, TwoSlotsRotateThroughChunksTheFirstDecodeAndLaterDe
         << "every block is cache-only or free";
 }
 
-// A request that finishes right after its prefill (a one-token budget) never
-// rotates: finish publishes slot 1 as the prefill wrote it -- the state after
+// A request that finishes right after its final prefill (a one-token budget)
+// does not rotate again: finish publishes slot 1 as the prefill wrote it -- the state after
 // the prompt -- and the partial KV block in place, and a longer prompt resumes
 // from exactly those blocks.
 TEST_F(StateCheckpointSuite, FinishRightAfterPrefillPublishesThePrefillsLiveSlotInPlace) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 1});
-    const ExecutionPlan prefill = PlanOnce();
+    const ExecutionPlan prefill = PlanFinalPrefill("r");
     const ForwardBatch* batch = FindForwardBatch(prefill);
     ASSERT_NE(batch, nullptr);
     const std::vector<std::int32_t> state_row = StateRow(*batch, "state0", "r");
@@ -253,7 +329,7 @@ TEST_F(StateCheckpointSuite, FinishRightAfterPrefillPublishesThePrefillsLiveSlot
 TEST_F(StateCheckpointSuite, FinishWithAForwardInFlightSettlesAtTheFrontierThatForwardLands) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(7), .max_new_tokens = 8});
-    ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);
+    ASSERT_NE(FindForwardBatch(PlanFinalPrefill("r")), nullptr);
     SendForwardDone("r", {101});
     ASSERT_NE(FindForwardBatch(PlanOnce()), nullptr);  // first decode: publishes the state at 7, rotates
     SendForwardDone("r", {102});
@@ -282,7 +358,7 @@ TEST_F(StateCheckpointSuite, FinishWithAForwardInFlightSettlesAtTheFrontierThatF
 TEST_F(StateCheckpointSuite, AQuiescentFinishSettlesWithTheFinishEvent) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     Submit(RequestWithTokens("r", MakeTokens(6)));
-    PlanOnce();
+    PlanFinalPrefill("r");
     SendForwardDone("r", {101});
     PlanOnce();  // first decode
     SendForwardDone("r", {102});
@@ -297,7 +373,7 @@ TEST_F(StateCheckpointSuite, AQuiescentFinishSettlesWithTheFinishEvent) {
 TEST_F(StateCheckpointSuite, AnAbortWhileFinishingPublishesNothing) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     Submit(RequestWithTokens("r", MakeTokens(6)));
-    PlanOnce();
+    PlanFinalPrefill("r");
     SendForwardDone("r", {101});
     PlanOnce();  // decode in flight
     SendFinish("r");
@@ -311,7 +387,7 @@ TEST_F(StateCheckpointSuite, AbortReleasesBothSlotsAndPublishesNothing) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     const std::int32_t empty = scheduler_->EmptyLcmBlocks();
     Submit(RequestWithTokens("r", MakeTokens(6)));
-    PlanOnce();
+    PlanFinalPrefill("r");
     SendForwardDone("r", {101});
     PlanOnce();  // first decode: prompt end published (page + tail + state)
     SendForwardDone("r", {102});
@@ -319,15 +395,15 @@ TEST_F(StateCheckpointSuite, AbortReleasesBothSlotsAndPublishesNothing) {
     SendAbortEvent("r");
     PlanOnce();
     // Only the published entries stay: page [1 2 3 4], the tail [5 6] in the
-    // full group, and the prompt-end state in each state group.
-    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), empty - 2 - 3);
+    // full group, and the page-end and prompt-end states in each state group.
+    EXPECT_EQ(scheduler_->EmptyLcmBlocks(), empty - 2 - 2 * 3);
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), empty) << "all of them evictable";
 }
 
 TEST_F(StateCheckpointSuite, SpeculativeDecodeWritesTheLiveSlotInPlace) {
     Reset(/*host_cache=*/false, /*decode_width=*/3);
     Submit(RequestWithTokens("r", MakeTokens(6)));
-    PlanOnce();
+    PlanFinalPrefill("r");
     SendForwardDone("r", {101});
     const std::vector<std::int32_t> first = PlanAndStateRow("r");
     ASSERT_GT(first[0], 0);
@@ -351,7 +427,7 @@ TEST_F(StateCheckpointSuite, SpeculativeDecodeWritesTheLiveSlotInPlace) {
 TEST_F(StateCheckpointSuite, AStateCheckpointLeavesWithItsKvTail) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     Submit(RequestWithTokens("r", MakeTokens(6)));
-    PlanOnce();
+    PlanFinalPrefill("r");
     SendForwardDone("r", {101});
     PlanOnce();  // prompt end: tail [5 6] and the state at 6 published
     SendForwardDone("r", {102});
@@ -365,11 +441,7 @@ TEST_F(StateCheckpointSuite, AStateCheckpointLeavesWithItsKvTail) {
     for (std::int32_t i = 0; i < 40; ++i) {
         const std::string id = "flood" + std::to_string(i);
         Submit(RequestWithTokens(id, MakeTokens(24, 1000 * (i + 1))));
-        PlanOnce();
-        SendForwardDone(id);
-        PlanOnce();
-        SendForwardDone(id);
-        PlanOnce();
+        PlanFinalPrefill(id);
         SendForwardDone(id, {7});
         SendFinish(id);
         PlanOnce();
@@ -381,7 +453,7 @@ TEST_F(StateCheckpointSuite, AStateCheckpointLeavesWithItsKvTail) {
 TEST_F(StateCheckpointSuite, AHostCheckpointLoadsIntoSlotZero) {
     Reset(/*host_cache=*/true, /*decode_width=*/1);
     Submit(RequestWithTokens("r", MakeTokens(6)));
-    AckWriteBacks(PlanOnce());
+    AckWriteBacks(PlanFinalPrefill("r"));
     SendForwardDone("r", {101});
     AckWriteBacks(PlanOnce());  // prompt end: page, tail and the three states stream to Host
     SendForwardDone("r", {102});
@@ -408,27 +480,31 @@ protected:
     }
 };
 
-// A model with no KV group has no KV boundary to cut at: a prompt a page
-// boundary could be matched at is not a junction, and the first chunk runs
-// to the budget.
+// A model with no KV group has no junction, but retains complete-page state
+// checkpoints before a generation-prefix tail just like a hybrid model.
 TEST_F(StateOnlySuite, NoKvGroupMeansNoJunctionCut) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     Submit(RequestWithTokens("r", MakeTokens(7)));
     const ExecutionPlan plan = PlanOnce();
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
-    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{7});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{4});
     const std::vector<std::int32_t> row = StateRow(*batch, "state0", "r");
     EXPECT_GT(row.at(0), 0) << "a zeroed block is the first chunk's input";
     EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("state0"), row.at(0)), 1);
+    SendForwardDone("r");
+    const ExecutionPlan tail = PlanOnce();
+    const ForwardBatch* final = FindForwardBatch(tail);
+    ASSERT_NE(final, nullptr);
+    EXPECT_EQ(final->input_lengths, std::vector<std::int32_t>{3});
+    EXPECT_EQ(StateRow(*final, "state0", "r").at(0), row.at(1));
     SendForwardDone("r", {101});
     SendFinish("r");
     PlanOnce();
 
-    // The prompt-end checkpoint at 7 is the only one: a longer prompt sharing
-    // the seven tokens resumes there, one sharing fewer resumes at zero.
+    // The exact prompt end and the complete-page checkpoint are both reusable.
     EXPECT_EQ(Probe("hit", {1, 2, 3, 4, 5, 6, 7, 88, 89}).prefix_tokens, 7);
-    EXPECT_EQ(Probe("shorter", {1, 2, 3, 4, 5, 66, 67}).prefix_tokens, 0);
+    EXPECT_EQ(Probe("shorter", {1, 2, 3, 4, 5, 66, 67}).prefix_tokens, 4);
 }
 
 // A pool sized at two blocks per State group per live request: four one-page
@@ -492,23 +568,23 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
         cfg.disable_l2_cache = false;
-        cfg.debug_force_retraction_interval = 4;
+        cfg.debug_force_retraction_interval = 5;
         return cfg;
     }
 };
 
 TEST_F(StateRetractionSuite, TheImageCarriesBothSlotsAndRestoresTheLiveOneAsACopy) {
     Submit(RequestWithTokens("r", MakeTokens(6)));
-    AckWriteBacks(PlanOnce());  // plan 1: prefill
+    AckWriteBacks(PlanFinalPrefill("r"));  // plans 1-2: prefill
     SendForwardDone("r", {101});
     ExecutionPlan plan;
-    const std::vector<std::int32_t> first = PlanAndStateRow("r", &plan);  // plan 2: first decode
+    const std::vector<std::int32_t> first = PlanAndStateRow("r", &plan);  // plan 3: first decode
     SendForwardDone("r", {102});
-    const std::vector<std::int32_t> second = PlanAndStateRow("r", &plan);  // plan 3: slot 0 released
+    const std::vector<std::int32_t> second = PlanAndStateRow("r", &plan);  // plan 4: slot 0 released
     EXPECT_EQ(second, (std::vector<std::int32_t>{0, first[1]}));
     SendForwardDone("r", {103});
 
-    // Plan 4 retracts r = [1..6, 101, 102, 103], frontier 8: the page
+    // Plan 5 retracts r = [1..6, 101, 102, 103], frontier 8: the page
     // [101 102] completes, the state the decodes wrote is published as the
     // checkpoint at 8 and rides L2 like the KV pages; the pool carries only
     // the blob.
@@ -554,10 +630,10 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
         cfg.disable_l2_cache = false;
-        cfg.debug_force_retraction_interval = 3;
+        cfg.debug_force_retraction_interval = 4;
         // One full and one State group over six usable blocks: the retraction
-        // leaves five cache-only entries and one empty block, fewer than the
-        // restore's two fresh ones.
+        // leaves six cache-only entries and no empty block, forcing the
+        // restore to evict while it claims its input checkpoint.
         std::erase_if(cfg.cache_groups, [](const CacheGroupConfig& group) {
             return group.group_id == "state1" || group.group_id == "state2";
         });
@@ -571,16 +647,16 @@ protected:
 
 TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTailCompanions) {
     Reset(/*host_cache=*/true, /*decode_width=*/2);
-    // r = [1..6]: plan 1 prefills; plan 2 (the first decode) publishes the tail
+    // r = [1..6]: plans 1-2 prefill; plan 3 (the first decode) publishes the tail
     // at 6 and the checkpoint at 6, which rotates into slot 0 while the tail's
-    // block is copied in; plan 3 retracts r at frontier 7 and publishes the
+    // block is copied in; plan 4 retracts r at frontier 7 and publishes the
     // tail at 7 and the checkpoint at 7. The image: page 0 and slot 0 (the
     // checkpoint at 6) are published slots the restore claims from the
     // Device; the tail block and slot 1 are writable and come back as copies.
     // The two-token decode width makes the full group need a growth block
     // beyond the tail copy, so it evicts within its own index.
     Submit(RequestSpec{.request_id = "r", .tokens = MakeTokens(6), .max_new_tokens = 2});
-    AckWriteBacks(PlanOnce());
+    AckWriteBacks(PlanFinalPrefill("r"));
     SendForwardDone("r", {101});
     ExecutionPlan plan;
     const std::vector<std::int32_t> first = PlanAndStateRow("r", &plan);
@@ -589,13 +665,13 @@ TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTai
     const ExecutionPlan retraction = PlanOnce();
     ASSERT_EQ(scheduler_->RetractedSize(), 1u);
     AckImageStores(retraction);
-    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 1);
+    ASSERT_EQ(scheduler_->EmptyLcmBlocks(), 0);
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 6)
-        << "five cache-only entries: page 0, the two tails' full blocks, the two checkpoints";
+        << "six cache-only entries: page 0, two tails' full blocks and three checkpoints";
 
     // The restore claims page 0 and the checkpoint at 6 and needs fresh blocks
     // for the tail copy, the full group's growth and the live slot: more than
-    // the one empty, so each group evicts within its own index -- the full
+    // the empty pool, so each group evicts within its own index -- the full
     // group the tail at 6's block, the oldest. Its cascade reaches the state
     // entry at 6, which the restore has already claimed and pinned; evicting
     // first would have taken it, and slot 0 would have come back as a keyed
