@@ -2,7 +2,7 @@
 
 ## Triggers and change selection
 
-The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `PR Test Ascend NPU ARM`.
+The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `Ascend NPU Tests`.
 It runs in `lightseekorg/tokenspeed` or the repository identified by the full `owner/repository` value of the `TOKENSPEED_NPU_CI_REPOSITORY` repository variable. Forks must explicitly set that variable.
 Triggers include pushes to main, `pull_request` events targeting main, and `workflow_dispatch`.
 The `select` job can run in an allowed repository. The hardware job additionally requires `TOKENSPEED_NPU_ARM_CI_ENABLED` to be set to `true`.
