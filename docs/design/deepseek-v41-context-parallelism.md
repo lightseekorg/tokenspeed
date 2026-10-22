@@ -5,22 +5,37 @@ KVP partitions persistent global KV and indexer K pages, and DCP computes
 decode attention over those pages. All groups are subgroups of attention TP;
 these modes do not add devices.
 
+## Terminology
+
+**Aggregate QCP** names the existing operator-level query partitioning for
+the indexer and attention kernels. **PD Prefill QCP** names the model-wide
+input query shard carried through the model. Aggregate describes the serving
+mode, not the number of machines. The two implementations retain separate
+options; no automatic role-based dispatch is performed.
+The existing `--deepseek-v41-*-query-parallel-size` option names are unchanged.
+
 ## Query computation
 
-The model-specific indexer QCP path interleaves query rows across attention TP
+The model-specific aggregate indexer QCP path interleaves query rows across attention TP
 before indexer query/weight projection. Each rank scores its local queries
 against the complete logical history. Logical Top-k IDs and lengths are
 gathered back in original row order. The candidate-producing Full indexer and
 CED-tail Reindex remain on their existing paths.
 
-Attention QCP exchanges local-head queries for a contiguous subset of query
+Aggregate attention QCP exchanges local-head queries for a contiguous subset of query
 rows with all heads. Selected prefill attention computes that subset, then an
 inverse exchange restores the TP head layout. SWA-only and global-attention
 layers have separate minimum query counts to amortize communication.
 
 These are operator-local partitions. Hidden states, Engram, MoE, compressor
 work, and DSpark auxiliary states retain their existing layouts. Generic
-`--query-context-parallel-size` remains the separate DSA model-wide layout.
+`--query-context-parallel-size` selects the separate model-wide QCP layout.
+V4.1 model-wide QCP currently supports eager, text-only PD prefill with
+KVP=1 and replicated attention heads. It preserves local token ownership
+through Engram, MoE and CED narrowing, gathers projected keys for cache
+publication, and gathers only sampled hidden rows at the output. It rejects
+PP, mixed batches, prefill graphs and speculation.
+Aggregate QCP and model-wide QCP must not be enabled together.
 
 ## Cache ownership
 
@@ -56,7 +71,7 @@ are scoped to one forward and invalidated by metadata refresh.
 
 ## Configuration
 
-For TP8, enable either or both operator-level QCP paths with:
+For TP8, enable either or both aggregate QCP paths with:
 
 ```text
 --deepseek-v41-indexer-query-parallel-size 8
@@ -64,7 +79,7 @@ For TP8, enable either or both operator-level QCP paths with:
 --disable-prefill-graph
 ```
 
-Each query size is either 1 (disabled) or the attention TP size. Indexer QCP
+Each query size is either 1 (disabled) or the attention TP size. Aggregate indexer QCP
 also requires sufficiently long query/history windows. Attention thresholds
 are set by `--deepseek-v41-attention-query-min-tokens` and
 `--deepseek-v41-attention-query-swa-min-tokens`.
@@ -79,13 +94,15 @@ For V4.1 aggregated KVP+DCP, select the backend and matching sizes:
 
 KVP may be any supported divisor of attention TP. Shared launch validation
 requires matching KVP/DCP sizes for aggregated and PD decode engines, and
-separate prefill/decode rounds for aggregated DCP. QCP can be enabled with
+separate prefill/decode rounds for aggregated DCP. Aggregate QCP can be enabled with
 either replicated or sharded KV. V4.1-specific restrictions are listed below.
 
 PD prefill can use KVP with DCP size 1 and
-`--disaggregation-layerwise-interval 0`. V4.1 PD decode with KVP is not
-supported. KVP requires eager prefill, no mixed batches, and either no
-speculation or DSpark. CUDA Graph decode is supported.
+`--disaggregation-layerwise-interval 0`. V4.1 PD decode with KVP uses the existing page-owner transfer planning
+and DCP decode path. Eager PD KVP decode has smoke coverage and currently
+rejects speculation. KVP requires eager prefill and no mixed batches.
+Aggregate serving supports DSpark and CUDA Graph decode; PD Graph decode
+and PD speculation require separate validation.
 
 ## Validation and tradeoffs
 
@@ -94,7 +111,7 @@ cache ownership, metadata refresh and selection reuse. Kernel tests compare
 partial outputs/LSE against a reference, local Top-k against replicated
 scoring, and repeated graph replay with changing lengths.
 
-QCP targets long-prefill latency. KVP trades communication for persistent KV
+Aggregate QCP targets long-prefill latency. KVP trades communication for persistent KV
 capacity; V4.1's small selected-attention workload does not imply a decode
 speedup. Performance and model accuracy need paired workload measurements.
 Changing collective/reduction order can change greedy outputs, so equal task

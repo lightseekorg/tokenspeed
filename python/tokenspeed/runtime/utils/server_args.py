@@ -252,11 +252,11 @@ def validate_context_parallel_roles(
                 "rank (the drafter's steps only), which no engine serving "
                 "steady-state decode should pay"
             )
-        if qcp_size != kvp_size:
+        if kvp_size not in (1, qcp_size):
             raise ValueError(
-                "--query-context-parallel-size must equal --kv-parallel-size "
-                f"(got qcp={qcp_size}, kvp={kvp_size}): the history gather "
-                "splits by the page owners of the whole shard group"
+                "--query-context-parallel-size must equal --kv-parallel-size when KVP is enabled "
+                f"(got qcp={qcp_size}, kvp={kvp_size}): page owners must span "
+                "the whole query shard group"
             )
     if dcp_size > 1:
         if disaggregation_mode not in ("null", "decode"):
@@ -3730,7 +3730,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.deepseek_v41_attention_query_swa_min_tokens,
             help="Additional minimum query rows per request for SWA-only V4.1 "
-            "attention QCP head exchange (default: 4096). The larger of this and "
+            "aggregate attention QCP head exchange (default: 4096). The larger of this and "
             "--deepseek-v41-attention-query-min-tokens applies. Tune for the "
             "deployment; this is not a hardware auto-tuner.",
         )
@@ -3739,7 +3739,7 @@ class ServerArgs:
             type=int,
             default=ServerArgs.deepseek_v41_attention_query_min_tokens,
             help="Minimum query rows per request in the current prefill window "
-            "for V4.1 attention QCP head exchange (default: 1024). Also requires "
+            "for V4.1 aggregate attention QCP head exchange (default: 1024). Also requires "
             "at least one query per rank. This threshold does not enable "
             "exchange or auto-tune for the GPU/interconnect.",
         )
@@ -3747,7 +3747,7 @@ class ServerArgs:
             "--deepseek-v41-attention-query-parallel-size",
             type=int,
             default=ServerArgs.deepseek_v41_attention_query_parallel_size,
-            help="Enable DeepSeek V4.1 prefill attention QCP via query/head exchange "
+            help="Enable DeepSeek V4.1 aggregate attention QCP (operator-level query parallelism) via query/head exchange "
             "over attention TP. Set 1 to disable (default), or attention TP "
             "size to enable for eligible long requests with 64 total heads. "
             "KV storage and model projections remain unchanged.",
@@ -3756,7 +3756,7 @@ class ServerArgs:
             "--deepseek-v41-indexer-query-parallel-size",
             type=int,
             default=ServerArgs.deepseek_v41_indexer_query_parallel_size,
-            help="Enable DeepSeek V4.1 long-prefill encoder indexer QCP for query "
+            help="Enable DeepSeek V4.1 long-prefill encoder aggregate indexer QCP for query "
             "projections and scoring over attention TP. Set 1 to disable "
             "(default), or the attention TP size to enable. KV remains "
             "replicated; this does not enable the generic QCP execution path.",
@@ -3765,15 +3765,14 @@ class ServerArgs:
             "--query-context-parallel-size",
             type=int,
             default=ServerArgs.query_context_parallel_size,
-            help="Query context parallelism (QCP) on the PD prefill role: shard "
-            "every extend forward's query rows over the attention TP group, rank "
-            "r computing a contiguous slice of the chunk's rows against the "
-            "gathered KV history of its requests. Requires --disaggregation-mode "
-            "prefill and must equal both --attn-tp-size and --kv-parallel-size; "
-            "needs GPU DSA attention with a bf16 KV cache and keeps the prefill "
-            "eager. The attention weights are head-replicated unless "
-            "--attn-head-tp-size equals it, which shards them over the shard "
-            "group.",
+            help="Model-wide query context parallelism (QCP) on the PD prefill "
+            "role. Shards extend query rows over attention TP and requires "
+            "--query-context-parallel-size equal to --attn-tp-size. V4.1 "
+            "requires KVP=1, replicated attention heads and eager prefill. "
+            "GPU DSA requires KVP equal to QCP and a bf16 KV cache; "
+            "--attn-head-tp-size can shard its heads. For V4.1 aggregate "
+            "serving, use the separate --deepseek-v41-*-query-parallel-size "
+            "options for aggregate QCP.",
         )
         parser.add_argument(
             "--dense-tp-size",

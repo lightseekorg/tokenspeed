@@ -84,6 +84,7 @@ def test_off_by_default_everywhere():
         # A prefill engine shards its pages with or without a query shard.
         dict(kvp_size=4, dcp_size=1, qcp_size=1, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
+        dict(kvp_size=1, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
         dict(kvp_size=4, dcp_size=4, qcp_size=1, disaggregation_mode="decode"),
         dict(kvp_size=8, dcp_size=8, qcp_size=1, disaggregation_mode="null"),
     ],
@@ -137,10 +138,6 @@ def test_the_roles_that_take_the_flags(kwargs):
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=2, disaggregation_mode="decode"),
             "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
-        ),
-        (
-            dict(kvp_size=1, dcp_size=1, qcp_size=2, disaggregation_mode="prefill"),
-            "--query-context-parallel-size must equal --kv-parallel-size",
         ),
         (
             dict(kvp_size=2, dcp_size=1, qcp_size=4, disaggregation_mode="prefill"),
@@ -226,7 +223,6 @@ def test_the_prefill_role_shards_its_pages_without_a_query_shard():
             ["--disaggregation-mode", "decode"],
             "--query-context-parallel-size > 1 requires --disaggregation-mode prefill",
         ),
-        (["--kv-parallel-size", "1"], "must equal --kv-parallel-size"),
         (["--enable-mixed-batch"], "--enable-mixed-batch"),
         (["--data-parallel-size", "2"], "attention DP 1"),
     ],
@@ -389,6 +385,9 @@ def _dsa_attn_config(**overrides):
         kernel_page_size=64,
         context_len=4096,
         max_bs=4,
+        kvp_size=2,
+        kvp_rank=0,
+        kvp_group=(0, 1),
         qcp_size=2,
         qcp_rank=0,
         qcp_group=(0, 1),
@@ -452,3 +451,8 @@ def test_v41_aggregated_kvp_requires_explicit_matching_dcp(size):
                 str(size),
             ]
         )
+
+
+def test_dsa_query_sharding_still_requires_sharded_kv():
+    with pytest.raises(ValueError, match="KVP equal to QCP"):
+        _dsa_attn_config(kvp_size=1, kvp_rank=0, kvp_group=(0,))
