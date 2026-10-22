@@ -1,4 +1,4 @@
-name: AMD Tests
+name: AMD MI350 Tests
 
 # Split vendor CI into separate workflows so either side can be rerun without
 # waiting for the other side's jobs to finish.
@@ -13,7 +13,7 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/amd-tests.yml"
+      - ".github/workflows/amd-mi350-tests.yml"
       - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
@@ -28,7 +28,7 @@ on:
       - "tokenspeed-mla/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
-      - ".github/workflows/amd-tests.yml"
+      - ".github/workflows/amd-mi350-tests.yml"
       - ".github/workflows/nvidia-b200-tests.yml"
       - ".github/workflows/pr-test-nvidia-arm.yml"
       - ".github/workflows/run-ci-task-matrix.yml"
@@ -53,7 +53,7 @@ env:
   TOKENSPEED_B200_RUNNER_LABEL: ${{ vars.TOKENSPEED_B200_RUNNER_LABEL }}
 
 concurrency:
-  group: pr-test-amd-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
+  group: pr-test-amd-mi350-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -117,7 +117,7 @@ jobs:
               ;;
           esac
           python3 test/ci_system/ci_path_filter.py \
-            --runner-group amd \
+            --runner-group amd-mi350 \
             --event-name "${{ github.event_name }}" \
             --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
@@ -137,7 +137,7 @@ jobs:
               --root test/ci \
               --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
               --trigger "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.trigger || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
-              --runner-group "amd" \
+              --runner-group "amd-mi350" \
               --workflow-stage "$workflow_stage")
             echo "${output}_matrix=${matrix}" >> "$GITHUB_OUTPUT"
             printf '%s' "$matrix" | python3 -c "import json, sys; print('${output}_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"
