@@ -1416,8 +1416,8 @@ Notes:
   default batch limit is 80 requests, not 160.
 - Name no `--reasoning-parser` or `--tool-call-parser`. The bundled
   `tokenspeed-smg` version pinned in
-  [python/pyproject.toml](../../python/pyproject.toml) reads the output through
-  the checkpoint's `response_template`.
+  [python/pyproject.toml](https://github.com/lightseekorg/tokenspeed/blob/main/python/pyproject.toml)
+  reads the output through the checkpoint's `response_template`.
 
 The first start on a fresh machine tunes kernels for 30 to 45 minutes; pass
 `--engine-startup-timeout 5400`. Later starts reuse the caches.
