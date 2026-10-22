@@ -1010,8 +1010,7 @@ def packed_block_tables_from_forward_op(
         if arr.shape[0] == 0:
             continue
         if arr.shape[1] == 0:
-            # Kept out of the pack: a zero-width table must stay loud in the
-            # replay fill's cols >= 1 assert, not be silently tail-padded.
+            # Kept out of the pack: CacheBatchMetadata rejects a zero-width table.
             out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
             out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
             continue
