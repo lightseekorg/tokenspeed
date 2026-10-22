@@ -25,13 +25,13 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
-__all__ = ["launch_gluon_router_gemv_splitk_gfx950"]
+__all__ = ["launch_gluon_router_sqrt_softplus_topk_gemv_gfx950"]
 
 cdna4 = gl.amd.cdna4
 
 
 @gluon.jit
-def gluon_router_gemv_splitk_gfx950(
+def gluon_router_sqrt_softplus_topk_gemv_gfx950(
     x,
     w,
     partials,
@@ -86,7 +86,7 @@ def gluon_router_gemv_splitk_gfx950(
         )
 
 
-def launch_gluon_router_gemv_splitk_gfx950(
+def launch_gluon_router_sqrt_softplus_topk_gemv_gfx950(
     x: torch.Tensor,
     weight: torch.Tensor,
     block_k: int = 512,
@@ -110,7 +110,7 @@ def launch_gluon_router_gemv_splitk_gfx950(
     )
     if tokens == 0:
         return partials
-    gluon_router_gemv_splitk_gfx950[(experts // block_n, split)](
+    gluon_router_sqrt_softplus_topk_gemv_gfx950[(experts // block_n, split)](
         x,
         weight,
         partials,

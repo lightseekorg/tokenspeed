@@ -81,7 +81,7 @@ def _scheduler(ts, make_config):
             role="fused",
             num_snapshot_pages=1,
             max_retracted_requests=0,
-            l3_prefetch_min_pages=0,
+            storage_config=None,
             cache_groups=groups,
         )
     )

@@ -1071,6 +1071,35 @@ class MambaAttnBackend(AttentionBackend):
         self._qsl_dirty = [False] * max_bs
         self._qsl_last_mode = [None] * max_bs
         self._state_out_live = [False] * max_bs
+        self._prepare_replay_state_tapes(max_bs)
+
+    def _prepare_replay_state_tapes(self, max_bs: int) -> None:
+        """Upload immutable tape descriptions before any serving refresh."""
+        gids = self._state_group_ids
+        if (
+            not self.state_paging_active
+            or torch.device(self.device).type != "cuda"
+            or len(gids) > _TAPE_MAX_STATE_GROUPS
+        ):
+            return
+        from tokenspeed_kernel.ops.metadata import PrepTape, Reg
+
+        for bs in range(1, max_bs + 1):
+            tape = PrepTape(self.device)
+            for i, gid in enumerate(gids):
+                sin = self.state_in_by_group[gid][bs - 1]
+                sout = self.state_out_by_group[gid][bs - 1]
+                tape.state_pages(
+                    sin,
+                    sout,
+                    rows_ptr=Reg(Reg.PTR0 + i),
+                    bs=Reg.REAL_BS,
+                    row_stride=Reg(Reg.USER0 + i),
+                )
+                tape.filltail(sin, live=Reg.REAL_BS, total=bs, value=self.pad_slot_id)
+                tape.filltail(sout, live=Reg.REAL_BS, total=bs, value=self.pad_slot_id)
+            tape.finalize()
+            self._replay_state_tapes[bs] = tape
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -1285,30 +1314,9 @@ class MambaAttnBackend(AttentionBackend):
             )
         )
         if use_tape:
-            from tokenspeed_kernel.ops.metadata import PrepTape, Reg
+            from tokenspeed_kernel.ops.metadata import Reg
 
-            tapes = self._replay_state_tapes
-            tape = tapes.get(bs)
-            if tape is None:
-                tape = PrepTape(self.device)
-                for i, gid in enumerate(gids):
-                    sin = self.state_in_by_group[gid][bs - 1]
-                    sout = self.state_out_by_group[gid][bs - 1]
-                    tape.state_pages(
-                        sin,
-                        sout,
-                        rows_ptr=Reg(Reg.PTR0 + i),
-                        bs=Reg.REAL_BS,
-                        row_stride=Reg(Reg.USER0 + i),
-                    )
-                    tape.filltail(
-                        sin, live=Reg.REAL_BS, total=bs, value=self.pad_slot_id
-                    )
-                    tape.filltail(
-                        sout, live=Reg.REAL_BS, total=bs, value=self.pad_slot_id
-                    )
-                tape.finalize()
-                tapes[bs] = tape
+            tape = self._replay_state_tapes[bs]
             regs = {Reg.REAL_BS: real_bs}
             for i, gid in enumerate(gids):
                 rows = block_tables[gid]

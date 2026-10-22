@@ -72,6 +72,12 @@ can never see a silently-defaulted one. This is deliberate — a `= False`
 default once hid `extend_with_prefix` being swallowed by a composite's
 `**kwargs`, and FlashMLA planned a ragged prefill for a prefix-cached batch.
 
+Extend planning uses the existing CPU length mirrors for host arithmetic:
+total cache length is the cached prefix plus the current input length.
+FlashInfer receives host CSR metadata derived from those mirrors, with fresh
+pinned sources for asynchronous uploads. Planning does not download device
+lengths or indptrs; mixed batches apply the same rule to their extend rows.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -81,6 +87,25 @@ buffers are sized by `max_decode_bs` — `init_cuda_graph_state` runs
 unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
+
+State paging finalizes immutable metadata tapes for every supported decode
+batch size when the buffers are built. Finalization uploads CPU descriptions,
+so it belongs to startup, including sizes outside the capture ladder. Refresh
+supplies runtime registers and runs a prepared tape. Rebuilding the buffers
+rebuilds tapes that contain their addresses.
+
+Distributed-argmax eligibility and communication state are prepared after
+heads, draft sharing and sampling configuration are wired, before graph owners
+or any forward. Prefill-only, eager and captured execution use that same
+prepared processor. A prepared fallback is distinct from uninitialized state;
+decode warmup is not an initializer. The kernel state keys on the runtime
+logits dtype, which a quantized head does not declare on its (possibly
+transposed or packed) weight, so preparation builds the state for every
+supported logits dtype up front, keyed by the head's
+`num_embeddings_per_partition`; the forward and the sharded argmax only select
+the prepared state matching `logits.dtype`, with the portable packed-key
+all-reduce prepared as the fallback for any other dtype. They never construct,
+rendezvous or allocate communication state.
 
 ### Ascend context-parallel decode
 
@@ -292,6 +317,11 @@ replicated token rows uses the existing `ColumnParallelLinear` and
 
 The model runner prepares fixed-capacity communication workspaces before
 cache-memory profiling and graph capture.
+Distributed initialization also reserves the shared all-reduce workspace for
+the complete enabled fusion token window. A prefill-only process may never
+warm a decode graph; its first fused reduction must not resize or rendezvous
+for that workspace on the serving thread. Disabled fusion retains the
+ordinary one-shot reduction capacity.
 Preparation binds each Linear and its workspace to the selected communication
 backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.
@@ -1116,13 +1146,46 @@ and kernel page size from
 with the existing forward and MTP reuse boundaries. The router clears this
 share before the root prepares its indexer child; the indexer does not clear it again.
 
-QSA block selection carries the same uniform query width from
-`decode_query_lengths` into its kernel API, using `None` for ragged or mixed
-queries. Materialized scoring may group a divisor of that width to share K
+QSA block selection carries an explicit uniform query width into its kernel
+API. Decode derives it from its uniform row contract; extend metadata checks
+the scheduler's host query lengths, including fixed-width decode rows in a
+mixed batch. Ragged runs carry `None`. This adds no device-to-host length read.
+Materialized scoring can group a divisor of that width to share K
 within a request; it must retain each query's complete-block frontier and
 selection. Group size one and larger groups use the same scoring kernel, in
 both eager and captured forwards. Grouping must not be inferred from the total
 row count or page-table batch size for a ragged layout.
+
+QSA block selection enters through the public QSA API and `select_kernel`.
+The materialized path composes the registered `qsa_block_scores` and
+`qsa_block_topk_select` operators; the fused path uses `qsa_block_topk_stream`.
+Required `logits`/`stream` features keep backend overrides within the requested
+algorithm, including forced kernel names that bypass ordinary operator matching.
+CUDA selection owns its launch details and scratch. Automatic
+selection uses query rows, table capacity, and supported layouts, never the
+prefill/decode mode. The caller's logits budget forces streaming when the score
+matrix would exceed it. Explicit paths bypass that automatic budget.
+
+Supported Blackwell stream layouts use CuTe DSL; other layouts and vendors
+retain portable Triton. The Blackwell CuTe specializations use four
+BF16 index heads of width 128, 64-block pages, and block top-k 512. Grouped
+scoring requires explicit eight-row request runs; small query grids can score
+rows independently, including ragged queries. Grouped streams keep exact
+running selections in selector registers, with double-buffered score
+candidates overlapping selection and MMA across tiles. Small grids can split
+the key range into bounded global scratch. The caller's partial-workspace
+budget bounds that scratch. Grouped CuTe and portable Triton streaming only
+allocate their output; each Triton program scans a group contained in an explicit
+uniform request run and keeps each row's running top-k locally, with no split/merge
+buffers. Ragged runs use group size one in the same kernel. Candidate pruning must
+prove that discarded scores cannot enter the top-k, or perform a full-score
+fallback. Each row retains its complete-block frontier. Query count, request
+count, page-table width, and Q strides remain runtime values; split geometry is
+bucketed before specializing the compiled signature. PDL waits precede
+asynchronous Q copies and producer-owned metadata reads.
+Trimmed batched page-table views retain a runtime row stride. Speculative
+context padding counts toward their capacity; compact candidate offsets must
+restore the full logical block id instead of wrapping at 65536 blocks.
 
 Different query groups can produce slightly different FP32 scores because
 their dot/reduction layouts differ; cross-layout bitwise equality is not a
@@ -1139,12 +1202,20 @@ Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
-The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, as does every single-request forward. Multi-request
-prefill and mixed/ragged queries use `None`.
-Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
-single-token prefill. Adapting ragged rows to one-token queries must retain
-this distinction. Both use the same cache writer and sparse-attention call.
+QSA uses positive `decode_query_lengths` for uniform decode/verification and
+`None` for prefill or mixed/ragged queries, including one-token prefill.
+Only decode may use CuTe. PrimTS accepts supported BF16 prefill and decode
+with logical block candidates on SM100/SM103; groups stay within each request.
+Other supported NVIDIA inputs use FA2 over equivalent physical slots.
+All kernels share the cache writer and sparse-attention call. The indexer
+returns physical slots across graph breaks and keeps logical candidates
+in the existing per-forward share for both stages. Draft steps carrying
+only physical slots use the direct-slot kernels.
+
+The QSA leaf owns PrimTS plans and per-device scratch for its current KV pool.
+Calls, including graph replays, are ordered across streams. Rebinding drops
+eager plans; capture sessions retain graph plans and allocations until release.
+Scratch may grow without moving graph inputs. Each run regenerates its data.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
 candidates from the zero-initialized slot 1 of the reserved null page.

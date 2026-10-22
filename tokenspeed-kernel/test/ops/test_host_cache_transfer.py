@@ -72,6 +72,44 @@ requires_cuda = pytest.mark.skipif(
 )
 
 
+@requires_cuda
+def test_address_binding_and_rebinding_are_asynchronous():
+    module = _load_host_transfer_contract_module()
+    workspace = module.HostTransferWorkspace()
+    buffers = tuple(
+        tuple(torch.empty(8, dtype=torch.uint8, device="cuda") for _ in range(2))
+        for _ in range(2)
+    )
+    hosts = tuple(torch.empty(8, dtype=torch.uint8, pin_memory=True) for _ in range(2))
+    bindings = (
+        (buffers[0], hosts[0]),
+        (buffers[0], hosts[0]),
+        (buffers[0], hosts[1]),
+        (buffers[1], hosts[1]),
+        (buffers[0], hosts[0]),
+    )
+    expected = [
+        [buffer.data_ptr() for buffer in device_buffers]
+        + [int(module.current_platform().device_visible_data_ptr(host))]
+        for device_buffers, host in bindings
+    ]
+    tables = []
+    stream = torch.cuda.Stream()
+    previous_debug_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        with torch.cuda.stream(stream):
+            for device_buffers, host in bindings:
+                tables.append(workspace.bind_addresses(device_buffers, host))
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_debug_mode)
+    stream.synchronize()
+
+    # Earlier tables must retain their own binding after subsequent rebinds.
+    assert tables[0].data_ptr() == tables[1].data_ptr()
+    assert [table.cpu().tolist() for table in tables] == expected
+
+
 def _sample_geometry(
     contract,
     *,

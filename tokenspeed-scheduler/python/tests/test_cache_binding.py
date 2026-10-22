@@ -36,8 +36,9 @@ def test_removed_storage_cache_api_is_not_exported():
     assert not hasattr(request, "rolling_hashes")
     assert not hasattr(request, "storage_hit_pages")
 
-    # Cache.PrefetchOp / Cache.PrefetchDoneEvent exist again, as the
-    # pre-admission L3 fill (not the old adjunct API).
+    # The pre-admission prefetch protocol is gone with the adjunct API.
+    assert not hasattr(Cache, "PrefetchOp")
+    assert not hasattr(Cache, "PrefetchDoneEvent")
     assert not hasattr(Cache, "BackUpOp")
     assert not hasattr(Cache, "CacheKind")
     assert not hasattr(Cache.WriteBackOp, "is_retract")
@@ -73,17 +74,6 @@ def test_cache_event_fields_are_bound():
 
     load_back = Cache.LoadBackDoneEvent(8)
     assert load_back.op_id == 8
-    assert not hasattr(
-        load_back, "success"
-    ), "a load cannot miss: an L3 miss is a PrefetchDoneEvent"
-
-    prefetch = Cache.PrefetchDoneEvent(12, 3)
-    assert prefetch.op_id == 12
-    assert prefetch.landed_pages == 3
-    with pytest.raises(TypeError):
-        Cache.PrefetchDoneEvent()
-    with pytest.raises(TypeError):
-        Cache.PrefetchDoneEvent(13)
 
 
 def test_execution_event_accepts_cache_events():
@@ -95,7 +85,6 @@ def test_execution_event_accepts_cache_events():
     load_back = Cache.LoadBackDoneEvent(8)
     assert execution_event.add_event(load_back) is execution_event
 
-    assert execution_event.add_event(Cache.PrefetchDoneEvent(9, 0)) is execution_event
     assert execution_event.add_event(Cache.SnapshotDoneEvent()) is execution_event
     assert execution_event.add_event(Cache.RestoreDoneEvent()) is execution_event
 
@@ -119,27 +108,6 @@ def test_snapshot_ops_carry_the_blob_slot_and_source_tier():
         assert not hasattr(Cache.SnapshotOp, field)
     assert int(Cache.HostTier.L2) == 0
     assert int(Cache.HostTier.SnapshotPool) == 1
-
-
-def test_recompute_retract_is_gone_and_prefetch_op_is_bound():
-    # There is no retraction without an image: the L3-miss case is handled
-    # before admission by the prefetch op, never by a forward-event retract.
-    assert not hasattr(ts.ForwardEvent, "RecomputeRetract")
-    assert not hasattr(ts.ForwardEvent, "Retract")
-    for field in (
-        "op_ids",
-        "request_ids",
-        "first_pages",
-        "num_pages",
-        "group_ids",
-        "host_pages",
-        "content_hashes",
-        "page_offsets",
-        "page_indices",
-    ):
-        assert hasattr(Cache.PrefetchOp, field), field
-    assert not hasattr(Cache.LoadBackOp, "prefetch_from_storage")
-    assert not hasattr(ts.Scheduler, "waiting_prefix_hashes")
 
 
 def test_scheduler_aborts_are_bound():

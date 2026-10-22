@@ -207,7 +207,7 @@ if platform.is_amd:
 
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe import (
-        launch_gluon_router_gemv_splitk_gfx950,
+        launch_gluon_router_sqrt_softplus_topk_gemv_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe import (
         launch_gluon_sqrt_softplus_topk_gfx950 as _topk_impl,
@@ -299,7 +299,7 @@ if platform.is_amd:
         routed_scaling_factor: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Split-K GEMV partials; the top-k kernel sums them in order.
-        partials = launch_gluon_router_gemv_splitk_gfx950(hidden_states, gate_weight)
+        partials = launch_gluon_router_sqrt_softplus_topk_gemv_gfx950(hidden_states, gate_weight)
         weights, ids, _ = _topk_impl(
             partials,
             top_k,

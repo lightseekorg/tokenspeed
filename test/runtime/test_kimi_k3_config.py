@@ -297,6 +297,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -322,6 +323,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -365,6 +367,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -383,6 +386,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=False,
                 use_marlin=True,
@@ -406,6 +410,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -987,6 +992,7 @@ class TestKimiK3RegistrationTests:
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
                     use_mega_moe=False,
+                    owns_ep_communication=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1076,6 +1082,7 @@ class TestKimiK3RegistrationTests:
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
                     use_mega_moe=False,
+                    owns_ep_communication=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1117,6 +1124,7 @@ class TestKimiK3RegistrationTests:
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
                     use_mega_moe=False,
+                    owns_ep_communication=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,

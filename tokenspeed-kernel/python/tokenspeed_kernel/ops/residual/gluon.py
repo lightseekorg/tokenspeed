@@ -437,32 +437,6 @@ if current_platform().is_amd:
 
     @register_kernel(
         "residual",
-        "mhc_apply_pre_fp8_group32",
-        name="gluon_mhc_apply_pre_fp8_group32_gfx950",
-        solution="gluon",
-        capability=_GFX950,
-        signatures=frozenset(
-            {
-                format_signature(
-                    residual=dense_tensor_format(torch.bfloat16),
-                    pre=dense_tensor_format(torch.float32),
-                )
-            }
-        ),
-        traits={
-            "buffer_offsets_fit_int32": frozenset({True}),
-            "hc_mult": frozenset({4}),
-        },
-        priority=Priority.SPECIALIZED,
-    )
-    def gluon_mhc_apply_pre_fp8_group32_gfx950(residual, pre, norm_weight, norm_eps):
-        """Collapse four streams with RMSNorm and also emit group-32 E4M3 codes."""
-        return launch_gluon_mhc_apply_pre_gfx950(
-            residual, pre, norm_weight=norm_weight, norm_eps=norm_eps, quantize=True
-        )
-
-    @register_kernel(
-        "residual",
         "hyperconnection_mix",
         name="gluon_hyperconnection_mix_gfx950",
         solution="gluon",

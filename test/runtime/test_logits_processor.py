@@ -21,10 +21,12 @@ import tokenspeed.runtime.layers.logits_processor as logits_processor_module  # 
 from tokenspeed.runtime.execution.context import InputLogprobRows  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.layers.logits_processor import (  # noqa: E402
+    DistArgmaxPrepared,
     LogitsMetadata,
     LogitsProcessor,
     VocabParallelArgmax,
     fused_softcap,
+    prepare_logits_communication,
 )
 from tokenspeed.runtime.layers.vocab_parallel_embedding import (  # noqa: E402
     ParallelLMHead,
@@ -47,7 +49,7 @@ def nvidia_logits(monkeypatch):
 
 @pytest.mark.parametrize("do_argmax", [False, True])
 def test_cpu_tp_logits_do_not_query_an_accelerator_capture(monkeypatch, do_argmax):
-    """Both lazy gates work with real CPU logits and no CUDA context."""
+    """The prepared argmax and the lazy gather gate need no CUDA context."""
     from transformers import PretrainedConfig
 
     def cuda_query():
@@ -79,6 +81,7 @@ def test_cpu_tp_logits_do_not_query_an_accelerator_capture(monkeypatch, do_argma
     )
     with torch.no_grad():
         head.weight.copy_(torch.tensor([[1, 0], [0, 1], [-1, 0], [0, -1]]))
+    processor.prepare_communication(head)
     local = hidden @ head.weight.T
     output = processor._get_logits(hidden, head, None, require_full_vocab=False)
     expected = local if do_argmax else torch.cat((local, local), dim=-1)
@@ -682,10 +685,13 @@ def test_dist_argmax_state_serves_the_bf16_logits_of_a_transposed_quantized_head
         lambda tensor, **k: None,
     )
     created = []
+    made = {}
 
     def fake_create(**kwargs):
+        state = SimpleNamespace(dtype=kwargs["dtype"])
+        made[kwargs["dtype"]] = state
         created.append(kwargs["dtype"])
-        return SimpleNamespace(dtype=kwargs["dtype"])
+        return state
 
     monkeypatch.setattr(
         logits_processor_module, "try_create_dist_argmax_state", fake_create
@@ -712,6 +718,12 @@ def test_dist_argmax_state_serves_the_bf16_logits_of_a_transposed_quantized_head
     )
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
 
+    # Only the 4096-wide shard passes the vocab check that guards the state;
+    # startup prepares every supported logits dtype, outside any forward.
+    proc.prepare_communication(lm_head)
+    assert created == [torch.float16, torch.bfloat16, torch.float32]
+    created.clear()
+
     logits = proc._get_logits(
         torch.randn(3, hidden, dtype=torch.bfloat16),
         lm_head,
@@ -719,9 +731,37 @@ def test_dist_argmax_state_serves_the_bf16_logits_of_a_transposed_quantized_head
         require_full_vocab=False,
     )
 
-    # Only the 4096-wide shard passes the vocab check that guards the state.
-    assert created == [torch.bfloat16]
+    # The forward selects the prepared state by logits dtype; it builds nothing.
+    assert created == []
     assert logits.shape == (3, shard)  # left sharded for the distributed argmax
+
+    reduced = []
+
+    def fake_reduce(state, shard_logits):
+        reduced.append(state)
+        return None, shard_logits.argmax(dim=-1)
+
+    monkeypatch.setattr(logits_processor_module, "distributed_argmax", fake_reduce)
+    proc._argmax(logits)
+    assert reduced == [made[torch.bfloat16]]
+
+    # Under graph capture the forward still only selects; a dtype switch picks
+    # that dtype's prepared state.
+    monkeypatch.setattr(
+        logits_processor_module.torch.cuda,
+        "is_current_stream_capturing",
+        lambda: True,
+    )
+    captured = proc._get_logits(
+        torch.randn(3, hidden, dtype=torch.bfloat16),
+        lm_head,
+        md,
+        require_full_vocab=False,
+    )
+    assert created == []
+    assert captured.shape == (3, shard)
+    proc._argmax(captured.float())
+    assert reduced[-1] is made[torch.float32]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -750,7 +790,10 @@ def test_argmax_routes_sharded_to_kernel(monkeypatch):
         tp_group=(0, 1),
         dp_lm_head_tp=False,
     )
-    proc._dist_argmax_state = object()  # non-None, non-sentinel => active
+    proc._dist_argmax_state = DistArgmaxPrepared(
+        states={torch.float32: object()},  # prepared for the shard's dtype
+        fallback=VocabParallelArgmax((0, 1), 0),
+    )
 
     recorded = {}
 
@@ -813,10 +856,143 @@ def test_get_logits_skips_gather_when_dist_argmax_active(monkeypatch, nvidia_log
     )
 
     hidden = torch.randn(4, 2, dtype=torch.float32)
-    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))  # 4*2 == 8
+    lm_head = SimpleNamespace(
+        weight=torch.randn(4, 2, dtype=torch.float32), num_embeddings_per_partition=4
+    )  # 4*2 == 8
+    proc.prepare_communication(lm_head)
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
     assert out.shape == (4, 4)  # local shard width retained, not gathered to 8
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.EXTEND, ForwardMode.DECODE])
+@pytest.mark.parametrize("vetoed", [False, True])
+def test_startup_prepares_shared_head_before_first_forward(monkeypatch, mode, vetoed):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", vetoed)
+    capturing = {"active": False}
+    monkeypatch.setattr(
+        torch.cuda, "is_current_stream_capturing", lambda: capturing["active"]
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8),
+        do_argmax=True,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        dp_lm_head_tp=False,
+    )
+    language = torch.nn.Module()
+    language.lm_head = torch.nn.Linear(2, 4, bias=False)
+    language.lm_head.num_embeddings_per_partition = 4
+    language.logits_processor = processor
+    model = torch.nn.Module()
+    model.language_model = language
+    # A shared draft head/processor must reuse the prepared verdict.
+    draft = torch.nn.Module()
+    draft.lm_head = language.lm_head
+    draft.logits_processor = processor
+    prepare_logits_communication(model)
+    prepared = processor._dist_argmax_state
+    prepare_logits_communication(draft)
+    assert processor._dist_argmax_state is prepared
+
+    def gather(output, logits, group):
+        output.copy_(torch.cat((logits, logits), dim=0))
+
+    # The process group is unavailable in this CPU test; the LM-head and
+    # logits path are real. Capture now forbids late state construction.
+    monkeypatch.setattr(logits_processor_module, "all_gather_single", gather)
+    capturing["active"] = True
+    hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    local = hidden @ language.lm_head.weight.T
+    logits = processor._get_logits(
+        hidden,
+        language.lm_head,
+        LogitsMetadata(forward_mode=mode, query_shard=None),
+        require_full_vocab=False,
+    )
+    expected = torch.cat((local, local), dim=-1) if vetoed else local
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+
+def test_prepared_argmax_reuses_weight_updates_and_rebinds_padded_head(monkeypatch):
+    monkeypatch.setitem(global_server_args_dict, "force_deterministic_rsag", False)
+    capturing = {"active": False}
+    monkeypatch.setattr(
+        logits_processor_module,
+        "is_current_stream_capturing",
+        lambda device: capturing["active"],
+    )
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=8),
+        do_argmax=True,
+        tp_rank=0,
+        tp_size=2,
+        tp_group=(0, 1),
+        dp_lm_head_tp=False,
+    )
+    head = torch.nn.Linear(2, 4, bias=False)
+    head.num_embeddings_per_partition = 4
+    processor.prepare_communication(head)
+    state = processor._dist_argmax_state
+    with torch.no_grad():
+        head.weight.fill_(2)
+    processor.prepare_communication(head)
+    assert processor._dist_argmax_state is state
+
+    padded_head = torch.nn.Linear(2, 5, bias=False)
+    padded_head.num_embeddings_per_partition = 5
+    capturing["active"] = True
+    with pytest.raises(RuntimeError, match="before CUDA graph capture"):
+        processor.prepare_communication(padded_head)
+    assert processor._dist_argmax_state is state
+    capturing["active"] = False
+    processor.prepare_communication(padded_head)
+    monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_single",
+        lambda output, logits, group: output.copy_(torch.cat((logits, logits), dim=0)),
+    )
+    hidden = torch.tensor([[1.0, 2.0]])
+    local = hidden @ padded_head.weight.T
+    logits = processor._get_logits(
+        hidden,
+        padded_head,
+        LogitsMetadata(forward_mode=ForwardMode.EXTEND, query_shard=None),
+        require_full_vocab=False,
+    )
+    torch.testing.assert_close(
+        logits, torch.cat((local, local), dim=-1)[:, :8].float(), rtol=0, atol=0
+    )
+
+
+def test_inactive_argmax_preserves_weightless_quantized_head():
+    class QuantMethod:
+        def apply(self, head, hidden, bias):
+            return hidden @ head.qweight.T
+
+    class Head(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.quant_method = QuantMethod()
+            self.qweight = torch.nn.Parameter(torch.eye(2))
+
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=2),
+        dp_lm_head_tp=False,
+    )
+    model = torch.nn.Module()
+    model.logits_processor = processor
+    model.lm_head = Head()
+    prepare_logits_communication(model)
+    hidden = torch.tensor([[1.0, 2.0]])
+    logits = processor._get_logits(
+        hidden,
+        model.lm_head,
+        LogitsMetadata(forward_mode=ForwardMode.EXTEND, query_shard=None),
+        require_full_vocab=False,
+    )
+    torch.testing.assert_close(logits, hidden, rtol=0, atol=0)
 
 
 def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch):
@@ -858,12 +1034,14 @@ def test_require_full_vocab_logits_turns_the_fused_draft_argmax_off(monkeypatch)
 def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
     monkeypatch, nvidia_logits
 ):
-    """The uninitialised sentinel must not be mistaken for a built state.
+    """Forward never builds the distributed argmax; capture defers the gather gate.
 
-    The gate reduces across the group, so it is skipped inside a capture. The
-    sentinel is an ``object()`` and so passes ``is not None``: leaving it in
-    place would hand it to ``all_gather_inner`` as if it were a state. It must
-    also survive, or an eager call afterwards would never build the real one.
+    The uninitialized sentinel is an ``object()`` and so passes
+    ``is not None``: forward must refuse it instead of handing it to the
+    gather as if it were a state. Once ``prepare_communication`` has resolved
+    the argmax (None = prepared fallback), a capture takes the plain gather
+    and leaves the all-gather gate's sentinel for an eager call, since that
+    gate still rendezvouses lazily.
     """
     proc = LogitsProcessor(
         config=SimpleNamespace(
@@ -876,19 +1054,34 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
         dp_lm_head_tp=False,
     )
     monkeypatch.setattr(
+        logits_processor_module,
+        "all_gather_inner",
+        lambda *a, **k: pytest.fail("the sentinel must never reach the gather"),
+    )
+    hidden = torch.randn(4, 2, dtype=torch.bfloat16)
+    lm_head = SimpleNamespace(
+        weight=torch.randn(4, 2, dtype=torch.bfloat16), num_embeddings_per_partition=4
+    )
+    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
+    with pytest.raises(RuntimeError, match="must be prepared before forwarding"):
+        proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
+
+    # A prepared fallback gathers plainly inside a capture; both gates stay off.
+    monkeypatch.setattr(
+        proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: None
+    )
+    proc.prepare_communication(lm_head)
+    monkeypatch.setattr(
         proc,
         "_init_dist_argmax_state",
-        lambda lm_head: pytest.fail("the gate must not run inside a capture"),
+        lambda lm_head, logits_dtype: pytest.fail(
+            "forward never re-runs the argmax gate"
+        ),
     )
     monkeypatch.setattr(
         proc,
         "_init_all_gather_state",
         lambda lm_head: pytest.fail("the gate must not run inside a capture"),
-    )
-    monkeypatch.setattr(
-        logits_processor_module,
-        "all_gather_inner",
-        lambda *a, **k: pytest.fail("the sentinel must never reach the gather"),
     )
     monkeypatch.setattr(
         logits_processor_module, "is_current_stream_capturing", lambda device: True
@@ -899,21 +1092,15 @@ def test_capture_takes_the_plain_gather_and_leaves_the_gate_for_later(
         lambda out, inp, group: None,
     )
 
-    hidden = torch.randn(4, 2, dtype=torch.bfloat16)
-    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.bfloat16))
-    md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
 
     assert out.shape == (4, 8)
     assert proc._all_gather_state is LogitsProcessor._LOGITS_AG_STATE_UNINITIALIZED
-    assert proc._dist_argmax_state is LogitsProcessor._LOGITS_DIST_ARGMAX_UNINITIALIZED
+    assert proc._dist_argmax_state is None
 
     # A subsequent eager forward must still be able to initialize the states.
     monkeypatch.setattr(
         logits_processor_module, "is_current_stream_capturing", lambda device: False
-    )
-    monkeypatch.setattr(
-        proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: None
     )
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
     monkeypatch.setattr(
@@ -944,6 +1131,7 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch, nvidia_logits):
         proc, "_init_dist_argmax_state", lambda lm_head, logits_dtype: object()
     )
     monkeypatch.setattr(proc, "_init_all_gather_state", lambda lm_head: object())
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     called = {}
 
     def fake_ag(state, logits, **kw):
@@ -957,8 +1145,9 @@ def test_get_logits_softcap_disables_fused_argmax(monkeypatch, nvidia_logits):
 
     hidden = torch.randn(4, 2, dtype=torch.bfloat16)
     lm_head = SimpleNamespace(
-        weight=torch.randn(4, 2, dtype=torch.bfloat16)
+        weight=torch.randn(4, 2, dtype=torch.bfloat16), num_embeddings_per_partition=4
     )  # 4*2 == 8
+    proc.prepare_communication(lm_head)
     md = LogitsMetadata(forward_mode=ForwardMode.DECODE, query_shard=None)
     out = proc._get_logits(hidden, lm_head, md, require_full_vocab=False)
     assert called.get("ag")  # gathered (softcap on full vocab), not early-returned
@@ -1185,7 +1374,10 @@ def test_input_logprobs_bypass_the_sharded_argmax_shortcut(monkeypatch, nvidia_l
 
     monkeypatch.setattr(logits_processor_module, "all_gather_single", collective)
     hidden = torch.randn(3, 2, dtype=torch.float32)
-    lm_head = SimpleNamespace(weight=torch.randn(4, 2, dtype=torch.float32))
+    lm_head = SimpleNamespace(
+        weight=torch.randn(4, 2, dtype=torch.float32), num_embeddings_per_partition=4
+    )
+    proc.prepare_communication(lm_head)
     md = LogitsMetadata(
         forward_mode=ForwardMode.EXTEND,
         query_shard=None,
@@ -1586,6 +1778,7 @@ def test_rocm_keeps_the_portable_sharded_argmax(monkeypatch):
     hidden = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     head = torch.nn.Linear(2, 4, bias=False).requires_grad_(False)
     head.num_embeddings_per_partition = 4
+    processor.prepare_communication(head)
     actual = processor._get_logits(
         hidden,
         head,

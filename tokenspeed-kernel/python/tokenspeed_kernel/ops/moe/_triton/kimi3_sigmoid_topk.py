@@ -118,6 +118,7 @@ def kimi3_sigmoid_bias_topk(
     logical_to_physical_map: torch.Tensor | None = None,
     weights_dtype: torch.dtype = torch.float32,
     enable_pdl: bool = False,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Route Kimi K3 tokens to their top 16 of 896 experts, one row per CTA.
 
@@ -135,10 +136,13 @@ def kimi3_sigmoid_bias_topk(
             router-logits read with ``gdc_wait`` / ``gdc_launch_dependents``
             (NVIDIA only; ignored elsewhere). Safe only when the router GEMV
             that writes ``router_logits`` is chained on the same stream/graph.
+        out: Optional contiguous weight and expert-ID output buffers. Weights
+            use the supplied buffer's precision. Omission allocates weights in
+            ``weights_dtype`` and IDs in INT32.
 
     Returns:
-        ``(topk_weights, topk_ids)`` shaped ``[tokens, 16]`` with ``weights_dtype``
-        weights and INT32 ids (physical ids when a dispatch map is given).
+        ``(topk_weights, topk_ids)`` shaped ``[tokens, 16]``. Supplied output
+        buffers are returned in place. A dispatch map produces physical IDs.
     """
     if (
         router_logits.dim() != 2
@@ -171,16 +175,15 @@ def kimi3_sigmoid_bias_topk(
             "int32/int64 [896] tensor"
         )
 
-    topk_ids = torch.empty(
-        (tokens, 16),
-        dtype=torch.int32,
-        device=router_logits.device,
-    )
-    topk_weights = torch.empty(
-        (tokens, 16),
-        dtype=weights_dtype,
-        device=router_logits.device,
-    )
+    if out is None:
+        topk_weights = torch.empty(
+            (tokens, 16), dtype=weights_dtype, device=router_logits.device
+        )
+        topk_ids = torch.empty(
+            (tokens, 16), dtype=torch.int32, device=router_logits.device
+        )
+    else:
+        topk_weights, topk_ids = out
     # waves_per_eu is a CDNA-only occupancy hint; NVIDIA Triton rejects it.
     amd_kwargs = {"waves_per_eu": 1} if Platform.get().is_amd else {}
     pdl_kwargs = (

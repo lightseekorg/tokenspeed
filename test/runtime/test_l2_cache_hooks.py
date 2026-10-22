@@ -38,6 +38,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
+
 # CPU-only tests scheduled in runtime-1gpu because they import the full runtime.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
@@ -80,21 +82,6 @@ class _FakeRestoreBatch(_FakeSnapshotBatch):
         self.content_hashes = [[""]] * len(op_ids)
         self.page_offsets = [[0]] * len(op_ids)
         self.source_tiers = [[1]] * len(op_ids)
-
-
-class _FakePrefetchBatch:
-    """The wire face of ``Cache.PrefetchOp``: one row per waiting request."""
-
-    def __init__(self, op_ids) -> None:
-        self.op_ids = list(op_ids)
-        self.request_ids = [f"r{op_id}" for op_id in op_ids]
-        self.first_pages = [0] * len(op_ids)
-        self.num_pages = [1] * len(op_ids)
-        self.group_ids = [[0]] * len(op_ids)
-        self.host_pages = [[1]] * len(op_ids)
-        self.content_hashes = [["h"]] * len(op_ids)
-        self.page_offsets = [[0]] * len(op_ids)
-        self.page_indices = [[0]] * len(op_ids)
 
 
 class _Device:
@@ -167,29 +154,6 @@ def _install_collectives(
     monkeypatch.setattr(cache_hooks_module.dist, "all_gather_object", all_gather_object)
 
 
-def test_collective_doubles_require_op_and_group() -> None:
-    tree = ast.parse(Path(__file__).read_text())
-    found_reduce = False
-    found_gather = False
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.FunctionDef):
-            continue
-        defaults = dict(
-            zip((arg.arg for arg in node.args.kwonlyargs), node.args.kw_defaults)
-        )
-        if node.name == "_all_reduce":
-            found_reduce = True
-            assert node.args.defaults == []
-            assert defaults["op"] is None
-            assert defaults["group"] is None
-        elif node.name == "_all_gather_object":
-            found_gather = True
-            assert node.args.defaults == []
-            assert defaults["group"] is None
-    assert found_reduce
-    assert found_gather
-
-
 @pytest.fixture()
 def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
     # The C++ op bindings (Cache.WriteBackOp, Cache.SnapshotOp, ...) expose no
@@ -203,14 +167,17 @@ def fake_cache_ops(monkeypatch: pytest.MonkeyPatch):
             LoadBackOp=(),
             SnapshotOp=_FakeSnapshotBatch,
             RestoreOp=_FakeRestoreBatch,
-            PrefetchOp=_FakePrefetchBatch,
+            StorageQueryOp=Cache.StorageQueryOp,
+            StorageGetOp=Cache.StorageGetOp,
+            StoragePutOp=Cache.StoragePutOp,
+            StorageCancelOp=Cache.StorageCancelOp,
         ),
     )
 
 
 def test_disabled_kvstore_is_a_no_op() -> None:
     hooks = _single_rank_hooks(None)
-    hooks.count_plan_ops(SimpleNamespace(cache=[SimpleNamespace()]))
+    hooks.count_ops(())
     assert hooks.poll_ready_events() == []
 
 
@@ -228,12 +195,12 @@ def test_submit_counts_in_flight_and_rejects_unknown_ops(fake_cache_ops) -> None
     hooks = _single_rank_hooks(device)
     plan = SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[1, 2])])
 
-    hooks.count_plan_ops(plan)
+    hooks.count_ops(cache_ops_from_plan(plan).device)
 
     assert hooks._num_inflight == 2
 
     with pytest.raises(TypeError, match="unsupported cache op kind"):
-        hooks.count_plan_ops(SimpleNamespace(cache=[object()]))
+        hooks.count_ops(cache_ops_from_plan(SimpleNamespace(cache=[object()])).device)
 
 
 def test_snapshot_and_restore_batches_count_one_ticket_per_request(
@@ -250,30 +217,33 @@ def test_snapshot_and_restore_batches_count_one_ticket_per_request(
             _FakeWriteBackOp(op_ids=[1]),
             _FakeSnapshotBatch(op_ids=[2, 3]),
             _FakeRestoreBatch(op_ids=[4]),
-            _FakePrefetchBatch(op_ids=[5, 6]),
+            _FakeSnapshotBatch(op_ids=[5, 6]),
         ]
     )
 
-    hooks.count_plan_ops(plan)
+    hooks.count_ops(cache_ops_from_plan(plan).device)
 
     assert hooks._num_inflight == 6
     for event in (
         _cache_event("SnapshotDoneEvent", 2),
         _cache_event("RestoreDoneEvent", 4),
-        Cache.PrefetchDoneEvent(5, 3),
+        _cache_event("SnapshotDoneEvent", 5),
     ):
         device.results = [event]
         (ready,) = hooks.poll_ready_events()
         assert type(ready).__name__ == type(event).__name__
         assert ready.op_id == event.op_id
-    assert ready.landed_pages == 3
     assert hooks._num_inflight == 3
 
 
 def test_poll_returns_completed_events_and_settles_inflight(fake_cache_ops) -> None:
     device = _Device()
     hooks = _single_rank_hooks(device)
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])])
+        ).device
+    )
 
     # Nothing completed yet: in flight, but no ready payloads.
     assert hooks.poll_ready_events() == []
@@ -302,7 +272,11 @@ def test_pp_peer_missing_writeback_keeps_payload_pending(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])])
+        ).device
+    )
     device.results = [_writeback_done_event(7)]
 
     gather_groups: list = []
@@ -337,7 +311,11 @@ def test_pp_agreed_writeback_emits_event(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])])
+        ).device
+    )
     device.results = [_writeback_done_event(7)]
 
     gather_groups: list = []
@@ -375,7 +353,11 @@ def test_gather_order_is_attention_tp_then_pp(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])])
+        ).device
+    )
     device.results = [_writeback_done_event(7)]
 
     reduce_groups: list = []
@@ -415,7 +397,11 @@ def test_empty_tp_intersection_still_gathers_pp(
         pp_size=2,
         pp_cpu_group=pp_group,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])])
+        ).device
+    )
     device.results = [_writeback_done_event(7)]
 
     gather_groups: list = []
@@ -477,7 +463,11 @@ def test_replica_runs_collectives_only_while_a_ticket_is_open(
     )
 
     assert hooks.poll_ready_events() == [] and collectives == []
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])])
+        ).device
+    )
     device.results = [_writeback_done_event(7)]
     assert [e.op_id for e in hooks.poll_ready_events()] == [7]
     assert collectives == ["reduce", "gather"]
@@ -516,7 +506,11 @@ def test_tickets_stay_open_until_the_replica_commits_them(
     _install_collectives(
         monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7, 8])]))
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7, 8])])
+        ).device
+    )
     device.results = [_writeback_done_event(7), _writeback_done_event(8)]
     assert hooks.poll_ready_events() == []  # the peer has neither yet
     assert hooks.poll_ready_events() == []
@@ -529,42 +523,26 @@ def test_tickets_stay_open_until_the_replica_commits_them(
     assert hooks.poll_ready_events() == [] and collectives == []
 
 
-def test_replica_backup_failure_raises_after_poll_all_reduce(
-    fake_cache_ops, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_d2h_ack_is_independent_of_backend_health(fake_cache_ops):
     device = _Device()
-    device.backup_failed = True
-    pp_group = object()
     hooks = _hooks(
         device,
         speculative_algorithm=None,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
-        pp_size=2,
-        pp_cpu_group=pp_group,
+        pp_size=1,
+        pp_cpu_group=None,
     )
-    hooks.count_plan_ops(SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])]))
-
-    reduce_groups: list = []
-    gather_groups: list = []
-
-    def _all_reduce(tensor, *, op, group) -> None:
-        del op
-        reduce_groups.append(group)
-        tensor[1] = max(int(tensor[1].item()), 1)
-
-    def _all_gather_object(output, obj, *, group) -> None:
-        gather_groups.append(group)
-        del output, obj
-
-    _install_collectives(
-        monkeypatch, all_reduce=_all_reduce, all_gather_object=_all_gather_object
+    hooks.count_ops(
+        cache_ops_from_plan(
+            SimpleNamespace(cache=[_FakeWriteBackOp(op_ids=[7])])
+        ).device
     )
-
-    with pytest.raises(RuntimeError, match="L3 backup failed on a replica rank"):
-        hooks.poll_ready_events()
-    assert reduce_groups == [pp_group]
-    assert gather_groups == []
+    event = Cache.WriteBackDoneEvent()
+    event.op_id = 7
+    device.results = [event]
+    device.backup_failed = True
+    assert [x.op_id for x in hooks.poll_ready_events()] == [7]
 
 
 if __name__ == "__main__":
@@ -645,7 +623,7 @@ def test_tp_pp_grid_counts_stay_equal_and_all_ranks_stop_polling_together(
             global_rank=rank,
         )
         try:
-            hooks.count_plan_ops(plan)
+            hooks.count_ops(cache_ops_from_plan(plan).device)
             for round_idx in range(num_rounds):
                 device.results = [
                     _cache_event(kind, op_id)

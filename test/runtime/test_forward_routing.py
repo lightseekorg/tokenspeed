@@ -31,10 +31,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, DeviceRole
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.pd.decode_executor import DisaggDecodeExecutor
 from tokenspeed.runtime.pd.prefill_executor import DisaggPrefillExecutor
+
+
+def _execute(handle, plan, planned):
+    return handle.execute(plan, planned, cache_ops=cache_ops_from_plan(plan).device)
 
 
 class _ForwardThread:
@@ -133,7 +138,7 @@ def _planned(*, num_extends=0):
 
 def test_plain_engine_forwards_with_the_batch_grammar():
     trace = []
-    pending = _handle(trace).execute(_plan(), _planned())
+    pending = _execute(_handle(trace), _plan(), _planned())
 
     assert trace[0] == "submit"
     assert trace[1][1] == "GRAMMAR"
@@ -156,9 +161,8 @@ def test_decode_node_triggers_the_receive_from_the_plan_stream():
     )
     remote_prefill = SimpleNamespace(request_pool_indices=[3, 4], num_extends=lambda: 1)
 
-    pending = handle.execute(
-        _plan(pages_to_zero=[7], remote_prefill=remote_prefill),
-        None,
+    pending = _execute(
+        handle, _plan(pages_to_zero=[7], remote_prefill=remote_prefill), None
     )
     trace.remove("submit")  # the zeroing submission itself
     trace.remove("submit")  # the receive submission itself
@@ -178,8 +182,8 @@ def test_decode_node_masks_local_batches_with_the_batch_grammar():
     """The matcher was advanced past the prefill node's token when the
     RemotePrefillDoneEvent landed, so decode masks from the right state."""
     trace = []
-    pending = _handle(trace, _DecodePeer(trace)).execute(
-        _plan(), _planned(num_extends=0)
+    pending = _execute(
+        _handle(trace, _DecodePeer(trace)), _plan(), _planned(num_extends=0)
     )
 
     assert pending is not None
@@ -192,7 +196,8 @@ def test_prefill_node_sends_remote_decodes_from_the_plan_stream():
     trace = []
     remote_decode = SimpleNamespace(request_ids=["done"])
 
-    pending = _handle(trace, _PrefillPeer(trace)).execute(
+    pending = _execute(
+        _handle(trace, _PrefillPeer(trace)),
         _plan(remote_decode=remote_decode),
         _planned(num_extends=1),
     )
@@ -213,8 +218,8 @@ def test_remote_decodes_go_out_even_on_an_idle_round():
     trace = []
     remote_decode = SimpleNamespace(request_ids=["done"])
 
-    result = _handle(trace, _PrefillPeer(trace)).execute(
-        _plan(remote_decode=remote_decode), None
+    result = _execute(
+        _handle(trace, _PrefillPeer(trace)), _plan(remote_decode=remote_decode), None
     )
 
     assert result is None
@@ -225,7 +230,7 @@ def test_prefill_node_captures_next_input_ids_for_the_bootstrap_payload():
     trace = []
     peer = _PrefillPeer(trace)
 
-    pending = _handle(trace, peer).execute(_plan(), _planned(num_extends=1))
+    pending = _execute(_handle(trace, peer), _plan(), _planned(num_extends=1))
 
     assert pending is not None
     # The layerwise arming is enqueued BEFORE the forward it arms — and
@@ -247,13 +252,10 @@ def test_a_failed_transfer_submission_surfaces_at_the_next_round():
 
     peer.execute = _boom
     handle = _handle(trace, peer)
-    handle.execute(
-        _plan(remote_decode=SimpleNamespace(request_ids=["x"])),
-        None,
-    )
+    _execute(handle, _plan(remote_decode=SimpleNamespace(request_ids=["x"])), None)
 
     with pytest.raises(RuntimeError, match="transfer submission failed"):
-        handle.execute(_plan(), None)
+        _execute(handle, _plan(), None)
 
 
 def test_role_values_are_the_disaggregation_modes():
