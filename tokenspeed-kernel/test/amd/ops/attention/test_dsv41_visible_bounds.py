@@ -20,6 +20,8 @@
 
 """Raw indexer visibility is bounded by consumers before int32 conversion."""
 
+from contextlib import ExitStack
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
@@ -161,8 +163,6 @@ def test_visibility_replay_refresh_and_no_capacity_specialization():
 @requires_gpu
 @pytest.mark.parametrize("width", [128, 131200])
 def test_block_visibility_capacity_does_not_recompile(width):
-    from contextlib import ExitStack
-
     logits = torch.randn(6, width, device="cuda")
     visible = _raw(6, "cuda")
     out = torch.empty(6, 4, dtype=torch.int32, device="cuda")
