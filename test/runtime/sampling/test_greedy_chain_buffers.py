@@ -109,7 +109,7 @@ def test_verify_reports_mismatched_shapes(monkeypatch, candidate_shape, target_s
         torch.full((2,), -1, device="cuda", dtype=torch.int32),
     )
     with pytest.raises(ValueError) as error:
-        greedy._verify_chain_greedy(*outputs, candidates, target, 2, 6)
+        greedy._verify_chain_greedy(*outputs, candidates, target, 2, 6, False)
     assert "expects candidates and target_predict shapes (2, 6)" in str(error.value)
     assert f"got candidates {candidate_shape}" in str(error.value)
     assert f"target_predict {target_shape}" in str(error.value)

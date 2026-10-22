@@ -56,6 +56,7 @@ def _verify_chain_greedy_torch(
     target_predict: torch.Tensor,  # [bs, N] int64 (argmax output)
     batch_size: int,
     num_draft_tokens: int,
+    count_bonus: bool,
 ) -> None:
     """Pure-torch equivalent of tokenspeed_kernel.verify_chain_greedy.
 
@@ -85,7 +86,7 @@ def _verify_chain_greedy_torch(
     flat_idx = (batch_off + pos).to(torch.int32)  # [bs, n]
     valid = pos <= num_accepted.unsqueeze(1)  # [bs, n]
     accept_index.copy_(torch.where(valid, flat_idx, torch.full_like(accept_index, -1)))
-    accept_token_num.copy_(num_accepted)
+    accept_token_num.copy_(num_accepted + int(count_bonus))
 
 
 def _verify_chain_greedy(
@@ -96,8 +97,11 @@ def _verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
+    count_bonus: bool,
 ) -> None:
-
+    """Greedy chain verify: ``accept_token_num`` counts the accepted draft
+    tokens, plus the bonus token when ``count_bonus``; ``accept_index`` is
+    written whole (-1 past the accepted prefix)."""
     # Prefer the CUDA kernel when available AND the tensors are on CUDA.
     if _verify_chain_greedy_cuda is not error_fn and candidates.is_cuda:
         # The CUDA kernel writes only accepted indices; other implementations
@@ -112,8 +116,9 @@ def _verify_chain_greedy(
             batch_size=batch_size,
             num_draft_tokens=num_draft_tokens,
         )
+        if count_bonus:
+            accept_token_num += 1
         return
-
     if candidates.is_cuda:
         if (
             candidates.shape != (batch_size, num_draft_tokens)
@@ -131,6 +136,7 @@ def _verify_chain_greedy(
             candidates=candidates,
             target_sampled=target_predict,
             write_rejected_targets=True,
+            count_bonus=count_bonus,
         )
         return
 
@@ -142,6 +148,7 @@ def _verify_chain_greedy(
         target_predict=target_predict,
         batch_size=batch_size,
         num_draft_tokens=num_draft_tokens,
+        count_bonus=count_bonus,
     )
 
 
@@ -248,6 +255,7 @@ class GreedySamplingBackend(SamplingBackend):
         ).reshape(bs, num_tokens_per_req)
 
         if tree is not None:
+            accept_index.fill_(-1)
             # The accepted path rides in accept_index so the TP broadcast below carries it.
             verify_tree(
                 predict,
@@ -266,6 +274,7 @@ class GreedySamplingBackend(SamplingBackend):
                 target_predict=target_predict,
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
+                count_bonus=True,
             )
             # Retain normal verification cost before forcing benchmark acceptance.
             if self.config.synthetic_acceptance_length is not None:
@@ -283,8 +292,8 @@ class GreedySamplingBackend(SamplingBackend):
                     accept_index,
                     accept_length,
                 )
-
-            accept_length += 1
+                # write_synthetic_outputs leaves the count without the bonus.
+                accept_length += 1
 
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length

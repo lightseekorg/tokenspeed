@@ -784,7 +784,6 @@ def test_graph_padding_restores_live_output_layout(live_bs):
         _pad_graph_req_pool_indices=lambda indices, bs: torch.nn.functional.pad(
             indices, (0, bs - len(indices)), value=0
         ),
-        _set_graph_state_write_indices=lambda *args: None,
         _prepare_request_token_history_graph_inputs=lambda **kwargs: None,
         _prepare_decode_metadata=lambda *args, **kwargs: None,
         _cuda_graph_key=lambda bs: bs,

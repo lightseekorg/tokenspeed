@@ -215,9 +215,9 @@ def test_qwen4_full_attention_keeps_ple_and_qsa_without_gdn(speculative, width) 
     if speculative:
         assert qsa_raw_key_field(2) in fields
     if speculative and width > 1:
-        # PLE: eight 64-byte rows plus 64 bytes of commit indices. QSA:
+        # PLE: eight 64-byte rows plus 32 bytes of commit indices. QSA:
         # two layers' 192-byte keys, 216 shared bytes and 32 address bytes.
-        assert setup.fixed_workspace_bytes == 576 + 440
+        assert setup.fixed_workspace_bytes == 544 + 440
     else:
         assert setup.fixed_workspace_bytes == 0
 

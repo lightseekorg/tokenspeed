@@ -190,9 +190,11 @@ class MultimodalRuntime:
         )
         if not mm_inputs:
             mrope_positions = self.input_buffers.mrope_positions_buf[:, :total_tokens]
-            mrope_positions.copy_(
-                base_positions.unsqueeze(0).expand_as(mrope_positions)
-            )
+            # A decode-only fill wrote them with the positions.
+            if not self.input_buffers.mrope_positions_ready:
+                mrope_positions.copy_(
+                    base_positions.unsqueeze(0).expand_as(mrope_positions)
+                )
             return mrope_positions
 
         if not is_prefill:

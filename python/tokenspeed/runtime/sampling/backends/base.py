@@ -631,10 +631,27 @@ class SamplingBackend(ABC):
         output_tokens: torch.Tensor,
         output_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
-        """If the backend wrote both outputs into a single contiguous GPU
-        buffer, return CPU views obtained from one D2H copy. Otherwise
-        return None and let the caller fall back to two separate D2Hs."""
-        return None
+        """If both outputs alias the packed verify outputs
+        (``_output_pack_buf``, as ``verify()`` and ``sample()`` leave them),
+        return CPU views obtained from one D2H copy. Otherwise return None
+        and let the caller fall back to two separate D2Hs."""
+        if (
+            output_tokens.data_ptr() != self._output_pack_buf.data_ptr()
+            or output_lengths.data_ptr() != self._accept_length_buf.data_ptr()
+        ):
+            return None
+        n_t = output_tokens.numel()
+        n_l = output_lengths.numel()
+        # Copy the whole [0, predict_max + n_l). The gap [n_t, predict_max)
+        # is stale padding (max_bs * max_n  vs.  bs * n) — small enough that
+        # the saved launch beats the wasted bandwidth.
+        size = self._predict_max + n_l
+        cpu_pack = torch.empty(size, dtype=torch.int32, pin_memory=True)
+        cpu_pack.copy_(self._output_pack_buf[:size], non_blocking=True)
+        return (
+            cpu_pack[:n_t].view(output_tokens.shape),
+            cpu_pack[self._predict_max : self._predict_max + n_l],
+        )
 
     # Backends whose verify() takes draft trees (tree=TreeVerifyBatch).
     supports_tree_verify: bool = False

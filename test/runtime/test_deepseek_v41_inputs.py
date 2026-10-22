@@ -125,11 +125,15 @@ def buffers(request, monkeypatch):
             req_pool_indices,
             valid_cache_lengths,
             uniform_input_length,
+            *,
+            mrope_positions_out,
         ):
             starts = valid_cache_lengths[req_pool_indices]
             positions_ptr.copy_(
                 (starts[:, None] + torch.arange(uniform_input_length)).flatten()
             )
+            if mrope_positions_out is not None:
+                mrope_positions_out.copy_(positions_ptr.expand(3, -1))
             seq_lens_out_ptr.copy_(starts + uniform_input_length)
 
         monkeypatch.setattr(InputBuffers, "_bulk_pinned", bulk)
@@ -143,7 +147,11 @@ def buffers(request, monkeypatch):
 
         monkeypatch.setattr(torch, "tensor", unpinned_tensor)
     ib = InputBuffers(
-        max_bs=4, max_num_tokens=32, state_write_padding_pool_index=5, device=device
+        max_bs=4,
+        max_num_tokens=32,
+        state_write_padding_pool_index=5,
+        device=device,
+        writes_mrope_positions=False,
     )
     ib.init_ngram_buffers(3, _hash_params(ib.device), VOCAB_SIZE)
     runtime = RuntimeStates(
@@ -445,6 +453,7 @@ def test_large_prefill_to_small_decode_keeps_graph_padding_dead(buffers):
         max_num_tokens=8192,
         state_write_padding_pool_index=5,
         device=original.device,
+        writes_mrope_positions=False,
     )
     ib.init_ngram_buffers(3, _hash_params(ib.device), VOCAB_SIZE)
     prompt = [i % 80 + 1 for i in range(1024)]
@@ -803,6 +812,7 @@ def test_executor_input_capacity_covers_decode_capture(
         spec_num_tokens=width,
         chunked_prefill_size=chunk_size,
         max_req_pool_size=5,
+        model_is_mrope=False,
         pp_size=pp_size,
         overlap_schedule_depth=depth,
         vocab_size=VOCAB_SIZE,
@@ -1356,7 +1366,11 @@ def test_image_mask_survives_input_clamp(buffers, prefix, length, image_rows):
 
 def test_engram_token_map_must_cover_the_vocabulary():
     ib = InputBuffers(
-        max_bs=1, max_num_tokens=4, state_write_padding_pool_index=1, device="cpu"
+        max_bs=1,
+        max_num_tokens=4,
+        state_write_padding_pool_index=1,
+        device="cpu",
+        writes_mrope_positions=False,
     )
     with pytest.raises(ValueError, match="fewer than the vocabulary"):
         ib.init_ngram_buffers(3, _hash_params("cpu"), VOCAB_SIZE + 1)

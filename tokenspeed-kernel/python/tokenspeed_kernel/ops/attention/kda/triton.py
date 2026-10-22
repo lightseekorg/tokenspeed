@@ -665,5 +665,7 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
 from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
     commit_state_groups,
     commit_state_pages,
+    verify_commit_resolve,
     verify_state_blocks,
+    verify_state_blocks_groups,
 )

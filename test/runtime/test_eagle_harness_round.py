@@ -388,6 +388,7 @@ def _rounds(
         max_bs=MAX_BS,
         max_num_tokens=MAX_BS * nodes,
         state_write_padding_pool_index=POOL,
+        writes_mrope_positions=False,
     )
     harness = EagleHarnessConfig(
         exec_mode=0,

@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import torch
+from tokenspeed_kernel.ops.metadata import eagle_chain_prologue, eagle_chain_step
 from tokenspeed_kernel.ops.sampling.triton import logprob_topk
 from typing_extensions import override
 
@@ -188,6 +189,20 @@ class Eagle(BaseDrafter):
             * spec_num_tokens
             - 1
         )
+        # A chain draft of decode requests computes its inputs in one launch
+        # (eagle_chain_prologue) into these: each request's verify row, its
+        # accepted frontier and its first multi-step position.
+        max_bs = self.input_buffers.max_bs
+        self.chain_gather_ids_buf = torch.zeros(
+            max_bs, dtype=torch.int64, device=self.device
+        )
+        self.chain_frontier_buf = torch.zeros(
+            max_bs, dtype=torch.int32, device=self.device
+        )
+        # int64, as the models' positions: the draft steps read it as is.
+        self.chain_positions_buf = torch.zeros(
+            max_bs, dtype=torch.int64, device=self.device
+        )
 
     @override
     def slot_state_rows(self, slot: int) -> list[torch.Tensor]:
@@ -292,6 +307,7 @@ class Eagle(BaseDrafter):
         draft_input: EagleDraftInput,
         bs: int,
         input_num_tokens: int,
+        gather_ids: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns (input_ids, gather_ids) for the first draft step.
 
@@ -347,9 +363,10 @@ class Eagle(BaseDrafter):
                 input_ids = input_ids[plan.local_slice]
         else:
             input_ids = draft_input.base_model_output
-            gather_ids = (
-                self.padded_gather_ids_offsets_buf[:bs] + draft_input.accept_lengths
-            )
+            if gather_ids is None:
+                gather_ids = (
+                    self.padded_gather_ids_offsets_buf[:bs] + draft_input.accept_lengths
+                )
 
         return input_ids, gather_ids
 
@@ -381,13 +398,16 @@ class Eagle(BaseDrafter):
         bs: int,
         draft_input: EagleDraftInput,
         narrowing: AcceptedPrefixPublisher,
+        gather_ids: torch.Tensor | None,
     ) -> tuple[LogitsProcessorOutput, DsaTopKState]:
+        """The first draft step. ``gather_ids`` holds each decode request's
+        verify row when :func:`eagle_chain_prologue` computed it, else None."""
 
         buffers = self.input_buffers
         forward_mode = draft_input.forward_mode
 
         input_ids, gather_ids = self._get_first_step_input(
-            draft_input, bs, draft_input.input_num_tokens
+            draft_input, bs, draft_input.input_num_tokens, gather_ids
         )
         draft_model = self.draft_model_runner.model
         input_num_tokens = draft_input.input_num_tokens
@@ -476,9 +496,13 @@ class Eagle(BaseDrafter):
         draft_input: EagleDraftInput,
         dsa_topk: DsaTopKState,
         frontier: torch.Tensor,
+        positions: torch.Tensor | None,
     ) -> None:
         """Draft steps ``1 .. S - 1``: ``lanes`` rows per request (1 for a
-        chain, K for a draft tree) forward from the accepted frontier."""
+        chain, K for a draft tree) forward from the accepted frontier.
+        ``positions`` is step 1's positions when :func:`eagle_chain_prologue`
+        computed them (and the lengths in ``draft_seq_lens_buf``), else
+        None."""
         lanes = self.lanes_per_request
         # Step 1 writes at the accepted frontier (vc + accept_length after the
         # target's verify) so rotary/cache metadata stay on the accepted
@@ -487,9 +511,12 @@ class Eagle(BaseDrafter):
 
         # +1 is the kernel's read-inclusive convention; advanced per iter.
         draft_seq_lens = self.draft_seq_lens_buf[:bs]
-        torch.add(cache_start, 1, out=draft_seq_lens)
-
-        positions = cache_start.repeat_interleave(lanes)
+        # The prologue's chain (int64 positions, no hot map): each step ends
+        # in one launch (eagle_chain_step).
+        fused_steps = positions is not None and self.tree_lanes is None
+        if positions is None:
+            torch.add(cache_start, 1, out=draft_seq_lens)
+            positions = cache_start.repeat_interleave(lanes)
         # Step i's write window: a chain's one advancing slot, or K lane slots per request.
         slot_starts = positions if self.tree_lanes is None else cache_start.clone()
 
@@ -583,6 +610,19 @@ class Eagle(BaseDrafter):
                 )
 
             with nvtx_range("draft_sample", color="yellow"):
+                if fused_steps:
+                    draft_ids = self.sample_draft_step(logits_output, step=i)
+                    # Column i + 1 takes the tokens; the window moves on.
+                    eagle_chain_step(
+                        draft_ids,
+                        next_tokens=next_tokens,
+                        column=i + 1,
+                        positions=positions,
+                        seq_lens=draft_seq_lens,
+                        advance=i + 1 < self.spec_num_steps,
+                    )
+                    hidden = logits_output.hidden_states
+                    continue
                 if self.tree_lanes is None:
                     draft_ids = self.sample_draft_step(logits_output, step=i)
                     # Column 0 holds last_verified_ids; drafter writes step `i` into column `i + 1`.
@@ -699,18 +739,48 @@ class Eagle(BaseDrafter):
 
         # Layout: column 0 holds the last verified id (the base model's accepted token);
         # columns 1..spec_num_steps hold the drafter's speculative tokens.
-        next_tokens = self._last_verified_window(bs, draft_input)
+        prologue = None
+        if (
+            draft_input.num_extends == 0
+            and self.tree_lanes is None
+            and self.hot_token_ids is None
+        ):
+            # A chain of decode requests: the window, each request's verify
+            # row, its accepted frontier and its first multi-step position in
+            # one launch (the values of _last_verified_window and
+            # _accepted_frontier).
+            next_tokens = torch.empty(
+                (bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
+            )
+            prologue = (self.chain_gather_ids_buf[:bs], self.chain_positions_buf[:bs])
+            frontier = self.chain_frontier_buf[:bs]
+            eagle_chain_prologue(
+                draft_input.base_model_output,
+                draft_input.accept_lengths,
+                self.padded_gather_ids_offsets_buf[:bs],
+                self.runtime_states.valid_cache_lengths,
+                self.input_buffers.req_pool_indices_buf[:bs],
+                next_tokens=next_tokens,
+                gather_ids=prologue[0],
+                frontier=frontier,
+                seq_lens=self.draft_seq_lens_buf[:bs],
+                positions=prologue[1],
+            )
+        else:
+            next_tokens = self._last_verified_window(bs, draft_input)
+            frontier = self._accepted_frontier(bs, draft_input)
 
         # The runner refreshed the draft decode metadata over the target's
         # post-verify lengths (vc + N). Step 0 narrows to the live rows, whose
         # context is the accepted frontier; the model publishes it through
         # this handle at the moment it switches to those rows.
-        frontier = self._accepted_frontier(bs, draft_input)
         narrowing = AcceptedPrefixPublisher(self.attn_backend, frontier)
 
         # First draft step. LogitsProcessor prunes `[num_prefill_tokens + num_decodes * spec_num_tokens, ...]`
         # down to `[bs, ...]`, so logits/hidden_states arrive here already aligned to one row per request.
-        logits_output, dsa_topk = self._run_first_step(bs, draft_input, narrowing)
+        logits_output, dsa_topk = self._run_first_step(
+            bs, draft_input, narrowing, None if prologue is None else prologue[0]
+        )
 
         if self.tree_lanes is None:
             draft_ids = self.sample_draft_step(logits_output, step=0)
@@ -748,6 +818,7 @@ class Eagle(BaseDrafter):
                 draft_input,
                 dsa_topk,
                 frontier,
+                None if prologue is None else prologue[1],
             )
         return self._draft_window(bs, next_tokens)
 

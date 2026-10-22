@@ -549,9 +549,8 @@ class TritonFullSamplingBackend(TritonSamplingBackend):
             candidates=candidates.to(torch.int32),
             target_sampled=target_sampled,
             write_rejected_targets=False,
+            count_bonus=True,
         )
-
-        accept_length += 1
 
         self.broadcast_verify_outputs()
 

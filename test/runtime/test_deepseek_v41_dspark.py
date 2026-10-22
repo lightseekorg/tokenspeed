@@ -687,7 +687,7 @@ def _assert_drafts_follow_their_rows(adapter, windows, pool):
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
 
     width, block, n = 6, 5, 3
-    ib = InputBuffers(n, 1024, 8, device="cuda:0")
+    ib = InputBuffers(n, 1024, 8, device="cuda:0", writes_mrope_positions=False)
     drafter = DeepseekV41DSpark(
         spec_num_tokens=width,
         spec_num_steps=block,
@@ -779,7 +779,7 @@ def _assert_drafter_run_writes_rows_and_drafts(adapter, windows, pool):
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
 
     width, block = 6, 5
-    ib = InputBuffers(3, 1024, 8, device="cuda:0")
+    ib = InputBuffers(3, 1024, 8, device="cuda:0", writes_mrope_positions=False)
     drafter = DeepseekV41DSpark(
         spec_num_tokens=width,
         spec_num_steps=block,
@@ -1126,7 +1126,9 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
         attn_backend=None,
         token_to_kv_pool=None,
         runtime_states=None,
-        input_buffers=InputBuffers(3, 1024, 8, device="cpu"),
+        input_buffers=InputBuffers(
+            3, 1024, 8, device="cpu", writes_mrope_positions=False
+        ),
         vocab_size=adapter.model.config.vocab_size,
     )
     drafter = DeepseekV41DSpark(**kwargs)

@@ -130,6 +130,7 @@ def _static_tree_drafter(model: LlamaForCausalLMEagle4, topk: int) -> Eagle4:
             max_bs=max_bs,
             max_num_tokens=max_bs * nodes,
             state_write_padding_pool_index=max_bs,
+            writes_mrope_positions=False,
         ),
         vocab_size=model.config.vocab_size,
     )

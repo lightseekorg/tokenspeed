@@ -639,8 +639,8 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         )
         return
     # Eight verify rows: shared int64[2] context plus two bf16[4, 3]
-    # conv states; the commit holds two int64 ids per request per layer.
-    assert ple_bytes == (8 * (16 + 2 * 24) + 2 * 2 * 2 * 8 if ple_enabled else 0)
+    # conv states; the commit holds two int32 ids per request per layer.
+    assert ple_bytes == (8 * (16 + 2 * 24) + 2 * 2 * 2 * 4 if ple_enabled else 0)
     assert setup.fixed_workspace_bytes == 128 + ple_bytes  # GDN conv + SSM: 128 B.
 
 

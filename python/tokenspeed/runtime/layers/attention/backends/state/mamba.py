@@ -58,7 +58,9 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
     commit_state_pages,
+    verify_commit_resolve,
     verify_state_blocks,
+    verify_state_blocks_groups,
 )
 from tokenspeed_kernel.ops.conv import (
     causal_conv1d_fn,
@@ -330,6 +332,8 @@ class MambaAttnBackend(AttentionBackend):
         self.tree_verify: TreeVerifyInputs | None = None
         self._verify_scratch = None
         self._verify_commit_ctx = None
+        # The padded batch of the pending verify: its row of the state stacks.
+        self._verify_commit_graph_bs = 0
         self._verify_copy_tables: dict[str, torch.Tensor | int | None] | None = None
 
     @property
@@ -351,6 +355,13 @@ class MambaAttnBackend(AttentionBackend):
         # and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
+        # For every bs, the state_in and state_out buffers above are the rows
+        # of one [groups, bs] stack each. A verify refresh records each
+        # request's live page (slot 1) in state_out, so a chain verify's
+        # commit reads both stacks in one launch (verify_commit_resolve)
+        # instead of this forward's block tables.
+        self.state_in_stacks: list[torch.Tensor] = []
+        self.state_out_stacks: list[torch.Tensor] = []
         self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._chain_ancestors_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -431,6 +442,7 @@ class MambaAttnBackend(AttentionBackend):
         self._verify_scratch = None
         self._verify_copy_tables = None
         self._verify_commit_ctx = None
+        self._verify_commit_graph_bs = 0
         self._mixed_forward_metadata = None
         self._gdn_replay = None
         self._tree_node_states = None
@@ -526,21 +538,24 @@ class MambaAttnBackend(AttentionBackend):
         holds a block, else the live slot 1); speculative outputs stay out of
         the state slab, and the accepted state is committed back to slot 1 by
         ``commit_state_after_acceptance``. Writes each group's in
-        pages into ``pages_out[group][:bs]`` and returns the per-group tables
-        (kept for the commit's page resolve).
+        pages into ``pages_out[group][:bs]`` (and its live pages into
+        ``live_pages_out[group][:bs]``, all groups in one launch) and returns
+        the per-group tables (kept for the commit's page resolve).
         """
-        tables: dict[str, torch.Tensor] = {}
-        for group_id in self._state_groups():
-            rows = self._state_rows(block_tables, group_id)
-            verify_state_blocks(
-                rows,
+        tables = {
+            group_id: self._state_rows(block_tables, group_id)
+            for group_id in self._state_groups()
+        }
+        if live_pages_out is not None:
+            verify_state_blocks_groups(
+                list(tables.values()),
                 batch_size=bs,
-                pages_out=pages_out[group_id],
-                live_pages_out=(
-                    None if live_pages_out is None else live_pages_out[group_id]
-                ),
+                pages_out=[pages_out[group_id] for group_id in tables],
+                live_pages_out=[live_pages_out[group_id] for group_id in tables],
             )
-            tables[group_id] = rows
+            return tables
+        for group_id, rows in tables.items():
+            verify_state_blocks(rows, batch_size=bs, pages_out=pages_out[group_id])
         return tables
 
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
@@ -925,6 +940,65 @@ class MambaAttnBackend(AttentionBackend):
             draft_blocker="draft-tree lanes have no linear-attention path",
         )
 
+    def _commit_verified_chain(
+        self, accepted_length: torch.Tensor, draft_token_num: int, graph_bs: int
+    ) -> None:
+        """Commit a chain verify's accepted prefix: one launch resolves every
+        row (verify_commit_resolve) from the refresh's page stacks, then the
+        conv rows copy and the recurrent state replays (or copies)."""
+        bs = accepted_length.shape[0]
+        copy_tables = self._verify_copy_tables_get()
+        layers = copy_tables["num_layers"]
+        rows = torch.empty(
+            bs + 3 * layers * bs, dtype=torch.int32, device=accepted_length.device
+        )
+        steps = rows[:bs]
+        src_rows, dst_rows, read_rows = rows[bs:].view(3, layers * bs).unbind(0)
+        verify_commit_resolve(
+            accepted_length,
+            self.state_out_stacks[graph_bs - 1],
+            self.state_in_stacks[graph_bs - 1],
+            copy_tables["group_sel"],
+            verify_width=draft_token_num,
+            steps_out=steps,
+            src_rows=src_rows,
+            dst_rows=dst_rows,
+            read_rows=read_rows,
+        )
+        copy_state_rows(
+            copy_tables["conv_scratch"],
+            copy_tables["conv_comp"],
+            src_rows,
+            dst_rows,
+            row_bytes=copy_tables["conv_bytes"],
+            src_row_strides=copy_tables["conv_scratch_stride"],
+            dst_row_strides=copy_tables["conv_comp_stride"],
+        )
+        if self.replay_ssm:
+            replay = self._gdn_replay
+            self._replay_commit(
+                replay.payload,
+                replay.parameters,
+                state_addresses=copy_tables["ssm_comp"],
+                state_row_strides=copy_tables["ssm_element_stride"],
+                read_indices=read_rows.view(layers, bs),
+                write_indices=dst_rows.view(layers, bs),
+                accepted_length=steps,
+                draft_token_num=draft_token_num,
+                geometry=replay.geometry,
+                state_dtype=replay.state_dtype,
+            )
+        else:
+            copy_state_rows(
+                copy_tables["ssm_scratch"],
+                copy_tables["ssm_comp"],
+                src_rows,
+                dst_rows,
+                row_bytes=copy_tables["ssm_bytes"],
+                src_row_strides=copy_tables["ssm_scratch_stride"],
+                dst_row_strides=copy_tables["ssm_comp_stride"],
+            )
+
     def commit_verified_state(
         self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
     ) -> None:
@@ -935,6 +1009,12 @@ class MambaAttnBackend(AttentionBackend):
             return
         _, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
+        if accepted_path is None:
+            self._commit_verified_chain(
+                accepted_length, draft_token_num, self._verify_commit_graph_bs
+            )
+            self._verify_commit_ctx = None
+            return
         group_ids = self._state_groups()
         write_stack, steps = self._resolve_verify_commit_pages(
             accepted_length, group_ids
@@ -1290,22 +1370,29 @@ class MambaAttnBackend(AttentionBackend):
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
             # Keep one graph-stable (state_in, state_out) buffer pair per state group.
-            for gid in self._state_group_ids:
+            groups = len(self._state_group_ids)
+            self.state_in_stacks.append(
+                torch.full(
+                    (groups, i + 1),
+                    self.pad_slot_id,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            self.state_out_stacks.append(
+                torch.full(
+                    (groups, i + 1),
+                    self.pad_slot_id,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            for g, gid in enumerate(self._state_group_ids):
                 self.state_in_by_group.setdefault(gid, []).append(
-                    torch.full(
-                        (i + 1,),
-                        self.pad_slot_id,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    self.state_in_stacks[i][g]
                 )
                 self.state_out_by_group.setdefault(gid, []).append(
-                    torch.full(
-                        (i + 1,),
-                        self.pad_slot_id,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    self.state_out_stacks[i][g]
                 )
         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
             0, max_bs + 1, dtype=torch.int32, device=self.device
@@ -1507,6 +1594,7 @@ class MambaAttnBackend(AttentionBackend):
                     draft_token_num,
                     state_in_blocks_by_group,
                 )
+                self._verify_commit_graph_bs = bs
                 self._prepare_verify_records(real_bs, seq_lens, draft_token_num)
             else:
                 self._verify_commit_ctx = None

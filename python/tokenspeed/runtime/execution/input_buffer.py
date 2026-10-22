@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from itertools import accumulate
 from typing import TYPE_CHECKING
 
@@ -56,6 +57,8 @@ class InputBuffers:
         state_write_padding_pool_index: int,
         device: str = "cuda",
         reads_state_checkpoints: bool = False,
+        *,
+        writes_mrope_positions: bool,
     ):
         self.device = device
         # Whether the scheduler may give extend rows in-forward State
@@ -63,6 +66,17 @@ class InputBuffers:
         # carries extend_state_checkpoint_lens (a scheduler build without the
         # option has no such field).
         self.reads_state_checkpoints = reads_state_checkpoints
+        # An M-RoPE model: a decode-only fill writes the text-only M-RoPE
+        # positions with the positions (mrope_positions_ready).
+        self.writes_mrope_positions = writes_mrope_positions
+        # Whether this step's fill wrote mrope_positions_buf[:, :tokens].
+        self.mrope_positions_ready = False
+        # How far the token-indexed and the request-indexed buffers can hold
+        # values other than their padding (the scrub's): the scrub of a step
+        # whose counts reach both marks writes nothing, so it is skipped.
+        # A writer outside this class calls mark_tails_dirty.
+        self._dirty_tokens = max_num_tokens
+        self._dirty_requests = max_bs
         self.max_num_tokens = max_num_tokens
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
@@ -92,7 +106,17 @@ class InputBuffers:
             self.input_ids_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
             # Used in draft prefill
             self.shifted_prefill_ids_buf = torch.ones_like(self.input_ids_buf)
-            self.input_lengths_buf = torch.ones((max_num_tokens,), dtype=torch.int32)
+            # The request slots, the state write slots and the input lengths
+            # share one allocation in this order, so one upload per step
+            # fills all three (fill_input_buffers).
+            self._request_slots_buf = torch.empty(
+                2 * max_bs + (max_num_tokens + 1) // 2, dtype=torch.int64
+            )
+            self.input_lengths_buf = (
+                self._request_slots_buf[2 * max_bs :]
+                .view(torch.int32)[:max_num_tokens]
+                .fill_(1)
+            )
             # Packed request layout read by request-token history; see
             # prepare_request_token_history_inputs.
             self.request_token_history_input_lengths_buf = torch.ones(
@@ -106,10 +130,11 @@ class InputBuffers:
             self.mrope_positions_buf = torch.zeros(
                 (3, max_num_tokens), dtype=torch.int64
             )
-            self.req_pool_indices_buf = torch.zeros((max_bs,), dtype=torch.int64)
-            self.state_write_req_pool_indices_buf = torch.full(
-                (max_bs,), state_write_padding_pool_index, dtype=torch.int64
-            )
+            self.req_pool_indices_buf = self._request_slots_buf[:max_bs].zero_()
+            self.state_write_req_pool_indices_buf = self._request_slots_buf[
+                max_bs : 2 * max_bs
+            ]
+            self.state_write_req_pool_indices_buf.fill_(state_write_padding_pool_index)
             self.seq_lens_buf = torch.ones((max_bs,), dtype=torch.int32)
             self.force_single_token_verify_buf = torch.zeros(max_bs, dtype=torch.bool)
             self.extend_prefix_lens_buf = torch.zeros(max_bs, dtype=torch.int32)
@@ -358,6 +383,56 @@ class InputBuffers:
         tape.finalize()
         return tape
 
+    def _scrub_tails(self, total_tokens: int, batch_size: int) -> None:
+        """Write the padding past this step's rows, unless no earlier step
+        (nor another writer, mark_tails_dirty) wrote past them."""
+        scrub = total_tokens < self._dirty_tokens or batch_size < self._dirty_requests
+        self._dirty_tokens, self._dirty_requests = total_tokens, batch_size
+        if scrub and self._pad_tape is not None:
+            self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
+        elif scrub:
+            if total_tokens < self.max_num_tokens:
+                self.input_ids_buf[total_tokens:].fill_(1)
+                self.positions_buf[total_tokens:].fill_(0)
+                self.mrope_positions_buf[:, total_tokens:].zero_()
+            if batch_size < self.max_bs:
+                self.req_pool_indices_buf[batch_size:].fill_(0)
+                self.state_write_req_pool_indices_buf[batch_size:].fill_(
+                    self.state_write_padding_pool_index
+                )
+                self.seq_lens_buf[batch_size:].fill_(1)
+            self.input_lengths_buf[batch_size:].zero_()
+
+    def mark_tails_dirty(self) -> None:
+        """A writer outside this class may have left values other than the
+        padding past any step's rows: the next fill scrubs every tail."""
+        self._dirty_tokens = self.max_num_tokens
+        self._dirty_requests = self.max_bs
+
+    def _upload_request_slots(
+        self, request_pool_indices: Sequence[int], input_lengths: Sequence[int]
+    ) -> None:
+        """Write the request slots, the state write slots and the input
+        lengths with one upload: the packed buffer's prefix up to the last
+        live length. The slot tails take their padding values (0 and the
+        sink slot); the lengths' tail is the pad tape's."""
+        batch_size = len(request_pool_indices)
+        max_bs = self.req_pool_indices_buf.shape[0]
+        (staging,) = self._bulk_pinned((2 * max_bs * 8 + batch_size * 4, torch.int8))
+        slots = staging[: 2 * max_bs * 8].view(torch.int64)
+        slots[batch_size:max_bs] = 0
+        slots[max_bs + batch_size :] = self.state_write_padding_pool_index
+        if batch_size:
+            pool = torch.as_tensor(request_pool_indices, dtype=torch.int64)
+            slots[:batch_size] = pool
+            slots[max_bs : max_bs + batch_size] = pool
+            staging[2 * max_bs * 8 :].view(torch.int32).copy_(
+                torch.as_tensor(input_lengths, dtype=torch.int32)
+            )
+        self._request_slots_buf.view(torch.int8)[: staging.shape[0]].copy_(
+            staging, non_blocking=True
+        )
+
     def _bulk_pinned(self, *specs):
         """One pinned allocation for this step, sliced per (numel, dtype).
 
@@ -408,35 +483,20 @@ class InputBuffers:
         and writes none of them (see ``load_round_inputs``)."""
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
+        self.mrope_positions_ready = False
 
         # CPU-side fast path: when the scheduler always emits a decode_input_ids
         # list (even though every entry is -1, meaning "no override").
         decode_input_ids = forward_op.decode_input_ids
         if decode_input_ids is not None and all(x == -1 for x in decode_input_ids):
             decode_input_ids = None
-        n_req = len(forward_op.request_pool_indices)
-        n_len = len(forward_op.input_lengths)
-        req_pool_indices_cpu, input_lengths_cpu = self._bulk_pinned(
-            (n_req, torch.int64), (n_len, torch.int32)
-        )
-        req_pool_indices_cpu.copy_(
-            torch.as_tensor(forward_op.request_pool_indices, dtype=torch.int64)
-        )
-        input_lengths_cpu.copy_(
-            torch.as_tensor(forward_op.input_lengths, dtype=torch.int32)
-        )
-        self.req_pool_indices_buf[:batch_size].copy_(
-            req_pool_indices_cpu,
-            non_blocking=True,
-        )
-        self.state_write_req_pool_indices_buf[:batch_size].copy_(
-            req_pool_indices_cpu,
-            non_blocking=True,
-        )
-
-        self.input_lengths_buf[:batch_size].copy_(
-            input_lengths_cpu,
-            non_blocking=True,
+        if len(forward_op.input_lengths) != batch_size:
+            raise RuntimeError(
+                f"{len(forward_op.input_lengths)} input lengths for "
+                f"{batch_size} requests"
+            )
+        self._upload_request_slots(
+            forward_op.request_pool_indices, forward_op.input_lengths
         )
         if runtime_states.has_request_token_history:
             self.prepare_request_token_history_inputs(
@@ -493,10 +553,10 @@ class InputBuffers:
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
 
-        # Decode-only fast path: one fused Triton kernel writes positions and
-        # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]
-        # directly, so the indexSelect + compute_position + seq_lens add are
-        # all gone.
+        # Decode-only fast path: one fused Triton kernel writes positions,
+        # seq_lens and (an M-RoPE model) the text-only M-RoPE positions in a
+        # single launch and reads valid_cache_lengths[pool_idx] directly, so
+        # the indexSelect + compute_position + seq_lens add are all gone.
         if num_extends == 0 and batch_size > 0:
             fused_decode_input_prep(
                 positions_ptr=self.positions_buf[:total_tokens],
@@ -504,7 +564,13 @@ class InputBuffers:
                 req_pool_indices=req_pool_indices_device,
                 valid_cache_lengths=runtime_states.valid_cache_lengths,
                 uniform_input_length=total_tokens // batch_size,
+                mrope_positions_out=(
+                    self.mrope_positions_buf[:, :total_tokens]
+                    if self.writes_mrope_positions
+                    else None
+                ),
             )
+            self.mrope_positions_ready = self.writes_mrope_positions
             # Decode path's seq_lens / positions are done.
             valid_cache_lengths = None
         else:
@@ -568,9 +634,10 @@ class InputBuffers:
                 out=self.seq_lens_buf[:batch_size],
             )
 
-        # Refresh the padding tail of the persistent buffers every iteration.
-        # The captured graph replays at a padded batch size and DOES read the
-        # padded rows; a previous iter with a *larger* total_tokens / batch_size
+        # Refresh the padding tail of the persistent buffers after any step
+        # that wrote past this one's rows (or another writer marked the tails
+        # dirty). The captured graph replays at a padded batch size and DOES
+        # read the padded rows; a previous iter with a *larger* total_tokens / batch_size
         # leaves stale values in the tail (per-request seq lengths, positions,
         # token ids, req-pool slots). Reusing those for padded tokens forces
         # attention to scan oversize ranges and -- for a stale out-of-range
@@ -579,20 +646,7 @@ class InputBuffers:
         # req_pool=0, positions=0) are not enough on their own once a larger
         # iter has overwritten the tail, so scrub it back here (cheap
         # tail-only fills; the active prefix was written above).
-        if self._pad_tape is not None:
-            self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
-        else:
-            if total_tokens < self.max_num_tokens:
-                self.input_ids_buf[total_tokens:].fill_(1)
-                self.positions_buf[total_tokens:].fill_(0)
-                self.mrope_positions_buf[:, total_tokens:].zero_()
-            if batch_size < self.max_bs:
-                self.req_pool_indices_buf[batch_size:].fill_(0)
-                self.state_write_req_pool_indices_buf[batch_size:].fill_(
-                    self.state_write_padding_pool_index
-                )
-                self.seq_lens_buf[batch_size:].fill_(1)
-            self.input_lengths_buf[batch_size:].zero_()
+        self._scrub_tails(total_tokens, batch_size)
         return decode_input_ids
 
     @nvtx_range("input_prep_load", color="cyan")
@@ -757,3 +811,4 @@ class InputBuffers:
             # correction never goes negative.
             num_tokens_per_req = total_tokens // batch_size if batch_size > 0 else 1
             self.seq_lens_buf[:batch_size].fill_(max(num_tokens_per_req, 1))
+            self._dirty_requests = max(self._dirty_requests, batch_size)

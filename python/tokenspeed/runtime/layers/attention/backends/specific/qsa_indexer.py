@@ -35,6 +35,7 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+    DecodeFillTarget,
     GroupTableSpec,
     GroupTableStacks,
 )
@@ -183,6 +184,12 @@ class QSAIndexerBackend(AttentionBackend):
     def _fill_tables(
         self, bs: int, actual_bs: int, block_tables: Mapping[str, torch.Tensor]
     ) -> None:
+        self._check_tables(actual_bs, block_tables)
+        self._tables.fill(bs, actual_bs, block_tables)
+
+    def _check_tables(
+        self, actual_bs: int, block_tables: Mapping[str, torch.Tensor]
+    ) -> None:
         if self._tables is None:
             raise RuntimeError("QSA metadata must be allocated before forward")
         if actual_bs > 0:
@@ -193,7 +200,6 @@ class QSAIndexerBackend(AttentionBackend):
                 raise RuntimeError("QSA indexer requires two-dimensional block tables")
             if any(block_tables[gid].shape[1] == 0 for gid in self._tables.group_ids):
                 raise RuntimeError("QSA indexer requires nonempty block-table columns")
-        self._tables.fill(bs, actual_bs, block_tables)
 
     def _metadata(
         self,
@@ -301,12 +307,23 @@ class QSAIndexerBackend(AttentionBackend):
         del req_pool_indices, kwargs
         if not forward_mode.is_decode_or_idle():
             raise RuntimeError("QSA refresh_decode_metadata serves decode only")
-        self._fill_tables(bs, actual_bs, block_tables)
-        torch.clamp_min(
-            seq_lens[:bs],
-            1 if self.is_draft else self.spec_num_tokens,
-            out=self._seq_lens[:bs],
-        )
+        floor = 1 if self.is_draft else self.spec_num_tokens
+        self._check_tables(actual_bs, block_tables)
+        # The tables and the clamped lengths in one launch when it can.
+        if not self._tables.fill_decode(
+            bs,
+            actual_bs,
+            block_tables,
+            seq_lens,
+            1,
+            {
+                self._tables.group_ids[0]: DecodeFillTarget(
+                    self._seq_lens[:bs], None, floor
+                )
+            },
+        ):
+            self._tables.fill(bs, actual_bs, block_tables)
+            torch.clamp_min(seq_lens[:bs], floor, out=self._seq_lens[:bs])
         metadata = self._decode_views.get(bs)
         if metadata is None:
             metadata = self._metadata(
@@ -330,6 +347,15 @@ class QSAIndexerBackend(AttentionBackend):
             raise RuntimeError(f"QSA indexer has no {forward_mode} metadata")
         self._active_metadata = metadata
         return metadata
+
+    def draft_seq_lens_targets(self, bs: int) -> list[torch.Tensor] | None:
+        # The hook also copies into a step-zero layout it retains.
+        active = self._active_metadata
+        if self._seq_lens is None or (
+            active is not None and active is not self.forward_decode_metadata
+        ):
+            return None
+        return [self._seq_lens[:bs]]
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         if self._seq_lens is None:

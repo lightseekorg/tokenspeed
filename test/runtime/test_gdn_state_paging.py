@@ -560,44 +560,15 @@ class TestVerifyMetadataTest:
             block_tables=block_tables,
         )
         accepted = torch.tensor([0, 5], dtype=torch.int32)
-        resolve_calls = []
         copy_calls = []
-        original_commit = mamba_module.commit_state_pages
-
-        def counted_commit(*args, **kwargs):
-            resolve_calls.append((args, kwargs))
-            return original_commit(*args, **kwargs)
 
         def recorded_copy(*args, **kwargs):
             copy_calls.append((args, kwargs))
 
-        def reference_rows(
-            steps, pages, src, dst, *, verify_width, num_layers, group_indices
-        ):
-            base = torch.arange(steps.numel(), dtype=torch.int32) * (verify_width + 1)
-            src.copy_((base + steps.clamp(1, verify_width)).repeat(num_layers))
-            selected = pages.index_select(0, group_indices).reshape(-1)
-            dst.copy_(torch.where(selected > 0, selected, -1))
-
-        with (
-            patch.object(mamba_module, "commit_state_pages", counted_commit),
-            patch.object(mamba_module, "copy_state_rows", recorded_copy),
-            patch.object(mamba_module, "state_verify_commit_rows", reference_rows),
-        ):
+        # One resolve gives every layer's scratch row (request * (width + 1)
+        # + clamped accepted count) and live page (slot 1 of its group).
+        with patch.object(mamba_module, "copy_state_rows", recorded_copy):
             self.backend.commit_verified_state(accepted, accepted_path=None)
-
-        assert (len(resolve_calls)) == (2)
-        assert (
-            [
-                kwargs["pages_out"][kwargs["out_row"]].tolist()
-                for _, kwargs in resolve_calls
-            ]
-        ) == ([[11, 23], [31, 43]])
-        for _, kwargs in resolve_calls:
-            assert (kwargs["batch_size"]) == (2)
-            assert (kwargs["draft_tokens"]) == (4)
-            assert (kwargs["pages_out"].dtype) == (torch.int32)
-            assert (kwargs["steps_out"].tolist()) == ([1, 4])
 
         assert (len(copy_calls)) == (2)
         for args, _ in copy_calls:
@@ -614,8 +585,8 @@ class TestVerifyCommitGPUTest:
 
         if not torch.cuda.is_available():
             pytest.skip("needs a CUDA device")
-        from tokenspeed_kernel.ops.kvcache.triton import (
-            _state_verify_commit_rows_kernel,
+        from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (
+            _verify_commit_resolve_kernel,
         )
 
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -697,10 +668,10 @@ class TestVerifyCommitGPUTest:
                     with (
                         patch.object(mamba, "gdn_replay_commit") as replay,
                         patch.object(
-                            _state_verify_commit_rows_kernel,
+                            _verify_commit_resolve_kernel,
                             "run",
-                            wraps=_state_verify_commit_rows_kernel.run,
-                        ) as commit_rows_launch,
+                            wraps=_verify_commit_resolve_kernel.run,
+                        ) as resolve_launch,
                     ):
                         with torch.profiler.profile(
                             activities=[
@@ -718,19 +689,18 @@ class TestVerifyCommitGPUTest:
                         for e in events
                         if e.device_type == torch.autograd.DeviceType.CUDA
                     ]
-                    commit_rows_launch.assert_called_once()
-                    # Replay still assembles its separate read indices; the
-                    # scratch-copy path needs no PyTorch index arithmetic.
-                    if not replay_ssm:
-                        assert not (
-                            {
-                                "aten::index_select",
-                                "aten::add",
-                                "aten::repeat",
-                                "aten::stack",
-                            }.intersection(e.name for e in events)
-                        )
-                        assert not any("elementwise" in name for name in gpu_kernels)
+                    resolve_launch.assert_called_once()
+                    # One resolve launch gives the copy rows and the replay's
+                    # read pages: no PyTorch index arithmetic.
+                    assert not (
+                        {
+                            "aten::index_select",
+                            "aten::add",
+                            "aten::repeat",
+                            "aten::stack",
+                        }.intersection(e.name for e in events)
+                    )
+                    assert not any("elementwise" in name for name in gpu_kernels)
                     source_rows = [1, 6, 11][:live_bs]
                     for layer, group in layer_groups.items():
                         for kind, name in enumerate(("conv_state", "recurrent_state")):
@@ -749,6 +719,15 @@ class TestVerifyCommitGPUTest:
                             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     if replay_ssm:
                         replay.assert_called_once()
+                        sel = backend._verify_copy_tables_get()["group_sel"].tolist()
+                        groups = backend._state_groups()
+                        expected_read = [
+                            read_pages[groups[g]][:live_bs].tolist() for g in sel
+                        ]
+                        assert (
+                            replay.call_args.kwargs["read_indices"].tolist()
+                            == expected_read
+                        )
                         kwargs = replay.call_args.kwargs
                         torch.testing.assert_close(
                             kwargs["accepted_length"],
