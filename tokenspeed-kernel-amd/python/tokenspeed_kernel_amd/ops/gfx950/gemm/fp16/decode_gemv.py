@@ -58,6 +58,15 @@ def _rowcta_config(n: int, k: int) -> tuple[int, int]:
     return 512, 4
 
 
+def gluon_rowcta_bf16_gemv_geometry_gfx950(n: int, k: int) -> tuple[int, int]:
+    """Return the ``(BLOCK_K, wave count)`` a single row of ``[N, K]`` runs with.
+
+    A kernel that reproduces this GEMV's per-output reduction, bit for bit,
+    must use the same geometry.
+    """
+    return _rowcta_config(n, k)
+
+
 @gluon.jit
 def _rowcta_bf16_gemv_kernel(
     x_ptr,
@@ -194,6 +203,7 @@ def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
 
 
 __all__ = [
+    "gluon_rowcta_bf16_gemv_geometry_gfx950",
     "gluon_rowcta_bf16_gemv_gfx950",
     "prefers_gluon_rowcta_bf16_gemv_gfx950",
 ]
