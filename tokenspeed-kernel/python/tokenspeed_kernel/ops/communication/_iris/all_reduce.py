@@ -1773,8 +1773,12 @@ class ProducerAllReduce:
     ``run`` selects the protocol from the payload and can return the push
     state's borrowed output instead of ``output``. Fusions may share the Lamport
     one-shot mailbox and its per-512-element stage counters; the two-shot owns
-    its own. Pull scratch is shared with the generic producer reduction; all uses
-    and consumers must be stream ordered.
+    its own. A use covers whole tiles from the start of each slot and every rank
+    makes the same sequence of uses. Within a use, each push to a tile reads that
+    tile's stage first, and the receiver restores the markers of everything it
+    consumed and advances each tile's stage once; the next use of a tile, a
+    later launch, observes both. Pull scratch is shared with the generic
+    producer reduction; all uses and consumers must be stream ordered.
     """
 
     LAMPORT_MAX_ELEMENTS = 43 * 4096
