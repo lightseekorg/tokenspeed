@@ -72,7 +72,8 @@ def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     accumulator = parts[0].to(torch.float32)
     for rank in range(1, parts.shape[0]):
         accumulator = accumulator + parts[rank].to(torch.float32)
-    out.copy_(accumulator.to(out.dtype))
+    # A -0.0 sum leaves as +0.0, as the kernel stores it.
+    out.copy_((accumulator + 0.0).to(out.dtype))
     return out
 
 

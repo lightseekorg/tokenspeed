@@ -224,26 +224,28 @@ class TrtllmAllReduceBackend(CommBackend):
         """SUM all-reduce folding ranks 0..n-1 in fp32 with one rounding.
 
         The workspace kernels sum in this order on every strategy, so the
-        result is the rank-ordered fold bit for bit. Rows beyond the
-        workspace's capacity fold in near-equal chunks it holds: a row's fold
-        does not depend on the rows around it. None when no armed workspace
-        serves the call.
+        result is the rank-ordered fold bit for bit. Rows beyond what the
+        fold serves (the armed capacity, at most the two-shot range) fold in
+        near-equal chunks: a row's fold does not depend on the rows around
+        it. None when no armed workspace serves the call.
         """
         res = self._resources.get(group)
         if res is None:
             return None
         from tokenspeed_kernel.ops.communication.trtllm import (
+            MNNVL_TWOSHOT_MAX_TOKEN,
             trtllm_workspace_allreduce,
         )
 
         if tensor.dim() == 0 or tensor.numel() == 0:
             return None
         rows = tensor.numel() // tensor.shape[-1]
-        if rows <= res["max_token_num"]:
+        capacity = min(res["max_token_num"], MNNVL_TWOSHOT_MAX_TOKEN)
+        if rows <= capacity:
             return trtllm_workspace_allreduce(
                 tensor, res["device_group"], fp32_acc=True
             )
-        chunks = -(-rows // res["max_token_num"])
+        chunks = -(-rows // capacity)
         step = -(-rows // chunks)
         source = tensor.reshape(rows, tensor.shape[-1])
         out = torch.empty(source.shape, dtype=source.dtype, device=source.device)

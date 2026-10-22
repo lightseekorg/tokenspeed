@@ -12,6 +12,7 @@ from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
     Collective,
     Route,
+    ordered_fold_sum,
 )
 from tokenspeed.runtime.distributed.comm_backend.iris import (
     IrisBackend,
@@ -563,6 +564,14 @@ def test_batch_invariant_all_reduce_takes_the_trtllm_fold_where_it_serves(
     tensor = torch.ones(4, 16, dtype=torch.bfloat16)
     assert routing.all_reduce(tensor, GROUP) is tensor
     assert torch.equal(tensor, gather_fold)
+
+
+def test_ordered_fold_sum_stores_a_zero_sum_as_positive_zero():
+    # The torch fold matches the kernels: only an all -0.0 sum would keep its sign.
+    parts = torch.tensor([[-0.0, -0.0, 1.0], [-0.0, 0.0, -1.0]])
+    out = torch.empty(3)
+    ordered_fold_sum(parts, out)
+    assert out.view(torch.int32).tolist() == [0, 0, 0]
 
 
 def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(
