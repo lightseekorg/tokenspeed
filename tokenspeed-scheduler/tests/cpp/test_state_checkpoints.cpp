@@ -188,6 +188,35 @@ TEST_F(HybridPrefixReuseSuite, AnAlignedPromptAlsoRetainsACheckpointBeforeItsLas
     EXPECT_EQ(Probe("next", next).prefix_tokens, 28);
 }
 
+TEST_F(HybridPrefixReuseSuite, AOneTokenCompletionRetainsItsCheckpointOnHostWithASlidingWindow) {
+    for (const bool with_window : {false, true}) {
+        SCOPED_TRACE(with_window);
+        config_ = MakeConfig();
+        config_.disable_l2_cache = false;
+        if (with_window) {
+            config_.cache_groups.push_back(CacheGroupConfig{
+                .group_id = "recent",
+                .block_granularity = 1,
+                .total_pages = (config_.device_allocator.total_pages - 1) * kP + 1,
+                .cache_blocks_per_lcm_block = kP,
+                .attn_kind = AttnKind::kSlidingWindow,
+                .sliding_window_tokens = kP,
+                .replayable = false,
+            });
+        }
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        ASSERT_FALSE(CompletePrompt("previous", MakeTokens(31)).empty());
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+
+        auto next = MakeTokens(31);
+        next.back() = 1001;
+        next.push_back(1002);
+        const Resume resume = Probe("next", std::move(next));
+        EXPECT_EQ(resume.prefix_tokens, 28);
+        EXPECT_GT(resume.load_rows, 0) << "the checkpoint must survive on Host without a decode admission";
+    }
+}
+
 TEST_F(HybridPrefixReuseSuite, AnIdenticalPromptReusesStateBeforeItsLogitsReplayToken) {
     Reset(/*host_cache=*/false, /*decode_width=*/1);
     ASSERT_FALSE(CompletePrompt("previous", MakeTokens(31)).empty());
