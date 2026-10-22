@@ -362,7 +362,11 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     full = SimpleNamespace(positions=positions, request_indices=requests)
     empty = SimpleNamespace(positions=positions[:0], request_indices=requests[:0])
     plan = SimpleNamespace(
-        source=full, query=empty, keep_rows=torch.empty(0, dtype=torch.int64)
+        source=full,
+        query=empty,
+        keep_rows=torch.empty(0, dtype=torch.int64),
+        source_shard=None,
+        query_shard=None,
     )
     forward = load_symbol(
         RUNTIME + "models/deepseek_v41.py",
@@ -375,7 +379,7 @@ def test_zero_decoder_attention_still_runs_the_global_producer():
     attention = SimpleNamespace(
         layer_id=20,
         ced_decoder_start=20,
-        _write_global_kv=lambda hidden, *args: writes.append(hidden.clone()),
+        _write_global_kv=lambda hidden, *args, **kwargs: writes.append(hidden.clone()),
     )
     hidden = torch.randn(4, 8)
     output = forward(
@@ -405,7 +409,7 @@ def test_zero_decoder_skips_layers_and_normalization():
         pre_mix=torch.empty(0, 4),
         captured=[torch.empty(0, 8)] * 2,
     )
-    hidden, captures = forward(model, state, None)
+    hidden, captures = forward(model, state, SimpleNamespace(query_shard=None))
     assert hidden.shape == (0, 8)
     assert [t.shape for t in captures] == [(0, 8)] * 3
 
@@ -547,6 +551,11 @@ def test_drafter_future_inputs_keep_original_request_rows():
         tree_spec=None,
         capturable_grammar=None,
         dspark_context_producer=None,
+        attn_backend=SimpleNamespace(
+            prepare_cache_batch=lambda *args, **kwargs: None,
+            writeback_accepted_kv=lambda *args: None,
+        ),
+        device_module=SimpleNamespace(current_stream=lambda: None),
         drafter=SimpleNamespace(
             prepare_target_forward=lambda ctx: None,
             rewrite_verify_outputs=lambda ctx, output_tokens, accept_lengths: None,
@@ -625,6 +634,8 @@ def test_layout_and_decoder_metadata_agree_on_current_prefill_target(
     )
     backend = SimpleNamespace(
         device="cpu",
+        kvp_size=1,
+        _local_decode_selections={},
         spec_num_tokens=2,
         spec=SimpleNamespace(sliding_window_tokens=2, max_query_tokens=32),
         _swa_plans={},

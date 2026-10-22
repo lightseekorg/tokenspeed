@@ -594,7 +594,9 @@ def test_cuda_quantized_projection_forward():
     assert empty.shape == (0, 4, 32)
 
 
-def test_distributed_four_way_lookup():
+def test_distributed_four_way_lookup(monkeypatch):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
     if int(os.environ.get("WORLD_SIZE", "1")) != 4:
         pytest.skip("launch with torchrun --nproc_per_node=4")
     from tokenspeed.runtime.distributed.process_group_manager import (
@@ -605,6 +607,15 @@ def test_distributed_four_way_lookup():
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     torch.cuda.set_device(device)
     mapping = _mapping(rank, 4, 4)
+    for key, value in dict(
+        mapping=mapping,
+        chunked_prefill_size=16,
+        max_num_seqs=4,
+        max_prefill_tokens=16,
+        max_model_len=32,
+        speculative_algorithm=None,
+    ).items():
+        monkeypatch.setitem(global_server_args_dict, key, value)
     process_group_manager.init_distributed(
         mapping,
         distributed_init_method="env://",
@@ -622,6 +633,16 @@ def test_distributed_four_way_lookup():
         torch.testing.assert_close(
             table(ids), _dequant(codes, scales)[ids.cpu()].to(device), rtol=0, atol=0
         )
+        from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+        for rows in (7, 2):
+            full_ids = torch.arange(rows * 3, device=device).reshape(rows, 3) % 19
+            plan = QueryShardPlan.from_forward(
+                total_tokens=rows, input_lengths=[rows], size=4, rank=rank
+            )
+            actual = table(full_ids[plan.local_slice], query_shard=plan)
+            expected = _dequant(codes, scales)[full_ids.cpu()][plan.local_slice]
+            torch.testing.assert_close(actual, expected.to(device), rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
 
@@ -980,3 +1001,41 @@ def test_cuda_host_table_gather_matches_device_shard():
         AssertionError("host gather must not register")
     )
     host_embed(ids)
+
+
+@pytest.mark.parametrize("counts", [(2, 1, 1, 1), (1, 1, 0, 0)])
+def test_query_sharded_embedding_matches_full_lookup(monkeypatch, counts):
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+
+    codes, scales = _weights(19, 64)
+    ids = torch.arange(sum(counts) * 3).reshape(-1, 3) % 19
+    expected = _dequant(codes, scales)[ids]
+    tables = []
+    partials = []
+    # Only transport is mocked: each table computes its actual contribution.
+    monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
+    for rank in range(4):
+        table = RowShardedEngramEmbedding(
+            19, 64, _mapping(rank, 4, 4), "cpu", False, "gpu", 1
+        )
+        table.weight_loader(table.weight, codes)
+        table.weight_loader(table.scale, scales)
+        tables.append(table)
+        partials.append(table(ids).flatten(1))
+    total = torch.stack(partials).sum(0)
+    for rank, table in enumerate(tables):
+        plan = QueryShardPlan(4, rank, counts, (0, 0, 0, 0))
+
+        def gather(local, group, row_counts):
+            torch.testing.assert_close(local, ids[plan.local_slice])
+            assert tuple(row_counts) == counts
+            return ids
+
+        def scatter(local, group, row_counts):
+            torch.testing.assert_close(local, partials[rank], rtol=0, atol=0)
+            return total[plan.local_slice]
+
+        monkeypatch.setattr(engram, "token_all_gather_rows", gather)
+        monkeypatch.setattr(engram, "token_reduce_scatter", scatter)
+        actual = table(ids[plan.local_slice], query_shard=plan)
+        torch.testing.assert_close(actual, expected[plan.local_slice], rtol=0, atol=0)

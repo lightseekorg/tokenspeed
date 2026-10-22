@@ -386,3 +386,268 @@ def test_shared_q_decode_graph_replay_with_auxiliary_indexer(monkeypatch):
         torch.testing.assert_close(captured, expected, rtol=0, atol=0)
         for actual_index, expected_index in zip(captured_index, selected[-1]):
             torch.testing.assert_close(actual_index, expected_index, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("qcp_size", [1, 4])
+@pytest.mark.parametrize("rank", [0, 1, 3])
+def test_attention_projection_weights_follow_query_layout(qcp_size, rank):
+    """QCP replicas compute complete head projections for their own rows."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+
+    config = _config()
+    mapping = Mapping(
+        rank=rank,
+        world_size=4,
+        attn_tp_size=4,
+        attn_qcp_size=qcp_size,
+        dense_tp_size=4,
+        moe_tp_size=1,
+        moe_ep_size=4,
+    )
+    with torch.device("cpu"):
+        attention = DeepseekV41Attention(
+            config, mapping, 0, 20, None, "layers.0.attn", aux_stream=None
+        )
+    torch.manual_seed(831)
+    head_size = mapping.attn.head_tp_size
+    head_rank = mapping.attn.head_tp_rank
+    weights = {}
+    for name, layer in (
+        ("wq_b", attention.wq_b),
+        ("wo_a", attention.wo_a),
+        ("wo_b", attention.wo_b),
+    ):
+        full = (
+            torch.randn(layer.output_size, layer.input_size, dtype=torch.bfloat16)
+            * 0.03
+        )
+        layer.weight.weight_loader(layer.weight, full)
+        weights[name] = full
+        local = (
+            full.chunk(head_size, dim=1)[head_rank]
+            if name == "wo_b"
+            else full.chunk(head_size, dim=0)[head_rank]
+        )
+        torch.testing.assert_close(layer.weight, local, rtol=0, atol=0)
+
+    sink = torch.arange(config.num_attention_heads, dtype=torch.float32)
+    attention.load_sink(attention.attn_sink, sink)
+    torch.testing.assert_close(
+        attention.attn_sink, sink.chunk(head_size)[head_rank], rtol=0, atol=0
+    )
+    query = torch.randn(3, config.q_lora_rank, dtype=torch.bfloat16)
+    actual, _ = attention.wq_b(query, block_scale=None, output_dtype=None)
+    expected = F.linear(query, weights["wq_b"].chunk(head_size, dim=0)[head_rank])
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    latent = torch.randn(3, config.o_groups * config.o_lora_rank, dtype=torch.bfloat16)
+    actual, _ = attention.wo_b(
+        latent.chunk(head_size, dim=1)[head_rank].contiguous(), scale=None
+    )
+    expected = F.linear(
+        latent.chunk(head_size, dim=1)[head_rank],
+        weights["wo_b"].chunk(head_size, dim=1)[head_rank],
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("lengths", [[1], [7], [5, 2]])
+@pytest.mark.parametrize("prefix", [0, 1])
+def test_compressor_query_shards_preserve_pairs_and_tails(
+    monkeypatch, ratio, lengths, prefix
+):
+    from test.runtime.test_deepseek_v41_cache import _backend, _extend, _tables
+
+    from tokenspeed.runtime.distributed import comm_ops
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.paged_attention import QueryShardGather
+
+    torch.manual_seed(832)
+    config = _config()
+    config.head_dim = 512
+    owner = 20 if ratio == 1 else 2
+    compressor = v41.DeepseekV41Compressor(config, owner, "compressor")
+    _initialize(compressor)
+    x = torch.randn(sum(lengths), config.hidden_size, dtype=torch.bfloat16)
+    prefixes = [prefix] + [0] * (len(lengths) - 1)
+    prompts = [p + n for p, n in zip(prefixes, lengths)]
+    reference = _backend("cpu", 2)
+    meta = _extend(
+        reference, _tables("cpu"), lengths, prefixes, [0] * len(lengths), prompts
+    )
+    initial_tail = None
+    if ratio == 2:
+        tail = reference.cache_pool.compressor_tail(owner)
+        tail.normal_()
+        initial_tail = tail.clone()
+    expected = compressor(
+        x, owner, meta.positions, meta.request_indices, reference, ForwardMode.EXTEND
+    )
+    projected = (
+        F.linear(x, compressor.wkv.weight)
+        if ratio == 1
+        else F.linear(x.float(), compressor.wkv_wgate.weight.float())
+    )
+    for rank in range(4):
+        backend = _backend("cpu", 2)
+        local_meta = _extend(
+            backend, _tables("cpu"), lengths, prefixes, [0] * len(lengths), prompts
+        )
+        if initial_tail is not None:
+            backend.cache_pool.compressor_tail(owner).copy_(initial_tail)
+        plan = QueryShardPlan.from_forward(
+            total_tokens=sum(lengths), input_lengths=lengths, size=4, rank=rank
+        )
+        calls = []
+
+        def gather(value, group, counts, backend=None):
+            # Only the unavailable process group is replaced: projection,
+            # pair pooling and persistent tail updates execute real code.
+            assert group == (0, 1, 2, 3)
+            assert counts == list(plan.row_counts)
+            assert value.dtype == torch.bfloat16
+            torch.testing.assert_close(
+                value.view(projected.dtype),
+                projected[plan.local_slice],
+                rtol=1e-5,
+                atol=1e-6,
+            )
+            calls.append(value.shape[0])
+            return projected.clone().view(torch.bfloat16)
+
+        monkeypatch.setattr(comm_ops, "token_all_gather", gather)
+        actual = compressor(
+            x[plan.local_slice],
+            owner,
+            local_meta.positions,
+            local_meta.request_indices,
+            backend,
+            ForwardMode.EXTEND,
+            key_rows=QueryShardGather(plan, (0, 1, 2, 3)),
+        )
+        assert calls == [plan.local_rows]
+        for got, want in zip(actual, expected):
+            torch.testing.assert_close(got, want, rtol=0, atol=0)
+        if ratio == 2:
+            torch.testing.assert_close(
+                backend.cache_pool.compressor_tail(owner),
+                reference.cache_pool.compressor_tail(owner),
+                rtol=0,
+                atol=0,
+            )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("layer", [0, 2, 20])
+@pytest.mark.parametrize("lengths", [[1, 2], [257, 3]])
+@torch.inference_mode()
+def test_attention_model_query_shards(monkeypatch, layer, lengths):
+    from test.runtime.test_deepseek_v41_cache import _backend, _extend, _tables
+
+    from tokenspeed.runtime.distributed import comm_ops
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.query_shard import QueryShardPlan
+    from tokenspeed.runtime.layers.attention.backends.specific import (
+        deepseek_v41 as impl,
+    )
+
+    torch.manual_seed(835)
+    config = _config()
+    config.head_dim = 512
+    # Keep the fused QKV slices 128-byte aligned, as in the production model.
+    config.q_lora_rank = 64
+    config.index_head_dim = 128
+    config.qk_rope_head_dim = 64
+    config.max_position_embeddings = 512
+    with torch.device("cuda"):
+        reference_attention = DeepseekV41Attention(
+            config, _mapping(0, 1, 1), layer, 20, None, "attention", aux_stream=None
+        )
+    _initialize(reference_attention)
+    total = sum(lengths)
+    x = torch.randn(total, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+    tables = _tables("cuda")
+    reference = _backend("cuda", 2)
+
+    def prepare(backend):
+        return _extend(backend, tables, lengths, [0, 0], [0, 0], lengths)
+
+    meta = prepare(reference)
+    before = reference.cache_pool.arena.buffer.clone()
+    expected = reference_attention(
+        meta.positions, x, _ctx(reference, total, ForwardMode.EXTEND), True
+    )
+    # The missing process group receives projections produced by the same real
+    # operators as each rank; only their transport is replaced.
+    compressor = reference_attention.compressor
+    projected = None
+    if compressor is not None:
+        if compressor.ratio == 1:
+            projected, _ = compressor.wkv(x, block_scale=None, output_dtype=None)
+        else:
+            projected = v41.dsv4_linear_fp32(
+                x, compressor.wkv_wgate.weight, override=None, solution=None
+            )
+    qkv, _ = reference_attention.wq_a_wkv(x, block_scale=None, output_dtype=None)
+    swa = qkv[:, config.q_lora_rank :]
+    full_query_rows = v41._row_plan(
+        layer, 20, _ctx(reference, total, ForwardMode.EXTEND)
+    )
+    if full_query_rows.keep_rows is not None:
+        swa = swa[full_query_rows.keep_rows]
+    if not (current_platform().is_blackwell or current_platform().is_cdna4):
+        swa = v41._attention_norm(swa, reference_attention.kv_norm)
+    outputs = []
+    for rank in range(4):
+        mapping = Mapping(
+            rank=rank,
+            world_size=4,
+            attn_tp_size=4,
+            attn_qcp_size=4,
+            dense_tp_size=4,
+            moe_tp_size=1,
+            moe_ep_size=4,
+        )
+        with torch.device("cuda"):
+            attention = DeepseekV41Attention(
+                config, mapping, layer, 20, None, "attention", aux_stream=None
+            )
+        attention.load_state_dict(reference_attention.state_dict())
+        backend = _backend("cuda", 2)
+        backend.cache_pool.arena.buffer.copy_(before)
+        local_meta = prepare(backend)
+        plan = QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+        )
+        ctx = _ctx(backend, total, ForwardMode.EXTEND)
+        ctx.query_shard = plan
+        row_plan = v41._row_plan(layer, 20, ctx)
+
+        def gather_projection(payload, group, counts, backend=None):
+            assert payload.dtype == torch.bfloat16
+            assert counts == list(plan.row_counts)
+            actual = payload.view(projected.dtype)
+            torch.testing.assert_close(actual, projected[plan.local_slice])
+            return projected.contiguous().view(torch.bfloat16)
+
+        def gather_swa(value, group, counts):
+            query_plan = row_plan.query_shard
+            assert counts == list(query_plan.row_counts)
+            torch.testing.assert_close(value, swa[query_plan.local_slice])
+            return swa.clone()
+
+        monkeypatch.setattr(comm_ops, "token_all_gather", gather_projection)
+        monkeypatch.setattr(impl, "token_all_gather", gather_swa)
+        outputs.append(
+            attention(
+                local_meta.positions[plan.local_slice], x[plan.local_slice], ctx, True
+            )
+        )
+        torch.testing.assert_close(
+            backend.cache_pool.arena.buffer,
+            reference.cache_pool.arena.buffer,
+            rtol=0,
+            atol=0,
+        )
+    torch.testing.assert_close(torch.cat(outputs), expected, rtol=0, atol=0)
