@@ -438,14 +438,14 @@ def test_a_128_aligned_launcher_keeps_the_triton_moe_at_tp8(
 
 def test_explicit_backends_and_rl_bitwise_keep_their_choice(checkpoints, caplog, sm100):
     """An explicit backend is never replaced, and --numerics rl-bitwise folds
-    auto to aok before the MoE default is asked."""
+    auto available for capability-based expert planning."""
     args = _resolve(
         checkpoints["beam"], caplog, attention_backend="triton", moe_backend="triton"
     )
     assert (args.attention_backend, args.moe_backend) == ("triton", "triton")
     assert _lines(caplog, "attention") == _lines(caplog, "moe") == []
     args = _resolve(checkpoints["beam"], caplog, numerics="rl-bitwise")
-    assert args.moe_backend == "aok" and _lines(caplog, "moe") == []
+    assert args.moe_backend == "auto" and _lines(caplog, "moe") == []
 
 
 def test_other_models_and_the_drafter_are_not_asked(checkpoints, caplog, sm100):

@@ -273,10 +273,10 @@ class TestConfigurationTest:
         with pytest.raises((ValueError), match=("DSA, FlashMLA")):
             self._config(components=(self._component("mha"),))
 
-    def test_kvp_supports_the_host_kvstore_and_l3(self):
+    def test_kvp_keeps_host_kvstore_and_allows_l3(self):
         # Host blocks are allocated in their Device block's residue class, so
         # the KVStore (and the retraction snapshot pool) serve a sharded
-        # engine. L3 keys identify content independently of its current owner.
+        # engine. L3 keys use a replica identity independent of allocation.
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
         args.kv_parallel_size = 2

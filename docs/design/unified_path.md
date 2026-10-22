@@ -72,6 +72,12 @@ can never see a silently-defaulted one. This is deliberate — a `= False`
 default once hid `extend_with_prefix` being swallowed by a composite's
 `**kwargs`, and FlashMLA planned a ragged prefill for a prefix-cached batch.
 
+Extend planning uses the existing CPU length mirrors for host arithmetic:
+total cache length is the cached prefix plus the current input length.
+FlashInfer receives host CSR metadata derived from those mirrors, with fresh
+pinned sources for asynchronous uploads. Planning does not download device
+lengths or indptrs; mixed batches apply the same rule to their extend rows.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -81,6 +87,25 @@ buffers are sized by `max_decode_bs` — `init_cuda_graph_state` runs
 unconditionally at wrapper construction, `enforce_eager` included. A decode
 above the ladder runs the same refresh with no graph; it is a first-class
 path, not a fallback.
+
+State paging finalizes immutable metadata tapes for every supported decode
+batch size when the buffers are built. Finalization uploads CPU descriptions,
+so it belongs to startup, including sizes outside the capture ladder. Refresh
+supplies runtime registers and runs a prepared tape. Rebuilding the buffers
+rebuilds tapes that contain their addresses.
+
+Distributed-argmax eligibility and communication state are prepared after
+heads, draft sharing and sampling configuration are wired, before graph owners
+or any forward. Prefill-only, eager and captured execution use that same
+prepared processor. A prepared fallback is distinct from uninitialized state;
+decode warmup is not an initializer. The kernel state keys on the runtime
+logits dtype, which a quantized head does not declare on its (possibly
+transposed or packed) weight, so preparation builds the state for every
+supported logits dtype up front, keyed by the head's
+`num_embeddings_per_partition`; the forward and the sharded argmax only select
+the prepared state matching `logits.dtype`, with the portable packed-key
+all-reduce prepared as the fallback for any other dtype. They never construct,
+rendezvous or allocate communication state.
 
 ### Ascend context-parallel decode
 
@@ -105,6 +130,31 @@ directly into persistent consumer buffers. Layers share this result within
 the forward; replay recomputes it from the live request inputs. Eager and Graph
 execution use this same path. This DSA-specific preparation retains the common
 DCP ownership semantics without changing the shared placement implementation.
+Prefill and decode shapes without a prepared fused projection use the same
+persistent metadata outputs. They exchange query and TopK candidates over the
+existing device group, then merge sparse-attention partials on the model stream.
+That path creates no auxiliary communicator or stream. The model adapter must
+pass ``fused=True`` after fused Prolog and ``fused=False`` after ordinary
+projections. A fused call without its packed query fails before selection;
+a live native error is never retried through the collective path. A model with
+fused decode prepared can still execute ordinary prefill or smaller decode
+buckets. Capturing collective buckets requires HCCL graph support and target
+device validation; eager or fused-only validation does not establish that.
+
+The public ``AscendDSABackend.attention_kernels(is_prefill=...)`` hook returns
+the stage's SFA provider. Plugins may override it while preserving the
+``AscendDSAKernels`` tensor contracts and the common cache/CP metadata. Partial
+outputs use the shared DCP combine: zero empty-shard O before exchange, then
+normalize all-empty LSE rows before the native merge.
+
+For ``T`` query rows and ``H`` global heads, the BF16 gathered query occupies
+``T * H * 576 * 2`` bytes. Each FP32 partial-output buffer occupies
+``T * H * 512 * 4`` bytes; exchange needs both send and receive buffers, with
+additional storage for sanitization/layout conversion, TopK and LSE. At 16K
+rows and 64 heads these are 1.125 GiB for Q and 2 GiB per partial buffer.
+Plan the prefill chunk against this transient peak as well as resident weights
+and cache; the native fused bucket's memory plan does not bound this path.
+
 Single-rank decode uses the same preparation with identity page ownership:
 verify still needs one causal length and page-table row per candidate. Its
 Indexer and attention receive matching per-query batch axes, even without a
@@ -265,8 +315,13 @@ error, not an instruction to assume equal counts across ranks. Ordinary TP with
 replicated token rows uses the existing `ColumnParallelLinear` and
 `RowParallelLinear` contracts instead.
 
-The model runner prepares fixed-capacity communication workspaces before
-cache-memory profiling and graph capture.
+The model runner calls `prepare_dp_linear_communication` to prepare fixed-capacity
+communication workspaces before cache-memory profiling and graph capture.
+Distributed initialization also reserves the shared all-reduce workspace for
+the complete enabled fusion token window. A prefill-only process may never
+warm a decode graph; its first fused reduction must not resize or rendezvous
+for that workspace on the serving thread. Disabled fusion retains the
+ordinary one-shot reduction capacity.
 Preparation binds each Linear and its workspace to the selected communication
 backend; forward operations dispatch through that same backend.
 Generic projection operations use the backend's ordinary collectives.
@@ -280,58 +335,51 @@ another projection reuses it. Final outputs belong to the caller and
 remain valid across later forwards. Graphs referencing a workspace are destroyed
 before it is released.
 
-Projection fusion replaces communication, quantization, and GEMM with one
-kernel within the same backend dispatch path. Column projection fuses
-all-gather, FP8 GEMM, and all-to-all; row projection fuses all-to-all, FP8 GEMM,
-and reduce-scatter. The goal is to reduce launch overhead and let computation
-consume peer data as it becomes available.
+Fused projection runs communication, quantization, and FP8 GEMM in one kernel.
+Column projection combines all-gather, GEMM, and all-to-all.
+Row projection combines all-to-all, GEMM, and reduce-scatter.
 
-Row projection also accepts E4M3 inputs with FP32 scales per 128 channels,
-allowing the preceding RMSNorm/gate operation to quantize once. Fusion forwards
-those values and scales without requantizing; the ordinary path exchanges both
-before GEMM. Eligible node-local fallback exchanges FP8 values and scales in one
-Lamport launch, including padding for unequal or empty owners. BF16 input keeps
-quantization inside the projection. Both formats
-return BF16, share workspace ownership, and are prepared before graph capture.
-All ranks in a projection call supply the same activation format. When active
-owners prequantize, empty owners also supply empty E4M3 values and FP32 scales
-so the ordinary fallback executes matching collectives on every rank.
+Use `DPColumnParallelLinear` or `DPRowParallelLinear` with `AutoBackend`.
+The backend selects fusion for supported TP2 and TP4 groups within one node.
+Fusion requires FP8 weights with FP32 scales for each 128 × 128 block.
+At least one rank must have 64 physical input rows.
+Smaller batches, batch-invariant collectives, and unsupported configurations use
+the ordinary projection operations. All ranks use their physical row counts to
+select the same path.
 
-Both directions follow the existing workspace ownership contract: the backend
-prepares shared communication storage, each Linear supplies its weights, and
-the caller owns the final output. All ranks select the same path using their
-physical subgroup counts, including unequal and empty owners. Eligible
-node-local TP2 and TP4 projections use fusion; smaller batches, batch-invariant
-collectives, and unsupported configurations retain the ordinary operations.
+Both fused kernels accept BF16 inputs and return BF16 outputs.
+Row projection also accepts E4M3 inputs with FP32 scales per 128 channels.
+Pass the scales to `DPRowParallelLinear.forward` through its `scale` argument.
+The kernel skips input quantization in this case. All ranks must use the same
+input format. For FP8 inputs, empty ranks must supply empty E4M3 inputs and
+FP32 scales.
 
-Row counts remain runtime inputs. Prepared row buckets bound specialization
-and are warmed before graph capture. Intermediate buckets reduce padding;
-large buckets can skip whole padding tiles while retaining prepared strides.
-Tiles crossing owner boundaries acquire each owner's readiness and route each
-output piece to its owner. Row fusion covers the prepared workspace capacity
-without a separate upper dispatch cutoff.
+Prepared FP8 row buckets can transpose activation scales inside 128-row blocks
+so each K group's scales occupy consecutive shared-memory banks. The exchange
+and GEMM use the same layout. This is limited to aligned owner boundaries,
+preserving each owner's byte range when FP8 and BF16 calls share the workspace.
+Scale values, FP32 accumulation order, and output rounding stay unchanged.
 
-The kernel combines input exchange and quantization with a pipelined GEMM and
-output exchange. Warp groups divide computation and data movement;
-completed GEMM CTAs share reduction work through a device queue. Selected
-buckets also overlap GEMM and reduction within a CTA or share operand loads
-between CTAs. These are scheduling choices within the same execution path.
-Peer waits require a fully resident grid; concurrent workspace use and competing
-distributed kernels are unsupported.
+The backend prepares kernels before CUDA graph capture.
+Prepared row buckets can use different resident CTA counts. CTA zero advances
+inactive CTA epochs with the active grid so later bucket changes preserve the
+workspace's collective completion protocol.
+Each GEMM tile acquires input readiness from every owner it intersects, including
+tiles that cross an owner boundary. Output stores also wait for those owners to
+finish consuming the preceding call. A grid that keeps each CTA on one M tile
+must still wait for both owners when that tile crosses a boundary.
+TP4 row buckets that clear receive storage during input staging preserve one
+common clean prefix after reduction. It covers every smaller bucket that skips
+this staging clear. Larger buckets clear the remainder before publishing their
+input epoch; all producers and reducers acquire that epoch before using it.
+This contract applies across bucket and input-format changes.
+Supply runtime row counts within the prepared workspace capacity.
+Use each workspace on one stream.
+Do not run other distributed kernels at the same time.
 
-Each row-projection producer rounds its partial output to BF16. The owner sums
-partials in fixed rank order in FP32, then rounds to BF16. Ordinary BF16
-collective reductions can round differently. Negative zero marks unfinished
-receive values; produced zeros are canonicalized so readiness remains distinct
-from data without changing this reduction contract.
-
-Receive storage, including padding, is cleared before the next producer can
-write it. Input publication and consumption acknowledgements order reuse, using
-multicast when available. Some buckets consume every prepared partial, including
-padding, so completion also proves that peers finished reading the owner's
-input. Those buckets may reuse the same input layout without another peer join;
-layout changes and kernels that skip padding retain that join. Empty owners
-participate in every communication epoch.
+Row projection rounds partial results to BF16, sums them in fixed rank order
+in FP32, and returns BF16. This result can differ from an ordinary BF16
+collective reduction.
 
 ### Padding contract
 
@@ -996,6 +1044,15 @@ packs tokens and accept lengths into one region (`_output_pack_buf`), so its
 Triton backends return separate token and length buffers and take the
 executor's two-copy path (`get_packed_output_d2h` returns None).
 
+### Logits capture state follows the tensor's device
+
+The logits processor queries capture on the tensor's accelerator module;
+CPU tensors have no capture. Lazy communication-state probes stay outside
+capture and use the TP group's configured device collective, including HCCL
+on NPU. The multicast argmax provider retains its NVIDIA eligibility vote;
+an ineligible group keeps the portable vocabulary-parallel argmax or the
+plain gather, without entering CUDA APIs on another device.
+
 ## What stays graph-only
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
@@ -1082,13 +1139,46 @@ and kernel page size from
 with the existing forward and MTP reuse boundaries. The router clears this
 share before the root prepares its indexer child; the indexer does not clear it again.
 
-QSA block selection carries the same uniform query width from
-`decode_query_lengths` into its kernel API, using `None` for ragged or mixed
-queries. Materialized scoring may group a divisor of that width to share K
+QSA block selection carries an explicit uniform query width into its kernel
+API. Decode derives it from its uniform row contract; extend metadata checks
+the scheduler's host query lengths, including fixed-width decode rows in a
+mixed batch. Ragged runs carry `None`. This adds no device-to-host length read.
+Materialized scoring can group a divisor of that width to share K
 within a request; it must retain each query's complete-block frontier and
 selection. Group size one and larger groups use the same scoring kernel, in
 both eager and captured forwards. Grouping must not be inferred from the total
 row count or page-table batch size for a ragged layout.
+
+QSA block selection enters through the public QSA API and `select_kernel`.
+The materialized path composes the registered `qsa_block_scores` and
+`qsa_block_topk_select` operators; the fused path uses `qsa_block_topk_stream`.
+Required `logits`/`stream` features keep backend overrides within the requested
+algorithm, including forced kernel names that bypass ordinary operator matching.
+CUDA selection owns its launch details and scratch. Automatic
+selection uses query rows, table capacity, and supported layouts, never the
+prefill/decode mode. The caller's logits budget forces streaming when the score
+matrix would exceed it. Explicit paths bypass that automatic budget.
+
+Supported Blackwell stream layouts use CuTe DSL; other layouts and vendors
+retain portable Triton. The Blackwell CuTe specializations use four
+BF16 index heads of width 128, 64-block pages, and block top-k 512. Grouped
+scoring requires explicit eight-row request runs; small query grids can score
+rows independently, including ragged queries. Grouped streams keep exact
+running selections in selector registers, with double-buffered score
+candidates overlapping selection and MMA across tiles. Small grids can split
+the key range into bounded global scratch. The caller's partial-workspace
+budget bounds that scratch. Grouped CuTe and portable Triton streaming only
+allocate their output; each Triton program scans a group contained in an explicit
+uniform request run and keeps each row's running top-k locally, with no split/merge
+buffers. Ragged runs use group size one in the same kernel. Candidate pruning must
+prove that discarded scores cannot enter the top-k, or perform a full-score
+fallback. Each row retains its complete-block frontier. Query count, request
+count, page-table width, and Q strides remain runtime values; split geometry is
+bucketed before specializing the compiled signature. PDL waits precede
+asynchronous Q copies and producer-owned metadata reads.
+Trimmed batched page-table views retain a runtime row stride. Speculative
+context padding counts toward their capacity; compact candidate offsets must
+restore the full logical block id instead of wrapping at 65536 blocks.
 
 Different query groups can produce slightly different FP32 scores because
 their dot/reduction layouts differ; cross-layout bitwise equality is not a
@@ -1105,12 +1195,20 @@ Draft step zero still preserves the dense decode-context
 and KV-recording override, while QSA keeps its original context and narrows
 the selected top-k rows with the queries.
 
-The QSA API preserves `decode_query_lengths`: uniform decode/verification
-uses a positive width, as does every single-request forward. Multi-request
-prefill and mixed/ragged queries use `None`.
-Only decode may select CuTe; NVIDIA prefill uses FlashInfer FA2, including
-single-token prefill. Adapting ragged rows to one-token queries must retain
-this distinction. Both use the same cache writer and sparse-attention call.
+QSA uses positive `decode_query_lengths` for uniform decode/verification and
+`None` for prefill or mixed/ragged queries, including one-token prefill.
+Only decode may use CuTe. PrimTS accepts supported BF16 prefill and decode
+with logical block candidates on SM100/SM103; groups stay within each request.
+Other supported NVIDIA inputs use FA2 over equivalent physical slots.
+All kernels share the cache writer and sparse-attention call. The indexer
+returns physical slots across graph breaks and keeps logical candidates
+in the existing per-forward share for both stages. Draft steps carrying
+only physical slots use the direct-slot kernels.
+
+The QSA leaf owns PrimTS plans and per-device scratch for its current KV pool.
+Calls, including graph replays, are ordered across streams. Rebinding drops
+eager plans; capture sessions retain graph plans and allocations until release.
+Scratch may grow without moving graph inputs. Each run regenerates its data.
 
 QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
 candidates from the zero-initialized slot 1 of the reserved null page.

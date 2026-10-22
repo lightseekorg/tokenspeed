@@ -377,6 +377,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                                 isinstance(obj, GenerateReqInput)
                                 and obj.input_ids is not None
                                 and obj.text is None
+                                and (skip_names is None or "text" not in skip_names)
                             ):
                                 if self.tokenizer is not None:
                                     obj.text = self.tokenizer.decode(

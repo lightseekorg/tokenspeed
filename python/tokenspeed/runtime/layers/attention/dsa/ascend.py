@@ -458,6 +458,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             ctx.forward_mode,
             ctx.bs,
             save_kv_cache=False,
+            fused=True,
             index_query=index_query,
             index_key=None,
             index_weights=index_weights,

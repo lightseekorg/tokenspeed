@@ -31,6 +31,7 @@
 #include <variant>
 #include <vector>
 
+#include "cache/tier/storage.h"
 #include "utils.h"
 
 namespace tokenspeed {
@@ -164,68 +165,6 @@ struct LoadBackBatch {
             dst_pages.push_back(std::move(operation_destinations));
             content_hashes.push_back(std::move(operation_hashes));
             page_offsets.push_back(std::move(operation_offsets));
-        }
-    }
-};
-
-// L3 -> Host, before admission: the objects behind a Submitted request's
-// L3-registered prefix pages, fetched into Host blocks the request pins while
-// it waits (fsm::Prefetching). One op per request; rows in prefix-page order
-// (every group's rows of a page before the next page's), each naming the key
-// to fetch and the Host page to fill. The runtime fetches in order, stops at
-// the first page that fails (or at its timeout), and acknowledges the whole
-// op once with the number of leading prefix pages that landed
-// (cache::PrefetchDone::landed_pages); the scheduler publishes those and
-// frees the rest. No stream dependency: nothing in the round reads the pages.
-struct PrefetchOperation {
-    std::uint32_t op_id{0};
-    std::string request_id;
-    std::vector<CacheTransfer> transfers;    // source_page unused (-1); destination_page = Host page
-    std::vector<std::int32_t> page_indices;  // parallel to transfers: the row's prefix page in the prompt
-    std::int32_t first_page{0};              // the prefix page the fill starts at (the Host hit's end)
-    std::int32_t num_pages{0};               // prefix pages the rows cover, from first_page
-};
-
-struct PrefetchBatch {
-    std::vector<std::uint32_t> op_ids;
-    std::vector<std::string> request_ids;
-    std::vector<std::int32_t> first_pages;
-    std::vector<std::int32_t> num_pages;
-    std::vector<std::vector<std::uint32_t>> group_ids;
-    std::vector<std::vector<std::int32_t>> host_pages;
-    std::vector<std::vector<std::string>> content_hashes;
-    std::vector<std::vector<std::int32_t>> page_offsets;
-    // Per row: the prompt's prefix page index (non-decreasing within an op).
-    // landed_pages = the largest n <= num_pages such that every row with
-    // page_index < first_page + n landed.
-    std::vector<std::vector<std::int32_t>> page_indices;
-
-    explicit PrefetchBatch(const std::vector<PrefetchOperation>& ops) {
-        std::unordered_set<CacheTransfer, CacheTransferHash> seen;
-        for (const PrefetchOperation& op : ops) {
-            _assert(!op.transfers.empty() && op.num_pages > 0, "prefetch op carries no rows");
-            _assert(op.page_indices.size() == op.transfers.size(), "every prefetch row names its prefix page");
-            std::vector<std::uint32_t> operation_groups;
-            std::vector<std::int32_t> operation_pages;
-            std::vector<std::string> operation_hashes;
-            std::vector<std::int32_t> operation_offsets;
-            for (const CacheTransfer& transfer : op.transfers) {
-                _assert(seen.insert(transfer).second, "duplicate prefetch row within one plan");
-                _assert(!transfer.content_hash.empty(), "a prefetch row names the object it fetches");
-                operation_groups.push_back(transfer.group_id);
-                operation_pages.push_back(transfer.destination_page);
-                operation_hashes.push_back(transfer.content_hash);
-                operation_offsets.push_back(transfer.page_offset);
-            }
-            op_ids.push_back(op.op_id);
-            request_ids.push_back(op.request_id);
-            first_pages.push_back(op.first_page);
-            num_pages.push_back(op.num_pages);
-            group_ids.push_back(std::move(operation_groups));
-            host_pages.push_back(std::move(operation_pages));
-            content_hashes.push_back(std::move(operation_hashes));
-            page_offsets.push_back(std::move(operation_offsets));
-            page_indices.push_back(op.page_indices);
         }
     }
 };
@@ -365,6 +304,6 @@ struct SnapshotRestoreBatch {
 };
 
 using CacheOperation =
-    std::variant<LoadBackBatch, WriteBackBatch, SnapshotStoreBatch, SnapshotRestoreBatch, PrefetchBatch>;
+    std::variant<LoadBackBatch, WriteBackBatch, SnapshotStoreBatch, SnapshotRestoreBatch, StorageOperation>;
 
 }  // namespace tokenspeed

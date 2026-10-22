@@ -20,6 +20,7 @@
 
 """Iris all-reduce protocols and the synchronization used by its fusions."""
 
+import dataclasses
 import math
 
 import torch
@@ -33,12 +34,62 @@ from tokenspeed_kernel.ops.communication.iris import (
     _use_two_stage_producer_direct,
     producer_direct_all_reduce_can_run,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
-_SUBGROUP_SIZE = 64
+hip_utils = triton.language.extra.hip.utils
+
 _PULL_MAX_PROGRAMS = 84
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class IrisCachePolicy:
+    """Cache modifiers for Iris accesses whose policy differs by architecture.
+
+    Flag polls (".cv"), stores publishing into the local heap (".wt"), and
+    system-scope atomics are the same on every architecture and stay literal.
+    Kernels built only for gfx950 may keep literals for these roles too.
+
+    Attributes:
+        peer_payload_load: Streaming load of data a peer published, issued
+            after its readiness is observed; empty selects the default.
+        peer_signal_store: Store into a peer's memory that the peer polls,
+            such as a barrier epoch or a Lamport mailbox; empty selects the
+            default.
+    """
+
+    peer_payload_load: str
+    peer_signal_store: str
+
+
+_IRIS_CACHE_POLICIES = {
+    ArchVersion(9, 5): IrisCachePolicy(
+        peer_payload_load=".cg",
+        peer_signal_store=".wt",
+    ),
+    # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
+    # partially read sector over the fabric, and ".wt" peer stores are an order
+    # of magnitude slower than plain ones.
+    ArchVersion(12, 5): IrisCachePolicy(
+        peer_payload_load="",
+        peer_signal_store="",
+    ),
+}
+
+
+def iris_cache_policy(arch: ArchVersion | None = None) -> IrisCachePolicy:
+    """Return the Iris cache policy for ``arch``, or for the current device.
+
+    Raises:
+        ValueError: ``arch`` has no Iris cache policy.
+    """
+    if arch is None:
+        arch = current_platform().arch_version
+    policy = _IRIS_CACHE_POLICIES.get(arch)
+    if policy is None:
+        raise ValueError(f"Iris has no cache policy for {arch}")
+    return policy
 
 
 def _pull_scratch_numel(max_numel: int, world_size: int) -> int:
@@ -146,6 +197,7 @@ class StagedPullOneShot:
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
+            PEER_PAYLOAD_LOAD_CACHE=iris_cache_policy().peer_payload_load,
             num_warps=self.num_subgroups,
         )
 
@@ -160,12 +212,14 @@ def _launch_pull_twoshot(
     exit_barrier: bool,
     hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
+    policy = iris_cache_policy()
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
     numel = out.numel() if hc_post is None else out.numel() // 4
     partition_words = numel // peers.world_size // elements_per_word
+    subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * _SUBGROUP_SIZE
+        * subgroup_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )
@@ -184,11 +238,12 @@ def _launch_pull_twoshot(
         NUM_PROGRAMS=num_programs,
         NUM_TILES=num_tiles,
         NUM_WARPS=_TWO_SHOT_NUM_SUBGROUPS,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
         WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
+        PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+        PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
         **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
@@ -323,6 +378,7 @@ class ProducerPull:
                 hc_post=hc_post,
             )
             return
+        policy = iris_cache_policy()
         num_tiles = triton.cdiv(numel, self.BLOCK_SIZE)
         num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
         iris_pull_oneshot[(num_programs,)](
@@ -337,11 +393,12 @@ class ProducerPull:
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
             NUM_WARPS=self.NUM_SUBGROUPS,
-            SUBGROUP_SIZE=_SUBGROUP_SIZE,
             WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
             ELEMENTS_PER_WORD=_PACKED_WORD_BYTES // inputs.element_size(),
+            PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+            PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
             **_hc_post_args(hc_post, _PACKED_WORD_BYTES // inputs.element_size()),
             num_warps=self.NUM_SUBGROUPS,
         )
@@ -479,6 +536,7 @@ def iris_pull_oneshot_staged(
     BLOCK_SIZE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: tl.constexpr,
 ):
     """One-shot all-reduce over rotating staging slots.
 
@@ -551,7 +609,7 @@ def iris_pull_oneshot_staged(
                 heap_bases,
                 mask=mask,
                 other=0.0,
-                cache_modifier=".cg",
+                cache_modifier=PEER_PAYLOAD_LOAD_CACHE,
                 hint=BLOCK_SIZE,
             ).to(tl.float32)
     tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
@@ -835,6 +893,7 @@ def _iris_sync_rank_epoch(
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
     PUBLISH: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """Wait until each peer's workgroup counter reaches the requested epoch.
 
@@ -865,7 +924,7 @@ def _iris_sync_rank_epoch(
             remote_flags,
             epoch,
             mask=peer_mask,
-            cache_modifier=".wt",
+            cache_modifier=PEER_SIGNAL_STORE_CACHE,
         )
         wait_flags = ready_flags + block_id * WORLD_SIZE + peer_ids
     else:
@@ -1028,11 +1087,12 @@ def iris_pull_oneshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     residual=None,
     post=None,
     comb=None,
@@ -1049,6 +1109,7 @@ def iris_pull_oneshot(
     and completion. All peer reads finish before the next producer can reuse
     the symmetric input; PUBLISH_READY selects how those counters are exchanged.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -1081,6 +1142,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -1123,7 +1185,7 @@ def iris_pull_oneshot(
                     packed_offset.to(gl.int32),
                     mask=mask,
                     other=0,
-                    cache=".cg",
+                    cache=PEER_PAYLOAD_LOAD_CACHE,
                 )
                 peer_0, peer_1, peer_2, peer_3 = _unpack_word(
                     peer_packed, ELEMENT_DTYPE, ELEMENTS_PER_WORD
@@ -1186,6 +1248,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
 
@@ -1212,11 +1275,12 @@ def iris_pull_twoshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     residual=None,
     post=None,
     comb=None,
@@ -1234,6 +1298,7 @@ def iris_pull_twoshot(
     EXIT_BARRIER adds a final peer wait for callers that stage inputs before
     launch. Both communication phases run in this one kernel.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -1266,6 +1331,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -1322,7 +1388,7 @@ def iris_pull_twoshot(
             peer_inputs + gl.expand_dims(input_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_PAYLOAD_LOAD_CACHE,
         )
         peer_values.store(values)
 
@@ -1366,6 +1432,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
     # Gather one reduced partition from every rank into the local output.
@@ -1377,7 +1444,7 @@ def iris_pull_twoshot(
             peer_scratch + gl.expand_dims(partition_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_PAYLOAD_LOAD_CACHE,
         )
         output_offset = gl.expand_dims(peer_ids * PARTITION_WORDS, 1) + gl.expand_dims(
             partition_offset, 0
@@ -1432,6 +1499,7 @@ def iris_pull_twoshot(
             NUM_WARPS,
             SUBGROUP_SIZE,
             PUBLISH=True,
+            PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
         )
 
 

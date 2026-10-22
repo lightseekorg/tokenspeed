@@ -45,13 +45,16 @@ struct CacheCoordinatorTestAccess {
 
     static std::uint64_t NextAccessEpoch(CacheCoordinator& coordinator) { return ++coordinator.next_access_epoch_; }
 
-    static std::size_t NumStorageKeyOrder(const CacheCoordinator& coordinator) {
-        return coordinator.storage_key_order_.size();
-    }
-
     // The planner's Device eviction of one entry, with its tail cascade.
     static bool EvictCachedBlock(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location) {
         return coordinator.evictCachedBlock(group_id, location);
+    }
+
+    // A Device-cached block, located rather than referenced: a held reference
+    // would pin it against eviction.
+    static std::optional<CacheBlockLocation> DeviceLocationOf(const CacheCoordinator& coordinator,
+                                                              std::size_t group_index, const CacheKey& key) {
+        return coordinator.deviceLocationOf(group_index, key);
     }
 };
 

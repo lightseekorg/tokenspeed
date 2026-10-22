@@ -24,7 +24,6 @@ import contextlib
 import copy
 import os
 import signal
-import threading
 from enum import Enum, auto
 
 import psutil
@@ -50,8 +49,10 @@ from tokenspeed.runtime.utils import (
 from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.process import (
+    begin_process_shutdown,
+    kill_process_tree,
     receive_ready_messages,
-    register_usr_signal,
+    register_child_failure_signals,
     start_process_with_ready_pipe,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
@@ -177,6 +178,8 @@ class DataParallelController:
         self.chunked_prefill_size = None
         self.max_model_len = None
         self.supports_prompt_logprobs = None
+        self.multimodal_encoder_dtype = None
+        self.cache_storage = None
         self.server_args = server_args
         self.port_args = port_args
         self.load_balance_method = LoadBalanceMethod.from_str(
@@ -272,7 +275,6 @@ class DataParallelController:
         self._request_dispatcher.add_fallback_fn(self.send_control_message)
 
     def launch_dp_schedulers(self, server_args, port_args):
-        threads = []
         dp_port_args = []
 
         # Parse dist_init_addr from port_args to create per-dp-rank ports
@@ -309,7 +311,7 @@ class DataParallelController:
             )
             dp_port_args.append(tmp_port_args)
 
-            # Bind to scheduler_input_ipc_name BEFORE starting scheduler threads
+            # Bind to scheduler_input_ipc_name BEFORE starting scheduler processes
             # This ensures the port is available when scheduler tries to connect
             if server_args.node_rank == 0:
                 self.workers[dp_rank] = IpcSender(
@@ -331,19 +333,31 @@ class DataParallelController:
                 dp_ranks_per_node * server_args.node_rank,
                 dp_ranks_per_node * (server_args.node_rank + 1),
             )
+        scheduler_pipe_readers = []
         for dp_rank in dp_rank_range:
-            # Create a thread for each worker
-            thread = threading.Thread(
-                target=self.launch_tensor_parallel_group,
-                args=(server_args, dp_port_args[dp_rank], dp_rank),
+            scheduler_pipe_readers.extend(
+                self.launch_tensor_parallel_group(
+                    server_args, dp_port_args[dp_rank], dp_rank
+                )
             )
-            threads.append(thread)
 
-        # Start all threads
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join()
+        # Process.start only launches workers; model loading remains parallel.
+        # Supervise every group together so a failed group cannot strand a
+        # launch thread waiting on a healthy group in a world collective.
+        scheduler_info = receive_ready_messages(
+            scheduler_pipe_readers, self.scheduler_procs
+        )
+        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
+        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
+        self.max_single_request_tokens = scheduler_info[0]["max_single_request_tokens"]
+        self.max_num_seqs = scheduler_info[0]["max_num_seqs"]
+        self.chunked_prefill_size = scheduler_info[0]["chunked_prefill_size"]
+        self.max_model_len = scheduler_info[0]["max_model_len"]
+        self.multimodal_encoder_dtype = scheduler_info[0].get(
+            "multimodal_encoder_dtype"
+        )
+        self.cache_storage = scheduler_info[0]["cache_storage"]
+        self.supports_prompt_logprobs = scheduler_info[0]["supports_prompt_logprobs"]
 
         return dp_port_args
 
@@ -356,7 +370,6 @@ class DataParallelController:
         from tokenspeed.runtime.engine.event_loop import run_event_loop
 
         scheduler_pipe_readers = []
-        group_procs = []
         mapping_template = server_args.mapping
         attn_tp_size = mapping_template.attn.tp_size
 
@@ -382,22 +395,8 @@ class DataParallelController:
                 contextlib.nullcontext(),
             )
             self.scheduler_procs.append(proc)
-            group_procs.append(proc)
             scheduler_pipe_readers.append(reader)
-        # Wait for model to finish loading
-        scheduler_info = receive_ready_messages(scheduler_pipe_readers, group_procs)
-
-        self.max_total_num_tokens = scheduler_info[0]["max_total_num_tokens"]
-        self.max_req_input_len = scheduler_info[0]["max_req_input_len"]
-        self.max_single_request_tokens = scheduler_info[0]["max_single_request_tokens"]
-        self.max_num_seqs = scheduler_info[0]["max_num_seqs"]
-        self.chunked_prefill_size = scheduler_info[0]["chunked_prefill_size"]
-        self.max_model_len = scheduler_info[0]["max_model_len"]
-        self.multimodal_encoder_dtype = scheduler_info[0].get(
-            "multimodal_encoder_dtype"
-        )
-        self.cache_storage = scheduler_info[0]["cache_storage"]
-        self.supports_prompt_logprobs = scheduler_info[0]["supports_prompt_logprobs"]
+        return scheduler_pipe_readers
 
     def dispatch_generate_request(self, req):
         """Route one tokenized request, honoring an attention-DP hard pin.
@@ -469,8 +468,14 @@ def run_data_parallel_controller_process(
     setproctitle.setproctitle("tokenspeed::data_parallel_controller")
     configure_logger(server_args)
     parent_process = psutil.Process().parent()
-    register_usr_signal()
+    register_child_failure_signals()
 
+    def request_shutdown(signum, frame):
+        if begin_process_shutdown():
+            raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    failed = False
     try:
         controller = DataParallelController(server_args, port_args)
         pipe_writer.send(
@@ -495,7 +500,19 @@ def run_data_parallel_controller_process(
                 f"Scheduler or DataParallelController {proc.pid!s} terminated with "
                 f"{proc.exitcode!s}",
             )
-    except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DataParallelController hit an exception: {traceback!s}")
-        parent_process.send_signal(signal.SIGUSR1)
+    except BaseException as exc:
+        failed = not isinstance(exc, SystemExit) or exc.code not in (None, 0)
+        if failed:
+            traceback = get_exception_traceback()
+            logger.error(f"DataParallelController hit an exception: {traceback!s}")
+        raise
+    finally:
+        # The constructor may have started workers before it raised, so cleanup
+        # belongs to this process even when no controller object was returned.
+        try:
+            begin_process_shutdown()
+        finally:
+            pipe_writer.close()
+            kill_process_tree(os.getpid(), include_parent=False)
+            if failed:
+                parent_process.send_signal(signal.SIGUSR1)

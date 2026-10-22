@@ -496,6 +496,7 @@ def gluon_kda_paged_prefill_wu_vector_gfx1250(
     u,
     w,
     kg,
+    chunk_starts,
     cu_seqlens,
     chunk_indices,
     H: gl.constexpr,
@@ -519,6 +520,9 @@ def gluon_kda_paged_prefill_wu_vector_gfx1250(
     end = gl.load(cu_seqlens + sequence + 1).to(gl.int32)
     length = end - begin
     token0 = local_chunk * BT
+    # Publish where each sequence's chunks start in the chunk-major Kg.
+    if (local_chunk == 0) & (head == 0) & (out_block == 0):
+        gl.store(chunk_starts + sequence, chunk)
 
     load_t_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
     load_x_layout: gl.constexpr = gl.BlockedLayout([1, 8], [4, 8], [8, 1], [1, 0])
@@ -592,7 +596,19 @@ def gluon_kda_paged_prefill_wu_vector_gfx1250(
     valid_keys = (token0 + rows_x[:, None] < length) & (value_offsets < K)
     last_gate = gl.min(gl.where(valid_keys, gate, float("inf")), axis=0)
     gated_key = raw_k * gl.exp(last_gate[None, :] - gate)
-    gl.store(kg + bk_offsets, gated_key.to(gl.bfloat16), mask=key_mask)
+    # Kg is stored per chunk as [key, token] so the state scan can load its
+    # WMMA operand (8 consecutive tokens per lane) with 16-byte vector loads.
+    # Tail tokens are already zero, so whole chunks are written unmasked.
+    kg_store_layout: gl.constexpr = gl.BlockedLayout([8, 1], [8, 4], [1, 8], [0, 1])
+    kg_tokens = gl.arange(0, BT, layout=gl.SliceLayout(1, kg_store_layout))
+    kg_keys = gl.arange(0, BO, layout=gl.SliceLayout(0, kg_store_layout))
+    gl.store(
+        kg
+        + (chunk * H + head) * K * BT
+        + (out_block * BO + kg_keys[None, :]) * BT
+        + kg_tokens[:, None],
+        gl.convert_layout(gated_key.to(gl.bfloat16), kg_store_layout),
+    )
 
 
 @gluon.jit
@@ -606,6 +622,7 @@ def gluon_kda_paged_prefill_state_scan_gfx1250(
     vnew,
     output,
     final_state,
+    chunk_starts,
     cu_seqlens,
     H: gl.constexpr,
     K: gl.constexpr,
@@ -685,6 +702,11 @@ def gluon_kda_paged_prefill_state_scan_gfx1250(
     out_values = value_block * BO + uv_values
     key_base = (begin * H + head) * K
     value_base = (begin * H + head) * V
+    # Kg is chunk-major; the W/U kernel recorded this sequence's first chunk.
+    # Empty sequences have no entry, but they also run no chunks below.
+    kg_head = kg + (gl.load(chunk_starts + sequence).to(gl.int64) * H + head) * K * BT
+    kg_offsets0 = (kg_keys[None, :] * BT + kg_rows[:, None]).to(gl.int32)
+    kg_offsets1 = kg_offsets0 + BK * BT
 
     # The next chunk's q/w/u/kg/gate do not depend on H. Issue those loads
     # before this chunk's math. The last chunk is not prefetched: a load past
@@ -708,12 +730,8 @@ def gluon_kda_paged_prefill_state_scan_gfx1250(
         u_value = cdna5.buffer_load(
             u + value_base, result_offsets, mask=result_mask, other=0.0
         ).to(gl.float32)
-        kg_token = gl.minimum(token0 + kg_rows[:, None], length - 1)
-        kg_offsets0 = (kg_token * H * K + kg_keys[None, :]).to(gl.int32)
-        kg_offsets1 = kg_offsets0 + BK
-        kg_mask = (token0 + kg_rows[:, None] < length) & (kg_keys[None, :] < BK)
-        kg0 = cdna5.buffer_load(kg + key_base, kg_offsets0, mask=kg_mask, other=0.0)
-        kg1 = cdna5.buffer_load(kg + key_base, kg_offsets1, mask=kg_mask, other=0.0)
+        kg0 = cdna5.buffer_load(kg_head, kg_offsets0)
+        kg1 = cdna5.buffer_load(kg_head, kg_offsets1)
         last_token = gl.minimum(token0 + BT, length) - 1
         bg0 = cdna5.buffer_load(
             bg + key_base,
@@ -757,18 +775,9 @@ def gluon_kda_paged_prefill_state_scan_gfx1250(
             nu = cdna5.buffer_load(
                 u + value_base, nresult_offsets, mask=nresult_mask, other=0.0
             ).to(gl.float32)
-            nkg_token = gl.minimum(next_token + kg_rows[:, None], length - 1)
-            nkg_offsets0 = (nkg_token * H * K + kg_keys[None, :]).to(gl.int32)
-            nkg_offsets1 = nkg_offsets0 + BK
-            nkg_mask = (next_token + kg_rows[:, None] < length) & (
-                kg_keys[None, :] < BK
-            )
-            nkg0 = cdna5.buffer_load(
-                kg + key_base, nkg_offsets0, mask=nkg_mask, other=0.0
-            )
-            nkg1 = cdna5.buffer_load(
-                kg + key_base, nkg_offsets1, mask=nkg_mask, other=0.0
-            )
+            next_kg = kg_head + (local_chunk + 1) * H * K * BT
+            nkg0 = cdna5.buffer_load(next_kg, kg_offsets0)
+            nkg1 = cdna5.buffer_load(next_kg, kg_offsets1)
             nlast = gl.minimum(next_token + BT, length) - 1
             nbg0 = cdna5.buffer_load(
                 bg + key_base,
@@ -972,6 +981,7 @@ def _launch_producer(
     u: torch.Tensor,
     w: torch.Tensor,
     kg: torch.Tensor,
+    chunk_starts: torch.Tensor,
     cu_seqlens: torch.Tensor,
     chunk_indices: torch.Tensor,
 ) -> None:
@@ -993,6 +1003,7 @@ def _launch_producer(
         u,
         w,
         kg,
+        chunk_starts,
         cu_seqlens,
         chunk_indices,
         H=heads,
@@ -1093,7 +1104,10 @@ def launch_gluon_kda_paged_prefill_gfx1250(
         device=q.device,
         dtype=torch.bfloat16,
     )
-    kg = torch.empty_like(k, dtype=torch.bfloat16)
+    kg = torch.empty(
+        num_chunks, heads, key_dim, chunk_size, device=q.device, dtype=torch.bfloat16
+    )
+    chunk_starts = torch.empty(num_sequences, device=q.device, dtype=torch.int32)
     qg = torch.empty_like(q, dtype=torch.bfloat16)
     gluon_kda_paged_prefill_preprocess_gfx1250[(num_chunks, heads)](
         q,
@@ -1153,6 +1167,7 @@ def launch_gluon_kda_paged_prefill_gfx1250(
         u=u,
         w=w,
         kg=kg,
+        chunk_starts=chunk_starts,
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
@@ -1168,6 +1183,7 @@ def launch_gluon_kda_paged_prefill_gfx1250(
         vnew,
         output,
         final_state,
+        chunk_starts,
         cu_seqlens,
         H=heads,
         K=key_dim,

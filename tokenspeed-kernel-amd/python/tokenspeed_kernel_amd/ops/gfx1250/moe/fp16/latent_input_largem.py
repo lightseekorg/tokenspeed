@@ -429,7 +429,7 @@ def launch_gluon_latent_input_largem_gfx1250(
     Args:
         hidden_states: Contiguous BF16 activation shaped ``[tokens, 7168]``.
             Any positive ``tokens`` works; a partial final row tile is
-            masked. Automatic dispatch uses this kernel from 1536 tokens.
+            masked. Automatic dispatch uses this kernel from 1025 tokens.
         router_weight: Packed weight view shaped ``[896, 7168]``.
         routed_down_weight: Packed weight view shaped ``[3584, 7168]``.
         shared_gate_up_weight: Packed weight view shaped ``[1536, 7168]``.

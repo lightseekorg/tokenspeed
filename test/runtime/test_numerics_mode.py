@@ -48,17 +48,25 @@ class TestNumericsMode:
         assert args.disable_pdl
         assert not (args.enable_allreduce_fusion)
         assert (args.comm_fusion_max_num_tokens) == (-1)
-        assert (args.moe_backend) == ("aok")
+        assert args.moe_backend == "auto"
         assert args.batch_invariant_collectives
 
-    def test_rl_bitwise_refuses_non_invariant_backends(self):
-        with pytest.raises((ValueError), match=("--moe-backend triton")):
-            ServerArgs(model="x", numerics="rl-bitwise", moe_backend="triton")
-        with pytest.raises((ValueError), match=("--draft-moe-backend triton")):
-            ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="triton")
-        # An explicit auto is a select-for-me request, folded like the target's.
+    def test_rl_bitwise_leaves_provider_validation_to_expert_planning(self):
+        assert (
+            ServerArgs(
+                model="x", numerics="rl-bitwise", moe_backend="triton"
+            ).moe_backend
+            == "triton"
+        )
+        assert (
+            ServerArgs(
+                model="x", numerics="rl-bitwise", draft_moe_backend="triton"
+            ).draft_moe_backend
+            == "triton"
+        )
+        # Auto asks the registry for a provider with the required capabilities.
         args = ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="auto")
-        assert (args.draft_moe_backend) == ("aok")
+        assert args.draft_moe_backend == "auto"
         with pytest.raises((ValueError), match=("--sampling-backend triton")):
             ServerArgs(model="x", numerics="rl-bitwise", sampling_backend="triton")
         args = ServerArgs(

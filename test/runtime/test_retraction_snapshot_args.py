@@ -23,7 +23,6 @@
 ``ServerArgs`` settles the knobs (role, request cap, the abort-only ratio 0);
 ``cache/l2/sizing.py`` turns them into LCM blocks against the rank's layout,
 with the tail unit the scheduler's ``CapacityModel`` answers.
-Registered in runtime-1gpu because ServerArgs imports the kernel runtime.
 """
 
 import logging
@@ -62,14 +61,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa:
     CacheGroupSpec,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
-
-PREFETCH = dict(
-    kvstore_prefetch_min_pages=2,
-    kvstore_prefetch_timeout_base_s=1.0,
-    kvstore_prefetch_timeout_per_page_s=0.0,
-    kvstore_prefetch_batch_pages=128,
-)
-
 
 # ----------------------------------------------------------------------
 # ServerArgs: the knobs as the operator states them
@@ -134,7 +125,8 @@ def test_ratio_zero_is_the_one_way_to_run_abort_only():
 
 
 @pytest.mark.parametrize("role", ["prefill", "encode"])
-def test_non_retracting_roles_resolve_to_no_pool_with_a_log(role, caplog):
+def test_non_retracting_roles_resolve_to_no_pool_with_a_log(role, caplog, monkeypatch):
+    monkeypatch.setattr(logging.getLogger(ServerArgs.__module__), "propagate", True)
     with caplog.at_level(logging.INFO):
         args = ServerArgs(
             model="x", disaggregation_mode=role, retraction_snapshot_host_gb=2.0
@@ -175,25 +167,36 @@ def test_the_pool_is_independent_of_the_kvstore():
     assert not args.retraction_snapshot_pool_disabled
 
 
-@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
-def test_kvp_takes_both_host_tiers_and_l3(role):
+def test_kvp_takes_both_host_tiers_and_l3():
     # The scheduler allocates every Host block in its Device block's residue
     # class and the executor translates ownership on both ends of every row,
     # so a KV-page-sharded engine may run the Host KVStore and the snapshot
-    # pool. Aggregated and prefill roles also prefetch L3 into owned Host blocks.
-    sharded = dict(
+    # pool. L3 page keys follow the replica rather than the allocated owner.
+    sharded_decode = dict(
+        model="x",
+        world_size=2,
+        disaggregation_mode="decode",
+        kv_parallel_size=2,
+        decode_context_parallel_size=2,
+    )
+    args = ServerArgs(**sharded_decode, retraction_snapshot_host_gb=1.0)
+    assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
+    args = ServerArgs(**sharded_decode, kvstore_storage_backend="mooncake")
+    assert args.kvstore_storage_backend == "mooncake"
+
+
+@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
+def test_l3_accepts_kvp_in_every_serving_role(role):
+    args = ServerArgs(
         model="x",
         world_size=2,
         disaggregation_mode=role,
         kv_parallel_size=2,
-        decode_context_parallel_size=1 if role == "prefill" else 2,
-        query_context_parallel_size=2 if role == "prefill" else 1,
+        decode_context_parallel_size=2,
+        kvstore_storage_backend="mooncake",
     )
-    if role != "prefill":
-        args = ServerArgs(**sharded, retraction_snapshot_host_gb=1.0)
-        assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
-    args = ServerArgs(**sharded, kvstore_storage_backend="mooncake", **PREFETCH)
-    assert args.enable_kvstore and args.mapping.attn.kvp_size == 2
+    assert args.enable_kvstore and args.kvstore_storage_backend == "mooncake"
+    assert args.mapping.attn.kvp_size == 2
 
 
 def test_forced_retraction_is_a_test_knob_that_needs_a_pool():
@@ -205,29 +208,6 @@ def test_forced_retraction_is_a_test_knob_that_needs_a_pool():
     for interval in (3, -2):
         args = ServerArgs(model="x", debug_force_retraction_interval=interval)
         assert args.debug_force_retraction_interval == interval
-
-
-def test_the_l3_prefetch_knobs_are_explicit_with_a_store_and_absent_without():
-    # No silent default: the threshold, the deadline and the batch all come
-    # with the store; without one they have nothing to size.
-    with pytest.raises(
-        ValueError, match="needs the L3 prefetch knobs: --kvstore-prefetch-min-pages"
-    ):
-        ServerArgs(model="x", kvstore_storage_backend="memory")
-    with pytest.raises(ValueError, match="need --kvstore-storage-backend"):
-        ServerArgs(model="x", kvstore_prefetch_min_pages=2)
-    args = ServerArgs(model="x", kvstore_storage_backend="memory", **PREFETCH)
-    assert args.kvstore_prefetch_min_pages == 2
-    for bad in (
-        dict(kvstore_prefetch_min_pages=0),
-        dict(kvstore_prefetch_timeout_base_s=0.0),
-        dict(kvstore_prefetch_timeout_per_page_s=-1.0),
-        dict(kvstore_prefetch_batch_pages=0),
-    ):
-        with pytest.raises(ValueError, match=next(iter(bad)).replace("_", "-")):
-            ServerArgs(
-                model="x", kvstore_storage_backend="memory", **{**PREFETCH, **bad}
-            )
 
 
 # ----------------------------------------------------------------------

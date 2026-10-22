@@ -54,6 +54,7 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
 from tokenspeed_kernel.selection import (
+    KernelPlan,
     NoKernelFoundError,
     SelectedKernel,
     resolve_kernel_override,
@@ -81,6 +82,7 @@ __all__ = [
     # GEMM
     "bmm",
     "mm",
+    "plan_dense_gemm",
     # NVFP4 x BF16 weight preparation
     "has_flashinfer_cute_dsl_nvfp4_a16",
     "prepare_nvfp4_a16_weights",
@@ -481,6 +483,38 @@ def _mm_mxfp8_prepacked(
     return result
 
 
+def plan_dense_gemm(
+    *,
+    mode: str,
+    input_size: int,
+    output_size: int,
+    dtype: torch.dtype,
+    batch_size: int | None,
+    batch_invariant: bool,
+) -> KernelPlan:
+    """Plan dense MM/BMM from model geometry, without allocating example tokens.
+
+    ``batch_size`` is the fixed head/group count for BMM, and None for MM.
+    The token dimension M remains unrestricted. Both inputs and output use dtype.
+    """
+    if mode not in ("mm", "bmm") or (mode == "bmm") != (batch_size is not None):
+        raise ValueError("Dense GEMM planning requires mm or bmm with its group count")
+    traits = {"n": output_size, "k": input_size, "out_dtype": dtype}
+    if batch_size is not None:
+        traits["batch"] = batch_size
+    return KernelPlan.select(
+        "gemm",
+        mode,
+        format_signature(a=dense_tensor_format(dtype), b=dense_tensor_format(dtype)),
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
+        static_traits=traits,
+        variable_traits=frozenset({"m"}),
+        solution=None,
+        declared_traits=frozenset(),
+        ignore_layout=False,
+    )
+
+
 def mm(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -493,6 +527,7 @@ def mm(
     alpha: torch.Tensor | None = None,
     block_size: list[int] | None = None,
     quant: str | None = None,
+    plan: KernelPlan | None = None,
     override: str | None = None,
     solution: str | None = None,
     prepacked_scales: bool = False,
@@ -525,6 +560,7 @@ def mm(
             ``"nvfp4"``, ``"nvfp4_a16"``, ``"mxfp4"``, ``"none"``.
             ``"nvfp4_a16"`` uses dense BF16 activations and prepared packed
             NVFP4 weights. If ``None``, inferred from input dtypes and scales.
+        plan: Initialization-time kernel selection; execution never reselects.
         override: Force selection of a specific kernel by name (e.g.
             ``"cublaslt_mm_nvfp4"``). Bypasses heuristic scoring.
         solution: Restrict selection to a registered implementation family.
@@ -535,6 +571,13 @@ def mm(
             ``[1, 32]`` from ``prepare_mxfp8_weight_scales``, and ``A`` may
             also be E4M3 codes with canonical ``[M, K/32]`` UE8M0 ``A_scales``.
     """
+    if plan is not None and (
+        prepacked_scales
+        or quant not in (None, "none")
+        or A_scales is not None
+        or B_scales is not None
+    ):
+        raise ValueError("A dense GEMM plan cannot use online quantization")
     override = resolve_kernel_override("gemm", "mm", override)
     enable_pdl = pdl_enabled()
     out_dtype = out_dtype or (out.dtype if out is not None else A.dtype)
@@ -615,7 +658,9 @@ def mm(
     # A dense layer's large-M arm reaches mm directly, while small M can
     # select mv. Expose those branches at the shared kernel boundary.
     if (
-        override is None
+        plan is None
+        and solution is None
+        and override is None
         and alpha is None
         and quant in (None, "none")
         and A_scales is None
@@ -672,14 +717,26 @@ def mm(
     )
     select_dtype = signature.storage_dtype_for("a") or A.dtype
 
-    kernel = select_kernel(
-        "gemm",
-        "mm",
-        signature,
-        traits=traits,
-        solution=solution,
-        override=override,
-    )
+    if plan is not None:
+        plan.validate(
+            "gemm",
+            "mm",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+            features=None,
+        )
+        kernel = plan.kernel
+    else:
+        kernel = select_kernel(
+            "gemm",
+            "mm",
+            signature,
+            traits=traits,
+            solution=solution,
+            override=override,
+        )
     # Online activation quantization
     if (
         quant == "mxfp8"
@@ -759,6 +816,7 @@ def bmm(
     block_size: list[int] | None = None,
     quant: str | None = None,
     enable_pdl: bool = False,
+    plan: KernelPlan | None = None,
     override: str | None = None,
 ) -> torch.Tensor:
     """Batched matrix multiply with automatic kernel selection.
@@ -791,6 +849,7 @@ def bmm(
             If ``None``, inferred from input dtypes and scales.
         enable_pdl: Whether to request Programmatic Dependent Launch support
             from kernels that accept it.
+        plan: Initialization-time kernel selection; execution never reselects.
         override: Force selection of a specific kernel by name. Bypasses
             heuristic scoring.
     """
@@ -833,13 +892,25 @@ def bmm(
     )
     select_dtype = signature.storage_dtype_for("a") or A.dtype
 
-    kernel = select_kernel(
-        "gemm",
-        "bmm",
-        signature,
-        traits=traits,
-        override=override,
-    )
+    if plan is not None:
+        plan.validate(
+            "gemm",
+            "bmm",
+            signature,
+            traits=traits,
+            override=override,
+            features=None,
+            solution=None,
+        )
+        kernel = plan.kernel
+    else:
+        kernel = select_kernel(
+            "gemm",
+            "bmm",
+            signature,
+            traits=traits,
+            override=override,
+        )
 
     if (
         quant == "mxfp8"

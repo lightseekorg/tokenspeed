@@ -215,6 +215,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         internal_activation_dtype="input",
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         solution="flashinfer_cutlass",
     )
     reference_w13 = w13.clone()

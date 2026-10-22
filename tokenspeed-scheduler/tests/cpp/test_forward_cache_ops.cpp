@@ -734,11 +734,12 @@ TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
     }
 }
 
-TEST(SchedulerConfigValidateTest, L3StorageAcceptsShardedGroups) {
+TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     SchedulerConfig config = MakeValidConfig();
     config.host_allocator.total_pages = 32;
     config.enable_l3_storage = true;
-    config.l3_prefetch_min_pages = 1;
+    config.storage_config = StorageConfig{
+        8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
     config.cache_groups[0].cache_blocks_per_lcm_block = 2;
     config.cache_groups[0].shard_count = 2;
     EXPECT_NO_THROW(config.Validate());

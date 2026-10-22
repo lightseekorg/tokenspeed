@@ -20,10 +20,10 @@
 
 """The runtime's side of a retraction, driven against the real C++ scheduler.
 
-No engine: the scheduler is built through ``make_config`` exactly as the event
-loop builds it, its plans are adapted by ``cache_ops_from_plan`` exactly as
-``DeviceHandle.execute`` adapts them, and the ACKs the Host cache executor
-would produce are fed back through ``CacheOpHooks`` and ``advance_scheduler``
+No engine: the scheduler is built through ``make_config`` as in the event
+loop. ``cache_ops_from_plan`` prepares one Device-copy tuple for the hooks
+to count and ``DeviceHandle.execute`` to consume. The Host cache executor's
+ACKs are fed back through ``CacheOpHooks`` and ``advance_scheduler``
 exactly as the loop feeds them. The forced-retraction knob
 (``debug_force_retraction_interval``) stands in for capacity pressure, so a
 decoding request is retracted, imaged, restored and resumes ``Decoding`` with
@@ -84,7 +84,7 @@ def _scheduler(*, l2: bool, force_interval: int) -> ts.Scheduler:
         role="fused",
         num_snapshot_pages=POOL_LCM_BLOCKS + 1,
         max_retracted_requests=2,
-        l3_prefetch_min_pages=0,
+        storage_config=None,
         debug_force_retraction_interval=force_interval,
         cache_groups=groups,
     )
@@ -145,8 +145,8 @@ class _Driver:
         self.acked += len(events)
         advance_scheduler(self.scheduler, events)
         plan = self.scheduler.next_execution_plan()
-        self.hooks.count_plan_ops(plan)
-        ops = cache_ops_from_plan(plan)
+        ops = cache_ops_from_plan(plan).device
+        self.hooks.count_ops(ops)
         self.tickets += sum(
             1 if isinstance(op, (SnapshotOp, RestoreOp)) else len(op.op_ids)
             for op in ops
@@ -251,11 +251,11 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
 
     # Until every store's ACK lands the image is not landed: no restore.
     rnd = driver.round()
-    assert rnd.ops == [] and rnd.forwards == []
+    assert rnd.ops == () and rnd.forwards == []
     driver.complete([store])
     if l2:
         rnd = driver.round()
-        assert rnd.ops == [] and rnd.forwards == []
+        assert rnd.ops == () and rnd.forwards == []
         driver.complete([tail_store])
 
     # The ACKs make the image eligible; the next plan restores: one op whose
@@ -279,7 +279,7 @@ def test_forced_retraction_images_restores_and_resumes_decoding(l2: bool) -> Non
         assert all(t.content_hash == "" for t in restore.transfers)
     assert scheduler.retracted_size() == 1 and scheduler.decoding_size() == 0
     rnd = driver.round()
-    assert rnd.ops == [] and rnd.forwards == []
+    assert rnd.ops == () and rnd.forwards == []
     driver.complete([restore])
 
     # RestoreDone: Decoding again, same token count, nothing left in the pool
@@ -318,7 +318,7 @@ def test_an_aborted_victims_store_is_still_acknowledged_and_frees_its_image() ->
     assert scheduler.retracted_size() == 0 and scheduler.waiting_size() == 0
     driver.complete([store])
     rnd = driver.round()
-    assert rnd.ops == [] and rnd.forwards == []
+    assert rnd.ops == () and rnd.forwards == []
     assert scheduler.snapshot_pool_free_blocks() == pool_free
     assert driver.acked == driver.tickets
 
@@ -330,7 +330,7 @@ def test_the_knob_is_off_by_default() -> None:
     _prefill_and_decode_once(driver)
     for _ in range(4):
         rnd = driver.round()
-        assert rnd.ops == [] and len(rnd.forwards) == 1
+        assert rnd.ops == () and len(rnd.forwards) == 1
         driver.land(rnd.forwards[0])
     assert scheduler.retracted_size() == 0
 
@@ -391,7 +391,7 @@ def test_a_capacity_blocked_round_with_no_fitting_image_aborts_the_newest_reside
             role="fused",
             num_snapshot_pages=1,
             max_retracted_requests=0,
-            l3_prefetch_min_pages=0,
+            storage_config=None,
             cache_groups=groups,
         )
     )

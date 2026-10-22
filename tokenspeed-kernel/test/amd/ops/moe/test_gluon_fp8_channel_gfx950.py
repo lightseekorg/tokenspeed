@@ -338,6 +338,7 @@ def tp8_channel_fixture():
         expert_id_repeats=False,
         activation_clamped=False,
         combine_order="rank",
+        features=frozenset(),
         solution="triton",
         fast_math=False,
     )

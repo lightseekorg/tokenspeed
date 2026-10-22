@@ -86,6 +86,7 @@ if current_platform().is_amd:
             }
         ),
         priority=Priority.SPECIALIZED,
+        features=frozenset({"logits"}),
     )
     def gluon_qsa_block_scores_gfx950(
         query: torch.Tensor,
@@ -124,6 +125,7 @@ if current_platform().is_amd:
             {format_signature(logits=dense_tensor_format(torch.float32))}
         ),
         priority=Priority.SPECIALIZED,
+        features=frozenset({"logits"}),
     )
     def gluon_qsa_block_topk_select_gfx950(
         logits: torch.Tensor,

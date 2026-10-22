@@ -78,7 +78,8 @@ _SUPPORTED_QUANT_ALGOS = frozenset(
 )
 
 
-def _normalize_quant_algo(algo: str) -> str:
+def normalize_quant_algo(algo: str) -> str:
+    """Return the canonical name for an uppercase ModelOpt quantization algorithm."""
     return _QUANT_ALGO_ALIASES.get(algo, algo)
 
 
@@ -145,7 +146,7 @@ class ModelOptMixedConfig(QuantizationConfig):
     ) -> None:
         super().__init__(exclude_modules=exclude_modules)
         self.quantized_layers = {
-            name: _normalize_quant_algo(algo) for name, algo in quantized_layers.items()
+            name: normalize_quant_algo(algo) for name, algo in quantized_layers.items()
         }
         self.kv_cache_quant_algo = kv_cache_quant_algo
         self.group_size = group_size
@@ -225,7 +226,7 @@ class ModelOptMixedConfig(QuantizationConfig):
         unknown: set[str] = set()
         for name, info in raw_layers.items():
             raw_algo = str(info.get("quant_algo", "")).upper()
-            algo = _normalize_quant_algo(raw_algo)
+            algo = normalize_quant_algo(raw_algo)
             if algo not in _SUPPORTED_QUANT_ALGOS:
                 unknown.add(raw_algo)
                 continue

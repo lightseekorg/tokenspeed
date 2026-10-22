@@ -135,8 +135,46 @@ public:
     }
 
     template <typename State>
+    State* GetIf() {
+        return std::get_if<State>(&state_);
+    }
+
+    template <typename State>
     const State* GetIf() const {
         return std::get_if<State>(&state_);
+    }
+
+    fsm::AdmissionResources* AdmissionResourcesPtr() {
+        return std::visit(
+            [](auto& state) -> fsm::AdmissionResources* {
+                using State = std::remove_cvref_t<decltype(state)>;
+                if constexpr (std::same_as<State, fsm::Prefetching>) {
+                    return &state.Admission();
+                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping>) {
+                    return &state.admission;
+                }
+                return nullptr;
+            },
+            state_);
+    }
+
+    const fsm::AdmissionResources* AdmissionResourcesPtr() const {
+        return std::visit(
+            [](const auto& state) -> const fsm::AdmissionResources* {
+                using State = std::remove_cvref_t<decltype(state)>;
+                if constexpr (std::same_as<State, fsm::Prefetching>) {
+                    return &state.Admission();
+                } else if constexpr (std::same_as<State, fsm::Submitted> || std::same_as<State, fsm::Bootstrapping>) {
+                    return &state.admission;
+                }
+                return nullptr;
+            },
+            state_);
+    }
+
+    bool AwaitsBootstrap() const {
+        const auto* prefetch = GetIf<fsm::Prefetching>();
+        return Is<fsm::Bootstrapping>() || (prefetch != nullptr && prefetch->AwaitsBootstrap());
     }
 
     // True in every state that carries ForwardResources; Bootstrapping,

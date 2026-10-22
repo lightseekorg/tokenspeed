@@ -30,7 +30,7 @@ import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
 from tokenspeed_kernel.signature import (
     dense_format_signature,
     dense_tensor_format,
@@ -51,6 +51,9 @@ __all__ = [
     "moe_process_weights",
     "moe_warmup",
     "moe_topk",
+    "softmax_bias_topk",
+    "plan_softmax_bias_topk",
+    "torch_softmax_bias_topk",
     "packed_projection_weight_view",
     "moe_sigmoid_bias_topk_routing",
     "FUSED_ROUTING_MAX_TOKENS",
@@ -60,6 +63,72 @@ __all__ = [
     "routed_input_scale_rmsnorm_sum_gathered",
     "prepare_sm90_fp8_moe",
 ]
+
+
+def plan_softmax_bias_topk(
+    *, dtype: torch.dtype, experts: int, top_k: int
+) -> KernelPlan:
+    """Plan FP32 softmax/bias routing with PyTorch's sorted top-k tie order.
+
+    dtype describes logits; experts includes identity candidates. top_k and
+    expert count are fixed model dimensions; token rows may vary at execution.
+    The provider's batch-invariant domain is checked during selection.
+    """
+    if not 0 < top_k <= experts:
+        raise ValueError("top_k must be in [1, experts]")
+    return KernelPlan.select(
+        "moe",
+        "softmax_bias_topk",
+        format_signature(router_logits=dense_tensor_format(dtype)),
+        features=frozenset({"batch_invariant"}),
+        static_traits={"experts": experts, "top_k": top_k, "tie_order": "torch"},
+        variable_traits=frozenset({"m"}),
+        declared_traits=frozenset({"tie_order"}),
+        solution=None,
+        ignore_layout=False,
+    )
+
+
+def softmax_bias_topk(
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    top_k: int,
+    num_real_experts: int,
+    routed_scaling_factor: float,
+    indices_dtype: torch.dtype,
+    plan: KernelPlan,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Execute a planned torch-order router; return FP32 weights and expert IDs.
+
+    router_logits is [tokens, candidates], correction_bias is [candidates].
+    IDs >= num_real_experts become -1 without discarding their weights.
+    Pass candidates as num_real_experts to keep all local IDs for group mapping.
+    indices_dtype selects the returned integer dtype. The scale multiplies
+    selected unbiased probabilities. No renormalization is performed here.
+    """
+    plan.validate(
+        "moe",
+        "softmax_bias_topk",
+        format_signature(router_logits=dense_tensor_format(router_logits.dtype)),
+        traits={
+            "experts": router_logits.shape[-1],
+            "top_k": top_k,
+            "m": router_logits.shape[0],
+            "tie_order": "torch",
+        },
+        features=frozenset({"batch_invariant"}),
+        solution=None,
+        override=None,
+    )
+    return plan.kernel(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        top_k=top_k,
+        num_real_experts=num_real_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        indices_dtype=indices_dtype,
+    )
 
 
 def prepare_sm90_fp8_moe(
@@ -754,6 +823,7 @@ def _moe_sigmoid_bias_topk(
     weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts using ``sigmoid(logits) + correction_bias``.
 
@@ -766,15 +836,19 @@ def _moe_sigmoid_bias_topk(
         logical_to_physical_map: Optional ``[experts]`` integer map applying
             static expert-location dispatch to the selected ids (fused into
             the specialized decode kernel; a gather elsewhere).
-        weights_dtype: Output dtype for the route weights (selection always
-            runs in FP32).
+        weights_dtype: Dtype for allocated route weights (selection always
+            runs in FP32). Supplied output buffers select their own precision.
         override: Optional exact registered kernel name.
         solution: Optional implementation solution.
+        out: Optional contiguous weight and expert-ID output buffers. FP32
+            weight storage retains FP32 precision, including when
+            ``weights_dtype`` is BF16. IDs can use INT32 or INT64. The selected
+            kernel must support these buffers.
 
     Returns:
-        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Weights
-        are ``weights_dtype`` and ids are INT32 (physical ids when a dispatch
-        map is given).
+        ``(topk_weights, topk_ids)`` with shapes ``[tokens, topk]``. Supplied
+        output buffers are returned in place. Without buffers, weights use
+        ``weights_dtype`` and IDs use INT32. A dispatch map produces physical IDs.
     """
     if router_logits.dim() != 2:
         raise ValueError("router_logits must have shape [tokens, experts]")
@@ -795,11 +869,33 @@ def _moe_sigmoid_bias_topk(
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
+    if out is not None:
+        weights, ids = out
+        shape = (tokens, topk)
+        for tensor in out:
+            if (
+                tensor.shape != shape
+                or tensor.device != router_logits.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"Routing output must be contiguous {shape} on {router_logits.device}"
+                )
+        if weights.dtype != weights_dtype and not (
+            weights_dtype == torch.bfloat16 and weights.dtype == torch.float32
+        ):
+            raise ValueError(
+                "Routing weights must use the requested dtype or FP32 storage "
+                "for BF16 requests"
+            )
+        if ids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Routing expert IDs must use INT32 or INT64")
     if tokens == 0:
-        shape = (0, topk)
+        if out is not None:
+            return out
         return (
-            torch.empty(shape, device=router_logits.device, dtype=weights_dtype),
-            torch.empty(shape, device=router_logits.device, dtype=torch.int32),
+            torch.empty((0, topk), dtype=weights_dtype, device=router_logits.device),
+            torch.empty((0, topk), dtype=torch.int32, device=router_logits.device),
         )
     if (
         override is None
@@ -829,7 +925,15 @@ def _moe_sigmoid_bias_topk(
         except NoKernelFoundError:
             mapped_kernel = None
         if mapped_kernel is not None:
-            topk_weights, topk_ids = mapped_kernel(
+            spec = KernelRegistry.get().get_by_name(mapped_kernel.name)
+            supports_output_buffers = spec is not None and True in spec.traits.get(
+                "supports_output_buffers", frozenset({False})
+            )
+            if out is not None and not supports_output_buffers:
+                raise ValueError(
+                    f"{mapped_kernel.name} does not accept routing output buffers"
+                )
+            kwargs = dict(
                 router_logits=router_logits,
                 correction_bias=correction_bias,
                 topk=topk,
@@ -838,6 +942,10 @@ def _moe_sigmoid_bias_topk(
                 logical_to_physical_map=logical_to_physical_map,
                 weights_dtype=weights_dtype,
             )
+            if supports_output_buffers:
+                topk_weights, topk_ids = mapped_kernel(**kwargs, out=out)
+            else:
+                topk_weights, topk_ids = mapped_kernel(**kwargs)
             return topk_weights, topk_ids
 
     kernel = select_kernel(
@@ -848,7 +956,13 @@ def _moe_sigmoid_bias_topk(
         override=override,
         solution=solution,
     )
-    topk_weights, topk_ids = kernel(
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    supports_output_buffers = spec is not None and True in spec.traits.get(
+        "supports_output_buffers", frozenset({False})
+    )
+    if out is not None and not supports_output_buffers:
+        raise ValueError(f"{kernel.name} does not accept routing output buffers")
+    kwargs = dict(
         router_logits=router_logits,
         correction_bias=correction_bias,
         topk=topk,
@@ -856,8 +970,15 @@ def _moe_sigmoid_bias_topk(
         normalize_topk_weights=normalize_topk_weights,
         weights_dtype=weights_dtype,
     )
+    if supports_output_buffers:
+        topk_weights, topk_ids = kernel(**kwargs, out=out)
+    else:
+        topk_weights, topk_ids = kernel(**kwargs)
     if logical_to_physical_map is not None:
         topk_ids = logical_to_physical_map[topk_ids.long()].to(torch.int32)
+        if out is not None:
+            out[1].copy_(topk_ids)
+            topk_ids = out[1]
     return topk_weights, topk_ids
 
 
@@ -959,6 +1080,7 @@ def moe_topk(
     topk_weights_dtype: torch.dtype = torch.float32,
     override: str | None = None,
     solution: str | None = None,
+    out: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Produce expert weights and ids using a registered MoE TopK kernel.
 
@@ -983,9 +1105,13 @@ def moe_topk(
             and Triton can write BF16 directly after scaling.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        out: Optional (weights, ids) output buffers for biased sigmoid routing.
+            IDs must use topk_indices_dtype. Weights use the supplied buffer's
+            precision; FP32 storage is also accepted for BF16 requests.
+            Omission allocates the outputs in the selected kernel.
     Returns:
         Weights and expert ids shaped [tokens, top_k], using the requested
-        output dtypes (FP32 weights and INT32 ids by default).
+        output dtypes, or the supplied out buffers.
     """
     if selection_method not in {"topk", "hash"}:
         raise ValueError(f"unsupported MoE selection method: {selection_method!r}")
@@ -1000,6 +1126,13 @@ def moe_topk(
         raise ValueError("topk_indices_dtype must be torch.int32 or torch.int64")
     if not topk_weights_dtype.is_floating_point:
         raise ValueError("topk_weights_dtype must be a floating-point dtype")
+    if out is not None:
+        if score_function != "sigmoid":
+            raise ValueError(
+                "Routing output buffers currently support biased sigmoid top-k"
+            )
+        if out[1].dtype != topk_indices_dtype:
+            raise ValueError("Routing expert-ID output must match topk_indices_dtype")
 
     scaling_factor = 1.0 if routed_scaling_factor is None else routed_scaling_factor
     if score_function == "softmax":
@@ -1035,6 +1168,7 @@ def moe_topk(
             weights_dtype=topk_weights_dtype,
             override=override,
             solution=solution,
+            out=out,
         )
         return topk_weights, topk_ids.to(topk_indices_dtype)
 
@@ -1333,14 +1467,36 @@ def _build_traits(
 
 
 def _select_moe_apply(
-    input_dtype: torch.dtype, traits: dict[str, Any], solution: str | None
+    input_dtype: torch.dtype,
+    traits: dict[str, Any],
+    solution: str | None,
+    features: frozenset[str],
 ):
+    signature = format_signature(x=dense_tensor_format(input_dtype))
+    if "batch_invariant" in features:
+        selected = KernelPlan.select(
+            "moe",
+            "apply",
+            signature,
+            features=features,
+            static_traits=traits,
+            variable_traits=frozenset({"m", "num_tokens", "batch_size"}),
+            solution=solution,
+            declared_traits=(
+                frozenset({"combine_order"})
+                if traits["combine_order"] == "slot"
+                else frozenset()
+            ),
+            ignore_layout=True,
+        )
+        return selected.kernel, selected.spec
     kernel = select_kernel(
         "moe",
         "apply",
-        format_signature(x=dense_tensor_format(input_dtype)),
+        signature,
         traits=traits,
         solution=solution,
+        features=features,
         ignore_layout=True,
     )
     apply_spec = KernelRegistry.get().get_by_name(kernel.name)
@@ -1405,6 +1561,7 @@ def moe_plan(
     persistent_max_num_tokens_per_gpu: int | None = None,
     fast_math: bool,
     combine_order: str,
+    features: frozenset[str],
     solution: str | None = None,
     fp32_correction_bias: bool = False,
 ) -> dict:
@@ -1477,6 +1634,10 @@ def moe_plan(
             the caller must not reduce; it needs a kernel declaring the
             ``combine_order`` trait with ``"slot"`` and, for ``ep_size > 1``,
             the EP process group. Required keyword.
+        features: Registered capabilities the apply kernel must declare, e.g.
+            ``frozenset({"batch_invariant"})``, which plans the kernel once
+            from static geometry (``KernelPlan``); empty for ordinary
+            selection. Required keyword.
         solution: Optional kernel solution to force through normal selection.
             None leaves the concrete kernel choice to the registry.
         fp32_correction_bias: Whether routing must add the DeepSeekV3
@@ -1534,7 +1695,7 @@ def moe_plan(
     )
     traits["persistent_workspace"] = persistent_max_num_tokens_per_gpu is not None
 
-    kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
+    kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution, features)
     # A kernel that routes from logits keeps an FP32 correction bias only if
     # its hook says so; TokenSpeed's top-k routers always add it in FP32.
     fp32_bias_hook = getattr(kernel.impl, "_tokenspeed_fp32_correction_bias", None)
@@ -1551,7 +1712,7 @@ def moe_plan(
             )
         _log_fp32_correction_bias_fallback(apply_spec.name)
         routing_mode = traits["routing_mode"] = "precomputed_topk"
-        kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution)
+        kernel, apply_spec = _select_moe_apply(input_dtype, traits, solution, features)
     _validate_selected_deepep_mode(
         a2a_backend,
         deepep_mode,
@@ -1600,6 +1761,9 @@ def moe_plan(
         "weight_dtype": weight_dtype,
         "activation": activation,
         "apply_kernel_name": apply_spec.name,
+        "apply_kernel": kernel,
+        "input_dtype": input_dtype,
+        "features": features,
         "weight_preprocessor": apply_spec.weight_preprocessor,
         "warmup": getattr(kernel.impl, "_tokenspeed_warmup", None),
         "a2a_backend": a2a_backend,
@@ -1749,12 +1913,11 @@ def moe_apply(
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
     data = x[0] if isinstance(x, tuple) else x
-    kernel = select_kernel(
-        "moe",
-        "apply",
-        format_signature(x=dense_tensor_format(data.dtype)),
-        override=plan["apply_kernel_name"],
-    )
+    kernel = plan["apply_kernel"]
+    if "batch_invariant" in plan["features"] and data.dtype != plan["input_dtype"]:
+        raise ValueError(
+            "Batch-invariant MoE input dtype differs from its initialization plan"
+        )
     # Only the all-to-all EP kernels own dispatch/combine legs, so the mode
     # decision stays off the signature every other apply kernel implements.
     a2a_kwargs = (
@@ -1808,6 +1971,9 @@ import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.native  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.triton  # noqa: E402,F401
-from tokenspeed_kernel.ops.moe.native import torch_softmax_topk  # noqa: E402
+from tokenspeed_kernel.ops.moe.native import (
+    torch_softmax_topk,
+    torch_softmax_bias_topk,
+)  # noqa: E402
 
 # isort: on

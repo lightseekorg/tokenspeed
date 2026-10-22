@@ -253,6 +253,7 @@ def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["supports_deferred_finalize"]
     assert plan["topk_weights_dtype"] == torch.bfloat16
@@ -378,6 +379,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     assert plan["apply_kernel_name"] == "flashinfer_trtllm_mxfp4_situ_moe_apply"
     assert plan["support_routing"] is True
@@ -404,6 +406,7 @@ def test_swiglu_quantizer_keeps_native_padding(monkeypatch) -> None:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
     kernel_moe_process_weights(plan, w)
     original_hidden = HIDDEN - 32
@@ -472,6 +475,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         fp8_scale_block_shape=None,
         internal_activation_dtype="fp8",
         with_bias=False,

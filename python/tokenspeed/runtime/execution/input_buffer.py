@@ -530,7 +530,9 @@ class InputBuffers:
             self.force_single_token_verify_buf[
                 row_offset : row_offset + expected_count
             ] = force_single_token
-            runtime_states.spec_candidates_ready[decode_req_pool_indices] = False
+            runtime_states.spec_candidates_ready.index_fill_(
+                0, decode_req_pool_indices, False
+            )
 
         # Decode-only fast path: one fused Triton kernel writes positions and
         # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]

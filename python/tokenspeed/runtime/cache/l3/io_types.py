@@ -18,28 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Record the latency of selected functions."""
+"""Storage facts distinguish validity, object failure and native retirement."""
 
-from tokenspeed.runtime.metrics.utils import exponential_buckets
-
-enable_metrics = False
+from dataclasses import dataclass
 
 
-def enable_func_timer():
-    """Enable Prometheus-backed function latency metrics."""
-    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-    from prometheus_client import Histogram
-
-    global enable_metrics, FUNC_LATENCY
-    enable_metrics = True
-
-    FUNC_LATENCY = Histogram(
-        "tokenspeed:func_latency_seconds",
-        "Function latency in seconds",
-        # captures latency in range [50ms - ~50s]
-        buckets=exponential_buckets(start=0.05, width=1.5, length=18),
-        labelnames=["name"],
-    )
+@dataclass(frozen=True, slots=True)
+class StorageIOResult:
+    success: tuple[bool, ...]
+    retired: bool
+    # Confirmed absent or invalid objects, never policy/queue/transport errors.
+    object_failures: tuple[bool, ...]
 
 
-FUNC_LATENCY = None
+@dataclass(frozen=True, slots=True)
+class StorageCompletion:
+    op_id: int
+    success: tuple[bool, ...]
+    retired: bool
+    object_failures: tuple[bool, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoragePoll:
+    """Local completion facts and bounded pressure observations for one round."""
+
+    completions: tuple[StorageCompletion, ...]
+    queued_operations: int
+    queued_bytes: int
+    oldest_operation_us: int
