@@ -675,6 +675,11 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
         _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
         off_pipe = (_off,)
         raw_pipe = (_raw,)
+    else:
+        first_offsets = (
+            panel_value_offsets[:, None] + value_split_idx * (8 // VALUE_SPLITS) * 16
+        ) * D + key_offsets[None, :]
+        first_raw = gl.load(state_pool + read_base + first_offsets).to(gl.float32)
 
     # Process Q/K/V/decay together so Q/K/V share convolution loads.
     # Decay lanes use Q as an in-bounds dummy address and skip state writes.
@@ -837,6 +842,9 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(
             if VALUE_SPLITS == 1:
                 panel_offsets = off_pipe[0]
                 running = raw_pipe[0]
+            elif panel_idx % panels_per_split == 0:
+                panel_offsets = first_offsets
+                running = first_raw
             else:
                 panel_offsets = (
                     panel_value_offsets[:, None] + panel_idx * 16

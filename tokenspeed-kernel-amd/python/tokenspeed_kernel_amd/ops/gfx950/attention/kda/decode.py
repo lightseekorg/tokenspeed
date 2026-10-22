@@ -658,15 +658,19 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
     raw_pipe = ()
     if VALUE_SPLITS == 1:
         _off = panel_value_offsets[:, None] * D + key_offsets[None, :]
-        _raw = gl.load(state_pool + read_base + _off).to(gl.float32)
+        _raw = gl.load(state_pool + read_base + _off, cache_modifier=".cg").to(
+            gl.float32
+        )
         off_pipe = (_off,)
         raw_pipe = (_raw,)
-    elif TOKENS_PER_SEQUENCE == 1:
+    else:
         first_offsets = (
             panel_value_offsets[:, None]
             + value_split_idx * panels_per_split * panel_rows
         ) * D + key_offsets[None, :]
-        first_raw = gl.load(state_pool + read_base + first_offsets).to(gl.float32)
+        first_raw = gl.load(
+            state_pool + read_base + first_offsets, cache_modifier=".cg"
+        ).to(gl.float32)
 
     # Process Q/K/V/decay together so Q/K/V share convolution loads.
     # Decay lanes use Q as an in-bounds dummy address and skip state writes.
@@ -841,9 +845,9 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
             prefetch_offsets = (
                 panel_value_offsets[:, None] + prefetch_idx * panel_rows
             ) * D + key_offsets[None, :]
-            prefetch_raw = gl.load(state_pool + read_base + prefetch_offsets).to(
-                gl.float32
-            )
+            prefetch_raw = gl.load(
+                state_pool + read_base + prefetch_offsets, cache_modifier=".cg"
+            ).to(gl.float32)
             off_pipe = off_pipe + (prefetch_offsets,)
             raw_pipe = raw_pipe + (prefetch_raw,)
     for panel_idx in gl.static_range(panel_count):
@@ -851,14 +855,16 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
             if VALUE_SPLITS == 1:
                 panel_offsets = off_pipe[0]
                 running = raw_pipe[0]
-            elif TOKENS_PER_SEQUENCE == 1 and panel_idx % panels_per_split == 0:
+            elif panel_idx % panels_per_split == 0:
                 panel_offsets = first_offsets
                 running = first_raw
             else:
                 panel_offsets = (
                     panel_value_offsets[:, None] + panel_idx * panel_rows
                 ) * D + key_offsets[None, :]
-                running = gl.load(state_pool + read_base + panel_offsets).to(gl.float32)
+                running = gl.load(
+                    state_pool + read_base + panel_offsets, cache_modifier=".cg"
+                ).to(gl.float32)
 
             for token_offset in gl.static_range(TOKENS_PER_SEQUENCE):
                 q_value = q_values[token_offset]
@@ -902,9 +908,9 @@ def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(
                     next_offsets = (
                         panel_value_offsets[:, None] + next_idx * panel_rows
                     ) * D + key_offsets[None, :]
-                    next_raw = gl.load(state_pool + read_base + next_offsets).to(
-                        gl.float32
-                    )
+                    next_raw = gl.load(
+                        state_pool + read_base + next_offsets, cache_modifier=".cg"
+                    ).to(gl.float32)
                     off_pipe = off_pipe[1:] + (next_offsets,)
                     raw_pipe = raw_pipe[1:] + (next_raw,)
                 else:
