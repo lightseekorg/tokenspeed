@@ -187,6 +187,7 @@ class _Host:
     def __init__(self, *, nbytes: int, page: int):
         self.host_buffer = _PtrBuffer(nbytes)
         self._page = int(page)
+        self.host_cache_block_bytes = (self._page,)
 
     def host_block_range(self, group_index: int, block_id: int) -> tuple[int, int]:
         del group_index
