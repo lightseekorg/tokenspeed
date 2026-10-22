@@ -97,6 +97,8 @@ __all__ = [
     "grouped_bf16_projection_quantize_fp8",
     # MV: small-M dense projection
     "mv",
+    "mv_weightless_rmsnorm_gated_sigmoid",
+    "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
@@ -1912,6 +1914,82 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     return split_fp32_weight_bf16x3(weight)
 
 
+def mv_weightless_rmsnorm_gated_sigmoid_supported(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Whether :func:`mv_weightless_rmsnorm_gated_sigmoid` serves this row.
+
+    It reproduces the two calls it replaces, so it applies only where they
+    select the Triton gated norm and the gfx950 single-row GEMV.
+    """
+    if (
+        not current_platform().is_cdna4
+        or not x.is_cuda
+        or x.ndim != 2
+        or x.shape[0] != 1
+        or x.shape[1] != num_heads * head_dim
+        or not x.is_contiguous()
+        or gate.shape != x.shape
+        or gate.stride(1) != 1
+        or weight.ndim != 2
+        or weight.shape[1] != x.shape[1]
+        or not weight.is_contiguous()
+        or x.dtype != torch.bfloat16
+        or gate.dtype != x.dtype
+        or weight.dtype != x.dtype
+        or gate.device != x.device
+        or weight.device != x.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return False
+    n, k = weight.shape
+    if not supports_gluon_gated_rowcta_bf16_gemv_gfx950(n, k, num_heads, head_dim):
+        return False
+    norm = select_kernel(
+        "layernorm",
+        "weightless_rmsnorm_gated_sigmoid",
+        dense_format_signature(("x", "gate"), (x.dtype, gate.dtype)),
+    )
+    gemv = _select_mv(1, n, k, True, x.dtype, weight.dtype, False)
+    return (
+        norm.name == "triton_weightless_rmsnorm_gated_sigmoid"
+        and gemv is KernelRegistry.get().get_impl("gluon_rowcta_bf16_gemv_gfx950")
+    )
+
+
+def mv_weightless_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize, gate and project one row in one launch.
+
+    Computes ``mv(weightless_rmsnorm_gated_sigmoid(x, gate, ...), weight,
+    out)`` where :func:`mv_weightless_rmsnorm_gated_sigmoid_supported` holds.
+
+    Args:
+        x: Contiguous BF16 row ``[1, num_heads * head_dim]``.
+        gate: Gate logits with ``x``'s shape and a unit inner stride.
+        weight: ``[N, K]`` weight.
+        num_heads: Heads in ``x``.
+        eps: Epsilon added to each per-head variance.
+        out: ``[1, N]`` destination.
+
+    Returns:
+        ``out``.
+    """
+    return launch_gluon_gated_rowcta_bf16_gemv_gfx950(
+        x, gate, weight, out, num_heads, eps
+    )
+
+
 # ===-----------------------------------------------------------------------===#
 # Linear AttnRes partials
 # ===-----------------------------------------------------------------------===#
@@ -2253,7 +2331,9 @@ def linear_attnres_partials(
 
 if _platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        launch_gluon_gated_rowcta_bf16_gemv_gfx950,
         prefers_gluon_rowcta_bf16_gemv_gfx950,
+        supports_gluon_gated_rowcta_bf16_gemv_gfx950,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.largem import (
         supports_gluon_mm_a16w16_prefill_gfx950,
@@ -2286,6 +2366,14 @@ else:
 
     def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
         return False
+
+    def supports_gluon_gated_rowcta_bf16_gemv_gfx950(
+        n: int, k: int, num_heads: int, head_dim: int
+    ) -> bool:
+        return False
+
+    def launch_gluon_gated_rowcta_bf16_gemv_gfx950(*args) -> torch.Tensor:
+        raise RuntimeError("the gated single-row GEMV requires gfx950")
 
 
 # FP8 storage dtypes served by the w8a8 projection branch (matches the

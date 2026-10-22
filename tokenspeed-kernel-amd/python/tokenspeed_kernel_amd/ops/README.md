@@ -126,6 +126,12 @@ independent weight streams in flight per CU, which suits cold weights.
   `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or
   hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
   measured shapes route single rows to `mv` separately.
+- `gluon_gated_rowcta_bf16_gemv_gfx950` projects one row through a per-head
+  weightless RMSNorm x sigmoid(gate) prologue that every program recomputes. It
+  keeps the Triton gated norm's layout and this GEMV's reduction, so it is
+  bitwise identical to both launches.
+  `gemm.mv_weightless_rmsnorm_gated_sigmoid` takes it for the `(N, K, heads)`
+  shapes in `_GATED_SHAPES` when neither selection is overridden.
 
 ### gfx950 FP32 router GEMV
 

@@ -32,6 +32,11 @@ from tokenspeed_kernel.ops.gemm import (  # noqa: E402
     _use_mv,
     mm,
     mv,
+    mv_weightless_rmsnorm_gated_sigmoid,
+    mv_weightless_rmsnorm_gated_sigmoid_supported,
+)
+from tokenspeed_kernel.ops.layernorm import (  # noqa: E402
+    weightless_rmsnorm_gated_sigmoid,
 )
 from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (  # noqa: E402
     _PREFERRED_SHAPES,
@@ -61,6 +66,41 @@ def test_gluon_rowcta_bf16_gemv_matches_reference(n: int, k: int) -> None:
     gluon_rowcta_bf16_gemv_gfx950(x, weight, actual)
     expected = x.float() @ weight.float().T
     torch.testing.assert_close(actual.float(), expected, atol=0.5, rtol=8e-3)
+
+
+def test_gated_gemv_matches_the_gate_norm_then_the_gemv() -> None:
+    """One launch reproduces the gated norm and the single-row GEMV bit for bit.
+
+    This is Muse Spark's TP8 output projection; the gate is a strided view of
+    a wider projection, as the attention split leaves it. The TP4 projection
+    keeps the two launches.
+    """
+    n, heads = 8192, 16
+    k = heads * 64
+    generator = torch.Generator(device="cuda").manual_seed(20261022 + k)
+    x = torch.randn((1, k), dtype=torch.bfloat16, device="cuda", generator=generator)
+    projected = torch.randn(
+        (1, 3 * k), dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    gate = projected[:, k : 2 * k]
+    weight = (
+        torch.randn((n, k), dtype=torch.bfloat16, device="cuda", generator=generator)
+        / 32
+    )
+    assert mv_weightless_rmsnorm_gated_sigmoid_supported(x, gate, weight, heads, 64)
+    gated = weightless_rmsnorm_gated_sigmoid(x, gate, heads, 64, 1e-6, False)
+    expected = mv(gated, weight)
+    actual = torch.empty_like(expected)
+    mv_weightless_rmsnorm_gated_sigmoid(x, gate, weight, heads, 1e-6, actual)
+    assert torch.equal(actual, expected)
+    # A row narrower than the weight's K is not one the launch can serve.
+    assert not mv_weightless_rmsnorm_gated_sigmoid_supported(
+        x[:, : k // 2], gate[:, : k // 2], weight, heads, 64
+    )
+    wide = torch.empty((1, 2 * k), dtype=torch.bfloat16, device="cuda")
+    assert not mv_weightless_rmsnorm_gated_sigmoid_supported(
+        wide, wide, weight.new_empty((n, 2 * k)), 2 * heads, 64
+    )
 
 
 def test_decode_gemv_selects_gluon_on_gfx950() -> None:
