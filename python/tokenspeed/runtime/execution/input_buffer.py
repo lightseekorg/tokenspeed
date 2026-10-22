@@ -325,16 +325,19 @@ class InputBuffers:
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
 
-        The six fills below are independent and touch persistent buffers, so a
+        The fills below are independent and touch persistent buffers, so a
         tape records them once and replays them as a single kernel instead of
-        six launches on every step's critical path. Non-CUDA callers keep the
-        torch spelling.
+        one launch each on every step's critical path. Non-CUDA callers keep
+        the torch spelling.
         """
         if torch.device(self.device).type != "cuda":
             return None
         tape = PrepTape(self.device)
         tape.filltail(self.input_ids_buf, Reg.TOKENS, self.max_num_tokens, 1)
         tape.filltail(self.positions_buf, Reg.TOKENS, self.max_num_tokens, 0)
+        for row in self.mrope_positions_buf:
+            tape.filltail(row, Reg.TOKENS, self.max_num_tokens, 0)
+        tape.filltail(self.input_lengths_buf, Reg.BS, self.max_num_tokens, 0)
         tape.filltail(self.req_pool_indices_buf, Reg.BS, self.max_bs, 0)
         tape.filltail(
             self.state_write_req_pool_indices_buf,
@@ -676,8 +679,6 @@ class InputBuffers:
         # tail-only fills; the active prefix was written above).
         if self._pad_tape is not None:
             self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
-            if total_tokens < self.max_num_tokens:
-                self.mrope_positions_buf[:, total_tokens:].zero_()
         else:
             if total_tokens < self.max_num_tokens:
                 self.input_ids_buf[total_tokens:].fill_(1)
@@ -689,8 +690,7 @@ class InputBuffers:
                     self.state_write_padding_pool_index
                 )
                 self.seq_lens_buf[batch_size:].fill_(1)
-
-        self.input_lengths_buf[batch_size:].zero_()
+            self.input_lengths_buf[batch_size:].zero_()
         return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):
