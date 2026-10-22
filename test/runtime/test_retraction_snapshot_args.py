@@ -185,14 +185,17 @@ def test_kvp_takes_both_host_tiers_and_l3():
     assert args.kvstore_storage_backend == "mooncake"
 
 
-@pytest.mark.parametrize("role", ["null", "prefill", "decode"])
-def test_l3_accepts_kvp_in_every_serving_role(role):
+@pytest.mark.parametrize(
+    ("role", "dcp_size"), [("null", 2), ("prefill", 1), ("decode", 2)]
+)
+def test_l3_accepts_kvp_in_every_serving_role(role, dcp_size):
+    # Prefill shards KV storage without the decode-only DCP launch option.
     args = ServerArgs(
         model="x",
         world_size=2,
         disaggregation_mode=role,
         kv_parallel_size=2,
-        decode_context_parallel_size=2,
+        decode_context_parallel_size=dcp_size,
         kvstore_storage_backend="mooncake",
     )
     assert args.enable_kvstore and args.kvstore_storage_backend == "mooncake"
