@@ -331,6 +331,36 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesATailDescriptorAtAnUnalignedFini
     EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed[1]).block_hashes, page.block_hashes);
 }
 
+class HybridKvCacheEventTestSuite : public SchedulerKvCacheEventTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 16;
+        CacheGroupConfig state = cfg.cache_groups.front();
+        state.group_id = "linear_attention_0";
+        state.attn_kind = AttnKind::kState;
+        state.block_granularity = 0;
+        cfg.cache_groups.push_back(std::move(state));
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// A State group has no token span, so a tail boundary's residency must not ask it for a block granularity.
+TEST_F(HybridKvCacheEventTestSuite, DrainsATailBoundaryAlongsideAStateGroup) {
+    Submit(RequestSpec{.request_id = "r1", .tokens = {1, 2, 3}});
+    PlanOnce();
+    SendForwardDone("r1", {42});
+    SendFinish("r1");
+
+    // Only the prompt end has a state checkpoint, so only the tail [3] is complete; the page [1 2] stays partial.
+    std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    EXPECT_EQ(std::get<KvBlockStoredEvent>(events[0]).token_ids, (std::vector<std::int32_t>{3}));
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+}
+
 class MultiGroupKvCacheEventTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

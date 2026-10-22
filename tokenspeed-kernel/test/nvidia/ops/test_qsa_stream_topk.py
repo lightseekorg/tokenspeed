@@ -150,11 +150,22 @@ def _assert_matches_reference(
 
 @pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    ("page_counts", "small_grid"),
+    [
+        pytest.param((9, 16, 24, 32), False, id="prefill"),
+        pytest.param((33, 40, 56, 64), False, id="dense"),
+        pytest.param((65, 80, 100, 128), False, id="overlap"),
+        pytest.param((129, 160, 200, 256), True, id="split"),
+    ],
+)
 def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
     device: str,
     monkeypatch: pytest.MonkeyPatch,
     request_dtype: torch.dtype,
     enable_pdl: bool,
+    page_counts: tuple[int, ...],
+    small_grid: bool,
 ) -> None:
     torch.manual_seed(89)
     monkeypatch.setattr(stream_topk, "_COMPILED", {})
@@ -167,14 +178,27 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
         return original_compile(*args)
 
     monkeypatch.setattr(stream_topk, "_compile", counted_compile)
-    # Change request count, page-table width and Q row/head strides without
-    # introducing a new compiled signature.
-    for rows, width, pages, storage_heads, storage_dim in (
-        (256, 8, 65, 4, 128),
-        (512, 8, 80, 5, 128),
-        (384, 16, 100, 5, 256),
-        (640, 32, 128, 4, 128),
-    ):
+    # Widths share two compiled variants: aligned and partial final groups.
+    # Request counts, page-table widths and Q strides stay dynamic in both.
+    layouts = (
+        (256, 8, 4, 128),
+        (512, 8, 5, 128),
+        (384, 16, 5, 256),
+        (640, 32, 4, 128),
+        (272, 17, 5, 128),
+        (288, 18, 5, 256),
+        (285, 19, 5, 256),
+        (300, 20, 4, 128),
+        (315, 21, 5, 128),
+        (330, 22, 5, 256),
+        (322, 23, 4, 128),
+        (384, 16, 5, 128),
+        (285, 19, 4, 128),
+    )
+    for i, (rows, width, storage_heads, storage_dim) in enumerate(layouts):
+        pages = page_counts[i % len(page_counts)]
+        if small_grid:
+            rows = width * (2 + i % 3)
         query = torch.randn(
             rows, storage_heads, storage_dim, device=device, dtype=torch.bfloat16
         )[:, :4, :128]
@@ -221,7 +245,7 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
         _assert_matches_reference(
             query, keys, table, requests, complete, selected, 64, 512
         )
-    assert compile_count == 1
+        assert compile_count == (1 if i < 4 else 2)
 
 
 @pytest.mark.parametrize(
@@ -1049,3 +1073,152 @@ def test_stream_topk_respects_global_workspace_budget(
         _assert_matches_reference(
             query, keys, table, requests, complete, selected, 64, 512
         )
+
+
+@pytest.mark.parametrize("pages", [32, 64])
+@pytest.mark.parametrize("rows", [136, 137])
+@pytest.mark.parametrize("frontier", [0, 512])
+def test_stream_topk_short_frontier_preserves_output_bounds(
+    device: str, pages: int, rows: int, frontier: int
+) -> None:
+    query = torch.zeros(rows, 4, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.zeros(pages * 64, 1, 128, device=device, dtype=query.dtype)
+    table = torch.arange(pages, device=device, dtype=torch.int32)[None]
+    requests = torch.zeros(rows, device=device, dtype=torch.int32)
+    # Back the views with padding so excess CTA threads visibly corrupt the
+    # output guard instead of accessing an unrelated allocator block.
+    complete_storage = torch.full(
+        (rows + 8,), frontier, device=device, dtype=torch.int32
+    )
+    complete = complete_storage[:rows]
+    output_storage = torch.full((rows + 8, 512), -2, device=device, dtype=torch.int32)
+    selected = output_storage[:rows]
+    config = stream_topk._configuration(rows, pages * 64, rows, 0)
+    compiled = stream_topk._compile(
+        query, keys, table, requests, complete, selected, [], rows, config, True
+    )
+    compiled[0](
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        selected,
+        query.stride(0),
+        query.stride(1),
+        rows,
+    )
+    expected = torch.arange(512, device=device, dtype=torch.int32)
+    expected.masked_fill_(expected >= frontier, -1)
+    torch.testing.assert_close(selected.sort(1).values, expected.expand(rows, -1))
+    assert bool((output_storage[rows:] == -2).all())
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("pages", [32, 64, 128, 574])
+@pytest.mark.parametrize("remainder", range(1, 8))
+def test_stream_topk_request_tails(
+    device: str, pages: int, remainder: int, enable_pdl: bool
+) -> None:
+    """Partial groups must not read/write the following request or tensor end."""
+    torch.manual_seed(317)
+    width, requests_count = 16 + remainder, 9
+    rows, capacity = width * requests_count, pages * 64
+    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    keys = torch.randn(capacity, 1, 128, device=device, dtype=query.dtype)
+    table = torch.stack(
+        [torch.randperm(pages, device=device) for _ in range(requests_count)]
+    ).to(torch.int32)
+    requests = torch.arange(requests_count, device=device, dtype=torch.int32)
+    requests = requests.repeat_interleave(width)
+    frontiers = torch.tensor(
+        [0, 1, 511, 512, 513, capacity - 1, capacity], device=device, dtype=torch.int32
+    )
+    complete = frontiers[torch.arange(rows, device=device) % frontiers.numel()]
+    complete[:width] = 0
+    complete[width : 2 * width] = 512
+    query[:width] = float("nan")
+
+    def invoke() -> torch.Tensor:
+        return qwen4_exp_qsa_block_topk(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=0,
+            max_logits_bytes=0,
+            path="auto",
+            enable_pdl=enable_pdl,
+            solution="cute_dsl",
+            override=None,
+        )
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    # Exercise both sides of every request boundary and the final partial group.
+    sample = torch.cat(
+        [
+            torch.arange(requests_count, device=device) * width,
+            torch.arange(1, requests_count + 1, device=device) * width - 1,
+            torch.arange(rows - remainder, rows, device=device),
+        ]
+    ).unique()
+    for step in range(2):
+        if step:
+            query[:width].zero_()
+            complete.copy_(capacity - complete)
+            table.copy_(table.roll(1, dims=0))
+        graph.replay()
+        torch.testing.assert_close(
+            (selected >= 0).sum(1), complete.clamp_max(512).long()
+        )
+        assert bool(((selected < complete[:, None]) | (selected < 0)).all())
+        ordered = selected.sort(1).values
+        assert bool(
+            ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, :-1] == -1)).all()
+        )
+        _assert_matches_reference(
+            query[sample],
+            keys,
+            table,
+            requests[sample],
+            complete[sample],
+            selected[sample],
+            64,
+            512,
+        )
+
+
+@pytest.mark.parametrize("remainder", range(1, 8))
+def test_stream_topk_split_request_tails(device: str, remainder: int) -> None:
+    torch.manual_seed(319)
+    width, pages = 8 + remainder, 256
+    rows, capacity = width * 2, pages * 64
+    query = torch.randn(rows, 4, 128, device=device, dtype=torch.bfloat16)
+    keys = torch.randn(capacity, 1, 128, device=device, dtype=query.dtype)
+    table = torch.stack(
+        [torch.randperm(pages, device=device), torch.randperm(pages, device=device)]
+    ).to(torch.int32)
+    requests = torch.arange(2, device=device, dtype=torch.int64).repeat_interleave(
+        width
+    )
+    complete = torch.linspace(0, capacity, rows, device=device).to(torch.int32)
+    selected = cute_dsl_qsa_stream_topk(
+        query,
+        keys,
+        table,
+        requests,
+        complete,
+        page_size=64,
+        block_topk=512,
+        queries_per_request=width,
+        max_partial_bytes=32 << 20,
+        enable_pdl=True,
+    )
+    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)

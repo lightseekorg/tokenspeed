@@ -90,6 +90,7 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_mxfp8_weight_scales,
 )
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -97,6 +98,7 @@ from tokenspeed_kernel.ops.quantization import (
 )
 from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 from torch import nn
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
@@ -136,6 +138,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
+from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -1336,6 +1339,35 @@ class DeepseekV41MoE(DeepseekV4MoE):
             bias = torch.where(image_mask.unsqueeze(-1), bias_vl, bias)
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
         return logits, bias, None, None
+
+    def _compute_topk_output(self, hidden_states, image_mask):
+        gate, config = self.gate, self.topk.topk_config
+        if (
+            hidden_states.is_cuda
+            and (gate.bias_vl is None or image_mask is None)
+            and gate.tid2eid is None
+            and not self.topk.simulate_routing
+            and self.experts.supports_precomputed_topk
+        ):
+            # moe_topk fuses the router GEMM when a kernel supports it.
+            try:
+                topk_weights, topk_ids = moe_topk(
+                    None,
+                    config.top_k,
+                    "sqrt_softplus",
+                    "topk",
+                    config.renormalize,
+                    config.routed_scaling_factor,
+                    correction_bias=gate.e_score_correction_bias,
+                    topk_weights_dtype=self.topk.weights_dtype,
+                    hidden_states=hidden_states,
+                    gate_weight=gate.weight,
+                )
+            except NoKernelFoundError:
+                pass
+            else:
+                return StandardTopKOutput(topk_weights, topk_ids, None)
+        return super()._compute_topk_output(hidden_states, image_mask)
 
 
 class DeepseekV41DecoderLayer(nn.Module):

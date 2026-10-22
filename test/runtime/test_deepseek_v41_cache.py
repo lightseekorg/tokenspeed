@@ -328,6 +328,7 @@ def test_packed_refresh_positions_padding_and_token_count(
             torch.tensor([129 + verify_width, 3 + verify_width]),
             ForwardMode.DECODE,
             use_graph=for_graph_replay,
+            settle=lambda: None,
             block_tables=tables,
         )
         assert backend.query_metadata(ForwardMode.DECODE) is meta
@@ -1504,6 +1505,7 @@ def test_target_runner_refresh_omits_num_extends_after_mixed_metadata():
             seq_lens,
             ForwardMode.DECODE,
             use_graph=False,
+            settle=lambda: None,
             block_tables=tables,
         )
         meta = backend.query_metadata(ForwardMode.DECODE)

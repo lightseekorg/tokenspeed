@@ -39,7 +39,7 @@ namespace tokenspeed {
 
 void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     Request* request = findRequest(event.request_id);
-    if (request != nullptr && request->Is<fsm::Bootstrapping>()) {
+    if (request != nullptr && request->IsAnyOf<fsm::Bootstrapping, fsm::Prefetching>()) {
         request->Apply(fsm::BootstrappedEvent{});
     }
 }
@@ -49,6 +49,7 @@ void Scheduler::handleEvent(const pd::FailedEvent& event) {
     if (request == nullptr || request->Is<fsm::Finished>()) {
         return;
     }
+    releaseStorage(*request);
     request->Apply(fsm::AbortEvent{&coordinator_});
 }
 
@@ -64,6 +65,7 @@ void Scheduler::handleEvent(const pd::SucceededEvent& event) {
     // frontier is final here, so it finishes like any request -- the P's
     // prompt-end state and partial page, the D's final state and tail are
     // published when it settles.
+    releaseStorage(*request);
     request->Apply(fsm::FinishEvent{&coordinator_});
 }
 
@@ -91,6 +93,7 @@ void Scheduler::handleEvent(const forward::Finish& event) {
         if (pdTransferInFlight(*request)) {
             throw std::logic_error("PD Finish received while transfer pages are pinned");
         }
+        releaseStorage(*request);
         request->Apply(fsm::FinishEvent{&coordinator_});
     }
 }
@@ -153,6 +156,7 @@ void Scheduler::handleEvent(const forward::ExtendResult& event) {
 
 void Scheduler::handleEvent(const forward::Abort& event) {
     if (Request* request = findRequest(event.request_id)) {
+        releaseStorage(*request);
         request->Apply(fsm::AbortEvent{&coordinator_});
     }
 }
@@ -170,29 +174,16 @@ void Scheduler::handleEvent(const cache::WriteBackDone& event) {
             request->Apply(fsm::StoreLandedEvent{event.op_id, published});
         }
     }
+    if (storage_transfers_ && storage_allowed_) {
+        std::vector<CacheKey> keys;
+        keys.reserve(published.size());
+        for (const auto& entry : published) keys.push_back(entry.key);
+        storage_transfers_->QueueBackups(keys);
+    }
 }
 
 void Scheduler::handleEvent(const cache::LoadBackDone& event) {
     tier_transfers_.CompleteLoadBack(event.op_id);
-}
-
-void Scheduler::handleEvent(const cache::PrefetchDone& event) {
-    std::optional<TierTransferManager::PrefetchCompleted> done =
-        tier_transfers_.CompletePrefetch(event.op_id, event.landed_pages);
-    if (!done) {
-        return;  // unknown or duplicate ACK
-    }
-    // The objects that did not land are forgotten; a later probe may find
-    // them again and register them afresh.
-    coordinator_.UnregisterStorageKeys(done->unlanded);
-    Request* request = findRequest(done->request_id);
-    const auto* prefetching = request == nullptr ? nullptr : request->GetIf<fsm::Prefetching>();
-    if (prefetching == nullptr || prefetching->prefetch_op != event.op_id) {
-        return;  // aborted while prefetching: the landed entries stay published, now evictable
-    }
-    spdlog::info("[Scheduler] prefetch: request {} landed {} of its L3 page(s); admissible again", request->Id(),
-                 event.landed_pages);
-    request->Apply(fsm::PrefetchDoneEvent{std::move(done->published)});
 }
 
 void Scheduler::handleEvent(const cache::SnapshotDone& event) {

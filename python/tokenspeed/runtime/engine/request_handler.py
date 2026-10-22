@@ -219,6 +219,7 @@ class RequestHandler:
         architectures: list[str] | None = None,
         *,
         tokenizer_kwargs: Mapping[str, object],
+        l3,
         pause_controller=None,
         memory_controller=None,
         device=None,
@@ -235,6 +236,7 @@ class RequestHandler:
         # data plane so it is ordered against forwards. The scheduler worker
         # passes the handle in; None elsewhere (e.g. unit tests).
         self._device = device
+        self._l3 = l3
 
         mapping = server_args.mapping
         self.attn_tp_size = mapping.attn.tp_size
@@ -538,7 +540,7 @@ class RequestHandler:
 
         Device/Host still hold KV from the previous checkpoint until a
         successful ``flush_cache``. Switching the Mooncake prefix first
-        lets later D2H copies (not yet in ``_backup_futures``) land under
+        lets later D2H copies (not yet submitted to storage) land under
         the new namespace, and lets Admit reuse the stale local indexes
         as if they belonged to the new weights.
         """
@@ -546,12 +548,7 @@ class RequestHandler:
         storage_backend = self.server_args.kvstore_storage_backend
         if storage_backend is None or recv_req.flush_cache:
             return True, ""
-        version = resolve_l3_weight_version(
-            self.server_args.weight_version,
-            _requested_weight_version(recv_req),
-            flush_cache=False,
-            storage_backend=storage_backend,
-        )
+        version = resolve_l3_weight_version(_requested_weight_version(recv_req))
         if version is None or str(version) == str(self.server_args.weight_version):
             return True, ""
         return (
@@ -723,16 +720,13 @@ class RequestHandler:
         return self.clear_cache_fn is not None and self.clear_cache_fn()
 
     def _delete_l3_namespace(self) -> bool:
-        device = self._device
-        if device is None:
-            return True
-        return bool(device.delete_l3_namespace())
+        return self._l3 is None or self._l3.delete_namespace()
 
     def _converge_replica_decision(self, local_ok: bool) -> bool:
         """MIN-reduce a yes/no across every rank that shares this flush.
 
-        Attention TP, then PP (same order as
-        ``EventLoop._converge_l3_exists``), then attention DP. Exists and
+        Attention TP, then PP (the cache hooks' replica order), then
+        attention DP. Storage completions and
         WriteBackDone omit DP because those ranks hold different sequences.
         Flush includes DP: ``storage_object_key`` has no DP rank, so a
         replica that is clearable must not ``remove_by_prefix`` while
@@ -770,7 +764,9 @@ class RequestHandler:
         land in a peer still serving the previous ``weight_version``.
         Flushed L3 updates require an explicit ``weight_version``. An
         explicit new version with ``flush_cache=False`` is rejected
-        before the GPU load.
+        before the GPU load. Re-sending the current version is a no-op:
+        the namespace already names it, and ``set_weight_version`` would
+        raise on a serving executor that still has unretired operations.
         """
 
         ok, err = self._require_weight_version_for_l3_flush(recv_req)
@@ -779,16 +775,12 @@ class RequestHandler:
         ok, err = self._require_flush_for_l3_version_switch(recv_req)
         if not ok:
             return False, err
-        version = resolve_l3_weight_version(
-            self.server_args.weight_version,
-            _requested_weight_version(recv_req),
-            flush_cache=recv_req.flush_cache,
-            storage_backend=self.server_args.kvstore_storage_backend,
-        )
-        if version is None:
+        version = resolve_l3_weight_version(_requested_weight_version(recv_req))
+        if version is None or str(version) == str(self.server_args.weight_version):
             return True, msg
+        if self._l3 is not None:
+            self._l3.set_weight_version(str(version))
         self.server_args.weight_version = str(version)
-        self._device.set_l3_weight_version(str(version))
         return True, msg
 
     def handle_generate_request(

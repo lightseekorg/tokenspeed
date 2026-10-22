@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import logging
 import multiprocessing as mp
 import os
 import signal
@@ -36,17 +35,42 @@ from typing import Any
 
 import psutil
 
-logger = logging.getLogger(__name__)
+_process_shutdown_started = False
 
 
 def register_usr_signal():
-    parent_process = psutil.Process().parent()
+    parent_pid = os.getppid()
 
     def signal_handler(sig, frame):
-        logger.error("recv usr signal, kill usr signal to parent")
-        parent_process.send_signal(signal.SIGUSR1)
+        os.kill(parent_pid, signal.SIGUSR1)
 
     signal.signal(signal.SIGUSR1, signal_handler)
+
+
+def begin_process_shutdown() -> bool:
+    """Latch owner cleanup, returning whether this is the first shutdown request.
+
+    Failure and termination callbacks share this latch so a second worker's
+    notification cannot interrupt cleanup already unwinding the process.
+    """
+    global _process_shutdown_started
+    if _process_shutdown_started:
+        return False
+    _process_shutdown_started = True
+    return True
+
+
+def register_child_failure_signals():
+    """Unwind once to the launcher that owns cleanup after a child failure."""
+    global _process_shutdown_started
+    _process_shutdown_started = False
+
+    def signal_handler(sig, frame):
+        if begin_process_shutdown():
+            raise SystemExit(1)
+
+    signal.signal(signal.SIGUSR1, signal_handler)
+    signal.signal(signal.SIGQUIT, signal_handler)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -115,12 +139,15 @@ def start_process_with_ready_pipe(
 def receive_ready_messages(
     readers: Sequence[Connection], procs: Sequence[mp.Process]
 ) -> list[Any]:
-    """Receive one message per reader, failing as soon as any child dies.
+    """Receive one message per reader, failing when any child exits or closes its pipe.
 
     ``readers[i]`` is the ready pipe of ``procs[i]``. Waiting on every pipe
     and every process at once matters with several ranks: when one rank is
     killed, the others can block in a collective and never report, so
     waiting on their pipes alone would hang.
+
+    Detection never waits for cleanup or terminates workers. The launcher
+    owns shutdown of the process tree.
 
     Args:
         readers: The read ends from ``start_process_with_ready_pipe``.
@@ -131,20 +158,27 @@ def receive_ready_messages(
 
     Raises:
         RuntimeError: A process exited before every reader got its message,
-            including one that had already reported: its peers may be
-            waiting on it.
+            including one that had already reported, or closed its pipe
+            while cleanup still runs: its peers may be waiting on it.
     """
     messages: list[Any] = [None] * len(readers)
-    pending = {reader: index for index, reader in enumerate(readers)}
+    reader_indices = {reader: index for index, reader in enumerate(readers)}
+    pending = set(readers)
     sentinels = {proc.sentinel: index for index, proc in enumerate(procs)}
     while pending:
-        ready = connection.wait([*pending, *sentinels])
-        for reader in [obj for obj in ready if obj in pending]:
-            index = pending.pop(reader)
+        ready = connection.wait([*reader_indices, *sentinels])
+        for reader in [obj for obj in ready if obj in reader_indices]:
+            index = reader_indices[reader]
             try:
-                messages[index] = reader.recv()
+                message = reader.recv()
             except EOFError:
                 _raise_process_died(procs, index)
+            if reader not in pending:
+                raise RuntimeError(
+                    f"Scheduler process {index} reported readiness twice"
+                )
+            messages[index] = message
+            pending.remove(reader)
         for index in [sentinels[obj] for obj in ready if obj in sentinels]:
             _raise_process_died(procs, index)
     return messages
@@ -152,9 +186,8 @@ def receive_ready_messages(
 
 def _raise_process_died(procs: Sequence[mp.Process], index: int) -> None:
     proc = procs[index]
-    proc.join()
     raise RuntimeError(
-        f"Scheduler process {index} (pid {proc.pid}) exited with code "
-        f"{proc.exitcode} before startup finished. Please check if there are "
-        "relevant logs."
+        f"Scheduler process {index} (pid {proc.pid}) exited or closed its "
+        f"ready pipe before startup finished (exit code {proc.exitcode}). "
+        "Please check if there are relevant logs."
     )
