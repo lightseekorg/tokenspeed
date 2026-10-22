@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     quantize_fp8_with_scale,
@@ -608,6 +609,126 @@ def test_quantize_fp8_dynamic_token_group(
     torch.testing.assert_close(scale, expected_scales)
     reconstructed = out.float() * scale.repeat_interleave(group_size, dim=-1)
     assert torch.norm(reconstructed - x.float()) / torch.norm(x.float()) < 0.04
+
+
+# 7168 is Kimi K3's hidden size, 128 the DSA index head dimension. Per token,
+# 384 pads each group to a 512-wide block, and 33 and 129 leave most of a 64-
+# and a 256-wide block masked. The shapes take quantize_fp8 through each of
+# its launch tiles. An offset input is contiguous but starts one element into
+# its storage; a 3-D input splits each row into its groups.
+@pytest.mark.parametrize("layout", ["2d", "offset", "3d"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(
+    "granularity,group_size,columns",
+    [
+        ("token_group", 128, 128),
+        ("token_group", 128, 384),
+        ("token_group", 128, 7168),
+        ("token_group", 32, 128),
+        ("token_group", 32, 384),
+        ("token_group", 32, 7168),
+        ("token", None, 33),
+        ("token", None, 128),
+        ("token", None, 129),
+        ("token", None, 384),
+        ("token", None, 7168),
+    ],
+)
+@pytest.mark.parametrize("rows", [0, 1, 7, 128, 4095, 4096])
+def test_triton_fp8_token_group_tiles_match_one_group_per_program(
+    device: str,
+    rows: int,
+    columns: int,
+    granularity: str,
+    group_size: int | None,
+    dtype: torch.dtype,
+    layout: str,
+    require,
+) -> None:
+    require("quantization", "fp8_with_scale", "triton", dtype, "x")
+    torch.manual_seed(6)
+    width = columns if group_size is None else group_size
+    groups = torch.randn(rows * columns // width, width, device=device) * 10
+    groups[3::5] = 0
+    groups[1::7] *= 1e-12
+    groups[2::11, :2] = (
+        torch.tensor([1.0, -1.0], device=device) * torch.finfo(dtype).max
+    )
+    # A NaN, an all-NaN group and an inf: the tiles below reduce the amax
+    # across lanes with different instructions.
+    groups[4::13, 5] = float("nan")
+    groups[6::17] = float("nan")
+    groups[8::19, 3] = float("inf")
+    x = groups.to(dtype).flatten()
+    if layout == "offset":
+        x = torch.cat([x.new_zeros(1), x])[1:]
+    if layout == "3d":
+        x = x.view(rows, columns // width, width)
+    else:
+        x = x.view(rows, columns)
+
+    codes, scales = quantize_fp8(
+        x,
+        granularity=granularity,
+        group_size=group_size,
+        override="triton_quantize_fp8_with_scale",
+    )
+
+    # Tiling invariance: whichever tile quantize_fp8 took, the same kernel
+    # launched with each tile -- one group per program as before tiling, 1024
+    # and 8192 elements -- gives the same bits. The outputs are the front of
+    # sentinel-filled buffers one tile longer, so a partial last tile that
+    # writes past the last group shows in the slack.
+    block = triton.next_power_of_2(width)
+    n = groups.shape[0]
+    for groups_per_program in {1, max(1024 // block, 1), max(8192 // block, 1)}:
+        code_buffer = torch.full(
+            (n + groups_per_program, width), 0x5A, dtype=torch.uint8, device=device
+        )
+        scale_buffer = torch.full((n + groups_per_program,), -1.0, device=device)
+        expected_codes = code_buffer[:n].view(_FP8_DTYPE).view_as(codes)
+        expected_scales = scale_buffer[:n].view_as(scales)
+        quant_triton._fp8_token_group_quantize_kernel[
+            (triton.cdiv(n, groups_per_program),)
+        ](
+            x,
+            expected_codes,
+            expected_scales,
+            n,
+            width,
+            1e-10,
+            bit8_min=_FP8_FINFO.min,
+            bit8_max=_FP8_FINFO.max,
+            BLOCK=block,
+            GROUPS_PER_PROGRAM=groups_per_program,
+            num_warps=min(max(groups_per_program * block // 256, 1), 8),
+            num_stages=1,
+        )
+        assert _bitwise_equal(codes, expected_codes)
+        assert _bitwise_equal(scales, expected_scales)
+        assert (code_buffer[n:] == 0x5A).all()
+        assert (scale_buffer[n:] == -1.0).all()
+    # Against PyTorch: the amax ignoring NaN, floored at 1e-10, over 448, then
+    # the clamped quotient of each finite value. Triton's division is within
+    # 2 ulp of PyTorch's correctly rounded one, so a code may be one FP8 step
+    # off where the quotient is that close to a rounding boundary.
+    values = x.float().view(-1, width)
+    amax = values.abs().nan_to_num(nan=0.0, posinf=float("inf")).amax(-1)
+    torch.testing.assert_close(
+        scales.flatten(), amax.clamp_min(1e-10) / _FP8_FINFO.max, rtol=2**-21, atol=0
+    )
+    reference_codes = (
+        (values / scales.view(-1, 1))
+        .clamp(_FP8_FINFO.min, _FP8_FINFO.max)
+        .to(_FP8_DTYPE)
+    )
+    # Same-sign E4M3 bit patterns are ordered by magnitude, NaN right after the
+    # largest finite value, so a finite input must also not give a NaN code.
+    finite = values.isfinite()
+    assert not codes.view(-1, width).float()[finite].isnan().any()
+    reference_bits = reference_codes.view(torch.uint8).int()
+    steps = codes.view(torch.uint8).view(-1, width).int() - reference_bits
+    assert (steps[finite].abs() <= 1).all()
 
 
 def _quantize_fp8_native_scales(
