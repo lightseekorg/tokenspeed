@@ -185,7 +185,9 @@ def test_task_yaml_requires_groups_of_its_runner_labels(tmp_path, labels, expect
 
 
 def test_existing_task_yaml_requires_only_its_runner_groups():
-    assert required_groups("test/ci/perf/kernel-benchmark-amd-gfx950.yaml") == {"amd-mi350"}
+    assert required_groups("test/ci/perf/kernel-benchmark-amd-gfx950.yaml") == {
+        "amd-mi350"
+    }
 
 
 @pytest.mark.parametrize(
