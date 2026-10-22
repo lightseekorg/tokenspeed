@@ -115,9 +115,9 @@ def test_greedy_chain_graph_replay_refreshes_full_window(device):
             *actual, candidates, target, write_rejected_targets=True, enable_pdl=False
         )
     for pattern in ("all", "none", "partial", "invalid_tail"):
-        c, t = _inputs(8, 6, pattern, device)
-        candidates.copy_(c)
-        target.copy_(t)
+        new_candidates, new_target = _inputs(8, 6, pattern, device)
+        candidates.copy_(new_candidates)
+        target.copy_(new_target)
         graph.replay()
         for got, want in zip(actual, _reference(candidates, target)):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
@@ -142,14 +142,18 @@ def test_greedy_chain_no_row_or_stride_specialization(device):
             )
         for padding in (1, 7, 31):
             storage = torch.empty(8, 6 + padding, dtype=torch.int32, device=device)
-            c = storage[:, :6].copy_(candidates[:8])
+            strided_candidates = storage[:, :6].copy_(candidates[:8])
             out = (
                 torch.empty(8 * 6 * 2, dtype=torch.int32, device=device)[::2],
                 torch.empty(8, 6 + padding, dtype=torch.int32, device=device)[:, :6],
                 torch.empty(16, dtype=torch.int32, device=device)[::2],
             )
             verify_chain_target_sampled(
-                *out, c, target[:8], write_rejected_targets=True, enable_pdl=False
+                *out,
+                strided_candidates,
+                target[:8],
+                write_rejected_targets=True,
+                enable_pdl=False,
             )
-            for got, want in zip(out, _reference(c, target[:8])):
+            for got, want in zip(out, _reference(strided_candidates, target[:8])):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
