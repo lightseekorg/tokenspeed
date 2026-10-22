@@ -901,11 +901,11 @@ def packed_block_tables_from_forward_op(
 
     All groups stage into ONE pinned buffer and ride ONE H2D copy; the
     returned per-group views share a single storage, which is the
-    precondition of the backends' one-launch packed replay fill
-    (``_try_packed_group_unpack``). Per-group uploads would fail its
-    same-storage check and fall back to per-group copy/fill chains
-    (~40 tiny transfers per decode step). The host stage is returned too,
-    so a backend planning from the tables reads them without a D2H sync.
+    precondition of the routers' one-launch fill of every group
+    (``GroupTableStacks.fill``). Per-group uploads would fail its
+    same-storage check and fall back to one launch per group. The host
+    stage is returned too, so a backend planning from the tables reads them
+    without a D2H sync.
 
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
