@@ -63,48 +63,299 @@ _HEAD_GROUPS_PER_CTA = 4
 # block. That pays off while rows x head blocks x tiles stays within this
 # budget (about 2.5 tiles per CU).
 _HEAD_BLOCK_TILES = 640
+# Raw-row LDS ring depth; deeper rings measured slower at decode shapes.
+_STAGES = 2
 
 
 @gluon.jit
-def _tile_slots(slots, slot_row, tile_idx, length, width, capacity, TILE_K, LAYOUT):
-    """Return (clamped slot, valid) for one tile of a query row's selections."""
-    positions = tile_idx * TILE_K + gl.arange(0, TILE_K, layout=LAYOUT)
-    in_range = (positions < length) & (positions < width)
-    slot = gl.amd.cdna5.buffer_load(
-        slots + slot_row, positions, mask=in_range, other=-1
+def _stage_slots(
+    slots_smem,
+    swa_slots,
+    swa_row,
+    swa_width,
+    global_slots,
+    global_row,
+    global_width,
+    SWA_TILES: gl.constexpr,
+    TILE_K: gl.constexpr,
+    HAS_GLOBAL: gl.constexpr,
+):
+    """Copy a query row's SWA then global slots into LDS rows of TILE_K.
+
+    Row ``r < SWA_TILES`` holds SWA tile ``r``, row ``SWA_TILES + j`` global
+    tile ``j``; positions past a width read -1.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
+    tiles = gl.arange(0, slots_smem.shape[0], layout=gl.SliceLayout(1, layout))
+    is_swa = (tiles < SWA_TILES)[:, None]
+    positions = (gl.where(tiles < SWA_TILES, tiles, tiles - SWA_TILES) * TILE_K)[
+        :, None
+    ] + gl.arange(0, TILE_K, layout=gl.SliceLayout(0, layout))[None, :]
+    slot = gl.load(
+        swa_slots + swa_row + positions,
+        mask=is_swa & (positions < swa_width),
+        other=-1,
     )
-    valid = in_range & (slot >= 0) & (slot < capacity)
+    if HAS_GLOBAL:
+        global_slot = gl.load(
+            global_slots + global_row + positions,
+            mask=(tiles >= SWA_TILES)[:, None] & (positions < global_width),
+            other=-1,
+        )
+        slot = gl.where(is_swa, slot, global_slot)
+    slots_smem.store(slot)
+
+
+@gluon.jit
+def _staged_slots(slots_smem, smem_row, first, bound, capacity, TILE_K, LAYOUT):
+    """Return (clamped slot, valid) of one staged tile in LAYOUT.
+
+    ``first`` is the tile's first position in its segment and ``bound`` the
+    segment's end for this split (0 for a padding tile).
+    """
+    positions = first + gl.arange(0, TILE_K, layout=LAYOUT)
+    slot = slots_smem.index(smem_row).load(LAYOUT)
+    valid = (positions < bound) & (slot >= 0) & (slot < capacity)
     return gl.where(valid, slot, 0), valid
 
 
-@gluon.jit
-def _load_swa_rows(cache, slot, valid, page_stride, RAW_LAYOUT: gl.constexpr):
-    """Load SWA rows: E4M3 bytes [TILE_K, 32, 16] and E8M0 scales [TILE_K, 32].
-
-    A lane owns 16 contiguous value bytes of a row (one dwordx4). Chunk ``c``
-    covers dims ``16c..16c+15``, whose E8M0 scale is byte ``c // 2``. Invalid
-    rows (clamped to slot 0) load zero values and zero scales: an unwritten
-    0xFF scale would dequantize to Inf and turn their zeros into NaN.
-    """
-    scale_layout: gl.constexpr = gl.SliceLayout(2, RAW_LAYOUT)
-    page_base = (slot // 64).to(tl.int64) * page_stride
-    row = slot % 64
-    chunks = gl.arange(0, 32, layout=gl.SliceLayout(0, scale_layout))
-    lanes = gl.arange(0, 16, layout=gl.SliceLayout(0, gl.SliceLayout(1, RAW_LAYOUT)))
-    value_offsets = (
-        (page_base + row * 512)[:, None, None]
-        + (chunks * 16)[None, :, None]
-        + lanes[None, None, :]
+@gluon.constexpr_function
+def _warp_split_row_layout(tile_k, num_warps, warp_size):
+    # TDM gathers take lane-uniform row indices; each warp gathers its own rows.
+    rows_per_warp = tile_k // num_warps
+    return gl.DistributedLinearLayout(
+        reg_bases=[[1 << i] for i in range(rows_per_warp.bit_length() - 1)],
+        lane_bases=[[0]] * (warp_size.bit_length() - 1),
+        warp_bases=[[rows_per_warp << i] for i in range(num_warps.bit_length() - 1)],
+        block_bases=[],
+        shape=[tile_k],
     )
-    scale_offsets = (page_base + 64 * 512 + row * 16)[:, None] + (chunks // 2)[None, :]
-    values = gl.load(cache + value_offsets, mask=valid[:, None, None], other=0)
-    scales = gl.load(cache + scale_offsets, mask=valid[:, None], other=0)
-    return values, scales
+
+
+@gluon.jit
+def _gather_values(
+    value_desc,
+    value_rows,
+    rows_per_page,
+    slots_smem,
+    smem_row,
+    first,
+    bound,
+    capacity,
+    values_smem,
+    TILE_K: gl.constexpr,
+    ROW_LAYOUT: gl.constexpr,
+):
+    """Start a TDM gather of one tile's value rows into LDS.
+
+    The cache is viewed as ``value_rows`` rows of the value width,
+    ``rows_per_page`` per page with the values in the first 64. Invalid rows
+    index one past the end, which the gather zero-fills.
+    """
+    slot, valid = _staged_slots(
+        slots_smem, smem_row, first, bound, capacity, TILE_K, ROW_LAYOUT
+    )
+    gl.amd.cdna5.tdm.async_gather(
+        value_desc,
+        gl.where(valid, slot // 64 * rows_per_page + slot % 64, value_rows),
+        values_smem,
+    )
+
+
+@gluon.jit
+def _copy_scales(
+    scales_smem,
+    is_swa,
+    swa_cache,
+    swa_page_stride,
+    global_cache,
+    global_page_stride,
+    slots_smem,
+    smem_row,
+    first,
+    bound,
+    capacity,
+    TILE_K: gl.constexpr,
+    HAS_GLOBAL: gl.constexpr,
+):
+    """Start one commit group copying a tile's scales into LDS [TILE_K, 32].
+
+    Scale rows are too narrow for an int32 TDM row view of a large cache, so
+    they take one unmasked async copy (a masked one would branch around the
+    copy and break the group count). Invalid rows read row 0, whose scales
+    the dequant keeps finite. SWA rows fill both halves with their 16 scales.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1, 16], [16, 2], [4, 1], [1, 0])
+    slot, _ = _staged_slots(
+        slots_smem,
+        smem_row,
+        first,
+        bound,
+        capacity,
+        TILE_K,
+        gl.SliceLayout(1, layout),
+    )
+    page = (slot // 64).to(tl.int64)[:, None]
+    row = (slot % 64)[:, None]
+    cols = gl.arange(0, 32, layout=gl.SliceLayout(0, layout))[None, :]
+    source = swa_cache + page * swa_page_stride + 64 * 512 + row * 16 + cols % 16
+    if HAS_GLOBAL:
+        source = gl.where(
+            is_swa,
+            source,
+            global_cache + page * global_page_stride + 64 * 256 + row * 32 + cols,
+        )
+    gl.amd.cdna5.async_copy.global_to_shared(scales_smem, source)
+    gl.amd.cdna5.async_copy.commit_group()
+
+
+@gluon.jit
+def _tile_coords(
+    tile,
+    num_tiles,
+    swa_tiles,
+    swa_first,
+    swa_bound,
+    swa_capacity,
+    global_first,
+    global_bound,
+    global_capacity,
+    SWA_TILES: gl.constexpr,
+    GLOBAL_TILES: gl.constexpr,
+    TILE_K: gl.constexpr,
+):
+    """Map the split's tile index to (slot LDS row, first, bound, capacity).
+
+    The split's first ``swa_tiles`` tiles are SWA tiles; tiles from
+    ``num_tiles`` on are padding with bound 0.
+    """
+    is_swa = tile < swa_tiles
+    swa_tile = swa_first + tile
+    global_tile = global_first + tile - swa_tiles
+    smem_row = gl.where(
+        is_swa,
+        gl.minimum(swa_tile, SWA_TILES - 1),
+        SWA_TILES + gl.minimum(gl.maximum(global_tile, 0), GLOBAL_TILES - 1),
+    )
+    first = gl.where(is_swa, swa_tile, global_tile) * TILE_K
+    bound = gl.where(tile < num_tiles, gl.where(is_swa, swa_bound, global_bound), 0)
+    capacity = gl.where(is_swa, swa_capacity, global_capacity)
+    return smem_row, first, bound, capacity
+
+
+@gluon.jit
+def _issue_tile(
+    tile,
+    num_tiles,
+    swa_tiles,
+    swa_first,
+    swa_bound,
+    global_first,
+    global_bound,
+    slots_smem,
+    swa_capacity,
+    global_capacity,
+    swa_cache,
+    swa_page_stride,
+    global_cache,
+    global_page_stride,
+    swa_value_desc,
+    swa_value_rows,
+    global_value_desc,
+    global_value_rows,
+    swa_values_ring,
+    global_values_ring,
+    scales_ring,
+    SWA_TILES: gl.constexpr,
+    GLOBAL_TILES: gl.constexpr,
+    STAGES: gl.constexpr,
+    TILE_K: gl.constexpr,
+    HAS_GLOBAL: gl.constexpr,
+    ROW_LAYOUT: gl.constexpr,
+):
+    """Start the split's tile into its ring buffer: one TDM gather of values
+    from the tile's own segment (padding tiles gather only zero-filled rows)
+    and one scale commit group."""
+    smem_row, first, bound, capacity = _tile_coords(
+        tile,
+        num_tiles,
+        swa_tiles,
+        swa_first,
+        swa_bound,
+        swa_capacity,
+        global_first,
+        global_bound,
+        global_capacity,
+        SWA_TILES,
+        GLOBAL_TILES,
+        TILE_K,
+    )
+    buffer = tile % STAGES
+    is_swa = tile < swa_tiles
+    swa_rows_per_page = (swa_page_stride // 512).to(gl.int32)
+    if HAS_GLOBAL:
+        if is_swa:
+            _gather_values(
+                swa_value_desc,
+                swa_value_rows,
+                swa_rows_per_page,
+                slots_smem,
+                smem_row,
+                first,
+                bound,
+                capacity,
+                swa_values_ring.index(buffer),
+                TILE_K,
+                ROW_LAYOUT,
+            )
+        else:
+            _gather_values(
+                global_value_desc,
+                global_value_rows,
+                (global_page_stride // 256).to(gl.int32),
+                slots_smem,
+                smem_row,
+                first,
+                bound,
+                capacity,
+                global_values_ring.index(buffer),
+                TILE_K,
+                ROW_LAYOUT,
+            )
+    else:
+        _gather_values(
+            swa_value_desc,
+            swa_value_rows,
+            swa_rows_per_page,
+            slots_smem,
+            smem_row,
+            first,
+            bound,
+            capacity,
+            swa_values_ring.index(buffer),
+            TILE_K,
+            ROW_LAYOUT,
+        )
+    _copy_scales(
+        scales_ring.index(buffer),
+        is_swa,
+        swa_cache,
+        swa_page_stride,
+        global_cache,
+        global_page_stride,
+        slots_smem,
+        smem_row,
+        first,
+        bound,
+        capacity,
+        TILE_K,
+        HAS_GLOBAL,
+    )
 
 
 @gluon.jit
 def _dequant_swa_rows(values, scales, RAW_LAYOUT: gl.constexpr):
-    """E4M3 times E8M0 scale into BF16 [TILE_K, 512].
+    """E4M3 [TILE_K, 16, 2, 16] times E8M0 per 32 dims into BF16 [TILE_K, 512].
 
     The upcast runs at a uniform unit scale: a per-lane E8M0 scale reaches the
     wrong lanes on GFX1250. The power-of-two scale then multiplies exactly.
@@ -114,42 +365,11 @@ def _dequant_swa_rows(values, scales, RAW_LAYOUT: gl.constexpr):
         values.to(gl.float8e4nv, bitcast=True), unit, gl.bfloat16
     )
     # E8M0 byte s is 2^(s - 127): BF16 exponent bits, with s = 0 as 2^-127.
-    bits = gl.where(scales == 0, 0x40, scales.to(gl.int16) << 7)
-    kv = kv * bits.to(gl.bfloat16, bitcast=True)[:, :, None]
+    # The NaN byte 0xFF (unwritten rows) takes 2^-127 too, so the zero values
+    # of invalid rows stay zero.
+    bits = gl.where((scales == 0) | (scales == 0xFF), 0x40, scales.to(gl.int16) << 7)
+    kv = kv * bits.to(gl.bfloat16, bitcast=True)[:, :, None, None]
     return kv.reshape([kv.shape[0], 512])
-
-
-@gluon.jit
-def _load_global_rows(cache, slot, valid, page_stride, RAW_LAYOUT: gl.constexpr):
-    """Load global rows: E2M1 bytes [TILE_K, 16, 2, 8], E4M3 scales [TILE_K, 16, 2].
-
-    A lane owns 16 contiguous packed bytes (32 dims) of a row: chunk ``c`` and
-    scale group ``g`` of 16 dims (scale byte ``2c + g``). Invalid rows
-    (clamped to slot 0) get zero bytes and zero scales.
-    """
-    scale_layout: gl.constexpr = gl.SliceLayout(3, RAW_LAYOUT)
-    chunk_layout: gl.constexpr = gl.SliceLayout(0, scale_layout)
-    page_base = (slot // 64).to(tl.int64) * page_stride
-    row = slot % 64
-    chunks = gl.arange(0, 16, layout=gl.SliceLayout(1, chunk_layout))
-    groups = gl.arange(0, 2, layout=gl.SliceLayout(0, chunk_layout))
-    scale_idx = chunks[:, None] * 2 + groups[None, :]
-    lanes = gl.arange(
-        0,
-        8,
-        layout=gl.SliceLayout(0, gl.SliceLayout(1, gl.SliceLayout(2, RAW_LAYOUT))),
-    )
-    value_offsets = (
-        (page_base + row * 256)[:, None, None, None]
-        + (scale_idx * 8)[None, :, :, None]
-        + lanes[None, None, None, :]
-    )
-    scale_offsets = (page_base + 64 * 256 + row * 32)[:, None, None] + scale_idx[
-        None, :, :
-    ]
-    values = gl.load(cache + value_offsets, mask=valid[:, None, None, None], other=0)
-    scales = gl.load(cache + scale_offsets, mask=valid[:, None, None], other=0)
-    return values, scales
 
 
 @gluon.jit
@@ -164,6 +384,9 @@ def _dequant_global_rows(values, scales, OUT_LAYOUT: gl.constexpr):
     kv = gl.convert_layout(
         gl.amd.cdna5.scaled_upcast(values, unit, gl.bfloat16, axis=3), OUT_LAYOUT
     )
+    # NaN scales (0x7F, 0xFF; unwritten rows) read as zero, so the zero values
+    # of invalid rows stay zero.
+    scales = gl.where((scales & 0x7F) == 0x7F, 0, scales)
     scale = gl.convert_layout(
         scales.to(gl.float8e4nv, bitcast=True).to(gl.bfloat16),
         gl.SliceLayout(3, OUT_LAYOUT),
@@ -174,7 +397,6 @@ def _dequant_global_rows(values, scales, OUT_LAYOUT: gl.constexpr):
 
 @gluon.jit
 def _attend_tile(
-    kv,
     kv_shared,
     valid_rows,
     q_dot,
@@ -191,14 +413,13 @@ def _attend_tile(
     TILE_K: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
 ):
-    """Fold one dequantized BF16 tile [TILE_K, 512] into the softmax."""
+    """Fold the dequantized BF16 tile [TILE_K, 512] in kv_shared into the softmax."""
     k_dot_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=WMMA_LAYOUT, k_width=8
     )
     p_dot_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=0, parent=WMMA_LAYOUT, k_width=8
     )
-    kv_shared.store(kv)
     # V is read from LDS only after QK, so the K and V operands are never live
     # together; that register saving outweighs the second LDS read.
     if active:
@@ -315,12 +536,18 @@ def gluon_dsv41_selected_attention_gfx1250(
     softmax_scale: tl.float32,
     swa_capacity,
     global_capacity,
+    swa_value_rows,
+    global_value_rows,
     num_heads,
     HAS_GLOBAL: gl.constexpr,
     HEAD_GROUPS: gl.constexpr,
     BLOCK_H: gl.constexpr,
     TILE_K: gl.constexpr,
     HEAD_DIM: gl.constexpr,
+    SWA_TILES: gl.constexpr,
+    GLOBAL_TILES: gl.constexpr,
+    SLOT_TILES: gl.constexpr,
+    STAGES: gl.constexpr,
 ):
     # Program (t, s, b) covers query row t, the s-th contiguous share of its
     # selected tiles (SWA tiles first, then global tiles) and head block b.
@@ -335,8 +562,13 @@ def gluon_dsv41_selected_attention_gfx1250(
         instr_shape=[16, 16, 32],
     )
     q_layout: gl.constexpr = gl.BlockedLayout([1, 16], [1, 32], [4, 1], [1, 0])
+    # SWA rows dequantize as [TILE_K, 16, 2, 16]: a lane owns 16 bytes of one
+    # 32-dim E8M0 scale group.
     swa_raw_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 16], [1, 32, 1], [4, 1, 1], [2, 1, 0]
+        [1, 1, 1, 16], [1, 16, 2, 1], [4, 1, 1, 1], [3, 2, 1, 0]
+    )
+    swa_scale_layout: gl.constexpr = gl.SliceLayout(
+        2, gl.SliceLayout(3, swa_raw_layout)
     )
     global_raw_layout: gl.constexpr = gl.BlockedLayout(
         [1, 1, 2, 8], [2, 16, 1, 1], [4, 1, 1, 1], [3, 2, 1, 0]
@@ -344,7 +576,14 @@ def gluon_dsv41_selected_attention_gfx1250(
     global_kv_layout: gl.constexpr = gl.BlockedLayout(
         [1, 1, 2, 16], [2, 16, 1, 1], [4, 1, 1, 1], [3, 2, 1, 0]
     )
-    swa_row_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, swa_raw_layout))
+    gather_row_layout: gl.constexpr = _warp_split_row_layout(TILE_K, 4, 32)
+    raw_shared_1d: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[0]
+    )
+    raw_shared_2d: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
+    swa_row_layout: gl.constexpr = gl.SliceLayout(1, swa_scale_layout)
     global_row_layout: gl.constexpr = gl.SliceLayout(
         1, gl.SliceLayout(2, gl.SliceLayout(3, global_raw_layout))
     )
@@ -385,6 +624,54 @@ def gluon_dsv41_selected_attention_gfx1250(
     global_first = gl.maximum(tile_begin, swa_tiles) - swa_tiles
     global_stop = gl.maximum(tile_end, swa_tiles) - swa_tiles
     global_bound = gl.minimum(global_len, global_stop * TILE_K)
+    swa_tiles_here = swa_stop - swa_first
+    num_tiles = swa_tiles_here + global_stop - global_first
+
+    # Every copy reads its slots from LDS, so issuing a tile never waits on a
+    # global load.
+    slots_table = gl.allocate_shared_memory(
+        gl.int32, [SLOT_TILES, TILE_K], layout=raw_shared_2d
+    )
+    slots_smem = slots_table.reinterpret(gl.int32, [SLOT_TILES, TILE_K], raw_shared_1d)
+    _stage_slots(
+        slots_table,
+        swa_slots,
+        swa_row,
+        swa_width,
+        global_slots,
+        global_row,
+        global_width,
+        SWA_TILES,
+        TILE_K,
+        HAS_GLOBAL,
+    )
+    swa_values_ring = gl.allocate_shared_memory(
+        gl.uint8, [STAGES, TILE_K, 512], layout=raw_shared_2d
+    )
+    scales_ring = gl.allocate_shared_memory(
+        gl.uint8, [STAGES, TILE_K, 32], layout=raw_shared_2d
+    )
+    swa_value_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=swa_cache,
+        shape=[swa_value_rows, 512],
+        strides=[512, 1],
+        block_shape=[TILE_K, 512],
+        layout=raw_shared_2d,
+    )
+    if HAS_GLOBAL:
+        global_values_ring = gl.allocate_shared_memory(
+            gl.uint8, [STAGES, TILE_K, 256], layout=raw_shared_2d
+        )
+        global_value_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+            base=global_cache,
+            shape=[global_value_rows, 256],
+            strides=[256, 1],
+            block_shape=[TILE_K, 256],
+            layout=raw_shared_2d,
+        )
+    else:
+        global_values_ring = swa_values_ring
+        global_value_desc = swa_value_desc
 
     q_heads = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, q_layout))
     q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_layout))
@@ -449,38 +736,126 @@ def gluon_dsv41_selected_attention_gfx1250(
             )
             accumulator = gl.zeros([BLOCK_H, HEAD_DIM], dtype=gl.float32, layout=wmma)
 
-            # Rows are loaded in the tile that uses them: a software pipeline
-            # holding the next tile's raw rows costs more occupancy than its
-            # overlap saves.
-            for tile in range(swa_first, swa_stop):
-                slot, valid = _tile_slots(
-                    swa_slots,
-                    swa_row,
-                    tile,
+            # The split's tiles, SWA first, run through a ring of STAGES raw
+            # LDS tiles: copies run STAGES - 1 tiles ahead of the tile being
+            # dequantized, one value gather and one scale group per tile.
+            for stage in gl.static_range(STAGES - 1):
+                _issue_tile(
+                    stage,
+                    num_tiles,
+                    swa_tiles_here,
+                    swa_first,
                     swa_bound,
-                    swa_width,
+                    global_first,
+                    global_bound,
+                    slots_smem,
                     swa_capacity,
+                    global_capacity,
+                    swa_cache,
+                    swa_page_stride,
+                    global_cache,
+                    global_page_stride,
+                    swa_value_desc,
+                    swa_value_rows,
+                    global_value_desc,
+                    global_value_rows,
+                    swa_values_ring,
+                    global_values_ring,
+                    scales_ring,
+                    SWA_TILES,
+                    GLOBAL_TILES,
+                    STAGES,
                     TILE_K,
-                    swa_row_layout,
+                    HAS_GLOBAL,
+                    gather_row_layout,
                 )
-                # The softmax needs the mask in the score layout; reloading the
-                # cached slots avoids a cross-lane layout conversion.
-                _, score_valid = _tile_slots(
-                    swa_slots,
-                    swa_row,
-                    tile,
+            for tile in range(num_tiles):
+                _issue_tile(
+                    tile + STAGES - 1,
+                    num_tiles,
+                    swa_tiles_here,
+                    swa_first,
                     swa_bound,
-                    swa_width,
+                    global_first,
+                    global_bound,
+                    slots_smem,
                     swa_capacity,
+                    global_capacity,
+                    swa_cache,
+                    swa_page_stride,
+                    global_cache,
+                    global_page_stride,
+                    swa_value_desc,
+                    swa_value_rows,
+                    global_value_desc,
+                    global_value_rows,
+                    swa_values_ring,
+                    global_values_ring,
+                    scales_ring,
+                    SWA_TILES,
+                    GLOBAL_TILES,
+                    STAGES,
+                    TILE_K,
+                    HAS_GLOBAL,
+                    gather_row_layout,
+                )
+                gl.amd.cdna5.tdm.async_wait(STAGES - 1)
+                gl.amd.cdna5.async_copy.wait_group(STAGES - 1)
+                buffer = tile % STAGES
+                is_swa = tile < swa_tiles_here
+                smem_row, first, bound, capacity = _tile_coords(
+                    tile,
+                    num_tiles,
+                    swa_tiles_here,
+                    swa_first,
+                    swa_bound,
+                    swa_capacity,
+                    global_first,
+                    global_bound,
+                    global_capacity,
+                    SWA_TILES,
+                    GLOBAL_TILES,
+                    TILE_K,
+                )
+                if is_swa:
+                    swa_values = (
+                        swa_values_ring.index(buffer)
+                        .reshape([TILE_K, 16, 2, 16])
+                        .load(swa_raw_layout)
+                    )
+                    swa_scales = (
+                        scales_ring.index(buffer).slice(0, 16, 1).load(swa_scale_layout)
+                    )
+                    kv_shared.store(
+                        _dequant_swa_rows(swa_values, swa_scales, swa_raw_layout)
+                    )
+                else:
+                    if HAS_GLOBAL:
+                        global_values = (
+                            global_values_ring.index(buffer)
+                            .reshape([TILE_K, 16, 2, 8])
+                            .load(global_raw_layout)
+                        )
+                        global_scales = (
+                            scales_ring.index(buffer)
+                            .reshape([TILE_K, 16, 2])
+                            .load(gl.SliceLayout(3, global_raw_layout))
+                        )
+                        kv_shared.store(
+                            _dequant_global_rows(
+                                global_values, global_scales, global_kv_layout
+                            )
+                        )
+                _, score_valid = _staged_slots(
+                    slots_smem,
+                    smem_row,
+                    first,
+                    bound,
+                    capacity,
                     TILE_K,
                     score_row_layout,
                 )
-                values, scales = _load_swa_rows(
-                    swa_cache, slot, valid, swa_page_stride, swa_raw_layout
-                )
-                kv = _dequant_swa_rows(values, scales, swa_raw_layout)
                 max_value, denominator, accumulator, row_sum, row_count = _attend_tile(
-                    kv,
                     kv_shared,
                     score_valid,
                     q_dot,
@@ -497,57 +872,9 @@ def gluon_dsv41_selected_attention_gfx1250(
                     TILE_K,
                     wmma,
                 )
-            if HAS_GLOBAL:
-                for tile in range(global_first, global_stop):
-                    slot, valid = _tile_slots(
-                        global_slots,
-                        global_row,
-                        tile,
-                        global_bound,
-                        global_width,
-                        global_capacity,
-                        TILE_K,
-                        global_row_layout,
-                    )
-                    # Score-layout mask, as in the SWA loop.
-                    _, score_valid = _tile_slots(
-                        global_slots,
-                        global_row,
-                        tile,
-                        global_bound,
-                        global_width,
-                        global_capacity,
-                        TILE_K,
-                        score_row_layout,
-                    )
-                    values, scales = _load_global_rows(
-                        global_cache,
-                        slot,
-                        valid,
-                        global_page_stride,
-                        global_raw_layout,
-                    )
-                    kv = _dequant_global_rows(values, scales, global_kv_layout)
-                    max_value, denominator, accumulator, row_sum, row_count = (
-                        _attend_tile(
-                            kv,
-                            kv_shared,
-                            score_valid,
-                            q_dot,
-                            valid_heads,
-                            softmax_scale,
-                            max_value,
-                            denominator,
-                            accumulator,
-                            row_sum,
-                            row_count,
-                            active,
-                            with_row_sum,
-                            BLOCK_H,
-                            TILE_K,
-                            wmma,
-                        )
-                    )
+            # Retire the padding copies issued by the last steps.
+            gl.amd.cdna5.tdm.async_wait(0)
+            gl.amd.cdna5.async_copy.wait_group(0)
 
             if active:
                 if single:
@@ -779,21 +1106,33 @@ def _output(out, shape, dtype, device):
     return out
 
 
-def _cache(cache, row_bytes, name):
+def _cache(cache, row_bytes, value_bytes, name):
+    """Validate a page-planar cache; return its rows of value_bytes."""
     if (
         cache.dtype != torch.uint8
         or cache.ndim != 3
         or cache.shape[1:] != (64, row_bytes)
     ):
         raise ValueError(f"{name} cache must be uint8 [pages, 64, {row_bytes}]")
-    # Native reads need contiguous page bytes and 16-byte aligned pages.
+    # TDM gathers view the cache as rows of one page's value bytes, which
+    # needs contiguous page bytes and a page stride of whole rows.
     if (
         cache.stride(2) != 1
         or cache.stride(1) != row_bytes
-        or cache.stride(0) % 16 != 0
+        or cache.stride(0) % value_bytes != 0
         or cache.data_ptr() % 16 != 0
     ):
-        raise ValueError(f"{name} cache pages must be contiguous and 16-byte aligned")
+        raise ValueError(
+            f"{name} cache pages must be contiguous, 16-byte aligned and "
+            f"{value_bytes}-byte strided"
+        )
+    if cache.shape[0] == 0:
+        return 0
+    rows = (cache.shape[0] - 1) * (cache.stride(0) // value_bytes) + _PAGE_ROWS
+    # Gather row indices are int32.
+    if rows >= 2**31:
+        raise ValueError(f"{name} cache exceeds 2**31 rows of {value_bytes} bytes")
+    return rows
 
 
 def _integers(x, shape, name):
@@ -934,7 +1273,7 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
         raise ValueError("all tensors must share a CUDA/ROCm device")
     if attn_sink.shape != (q.shape[1],) or attn_sink.dtype != torch.float32:
         raise ValueError("attn_sink must be FP32 [heads]")
-    _cache(swa_cache, _SWA_ROW_BYTES, "swa")
+    swa_value_rows = _cache(swa_cache, _SWA_ROW_BYTES, 512, "swa")
     if swa_slots.ndim != 2 or swa_slots.shape[0] != q.shape[0]:
         raise ValueError("slots must have one row per query")
     _integers(swa_slots, swa_slots.shape, "slots")
@@ -945,10 +1284,11 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
             raise ValueError(
                 "absent global cache requires None global slots and lengths"
             )
+        global_value_rows = 0
     else:
         if global_slots is None or global_lens is None:
             raise ValueError("global cache requires global slots and lengths")
-        _cache(global_cache, _GLOBAL_ROW_BYTES, "global")
+        global_value_rows = _cache(global_cache, _GLOBAL_ROW_BYTES, 256, "global")
         if global_slots.ndim != 2 or global_slots.shape[0] != q.shape[0]:
             raise ValueError("slots must have one row per query")
         _integers(global_slots, global_slots.shape, "slots")
@@ -984,9 +1324,9 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
         global_slot_stride = 0
 
     tokens = q.shape[0]
-    max_tiles = triton.cdiv(swa_slots_i.shape[1], _TILE_K) + triton.cdiv(
-        global_width, _TILE_K
-    )
+    swa_tiles = triton.cdiv(swa_slots_i.shape[1], _TILE_K)
+    global_tiles = triton.cdiv(global_width, _TILE_K)
+    max_tiles = swa_tiles + global_tiles
     # The token count only picks one of three head-group widths.
     head_groups = 1
     while (
@@ -1056,12 +1396,18 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
         scale,
         swa_cache.shape[0] * _PAGE_ROWS,
         global_capacity,
+        swa_value_rows,
+        global_value_rows,
         q.shape[1],
         HAS_GLOBAL=has_global,
         HEAD_GROUPS=head_groups,
         BLOCK_H=_BLOCK_H,
         TILE_K=_TILE_K,
         HEAD_DIM=_HEAD_DIM,
+        SWA_TILES=swa_tiles,
+        GLOBAL_TILES=global_tiles,
+        SLOT_TILES=triton.next_power_of_2(max_tiles),
+        STAGES=_STAGES,
         num_warps=4,
         num_stages=1,
     )

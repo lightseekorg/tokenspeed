@@ -825,9 +825,18 @@ over many CUs.
 gfx950 contract, split and zero-query shortcut above. QK and PV use 16x16x32
 BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
 scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
-BF16 power of two, the E4M3 global scale as BF16. Rows are not prefetched,
-and V is read from LDS only after QK: the registers this saves buy more
-workgroups per CU than the overlap would.
+BF16 power of two, the E4M3 global scale as BF16. V is read from LDS only
+after QK, so the K and V operands are never live together.
+
+A workgroup stages its slots in LDS, then runs its tiles through a two-deep
+LDS ring: while one tile is dequantized, a TDM gather fetches the next tile's
+value rows and an async copy its scales. Prefetching rows into registers
+instead was slower: it doubled the live rows. The gathers view a cache as
+rows of a page's value bytes (512 SWA, 256 global) with int32 row indices, so
+page strides must be whole such rows, as the arena plan aligns them, and a
+cache spans at most 2^31 rows. Invalid rows gather as zero values while their
+scale copies read row 0; the dequant reads NaN scale bytes as tiny or zero,
+so those rows stay zero even over unwritten memory.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks
