@@ -314,7 +314,6 @@ def test_small_route_production_alignment_graph_replay() -> None:
 def test_large_route_count_reset_and_graph_replay() -> None:
     """The shared large sorter resets counts when local routes disappear."""
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import moe_align_device
-    from utils import assert_no_triton_compile
 
     num_tokens, top_k, num_experts, block_m, expert_start = 130, 8, 4, 16, 12
     ids = torch.full(
