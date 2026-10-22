@@ -105,7 +105,7 @@ class HcclBackend(CommBackend):
         if len(group) == 1:
             output.copy_(input)
             return
-        dist.all_gather_single(output, input, group=self._process_group(group))
+        dist.all_gather_into_tensor(output, input, group=self._process_group(group))
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         if len(group) == 1:
@@ -115,7 +115,7 @@ class HcclBackend(CommBackend):
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        dist.reduce_scatter_single(output, tensor, group=self._process_group(group))
+        dist.reduce_scatter_tensor(output, tensor, group=self._process_group(group))
         return output
 
     def all_to_all_single(
@@ -144,6 +144,12 @@ class HcclBackend(CommBackend):
         scattered_num_tokens: list[int],
     ) -> torch.Tensor:
         max_tokens = max(scattered_num_tokens)
+        if max_tokens == 0:
+            return tensor
+        if min(scattered_num_tokens) == max_tokens:
+            if len(group) == 1:
+                return tensor.clone(memory_format=torch.contiguous_format)
+            return self.all_gather(tensor.contiguous(), group)
         if tensor.shape[0] < max_tokens:
             tensor = torch.cat(
                 (
@@ -154,9 +160,14 @@ class HcclBackend(CommBackend):
 
         gathered = tensor.new_empty(len(group) * max_tokens, tensor.shape[-1])
         self.all_gather_single(gathered, tensor.contiguous(), group)
-        # Equal-sized shards already form the contiguous, rank-ordered output.
-        if all(tokens == max_tokens for tokens in scattered_num_tokens):
-            return gathered
+        # Full shards followed by one partial shard and empty ranks already
+        # form a contiguous prefix. Slicing drops only trailing padding.
+        total = sum(scattered_num_tokens)
+        if all(
+            tokens == min(max_tokens, max(0, total - rank * max_tokens))
+            for rank, tokens in enumerate(scattered_num_tokens)
+        ):
+            return gathered[:total]
         return torch.cat(
             [
                 gathered[rank * max_tokens : rank * max_tokens + tokens]
@@ -172,25 +183,32 @@ class HcclBackend(CommBackend):
     ) -> torch.Tensor:
         """Reduce rank-major rows, padding only unequal token counts."""
         max_tokens = max(scattered_num_tokens)
-        # Equal rank-major slices already have the collective's input layout.
-        if all(tokens == max_tokens for tokens in scattered_num_tokens):
+        if max_tokens == 0:
+            return tensor
+        if min(scattered_num_tokens) == max_tokens:
+            if len(group) == 1:
+                return tensor.clone()
             return self.reduce_scatter(tensor.contiguous(), group)
-        padded = tensor.new_zeros(
-            len(group) * max_tokens,
-            tensor.shape[-1],
-        )
-        offset = 0
-        for rank, tokens in enumerate(scattered_num_tokens):
-            padded[rank * max_tokens : rank * max_tokens + tokens].copy_(
-                tensor[offset : offset + tokens]
-            )
-            offset += tokens
+        if tensor.device.type == "npu":
+            from tokenspeed_kernel.ops.communication.ascend import pad_token_shards
 
+            padded = pad_token_shards(tensor, scattered_num_tokens)
+        else:
+            padded = tensor.new_zeros(
+                len(group) * max_tokens,
+                tensor.shape[-1],
+            )
+            offset = 0
+            for rank, tokens in enumerate(scattered_num_tokens):
+                padded[rank * max_tokens : rank * max_tokens + tokens].copy_(
+                    tensor[offset : offset + tokens]
+                )
+                offset += tokens
         output = tensor.new_empty(max_tokens, tensor.shape[-1])
         if len(group) == 1:
             output.copy_(padded)
         else:
-            dist.reduce_scatter_single(
+            dist.reduce_scatter_tensor(
                 output,
                 padded.contiguous(),
                 group=self._process_group(group),

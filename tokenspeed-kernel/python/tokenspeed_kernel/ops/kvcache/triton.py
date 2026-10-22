@@ -515,6 +515,14 @@ def zero_page_fields(
     if num_ranges == 0:
         return
 
+    if backing.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.cache_zero import (
+            zero_page_fields as ascend_zero_page_fields,
+        )
+
+        ascend_zero_page_fields(backing, pages, fields, max_field_bytes=max_field_bytes)
+        return
+
     block_size = 1024
     # Same CTA budget as zero_byte_ranges: bound short ranges, keep a few
     # large ones wide enough to occupy the device.

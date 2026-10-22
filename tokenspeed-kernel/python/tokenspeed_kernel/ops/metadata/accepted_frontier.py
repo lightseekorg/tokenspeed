@@ -131,7 +131,7 @@ def advance_accepted_frontier(
         raise ValueError("advance_accepted_frontier needs colocated tensors")
     if batch_size == 0:
         return
-    if not req_pool_indices.is_cuda:
+    if req_pool_indices.device.type == "cpu":
         _advance_accepted_frontier_torch(
             req_pool_indices,
             input_lengths,

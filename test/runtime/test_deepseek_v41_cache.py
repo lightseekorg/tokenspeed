@@ -106,6 +106,8 @@ def _config(device):
         candidate_topk=2,
         candidate_block_size=8,
         max_query_tokens=514,
+        kv_cache_mode="quantized",
+        pa_mode=None,
         # The geometry assertions in this file pin the checkpoint's own rows,
         # so CPU fixtures stay on them; a test that runs real kernels has to
         # store the rows this GPU's FlashMLA can actually read.
@@ -188,7 +190,13 @@ def _pool(recipe, device):
         token_capacity=1024,
         enable_memory_saver=False,
     )
-    return DeepseekV41CachePool(arena, layer_num=40, rank=0, field_layer_offset=0)
+    return DeepseekV41CachePool(
+        arena,
+        layer_num=40,
+        rank=0,
+        field_layer_offset=0,
+        pa_mode=recipe.attn_config.component(DeepseekV41Config).pa_mode,
+    )
 
 
 def _verify_backend(device, max_bs, verify_width):
@@ -972,13 +980,16 @@ def test_gpu_backend_decode_capture_replay_and_above_ladder(shared_pool, verify_
 
 @pytest.mark.parametrize("verify_width", [1, 3, 6, 8])
 @pytest.mark.parametrize("overlap_depth", [0, 1])
-def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
+def test_packed_config_and_recipe_capacity(verify_width, overlap_depth, monkeypatch):
+    monkeypatch.delenv("TS_V41_PA_MODE", raising=False)
     recipe = _recipe("cpu")
     hf = recipe.model_config.hf_config
     hf.candidate_topk_blocks, hf.candidate_block_size, hf.index_topk = 2, 8, 4
     args = ServerArgs(
         model="x",
         device="cpu",
+        npu_v41_index_cache=None,
+        npu_v41_kv_cache=None,
         attn_tp_size=1,
         deepseek_v41_attention_query_swa_min_tokens=4096,
         deepseek_v41_attention_query_min_tokens=1024,
@@ -1010,7 +1021,35 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
     )
     config = DeepseekV41Config.generate(args, model, False)
     spec = config.component(DeepseekV41Config)
+    assert spec.kv_cache_mode == "quantized"
     assert spec.cache_format in V41_CACHE_FORMATS
+    with patch(
+        "tokenspeed.runtime.layers.attention.configs.deepseek_v41.current_platform",
+        return_value=SimpleNamespace(is_npu=True, is_hopper=False),
+    ):
+        for mode in ("bf16", "bf16-qdq"):
+            args.npu_v41_kv_cache = args.npu_v41_index_cache = mode
+            npu_spec = DeepseekV41Config.generate(args, model, False).component(
+                DeepseekV41Config
+            )
+            assert npu_spec.kv_cache_mode == mode
+            assert npu_spec.cache_format == f"v41_index_{mode}"
+            assert npu_spec.pa_mode == "compact"
+        args.npu_v41_kv_cache = args.npu_v41_index_cache = "bf16"
+        monkeypatch.setenv("TS_V41_PA_MODE", "direct")
+        direct = DeepseekV41Config.generate(args, model, False).component(
+            DeepseekV41Config
+        )
+        monkeypatch.setenv("TS_V41_PA_MODE", "invalid")
+        assert direct.pa_mode == "direct"
+        with pytest.raises(ValueError, match="TS_V41_PA_MODE"):
+            DeepseekV41Config.generate(args, model, False)
+        monkeypatch.delenv("TS_V41_PA_MODE")
+        for mode in (None, "quantized"):
+            args.npu_v41_kv_cache = mode
+            with pytest.raises(ValueError, match="bf16-qdq or bf16"):
+                DeepseekV41Config.generate(args, model, False)
+    args.npu_v41_kv_cache = args.npu_v41_index_cache = None
     config = replace(config, components=(replace(spec, cache_format="v41"),))
     assert config.speculative_num_draft_tokens == verify_width
     assert config.max_bs == 2
@@ -1357,7 +1396,13 @@ def test_recipe_declares_the_private_groups_replayable():
         token_capacity=1024,
         enable_memory_saver=False,
     )
-    pool = DeepseekV41CachePool(arena, layer_num=40, rank=0, field_layer_offset=0)
+    pool = DeepseekV41CachePool(
+        arena,
+        layer_num=40,
+        rank=0,
+        field_layer_offset=0,
+        pa_mode=recipe.attn_config.component(DeepseekV41Config).pa_mode,
+    )
     with pytest.raises(ValueError, match="must be a replayable group"):
         backend.set_cache_pool(pool)
 
@@ -1981,6 +2026,8 @@ def test_gpu_replayed_rows_attend_from_the_window_start_only():
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_prefill_plan_reuses_addresses_and_refresh_rechecks_pages(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     backend = _backend(device, 2)
     tables = _tables(device)
     meta = _extend(backend, tables, [3], [128], [0], _final([3], [128]))
@@ -2016,6 +2063,8 @@ def test_prefill_plan_reuses_addresses_and_refresh_rechecks_pages(device):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_prefill_plan_distinguishes_reordered_subset_and_checks_dependencies(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
     backend = _backend(device, 2)
     tables = _tables(device)
     meta = _extend(backend, tables, [4], [128], [0], _final([4], [128]))
@@ -2061,7 +2110,8 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     captured = []
 
-    def selected(*args, lse):
+    def selected(*args, lse, pa_mode, pa_context):
+        assert pa_mode is None and pa_context is None
         assert lse is None
         captured.append(args)
         return torch.zeros_like(args[0])
@@ -3039,3 +3089,168 @@ def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
     record = backend.sparse_topk.prefill
     assert record.positions is meta.positions
     assert record.request_indices is meta.request_indices
+
+
+@pytest.mark.parametrize("dspark", [False, True])
+@pytest.mark.parametrize("mode", ["bf16-qdq", "bf16"])
+def test_bf16_index_planes_are_contiguous_and_budgeted(dspark, mode):
+    recipe = _recipe("cpu")
+    spec = recipe.attn_config.component(DeepseekV41Config)
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        components=(replace(spec, cache_format=f"v41_index_{mode}"),),
+    )
+    if dspark:
+        recipe.server_args.speculative_algorithm = "DSPARK"
+        recipe.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(dspark_num_stages=3)
+        )
+    layout = _layout(recipe)
+    recipe.check_layout(layout)
+    assert len(layout.plane_bytes) == 5
+    planes = [f for f in layout.fields if f.field_id.endswith(".index_k")]
+    assert len(planes) == 4
+    assert all(f.dtype == "bfloat16" for f in planes)
+    assert all(f.page_stride_bytes == 64 * 128 * 2 for f in planes)
+    setup = recipe.setup()
+    assert (
+        setup.spec.memory_plan.arena_bytes + setup.fixed_workspace_bytes
+        <= recipe.cache_budget_bytes
+    )
+
+
+@pytest.mark.parametrize("index_mode", ["bf16", "bf16-qdq"])
+def test_unquantized_kv_preserves_bf16_storage_geometry(index_mode):
+    recipe = _recipe("cpu")
+    original = recipe.attn_config.component(DeepseekV41Config)
+    layouts = []
+    for mode in ("bf16-qdq", "bf16"):
+        spec = replace(
+            original, kv_cache_mode=mode, cache_format=f"v41_index_{index_mode}"
+        )
+        recipe.attn_config = replace(recipe.attn_config, components=(spec,))
+        layout = _layout(recipe)
+        recipe.check_layout(layout)
+        layouts.append(layout)
+        assert spec.bf16_kv_cache
+        assert spec.quantize_bf16_index == (index_mode == "bf16-qdq")
+        suffix = "_bf16" if mode == "bf16" else "_bf16_qdq"
+        assert spec.row_layout().swa_kernel_format == "swa" + suffix
+        assert spec.row_layout().global_kernel_format == "global" + suffix
+    assert layouts[0] == layouts[1]
+
+
+def test_unquantized_kv_rejects_unknown_mode():
+    spec = _config("cpu").component(DeepseekV41Config)
+    with pytest.raises(ValueError, match="KV mode"):
+        replace(spec, kv_cache_mode="bf16-typo").row_layout()
+
+
+@pytest.mark.parametrize("index_mode", ["bf16", "bf16-qdq"])
+def test_bf16_index_writer_skips_unused_packed_values(monkeypatch, index_mode):
+    from tokenspeed_kernel.ops.attention import dsv41
+
+    recipe = _recipe("cpu")
+    spec = replace(
+        recipe.attn_config.component(DeepseekV41Config),
+        kv_cache_mode="bf16",
+        cache_format=f"v41_index_{index_mode}",
+    )
+    recipe.attn_config = replace(recipe.attn_config, components=(spec,))
+    backend = DeepseekV41AttentionBackend(recipe.attn_config, spec)
+    backend.set_cache_pool(_pool(recipe, "cpu"))
+    backend.init_cuda_graph_state(2, max_tokens_per_req=1, overlap_schedule_depth=1)
+    tables = _tables("cpu")
+    meta = _extend(backend, tables, [8, 3], [4, 2], [4, 0], [12, 5])
+    seen = {}
+    monkeypatch.setattr(
+        dsv41,
+        "cache_scatter",
+        lambda rows, cache, slots, fmt: seen.__setitem__(fmt, slots.clone()),
+    )
+
+    def write_index(rows, cache, slots, *, quantize):
+        seen["bf16"] = slots.clone()
+        assert quantize == (index_mode == "bf16-qdq")
+
+    monkeypatch.setattr(dsv41, "store_index_bf16", write_index)
+    for owner, positions, requests, mask in (
+        (20, meta.positions, meta.request_indices, [True] * 4 + [False] * 7),
+        (
+            2,
+            torch.tensor([4, 6, 8, 10, 2, -1]),
+            torch.tensor([0, 0, 0, 0, 1, -1]),
+            [True, True, False, False, False, False],
+        ),
+    ):
+        seen.clear()
+        backend.write_global(
+            owner,
+            torch.zeros(len(positions), 512),
+            torch.zeros(len(positions), 128),
+            positions,
+            requests,
+            ForwardMode.EXTEND,
+            None,
+        )
+        slots = backend.cache_slots(
+            R1 if owner == 20 else R2, positions, requests, ForwardMode.EXTEND
+        ).masked_fill(torch.tensor(mask), -1)
+        assert torch.equal(seen["global_bf16"], slots)
+        assert torch.equal(seen["bf16"], slots)
+        assert "index" not in seen
+
+
+@pytest.mark.parametrize("dspark", [False, True])
+@pytest.mark.parametrize("pd", [False, True])
+def test_paged_attention_layout_keeps_dspark_windows_and_pd_groups(
+    monkeypatch, dspark, pd
+):
+    recipe = _recipe("cpu")
+    spec = recipe.attn_config.component(DeepseekV41Config)
+    recipe.attn_config = replace(
+        recipe.attn_config,
+        pd_disaggregation_enabled=pd,
+        components=(
+            replace(spec, kv_cache_mode="bf16", cache_format="v41_index_bf16"),
+        ),
+    )
+    if dspark:
+        recipe.server_args.speculative_algorithm = "DSPARK"
+        recipe.draft_model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(dspark_num_stages=3)
+        )
+    if pd:
+        recipe.server_args.disaggregation_mode = "decode"
+    original = _layout(recipe)
+    spec = recipe.attn_config.component(DeepseekV41Config)
+    recipe.attn_config = replace(
+        recipe.attn_config, components=(replace(spec, pa_mode="direct"),)
+    )
+    # Once configured, later environment changes cannot alter layout or budget.
+    monkeypatch.setenv("TS_V41_PA_MODE", "invalid-after-initialization")
+    layout = _layout(recipe)
+    recipe.check_layout(layout)
+    assert len(layout.plane_bytes) == 5
+    assert [(f.field_id, f.shape, f.dtype) for f in layout.fields] == [
+        (f.field_id, f.shape, f.dtype) for f in original.fields
+    ]
+    windows = [f for f in layout.fields if "dspark_kv" in f.field_id]
+    assert len(windows) == (3 if dspark else 0)
+    assert all(f.dtype == "bfloat16" and f.shape == (64, 512) for f in windows)
+    plan = layout.bind(3)
+    for field in plan.fields:
+        if field.plane_id == "flatkv":
+            assert field.page_stride_bytes % 1024 == 0
+            assert plan.field_page_byte_offset(field.field_id, 0) % 1024 == 0
+    context = SimpleNamespace(key_rope=torch.empty(0), extra_bytes=0, rows=0)
+    with patch(
+        "tokenspeed_kernel.ops.attention.dsv41.ascend.create_paged_context",
+        return_value=context,
+    ) as create_context:
+        pool = _pool(recipe, "cpu")
+    assert pool.pa_context is context
+    create_context.assert_called_once_with(pool.arena)
+    monkeypatch.setenv("TS_V41_PA_MODE", "compact")
+    assert _layout(recipe) == layout
+    assert pool.pa_mode == "direct"

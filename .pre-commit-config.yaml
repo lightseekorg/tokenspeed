@@ -26,7 +26,9 @@ repos:
     rev: v18.1.8
     hooks:
       - id: clang-format
-        files: ^tokenspeed-scheduler/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx)$
+        files: ^(tokenspeed-scheduler|tokenspeed-kernel-npu/csrc)/.*\.(c|cc|cpp|cxx|h|hh|hpp|hxx|asc)$
+        # Ascend C uses .asc, which identify does not classify as C++.
+        types_or: [file]
   - repo: https://github.com/PyCQA/isort
     rev: 8.0.1
     hooks:

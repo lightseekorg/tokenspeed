@@ -20,6 +20,7 @@
 
 """Strided V4.1 FlatKV views over the scheduler-owned shared arena."""
 
+import logging
 from collections.abc import Mapping
 
 import numpy as np
@@ -54,6 +55,7 @@ class DeepseekV41CachePool(CachePool):
         layer_num: int,
         rank: int,
         field_layer_offset: int,
+        pa_mode: str | None,
     ) -> None:
         super().__init__(
             arena=arena,
@@ -63,6 +65,22 @@ class DeepseekV41CachePool(CachePool):
         )
         self.layer_num = layer_num
         self._bind_layer_planes()
+        if pa_mode not in (None, "compact", "direct"):
+            raise ValueError(f"Unsupported PA mode: {pa_mode!r}")
+        self.pa_mode = pa_mode
+        self.pa_context = None
+        if pa_mode == "direct":
+            from tokenspeed_kernel.ops.attention.dsv41.ascend import (
+                create_paged_context,
+            )
+
+            self.pa_context = create_paged_context(arena)
+            logging.getLogger(__name__).info(
+                f"Direct PA parents={arena.plan.num_lcm_blocks} "
+                f"token_capacity={arena.runtime_contract.token_capacity} "
+                f"arena_bytes={arena.buffer.nbytes} zero_rope_bytes={self.pa_context.key_rope.nbytes} "
+                f"constant_bytes={self.pa_context.extra_bytes} physical_rows={self.pa_context.rows}"
+            )
 
     def _field(self, layer: int, name: str) -> torch.Tensor:
         if not 0 <= layer < self.layer_num:
@@ -76,21 +94,18 @@ class DeepseekV41CachePool(CachePool):
         return view
 
     def swa(self, layer: int) -> torch.Tensor:
-        """Return layer's page-planar uint8 [pages, 64, R] FP8 values/E8M0 scales."""
+        """Return SWA packed bytes or BF16-QDQ [pages,64,512] per recipe."""
         return self._field(layer, "swa")
 
     def global_kv(self, owner: int) -> torch.Tensor:
-        """Return owner's page-planar uint8 [pages, 64, R] quantized values/scales.
+        """Return owner's packed bytes or BF16-QDQ [pages,64,512].
 
         Pass the KV source layer, not a Reuse/Reindex consumer layer.
         """
         return self._field(owner, "global_kv")
 
     def index_k(self, owner: int) -> torch.Tensor:
-        """Return owner's uint8 [pages, 64, 68] page-planar FP4 values/E8M0 scales.
-
-        Main KV and index K share logical rows and page ids, not byte offsets.
-        """
+        """Return the owner's packed or BF16 index field, as declared by LCM."""
         return self._field(owner, "index_k")
 
     def compressor_tail(self, owner: int) -> torch.Tensor:

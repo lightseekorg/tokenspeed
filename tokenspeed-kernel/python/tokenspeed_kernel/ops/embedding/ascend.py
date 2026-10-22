@@ -74,3 +74,54 @@ if current_platform().is_npu:
             q_rope_out=q_rope_out,
             k_rope_out=k_rope_out,
         )
+
+    @register_kernel(
+        "embedding",
+        "host_uint8_row_gather",
+        name="ascend_host_uint8_row_gather",
+        solution="torch_npu",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("x", "dense", {torch.uint8}),
+        priority=Priority.PORTABLE,
+    )
+    def ascend_host_uint8_row_gather(table, indices, out):
+        """Eager host gather; copy selected bytes only, without device FP8 types."""
+        if out.device != indices.device:
+            raise ValueError("Host gather destination must share the indices device")
+        if table.shape[0] == 0:
+            return out.zero_()
+        ids = indices.to(device=table.device, dtype=torch.int64)
+        valid = (ids >= 0) & (ids < table.shape[0])
+        values = table[ids.clamp(0, table.shape[0] - 1)]
+        out.copy_(values.masked_fill(~valid.unsqueeze(-1), 0))
+        return out
+
+    @register_kernel(
+        "embedding",
+        "fp8_e8m0_rows",
+        name="ascend_fp8_e8m0_rows",
+        solution="torch_npu",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures("x", "dense", {torch.uint8}),
+        priority=Priority.PORTABLE,
+    )
+    def ascend_fp8_e8m0_rows(codes, scales):
+        from tokenspeed_kernel_npu.ops.dsv41_engram_decode import fp8_e8m0_rows
+
+        return fp8_e8m0_rows(codes, scales)
+
+    @register_kernel(
+        "embedding",
+        "mxfp8_embedding",
+        name="ascend_mxfp8_embedding",
+        solution="torch_npu",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=format_signatures(
+            "weight", "dense", {torch.uint8, torch.float8_e4m3fn}
+        ),
+        priority=Priority.PERFORMANT,
+    )
+    def ascend_mxfp8_embedding(weight, scales, indices, row_start, row_end):
+        from tokenspeed_kernel_npu.ops.mxfp8_embedding import mxfp8_embedding
+
+        return mxfp8_embedding(weight, scales, indices, row_start, row_end)

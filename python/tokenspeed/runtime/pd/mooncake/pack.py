@@ -75,8 +75,9 @@ class PageFieldCopies:
     ``(src_base, src_stride, dst_base, dst_stride, length)`` rows; descriptor
     ``(f, i)`` copies ``length`` bytes from ``src_base + src_pages[i] *
     src_stride`` to ``dst_base + dst_pages[i] * dst_stride``. Mooncake's
-    ``batch_transfer_sync_write_pages`` consumes this shape directly, so a
-    group is one call with no descriptor built on the host. Never packed.
+    GPU Mooncake's ``batch_transfer_sync_write_pages`` consumes this shape
+    directly. The Ascend adapter expands bounded batches for its ordinary
+    batch-WRITE API. Never packed.
     """
 
     src_pages: np.ndarray

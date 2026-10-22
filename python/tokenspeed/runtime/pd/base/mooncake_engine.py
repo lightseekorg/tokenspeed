@@ -40,7 +40,16 @@ def enable_mooncake_ipv6_for_host(hostname: str) -> None:
 
 
 class MooncakeTransferEngine:
-    def __init__(self, hostname: str, gpu_id: int, ib_device: str | None = None):
+    def __init__(
+        self,
+        hostname: str,
+        gpu_id: int,
+        ib_device: str | None = None,
+        *,
+        transport: str = "rdma",
+    ):
+        if transport not in ("rdma", "ascend_direct"):
+            raise ValueError(f"Unsupported Mooncake transport: {transport}")
         enable_mooncake_ipv6_for_host(hostname)
         try:
             from mooncake.engine import TransferEngine
@@ -55,14 +64,20 @@ class MooncakeTransferEngine:
         self.hostname = hostname
         self.gpu_id = gpu_id
         self.ib_device = ib_device
-        # Page-gathered batch WRITE (pages x fields expanded inside Mooncake)
-        # is the only way the CachePD sender moves whole fields, so an engine
-        # without it is a wrong install, not a slower one.
-        if not hasattr(self.engine, "batch_transfer_sync_write_pages"):
+        self.transport = transport
+        # GPU builds require the native page-grid extension. Ascend builds
+        # use their batch-WRITE API with bounded descriptor expansion below.
+        if transport == "rdma" and not hasattr(
+            self.engine, "batch_transfer_sync_write_pages"
+        ):
             raise RuntimeError(
                 "Mooncake's TransferEngine lacks batch_transfer_sync_write_pages; "
                 "install tokenspeed-mooncake >= 0.3.13.post20260929."
             )
+        if transport == "ascend_direct" and not hasattr(
+            self.engine, "batch_transfer_sync_write"
+        ):
+            raise RuntimeError("Ascend Mooncake requires batch_transfer_sync_write")
 
         self.initialize(
             hostname=self.hostname,
@@ -119,7 +134,7 @@ class MooncakeTransferEngine:
         ret_value = self.engine.initialize(
             hostname,
             "P2PHANDSHAKE",
-            "rdma",
+            self.transport,
             device_name if device_name is not None else "",
         )
         if ret_value != 0:
@@ -188,6 +203,34 @@ class MooncakeTransferEngine:
     ) -> int:
         """WRITE the pages x fields grid described by ``fields`` (see
         ``PageFieldCopies``) in batches of at most ``max_batch_size``."""
+        if self.transport == "ascend_direct":
+            # Ascend's engine has the batch-WRITE API, but not TokenSpeed's
+            # native page-grid extension. Expand only one bounded batch at a
+            # time; the cache contract and byte offsets are unchanged.
+            from tokenspeed.runtime.pd.mooncake.pack import PageFieldCopies
+
+            PageFieldCopies(src_pages, dst_pages, fields)
+            if max_batch_size <= 0:
+                raise ValueError("max_batch_size must be positive")
+            for src_base, src_stride, dst_base, dst_stride, length in fields:
+                for start in range(0, len(src_pages), max_batch_size):
+                    src = (
+                        src_base
+                        + src_pages[start : start + max_batch_size] * src_stride
+                    )
+                    dst = (
+                        dst_base
+                        + dst_pages[start : start + max_batch_size] * dst_stride
+                    )
+                    ret = self.batch_transfer_sync(
+                        session_id,
+                        src.tolist(),
+                        dst.tolist(),
+                        [int(length)] * len(src),
+                    )
+                    if ret < 0:
+                        return ret
+            return 0
         try:
             ret = self.engine.batch_transfer_sync_write_pages(
                 session_id, src_pages, dst_pages, fields, max_batch_size

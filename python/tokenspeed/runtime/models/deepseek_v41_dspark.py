@@ -39,6 +39,7 @@ from types import SimpleNamespace
 import torch
 from tokenspeed_kernel.ops.attention import dsv41
 from tokenspeed_kernel.ops.attention.dsv41 import rope_inplace
+from tokenspeed_kernel.ops.gemm import dsv4_linear_fp32
 from torch import nn
 
 from tokenspeed.runtime.layers.attention.deepseek_v41_geometry import (
@@ -66,6 +67,10 @@ from tokenspeed.runtime.utils import add_prefix
 
 def _quantized_kv(x: torch.Tensor) -> torch.Tensor:
     """Materialize the reference all-channel FP8/E8M0 KV round trip as BF16."""
+    if x.device.type == "npu":
+        rows = x.reshape(-1, x.shape[-1]).contiguous()
+        packed = dsv41.cache_pack(rows, "swa", None)
+        return dsv41.cache_unpack(packed, "swa", None).reshape_as(x).to(x.dtype)
     codes, scales = v41_quantize_fp8(x.reshape(-1, x.shape[-1]))
     values = codes.float().unflatten(-1, (-1, 32))
     values = values * scales.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
@@ -100,6 +105,11 @@ def _write_window_rows(
     already there, so the write stays graph-safe without a data-dependent
     branch and the sentinel page keeps its contents.
     """
+    if window.device.type == "npu" and window.shape[1:] == (64, 512):
+        # Advanced indexing a strided arena field materializes the whole field
+        # on Ascend. The cache kernel addresses only the requested physical rows.
+        dsv41.cache_scatter(values, window, slots, "swa_bf16")
+        return
     rows_per_page = window.shape[1]
     valid = (slots >= 0).unsqueeze(-1)
     slots = slots.clamp_min(0).long()
@@ -132,7 +142,14 @@ class _WindowAttention:
         the target writes its own SWA rows.
         """
         batch, block = self.history_slots.shape[0], self.block_size
-        history = self.window[self.selection.page, self.selection.row]
+        if self.window.device.type == "npu" and self.window.shape[1:] == (64, 512):
+            # Match the old null-page read for negative slots; visibility is
+            # still controlled by selection.indices, not by the gathered bytes.
+            history = dsv41.cache_gather(
+                self.window, self.history_slots.clamp_min(0), "swa_bf16", None
+            )
+        else:
+            history = self.window[self.selection.page, self.selection.row]
         if swa.is_cuda and swa.shape[-1] == 512:
             rows = dsv41.dspark_rows(
                 swa,
@@ -177,7 +194,7 @@ class _WindowAttention:
         kv = self._workspace(
             swa, positions, swa_rope_cache, swa_norm_weight, swa_norm_eps
         )
-        if q.is_cuda and q.shape[-1] == 512:
+        if (q.is_cuda or q.device.type == "npu") and q.shape[-1] == 512:
             out = self._kernel_forward(q, kv, attn_sink, softmax_scale)
         else:
             out = self._reference_forward(q, kv, attn_sink, softmax_scale)
@@ -208,6 +225,7 @@ class _WindowAttention:
             kv.view(-1, 1, kv.shape[-1]),
             self.selection.indices,
             lse=None,
+            pa_mode="compact" if q.device.type == "npu" else None,
         )
 
     def _reference_forward(self, q, kv, attn_sink, softmax_scale):
@@ -247,6 +265,8 @@ class DeepseekV41DSparkModel(DeepseekV41Model):
         flat = hidden_states.reshape(-1, hidden_states.shape[-1])
         if flat.is_cuda:
             logits = torch.mm(flat, head.T, out_dtype=torch.float32)
+        elif flat.device.type == "npu" and flat.dtype == torch.bfloat16:
+            logits = dsv4_linear_fp32(flat, head, override=None, solution=None)
         else:
             logits = flat.float() @ head.float().T
         return logits.view(*hidden_states.shape[:-1], head.shape[0])
@@ -514,9 +534,12 @@ class DeepseekV41ForCausalLMDSpark(DeepseekV41ForCausalLM, TargetCaptureConfigur
                     # The context write's merged projection loads the same
                     # shard as this stage's own wq_a_wkv.
                     yield f"context_wkv.{stage}.{wkv[1]}", tensor
-                if stage == 0 and suffix.startswith(("main_proj.", "main_norm.")):
-                    name = suffix
-                elif stage == self.model.num_stages - 1 and suffix == "norm.weight":
+                if (
+                    stage == 0
+                    and suffix.startswith(("main_proj.", "main_norm."))
+                    or stage == self.model.num_stages - 1
+                    and suffix == "norm.weight"
+                ):
                     name = suffix
                 elif stage == self.model.num_stages - 1 and suffix in (
                     "markov_head.embed.weight",

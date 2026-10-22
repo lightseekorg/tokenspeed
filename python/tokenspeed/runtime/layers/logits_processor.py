@@ -592,6 +592,8 @@ class LogitsProcessor(nn.Module):
         Returns:
             The state, or None when this group must use the gather path.
         """
+        if not current_platform().is_nvidia:
+            return None
         device = lm_head.weight.device
         key = (
             self.tp_group,

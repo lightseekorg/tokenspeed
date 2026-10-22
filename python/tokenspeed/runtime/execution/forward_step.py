@@ -696,6 +696,19 @@ class ForwardStepRunner:
 
         return graph, out
 
+    def _update_npu_graph_host_lengths(self, graph, seq_lens) -> None:
+        backends = (self.attn_backend, self.draft_attn_backend)
+        if any(
+            backend.npu_graph_requires_host_lengths()
+            for backend in backends
+            if backend is not None
+        ):
+            graph.update(
+                cpu_update_input=[
+                    {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                ]
+            )
+
     def warmup_decode_path(
         self,
         batch_sizes: tuple[int, ...],
@@ -1158,11 +1171,7 @@ class ForwardStepRunner:
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
-                graph.update(
-                    cpu_update_input=[
-                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                    ]
-                )
+                self._update_npu_graph_host_lengths(graph, seq_lens)
             if self._expert_load_rows is not None:
                 # Every rank replays the same padded batch; the live rows are
                 # the DP-gathered live counts (this rank's own without DP).

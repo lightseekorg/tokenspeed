@@ -864,8 +864,7 @@ def _moe_sigmoid_bias_topk(
         or not logical_to_physical_map.is_contiguous()
     ):
         raise ValueError(
-            "logical_to_physical_map must be contiguous colocated INT32/INT64 "
-            "[experts]"
+            "logical_to_physical_map must be contiguous colocated INT32/INT64 [experts]"
         )
     if not 0 < topk <= experts:
         raise ValueError(f"topk must be in [1, {experts}], got {topk}")
@@ -1045,6 +1044,11 @@ def _assert_indices_in_range(
     upper_bound: int,
     name: str,
 ) -> None:
+    if indices.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.dsv41_router import assert_indices_in_range
+
+        assert_indices_in_range(indices, upper_bound)
+        return
     valid = ((indices >= 0) & (indices < upper_bound)).all()
     message = f"{name} entries must be in [0, {upper_bound})"
     if indices.device.type == "cpu":

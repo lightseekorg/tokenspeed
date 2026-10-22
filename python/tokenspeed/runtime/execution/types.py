@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 import torch
 
 if TYPE_CHECKING:
+    from tokenspeed.runtime.execution.copy_completion import CopyStreamCompletion
     from tokenspeed.runtime.grammar.capturable_grammar import (
         GrammarStepCompletion,
     )
@@ -273,7 +274,8 @@ class ModelExecutionResult:
     """
 
     output_tokens: torch.Tensor
-    copy_event: torch.cuda.Event | None = None
+    # CUDA event or an exclusive NPU copy-stream completion, joined at commit.
+    copy_event: torch.cuda.Event | CopyStreamCompletion | None = None
     output_lengths: torch.Tensor | None = None
     grammar_completion: GrammarStepCompletion | None = None
     # Per-position logprob of the sampled token, same layout as output_tokens.

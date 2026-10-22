@@ -1,5 +1,11 @@
 # The unified decode path
 
+An idle attention-DP replica must retain the model's layer-entry collectives,
+including Engram when its table TP spans DP replicas. Its zero-row forward
+uses the same layer wrapper as active rows: Engram exchange/lookup comes before
+that layer's MoE exchange. Skipping the table lookup only on idle replicas
+deadlocks the remaining requests as a batch drains.
+
 This document records the invariants of the decode execution path after the
 persistent-batch unification: eager decode and CUDA-graph decode share one
 metadata path, one padding contract, one sampling route, and one output-buffer
@@ -171,6 +177,12 @@ their ordinary HCCL implementation. Eager and graph capture use the same
 collective path and return the original in-place output buffer.
 Ranks choose the collective from the shared dtype, operation and element
 count; local layout differences only require packing and copying back.
+
+HCCL token gathers preserve rank order. If the padded result consists of full
+shards, at most one partial shard, then empty ranks, its live rows are already a
+contiguous prefix: return that view without another concatenation. Interior
+padding still requires compaction. These decisions use the same host row counts
+in eager execution and graph capture; no device metadata is read on the host.
 
 ### Rebinding a cache pool
 
@@ -2031,6 +2043,13 @@ dense / MoE groups that are neither 1 nor the attention TP width in
 attention family (GPU DSA), device, and KV cache (bf16: the gathered write is
 `latent_store`, native rows only) in `AttnConfig`, which sees them resolved.
 
+## Ascend V4.1 decode graphs
+
+Ascend uses one native NPUGraph per batch-size bucket, including attention,
+MoE, HCCL collectives and device Engram lookup. The shared runner prepares
+request metadata before replay. Graph-visible buffers retain stable addresses;
+selection, cache and compressor operations consume refreshed device metadata.
+
 ## Non-goals
 
 Extend/mixed metadata keeps its dynamic-shape construction path
@@ -2182,3 +2201,46 @@ cache groups. Its eager and captured decode share metadata refresh and DCP
 partial-output reduction; SWA and compressor tails remain replicated. See
 [the V4.1 context-parallel contract](deepseek-v41-context-parallelism.md) for
 ownership, graph lifetime and supported configurations.
+
+### Ascend V4.1 execution
+
+Native MoE routing uses fixed-capacity buffers and device expert counts.
+Rank-major communication buffers must not undergo token-prefix padding cleanup.
+
+The runner queries target and draft attention trees for host length updates.
+Unknown leaves retain `graph.update`; V4.1 SFA consumes device selections and
+masks, and direct paged attention uses a fixed physical arena span. Those paths
+need no host length copy but still require in-place device metadata refresh.
+
+Attention-DP serving uses PD decode, PP1, EP across all ranks and rank-ordered
+MoE reduction. Target and draft use the same LM-head group and logits layout.
+Draft collective rows derive from `global_num_decodes` times proposal width,
+including zero-row idle replicas; they must not use total mixed-batch counts.
+KV windows and speculative request state remain local to the attention replica.
+
+`--engram-tp-size` can shard FP8/group32 device tables across attention replicas.
+Each layer gathers hash IDs, looks up its disjoint table shard, reduces over the
+table group, and selects local rows. Idle replicas participate in the same
+collectives. Wider table TP requires NPU, PP1, device tables, attention DP
+without QCP, and PD decode. Omitting the option retains attention-TP ownership.
+
+Shared-expert Dense TP may span whole attention cohorts. Experts consume the
+DP-global row list; only the first Dense cohort contributes the shared output
+to the rank-ordered EP reduction.
+
+Host metadata uploads use fresh pinned allocations, retained until transfer
+completion. Reusing mutable staging across overlapping rounds would race.
+
+Engram history assembly reuses the accepted tail for unchanged decode slots.
+Admissions, extends, retractions, slot handoffs and overrides retain checked
+snapshot seeding. Device history/hash kernels and accepted-frontier commit use
+the same persistent buffers and ownership as the shared path.
+
+An explicit `--draft-moe-backend ascend_bf16` with an `ascend_w4a4` target
+expands original draft checkpoint weights without the target FlatQuant transform.
+Target settings are restored after draft construction, including on failure.
+
+DSpark window copies use strided BF16 physical-slot access to avoid copying the
+whole arena field through advanced indexing. Invalid writes leave storage
+untouched; negative history slots read the null page under the visibility mask.
+Draft KV quantization and LCM/PD ownership are unchanged.

@@ -1181,6 +1181,7 @@ def test_engine_wrapper_requires_and_forwards_the_page_gathered_write(
     fields = np.zeros((2, 5), dtype=np.int64)
     seen = []
     wrapper = object.__new__(MooncakeTransferEngine)
+    wrapper.transport = "rdma"
     wrapper.engine = SimpleNamespace(
         batch_transfer_sync_write_pages=lambda session, s, d, f, batch: seen.append(
             ("pages", s, d, f, batch)

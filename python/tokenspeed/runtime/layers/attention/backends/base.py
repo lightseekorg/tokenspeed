@@ -307,6 +307,17 @@ class AttentionBackend(CachePoolBinding, ABC):
         super()._publish_cache_pool(cache_pool)
         self._sparse_topk.clear()
 
+    def npu_graph_requires_host_lengths(self) -> bool:
+        """Whether native NPU replay must update host attention attributes.
+
+        Unknown leaves retain the general FIA path. Composites can skip the
+        host synchronization only when every attention child can skip it.
+        """
+        children = self.child_backends()
+        return not children or any(
+            child.npu_graph_requires_host_lengths() for child in children
+        )
+
     def configure_runtime(self, **kwargs) -> None:
         """Post-load configuration hook (information unavailable at
         construction, e.g. sliding window sizes). Default: no-op."""

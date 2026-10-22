@@ -299,15 +299,18 @@ class ReplicatedLinear(LinearBase):
 
         if begin_size is not None:
             shard_size = loaded_weight.shape[0]
-            param[begin_size : begin_size + shard_size].data.copy_(loaded_weight)
+            param_data = param[begin_size : begin_size + shard_size].data
         elif shard_id is not None:
             shard_size = loaded_weight.shape[0]
-            param[shard_id * shard_size : (shard_id + 1) * shard_size].data.copy_(
-                loaded_weight
-            )
+            param_data = param[shard_id * shard_size : (shard_id + 1) * shard_size].data
         else:
             assert param.size() == loaded_weight.size()
-            param.data.copy_(loaded_weight)
+            param_data = param.data
+
+        if isinstance(param, BaseWeightParameter):
+            param.copy_weight(param_data, loaded_weight)
+        else:
+            param_data.copy_(loaded_weight)
 
     def forward(
         self,

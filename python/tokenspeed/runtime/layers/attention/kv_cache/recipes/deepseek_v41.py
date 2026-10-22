@@ -85,7 +85,23 @@ class DeepseekV41Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        return 0.05
+        # Dedicated index planes share parent IDs, not bytes, with FlatKV.
+        # The planner measures every group's share against the whole parent;
+        # check_layout below independently pins the exact allocation.
+        if not (
+            self.attn_config.component(DeepseekV41Config).bf16_index_cache
+            or self.attn_config.component(DeepseekV41Config).bf16_kv_cache
+        ):
+            return 0.05
+        total, packing = self._lcm_block_bytes(), self._group_packing()
+        return (
+            max(
+                total / packing[spec.group_id] / sum(f.payload_bytes for f in fields)
+                - 1
+                for spec, fields in self.groups()
+            )
+            + 1e-12
+        )
 
     def dspark_stages(self) -> int:
         """Number of same-checkpoint DSpark draft stages, 0 without DSpark."""
@@ -166,12 +182,30 @@ class DeepseekV41Recipe(CacheRecipe):
                     shape=shape,
                     dtype=dtype,
                     exact_page_stride=False,
-                    page_stride_alignment_bytes=stride_alignment,
+                    page_stride_alignment_bytes=(
+                        1024
+                        if self.attn_config.component(DeepseekV41Config).pa_mode
+                        == "direct"
+                        else stride_alignment
+                    ),
+                    field_offset_alignment_bytes=(
+                        1024
+                        if self.attn_config.component(DeepseekV41Config).pa_mode
+                        == "direct"
+                        else 1
+                    ),
                 )
             )
 
+        bf16_kv = self.attn_config.component(DeepseekV41Config).bf16_kv_cache
         for layer in range(self.num_target_layers):
-            add(V41_SWA_GROUP_ID, layer, "swa", (64, rows.swa_row_bytes), "uint8")
+            add(
+                V41_SWA_GROUP_ID,
+                layer,
+                "swa",
+                (64, 512 if bf16_kv else rows.swa_row_bytes),
+                "bfloat16" if bf16_kv else "uint8",
+            )
         # The draft reads each stage's window with the target's SWA slots, so
         # the rows live in the SWA group; the last target layer owns the field
         # ids, so PD and L2 treat them as target state produced with that layer.
@@ -187,8 +221,28 @@ class DeepseekV41Recipe(CacheRecipe):
             gid = (
                 V41_GLOBAL_R2_GROUP_ID if ratios[owner] == 2 else V41_GLOBAL_R1_GROUP_ID
             )
-            add(gid, owner, "global_kv", (64, rows.global_row_bytes), "uint8")
-            add(gid, owner, "index_k", (64, rows.index_row_bytes), "uint8")
+            add(
+                gid,
+                owner,
+                "global_kv",
+                (64, 512 if bf16_kv else rows.global_row_bytes),
+                "bfloat16" if bf16_kv else "uint8",
+            )
+            if self.attn_config.component(DeepseekV41Config).bf16_index_cache:
+                # One contiguous plane per owner permits native row gathers;
+                # LCM still owns allocation, zeroing, prefix reuse and transfer.
+                fields[gid].append(
+                    CacheFieldSpec(
+                        field_id=f"layer.{owner}.index_k",
+                        plane_id=f"index_bf16_{owner}",
+                        shape=(64, 128),
+                        dtype="bfloat16",
+                        exact_page_stride=True,
+                        page_stride_alignment_bytes=256,
+                    )
+                )
+            else:
+                add(gid, owner, "index_k", (64, rows.index_row_bytes), "uint8")
             if ratios[owner] == 2:
                 add(
                     V41_COMPRESSOR_TAIL_GROUP_ID,
@@ -242,6 +296,21 @@ class DeepseekV41Recipe(CacheRecipe):
         return rows.dspark_group_packing if self.dspark_stages() else rows.group_packing
 
     def _lcm_block_bytes(self) -> int:
+        spec = self.attn_config.component(DeepseekV41Config)
+        if spec.pa_mode == "direct" and not (
+            spec.bf16_kv_cache and spec.bf16_index_cache
+        ):
+            raise ValueError("Direct PA requires BF16 target KV and index cache")
+        if spec.bf16_kv_cache or spec.bf16_index_cache:
+            from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+            return pack(
+                self.groups(),
+                prefix_granularity=self.prefix_granularity,
+                cache_blocks_per_lcm_block=self._group_packing(),
+                alignment=self.alignment,
+                max_padding_fraction=20,
+            ).lcm_block_bytes
         rows = self._row_layout()
         return (
             rows.dspark_lcm_block_bytes
@@ -257,15 +326,26 @@ class DeepseekV41Recipe(CacheRecipe):
     @override
     def check_layout(self, layout: CacheLayout) -> None:
         expected = self._lcm_block_bytes()
-        if layout.lcm_block_bytes != expected or len(layout.plane_bytes) != 1:
+        planes = (
+            5 if self.attn_config.component(DeepseekV41Config).bf16_index_cache else 1
+        )
+        if layout.lcm_block_bytes != expected or len(layout.plane_bytes) != planes:
             raise ValueError(
-                f"DeepSeek V4.1 Flash requires one {expected:,}-byte plane"
+                f"DeepSeek V4.1 Flash requires {planes} planes totaling {expected:,} bytes"
             )
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
+        parent_bytes = layout.lcm_block_bytes
+        reserve = 0
+        if self.attn_config.component(DeepseekV41Config).pa_mode == "direct":
+            flat = dict(layout.plane_bytes)["flatkv"]
+            # Persistent zero64 rotary rows (one eighth of BF16-512 bytes)
+            # and int32 identity page table. Include the reserved null parent.
+            parent_bytes += (flat + 7) // 8 + (flat + 65535) // 65536 * 4
+            reserve = 8192 + 4 * 1024 * 1024  # tail rounding and query-zero slab
         budgeted = self._budgeted_parents(
-            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
+            self.cache_budget_bytes - self.workspace_bytes() - reserve, parent_bytes
         )
         return self.parents_needed(layout, self.token_capacity(layout, budgeted))
 

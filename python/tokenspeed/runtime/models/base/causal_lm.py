@@ -258,11 +258,11 @@ class BaseCausalLM(nn.Module):
 
         return LogitsProcessor(
             config,
-            skip_all_gather=self.mapping.attn.has_dp,
+            skip_all_gather=self.mapping.lm_head_skip_all_gather,
             tp_rank=self.mapping.lm_head.tp_rank,
             tp_size=self.mapping.lm_head.tp_size,
             tp_group=self.mapping.lm_head.tp_group,
-            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
+            dp_lm_head_tp=self.mapping.lm_head_crosses_attention_dp,
         )
 
     def post_init(self) -> None:

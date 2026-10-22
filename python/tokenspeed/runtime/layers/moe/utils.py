@@ -71,6 +71,8 @@ class All2AllBackend(Enum):
 
 
 class MoeBackend(Enum):
+    ASCEND_W4A4 = "ascend_w4a4"
+    ASCEND_BF16 = "ascend_bf16"
 
     AUTO = "auto"
     TRITON = "triton"

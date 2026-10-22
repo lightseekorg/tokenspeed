@@ -70,6 +70,7 @@ import os
 import re
 from collections import Counter
 from collections.abc import Iterable
+from contextlib import nullcontext
 from copy import copy
 from dataclasses import dataclass
 from weakref import WeakValueDictionary
@@ -83,6 +84,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     rope_inplace,
     rope_pad_query,
 )
+from tokenspeed_kernel.ops.communication.ascend import sum_token_shards
 from tokenspeed_kernel.ops.gemm import (
     dsv4_linear_fp32,
     grouped_bf16_projection,
@@ -104,6 +106,7 @@ from tokenspeed.runtime.distributed import Mapping
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
+    all_gather,
     all_reduce,
     all_reduce_mhc_post,
     can_acquire_all_reduce_outputs,
@@ -241,6 +244,17 @@ class _V41Fp8Config(Mxfp8Config):
         return _ReferenceFp8LinearMethod(self)
 
 
+class _NpuFp8ToBf16Parameter(ModelWeightParameter):
+    def copy_weight(
+        self, destination: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        # The shared loader has already selected this rank's shard. Ascend
+        # cannot cast FP8 codes on device, so widen only that shard on CPU.
+        if loaded_weight.dtype != torch.float8_e4m3fn:
+            raise TypeError("V4.1 dense loading requires FP8 checkpoint codes")
+        super().copy_weight(destination, loaded_weight.cpu().to(torch.bfloat16))
+
+
 class _ReferenceFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Mxfp8Config):
         super().__init__(quant_config)
@@ -252,7 +266,7 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         # every shape. So load the codes straight into a BF16 weight and fold
         # the power-of-two scales in once -- both exact in BF16 -- and run the
         # BF16 GEMM. Costs the FP8 weight size again.
-        self.load_as_bf16 = current_platform().is_hopper
+        self.load_as_bf16 = current_platform().is_hopper or current_platform().is_npu
 
     def create_weights(
         self,
@@ -264,27 +278,41 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        super().create_weights(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
-        )
+        target_device = torch.empty(0).device
+        # Ascend cannot allocate FP8 device tensors. Construct the generic
+        # loader metadata on CPU, then allocate only the final BF16 weight.
+        cpu_metadata = current_platform().is_npu and target_device.type != "meta"
+        with torch.device("cpu") if cpu_metadata else nullcontext():
+            super().create_weights(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
         if self.load_as_bf16:
             # Same shape and sharding loader as the FP8 parameter; the loader's
             # copy widens each E4M3 code to BF16 exactly.
             codes = layer.weight
-            layer.weight = ModelWeightParameter(
-                data=torch.empty_like(codes.data, dtype=torch.bfloat16),
+            parameter_cls = (
+                _NpuFp8ToBf16Parameter
+                if current_platform().is_npu
+                else ModelWeightParameter
+            )
+            layer.weight = parameter_cls(
+                data=torch.empty_like(
+                    codes.data, dtype=torch.bfloat16, device=target_device
+                ),
                 input_dim=codes.input_dim,
                 output_dim=codes.output_dim,
                 weight_loader=codes.weight_loader,
             )
             layer.weight.loads_fp8_codes = True
         scale = layer.weight_scale_inv
+        if cpu_metadata:
+            scale.data = scale.data.to(target_device)
         original_loader = scale.weight_loader
 
         def load_scale(
@@ -315,9 +343,13 @@ class _ReferenceFp8LinearMethod(Fp8LinearMethod):
             super().process_weights_after_loading(layer)
             self.prepare_weight_scales(layer)
             return
-        scale = layer.weight_scale_inv.data.view(torch.float8_e8m0fnu).to(
-            torch.bfloat16
-        )
+        scale_bytes = layer.weight_scale_inv.data
+        if current_platform().is_npu:
+            # One-time loading conversion; no FP8 dtype is created on Ascend.
+            scale = scale_bytes.cpu().view(torch.float8_e8m0fnu).to(torch.bfloat16)
+            scale = scale.to(layer.weight.device)
+        else:
+            scale = scale_bytes.view(torch.float8_e8m0fnu).to(torch.bfloat16)
         layer.weight.data.unflatten(-1, (-1, 32)).mul_(scale.unsqueeze(-1))
         layer.register_parameter("weight_scale_inv", None)
         layer.quant_method = UnquantizedLinearMethod()
@@ -431,7 +463,7 @@ def _replicated(input_size, output_size, dtype, quant_config, prefix):
     return layer
 
 
-def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
+def _column(input_size, output_size, dtype, quant_config, prefix, partition):
     layer = ColumnParallelLinear(
         input_size=input_size,
         output_size=output_size,
@@ -442,9 +474,9 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
         quant_config=quant_config,
         output_sizes=None,
         prefix=prefix,
-        tp_rank=mapping.attn.tp_rank,
-        tp_size=mapping.attn.tp_size,
-        tp_group=mapping.attn.tp_group,
+        tp_rank=partition.tp_rank,
+        tp_size=partition.tp_size,
+        tp_group=partition.tp_group,
         use_presharded_weights=False,
         override_kernel_name=None,
         interleave_linear_and_gate=False,
@@ -454,7 +486,7 @@ def _column(input_size, output_size, dtype, quant_config, prefix, mapping):
 
 def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     """RMSNorm in the reference cast order: FP32 scale, FP32 weight, one round."""
-    if x.is_cuda:
+    if x.is_cuda or x.device.type == "npu":
         from tokenspeed_kernel.ops.layernorm import reference_rmsnorm
 
         return reference_rmsnorm(x, norm.weight, norm.variance_epsilon, None)
@@ -550,7 +582,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
 
     def _prepare_cache(self, device: torch.device) -> None:
         if self.cos_sin_cache is None or self.cos_sin_cache.device != device:
-            if torch.cuda.is_current_stream_capturing():
+            if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("Warm up V4.1 RoPE before graph capture")
             key = (self._table_key, device)
             table = _ROPE_TABLES.get(key)
@@ -573,7 +605,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
     ) -> torch.Tensor:
         """Rotate only x's trailing RoPE dimensions at absolute token positions."""
-        if not x.is_cuda:
+        if x.device.type == "cpu":
             angles = positions.clamp_min(0).float().unsqueeze(-1) * self.inv_freq
             freqs = torch.polar(torch.ones_like(angles), angles)
             if inverse:
@@ -594,7 +626,7 @@ class DeepseekV41RotaryEmbedding(nn.Module):
         self, x: torch.Tensor, positions: torch.Tensor, inverse: bool
     ) -> torch.Tensor:
         """Rotate a fresh projection/output in place; never pass shared latents before index K reads them."""
-        if not x.is_cuda:
+        if x.device.type == "cpu":
             return self(x, positions, inverse)
         self._prepare_cache(x.device)
         cache = self.inverse_cos_sin_cache if inverse else self.cos_sin_cache
@@ -611,7 +643,7 @@ def v41_hc_mixes(
     sinkhorn_iters: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Derive pre/post/comb from the full HC stream; comb is [input HC, output HC]."""
-    if x.is_cuda:
+    if x.is_cuda or x.device.type == "npu":
         from tokenspeed_kernel.ops.residual import mhc_mixes
 
         return mhc_mixes(x, weight, scale, base, norm_eps, hc_eps, sinkhorn_iters)
@@ -645,7 +677,7 @@ def v41_hc_post(
     x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor
 ) -> torch.Tensor:
     """Apply the current sublayer's post/comb, summing input—not output—HC copies."""
-    if not x.is_cuda:
+    if not x.is_cuda and x.device.type != "npu":
         mixed = (comb.unsqueeze(-1) * residual.float().unsqueeze(-2)).sum(-3)
         return (post.unsqueeze(-1) * x.float().unsqueeze(-2) + mixed).to(x.dtype)
     from tokenspeed_kernel.ops.residual import mhc_post
@@ -654,6 +686,10 @@ def v41_hc_post(
 
 
 def _v41_hc_input(x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    if x.device.type == "npu":
+        from tokenspeed_kernel.ops.residual import mhc_apply_pre_norm
+
+        return mhc_apply_pre_norm(x, pre, norm.weight, norm.variance_epsilon)
     if not x.is_cuda:
         return _norm(v41_hc_pre(x, pre), norm)
     from tokenspeed_kernel.ops.residual import mhc_apply_pre
@@ -735,7 +771,7 @@ class DeepseekV41Compressor(nn.Module):
                 dsv4_linear_fp32(
                     x.contiguous(), self.wkv_wgate.weight, override=None, solution=None
                 )
-                if x.is_cuda
+                if x.is_cuda or x.device.type == "npu"
                 else F.linear(x.float(), self.wkv_wgate.weight.float())
             )
             content, scores = projected.chunk(2, dim=-1)
@@ -873,6 +909,33 @@ def _row_plan(layer_id: int, ced_decoder_start: int, ctx: ForwardContext) -> V41
     return V41RowPlan(view.metadata, view.metadata, None)
 
 
+def _npu_dp_moe(mapping) -> bool:
+    from tokenspeed.runtime.models.deepseek_v41_parallel import supports_ascend_dp_moe
+
+    enabled = supports_ascend_dp_moe(
+        mapping, get_moe_backend().value, current_platform().is_npu
+    )
+    if enabled and global_server_args_dict["moe_combine_order"] != "rank":
+        raise ValueError("Ascend V4.1 DP MoE requires --moe-combine-order rank")
+    return enabled
+
+
+def _npu_wide_tp_projection(config, mapping) -> bool:
+    """Use Dense TP for output projections when NPU attention TP exceeds groups.
+
+    Neighboring attention shards exchange only one output group's heads.
+    Group leaders contribute output partials; the first Dense TP cohort still
+    contributes shared-expert partials. Grouped GEMM dimensions are unchanged.
+    """
+    wide = current_platform().is_npu and mapping.attn.tp_size > config.o_groups
+    if wide and (mapping.dense.tp_size != config.o_groups or mapping.attn.dp_size != 1):
+        raise ValueError(
+            "NPU V4.1 attention TP wider than output groups requires attention DP1 "
+            f"and --dense-tp-size {config.o_groups}"
+        )
+    return wide
+
+
 class DeepseekV41Attention(nn.Module):
     def __init__(
         self,
@@ -892,7 +955,28 @@ class DeepseekV41Attention(nn.Module):
         self.mapping = mapping
         self.head_dim = config.head_dim
         self.n_local_heads = config.num_attention_heads // mapping.attn.tp_size
-        self.n_local_groups = config.o_groups // mapping.attn.tp_size
+        self.gather_output_heads = _npu_wide_tp_projection(config, mapping)
+        self.output_partition = mapping.attn
+        self.output_head_group = None
+        if self.gather_output_heads:
+            from tokenspeed.runtime.distributed.process_group_manager import (
+                process_group_manager,
+            )
+            from tokenspeed.runtime.models.deepseek_v41_parallel import (
+                grouped_output_partition,
+            )
+
+            self.output_partition, self.output_head_group = grouped_output_partition(
+                mapping, config.o_groups
+            )
+            # All model ranks construct these groups before warmup/capture.
+            if torch.distributed.is_initialized():
+                process_group_manager.init_process_group(
+                    self.output_head_group, backend="hccl"
+                )
+        self.output_heads = config.num_attention_heads // self.output_partition.tp_size
+        self.n_local_groups = config.o_groups // self.output_partition.tp_size
+        self.hidden_size = config.hidden_size
         self.o_lora_rank = config.o_lora_rank
         self.compress_ratio = config.compress_ratios[layer_id]
         self.is_kv_source = layer_id in config.kv_source_layer_ids
@@ -920,7 +1004,7 @@ class DeepseekV41Attention(nn.Module):
             torch.bfloat16,
             quant_config,
             add_prefix("wq_b", prefix),
-            mapping,
+            mapping.attn,
         )
         self.kv_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps).to(
             dtype=torch.bfloat16
@@ -931,7 +1015,7 @@ class DeepseekV41Attention(nn.Module):
             torch.bfloat16,
             None,
             add_prefix("wo_a", prefix),
-            mapping,
+            self.output_partition,
         )
         self.wo_b = RowParallelLinear(
             input_size=config.o_groups * config.o_lora_rank,
@@ -943,9 +1027,9 @@ class DeepseekV41Attention(nn.Module):
             reduce_results=False,
             quant_config=quant_config,
             prefix=add_prefix("wo_b", prefix),
-            tp_rank=mapping.attn.tp_rank,
-            tp_size=mapping.attn.tp_size,
-            tp_group=mapping.attn.tp_group,
+            tp_rank=self.output_partition.tp_rank,
+            tp_size=self.output_partition.tp_size,
+            tp_group=self.output_partition.tp_group,
             use_presharded_weights=False,
             override_kernel_name=None,
             interleave_linear_and_gate=False,
@@ -1256,6 +1340,52 @@ class DeepseekV41Attention(nn.Module):
         out = out[:, : self.n_local_heads]
         if out_rope_cache is None:
             out = self.rotary_emb.apply_owned(out, positions, True)
+        return self._project_output(out, reduce_output=reduce_output)
+
+    @torch.no_grad()
+    def prepare_wo_a_layout(self) -> None:
+        """Pretranspose the single-group NPU weight, preserving its logical shape."""
+        weight = self.wo_a.weight
+        if (
+            weight.device.type == "npu"
+            and weight.dtype == torch.bfloat16
+            and self.n_local_groups == 1
+            and weight.ndim == 2
+        ):
+            # The original einsum lowers to BMM with a transposed right operand.
+            # Store that right operand contiguously once; retain the Parameter,
+            # canonical checkpoint shape and the existing BMM arithmetic.
+            weight.data = weight.transpose(0, 1).contiguous().transpose(0, 1)
+
+    def _project_output(self, out, *, reduce_output=True):
+        projected = None
+        if self.gather_output_heads:
+            shards = len(self.output_head_group)
+            shard = self.mapping.attn.tp_rank % shards
+            local = out.flatten(1)
+            width = local.shape[1]
+            # Split wo_a's K dimension instead of gathering/transposing heads.
+            # Keep FP32 partials until the original BF16 projection boundary.
+            partial = dsv4_linear_fp32(
+                local,
+                self.wo_a.weight[:, shard * width : (shard + 1) * width],
+                override=None,
+                solution=None,
+            )
+            gathered = all_gather(partial, group=self.output_head_group, dim=0)
+            if shard:
+                partial = out.new_zeros(
+                    (out.shape[0], self.hidden_size), dtype=torch.float32
+                )
+                if not reduce_output:
+                    return partial.to(out.dtype)
+                return all_reduce(
+                    partial,
+                    group=self.mapping.attn.tp_group,
+                    backend=None,
+                    op=torch.distributed.ReduceOp.SUM,
+                ).to(out.dtype)
+            projected = sum_token_shards(gathered, shards)
         grouped = out.reshape(out.shape[0], self.n_local_groups, -1)
         weight = self.wo_a.weight.reshape(self.n_local_groups, self.o_lora_rank, -1)
         target = None
@@ -1266,7 +1396,9 @@ class DeepseekV41Attention(nn.Module):
                 self.mapping.attn.tp_group,
             )
         method = self.wo_b.quant_method
-        if (
+        if projected is not None:
+            out, _ = self.wo_b(projected, scale=None, out=target)
+        elif (
             grouped.is_cuda
             and (current_platform().is_cdna4 or current_platform().is_cdna5)
             and isinstance(method, _ReferenceFp8LinearMethod)
@@ -1279,12 +1411,16 @@ class DeepseekV41Attention(nn.Module):
             out = grouped_bf16_projection(grouped, weight, None, None).flatten(1)
             out, _ = self.wo_b(out, scale=None, out=target)
         if self.mapping.attn.has_tp and reduce_output:
+            output_dtype = out.dtype
+            fp32_reduce = self.gather_output_heads or (
+                out.device.type == "npu" and self.mapping.attn.dp_size > 1
+            )
             out = all_reduce(
-                out,
+                out.float() if fp32_reduce else out,
                 group=self.mapping.attn.tp_group,
                 backend=None,
                 op=torch.distributed.ReduceOp.SUM,
-            )
+            ).to(output_dtype)
         return out
 
 
@@ -1293,22 +1429,30 @@ class DeepseekV41MoE(DeepseekV4MoE):
 
     def __init__(self, config, mapping, quant_config, layer_index, prefix, aux_stream):
         expert_config = config
+        wide = _npu_wide_tp_projection(config, mapping)
+        self.dp_replicated_rows = _npu_dp_moe(mapping)
+        self.shared_projection_active = (
+            not (wide or self.dp_replicated_rows)
+            or mapping.moe.tp_ep_rank < mapping.dense.tp_size
+        )
         padded = (
             get_moe_backend().is_mega_moe() and config.moe_intermediate_size % 512 != 0
         )
-        if padded:
+        if padded or wide or self.dp_replicated_rows:
             # MegaMoE TMA loads require a 16-byte-aligned 1x32 scale row.
             # V4.1's 2304-wide routed FFN therefore needs 2560-wide storage.
             expert_config = copy(config)
-            expert_config.moe_intermediate_size = (
-                (config.moe_intermediate_size + 511) // 512 * 512
-            )
+            if padded:
+                expert_config.moe_intermediate_size = (
+                    (config.moe_intermediate_size + 511) // 512 * 512
+                )
             expert_config.n_shared_experts = None
         super().__init__(
             expert_config, mapping, quant_config, layer_index, prefix, aux_stream
         )
         self.gate.register_parameter("bias_vl", None)
-        if padded:
+        self.register_buffer("_npu_router_weight_fp32", None, persistent=False)
+        if padded or wide or self.dp_replicated_rows:
             self.config = config
             self.n_shared_experts = config.n_shared_experts
             if config.n_shared_experts is not None:
@@ -1324,8 +1468,40 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     is_shared_expert=False,
                 )
 
+    def _uses_replicated_dp_rows(self) -> bool:
+        return self.dp_replicated_rows
+
+    def _forward_shared_experts(self, hidden_states, ctx=None, comm_manager=None):
+        if not self.shared_projection_active:
+            return None
+        return super()._forward_shared_experts(hidden_states, ctx, comm_manager)
+
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob and self.config.num_experts_per_tok > 1
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        """Cache the loaded router weight's FP32 expansion on Ascend only.
+
+        Refresh an existing allocation in place, preserving graph pointers.
+        Initial creation is deferred to the first forward: dummy and sharded
+        loaders can populate parameters after this hook has already run.
+        """
+        del layer
+        weight = self.gate.weight.detach()
+        if weight.device.type != "npu":
+            self._npu_router_weight_fp32 = None
+        elif self._npu_router_weight_fp32 is None:
+            return
+        elif weight.dtype == torch.float32:
+            self._npu_router_weight_fp32 = weight
+        elif (
+            self._npu_router_weight_fp32.dtype != torch.float32
+            or self._npu_router_weight_fp32.shape != weight.shape
+            or self._npu_router_weight_fp32.device != weight.device
+        ):
+            self._npu_router_weight_fp32 = weight.float()
+        else:
+            self._npu_router_weight_fp32.copy_(weight)
 
     def _routing_inputs(self, hidden_states, image_mask):
         bias_vl = self.gate.bias_vl
@@ -1334,7 +1510,32 @@ class DeepseekV41MoE(DeepseekV4MoE):
         bias = self.gate.e_score_correction_bias
         if bias_vl is not None and image_mask is not None:
             bias = torch.where(image_mask.unsqueeze(-1), bias_vl, bias)
-        logits = F.linear(hidden_states.float(), self.gate.weight.float())
+        if (
+            hidden_states.device.type == "npu"
+            and hidden_states.dtype == torch.bfloat16
+            and self.gate.weight.dtype == torch.bfloat16
+        ):
+            # Keep the stored BF16 operands and FP32 logits, as on CUDA.
+            # This avoids expanding every activation into FP32 for CANN GEMM.
+            logits = dsv4_linear_fp32(
+                hidden_states, self.gate.weight, override=None, solution=None
+            )
+            return logits, bias, None, None
+        weight = (
+            self._npu_router_weight_fp32 if hidden_states.device.type == "npu" else None
+        )
+        if (
+            weight is None
+            or weight.dtype != torch.float32
+            or weight.device != self.gate.weight.device
+            or weight.shape != self.gate.weight.shape
+        ):
+            if hidden_states.device.type == "npu":
+                weight = self.gate.weight.detach().float()
+                self._npu_router_weight_fp32 = weight
+            else:
+                weight = self.gate.weight.float()
+        logits = F.linear(hidden_states.float(), weight)
         return logits, bias, None, None
 
 
@@ -1434,19 +1635,23 @@ class DeepseekV41DecoderLayer(nn.Module):
             # every decoder consumer are unnecessary for an open chunk.
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             self.attn(positions, x, ctx, reduce_output=True)
-            if self.ffn.owns_ep_communication:
+            if self.ffn.owns_ep_communication or self.ffn.dp_replicated_rows:
                 self._forward_ffn(
                     x[:0], None if image_mask is None else image_mask[:0], ctx, False
                 )
             return residual[:0], pre_mix[:0]
         overlap = (
-            residual.is_cuda
+            residual.device.type in ("cuda", "npu")
             and ctx.forward_mode is not None
             and ctx.forward_mode.is_decode()
             and self.hc_stream_fork.aux_stream is not None
             and self.hc_stream_fork.aux_stream.device == residual.device
         )
-        consumer = torch.cuda.current_stream() if overlap else None
+        consumer = (
+            torch.get_device_module(residual.device).current_stream()
+            if overlap
+            else None
+        )
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
         with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
@@ -1471,11 +1676,14 @@ class DeepseekV41DecoderLayer(nn.Module):
                     None,
                     None,
                 )
+            # NPU attention owns its FP32 reduction and BF16 rounding. Only
+            # CUDA can fuse the deferred all-reduce into mHC post below.
+            reduce_attention = residual.device.type == "npu"
             x = self.attn(
                 positions,
                 x,
                 ctx,
-                reduce_output=False,
+                reduce_output=reduce_attention,
                 hidden_codes=codes,
                 hidden_scales=scales,
             )
@@ -1492,7 +1700,11 @@ class DeepseekV41DecoderLayer(nn.Module):
             residual,
             post,
             comb,
-            self.attn.mapping.attn.tp_group if self.attn.mapping.attn.has_tp else None,
+            (
+                self.attn.mapping.attn.tp_group
+                if self.attn.mapping.attn.has_tp and not reduce_attention
+                else None
+            ),
         )
         residual = hidden_states
         if overlap:
@@ -1524,6 +1736,13 @@ class DeepseekV41DecoderLayer(nn.Module):
         """
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
+        if self.ffn.dp_replicated_rows:
+            from tokenspeed.runtime.models.deepseek_v41_parallel import (
+                replicated_rows_moe,
+            )
+
+            out = replicated_rows_moe(x, image_mask, ctx, self.ffn, self.comm_manager)
+            return (out, None) if defer_reduce else out
         if self.ffn.owns_ep_communication:
             counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
             out = self.ffn(
@@ -1665,7 +1884,19 @@ class DeepseekV41Model(nn.Module):
             == mapping.moe.tp_size
             == 1
         )
-        if mapping.attn.tp_size != mapping.moe.tp_ep_size and not local_fused_ep:
+        self.dp_replicated_rows = _npu_dp_moe(mapping)
+        self.decoder_cpu_group = None
+        if self.dp_replicated_rows:
+            from tokenspeed.runtime.models.deepseek_v41_parallel import (
+                create_decoder_cpu_group,
+            )
+
+            self.decoder_cpu_group = create_decoder_cpu_group(mapping)
+        if (
+            mapping.attn.tp_size != mapping.moe.tp_ep_size
+            and not local_fused_ep
+            and not self.dp_replicated_rows
+        ):
             raise NotImplementedError(
                 "V4.1 requires attention TP == MoE TPxEP or fused EP with attention/dense/MoE TP1"
             )
@@ -1675,15 +1906,16 @@ class DeepseekV41Model(nn.Module):
             )
         if config.num_hash_layers != 0:
             raise ValueError("V4.1 uses learned MoE routing, not V4 hash routing")
+        wide_projection = _npu_wide_tp_projection(config, mapping)
         if (
             any(
                 n % mapping.attn.tp_size
                 for n in (
                     config.num_attention_heads,
-                    config.o_groups,
                     config.index_n_heads,
                 )
             )
+            or (not wide_projection and config.o_groups % mapping.attn.tp_size)
             or config.num_attention_heads % config.o_groups
         ):
             raise ValueError(
@@ -1714,11 +1946,15 @@ class DeepseekV41Model(nn.Module):
         )
         device = self.embed_tokens.weight.device
         self.aux_stream = (
-            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+            torch.get_device_module(device).Stream(device=device)
+            if device.type in ("cuda", "npu")
+            else None
         )
         # HC must also overlap the attention/index and shared-expert branches.
         self.hc_stream = (
-            torch.cuda.Stream(device=device) if device.type == "cuda" else None
+            torch.get_device_module(device).Stream(device=device)
+            if device.type in ("cuda", "npu")
+            else None
         )
         self.layers = nn.ModuleList(
             [
@@ -1777,6 +2013,15 @@ class DeepseekV41Model(nn.Module):
         invocations are unsupported. The four stages below are the whole
         forward; the prefill graph calls them individually.
         """
+        decoder_counts = None
+        if self.dp_replicated_rows:
+            from tokenspeed.runtime.models.deepseek_v41_parallel import (
+                decoder_global_rows,
+            )
+
+            decoder_counts = decoder_global_rows(
+                ctx, self.mapping, self.decoder_cpu_group
+            )
         if input_ids.numel() == 0:
             if self.mapping.attn.has_dp:
                 hidden = self.embed_tokens.weight.new_empty(
@@ -1785,8 +2030,28 @@ class DeepseekV41Model(nn.Module):
                 pre_mix = torch.empty(
                     (0, self.config.hc_mult), dtype=torch.float32, device=hidden.device
                 )
+                state = V41RowState(
+                    hidden,
+                    pre_mix,
+                    positions,
+                    image_mask,
+                    None,
+                    engram_token_mask,
+                    [],
+                )
                 for layer in self.layers:
-                    hidden, pre_mix = layer(hidden, pre_mix, positions, image_mask, ctx)
+                    if (
+                        self.dp_replicated_rows
+                        and layer.layer_id >= self.ced_decoder_start
+                    ):
+                        with report_collective_sizing(ctx, 0, decoder_counts):
+                            hidden, pre_mix = self._run_layer(
+                                layer, hidden, pre_mix, state, ctx, state.captured
+                            )
+                    else:
+                        hidden, pre_mix = self._run_layer(
+                            layer, hidden, pre_mix, state, ctx, state.captured
+                        )
             return (
                 self.embed_tokens.weight.new_empty((0, self.config.hidden_size)),
                 None,
@@ -1803,8 +2068,12 @@ class DeepseekV41Model(nn.Module):
             engram_token_mask=engram_token_mask,
             image_mask=image_mask,
         )
-        state = self.narrowing_forward(state, ctx)
-        hidden, captured = self.decoder_forward(state, ctx)
+        state = self.narrowing_forward(
+            state, ctx, decoder_global_num_tokens=decoder_counts
+        )
+        hidden, captured = self.decoder_forward(
+            state, ctx, decoder_global_num_tokens=decoder_counts
+        )
         output = self.finish_forward(hidden, captured, ctx)
         backend.end_indexer_forward()
         return output
@@ -1824,10 +2093,27 @@ class DeepseekV41Model(nn.Module):
         unweighted HC mean the draft was trained on, appended to ``captured``.
         """
         if layer.engram is not None:
+            # An idle DP replica still owns table shards used by active peers.
+            # Keep its Engram collectives in the same layer order as live rows.
+            if hidden.shape[0] == 0:
+                hashes = torch.empty(
+                    (0, layer.engram.n_hash_cols),
+                    dtype=torch.int64,
+                    device=hidden.device,
+                )
+                mask = torch.empty(0, dtype=torch.bool, device=hidden.device)
+            else:
+                hashes = state.hashes[:, layer.engram.layer_hash_index]
+                mask = state.engram_token_mask
             hidden = layer.engram(
                 hidden,
-                state.hashes[:, layer.engram.layer_hash_index],
-                state.engram_token_mask,
+                hashes,
+                mask,
+                global_num_tokens=(
+                    ctx.collective_global_num_tokens
+                    if ctx.collective_global_num_tokens is not None
+                    else ctx.global_num_tokens
+                ),
             )
         if layer.layer_id in self.dspark_capture_layers:
             captured.append(hidden.mean(dim=1))
@@ -1887,7 +2173,13 @@ class DeepseekV41Model(nn.Module):
         state.hidden, state.pre_mix = h, pre_mix
         return state
 
-    def narrowing_forward(self, state: V41RowState, ctx: ForwardContext) -> V41RowState:
+    def narrowing_forward(
+        self,
+        state: V41RowState,
+        ctx: ForwardContext,
+        *,
+        decoder_global_num_tokens: list[int] | None = None,
+    ) -> V41RowState:
         """Run the candidate source layer and narrow to the decoder view.
 
         The layer projects the decoder's global KV from every row of ``state``
@@ -1913,6 +2205,7 @@ class DeepseekV41Model(nn.Module):
             view.keep_rows is not None
             and ctx.global_num_tokens is not None
             and not self.layers[start].ffn.owns_ep_communication
+            and decoder_global_num_tokens is None
         ):
             raise NotImplementedError(
                 "V4.1 CED narrowing under attention data parallelism needs the "
@@ -1922,7 +2215,9 @@ class DeepseekV41Model(nn.Module):
         # Fused EP exchanges actual local row counts inside its dispatch. The
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
-        with report_collective_sizing(ctx, view.metadata.positions.numel(), None):
+        with report_collective_sizing(
+            ctx, view.metadata.positions.numel(), decoder_global_num_tokens
+        ):
             hidden, pre_mix = self._run_layer(
                 self.layers[start], state.hidden, state.pre_mix, state, ctx, captured
             )
@@ -1949,7 +2244,11 @@ class DeepseekV41Model(nn.Module):
         )
 
     def decoder_forward(
-        self, state: V41RowState, ctx: ForwardContext
+        self,
+        state: V41RowState,
+        ctx: ForwardContext,
+        *,
+        decoder_global_num_tokens: list[int] | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Run the layers above the candidate source and the final norm.
 
@@ -1969,7 +2268,7 @@ class DeepseekV41Model(nn.Module):
         ctx.attn_backend.begin_indexer_stage()
         layers = self.layers[start + 1 :]
         if layers:
-            with report_collective_sizing(ctx, state.rows, None):
+            with report_collective_sizing(ctx, state.rows, decoder_global_num_tokens):
                 for layer in layers:
                     h, pre_mix = self._run_layer(
                         layer, h, pre_mix, state, ctx, captured
@@ -2345,7 +2644,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             raise ValueError(f"{name}: expected {expected}, got {tuple(tensor.shape)}")
         key = name.rsplit(".", 1)[0]
         rows = linear.weight.shape[0]
-        start = self.mapping.attn.tp_rank * rows
+        start = linear.tp_rank * rows
         # Retain only local codes/scales even when the two arrive in different files.
         if field == "scale":
             local = (
@@ -2368,9 +2667,23 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
             # Keep the dtype marker to reject a scale arriving after BF16 weights.
             pair["weight"] = weight.new_empty(0)
         elif scale is not None:
-            scale = scale.to(linear.weight.device).view(torch.float8_e8m0fnu).float()
+            if linear.weight.device.type == "npu":
+                # wo_a has a separate grouped loader; decode both FP8 formats
+                # before transfer, just as the ordinary NPU Dense loader does.
+                scale = (
+                    scale.cpu()
+                    .view(torch.float8_e8m0fnu)
+                    .float()
+                    .to(linear.weight.device)
+                )
+                weight = weight.cpu().float().to(linear.weight.device)
+            else:
+                scale = (
+                    scale.to(linear.weight.device).view(torch.float8_e8m0fnu).float()
+                )
+                weight = weight.to(linear.weight.device).float()
             scale = scale.repeat_interleave(32, dim=0)[start % 32 : start % 32 + rows]
-            weight = weight.to(linear.weight.device).float().unflatten(-1, (-1, 32))
+            weight = weight.unflatten(-1, (-1, 32))
             default_weight_loader(
                 linear.weight,
                 (weight * scale.unsqueeze(-1)).flatten(-2).to(torch.bfloat16),
@@ -2603,7 +2916,7 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
 
     def post_load_weights(self) -> None:
         for module in self.modules():
-            if isinstance(module, MoELayer):
+            if isinstance(module, (MoELayer, DeepseekV41MoE)):
                 module.process_weights_after_loading(module)
             elif isinstance(module, LinearBase) and isinstance(
                 module.quant_method, _ReferenceFp8LinearMethod
@@ -2611,6 +2924,8 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 # The target and DSpark share this hook. Refresh in place after
                 # a complete weight update; captured graphs retain the buffer.
                 module.quant_method.prepare_weight_scales(module)
+            elif isinstance(module, DeepseekV41Attention):
+                module.prepare_wo_a_layout()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded

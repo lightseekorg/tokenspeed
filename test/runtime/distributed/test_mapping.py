@@ -538,6 +538,28 @@ class TestLmHeadMapping:
         with pytest.raises(ValueError, match="attention TP group"):
             Mapping(rank=0, world_size=4, attn_tp_size=4, lm_head_tp_size=8)
 
+    def test_head_shards_within_each_attention_dp_replica(self):
+        for rank in range(16):
+            m = Mapping(
+                rank=rank,
+                world_size=16,
+                attn_tp_size=8,
+                attn_dp_size=2,
+                lm_head_tp_size=8,
+            )
+            assert m.lm_head.tp_group == m.attn.tp_group
+            assert m.lm_head.tp_rank == rank % 8
+            assert not m.lm_head_crosses_attention_dp
+            assert not m.lm_head_skip_all_gather
+        replicated = Mapping(rank=9, world_size=16, attn_tp_size=8, attn_dp_size=2)
+        assert replicated.lm_head_skip_all_gather
+        assert not replicated.lm_head_crosses_attention_dp
+        cross = Mapping(
+            rank=9, world_size=16, attn_tp_size=1, attn_dp_size=16, lm_head_tp_size=8
+        )
+        assert cross.lm_head_skip_all_gather
+        assert cross.lm_head_crosses_attention_dp
+
     def test_under_dp_needs_attention_tp_1(self):
         with pytest.raises(ValueError, match="attention TP 1"):
             Mapping(

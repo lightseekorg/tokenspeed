@@ -51,6 +51,9 @@ _PAGED_FORMATS = {
     "index": {68: "index", 132: "index_v4"},
 }
 _CAPABILITY = CapabilityRequirement(vendors=frozenset({"nvidia", "amd"}))
+_COMPRESSOR_CAPABILITY = CapabilityRequirement(
+    vendors=frozenset({"nvidia", "amd", "ascend"})
+)
 
 
 def _paged_format(cache, role):
@@ -394,8 +397,10 @@ def _scale_bytes(cache_format):
 
 
 def _same_device(x, tensors):
-    if not x.is_cuda or any(t.device != x.device for t in tensors if t is not None):
-        raise ValueError("all tensors must share a CUDA/ROCm device")
+    if x.device.type not in ("cuda", "npu") or any(
+        t.device != x.device for t in tensors if t is not None
+    ):
+        raise ValueError("all tensors must share a CUDA/ROCm or NPU device")
 
 
 def _integers(x, shape, name):
@@ -592,7 +597,7 @@ def _compressor_tail_scatter_kernel(
     "dsv41_compressor_tail_scatter",
     name="triton_dsv41_compressor_tail_scatter",
     solution="triton",
-    capability=_CAPABILITY,
+    capability=_COMPRESSOR_CAPABILITY,
     signatures=frozenset({format_signature(x=dense_tensor_format(torch.float32))}),
     priority=Priority.PORTABLE,
 )
@@ -802,7 +807,11 @@ def _index_inputs(q, weights, cache):
         torch.float32,
     ):
         raise ValueError("weights must be BF16/FP32 [tokens, heads], already scaled")
-    _cache(cache, _paged_format(cache, "index"))
+    if cache.dtype == torch.bfloat16:
+        if cache.ndim != 3 or cache.shape[1:] != (64, 128) or not cache.is_contiguous():
+            raise ValueError("BF16 index cache must be contiguous [pages, 64, 128]")
+    else:
+        _cache(cache, _paged_format(cache, "index"))
     _same_device(q, (weights, cache))
 
 
@@ -1356,7 +1365,7 @@ def _compressor_pool(
 ):
     row = tl.program_id(0)
     channels = tl.arange(0, 512)
-    live = tl.load(ACTIVE + row * A0)
+    live = tl.load(ACTIVE + row * A0).to(tl.int1)
     previous = tl.load(PREVIOUS + row * P0)
     slot = tl.load(SLOTS + row * S0)
     in_current = live & (previous >= 0) & (previous < N)
@@ -1393,7 +1402,7 @@ def _compressor_pool(
     "dsv41_compressor_pool",
     name="triton_dsv41_compressor_pool",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    capability=_COMPRESSOR_CAPABILITY,
     signatures=frozenset({format_signature(x=dense_tensor_format(torch.float32))}),
     priority=Priority.PORTABLE,
 )

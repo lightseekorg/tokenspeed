@@ -30,7 +30,7 @@ import socket
 from collections.abc import Sequence
 from typing import Literal
 
-from tokenspeed_kernel.ops.attention.gdn.triton import CHUNK_SIZE as FLA_CHUNK_SIZE
+from tokenspeed_kernel.ops.attention.gdn import CHUNK_SIZE as FLA_CHUNK_SIZE
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.numerics import (
@@ -486,6 +486,9 @@ class ServerArgs:
     dense_gemm_backend: str = "auto"
 
     # MoE backend
+    npu_flatquant_config: str | None = None
+    npu_v41_index_cache: str | None = None
+    npu_v41_kv_cache: str | None = None
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
@@ -574,6 +577,7 @@ class ServerArgs:
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
+    engram_tp_size: int | None = None
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -961,6 +965,17 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
+        if self.npu_flatquant_config is not None and self.moe_backend != "ascend_w4a4":
+            raise ValueError(
+                "--npu-flatquant-config requires --moe-backend ascend_w4a4"
+            )
+        if self.moe_backend in {"ascend_w4a4", "ascend_bf16"}:
+            if not current_platform().is_npu:
+                raise ValueError("Ascend MoE backends require an NPU")
+            if self.moe_mxfp4_fp8_activation:
+                raise ValueError("Ascend BF16/INT4 MoE cannot enable FP8 activations")
+            if self.moe_backend == "ascend_w4a4" and self.npu_flatquant_config is None:
+                raise ValueError("ascend_w4a4 requires --npu-flatquant-config")
         _require_choice(
             "--dense-gemm-backend",
             self.dense_gemm_backend,
@@ -1265,7 +1280,7 @@ class ServerArgs:
                     else ""
                 )
             )
-        if attn.has_dp and self.mapping.lm_head.has_tp and self.dp_sampling:
+        if self.mapping.lm_head_crosses_attention_dp and self.dp_sampling:
             raise ValueError(
                 "--lm-head-tp-size > 1 under attention DP transposes the logits "
                 "back to each rank's own rows and cannot combine with --dp-sampling"
@@ -2277,8 +2292,7 @@ class ServerArgs:
             nargs="?",
             metavar="model",
             default=None,
-            help="The model name or path (positional argument). "
-            "Equivalent to --model.",
+            help="The model name or path (positional argument). Equivalent to --model.",
         )
         parser.add_argument(
             "--model",
@@ -2916,10 +2930,31 @@ class ServerArgs:
             "Other quantization formats and routed experts are unchanged.",
         )
         parser.add_argument(
+            "--npu-v41-kv-cache",
+            choices=["bf16-qdq", "bf16"],
+            default=None,
+            help="Required NPU V4.1 KV storage mode: bf16 stores unquantized SWA/global KV; "
+            "bf16-qdq retains FP8 SWA/FP4 global quantization values in BF16 fields. "
+            "Both BF16 modes use the same storage capacity. Index Q/K is selected "
+            "separately with --npu-v41-index-cache.",
+        )
+        parser.add_argument(
+            "--npu-v41-index-cache",
+            choices=["bf16-qdq", "bf16"],
+            default=None,
+            help="Required NPU V4.1 index cache mode: bf16-qdq preserves FP4 operand values; bf16 uses unquantized index Q/K.",
+        )
+        parser.add_argument(
+            "--npu-flatquant-config",
+            type=str,
+            default=None,
+            help="Preconverted W4A4 shard manifest for ascend_w4a4; no online weight conversion.",
+        )
+        parser.add_argument(
             "--moe-backend",
             type=str,
             default=ServerArgs.moe_backend,
-            help="MoE runner backend: auto, triton, gluon, flashinfer_trtllm, "
+            help="MoE runner backend: auto, triton, gluon, ascend_w4a4, ascend_bf16, flashinfer_trtllm, "
             "flashinfer_cutlass, flashinfer_cutedsl, deep_gemm, mega_moe, "
             "gluon_petit, or a registered plugin solution. Under --numerics "
             "rl-bitwise the selected kernel must declare batch invariance.",
@@ -3155,8 +3190,16 @@ class ServerArgs:
             "--deepseek-v4-prefill-chunk-size",
             type=int,
             default=ServerArgs.deepseek_v4_prefill_chunk_size,
+            help=("Maximum number of requests per DeepSeek V4 FlashMLA prefill chunk."),
+        )
+        parser.add_argument(
+            "--engram-tp-size",
+            type=int,
+            default=ServerArgs.engram_tp_size,
             help=(
-                "Maximum number of requests per DeepSeek V4 FlashMLA prefill " "chunk."
+                "Engram device-table shard count. Omit to use attention TP. "
+                "Ascend V4.1 PD decode can use the whole EP world to share "
+                "the original FP8 tables across attention-DP replicas."
             ),
         )
         parser.add_argument(

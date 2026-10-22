@@ -79,3 +79,8 @@ Verify the gRPC servicer and the source paths together:
 PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}" \
     python -m smg_grpc_servicer.tokenspeed --help
 ```
+
+For V4.1, follow the [serving guide](../docs/guides/deepseek-v41-ascend.md)
+for additional external dependencies, native library builds and PD launch
+configuration. [Operator contracts](python/tokenspeed_kernel_npu/ops/README.dsv41.md)
+describe cache formats, numerical behavior and graph requirements.

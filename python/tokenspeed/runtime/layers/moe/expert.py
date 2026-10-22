@@ -42,6 +42,7 @@ from tokenspeed.runtime.layers.activation import SwigluArg
 from tokenspeed.runtime.layers.moe.topk import TopKOutput, TopKOutputFormat
 from tokenspeed.runtime.layers.moe.types import MoELayerSpec
 from tokenspeed.runtime.layers.moe.utils import (
+    MoeBackend,
     RoutingMethodType,
     get_all2all_backend,
     get_deepep_mode,
@@ -96,6 +97,9 @@ class MoELayer(torch.nn.Module):
     ):
         super().__init__()
         self.layer_index = layer_index
+        self.npu_flatquant_config: str | None = global_server_args_dict[
+            "npu_flatquant_config"
+        ]
         # Deployment-level override for the activation precision (e.g. a K3
         # w4a8 flag), forcing the value the quant_config would otherwise derive.
         self._internal_activation_dtype_override = internal_activation_dtype_override
@@ -344,6 +348,14 @@ class MoELayer(torch.nn.Module):
         # layer synthetic inputs (kernel tuning) must match it.
         self.input_dtype = input_dtype
 
+        if get_moe_backend() in (MoeBackend.ASCEND_W4A4, MoeBackend.ASCEND_BF16):
+            if internal_activation_dtype != "input":
+                raise ValueError(
+                    "Ascend BF16/INT4 MoE cannot override an explicit FP8/MXFP4 activation request"
+                )
+            if get_moe_backend() == MoeBackend.ASCEND_W4A4:
+                internal_activation_dtype = "int4"
+
         # Moe Backend plan
         moe_backend = get_moe_backend().value
         # Preserve the legacy CLI name; weight dtype selects the MegaMoE implementation.
@@ -545,6 +557,10 @@ class MoELayer(torch.nn.Module):
             self.plan["supports_deferred_finalize"] = False
             self.plan["precision_policy"] = precision_policy
             self.plan["output_scale"] = output_scale
+
+        if self.plan["solution"] in {"ascend_w4a4", "ascend_bf16"}:
+            if moe_backend != self.plan["solution"]:
+                raise ValueError("Select the Ascend V4.1 bring-up backend explicitly")
 
         create_layer_weights(
             self._spec,

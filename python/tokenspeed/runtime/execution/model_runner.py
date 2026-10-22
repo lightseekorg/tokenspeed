@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import inspect
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
@@ -98,6 +99,38 @@ def infer_multimodal_encoder_dtype(model: torch.nn.Module) -> str | None:
     return None
 
 
+@contextmanager
+def draft_moe_configuration(server_args, *, is_draft_worker: bool):
+    """Apply an explicit draft backend while constructing its own expert layers.
+
+    FlatQuant parameters belong to the W4A4 target when the user selects a BF16
+    draft. Restore the target configuration and backend even if loading fails.
+    """
+    override = (
+        is_draft_worker
+        and server_args.draft_moe_backend is not None
+        and server_args.draft_moe_backend != server_args.moe_backend
+    )
+    if not override:
+        yield
+        return
+    backend, flatquant = server_args.moe_backend, server_args.npu_flatquant_config
+    server_args.moe_backend = server_args.draft_moe_backend
+    if (
+        server_args.device == "npu"
+        and backend == "ascend_w4a4"
+        and server_args.draft_moe_backend == "ascend_bf16"
+    ):
+        server_args.npu_flatquant_config = None
+    try:
+        yield
+    finally:
+        server_args.moe_backend = backend
+        server_args.npu_flatquant_config = flatquant
+        global_server_args_dict_update(server_args)
+        initialize_moe_config(server_args)
+
+
 class ModelRunner:
     def __init__(
         self,
@@ -159,62 +192,50 @@ class ModelRunner:
             vocab_size=model_config.vocab_size,
         )
 
-        draft_moe_override = (
-            self.is_draft_worker
-            and server_args.draft_moe_backend is not None
-            and server_args.draft_moe_backend != server_args.moe_backend
-        )
-        if draft_moe_override:
-            saved_moe_backend = server_args.moe_backend
-            server_args.moe_backend = server_args.draft_moe_backend
+        with draft_moe_configuration(server_args, is_draft_worker=self.is_draft_worker):
+            # Auto-detect FP8 KV cache from checkpoint quant config (e.g. NVFP4 models
+            # with kv_cache_quant_algo: "FP8" in hf_quant_config.json).
+            if server_args.kv_cache_dtype == "auto":
+                quant_cfg = model_config._parse_quant_hf_config()
+                if quant_cfg is not None:
+                    kv_algo = quant_cfg.get("kv_cache_quant_algo")
+                    if isinstance(kv_algo, str) and kv_algo.upper() == "FP8":
+                        server_args.kv_cache_dtype = "fp8_e4m3"
+                        logger.info(
+                            "Auto-detected kv_cache_dtype=fp8_e4m3 from checkpoint "
+                            f"quant config (kv_cache_quant_algo={kv_algo!s})",
+                        )
 
-        # Auto-detect FP8 KV cache from checkpoint quant config (e.g. NVFP4 models
-        # with kv_cache_quant_algo: "FP8" in hf_quant_config.json).
-        if server_args.kv_cache_dtype == "auto":
-            quant_cfg = model_config._parse_quant_hf_config()
-            if quant_cfg is not None:
-                kv_algo = quant_cfg.get("kv_cache_quant_algo")
-                if isinstance(kv_algo, str) and kv_algo.upper() == "FP8":
-                    server_args.kv_cache_dtype = "fp8_e4m3"
-                    logger.info(
-                        "Auto-detected kv_cache_dtype=fp8_e4m3 from checkpoint "
-                        f"quant config (kv_cache_quant_algo={kv_algo!s})",
-                    )
-
-        global_server_args_dict_update(server_args)
-        initialize_moe_config(server_args)
-
-        self.memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-        # The target's expert placement (redundant replicas, load counters) is
-        # process-global so its model picks it up while it is built and loaded.
-        # A draft routes its own experts trivially: the target's placement is
-        # hidden while the draft is built, then restored for serving.
-        # Online rebalancing (--enable-eplb) moves the target's expert weights
-        # between slots: its staging buffer and P2P channels are reserved here,
-        # after the load and before the cache profile sizes the KV arena.
-        self.expert_location_updater: ExpertLocationUpdater | None = None
-        if self.is_draft_worker:
-            target_placement = get_global_expert_location_metadata()
-            set_global_expert_location_metadata(None)
-            try:
-                self.load_model()
-            finally:
-                set_global_expert_location_metadata(target_placement)
-        else:
-            set_global_expert_location_metadata(
-                build_expert_placement(server_args, model_config)
-            )
-            self.load_model()
-            if server_args.enable_eplb:
-                self.expert_location_updater = build_expert_location_updater(
-                    self.model, model_config, server_args
-                )
-        if draft_moe_override:
-            server_args.moe_backend = saved_moe_backend
             global_server_args_dict_update(server_args)
             initialize_moe_config(server_args)
+
+            self.memory_saver_adapter = TorchMemorySaverAdapter.create(
+                enable=server_args.enable_memory_saver
+            )
+            # The target's expert placement (redundant replicas, load counters) is
+            # process-global so its model picks it up while it is built and loaded.
+            # A draft routes its own experts trivially: the target's placement is
+            # hidden while the draft is built, then restored for serving.
+            # Online rebalancing (--enable-eplb) moves the target's expert weights
+            # between slots: its staging buffer and P2P channels are reserved here,
+            # after the load and before the cache profile sizes the KV arena.
+            self.expert_location_updater: ExpertLocationUpdater | None = None
+            if self.is_draft_worker:
+                target_placement = get_global_expert_location_metadata()
+                set_global_expert_location_metadata(None)
+                try:
+                    self.load_model()
+                finally:
+                    set_global_expert_location_metadata(target_placement)
+            else:
+                set_global_expert_location_metadata(
+                    build_expert_placement(server_args, model_config)
+                )
+                self.load_model()
+                if server_args.enable_eplb:
+                    self.expert_location_updater = build_expert_location_updater(
+                        self.model, model_config, server_args
+                    )
 
     def load_model(self):
         self.model = WeightLoader.load_model(

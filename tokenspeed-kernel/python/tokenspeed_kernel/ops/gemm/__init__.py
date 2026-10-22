@@ -3725,6 +3725,7 @@ def kimi3_router_projection(
 # Backend registration (side-effect imports)
 # isort: off
 import tokenspeed_kernel.numerics.torch.gemm  # noqa: E402,F401
+import tokenspeed_kernel.ops.gemm.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401

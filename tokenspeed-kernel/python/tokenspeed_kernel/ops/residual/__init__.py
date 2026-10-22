@@ -764,6 +764,45 @@ def mhc_apply_pre_quantize_fp8(
     return kernel(residual, pre, norm_weight, norm_eps)
 
 
+def mhc_apply_pre_norm(
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    weight: _torch.Tensor,
+    eps: float,
+) -> _torch.Tensor:
+    """Apply an existing HC4 pre-mix and RMSNorm, preserving BF16 rounding.
+
+    Args:
+        residual: BF16 residual streams [T,4,H].
+        pre: FP32 pre-mix [T,4], including strided coefficient rows.
+        weight: BF16 or FP32 RMSNorm weight [H].
+        eps: RMSNorm epsilon.
+
+    Returns:
+        BF16 layer input [T,H]. The mixed residual is rounded to BF16 before
+        computing RMSNorm in FP32. No coefficient generation is performed.
+    """
+    if residual.ndim != 3 or residual.shape[1] != 4 or residual.shape[2] < 1:
+        raise ValueError("mhc_apply_pre_norm requires residual [T,4,H], H > 0")
+    if pre.shape != residual.shape[:2] or weight.shape != (residual.shape[2],):
+        raise ValueError("mhc_apply_pre_norm shapes disagree")
+    if residual.dtype != _torch.bfloat16 or pre.dtype != _torch.float32:
+        raise ValueError("mhc_apply_pre_norm requires BF16 residual and FP32 pre")
+    if weight.dtype not in (_torch.bfloat16, _torch.float32):
+        raise ValueError("mhc_apply_pre_norm weight must be BF16 or FP32")
+    if any(t.device != residual.device for t in (pre, weight)):
+        raise ValueError("mhc_apply_pre_norm inputs must share a device")
+    kernel = select_kernel(
+        "residual",
+        "mhc_apply_pre_norm",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        override=None,
+        solution=None,
+    )
+    return kernel(residual, pre, weight, eps)
+
+
 def mhc_pre(
     residual: _torch.Tensor,
     fn: _torch.Tensor,
@@ -964,6 +1003,7 @@ def mhc_fused_hc(
 
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.ops.residual.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual.cuda  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary  # noqa: E402,F401
 import tokenspeed_kernel.ops.residual._triton.gated_boundary  # noqa: E402,F401
@@ -989,6 +1029,7 @@ __all__ = [
     "gated_residual_combine",
     "gated_residual_mix",
     "mhc_apply_pre",
+    "mhc_apply_pre_norm",
     "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",
     "mhc_mixes",
@@ -1032,7 +1073,7 @@ def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps
         raise ValueError("normalized_dot_gate shapes, mask or epsilon are invalid")
     values = (residual, key_value, query_weight, key_weight)
     if (
-        not residual.is_cuda
+        residual.device.type not in ("cuda", "npu")
         or any(t.dtype != _torch.bfloat16 for t in values)
         or any(
             not t.is_contiguous() or t.device != residual.device
@@ -1040,7 +1081,7 @@ def normalized_dot_gate(residual, key_value, query_weight, key_weight, mask, eps
         )
     ):
         raise ValueError(
-            "normalized_dot_gate requires contiguous colocated GPU BF16 operands"
+            "normalized_dot_gate requires contiguous colocated CUDA/NPU BF16 operands"
         )
     kernel = select_kernel(
         "residual",
