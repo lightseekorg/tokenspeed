@@ -766,3 +766,12 @@ cleanup runs outside the callback.
   the same round, decided from rank-identical state (counts the ranks keep
   the same, agreed flags), never from a rank's own view; a rank-local error
   inside such a sequence goes into the agreement instead of out of the round.
+
+## External encoder with an aggregated language model
+
+`--enable-encoder-disaggregation` enables the existing EPD receive path and
+receive-buffer budgeting in aggregated (`null`) mode. The Rust host gates
+requests carrying encoder handshakes until their embeddings are published;
+local image and text requests retain their normal admission path. The device
+side owns receive buffers and reassembly as on a prefill node. This does not
+construct a P/D KV-transfer peer or change where decode executes.

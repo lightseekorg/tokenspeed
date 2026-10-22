@@ -324,10 +324,11 @@ def build_epd_receive(
     attn_tp_cpu_group: Any,
     pg_manager,
 ) -> EpdReceive | None:
-    """The receive of a multimodal prefill node's first stage, None elsewhere
-    (a later pipeline stage receives nothing and follows the first's
-    decisions). Allocates the receive pools, which the cache budget left out
-    (``recv_pool_bytes``)."""
+    """Receive on a multimodal prefill or explicitly enabled aggregated node.
+
+    Only the first pipeline stage receives; later stages follow its decisions.
+    Allocates the receive pools left out by ``recv_pool_bytes``.
+    """
     if not is_epd_prefill_node(server_args, model_config.is_multimodal_active):
         return None
     # Resolved only past the gate: reading the vision tower's dtype raises on

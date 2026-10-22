@@ -729,6 +729,7 @@ class ServerArgs:
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
+    enable_encoder_disaggregation: bool = False
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
@@ -759,6 +760,10 @@ class ServerArgs:
         return _SPEC_OVERSHOOT_SPANS * int(self.speculative_num_draft_tokens)
 
     def __post_init__(self):
+        if self.enable_encoder_disaggregation and self.disaggregation_mode != "null":
+            raise ValueError(
+                "--enable-encoder-disaggregation is for aggregated mode only"
+            )
         self.resolve_basic_defaults()
         self.resolve_model_defaults()
         self.resolve_launcher_topology()
@@ -3991,6 +3996,11 @@ class ServerArgs:
             ),
         )
         # Disaggregation
+        parser.add_argument(
+            "--enable-encoder-disaggregation",
+            action="store_true",
+            help="Receive external encoder embeddings in aggregated mode without P/D KV transfer",
+        )
         parser.add_argument(
             "--disaggregation-mode",
             type=str,

@@ -1516,6 +1516,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_encoder_disaggregation=False,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -1606,23 +1607,26 @@ def test_each_rank_leaves_its_own_pool_out_before_the_minimum(monkeypatch) -> No
 @pytest.mark.parametrize("slots, slot_mb", [(2, 1), (0, 1), (-1, 1), (2, 0), (2, -1)])
 @pytest.mark.parametrize("num_deepstack", [0, 3])
 @pytest.mark.parametrize(
-    "mode, active",
+    "mode, active, external",
     [
-        ("prefill", True),
-        ("prefill", False),
-        ("decode", True),
-        ("null", True),
-        ("encode", True),
+        ("prefill", True, False),
+        ("prefill", False, False),
+        ("decode", True, False),
+        ("null", True, False),
+        ("null", True, True),
+        ("null", False, True),
+        ("encode", True, False),
     ],
 )
 def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
-    monkeypatch, slots, slot_mb, num_deepstack, mode, active
+    monkeypatch, slots, slot_mb, num_deepstack, mode, active, external
 ) -> None:
     from tokenspeed.runtime.epd import prefill_receive, recv_pool
 
     _receive_pool_env(monkeypatch, slots, slot_mb)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_encoder_disaggregation=external,
         mapping=SimpleNamespace(is_first_pp_rank=True),
     )
     facts = SimpleNamespace(
@@ -1647,7 +1651,12 @@ def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
         # the bytes the budget left out, losing at most their alignment.
         assert built >= left_out - 256 * (1 + num_deepstack) * settings.slots
     assert built <= left_out
-    receives = mode == "prefill" and active and slots > 0 and slot_mb > 0
+    receives = (
+        (mode == "prefill" or (mode == "null" and external))
+        and active
+        and slots > 0
+        and slot_mb > 0
+    )
     assert (built > 0) == (left_out > 0) == receives
 
 

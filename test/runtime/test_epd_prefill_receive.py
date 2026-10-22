@@ -280,6 +280,7 @@ def test_a_slot_returns_only_once_its_copy_finished():
 def _server_args(mode, *, first_stage=True):
     return SimpleNamespace(
         disaggregation_mode=mode,
+        enable_encoder_disaggregation=False,
         mapping=SimpleNamespace(is_first_pp_rank=first_stage),
     )
 
