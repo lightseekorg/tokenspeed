@@ -299,7 +299,9 @@ if platform.is_amd:
         routed_scaling_factor: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Split-K GEMV partials; the top-k kernel sums them in order.
-        partials = launch_gluon_router_sqrt_softplus_topk_gemv_gfx950(hidden_states, gate_weight)
+        partials = launch_gluon_router_sqrt_softplus_topk_gemv_gfx950(
+            hidden_states, gate_weight
+        )
         weights, ids, _ = _topk_impl(
             partials,
             top_k,
