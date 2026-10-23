@@ -1264,8 +1264,8 @@ def test_shifted_mhc_gpu_layer_matches_fallback(
             with cap:
                 captured = _complete_layer(*args)
             # Attention cannot fork across the eager break. The FFN fork joins
-            # inside its segment when native MegaMHC declines.
-            assert scopes == [False, not use_mega]
+            # inside its segment: MegaMHC is never captured.
+            assert scopes == [False, True]
             for _ in range(3):
                 residual.normal_()
                 pre.uniform_()
