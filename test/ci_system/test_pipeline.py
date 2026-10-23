@@ -1516,7 +1516,7 @@ def test_build_matrix_selects_kernel_benchmark_stage(tmp_path):
         tmp_path,
         tmp_path,
         trigger="per-commit",
-        runner_group="amd",
+        runner_group="amd-mi350",
         workflow_stage="kernel-benchmark",
     )
 
@@ -1587,7 +1587,7 @@ def test_build_matrix_can_select_or_exclude_multi_node_tasks(tmp_path):
         tmp_path,
         tmp_path,
         trigger="per-commit",
-        runner_group="amd",
+        runner_group="amd-mi350",
     ) == {"include": []}
 
 

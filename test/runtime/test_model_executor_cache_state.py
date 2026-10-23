@@ -158,6 +158,9 @@ def test_draft_final_step_follows_the_complete_drafter_run():
         def prepare_target_forward(self, ctx):
             events.append("prepare-target")
 
+        def rewrite_verify_outputs(self, ctx, output_tokens, accept_lengths):
+            pass
+
         def run(self, **_kwargs):
             events.extend(("draft-write-0", "draft-write-1", "draft-return"))
             return torch.tensor([7], dtype=torch.int32)

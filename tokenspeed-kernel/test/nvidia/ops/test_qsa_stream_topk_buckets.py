@@ -84,6 +84,10 @@ def _bucket_scores(capacity: int, device: str) -> list[tuple[str, torch.Tensor]]
         pytest.param(136, 32, 136, id="grouped-prefill"),
         pytest.param(136, 64, 136, id="dense-prefill"),
         pytest.param(136, 128, 136, id="overlap-prefill"),
+        pytest.param(137, 32, 137, id="grouped-prefill-tail"),
+        pytest.param(139, 64, 139, id="dense-prefill-tail"),
+        pytest.param(143, 128, 143, id="overlap-prefill-tail"),
+        pytest.param(15, 256, 15, id="split-prefill-tail"),
         pytest.param(136, 2048, 136, id="overlap-second-window"),
     ],
 )

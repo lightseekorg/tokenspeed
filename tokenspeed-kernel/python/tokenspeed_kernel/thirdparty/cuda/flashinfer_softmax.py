@@ -56,12 +56,18 @@ def softmax(
     logits: torch.Tensor,
     temperature: Optional[Union[float, torch.Tensor]] = None,
     enable_pdl: bool | None = None,
+    skip_greedy_top_ks: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """softmax(logits / temperature). Returns fp32 probs.
 
     With PDL enabled, logits and per-request temperatures may be written by a
     preceding kernel in the same stream. Every softmax kernel waits for those
     writes before reading either input; this also applies during graph replay.
+
+    ``skip_greedy_top_ks`` (``[rows]`` int32, read after the same wait): rows
+    whose top-k is 1 do no work and leave their row of the output (``out``
+    when given) unwritten.
     """
     enable_pdl = pdl_enabled() if enable_pdl is None else enable_pdl
     assert logits.is_contiguous(), "softmax expects contiguous logits"
@@ -81,7 +87,7 @@ def softmax(
         temp_arr = None
         temp_val = 1.0 if temperature is None else float(temperature)
 
-    output = torch.empty_like(logits, dtype=torch.float32)
+    output = torch.empty_like(logits, dtype=torch.float32) if out is None else out
     workspace = _get_workspace(logits.device)
     _load_module().softmax(
         workspace,
@@ -89,6 +95,7 @@ def softmax(
         output,
         temp_arr,
         float(temp_val),
+        skip_greedy_top_ks,
         enable_pdl,
     )
     return output

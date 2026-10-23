@@ -39,7 +39,7 @@ from tokenspeed.runtime.layers.logits_processor import (
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
-from tokenspeed.runtime.utils.server_args import ServerArgs
+from tokenspeed.runtime.utils.server_args import AUX_CAPTURE_SPEC_ALGORITHMS, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 
 if TYPE_CHECKING:
@@ -213,7 +213,7 @@ def configure_draft_target(
         )
     if DrafterImpl.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
-    if server_args.speculative_algorithm == "EAGLE3" and hasattr(
+    if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS and hasattr(
         model_runner.model, "set_eagle3_layers_to_capture"
     ):
         # capture the layers the draft was trained on, not the default

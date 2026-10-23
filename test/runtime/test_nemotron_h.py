@@ -483,6 +483,7 @@ def _super_cache_recipe(
             max_total_tokens=None,
             speculative_num_draft_tokens=draft_tokens,
             speculative_eagle_topk=topk,
+            speculative_draft_tree=with_draft and topk > 1,
             enable_replay_ssm=with_draft,
             kv_offload_config=None,
         ),
@@ -1273,6 +1274,87 @@ def test_mtp_checkpoint_names_map_onto_the_head():
     assert _mtp_param_name("mtp.layers.1.mixer.gate.weight") == (
         "layers.1.mixer.gate.weight"
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the BF16 squared-ReLU experts run on SM100-class GPUs",
+)
+def test_eagle_taps_are_the_full_stream_after_each_named_block(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """An EAGLE draft trained on layer ids reads, per id i, the residual stream
+    after block i (unnormed): the input of block i + 1, or of the final norm."""
+    from tokenspeed.runtime.distributed.mapping import Mapping
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+    from tokenspeed.runtime.layers.moe import utils as moe_utils
+    from tokenspeed.runtime.models.nemotron_h import NemotronHForCausalLM
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    mapping = Mapping(rank=0, world_size=1)
+    monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
+    monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
+    # The engine's default --moe-backend (an earlier test may have left another one set).
+    monkeypatch.setattr(moe_utils, "MOE_BACKEND", moe_utils.MoeBackend.AUTO)
+    config = _config(
+        hybrid_override_pattern="EEEE",
+        hidden_size=256,
+        vocab_size=64,
+        n_routed_experts=16,
+        num_experts_per_tok=4,
+        moe_intermediate_size=128,
+        moe_shared_expert_intermediate_size=256,
+        moe_latent_size=128,
+        routed_scaling_factor=2.5,
+    )
+    old_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with torch.device("cuda"):
+            model = NemotronHForCausalLM(config, mapping)
+    finally:
+        torch.set_default_dtype(old_dtype)
+    g = torch.Generator(device="cuda").manual_seed(5)
+    for param in model.parameters():
+        scale = param.shape[-1] ** -0.5 if param.dim() > 1 else 1.0
+        param.data.copy_(torch.randn(param.shape, generator=g, device="cuda") * scale)
+    for block in model.model.layers:
+        block.mixer.experts.process_weights_after_loading(block.mixer.experts)
+    outputs = []
+    for block in model.model.layers:
+        block.register_forward_hook(
+            lambda module, args, out: outputs.append(
+                ([t.clone() for t in out[0] if t is not None], out[1].clone())
+            )
+        )
+    tokens = torch.tensor([3, 1, 4, 1, 5, 9, 2], device="cuda")
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=1,
+        input_num_tokens=tokens.shape[0],
+        forward_mode=ForwardMode.EXTEND,
+        output_layout=None,
+    )
+    assert model.model(tokens, None, ctx)[1] is None
+
+    model.set_eagle3_layers_to_capture([0, 3])
+    outputs.clear()
+    _, taps = model.model(tokens, None, ctx)
+
+    def stream_after(block: int) -> torch.Tensor:
+        """The block's input residual plus its two partial outputs, rounded as
+        the fused add + norm rounds them."""
+        (routed, shared), residual = outputs[block]
+        return ((routed + shared).float() + residual.float()).bfloat16()
+
+    assert len(taps) == 2
+    assert torch.equal(taps[0], stream_after(0))
+    assert torch.equal(taps[1], stream_after(3))
+    # Not the stream entering the named block.
+    assert not torch.equal(taps[0], outputs[0][1])
 
 
 if __name__ == "__main__":

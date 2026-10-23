@@ -70,4 +70,4 @@ class FakeLLM:
         self.scheduler_calls.append(("abort", rid))
 
     async def flush_cache(self):
-        return None
+        return SimpleNamespace(success=self.succeed)

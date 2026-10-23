@@ -59,7 +59,6 @@ from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.config import metrics_enabled
-from tokenspeed.runtime.metrics.func_timer import enable_func_timer
 from tokenspeed.runtime.utils.network import (  # noqa: F401
     get_free_port,
     is_valid_ipv6_address,
@@ -726,7 +725,6 @@ def launch_dummy_health_check_server(host, port, enable_metrics):
     # Add prometheus middleware
     if enable_metrics:
         add_prometheus_middleware(app)
-        enable_func_timer()
 
     config = uvicorn.Config(
         app,

@@ -273,10 +273,10 @@ class TestConfigurationTest:
         with pytest.raises((ValueError), match=("DSA, FlashMLA")):
             self._config(components=(self._component("mha"),))
 
-    def test_kvp_keeps_the_host_kvstore_but_refuses_l3(self):
+    def test_kvp_keeps_host_kvstore_and_allows_l3(self):
         # Host blocks are allocated in their Device block's residue class, so
         # the KVStore (and the retraction snapshot pool) serve a sharded
-        # engine; an L3 key has no owner-stable form under sharding.
+        # engine. L3 keys use a replica identity independent of allocation.
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
         args.kv_parallel_size = 2
@@ -288,8 +288,7 @@ class TestConfigurationTest:
         assert args.enable_kvstore, "KVStore is on by default"
         args.validate_cache_options()
         args.kvstore_storage_backend = "mooncake"
-        with pytest.raises((ValueError), match=("L3")):
-            args.validate_cache_options()
+        args.validate_cache_options()
 
 
 if __name__ == "__main__":

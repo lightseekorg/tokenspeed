@@ -38,7 +38,7 @@ from tokenspeed.runtime.execution.types import (
 
 @pytest.fixture
 def thread():
-    ft = ForwardThread(torch.device("cpu"))
+    ft = ForwardThread(torch.device("cpu"), settle=lambda: None)
     yield ft
     ft.shutdown()
 
@@ -48,6 +48,21 @@ def test_fifo_order_and_results(thread):
     futures = [thread.submit(lambda i=i: (order.append(i), i)[1]) for i in range(100)]
     assert [f.result() for f in futures] == list(range(100))
     assert order == list(range(100))
+
+
+def test_tasks_see_the_pending_round_settled_but_forwards_settle_it_themselves():
+    """A forward's pending work (a drafter's round) is settled before any other
+    task runs; a forward settles it itself."""
+    pending = []
+    ft = ForwardThread(torch.device("cpu"), settle=pending.clear)
+    try:
+        pending.append("round")
+        assert ft.submit_forward(lambda: list(pending)).result() == ["round"]
+        assert ft.submit(lambda: list(pending)).result() == []
+        pending.append("round")
+        assert ft.run(lambda: list(pending)) == []
+    finally:
+        ft.shutdown()
 
 
 def test_exception_relayed_and_thread_survives(thread):
@@ -73,7 +88,7 @@ def test_submit_does_not_block_on_slow_work(thread):
 def test_pending_execution_joins_future_then_copy_event():
     calls = []
     results = SimpleNamespace(sync=lambda: calls.append("sync"))
-    ft = ForwardThread(torch.device("cpu"))
+    ft = ForwardThread(torch.device("cpu"), settle=lambda: None)
     try:
         pending = PendingExecution(ft.submit(lambda: (calls.append("run"), results)[1]))
         assert pending.result() is results
@@ -91,7 +106,7 @@ def test_sync_is_rejected_after_the_pending_execution_synced():
         output_tokens=torch.tensor([7], dtype=torch.int32),
         copy_event=event,
     )
-    ft = ForwardThread(torch.device("cpu"))
+    ft = ForwardThread(torch.device("cpu"), settle=lambda: None)
     try:
         assert PendingExecution(ft.submit(lambda: results)).result() is results
         with pytest.raises(RuntimeError, match="exactly once"):

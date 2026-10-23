@@ -33,9 +33,12 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_rendezvous,
     _iris_sync_peers,
     _iris_sync_rank_epoch,
+    iris_cache_policy,
 )
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
 from tokenspeed_kernel.platform import current_platform
+
+hip_utils = triton.language.extra.hip.utils
 
 if current_platform().is_cdna4:
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.quantize_gluon import (
@@ -114,12 +117,14 @@ class IrisAllGather:
         else:
             output = tensor.new_empty((num_tokens, total_hidden_size))
         chunk_rows = self.producer.data.numel() // total_hidden_size
+        policy = iris_cache_policy()
+        subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
         for start in range(0, num_tokens, chunk_rows):
             local = tensor[start : start + chunk_rows]
             rows = local.shape[0]
             elements_per_word = 8 // self.producer.data.element_size()
             local_words = rows * local_hidden_size // elements_per_word
-            block_words = 64 * 1 * 4
+            block_words = subgroup_size * 1 * 4
             num_tiles = triton.cdiv(local_words, block_words)
             num_programs = min(num_tiles, 84)
             published_input = (
@@ -141,9 +146,10 @@ class IrisAllGather:
                 TOTAL_HIDDEN_WORDS=total_hidden_size // elements_per_word,
                 BLOCK_WORDS=block_words,
                 NUM_WARPS=1,
-                SUBGROUP_SIZE=64,
                 WORDS_PER_LANE=4,
                 INPUT_PUBLISHED=published_input,
+                PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+                PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
                 num_warps=1,
             )
         return output
@@ -197,9 +203,10 @@ def iris_pull_allgather_columns(
     TOTAL_HIDDEN_WORDS: gl.constexpr,
     BLOCK_WORDS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     INPUT_PUBLISHED: gl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """Concatenate equal feature shards from four ranks into each local output.
 
@@ -208,6 +215,7 @@ def iris_pull_allgather_columns(
     Widths and element counts are measured in 64-bit words. Peer counters guard
     input publication and completion before the symmetric storage is reused.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     num_tiles = gl.cdiv(LOCAL_WORDS, BLOCK_WORDS)
     local_heap = _iris_heap_base(RANK, *heaps)
@@ -253,7 +261,7 @@ def iris_pull_allgather_columns(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
-        REMOTE_STORE_CACHE=".wt",
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
     gl.atomic_add(epoch_ptr, 0, sem="acquire", scope="sys")
 
@@ -275,7 +283,7 @@ def iris_pull_allgather_columns(
                 peer_input + output_offset,
                 mask=mask,
                 other=0,
-                cache_modifier=".cg",
+                cache_modifier=PEER_PAYLOAD_LOAD_CACHE,
             )
             gl.amd.cdna4.buffer_store(
                 packed,
@@ -297,7 +305,7 @@ def iris_pull_allgather_columns(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
-        REMOTE_STORE_CACHE=".wt",
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
 

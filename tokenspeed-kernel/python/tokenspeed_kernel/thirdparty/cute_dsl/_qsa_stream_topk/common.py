@@ -29,6 +29,23 @@ from cutlass.cute.typing import Pointer
 from cutlass.cutlass_dsl import dsl_user_op
 
 
+@cute.jit
+def _query_group_bounds(
+    group: cutlass.Int32, width: cutlass.Int32, has_tail: cutlass.Constexpr[bool]
+):
+    """Keep eight-row CTAs within one request, including its final partial group."""
+    row_base = group * 8
+    valid_rows = cutlass.Int32(8)
+    if cutlass.const_expr(has_tail):
+        groups_per_request = cute.ceil_div(width, 8)
+        request = group // groups_per_request
+        offset = (group % groups_per_request) * 8
+        row_base = request * width + offset
+        if offset + 8 > width:
+            valid_rows = width - offset
+    return row_base, valid_rows
+
+
 @dsl_user_op
 def _copy_u128(destination: Pointer, source: Pointer, *, loc=None, ip=None):
     _llvm.inline_asm(

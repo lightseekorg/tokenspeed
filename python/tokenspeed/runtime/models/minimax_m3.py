@@ -68,6 +68,9 @@ from tokenspeed.runtime.layers.parameter import (
     BlockQuantScaleParameter,
 )
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
+from tokenspeed.runtime.layers.quantization.mxfp8_nvfp4 import (
+    preprocess_mxfp8_nvfp4_weights,
+)
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from tokenspeed.runtime.model_loader.weight_utils import default_weight_loader
@@ -683,6 +686,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
         super().__init__()
         self.mapping = mapping
         self.layer_id = layer_id
+        self.is_final_layer = layer_id == config.num_hidden_layers - 1
         self.is_moe_layer = config.mlp_layer_types[layer_id] == "sparse"
         previous_is_moe_layer = (
             layer_id > 0 and config.mlp_layer_types[layer_id - 1] == "sparse"
@@ -764,9 +768,18 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
         else:
             hidden_states = self.mlp(hidden_states)
-        hidden_states, residual = self.comm_manager.post_mlp_fused(
-            hidden_states, residual, ctx
+        # In all-reduce mode the model's FinalNormOp reduces the last layer's
+        # MLP output, fused with the norm or not, so this layer must not reduce
+        # it as well. Idle forwards skip the final norm and keep this collective.
+        defer_to_final_norm = (
+            self.is_final_layer
+            and not ctx.forward_mode.is_idle()
+            and self.comm_manager.use_all_reduce(self.is_moe_layer)
         )
+        if not defer_to_final_norm:
+            hidden_states, residual = self.comm_manager.post_mlp_fused(
+                hidden_states, residual, ctx
+            )
         return hidden_states, residual
 
 
@@ -861,6 +874,7 @@ class MiniMaxM3SparseForCausalLM(BaseCausalLM):
         weights: Iterable[tuple[str, torch.Tensor]],
         **kwargs,
     ) -> set[str]:
+        weights = preprocess_mxfp8_nvfp4_weights(weights, self.quant_config)
         stacked_params_mapping = [
             (".qkv_proj", ".q_proj", "q"),
             (".qkv_proj", ".k_proj", "k"),
@@ -1682,7 +1696,6 @@ class MiniMaxM3SparseForConditionalGeneration(MiniMaxM3SparseForCausalLM):
             ctx=multimodal_context,
             encoders=self.get_multimodal_encoder_specs(),
             multimodal_model=self,
-            is_decode_or_idle=ctx.forward_mode.is_decode_or_idle(),
         )
         hidden_states, aux_hidden_states = self.model(
             input_ids,

@@ -118,7 +118,7 @@ class _Engine:
                 role="fused",
                 num_snapshot_pages=1,
                 max_retracted_requests=0,
-                l3_prefetch_min_pages=0,
+                storage_config=None,
                 decode_input_tokens=width,
                 overlap_schedule_depth=int(overlap),
                 cache_groups=[
@@ -191,7 +191,10 @@ class _Engine:
             batch.request_pool_indices,
             [self.stop_criteria[rid] for rid in batch.request_ids],
         )
-        self.buffers.fill_input_buffers(batch, self.states, total, ngram_inputs=None)
+        decode_input_ids = self.buffers.fill_input_buffers(batch, self.states, total)
+        self.buffers.load_round_inputs(
+            batch, self.states, total, decode_input_ids, ngram_inputs=None
+        )
         input_ids = self.buffers.input_ids_buf[:total].tolist()
         positions = self.buffers.positions_buf[:total].tolist()
         pages = batch.block_tables_arrays()["history"][0]

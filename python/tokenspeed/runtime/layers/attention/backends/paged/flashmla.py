@@ -213,10 +213,6 @@ class FlashMLABackend(PagedAttentionBackend):
         self.kv_indptr = torch.zeros(
             (max_bs + 1,), dtype=torch.int32, device=config.device
         )
-        self.qo_indptr = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=config.device
-        )
-
         self._build_prefill_wrappers()
         self.indices_updater_prefill = _PrefillIndicesUpdater(config, spec, self)
 
@@ -507,9 +503,6 @@ class FlashMLABackend(PagedAttentionBackend):
         page_table_cpu: torch.Tensor | None,
     ):
         # EXTEND path — flashinfer ragged/paged prefill.
-        seq_lens_cpu = seq_lens.cpu()
-        seq_lens_sum = seq_lens_cpu.sum().item()
-
         extend_no_prefix = not extend_with_prefix
         if extend_no_prefix and bool(extend_prefix_lens_cpu.any()):
             # The ragged plan sizes its paged kv_indices by the prefix sum
@@ -538,8 +531,9 @@ class FlashMLABackend(PagedAttentionBackend):
 
         self.indices_updater_prefill.update(
             seq_lens,
-            seq_lens_sum,
             extend_prefix_lens,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
+            prefix_lens_cpu=extend_prefix_lens_cpu,
             page_table=prefill_table,
             prefill_wrapper_paged=self.prefill_wrapper_paged,
             use_ragged=use_ragged,
@@ -940,37 +934,36 @@ class _PrefillIndicesUpdater:
         self.q_data_type = config.dtype
 
         self.kv_indptr = attn_backend.kv_indptr
-        self.qo_indptr = attn_backend.qo_indptr
         self.prefill_wrapper_ragged = attn_backend.prefill_wrapper_ragged
 
     def update(
         self,
         seq_lens: torch.Tensor,
-        seq_lens_sum: int,
         prefix_lens: torch.Tensor,
         *,
+        extend_seq_lens_cpu: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
         page_table: torch.Tensor,
         prefill_wrapper_paged: BatchMLAPagedAttentionWrapper,
         use_ragged: bool,
     ):
         if use_ragged:
             paged_kernel_lens = prefix_lens
-            paged_kernel_lens_sum = 0
+            paged_kernel_lens_cpu = prefix_lens_cpu
         else:
             paged_kernel_lens = seq_lens
-            paged_kernel_lens_sum = seq_lens_sum
+            paged_kernel_lens_cpu = prefix_lens_cpu + extend_seq_lens_cpu
 
         self._call_begin_forward(
             self.prefill_wrapper_ragged,
             prefill_wrapper_paged,
             paged_kernel_lens,
-            paged_kernel_lens_sum,
             seq_lens,
-            prefix_lens,
             self.kv_indptr,
-            self.qo_indptr,
             use_ragged,
             page_table,
+            paged_kernel_lens_cpu=paged_kernel_lens_cpu,
+            extend_seq_lens_cpu=extend_seq_lens_cpu,
         )
 
     def _call_begin_forward(
@@ -978,21 +971,35 @@ class _PrefillIndicesUpdater:
         wrapper_ragged: BatchPrefillWithRaggedKVCacheWrapper,
         wrapper_paged: BatchMLAPagedAttentionWrapper,
         paged_kernel_lens: torch.Tensor,
-        paged_kernel_lens_sum: int,
         seq_lens: torch.Tensor,
-        prefix_lens: torch.Tensor,
         kv_indptr: torch.Tensor,
-        qo_indptr: torch.Tensor,
         use_ragged: bool,
         page_table: torch.Tensor,
+        *,
+        paged_kernel_lens_cpu: torch.Tensor,
+        extend_seq_lens_cpu: torch.Tensor,
     ):
         bs = len(seq_lens)
         sm_scale = self.scaling
 
+        # FlashInfer plans on the host. Derive its CSR metadata from the
+        # runner's mirrors instead of downloading stream-ordered device lengths.
+        # Fresh pinned storage also prevents refilling a prior asynchronous H2D.
+        host_metadata = torch.empty(
+            (3, bs + 1), dtype=torch.int32, device="cpu", pin_memory=True
+        )
+        qo_indptr_cpu, kv_indptr_cpu = host_metadata[:2]
+        kv_len_arr_cpu = host_metadata[2, :bs]
+        qo_indptr_cpu[0] = 0
+        kv_indptr_cpu[0] = 0
+        kv_len_arr_cpu.copy_(paged_kernel_lens_cpu)
+        torch.cumsum(extend_seq_lens_cpu, dim=0, out=qo_indptr_cpu[1:])
+        torch.cumsum(kv_len_arr_cpu, dim=0, out=kv_indptr_cpu[1:])
+
         torch.cumsum(paged_kernel_lens, dim=0, out=kv_indptr[1 : bs + 1])
         kv_indptr = kv_indptr[: bs + 1]
         kv_indices = torch.empty(
-            paged_kernel_lens_sum,
+            int(kv_indptr_cpu[-1]),
             dtype=torch.int32,
             device=seq_lens.device,
         )
@@ -1003,26 +1010,23 @@ class _PrefillIndicesUpdater:
             kv_indices,
             page_table.shape[1],
         )
-        torch.cumsum(seq_lens - prefix_lens, dim=0, out=qo_indptr[1 : bs + 1])
-        qo_indptr = qo_indptr[: bs + 1]
-
         if use_ragged:
             wrapper_ragged.begin_forward(
-                qo_indptr=qo_indptr,
-                kv_indptr=qo_indptr,
+                qo_indptr=qo_indptr_cpu,
+                kv_indptr=qo_indptr_cpu,
                 num_qo_heads=self.num_local_heads,
                 num_kv_heads=self.num_local_heads,
                 head_dim_qk=self.qk_nope_head_dim + self.qk_rope_head_dim,
                 head_dim_vo=self.v_head_dim,
                 q_data_type=self.q_data_type,
+                non_blocking=True,
             )
         else:
-            kv_len_arr = kv_indptr[1:] - kv_indptr[:-1]
             wrapper_paged.plan(
-                qo_indptr,
-                kv_indptr,
+                qo_indptr_cpu,
+                kv_indptr_cpu,
                 kv_indices,
-                kv_len_arr,
+                kv_len_arr_cpu,
                 self.num_local_heads,
                 self.kv_lora_rank,
                 self.qk_rope_head_dim,

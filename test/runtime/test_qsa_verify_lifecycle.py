@@ -58,7 +58,9 @@ def _runner(
     events = []
     commits = {"recurrent": [], "ple": [], "qsa": []}
     wrapper = object.__new__(ForwardStepRunner)
-    wrapper.config = SimpleNamespace(spec_algo="MTP", max_req_pool_size=8, spec_topk=1)
+    wrapper.config = SimpleNamespace(
+        spec_algo="MTP", max_req_pool_size=8, spec_draft_tree=False
+    )
     wrapper.device = "cpu"
     full_backend = object.__new__(AttentionBackend)
     full_backend.device = "cpu"
@@ -117,7 +119,12 @@ def _runner(
         ),
     )
     wrapper.drafter = (
-        SimpleNamespace(attn_backend=draft_backend) if has_drafter else None
+        SimpleNamespace(
+            attn_backend=draft_backend,
+            replay_decode_graph=lambda graph, *, bs, graph_bs: graph.replay(),
+        )
+        if has_drafter
+        else None
     )
     wrapper.max_tokens_per_req = 4
     wrapper.input_buffers = SimpleNamespace(
@@ -184,6 +191,7 @@ def _run(wrapper, mode):
         positions=None,
         block_tables={},
         block_tables_cpu={},
+        settle=lambda: None,
     )
     assert ctx.bs == 2
     return result

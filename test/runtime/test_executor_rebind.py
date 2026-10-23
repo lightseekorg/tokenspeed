@@ -237,7 +237,8 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
         release_graphs=lambda: order.append("prefill")
     )
     executor.drafter = SimpleNamespace(
-        release_prefill_graph=lambda: order.append("drafter")
+        release_prefill_graph=lambda: order.append("drafter"),
+        release_round_graphs=lambda: order.append("drafter rounds"),
     )
     monkeypatch.setattr(
         module,
@@ -250,7 +251,14 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
 
     executor.release_graphs()
 
-    assert order == ["decode", "prefill", "drafter", ("unfreeze", "cuda"), "collect"]
+    assert order == [
+        "decode",
+        "prefill",
+        "drafter",
+        "drafter rounds",
+        ("unfreeze", "cuda"),
+        "collect",
+    ]
 
 
 def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeypatch):
