@@ -840,9 +840,12 @@ gather as zero values while their scale copies read row 0; the dequant reads
 NaN scale bytes as tiny or zero, so those rows stay zero even over unwritten
 memory.
 
-The zero-query check and the staged slot rows load clamped rather than
-masked, since a row mask becomes a branch and a full wait around each load.
-Outputs and partials store straight from the WMMA layout.
+Tiles dequantize from the ring straight into the QK operand layout. The BF16
+tile in LDS only feeds the transposed PV read, which reads 16 rows at once,
+so the ring pads each row by 16 bytes to keep them off shared banks. The
+zero-query check and the staged slot rows load clamped rather than masked,
+since a row mask becomes a branch and a full wait around each load. Outputs
+and partials store straight from the WMMA layout.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks

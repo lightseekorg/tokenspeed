@@ -369,49 +369,68 @@ def _issue_tile(
 
 
 @gluon.jit
-def _dequant_swa_rows(values, scales, RAW_LAYOUT: gl.constexpr):
-    """E4M3 [TILE_K, 16, 2, 16] times E8M0 per 32 dims into BF16 [TILE_K, 512].
+def _dequant_swa_tile(values_smem, scales_smem, WMMA_LAYOUT: gl.constexpr):
+    """E4M3 [TILE_K, 512] times E8M0 per 32 dims into the QK operand [512, TILE_K].
 
     The upcast runs at a uniform unit scale: a per-lane E8M0 scale reaches the
     wrong lanes on GFX1250. The power-of-two scale then multiplies exactly.
     """
-    unit = gl.full(values.shape, 127, dtype=gl.uint8, layout=RAW_LAYOUT)
+    k_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=8
+    )
+    values = values_smem.permute([1, 0]).load(k_layout)
+    unit = gl.full(values.shape, 127, dtype=gl.uint8, layout=k_layout)
     kv = gl.amd.cdna5.scaled_upcast(
         values.to(gl.float8e4nv, bitcast=True), unit, gl.bfloat16
     )
+    kv = kv.reshape([16, 32, kv.shape[1]])
+    scale_layout: gl.constexpr = gl.SliceLayout(1, kv.type.layout)
+    scales = scales_smem.permute([1, 0]).slice(0, 16, 0).load(scale_layout)
     # E8M0 byte s is 2^(s - 127): BF16 exponent bits, with s = 0 as 2^-127.
     # The NaN byte 0xFF (unwritten rows) takes 2^-127 too, so the zero values
     # of invalid rows stay zero.
     bits = gl.where((scales == 0) | (scales == 0xFF), 0x40, scales.to(gl.int16) << 7)
-    kv = kv * bits.to(gl.bfloat16, bitcast=True)[:, :, None, None]
-    return kv.reshape([kv.shape[0], 512])
+    kv = kv * bits.to(gl.bfloat16, bitcast=True)[:, None, :]
+    return gl.convert_layout(
+        kv.reshape([512, kv.shape[2]]), k_layout, assert_trivial=True
+    )
 
 
 @gluon.jit
-def _dequant_global_rows(values, scales, OUT_LAYOUT: gl.constexpr):
-    """E2M1 (even dim in the low nibble) times E4M3 into BF16 [TILE_K, 512].
+def _dequant_global_tile(values_smem, scales_smem, WMMA_LAYOUT: gl.constexpr):
+    """E2M1 [TILE_K, 256] (even dim in the low nibble) times E4M3 per 16 dims
+    into the QK operand [512, TILE_K].
 
     The upcast runs at unit E8M0 scale. E4M3 converts exactly to BF16, and an
     E2M1 value times an E4M3 scale needs at most five significant bits, so the
     product is exact before its single BF16 rounding.
     """
-    unit = gl.full([values.shape[0], 16, 2, 16], 127, dtype=gl.uint8, layout=OUT_LAYOUT)
-    kv = gl.convert_layout(
-        gl.amd.cdna5.scaled_upcast(values, unit, gl.bfloat16, axis=3), OUT_LAYOUT
+    k_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=8
     )
+    packed_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=WMMA_LAYOUT, k_width=4
+    )
+    values = values_smem.permute([1, 0]).load(packed_layout)
+    unit = gl.full(
+        [2 * values.shape[0], values.shape[1]], 127, dtype=gl.uint8, layout=k_layout
+    )
+    kv = gl.amd.cdna5.scaled_upcast(values, unit, gl.bfloat16, axis=0)
+    kv = kv.reshape([32, 16, kv.shape[1]])
+    scale_layout: gl.constexpr = gl.SliceLayout(1, kv.type.layout)
+    scales = scales_smem.permute([1, 0]).load(scale_layout)
     # NaN scales (0x7F, 0xFF; unwritten rows) read as zero, so the zero values
     # of invalid rows stay zero.
     scales = gl.where((scales & 0x7F) == 0x7F, 0, scales)
-    scale = gl.convert_layout(
-        scales.to(gl.float8e4nv, bitcast=True).to(gl.bfloat16),
-        gl.SliceLayout(3, OUT_LAYOUT),
+    kv = kv * scales.to(gl.float8e4nv, bitcast=True).to(gl.bfloat16)[:, None, :]
+    return gl.convert_layout(
+        kv.reshape([512, kv.shape[2]]), k_layout, assert_trivial=True
     )
-    kv = kv * scale[:, :, :, None]
-    return kv.reshape([kv.shape[0], 512])
 
 
 @gluon.jit
 def _attend_tile(
+    k_dot,
     kv_shared,
     valid_rows,
     q_dot,
@@ -428,7 +447,11 @@ def _attend_tile(
     TILE_K: gl.constexpr,
     WMMA_LAYOUT: gl.constexpr,
 ):
-    """Fold the dequantized BF16 tile [TILE_K, 512] in kv_shared into the softmax."""
+    """Fold a dequantized tile into the softmax.
+
+    k_dot is its BF16 QK operand [512, TILE_K] and kv_shared holds the same
+    tile as [TILE_K, 512] for PV.
+    """
     k_dot_layout: gl.constexpr = gl.DotOperandLayout(
         operand_index=1, parent=WMMA_LAYOUT, k_width=8
     )
@@ -436,11 +459,10 @@ def _attend_tile(
         operand_index=0, parent=WMMA_LAYOUT, k_width=8
     )
     # V is read from LDS only after QK, so the K and V operands are never live
-    # together; that register saving outweighs the second LDS read.
+    # together.
     # Invalid rows dequantize to zero, so all-one weights give the V row sum.
     ones = gl.full([BLOCK_H, TILE_K], 1.0, dtype=gl.bfloat16, layout=p_dot_layout)
     if active:
-        k_dot = kv_shared.permute([1, 0]).load(k_dot_layout)
         scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=WMMA_LAYOUT)
         scores = gl.amd.cdna5.wmma(q_dot, k_dot, scores) * softmax_scale
         scores = gl.where(
@@ -584,20 +606,6 @@ def gluon_dsv41_selected_attention_gfx1250(
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
-    # SWA rows dequantize as [TILE_K, 16, 2, 16]: a lane owns 16 bytes of one
-    # 32-dim E8M0 scale group.
-    swa_raw_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 1, 16], [1, 16, 2, 1], [4, 1, 1, 1], [3, 2, 1, 0]
-    )
-    swa_scale_layout: gl.constexpr = gl.SliceLayout(
-        2, gl.SliceLayout(3, swa_raw_layout)
-    )
-    global_raw_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 2, 8], [2, 16, 1, 1], [4, 1, 1, 1], [3, 2, 1, 0]
-    )
-    global_kv_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 2, 16], [2, 16, 1, 1], [4, 1, 1, 1], [3, 2, 1, 0]
-    )
     gather_row_layout: gl.constexpr = _warp_split_row_layout(TILE_K, 4, 32)
     raw_shared_1d: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[0]
@@ -605,9 +613,13 @@ def gluon_dsv41_selected_attention_gfx1250(
     raw_shared_2d: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
-    swa_row_layout: gl.constexpr = gl.SliceLayout(1, swa_scale_layout)
-    global_row_layout: gl.constexpr = gl.SliceLayout(
-        1, gl.SliceLayout(2, gl.SliceLayout(3, global_raw_layout))
+    # The QK operand reads 16 value rows at once; a 16-byte pad per row puts
+    # them in different banks.
+    swa_ring_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[512, 16]], [TILE_K, 512], [1, 0]
+    )
+    global_ring_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [TILE_K, 256], [1, 0]
     )
     score_row_layout: gl.constexpr = gl.SliceLayout(0, wmma)
     head_layout: gl.constexpr = gl.SliceLayout(1, wmma)
@@ -708,7 +720,7 @@ def gluon_dsv41_selected_attention_gfx1250(
         (global_page_stride // 256).to(gl.int32),
     )
     swa_values_ring = gl.allocate_shared_memory(
-        gl.uint8, [STAGES, TILE_K, 512], layout=raw_shared_2d
+        gl.uint8, [STAGES, TILE_K, 512], layout=swa_ring_layout
     )
     scales_ring = gl.allocate_shared_memory(
         gl.uint8, [STAGES, TILE_K, 32], layout=raw_shared_2d
@@ -718,18 +730,18 @@ def gluon_dsv41_selected_attention_gfx1250(
         shape=[swa_value_rows, 512],
         strides=[512, 1],
         block_shape=[TILE_K, 512],
-        layout=raw_shared_2d,
+        layout=swa_ring_layout,
     )
     if HAS_GLOBAL:
         global_values_ring = gl.allocate_shared_memory(
-            gl.uint8, [STAGES, TILE_K, 256], layout=raw_shared_2d
+            gl.uint8, [STAGES, TILE_K, 256], layout=global_ring_layout
         )
         global_value_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=global_cache,
             shape=[global_value_rows, 256],
             strides=[256, 1],
             block_shape=[TILE_K, 256],
-            layout=raw_shared_2d,
+            layout=global_ring_layout,
         )
     else:
         global_values_ring = swa_values_ring
@@ -899,7 +911,6 @@ def gluon_dsv41_selected_attention_gfx1250(
                 gl.amd.cdna5.tdm.async_wait(STAGES - 1)
                 gl.amd.cdna5.async_copy.wait_group(STAGES - 1)
                 buffer = tile % STAGES
-                is_swa = tile < swa_tiles_here
                 smem_row, _, _, _ = _tile_coords(
                     tile,
                     num_tiles,
@@ -914,39 +925,31 @@ def gluon_dsv41_selected_attention_gfx1250(
                     GLOBAL_TILES,
                     TILE_K,
                 )
-                if is_swa:
-                    swa_values = (
-                        swa_values_ring.index(buffer)
-                        .reshape([TILE_K, 16, 2, 16])
-                        .load(swa_raw_layout)
-                    )
-                    swa_scales = (
-                        scales_ring.index(buffer).slice(0, 16, 1).load(swa_scale_layout)
-                    )
-                    kv_shared.store(
-                        _dequant_swa_rows(swa_values, swa_scales, swa_raw_layout)
-                    )
+                # Tiles dequantize straight into the QK operand; LDS keeps a
+                # BF16 copy only for the transposed PV read.
+                if HAS_GLOBAL:
+                    if tile < swa_tiles_here:
+                        k_dot = _dequant_swa_tile(
+                            swa_values_ring.index(buffer),
+                            scales_ring.index(buffer),
+                            wmma,
+                        )
+                    else:
+                        k_dot = _dequant_global_tile(
+                            global_values_ring.index(buffer),
+                            scales_ring.index(buffer),
+                            wmma,
+                        )
                 else:
-                    if HAS_GLOBAL:
-                        global_values = (
-                            global_values_ring.index(buffer)
-                            .reshape([TILE_K, 16, 2, 8])
-                            .load(global_raw_layout)
-                        )
-                        global_scales = (
-                            scales_ring.index(buffer)
-                            .reshape([TILE_K, 16, 2])
-                            .load(gl.SliceLayout(3, global_raw_layout))
-                        )
-                        kv_shared.store(
-                            _dequant_global_rows(
-                                global_values, global_scales, global_kv_layout
-                            )
-                        )
+                    k_dot = _dequant_swa_tile(
+                        swa_values_ring.index(buffer), scales_ring.index(buffer), wmma
+                    )
+                kv_shared.permute([1, 0]).store(k_dot)
                 score_valid = (
                     gather_rows_smem.index(smem_row).load(score_row_layout) >= 0
                 )
                 max_value, denominator, accumulator, row_sum, row_count = _attend_tile(
+                    k_dot,
                     kv_shared,
                     score_valid,
                     q_dot,
