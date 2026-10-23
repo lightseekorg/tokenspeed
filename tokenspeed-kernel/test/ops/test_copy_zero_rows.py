@@ -73,13 +73,25 @@ def test_captured_graph_reads_the_count_at_replay(device) -> None:
 
 def test_varying_shapes_and_counts_reuse_one_compile(device) -> None:
     for rows in (16, 17):
-        zero_rows_after(
-            torch.ones(rows, 32, device=device), torch.tensor([3], device=device)
-        )
+        for dtype in (torch.int64, torch.int32):
+            zero_rows_after(
+                torch.ones(rows, 32, device=device),
+                torch.tensor([3], dtype=dtype, device=device),
+            )
     with assert_no_triton_compile(_zero_rows_after_kernel):
         for rows, cols, live in ((352, 6144, 300), (8192, 128, 8191), (1792, 37, 0)):
             _check(torch.ones(rows, cols, device=device), live)
         _check(torch.ones(512, 1024, device=device)[:, :999].t(), 7)
+        # The runtime passes the last entry of query_start_loc, whose offset
+        # in that buffer moves with the request count.
+        for num_requests in (1, 2, 3, 4):
+            query_start_loc = torch.arange(
+                0, 5 * num_requests + 1, 5, dtype=torch.int32, device=device
+            )
+            rows = torch.ones(32, 8, device=device)
+            zero_rows_after(rows, query_start_loc[-1:])
+            live = 5 * num_requests
+            assert rows[:live].eq(1).all() and rows[live:].eq(0).all()
 
 
 def test_column_offsets_past_int32_reach_their_rows(device) -> None:

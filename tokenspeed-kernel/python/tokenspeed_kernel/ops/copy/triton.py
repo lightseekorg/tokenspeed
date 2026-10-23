@@ -29,7 +29,13 @@ _BLOCK_ROWS = 16
 _BLOCK_COLS = 256
 
 
-@triton.jit(do_not_specialize=["rows", "cols", "row_stride", "col_stride"])
+# ``live_rows`` is often the last entry of a per-request offset table, so its
+# pointer alignment moves with the request count; it is read once, so keying
+# the compile on that alignment would only recompile while serving.
+@triton.jit(
+    do_not_specialize=["rows", "cols", "row_stride", "col_stride"],
+    do_not_specialize_on_alignment=["live_rows"],
+)
 def _zero_rows_after_kernel(
     data,
     live_rows,
