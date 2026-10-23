@@ -865,7 +865,9 @@ Its responsibilities:
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
   On Device, evicting a History block under a chain hash also evicts the
   State checkpoints under that hash, so Device state does not outlive the
-  KV it continues.
+  KV it continues. Evicting one State group's checkpoint there evicts every
+  other State group's checkpoint at the same hash, since a resume needs all
+  of them; it takes no KV along, which still serves the boundaries past it.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the

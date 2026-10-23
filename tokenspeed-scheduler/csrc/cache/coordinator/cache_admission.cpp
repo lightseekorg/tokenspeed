@@ -1087,8 +1087,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         }
     }
     // Nothing is published or reclaimed here, so every planned victim is a
-    // cache-only block the planner saw as evictable (or a tail companion an
-    // earlier victim's eviction already took).
+    // cache-only block the planner saw as evictable (or a tail companion or
+    // same-hash State checkpoint an earlier victim's cascade already took).
     for (const auto& [group_id, location] : candidate->victims) {
         if (!evictCachedBlock(group_id, location, &DeviceEvictionStats::restore)) {
             FatalCheck(!pool_.IsOccupied(location), "restore victim changed before acquisition");

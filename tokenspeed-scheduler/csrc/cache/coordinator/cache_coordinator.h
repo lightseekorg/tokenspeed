@@ -693,8 +693,9 @@ private:
     void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens,
                           DeviceEvictionCounts DeviceEvictionStats::*reason);
     // Device eviction of a planned or flushed victim, with its cascade (its
-    // tail's companions or the state checkpoints under its hash), all counted
-    // under `reason`.
+    // tail's companions or, for a page's KV block or one State group's
+    // checkpoint, every State group's checkpoint under its hash), all counted
+    // under `reason`. A companion still pinned elsewhere stays.
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                           DeviceEvictionCounts DeviceEvictionStats::*reason);
     // Device eviction of one entry without the tail cascade; the cascade

@@ -5651,6 +5651,117 @@ TEST_F(TailPublicationTest, CapCountsOnlyTheBlocksItEvictsAndLeavesAPinnedCompan
     EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 0u) << "the pool never ran short";
 }
 
+// ---------------------------------------------------------------------------
+// A state checkpoint resumes only with every State group's block at its hash,
+// so the blocks leave the Device together; the KV of its page stays. K3
+// shape: P = 4, one Full group (one block per page, four per parent) and three
+// State groups (one per parent), in a pool of exactly seven parents.
+// ---------------------------------------------------------------------------
+class StateCheckpointCascadeTest : public ::testing::Test {
+protected:
+    static constexpr std::int32_t kP = 4;
+
+    StateCheckpointCascadeTest()
+        : pool_(/*num_lcm_blocks=*/7, {4, 1, 1, 1}),
+          coordinator_{MakeCoordinator(
+              std::vector<CacheGroupSpec>{
+                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
+              kP, pool_, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+              /*stream_device_cache_to_host=*/false)},
+          hashes_{ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}})} {}
+
+    // A request over three pages publishes them with its checkpoint at their
+    // end (hashes_[2]) and finishes: one Full parent holds the three pages,
+    // three State parents the checkpoints, and the zero states' three parents
+    // are empty again.
+    void PublishCheckpointAndFinish() {
+        std::vector<BlockTable> tables(4);
+        ASSERT_TRUE(AdmitForTest(coordinator_, tables, 3 * kP));
+        CacheCompletedBlocksForTest(coordinator_, tables, hashes_,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
+                                    /*first_new_prefix_page=*/0, /*num_computed_tokens=*/3 * kP,
+                                    CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                    /*publish_state=*/true);
+        coordinator_.Free(tables);
+        ASSERT_EQ(coordinator_.NumEmptyLcmBlocks(), 3);
+    }
+
+    bool Cached(std::uint32_t group, std::size_t page) const {
+        return coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(group))
+            .Contains(pool_, Key(hashes_[page], group));
+    }
+
+    CacheBlockLocation CheckpointLocation(std::uint32_t group) const {
+        const std::optional<CacheBlockLocation> location =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, group, Key(hashes_[2], group));
+        _assert(location.has_value(), "the checkpoint is published");
+        return *location;
+    }
+
+    BlockPool pool_;
+    CacheCoordinator coordinator_;
+    std::vector<std::string> hashes_;
+};
+
+TEST_F(StateCheckpointCascadeTest, EvictingOneStateCheckpointEvictsTheOtherStateGroupsAtItsHash) {
+    PublishCheckpointAndFinish();
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 1, CheckpointLocation(1)));
+
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        EXPECT_FALSE(Cached(group, 2)) << "group " << group;
+    }
+    for (std::size_t page = 0; page < 3; ++page) {
+        EXPECT_TRUE(Cached(0, page)) << "a checkpoint takes no KV along: page " << page;
+    }
+    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(hashes_[2], 0), /*tail_tokens=*/0),
+              CacheCoordinator::BoundaryResidency::kPartial);
+    EXPECT_EQ(coordinator_.NumEmptyLcmBlocks(), 6) << "three State parents freed";
+    // The checkpoint and the two it takes along count under the same reason.
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 3u);
+}
+
+TEST_F(StateCheckpointCascadeTest, APinnedStateSiblingStaysWhenItsCheckpointIsEvicted) {
+    PublishCheckpointAndFinish();
+    // Group 3's checkpoint is held, as a request table resuming on it would.
+    CacheBlockRef pinned = coordinator_.GroupPrefixIndex(3).Find(pool_, Key(hashes_[2], 3));
+    ASSERT_TRUE(static_cast<bool>(pinned));
+
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, 2, CheckpointLocation(2)));
+    EXPECT_FALSE(Cached(1, 2));
+    EXPECT_FALSE(Cached(2, 2));
+    EXPECT_TRUE(Cached(3, 2)) << "the pinned sibling stays indexed";
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 2u) << "group 2's checkpoint and group 1's";
+
+    pinned.reset();
+    EXPECT_TRUE(Cached(3, 2)) << "released, it is an ordinary cache entry again";
+    EXPECT_EQ(coordinator_.NumEmptyLcmBlocks(), 5);
+}
+
+// A new request's six State blocks (a zero state and a live slot per group)
+// need three parents beyond the three empty ones: the planner takes the three
+// checkpoints, oldest-first group 1's, whose eviction takes the other two;
+// their own planned evictions then find them gone, and the admission fits.
+TEST_F(StateCheckpointCascadeTest, PlannedCheckpointVictimsLeaveTogether) {
+    PublishCheckpointAndFinish();
+    std::vector<BlockTable> tables(4);
+    ASSERT_TRUE(AdmitForTest(coordinator_, tables, kP));
+
+    for (std::size_t group = 1; group <= 3; ++group) {
+        EXPECT_EQ(tables[group].NumBlocks(), 2) << "group " << group;
+        EXPECT_FALSE(Cached(static_cast<std::uint32_t>(group), 2)) << "group " << group;
+    }
+    for (std::size_t page = 0; page < 3; ++page) {
+        EXPECT_TRUE(Cached(0, page)) << "the Full group's hole funds its block: page " << page;
+    }
+    // Each checkpoint counts once: a planned eviction that finds its victim
+    // already gone counts nothing.
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 3u);
+    coordinator_.Free(tables);
+}
+
 }  // namespace
 TEST(StoragePrefixReservationTest, DistributesRestoredPagesAcrossCyclicOwners) {
     BlockPool pool(4, {2});

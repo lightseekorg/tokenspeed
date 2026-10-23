@@ -1406,18 +1406,20 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     }
     if (const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(removed->content_hash)) {
         evictTailEntries(removed->content_hash, *tail_tokens, reason);
-    } else if (!GroupIsState(group_id)) {
-        // A state checkpoint is matched only with the KV below it: a KV block
-        // of its page gone, it is dead weight and leaves too.
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
+    } else {
+        // A state checkpoint is matched only with the KV below it and with
+        // the checkpoints every other State group holds at its hash: a KV
+        // block of its page gone, or one of those checkpoints, it is dead
+        // weight and leaves too. A checkpoint takes no KV along: the page
+        // still serves the boundaries past it.
+        ForEachBoundaryKey(*removed, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
             if (!GroupIsState(i)) {
-                continue;
+                return;
             }
-            const CacheKey key{.group_id = groups_[i].Id(), .content_hash = removed->content_hash, .page_offset = 0};
             if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
                 evictCachedBlockAlone(groups_[i].Id(), *location, reason);
             }
-        }
+        });
     }
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
