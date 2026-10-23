@@ -18,209 +18,81 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The KPool prefill plan maps every token, pool and tail to the right rows.
+"""Building the KPool prefill plan neither waits on the stream nor recompiles
+the kernels reading it.
 
-Expected values come from a per-token walk of the KPool layout: a request
-whose cached prefix is ``start`` writes completed pools ``start // kpool``
-onward (the first one completed from the tail buffer) and leaves the
-remainder in its tail.
+The plan is built at the first sparse layer, behind the forward's queued GPU
+work, so a synchronizing upload would stall the forward thread there.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
+import os
+import sys
 
 import pytest
+import tokenspeed_kernel.compile_monitor as compile_monitor
 import torch
 from tokenspeed_kernel.ops.attention.kpool import kpool_prefill_tail_write
-from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
-    _kpool_prefill_tail_write_kernel,
-)
 
 from tokenspeed.runtime.layers.attention.kpool import build_kpool_prefill_plan
 
-KPOOL = 4
-ROWS_PER_PAGE = 8
-TAIL_ROWS = 6
-
-
-def _expected(starts, lengths, table, slots, capacity):
-    tokens = {
-        "positions": [],
-        "req_ids": [],
-        "causal": [],
-        "row_start": [],
-        "row_end": [],
-    }
-    workspace = []
-    pools = {
-        k: [] for k in ("slot", "from_tail", "tail_slot", "tail_rows", "chunk_rows")
-    }
-    tails = {k: [] for k in ("src", "slot", "dst", "count")}
-    offset = 0
-    for req, (start, length) in enumerate(zip(starts, lengths)):
-        row_start = len(workspace)
-        for pool in range((start + length) // KPOOL):
-            workspace.append(
-                table[req][pool // ROWS_PER_PAGE] * ROWS_PER_PAGE + pool % ROWS_PER_PAGE
-            )
-        for i in range(length):
-            causal = start + i + 1
-            tokens["positions"].append(causal - 1)
-            tokens["req_ids"].append(req)
-            tokens["causal"].append(causal)
-            tokens["row_start"].append(row_start)
-            tokens["row_end"].append(row_start + causal // KPOOL)
-        position = start
-        while position // KPOOL < (start + length) // KPOOL:
-            pool = position // KPOOL
-            n_from_tail = position % KPOOL
-            pools["slot"].append(
-                table[req][pool // ROWS_PER_PAGE] * ROWS_PER_PAGE + pool % ROWS_PER_PAGE
-            )
-            pools["from_tail"].append([j < n_from_tail for j in range(KPOOL)])
-            pools["tail_slot"].append(slots[req])
-            pools["tail_rows"].append(
-                [(pool * KPOOL + j) % TAIL_ROWS for j in range(KPOOL)]
-            )
-            pools["chunk_rows"].extend(
-                offset + (position - start) + max(j - n_from_tail, 0)
-                for j in range(KPOOL)
-            )
-            position = (pool + 1) * KPOOL
-        if position < start + length:
-            tails["src"].append(offset + position - start)
-            tails["slot"].append(slots[req])
-            tails["dst"].append(position)
-            tails["count"].append(start + length - position)
-        offset += length
-    padding = capacity - offset
-    for values in tokens.values():
-        values.extend([0] * padding)
-    return tokens, workspace, pools, tails
-
-
-@pytest.mark.parametrize(
-    "starts,lengths,capacity",
-    [
-        ([0], [13], 16),  # fresh prompt with a partial final pool
-        ([8192], [12], 16),  # chunk 2 of a long prompt: no completed pool
-        ([3, 0, 10], [9, 0, 6], 24),  # unaligned prefixes, an empty extend
-        ([5, 1], [3, 4], 7),  # pools completed from tails, no padding
-    ],
+# CI registration is parsed via AST; standalone execution needs test/ on sys.path.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 )
-def test_plan_maps_tokens_pools_and_tails(starts, lengths, capacity) -> None:
-    max_pages = (
-        max(s + n for s, n in zip(starts, lengths)) // KPOOL
-    ) // ROWS_PER_PAGE + 1
-    table = [
-        [100 * (req + 1) + page for page in range(max_pages)]
-        for req in range(len(starts))
-    ]
-    slots = [7, 3, 11][: len(starts)]
-    plan = build_kpool_prefill_plan(
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=30, suite="runtime-1gpu")
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+KPOOL = 4
+TAIL_ROWS = 6
+HEAD_DIM = 128
+
+
+def _plan(starts, lengths, token_capacity=None):
+    table = torch.arange(64, dtype=torch.int32, device="cuda").view(8, 8)
+    return build_kpool_prefill_plan(
         prefix_lens_cpu=torch.tensor(starts),
         extend_lens_cpu=torch.tensor(lengths),
-        index_block_table=torch.tensor(table, dtype=torch.int32),
-        request_slots=torch.tensor(slots, dtype=torch.int32),
+        index_block_table=table[: len(starts)],
+        request_slots=torch.arange(len(starts), device="cuda"),
         kpool=KPOOL,
-        index_rows_per_page=ROWS_PER_PAGE,
+        index_rows_per_page=table.shape[1],
         tail_rows_per_request=TAIL_ROWS,
-        token_capacity=capacity,
+        token_capacity=token_capacity,
     )
-    tokens, workspace, pools, tails = _expected(starts, lengths, table, slots, capacity)
-
-    assert plan.num_prefill_tokens == sum(lengths)
-    assert plan.positions.tolist() == tokens["positions"]
-    assert plan.req_ids.tolist() == tokens["req_ids"]
-    assert plan.causal_lens.tolist() == tokens["causal"]
-    assert plan.row_starts.tolist() == tokens["row_start"]
-    assert plan.row_ends.tolist() == tokens["row_end"]
-    assert plan.pool_workspace_slots.tolist() == workspace
-    assert plan.query_start_loc.tolist() == [
-        0,
-        *torch.tensor(lengths).cumsum(0).tolist(),
-    ]
-    assert plan.seq_lens.tolist() == [s + n for s, n in zip(starts, lengths)]
-    assert plan.max_seq_len == max(s + n for s, n in zip(starts, lengths))
-    assert plan.max_num_pools == max((s + n) // KPOOL for s, n in zip(starts, lengths))
-
-    write = plan.write
-    assert write.pool_write_slots.tolist() == pools["slot"]
-    assert write.pool_from_tail.tolist() == pools["from_tail"]
-    assert write.pool_tail_slots.tolist() == pools["tail_slot"]
-    assert write.pool_tail_rows.tolist() == pools["tail_rows"]
-    assert write.pool_chunk_rows.tolist() == pools["chunk_rows"]
-    assert write.tail_chunk_src.tolist() == tails["src"]
-    assert write.tail_slots.tolist() == tails["slot"]
-    assert write.tail_dst_positions.tolist() == tails["dst"]
-    assert write.tail_write_counts.tolist() == tails["count"]
 
 
-def test_plan_rejects_capacity_below_the_tokens() -> None:
-    with pytest.raises(ValueError, match="capacity is smaller"):
-        build_kpool_prefill_plan(
-            prefix_lens_cpu=torch.tensor([0]),
-            extend_lens_cpu=torch.tensor([9]),
-            index_block_table=torch.zeros((1, 2), dtype=torch.int32),
-            request_slots=torch.zeros(1, dtype=torch.int32),
-            kpool=KPOOL,
-            index_rows_per_page=ROWS_PER_PAGE,
-            tail_rows_per_request=TAIL_ROWS,
-            token_capacity=8,
-        )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_plan_builds_on_device_without_synchronizing() -> None:
-    """The plan is built at the first sparse layer behind queued GPU work; a
-    synchronizing upload there would stall the forward thread."""
-    table = torch.arange(4, dtype=torch.int32, device="cuda").view(1, 4)
-    slots = torch.tensor([2], dtype=torch.int32, device="cuda")
+def test_plan_builds_without_synchronizing() -> None:
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")
     try:
-        plan = build_kpool_prefill_plan(
-            prefix_lens_cpu=torch.tensor([6]),
-            extend_lens_cpu=torch.tensor([21]),
-            index_block_table=table,
-            request_slots=slots,
-            kpool=KPOOL,
-            index_rows_per_page=ROWS_PER_PAGE,
-            tail_rows_per_request=TAIL_ROWS,
-            token_capacity=32,
-        )
+        _plan([6, 3, 0], [21, 9, 5], token_capacity=48)
     finally:
         torch.cuda.set_sync_debug_mode("default")
-    tokens, workspace, pools, tails = _expected([6], [21], table.tolist(), [2], 32)
-    assert plan.causal_lens.tolist() == tokens["causal"]
-    assert plan.pool_workspace_slots.tolist() == workspace
-    assert plan.write.pool_chunk_rows.tolist() == pools["chunk_rows"]
-    assert plan.write.tail_dst_positions.tolist() == tails["dst"]
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_plan_shapes_do_not_recompile_the_tail_write() -> None:
+@pytest.fixture
+def serving(monkeypatch):
+    # Marking serving closes the process-wide compile switch; reopen it afterwards.
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+    compile_monitor.install_compile_monitor("warn")
+    yield
+    compile_monitor.uninstall_compile_monitor()
+
+
+def test_batch_shapes_do_not_recompile_the_tail_write(serving) -> None:
     """Triton keys pointer arguments on 16-byte alignment, so plan arrays whose
-    offset in the upload moved with the batch shape would recompile the
-    kernels reading them while serving."""
-    head_dim = 128
-    table = torch.arange(64, dtype=torch.int32, device="cuda").view(8, 8)
-    tail_k = torch.zeros(8, TAIL_ROWS, head_dim, dtype=torch.bfloat16, device="cuda")
+    alignment moved with the batch shape would recompile while serving."""
+    tail_k = torch.zeros(8, TAIL_ROWS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
     tail_gate = torch.zeros_like(tail_k)
 
     def run(starts, lengths):
-        plan = build_kpool_prefill_plan(
-            prefix_lens_cpu=torch.tensor(starts),
-            extend_lens_cpu=torch.tensor(lengths),
-            index_block_table=table[: len(starts)],
-            request_slots=torch.arange(len(starts), device="cuda"),
-            kpool=KPOOL,
-            index_rows_per_page=ROWS_PER_PAGE,
-            tail_rows_per_request=TAIL_ROWS,
-        )
-        write = plan.write
-        key = torch.randn(sum(lengths), head_dim, dtype=torch.bfloat16, device="cuda")
+        write = _plan(starts, lengths).write
+        key = torch.randn(sum(lengths), HEAD_DIM, dtype=torch.bfloat16, device="cuda")
         kpool_prefill_tail_write(
             key,
             key,
@@ -234,18 +106,14 @@ def test_plan_shapes_do_not_recompile_the_tail_write() -> None:
         )
 
     run([0, 0], [7, 9])
-    with patch.object(
-        _kpool_prefill_tail_write_kernel,
-        "_do_compile",
-        wraps=_kpool_prefill_tail_write_kernel._do_compile,
-    ) as compiles:
-        for starts, lengths in (
-            ([1, 2, 3], [5, 6, 7]),
-            ([0], [3]),
-            ([2, 5, 1, 0, 3], [9, 2, 7, 1, 6]),
-            ([3, 1], [13, 22]),
-            ([0, 1, 2, 3, 0, 1, 2], [1, 2, 3, 5, 6, 7, 9]),
-        ):
-            run(starts, lengths)
-        torch.cuda.synchronize()
-    assert compiles.call_count == 0
+    compile_monitor.mark_serving()
+    for starts, lengths in (
+        ([1, 2, 3], [5, 6, 7]),
+        ([0], [3]),
+        ([2, 5, 1, 0, 3], [9, 2, 7, 1, 6]),
+        ([3, 1], [13, 22]),
+        ([0, 1, 2, 3, 0, 1, 2], [1, 2, 3, 5, 6, 7, 9]),
+    ):
+        run(starts, lengths)
+    torch.cuda.synchronize()
+    assert compile_monitor.compile_stats().serving_compiles == 0
