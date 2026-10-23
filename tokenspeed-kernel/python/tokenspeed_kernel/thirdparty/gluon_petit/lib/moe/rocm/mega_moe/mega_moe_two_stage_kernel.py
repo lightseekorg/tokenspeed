@@ -494,17 +494,20 @@ class MegaMoETwoStageCommComputeKernel(DeviceTemplate):
 class MegaMoECombineKernel(DeviceTemplate):
     kNumSMs, kNumWarps, kThreads, kOutputHandoffGridSyncIndex = 128, 8, 512, 4
 
-    def __init__(self, Config):
-        self._key = (Config.cache_key,)
+    def __init__(self, Config, kReduceRoutes):
+        self._key = (Config.cache_key, kReduceRoutes)
         self.Config, self.Workspace = Config, MegaMoEWorkspace(Config)
-        self.Reducer = SourceRouteReducer(Config, self.kNumSMs, self.kThreads)
+        self.Reducer = SourceRouteReducer(
+            Config, self.kNumSMs, self.kThreads, kReduceRoutes
+        )
 
     @device_method
     def Run(self, out, num_tokens, output_row_stride, base, rank, sm_id, tid):
-        """Synchronize stage-two writes across ranks and reduce local token routes.
+        """Synchronize stage-two writes across ranks and read local token routes.
 
         Every rank participates in the epoch handoff, even with zero tokens.
-        The reducer writes BF16 rows to out, using output_row_stride elements.
+        The reducer writes BF16 rows to out, using output_row_stride elements:
+        one summed row per token, or one row per route without reduction.
         """
         wid, wtid = tid // 64, tid % 64
         workspace = self.Workspace.Initialize(base, rank)

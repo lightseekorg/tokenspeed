@@ -87,8 +87,16 @@ class MegaMoETwoStage2Epilogue(TwoStageStage2Epilogue):
 
 
 class SourceRouteReducer(DeviceTemplate):
-    def __init__(self, Config, kGridBlocks=None, kBlockThreads=None):
-        self._key = (Config.cache_key, kGridBlocks, kBlockThreads)
+    """Read each local token's returned routes with system-coherent loads.
+
+    If ``kReduceRoutes`` is true, the reducer sums a token's routes into one
+    ``[hidden]`` output row; otherwise it copies them unsummed into
+    ``[topk, hidden]`` rows.
+    """
+
+    def __init__(self, Config, kGridBlocks, kBlockThreads, kReduceRoutes):
+        self._key = (Config.cache_key, kGridBlocks, kBlockThreads, kReduceRoutes)
+        self.kReduceRoutes = kReduceRoutes
         self.Workspace = MegaMoEWorkspace(Config)
         self.kNumRanks = Config.kNumRanks
         self.kNumSMs = Config.kNumSMs if kGridBlocks is None else kGridBlocks
@@ -161,26 +169,44 @@ class SourceRouteReducer(DeviceTemplate):
                             valid,
                         ),
                     )
-                zero = l.full((), 0.0, l.float32)
-                accum = ((zero, zero),) * kPackedElements
-                for topk in l.static_range(self.kTopK):
+                if self.kReduceRoutes:
+                    zero = l.full((), 0.0, l.float32)
+                    accum = ((zero, zero),) * kPackedElements
+                    for topk in l.static_range(self.kTopK):
+                        for pair in l.static_range(kPackedElements):
+                            word = route_values[topk][pair]
+                            bf16 = (
+                                (word << 16).to(l.float32, bitcast=True),
+                                (word & 0xFFFF0000).to(l.float32, bitcast=True),
+                            )
+                            value = amdgcn_pk_add_f32(accum[pair], bf16)
+                            accum = accum[:pair] + (value,) + accum[pair + 1 :]
+                    packed_output = ()
                     for pair in l.static_range(kPackedElements):
-                        word = route_values[topk][pair]
-                        bf16 = (
-                            (word << 16).to(l.float32, bitcast=True),
-                            (word & 0xFFFF0000).to(l.float32, bitcast=True),
+                        packed_output += (
+                            amdgcn_cvt_pk_bf16_f32(accum[pair][0], accum[pair][1]),
                         )
-                        value = amdgcn_pk_add_f32(accum[pair], bf16)
-                        accum = accum[:pair] + (value,) + accum[pair + 1 :]
-                packed_output = ()
-                for pair in l.static_range(kPackedElements):
-                    packed_output += (
-                        amdgcn_cvt_pk_bf16_f32(accum[pair][0], accum[pair][1]),
+                    store_vector4(
+                        output.to(l.pointer_type(l.uint32))
+                        + (
+                            token * (output_row_stride // self.kElementsPerVec)
+                            + vec_col
+                        )
+                        * 4,
+                        packed_output,
+                        valid,
                     )
-                store_vector4(
-                    output.to(l.pointer_type(l.uint32))
-                    + (token * (output_row_stride // self.kElementsPerVec) + vec_col)
-                    * 4,
-                    packed_output,
-                    valid,
-                )
+                else:
+                    # Each route row keeps output_row_stride elements.
+                    for topk in l.static_range(self.kTopK):
+                        store_vector4(
+                            output.to(l.pointer_type(l.uint32))
+                            + (
+                                (token * self.kTopK + topk)
+                                * (output_row_stride // self.kElementsPerVec)
+                                + vec_col
+                            )
+                            * 4,
+                            route_values[topk],
+                            valid,
+                        )

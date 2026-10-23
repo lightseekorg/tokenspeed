@@ -3002,12 +3002,23 @@ _DSV41_FLASH_DSPARK_PROFILE = _Profile(
     has_bias=False,
     activation="silu_clamped",
 )
+_MUSE_SPARK_PROFILE = _Profile(
+    name="muse_spark",
+    num_experts=256,
+    top_k=8,
+    model_dim=4096,
+    logical_intermediate=4096,
+    inter_dim=4096,
+    has_bias=False,
+    activation="silu",
+)
 _PROFILES = (
     _GPT_OSS_120B_PROFILE,
     _DSV4_PROFILE,
     _KIMI_K3_PROFILE,
     _DSV41_FLASH_PROFILE,
     _DSV41_FLASH_DSPARK_PROFILE,
+    _MUSE_SPARK_PROFILE,
 )
 
 
@@ -3149,19 +3160,19 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
         return profile
 
     if w.activation not in {"silu", "swiglu"} or w.swiglu_beta is not None:
-        raise ValueError("Gluon Petit DeepSeek MegaMoE requires standard SiLU")
+        raise ValueError("Gluon Petit SiLU MegaMoE requires standard SiLU")
     if w.w13_input_layout != "concatenated":
-        raise ValueError("Gluon Petit DeepSeek MegaMoE requires concatenated W13 input")
+        raise ValueError("Gluon Petit SiLU MegaMoE requires concatenated W13 input")
     swiglu_arg = getattr(w, "swiglu_arg", None)
     if swiglu_arg is not None and swiglu_arg.alpha is not None:
         raise ValueError(
-            "Gluon Petit DeepSeek MegaMoE does not support nonstandard SiLU alpha"
+            "Gluon Petit SiLU MegaMoE does not support nonstandard SiLU alpha"
         )
     if (
         getattr(w, "w13_weight_bias", None) is not None
         or getattr(w, "w2_weight_bias", None) is not None
     ):
-        raise ValueError("Gluon Petit DeepSeek MegaMoE requires bias-free experts")
+        raise ValueError("Gluon Petit SiLU MegaMoE requires bias-free experts")
 
     if profile.activation == "silu_clamped":
         if swiglu_arg is None or swiglu_arg.limit != 10.0:
@@ -3171,7 +3182,7 @@ def _validate_layer(w: torch.nn.Module) -> _Profile:
         return profile
     if swiglu_arg is not None and swiglu_arg.limit is not None:
         raise ValueError(
-            "Gluon Petit DSV4 MegaMoE does not support an activation clamp; "
+            "Gluon Petit unclamped SiLU MegaMoE does not support an activation clamp; "
             "select a backend that preserves the checkpoint activation"
         )
     return profile
@@ -3341,7 +3352,7 @@ def gluon_petit_mxfp4_megamoe_weights(plan: dict, w: torch.nn.Module) -> None:
         "weight_dtype": frozenset({"mxfp4"}),
         "activation": frozenset({"swiglu", "silu", "situ"}),
         "routing_mode": frozenset({"precomputed_topk"}),
-        "supports_deferred_finalize": frozenset({False}),
+        "supports_deferred_finalize": frozenset({False, True}),
         "supports_ep": frozenset({True}),
         "supports_all_to_all_ep": frozenset({True}),
         "a2a_backend": frozenset({"gluon_petit"}),
@@ -3365,7 +3376,7 @@ def gluon_petit_mxfp4_megamoe_apply(
     enable_pdl: bool,
     low_latency: bool | None,
     overlap_fn: Callable[[], None] | None,
-) -> torch.Tensor:
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, None]:
     """Run the fused Gluon Petit dispatch, experts, return, and combine path.
 
     Args:
@@ -3377,17 +3388,21 @@ def gluon_petit_mxfp4_megamoe_apply(
         topk_ids: Precomputed global expert ids for every local token.
         num_tokens_global: Unused global token-count hint.
         max_num_tokens_per_gpu: Largest local token count in this collective.
-        do_finalize: Whether to produce the combined output.
+        do_finalize: Whether to produce the combined output. If ``False``,
+            every local token's routes return to this rank unweighted and
+            unsummed.
         enable_pdl: Unused programmatic dependent launch setting.
         low_latency: Unused all-to-all mode hint.
         overlap_fn: Optional work to enqueue before the Petit collective.
 
     Returns:
-        Final local BF16 output with shape ``[local_tokens, model_dim]``.
+        Final local BF16 output with shape ``[local_tokens, model_dim]``. With
+        ``do_finalize=False``, ``(routes, topk_weights, None)``: ``routes``
+        holds each selected expert's unweighted BF16 output,
+        ``[local_tokens, top_k, model_dim]`` in ``topk_ids`` order, so no
+        permute map is returned.
     """
     del plan, router_logits, num_tokens_global, enable_pdl, low_latency
-    if not do_finalize:
-        raise ValueError("Gluon Petit MegaMoE does not support deferred finalize")
     if topk_weights is None or topk_ids is None:
         raise ValueError(
             "Gluon Petit MegaMoE requires precomputed top-k ids and weights"
@@ -3412,9 +3427,27 @@ def gluon_petit_mxfp4_megamoe_apply(
     if num_tokens:
         workspace.config.quantize(x.contiguous(), out=inputs)
         inputs.expert_ids.copy_(topk_ids.to(torch.int32))
-        inputs.expert_weights.copy_(topk_weights.to(torch.float32))
+        if do_finalize:
+            inputs.expert_weights.copy_(topk_weights.to(torch.float32))
+        else:
+            # Unit weights keep each route unscaled; the caller applies
+            # topk_weights after its per-route norm.
+            inputs.expert_weights.fill_(1.0)
     if overlap_fn is not None:
         overlap_fn()
+    if not do_finalize:
+        routes = workspace.config.run_routes(
+            workspace.heap,
+            state.w13_weight,
+            state.w2_weight,
+            state.w13_scale,
+            state.w2_scale,
+            num_tokens,
+            w13_bias=state.w13_bias,
+            w2_bias=state.w2_bias,
+            inputs=inputs,
+        )
+        return routes, topk_weights, None
     output = x.new_empty((num_tokens, profile.model_dim))
     return workspace.config.run(
         workspace.heap,

@@ -157,6 +157,7 @@ def MegaMoe(
     scales_w2,
     num_tokens,
     solution_id,
+    reduce_routes,
     w13_bias=None,
     w2_bias=None,
     out=None,
@@ -164,6 +165,11 @@ def MegaMoe(
     input_topk_ids=None,
     input_topk_weights=None,
 ):
+    """Launch MegaMoE; return reduced rows or, without reduction, the routes.
+
+    If ``reduce_routes`` is false, ``out`` holds ``[num_tokens, topk, hidden]``
+    routes, each scaled by its expert weight.
+    """
     info = LookupSolution(heap, solution_id)
     device = heap.device_index
     for name, tensor in (
@@ -196,15 +202,30 @@ def MegaMoe(
     with torch.cuda.device(device):
         if out is None:
             out = torch.empty(
-                (num_tokens, info.compute_hidden_size),
+                (
+                    (num_tokens, info.compute_hidden_size)
+                    if reduce_routes
+                    else (num_tokens, info.topk, info.hidden_size)
+                ),
                 dtype=torch.bfloat16,
                 device=device,
             )
         CheckTensor(out, torch.bfloat16, device, "out")
         _check(
-            out.shape
-            in ((num_tokens, info.hidden_size), (num_tokens, info.compute_hidden_size)),
-            "out must be [num_tokens, hidden_size] or [num_tokens, compute_hidden_size]",
+            (
+                out.shape
+                in (
+                    (num_tokens, info.hidden_size),
+                    (num_tokens, info.compute_hidden_size),
+                )
+                if reduce_routes
+                else out.shape == (num_tokens, info.topk, info.hidden_size)
+            ),
+            (
+                "out must be [num_tokens, hidden_size] or [num_tokens, compute_hidden_size]"
+                if reduce_routes
+                else "out must be [num_tokens, topk, hidden_size]"
+            ),
         )
         for name, tensor in (("w13_bias", w13_bias), ("w2_bias", w2_bias)):
             if tensor is not None:
@@ -238,7 +259,8 @@ def MegaMoe(
             )
         params = MegaMoEParams(
             out,
-            out.stride(0),
+            # Elements between consecutive token or route rows.
+            out.stride(-2),
             w13,
             w2,
             scales_w13,
@@ -253,6 +275,7 @@ def MegaMoe(
             w2_bias,
             heap.local_tensor().view(torch.uint8),
             heap.rank,
+            reduce_routes,
             torch.cuda.current_stream(device),
         )
         CheckKernelStatus(MegaMoECompute(params, solution_id), "MegaMoE")

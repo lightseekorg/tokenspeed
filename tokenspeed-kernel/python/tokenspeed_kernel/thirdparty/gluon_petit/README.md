@@ -14,7 +14,8 @@ use `tokenspeed-triton` and no separate Triton package is installed.
 
 The retained runtime supports the registered GFX950 MegaMoE configurations,
 including GPT-OSS 120B (EP8, 128 experts, top-4, 2880x3072, biased OpenAI
-SwiGLU) and DeepSeek V4 (EP8, 384 experts, top-6, 7168x3072, bias-free SiLU).
+SwiGLU), DeepSeek V4 (EP8, 384 experts, top-6, 7168x3072, bias-free SiLU), and
+Muse Spark (EP8, 256 experts, top-8, 4096x4096, bias-free SiLU).
 The HIP VMM binding is compiled on first use through
 `torch.utils.cpp_extension`, so a ROCm development environment is required.
 
@@ -29,11 +30,21 @@ when selecting a kernel plan.
 Select the backend with both `--moe-backend gluon_petit` and
 `--all2all-backend gluon_petit`. It requires one 8-GPU GFX950 node, EP8/TP1,
 BF16 model activations, serialized MXFP4 expert weights, trivial expert
-placement, and no more than 1024 tokens per rank. The registered profiles are
-GPT-OSS 120B and the DeepSeek V4 expert geometry with unclamped SiLU.
+placement, and no more than 1024 tokens per rank. The registered profiles
+include GPT-OSS 120B, Muse Spark, and the DeepSeek V4 expert geometry with
+unclamped SiLU.
 Checkpoints declaring a SiLU activation clamp are rejected because this kernel
 cannot preserve that activation. Explicit FP8 activation requests are also
 rejected; this backend quantizes activations to MXFP4.
+
+## Route outputs
+
+By default, the combine sums each token's routes on its source rank.
+`MegaMoeConfig.run_routes` copies them instead. After the combine handshake,
+`SourceRouteReducer` reads each local token's routes with system-coherent
+loads. It writes them unsummed, each scaled by its expert weight, into a
+`[tokens, topk, model_dim]` BF16 output. Later ordinary kernels therefore
+never read peer-written workspace memory.
 
 ## Retained API
 
