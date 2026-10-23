@@ -79,6 +79,10 @@ TEST_F(FinishOnlyWriteBackTestSuite, PrefillStreamsMlaPagesDecodeDefersUntilFini
     EXPECT_EQ(prefill_write_back.group_ids.front(), (std::vector<std::uint32_t>{0, 0}));
     SendWriteBackDone(prefill_write_back.op_ids.front());
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 2);
+    const HostCacheStats after_publication = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(after_publication.publication_stores.ops, 1u);
+    EXPECT_EQ(after_publication.publication_stores.blocks, (std::vector<std::uint64_t>{2}));
+    EXPECT_EQ(after_publication.finish_stores.ops, 0u);
 
     SendForwardDone("r0", {43});
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
@@ -98,6 +102,16 @@ TEST_F(FinishOnlyWriteBackTestSuite, PrefillStreamsMlaPagesDecodeDefersUntilFini
            "2 plus a one-token tail)";
     SendWriteBackDone(finish_write_back.op_ids.front());
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    // Finish requeues the whole chain: the two prompt pages are skipped as
+    // already on Host, the decode page and the tail are stored.
+    const HostCacheStats stats = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(stats.publication_stores.ops, 1u) << "decode publishes nothing to Host";
+    EXPECT_EQ(stats.finish_stores.ops, 1u);
+    EXPECT_EQ(stats.finish_stores.blocks, (std::vector<std::uint64_t>{2}));
+    EXPECT_EQ(stats.finish_stores.host_cached, 2u);
+    EXPECT_EQ(
+        stats.finish_stores.in_flight + stats.finish_stores.evicted_before_drain + stats.finish_stores.no_placement,
+        0u);
 }
 
 TEST_F(FinishOnlyWriteBackTestSuite, FinishStoresTheTailOfAOneTokenPrompt) {
@@ -124,6 +138,12 @@ TEST_F(FinishOnlyWriteBackTestSuite, AbortEmitsNoStore) {
     SendAbortEvent("r0");
 
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(PlanOnce()).empty());
+    const TierTransferManager::WriteBackStats finish_stores = scheduler_->GetHostCacheStats().finish_stores;
+    EXPECT_EQ(finish_stores.ops, 0u);
+    EXPECT_EQ(finish_stores.host_cached + finish_stores.in_flight + finish_stores.evicted_before_drain +
+                  finish_stores.no_placement + finish_stores.blocks[0],
+              0u)
+        << "an abort drains no finish candidate";
 }
 
 class FinishOnlyHybridWriteBackTestSuite : public FinishOnlyWriteBackTestSuite {
@@ -441,6 +461,28 @@ protected:
     }
 };
 
+// One usable Host L2 parent: of the victim's three published slots, one gets
+// a Host block and two fall back to the snapshot pool.
+class DecodeRetractionOneHostParentTestSuite : public DecodeRetractionL2TestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 2;  // null parent + one
+        return cfg;
+    }
+};
+
+// And a one-page snapshot pool. The fit check counts every published slot on
+// Host L2, so only taking the image finds the two fallback slots too many.
+class DecodeRetractionOneSnapshotPageTestSuite : public DecodeRetractionOneHostParentTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = DecodeRetractionOneHostParentTestSuite::MakeConfig();
+        cfg.snapshot_allocator.total_pages = 2;  // null parent + one
+        return cfg;
+    }
+};
+
 class DecodeRetractionNoPrefixCacheTestSuite : public DecodeRetractionL2TestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -534,6 +576,13 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     EXPECT_EQ(write_back.source_pinned, std::vector<bool>{false})
         << "the victim's pages are granted away this round; the runtime must order the copy ahead of reuse";
     EXPECT_EQ(write_back.src_pages.at(0).size(), 3u);
+    // Every published slot of the attempt took the L2 leg.
+    const HostCacheStats retracted = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(retracted.retraction_stores.ops, 1u);
+    EXPECT_EQ(retracted.retraction_stores.blocks, (std::vector<std::uint64_t>{3}));
+    EXPECT_EQ(retracted.retraction_stores.host_cached + retracted.retraction_stores.in_flight +
+                  retracted.retraction_stores.snapshot_fallback + retracted.retraction_stores.image_refused,
+              0u);
     const SnapshotStoreBatch* store = FindSnapshotStore(retract);
     ASSERT_NE(store, nullptr) << "the tail leg always rides the plan: it carries the slot-state blob";
     EXPECT_EQ(store->request_ids, (std::vector<std::string>{"running"}));
@@ -576,6 +625,10 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     }
     EXPECT_EQ(scheduler_->DecodingSize(), 0u) << "a retracted request returns to Decode only after the ACK";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    const HostCacheStats restoring = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(restoring.restore_loads.ops, 1u);
+    EXPECT_EQ(restoring.restore_loads.blocks, (std::vector<std::uint64_t>{3}));
+    EXPECT_EQ(restoring.prefix_loads.ops, 0u) << "a restore is no prefix-hit load";
     SendRestoreDone(restore->op_ids.front());
     SendRestoreDone(restore->op_ids.front());  // Duplicate ACK is ignored.
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
@@ -599,6 +652,58 @@ TEST_F(DecodeRetractionL2TestSuite, RetractionLetsBlockedAdmissionRunAndRestores
     ASSERT_NE(ordinary, nullptr);
     ASSERT_EQ(ordinary->request_ids, (std::vector<std::string>{"running"}));
     EXPECT_EQ(ordinary->decode_input_ids.front(), -1) << "from the second step on the device has its own capture";
+}
+
+TEST_F(DecodeRetractionOneHostParentTestSuite, PublishedSlotsWithoutAHostBlockRideTheSnapshotPool) {
+    ExecutionPlan retract;
+    DriveRunningToRetraction(retract);
+    const TierTransferManager::WriteBackStats retraction_stores = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(retraction_stores.ops, 1u);
+    EXPECT_EQ(retraction_stores.blocks, (std::vector<std::uint64_t>{1}));
+    EXPECT_EQ(retraction_stores.snapshot_fallback, 2u);
+    EXPECT_EQ(retraction_stores.image_refused, 0u);
+    EXPECT_EQ(scheduler_->SnapshotPoolFreeBlocks(), 6 - 2);
+    AckImageStores(retract);
+    FinishRemote("blocked", /*bootstrap_token=*/142);
+    FinishRemote("other", /*bootstrap_token=*/242);
+
+    const ExecutionPlan recovery = PlanOnce();
+    const SnapshotRestoreBatch* restore = FindRestore(recovery);
+    ASSERT_NE(restore, nullptr);
+    EXPECT_EQ(restore->src_pages.at(0).size(), 3u);
+    const TierTransferManager::LoadBackStats restore_loads = scheduler_->GetHostCacheStats().restore_loads;
+    EXPECT_EQ(restore_loads.ops, 1u);
+    EXPECT_EQ(restore_loads.blocks, (std::vector<std::uint64_t>{1})) << "the snapshot-pool rows are no L2 traffic";
+    AckRestores(recovery);
+    EXPECT_EQ(scheduler_->DecodingSize(), 1u);
+}
+
+TEST_F(DecodeRetractionOneSnapshotPageTestSuite, ARefusedImageDropsTheHostBlocksItAcquired) {
+    Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1),
+            MakeRequestSpec("other", /*num_pages=*/2, /*start=*/201)});
+    SendBootstrapped("running");
+    SendBootstrapped("other");
+    PlanOnce();
+    PlanOnce();
+    SendRemotePrefillDone("running", /*bootstrap_token=*/42);
+    Submit({MakeRequestSpec("blocked", /*num_pages=*/2, /*start=*/101)});
+    SendBootstrapped("blocked");
+    for (const std::int32_t token : {43, 44}) {
+        PlanOnce();
+        SendForwardDone("running", {token});
+    }
+
+    // running needs a page and is the only victim: its image would put two
+    // slots in a one-page pool, so the attempt is refused.
+    const ExecutionPlan refused = PlanOnce();
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(refused).empty());
+    const TierTransferManager::WriteBackStats retraction_stores = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(retraction_stores.ops, 0u);
+    EXPECT_EQ(retraction_stores.blocks, (std::vector<std::uint64_t>{0}));
+    EXPECT_EQ(retraction_stores.snapshot_fallback, 2u);
+    EXPECT_EQ(retraction_stores.image_refused, 1u) << "the attempt's one Host block and ticket";
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
 }
 
 TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RestoreUsesItsOwnImageWithPrefixCachingDisabled) {

@@ -417,6 +417,18 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
     return coordinator_.NumActiveLcmBlocks(request_tables);
 }
 
+HostCacheStats Scheduler::GetHostCacheStats() const {
+    return HostCacheStats{
+        .publication_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kPublication),
+        .finish_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kFinish),
+        .retraction_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kRetraction),
+        .prefix_loads = tier_transfers_.PrefixLoadStats(),
+        .restore_loads = tier_transfers_.RestoreLoadStats(),
+        .host_evictions = coordinator_.HostEvictions(),
+        .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
+    };
+}
+
 std::int32_t Scheduler::CacheGroupTotalPages(const std::string& group_id) const {
     return config_.cache_groups[groupIndex(group_id)].total_pages;
 }
@@ -498,7 +510,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // Boundary publications of live requests: their owners hold the pages,
         // and the ticket pins them until the ACK, so the copy stays off the
         // forward's critical path.
-        if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck)) {
+        if (auto store =
+                tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication)) {
             write_back_operations.push_back(std::move(*store));
         }
     }

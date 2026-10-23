@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -35,12 +37,19 @@
 
 namespace tokenspeed {
 
+// Which call drained a Host L2 store (not which code queued its candidates):
+// boundary publication or finish through StartPendingStores, a retraction
+// image through StartRetractionStores. Accounting only -- it selects the
+// counters a store lands in, never reaches the runtime (which branches on
+// StoreSourceGuard), and no scheduling decision reads it.
+enum class HostStoreCause : std::uint8_t { kPublication, kFinish, kRetraction };
+
 // Owns the mechanics and asynchronous lifetime of transfers between Device and
 // Host cache tiers. Scheduling policy and request state transitions stay in
 // Scheduler.
 class TierTransferManager {
 public:
-    explicit TierTransferManager(CacheCoordinator& coordinator) : coordinator_{coordinator} {}
+    explicit TierTransferManager(CacheCoordinator& coordinator);
 
     // Drains the coordinator's pending store candidates into one write-back
     // op. `guard` says how the Device sources are protected while the copy is
@@ -48,7 +57,8 @@ public:
     // gets the same guard. Boundary publication and finish drain with
     // kPinnedUntilAck; a retraction's stream-ordered L2 leg does not use the
     // queue -- StartRetractionStores builds it from the victim's tables.
-    std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard);
+    // `cause` (kPublication or kFinish) only picks the counters.
+    std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause);
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a
@@ -124,6 +134,35 @@ public:
                !snapshot_restores_.empty();
     }
 
+    // Cumulative Host L2 counters, never reset. Accounting only: no
+    // scheduling decision reads them. Each candidate a StartPendingStores
+    // drain takes lands in exactly one outcome -- host_cached, in_flight,
+    // evicted_before_drain, no_placement, or stored (counted in blocks) -- and
+    // so does each published slot of one retraction attempt: host_cached,
+    // in_flight, stored, snapshot_fallback or image_refused.
+    struct WriteBackStats {
+        std::uint64_t ops{0};
+        std::vector<std::uint64_t> blocks;      // stored, by cache group index
+        std::uint64_t host_cached{0};           // already a Host entry
+        std::uint64_t in_flight{0};             // on an unacknowledged store, or queued twice in one drain
+        std::uint64_t evicted_before_drain{0};  // left the Device index before the drain
+        std::uint64_t no_placement{0};          // no Host block in its group and bucket
+        std::uint64_t snapshot_fallback{0};     // retraction: the slot rides the snapshot pool instead
+        std::uint64_t image_refused{0};         // retraction: the Host block died with a refused image
+    };
+    // Host L2 -> Device copies: of prefix-hit loads (one op per first
+    // admission the Host wins), and of restores (one op per restore that has
+    // L2 rows, counting those rows only, not the snapshot pool's).
+    struct LoadBackStats {
+        std::uint64_t ops{0};
+        std::vector<std::uint64_t> blocks;  // by cache group index
+    };
+    const WriteBackStats& WriteBackStatsFor(HostStoreCause cause) const {
+        return write_back_stats_[static_cast<std::size_t>(cause)];
+    }
+    const LoadBackStats& PrefixLoadStats() const { return prefix_load_stats_; }
+    const LoadBackStats& RestoreLoadStats() const { return restore_load_stats_; }
+
 private:
     // A store ticket always pins its Host destination; the ACK's one job is
     // publishing that entry (CacheHostBlock). Whether it also pins the Device
@@ -176,6 +215,10 @@ private:
     std::unordered_map<std::uint32_t, InFlightSnapshotStore> snapshot_stores_;
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
     std::uint32_t next_op_id_{0};
+    // Indexed by HostStoreCause; every per-group vector is sized at construction.
+    std::array<WriteBackStats, 3> write_back_stats_;
+    LoadBackStats prefix_load_stats_;
+    LoadBackStats restore_load_stats_;
 };
 
 }  // namespace tokenspeed

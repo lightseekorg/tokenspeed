@@ -3010,6 +3010,8 @@ TEST(CacheCoordinatorHostReplacement, SingleGroupBatchUsesChildrenWithoutParentC
     EXPECT_EQ(batch.stats.unallocated, 0u);
     EXPECT_EQ(batch.stats.group_scans, 1u);
     EXPECT_EQ(batch.stats.parent_candidates, 0u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 0u);
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) {
@@ -3039,6 +3041,7 @@ TEST(CacheCoordinatorHostReplacement, BatchPreservesEmptyRefForPinnedShortfall) 
     EXPECT_EQ(batch.stats.unallocated, 1u);
     EXPECT_EQ(batch.stats.group_scans, 1u);
     EXPECT_EQ(batch.stats.parent_candidates, 0u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 0u);
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchGivesScarceFreeCapacityToFirstCandidateGroup) {
@@ -3101,6 +3104,7 @@ TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) 
     HostPut(coordinator, host_pool, "old-1", 0);
     HostPut(coordinator, host_pool, "old-2", 0);
     HostPut(coordinator, host_pool, "old-3", 0);
+    HostPut(coordinator, device_pool, "old-1", 0);
 
     const std::array<std::uint32_t, 3> groups{1, 1, 0};
     const std::array<std::int32_t, 3> buckets{0, 0, 0};
@@ -3119,6 +3123,68 @@ TEST(CacheCoordinatorHostReplacement, BatchRebindsParentsOnceAcrossMixedGroups) 
     EXPECT_EQ(batch.stats.parent_candidates, 2u);
     EXPECT_EQ(batch.stats.allocated, 3u);
     EXPECT_EQ(batch.stats.unallocated, 0u);
+    // Group 0 gave its older parent, old-0 and old-1, whole to group 1's
+    // requests and then one entry to its own.
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-0", 0)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("old-1", 0)));
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 1u) << "the Device index still holds \"old-1\"";
+}
+
+TEST(CacheCoordinatorHostReplacement, CountsTheVictimsTheDeviceStillHolds) {
+    BlockPool device_pool(2, {1});
+    BlockPool host_pool(2, {1});
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    HostPut(coordinator, host_pool, "host-only", 0);
+    HostPut(coordinator, host_pool, "resident", 0);
+    HostPut(coordinator, device_pool, "resident", 0);
+
+    const std::array<std::uint32_t, 2> groups{0, 0};
+    const std::array<std::int32_t, 2> buckets{0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_EQ(batch.stats.allocated, 2u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 2u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 1u) << "the Device index still holds \"resident\"";
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(device_pool, Key("resident", 0)))
+        << "the residency check leaves the Device entry alone";
+}
+
+TEST(CacheCoordinatorHostReplacement, FlushCountsHostEvictionsAndUndrainedStoreCandidates) {
+    BlockPool device_pool(2, {1, 1});
+    BlockPool host_pool(5, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    HostPut(coordinator, host_pool, "a", 0);
+    HostPut(coordinator, host_pool, "b", 0);
+    HostPut(coordinator, host_pool, "c", 1);
+    HostPut(coordinator, host_pool, "e", 0);
+    HostPut(coordinator, host_pool, "e", 1);
+    HostPut(coordinator, device_pool, "d", 0);
+    HostPut(coordinator, device_pool, "d", 1);
+    coordinator.QueueCachedBlocksForStore(std::array<std::string, 1>{"d"});
+
+    ASSERT_TRUE(coordinator.ClearDeviceCache());
+    EXPECT_EQ(coordinator.StoreCandidatesDroppedByFlush(), 2u) << "one queued candidate per group, never drained";
+    EXPECT_EQ(coordinator.HostEvictions().flush.blocks, 0u) << "the Device flush leaves Host alone";
+
+    ASSERT_TRUE(coordinator.ClearCache());
+    EXPECT_EQ(coordinator.StoreCandidatesDroppedByFlush(), 2u);
+    EXPECT_EQ(coordinator.HostEvictions().flush.blocks, 5u) << "three Host entries in group 0, two in group 1";
+    EXPECT_EQ(coordinator.HostEvictions().flush.device_resident, 0u);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
 }
 
 TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingDoesNotRescanPlacementPoolPerVictim) {

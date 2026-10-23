@@ -48,6 +48,19 @@
 
 namespace tokenspeed {
 
+// Host L2 counters: cumulative since start and never reset. Accounting
+// only, for tests and inspection: no scheduling decision reads them and the
+// runtime exports none.
+struct HostCacheStats {
+    TierTransferManager::WriteBackStats publication_stores;
+    TierTransferManager::WriteBackStats finish_stores;
+    TierTransferManager::WriteBackStats retraction_stores;
+    TierTransferManager::LoadBackStats prefix_loads;
+    TierTransferManager::LoadBackStats restore_loads;
+    CacheCoordinator::HostEvictionStats host_evictions;
+    std::uint64_t store_candidates_dropped_by_flush{0};
+};
+
 class Scheduler {
 public:
     explicit Scheduler(SchedulerConfig config);
@@ -115,6 +128,7 @@ public:
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+    HostCacheStats GetHostCacheStats() const;
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }

@@ -304,7 +304,7 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered);
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kStreamOrdered, HostStoreCause::kPublication);
     ASSERT_TRUE(write_back);
     EXPECT_FALSE(write_back->source_pinned);
     EXPECT_FALSE(transfers.HasPinnedStoresInFlight());
@@ -312,9 +312,14 @@ TEST(CacheOperationTest, StreamOrderedStorePinsNoDeviceSource) {
     // The ticket pins no Device source: the runtime orders the D2H copy on
     // the forward thread's stream ahead of any reuse, so the cache stays clearable.
     EXPECT_TRUE(coordinator.ClearDeviceCache());
+    EXPECT_EQ(coordinator.StoreCandidatesDroppedByFlush(), 0u) << "the drain took the only candidate";
 
     transfers.CompleteWriteBack(write_back->op_id);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(CacheKey{.group_id = 0, .content_hash = "h0"}));
+    const TierTransferManager::WriteBackStats& publication_stores =
+        transfers.WriteBackStatsFor(HostStoreCause::kPublication);
+    EXPECT_EQ(publication_stores.ops, 1u);
+    EXPECT_EQ(publication_stores.blocks, (std::vector<std::uint64_t>{1}));
 }
 
 TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
@@ -339,10 +344,12 @@ TEST(CacheOperationTest, PinnedStoreHoldsDeviceSourceUntilAck) {
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
     ASSERT_TRUE(write_back);
     EXPECT_TRUE(write_back->source_pinned);
     EXPECT_TRUE(transfers.HasPinnedStoresInFlight());
+    EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kFinish).blocks, (std::vector<std::uint64_t>{1}));
+    EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kPublication).ops, 0u) << "the cause picks the counters";
     coordinator.Free(tables);
     // The owner is gone, but the ticket still holds the Device source: it is
     // neither evictable nor clearable until the runtime acknowledges the copy.
@@ -385,7 +392,7 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     cache_device(first_key);
     const std::array first_hashes{first_key.content_hash};
     coordinator.QueueCachedBlocksForStore(first_hashes);
-    auto first = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    auto first = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
     ASSERT_TRUE(first);
     ASSERT_EQ(first->transfers.size(), 1u);
     const std::int32_t destination = first->transfers.front().destination_page;
@@ -394,15 +401,26 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     cache_device(second_key);
     const std::array second_hashes{second_key.content_hash};
     coordinator.QueueCachedBlocksForStore(second_hashes);
-    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck));
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication));
+    const TierTransferManager::WriteBackStats& publication_stores =
+        transfers.WriteBackStatsFor(HostStoreCause::kPublication);
+    EXPECT_EQ(publication_stores.no_placement, 1u)
+        << "the only Host block is the in-flight ticket's unpublished destination";
+    EXPECT_EQ(publication_stores.ops, 1u);
 
     transfers.CompleteWriteBack(first->op_id);
     coordinator.QueueCachedBlocksForStore(second_hashes);
-    auto second = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    auto second = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
     ASSERT_TRUE(second);
     ASSERT_EQ(second->transfers.size(), 1u);
     EXPECT_EQ(second->transfers.front().destination_page, destination);
     transfers.CompleteWriteBack(second->op_id);
+    // Three drained candidates, each in one outcome: two stored, one unplaced.
+    EXPECT_EQ(publication_stores.ops, 2u);
+    EXPECT_EQ(publication_stores.blocks, (std::vector<std::uint64_t>{2}));
+    EXPECT_EQ(publication_stores.host_cached + publication_stores.in_flight + publication_stores.evicted_before_drain +
+                  publication_stores.no_placement + publication_stores.blocks[0],
+              3u);
 }
 
 TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
@@ -429,7 +447,12 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     coordinator.CacheFullBlocks(tables, hashes, admission->access_epoch, /*first_slot=*/0, CacheBoundaryKind::kChunk);
 
     coordinator.QueueCachedBlocksForStore(hashes);
-    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck));
+    EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish));
+    const TierTransferManager::WriteBackStats& finish_stores = transfers.WriteBackStatsFor(HostStoreCause::kFinish);
+    EXPECT_EQ(finish_stores.no_placement, 1u);
+    EXPECT_EQ(finish_stores.ops, 0u);
+    EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kRetraction).snapshot_fallback, 0u)
+        << "a drain is no retraction attempt";
     coordinator.Free(tables);
     EXPECT_TRUE(coordinator.ClearDeviceCache());
 }
@@ -482,7 +505,7 @@ TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
     const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
     coordinator.QueueCachedBlocksForStore(group_zero_hashes);
 
-    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
 
     ASSERT_TRUE(write_back);
     // The first candidate reclaims the old parent across groups. Its new
@@ -490,11 +513,75 @@ TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
     ASSERT_EQ(write_back->transfers.size(), 1u);
     EXPECT_EQ(write_back->transfers[0].group_id, 1u);
     EXPECT_EQ(write_back->transfers[0].source_page, group_one_source);
+    // Group 0's parent went whole to group 1; group 0's own two found no placement.
+    const TierTransferManager::WriteBackStats& publication_stores =
+        transfers.WriteBackStatsFor(HostStoreCause::kPublication);
+    EXPECT_EQ(publication_stores.blocks, (std::vector<std::uint64_t>{0, 1}));
+    EXPECT_EQ(publication_stores.no_placement, 2u);
+    EXPECT_EQ(publication_stores.host_cached + publication_stores.in_flight + publication_stores.evicted_before_drain,
+              0u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 2u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 0u);
 
     transfers.CompleteWriteBack(write_back->op_id);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_one));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_zero_first));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_zero_second));
+}
+
+// Every candidate a drain takes lands in exactly one outcome.
+TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
+    BlockPool device_pool{4, {1}};
+    BlockPool host_pool{4, {1}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull,
+        .cache_blocks_per_lcm_block = 1,
+        .block_granularity = 2,
+    }};
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false);
+    TierTransferManager transfers{coordinator};
+    const CacheKey on_host{.group_id = 0, .content_hash = "on-host"};
+    const CacheKey stored{.group_id = 0, .content_hash = "stored"};
+    const CacheKey travelling{.group_id = 0, .content_hash = "travelling"};
+    const CacheKey evicted{.group_id = 0, .content_hash = "evicted"};
+    for (const CacheKey& key : {on_host, stored, travelling, evicted}) {
+        CacheBlockRef block = device_pool.AcquireBlock(0);
+        ASSERT_TRUE(block);
+        coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, /*access_epoch=*/1,
+                                                 /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                 /*newly_cached=*/nullptr);
+    }
+    CacheBlockRef host_copy = host_pool.AcquireBlock(0);
+    coordinator.CacheHostBlock(host_copy, on_host);
+    host_copy.reset();
+
+    coordinator.QueueCachedBlocksForStore(std::array{travelling.content_hash});
+    const auto earlier = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
+    ASSERT_TRUE(earlier);
+
+    coordinator.QueueCachedBlocksForStore(std::array{on_host.content_hash, stored.content_hash, stored.content_hash,
+                                                     travelling.content_hash, evicted.content_hash});
+    const CacheBlockLocation evicted_location = coordinator.GroupPrefixIndex(0).Find(device_pool, evicted)->Location();
+    ASSERT_TRUE(coordinator.GroupPrefixIndex(0).Evict(device_pool, evicted_location));
+    const auto store = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
+    ASSERT_TRUE(store);
+    ASSERT_EQ(store->transfers.size(), 1u);
+    EXPECT_EQ(store->transfers.front().content_hash, stored.content_hash);
+
+    const TierTransferManager::WriteBackStats& publication_stores =
+        transfers.WriteBackStatsFor(HostStoreCause::kPublication);
+    EXPECT_EQ(publication_stores.host_cached, 1u);
+    EXPECT_EQ(publication_stores.in_flight, 2u) << "queued twice in the drain, and carried by the earlier store";
+    EXPECT_EQ(publication_stores.evicted_before_drain, 1u);
+    EXPECT_EQ(publication_stores.no_placement, 0u);
+    EXPECT_EQ(publication_stores.blocks, (std::vector<std::uint64_t>{1}));
+    EXPECT_EQ(publication_stores.ops, 1u);
+    EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kFinish).blocks, (std::vector<std::uint64_t>{1}));
+    transfers.CompleteWriteBack(store->op_id);
+    transfers.CompleteWriteBack(earlier->op_id);
 }
 
 TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRequest) {
@@ -596,15 +683,17 @@ TEST(CacheOperationTest, StateCheckpointStreamsOnlyWhenPublished) {
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 1, 0, 2, CacheBoundaryKind::kChunk, true,
                                     /*publish_state=*/false);
         EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
-        EXPECT_FALSE(transfers.StartPendingStores(guard));
+        EXPECT_FALSE(transfers.StartPendingStores(guard, HostStoreCause::kPublication));
         CacheCompletedBlocksForTest(coordinator, tables, hashes, 2, 0, 2, CacheBoundaryKind::kEndpoint, true,
                                     /*publish_state=*/true);
         EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, key));
         EXPECT_EQ(coordinator.GroupPrefixIndex(0).Find(pool, key), tables[0].Blocks()[1]) << "slot 1 is the checkpoint";
-        const auto store = transfers.StartPendingStores(guard);
+        const auto store = transfers.StartPendingStores(guard, HostStoreCause::kPublication);
         ASSERT_TRUE(store);
         ASSERT_EQ(store->transfers.size(), 1u);
         EXPECT_EQ(store->source_pinned, guard == StoreSourceGuard::kPinnedUntilAck);
+        EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kPublication).blocks, (std::vector<std::uint64_t>{1}))
+            << "the State group's checkpoint, once published";
         coordinator.Free(tables);
         EXPECT_EQ(coordinator.ClearDeviceCache(), guard == StoreSourceGuard::kStreamOrdered);
         EXPECT_FALSE(coordinator.ContainsHostCachedBlock(key));
@@ -719,6 +808,8 @@ TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
 
     TierTransferManager transfers(coordinator);
     LoadBackOperation op = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+    EXPECT_EQ(transfers.PrefixLoadStats().ops, 1u);
+    EXPECT_EQ(transfers.PrefixLoadStats().blocks, (std::vector<std::uint64_t>{1}));
     transfers.CompleteLoadBack(op.op_id);
 }
 

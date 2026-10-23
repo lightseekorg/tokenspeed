@@ -603,10 +603,14 @@ not count it — until `CompleteWriteBack` publishes the Host entry and drops th
 pin. Nothing else needs to know the copy is in flight, so the runtime copies
 on its own stream and no forward waits. A cached block is never written again
 by its owner (prefix reuse already depends on that), so the pin alone makes
-the copy race-free. Both guards share one ticket (`StartPendingStores(guard)`
-drains the publication queue; `StartRetractionStores` builds the image's L2
-leg from the victim's tables), and the op carries `source_pinned` to the
-runtime, which branches on the guard and never on the reason.
+the copy race-free. Both guards share one ticket (`StartPendingStores(guard,
+cause)` drains the publication queue; `StartRetractionStores` builds the
+image's L2 leg from the victim's tables), and the op carries `source_pinned`
+to the runtime, which branches on the guard and never on the reason. The
+`HostStoreCause` (publication, finish or retraction) names the drain point; it
+only selects the Host L2 counters a store's outcomes land in, which no
+scheduling decision reads. They count deterministic events only (no clock), so
+the mirrored schedulers on every rank hold the same values.
 
 **Per-victim quiescence, not global.** A request whose own forward is still
 out must not be retracted — its result would land on pages it no longer owns,

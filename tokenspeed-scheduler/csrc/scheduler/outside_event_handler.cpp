@@ -135,7 +135,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     coordinator_.QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
-    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {

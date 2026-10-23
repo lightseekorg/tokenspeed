@@ -1714,6 +1714,11 @@ TEST_F(FusedRetractionL2TestSuite, TheImageWaitsForAnEarlierStoreThatCarriesOneO
     const auto& image_store = std::get<WriteBackBatch>(image_stores.front());
     EXPECT_EQ(image_store.src_pages.at(0).size(), 2u) << "[42 43] in both groups; the prompt pages are Host-warm";
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 4) << "the image pins the Host-warm prompt pages";
+    const TierTransferManager::WriteBackStats image_stats = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(image_stats.host_cached, 4u) << "the two prompt pages in both groups";
+    EXPECT_EQ(image_stats.in_flight, 0u) << "their store was acknowledged first";
+    EXPECT_EQ(image_stats.ops, 1u);
+    EXPECT_EQ(image_stats.blocks, (std::vector<std::uint64_t>{1, 1}));
     const SnapshotStoreBatch* tail_store = FindSnapshotStore(retraction);
     ASSERT_NE(tail_store, nullptr);
     SendForwardDone("r2", {145});
@@ -2096,6 +2101,10 @@ TEST_F(SharedImagePagesSuite, VictimsPinAnInFlightStoresBlocksAndWaitForItsAck) 
     const auto& r1_l2_leg = std::get<WriteBackBatch>(p3_stores.front());
     EXPECT_EQ(r1_l2_leg.src_pages.at(0).size(), 2u) << "the tail page with token 42, in both groups";
     EXPECT_EQ(r1_l2_leg.source_pinned, std::vector<bool>{false}) << "an image leg is stream-ordered";
+    const TierTransferManager::WriteBackStats r1_image = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(r1_image.in_flight, 4u) << "the two prompt pages in both groups ride the pinned store";
+    EXPECT_EQ(r1_image.host_cached, 0u);
+    EXPECT_EQ(r1_image.blocks, (std::vector<std::uint64_t>{1, 1}));
     const SnapshotStoreBatch* r1_tail = FindSnapshotStore(p3);
     ASSERT_NE(r1_tail, nullptr);
     EXPECT_TRUE(r1_tail->src_pages.at(0).empty()) << "every data slot is published: the pool carries the blob only";
@@ -2114,6 +2123,10 @@ TEST_F(SharedImagePagesSuite, VictimsPinAnInFlightStoresBlocksAndWaitForItsAck) 
     // r2 pins the same ticket block and waits for the same op.
     const ExecutionPlan p6 = PlanOnce();
     ASSERT_EQ(scheduler_->RetractedSize(), 2u);
+    const TierTransferManager::WriteBackStats both_images = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(both_images.in_flight, 8u) << "r2's two prompt pages ride the same pinned store";
+    EXPECT_EQ(both_images.ops, 2u);
+    EXPECT_EQ(both_images.blocks, (std::vector<std::uint64_t>{2, 2}));
     const SnapshotStoreBatch* r2_tail = FindSnapshotStore(p6);
     ASSERT_NE(r2_tail, nullptr);
     AckImageStores(p3);

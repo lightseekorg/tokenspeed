@@ -371,6 +371,21 @@ public:
     struct StoreCandidate {
         CacheKey key;
     };
+    // Host entries evicted for one reason, each also counted as
+    // device_resident when the Device index still held its key.
+    struct HostEvictionCounts {
+        std::uint64_t blocks{0};
+        std::uint64_t device_resident{0};
+    };
+    // Host evictions over every cache group, by why the entry left.
+    struct HostEvictionStats {
+        // AcquireHostBlocks' global LRU took it, as one child or with a whole
+        // parent, whoever asked (a publication, finish or retraction store, an
+        // L3 prefetch).
+        HostEvictionCounts lru;
+        // ClearCache, after the Device clear, so never device_resident.
+        HostEvictionCounts flush;
+    };
     struct HostAllocationStats {
         std::size_t requested{0};
         std::size_t allocated{0};
@@ -423,6 +438,12 @@ public:
     StorageQuery MissingStorageKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
     StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
                                             std::size_t max_blocks);
+
+    // Cumulative Host counters, never reset (accounting only): the Host
+    // evictions by reason, and the store candidates ClearDeviceCache dropped
+    // before any drain took them.
+    const HostEvictionStats& HostEvictions() const { return host_evictions_; }
+    std::uint64_t StoreCandidatesDroppedByFlush() const { return store_candidates_dropped_by_flush_; }
 
     // Publishes a Device block a restore filled from Host L2
     // (CompleteSnapshotRestore): the entry comes back with the logical block
@@ -589,7 +610,11 @@ private:
     // Device eviction of one entry without the tail cascade; the cascade
     // calls it for the companions of the block that left.
     bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location);
-    bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    // Evicts an unpinned Host entry and counts it under
+    // host_evictions_.*reason, as device_resident too when the Device index
+    // still holds its key.
+    bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
+                              HostEvictionCounts HostEvictionStats::*reason);
     std::optional<CacheBlockLocation> deviceLocationOf(std::size_t group_index, const CacheKey& key) const;
     // Drops a tail hash from the tail table once no tier holds an entry for it.
     void pruneTailIfUnreferenced(const ContentHash& hash);
@@ -631,6 +656,9 @@ private:
     TailTable tails_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
+    // Accounting only.
+    HostEvictionStats host_evictions_;
+    std::uint64_t store_candidates_dropped_by_flush_{0};
 };
 
 // The prefix-match policy of one spec: full attention is prefix-closed with

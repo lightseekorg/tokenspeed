@@ -875,7 +875,7 @@ Its responsibilities:
   request published (pages, tail, state slot 1) is queued before request
   ownership is released. Ordinary sliding-window entries always stream when
   published. The queue is drained by
-  `TierTransferManager::StartPendingStores(guard)`, and every store it
+  `TierTransferManager::StartPendingStores(guard, cause)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,
   `CacheCoordinator::PublishedDataSlots` names the data slots that are

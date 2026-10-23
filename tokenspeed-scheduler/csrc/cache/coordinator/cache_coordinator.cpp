@@ -143,6 +143,7 @@ bool CacheCoordinator::ClearDeviceCache() {
         }
     }
 
+    store_candidates_dropped_by_flush_ += pending_stores_.size();
     pending_stores_.clear();
     for (const auto& [group_id, location] : cached_locations) {
         // The cascade of an earlier eviction may already have taken this one.
@@ -177,6 +178,7 @@ bool CacheCoordinator::ClearCache() {
     for (const auto& [group_id, location] : host_locations) {
         _assert(groups_[group_id].Index().Evict(*host_pool_, location).has_value(),
                 "clearable Host cache entry disappeared");
+        ++host_evictions_.flush.blocks;
     }
     tails_.Clear();
     return true;
@@ -1182,7 +1184,8 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                 // The retry above found no compatible hole. Releasing one
                 // Host child creates the only placement for its refill.
                 const CacheBlockLocation location = candidates.entries[candidates.next++].location;
-                _assert(evictHostCachedBlock(group_id, location), "selected Host child is not evictable");
+                _assert(evictHostCachedBlock(group_id, location, &HostEvictionStats::lru),
+                        "selected Host child is not evictable");
             } else {
                 const auto [parent_value, victim_parent] = victim_parents.front();
                 discard_parent();
@@ -1192,7 +1195,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
                 for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
                     const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};
                     if (host_pool_->IsOccupied(location)) {
-                        _assert(evictHostCachedBlock(bound_group, location),
+                        _assert(evictHostCachedBlock(bound_group, location, &HostEvictionStats::lru),
                                 "selected Host parent changed before eviction");
                     }
                 }
@@ -1271,10 +1274,17 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     return true;
 }
 
-bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
+bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
+                                            HostEvictionCounts HostEvictionStats::*reason) {
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(*host_pool_, location);
     if (!removed) {
         return false;
+    }
+    HostEvictionCounts& evicted = host_evictions_.*reason;
+    ++evicted.blocks;
+    // Contains takes no reference, so it pins nothing on the Device tier.
+    if (groups_[group_id].Index().Contains(pool_, *removed)) {
+        ++evicted.device_resident;
     }
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
