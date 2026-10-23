@@ -1098,6 +1098,11 @@ class MambaAttnBackend(AttentionBackend):
             scan_checkpoint_rows=scan_checkpoint_rows,
         )
 
+        if forward_mode.is_mixed() and self.deferred_state_commit and num_extends < bs:
+            self._prepare_mixed_verify_metadata(
+                bs, num_extends, req_pool_indices, seq_lens, block_tables
+            )
+
     def _scan_state_checkpoints(
         self,
         checkpoints: InForwardStateCheckpoints,
@@ -1132,11 +1137,6 @@ class MambaAttnBackend(AttentionBackend):
             ),
             rows.to(self.device),
         )
-
-        if forward_mode.is_mixed() and self.deferred_state_commit and num_extends < bs:
-            self._prepare_mixed_verify_metadata(
-                bs, num_extends, req_pool_indices, seq_lens, block_tables
-            )
 
     def _prepare_mixed_verify_metadata(
         self,
