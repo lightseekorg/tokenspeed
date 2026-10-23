@@ -217,9 +217,9 @@ private:
                                                            std::span<const GroupDemand> demands,
                                                            const RequestProgress& progress,
                                                            std::optional<std::uint64_t> request_access_epoch);
-    bool admitWithKvEventTracking(ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request,
-                                  const fsm::CacheProgress& cache_progress, std::span<const GroupDemand> demands,
-                                  const RequestProgress& progress);
+    std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
+        ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
+        std::span<const GroupDemand> demands, const RequestProgress& progress);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,

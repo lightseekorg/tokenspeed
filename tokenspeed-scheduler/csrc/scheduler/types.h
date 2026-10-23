@@ -91,6 +91,15 @@ struct SchedulerConfig {
     // Zero preserves the default logits contract, which already recomputes at
     // least the final prompt token. The effective hit is page-aligned down.
     std::int32_t prefix_replay_tokens{0};
+    // Write a reusable State checkpoint inside the prefill forward that spans
+    // the page boundary before a long prompt's replay tail
+    // (PrefillStateCheckpointTokens), without cutting a chunk there: that
+    // forward holds one more block per State group, and the request's next
+    // publication point publishes it under the boundary's page hash. The
+    // runtime writes the state at ForwardBatch::extend_state_checkpoint_lens
+    // into the third entry of every State group's row. Requires prefix
+    // caching, except on the D role, which never computes a prompt.
+    bool state_checkpoint_in_forward{false};
 
     // The single validation entry point for a scheduler configuration: every
     // scheduler scalar, every group's own invariants, and the cross-checks

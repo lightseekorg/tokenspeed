@@ -270,6 +270,7 @@ def create_l3_executor(
         cache_signature=cache_signature,
         pipeline_rank=pipeline_rank,
         attn_tp_size=int(server_args.mapping.attn.tp_size),
+        group_shard_counts=ownership.shard_counts,
         draft_model=draft_model,
         draft_revision=draft_revision,
         cache_quantization=cache_quantization,

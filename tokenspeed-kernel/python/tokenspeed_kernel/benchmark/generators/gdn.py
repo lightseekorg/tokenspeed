@@ -260,6 +260,7 @@ def prepare_gdn_chunk_prefill(
 
     Inputs mirror the runtime's prefill scan: FP32 log gates, BF16 betas,
     in-kernel Q/K L2 normalization and an FP32 initial and final state.
+    This case does not request intermediate state checkpoints.
     """
 
     model_profile, profile = _profile(request)

@@ -230,6 +230,36 @@ state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
 
+**In-forward checkpoint (opt-in).** By default a prompt that diverges inside
+the last page of an earlier long prompt, or resends it, resumes from an
+earlier checkpoint: the prompt-end state cannot serve a hit that must replay
+the final token. With `state_checkpoint_in_forward`
+(`--enable-state-checkpoint-in-forward`, off by default, requires prefix
+caching) the forward that spans the last prefix-page boundary before a long
+prompt's replay tail (`PrefillStateCheckpointTokens`: a prompt longer than
+`max_scheduled_tokens`; the tail is at least one token, `prefix_replay_tokens`
+and the largest replayable group's window) also writes the state there. No
+chunk is cut: the admission of that forward acquires one more block per State
+group outside the two slots (`StateStep::checkpoint`,
+`AdmissionResult::state_checkpoint_blocks`), the forward's rows carry it as a
+third entry with the tokens before it (`extend_state_checkpoint_lens`), and
+the runtime stores every State group's state at that position into it. The
+request holds the block in `CacheProgress` until its next publication point --
+the next chunk's or first decode's admission, a finish or a retraction --
+which publishes it under the boundary's page hash, like a natural checkpoint.
+A boundary a chunk ends on needs none (the chunk end's slot 1 is published
+there, as at a junction). The scan emits states only whole pages from a
+forward's start, and the budget a batch's decodes leave rarely ends on a page,
+so a chunk ending less than a full chunk before the boundary ends on a page
+when the budget reaches one, unless a junction at or past its end comes first
+(the chunk after the junction starts there anyway). A chunk that would still
+span the boundary from inside a page (a hit on a prompt-end tail) ends at the
+boundary, and so does one whose admission cannot also hold the extra block (a
+cache with no spare block): the next chunk's admission publishes its live slot
+there, at the cost of one more round. Multi-turn traffic whose next turn
+re-renders the end of the previous prompt then reuses the common prefix
+immediately.
+
 **A finish settles when its last forward has landed.** `forward::Finish`
 (and the P role's `pd::SucceededEvent`) moves a page-holding request to
 `Finishing` and nothing else; after every batch of events,
@@ -269,8 +299,9 @@ Host hit). When the KV groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
 shares the prefix resumes at the KV boundary in every group. No alignment is
-ever imposed on a chunk for the state's sake, and no checkpoint is produced
-inside a forward: a chunk's state output is its own natural checkpoint.
+ever imposed on a chunk for the state's sake, and apart from the opt-in
+in-forward checkpoint above no checkpoint is produced inside a forward: a
+chunk's state output is its own natural checkpoint.
 `CacheProgress::junction_tokens` is the only progress a State group adds to
 the request; the backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
@@ -278,6 +309,9 @@ the request; the backend contract for the two slots is in
 **Capacity.** A State group holds at most two blocks per live request on
 every role — the pair, never a page per token — so `ReservePrefillDemands`
 reserves nothing for it and the capacity model (§1.4) charges `2` per request.
+An in-forward checkpoint's block is a third only between its forward and the
+next publication point, and only when the pool holds it then (otherwise the
+chunk is cut at the boundary); the bound charges nothing for it.
 On the D role the landing writes slot 1 and slot 0 stays null unless this
 node already holds the prompt-end checkpoint (§3.2).
 
@@ -945,10 +979,12 @@ publication is a mutation of a boundary that must already have its token
 descriptor (`registerKvEventPrefixPages`), and `DrainKvEvents` drops the
 descriptor of a boundary with no cached child. A boundary is `BlockStored`
 only while every group holds its child -- the State groups included, whose
-checkpoint exists only at a natural point -- so a hybrid model emits
-`BlockStored` for its prompt end, its finish and its junction cuts, never
-for an interior chunk end's chain hash; a tail's descriptor carries the
-rows below `T` and the residency check counts a tail's blocks from it. Retraction publishes twice
+checkpoint exists only at a natural point or the opt-in in-forward
+checkpoint (§1.2) -- so a hybrid model emits `BlockStored` for its prompt
+end, its finish, its junction cuts and the in-forward checkpoint's page
+boundary, never for another interior chunk end's chain hash; a tail's
+descriptor carries the rows below `T` and the residency check counts a
+tail's blocks from it. Retraction publishes twice
 without an admission: `retractVictim` registers the newly hashed pages before
 `CacheCompletedBlocks` (as the finish-time publication does), and the
 `RestoreDone` handler registers the restored request's whole prefix chain

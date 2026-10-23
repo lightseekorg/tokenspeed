@@ -76,7 +76,11 @@ def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
     executor.config = SimpleNamespace(
-        spec_algo=None, enforce_eager=False, pp_size=1, max_req_pool_size=3
+        spec_algo=None,
+        enforce_eager=False,
+        pp_size=1,
+        max_req_pool_size=3,
+        state_checkpoint_in_forward=False,
     )
     executor.model_runner = SimpleNamespace(model="target model")
     executor.attn_backend = _Holder("target", log)
@@ -177,7 +181,11 @@ def test_a_block_drafter_is_rechecked_against_the_targets_new_pool(
     log = []
     executor = _executor(monkeypatch, log, with_draft=True)
     executor.config = SimpleNamespace(
-        spec_algo=spec_algo, enforce_eager=False, pp_size=1, max_req_pool_size=3
+        spec_algo=spec_algo,
+        enforce_eager=False,
+        pp_size=1,
+        max_req_pool_size=3,
+        state_checkpoint_in_forward=False,
     )
     monkeypatch.setattr(
         module, "check_block_drafter_storage", lambda m, p: log.append(("check", m, p))

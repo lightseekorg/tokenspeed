@@ -1315,13 +1315,18 @@ router together with every other such leaf in one batched copy, since at
 bs=1 each separate stream copy costs a few microseconds. QSA's indexer
 owns separate stacks for its two raw groups using the same fill at ratio
 one. The fill is one expand
-launch per group with plain scalar arguments (scheduler block count, source
-stride, live requests) — no device-side metadata tensor, because the
+launch for every group when the tables are row-major views of one storage,
+as the bridge uploads them, and one launch per group otherwise. Its
+arguments are plain scalars (each group's offset in the upload and block
+count, live requests) — no device-side metadata tensor, because the
 per-step pinned staging + H2D it would need lands on the bs=1 latency path;
 padding requests (`[actual_bs, bs)`) and each group's column tail resolve to
 null page 0.
 The bridge's `{gid: view}` dict is the router's input; the router does not
-depend on the views sharing one storage. The slot math lives in
+require the views to share one storage, only the one-launch fill does. The
+executor pads stopped requests' state rows in place
+(`RuntimeStates.masked_state_tables`), so the views stay in that storage.
+The slot math lives in
 `paged/write_locations.py` as pure functions with one invariant: `slot = table[req, pos // P] * P + pos % P` is page-size
 invariant, so locations computed over the kernel-page stack equal
 raw-table locations bit for bit.

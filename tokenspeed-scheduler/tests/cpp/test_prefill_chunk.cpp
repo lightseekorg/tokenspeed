@@ -146,6 +146,29 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0), 5);
 }
 
+TEST(PrefillStateCheckpointTest, LongPromptsLeaveAReusablePageBeforeTheirReplayTail) {
+    auto specs = FullOnlySpecs();
+    specs.push_back(
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0});
+    BlockPool pool(64, {1, 1});
+    const CacheCoordinator hybrid = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false);
+    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 26, 8, 0), 24);
+    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 24, 8, 0), 20) << "leave the last logits token";
+    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 8, 8, 0), 0) << "a prompt within one budget needs none";
+    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 26, 8, 7), 16) << "leave the configured replay tail";
+    EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 4, 2, 8), 0) << "no positive checkpoint fits";
+
+    BlockPool plain_pool(64, {1});
+    const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, false, nullptr, nullptr, false);
+    EXPECT_EQ(PrefillStateCheckpointTokens(plain, 26, 8, 0), 0) << "no State group, no checkpoint";
+
+    auto replay_specs = ReplayableSpecs();
+    replay_specs.push_back(specs.back());
+    BlockPool replay_pool(64, {1, 1, 1, 1});
+    const CacheCoordinator replay = MakeCoordinator(replay_specs, 4, replay_pool, false, nullptr, nullptr, false);
+    EXPECT_EQ(PrefillStateCheckpointTokens(replay, 30, 16, 0), 20) << "leave the largest replayable window";
+}
+
 TEST(MinPrefillChunkTokensTest, ReservesReplayPlusAWindowOrPage) {
     BlockPool pool(16, {1, 1, 1});
     // W = 8 > P = 4: replay plus another window.

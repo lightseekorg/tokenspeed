@@ -732,9 +732,13 @@ enum class AllReduceFusionPattern : int {
   // residual_out = RN(RN(x_scale * a) + RN(residual_scale * residual_in)),
   // norm_out = RMSNorm(residual_out; rms_gamma); both norms use rms_eps.
   kARSandwichResidualRMSNorm = 11,
+  // kARSandwichResidualRMSNorm whose norm_out is also (or only) written as
+  // per-token FP8 E4M3: quant_out holds the codes, scale_out one FP32 dequant
+  // scale per token; norm_out may be null.
+  kARSandwichResidualRMSNormTokenFP8 = 12,
   // DeepSeek-V4.1 mHC boundary (trtllm_mnnvl_mhc.cu): all-reduce, then mHC
   // post, pre-mix and RMSNorm in the epilogue.
-  kAllReduceMhcNorm = 12,
+  kAllReduceMhcNorm = 13,
 };
 
 enum class QuantType : int { kNone = 0, kFP8 = 1, kFP4 = 2, kFP8BlockWise = 3 };

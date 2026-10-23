@@ -1561,10 +1561,8 @@ class KimiLinearKDA(nn.Module):
                     scales = None
                 return self.o_proj(empty, scale=scales, ctx=ctx, out=projection_out)[0]
             return h
-        # Prefill consumes compact QKV; perform this copy in the captured
-        # projection segment rather than inside the eager attention break.
-        if not ctx.forward_mode.is_decode():
-            mixed_qkv = mixed_qkv.contiguous()
+        # Pass the projection's q|k|v view directly; the backend handles its
+        # layout.
         # f_b runs inside the backend: fused into the decode scan kernel, a
         # plain GEMV on the prefill path.
         # Fused [3*proj, k] conv kernel bank, built once in post_load_weights.
