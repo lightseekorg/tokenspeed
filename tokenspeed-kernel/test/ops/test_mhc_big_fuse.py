@@ -22,14 +22,13 @@ import inspect
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.residual import (
-    mhc_mix_coefficients,
-    torch_mhc_apply_pre,
-)
+from tokenspeed_kernel.numerics.torch.residual import mhc_mix_coefficients
 from tokenspeed_kernel.ops.residual.triton import (
     _pre_reduce_apply_fuses_norm,
     _pre_reduce_apply_is_supported,
 )
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 
 def test_mhc_big_fuse_launch_contract_is_explicit() -> None:
@@ -57,7 +56,17 @@ def reference(
     pre, post, comb = mhc_mix_coefficients(
         values * rstd[:, None], scale, base, hc_eps, sinkhorn_iters
     )
-    layer = torch_mhc_apply_pre(residual, pre, norm_weight=None, norm_eps=None)
+    apply_pre = select_kernel(
+        "residual",
+        "mhc_apply_pre",
+        format_signature(
+            residual=dense_tensor_format(residual.dtype),
+            pre=dense_tensor_format(pre.dtype),
+        ),
+        traits=None,
+        solution="reference",
+    )
+    layer = apply_pre(residual, pre, norm_weight=None, norm_eps=None)
     return layer, post, comb
 
 

@@ -50,6 +50,7 @@ from tokenspeed_kernel.selection import (
     kernel_override,
     register_oracle,
     select_kernel,
+    select_reference,
     set_selection_policy,
     spec_matches_shape_traits,
     spec_matches_traits,
@@ -1508,3 +1509,117 @@ class TestGemmDispatchProfiling:
                 },
             )
         ]
+
+
+def _register(name: str, solution: str, priority: int, traits=None) -> None:
+    register_kernel(
+        "gemm",
+        "mm",
+        name=name,
+        solution=solution,
+        signatures=format_signatures(("a", "b"), "dense", {torch.bfloat16}),
+        traits=traits,
+        priority=priority,
+    )(lambda: name)
+
+
+class TestReferenceSolution:
+    def test_prefers_a_torch_kernel_over_triton(self):
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        _register("torch_ref_mm", "torch", Priority.REFERENCE)
+        _register("cuda_ref_mm", "cuda", Priority.SPECIALIZED)
+        selected = select_kernel("gemm", "mm", GEMM_BF16, solution="reference")
+        assert selected() == "torch_ref_mm"
+
+    def test_falls_back_to_triton_without_a_matching_torch_kernel(self):
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        _register(
+            "torch_ref_mm",
+            "torch",
+            Priority.REFERENCE,
+            traits={"b_layout": frozenset({"NK"})},
+        )
+        assert select_kernel("gemm", "mm", GEMM_BF16, solution="reference")() == (
+            "torch_ref_mm"
+        )
+        # The torch kernel fails the traits, so the reference is Triton.
+        selected = select_kernel(
+            "gemm", "mm", GEMM_BF16, traits={"b_layout": "KN"}, solution="reference"
+        )
+        assert selected() == "triton_ref_mm"
+
+    def test_has_no_kernel_without_torch_or_triton(self):
+        _register("cuda_ref_mm", "cuda", Priority.SPECIALIZED)
+        with pytest.raises(NoKernelFoundError, match="'reference'"):
+            select_kernel("gemm", "mm", GEMM_BF16, solution="reference")
+
+    def test_override_resolves_reference_to_torch_first(self):
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        _register("torch_ref_mm", "torch", Priority.REFERENCE)
+        selected = select_kernel("gemm", "mm", GEMM_BF16, override="reference")
+        assert selected() == "torch_ref_mm"
+
+    def test_explain_names_the_resolved_solution(self):
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        text = explain_selection("gemm", "mm", GEMM_BF16, solution="reference")
+        assert "Solution: reference (resolves to 'triton')" in text
+        assert "1. triton_ref_mm  [SELECTED]" in text
+
+
+class TestSelectReference:
+    def test_reference_must_accept_every_trait_of_the_kernel(self):
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        _register(
+            "torch_nk_mm",
+            "torch",
+            Priority.REFERENCE + 1,
+            {"b_layout": frozenset({"NK"})},
+        )
+        _register(
+            "torch_any_mm",
+            "torch",
+            Priority.REFERENCE,
+            {"b_layout": frozenset({"KN", "NK"})},
+        )
+        _register(
+            "gluon_mm",
+            "gluon",
+            Priority.SPECIALIZED,
+            {"b_layout": frozenset({"KN", "NK"})},
+        )
+        spec = KernelRegistry.get().get_by_name("gluon_mm")
+        assert select_reference(spec, GEMM_BF16, traits=None)() == "torch_any_mm"
+
+    def test_reference_must_accept_the_call_shape(self):
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        _register(
+            "torch_small_mm", "torch", Priority.REFERENCE, {"m_max": frozenset({16})}
+        )
+        _register("gluon_mm", "gluon", Priority.SPECIALIZED)
+        spec = KernelRegistry.get().get_by_name("gluon_mm")
+        assert select_reference(spec, GEMM_BF16, traits={"m": 8})() == "torch_small_mm"
+        assert select_reference(spec, GEMM_BF16, traits={"m": 64})() == "triton_ref_mm"
+
+    def test_kernel_under_test_is_not_its_own_reference(self):
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        spec = KernelRegistry.get().get_by_name("triton_ref_mm")
+        assert select_reference(spec, GEMM_BF16, traits=None) is None
+
+    def test_a_top_ranked_kernel_takes_the_next_triton_kernel(self):
+        _register("triton_fast_mm", "triton", Priority.PERFORMANT)
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        spec = KernelRegistry.get().get_by_name("triton_fast_mm")
+        assert select_reference(spec, GEMM_BF16, traits=None)() == "triton_ref_mm"
+
+    def test_the_only_torch_kernel_takes_a_triton_reference(self):
+        _register("torch_ref_mm", "torch", Priority.REFERENCE)
+        _register("triton_ref_mm", "triton", Priority.PORTABLE)
+        spec = KernelRegistry.get().get_by_name("torch_ref_mm")
+        assert select_reference(spec, GEMM_BF16, traits=None)() == "triton_ref_mm"
+
+    def test_overrides_do_not_redirect_the_reference(self):
+        _register("torch_ref_mm", "torch", Priority.REFERENCE)
+        _register("gluon_mm", "gluon", Priority.SPECIALIZED)
+        spec = KernelRegistry.get().get_by_name("gluon_mm")
+        with kernel_override("gemm", "mm", "gluon_mm"):
+            assert select_reference(spec, GEMM_BF16, traits=None)() == "torch_ref_mm"

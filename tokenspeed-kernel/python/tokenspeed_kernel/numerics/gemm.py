@@ -211,6 +211,13 @@ class GemmInputGenerator(InputGenerator):
             return (*batch_shape, K, M)
         return (*batch_shape, M, K)
 
+    def _stored(self, value: torch.Tensor, role: str) -> torch.Tensor:
+        """``value`` stored column-major when the kernel's
+        ``<role>_inner_stride_one`` trait requires a non-unit inner stride."""
+        if self.traits.get(f"{role}_inner_stride_one") == frozenset({False}):
+            return value.transpose(-1, -2).contiguous().transpose(-1, -2)
+        return value
+
     def _b_shape(
         self,
         *,
@@ -246,6 +253,7 @@ class GemmInputGenerator(InputGenerator):
             self._b_shape(batch_shape=batch_shape, N=N, K=K, layout=b_layout),
             b_dtype,
         )
+        A, B = self._stored(A, "a"), self._stored(B, "b")
 
         block_size = self._block_size(a_format, b_format)
         A_scales = self._scale_for_format(

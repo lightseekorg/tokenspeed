@@ -103,9 +103,11 @@ The generator declares how many fresh input sets to run, and each validator
 receives every run's candidate/reference pair for its output along with
 validator-specific options. The built-in `close` validator accepts absolute
 and relative tolerances; `set_output_validator` registers additional
-validators. Generators typically compare against the operation's
-registered `torch` solution, the PyTorch references under
-`tokenspeed_kernel/numerics/torch/`.
+validators. Generators compare against the kernel that
+`tokenspeed_kernel.selection.select_reference` selects: the operation's
+`"reference"` solution, which resolves to the PyTorch references under
+`tokenspeed_kernel/numerics/torch/` and, where none matches, to the portable
+Triton kernels.
 
 Correctness runs before timing. A failure prevents the case from producing a
 successful measurement. Correctness remains within the revision-local process,

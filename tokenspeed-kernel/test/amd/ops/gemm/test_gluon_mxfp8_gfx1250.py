@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
+from tokenspeed_kernel.ops.gemm import mm
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -72,8 +72,15 @@ def test_mxfp8_ue8m0_gemv_matches_dequantized_reference(
         torch.bfloat16,
         block_size=[1, 32],
     )
-    expected = torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, torch.float32, block_size=[1, 32]
+    expected = mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.float32,
+        block_size=[1, 32],
+        quant="mxfp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(
@@ -115,8 +122,15 @@ def test_fp8_blockscale_gemv_matches_dequantized_reference(
         torch.bfloat16,
         block_size=[128, 128],
     )
-    expected = torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, torch.float32, block_size=[128, 128]
+    expected = mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.float32,
+        block_size=[128, 128],
+        quant="mxfp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(
@@ -250,8 +264,15 @@ def test_fp8_blockscale_wide_tile_preserves_strided_out() -> None:
         block_size=[128, 128],
         out=out,
     )
-    expected = torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, torch.float32, block_size=[128, 128]
+    expected = mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.float32,
+        block_size=[128, 128],
+        quant="mxfp8",
+        solution="reference",
     )
 
     assert actual is out

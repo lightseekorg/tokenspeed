@@ -988,8 +988,9 @@ def test_compact_kvp_pages_table_width():
 
 
 def test_mhc_mixes_split_count():
-    from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
+    from tokenspeed_kernel.numerics.reference import reference_kernel
     from tokenspeed_kernel.ops.residual import triton as residual
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
     hidden = 4096
     generator = torch.Generator(device=DEVICE).manual_seed(5)
@@ -1002,8 +1003,15 @@ def test_mhc_mixes_split_count():
     def run(tokens):
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         pre, post, comb = residual.triton_mhc_mixes(*args)
-        _, post_ref, comb_ref = torch_mhc_pre(*args, None, None)
-        torch.testing.assert_close(post, post_ref.squeeze(-1), rtol=1e-3, atol=1e-3)
+        reference = reference_kernel(
+            "residual",
+            "mhc_mixes",
+            format_signature(residual=dense_tensor_format(x.dtype)),
+            traits=None,
+            kernel="triton_mhc_mixes",
+        )
+        _, post_ref, comb_ref = reference(*args)
+        torch.testing.assert_close(post, post_ref, rtol=1e-3, atol=1e-3)
         torch.testing.assert_close(comb, comb_ref, rtol=1e-3, atol=1e-3)
         return pre
 
@@ -1061,8 +1069,9 @@ def test_mhc_split_count_rounds_the_sm_fill_before_the_k_cap(
 
 
 def test_mhc_pre_split_count():
-    from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
+    from tokenspeed_kernel.numerics.reference import reference_kernel
     from tokenspeed_kernel.ops.residual import triton as residual
+    from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
     hidden = 4096
     generator = torch.Generator(device=DEVICE).manual_seed(7)
@@ -1075,7 +1084,19 @@ def test_mhc_pre_split_count():
         # Up to 256 tokens take the split-K GEMM and the four-stream mix kernel.
         args = (x[:tokens], fn, scale, base, 1e-6, 1e-5, 3)
         actual = residual.triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
-        for got, want in zip(actual, torch_mhc_pre(*args, None, None), strict=True):
+        reference = reference_kernel(
+            "residual",
+            "mhc_pre",
+            format_signature(
+                residual=dense_tensor_format(x.dtype),
+                fn=dense_tensor_format(fn.dtype),
+                hc_scale=dense_tensor_format(scale.dtype),
+                hc_base=dense_tensor_format(base.dtype),
+            ),
+            traits=None,
+            kernel="triton_mhc_pre",
+        )
+        for got, want in zip(actual, reference(*args, None, None), strict=True):
             torch.testing.assert_close(got.float(), want.float(), rtol=2e-2, atol=2e-2)
 
     def key(tokens):

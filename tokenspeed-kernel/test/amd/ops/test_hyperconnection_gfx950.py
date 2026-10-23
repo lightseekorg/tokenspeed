@@ -22,7 +22,8 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -78,8 +79,25 @@ def _mix(inputs, override, projection_scale=1.0, *, padded=True):
     )
 
 
+def _hyperconnection_reference(normalized, projection, up):
+    """``residual.hyperconnection_mix``'s reference solution for these inputs."""
+    signature = format_signature(
+        normalized=dense_tensor_format(normalized.dtype),
+        projection_weight=dense_tensor_format(projection.dtype),
+        up_weight=dense_tensor_format(up.dtype),
+    )
+    return select_kernel(
+        "residual",
+        "hyperconnection_mix",
+        signature,
+        traits=None,
+        solution="reference",
+    )
+
+
 def _fp64_reference(normalized, projection, up, projection_scale):
-    return torch_hyperconnection_mix(
+    reference = _hyperconnection_reference(normalized, projection, up)
+    return reference(
         normalized,
         projection,
         up,

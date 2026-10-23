@@ -26,16 +26,14 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.attention.kpool import (
-    kpool_compress,
-    torch_kpool_decode_append,
-    torch_kpool_prefill_tail_write,
-)
+from tokenspeed_kernel.numerics.reference import reference_kernel
+from tokenspeed_kernel.numerics.torch.attention.kpool import kpool_compress
 from tokenspeed_kernel.ops.attention.kpool import (
     kpool_decode_append,
     kpool_prefill_tail_write,
     kpool_prefill_write,
 )
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -214,7 +212,19 @@ def _reference_append(
         state.index_values.clone(),
         state.index_scales.clone(),
     )
-    torch_kpool_decode_append(
+    reference = reference_kernel(
+        "attention",
+        "kpool_decode_append",
+        format_signature(k=dense_tensor_format(keys.dtype)),
+        traits={
+            "head_dim": keys.shape[-1],
+            "pool_size": state.ape.shape[0],
+            "index_k_format": "fp8_scaled",
+            "rotate": True,
+        },
+        kernel=None,
+    )
+    reference(
         k=keys,
         gate=gates,
         tail_k=expected[0],
@@ -265,7 +275,14 @@ def _reference_tail_write(
     valid_counts: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     expected_k, expected_gate = tail_k.clone(), tail_gate.clone()
-    torch_kpool_prefill_tail_write(
+    reference = reference_kernel(
+        "attention",
+        "kpool_prefill_tail_write",
+        format_signature(k=dense_tensor_format(keys.dtype)),
+        traits={"head_dim": keys.shape[-1], "pool_size": _POOL},
+        kernel=None,
+    )
+    reference(
         k=keys,
         gate=gates,
         tail_k=expected_k,

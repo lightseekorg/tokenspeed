@@ -6,7 +6,6 @@ from tokenspeed_kernel.numerics.torch.layernorm import (
     torch_fused_qk_rmsnorm_rope,
     torch_qk_rmsnorm,
     torch_rmsnorm,
-    torch_weightless_rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm import add_rmsnorm, grouped_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import (
@@ -18,6 +17,8 @@ from tokenspeed_kernel.ops.layernorm.triton import (
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_format_signature
 from utils import assert_no_triton_compile
 
 platform = current_platform()
@@ -27,6 +28,14 @@ pytestmark = pytest.mark.skipif(
     not (platform.is_nvidia or platform.is_amd),
     reason="Triton layernorm tests require an NVIDIA or AMD GPU.",
 )
+
+
+def _reference(mode: str, roles: tuple[str, ...], *tensors: torch.Tensor):
+    """The ``"reference"`` solution of ``layernorm.<mode>`` for these inputs."""
+    signature = dense_format_signature(roles, tuple(t.dtype for t in tensors))
+    return select_kernel(
+        "layernorm", mode, signature, traits=None, solution="reference"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -154,7 +163,7 @@ def test_grouped_rmsnorm_matches_per_head_reference(
 
     actual = grouped_rmsnorm(x, shape[-1], eps, out=x)
 
-    reference = torch_weightless_rmsnorm(reference_input, eps, dtype)
+    reference = _reference("weightless_rmsnorm", ("x",), x)(reference_input, eps, dtype)
     assert actual is x
     torch.testing.assert_close(actual, reference, atol=2e-2, rtol=2e-2)
 
@@ -174,7 +183,9 @@ def test_grouped_rmsnorm_cuda_graph_replays(device: str) -> None:
     reference_input = x.clone()
     graph.replay()
     torch.cuda.synchronize()
-    reference = torch_weightless_rmsnorm(reference_input, eps, x.dtype)
+    reference = _reference("weightless_rmsnorm", ("x",), x)(
+        reference_input, eps, x.dtype
+    )
     torch.testing.assert_close(x, reference, atol=2e-2, rtol=2e-2)
 
 

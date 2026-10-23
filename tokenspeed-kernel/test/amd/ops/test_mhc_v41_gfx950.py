@@ -24,13 +24,14 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
+from tokenspeed_kernel.numerics.reference import reference_kernel
 from tokenspeed_kernel.ops.residual import mhc_apply_pre, mhc_mixes, mhc_post
 from tokenspeed_kernel.ops.residual.triton import (
     triton_mhc_apply_pre,
     triton_mhc_mixes,
     triton_mhc_post,
 )
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -56,9 +57,14 @@ def _mixes_args(tokens: int, hidden: int, seed: int) -> tuple:
 
 
 def _mixes_reference(residual, weight, scale, base, rms_eps, hc_eps, iters):
-    return torch_mhc_mixes(
-        residual, weight.double(), scale, base, rms_eps, hc_eps, iters
+    reference = reference_kernel(
+        "residual",
+        "mhc_mixes",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        kernel="gluon_mhc_mixes_gfx950",
     )
+    return reference(residual, weight.double(), scale, base, rms_eps, hc_eps, iters)
 
 
 @pytest.mark.parametrize("hidden", [4096, 5120])

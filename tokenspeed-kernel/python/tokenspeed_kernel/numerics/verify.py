@@ -40,10 +40,7 @@ from tokenspeed_kernel.numerics.tolerance import (
     get_family_tolerance,
 )
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
-from tokenspeed_kernel.selection import (
-    ref_compatible_with_spec,
-    spec_matches_shape_traits,
-)
+from tokenspeed_kernel.selection import select_reference, spec_matches_shape_traits
 from tokenspeed_kernel.signature import FormatSignature
 
 # isort: split
@@ -67,36 +64,18 @@ def _as_tolerance_fn(override: ToleranceOverride | None) -> ToleranceFn | None:
     )
 
 
-def _compatible_reference_for_signature(
-    registry: KernelRegistry,
-    spec: KernelSpec,
-    signature: FormatSignature,
-) -> KernelSpec | None:
-    ref_specs = registry.get_for_operator(
-        spec.family,
-        spec.mode,
-        format_signature=signature,
-        solution="torch",
-    )
-    for ref in ref_specs:
-        if ref.name == spec.name:
-            continue
-        if ref_compatible_with_spec(ref, spec):
-            return ref
-    return None
-
-
 def _verification_signature_and_reference(
-    registry: KernelRegistry,
     spec: KernelSpec,
     dtype: torch.dtype,
     dtype_role: str | Iterable[str],
 ) -> tuple[FormatSignature | None, KernelSpec | None]:
+    """The first of ``spec``'s signatures for ``dtype`` with a selectable
+    reference (see :func:`select_reference`), and that reference."""
     signatures = spec.format_signatures_for_storage_dtype(dtype, dtype_role)
     for signature in signatures:
-        ref_spec = _compatible_reference_for_signature(registry, spec, signature)
-        if ref_spec is not None:
-            return signature, ref_spec
+        reference = select_reference(spec, signature, traits=None)
+        if reference is not None:
+            return signature, KernelRegistry.get().get_by_name(reference.name)
     return (signatures[0], None) if signatures else (None, None)
 
 
@@ -111,7 +90,8 @@ def verify_kernel(
     device: str | None = None,
     seed: int = 42,
 ) -> list[ComparisonResult]:
-    """Verify one registered kernel against a reference kernel."""
+    """Verify one registered kernel against the ``"reference"`` solution that
+    :func:`~tokenspeed_kernel.selection.select_reference` picks for it."""
     load_builtin_kernels()
     registry = KernelRegistry.get()
     spec = registry.get_by_name(kernel_name)
@@ -122,9 +102,7 @@ def verify_kernel(
     if kernel is None:
         raise ValueError(f"Kernel implementation for {kernel_name!r} is missing")
 
-    signature, ref_spec = _verification_signature_and_reference(
-        registry, spec, dtype, dtype_role
-    )
+    signature, ref_spec = _verification_signature_and_reference(spec, dtype, dtype_role)
     if signature is None:
         raise ValueError(
             f"Kernel {kernel_name!r} does not support storage dtype={dtype} "
@@ -136,10 +114,6 @@ def verify_kernel(
             f"{spec.family}.{spec.mode} and dtype={dtype}; "
             f"kernel={spec.name} traits={spec.traits}"
         )
-    ref_kernel = registry.get_impl(ref_spec.name)
-    if ref_kernel is None:
-        raise ValueError(f"Reference implementation {ref_spec.name!r} is missing")
-
     generator = get_input_generator(
         spec.family,
         spec.mode,
@@ -158,9 +132,14 @@ def verify_kernel(
             if verbose:
                 print(f"[SKIP] {kernel_name} shape={shape} incompatible with traits")
             continue
+        reference = select_reference(spec, signature, traits=shape_traits(shape))
+        if reference is None:
+            if verbose:
+                print(f"[SKIP] {kernel_name} shape={shape} has no reference")
+            continue
 
         inputs = generator.generate(**shape)
-        expected = ref_kernel(**inputs)
+        expected = reference(**inputs)
         actual = kernel(**inputs)
 
         if not isinstance(actual, torch.Tensor) or not isinstance(

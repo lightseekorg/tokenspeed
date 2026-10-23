@@ -23,8 +23,8 @@ reference (same expert set, same weights) and win selection on NVIDIA."""
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.moe import _moe_sigmoid_bias_topk as moe_sigmoid_bias_topk
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.ops.moe.native import torch_sigmoid_bias_topk
 from tokenspeed_kernel.ops.moe.triton import triton_minimax_sigmoid_bias_topk
 from tokenspeed_kernel.platform import Platform
 
@@ -70,7 +70,7 @@ def test_minimax_adapter_matches_torch(tokens, experts, topk, normalize):
         routed_scaling_factor=2.5,
         normalize_topk_weights=normalize,
     )
-    ref_w, ref_i = torch_sigmoid_bias_topk(**kwargs)
+    ref_w, ref_i = moe_sigmoid_bias_topk(**kwargs, solution="reference")
     got_w, got_i = triton_minimax_sigmoid_bias_topk(**kwargs)
     assert got_w.dtype == torch.float32 and got_i.dtype == torch.int32
     for row in range(tokens):

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.moe import torch_latent_input
 from utils import assert_no_triton_compile, is_cdna5
 
 pytest.importorskip(
@@ -54,13 +53,14 @@ def _weights():
 
 
 def _reference(hidden, views):
-    return torch_latent_input(
-        hidden_states=hidden,
-        router_weight=views[0],
-        routed_weight=views[1],
-        shared_gate_up_weight=views[2],
+    return latent_moe_input_projections(
+        hidden,
+        views[0],
+        views[1],
+        views[2],
         gate_clamp=GATE_CLAMP,
         up_clamp=UP_CLAMP,
+        solution="reference",
     )
 
 
@@ -182,13 +182,14 @@ def test_launcher_rejects_a_packed_weight_that_is_not_the_views(
 
 def _expected(hidden, packed, router_n, latent_n, shared_n, beta, linear_beta):
     router, routed, shared = packed.split((router_n, latent_n, 2 * shared_n))
-    return torch_latent_input(
-        hidden_states=hidden,
-        router_weight=router,
-        routed_weight=routed,
-        shared_gate_up_weight=shared,
+    return latent_moe_input_projections(
+        hidden,
+        router,
+        routed,
+        shared,
         gate_clamp=beta,
         up_clamp=linear_beta,
+        solution="reference",
     )
 
 

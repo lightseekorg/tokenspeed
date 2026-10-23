@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
+from tokenspeed_kernel.numerics.reference import reference_kernel
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -69,7 +69,14 @@ def _operands(tokens: int, hidden: int, seed: int):
 
 
 def _reference(residual, weight, scale, base):
-    return torch_mhc_mixes(
+    reference = reference_kernel(
+        "residual",
+        "mhc_mixes",
+        format_signature(residual=dense_tensor_format(residual.dtype)),
+        traits=None,
+        kernel="gluon_mhc_mixes_gfx1250",
+    )
+    return reference(
         residual,
         weight.double(),
         scale.double(),

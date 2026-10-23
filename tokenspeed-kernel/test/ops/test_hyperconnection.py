@@ -27,7 +27,6 @@ from collections.abc import Sequence
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.layernorm import (
     gated_residual_combine_norm,
     grouped_gemma_rmsnorm,
@@ -40,6 +39,8 @@ from tokenspeed_kernel.ops.residual import (
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile, is_cdna4
 
 pytestmark = pytest.mark.skipif(
@@ -180,6 +181,22 @@ def _mix(
     )
 
 
+def _hyperconnection_reference(normalized, projection, up):
+    """``residual.hyperconnection_mix``'s reference solution for these inputs."""
+    signature = format_signature(
+        normalized=dense_tensor_format(normalized.dtype),
+        projection_weight=dense_tensor_format(projection.dtype),
+        up_weight=dense_tensor_format(up.dtype),
+    )
+    return select_kernel(
+        "residual",
+        "hyperconnection_mix",
+        signature,
+        traits=None,
+        solution="reference",
+    )
+
+
 def _mix_reference(
     normalized: torch.Tensor,
     projection: torch.Tensor,
@@ -188,7 +205,8 @@ def _mix_reference(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     # The reference runs on the host. Otherwise the two float64 GEMMs trigger
     # high execution time on simulator-based flows.
-    mixed, inject = torch_hyperconnection_mix(
+    reference = _hyperconnection_reference(normalized, projection, up)
+    mixed, inject = reference(
         normalized.cpu(),
         projection.cpu(),
         up.cpu(),

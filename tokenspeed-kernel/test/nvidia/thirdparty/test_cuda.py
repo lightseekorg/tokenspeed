@@ -92,7 +92,7 @@ class TestApplyRopeWithCosSinCacheInplace:
             key.clone(),
             self.HEAD_SIZE,
             cos_sin_cache,
-            solution="torch",
+            solution="reference",
         )
 
         output_q = torch.empty_like(query)
@@ -187,7 +187,7 @@ class TestApplyRopeWithCosSinCacheInplace:
             key.clone(),
             self.HEAD_SIZE,
             cos_sin_cache,
-            solution="torch",
+            solution="reference",
         )
 
         q_tk = query.clone()

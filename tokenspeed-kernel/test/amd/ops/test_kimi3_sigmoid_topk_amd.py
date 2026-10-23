@@ -124,7 +124,7 @@ def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
         16,
         routed_scaling_factor=scale,
         normalize_topk_weights=normalize,
-        solution="torch",
+        solution="reference",
     )
 
     graph = torch.cuda.CUDAGraph()
@@ -157,7 +157,7 @@ def test_prefill_sigmoid_bias_topk_matches_torch_and_captures(
         16,
         routed_scaling_factor=scale,
         normalize_topk_weights=normalize,
-        solution="torch",
+        solution="reference",
     )
     graph.replay()
     torch.cuda.synchronize()

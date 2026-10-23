@@ -22,7 +22,8 @@
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
+from tokenspeed_kernel.numerics.reference import reference_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile, is_cdna5
 
 if not is_cdna5():
@@ -59,7 +60,17 @@ def _inputs(tokens, valid_blocks, *, delta, write_block, seed):
 def _reference(inputs, valid_blocks, write_block):
     layer = inputs["layer"].clone()
     blocks = inputs["blocks"].clone()
-    output = torch_attn_res_fwd(
+    reference = reference_kernel(
+        "residual",
+        "attn_res_fwd",
+        format_signature(
+            layer_residual=dense_tensor_format(torch.bfloat16),
+            block_residual=dense_tensor_format(torch.bfloat16),
+        ),
+        traits=None,
+        kernel="gluon_attn_res_fwd_gfx1250",
+    )
+    output = reference(
         layer_residual=layer,
         block_residual=blocks,
         res_weight=inputs["res_weight"],

@@ -29,9 +29,7 @@ from fused_boundary_helpers import (
     assert_child_keeps_waiting,
     boundary_case,
 )
-from tokenspeed_kernel.numerics.torch.residual import (
-    torch_post_norm_residual_pre_norm,
-)
+from tokenspeed_kernel.numerics.reference import reference_kernel
 from tokenspeed_kernel.ops.moe import (
     routed_input_scale_rmsnorm_sum_gathered,
 )
@@ -139,7 +137,16 @@ def test_cluster_boundary_agrees_with_triton_up_to_variance_rounding(
     for got, twin, ref in zip(
         cluster[:2],
         triton[:2],
-        torch_post_norm_residual_pre_norm(*args, False, None, 1)[:2],
+        reference_kernel(
+            "residual",
+            "post_norm_residual_pre_norm",
+            format_signature(
+                stream=dense_tensor_format(args[0].dtype),
+                branch=dense_tensor_format(args[1].dtype),
+            ),
+            traits=None,
+            kernel="cute_dsl_post_norm_residual_pre_norm",
+        )(*args, False, None, 1)[:2],
     ):
         if got is None:
             assert twin is None and ref is None
