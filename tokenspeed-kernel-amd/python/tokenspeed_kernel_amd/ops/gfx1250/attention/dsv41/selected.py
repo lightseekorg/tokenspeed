@@ -51,8 +51,8 @@ _BLOCK_H = 16
 # Four waves split a tile's rows for QK, 16 rows each.
 _TILE_K = 64
 # Rows are split over workgroups only while the grid still fits the 256 CUs
-# once.
-_TARGET_CTAS = 256
+# at two workgroups each.
+_TARGET_CTAS = 512
 _MAX_SPLITS = 16
 # The reduce splits head dims over workgroups too: one workgroup per token and
 # 16-head group alone is too few to stream a small batch's partials.
@@ -236,6 +236,18 @@ def _copy_scales(
 
 
 @gluon.jit
+def _global_stage(values_ring, buffer, LAYOUT: gl.constexpr):
+    """Ring stage ``buffer`` viewed as a global tile [TILE_K, 256].
+
+    SWA and global tiles share each stage, so a global tile at a split's
+    SWA-to-global boundary never overlaps the other stage.
+    """
+    return values_ring.index(buffer).reinterpret(
+        gl.uint8, [values_ring.shape[1], 256], LAYOUT
+    )
+
+
+@gluon.jit
 def _tile_coords(
     tile,
     num_tiles,
@@ -290,8 +302,7 @@ def _issue_tile(
     swa_value_rows,
     global_value_desc,
     global_value_rows,
-    swa_values_ring,
-    global_values_ring,
+    values_ring,
     scales_ring,
     SWA_TILES: gl.constexpr,
     GLOBAL_TILES: gl.constexpr,
@@ -299,6 +310,7 @@ def _issue_tile(
     TILE_K: gl.constexpr,
     HAS_GLOBAL: gl.constexpr,
     ROW_LAYOUT: gl.constexpr,
+    GLOBAL_LAYOUT: gl.constexpr,
 ):
     """Start the split's tile into its ring buffer: one TDM gather of values
     from the tile's own segment (padding tiles gather only zero-filled rows)
@@ -328,7 +340,7 @@ def _issue_tile(
                 gather_rows_smem,
                 smem_row,
                 padding,
-                swa_values_ring.index(buffer),
+                values_ring.index(buffer),
                 ROW_LAYOUT,
             )
         else:
@@ -338,7 +350,7 @@ def _issue_tile(
                 gather_rows_smem,
                 smem_row,
                 padding,
-                global_values_ring.index(buffer),
+                _global_stage(values_ring, buffer, GLOBAL_LAYOUT),
                 ROW_LAYOUT,
             )
     else:
@@ -348,7 +360,7 @@ def _issue_tile(
             gather_rows_smem,
             smem_row,
             padding,
-            swa_values_ring.index(buffer),
+            values_ring.index(buffer),
             ROW_LAYOUT,
         )
     _copy_scales(
@@ -613,13 +625,14 @@ def gluon_dsv41_selected_attention_gfx1250(
     raw_shared_2d: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
-    # The QK operand reads 16 value rows at once; a 16-byte pad per row puts
-    # them in different banks.
+    # The QK operand reads 16 value rows at once; an 8-byte pad per 256 bytes
+    # puts them in different banks. Both views of the shared value ring need
+    # the same padding.
     swa_ring_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[512, 16]], [TILE_K, 512], [1, 0]
+        [[256, 8]], [TILE_K, 512], [1, 0]
     )
     global_ring_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[256, 16]], [TILE_K, 256], [1, 0]
+        [[256, 8]], [TILE_K, 256], [1, 0]
     )
     score_row_layout: gl.constexpr = gl.SliceLayout(0, wmma)
     head_layout: gl.constexpr = gl.SliceLayout(1, wmma)
@@ -719,7 +732,9 @@ def gluon_dsv41_selected_attention_gfx1250(
         global_capacity,
         (global_page_stride // 256).to(gl.int32),
     )
-    swa_values_ring = gl.allocate_shared_memory(
+    # SWA and global tiles share one value ring, which keeps the LDS of a
+    # workgroup within half a CU.
+    values_ring = gl.allocate_shared_memory(
         gl.uint8, [STAGES, TILE_K, 512], layout=swa_ring_layout
     )
     scales_ring = gl.allocate_shared_memory(
@@ -733,9 +748,6 @@ def gluon_dsv41_selected_attention_gfx1250(
         layout=swa_ring_layout,
     )
     if HAS_GLOBAL:
-        global_values_ring = gl.allocate_shared_memory(
-            gl.uint8, [STAGES, TILE_K, 256], layout=global_ring_layout
-        )
         global_value_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
             base=global_cache,
             shape=[global_value_rows, 256],
@@ -744,7 +756,6 @@ def gluon_dsv41_selected_attention_gfx1250(
             layout=global_ring_layout,
         )
     else:
-        global_values_ring = swa_values_ring
         global_value_desc = swa_value_desc
 
     # The split's tiles, SWA first, run through a ring of STAGES raw LDS
@@ -772,8 +783,7 @@ def gluon_dsv41_selected_attention_gfx1250(
             swa_value_rows,
             global_value_desc,
             global_value_rows,
-            swa_values_ring,
-            global_values_ring,
+            values_ring,
             scales_ring,
             SWA_TILES,
             GLOBAL_TILES,
@@ -781,6 +791,7 @@ def gluon_dsv41_selected_attention_gfx1250(
             TILE_K,
             HAS_GLOBAL,
             gather_row_layout,
+            global_ring_layout,
         )
     # Bit g of active_groups marks a head group with a nonzero query, which
     # needs its own pass over the selected rows. A -0.0 counts as nonzero,
@@ -867,8 +878,7 @@ def gluon_dsv41_selected_attention_gfx1250(
                         swa_value_rows,
                         global_value_desc,
                         global_value_rows,
-                        swa_values_ring,
-                        global_values_ring,
+                        values_ring,
                         scales_ring,
                         SWA_TILES,
                         GLOBAL_TILES,
@@ -876,6 +886,7 @@ def gluon_dsv41_selected_attention_gfx1250(
                         TILE_K,
                         HAS_GLOBAL,
                         gather_row_layout,
+                        global_ring_layout,
                     )
             for tile in range(num_tiles):
                 _issue_tile(
@@ -898,8 +909,7 @@ def gluon_dsv41_selected_attention_gfx1250(
                     swa_value_rows,
                     global_value_desc,
                     global_value_rows,
-                    swa_values_ring,
-                    global_values_ring,
+                    values_ring,
                     scales_ring,
                     SWA_TILES,
                     GLOBAL_TILES,
@@ -907,6 +917,7 @@ def gluon_dsv41_selected_attention_gfx1250(
                     TILE_K,
                     HAS_GLOBAL,
                     gather_row_layout,
+                    global_ring_layout,
                 )
                 gl.amd.cdna5.tdm.async_wait(STAGES - 1)
                 gl.amd.cdna5.async_copy.wait_group(STAGES - 1)
@@ -930,19 +941,19 @@ def gluon_dsv41_selected_attention_gfx1250(
                 if HAS_GLOBAL:
                     if tile < swa_tiles_here:
                         k_dot = _dequant_swa_tile(
-                            swa_values_ring.index(buffer),
+                            values_ring.index(buffer),
                             scales_ring.index(buffer),
                             wmma,
                         )
                     else:
                         k_dot = _dequant_global_tile(
-                            global_values_ring.index(buffer),
+                            _global_stage(values_ring, buffer, global_ring_layout),
                             scales_ring.index(buffer),
                             wmma,
                         )
                 else:
                     k_dot = _dequant_swa_tile(
-                        swa_values_ring.index(buffer), scales_ring.index(buffer), wmma
+                        values_ring.index(buffer), scales_ring.index(buffer), wmma
                     )
                 kv_shared.permute([1, 0]).store(k_dot)
                 score_valid = (
@@ -1041,17 +1052,20 @@ def gluon_dsv41_selected_attention_gfx1250(
 
 
 @gluon.jit
-def _split_state(part_stats, part_count, rows, heads, num_heads, mask, active):
-    """Per-split (max, sum) [splits, heads]; zero-query heads use frame 0, count."""
+def _split_state(part_stats, part_count, rows, heads, num_heads, valid, active):
+    """Per-split (max, sum) [splits, heads]; zero-query heads use frame 0, count.
+
+    rows and heads must be in range; entries outside valid read as empty.
+    """
     if active:
         stats = (
             part_stats + (rows[:, None].to(tl.int64) * num_heads + heads[None, :]) * 2
         )
-        split_max = gl.load(stats, mask=mask, other=-float("inf"))
-        split_sum = gl.load(stats + 1, mask=mask, other=0.0)
+        split_max = gl.where(valid, gl.load(stats), -float("inf"))
+        split_sum = gl.where(valid, gl.load(stats + 1), 0.0)
     else:
-        count = gl.load(
-            part_count + rows[:, None] + heads[None, :] * 0, mask=mask, other=0
+        count = gl.where(
+            valid, gl.load(part_count + rows[:, None] + heads[None, :] * 0), 0
         )
         split_max = gl.where(count > 0, 0.0, -float("inf"))
         split_sum = count.to(gl.float32)
@@ -1077,7 +1091,7 @@ def gluon_dsv41_selected_attention_reduce_gfx1250(
     stride_rope: tl.int64,
     BLOCK_H: gl.constexpr,
     HEAD_GROUPS: gl.constexpr,
-    MAX_SPLITS: gl.constexpr,
+    SPLIT_BLOCK: gl.constexpr,
     HEAD_DIM: gl.constexpr,
     DIM_BLOCK: gl.constexpr,
     ROPE_DIM: gl.constexpr,
@@ -1086,10 +1100,12 @@ def gluon_dsv41_selected_attention_reduce_gfx1250(
 
     Each program covers 16 heads and ``DIM_BLOCK`` dims. Zero-query heads use
     frame 0, weight ``count`` and value ``row_sum`` for every split, which is
-    exactly their all-zero-score softmax state. Splits are merged four at a
-    time so their loads are in flight together.
+    exactly their all-zero-score softmax state. All splits (at most
+    ``SPLIT_BLOCK``, a power of two) load at once, unmasked, at
+    clamped splits and heads: splits and heads sit in registers, and a mask
+    uniform per register would become a branch and a full wait around every
+    load. A clamped split's weight is zero; clamped heads are not stored.
     """
-    CHUNK: gl.constexpr = 4
     layout: gl.constexpr = gl.BlockedLayout(
         [1, 1, 4], [1, 32 // (DIM_BLOCK // 4), DIM_BLOCK // 4], [1, 4, 1], [2, 1, 0]
     )
@@ -1102,65 +1118,44 @@ def gluon_dsv41_selected_attention_reduce_gfx1250(
         0, BLOCK_H, layout=gl.SliceLayout(0, stat_layout)
     )
     valid_head = heads < num_heads
+    heads = gl.minimum(heads, num_heads - 1)
     active_bits = gl.load(
         part_active + token_idx * head_blocks + group_idx // HEAD_GROUPS
     )
     active = ((active_bits >> (group_idx % HEAD_GROUPS)) & 1) != 0
-    sink = gl.load(attn_sink + heads, mask=valid_head, other=0.0).to(gl.float32)
-    splits = gl.arange(0, MAX_SPLITS, layout=gl.SliceLayout(1, stat_layout))
-    split_max, _ = _split_state(
-        part_stats,
-        part_count,
-        token_idx * num_splits + splits,
-        heads,
-        num_heads,
-        (splits < num_splits)[:, None] & valid_head[None, :],
-        active,
+    sink = gl.where(valid_head, gl.load(attn_sink + heads).to(gl.float32), 0.0)
+    splits = gl.arange(0, SPLIT_BLOCK, layout=gl.SliceLayout(1, stat_layout))
+    valid = (splits < num_splits)[:, None] & valid_head[None, :]
+    rows = token_idx * num_splits + gl.minimum(splits, num_splits - 1)
+    split_max, split_sum = _split_state(
+        part_stats, part_count, rows, heads, num_heads, valid, active
     )
     frame = gl.maximum(gl.max(split_max, axis=0), sink)
     frame = gl.where(frame > -float("inf"), frame, 0.0)
-    total = gl.exp(sink - frame)
-    merged = gl.zeros([BLOCK_H, DIM_BLOCK], dtype=gl.float32, layout=out_layout)
+    weight = gl.exp(split_max - frame[None, :])
+    total = gl.exp(sink - frame) + gl.sum(split_sum * weight, axis=0)
     out_heads = group_idx * BLOCK_H + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(1, out_layout)
     )
     dims = dim_base + gl.arange(0, DIM_BLOCK, layout=gl.SliceLayout(0, out_layout))
-    chunk = gl.arange(0, CHUNK, layout=gl.SliceLayout(1, stat_layout))
-    chunk_dims = dim_base + gl.arange(
+    value_dims = dim_base + gl.arange(
         0, DIM_BLOCK, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout))
     )
-    for start in gl.static_range(0, MAX_SPLITS, CHUNK):
-        if start < num_splits:
-            split = start + chunk
-            valid = (split < num_splits)[:, None] & valid_head[None, :]
-            rows = token_idx * num_splits + split
-            chunk_max, chunk_sum = _split_state(
-                part_stats, part_count, rows, heads, num_heads, valid, active
-            )
-            weight = gl.exp(chunk_max - frame[None, :])
-            total += gl.sum(chunk_sum * weight, axis=0)
-            if active:
-                values = gl.load(
-                    part_acc
-                    + (
-                        rows[:, None, None].to(tl.int64) * num_heads
-                        + heads[None, :, None]
-                    )
-                    * HEAD_DIM
-                    + chunk_dims[None, None, :],
-                    mask=valid[:, :, None],
-                    other=0.0,
-                )
-            else:
-                values = gl.load(
-                    part_row_sum
-                    + rows[:, None, None].to(tl.int64) * HEAD_DIM
-                    + chunk_dims[None, None, :]
-                    + heads[None, :, None] * 0,
-                    mask=valid[:, :, None],
-                    other=0.0,
-                )
-            merged += gl.sum(values * weight[:, :, None], axis=0)
+    if active:
+        values = gl.load(
+            part_acc
+            + (rows[:, None, None].to(tl.int64) * num_heads + heads[None, :, None])
+            * HEAD_DIM
+            + value_dims[None, None, :]
+        )
+    else:
+        values = gl.load(
+            part_row_sum
+            + rows[:, None, None].to(tl.int64) * HEAD_DIM
+            + value_dims[None, None, :]
+            + heads[None, :, None] * 0
+        )
+    merged = gl.sum(values * weight[:, :, None], axis=0)
     scale = gl.convert_layout(
         gl.where(total > 0.0, 1.0 / total, 0.0), gl.SliceLayout(1, out_layout)
     )
@@ -1443,6 +1438,9 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
             _TARGET_CTAS // (tokens * head_blocks),
         ),
     )
+    # The reduce loads every split at once. Its width bounds the split count
+    # from the slot widths alone, so a new batch size never recompiles it.
+    split_block = triton.next_power_of_2(max(1, min(_MAX_SPLITS, max_tiles // 2)))
     if splits > 1:
         heads = q.shape[1]
         part_stats = torch.empty(
@@ -1526,7 +1524,7 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
             rope_cos_sin.stride(0) if rope else 0,
             BLOCK_H=_BLOCK_H,
             HEAD_GROUPS=head_groups,
-            MAX_SPLITS=_MAX_SPLITS,
+            SPLIT_BLOCK=split_block,
             HEAD_DIM=_HEAD_DIM,
             DIM_BLOCK=_REDUCE_DIM_BLOCK,
             ROPE_DIM=rope_cos_sin.shape[1] if rope else 0,

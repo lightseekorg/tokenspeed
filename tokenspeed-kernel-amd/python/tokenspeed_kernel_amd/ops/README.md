@@ -842,10 +842,14 @@ memory.
 
 Tiles dequantize from the ring straight into the QK operand layout. The BF16
 tile in LDS only feeds the transposed PV read, which reads 16 rows at once,
-so the ring pads each row by 16 bytes to keep them off shared banks. The
-zero-query check and the staged slot rows load clamped rather than masked,
-since a row mask becomes a branch and a full wait around each load. Outputs
-and partials store straight from the WMMA layout.
+so the ring pads every 256 bytes of a row by 8 to keep them off shared banks.
+SWA and global tiles share the ring, so a workgroup takes 146 KiB of LDS, two
+fit on a CU and rows split until the grid reaches 512 workgroups. The
+zero-query check, the staged slot rows and the reduce's splits load clamped
+rather than masked, since a row mask becomes a branch and a full wait around
+each load. Outputs and partials store straight from the WMMA layout. The
+reduce loads all splits at once; its width depends only on the slot widths,
+so batch size never recompiles it.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks
