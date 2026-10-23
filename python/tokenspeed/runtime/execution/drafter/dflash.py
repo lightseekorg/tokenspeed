@@ -227,6 +227,8 @@ class DFlash(BaseDrafter):
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
+        # A draft-owned mask row replaces the target's; wire_target binds it.
+        self.mask_embedding_partial: torch.Tensor | None = None
         self._init_native_buffers()
         self._validate_draft_attention_window()
         self._validate_draft_window_sink()
@@ -426,6 +428,25 @@ class DFlash(BaseDrafter):
         if self.embed_tokens is None:
             self.embed_tokens = self.model.embed_tokens
         self._first_layer_input = self._first_layer_input_mode()
+        # Drafts without their own embedding table use the target's mask row.
+        own_mask_embedding = getattr(self.model, "own_mask_embedding", None)
+        own_row = own_mask_embedding() if own_mask_embedding is not None else None
+        self.mask_embedding_partial = None
+        if own_row is not None:
+            logger.info(
+                "Block draft uses its own embedding for mask token "
+                f"{self.mask_token_id}."
+            )
+            # The row joins the first layer's input as _first_layer_embeds
+            # hands it in: whole on every rank ("full"), else whole on the
+            # dense group's first rank and zeros on the others.
+            whole = (
+                self._first_layer_input == "full"
+                or self.model.mapping.dense.tp_rank == 0
+            )
+            self.mask_embedding_partial = (
+                own_row if whole else torch.zeros_like(own_row)
+            )
         self.lm_head = target_model.lm_head
         self.logits_processor = language_model.logits_processor
         self._replicate_head_over_attention_dp()
@@ -1502,6 +1523,11 @@ class DFlash(BaseDrafter):
 
         flat_ids = block_ids.reshape(-1)
         input_embeds = self._first_layer_embeds(flat_ids)
+        if self.mask_embedding_partial is not None:
+            # Row 0 is the anchor; every later row is the mask token.
+            input_embeds.view(bs, self.draft_query_width, -1)[:, 1:].copy_(
+                self.mask_embedding_partial
+            )
 
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(

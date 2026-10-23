@@ -462,6 +462,26 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
         # Name the DFlash drafter reads off the draft model.
         self.block_size = read_checkpoint_block_size(config)
         self._residual_buffer: torch.Tensor | None = None
+        # A checkpoint that ships its own embedding table can carry a trained
+        # mask-token row that differs from the target's (the target never
+        # trains that reserved token). load_weights keeps only that row; the
+        # other rows come from the shared target embedding.
+        mask_token_id = (getattr(config, "dflash_config", {}) or {}).get(
+            "mask_token_id", getattr(config, "mask_token_id", None)
+        )
+        self.mask_token_id: int | None = (
+            None if mask_token_id is None else int(mask_token_id)
+        )
+        self.register_buffer(
+            "mask_embedding",
+            torch.zeros(int(config.hidden_size)),
+            persistent=False,
+        )
+        self.has_own_mask_embedding = False
+
+    def own_mask_embedding(self) -> torch.Tensor | None:
+        """The checkpoint's own mask-token embedding, if it ships one."""
+        return self.mask_embedding if self.has_own_mask_embedding else None
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project the concatenated target taps to normalized context rows.
@@ -629,6 +649,11 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
 
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+            if name in ("embed_tokens.weight", "model.embed_tokens.weight"):
+                if self.mask_token_id is not None:
+                    self.mask_embedding.copy_(loaded_weight[self.mask_token_id])
+                    self.has_own_mask_embedding = True
                 continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:

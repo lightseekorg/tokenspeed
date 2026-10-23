@@ -31,6 +31,7 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     is_block_drafter,
     model_wide_kwargs,
     resolve_cache_layer_types,
+    block_draft_is_causal,
     resolve_dtype,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -104,6 +105,9 @@ class MHAConfig(SoftmaxAttnConfig):
         )
         return AttnConfig(
             components=(spec,),
+            draft_block_causal=(
+                draft_block_decode and block_draft_is_causal(hf_config)
+            ),
             **model_wide_kwargs(
                 server_args,
                 model_config,
