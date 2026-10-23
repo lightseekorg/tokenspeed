@@ -76,6 +76,13 @@ def _stage_slots(
     global_slots,
     global_row,
     global_width,
+    gather_rows_smem,
+    swa_len,
+    swa_capacity,
+    swa_rows_per_page,
+    global_len,
+    global_capacity,
+    global_rows_per_page,
     SWA_TILES: gl.constexpr,
     TILE_K: gl.constexpr,
     HAS_GLOBAL: gl.constexpr,
@@ -83,7 +90,8 @@ def _stage_slots(
     """Copy a query row's SWA then global slots into LDS rows of TILE_K.
 
     Row ``r < SWA_TILES`` holds SWA tile ``r``, row ``SWA_TILES + j`` global
-    tile ``j``; positions past a width read -1.
+    tile ``j``; positions past a width read -1. gather_rows_smem gets each
+    position's value row in the TDM row view of its cache, -1 if unusable.
     """
     layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
     tiles = gl.arange(0, slots_smem.shape[0], layout=gl.SliceLayout(1, layout))
@@ -104,6 +112,13 @@ def _stage_slots(
         )
         slot = gl.where(is_swa, slot, global_slot)
     slots_smem.store(slot)
+    length = gl.where(is_swa, swa_len, global_len)
+    capacity = gl.where(is_swa, swa_capacity, global_capacity)
+    rows_per_page = gl.where(is_swa, swa_rows_per_page, global_rows_per_page)
+    valid = (positions < length) & (slot >= 0) & (slot < capacity)
+    gather_rows_smem.store(
+        gl.where(valid, (slot >> 6) * rows_per_page + (slot & 63), -1)
+    )
 
 
 @gluon.jit
@@ -136,30 +151,23 @@ def _warp_split_row_layout(tile_k, num_warps, warp_size):
 def _gather_values(
     value_desc,
     value_rows,
-    rows_per_page,
-    slots_smem,
+    gather_rows_smem,
     smem_row,
-    first,
-    bound,
-    capacity,
+    padding,
     values_smem,
-    TILE_K: gl.constexpr,
     ROW_LAYOUT: gl.constexpr,
 ):
-    """Start a TDM gather of one tile's value rows into LDS.
+    """Start a TDM gather of one tile's staged value rows into LDS.
 
-    The cache is viewed as ``value_rows`` rows of the value width,
-    ``rows_per_page`` per page with the values in the first 64. Invalid rows
-    index one past the end, which the gather zero-fills.
+    The cache is viewed as ``value_rows`` rows of the value width. Unusable
+    rows (-1) and every row of a padding tile index one past the end, which
+    the gather zero-fills.
     """
-    slot, valid = _staged_slots(
-        slots_smem, smem_row, first, bound, capacity, TILE_K, ROW_LAYOUT
-    )
-    gl.amd.cdna5.tdm.async_gather(
-        value_desc,
-        gl.where(valid, slot // 64 * rows_per_page + slot % 64, value_rows),
-        values_smem,
-    )
+    rows = gather_rows_smem.index(smem_row).load(ROW_LAYOUT)
+    # Branch-free clamp: TDM takes the rows in SGPRs, and a lane-mask select
+    # per row would cost a VALU->SALU dependency each.
+    rows = gl.minimum((rows | padding).to(gl.uint32), value_rows.to(gl.uint32))
+    gl.amd.cdna5.tdm.async_gather(value_desc, rows.to(gl.int32), values_smem)
 
 
 @gluon.jit
@@ -253,6 +261,7 @@ def _issue_tile(
     global_first,
     global_bound,
     slots_smem,
+    gather_rows_smem,
     swa_capacity,
     global_capacity,
     swa_cache,
@@ -292,48 +301,36 @@ def _issue_tile(
     )
     buffer = tile % STAGES
     is_swa = tile < swa_tiles
-    swa_rows_per_page = (swa_page_stride // 512).to(gl.int32)
+    padding = -(tile >= num_tiles).to(gl.int32)
     if HAS_GLOBAL:
         if is_swa:
             _gather_values(
                 swa_value_desc,
                 swa_value_rows,
-                swa_rows_per_page,
-                slots_smem,
+                gather_rows_smem,
                 smem_row,
-                first,
-                bound,
-                capacity,
+                padding,
                 swa_values_ring.index(buffer),
-                TILE_K,
                 ROW_LAYOUT,
             )
         else:
             _gather_values(
                 global_value_desc,
                 global_value_rows,
-                (global_page_stride // 256).to(gl.int32),
-                slots_smem,
+                gather_rows_smem,
                 smem_row,
-                first,
-                bound,
-                capacity,
+                padding,
                 global_values_ring.index(buffer),
-                TILE_K,
                 ROW_LAYOUT,
             )
     else:
         _gather_values(
             swa_value_desc,
             swa_value_rows,
-            swa_rows_per_page,
-            slots_smem,
+            gather_rows_smem,
             smem_row,
-            first,
-            bound,
-            capacity,
+            padding,
             swa_values_ring.index(buffer),
-            TILE_K,
             ROW_LAYOUT,
         )
     _copy_scales(
@@ -422,6 +419,8 @@ def _attend_tile(
     )
     # V is read from LDS only after QK, so the K and V operands are never live
     # together; that register saving outweighs the second LDS read.
+    # Invalid rows dequantize to zero, so all-one weights give the V row sum.
+    ones = gl.full([BLOCK_H, TILE_K], 1.0, dtype=gl.bfloat16, layout=p_dot_layout)
     if active:
         k_dot = kv_shared.permute([1, 0]).load(k_dot_layout)
         scores = gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=WMMA_LAYOUT)
@@ -440,10 +439,11 @@ def _attend_tile(
         v_dot = kv_shared.load(k_dot_layout)
         accumulator = gl.amd.cdna5.wmma(p_dot, v_dot, accumulator)
         max_value = next_max
-    if with_row_sum:
-        # Invalid rows dequantize to zero, so all-one weights give the V row sum.
-        ones = gl.full([BLOCK_H, TILE_K], 1.0, dtype=gl.bfloat16, layout=p_dot_layout)
+        if with_row_sum:
+            row_sum = gl.amd.cdna5.wmma(ones, v_dot, row_sum)
+    elif with_row_sum:
         row_sum = gl.amd.cdna5.wmma(ones, kv_shared.load(k_dot_layout), row_sum)
+    if with_row_sum:
         row_count += gl.sum(valid_rows.to(gl.int32), axis=0)
     return max_value, denominator, accumulator, row_sum, row_count
 
@@ -633,6 +633,12 @@ def gluon_dsv41_selected_attention_gfx1250(
         gl.int32, [SLOT_TILES, TILE_K], layout=raw_shared_2d
     )
     slots_smem = slots_table.reinterpret(gl.int32, [SLOT_TILES, TILE_K], raw_shared_1d)
+    gather_rows_table = gl.allocate_shared_memory(
+        gl.int32, [SLOT_TILES, TILE_K], layout=raw_shared_2d
+    )
+    gather_rows_smem = gather_rows_table.reinterpret(
+        gl.int32, [SLOT_TILES, TILE_K], raw_shared_1d
+    )
     _stage_slots(
         slots_table,
         swa_slots,
@@ -641,6 +647,13 @@ def gluon_dsv41_selected_attention_gfx1250(
         global_slots,
         global_row,
         global_width,
+        gather_rows_table,
+        swa_len,
+        swa_capacity,
+        (swa_page_stride // 512).to(gl.int32),
+        global_len,
+        global_capacity,
+        (global_page_stride // 256).to(gl.int32),
         SWA_TILES,
         TILE_K,
         HAS_GLOBAL,
@@ -673,6 +686,41 @@ def gluon_dsv41_selected_attention_gfx1250(
         global_values_ring = swa_values_ring
         global_value_desc = swa_value_desc
 
+    # The split's tiles, SWA first, run through a ring of STAGES raw LDS
+    # tiles: copies run STAGES - 1 tiles ahead of the tile being dequantized,
+    # one value gather and one scale group per tile. The first pass's
+    # leading copies overlap the query checks.
+    for stage in gl.static_range(STAGES - 1):
+        _issue_tile(
+            stage,
+            num_tiles,
+            swa_tiles_here,
+            swa_first,
+            swa_bound,
+            global_first,
+            global_bound,
+            slots_smem,
+            gather_rows_smem,
+            swa_capacity,
+            global_capacity,
+            swa_cache,
+            swa_page_stride,
+            global_cache,
+            global_page_stride,
+            swa_value_desc,
+            swa_value_rows,
+            global_value_desc,
+            global_value_rows,
+            swa_values_ring,
+            global_values_ring,
+            scales_ring,
+            SWA_TILES,
+            GLOBAL_TILES,
+            STAGES,
+            TILE_K,
+            HAS_GLOBAL,
+            gather_row_layout,
+        )
     q_heads = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, q_layout))
     q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_layout))
     q_base = q + token_idx.to(tl.int64) * stride_q_t + q_dims[None, :]
@@ -736,39 +784,38 @@ def gluon_dsv41_selected_attention_gfx1250(
             )
             accumulator = gl.zeros([BLOCK_H, HEAD_DIM], dtype=gl.float32, layout=wmma)
 
-            # The split's tiles, SWA first, run through a ring of STAGES raw
-            # LDS tiles: copies run STAGES - 1 tiles ahead of the tile being
-            # dequantized, one value gather and one scale group per tile.
-            for stage in gl.static_range(STAGES - 1):
-                _issue_tile(
-                    stage,
-                    num_tiles,
-                    swa_tiles_here,
-                    swa_first,
-                    swa_bound,
-                    global_first,
-                    global_bound,
-                    slots_smem,
-                    swa_capacity,
-                    global_capacity,
-                    swa_cache,
-                    swa_page_stride,
-                    global_cache,
-                    global_page_stride,
-                    swa_value_desc,
-                    swa_value_rows,
-                    global_value_desc,
-                    global_value_rows,
-                    swa_values_ring,
-                    global_values_ring,
-                    scales_ring,
-                    SWA_TILES,
-                    GLOBAL_TILES,
-                    STAGES,
-                    TILE_K,
-                    HAS_GLOBAL,
-                    gather_row_layout,
-                )
+            if group > 0:
+                for stage in gl.static_range(STAGES - 1):
+                    _issue_tile(
+                        stage,
+                        num_tiles,
+                        swa_tiles_here,
+                        swa_first,
+                        swa_bound,
+                        global_first,
+                        global_bound,
+                        slots_smem,
+                        gather_rows_smem,
+                        swa_capacity,
+                        global_capacity,
+                        swa_cache,
+                        swa_page_stride,
+                        global_cache,
+                        global_page_stride,
+                        swa_value_desc,
+                        swa_value_rows,
+                        global_value_desc,
+                        global_value_rows,
+                        swa_values_ring,
+                        global_values_ring,
+                        scales_ring,
+                        SWA_TILES,
+                        GLOBAL_TILES,
+                        STAGES,
+                        TILE_K,
+                        HAS_GLOBAL,
+                        gather_row_layout,
+                    )
             for tile in range(num_tiles):
                 _issue_tile(
                     tile + STAGES - 1,
@@ -779,6 +826,7 @@ def gluon_dsv41_selected_attention_gfx1250(
                     global_first,
                     global_bound,
                     slots_smem,
+                    gather_rows_smem,
                     swa_capacity,
                     global_capacity,
                     swa_cache,
@@ -803,7 +851,7 @@ def gluon_dsv41_selected_attention_gfx1250(
                 gl.amd.cdna5.async_copy.wait_group(STAGES - 1)
                 buffer = tile % STAGES
                 is_swa = tile < swa_tiles_here
-                smem_row, first, bound, capacity = _tile_coords(
+                smem_row, _, _, _ = _tile_coords(
                     tile,
                     num_tiles,
                     swa_tiles_here,
@@ -846,14 +894,8 @@ def gluon_dsv41_selected_attention_gfx1250(
                                 global_values, global_scales, global_kv_layout
                             )
                         )
-                _, score_valid = _staged_slots(
-                    slots_smem,
-                    smem_row,
-                    first,
-                    bound,
-                    capacity,
-                    TILE_K,
-                    score_row_layout,
+                score_valid = (
+                    gather_rows_smem.index(smem_row).load(score_row_layout) >= 0
                 )
                 max_value, denominator, accumulator, row_sum, row_count = _attend_tile(
                     kv_shared,

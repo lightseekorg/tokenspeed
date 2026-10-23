@@ -828,15 +828,17 @@ scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
 BF16 power of two, the E4M3 global scale as BF16. V is read from LDS only
 after QK, so the K and V operands are never live together.
 
-A workgroup stages its slots in LDS, then runs its tiles through a two-deep
-LDS ring: while one tile is dequantized, a TDM gather fetches the next tile's
-value rows and an async copy its scales. Prefetching rows into registers
-instead was slower: it doubled the live rows. The gathers view a cache as
-rows of a page's value bytes (512 SWA, 256 global) with int32 row indices, so
-page strides must be whole such rows, as the arena plan aligns them, and a
-cache spans at most 2^31 rows. Invalid rows gather as zero values while their
-scale copies read row 0; the dequant reads NaN scale bytes as tiny or zero,
-so those rows stay zero even over unwritten memory.
+A workgroup stages its slots in LDS, resolving each position's gather row (-1
+when unusable) in one pass, since TDM takes row indices in SGPRs. Its tiles
+then run through a two-deep LDS ring: while one tile is dequantized, a TDM
+gather fetches the next tile's value rows and an async copy its scales.
+Prefetching rows into registers instead was slower: it doubled the live rows.
+The gathers view a cache as rows of a page's value bytes (512 SWA, 256
+global) with int32 row indices, so page strides must be whole such rows, as
+the arena plan aligns them, and a cache spans at most 2^31 rows. Invalid rows
+gather as zero values while their scale copies read row 0; the dequant reads
+NaN scale bytes as tiny or zero, so those rows stay zero even over unwritten
+memory.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks
