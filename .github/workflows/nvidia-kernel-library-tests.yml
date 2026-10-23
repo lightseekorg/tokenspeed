@@ -2,8 +2,9 @@ name: NVIDIA Kernel Library Tests
 
 on:
   schedule:
-    # Check the latest main at 00:17 and 12:17 UTC.
-    - cron: "17 */12 * * *"
+    # Check the latest main six times daily in US Pacific time.
+    - cron: "0 0,6,9,12,15,18 * * *"
+      timezone: "America/Los_Angeles"
   workflow_dispatch:
 
 permissions:

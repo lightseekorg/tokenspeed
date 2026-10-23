@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MIN_NODES,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    GdnStateCheckpoints,
     _qkv_rows_strided,
     gdn_chunk_prefill,
     gdn_decode_mtp,
@@ -473,6 +474,103 @@ def test_gdn_chunk_prefill_output_h_contract(device: str, solution: str, require
 
     assert result.out.shape == v.shape
     assert result.final_state.shape == initial_state.shape
+
+
+def test_gdn_chunk_prefill_state_checkpoints_are_the_truncated_final_states(
+    device: str, require
+):
+    # A caller-owned checkpoint buffer at a 128-token interval: sequence i's
+    # j-th state is the final state of the same scan cut after (j + 1) * 128
+    # of its tokens, bit for bit.
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    lengths = (300, 520)
+    interval = 128
+    q, k, v, g, beta, initial_state, _ = _make_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        seq_len=sum(lengths),
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.float32,
+        nonzero_state=True,
+    )
+    initial_state = initial_state.repeat(len(lengths), 1, 1, 1)
+    initial_state[1] *= -1
+    starts = (0, lengths[0])
+    cu_seqlens = torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()])
+    counts = [length // interval for length in lengths]
+    cu_starts = torch.tensor([0, counts[0], counts[0] + counts[1]], dtype=torch.int32)
+    states = torch.full(
+        (sum(counts), *initial_state.shape[1:]), float("nan"), device=device
+    )
+    scale = q.shape[-1] ** -0.5
+    gdn_chunk_prefill(
+        q,
+        k,
+        v,
+        g,
+        beta,
+        scale=scale,
+        initial_state=initial_state,
+        cu_seqlens=cu_seqlens.to(device=device, dtype=torch.int32),
+        qk_l2norm=True,
+        output_final_state=True,
+        state_checkpoints=GdnStateCheckpoints(
+            every_n_tokens=interval, states=states, cu_starts=cu_starts.to(device)
+        ),
+    )
+    for i, (start, count) in enumerate(zip(starts, counts)):
+        for j in range(count):
+            end = start + (j + 1) * interval
+            truncated = gdn_chunk_prefill(
+                q[:, start:end],
+                k[:, start:end],
+                v[:, start:end],
+                g[:, start:end],
+                beta[:, start:end],
+                scale=scale,
+                initial_state=initial_state[i : i + 1],
+                cu_seqlens=torch.tensor(
+                    [0, end - start], device=device, dtype=torch.int32
+                ),
+                qk_l2norm=True,
+                output_final_state=True,
+            )
+            assert torch.equal(
+                states[int(cu_starts[i]) + j], truncated.final_state[0]
+            ), (i, j)
+
+
+def test_gdn_chunk_prefill_state_checkpoints_exclude_output_h(device: str, require):
+    require("attention", "gdn_chunk_prefill", "flashinfer", torch.bfloat16, "q")
+    q, k, v, g, beta, initial_state, cu_seqlens = _make_inputs(
+        device=device,
+        dtype=torch.bfloat16,
+        seq_len=128,
+        num_q_heads=16,
+        num_v_heads=32,
+        state_dtype=torch.float32,
+        nonzero_state=False,
+    )
+    checkpoints = GdnStateCheckpoints(
+        every_n_tokens=64,
+        states=torch.empty((2, *initial_state.shape[1:]), device=device),
+        cu_starts=torch.tensor([0, 2], device=device, dtype=torch.int32),
+    )
+    with pytest.raises(ValueError, match="exclusive"):
+        gdn_chunk_prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale=None,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            qk_l2norm=True,
+            output_h=True,
+            state_checkpoints=checkpoints,
+        )
 
 
 # ===-----------------------------------------------------------------------===#

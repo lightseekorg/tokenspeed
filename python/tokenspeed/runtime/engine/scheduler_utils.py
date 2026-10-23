@@ -358,6 +358,7 @@ def make_config(
     cache_groups: Sequence[CacheGroupConfig] | None = None,
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
+    state_checkpoint_in_forward: bool = False,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -395,6 +396,11 @@ def make_config(
         cache_groups: The arena's scheduler group configs.
         enable_mixed_prefill_decode: Mixed prefill/decode batches.
         prefix_replay_tokens: Prompt tail recomputed after a prefix hit.
+        state_checkpoint_in_forward:
+            ``--enable-state-checkpoint-in-forward``: the prefill forward that
+            spans a long prompt's last prefix-page boundary before its replay
+            tail also writes the State checkpoint there. Requires prefix
+            caching.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -433,6 +439,12 @@ def make_config(
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache
     cfg.prefix_replay_tokens = prefix_replay_tokens
+    if state_checkpoint_in_forward:
+        # Set only when on: off is the binding's default, so the runtime keeps
+        # working with a scheduler wheel released before this field, where
+        # turning the option on raises AttributeError here instead of being
+        # ignored.
+        cfg.state_checkpoint_in_forward = True
     cfg.disable_l2_cache = disable_l2_cache
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
@@ -901,11 +913,11 @@ def packed_block_tables_from_forward_op(
 
     All groups stage into ONE pinned buffer and ride ONE H2D copy; the
     returned per-group views share a single storage, which is the
-    precondition of the backends' one-launch packed replay fill
-    (``_try_packed_group_unpack``). Per-group uploads would fail its
-    same-storage check and fall back to per-group copy/fill chains
-    (~40 tiny transfers per decode step). The host stage is returned too,
-    so a backend planning from the tables reads them without a D2H sync.
+    precondition of the routers' one-launch fill of every group
+    (``GroupTableStacks.fill``). Per-group uploads would fail its
+    same-storage check and fall back to one launch per group. The host
+    stage is returned too, so a backend planning from the tables reads them
+    without a D2H sync.
 
     Args:
         forward_op: Scheduler forward operation exporting CPU NumPy tables.
@@ -1010,8 +1022,7 @@ def packed_block_tables_from_forward_op(
         if arr.shape[0] == 0:
             continue
         if arr.shape[1] == 0:
-            # Kept out of the pack: a zero-width table must stay loud in the
-            # replay fill's cols >= 1 assert, not be silently tail-padded.
+            # Kept out of the pack: CacheBatchMetadata rejects a zero-width table.
             out[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32, device=device)
             out_cpu[key] = torch.empty((arr.shape[0], 0), dtype=torch.int32)
             continue

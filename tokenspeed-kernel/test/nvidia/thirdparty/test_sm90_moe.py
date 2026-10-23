@@ -21,7 +21,10 @@
 """Exact source edits and numerical isolation for the private SM90 MoE adapter."""
 
 import difflib
+import json
+import tempfile
 from functools import partial
+from pathlib import Path
 
 import pytest
 import torch
@@ -72,13 +75,17 @@ def test_unknown_modes_are_rejected(mode):
         prepare_sm90_fp8_moe(mode=mode)
 
 
-@pytest.fixture(scope="module")
-def implementations():
+def _require_private_sm90():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper SM90")
     flashinfer = pytest.importorskip("flashinfer")
     if flashinfer.__version__ != "0.7.2":
         pytest.skip("The private source patch targets FlashInfer 0.7.2")
+
+
+@pytest.fixture(scope="module")
+def implementations():
+    _require_private_sm90()
     # Build before warmup/capture, with independent stage configurations coexisting.
     return {
         "default": prepare_sm90_fp8_moe(mode="default"),
@@ -221,6 +228,73 @@ def test_direct_lookup_overflow_matches_original(implementations, expert_weights
     for mode in ("optimized", "fc1_4", "fc2_4", "both_4"):
         actual = implementations[mode](**arguments, expected_m=1)[0]
         torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("tokens", (32, 512))
+def test_prefix_scan_with_more_experts_than_threads_matches_original(
+    implementations, tokens
+):
+    # 512 experts take two scan chunks of the 384-thread SwapAB block.
+    experts = 512
+    weights = _make_expert_weights(experts, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+    arguments = _arguments(weights, tokens, experts, HIDDEN_SIZE, TOP_K, False)
+    reference = implementations["default"](**arguments)[0].clone()
+    hint = max(1, (tokens * TOP_K + experts - 1) // experts)
+    for mode in ("expected_m", "optimized", "fc1_4"):
+        actual = implementations[mode](**arguments, expected_m=hint)[0]
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
+def _activation_quantization_launches(call):
+    """Kernel names and grids of the grouped activation quantization in one call."""
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as profile:
+        call()
+        torch.cuda.synchronize()
+    with tempfile.TemporaryDirectory() as directory:
+        trace = Path(directory) / "trace.json"
+        profile.export_chrome_trace(str(trace))
+        events = json.loads(trace.read_text())["traceEvents"]
+    return [
+        (event["name"], event["args"]["grid"])
+        for event in events
+        if event.get("cat") == "kernel"
+        and "fp8_blockscale_gemm::scale_1x128_kernel<" in event["name"]
+    ]
+
+
+def test_small_call_quantization_follows_its_own_rows():
+    """A decode-sized call quantizes as if no larger batch had run before it.
+
+    The block-scale runner keeps the largest M it has seen for its workspace.
+    Sizing the grouped activation quantization from that high-water mark gave
+    every later small call the large batch's grid and linear expert search.
+    """
+    _require_private_sm90()
+    # A private mode with an explicit FC1 stage bound; shared with other tests.
+    moe = prepare_sm90_fp8_moe(mode="optimized", max_num_stages_fc1=4)
+    weights = _make_expert_weights(EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+    small = _arguments(weights, 1, EXPERTS, HIDDEN_SIZE, TOP_K, False)
+    large = _arguments(weights, 1024, EXPERTS, HIDDEN_SIZE, TOP_K, False)
+    reference = moe(**small, expected_m=1)[0].clone()
+    moe(**large, expected_m=(1024 * TOP_K + EXPERTS - 1) // EXPERTS)
+
+    launches = _activation_quantization_launches(lambda: moe(**small, expected_m=1))
+    # FC1 quantizes [rows, HIDDEN_SIZE] and FC2 [rows, INTERMEDIATE_SIZE]. One warp
+    # handles one 128-wide group and a block has eight warps; more blocks would idle.
+    rows = TOP_K
+    assert len(launches) == 2
+    for (name, grid), width in zip(launches, (HIDDEN_SIZE, INTERMEDIATE_SIZE)):
+        assert "scale_1x128_kernel<true," in name
+        assert grid[0] <= -(-rows * (width // 128) // 8)
+    torch.testing.assert_close(moe(**small, expected_m=1)[0], reference, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = moe(**small, expected_m=1)[0]
+    graph.replay()
+    torch.testing.assert_close(output, reference, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("hint", (0, -1, True, 1.5, 2**32))

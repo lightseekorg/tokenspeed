@@ -811,6 +811,7 @@ def test_executor_input_capacity_covers_decode_capture(
         output_length=width,
         enable_nan_detection=False,
         enable_speculative_sampling=False,
+        state_checkpoint_in_forward=False,
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),

@@ -164,6 +164,13 @@ class HybridLinearAttnBackend(AttentionBackend):
     def child_backends(self):
         return (self.full_attn_backend, self.linear_attn_backend)
 
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        return all(
+            backend.stores_in_forward_state_checkpoints
+            for backend in self.child_backends()
+        )
+
     def _backend_for_layer(self, layer_id: int) -> AttentionBackend:
         if layer_id in self.full_attn_layers:
             return self.full_attn_backend

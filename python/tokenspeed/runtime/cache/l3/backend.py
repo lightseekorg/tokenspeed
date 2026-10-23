@@ -931,6 +931,7 @@ def storage_deployment_id(
     cache_signature: str,
     pipeline_rank: int,
     attn_tp_size: int,
+    group_shard_counts: Sequence[int],
     draft_model: str,
     draft_revision: str,
     cache_quantization: str,
@@ -954,6 +955,8 @@ def storage_deployment_id(
     added separately by ``storage_key_prefix``. Empty draft facts mean no
     draft pool. ``attn_tp_size`` distinguishes head assignments that can
     otherwise have identical local layouts under replicated KV heads.
+    ``group_shard_counts`` isolates the per-group replica numbering used by
+    page-cyclic objects. An all-replicated layout keeps its existing identity.
     """
     if not isinstance(model_overrides, dict):
         raise TypeError("model_overrides must be a dict")
@@ -963,6 +966,11 @@ def storage_deployment_id(
         raise ValueError("kv_producer must be explicit and nonempty")
     if isinstance(eagle3_layers_to_capture, (str, bytes)):
         raise TypeError("eagle3_layers_to_capture must be a sequence of ints")
+    if isinstance(group_shard_counts, (str, bytes)):
+        raise TypeError("group_shard_counts must be a sequence of ints")
+    shards = [int(count) for count in group_shard_counts]
+    if not shards or any(count < 1 for count in shards):
+        raise ValueError("group_shard_counts must contain positive shard counts")
     payload = json.dumps(
         {
             "model": str(model_name),
@@ -977,6 +985,11 @@ def storage_deployment_id(
             "cache_quantization": str(cache_quantization),
             "runtime_compat": str(runtime_compat),
             "kv_producer": kv_producer,
+            **(
+                {"group_shard_counts": shards}
+                if any(count > 1 for count in shards)
+                else {}
+            ),
             "attention_backend": str(attention_backend),
             "draft_attention_backend": str(draft_attention_backend),
             "skip_softmax_threshold": float(skip_softmax_threshold),
