@@ -119,6 +119,7 @@ from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
+    is_breakable_capture_active,
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import (
@@ -1412,7 +1413,9 @@ def _v41_hc_post_pre(
             pending.reduce_group,
         )
         return residual, x, None
-    if not prefer_overlap:
+    # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
+    # read the previous replay's partials, so keep it out of captured segments.
+    if not prefer_overlap and not is_breakable_capture_active():
         shifted = try_mhc_shifted_post_pre_norm(
             pending.x,
             residual,
