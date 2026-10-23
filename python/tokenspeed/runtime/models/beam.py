@@ -204,11 +204,10 @@ class BeamRMSNorm(RMSNorm):
     The weight is stored in the checkpoint dtype.
 
     An input norm whose attention runs its Q/K/V and gate projections as one
-    FP8 GEMM (``BeamDecoderLayer`` sets ``_token_fp8_consumer``) normalizes
-    that attention's decode rows with ``rmsnorm_quantize_fp8``
-    (``quantization.rmsnorm_fp8``), whose launch also writes them quantized per
-    token, and offers the codes to the attention, which then skips its own
-    quantization of the rows.
+    FP8 GEMM, or a post-attention norm whose dense MLP runs gate/up as an FP8
+    GEMM (``BeamDecoderLayer`` sets ``_token_fp8_consumer``), also writes its
+    decode rows quantized per token in the same launch and offers them to that
+    consumer, which then skips its own quantization of the rows.
     """
 
     # No depth-scale pair of its own: a scale reaches this norm only as an
@@ -218,6 +217,7 @@ class BeamRMSNorm(RMSNorm):
     def __init__(self, hidden_size: int, eps: float, dtype: torch.dtype) -> None:
         super().__init__(hidden_size=hidden_size, eps=eps)
         self.weight.data = self.weight.data.to(dtype=dtype)
+        self._token_fp8_consumer: BeamAttention | BeamMLP | None = None
 
     def forward(
         self,
@@ -230,7 +230,7 @@ class BeamRMSNorm(RMSNorm):
     ):
         if residual is None and (x_scale is not None or residual_scale is not None):
             raise ValueError("x_scale and residual_scale need a residual")
-        consumer = self.__dict__.get("_token_fp8_consumer")
+        consumer = self._token_fp8_consumer
         if out is None and consumer is not None and consumer.takes_token_fp8(x):
             return self._forward_token_fp8(
                 consumer, x, residual, x_scale, residual_scale
@@ -276,16 +276,17 @@ class BeamRMSNorm(RMSNorm):
 
     def _forward_token_fp8(
         self,
-        consumer: "BeamAttention",
+        consumer: "BeamAttention | BeamMLP",
         x: torch.Tensor,
         residual: torch.Tensor | None,
         x_scale: float | None,
         residual_scale: float | None,
     ):
-        """``forward`` for the rows the attention's fused FP8 GEMM reads: one
-        ``rmsnorm_quantize_fp8`` launch normalizes them as ``forward`` does
-        (with a residual, the BF16-rounded sum of the scaled pair) and also
-        writes them quantized per token for the attention."""
+        """Normalize the consumer's rows and quantize them in one launch.
+
+        With a residual, the norm reads the BF16-rounded sum of the scaled
+        pair, as ``forward`` does, before writing per-token FP8 for the GEMM.
+        """
         rejection = scale_pair_rejection(x_scale, residual_scale)
         if rejection:
             raise ValueError(f"x_scale / residual_scale: {rejection}")
@@ -1102,11 +1103,11 @@ class BeamMLP(LlamaMLP):
 
     Where gate/up and down are compressed-tensors FP8 W8A8 linears with
     dynamic activations on the FP8 GEMMs, and a vendor per-tensor FP8 GEMM is
-    registered (``fp8_unscaled_gemm_available``), the rows the one-launch
-    per-token quantizer takes (up to 64) run: the
-    per-token quantization of the input, gate/up on that GEMM with unit
-    scales (``fp8_unscaled_linear``), one launch that applies its scales, the
-    SwiGLU and the down projection's per-token quantization
+    registered (``fp8_unscaled_gemm_available``), up to 64 rows run: the
+    per-token quantization of the input (or the codes and scales the
+    post-attention norm wrote in its own launch and offered), gate/up on that
+    GEMM with unit scales (``fp8_unscaled_linear``), one launch that applies
+    its scales, the SwiGLU and the down projection's per-token quantization
     (``silu_and_mul_quantize_fp8``), and the scaled FP8 down GEMM. Everything
     else (BF16 checkpoints, other rows) runs ``LlamaMLP.forward``.
     """
@@ -1114,6 +1115,9 @@ class BeamMLP(LlamaMLP):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.register_buffer("fp8_unit_scale", None, persistent=False)
+        # The post-attention norm's per-token FP8 of the rows it returned
+        # last, offered for this MLP's gate/up GEMM: (rows, codes, scales).
+        self._token_fp8: tuple[torch.Tensor, ...] | None = None
 
     def process_weights_after_loading(self, layer: nn.Module) -> None:
         # The loader visits this module before its projections, whose own
@@ -1137,16 +1141,37 @@ class BeamMLP(LlamaMLP):
             return
         self.fp8_unit_scale = torch.ones(1, dtype=torch.float32, device=weight.device)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not (
+    def _decode_unscaled(self, x: torch.Tensor) -> bool:
+        return (
             self.fp8_unit_scale is not None
             and x.ndim == 2
             and _token_fp8_rows(x.shape[0], x.dtype)
-        ):
-            return super().forward(x)
-        codes, token_scales = quantize_fp8(
-            x, granularity="token", enable_pdl=pdl_enabled()
         )
+
+    def takes_token_fp8(self, x: torch.Tensor) -> bool:
+        """Whether the post-attention norm can supply this gate/up GEMM's codes."""
+        return self._decode_unscaled(x) and x.dtype == torch.bfloat16
+
+    def offer_token_fp8(
+        self, rows: torch.Tensor, codes: torch.Tensor, scales: torch.Tensor
+    ) -> None:
+        self._token_fp8 = (rows, codes, scales)
+
+    def _input_fp8(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """The norm's codes and scales of exactly these rows, if it offered
+        them; consumed once."""
+        offered, self._token_fp8 = self._token_fp8, None
+        if offered is not None and offered[0] is x:
+            return offered[1], offered[2]
+        return None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        offered = self._input_fp8(x)
+        if not self._decode_unscaled(x):
+            return super().forward(x)
+        if offered is None:
+            offered = quantize_fp8(x, granularity="token", enable_pdl=pdl_enabled())
+        codes, token_scales = offered
         gate_up = fp8_unscaled_linear(
             codes, self.gate_up_proj.weight, self.fp8_unit_scale
         )
@@ -1233,11 +1258,16 @@ class BeamDecoderLayer(BaseDecoderLayer):
             query_sharded=False,
         )
         # The input norm writes its decode rows' per-token FP8 for the
-        # attention's fused FP8 GEMM where that runs (a plain attribute, not a
-        # submodule).
+        # attention's fused FP8 GEMM where that runs, and the post-attention
+        # norm for a dense MLP's FP8 gate/up GEMM (plain attributes, not
+        # submodules).
         if isinstance(self.self_attn, BeamAttention):
             object.__setattr__(
                 self.input_layernorm, "_token_fp8_consumer", self.self_attn
+            )
+        if isinstance(self.mlp, BeamMLP):
+            object.__setattr__(
+                self.post_attention_layernorm, "_token_fp8_consumer", self.mlp
             )
 
     @property

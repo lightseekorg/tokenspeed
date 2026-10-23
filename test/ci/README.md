@@ -55,12 +55,6 @@ Conversely, AMD runners split the `runtime-1gpu` suite across
 by their registered `est_time` (`run_ci_suite.py --auto-partition-*`). Other
 runners run the whole suite in `ut-runtime-1gpu`.
 
-PRs labeled `high priority` start `unit-test` and `model-test` concurrently.
-Applying the label starts a new CI run immediately and cancels the older run
-through the workflow's concurrency policy. A unit-test failure does not cancel
-model tests that are already running in this mode. The label does not restart
-AMD kernel benchmarks.
-
 The Qwen3.5 FP8 DeepEP correctness task runs GSM8K on four GB200 GPUs with
 attention TP2, attention DP2, and MoE EP4. DeepEP `auto` mode exercises its
 normal path during prefill and low-latency path during decode, and the task
