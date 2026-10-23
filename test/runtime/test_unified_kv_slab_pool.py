@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import importlib.util
-import itertools
 import os
-import pathlib
 import sys
 from functools import partial
 
@@ -16,29 +13,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
-
-_RUNTIME_DIR = (
-    pathlib.Path(__file__).resolve().parents[2] / "python" / "tokenspeed" / "runtime"
-)
-_KV_CACHE_DIR = _RUNTIME_DIR / "layers" / "attention" / "kv_cache"
-_RECIPES_DIR = _KV_CACHE_DIR / "recipes"
-
-
-def _load(mod_name: str, file_path: pathlib.Path):
-    spec = importlib.util.spec_from_file_location(mod_name, file_path)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    # Register before exec: on py3.9 @dataclass + `from __future__ import
-    # annotations` resolves field types via sys.modules[cls.__module__].
-    sys.modules[mod_name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# spec.py is self-contained: load it from the repo file under a private
-# name (no real package import, no sys.modules shadowing needed).
-_pcs = _load("kv_cache_spec_slab_under_test", _RECIPES_DIR / "spec.py")
-hybrid_slab_group_size = _pcs.hybrid_slab_group_size
 
 
 def _specs_for_layers(**kwargs):
@@ -54,93 +28,6 @@ GPT_OSS_LAYER_TYPES = ("sliding_attention", "full_attention") * 12
 SUBGROUP_LAYER_BLOCK = tuple(f"sliding_attention_{k}" for k in range(5)) + (
     "full_attention",
 )
-
-
-class TestHybridSlabGroupSizeTest:
-    """Each case pins exactly ONE reason the predicate returns None (or the
-    single shape where it activates)."""
-
-    def test_gpt_oss_shape_returns_group_size(self):
-        # gpt-oss: 12 sliding + 12 full, alternating -> 12 layers per group.
-        assert (hybrid_slab_group_size(GPT_OSS_LAYER_TYPES)) == (12)
-
-    def test_none_when_single_group(self):
-        assert (hybrid_slab_group_size(("full_attention",) * 24)) is None
-
-    def test_unequal_groups_return_largest_count(self):
-        # Unequal groups (e.g. Inkling: 55 sliding + 11 full): the slab
-        # count is the largest group's layer count; slabs past the smaller
-        # group's count are single-layer.
-        lt = ("sliding_attention",) * 8 + ("full_attention",) * 16
-        assert (hybrid_slab_group_size(lt)) == (16)
-        lt_inkling = ("sliding_attention",) * 55 + ("full_attention",) * 11
-        assert (hybrid_slab_group_size(lt_inkling)) == (55)
-
-    def test_sliding_subgroups_return_group_size(self):
-        # Inkling step 2.5: 5 sliding sub-groups + full, all count 11 ->
-        # 11 slabs, every slab bound by one layer of each of the 6 groups.
-        lt = SUBGROUP_LAYER_BLOCK * 11
-        assert (hybrid_slab_group_size(lt, sliding_window_tokens=512)) == (11)
-
-    def test_none_when_subgroup_suffix_not_digit(self):
-        lt = GPT_OSS_LAYER_TYPES + ("sliding_attention_x",)
-        assert (hybrid_slab_group_size(lt)) is None
-
-    def test_none_when_unknown_label(self):
-        # Unknown input degrades to None (safe legacy layout), never raises;
-        # loud rejection is spec.group's job.
-        lt = GPT_OSS_LAYER_TYPES + ("banana_attention",)
-        assert (hybrid_slab_group_size(lt)) is None
-
-    def test_none_when_empty(self):
-        # Plain models pass empty or None layer_types.
-        assert (hybrid_slab_group_size(())) is None
-        assert (hybrid_slab_group_size(None)) is None
-
-    def test_none_when_multi_window_sequence(self):
-        it = itertools.cycle((4, 512))
-        windows = [
-            next(it) if t == "sliding_attention" else None for t in GPT_OSS_LAYER_TYPES
-        ]
-        assert (
-            hybrid_slab_group_size(
-                GPT_OSS_LAYER_TYPES,
-                sliding_window_tokens=windows,
-            )
-        ) is None
-
-    def test_uniform_window_sequence_stays_active(self):
-        windows = [None if t == "full_attention" else 128 for t in GPT_OSS_LAYER_TYPES]
-        assert (
-            hybrid_slab_group_size(
-                GPT_OSS_LAYER_TYPES,
-                sliding_window_tokens=windows,
-            )
-        ) == (12)
-
-    def test_scalar_window_stays_active(self):
-        assert (
-            hybrid_slab_group_size(
-                GPT_OSS_LAYER_TYPES,
-                sliding_window_tokens=128,
-            )
-        ) == (12)
-
-    def test_none_when_window_sequence_length_mismatch(self):
-        assert (
-            hybrid_slab_group_size(
-                GPT_OSS_LAYER_TYPES,
-                sliding_window_tokens=[128],
-            )
-        ) is None
-
-    def test_garbage_elements_ignored_not_raised(self):
-        assert (
-            hybrid_slab_group_size(
-                GPT_OSS_LAYER_TYPES,
-                sliding_window_tokens=["a"] * len(GPT_OSS_LAYER_TYPES),
-            )
-        ) == (12)
 
 
 class TestMHAPoolSlabLayoutTest:

@@ -50,7 +50,8 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
     CacheGroupSpec,
-    group,
+    SlidingWindowTokens,
+    auto_group,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
     compute_offload_capacity,
@@ -227,10 +228,12 @@ class CacheRecipe(ABC):
 
     @property
     def group_ids(self) -> tuple[str, ...]:
-        """Per-layer cache group id, target layers then draft layers.
+        """Initial per-layer cache group ids, target layers then draft layers.
 
         Only the default per-layer :meth:`groups` walk consumes this seam:
-        it is the storage policy "layer i's fields go to group_ids[i]".
+        it declares compatible storage policies. The planner may refine an
+        unsplit sliding group; the returned group declarations own the final
+        assignment and field occurrence numbers.
         Families that override :meth:`groups` wholesale express that policy
         directly in their field declarations and need not implement it.
         """
@@ -293,6 +296,15 @@ class CacheRecipe(ABC):
     # Seams: groups
     # ------------------------------------------------------------------
 
+    @property
+    def sliding_window_tokens(self) -> SlidingWindowTokens:
+        """Target config's windows, scalar, per-layer, or None.
+
+        Families with draft-specific windows must merge them in an override,
+        as OrdinaryRecipe does for target and draft layers.
+        """
+        return self.attn_config.component(SoftmaxAttnConfig).sliding_window_tokens
+
     def fields_for_layer(
         self, layer_id: int, group_id: str, occurrence: int
     ) -> tuple[CacheFieldSpec, ...]:
@@ -307,19 +319,20 @@ class CacheRecipe(ABC):
     def groups(self) -> tuple[CacheGroupDeclaration, ...]:
         """Declare this family's cache groups, spec and fields together.
 
-        The default walks the layers once (:func:`spec.group`). Families with
+        The default plans per-layer groups (:func:`spec.auto_group`). Families with
         groups that are not per-layer either append whole-group declarations
         here or replace the walk entirely.
         """
-        return group(
+        return auto_group(
             layer_types=self.layer_types,
             group_ids=self.group_ids,
-            sliding_window_tokens=self.attn_config.component(
-                SoftmaxAttnConfig
-            ).sliding_window_tokens,
+            sliding_window_tokens=self.sliding_window_tokens,
             prefix_granularity=self.prefix_granularity,
             fields_for_layer=self.fields_for_layer,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
+            packing=self.packing,
+            alignment=self.alignment,
+            max_padding_fraction=self.max_padding_fraction,
         )
 
     def check_layout(self, layout: CacheLayout) -> None:

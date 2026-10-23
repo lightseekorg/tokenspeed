@@ -16,8 +16,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections import Counter
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 from typing import Literal, get_args
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes import plan
@@ -42,6 +44,7 @@ SlidingWindowTokens = int | Sequence[int | None] | None
 STATE_INPUT_SLOT = 0
 STATE_LIVE_SLOT = 1
 STATE_TABLE_SLOTS = 2
+_MAX_AUTO_CACHE_GROUPS = 16
 
 
 @dataclass(frozen=True)
@@ -170,13 +173,14 @@ def _ceil_div(dividend: int, divisor: int) -> int:
 # Cache-group label vocabulary (NOT the HF checkpoint's serialized enum:
 # Qwen3.5 checkpoints spell full attention "attention").
 FULL_ATTENTION = "full_attention"
+SLIDING_ATTENTION = "sliding_attention"
 LINEAR_ATTENTION = "linear_attention"
 
 # layer_type label -> cache-group kind. GPT-OSS uses the first two, Qwen3.5
 # GDN layers use "linear_attention"; unknown labels raise.
 _LAYER_TYPE_ATTN_KIND: dict[str, AttnKind] = {
     FULL_ATTENTION: "full_history",
-    "sliding_attention": "sliding_window",
+    SLIDING_ATTENTION: "sliding_window",
     LINEAR_ATTENTION: "state",
     # DSA attends sparsely but retains the full KV history (the indexer
     # selects from it), so its layers publish as full-history groups.
@@ -344,58 +348,6 @@ def _windows_per_layer(
     return windows, False
 
 
-def hybrid_slab_group_size(
-    layer_types: Sequence[str] | None,
-    *,
-    sliding_window_tokens: SlidingWindowTokens = None,
-) -> int | None:
-    """Slab count for the hybrid slab KV layout (the i-th layer of EACH
-    group shares slab i), or None when the model cannot share slabs.
-
-    This is the sizing divisor the ordinary recipe turns profiled bytes per
-    token into parents with; the planned field layout pairs layers the same
-    way through ``group``'s per-group occurrence counter. The scheduler's
-    single BlockPool owns each page id by at most one group, so paired
-    layers' live rows never overlap. Unknown labels degrade to None -- the
-    predicate gates an optimization, so it must not raise.
-
-    Groups may be unequal in size (e.g. Inkling's 55 sliding + 11 full):
-    the slab count is the LARGEST group's layer count; slabs beyond a
-    smaller group's count are single-layer. Equal groups keep the original
-    gpt-oss pairing (count == group size). Sliding sub-group labels
-    ("sliding_attention_<k>") count as separate groups — equal-count
-    sub-groups make every slab fully bound (Inkling 5x11 + 11 -> 11 slabs).
-
-    Multi-window models (a per-layer window sequence with >1 distinct
-    window) degrade to None: the slab pairing is per raw label, not per
-    (kind, window) group.
-    """
-    if not layer_types:
-        return None
-    counts: dict[str, int] = {}
-    for label in layer_types:
-        # State rows are not byte-equal with KV rows, so no slab pairing.
-        if _attn_kind_for_label(label) in (None, "state"):
-            return None
-        counts[label] = counts.get(label, 0) + 1
-    if len(counts) < 2:
-        return None
-    windows = sliding_window_tokens
-    if windows is None or isinstance(windows, int):
-        # One window for every sliding layer: pairing per raw label holds.
-        return max(counts.values())
-    if not isinstance(windows, Sequence) or len(windows) != len(layer_types):
-        return None
-    distinct = {
-        window
-        for label, window in zip(layer_types, windows)
-        if _attn_kind_for_label(label) == "sliding_window"
-        and _is_window_int(window)
-        and window > 0
-    }
-    return None if len(distinct) > 1 else max(counts.values())
-
-
 def _layer_attn_kind_windows(
     layer_types: Sequence[str],
     sliding_window_tokens: SlidingWindowTokens,
@@ -482,6 +434,154 @@ def split_recurrent_state_groups(layer_types: Sequence[str]) -> list[str]:
     return group_ids
 
 
+def auto_group(
+    *,
+    layer_types: Sequence[str],
+    group_ids: Sequence[str],
+    sliding_window_tokens: SlidingWindowTokens,
+    prefix_granularity: int,
+    fields_for_layer: Callable[[int, str, int], tuple[plan.CacheFieldSpec, ...]],
+    pd_disaggregation_enabled: bool,
+    packing: Callable[[tuple[CacheGroupDeclaration, ...]], Mapping[str, int] | None],
+    alignment: int,
+    max_padding_fraction: float,
+) -> tuple[CacheGroupDeclaration, ...]:
+    """Split oversized sliding groups using complete layer bytes and packing.
+
+    Keep explicit subgroups and indivisible state bundles. Candidates retain
+    every layer's window and transfer policy, and number planes only after
+    assigning layers. Accept strictly smaller parents without increasing the
+    bytes needed for one page of every group. At most sixteen total groups
+    are introduced; existing larger declarations remain valid.
+    """
+
+    def declare(ids):
+        return group(
+            layer_types=layer_types,
+            group_ids=ids,
+            sliding_window_tokens=sliding_window_tokens,
+            prefix_granularity=prefix_granularity,
+            fields_for_layer=fields_for_layer,
+            pd_disaggregation_enabled=pd_disaggregation_enabled,
+        )
+
+    original = declare(group_ids)
+    full_bytes = [
+        sum(field.payload_bytes for field in fields)
+        for spec, fields in original
+        if spec.attn_kind == "full_history"
+    ]
+    if not full_bytes:
+        return original
+    anchor_bytes = min(full_bytes)
+    if anchor_bytes <= 0:
+        return original  # Let the packer diagnose invalid field geometry.
+    policy_counts = Counter(
+        (spec.attn_kind, spec.sliding_window_tokens) for spec, _ in original
+    )
+    layers = {
+        spec.group_id: [i for i, gid in enumerate(group_ids) if gid == spec.group_id]
+        for spec, _ in original
+        if spec.attn_kind == "sliding_window"
+        and policy_counts[(spec.attn_kind, spec.sliding_window_tokens)] == 1
+    }
+    # Explicit finer labels are an existing recipe's ownership declaration.
+    layers = {
+        gid: indices
+        for gid, indices in layers.items()
+        if all(layer_types[i] == SLIDING_ATTENTION for i in indices)
+    }
+    if not layers:
+        return original
+    weights = {
+        i: sum(field.payload_bytes for field in fields_for_layer(i, gid, 0))
+        for gid, indices in layers.items()
+        for i in indices
+    }
+    if any(weight <= 0 for weight in weights.values()):
+        return original
+    totals = {gid: sum(weights[i] for i in indices) for gid, indices in layers.items()}
+    budgets = sorted(
+        {
+            anchor_bytes,
+            *(
+                _ceil_div(totals[gid], count)
+                for gid, indices in layers.items()
+                for count in range(2, min(len(indices), _MAX_AUTO_CACHE_GROUPS) + 1)
+            ),
+        },
+        reverse=True,
+    )
+
+    def cost(groups):
+        layout = plan.pack(
+            groups,
+            prefix_granularity=prefix_granularity,
+            cache_blocks_per_lcm_block=packing(groups),
+            alignment=alignment,
+            max_padding_fraction=max_padding_fraction,
+        )
+        page_bytes = {
+            gid: Fraction(layout.lcm_block_bytes, count)
+            for gid, count in layout.group_packing
+        }
+        return (
+            layout.lcm_block_bytes,
+            sum(page_bytes.values()),
+            sum(
+                page_bytes[spec.group_id]
+                for spec, _ in groups
+                if spec.attn_kind == "full_history"
+            ),
+        )
+
+    original_error = None
+    try:
+        best_bytes, original_page_bytes, original_full_bytes = cost(original)
+    except ValueError as exc:
+        # An invalid unsplit declaration is not an allocatable baseline.
+        # Search for a valid split, keeping all padding/stride constraints.
+        original_error = exc
+        best_bytes = original_page_bytes = original_full_bytes = float("inf")
+    best = original
+    # Decreasing the byte budget gives ties to fewer groups. Search past the
+    # full group's payload: heterogeneous planes can still leave padding.
+    for budget in budgets:
+        ids = list(group_ids)
+        used = set(group_ids)
+        for gid, indices in layers.items():
+            count = min(len(indices), _ceil_div(totals[gid], budget))
+            if count <= 1:
+                continue
+            names = [f"{gid}_auto_{index}" for index in range(count)]
+            if any(name in used for name in names):
+                return best
+            used.update(names)
+            loads = [0] * count
+            for i in indices:
+                # Stable ties reproduce round-robin for byte-equal layers.
+                index = min(range(count), key=loads.__getitem__)
+                ids[i] = names[index]
+                loads[index] += weights[i]
+        if len(set(ids)) > max(_MAX_AUTO_CACHE_GROUPS, len(original)):
+            break
+        candidate = declare(ids)
+        try:
+            parent_bytes, page_bytes, full_page_bytes = cost(candidate)
+        except ValueError:
+            # Changed plane sharing can violate a kernel's exact stride.
+            continue
+        if (
+            parent_bytes < best_bytes
+            and page_bytes <= original_page_bytes
+            and full_page_bytes <= original_full_bytes
+        ):
+            best, best_bytes = candidate, parent_bytes
+    if original_error is not None and best is original:
+        raise original_error
+    return best
+
+
 def group(
     *,
     layer_types: Sequence[str],  # len: num_layers
@@ -503,7 +603,7 @@ def group(
     group's CacheBlocks share one LCM parent is solved by the memory plan and
     published by the arena.
 
-    vLLM-style spec-value grouping: layers collapse into one group per
+    Layers collapse into one group per
     distinct group id. Group order = first-appearance order.
 
     Args:
@@ -636,6 +736,7 @@ def apply_pd_transfer_policies(
 __all__ = [
     "FULL_ATTENTION",
     "LINEAR_ATTENTION",
+    "SLIDING_ATTENTION",
     "CacheGroupSpec",
     "ATTN_KINDS",
     "AttnKind",
@@ -645,9 +746,9 @@ __all__ = [
     "STATE_LIVE_SLOT",
     "STATE_TABLE_SLOTS",
     "apply_pd_transfer_policies",
+    "auto_group",
     "group",
     "compute_max_logical_pages_for_capture",
-    "hybrid_slab_group_size",
     "layer_group_ids",
     "split_recurrent_state_groups",
     "validate_scheduler_config",

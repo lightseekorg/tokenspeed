@@ -2,7 +2,7 @@
 
 The slab layout shares one K/V slab between one layer from each attention
 group, doubling the page pool in tokens at the same byte budget. This test
-boots the SAME commit twice (slab: natural; legacy: predicate nulled via an
+boots the SAME commit twice (slab: natural; legacy: per-layer planes via an
 env-injected sitecustomize) and asserts the gain twice over: directly, via
 ``scheduler_info["max_total_num_tokens"]`` doubling, and behaviorally, via
 the round-2 prefix-hit-rate contrast (slab keeps the working set cached;
@@ -56,7 +56,7 @@ _APPROX_CACHED_TOKENS = _APPROX_PROMPT_TOKENS
 # recycling cliff on the slab arm, ~1.44x the halved legacy pool.
 _TARGET_POOL_FILL = 0.72
 _NUM_PROMPTS_MIN = 8
-_NUM_PROMPTS_MAX = 120
+_NUM_PROMPTS_MAX = 256
 
 _SAMPLING = {"max_new_tokens": 4, "temperature": 0}
 
@@ -109,37 +109,39 @@ def _chain_next_sitecustomize():
 _chain_next_sitecustomize()
 
 if os.environ.get("TOKENSPEED_FORCE_LEGACY_KV_LAYOUT") == "1":
-    # The only consumer (recipes/ordinary.py) binds hybrid_slab_group_size
-    # by a function-local from-import at call time, so patching the defining
-    # publish module is enough. Re-assert on EVERY hook fire rather than
-    # mark-and-skip: a module is registered in sys.modules while its body is
-    # still executing, so an early patch (fired by one of the module's own
-    # imports) is silently overwritten when its from-import line runs --
-    # only a later re-assert survives.
-    _TARGETS = (
-        "tokenspeed.runtime.layers.attention.kv_cache.recipes.spec",
-    )
+    from importlib.machinery import PathFinder
 
-    def _null_predicate(*a, **k):
-        return None
+    _TARGET = "tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary"
 
-    def _null_slab_predicate():
-        for name in _TARGETS:
-            mod = sys.modules.get(name)
-            if mod is None:
-                continue
-            if getattr(mod, "hybrid_slab_group_size", None) is not _null_predicate:
-                mod.hybrid_slab_group_size = _null_predicate
+    def _separate_layer_fields(module):
+        original = module.OrdinaryRecipe.fields_for_layer
+
+        def fields_for_layer(self, layer_id, group_id, occurrence):
+            # Global layer numbering prevents cross-group plane aliasing;
+            # capacity still follows the resulting packed bytes.
+            return original(self, layer_id, group_id, layer_id)
+
+        module.OrdinaryRecipe.fields_for_layer = fields_for_layer
 
     class _LegacyLayoutHook:
-        """meta_path hook: patch targets lazily on every uncached import."""
+        """Patch the recipe seam after its module finishes importing."""
 
         def find_spec(self, name, path=None, target=None):
-            _null_slab_predicate()
-            return None  # never handles the import itself
+            if name != _TARGET:
+                return None
+            spec = PathFinder.find_spec(name, path)
+            original_exec = spec.loader.exec_module
+
+            def exec_module(module):
+                original_exec(module)
+                _separate_layer_fields(module)
+
+            spec.loader.exec_module = exec_module
+            return spec
 
     sys.meta_path.insert(0, _LegacyLayoutHook())
-    _null_slab_predicate()
+    if _TARGET in sys.modules:
+        _separate_layer_fields(sys.modules[_TARGET])
 '''
 
 

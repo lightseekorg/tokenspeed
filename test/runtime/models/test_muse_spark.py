@@ -52,7 +52,6 @@ from tokenspeed.runtime.configs.muse_spark_config import (
 )
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    hybrid_slab_group_size,
     layer_group_ids,
 )
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
@@ -265,10 +264,6 @@ def test_muse_spark_config_groups_the_attention_pattern_into_caches() -> None:
     assert group_ids[:6] == [f"{s}_0", f, f"{s}_1", f"{s}_2", f"{s}_0", f]
     counts = {g: group_ids.count(g) for g in set(group_ids)}
     assert counts == {f: 16, f"{s}_0": 16, f"{s}_1": 15, f"{s}_2": 15}
-    slab = hybrid_slab_group_size(
-        config.cache_layer_types, sliding_window_tokens=windows
-    )
-    assert slab == 16
     assert config.architectures == ["MuseSparkForConditionalGeneration"]
     assert config.model_type == "muse_spark"
     assert (config.num_local_experts, config.num_experts_per_tok) == (4, 2)

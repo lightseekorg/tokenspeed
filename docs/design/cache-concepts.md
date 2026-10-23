@@ -986,7 +986,7 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   checkpoint's compute labels: a label names what the scheduler retains, and
   a layer's compute mask is a separate contract (see *Storage vs.
   visibility* below).
-* **`group`** (`recipes/spec.py`) walks those layers **once** and returns
+* **`group`** (`recipes/spec.py`) walks the chosen layer assignment and returns
   `(CacheGroupSpec, fields)` pairs — one per distinct group. The pairing is
   the point: a group id is spelled exactly once, in its spec, next to the
   fields that deposit bytes in it.
@@ -1053,13 +1053,41 @@ whole). No family restates the order of the stages, and `_RECIPES`
 Automatic packing uses powers of two to avoid excessive LCM padding;
 exact page-stride constraints and explicit recipe packing take precedence.
 
+The per-layer recipe walk first runs `auto_group`. Its input is the merged
+target and draft inventory, including each layer's complete field bundle.
+It balances oversized sliding groups by actual payload bytes against the
+smallest full-history group. Equal-byte layers are assigned round-robin in
+stable layer order. Each candidate is declared afresh before occurrence and
+plane numbering, then evaluated by the same packer used for allocation.
+Different windows, explicit finer groups, and recurrent-state bundles remain
+separate. Wholesale declarations keep their recipe-owned layout.
+
+An automatic split must strictly reduce aligned parent bytes and must not
+increase the sum of physical bytes for one page of every group, or the
+aggregate bytes per full-history page when a recipe uses packed groups.
+Ties retain fewer groups; automatic growth stops at sixteen total groups.
+This bounds scheduler tables and transfer work without a server flag. A candidate that
+violates exact page strides is discarded. This is a deterministic padding
+policy, not a throughput prediction or an optimal workload-specific search.
+If the unsplit declaration violates a padding or stride constraint, it is not
+an allocatable baseline. The search instead chooses a valid split with the
+smallest parent, retaining all original padding and stride constraints. If
+none exists within the group limit, startup reports the original error.
+State/conv recipes with cross-layer ownership retain their explicit groups;
+the planner never partitions arbitrary state arrays.
+
 Ordinary recipes pin one CacheBlock per group in each parent, so a group's
 stride does not shrink with its layer count or cache dtype. For example,
 equal-sized layers split into groups of one and four need a padding fraction
 of `3.0` for the smaller group. The recipe therefore opts out of the padding
 ratio limit through `max_padding_fraction`; the common packer still validates
-field geometry, strides and block-size limits, and the profiled byte budget
-still bounds capacity. Grouping, packing, and allocation are unchanged.
+field geometry, strides and block-size limits. Capacity divides the byte
+budget, less fixed workspaces, by the chosen layout's `lcm_block_bytes`,
+reserving the null parent. There is no independent target/draft layer-count
+formula. Token caps and KVP shard rounding still apply after that division.
+For nine full and forty-three sliding layers the planner selects five sliding
+groups of 9/9/9/8/8 layers. Appending five byte-equal full-history draft layers
+selects four sliding groups of 11/11/11/10 and a fourteen-layer parent.
 
 Hybrid recurrent recipes keep their groups balanced instead: every group's page
 spans the whole parent, so a parent is fully used only when every group fills

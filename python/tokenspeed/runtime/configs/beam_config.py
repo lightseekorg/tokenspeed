@@ -167,35 +167,6 @@ class BeamConfig(PretrainedConfig):
         return [int(kind == "sliding_attention") for kind in self.layer_types]
 
     @property
-    def cache_layer_types(self) -> list[str]:
-        """Per-layer KV cache group labels, read by the cache recipes only.
-
-        The hybrid slab layout gives every page as many layer slots as the
-        largest cache group has layers. With one sliding group (43 layers)
-        a full-attention page would carry 43 slots for 9 layers, so a long
-        context would pay 43 layers of KV per token. Splitting the sliding
-        layers round-robin into sub-groups no larger than the full group
-        (43 sliding + 9 full -> 5 sub-groups of at most 9) keeps every slot
-        of a full-attention page in use. All sub-groups share the one
-        window, so what each layer keeps and evicts is unchanged. A stack
-        whose sliding layers already fit one group keeps its labels.
-        """
-        sliding = self.layer_types.count("sliding_attention")
-        full = len(self.layer_types) - sliding
-        subgroups = -(-sliding // full) if full else 1
-        if subgroups <= 1:
-            return list(self.layer_types)
-        labels: list[str] = []
-        rank = 0
-        for kind in self.layer_types:
-            if kind == "sliding_attention":
-                labels.append(f"sliding_attention_{rank % subgroups}")
-                rank += 1
-            else:
-                labels.append(kind)
-        return labels
-
-    @property
     def mlp_only_layers(self) -> list[int]:
         return [i for i, kind in enumerate(self.mlp_layer_types) if kind == "dense"]
 

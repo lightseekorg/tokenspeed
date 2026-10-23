@@ -712,7 +712,7 @@ def test_parent_is_its_planes_whatever_the_group_packings() -> None:
 
 @pytest.mark.parametrize(
     ("full_layers", "sliding_layers", "usable_pages"),
-    ((2, 0, 15), (1, 4, 7)),
+    ((2, 0, 15), (1, 4, 31)),
 )
 def test_ordinary_mha_reserves_null_parent_within_cache_budget(
     full_layers: int, sliding_layers: int, usable_pages: int
@@ -1289,8 +1289,8 @@ def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
     assert _page_padding(plan)["linear_attention_0"] == 0
 
 
-def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
-    """Profiled capacity keeps the null page inside the budget.
+def test_ordinary_packed_layout_reserves_null_page_inside_budget() -> None:
+    """Packed capacity keeps the null page inside the budget.
 
     16_384 bytes at 16 bytes/token and P=64 buys 16 pages; one is the reserved
     null page, so 15 are schedulable.
@@ -1304,14 +1304,14 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
     recipe.server_args = SimpleNamespace(max_total_tokens=None)
     recipe.attn_config = _ns_config(
         prefix_granularity=64,
+        qcp_size=1,
         spec=SimpleNamespace(cache_layer_types=(), sliding_window_tokens=None),
-        cache_cell_size=lambda: 16,
     )
     recipe.draft_attn_config = None
     recipe.model_config = SimpleNamespace(num_attention_layers=1)
 
     usable_pages = recipe.num_lcm_blocks(
-        SimpleNamespace(lcm_block_bytes=1, prefix_granularity=64, group_packing=())
+        SimpleNamespace(lcm_block_bytes=1024, prefix_granularity=64, group_packing=())
     )
 
     assert usable_pages == 15

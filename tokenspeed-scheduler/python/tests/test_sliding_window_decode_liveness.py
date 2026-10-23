@@ -24,6 +24,8 @@ and §2)."""
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
@@ -86,6 +88,112 @@ def _d_role(cfg: "ts.SchedulerConfig") -> "ts.SchedulerConfig":
     for group in cfg.cache_groups:
         group.transfer_policy = ts.CacheTransferPolicy.FullSuffix
     return cfg
+
+
+def _split_sliding_config(cfg, count):
+    """Apply the planner's four/five-group sliding namespace to a scheduler."""
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id=f"{SLIDING_GROUP}_auto_{index}",
+            block_granularity=PAGE,
+            total_pages=cfg.num_device_pages,
+            attn_kind=ts.AttnKind.SlidingWindow,
+            sliding_window_tokens=cfg.cache_groups[0].sliding_window_tokens,
+        )
+        for index in range(count)
+    ] + [cfg.cache_groups[1]]
+    return cfg
+
+
+@pytest.mark.parametrize("count", [4, 5])
+@pytest.mark.parametrize("prefix_cache", [False, True])
+def test_multi_group_sliding_chunked_prefill_and_retraction(
+    monkeypatch, count, prefix_cache
+):
+    original_config = _config
+
+    def config(num_usable_pages, **kwargs):
+        return _split_sliding_config(original_config(num_usable_pages, **kwargs), count)
+
+    monkeypatch.setattr(sys.modules[__name__], "_config", config)
+    result = _run_closed_loop(
+        32 * (count + 1),
+        num_requests=8,
+        shared_tokens=96,
+        unique_tokens=8,
+        max_new_tokens=64,
+        window=64,
+        prefix_cache=prefix_cache,
+        max_scheduled_tokens=32,
+    )
+    assert result["outcome"] == "done", result
+    assert not result["aborted"], result
+    assert result["active"] == 0, result
+    assert set(result["generated"].values()) == {64}, result
+
+
+@pytest.mark.parametrize("count", [4, 5])
+def test_multi_group_sliding_short_acceptance_and_prefix_reuse(count):
+    cfg = _split_sliding_config(
+        _config(
+            256,
+            window=32,
+            prefix_cache=True,
+            overlap_schedule_depth=0,
+            max_scheduled_tokens=128,
+        ),
+        count,
+    )
+    cfg.decode_input_tokens = 8
+    scheduler = ts.Scheduler(cfg)
+    prompt = list(range(64))
+    _submit_and_step(scheduler, "first", prompt, 64)
+    _land(scheduler, "first", 1000, decode_reserve=None)
+    for token in range(1001, 1033):
+        batch, row, tables = _row_of(scheduler.next_execution_plan(), "first")
+        assert len(tables) == count + 1
+        live = [page for pages in tables.values() for page in pages if page > 0]
+        assert len(live) == len(set(live)), "groups must own disjoint physical pages"
+        # Verify reserves eight tokens, accepts only one, and drops the rest.
+        _land(scheduler, "first", token, decode_reserve=8)
+    finish = ts.ForwardEvent.Finish()
+    finish.request_id = "first"
+    events = ts.ExecutionEvent()
+    events.add_event(finish)
+    scheduler.advance(events)
+    scheduler.next_execution_plan()
+    assert scheduler.active_lcm_blocks() == 0
+    replay = prompt + list(range(1000, 1033)) + [9999]
+    plan = _submit_and_step(scheduler, "reuse", replay, 4)
+    batch, row, tables = _row_of(plan, "reuse")
+    assert batch.extend_prefix_lens[row] > 0
+    assert len(tables) == count + 1
+    for group_id, pages in tables.items():
+        if group_id != FULL_GROUP:
+            assert 0 in pages, "expired sliding history must stay absent on reuse"
+
+
+@pytest.mark.parametrize("count", [4, 5])
+def test_multi_group_sliding_exhaustion_restores_a_snapshot(monkeypatch, count):
+    original_config = _config
+
+    def config(num_usable_pages, **kwargs):
+        return _split_sliding_config(original_config(num_usable_pages, **kwargs), count)
+
+    monkeypatch.setattr(sys.modules[__name__], "_config", config)
+    result = _run_closed_loop(
+        16 * (count + 1),
+        num_requests=8,
+        shared_tokens=0,
+        unique_tokens=104,
+        max_new_tokens=32,
+        window=128,
+        prefix_cache=True,
+        max_scheduled_tokens=1024,
+    )
+    assert result["outcome"] == "done", result
+    assert result["retractions"] > 0, result
+    assert result["active"] == 0, result
 
 
 def _spec(request_id: str, tokens: list[int], max_new_tokens: int) -> "ts.RequestSpec":

@@ -55,17 +55,16 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     MXFP8_KV_SCALE_TILE_TOKENS,
     CacheGroupDeclaration,
-    hybrid_slab_group_size,
+    _layer_attn_kind_windows,
     layer_group_ids,
 )
 
 
 class OrdinaryRecipe(CacheRecipe):
-    """MHA / MLA / DSA / MSA: one cache group per attention structure.
+    """MHA / MLA / DSA / MSA: shared per-layer storage planning.
 
-    Capacity comes from the profiled bytes-per-token rather than the parent
-    size, and every group packs one CacheBlock per parent -- the identity
-    grain is the block span.
+    Capacity comes from the packed parent bytes. Every group packs one
+    CacheBlock per parent -- the identity grain is the block span.
     """
 
     def __init__(self, *, family, **kwargs) -> None:
@@ -76,12 +75,38 @@ class OrdinaryRecipe(CacheRecipe):
 
     @cached_property
     def group_ids(self) -> tuple[str, ...]:
-        ids = _config_group_ids(self.attn_config, self.num_target_layers)
-        if self.draft_attn_config is None:
-            return ids
-        if self.draft_attn_config.prefix_granularity != self.prefix_granularity:
-            raise ValueError("target and draft prefix granularities must match")
-        return ids + _config_group_ids(self.draft_attn_config, self.num_draft_layers)
+        labels = _config_group_labels(self.attn_config, self.num_target_layers)
+        if self.draft_attn_config is not None:
+            labels += _config_group_labels(
+                self.draft_attn_config, self.num_draft_layers
+            )
+        return tuple(
+            layer_group_ids(
+                layer_types=labels,
+                sliding_window_tokens=self.sliding_window_tokens,
+            )
+        )
+
+    @cached_property
+    @override
+    def sliding_window_tokens(self) -> tuple[int | None, ...]:
+        windows = []
+        for config, start, count in (
+            (self.attn_config, 0, self.num_target_layers),
+            (self.draft_attn_config, self.num_target_layers, self.num_draft_layers),
+        ):
+            if config is None:
+                continue
+            if config.prefix_granularity != self.prefix_granularity:
+                raise ValueError("target and draft prefix granularities must match")
+            windows.extend(
+                window
+                for _, window in _layer_attn_kind_windows(
+                    self.layer_types[start : start + count],
+                    config.component(SoftmaxAttnConfig).sliding_window_tokens,
+                )
+            )
+        return tuple(windows)
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
@@ -191,27 +216,13 @@ class OrdinaryRecipe(CacheRecipe):
             occurrence=occurrence,
         )
 
-    # ---- capacity: profiled bytes per token, not parent size ----
+    # ---- capacity: the same packed bytes the arena allocates ----
 
     @override
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
-            self.attn_config, self.num_target_layers
-        )
-        if self.draft_attn_config is not None:
-            bytes_per_token += (
-                self.draft_attn_config.cache_cell_size()
-                * _storage_layers(self.draft_attn_config, self.num_draft_layers)
-            )
-        if bytes_per_token <= 0:
-            raise ValueError(
-                f"KV cache cell size must be positive, got {bytes_per_token}"
-            )
-        # Every group packs one CacheBlock per parent, so a parent spans the
-        # identity grain and profiled bytes/token size it directly.
         parent_tokens = self.prefix_granularity
         budgeted = self._budgeted_parents(
-            self.cache_budget_bytes, bytes_per_token * parent_tokens
+            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
         )
         if self.token_limit is None:
             return budgeted
@@ -229,33 +240,17 @@ class OrdinaryRecipe(CacheRecipe):
         return self._capped_parents(budgeted, parent_tokens=parent_tokens)
 
 
-def _storage_layers(config, num_layers: int) -> int:
-    spec = config.component(SoftmaxAttnConfig)
-    group_size = hybrid_slab_group_size(
-        spec.cache_layer_types,
-        sliding_window_tokens=spec.sliding_window_tokens,
-    )
-    return group_size if group_size is not None else num_layers
-
-
-def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:
-    """Per-layer group ids for one ordinary attention config."""
+def _config_group_labels(config, num_layers: int) -> tuple[str, ...]:
+    """Keep the existing ordinary-family namespace before window resolution."""
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.configs.msa import MSAConfig
 
     spec = config.component(SoftmaxAttnConfig)
-    if isinstance(spec, MHAConfig | MSAConfig):
-        layer_types = tuple(spec.cache_layer_types)
-        if layer_types:
-            ids = tuple(
-                layer_group_ids(
-                    layer_types=layer_types,
-                    sliding_window_tokens=spec.sliding_window_tokens,
-                )
-            )
-            if len(ids) != num_layers:
-                raise ValueError("cache group ids must cover every layer")
-            return ids
+    if isinstance(spec, MHAConfig | MSAConfig) and spec.cache_layer_types:
+        labels = tuple(spec.cache_layer_types)
+        if len(labels) != num_layers:
+            raise ValueError("cache group ids must cover every layer")
+        return labels
     return (FULL_ATTENTION,) * num_layers
 
 

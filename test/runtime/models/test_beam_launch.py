@@ -191,20 +191,16 @@ def _attn_config(layer_types, window) -> AttnConfig:
     )
 
 
-def test_sliding_layers_split_into_groups_no_larger_than_the_full_group():
+def test_config_leaves_physical_groups_to_the_planner():
     config = _released_config()
-    labels = config.cache_layer_types
+    labels = config.layer_types
     assert [i for i, label in enumerate(labels) if label == "full_attention"] == (
         sorted(_FULL_LAYERS)
     )
     counts = {label: labels.count(label) for label in set(labels)}
     assert counts == {
         "full_attention": 9,
-        "sliding_attention_0": 9,
-        "sliding_attention_1": 9,
-        "sliding_attention_2": 9,
-        "sliding_attention_3": 8,
-        "sliding_attention_4": 8,
+        "sliding_attention": 43,
     }
     # Compute labels and the serialized checkpoint stay as they were.
     assert config.layer_types == _LAYER_TYPES
@@ -224,7 +220,7 @@ def test_a_page_holds_only_the_layers_its_group_keeps(draft_layers, layer_slots)
         family="mha",
         server_args=SimpleNamespace(max_total_tokens=None, kv_offload_config=None),
         model_config=SimpleNamespace(num_attention_layers=52, hf_config=None),
-        attn_config=_attn_config(config.cache_layer_types, config.sliding_window),
+        attn_config=_attn_config(config.layer_types, config.sliding_window),
         draft_model_config=(
             SimpleNamespace(num_attention_layers=draft_layers, hf_config=None)
             if draft_layers
@@ -245,7 +241,7 @@ def test_a_page_holds_only_the_layers_its_group_keeps(draft_layers, layer_slots)
     assert plan.lcm_block_bytes == 64 * layer_slots * 2 * 128 * 2
     assert {group.group_id for group in plan.groups} == {
         "full_attention",
-        *(f"sliding_attention_{k}" for k in range(5)),
+        *(f"sliding_attention_auto_{k}" for k in range(4 if draft_layers else 5)),
     }
     # The budget sizes the pages the plan lays out: none of it is left over
     # beyond one page and the reserved null page.
