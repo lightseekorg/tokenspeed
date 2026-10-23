@@ -508,6 +508,33 @@ public:
     // content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
+    // The cache keys one boundary holds in each group that publishes it:
+    // BlocksPerBoundary of them for a chain hash (tail_tokens 0), a tail's
+    // blocks from FirstTailBlockNeeded on (tail_tokens = T mod P), one for a
+    // State group. A replayable group has none. Every walk over the entries
+    // of one boundary goes through here; visit(group_index, key) sees them
+    // group by group in offset order, each key under the boundary's namespace
+    // and content hash.
+    template <typename Visit>
+    void ForEachBoundaryKey(const CacheKey& boundary, std::int32_t tail_tokens, Visit&& visit) const {
+        _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
+        // One key, its group and offset set in place: the content hash is
+        // copied once per boundary, not once per key.
+        CacheKey key{.namespace_id = boundary.namespace_id, .content_hash = boundary.content_hash};
+        for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
+            const auto i = static_cast<std::int32_t>(group_index);
+            // A replayable group never holds an entry.
+            if (GroupIsReplayable(i)) {
+                continue;
+            }
+            const std::int32_t past_end = tail_tokens > 0 ? TailBlocksFor(i, tail_tokens) : BlocksPerBoundary(i);
+            key.group_id = groups_[group_index].Id();
+            for (key.page_offset = tail_tokens > 0 ? FirstTailBlockNeeded(i, tail_tokens) : 0;
+                 key.page_offset < past_end; ++key.page_offset) {
+                visit(group_index, std::as_const(key));
+            }
+        }
+    }
 
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped.

@@ -207,31 +207,13 @@ CacheCoordinator::BlockRange CacheCoordinator::SlidingWindowBlocks(std::int32_t 
 
 CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(const CacheKey& boundary,
                                                                               std::int32_t tail_tokens) const {
-    _assert(tail_tokens >= 0 && tail_tokens < prefix_granularity_, "a tail lies strictly inside a prefix page");
     std::int32_t cached = 0;
     std::int32_t total = 0;
-    for (std::size_t group_index = 0; group_index < groups_.size(); ++group_index) {
-        // A replayable group never holds an entry, so it would keep every
-        // boundary permanently partial.
-        if (GroupIsReplayable(static_cast<std::int32_t>(group_index))) {
-            continue;
-        }
-        const std::int32_t pages_per_prefix_hash =
-            tail_tokens > 0 ? TailBlocksFor(static_cast<std::int32_t>(group_index), tail_tokens)
-                            : BlocksPerBoundary(static_cast<std::int32_t>(group_index));
-        const std::int32_t first_offset =
-            tail_tokens > 0 ? FirstTailBlockNeeded(static_cast<std::int32_t>(group_index), tail_tokens) : 0;
-        for (std::int32_t offset = first_offset; offset < pages_per_prefix_hash; ++offset) {
-            const CacheKey key{
-                .namespace_id = boundary.namespace_id,
-                .group_id = groups_[group_index].Id(),
-                .content_hash = boundary.content_hash,
-                .page_offset = offset,
-            };
-            cached += groups_[group_index].Index().Contains(pool_, key) ? 1 : 0;
-            ++total;
-        }
-    }
+    // A replayable group has no key here, so it never keeps a boundary partial.
+    ForEachBoundaryKey(boundary, tail_tokens, [&](std::size_t group_index, const CacheKey& key) {
+        cached += groups_[group_index].Index().Contains(pool_, key) ? 1 : 0;
+        ++total;
+    });
     if (cached == 0) {
         return BoundaryResidency::kNone;
     }
@@ -1467,35 +1449,28 @@ std::optional<CacheBlockLocation> CacheCoordinator::deviceLocationOf(std::size_t
 
 void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens,
                                         DeviceEvictionCounts DeviceEvictionStats::*reason) {
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t blocks = TailBlocksFor(static_cast<std::int32_t>(i), tail_tokens);
-        for (std::int32_t offset = 0; offset < blocks; ++offset) {
-            const CacheKey key{.group_id = groups_[i].Id(), .content_hash = hash, .page_offset = offset};
-            // A companion still pinned by a request table stays indexed; it
-            // ages out through the ordinary eviction order.
-            if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
-                evictCachedBlockAlone(groups_[i].Id(), *location, reason);
-            }
+    ForEachBoundaryKey(CacheKey{.content_hash = hash}, tail_tokens, [&](std::size_t i, const CacheKey& key) {
+        // A companion still pinned by a request table stays indexed; it
+        // ages out through the ordinary eviction order.
+        if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
+            evictCachedBlockAlone(groups_[i].Id(), *location, reason);
         }
-    }
+    });
 }
 
 void CacheCoordinator::pruneTailIfUnreferenced(const ContentHash& hash) {
     if (!tails_.Contains(hash)) {
         return;
     }
-    const std::int32_t tail_tokens = *tails_.TailTokensOf(hash);
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        const std::int32_t blocks = TailBlocksFor(static_cast<std::int32_t>(i), tail_tokens);
-        for (std::int32_t offset = 0; offset < blocks; ++offset) {
-            const CacheKey key{.group_id = groups_[i].Id(), .content_hash = hash, .page_offset = offset};
-            if (groups_[i].Index().Contains(pool_, key) ||
-                (host_pool_ != nullptr && groups_[i].Index().Contains(*host_pool_, key))) {
-                return;
-            }
-        }
+    bool referenced = false;
+    ForEachBoundaryKey(CacheKey{.content_hash = hash}, *tails_.TailTokensOf(hash),
+                       [&](std::size_t i, const CacheKey& key) {
+                           referenced = referenced || groups_[i].Index().Contains(pool_, key) ||
+                                        (host_pool_ != nullptr && groups_[i].Index().Contains(*host_pool_, key));
+                       });
+    if (!referenced) {
+        tails_.Remove(hash);
     }
-    tails_.Remove(hash);
 }
 
 void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
@@ -1874,16 +1849,11 @@ void CacheCoordinator::CacheHostTail(const ContentHash& prior, const TailPublica
     // A failed/partial GET can leave only some groups present. Record a hint
     // only when Host holds data under it; ordinary matching still validates
     // every group's exact boundary before claiming anything.
-    for (std::size_t i = 0; i < groups_.size(); ++i) {
-        for (std::int32_t offset = 0; offset < TailBlocksFor(static_cast<std::int32_t>(i), tail.tail_tokens);
-             ++offset) {
-            if (!ContainsHostCachedBlock(
-                    {.group_id = groups_[i].Id(), .content_hash = tail.hash, .page_offset = offset})) {
-                continue;
-            }
-            recordTail(prior, tail);
-            return;
-        }
+    bool on_host = false;
+    ForEachBoundaryKey(CacheKey{.content_hash = tail.hash}, tail.tail_tokens,
+                       [&](std::size_t, const CacheKey& key) { on_host = on_host || ContainsHostCachedBlock(key); });
+    if (on_host) {
+        recordTail(prior, tail);
     }
 }
 

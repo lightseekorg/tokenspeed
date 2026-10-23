@@ -71,14 +71,15 @@ TailSlots tailSlots(const GroupGeometry& geometry, std::int32_t prefix_granulari
 
 class AdmissionPlanner {
 public:
-    AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
-                     std::int32_t prefix_granularity, const BlockPool& pool, const BlockPool* host_pool,
-                     std::span<const GroupDemand> demands, std::optional<std::int32_t> num_computed_tokens,
-                     const CompletedPages* completed, const CacheCoordinator::PrefixProbe& prefix,
-                     std::span<const PlannedShape> shapes,
+    AdmissionPlanner(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
+                     std::span<const GroupGeometry> geometry, std::int32_t prefix_granularity, const BlockPool& pool,
+                     const BlockPool* host_pool, std::span<const GroupDemand> demands,
+                     std::optional<std::int32_t> num_computed_tokens, const CompletedPages* completed,
+                     const CacheCoordinator::PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
-        : groups_{groups},
+        : coordinator_{coordinator},
+          groups_{groups},
           geometry_{geometry},
           prefix_granularity_{prefix_granularity},
           pool_{pool},
@@ -445,18 +446,12 @@ private:
             return;
         }
         const TailPublication& tail = *completed_->tail;
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            // A State group keys one checkpoint under the tail's hash.
-            const std::int32_t blocks =
-                geometry_[i].HasTokenSpan() ? geometry_[i].BlocksNeededBeyond(0, tail.tail_tokens) : 1;
-            for (std::int32_t offset = 0; offset < blocks; ++offset) {
-                const CacheBlockRef block = groups_[i].Index().Find(
-                    pool_, CacheKey{.group_id = groups_[i].Id(), .content_hash = tail.hash, .page_offset = offset});
-                if (block) {
-                    protected_locations_.insert(block->Location());
-                }
-            }
-        }
+        coordinator_.ForEachBoundaryKey(CacheKey{.content_hash = tail.hash}, tail.tail_tokens,
+                                        [&](std::size_t i, const CacheKey& key) {
+                                            if (const CacheBlockRef block = groups_[i].Index().Find(pool_, key)) {
+                                                protected_locations_.insert(block->Location());
+                                            }
+                                        });
     }
 
     // The request's own slots that its retention has expired at this
@@ -615,6 +610,9 @@ private:
         return parents_needed <= empty_parent_count_;
     }
 
+    // The coordinator planned for, read through its public views
+    // (ForEachBoundaryKey); groups_, geometry_ and the pools are its own.
+    const CacheCoordinator& coordinator_;
     const std::vector<CacheGroup>& groups_;
     std::span<const GroupGeometry> geometry_;
     std::int32_t prefix_granularity_;
@@ -650,7 +648,7 @@ private:
     std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
 };
 
-std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
+std::optional<AdmissionPlan> planAdmission(const CacheCoordinator& coordinator, const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, std::int32_t prefix_granularity,
                                            const BlockPool& pool, const BlockPool* host_pool,
                                            CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
@@ -659,7 +657,8 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
-    AdmissionPlanner planner{groups,
+    AdmissionPlanner planner{coordinator,
+                             groups,
                              geometry,
                              prefix_granularity,
                              pool,
@@ -767,12 +766,12 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const bool copies_in =
         progress.completed_pages && progress.completed_pages->owner_continues && progress.completed_pages->tail;
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_,
+        planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_,
                       copies_in ? PrefixProbe{prefix} : PrefixProbe{std::move(prefix)}, demands, effective,
                       /*shapes=*/{}, /*claimed=*/{});
     if (!candidate && copies_in) {
         effective = withoutTailPublication(progress);
-        candidate = planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix),
+        candidate = planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix),
                                   demands, effective, /*shapes=*/{}, /*claimed=*/{});
     }
     if (!candidate) {
@@ -1063,7 +1062,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     }
 
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}), demands,
+        planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}), demands,
                       RequestProgress{}, shapes, protected_locations);
     if (!candidate) {
         return std::nullopt;
