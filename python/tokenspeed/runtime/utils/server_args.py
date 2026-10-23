@@ -190,6 +190,25 @@ def _checkpoint_architectures(
     return list(architectures) if isinstance(architectures, list) else []
 
 
+# Checkpoint architectures with decode monokernels (--decode-monokernel). A
+# model adds its architecture here with its monokernel seam.
+DECODE_MONOKERNEL_ARCHITECTURES = (
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+)
+
+
+def decode_monokernel_refusal(architectures: list[str]) -> str | None:
+    """Why ``--decode-monokernel`` cannot serve a checkpoint of
+    ``architectures``, or None when a monokernel exists for one of them."""
+    if any(a in DECODE_MONOKERNEL_ARCHITECTURES for a in architectures):
+        return None
+    return (
+        f"--decode-monokernel: no decode monokernel for {architectures or 'this model'} "
+        f"(models with one: {', '.join(DECODE_MONOKERNEL_ARCHITECTURES)})"
+    )
+
+
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -563,6 +582,9 @@ class ServerArgs:
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
+    # Run each eligible decoder layer's decode step as one persistent
+    # monokernel launch (DECODE_MONOKERNEL_ARCHITECTURES). Off by default.
+    decode_monokernel: bool = False
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -794,6 +816,10 @@ class ServerArgs:
         hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
+        if self.decode_monokernel and architectures is not None:
+            refusal = decode_monokernel_refusal(architectures)
+            if refusal is not None:
+                raise ValueError(refusal)
         self._beam_checkpoint = (
             None if architectures is None else "BeamForCausalLM" in architectures
         )
@@ -3263,6 +3289,20 @@ class ServerArgs:
                 "attention-TP rank holds a host shard and keeps the all-reduce "
                 "(anonymous mapping, huge-page friendly). auto: sharded when "
                 "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
+            "--decode-monokernel",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.decode_monokernel,
+            help=(
+                "Run each decoder layer's decode step as one persistent "
+                "monokernel launch, for small batches (decode and speculative "
+                "verify of up to 4 token rows). Models: "
+                f"{', '.join(DECODE_MONOKERNEL_ARCHITECTURES)} on gfx950, "
+                "without attention or expert parallelism. Startup fails when "
+                "the model has no monokernel layer. Larger steps keep the "
+                "regular path."
             ),
         )
         parser.add_argument(

@@ -169,7 +169,7 @@ def test_outer_graph_replays_gdn_lengths_pages_and_states(batch_size):
     states = torch.randn(12, V_HEADS, HEAD_DIM, HEAD_DIM, device="cuda") * 0.1
     initial_conv, initial_states = conv.clone(), states.clone()
     raw = torch.randn(bucket, channels, device="cuda", dtype=torch.bfloat16)
-    backend._layer_state = lambda layer_id: (
+    backend.layer_state = lambda layer_id: (
         backend.forward_metadata.state_in_blocks_by_group["state"],
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,

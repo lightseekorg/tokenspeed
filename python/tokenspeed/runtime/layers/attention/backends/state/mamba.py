@@ -1601,10 +1601,14 @@ class MambaAttnBackend(AttentionBackend):
 
     # ---- Forward ----
 
-    def _layer_state(
+    def layer_state(
         self, layer_id: int
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Resolve one recurrent layer's page indices and component views."""
+        """One recurrent layer's ``(state_in, state_out, conv, ssm)``.
+
+        ``state_in`` / ``state_out`` are the batch rows' input and output state
+        pages (-1 for padding rows); ``conv`` / ``ssm`` the layer's state pools.
+        """
         metadata = self.forward_metadata
         state_in_by_group = metadata.state_in_blocks_by_group
         group_id = self._state_group_for(layer_id)
@@ -1619,6 +1623,43 @@ class MambaAttnBackend(AttentionBackend):
             metadata.state_out_blocks_by_group[group_id],
             conv_states,
             ssm_states,
+        )
+
+    def fused_verify_operands(
+        self, layer_id: int, a_log: torch.Tensor, dt_bias: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """What a fused kernel needs to run one recurrent layer's target
+        verify itself, in place of :meth:`forward_extend`.
+
+        Returns ``(conv scratch [rows, *conv], scratch rows [bs * T] int32,
+        replay payload [bs * T, width])``: token ``t`` of request ``r`` writes
+        its conv window to scratch row ``r * (T + 1) + 1 + t`` and its
+        ``[k | v | a | b]`` to payload row ``r * T + t``, as the regular verify
+        does; the post-verify commit then reads them. It also stores the
+        layer's replay parameters on first use, as the regular verify does.
+
+        Raises:
+            RuntimeError: Not a target verify with ReplaySSM.
+        """
+        metadata = self.forward_metadata
+        replay = self._gdn_replay
+        if (
+            metadata.mamba_output_indices is None
+            or not self.replay_ssm
+            or replay is None
+        ):
+            raise RuntimeError("a fused verify needs a target verify with ReplaySSM")
+        slot = replay.layer_ids.index(layer_id)
+        if layer_id not in replay.initialized_layers:
+            # Model-static; copied once during warmup, before graph capture.
+            replay.parameters[slot, 0].copy_(a_log)
+            replay.parameters[slot, 1].copy_(dt_bias)
+            replay.initialized_layers.add(layer_id)
+        grid = metadata.mamba_output_indices
+        return (
+            self._verify_scratch[layer_id][0],
+            grid.reshape(-1),
+            replay.payload[slot, : grid.numel()],
         )
 
     def forward_decode(
@@ -1673,7 +1714,7 @@ class MambaAttnBackend(AttentionBackend):
 
         # Read the page holding position n-1 and write the page holding
         # position n. Padding rows use -1 and are skipped by both kernels.
-        state_in_blocks, state_out_blocks, conv_states, ssm_states = self._layer_state(
+        state_in_blocks, state_out_blocks, conv_states, ssm_states = self.layer_state(
             layer_id
         )
         read_indices = state_in_blocks
@@ -1997,7 +2038,7 @@ class MambaAttnBackend(AttentionBackend):
             draft_token_num = self.speculative_num_draft_tokens
             batch_size = seq_len // draft_token_num
             output_indices = self.forward_metadata.mamba_output_indices
-            state_in_blocks, _, conv_comp, ssm_comp = self._layer_state(layer_id)
+            state_in_blocks, _, conv_comp, ssm_comp = self.layer_state(layer_id)
             conv_scratch, ssm_scratch = self._verify_scratch[layer_id]
             fused_out = self._verify(
                 mixed_qkv,
@@ -2070,7 +2111,7 @@ class MambaAttnBackend(AttentionBackend):
             mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
         else:
             state_in_blocks, state_out_blocks, conv_states, ssm_states = (
-                self._layer_state(layer_id)
+                self.layer_state(layer_id)
             )
             recurrent_state, has_initial_states = _prepare_cache_prefill_state_inputs(
                 conv_states,

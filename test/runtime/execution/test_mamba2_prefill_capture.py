@@ -210,7 +210,7 @@ def test_outer_graph_replays_mamba2_lengths_pages_and_states(batch_size):
     initial_conv, initial_states = conv.clone(), states.clone()
     raw = torch.randn(bucket, channels, device="cuda", dtype=torch.bfloat16)
     backend = _backend()
-    backend._layer_state = lambda layer_id: (
+    backend.layer_state = lambda layer_id: (
         backend.forward_metadata.state_in_blocks_by_group["state"],
         backend.forward_metadata.state_out_blocks_by_group["state"],
         conv,
