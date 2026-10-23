@@ -80,3 +80,17 @@ def test_varying_shapes_and_counts_reuse_one_compile(device) -> None:
         for rows, cols, live in ((352, 6144, 300), (8192, 128, 8191), (1792, 37, 0)):
             _check(torch.ones(rows, cols, device=device), live)
         _check(torch.ones(512, 1024, device=device)[:, :999].t(), 7)
+
+
+def test_column_offsets_past_int32_reach_their_rows(device) -> None:
+    # A transposed view whose column walk spans more than 2**31 elements
+    # (2 GiB of uint8): 32-bit column offsets would wrap outside the buffer.
+    if torch.cuda.mem_get_info()[0] < 4 * 2**30:
+        pytest.skip("needs 4 GiB of free device memory")
+    rows, cols, col_stride = 4, 3, 2**30
+    base = torch.zeros(rows + (cols - 1) * col_stride, device=device, dtype=torch.uint8)
+    view = base.as_strided((rows, cols), (1, col_stride))
+    view.fill_(1)
+    zero_rows_after(view, torch.tensor([1], device=device))
+    assert view[0].eq(1).all() and view[1:].eq(0).all()
+    assert int(base.sum()) == cols

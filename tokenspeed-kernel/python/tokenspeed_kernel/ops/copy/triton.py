@@ -48,7 +48,8 @@ def _zero_rows_after_kernel(
         row_mask = (row >= live) & (row < rows)
         zero = tl.zeros((BLOCK_ROWS, BLOCK_COLS), dtype=data.dtype.element_ty)
         for start in range(0, cols, BLOCK_COLS):
-            col = start + tl.arange(0, BLOCK_COLS)
+            # 64-bit like the rows: a strided view's column walk can pass 2**31.
+            col = start + tl.arange(0, BLOCK_COLS).to(tl.int64)
             mask = row_mask[:, None] & (col[None, :] < cols)
             offsets = row[:, None] * row_stride + col[None, :] * col_stride
             tl.store(data + offsets, zero, mask=mask)
