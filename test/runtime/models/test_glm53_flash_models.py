@@ -226,7 +226,6 @@ def test_glm53_flash_decode_topk_skips_only_overwritten_workspace_fills(
         page_table=torch.zeros((1, 1), dtype=torch.int32),
         q_len_per_req=1,
         decode_start=decode_start,
-        num_tokens=4,
         num_decode_tokens=num_decode_tokens,
         topk=12,
     )
@@ -518,6 +517,7 @@ def test_nextn_keeps_flat_kv_prefill_slots_when_compacting_topk() -> None:
             [[40, 41, 42], [50, 51, 52], [60, 61, 62]], dtype=torch.int32
         ),
         topk_lens=torch.tensor([3, 3, 3], dtype=torch.int32),
+        row_offset=0,
     )
 
     _, selected = (

@@ -87,6 +87,7 @@ def _prepare_dsa_topk_for_mtp_decode(
             device=topk_lens.device, dtype=topk_lens.dtype
         )
         if decode_rows.numel() > 0:
+            decode_rows = decode_rows - decode_topk.row_offset
             selected_indices = torch.cat(
                 (selected_indices, topk_indices.index_select(0, decode_rows)),
                 dim=0,
@@ -100,4 +101,5 @@ def _prepare_dsa_topk_for_mtp_decode(
         decode_topk,
         topk_indices=selected_indices,
         topk_lens=selected_lens,
+        row_offset=0,
     )
