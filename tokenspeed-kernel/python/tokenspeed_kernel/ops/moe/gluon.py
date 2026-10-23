@@ -207,6 +207,9 @@ if platform.is_amd:
 
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe import (
+        launch_gluon_router_sqrt_softplus_topk_gemv_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe import (
         launch_gluon_sqrt_softplus_topk_gfx950 as _topk_impl,
     )
 
@@ -256,6 +259,60 @@ if platform.is_amd:
             routed_scaling_factor,
         )
         return weights.to(weights_dtype), ids, scores
+
+    @register_kernel(
+        "moe",
+        "router_topk",
+        name="gluon_router_sqrt_softplus_topk_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    gate_weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            # Measured to beat the decode GEMM plus top-k up to 128 rows.
+            "tokens": frozenset(range(1, 129)),
+            "experts": frozenset({256, 384}),
+            "hidden_alignment": frozenset({512}),
+            "top_k": frozenset({6}),
+            "routing_kind": frozenset({"plain", "bias", "hash"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_router_sqrt_softplus_topk_gfx950(
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        hash_indices_table: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        routed_scaling_factor: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Split-K GEMV partials; the top-k kernel sums them in order.
+        partials = launch_gluon_router_sqrt_softplus_topk_gemv_gfx950(
+            hidden_states, gate_weight
+        )
+        weights, ids, _ = _topk_impl(
+            partials,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            False,
+            routed_scaling_factor,
+        )
+        return weights, ids
 
 
 # ===-----------------------------------------------------------------------===#

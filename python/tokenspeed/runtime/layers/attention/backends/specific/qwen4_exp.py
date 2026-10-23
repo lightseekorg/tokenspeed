@@ -146,6 +146,13 @@ class Qwen4ExpBackend(AttentionBackend):
             *(backend.cache_consumer_attn_kinds for backend in self.child_backends())
         )
 
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        return all(
+            backend.stores_in_forward_state_checkpoints
+            for backend in self.child_backends()
+        )
+
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Preallocate target verify consumers and return their total byte count."""
         if self.is_draft or self.spec_num_tokens <= 1:

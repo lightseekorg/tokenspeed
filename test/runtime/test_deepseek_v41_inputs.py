@@ -183,7 +183,9 @@ def _fill(ib, runtime, op, snapshot):
         torch.tensor(op.request_pool_indices[:n], dtype=torch.int64, device=ib.device),
         torch.tensor(op.extend_prefix_lens, dtype=torch.int32, device=ib.device),
     )
-    ib.fill_input_buffers(op, runtime, sum(op.input_lengths), ngram_inputs=snapshot)
+    total = sum(op.input_lengths)
+    ids = ib.fill_input_buffers(op, runtime, total)
+    ib.load_round_inputs(op, runtime, total, ids, ngram_inputs=snapshot)
 
 
 def test_decode_override_clears_only_consumed_flags_without_host_sync(buffers):
@@ -199,7 +201,8 @@ def test_decode_override_clears_only_consumed_flags_without_host_sync(buffers):
     try:
         if on_cuda:
             torch.cuda.set_sync_debug_mode("error")
-        ib.fill_input_buffers(op, runtime, 2, ngram_inputs=snapshot)
+        ids = ib.fill_input_buffers(op, runtime, 2)
+        ib.load_round_inputs(op, runtime, 2, ids, ngram_inputs=snapshot)
     finally:
         if on_cuda:
             torch.cuda.set_sync_debug_mode(previous)
@@ -808,6 +811,7 @@ def test_executor_input_capacity_covers_decode_capture(
         output_length=width,
         enable_nan_detection=False,
         enable_speculative_sampling=False,
+        state_checkpoint_in_forward=False,
     )
     runner = SimpleNamespace(
         mapping=Mapping(rank=0, world_size=pp_size, pp_size=pp_size),
@@ -1170,7 +1174,8 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
 
     handle = DeviceHandle(
         SimpleNamespace(
-            forward_thread=SimpleNamespace(submit=submit), execute_forward_op=execute
+            forward_thread=SimpleNamespace(submit=submit, submit_forward=submit),
+            execute_forward_op=execute,
         ),
         host_cache_executor=None,
         kv_transfer=None,
@@ -1277,8 +1282,11 @@ def test_forced_single_token_resets_draft_tree_parents(buffers):
     ib, _ = buffers
     runtime = _spec_runtime(ib, 4)
     runtime.init_draft_trees(4)
+    runtime.init_draft_tree_q(4, num_slots=3, num_candidates=8)
     tree = torch.tensor([-1, 0, 0, 1], dtype=torch.int32, device=ib.device)
     runtime.future_parent_map[:] = tree
+    # A sampled tree: its nodes name their parents' draft q.
+    runtime.future_draft_q.slot[:] = torch.tensor([-1, 0, 0, 1], dtype=torch.int32)
     states = {"decode": _state([40, 41, 42], [43])}
     runtime.valid_cache_lengths[0] = 3
     runtime.future_input_map[0] = torch.tensor([43, 44, 45, 46], device=ib.device)
@@ -1287,6 +1295,9 @@ def test_forced_single_token_resets_draft_tree_parents(buffers):
     assert ib.force_single_token_verify_buf[0].item()
     assert runtime.future_parent_map[0].tolist() == [-1, 0, 1, 2]
     assert runtime.future_parent_map[1].tolist() == tree.tolist()
+    # The dummy chain is deterministic.
+    assert runtime.future_draft_q.slot[0].tolist() == [-1] * 4
+    assert runtime.future_draft_q.slot[1].tolist() == [-1, 0, 0, 1]
 
 
 @pytest.mark.parametrize(

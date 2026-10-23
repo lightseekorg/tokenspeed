@@ -1815,6 +1815,49 @@ def triton_mhc_mixes(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_it
     )
 
 
+@triton.jit(do_not_specialize=["X0", "X1"], do_not_specialize_on_alignment=["X0", "X1"])
+def _mhc_init_kernel(
+    X, Y, PRE, X0, X1, H: tl.constexpr, HC: tl.constexpr, B: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    d = tile * B + tl.arange(0, B)
+    # Strided views can span more than int32 elements within one row.
+    value = tl.load(X + row * X0 + d.to(tl.int64) * X1, d < H, 0)
+    for stream in tl.static_range(HC):
+        tl.store(Y + (row * HC + stream) * H + d, value, d < H)
+        if tile == 0:
+            tl.store(PRE + row * HC + stream, 1.0 if stream == 0 else 0.0)
+
+
+@register_kernel(
+    "residual",
+    "mhc_init",
+    name="triton_mhc_init",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(("hidden",), "dense", _DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_init(hidden, hc_mult):
+    rows, width = hidden.shape
+    residual = hidden.new_empty((rows, hc_mult, width))
+    pre = torch.empty((rows, hc_mult), dtype=torch.float32, device=hidden.device)
+    if rows:
+        _mhc_init_kernel[(rows, triton.cdiv(width, 1024))](
+            hidden,
+            residual,
+            pre,
+            hidden.stride(0),
+            hidden.stride(1),
+            H=width,
+            HC=hc_mult,
+            B=1024,
+            num_warps=4,
+        )
+    return residual, pre
+
+
 def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
     """Collapse BF16 [...,HC,H] with FP32 [...,HC] weights, returning BF16 [...,H]."""
     hidden = residual.shape[-1]

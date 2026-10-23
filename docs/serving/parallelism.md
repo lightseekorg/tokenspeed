@@ -660,8 +660,9 @@ sharded-history prefill with DCP decode, without a PD transfer or QCP. On PD,
 a prefill engine (with or without a query shard) and a decode engine (with
 `--decode-context-parallel-size`) each shard their cache independently; a
 transfer edge copies the pages its prefill rank and decode rank both own.
-Works with the Host KVStore and the retraction snapshot pool; not yet with
-L3 storage.
+Works with the Host KVStore, the retraction snapshot pool and L3 storage.
+L3 reuse requires the same CP layout; see
+[Host L2 and Mooncake Store L3](../configuration/server.md#host-l2-and-mooncake-store-l3).
 
 For non-PD MLA serving, use a DCP-capable backend, for example:
 
@@ -707,7 +708,7 @@ movement, so a row's bits do not depend on which rank computes it
 
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
-Host KVStore and the retraction snapshot pool but not L3 storage, as every
+Host KVStore, the retraction snapshot pool and L3 storage, as every
 KVP engine does), `N == --attn-tp-size`, attention DP 1, no
 `--enable-mixed-batch`, GPU DSA attention with a bf16 KV cache (checked where
 the attention config is built), and `--dense-tp-size` and the MoE TP×EP group

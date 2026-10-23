@@ -250,10 +250,11 @@ class BaseTransformerModel(nn.Module):
                     hidden_states, residual, ctx
                 )
 
-            # An id == num_layers (capture index num_layers + 1) selects the
-            # final norm's output residual as an aux state, matching how each
-            # layer type captures in-loop: BaseDecoderLayer gathers across
-            # attn-TP, CompiledDecoderLayer appends raw.
+            # Capture index num_layers + 1 (EAGLE3's id num_layers, DFLASH's
+            # last layer id) selects the final norm's output residual as an
+            # aux state, matching how each layer type captures in-loop:
+            # BaseDecoderLayer gathers across attn-TP, CompiledDecoderLayer
+            # appends raw.
             if (
                 aux_hidden_states is not None
                 and final_residual is not None
@@ -264,5 +265,12 @@ class BaseTransformerModel(nn.Module):
                         final_residual, ctx
                     )
                 aux_hidden_states.append(final_residual.clone())
+                if ctx.target_capture_sink is not None:
+                    notify_target_capture(
+                        ctx.target_capture_sink,
+                        self._dflash_capture_idx_map,
+                        len(self.layers) + 1,
+                        aux_hidden_states,
+                    )
 
         return hidden_states, aux_hidden_states or None

@@ -284,7 +284,7 @@ jobs:
           for task in matrix["include"]:
               searchable = f"{task['name']} {task['config']}".lower()
               runner = task["runner"]
-              if runner.startswith("slurm-"):
+              if runner.startswith("slurm-") or runner == "tokenspeed-npu-arm64":
                   continue
               if os.environ["EXACT_RUNNER"] and runner != os.environ["EXACT_RUNNER"]:
                   continue

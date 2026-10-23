@@ -18,12 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The capturable grammar's host fill writes the eager walk's masks, on CPU.
+"""The capturable grammar's host node writes the eager walk's masks.
 
 Real xgrammar matchers on a small vocabulary. The eager producer walks the
-draft chain position by position; the capturable one fills it with one
-matcher call and resets only the rows it wrote before. Both must give the
-same bits on every bound row, over steps whose batches change.
+draft chain position by position; the host node, C++ that calls the
+matchers without the GIL, fills it with one matcher call and resets only
+the rows it wrote before. Both must give the same bits on every bound row,
+over steps whose batches change.
 """
 
 from __future__ import annotations
@@ -40,19 +41,28 @@ import xgrammar as xgr
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=5, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the host node builds against the CUDA runtime",
+)
 
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
 from tokenspeed.runtime.grammar.capturable_grammar import (  # noqa: E402
-    GrammarHostBuffers,
-    GrammarStepCompletion,
+    CapturableGrammarExecutor,
     _fill_eager_bitmask,
 )
 from tokenspeed.runtime.grammar.xgrammar_backend import (  # noqa: E402
     XGrammarGrammar,
     keep_gil_in_matcher_calls,
+)
+
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires an NVIDIA GPU",
 )
 
 # 70 tokens, so a mask row is three int32 words; the grammar's tokens sit in
@@ -134,6 +144,22 @@ def _eager_masks(grammars, drafts, layout, monkeypatch):
     return buffers.vocab_mask_spec_buf
 
 
+def _host_fill(executor, grammars, layout, *, drafts=None):
+    """One execution of the host node for this batch. With nothing sampled
+    (accept lengths are zero) the previous batch's matchers stay put."""
+    if drafts is not None:
+        executor.candidates[: len(grammars)] = drafts
+    executor.add_batch(
+        grammars=grammars,
+        bs=len(grammars),
+        has_candidates=drafts is not None,
+        output_layout=layout,
+    )
+    executor.host.launch(torch.cuda.current_stream().cuda_stream)
+    torch.cuda.synchronize()
+    return executor.host_bitmask
+
+
 def _next_masks(grammars):
     masks = torch.zeros((len(grammars), 3), dtype=torch.int32)
     for i, grammar in enumerate(grammars):
@@ -144,11 +170,8 @@ def _next_masks(grammars):
 
 def test_draft_chain_masks_match_the_eager_walk_across_steps(compiled, monkeypatch):
     layout = ForwardOutputLayout(2, 1, 7, W)
-    host = GrammarHostBuffers(
-        max_bs=len(STEPS[0]),
-        vocab_size=len(VOCAB),
-        max_tokens_per_req=W,
-        pin_memory=False,
+    executor = CapturableGrammarExecutor(
+        max_bs=len(STEPS[0]), vocab_size=len(VOCAB), max_tokens_per_req=W
     )
     for step in STEPS:
         grammars, drafts = _batch(compiled, step)
@@ -159,19 +182,12 @@ def test_draft_chain_masks_match_the_eager_walk_across_steps(compiled, monkeypat
             monkeypatch,
         )
         before = _next_masks(grammars)
-        host.candidates[: len(step)] = drafts
-        host.fill(
-            dict(
-                grammars=grammars,
-                bs=len(step),
-                has_candidates=True,
-                completion=GrammarStepCompletion(output_layout=layout),
-            )
+        assert torch.equal(
+            _host_fill(executor, grammars, layout, drafts=drafts), expected
         )
-        assert torch.equal(host.bitmask, expected)
         # The walk leaves every matcher where it was.
         assert torch.equal(_next_masks(grammars), before)
-    assert (host.bitmask == -1).all()
+    assert (executor.host_bitmask == -1).all()
 
 
 def test_draft_past_the_vocabulary_ends_the_walk(monkeypatch):
@@ -182,41 +198,21 @@ def test_draft_past_the_vocabulary_ends_the_walk(monkeypatch):
     ).compile_grammar('root ::= [a-z0-9]* "}"')
     step = [((), (A, B, 80, C)), ((), (A, 95, B, C))]
     layout = ForwardOutputLayout(0, 0, len(step), W)
-    host = GrammarHostBuffers(
-        max_bs=len(step),
-        vocab_size=len(VOCAB),
-        max_tokens_per_req=W,
-        pin_memory=False,
+    executor = CapturableGrammarExecutor(
+        max_bs=len(step), vocab_size=len(VOCAB), max_tokens_per_req=W
     )
     grammars, drafts = _batch(compiled, step)
     expected = _eager_masks(_batch(compiled, step)[0], drafts, layout, monkeypatch)
-    host.candidates[: len(step)] = drafts
-    host.fill(
-        dict(
-            grammars=grammars,
-            bs=len(step),
-            has_candidates=True,
-            completion=GrammarStepCompletion(output_layout=layout),
-        )
-    )
-    assert torch.equal(host.bitmask, expected)
+    assert torch.equal(_host_fill(executor, grammars, layout, drafts=drafts), expected)
 
 
 def test_single_row_masks_reset_rows_left_by_a_previous_step(compiled):
-    host = GrammarHostBuffers(
-        max_bs=3, vocab_size=len(VOCAB), max_tokens_per_req=1, pin_memory=False
+    executor = CapturableGrammarExecutor(
+        max_bs=3, vocab_size=len(VOCAB), max_tokens_per_req=1
     )
     layout = ForwardOutputLayout(0, 0, 3, 1)
     for accepted in ([(A,), (), (A, B)], [None, (A, BRACE), None]):
         grammars = [None if a is None else _grammar(compiled, a) for a in accepted]
-        host.fill(
-            dict(
-                grammars=grammars,
-                bs=3,
-                has_candidates=False,
-                completion=GrammarStepCompletion(output_layout=layout),
-            )
-        )
         expected = _next_masks(grammars)
         expected[[g is None for g in grammars]] = -1
-        assert torch.equal(host.bitmask, expected)
+        assert torch.equal(_host_fill(executor, grammars, layout), expected)

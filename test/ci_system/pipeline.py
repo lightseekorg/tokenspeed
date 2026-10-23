@@ -61,7 +61,16 @@ SUPPORTED_SETUP_MODES = ("ci", "slurm")
 # jobs in the same workflow stage contend for the same hardware.
 SUPPORTED_PRIORITIES = ("high", "normal", "low")
 DEFAULT_PRIORITY = "normal"
-SUPPORTED_RUNNER_GROUPS = ("all", "amd", "nvidia", "nvidia-arm", "nvidia-x86")
+SUPPORTED_RUNNER_GROUPS = (
+    "all",
+    "amd",
+    "amd-mi350",
+    "amd-mi450",
+    "nvidia",
+    "nvidia-arm",
+    "nvidia-x86",
+    "npu",
+)
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
 B200_RUNNER_LABEL_ENV = "TOKENSPEED_B200_RUNNER_LABEL"
@@ -95,6 +104,7 @@ AMD_RUNNER_PREFIXES = (
     "amd-mi450-",
     "amd-mi45x-",
 )
+AMD_MI450_RUNNER_PREFIXES = ("amd-mi450-", "amd-mi45x-")
 # A pool whose label names cpu instead of a GPU count holds no accelerator.
 CPU_ONLY_RUNNER_MARKER = "-cpu-"
 NVIDIA_ARM_RUNNER_PREFIXES = (
@@ -118,6 +128,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def is_npu_runner(runner: str) -> bool:
+    return runner == "tokenspeed-npu-arm64"
+
+
 def is_cpu_only_runner(runner: str) -> bool:
     return CPU_ONLY_RUNNER_MARKER in runner
 
@@ -129,8 +143,18 @@ def is_nvidia_arm_runner(runner: str) -> bool:
 def runner_matches_group(runner: str, runner_group: str) -> bool:
     if runner_group == "all":
         return True
+    if runner_group == "npu":
+        return is_npu_runner(runner)
+    if is_npu_runner(runner):
+        return False
     if runner_group == "amd":
         return is_amd_runner(runner)
+    if runner_group == "amd-mi450":
+        return runner.startswith(AMD_MI450_RUNNER_PREFIXES)
+    if runner_group == "amd-mi350":
+        return is_amd_runner(runner) and not runner.startswith(
+            AMD_MI450_RUNNER_PREFIXES
+        )
     if runner_group == "nvidia":
         return not is_amd_runner(runner)
     if runner_group == "nvidia-arm":
@@ -769,6 +793,9 @@ def setup_runner(
         return local_env, pgm
     if setup_mode != "ci":
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
+    if is_npu_runner(runner):
+        # The existing NPU entry owns its deployed environment and host lock.
+        return local_env, pgm
 
     if is_gb200_runner(runner):
         pgm = make_manager()
@@ -1848,6 +1875,8 @@ def execute_task(
         )
     declared_runner = runner
     runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
+    if is_npu_runner(runner) and (task["type"] != "ut" or setup_mode != "ci"):
+        raise ValueError("NPU operator tasks require type=ut and --setup-mode=ci")
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -2095,7 +2124,7 @@ def execute_task(
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         _stop_managed_server()
-        if setup_mode == "ci" and not keep_runner_state:
+        if setup_mode == "ci" and not keep_runner_state and not is_npu_runner(runner):
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)

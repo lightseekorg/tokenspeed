@@ -22,13 +22,18 @@
 
 Each request owns ``R`` query rows over its committed prefix and a ``W``-key
 tree window at the end of its keys; row ``r`` sees window key ``j`` when bit
-``j`` of its 64-bit mask is set. A causal ``q_len = R`` decode over the prefix
-(trtllm-gen, with its log-sum-exp) covers keys ``[0, P - R + 1 + r)`` of row
-``r``; ``triton_tree_window_attention`` attends the rest (the prefix tail and
-the window) and merges both in one kernel. Target verify (``R == W == N``) and
-draft lanes (``R == K``, ``W == (S - 1) * K``) both use it. MLA keys are wider
+``j % 64`` of its mask word ``j // 64`` is set. A causal ``q_len = R`` decode
+over the prefix (trtllm-gen, with its log-sum-exp) covers keys
+``[0, P - R + 1 + r)`` of row ``r``; ``triton_tree_window_attention`` attends
+the rest (the prefix tail and the window) and merges both in one kernel.
+Target verify (``R == W == N``) and draft lanes (``R == K``,
+``W == (S - 1) * K``) both use it. MLA keys are wider
 than values: a key row is the value (the latent) followed by ``ROPE_DIM``
 rotary channels, scored as a second product.
+
+A sliding-window draft instead decodes each row alone over the window frozen at
+the prefix end, so its partial covers the row's whole prefix and only the tree
+window remains.
 """
 
 from __future__ import annotations
@@ -53,7 +58,7 @@ def _tree_window_merge_kernel(
     v_ptr,  # [slots, Hkv, D]
     table_ptr,  # [bs, max_pages] int32
     seq_lens_ptr,  # [bs] int32, including the W window keys
-    mask_ptr,  # [bs * R] int64
+    mask_ptr,  # [bs * R * WORDS] int64
     prefix_out_ptr,  # [bs * R, Hq, D] causal prefix partial
     prefix_lse_ptr,  # [bs * R, Hq] float32, base 2
     out_ptr,  # [bs * R, Hq, D]
@@ -78,6 +83,10 @@ def _tree_window_merge_kernel(
     sm_scale_log2,
     R: tl.constexpr,
     W: tl.constexpr,
+    # Mask words per row: cdiv(W, 64).
+    WORDS: tl.constexpr,
+    # Prefix keys left past each row's partial: R - 1 after a causal partial, else 0.
+    TAIL: tl.constexpr,
     GROUP: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -112,13 +121,17 @@ def _tree_window_merge_kernel(
             mask=row_ok[:, None],
             other=0.0,
         )
-    bits = tl.load(mask_ptr + token, mask=row_ok, other=0)
+    if WORDS == 1:
+        bits = tl.load(mask_ptr + token, mask=row_ok, other=0)
 
-    # Row r's partial covers keys [0, prefix - R + 1 + r); attend the prefix tail and the window.
+    # Partial row r covers keys [0, first + r) if causal, else the prefix; add the tail and window.
     seq_len = tl.load(seq_lens_ptr + req)
     prefix = seq_len - W
-    first = prefix - (R - 1)
-    covered = first + node
+    first = prefix - TAIL
+    if TAIL > 0:
+        covered = first + node
+    else:
+        covered = tl.full([ROWS_BLOCK], 0, tl.int32) + prefix
     has_partial = row_ok & (covered > 0)
     run_max = tl.load(
         prefix_lse_ptr + token * stride_lt + head * stride_lh,
@@ -136,10 +149,10 @@ def _tree_window_merge_kernel(
     ).to(tl.float32)
 
     cols = tl.arange(0, BLOCK)
-    for tile in range(0, R - 1 + W, BLOCK):
+    for tile in range(0, TAIL + W, BLOCK):
         col = tile + cols
         pos = first + col
-        col_ok = (col < R - 1 + W) & (pos >= 0)
+        col_ok = (col < TAIL + W) & (pos >= 0)
         page = tl.load(
             table_ptr + req * stride_table + pos // PAGE, mask=col_ok, other=0
         )
@@ -172,10 +185,18 @@ def _tree_window_merge_kernel(
             ).to(q.dtype)
             scores += tl.dot(q_rope, tl.trans(k_rope))
         scores *= sm_scale_log2
-        in_window = col >= R - 1
-        bit = (
-            (bits[:, None] >> tl.maximum(col - (R - 1), 0).to(tl.int64)[None, :]) & 1
-        ) != 0
+        in_window = col >= TAIL
+        window_col = tl.maximum(col - TAIL, 0)
+        if WORDS == 1:
+            word = bits[:, None]
+        else:
+            word = tl.load(
+                mask_ptr + token[:, None] * WORDS + (window_col // 64)[None, :],
+                mask=row_ok[:, None] & (in_window & (col < TAIL + W))[None, :],
+                other=0,
+            )
+        # Columns past the window would shift by 64 or more (undefined); they are masked anyway.
+        bit = ((word >> (window_col % 64).to(tl.int64)[None, :]) & 1) != 0
         visible = col_ok[None, :] & tl.where(
             in_window[None, :], bit, pos[None, :] >= covered[:, None]
         )
@@ -235,6 +256,7 @@ def triton_tree_window_attention(
     *,
     rows_per_req: int,
     window: int,
+    causal_prefix: bool,
     page_size: int,
     sm_scale: float,
 ) -> torch.Tensor:
@@ -270,6 +292,8 @@ def triton_tree_window_attention(
         sm_scale * 1.4426950408889634,
         R=rows_per_req,
         W=window,
+        WORDS=triton.cdiv(window, 64),
+        TAIL=rows_per_req - 1 if causal_prefix else 0,
         GROUP=group,
         HEAD_DIM=head_dim,
         ROPE_DIM=q.shape[2] - head_dim,

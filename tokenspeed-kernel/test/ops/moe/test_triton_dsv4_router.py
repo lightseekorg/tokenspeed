@@ -27,6 +27,7 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.numerics.torch.quantization import dequantize_mxfp4
 from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, moe_topk
+from tokenspeed_kernel.selection import NoKernelFoundError
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -143,6 +144,31 @@ def test_router_matches_reference(
         atol=1e-6,
         rtol=8e-3 if weights_dtype == torch.bfloat16 else 2e-6,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize("experts", [256, 384])
+@pytest.mark.parametrize("tokens", [1, 16, 17])
+def test_fused_router_matches_logits_path(experts: int, tokens: int) -> None:
+    torch.manual_seed(experts + tokens)
+    x = torch.randn(tokens, 4096, device="cuda").bfloat16()
+    gate = (torch.randn(experts, 4096, device="cuda") * 0.05).bfloat16()
+    bias = torch.randn(experts, device="cuda")
+    args = dict(
+        top_k=6,
+        score_function="sqrt_softplus",
+        selection_method="topk",
+        renormalize=True,
+        routed_scaling_factor=1.5,
+        correction_bias=bias,
+    )
+    try:
+        weights, ids = moe_topk(None, hidden_states=x, gate_weight=gate, **args)
+    except NoKernelFoundError:
+        pytest.skip("no fused router kernel on this platform")
+    expected_weights, expected_ids = moe_topk(x.float() @ gate.float().T, **args)
+    torch.testing.assert_close(ids, expected_ids, atol=0, rtol=0)
+    torch.testing.assert_close(weights, expected_weights, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")

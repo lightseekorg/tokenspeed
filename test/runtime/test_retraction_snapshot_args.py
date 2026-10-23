@@ -26,8 +26,22 @@ with the tail unit the scheduler's ``CapacityModel`` answers.
 """
 
 import logging
+import sys
+from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(
+    est_time=10,
+    suite="runtime-1gpu",
+    nightly=False,
+    disabled=None,
+    disabled_on_runners=None,
+    disabled_on_runners_reason=None,
+)
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
@@ -169,6 +183,23 @@ def test_kvp_takes_both_host_tiers_and_l3():
     assert args.enable_kvstore is True and args.retraction_snapshot_host_gb == 1.0
     args = ServerArgs(**sharded_decode, kvstore_storage_backend="mooncake")
     assert args.kvstore_storage_backend == "mooncake"
+
+
+@pytest.mark.parametrize(
+    ("role", "dcp_size"), [("null", 2), ("prefill", 1), ("decode", 2)]
+)
+def test_l3_accepts_kvp_in_every_serving_role(role, dcp_size):
+    # Prefill shards KV storage without the decode-only DCP launch option.
+    args = ServerArgs(
+        model="x",
+        world_size=2,
+        disaggregation_mode=role,
+        kv_parallel_size=2,
+        decode_context_parallel_size=dcp_size,
+        kvstore_storage_backend="mooncake",
+    )
+    assert args.enable_kvstore and args.kvstore_storage_backend == "mooncake"
+    assert args.mapping.attn.kvp_size == 2
 
 
 def test_forced_retraction_is_a_test_knob_that_needs_a_pool():

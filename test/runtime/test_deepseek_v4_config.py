@@ -816,6 +816,7 @@ class TestDeepseekV4Config:
             torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             use_graph=True,
+            settle=lambda: None,
         )
 
         # (padded_bs, actual_bs) are the leading positional args.
@@ -854,6 +855,7 @@ class TestDeepseekV4Config:
             torch.ones(4, dtype=torch.int32),
             forward_mode=ForwardMode.DECODE,
             use_graph=True,
+            settle=lambda: None,
             block_tables={"v4.swa": table},
         )
 
@@ -1005,6 +1007,7 @@ class TestDeepseekV4Config:
             seq_lens,
             forward_mode=ForwardMode.DECODE,
             use_graph=False,
+            settle=lambda: None,
         )
 
         draft_args, draft_kwargs = captured["draft"][-1]

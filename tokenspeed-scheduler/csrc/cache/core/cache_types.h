@@ -143,6 +143,11 @@ struct StateStep {
         kLand,
     };
     Kind kind{Kind::kKeep};
+    // A rotating prefill chunk that also writes the state at a page boundary
+    // inside it (SchedulerConfig::state_checkpoint_in_forward): one more
+    // fresh block, held outside the two-slot table until the request's next
+    // publication point publishes it (AdmissionResult::state_checkpoint_blocks).
+    bool checkpoint{false};
 
     bool operator==(const StateStep&) const noexcept = default;
 };
@@ -195,6 +200,12 @@ struct CompletedPages {
     // under the point's hash (the chain hash when aligned, the tail hash
     // otherwise). Ordinary chunk ends and decode steps publish no state.
     bool publish_state{false};
+    // An in-forward State checkpoint an earlier forward wrote at the page
+    // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
+    // publishes its block from state_checkpoint_blocks (indexed by group, null
+    // elsewhere) under that page's chain hash. Zero pages means none.
+    std::int32_t state_checkpoint_pages{0};
+    std::span<CacheBlockRef> state_checkpoint_blocks{};
     // Which kind of boundary the publication ends on (eviction provenance).
     CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
     // Prefill streams newly published history and state to Host. Decode

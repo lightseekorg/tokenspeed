@@ -253,8 +253,16 @@ A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
 retraction image -- published under the hash of that token count, page
-boundary or not. No forward computes an interior checkpoint, no scan is split
-into body and tail, and no state group declares a token span: a hit resumes
+boundary or not. The one interior checkpoint is opt-in
+(`--enable-state-checkpoint-in-forward`): the forward that spans a long
+prompt's last page boundary before its replay tail also stores the state at
+that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
+`InForwardStateCheckpoints`) -- the GDN scan emits it from inside the kernel,
+the conv and PLE windows are the inputs before it -- which is then published
+like a natural checkpoint
+([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
+No scan is split into body and tail, and no state group declares a token
+span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
 tail of the same instant in the history groups
 ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)
@@ -270,7 +278,10 @@ masked state writer (`store_state_rows`) drops its result, and the padded
 output rows are zeroed by a device-side bound the capture cannot freeze. The
 live tokens keep the packing of the unpadded forward, so a capture of any
 request count matches eager bit for bit; nothing about padding reaches the
-cache or the scheduler.
+cache or the scheduler. A forward that writes an in-forward State checkpoint
+keeps its live metadata instead (`prepare_prefill_metadata` returns False):
+the capacity layout carries no checkpoint, so the layer runs at its eager
+break of the ordinary prefill graph.
 
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays

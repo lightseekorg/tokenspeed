@@ -220,6 +220,18 @@ Python location, `error` raises there. CI runs the serving paths with
 `error`; the control plane's event wait and non-blocking copies pass
 unflagged, so a report is always a real stall.
 
+One named exception: a drafter may leave its round pending after the forward
+(`BaseDrafter.finish_round`) and finish it in the next forward's `settle`,
+before `load_round_inputs` (`complete_round`); every other forward-thread task
+finishes it first. A decode settles after the target's decode metadata and
+before the draft's, so what a forward queues before its settle runs beside
+the round and must leave alone what the round uses: `future_*`, the draft KV
+cache and decode metadata, the drafter's buffers, the kernel workspace and
+collective state. EAGLE-Harness chains a round's captured graphs on the GPU,
+behind the decode graph (`BaseDrafter.replay_decode_graph`), so what the
+forward queues after that graph (the verified-state commit, the outputs) runs
+beside the round too; an eager round polls a pinned flag to launch each depth.
+
 A JIT compilation on the forward thread is the same kind of stall, only
 longer: the round waits 100 ms to seconds while a kernel compiles for a new
 compile-cache key. Startup compiles on purpose (graph capture, tuning), so

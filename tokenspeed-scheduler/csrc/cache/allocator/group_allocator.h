@@ -283,6 +283,14 @@ public:
         _assert(!table.blocks_[0], "the input slot is acquired only when empty");
         return acquireStateSlot(pool, table, 0);
     }
+    // A fresh block for an in-forward State checkpoint (StateStep::checkpoint),
+    // placed like the table's own slots but held outside them; null when the
+    // pool has none.
+    CacheBlockRef AcquireStateCheckpoint(BlockPool& pool, const BlockTable& table) {
+        assertStateTable(table);
+        std::vector<CacheBlockRef> fresh = pool.AcquireBlocks(group_id_, 1, BucketLoads(table));
+        return fresh.size() == 1 ? std::move(fresh.front()) : CacheBlockRef{};
+    }
     // Slot 0's block when this step releases it and the table is its only
     // owner besides the index (reclaimable by the admission that releases it).
     std::optional<CacheBlockLocation> ReleasableStateInput(const PrefixCacheIndex& index, const BlockTable& table,

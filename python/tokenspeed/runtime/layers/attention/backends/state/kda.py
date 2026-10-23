@@ -28,6 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import torch
+from tokenspeed_kernel.ops.attention.gdn import GdnStateCheckpoints
 from tokenspeed_kernel.ops.attention.kda import (
     KdaPrefillCapacity,
     KdaReplayRecords,
@@ -1118,6 +1119,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
         num_real_tokens: int,
         lower_bound: float | None,
         cu_seqlens_cpu: torch.Tensor | None = None,
+        state_checkpoints: GdnStateCheckpoints | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run an exact-length or fixed-capacity KDA scan with live boundaries.
 
@@ -1132,6 +1134,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
         capacity admission without a per-layer synchronizing D2H. The prepared
         capacity path builds its chunk plan on device instead of on the host.
         """
+        if state_checkpoints is not None:
+            raise NotImplementedError(
+                f"{type(self).__name__} stores no in-forward State checkpoints"
+            )
         _reject_skip_term(D)
         head_k_dim = query.shape[3]
         num_value_heads = value.shape[2]

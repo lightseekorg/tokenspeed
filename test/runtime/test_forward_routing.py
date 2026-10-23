@@ -57,6 +57,9 @@ class _ForwardThread:
             future.set_exception(exc)
         return future
 
+    # The real thread's submit_forward only skips its settle hook.
+    submit_forward = submit
+
     def run(self, fn):
         self._trace.append("run")
         return fn()

@@ -132,7 +132,7 @@ class ForwardThread:
     (``execute_forward_op`` manages ``execution_stream`` itself).
     """
 
-    def __init__(self, device) -> None:
+    def __init__(self, device, *, settle: Callable[[], None]) -> None:
         # Resolve the CUDA index on the CALLER's thread: an index-less
         # "cuda" means the caller's current device (set_device(local_rank)
         # ran during distributed init), which a fresh thread would not
@@ -148,6 +148,8 @@ class ForwardThread:
                 if resolved.index is not None
                 else device_module.current_device()
             )
+        # Before every non-forward task: finishes a drafter's pending round.
+        self._settle = settle
         self._queue: queue.SimpleQueue = queue.SimpleQueue()
         self._thread = threading.Thread(
             target=self._run, name="tokenspeed::forward", daemon=True
@@ -161,10 +163,12 @@ class ForwardThread:
             item = self._queue.get()
             if item is None:
                 return
-            fn, future = item
+            fn, future, settles = item
             if not future.set_running_or_notify_cancel():
                 continue
             try:
+                if settles:
+                    self._settle()
                 future.set_result(fn())
             except BaseException as exc:  # noqa: BLE001 — relayed to the waiter
                 future.set_exception(exc)
@@ -183,7 +187,13 @@ class ForwardThread:
             A future resolved with ``fn``'s return value, or its exception.
         """
         future: Future = Future()
-        self._queue.put((fn, future))
+        self._queue.put((fn, future, True))
+        return future
+
+    def submit_forward(self, fn: Callable[[], Any]) -> Future:
+        """``submit`` for a model forward, which settles the previous one itself."""
+        future: Future = Future()
+        self._queue.put((fn, future, False))
         return future
 
     def run(self, fn: Callable[[], Any]) -> Any:
@@ -192,7 +202,7 @@ class ForwardThread:
         For the rare submissions whose caller genuinely needs the outcome
         before it can continue — startup and teardown, and the low-rate PD
         events that must see their device write land. The per-round forward
-        path uses ``submit`` and waits only at commit.
+        path uses ``submit_forward`` and waits only at commit.
 
         Args:
             fn: Zero-argument callable to run on the data plane.

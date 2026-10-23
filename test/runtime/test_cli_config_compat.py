@@ -989,7 +989,7 @@ class TestCLIConfigCompat:
 
     def test_speculative_eagle_topk_rejects_unsupported_trees(self, subtests):
         cases = [
-            (("DFLASH", 4, 15, 16), {}, "needs --speculative-algorithm EAGLE3 or MTP"),
+            (("DFLASH", 4, 15, 16), {}, "needs --speculative-algorithm EAGLE3, EAGLE4"),
             (("EAGLE3", 17, 2, 16), {}, "1..16 children"),
             (("EAGLE3", 0, 3, 4), {}, "1..16 children"),
             (("EAGLE3", 4, 11, 16), {}, "1..10 steps"),
