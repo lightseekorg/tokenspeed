@@ -450,19 +450,30 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     cache = pool.get_key_buffer(0)
     cache.zero_()
     if model_write:
+        from transformers import PretrainedConfig
+
+        from tokenspeed.runtime.distributed.mapping import Mapping
         from tokenspeed.runtime.models.deepseek_v3 import DeepseekV3AttentionMLA
 
-        model = SimpleNamespace(
-            kv_lora_rank=512,
-            qk_rope_head_dim=64,
-            qk_nope_head_dim=128,
-            qk_head_dim=192,
-            num_local_heads=1,
-            v_head_dim=128,
-            kv_b_proj=lambda latent: (latent.new_zeros((latent.shape[0], 256)),),
-            attn_mha=layer,
-            rotary_emb=None,
-        )
+        with torch.device("cuda"):
+            model = DeepseekV3AttentionMLA(
+                config=PretrainedConfig(rms_norm_eps=1e-6),
+                mapping=Mapping(rank=0, world_size=1),
+                hidden_size=128,
+                num_heads=1,
+                qk_nope_head_dim=128,
+                qk_rope_head_dim=64,
+                v_head_dim=128,
+                q_lora_rank=128,
+                kv_lora_rank=512,
+                quant_config=None,
+                layer_id=0,
+                skip_rope=True,
+                reduce_attn_results=False,
+            ).to(dtype=torch.bfloat16)
+        with torch.no_grad():
+            model.kv_b_proj.weight.zero_()
+        model.attn_mha = layer
         DeepseekV3AttentionMLA.forward_normal_chunked_kv_prepare(
             model,
             torch.arange(3, device="cuda"),
@@ -495,8 +506,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     (window,) = plan_prefix_history_gather(
         [loc],
         page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
-        prefix_lens_cpu=torch.tensor([3]),
-        chunk_len=3,
+        chunk_bounds_cpu=torch.tensor([[0], [3]]),
         page_size=1,
         placement=backend.cache_placement(layer),
     )
@@ -535,7 +545,7 @@ def test_physical_mla_writer_with_placement_and_explicit_history_gather(
     backend._prepare_prefix_history(
         loops,
         page_table_cpu=torch.tensor([[4, 8, 12]], dtype=torch.int32),
-        prefix_lens_cpu=torch.tensor([3]),
+        chunk_bounds_cpu=torch.tensor([[0], [3]]),
     )
     ((nope, rope),) = backend.read_prefix_history(
         pool, layer, loops, dst_dtype=torch.float32

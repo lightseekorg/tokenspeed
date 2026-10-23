@@ -69,12 +69,25 @@ def _random_layout(
     return table, slots
 
 
-def _chunk_slots(slots: list[list[int]], chunk_len: int) -> list[list[int]]:
-    """``chunk.get_chunks_paged``'s loop order: per loop, request-major."""
-    num_chunks = -(-max(len(s) for s in slots) // chunk_len)
+def _chunk_plan(prefix_lens, chunk_len, reuse):
+    from tokenspeed.runtime.layers.attention.chunk import chunking, plan_prefix_chunks
+
+    lengths = torch.tensor(prefix_lens)
+    if reuse:
+        return plan_prefix_chunks(lengths, chunk_len * len(prefix_lens))
+    return chunking(
+        lengths, -(-max(prefix_lens) // chunk_len), len(prefix_lens), chunk_len
+    )
+
+
+def _chunk_slots(slots: list[list[int]], boundaries: torch.Tensor) -> list[list[int]]:
     return [
-        [slot for s in slots for slot in s[j * chunk_len : (j + 1) * chunk_len]]
-        for j in range(num_chunks)
+        [
+            slot
+            for request, (start, end) in enumerate(zip(starts, ends))
+            for slot in slots[request][start:end]
+        ]
+        for starts, ends in zip(boundaries[:-1].tolist(), boundaries[1:].tolist())
     ]
 
 
@@ -85,14 +98,16 @@ CASES = [
     ([5000, 4097], 32, 4, 2048, 16),
     ([129, 0, 64], 64, 1, 64, 2),
     ([7], 1, 4, 3, 2),
+    ([30000, 0, 1000, 45000], 64, 2, 8192, 16),
     # More loops than one window covers.
     ([5000, 4097], 32, 4, 512, 4),
 ]
 
 
+@pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("prefix_lens,page_size,subpages,chunk_len,degree", CASES)
 def test_owned_prefix_chunk_rows_matches_per_row_owners(
-    prefix_lens, page_size, subpages, chunk_len, degree
+    prefix_lens, page_size, subpages, chunk_len, degree, reuse
 ):
     generator = torch.Generator().manual_seed(7)
     virtual_block_count = 4096
@@ -109,12 +124,11 @@ def test_owned_prefix_chunk_rows_matches_per_row_owners(
         subpages=subpages,
         virtual_block_count=virtual_block_count,
     )
-    chunks = _chunk_slots(slots, chunk_len)
+    bounds = _chunk_plan(prefix_lens, chunk_len, reuse).boundaries
+    chunks = _chunk_slots(slots, bounds)
     counts = owned_prefix_chunk_rows(
         table,
-        torch.tensor(prefix_lens),
-        chunk_len=chunk_len,
-        num_chunks=len(chunks),
+        bounds,
         page_size=page_size,
         placement=placement,
     )
@@ -133,18 +147,17 @@ def test_owned_prefix_chunk_rows_refuses_a_hole():
     with pytest.raises(ValueError, match="holes"):
         owned_prefix_chunk_rows(
             torch.tensor([[4, 0, 12]], dtype=torch.int32),
-            torch.tensor([3]),
-            chunk_len=3,
-            num_chunks=1,
+            torch.tensor([[0], [3]]),
             page_size=1,
             placement=placement,
         )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("reuse", [False, True])
 @pytest.mark.parametrize("prefix_lens,page_size,subpages,chunk_len,degree", CASES)
 def test_every_rank_reads_the_position_order_rows(
-    prefix_lens, page_size, subpages, chunk_len, degree
+    prefix_lens, page_size, subpages, chunk_len, degree, reuse
 ):
     """Emulate each window's all-gather over ``degree`` owners: every rank's
     send rows come from its own physical cache, and every rank's plan must
@@ -167,9 +180,10 @@ def test_every_rank_reads_the_position_order_rows(
         subpages=subpages,
         virtual_block_count=virtual_block_count,
     )
+    bounds = _chunk_plan(prefix_lens, chunk_len, reuse).boundaries
     chunks = [
         torch.tensor(chunk, dtype=torch.int32, device="cuda")
-        for chunk in _chunk_slots(slots, chunk_len)
+        for chunk in _chunk_slots(slots, bounds)
     ]
     placements = [
         CachePlacement(
@@ -198,8 +212,7 @@ def test_every_rank_reads_the_position_order_rows(
         plan_prefix_history_gather(
             chunks,
             page_table_cpu=table,
-            prefix_lens_cpu=torch.tensor(prefix_lens),
-            chunk_len=chunk_len,
+            chunk_bounds_cpu=bounds,
             page_size=page_size,
             placement=placement,
         )
@@ -284,7 +297,8 @@ class _RecordingBackend:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_read_prefix_history_prefetches_one_window_ahead():
+@pytest.mark.parametrize("reuse", [False, True])
+def test_read_prefix_history_prefetches_one_window_ahead(reuse):
     """Every layer's loops read their rows back through windows that the
     previous window -- of this layer, else of the previous latent layer --
     already launched; the gathers run in the same order on every rank."""
@@ -295,8 +309,8 @@ def test_read_prefix_history_prefetches_one_window_ahead():
         resolve_cache_slots,
     )
 
-    degree, page_size, subpages, chunk_len = 2, 32, 4, 512
-    prefix_lens = [5000, 300]
+    degree, page_size, subpages, chunk_len = 2, 32, 4, 1024
+    prefix_lens = [20000, 300]
     virtual_block_count = 512
     rows = page_size * subpages
     table, slots = _random_layout(
@@ -306,9 +320,10 @@ def test_read_prefix_history_prefetches_one_window_ahead():
         subpages=subpages,
         virtual_block_count=virtual_block_count,
     )
+    bounds = _chunk_plan(prefix_lens, chunk_len, reuse).boundaries
     chunks = [
         torch.tensor(chunk, dtype=torch.int32, device="cuda")
-        for chunk in _chunk_slots(slots, chunk_len)
+        for chunk in _chunk_slots(slots, bounds)
     ]
     every_slot = torch.cat(chunks).to(torch.int64)
     # A hybrid stack: latent planes on layers 1, 3 and 4 only.
@@ -346,8 +361,7 @@ def test_read_prefix_history_prefetches_one_window_ahead():
         history.prepare(
             chunks,
             page_table_cpu=table,
-            prefix_lens_cpu=torch.tensor(prefix_lens),
-            chunk_len=chunk_len,
+            chunk_bounds_cpu=bounds,
         )
         num_windows = len(history.windows)
         assert num_windows > 1
@@ -539,14 +553,13 @@ def test_history_gather_plans_at_first_read():
     loops = [torch.tensor([4, 5, 6], dtype=torch.int32)]
     with pytest.raises(RuntimeError, match="host page table"):
         history.prepare(
-            loops, page_table_cpu=None, prefix_lens_cpu=torch.tensor([3]), chunk_len=3
+            loops, page_table_cpu=None, chunk_bounds_cpu=torch.tensor([[0], [3]])
         )
     history.prepare(
         loops,
         # Page 0 below the prefix: an unplannable table, refused only on read.
         page_table_cpu=torch.tensor([[4, 0, 12]], dtype=torch.int32),
-        prefix_lens_cpu=torch.tensor([3]),
-        chunk_len=3,
+        chunk_bounds_cpu=torch.tensor([[0], [3]]),
     )
     with pytest.raises(ValueError, match="holes"):
         history.windows
@@ -554,7 +567,5 @@ def test_history_gather_plans_at_first_read():
     # A forward without prefix loops (a prefill with no cached prefix) has
     # no host table to plan from and reads nothing.
     no_loops = []
-    history.prepare(
-        no_loops, page_table_cpu=None, prefix_lens_cpu=torch.tensor([0]), chunk_len=3
-    )
+    history.prepare(no_loops, page_table_cpu=None, chunk_bounds_cpu=torch.tensor([[0]]))
     assert list(history.read(None, None, no_loops, dst_dtype=torch.int32)) == []

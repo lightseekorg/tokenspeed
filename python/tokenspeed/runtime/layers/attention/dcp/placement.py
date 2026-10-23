@@ -160,17 +160,15 @@ def owned_history_rows(
 
 def owned_prefix_chunk_rows(
     page_table_cpu: torch.Tensor,
-    prefix_lens_cpu: torch.Tensor,
+    chunk_bounds_cpu: torch.Tensor,
     *,
-    chunk_len: int,
-    num_chunks: int,
     page_size: int,
     placement: CachePlacement,
 ) -> torch.Tensor:
     """Count, on the host, how many rows of every prefix chunk each rank owns.
 
-    Prefix-chunk loop ``j`` reads rows ``[j * chunk_len, (j + 1) * chunk_len)``
-    of every request's cached prefix (``chunk.get_chunks_paged``). A rank's
+    Each loop reads the interval between consecutive per-request boundaries
+    from ``chunk.get_chunks_paged``. A rank's
     rows below position ``x`` are its whole pages below page ``x // page_size``
     plus ``x % page_size`` rows of that page when it owns it, so every chunk's
     counts are differences at the chunk bounds: one pass over the page table
@@ -179,9 +177,7 @@ def owned_prefix_chunk_rows(
     Args:
         page_table_cpu: ``[requests, columns]`` host int32 kernel-page table
             (virtual pages, batch-ordered; holes are page 0).
-        prefix_lens_cpu: ``[requests]`` host cached-prefix lengths.
-        chunk_len: Prefix rows every request contributes to one loop.
-        num_chunks: The forward's prefix-chunk loop count.
+        chunk_bounds_cpu: ``[num_chunks + 1, requests]`` host prefix positions.
         page_size: Tokens per kernel page.
         placement: The sharded group's ownership geometry.
 
@@ -192,17 +188,23 @@ def owned_prefix_chunk_rows(
         ValueError: the table does not cover a prefix, or a prefix row lies
             on a page without an owner, so the gather could not rebuild it.
     """
-    if page_table_cpu.dim() != 2 or prefix_lens_cpu.dim() != 1:
-        raise ValueError("owned_prefix_chunk_rows takes a [requests, columns] table")
-    if page_table_cpu.shape[0] != prefix_lens_cpu.numel():
-        raise ValueError(
-            f"page table has {page_table_cpu.shape[0]} rows for "
-            f"{prefix_lens_cpu.numel()} requests"
-        )
-    # Host arithmetic on small arrays, in numpy: torch dispatch would cost
-    # more than the counting, once per forward ahead of the device.
+    if (
+        page_table_cpu.device.type != "cpu"
+        or chunk_bounds_cpu.device.type != "cpu"
+        or page_table_cpu.dim() != 2
+        or chunk_bounds_cpu.dim() != 2
+        or chunk_bounds_cpu.shape[0] == 0
+        or page_table_cpu.shape[0] != chunk_bounds_cpu.shape[1]
+    ):
+        raise ValueError("expected CPU page table and [loops + 1, requests] boundaries")
+    # Count once on the host; the page-owner gather must use the same variable
+    # boundaries as the local slot-index builder.
     degree = len(placement.group)
-    prefix_lens = prefix_lens_cpu.numpy().astype(np.int64)
+    bounds = chunk_bounds_cpu.numpy().astype(np.int64).T
+    if np.any(bounds[:, 0] != 0) or np.any(np.diff(bounds, axis=1) < 0):
+        raise ValueError("prefix boundaries must start at zero and be nondecreasing")
+    num_chunks = bounds.shape[1] - 1
+    prefix_lens = bounds[:, -1]
     max_prefix = int(prefix_lens.max()) if prefix_lens.size else 0
     # Only the pages holding prefix rows matter; the mirror may be wider.
     columns = -(-max_prefix // page_size)
@@ -222,10 +224,6 @@ def owned_prefix_chunk_rows(
     below = np.zeros((owner.shape[0], columns + 1, degree + 1), dtype=np.int64)
     np.cumsum(
         np.eye(degree + 1, dtype=np.int64)[owner] * page_size, axis=1, out=below[:, 1:]
-    )
-    bounds = np.minimum(
-        np.arange(num_chunks + 1, dtype=np.int64)[None, :] * chunk_len,
-        prefix_lens[:, None],
     )
     whole = bounds // page_size
     rows_below = np.take_along_axis(below, whole[:, :, None], axis=1)

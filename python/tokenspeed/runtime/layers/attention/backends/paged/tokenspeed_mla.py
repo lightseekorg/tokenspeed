@@ -448,6 +448,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,
@@ -457,7 +458,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         self._prepare_prefix_history(
             chunk_kv_indices_list,
             page_table_cpu=page_table_cpu,
-            prefix_lens_cpu=extend_prefix_lens_cpu,
+            chunk_bounds_cpu=chunk_bounds_cpu,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(
             extend_prefix_lens=extend_prefix_lens,

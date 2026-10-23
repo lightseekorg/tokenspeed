@@ -27,14 +27,21 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.triton import tl, triton
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["page_table_ptr_stride"],
+    do_not_specialize_on_alignment=[
+        "chunk_start_idx_ptr",
+        "chunk_seq_lens_ptr",
+        "chunk_cum_seq_lens_ptr",
+    ],
+)
 def create_chunked_cache_kv_indices_paged(
     page_table_ptr,  # [bs, max_pages], row i == batch position i
     chunk_start_idx_ptr,  # (batch_size,)
     chunk_seq_lens_ptr,  # (batch_size,)
     chunk_cum_seq_lens_ptr,  # (batch_size + 1,)
     chunk_kv_indices_ptr,  # (num_chunk_tokens,)
-    page_table_ptr_stride: tl.constexpr,
+    page_table_ptr_stride,
     PAGE_SIZE: tl.constexpr,
 ):
     BLOCK_SIZE: tl.constexpr = 512
@@ -70,32 +77,16 @@ def get_max_chunk_capacity():
     )
 
 
-def prefix_chunk_len(batch_size: int) -> int:
-    """Prefix rows each request contributes to one prefix-chunk loop."""
-    return get_max_chunk_capacity() // batch_size
-
-
-# Here we suppose the length of each chunk is equal
-# For example, if we have 4 sequences with seq length [256, 512, 768, 1024], chunk_len = 256
-# num_chunks = cdiv(1024, 256) = 4
-# chunk_starts = [[0, 0, 0, 0], [256, 256, 256, 256], [512, 512, 512, 512], [768, 768, 768, 768]]
-# chunk_ends = [[256, 256, 256, 256], [256, 512, 512, 512], [256, 512, 768, 768], [256, 512, 768, 1024]]
-# chunk_seq_lens = [[256, 256, 256, 256], [0, 256, 256, 256], [0, 0, 256, 256], [0, 0, 0, 256]]
-"""
-        seq0 seq1 seq2 seq3
-chunk0   --   --   --   --
-chunk1   --   --   --   --
-chunk2   --   --   --   --
-chunk3   --   --   --   --
-"""
-
-
-# starts, ends, len_in_chunk, cum_seq_lens, all satisfy the above layout
 @dataclass
 class Chunks:
     starts: torch.Tensor
     ends: torch.Tensor
     len_in_chunk: torch.Tensor
+
+    @cached_property
+    def boundaries(self) -> torch.Tensor:
+        """Per-request positions before the first loop and after each loop."""
+        return torch.cat((self.ends.new_zeros((1, self.ends.shape[1])), self.ends))
 
     @cached_property
     def cum_seq_lens(self):
@@ -125,18 +116,73 @@ def chunking(prefix_lens: torch.Tensor, num_chunks, batch_size, chunk_len):
     return chunks
 
 
+def plan_prefix_chunks(prefix_lens_cpu: torch.Tensor, capacity: int) -> Chunks:
+    """Share a bounded expansion buffer among requests with remaining history.
+
+    Args:
+        prefix_lens_cpu: One nonnegative cached-prefix length per request on CPU.
+        capacity: Maximum total history rows expanded in one loop.
+
+    Returns:
+        CPU chunk boundaries and lengths in request order. Every prefix is read
+        exactly once; a finished request contributes no further rows.
+    """
+    if prefix_lens_cpu.device.type != "cpu" or prefix_lens_cpu.ndim != 1:
+        raise ValueError("prefix lengths must be a one-dimensional CPU tensor")
+    batch_size = prefix_lens_cpu.numel()
+    if capacity <= 0 or capacity < batch_size:
+        raise ValueError("history capacity must be positive and cover the batch")
+    lengths = prefix_lens_cpu.tolist()
+    if any(length < 0 for length in lengths):
+        raise ValueError("prefix lengths must be nonnegative")
+    if not lengths:
+        empty = torch.empty((0, 0), dtype=torch.int32)
+        return Chunks(empty, empty, empty)
+    share = capacity // batch_size
+    # Keep small partitions stable: FP8 attention rounding depends on the
+    # partition size, and pooling these short chunks can amplify its error.
+    if share < 1024:
+        return chunking(
+            prefix_lens_cpu, (max(lengths) + share - 1) // share, batch_size, share
+        )
+    consumed = [0] * batch_size
+    starts, ends = [], []
+    while consumed != lengths:
+        remaining = [length - start for length, start in zip(lengths, consumed)]
+        active = sorted(
+            (i for i, length in enumerate(remaining) if length),
+            key=remaining.__getitem__,
+        )
+        allocated = [0] * batch_size
+        budget = capacity
+        for offset, request in enumerate(active):
+            share, remainder = divmod(budget, len(active) - offset)
+            if remaining[request] <= share:
+                allocated[request] = remaining[request]
+                budget -= remaining[request]
+            else:
+                for position, request in enumerate(active[offset:]):
+                    allocated[request] = share + (position < remainder)
+                break
+        starts.append(consumed)
+        consumed = [start + size for start, size in zip(consumed, allocated)]
+        ends.append(consumed)
+    start_tensor = torch.tensor(starts, dtype=torch.int32).reshape(-1, batch_size)
+    end_tensor = torch.tensor(ends, dtype=torch.int32).reshape(-1, batch_size)
+    return Chunks(start_tensor, end_tensor, end_tensor - start_tensor)
+
+
 def get_chunks_paged(prefix_lens, prefix_lens_cpu, page_table, page_size):
     """Chunk the cached prefixes and resolve each chunk's KV slots through
     the batch-ordered ``[bs, max_pages]`` kernel page table."""
     device: torch.device = prefix_lens.device
     batch_size = len(prefix_lens_cpu)
-
-    chunk_len = prefix_chunk_len(batch_size)
-    max_prefix = prefix_lens_cpu.max().item()
-    num_chunks = (max_prefix + chunk_len - 1) // chunk_len
-
-    chunks = chunking(prefix_lens, num_chunks, batch_size, chunk_len)
-    chunks_cpu = chunking(prefix_lens_cpu, num_chunks, batch_size, chunk_len)
+    chunks_cpu = plan_prefix_chunks(prefix_lens_cpu, get_max_chunk_capacity())
+    num_chunks = chunks_cpu.starts.shape[0]
+    arrays = torch.stack(
+        (chunks_cpu.starts, chunks_cpu.ends, chunks_cpu.len_in_chunk)
+    ).to(device=device)
+    chunks = Chunks(*arrays.unbind(0))
 
     num_tokens_per_forward = chunks_cpu.len_in_chunk.sum(dim=1).tolist()
 
@@ -180,6 +226,8 @@ def build_chunked_prefill_metadata_arrays(
       cumsum along the seq dim, fed to the chunker as ``cum_seq_lens_kv``.
     - ``max_chunk_len_per_loop``: List[int], CPU max-seq-len per loop_idx,
       fed to the chunker as ``max_kv_len``.
+    - ``chunk_bounds_cpu``: (chunked_loop_num+1, num_extends) CPU positions,
+      shared with the distributed history gather.
 
     The q-side cumsum / max do not appear here: callers alias them to the
     causal pass's ``cum_extend_seq_lens`` / ``max_extend_seq_len``, since
@@ -201,4 +249,5 @@ def build_chunked_prefill_metadata_arrays(
         chunks.len_in_chunk,
         chunks.cum_seq_lens,
         max_chunk_len_per_loop,
+        chunks_cpu.boundaries,
     )
