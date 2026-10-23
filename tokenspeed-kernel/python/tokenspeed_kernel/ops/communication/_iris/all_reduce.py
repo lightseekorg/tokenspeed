@@ -704,16 +704,26 @@ def _iris_wait_lamport_slots(
 ):
     """Wait for each peer's BF16 packs in its slot to replace the empty markers.
 
-    Peer p's packs start at slots + p * SLOT_ELEMENTS; offsets index packs whose
-    axis-1 elements are consecutive and start at an even element, so odd
-    positions are the high halves of 32-bit words. Each subgroup polls until all
-    of its valid lanes have every peer's pack.
+    Peer p's packs start at slots + p * SLOT_ELEMENTS. slots is 16-byte aligned,
+    as Iris allocations are; each row of offsets indexes one pack of consecutive
+    elements starting at a multiple of its width. Each subgroup polls the packs
+    as 32-bit words until all of its valid lanes have every peer's pack, then
+    returns them as BF16 in LAYOUT.
     """
-    gl.static_assert(offsets.shape[1] % 2 == 0)
-    odd = gl.arange(0, offsets.shape[1], layout=gl.SliceLayout(0, LAYOUT)) % 2 == 1
-    values = ()
+    ROWS: gl.constexpr = offsets.shape[0]
+    WORDS: gl.constexpr = offsets.shape[1] // 2
+    gl.static_assert(offsets.shape[1] % 2 == 0 and SLOT_ELEMENTS % 8 == 0)
+    # Peers store whole words. Polling words keeps each one a single load at any
+    # pointer alignment; BF16 loads could split a word into a stale low half
+    # and an arrived high half.
+    words_ptr = gl.multiple_of(slots.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
+    first, _ = gl.split(gl.reshape(offsets, [ROWS, WORDS, 2]))
+    # Each thread's words stay as consecutive as its BF16 elements.
+    word_offsets = gl.max_contiguous(gl.multiple_of(first // 2, [1, WORDS]), [1, WORDS])
+    word_valid = gl.convert_layout(valid, gl.SliceLayout(1, word_offsets.type.layout))
+    loaded = ()
     for _ in gl.static_range(1, WORLD_SIZE):
-        values += (gl.full(offsets.shape, 0, gl.bfloat16, LAYOUT),)
+        loaded += (gl.zeros_like(word_offsets).to(gl.uint32),)
     waiting = _iris_subgroup_any(valid.to(gl.int32))
     while waiting:
         # Issue every peer's read before checking any; .cv bypasses stale
@@ -725,20 +735,33 @@ def _iris_wait_lamport_slots(
             peer = (RANK + delta) % WORLD_SIZE
             loaded += (
                 gl.amd.cdna4.buffer_load(
-                    slots + peer * SLOT_ELEMENTS,
-                    offsets,
-                    mask=valid[:, None],
+                    words_ptr + peer * (SLOT_ELEMENTS // 2),
+                    word_offsets,
+                    mask=word_valid[:, None],
                     cache=".cv",
                 ),
             )
-        # Payloads never hold negative zero and 32-bit words are written
-        # whole, so a word is still empty exactly when its high half is 0x8000.
-        missing = gl.full(valid.shape, False, gl.int1, gl.SliceLayout(1, LAYOUT))
+        # Payloads never hold negative zero, so a word is still empty exactly
+        # when its high half is 0x8000.
+        missing = gl.full(
+            word_valid.shape,
+            False,
+            gl.int1,
+            gl.SliceLayout(1, word_offsets.type.layout),
+        )
         for delta in gl.static_range(0, WORLD_SIZE - 1):
-            empty = (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000) & odd[None, :]
-            missing |= valid & (gl.max(empty.to(gl.int32), 1) != 0)
+            empty = (loaded[delta] >> 16) == 0x8000
+            missing |= word_valid & (gl.max(empty.to(gl.int32), 1) != 0)
         waiting = _iris_subgroup_any(missing.to(gl.int32))
-        values = loaded
+    values = ()
+    for delta in gl.static_range(0, WORLD_SIZE - 1):
+        low = loaded[delta].to(gl.uint16).to(gl.bfloat16, bitcast=True)
+        high = (loaded[delta] >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+        values += (
+            gl.convert_layout(
+                gl.reshape(gl.join(low, high), [ROWS, 2 * WORDS]), LAYOUT
+            ),
+        )
     return values
 
 
