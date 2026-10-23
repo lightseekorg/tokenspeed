@@ -71,11 +71,6 @@ class DeepseekV41Config(SoftmaxAttnConfig):
         if server_args.mapping.attn.kvp_size > 1:
             if server_args.disaggregation_mode not in ("null", "prefill", "decode"):
                 raise ValueError("V4.1 KVP requires aggregate, prefill or decode role")
-            if (
-                server_args.disaggregation_mode == "decode"
-                and server_args.speculative_algorithm is not None
-            ):
-                raise ValueError("V4.1 PD KVP decode does not yet support speculation")
             if server_args.speculative_algorithm not in (None, "DSPARK"):
                 raise ValueError("V4.1 KVP supports DSpark speculation only")
             if not server_args.disable_prefill_graph or server_args.enable_mixed_batch:
@@ -134,11 +129,11 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             if (
                 not server_args.disable_prefill_graph
                 or server_args.enable_mixed_batch
-                or server_args.speculative_algorithm is not None
+                or server_args.speculative_algorithm not in (None, "DSPARK")
                 or server_args.mapping.has_pp
             ):
                 raise ValueError(
-                    "V4.1 model QCP requires eager pure prefill without PP or speculation"
+                    "V4.1 model QCP requires eager pure prefill without PP; only DSpark speculation is supported"
                 )
             if (
                 query_size != 1

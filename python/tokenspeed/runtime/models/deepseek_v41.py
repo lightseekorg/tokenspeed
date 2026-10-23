@@ -2468,17 +2468,27 @@ class DeepseekV41Model(nn.Module):
     ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
         """Gather the sampled rows and report the narrowed tap layout."""
         view = ctx.attn_backend.decoder_view()
+        capture = (
+            ctx.capture_hidden_mode is not None
+            and ctx.capture_hidden_mode.need_capture()
+        )
         if ctx.query_shard is not None:
-            if captured or (
-                ctx.capture_hidden_mode is not None
-                and ctx.capture_hidden_mode.need_capture()
-            ):
-                raise NotImplementedError("V4.1 model QCP hidden capture is not wired")
             if view.logits_rows_cpu is None:
                 raise RuntimeError("V4.1 QCP output requires host sampled-row metadata")
             plan = _row_plan(
                 self.ced_decoder_start + 1, self.ced_decoder_start, ctx
             ).query_shard
+            if capture:
+                # DSpark writes replicated SWA-window fields before PD transfer.
+                # Gather CED taps, not the full encoder span or just sampled rows.
+                taps = captured or [hidden]
+                widths = [tap.shape[-1] for tap in taps]
+                packed = token_all_gather_rows(
+                    torch.cat(taps, dim=-1),
+                    self.mapping.attn.qcp_group,
+                    list(plan.row_counts),
+                )
+                captured = list(packed.split(widths, dim=-1))
             sampled = torch.tensor(view.logits_rows_cpu, dtype=torch.int64)
             plan = replace(plan, sampled_rows_per_rank=plan.rows_per_rank(sampled))
             if plan.sampled_rows_total != ctx.output_layout.num_output_tokens:
@@ -2495,18 +2505,13 @@ class DeepseekV41Model(nn.Module):
             else:
                 hidden = hidden[:0]
             ctx.logits_rows_selected = True
-            ctx.captured_rows = None
-            return hidden, None
-        ctx.logits_rows_selected = view.logits_rows is not None
+        else:
+            ctx.logits_rows_selected = view.logits_rows is not None
+            if view.logits_rows is not None:
+                hidden = hidden.index_select(0, view.logits_rows)
+                if hidden.shape[0] != ctx.output_layout.num_output_tokens:
+                    raise RuntimeError("V4.1 decoder and output layout disagree")
         ctx.captured_rows = None
-        if view.logits_rows is not None:
-            hidden = hidden.index_select(0, view.logits_rows)
-            if hidden.shape[0] != ctx.output_layout.num_output_tokens:
-                raise RuntimeError("V4.1 decoder and output layout disagree")
-        capture = (
-            ctx.capture_hidden_mode is not None
-            and ctx.capture_hidden_mode.need_capture()
-        )
         if capture and view.keep_rows is not None:
             by_request = {span.request: span for span in view.spans}
             offset = 0

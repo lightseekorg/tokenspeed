@@ -3432,19 +3432,25 @@ def test_model_qcp_prefill_config():
     with pytest.raises(ValueError, match="cannot combine with aggregate QCP"):
         DeepseekV41Config.generate(args, model, False)
     args.deepseek_v41_attention_query_parallel_size = 1
+    args.speculative_algorithm = "DSPARK"
+    args.speculative_num_draft_tokens = 5
+    args.speculative_num_steps = 4
+    assert DeepseekV41Config.generate(args, model, False).qcp_size == 4
     args.disaggregation_mode = "decode"
     with pytest.raises(ValueError, match="PD prefill role"):
         DeepseekV41Config.generate(args, model, False)
 
 
-def test_pd_replicated_prefill_to_sharded_decode_contract():
+@pytest.mark.parametrize("dspark", [False, True])
+def test_pd_replicated_prefill_to_sharded_decode_contract(dspark):
     from tokenspeed.runtime.pd.cache_protocol import build_arena_cache_transfer_contract
     from tokenspeed.runtime.pd.transfer_plan import (
         CacheTransferPlanner,
         local_transfer_pages,
     )
 
-    source_recipe, destination_recipe = _recipe("cpu"), _recipe("cpu")
+    recipe = _dspark_recipe if dspark else _recipe
+    source_recipe, destination_recipe = recipe("cpu"), recipe("cpu")
     source_recipe.attn_config = replace(
         source_recipe.attn_config,
         pd_disaggregation_enabled=True,
@@ -3533,5 +3539,10 @@ def test_pd_kvp_decode_config(size):
     assert config.kvp_size == size and config.pd_disaggregation_enabled
     assert config.qcp_size == 1
     args.speculative_algorithm = "DSPARK"
-    with pytest.raises(ValueError, match="does not yet support speculation"):
+    args.speculative_num_draft_tokens = 5
+    args.speculative_num_steps = 4
+    config = DeepseekV41Config.generate(args, model, False)
+    assert config.kvp_size == size and config.qcp_size == 1
+    args.speculative_algorithm = "EAGLE"
+    with pytest.raises(ValueError, match="DSpark speculation only"):
         DeepseekV41Config.generate(args, model, False)

@@ -34,7 +34,10 @@ V4.1 model-wide QCP currently supports eager, text-only PD prefill with
 KVP=1 and replicated attention heads. It preserves local token ownership
 through Engram, MoE and CED narrowing, gathers projected keys for cache
 publication, and gathers only sampled hidden rows at the output. It rejects
-PP, mixed batches, prefill graphs and speculation.
+PP, mixed batches and prefill graphs. With DSpark, it gathers the retained
+CED hidden taps in rank order before the existing drafter writes replicated
+SWA-window fields. Empty owners join the gather; cache coordinates remain
+those of the complete decoder view.
 Aggregate QCP and model-wide QCP must not be enabled together.
 
 ## Cache ownership
@@ -99,10 +102,19 @@ either replicated or sharded KV. V4.1-specific restrictions are listed below.
 
 PD prefill can use KVP with DCP size 1 and
 `--disaggregation-layerwise-interval 0`. V4.1 PD decode with KVP uses the existing page-owner transfer planning
-and DCP decode path. Eager PD KVP decode has smoke coverage and currently
-rejects speculation. KVP requires eager prefill and no mixed batches.
-Aggregate serving supports DSpark and CUDA Graph decode; PD Graph decode
-and PD speculation require separate validation.
+and DCP decode path. Eager PD KVP decode has smoke coverage. PD DSpark uses the same
+SWA-window fields as aggregate serving; both P and D must enable DSpark so
+the transfer includes the context windows. KVP requires eager prefill and
+no mixed batches.
+Aggregate serving supports DSpark and CUDA Graph decode. PD Prefill QCP8
+with replicated KV feeding KVP8/DCP8 decode now has DSpark smoke coverage
+with decode CUDA Graph enabled (capture sizes up to 4); prefill stays eager.
+Eight requests completed, including a chunked 18,018-token prompt and
+concurrent submissions with prefix-cache hits. This confirms basic execution,
+not general accuracy or graph replay coverage for every batch size. The long
+prompt matched the earlier eager/non-speculative output; the short prompt
+continued repeating after the correct answer instead of stopping. Paired
+speculation/graph accuracy checks remain required.
 
 ## Validation and tradeoffs
 

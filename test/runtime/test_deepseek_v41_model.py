@@ -3734,6 +3734,37 @@ def test_model_qcp_ced_communication_and_outputs(
         assert captured is None and ctx.logits_rows_selected
         assert ctx.query_shard is plan
 
+        # CPU tests replace only the unavailable distributed collective.
+        # Include empty owners and open chunks with no sampled output.
+        taps = [full_hidden, full_hidden + 1]
+
+        def gather_taps(payload, group, row_counts):
+            assert group == mapping.attn.qcp_group
+            assert row_counts == list(local.decoder_plan.row_counts)
+            expected_taps = torch.cat(taps, dim=-1)
+            torch.testing.assert_close(
+                payload, expected_taps[local.decoder_plan.local_slice], rtol=0, atol=0
+            )
+            return expected_taps.clone()
+
+        monkeypatch.setattr(
+            "tokenspeed.runtime.models.deepseek_v41.token_all_gather_rows",
+            gather_taps,
+        )
+        ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+        actual, captured = model.finish_forward(
+            full_hidden[local.decoder_plan.local_slice],
+            [tap[local.decoder_plan.local_slice] for tap in taps],
+            ctx,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        for actual_tap, expected_tap in zip(captured, taps, strict=True):
+            torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
+        if view.keep_rows is not None:
+            torch.testing.assert_close(
+                ctx.captured_rows.positions, view.metadata.positions
+            )
+
 
 @torch.inference_mode()
 def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
@@ -3856,5 +3887,33 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             torch.distributed.all_gather(gathered, outputs[1])
             for other in gathered:
                 torch.testing.assert_close(outputs[1], other, rtol=0, atol=0)
+
+            # Verify capture transport independently of GEMM/EP rounding:
+            # deterministic taps must be restored byte-for-byte across uneven
+            # CED owners, including ranks with no local rows.
+            view = backend.decoder_view()
+            local = backend.partition_prefill_queries(
+                plan, sampled_rows_cpu=torch.tensor([length - 1])
+            )
+            full = (
+                torch.arange(
+                    view.metadata.positions.numel() * config.hidden_size,
+                    device=device,
+                )
+                .remainder(127)
+                .reshape(-1, config.hidden_size)
+                .to(torch.bfloat16)
+            )
+            taps = [full, -full]
+            ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+            actual, captured = adapter.model.finish_forward(
+                full[local.decoder_plan.local_slice],
+                [tap[local.decoder_plan.local_slice] for tap in taps],
+                ctx,
+            )
+            expected = full[torch.tensor(view.logits_rows_cpu, device=device)]
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            for actual_tap, expected_tap in zip(captured, taps, strict=True):
+                torch.testing.assert_close(actual_tap, expected_tap, rtol=0, atol=0)
     finally:
         torch.distributed.destroy_process_group()
