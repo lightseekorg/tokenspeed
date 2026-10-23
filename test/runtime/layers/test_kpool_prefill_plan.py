@@ -73,7 +73,7 @@ def _expected(starts, lengths, table, slots, capacity):
                 table[req][pool // ROWS_PER_PAGE] * ROWS_PER_PAGE + pool % ROWS_PER_PAGE
             )
             pools["from_tail"].append([j < n_from_tail for j in range(KPOOL)])
-            pools["tail_slot"].append([slots[req]])
+            pools["tail_slot"].append(slots[req])
             pools["tail_rows"].append(
                 [(pool * KPOOL + j) % TAIL_ROWS for j in range(KPOOL)]
             )
