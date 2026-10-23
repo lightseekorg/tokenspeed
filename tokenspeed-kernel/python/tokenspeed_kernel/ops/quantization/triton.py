@@ -438,7 +438,7 @@ def _fp8_token_group_quantize(
         groups_per_program = 1024 // block
     else:
         groups_per_program = 8192 // block
-    if groups_per_cta is not None:
+    if groups_per_cta == 16:
         groups_per_program = groups_per_cta
     fp8_finfo = torch.finfo(out_dtype)
     args = (x, out, scales, groups, group_size, 1e-10)
@@ -453,7 +453,9 @@ def _fp8_token_group_quantize(
     # serving.
     if not is_serving() and block < 1024:
         tiles = (
-            (1, 16) if groups_per_cta is not None else (1, 1024 // block, 8192 // block)
+            (1, 8, 16)
+            if groups_per_cta is not None
+            else (1, 1024 // block, 8192 // block)
         )
         for tile in tiles:
             _fp8_token_group_quantize_kernel.warmup(
@@ -463,7 +465,7 @@ def _fp8_token_group_quantize(
                 USE_RECIPROCAL=groups_per_cta is not None and tile == 16,
                 num_warps=(
                     1
-                    if groups_per_cta is not None
+                    if groups_per_cta is not None and tile == 16
                     else min(max(tile * block // 256, 1), 8)
                 ),
                 grid=(1,),
@@ -475,7 +477,7 @@ def _fp8_token_group_quantize(
         USE_RECIPROCAL=groups_per_cta == 16,
         num_warps=(
             1
-            if groups_per_cta is not None
+            if groups_per_cta == 16
             else min(max(groups_per_program * block // 256, 1), 8)
         ),
     )
