@@ -311,8 +311,15 @@ bool plan_needs_device(const tokenspeed::ExecutionPlan& plan) {
         }
     }
     for (const tokenspeed::Operation& operation : plan.Operations()) {
-        const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation);
-        if (batch == nullptr || !batch->request_ids.empty()) {
+        if (const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation)) {
+            if (!batch->request_ids.empty()) {
+                return true;
+            }
+            continue;
+        }
+        // Storage operations run on the host's L3 executor, not the device.
+        const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
+        if (cache == nullptr || !std::holds_alternative<tokenspeed::StorageOperation>(*cache)) {
             return true;
         }
     }
@@ -377,6 +384,24 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
 
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan) {
     rust::Vec<StorageOpView> out;
+    const auto keys = [](const std::vector<tokenspeed::CacheKey>& cache_keys) {
+        rust::Vec<StorageKeyView> views;
+        views.reserve(cache_keys.size());
+        for (const tokenspeed::CacheKey& key : cache_keys) {
+            views.push_back(StorageKeyView{.group_id = key.group_id,
+                                           .content_hash = rust::String(key.content_hash),
+                                           .page_offset = key.page_offset});
+        }
+        return views;
+    };
+    const auto blocks = [](const std::vector<std::int32_t>& host_blocks) {
+        rust::Vec<std::int32_t> out;
+        out.reserve(host_blocks.size());
+        for (const std::int32_t block : host_blocks) {
+            out.push_back(block);
+        }
+        return out;
+    };
     for (const tokenspeed::Operation& operation : plan.Operations()) {
         const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
         if (cache == nullptr) {
@@ -387,18 +412,22 @@ rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan)
             continue;
         }
         std::visit(
-            [&out](const auto& op) {
+            [&](const auto& op) {
                 using Op = std::decay_t<decltype(op)>;
                 if constexpr (std::is_same_v<Op, tokenspeed::StorageCancelOperation>) {
-                    out.push_back(StorageOpView{.kind = StorageOpKind::Cancel, .op_id = op.op_id, .num_keys = 0});
+                    out.push_back(StorageOpView{
+                        .kind = StorageOpKind::Cancel, .op_id = op.op_id, .keys = {}, .host_blocks = {}});
+                } else if constexpr (std::is_same_v<Op, tokenspeed::StorageQueryOperation>) {
+                    out.push_back(StorageOpView{
+                        .kind = StorageOpKind::Query, .op_id = op.op_id, .keys = keys(op.keys), .host_blocks = {}});
                 } else {
-                    StorageOpKind kind = StorageOpKind::Query;
-                    if constexpr (std::is_same_v<Op, tokenspeed::StorageGetOperation>) {
-                        kind = StorageOpKind::Get;
-                    } else if constexpr (std::is_same_v<Op, tokenspeed::StoragePutOperation>) {
-                        kind = StorageOpKind::Put;
-                    }
-                    out.push_back(StorageOpView{.kind = kind, .op_id = op.op_id, .num_keys = op.keys.size()});
+                    const StorageOpKind kind = std::is_same_v<Op, tokenspeed::StorageGetOperation>
+                                                   ? StorageOpKind::Get
+                                                   : StorageOpKind::Put;
+                    out.push_back(StorageOpView{.kind = kind,
+                                                .op_id = op.op_id,
+                                                .keys = keys(op.keys),
+                                                .host_blocks = blocks(op.host_blocks)});
                 }
             },
             *storage);

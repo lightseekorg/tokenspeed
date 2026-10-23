@@ -30,10 +30,11 @@
 //!
 //! The control thread runs the completion queries itself: a launched
 //! forward's results (it waits on the forward's copy event, which releases
-//! the GIL), the cache acknowledgments, and the L3 probe, progress and
-//! completion. Each takes the GIL for its call only, under a dispatch guard
-//! that rejects device work, and none waits behind the forward thread's
-//! queue: the round head never waits for launches in flight.
+//! the GIL) and the cache acknowledgments. Each takes the GIL for its call
+//! only, under a dispatch guard that rejects device work, and none waits
+//! behind the forward thread's queue: the round head never waits for
+//! launches in flight. The L3 tier's storage executor is the host's own
+//! (`ts-l3`), outside the data plane.
 
 use std::{
     collections::HashMap,
@@ -50,10 +51,8 @@ use ts_control::eplb::SlotMoves;
 use ts_control::{
     event_loop::{DataPlane, DataPlaneError, Dispatch, DpRound},
     ingress::Admission,
-    l3::{StorageCompletion, StoragePoll, StoragePressure},
     output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, TopLogprobs},
 };
-use ts_metrics::{L3ExecutorSnapshot, L3OperationSnapshot};
 use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
@@ -106,13 +105,6 @@ enum Op {
     },
     ResumeMemory {
         tags: Vec<String>,
-        reply: mpsc::SyncSender<Result<(), String>>,
-    },
-    DeleteL3Namespace {
-        reply: mpsc::SyncSender<Result<bool, String>>,
-    },
-    SetL3WeightVersion {
-        version: String,
         reply: mpsc::SyncSender<Result<(), String>>,
     },
     SnapshotExpertLoad {
@@ -319,25 +311,6 @@ impl PythonDataPlane {
     }
 }
 
-/// One finished storage operation: `(op_id, success, retired,
-/// object_failures)`.
-type Completion = (u64, Vec<bool>, bool, Vec<bool>);
-
-/// One operation kind's L3 counters: `(kind, events, success_keys,
-/// failed_keys, success_bytes, queue_seconds, backend_seconds, operations,
-/// bytes)`.
-type OperationRow = (
-    String,
-    Vec<(String, f64)>,
-    f64,
-    f64,
-    f64,
-    f64,
-    f64,
-    Vec<(String, f64)>,
-    Vec<(String, f64)>,
-);
-
 /// A control struct as one msgpack frame.
 fn control_payload<T: Wire>(value: &T) -> Result<Bytes, DataPlaneError> {
     let frames = ts_wire::encode_frames(value);
@@ -437,79 +410,6 @@ impl DataPlane for PythonDataPlane {
             .collect()
     }
 
-    fn poll_storage(&mut self) -> Result<StoragePoll, DataPlaneError> {
-        let (now_us, completions, pressure, error): (
-            i64,
-            Vec<Completion>,
-            (i64, i64, i64),
-            Option<String>,
-        ) = self.query(|plane| {
-            plane
-                .call_method0("poll_storage")
-                .and_then(|poll| poll.extract())
-        })?;
-        Ok(StoragePoll {
-            now_us,
-            completions: completions
-                .into_iter()
-                .map(
-                    |(op_id, success, retired, object_failures)| StorageCompletion {
-                        op_id,
-                        success,
-                        retired,
-                        object_failures,
-                    },
-                )
-                .collect(),
-            pressure: StoragePressure {
-                queued_operations: pressure.0,
-                queued_bytes: pressure.1,
-                oldest_operation_us: pressure.2,
-            },
-            error,
-        })
-    }
-
-    fn storage_snapshot(&mut self) -> Result<L3ExecutorSnapshot, DataPlaneError> {
-        let (rows, health_state, health_epoch, unsafe_io): (Vec<OperationRow>, String, i64, bool) =
-            self.query(|plane| {
-                plane
-                    .call_method0("storage_snapshot")
-                    .and_then(|snapshot| snapshot.extract())
-            })?;
-        Ok(L3ExecutorSnapshot {
-            operations: rows
-                .into_iter()
-                .map(
-                    |(
-                        kind,
-                        events,
-                        success_keys,
-                        failed_keys,
-                        success_bytes,
-                        queue_seconds,
-                        backend_seconds,
-                        operations,
-                        bytes,
-                    )| L3OperationSnapshot {
-                        kind,
-                        events,
-                        success_keys,
-                        failed_keys,
-                        success_bytes,
-                        queue_seconds,
-                        backend_seconds,
-                        operations,
-                        bytes,
-                    },
-                )
-                .collect(),
-            health_state,
-            health_epoch: health_epoch as f64,
-            unsafe_io,
-        })
-    }
-
     fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
         self.queue(Op::Release(rids.to_vec()))
     }
@@ -548,15 +448,6 @@ impl DataPlane for PythonDataPlane {
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError> {
         let tags = tags.to_vec();
         self.ask(|reply| Op::ResumeMemory { tags, reply })
-    }
-
-    fn delete_l3_namespace(&mut self) -> Result<bool, DataPlaneError> {
-        self.ask(|reply| Op::DeleteL3Namespace { reply })
-    }
-
-    fn set_l3_weight_version(&mut self, version: &str) -> Result<(), DataPlaneError> {
-        let version = version.to_owned();
-        self.ask(|reply| Op::SetL3WeightVersion { version, reply })
     }
 
     fn attach_grammars(
@@ -678,15 +569,11 @@ fn forward_loop(
                 | Op::IdleForward { reply, .. }
                 | Op::ReleaseMemory { reply, .. }
                 | Op::ResumeMemory { reply, .. }
-                | Op::SetL3WeightVersion { reply, .. }
                 | Op::EpdSettle { reply, .. }
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::UpdateWeights { reply, .. } | Op::Profile { reply, .. } => {
-                    let _ = reply.send(Err(failure));
-                }
-                Op::DeleteL3Namespace { reply } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::SnapshotExpertLoad { reply } => {
@@ -849,20 +736,6 @@ fn run(py: Python<'_>, plane: &Bound<'_, PyAny>, op: Op, shared: &Shared) -> Res
         Op::ResumeMemory { tags, reply } => {
             let done = plane
                 .call_method1("resume_memory", (tags,))
-                .map(drop)
-                .map_err(python);
-            answer(reply, done)?;
-        }
-        Op::DeleteL3Namespace { reply } => {
-            let done = plane
-                .call_method0("delete_l3_namespace")
-                .and_then(|deleted| deleted.extract())
-                .map_err(python);
-            answer(reply, done)?;
-        }
-        Op::SetL3WeightVersion { version, reply } => {
-            let done = plane
-                .call_method1("set_l3_weight_version", (version,))
                 .map(drop)
                 .map_err(python);
             answer(reply, done)?;

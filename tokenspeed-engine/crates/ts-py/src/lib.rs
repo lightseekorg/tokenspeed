@@ -37,6 +37,8 @@
 //! structs stay the frontend's representation; control replies come back the
 //! same way.
 
+mod l3;
+
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -431,6 +433,7 @@ fn value_to_py(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
 /// The Python module.
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<l3::L3Executor>()?;
     module.add_class::<FrontendListener>()?;
     module.add_class::<PendingFrontend>()?;
     module.add_class::<Frontend>()?;

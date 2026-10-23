@@ -8,6 +8,7 @@ members = [
     "crates/ts-control",
     "crates/ts-grammar",
     "crates/ts-host",
+    "crates/ts-l3",
     "crates/ts-metrics",
     "crates/ts-mooncake",
     "crates/ts-pd",

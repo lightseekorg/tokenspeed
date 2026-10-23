@@ -51,13 +51,16 @@ use ts_control::{
     },
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
-    l3::{StorageCompletion, StorageLimits, StoragePoll},
     output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role},
     pd::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer},
     transport::EngineTransport,
 };
+use ts_l3::{
+    monotonic_clock, Executor, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
+    Namespace, Range, Store, StoreError,
+};
 use ts_scheduler::{
-    CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler, StorageOpKind,
+    CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
 };
 use ts_wire::{
     codec::Dict,
@@ -242,17 +245,6 @@ struct FakeDevice {
     ngram: Arc<Mutex<Vec<NgramRow>>>,
     /// Every token-history seed: (slot, prefix).
     history: Arc<Mutex<Vec<HistorySeed>>>,
-    /// L3: the leading keys of a get that land here, `None` for all of them.
-    l3_landed_keys: Option<usize>,
-    /// L3: polls a storage operation stays unfinished here.
-    l3_delay_polls: u32,
-    /// L3: storage operations started and unfinished, with their key counts
-    /// and the polls they waited.
-    storage: Vec<(u64, StorageOpKind, usize, u32)>,
-    /// L3: the storage clock.
-    storage_now_us: i64,
-    /// L3: every storage operation started, by kind.
-    storage_ops: Arc<Mutex<Vec<StorageOpKind>>>,
     /// PD: the transfers this engine's peer node sees.
     wire: Option<Arc<Mutex<Wire>>>,
     /// PD: each admitted request's room.
@@ -461,23 +453,6 @@ impl DataPlane for FakeDevice {
             .unwrap()
             .extend(ops.iter().map(|op| op.kind));
         self.unacknowledged.extend(ops);
-        for op in plan.storage_ops() {
-            self.storage_ops.lock().unwrap().push(op.kind);
-            match op.kind {
-                // A cancelled operation finishes at once, landing nothing.
-                StorageOpKind::Cancel => {
-                    if let Some(started) = self
-                        .storage
-                        .iter_mut()
-                        .find(|(op_id, ..)| *op_id == op.op_id)
-                    {
-                        started.1 = StorageOpKind::Cancel;
-                        started.3 = u32::MAX;
-                    }
-                }
-                kind => self.storage.push((op.op_id, kind, op.num_keys, 0)),
-            }
-        }
         if let Some(wire) = &self.wire {
             let mut wire = wire.lock().unwrap();
             if let Some(admitted) = plan.remote_prefill() {
@@ -618,55 +593,6 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
-    /// The store holds every key; a get lands its leading
-    /// `l3_landed_keys` here, a put stores everything, and an operation
-    /// finishes once it waited `l3_delay_polls` polls (a cancelled one at
-    /// once, landing nothing).
-    fn poll_storage(&mut self) -> Result<StoragePoll, DataPlaneError> {
-        self.storage_now_us += 1_000;
-        let mut completions = Vec::new();
-        let (landed, delay) = (self.l3_landed_keys, self.l3_delay_polls);
-        self.storage.retain_mut(|(op_id, kind, keys, polls)| {
-            if *polls != u32::MAX {
-                *polls += 1;
-                if *polls <= delay {
-                    return true;
-                }
-            }
-            let success: Vec<bool> = (0..*keys)
-                .map(|key| match *kind {
-                    StorageOpKind::Cancel => false,
-                    StorageOpKind::Get => landed.is_none_or(|landed| key < landed),
-                    _ => true,
-                })
-                .collect();
-            completions.push(StorageCompletion {
-                op_id: *op_id,
-                object_failures: vec![false; success.len()],
-                success,
-                retired: true,
-            });
-            false
-        });
-        Ok(StoragePoll {
-            now_us: self.storage_now_us,
-            completions,
-            ..StoragePoll::default()
-        })
-    }
-
-    fn storage_snapshot(&mut self) -> Result<ts_metrics::L3ExecutorSnapshot, DataPlaneError> {
-        Ok(ts_metrics::L3ExecutorSnapshot::default())
-    }
-
-    fn delete_l3_namespace(&mut self) -> Result<bool, DataPlaneError> {
-        Ok(true)
-    }
-
-    fn set_l3_weight_version(&mut self, _: &str) -> Result<(), DataPlaneError> {
-        Ok(())
-    }
-
     fn attach_grammars(
         &mut self,
         grammars: &[(String, u64, Vec<i32>)],
@@ -772,6 +698,138 @@ fn ipc(name: &str) -> String {
     )
 }
 
+/// A latch a store's queries wait on.
+#[derive(Default)]
+struct Gate {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+impl Gate {
+    fn closed() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn opened() -> Arc<Self> {
+        let gate = Self::default();
+        *gate.open.lock().unwrap() = true;
+        Arc::new(gate)
+    }
+
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.opened.notify_all();
+    }
+
+    fn pass(&self) {
+        let open = self.open.lock().unwrap();
+        drop(self.opened.wait_while(open, |open| !*open).unwrap());
+    }
+}
+
+/// The L3 store behind one rank's executor (`Tiers::L3`): it holds every key
+/// a query asks for, once `gate` lets the query through; a get lands its
+/// leading `landed` keys (every key when `None`) and a put stores
+/// everything. It counts the queries and gets it ran.
+struct ScriptedStore {
+    landed: Option<usize>,
+    gate: Arc<Gate>,
+    queries: Arc<Mutex<usize>>,
+    gets: Arc<Mutex<usize>>,
+}
+
+impl Store for ScriptedStore {
+    fn failures_retire(&self) -> bool {
+        true
+    }
+
+    fn batch_exists(&self, keys: &[String]) -> Result<Vec<bool>, StoreError> {
+        *self.queries.lock().unwrap() += 1;
+        self.gate.pass();
+        Ok(vec![true; keys.len()])
+    }
+
+    fn batch_get_into(
+        &self,
+        keys: &[String],
+        _: HostBuffer,
+        _: &[Range],
+    ) -> Result<IoResult, StoreError> {
+        *self.gets.lock().unwrap() += 1;
+        let landed = self.landed.unwrap_or(keys.len());
+        Ok(IoResult {
+            success: (0..keys.len()).map(|key| key < landed).collect(),
+            retired: true,
+            object_failures: vec![false; keys.len()],
+        })
+    }
+
+    fn batch_put_from(
+        &self,
+        keys: &[String],
+        _: HostBuffer,
+        _: &[Range],
+    ) -> Result<IoResult, StoreError> {
+        Ok(IoResult {
+            success: vec![true; keys.len()],
+            retired: true,
+            object_failures: vec![false; keys.len()],
+        })
+    }
+
+    fn remove_by_prefix(&self, _: &str) -> bool {
+        true
+    }
+
+    fn close(&self) {}
+}
+
+/// `Tiers::L3`'s Host pool: the scheduler's 1024 Host pages, one 8-byte
+/// block each, owned by every rank.
+fn l3_layout(rank: usize) -> HostLayout {
+    HostLayout {
+        groups: vec![GroupLayout {
+            packing: 1,
+            block_bytes: 8,
+            shard_count: 1,
+        }],
+        lcm_block_bytes: 8,
+        num_lcm_blocks: 1024,
+        owner_rank: 0,
+        tp_rank: rank,
+    }
+}
+
+/// One rank's L3 executor over `store` and a pool of its own, which lives
+/// for the process.
+fn l3_executor(store: ScriptedStore, rank: usize) -> Executor {
+    let layout = l3_layout(rank);
+    let pool: &'static mut [u8] = vec![0_u8; layout.bytes()].leak();
+    Executor::start(
+        Box::new(store),
+        HostBuffer {
+            base: pool.as_mut_ptr() as usize,
+            len: pool.len(),
+        },
+        layout,
+        Namespace {
+            deployment_id: "serving".to_owned(),
+            has_draft: false,
+        },
+        "v1",
+        ExecutorConfig {
+            max_operations: 8,
+            max_keys_per_operation: 8,
+            query_workers: 1,
+            read_workers: 1,
+            write_workers: 1,
+            failure_threshold: 1,
+            recovery_interval: Duration::from_secs(30),
+        },
+        monotonic_clock(),
+    )
+}
+
 /// What a test reads back from one rank.
 struct Rank {
     thread: Option<thread::JoinHandle<()>>,
@@ -780,7 +838,11 @@ struct Rank {
     idle_forwards: Arc<Mutex<usize>>,
     ngram: Arc<Mutex<Vec<NgramRow>>>,
     history: Arc<Mutex<Vec<HistorySeed>>>,
-    storage_ops: Arc<Mutex<Vec<StorageOpKind>>>,
+    /// L3: the queries and gets the rank's store ran.
+    storage_queries: Arc<Mutex<usize>>,
+    storage_gets: Arc<Mutex<usize>>,
+    /// L3: what the rank's store queries wait on.
+    storage_gate: Arc<Gate>,
     landed: Arc<Mutex<Vec<Landing>>>,
     device_ops: Arc<Mutex<Vec<String>>>,
     applied: Applied,
@@ -807,15 +869,14 @@ struct Engine {
 }
 
 impl Engine {
-    /// The storage operations rank 0 started, of `kind`.
-    fn storage_ops(&self, kind: StorageOpKind) -> usize {
-        self.ranks[0]
-            .storage_ops
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|seen| **seen == kind)
-            .count()
+    /// The queries rank 0's store ran.
+    fn storage_queries(&self) -> usize {
+        *self.ranks[0].storage_queries.lock().unwrap()
+    }
+
+    /// The gets rank 0's store ran.
+    fn storage_gets(&self) -> usize {
+        *self.ranks[0].storage_gets.lock().unwrap()
     }
 
     fn cache_ops(&self, kind: CacheOpKind) -> usize {
@@ -865,6 +926,10 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // A store query still waiting would hold its executor's close.
+        for rank in &self.ranks {
+            rank.storage_gate.open();
+        }
         for rank in &mut self.ranks {
             if let Some(thread) = rank.thread.take() {
                 thread.join().unwrap();
@@ -937,8 +1002,8 @@ struct Setup {
     /// L3 (`Tiers::L3`): the leading keys of a get that land on each rank;
     /// all of them when unset.
     l3_landed_keys: Option<fn(usize) -> usize>,
-    /// L3: polls a storage operation stays unfinished.
-    l3_delay_polls: u32,
+    /// L3: the stores' queries wait until the test opens their gates.
+    l3_held_queries: bool,
 }
 
 async fn start_ranks_with(
@@ -957,7 +1022,7 @@ async fn start_ranks_with(
         logprobs,
         request_token_history,
         l3_landed_keys,
-        l3_delay_polls,
+        l3_held_queries,
     } = setup;
     let (world, tp_size, num_engines) = match layout {
         Layout::Single => (1, 1, 1),
@@ -996,10 +1061,19 @@ async fn start_ranks_with(
                 ep_rank: rank,
                 // The trivial initial placement: slot p holds expert p % 4.
                 placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
-                l3_landed_keys: l3_landed_keys.map(|landed| landed(rank)),
-                l3_delay_polls,
                 ..Default::default()
             };
+            let storage_gate = if l3_held_queries {
+                Gate::closed()
+            } else {
+                Gate::opened()
+            };
+            let store = matches!(tiers, Tiers::L3).then(|| ScriptedStore {
+                landed: l3_landed_keys.map(|landed| landed(rank)),
+                gate: storage_gate.clone(),
+                queries: Arc::new(Mutex::new(0)),
+                gets: Arc::new(Mutex::new(0)),
+            });
             let handle = Rank {
                 thread: None,
                 released: device.released.clone(),
@@ -1007,7 +1081,13 @@ async fn start_ranks_with(
                 idle_forwards: device.idle_forwards.clone(),
                 ngram: device.ngram.clone(),
                 history: device.history.clone(),
-                storage_ops: device.storage_ops.clone(),
+                storage_queries: store
+                    .as_ref()
+                    .map_or_else(Default::default, |store| store.queries.clone()),
+                storage_gets: store
+                    .as_ref()
+                    .map_or_else(Default::default, |store| store.gets.clone()),
+                storage_gate,
                 landed: device.landed.clone(),
                 device_ops: device.device_ops.clone(),
                 applied: device.applied.clone(),
@@ -1082,10 +1162,6 @@ async fn start_ranks_with(
                         log_spec_accept_lengths: false,
                     },
                     kv_events: false,
-                    l3: matches!(tiers, Tiers::L3).then_some(StorageLimits {
-                        max_operations: 8,
-                        max_keys_per_operation: 8,
-                    }),
                     epd_prefill,
                     // The fake device fills bitmasks from the committed
                     // matcher state, as the eager path does.
@@ -1145,6 +1221,7 @@ async fn start_ranks_with(
                             grammars
                         }),
                         l3_metrics: None,
+                        l3: store.map(|store| l3_executor(store, rank)),
                     },
                 );
                 event_loop.run(&stop).unwrap();
@@ -1538,8 +1615,8 @@ async fn an_l3_get_admits_the_prefix_every_owner_landed() {
     .await;
     assert_eq!(tokens(&chunks[0]), [1000, 1001, 1002, 1003]);
     assert_eq!(chunks[0].last().unwrap().cached_tokens, 32);
-    assert_eq!(engine.storage_ops(StorageOpKind::Query), 1);
-    assert_eq!(engine.storage_ops(StorageOpKind::Get), 1);
+    assert_eq!(engine.storage_queries(), 1);
+    assert_eq!(engine.storage_gets(), 1);
     assert!(engine.cache_ops(CacheOpKind::LoadBack) > 0);
     engine.settle().await;
     assert_eq!(engine.released_on(1), engine.released_on(0));
@@ -1547,15 +1624,15 @@ async fn an_l3_get_admits_the_prefix_every_owner_landed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abort_while_storage_prepares_finishes_the_request() {
-    // The store answers slowly; the client gives up while the request still
-    // waits on its storage query. Every rank finishes it at the next round's
-    // head and releases it without a forward.
+    // The store holds its queries; the client gives up while the request
+    // still waits on its storage query. Every rank finishes it at the next
+    // round's head and releases it without a forward.
     let engine = start_ranks_with(
         Layout::Tp(2),
         1,
         Tiers::L3,
         Setup {
-            l3_delay_polls: 1_000_000,
+            l3_held_queries: true,
             ..Setup::default()
         },
     )
@@ -1570,7 +1647,7 @@ async fn an_abort_while_storage_prepares_finishes_the_request() {
         .await
         .unwrap();
     // The query went out, so the request waits in storage preparation.
-    while engine.storage_ops(StorageOpKind::Query) == 0 {
+    while engine.storage_queries() == 0 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     // The engine streams nothing more for a client's own abort.
@@ -1584,7 +1661,7 @@ async fn an_abort_while_storage_prepares_finishes_the_request() {
     }
     assert_eq!(engine.released_on(0), [("r0".to_owned(), 0)]);
     assert_eq!(engine.released_on(1), engine.released_on(0));
-    assert_eq!(engine.storage_ops(StorageOpKind::Get), 0);
+    assert_eq!(engine.storage_gets(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

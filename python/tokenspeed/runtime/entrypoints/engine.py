@@ -61,7 +61,7 @@ import uvloop
 import zmq
 from tokenspeed_engine import FrontendListener
 
-from tokenspeed.runtime.cache.l3.backend import (
+from tokenspeed.runtime.cache.l3.identity import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     resolve_l3_weight_version,
 )

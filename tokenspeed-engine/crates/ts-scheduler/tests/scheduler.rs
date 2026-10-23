@@ -341,9 +341,15 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     // ops never count it, and the request waits for its answer.
     let plan = scheduler.next_execution_plan();
     assert!(plan.cache_ops().is_empty());
+    assert!(!plan.needs_device());
     let ops = plan.storage_ops();
     assert_eq!(ops.len(), 1);
     assert_eq!(ops[0].kind, StorageOpKind::Query);
+    // The prompt's two prefix pages, in order; a query names no Host block.
+    assert_eq!(ops[0].keys.len(), 2);
+    assert!(ops[0].keys.iter().all(|key| key.group_id == 0));
+    assert_ne!(ops[0].keys[0].content_hash, ops[0].keys[1].content_hash);
+    assert!(ops[0].host_blocks.is_empty());
     assert!(plan
         .forward_batches()
         .iter()
@@ -351,7 +357,7 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
     assert!(scheduler.storage_pending());
 
     // No owner holds a key: the request admits without a stored prefix.
-    let keys = ops[0].num_keys;
+    let keys = ops[0].keys.len();
     let done = StorageRound {
         done: vec![StorageDoneView {
             op_id: ops[0].op_id,

@@ -18,17 +18,18 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The L3 storage tier as the loop sees it: the replica's agreement on its
-//! storage executors' reports, every round (`docs/design/async-l3-cache.md`).
+//! The L3 storage tier as the loop sees it: this rank's storage executor and
+//! the replica's agreement on what the executors report, every round
+//! (`docs/design/async-l3-cache.md`).
 //!
 //! The C++ scheduler owns readiness, deadlines and Host memory lifetime; it
-//! plans storage operations (query, get, put, cancel) that each cache owner's
-//! data plane runs on its Host-only executor. The ranks of a replica mirror
-//! one scheduler, so they agree each round on the storage clock and the
-//! permissions to run forwards and start storage work, and on each
-//! operation's outcome once every owner reported it. A fault on one rank,
-//! even in its own poll, fails every rank in the same round instead of
-//! stranding peers in the next collective.
+//! plans storage operations (query, get, put, cancel) that each cache owner
+//! runs on its Host-only executor (`ts-l3`), which the loop starts with the
+//! plan. The ranks of a replica mirror one scheduler, so they agree each
+//! round on the storage clock and the permissions to run forwards and start
+//! storage work, and on each operation's outcome once every owner reported
+//! it. A fault on one rank, even in its own poll, fails every rank in the
+//! same round instead of stranding peers in the next collective.
 
 use std::{
     collections::BTreeMap,
@@ -36,10 +37,12 @@ use std::{
 };
 
 use ts_collective::{Group, Mesh};
+use ts_l3::{Executor, Operation, StorageKey};
+pub use ts_l3::{StorageCompletion, StoragePoll, StoragePressure};
 use ts_metrics::L3SchedulerStats;
 use ts_scheduler::{
-    Scheduler, StorageCancellationView, StorageDoneView, StorageRound, StorageStatsView,
-    StorageTickView,
+    ExecutionPlan, Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind,
+    StorageRound, StorageStatsView, StorageTickView,
 };
 
 /// The scheduler's storage credits (`StorageConfig`) the agreement checks
@@ -50,44 +53,6 @@ pub struct StorageLimits {
     pub max_operations: usize,
     /// Keys one operation names.
     pub max_keys_per_operation: usize,
-}
-
-/// One operation this rank's executor finished (`StorageCompletion`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StorageCompletion {
-    /// The operation.
-    pub op_id: u64,
-    /// Per key: it succeeded here.
-    pub success: Vec<bool>,
-    /// The native I/O retired: nothing still touches its Host memory.
-    pub retired: bool,
-    /// Per key: the object is confirmed missing or invalid here.
-    pub object_failures: Vec<bool>,
-}
-
-/// The executor's queue pressure (`StoragePressure`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StoragePressure {
-    /// Operations queued.
-    pub queued_operations: i64,
-    /// Bytes queued.
-    pub queued_bytes: i64,
-    /// The oldest queued operation's age, in microseconds.
-    pub oldest_operation_us: i64,
-}
-
-/// One poll of this rank's storage executor.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct StoragePoll {
-    /// The storage clock, in microseconds; rank 0's is the replica's.
-    pub now_us: i64,
-    /// Operations finished since the last poll.
-    pub completions: Vec<StorageCompletion>,
-    /// Queue pressure.
-    pub pressure: StoragePressure,
-    /// Why the poll failed here, if it did: every rank still joins the
-    /// agreement, and every rank fails with it.
-    pub error: Option<String>,
 }
 
 /// The replica could not agree on its storage reports.
@@ -295,11 +260,8 @@ impl L3 {
             now_us,
             completions,
             pressure,
-            error,
         } = poll;
-        let invalid = if error.is_some() {
-            error
-        } else if [
+        let invalid = if [
             pressure.queued_operations,
             pressure.queued_bytes,
             pressure.oldest_operation_us,
@@ -342,6 +304,86 @@ impl L3 {
                 completions,
             },
         }
+    }
+}
+
+/// The tier on this rank: the executor running the plans' storage
+/// operations, and the replica's agreement on what the executors report.
+pub struct Tier {
+    /// This rank's executor.
+    pub executor: Executor,
+    /// The agreement.
+    pub agreement: L3,
+}
+
+impl Tier {
+    /// The tier over `executor`: the agreement checks the reports against
+    /// the executor's credits, the scheduler's.
+    pub fn new(executor: Executor) -> Self {
+        let config = executor.config();
+        Self {
+            executor,
+            agreement: L3::new(StorageLimits {
+                max_operations: config.max_operations,
+                max_keys_per_operation: config.max_keys_per_operation,
+            }),
+        }
+    }
+
+    /// Start `plan`'s storage operations; none waits for I/O.
+    pub fn submit(&self, plan: &ExecutionPlan) -> Result<(), ts_l3::ExecutorError> {
+        let operations = plan
+            .storage_ops()
+            .into_iter()
+            .map(|op| {
+                let keys = || -> Vec<StorageKey> {
+                    op.keys
+                        .iter()
+                        .map(|key| StorageKey {
+                            group: key.group_id,
+                            content_hash: key.content_hash.clone(),
+                            page_offset: key.page_offset,
+                        })
+                        .collect()
+                };
+                let operation = match op.kind {
+                    StorageOpKind::Query => Operation::Query {
+                        op_id: op.op_id,
+                        keys: keys(),
+                    },
+                    StorageOpKind::Get => Operation::Get {
+                        op_id: op.op_id,
+                        keys: keys(),
+                        host_blocks: op.host_blocks.clone(),
+                    },
+                    StorageOpKind::Put => Operation::Put {
+                        op_id: op.op_id,
+                        keys: keys(),
+                        host_blocks: op.host_blocks.clone(),
+                    },
+                    StorageOpKind::Cancel => Operation::Cancel { op_id: op.op_id },
+                    _ => return Err(ts_l3::ExecutorError::Invalid("its kind")),
+                };
+                Ok(operation)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if operations.is_empty() {
+            return Ok(());
+        }
+        self.executor.submit(&operations)
+    }
+
+    /// One round's agreement on this rank's poll; see [`L3::round`].
+    pub fn round(
+        &mut self,
+        allow_forward: bool,
+        allow_storage: bool,
+        mesh: &mut Mesh,
+        replica: &Group,
+    ) -> Result<StorageRound, L3Error> {
+        let poll = self.executor.poll();
+        self.agreement
+            .round(poll, allow_forward, allow_storage, mesh, replica)
     }
 }
 
@@ -581,10 +623,8 @@ mod tests {
             ),
             (poll(30, vec![]), true, true),
             (
-                StoragePoll {
-                    error: Some("injected local poll fault".to_owned()),
-                    ..poll(40, vec![])
-                },
+                // An op id 0 completion: malformed.
+                poll(40, vec![completion(0, &[true], true, &[false])]),
                 false,
                 false,
             ),
@@ -630,7 +670,7 @@ mod tests {
             assert!(!third.done[0].retired);
             // Every rank observes the peer's polling failure.
             let failure = outcomes[3].as_ref().unwrap_err();
-            assert!(failure.contains("injected local poll fault"), "{failure}");
+            assert!(failure.contains("Malformed L3 completion"), "{failure}");
         }
     }
 

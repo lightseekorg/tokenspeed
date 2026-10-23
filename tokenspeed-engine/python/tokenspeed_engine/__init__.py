@@ -25,6 +25,9 @@
   one per rank).
 * ``FrontendListener`` / ``Frontend`` connect a Python frontend
   (``AsyncLLM``) to the ranks over the msgpack ZMQ wire (``ts-client``).
+* ``L3Executor`` is the L3 storage tier's executor (``ts-l3``) for callers
+  outside a rank, such as tests over a data plane's Host pool; a rank's
+  host runs its own.
 """
 
 from pathlib import Path
@@ -33,6 +36,7 @@ from tokenspeed_engine._native import (
     EngineError,
     Frontend,
     FrontendListener,
+    L3Executor,
     PendingFrontend,
 )
 
@@ -40,6 +44,7 @@ __all__ = [
     "EngineError",
     "Frontend",
     "FrontendListener",
+    "L3Executor",
     "PendingFrontend",
     "host_binary",
 ]

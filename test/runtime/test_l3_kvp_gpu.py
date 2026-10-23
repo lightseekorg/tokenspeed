@@ -33,21 +33,29 @@ import json
 import os
 import subprocess
 import sys
-import time
 import unittest
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+# The owner processes import the shared test helpers from the repository root.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 
 def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
+    from test.l3_test_utils import (
+        StorageOp,
+        host_storage_executor,
+        run_storage,
+        store_library,
+    )
+
     import torch
+    from tokenspeed_scheduler import StorageKind
 
     from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
     from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
-    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
-    from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
-    from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
+    from tokenspeed.runtime.cache.l3.config import MooncakeStoreSettings
     from tokenspeed.runtime.cache.transfer.layout import (
         CacheField,
         CacheGroupLayout,
@@ -121,22 +129,17 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
     )
     config = json.loads(os.environ["MOONCAKE_GPU_TEST_CONFIG"])
     assert config["global_segment_size"] == 0 and config["protocol"] == "rdma"
-    backend = MooncakeKvStore(
-        config, host_buffer=executor.host_storage.host_buffer, tp_size=2, pp_size=1
-    )
     ownership = BlockOwnerTranslation.for_host_pool(
         layout, contract, num_host_lcm_blocks=4, rank=rank
     )
-    l3 = L3Executor(
-        backend,
+    l3 = host_storage_executor(
         executor.host_storage,
-        key_prefix=namespace,
+        shard_counts=ownership.shard_counts,
         rank=rank,
-        ownership=ownership,
-        config=StorageRuntimeConfig.from_extra_config(
-            None, host_blocks=4, prefix_granularity=1
+        deployment_id=namespace,
+        mooncake=MooncakeStoreSettings.resolve(
+            config, library=store_library(), tp_size=2, pp_size=1
         ),
-        prefix_for_weight_version=None,
     )
     expected = torch.arange(size, dtype=torch.int32).remainder(251).to(torch.uint8)
     try:
@@ -157,18 +160,11 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
         else:
             executor.host_storage.host_buffer.fill_(0)
             block = 3
-        keys, offsets, sizes = l3._page_ranges([(0, block, "h", 0)])
-        l3.submit(StorageJob(1, phase, tuple(keys), tuple(offsets), tuple(sizes)))
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            facts = l3.poll().completions
-            if facts:
-                break
-            time.sleep(0.005)
-        else:
-            raise AssertionError("native owner operation did not retire")
-        assert facts[0].success == (True,) and facts[0].retired
-        assert facts[0].object_failures == (False,)
+        kind = StorageKind.Put if phase == "put" else StorageKind.Get
+        done = run_storage(
+            l3, StorageOp(1, kind, [(0, "h", 0)], [block]), timeout_s=30.0
+        )
+        assert done[1:] == ([True], True, [False])
         if phase == "get":
             rows = [row for _, row in ownership.owned_positions([(0, 5, 3)])]
             if rows:
@@ -181,12 +177,12 @@ def exercise_owner(*, phase: str, rank: int, namespace: str) -> None:
             else:
                 assert bool((buffer == 0xA5).all().item())
         owned = rank == (1 if phase == "put" else 0)
-        assert sum(row.success_bytes for row in l3.snapshot().operations) == (
-            size if owned else 0
-        )
+        operations = l3.snapshot()[0]
+        # Each row's successful bytes (``L3Executor.snapshot``).
+        assert sum(row[4] for row in operations) == (size if owned else 0)
     finally:
+        l3.close(5.0)
         executor.shutdown()
-        l3.close(timeout_s=5)
 
 
 class L3KvpGpuTest(unittest.TestCase):

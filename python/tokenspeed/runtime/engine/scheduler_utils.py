@@ -455,7 +455,8 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
 
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
-    tuple. Unknown kinds fail the whole conversion without partial submission.
+    tuple: the engine host's L3 executor runs them. Unknown kinds fail the
+    whole conversion without partial submission.
     """
     device: list = []
     storage: list = []

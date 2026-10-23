@@ -18,6 +18,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ts-collective = { path = "../ts-collective" }
 ts-control = { path = "../ts-control" }
 ts-grammar = { path = "../ts-grammar" }
+ts-l3 = { path = "../ts-l3", features = ["python"] }
 ts-metrics = { path = "../ts-metrics" }
 ts-mooncake = { path = "../ts-mooncake" }
 ts-pd = { path = "../ts-pd" }

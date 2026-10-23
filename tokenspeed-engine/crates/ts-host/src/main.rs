@@ -59,7 +59,6 @@ use ts_control::{
     grammar::{GrammarConfig, Grammars},
     ingress::{IngressLimits, LogprobServability},
     kv_events::{KvEventPublisher, KvEventsConfig},
-    l3::StorageLimits,
     output::{FinishLog, OutputProcessor, Role},
     transport::{EngineTransport, TransportError},
 };
@@ -102,6 +101,8 @@ enum HostError {
     Metrics(#[from] ts_metrics::MetricsError),
     #[error(transparent)]
     KvEvents(#[from] ts_control::kv_events::KvEventsError),
+    #[error("the L3 store: {0}")]
+    Storage(#[from] ts_mooncake::Error),
     #[error(transparent)]
     Loop(#[from] LoopError),
     #[error("{0}")]
@@ -170,8 +171,8 @@ struct HostConfig {
     kv_events: bool,
     /// Where this rank publishes them, if it does.
     kv_events_publisher: Option<KvEventsConfig>,
-    /// With the L3 storage tier, the scheduler's storage credits.
-    l3: Option<StorageLimits>,
+    /// With the L3 storage tier, the executor's settings.
+    l3: Option<ts_l3::Settings>,
     /// `--enable-eplb`: the rebalance's settings.
     eplb: Option<Eplb>,
     /// An EPD prefill node: it receives image embeddings from encode
@@ -302,6 +303,14 @@ impl HostConfig {
         requires_bootstrap: bool,
         role: Role,
     ) -> PyResult<Self> {
+        let l3 = {
+            let l3 = config.getattr("l3")?;
+            if l3.is_none() {
+                None
+            } else {
+                Some(ts_l3::Settings::from_python(&l3)?)
+            }
+        };
         Ok(Self {
             handshake_address: config.getattr("handshake_address")?.extract()?,
             engine_index: config.getattr("engine_index")?.extract()?,
@@ -352,19 +361,10 @@ impl HostConfig {
             controls: ControlConfig {
                 memory_saver: config.getattr("memory_saver")?.extract()?,
                 memory_regions: config.getattr("memory_regions")?.extract()?,
-                l3_weight_version: config.getattr("l3_weight_version")?.extract()?,
+                // With L3, the namespace's weight version.
+                l3_weight_version: l3.as_ref().map(|l3| l3.weight_version.clone()),
             },
-            l3: {
-                let l3 = config.getattr("l3")?;
-                if l3.is_none() {
-                    None
-                } else {
-                    Some(StorageLimits {
-                        max_operations: l3.getattr("max_operations")?.extract()?,
-                        max_keys_per_operation: l3.getattr("max_keys_per_operation")?.extract()?,
-                    })
-                }
-            },
+            l3,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
             epd_prefill: config.getattr("epd_prefill")?.extract()?,
             grammar: {
@@ -578,7 +578,6 @@ fn serve(args: &Args) -> Result<(), HostError> {
         controls: config.controls.clone(),
         batch_log: config.batch_log.clone(),
         kv_events: config.kv_events,
-        l3: config.l3,
         epd_prefill: config.epd_prefill,
         eager_grammar: config.eager_grammar,
     };
@@ -595,6 +594,8 @@ fn serve(args: &Args) -> Result<(), HostError> {
         .as_ref()
         .filter(|_| config.metrics.engine)
         .map(|exporter| EngineMetrics::new(exporter, &config.metrics.labels));
+    // The L3 tier's executor connects its store before serving starts.
+    let l3 = config.l3.as_ref().map(ts_l3::Settings::start).transpose()?;
     let grammars = config
         .grammar
         .clone()
@@ -626,6 +627,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
             eplb,
             grammars,
             l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
+            l3,
         },
     );
     let served = event_loop.run(&stop);

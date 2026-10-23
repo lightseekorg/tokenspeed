@@ -33,7 +33,6 @@ import stat
 import sys
 import textwrap
 import threading
-import time
 from contextlib import nullcontext
 
 import msgspec
@@ -57,9 +56,6 @@ from tokenspeed_scheduler import (  # noqa: E402
     SchedulerConfig,
 )
 
-from tokenspeed.runtime.cache.l3.backend import MemoryKvStore  # noqa: E402
-from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
-from tokenspeed.runtime.cache.l3.executor import L3Executor  # noqa: E402
 from tokenspeed.runtime.engine.profiler import Profiler  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: E402
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
@@ -331,14 +327,12 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _data_plane(handle: DeviceHandle, l3: L3Executor | None = None) -> HostDataPlane:
-    """A text-only, aggregated rank's data plane over ``handle``, with the L3
-    executor ``l3`` when given."""
+def _data_plane(handle: DeviceHandle) -> HostDataPlane:
+    """A text-only, aggregated rank's data plane over ``handle``."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
     return HostDataPlane(
         handle,
-        l3,
         None,
         Profiler(
             server_args=server_args,
@@ -349,7 +343,6 @@ def _data_plane(handle: DeviceHandle, l3: L3Executor | None = None) -> HostDataP
         ),
         {},
         report_compiles=False,
-        server_args=server_args,
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
         epd_admission=None,
@@ -506,53 +499,14 @@ def test_the_data_plane_reports_cache_acknowledgments_in_landing_order(executor)
     assert plane.poll_cache_events() == []
 
 
-class _HostAllocation:
-    """The CPU stand-in for the L3 executor's pinned Host allocation."""
-
-    def __init__(self, data: bytearray) -> None:
-        self.host_buffer = data
-
-
-def test_the_data_plane_runs_a_plans_storage_operations_on_the_l3_executor(
-    executor,
-):
-    l3 = L3Executor(
-        MemoryKvStore(),
-        _HostAllocation(bytearray(64)),
-        key_prefix="test",
-        rank=0,
-        ownership=None,
-        config=StorageRuntimeConfig.from_extra_config(
-            None, host_blocks=8, prefix_granularity=2
-        ),
-        prefix_for_weight_version=None,
-    )
-    try:
-        plane = _data_plane(DeviceHandle(executor), l3)
-        # The waiting request's probe: a storage operation, and no forward.
-        assert (
-            plane.execute(
-                storage_scheduler().next_execution_plan(), None, None, None, None, None
-            )
-            is None
-        )
-        deadline = time.monotonic() + 3
-        completions = []
-        while not completions and time.monotonic() < deadline:
-            now_us, completions, pressure, error = plane.poll_storage()
-        assert error is None and type(now_us) is int
-        assert all(type(value) is int for value in pressure)
-        # An empty store holds neither key, and the probe retired.
-        ((op_id, success, retired, object_failures),) = completions
-        assert type(op_id) is int
-        assert (success, retired, object_failures) == (
-            [False, False],
-            True,
-            [False, False],
-        )
-        assert plane.poll_storage()[1] == []
-    finally:
-        l3.close(timeout_s=5.0)
+def test_the_data_plane_leaves_a_plans_storage_operations_to_the_host(executor):
+    plane = _data_plane(DeviceHandle(executor))
+    # The waiting request's probe: a storage operation, and no forward. The
+    # host's L3 executor runs it; the data plane, without a Host cache
+    # executor here, launches nothing.
+    plan = storage_scheduler().next_execution_plan()
+    assert [type(op).__name__ for op in plan.cache] == ["StorageQueryOp"]
+    assert plane.execute(plan, None, None, None, None, None) is None
 
 
 def test_a_released_request_is_forgotten(executor):

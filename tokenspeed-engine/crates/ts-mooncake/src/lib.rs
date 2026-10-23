@@ -18,14 +18,16 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The Mooncake transfer engine, owned by the engine host.
+//! The Mooncake transfer engine and store client, owned by the engine host.
 //!
 //! `tokenspeed-mooncake` ships `libtokenspeed_transfer_engine.so` beside its
 //! Python module: TokenSpeed's C entry points
 //! (`mooncake/include/transfer_engine_tokenspeed.h`), which behave as the
-//! Python `TransferEngine` methods TokenSpeed calls. The library is loaded at
-//! run time, so building the host needs no Mooncake and an engine without PD
-//! never loads it.
+//! Python `TransferEngine` methods TokenSpeed calls. The store client comes
+//! from the same wheel's `libmooncake_store.so` ([`store`]). The libraries
+//! are loaded at run time, so building the host needs no Mooncake, an engine
+//! without PD never loads the first and one without the L3 store never loads
+//! the second.
 
 // The crate is the FFI boundary to the library.
 #![allow(unsafe_code)]
@@ -36,6 +38,8 @@ use std::{
     ptr::NonNull,
     sync::Arc,
 };
+
+pub mod store;
 
 /// The ABI of the entry points this crate calls.
 const ABI_VERSION: c_int = 1;
@@ -97,6 +101,22 @@ pub enum Error {
     /// The columns of a transfer disagree.
     #[error("transfer columns disagree: {0}")]
     Shape(&'static str),
+    /// The store client did not connect.
+    #[error("the store client did not connect to {master} ({status})")]
+    Setup {
+        /// The master's address.
+        master: String,
+        /// The client's status.
+        status: c_int,
+    },
+    /// A store call failed as a whole.
+    #[error("{call} failed ({status})")]
+    Call {
+        /// The call.
+        call: &'static str,
+        /// Its status.
+        status: i64,
+    },
 }
 
 type Create =

@@ -484,7 +484,7 @@ controller, the engine core client and pickle IPC, the Python headless
 transport, the Python PD transfer executors and the EPD prefill hooks are
 deleted, and `docs/design/event-loop.md` describes the Rust loop. `ts-py`
 (`tokenspeed_engine._native`) is the Python frontend's connection to the ranks.
-Three deviations from the plan above:
+Four deviations from the plan above:
 
 * `AsyncLLM` stays, as the in-process frontend over `ts-py`: tokenization,
   detokenization, stop strings, `n > 1` fan-out and the `Engine` API stay in
@@ -500,13 +500,21 @@ Three deviations from the plan above:
   queries, and only for those: it waits on a launched forward's copy event
   through the torch event the data plane records (vendor-neutral, as the
   data plane already is; the wait releases the GIL), reads the landed
-  results, and polls the cache acknowledgments and the L3 executor, under a
+  results, and polls the cache acknowledgments, under a
   dispatch guard that rejects device work. Queued behind
   the forward thread instead, these would wait for every forward still being
   launched; the native event entries would need an implementation per
   vendor. The cost is the GIL on the commit path: a query can wait for the
   forward thread's Python, up to the interpreter's switch interval, as the
   Python event loop's commit did.
+* The L3 tier runs in the host rather than on the data plane: the executor,
+  its stores (the Mooncake store client through the store's C ABI, which
+  TokenSpeed's Mooncake build ships, and the in-memory test store) and its
+  metrics are `ts-l3`, so neither the per-round storage poll nor the
+  workers take the GIL. The data plane resolves the tier's settings at
+  startup (`cache/l3/factory.py`) and keeps the Host pool the executor
+  reads and writes by address. The store client keeps its own transfer
+  engine, apart from PD's.
 
 While Phases 2–3 are open, a change to the Python control plane must land
 with its Rust counterpart, or in the Rust plane's backlog with a test that

@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 ts-collective = { path = "../ts-collective" }
 ts-grammar = { path = "../ts-grammar" }
+ts-l3 = { path = "../ts-l3" }
 ts-metrics = { path = "../ts-metrics" }
 ts-scheduler = { path = "../ts-scheduler" }
 ts-wire = { path = "../ts-wire" }

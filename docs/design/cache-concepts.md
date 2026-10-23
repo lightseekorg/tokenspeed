@@ -897,9 +897,10 @@ Its responsibilities:
   positional-encoding or kernel changes that alter KV without changing the
   checkpoint, layout or recorded producer choices. A git SHA would split
   caches on unrelated changes; a package version may stay unchanged across
-  KV-affecting edits. Static facts are captured once. `storage_key_prefix`
-  combines their digest with explicit target/draft weight versions, without
-  re-reading mutable launch options or checkpoint files on version updates.
+  KV-affecting edits. Static facts are captured once. The namespace
+  (`ts-l3`'s `key_prefix`) combines their digest with explicit target/draft
+  weight versions, without re-reading mutable launch options or checkpoint
+  files on version updates.
   Use resolved `mapping.attn.tp_size`, not `--attn-tp-size` alone: different TP
   widths can have identical per-rank packed geometry while assigning different
   heads to a rank.

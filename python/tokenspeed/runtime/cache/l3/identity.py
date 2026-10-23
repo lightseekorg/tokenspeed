@@ -18,7 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Storage-backend interface for Host CacheBlocks under flat KV."""
+"""The L3 namespace's identity: everything that shapes the stored bytes.
+
+Objects written under one identity are never read under another: the
+checkpoints, the cache layout and quantization, and the producer facts that
+change the bytes go into the deployment id, and the weight versions into the
+namespace. The engine host names and moves the objects (``ts-l3``) from the
+id this module computes at startup.
+"""
 
 from __future__ import annotations
 
@@ -31,9 +38,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol
-
-from tokenspeed.runtime.cache.l3.io_types import StorageIOResult
+from typing import Any
 
 _HF_COMMIT_HASH_RE = re.compile(r"[0-9a-f]{40}")
 _HF_HUB_REPO_DIR_RE = re.compile(r"(?:models|datasets|spaces)--.+")
@@ -87,31 +92,6 @@ L3_FLUSH_REQUIRES_WEIGHT_VERSION = (
     "L3 flushed updates require weight_version so independent replicas "
     "cannot restore another checkpoint's objects"
 )
-
-
-def storage_object_key(
-    content_hash: str,
-    group_id: int,
-    page_offset: int,
-    *,
-    prefix: str,
-    rank: int,
-) -> str:
-    """Return the L3 object key for one packed Host CacheBlock.
-
-    TokenSpeed's Host pool is one compact byte buffer (flat KV). One Mooncake
-    object stores the packed bytes of a single CacheBlock, keyed by the
-    scheduler content hash plus the group/offset/rank that uniquely identify
-    the shard. Attention TP ranks each own a different physical KV slice.
-    The trailing ``|c0`` is the retired context-parallel shard id, kept
-    literal so objects written before its removal stay addressable; drop it
-    with the next deliberate key-format bump.
-    """
-
-    if not content_hash:
-        raise ValueError("content_hash must be non-empty")
-    tagged = f"{prefix}_{content_hash}" if prefix else content_hash
-    return f"{tagged}|g{int(group_id)}|o{int(page_offset)}|r{int(rank)}|c0"
 
 
 def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
@@ -952,7 +932,8 @@ def storage_deployment_id(
     producer options include draft dtype when a draft pool is present.
 
     The returned digest retains no mutable inputs. Weight generations are
-    added separately by ``storage_key_prefix``. Empty draft facts mean no
+    added separately, in the engine host's namespace (``ts-l3``'s
+    ``key_prefix``). Empty draft facts mean no
     draft pool. ``attn_tp_size`` distinguishes head assignments that can
     otherwise have identical local layouts under replicated KV heads.
     ``group_shard_counts`` isolates the per-group replica numbering used by
@@ -1001,195 +982,3 @@ def storage_deployment_id(
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode()).hexdigest()
-
-
-def storage_key_prefix(
-    deployment_id: str,
-    *,
-    weight_version: str,
-    draft_weight_version: str,
-) -> str:
-    """Combine a frozen deployment identity with target/draft weight versions.
-
-    An empty draft version means no draft generation. Both versions are
-    explicit so a caller cannot silently lose an independently updated draft.
-    This does not inspect weights, mutable launch options or Host allocation.
-    """
-    if not isinstance(deployment_id, str) or not deployment_id:
-        raise ValueError("deployment_id must be an explicit nonempty identity")
-    payload = json.dumps(
-        {
-            "deployment_id": deployment_id,
-            "weight_version": str(weight_version),
-            "draft_weight_version": str(draft_weight_version),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return "tsl3-" + hashlib.sha256(payload.encode()).hexdigest()
-
-
-def host_buffer_ptr(host_buffer: Any) -> int:
-    data_ptr = getattr(host_buffer, "data_ptr", None)
-    if callable(data_ptr):
-        return int(data_ptr())
-    raise TypeError(f"host buffer {type(host_buffer)!r} has no data_ptr()")
-
-
-def copy_host_bytes(host_buffer: Any, offset: int, size: int) -> bytes:
-    view = host_buffer[offset : offset + size]
-    tobytes = getattr(view, "tobytes", None)
-    if callable(tobytes):
-        return bytes(tobytes())
-    numpy = getattr(view, "numpy", None)
-    if callable(numpy):
-        return bytes(numpy())
-    return bytes(view)
-
-
-def write_host_bytes(host_buffer: Any, offset: int, payload: bytes) -> None:
-    size = len(payload)
-    dest = host_buffer[offset : offset + size]
-    copy_ = getattr(dest, "copy_", None)
-    if callable(copy_):
-        import torch
-
-        copy_(torch.frombuffer(bytearray(payload), dtype=torch.uint8))
-        return
-    host_buffer[offset : offset + size] = payload
-
-
-class KvStoreStorage(Protocol):
-    """Byte store for packed Host CacheBlocks.
-
-    Implementations must allow concurrent calls from the bounded I/O workers.
-    Workers retain the registered Host buffer for the entire native operation. ``batch_get_into`` / ``batch_put_from`` operate on
-    offsets into that registered buffer (SGLang HiCacheStorage v1).
-    """
-
-    # An exception or malformed result proves that Host access ended only
-    # under this backend contract. Valid results carry their own retired fact.
-    failures_retire: bool
-
-    def batch_get_into_result(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> StorageIOResult:
-        """Return per-key validity and proof that destination access ended."""
-
-    def batch_put_from_result(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> StorageIOResult:
-        """Return per-key publication and proof that source access ended."""
-
-    def batch_exists(self, keys: Sequence[str]) -> list[bool]:
-        """Return per-key existence, aligned with ``keys``."""
-
-    def batch_get_into(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> list[bool]:
-        """Read objects into Host buffer slices. True means a full-size copy."""
-
-    def batch_put_from(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> list[bool]:
-        """Write Host buffer slices into the store. True means the put succeeded."""
-
-    def remove_by_prefix(self, prefix: str) -> bool:
-        """Remove every object whose key starts with ``prefix``.
-
-        Returns True when matching objects are gone. False must not be
-        followed by an irreversible Device/Host ``ClearCache``.
-        """
-
-    def close(self) -> None:
-        """Release backend resources. Idempotent."""
-
-
-class MemoryKvStore:
-    """In-process dict store used by tests and as a Mooncake-free reference."""
-
-    def __init__(self) -> None:
-        self._objects: dict[str, bytes] = {}
-        self.failures_retire = True
-
-    def batch_exists(self, keys: Sequence[str]) -> list[bool]:
-        return [key in self._objects for key in keys]
-
-    def batch_get_into(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> list[bool]:
-        if not (len(keys) == len(offsets) == len(sizes)):
-            raise ValueError("ragged L3 get")
-        results = []
-        for key, offset, size in zip(keys, offsets, sizes):
-            payload = self._objects.get(key)
-            if payload is None or len(payload) != size:
-                results.append(False)
-                continue
-            write_host_bytes(host_buffer, int(offset), payload)
-            results.append(True)
-        return results
-
-    def batch_put_from(
-        self,
-        keys: Sequence[str],
-        host_buffer: Any,
-        offsets: Sequence[int],
-        sizes: Sequence[int],
-    ) -> list[bool]:
-        if not (len(keys) == len(offsets) == len(sizes)):
-            raise ValueError("ragged L3 put")
-        results = []
-        for key, offset, size in zip(keys, offsets, sizes):
-            if key in self._objects:
-                results.append(True)
-                continue
-            self._objects[key] = copy_host_bytes(host_buffer, int(offset), int(size))
-            results.append(True)
-        return results
-
-    def batch_get_into_result(
-        self, keys, host_buffer, offsets, sizes
-    ) -> StorageIOResult:
-        flags = tuple(self.batch_get_into(keys, host_buffer, offsets, sizes))
-        return StorageIOResult(flags, True, tuple(not flag for flag in flags))
-
-    def batch_put_from_result(
-        self, keys, host_buffer, offsets, sizes
-    ) -> StorageIOResult:
-        return StorageIOResult(
-            tuple(self.batch_put_from(keys, host_buffer, offsets, sizes)),
-            True,
-            (False,) * len(keys),
-        )
-
-    def remove_by_prefix(self, prefix: str) -> bool:
-        self._objects = {
-            key: payload
-            for key, payload in self._objects.items()
-            if not key.startswith(prefix)
-        }
-        return True
-
-    def close(self) -> None:
-        self._objects.clear()

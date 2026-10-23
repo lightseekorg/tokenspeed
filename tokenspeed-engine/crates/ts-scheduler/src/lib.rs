@@ -149,6 +149,17 @@ mod ffi {
         Cancel,
     }
 
+    /// A content-addressed cache key a storage operation names (`CacheKey`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StorageKeyView {
+        /// The cache group, by index.
+        group_id: u32,
+        /// The prefix page's content hash.
+        content_hash: String,
+        /// The block's ordinal within its prefix page.
+        page_offset: i32,
+    }
+
     /// A storage operation a plan starts on the cache owners' executors.
     #[derive(Debug, Clone, PartialEq)]
     struct StorageOpView {
@@ -156,8 +167,11 @@ mod ffi {
         kind: StorageOpKind,
         /// Its id; a cancel names the operation it cancels.
         op_id: u64,
-        /// The keys it names; 0 for a cancel.
-        num_keys: usize,
+        /// The keys it names; none for a cancel.
+        keys: Vec<StorageKeyView>,
+        /// A get's destination or a put's source Host block per key; none
+        /// for a query or a cancel.
+        host_blocks: Vec<i32>,
     }
 
     /// One cache op a plan puts in flight; each is acknowledged on its own.
@@ -362,8 +376,8 @@ mod ffi {
 pub use ffi::{
     CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView, ForwardBatchView,
     ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView, SchedulerSizes,
-    StorageCancellationView, StorageDoneView, StorageOpKind, StorageOpView, StorageStatsView,
-    StorageTickView,
+    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
+    StorageStatsView, StorageTickView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -568,7 +582,8 @@ impl ExecutionPlan {
     }
 
     /// Whether the data plane has anything to do for this plan: a batch,
-    /// a cache op, pages to zero or copy, or a remote stream.
+    /// a Host copy (cache op), pages to zero or copy, or a remote stream.
+    /// Storage operations are the L3 executor's, not the data plane's.
     pub fn needs_device(&self) -> bool {
         ffi::plan_needs_device(&self.0)
     }

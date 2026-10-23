@@ -58,9 +58,9 @@ operation that issues or orders device work, or changes the data plane's
 state, is queued for the forward thread, and fire-and-forget unless the loop
 needs its answer (a DP idle forward, the low-rate control operations), so a
 slow forward thread delays nothing but its own queue. The completion
-queries — a launched forward's results, the cache acknowledgments, the L3
-probe, progress and completion — read what landed and touch no stream, and
-the control thread calls them itself, taking the GIL for the call: queued,
+queries — a launched forward's results and the cache acknowledgments — read
+what landed and touch no stream, and the control thread calls them itself,
+taking the GIL for the call: queued,
 the round head would wait for every forward still being launched. A commit
 waits for the forward thread to have launched its forward, then on the
 forward's copy event, which releases the GIL while it waits. Taking the GIL
@@ -94,13 +94,13 @@ how long the caller may hold each piece:
 | `DeviceSpecs` | plain values the control plane plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
 | `DeviceHandle` | the running handle: the complete list of what the control plane may ask of the device side | held by the data plane (`HostDataPlane`) only |
 | `transfer` | the PD planner the Rust transfer peer calls (`pd/host_peer.py`), or None outside PD | handed to `ts-pd` at startup |
-| `host_cache` | shared Host resources, the CPU cache layout and the resolved attention choices; no Device buffers or executor | consumed at startup, by the L3 executor's construction |
+| `host_cache` | shared Host resources, the CPU cache layout and the resolved attention choices; no Device buffers or executor | consumed at startup, by the L3 settings (`cache/l3/factory.py`) |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
 `HostBootstrap` (`rust_host.py`) turns the build into what the Rust side
-takes: the scheduler, a plain `HostConfig`, and the data plane (holding the
-handle and, with L3, the Host-only L3 executor). Nothing else of the build
-crosses.
+takes: the scheduler, a plain `HostConfig` (with L3, the settings the host
+starts its L3 executor from), and the data plane holding the handle. Nothing
+else of the build crosses.
 
 Encoder facts describe the transferred tensor, independently of the language
 embedding width. A model may declare `get_encoder_output_spec()` as a width and
@@ -162,16 +162,16 @@ Consequences:
   closure" slot is the hole this whole design closes. The multimodal feature
   lifecycle needs none: EPD admission and the release of a request's SHM
   features are data-plane operations themselves, run on the forward thread.
-  L3 is constructed separately at startup by `cache/l3/factory.py`, using
+  L3 is resolved separately at startup by `cache/l3/factory.py`, using
   the builder's Host resource and CPU-only payload facts. `DeviceBuild` does
-  not create an L3 schema, namespace, backend or workers, and `DeviceSpecs`
+  not create an L3 schema, namespace, store or workers, and `DeviceSpecs`
   carries no L3 settings. The factory derives the schema and deployment
   identity from neutral Host resources and model configuration; see
-  [asynchronous L3](async-l3-cache.md#ownership). The data plane holds the
-  resulting Host-only executor; its CPU workers cannot reach the device
-  handle. The data plane submits the storage subset of `plan.cache` to it
-  independently from device work, and its completion facts enter the head
-  feedback point. The
+  [asynchronous L3](async-l3-cache.md#ownership). The host runs the
+  resulting Host-only executor (`ts-l3`) in Rust; its workers cannot reach
+  the device handle or the interpreter. The control plane submits the
+  storage subset of `plan.cache` to it independently from device work, and
+  its completion facts enter the head feedback point. The
   retraction snapshot pool adds no operation at all: its stores ride
   `execute` with the write-backs, its restores with the load-backs, its ACKs
   `poll_cache_results`, and `shutdown_cache` closes it with L2 -- one
@@ -338,10 +338,11 @@ back **only** as the launched forward's result, which the commit reads once
 its copy event landed, as plain lists built from the landed host copies.
 
 The plan's cache ops follow the same capture rule: the data plane adapts
-them once into immutable Device and storage tuples. `DeviceHandle.execute`
-runs copies from the supplied Device tuple. L3 CPU workers receive only Host
-jobs, with no GPU stream or forward-thread access. Their results return to
-the control plane through the executor's completion poll.
+them once into immutable Device and storage tuples, and
+`DeviceHandle.execute` runs copies from the supplied Device tuple. The L3
+executor's workers receive only Host jobs, with no GPU stream or
+forward-thread access. Their results return to the control plane through
+the executor's completion poll.
 
 `execution/device.py` states this in full, including the registered
 exceptions — grammar matchers, whose ownership splits by path and whose
@@ -565,7 +566,9 @@ everywhere and an idle replica polls nothing.
 **L3** (`l3`, `--kvstore-storage-backend`). The C++ scheduler owns each
 request's storage transaction: it plans QUERY, GET, PUT and CANCEL
 operations in `plan.cache` ([asynchronous L3](async-l3-cache.md)), which the
-data plane runs on the Host-only L3 executor, apart from device work. A QUERY and
+control plane submits to the host's Host-only L3 executor (`ts-l3`) when it
+dispatches the plan, apart from device work; no L3 path takes the GIL. A
+QUERY and
 GET run before admission, only with a storage backend: a request waiting for
 its preparation is skipped before local prefix hashing, so an idle round does
 not rehash a long prompt while native I/O is outstanding. Every round with
@@ -576,7 +579,7 @@ pressure: rank 0's clock, the intersected permissions and the worst pressure
 become the round's tick, and idle rounds exchange only the header, while
 completions and errors add a bounded payload exchange. A storage operation
 completes once every owner reported it: per key, success and native
-retirement on every owner, an object failure on any. A rank's poll error
+retirement on every owner, an object failure on any. A rank's invalid report
 enters the same header, and every rank fails after gathering it, so no rank
 strands a peer in the exchange. A frozen round plans too, with forwards and
 storage forbidden, so detaches and cancels still drain. An abort of a request
@@ -631,9 +634,10 @@ For orientation, one `EventLoop::round`:
    grammar advances), committing the queue first if the dispatch depends on
    a pending commit (Principle 4).
 4. **One `DataPlane::execute(plan, dispatch)` per round** that has device
-   work. The forward thread adapts the plan's cache ops once
-   (`cache_ops_from_plan`), submits the storage subset to the L3 executor
-   (Host workers: no stream, no Device page) and turns the rest into one
+   work, after the control thread submitted the plan's storage operations to
+   the L3 executor (Host workers: no stream, no Device page). The forward
+   thread adapts the plan's cache ops once (`cache_ops_from_plan`), sets the
+   storage subset aside and turns the rest into one
    `DeviceHandle.execute(plan, planned, cache_ops=...)`, which submits in an
    order that is itself a correctness contract for same-round page reuse:
    the Host-bound stores first --

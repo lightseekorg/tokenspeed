@@ -306,6 +306,10 @@ class Envs:
     # (libtokenspeed_transfer_engine.so); by default the one installed with
     # the tokenspeed-mooncake wheel.
     TOKENSPEED_MOONCAKE_LIBRARY = EnvStr(None)
+    # The Mooncake store library the Rust host's L3 executor loads
+    # (libmooncake_store.so); by default the one installed with the
+    # tokenspeed-mooncake wheel.
+    TOKENSPEED_MOONCAKE_STORE_LIBRARY = EnvStr(None)
 
     # Mooncake
     TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH = EnvStr(None)
