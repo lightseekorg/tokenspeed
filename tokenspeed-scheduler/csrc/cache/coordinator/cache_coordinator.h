@@ -429,6 +429,11 @@ public:
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
+    // Refreshes the last access of the Host entries under keys, back to front
+    // so a prefix's first page is the most recent; keys Host does not cache
+    // are skipped. A store candidate whose copy is already on Host was just
+    // republished by its owner, so its Host copy was in use, not idle.
+    void TouchHostCachedBlocks(std::span<const CacheKey> keys);
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;

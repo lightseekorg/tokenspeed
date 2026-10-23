@@ -46,8 +46,15 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
             storing_keys.insert(ticket.key);
         }
     }
+    // Candidates whose Host copy already exists: their owner republished
+    // them, so the copy is refreshed instead of stored again.
+    std::vector<CacheKey> already_on_host;
     for (auto& candidate : coordinator_.TakePendingStores()) {
-        if (coordinator_.ContainsHostCachedBlock(candidate.key) || !storing_keys.insert(candidate.key).second) {
+        if (coordinator_.ContainsHostCachedBlock(candidate.key)) {
+            already_on_host.push_back(std::move(candidate.key));
+            continue;
+        }
+        if (!storing_keys.insert(candidate.key).second) {
             continue;
         }
 
@@ -63,6 +70,8 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreS
         keys.push_back(std::move(candidate.key));
         device_block_refs.push_back(std::move(device_block_ref));
     }
+    // Before the allocation below picks Host victims by last access.
+    coordinator_.TouchHostCachedBlocks(already_on_host);
 
     if (keys.empty()) {
         return std::nullopt;

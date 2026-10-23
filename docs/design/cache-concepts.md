@@ -820,7 +820,9 @@ Its responsibilities:
   accessed child, so a cold sibling cannot cause newer data to be discarded.
   Equal epochs prefer
   evicting one child; group and physical location break remaining ties. A
-  prefix hit refreshes its access epoch, and earlier reuse grants no
+  prefix hit refreshes its access epoch, and so does a store candidate whose
+  copy is already on Host (its owner republished the page, as a finish does
+  for every page it holds, Device hits included); earlier reuse grants no
   additional protection. Pinned entries, partially pinned foreign parents,
   and blocks allocated earlier in the same batch remain protected. Parent
   candidates are snapshots; selection skips parents that are now empty or

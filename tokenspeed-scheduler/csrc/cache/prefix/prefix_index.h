@@ -317,6 +317,21 @@ public:
         return true;
     }
 
+    // Moves key's entry in pool to access_epoch; false when pool does not
+    // cache key.
+    bool Touch(const BlockPool& pool, const CacheKey& key, std::uint64_t access_epoch) {
+        CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return false;
+        }
+        CacheEntryIterator entry_it = findEntry(*cache_index, key);
+        if (entry_it == cache_index->entries.end()) {
+            return false;
+        }
+        touchEntry(*cache_index, entry_it, access_epoch);
+        return true;
+    }
+
     // Pins the probed hits: marks them acquired at access_epoch and returns
     // owning references aligned with probe.hits.
     PrefixMatch AcquireMatched(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,

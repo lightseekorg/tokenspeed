@@ -397,6 +397,57 @@ TEST(CacheOperationTest, HostDestinationCannotBeReusedBeforeWriteBackAck) {
     transfers.CompleteWriteBack(second->op_id);
 }
 
+// A store candidate whose copy is already on Host was republished by its
+// owner (a finish republishes every page it holds, Device hits included): the
+// batch refreshes that copy's last access instead of storing it again, so the
+// next Host allocation evicts the idle entry rather than the one in use.
+TEST(CacheOperationTest, ARepublishedHostCopyIsRefreshedNotStoredAgain) {
+    for (const bool republish : {false, true}) {
+        SCOPED_TRACE(republish);
+        BlockPool device_pool{3, {1}};
+        BlockPool host_pool{2, {1}};
+        const std::array specs{CacheGroupSpec{
+            .attn_kind = AttnKind::kFull,
+            .cache_blocks_per_lcm_block = 1,
+            .block_granularity = 2,
+        }};
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, /*prefix_granularity=*/2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                            /*snapshot_pool=*/nullptr,
+                            /*stream_device_cache_to_host=*/false);
+        TierTransferManager transfers{coordinator};
+        const CacheKey old_key{.group_id = 0, .content_hash = "old"};
+        const CacheKey new_key{.group_id = 0, .content_hash = "new"};
+        // Both pages are cached on Device and stored to Host, "old" first.
+        for (const CacheKey& key : {old_key, new_key}) {
+            CacheBlockRef block = device_pool.AcquireBlock(key.group_id);
+            ASSERT_TRUE(block);
+            coordinator.GroupPrefixIndex(0).Register(device_pool, block, key, /*access_epoch=*/1,
+                                                     /*logical_block_index=*/-1, CacheBoundaryKind::kChunk,
+                                                     /*newly_cached=*/nullptr);
+            const std::array hashes{key.content_hash};
+            coordinator.QueueCachedBlocksForStore(hashes);
+            auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+            ASSERT_TRUE(write_back);
+            transfers.CompleteWriteBack(write_back->op_id);
+        }
+        ASSERT_TRUE(coordinator.ContainsHostCachedBlock(old_key));
+        ASSERT_TRUE(coordinator.ContainsHostCachedBlock(new_key));
+        if (republish) {
+            const std::array hashes{old_key.content_hash};
+            coordinator.QueueCachedBlocksForStore(hashes);
+            EXPECT_FALSE(transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck))
+                << "a copy already on Host is not stored again";
+        }
+
+        CacheBlockRef replacement = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+
+        ASSERT_TRUE(replacement);
+        EXPECT_EQ(coordinator.ContainsHostCachedBlock(old_key), republish);
+        EXPECT_EQ(coordinator.ContainsHostCachedBlock(new_key), !republish);
+    }
+}
+
 TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     BlockPool device_pool{2, {1}};
     BlockPool host_pool{1, {1}};

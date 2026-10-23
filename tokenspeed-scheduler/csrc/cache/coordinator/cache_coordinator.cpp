@@ -1770,6 +1770,16 @@ bool CacheCoordinator::ContainsHostCachedBlock(const CacheKey& key) const {
     return groups_[key.group_id].Index().Contains(*host_pool_, key);
 }
 
+void CacheCoordinator::TouchHostCachedBlocks(std::span<const CacheKey> keys) {
+    if (host_pool_ == nullptr) {
+        return;
+    }
+    for (auto it = keys.rbegin(); it != keys.rend(); ++it) {
+        _assert(it->group_id < groups_.size(), "host cache key group id out of range");
+        groups_[it->group_id].Index().Touch(*host_pool_, *it, ++next_access_epoch_);
+    }
+}
+
 bool CacheCoordinator::IsHostCachedBlock(CacheBlockLocation location) const {
     if (host_pool_ == nullptr) {
         return false;
