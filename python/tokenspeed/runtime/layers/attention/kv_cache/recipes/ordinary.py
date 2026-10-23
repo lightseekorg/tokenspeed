@@ -376,7 +376,7 @@ def _index_k_field(config, layer_id: int) -> CacheFieldSpec:
     if isinstance(spec, DSAConfig):
         # One plane layout per index_k_format: FP8 keys plus scales as uint8
         # bytes, or the bf16 keys unquantized (configs/dsa.py).
-        if spec.index_k_format == "fp8_scaled":
+        if spec.index_k_format in ("fp8_scaled", "mxfp8"):
             return CacheFieldSpec(
                 f"layer.{layer_id}.index_k",
                 f"layer.{layer_id}.index_k",
@@ -384,7 +384,7 @@ def _index_k_field(config, layer_id: int) -> CacheFieldSpec:
                     config.prefix_granularity,
                     dsa_index_k_row_bytes(spec.index_head_dim),
                 ),
-                "uint8",
+                cache_dtype_name(index_k_plane_dtype(spec.index_k_format)),
             )
         return CacheFieldSpec(
             f"layer.{layer_id}.index_k",

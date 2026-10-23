@@ -32,6 +32,7 @@ from tokenspeed_kernel.benchmark.harness import (
     BenchmarkStatus,
     PreparedBenchmark,
 )
+from tokenspeed_kernel.numerics.torch.quantization import quantize_fp8_groups
 from tokenspeed_kernel.platform import PlatformInfo
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_kernels
 from tokenspeed_kernel.selection import NoKernelFoundError, select_kernel
@@ -249,6 +250,7 @@ def _packed_index_cache(
     *,
     config: _DSAConfig,
     generator: torch.Generator,
+    mxfp8: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     value_bytes = config.index_rows_per_page * config.index_head_dim
     scale_bytes = (
@@ -260,6 +262,8 @@ def _packed_index_cache(
         device="cuda",
     )
     cache = storage[:, : value_bytes + scale_bytes]
+    if mxfp8:
+        cache = cache.view(torch.int8)
     values = (
         cache[:, :value_bytes]
         .view(torch.float8_e4m3fn)
@@ -267,29 +271,24 @@ def _packed_index_cache(
     )
     scales = (
         cache[:, value_bytes:]
-        .view(torch.float32)
-        .view(pages, config.index_rows_per_page, config.index_scale_groups)
+        .view(torch.uint8 if mxfp8 else torch.float32)
+        .view(pages, config.index_rows_per_page, -1)
     )
     source = _randn(
         (pages, config.index_rows_per_page, config.index_head_dim),
         generator=generator,
         dtype=config.dtype,
     )
-    source_groups = source.float().view(
-        pages,
-        config.index_rows_per_page,
-        config.index_scale_groups,
-        128,
+    codes, scale_values = quantize_fp8_groups(
+        source,
+        32 if mxfp8 else 128,
+        power_of_two_scale=mxfp8,
+        min_scale=1e-4 / torch.finfo(torch.float8_e4m3fn).max,
     )
-    scale_values = source_groups.abs().amax(dim=-1).clamp_min(1e-4)
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    scale_values.div_(fp8_max)
-    values.copy_(
-        (source_groups / scale_values.unsqueeze(-1))
-        .clamp(-fp8_max, fp8_max)
-        .view_as(source)
+    values.copy_(codes)
+    scales.copy_(
+        (torch.log2(scale_values) + 127).to(torch.uint8) if mxfp8 else scale_values
     )
-    scales.copy_(scale_values)
     return cache, values, scales
 
 
@@ -506,7 +505,7 @@ def prepare_kpool_prefill_write(
         traits={
             "head_dim": config.index_head_dim,
             "pool_size": config.pool_size,
-            "index_k_format": "fp8_scaled",
+            "index_k_format": "mxfp8" if platform.is_blackwell else "fp8_scaled",
             "rotate": True,
         },
     )
@@ -527,6 +526,7 @@ def prepare_kpool_prefill_write(
         pages,
         config=config,
         generator=generator,
+        mxfp8=platform.is_blackwell,
     )
     write_slots = torch.arange(rows, dtype=torch.int64, device="cuda")
     ape = torch.randn(
@@ -574,7 +574,7 @@ def prepare_kpool_decode_append(
         traits={
             "head_dim": config.index_head_dim,
             "pool_size": config.pool_size,
-            "index_k_format": "fp8_scaled",
+            "index_k_format": "mxfp8" if platform.is_blackwell else "fp8_scaled",
             "rotate": True,
         },
     )
@@ -611,6 +611,7 @@ def prepare_kpool_decode_append(
         index_pages,
         config=config,
         generator=generator,
+        mxfp8=platform.is_blackwell,
     )
     seq_lens = torch.full(
         (batch,),
@@ -682,7 +683,7 @@ def _prepare_kpool_topk(
         "head_dim": config.index_head_dim,
         "pool_size": config.pool_size,
         "page_size": config.index_rows_per_page,
-        "index_k_format": "fp8_scaled",
+        "index_k_format": "mxfp8" if platform.is_blackwell else "fp8_scaled",
         "score_activation": "relu",
         "topk_layout": "global_slots",
         "topk_pools": config.topk_pools,

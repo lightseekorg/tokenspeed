@@ -252,10 +252,14 @@ def configure_dsa_attention(model_config, server_args: ServerArgs) -> None:
     model_config.index_n_heads = mla_config.index_n_heads
     model_config.index_kpool = getattr(mla_config, "index_kpool", None)
     model_config.index_topk_pattern = getattr(mla_config, "index_topk_pattern", None)
-    # The indexer's key plane: the FP8-with-scale rows every in-tree scoring
-    # leaf reads. A plugin hook that scores the checkpoint's bf16 keys sets
+    # Match the native indexer's scale format before allocating its key plane.
+    # A plugin hook that scores the checkpoint's bf16 keys sets
     # "bf16" after this (layers/attention/configs/dsa.py INDEX_K_FORMATS).
-    model_config.index_k_format = "fp8_scaled"
+    from tokenspeed_kernel.platform import current_platform
+
+    model_config.index_k_format = (
+        "mxfp8" if current_platform().is_blackwell else "fp8_scaled"
+    )
 
     model_config.scaling = 1 / math.sqrt(
         model_config.qk_nope_head_dim + model_config.qk_rope_head_dim
@@ -305,6 +309,10 @@ def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> Non
     )
     configure = configure_mla_attention if is_mtp else configure_dsa_attention
     configure(model_config, server_args)
+    if not is_mtp:
+        # Mixed-arena page strides use the portable DSA scorer, whose cache
+        # contract remains FP8 with FP32 scales.
+        model_config.index_k_format = "fp8_scaled"
 
 
 def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:

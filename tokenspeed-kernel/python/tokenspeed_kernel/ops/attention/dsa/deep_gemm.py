@@ -64,6 +64,34 @@ _PREFILL_TOPK_FEATURES = _TOPK_FEATURES | frozenset(
 )
 
 
+def _index_queries(q: torch.Tensor, weights: torch.Tensor, softmax_scale: float):
+    """Quantize directly to the hardware's MQA scale format."""
+    mx = platform.is_blackwell
+    values, scales = quantize_fp8(
+        q.reshape(-1, q.shape[-1]),
+        granularity="token_group",
+        group_size=32 if mx else 128,
+        scale_encoding="ue8m0" if mx else "float32",
+    )
+    if mx:
+        weights = (weights.float() * softmax_scale).to(torch.bfloat16)
+        return (
+            values.view_as(q),
+            scales.contiguous().view(torch.int32).reshape(q.shape[:2]),
+            weights,
+        )
+    return values.view_as(q), None, combine_topk_weights(weights, scales, softmax_scale)
+
+
+def _request_indices(lengths: torch.Tensor) -> torch.Tensor | None:
+    # Flattened verify queries each carry their own page-table row.
+    return (
+        torch.arange(lengths.shape[0], device=lengths.device, dtype=torch.int32)
+        if platform.is_blackwell
+        else None
+    )
+
+
 def _row_invariant_topk(
     logits: torch.Tensor, lengths: torch.Tensor, out: torch.Tensor, topk: int
 ) -> None:
@@ -89,7 +117,7 @@ def _row_invariant_topk(
 def _prepare_logits_for_topk(logits: torch.Tensor) -> torch.Tensor:
     """Return a top-k-ready view of DeepGEMM logits: compact rows, no NaN/inf.
 
-    DeepGEMM's ``fp8_mqa_logits`` family allocates ``[rows, aligned_cols]``
+    DeepGEMM's ``fp8_fp4_mqa_logits`` family allocates ``[rows, aligned_cols]``
     and returns the slice ``[:, :cols]``, which is non-contiguous whenever
     ``cols < aligned_cols`` and would force a copy inside kernels that
     require compact rows (e.g. the CuTe DSL top-k). When the input is such a
@@ -196,6 +224,7 @@ if platform.is_hopper_plus:
             seq_lens_2d,
             page_size,
             deep_gemm.get_num_sms(),
+            indices=_request_indices(seq_lens_2d),
         )
         if out is None:
             with torch.inference_mode(False):
@@ -279,7 +308,9 @@ if platform.is_hopper_plus:
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
             "topk": frozenset({512, 1024, 2048}),
-            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_format": frozenset(
+                {"mxfp8" if platform.is_blackwell else "fp8_scaled"}
+            ),
             "index_k_layout": frozenset({"packed"}),
         },
         priority=Priority.PERFORMANT,
@@ -329,17 +360,9 @@ if platform.is_hopper_plus:
         )
 
         q, weights = _pad_index_heads(q, weights)
-        q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
+        q_fp8, q_scale, scaled_weights = _index_queries(q, weights, softmax_scale)
 
-        kv_cache = index_k_cache.view(
+        kv_cache = index_k_cache.view(torch.uint8).view(
             -1,
             int(page_size),
             1,
@@ -364,16 +387,19 @@ if platform.is_hopper_plus:
         )
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]),
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            (
+                q_fp8.view(tokens, 1, q.shape[1], q.shape[-1]),
+                q_scale.unsqueeze(1) if q_scale is not None else None,
+            ),
             kv_cache,
             scaled_weights,
             seq_lens_2d,
             logits_block_table,
             plan,
             max_seq_len,
-            clean_logits=False,
-        )
+            indices=_request_indices(seq_lens_2d),
+        ).float()
         # Compact widened view with non-finite scores scrubbed; the
         # length-aware CuTe DSL top-k below consumes it without a copy.
         logits_full = _prepare_logits_for_topk(logits)
@@ -455,7 +481,9 @@ if platform.is_hopper_plus:
             "index_heads": frozenset({16, 32, 64}),
             "head_dim": frozenset({128}),
             "topk": frozenset({512, 1024, 2048}),
-            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_format": frozenset(
+                {"mxfp8" if platform.is_blackwell else "fp8_scaled"}
+            ),
             "index_k_layout": frozenset({"packed"}),
         },
         priority=Priority.PERFORMANT,
@@ -497,15 +525,7 @@ if platform.is_hopper_plus:
         out.fill_(-1)
 
         q, weights = _pad_index_heads(q, weights)
-        q_2d = q.view(-1, q.shape[-1])
-        q_fp8, q_scale = quantize_fp8(
-            q_2d,
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        q_fp8 = q_fp8.view_as(q)
-        scaled_weights = combine_topk_weights(weights, q_scale, softmax_scale)
+        q_fp8, q_scale, scaled_weights = _index_queries(q, weights, softmax_scale)
         if index_k_fp8 is None or index_k_scale is None:
             hd = q.shape[-1]
             num_groups = hd // 128
@@ -521,7 +541,7 @@ if platform.is_hopper_plus:
                 (int(page_size) * row_bytes, hd, 1),
             )
             scale_view = torch.as_strided(
-                flat.view(torch.float32),
+                flat.view(torch.int32 if platform.is_blackwell else torch.float32),
                 (
                     index_k_cache.shape[0] // int(page_size),
                     int(page_size),
@@ -563,15 +583,17 @@ if platform.is_hopper_plus:
             )
             if deep_gemm.get_pdl() != pdl_enabled():
                 deep_gemm.set_pdl(pdl_enabled())
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[start:end].contiguous(),
+            logits = deep_gemm.fp8_fp4_mqa_logits(
+                (
+                    q_fp8[start:end].contiguous(),
+                    q_scale[start:end].contiguous() if q_scale is not None else None,
+                ),
                 kv_fp8,
                 scaled_weights[start:end].contiguous(),
                 row_starts[start:end],
                 row_ends[start:end],
-                clean_logits=False,
                 max_seqlen_k=max(tile_max_seqlen_k, 1),
-            )
+            ).float()
             logits.nan_to_num_(
                 nan=float("-inf"), posinf=float("-inf"), neginf=float("-inf")
             )
@@ -620,6 +642,9 @@ if platform.is_hopper_plus:
             }
         ),
         traits={
+            "index_k_format": frozenset(
+                {"mxfp8" if platform.is_blackwell else "fp8_scaled"}
+            ),
             "index_heads": frozenset({16, 32, 64}),
             "head_dim": frozenset({128}),
             "page_size": frozenset({64}),
@@ -654,14 +679,7 @@ if platform.is_hopper_plus:
             page_size,
         )
         q, weights = _pad_index_heads(q.contiguous(), weights)
-        q_fp8, scale = quantize_fp8(
-            q.reshape(-1, q.shape[-1]),
-            granularity="token_group",
-            group_size=128,
-            scale_encoding="float32",
-        )
-        scale = scale[: q.shape[0] * q.shape[1]].contiguous()
-        weights = combine_topk_weights(weights, scale, softmax_scale)
+        q_fp8, q_scale, weights = _index_queries(q, weights, softmax_scale)
         if deep_gemm.get_pdl() != pdl_enabled():
             deep_gemm.set_pdl(pdl_enabled())
         # DeepGEMM's scheduler requires nonempty work even when this rank
@@ -669,18 +687,26 @@ if platform.is_hopper_plus:
         # every dummy score using the original (zero) lengths below.
         scoring_lengths = lengths.clamp_min(1)
         plan = deep_gemm.get_paged_mqa_logits_metadata(
-            scoring_lengths, page_size, deep_gemm.get_num_sms()
+            scoring_lengths,
+            page_size,
+            deep_gemm.get_num_sms(),
+            indices=_request_indices(scoring_lengths),
         )
-        logits = deep_gemm.fp8_paged_mqa_logits(
-            q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]),
-            index_k_cache.view(-1, page_size, 1, index_k_cache.shape[-1]),
+        logits = deep_gemm.fp8_fp4_paged_mqa_logits(
+            (
+                q_fp8.view(q.shape[0], 1, q.shape[1], q.shape[2]),
+                q_scale.unsqueeze(1) if q_scale is not None else None,
+            ),
+            index_k_cache.view(torch.uint8).view(
+                -1, page_size, 1, index_k_cache.shape[-1]
+            ),
             weights,
             scoring_lengths,
             pages,
             plan,
             pages.shape[1] * page_size,
-            clean_logits=False,
-        )
+            indices=_request_indices(scoring_lengths),
+        ).float()
         mask_index_scores(
             logits,
             positions,

@@ -141,6 +141,7 @@ def test_checkpoint_reaches_two_group_cache(checkpoint):
     config = _create_attn_config(args, model)
     spec = config.component(Dots3NoteAttentionConfig)
     assert model.attention_arch == AttentionArch.DSA
+    assert spec.index_k_format == "fp8_scaled"
     assert config.kv_cache_dtype == torch.float8_e4m3fn
     assert args.prefix_granularity == 128
     assert args.attention_backend == "dsa"

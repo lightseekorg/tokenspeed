@@ -857,6 +857,7 @@ def triton_dsa_index_candidates(
     "attention",
     "dsa_index_candidates",
     name="triton_dsa_sharded_index_candidates",
+    traits={"index_k_format": frozenset({"fp8_scaled"})},
     solution="triton",
     signatures=_TOPK_SIGNATURES,
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),

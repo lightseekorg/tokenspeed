@@ -165,15 +165,18 @@ def _index_k_plane_traits(index_k_cache: torch.Tensor, head_dim: int) -> dict:
     (``"fp8_scaled"``): ``"packed"`` as ``[slots, head_dim + 4 *
     head_dim / 128]`` rows, otherwise ``"page_planar"``. ``bfloat16`` planes
     hold the keys unquantized (``"bf16"``) and are only ever ``"packed"``
-    ``[slots, head_dim]``.
+    ``[slots, head_dim]``. ``int8`` planes use the same byte geometry as
+    ``uint8``, with one UE8M0 scale per 32 values (``"mxfp8"``).
     """
-    if index_k_cache.dtype == torch.uint8:
+    if index_k_cache.dtype in (torch.uint8, torch.int8):
         row_bytes = (
             head_dim + head_dim // _INDEX_K_FP8_GROUP_SIZE * _INDEX_K_SCALE_BYTES
         )
         packed = index_k_cache.ndim == 2 and index_k_cache.shape[1] == row_bytes
         return {
-            "index_k_format": "fp8_scaled",
+            "index_k_format": (
+                "mxfp8" if index_k_cache.dtype == torch.int8 else "fp8_scaled"
+            ),
             "index_k_layout": "packed" if packed else "page_planar",
         }
     if index_k_cache.dtype == torch.bfloat16:
@@ -185,7 +188,8 @@ def _index_k_plane_traits(index_k_cache: torch.Tensor, head_dim: int) -> dict:
         return {"index_k_format": "bf16", "index_k_layout": "packed"}
     raise TypeError(
         f"index-K plane dtype {index_k_cache.dtype} has no registered format: "
-        "uint8 holds FP8 keys with scales (fp8_scaled), bfloat16 holds the keys "
+        "uint8 holds FP8 keys with scales (fp8_scaled), int8 holds MXFP8 keys "
+        "(mxfp8), bfloat16 holds the keys "
         "unquantized (bf16)"
     )
 
@@ -218,6 +222,7 @@ def _candidate_lens_cpu_kwargs(
 # order, and the keywords carrying them (README, "Index-K plane formats").
 _INDEX_K_ROW_KEYWORDS = {
     "fp8_scaled": ("index_k_fp8", "index_k_scale"),
+    "mxfp8": ("index_k_fp8", "index_k_scale"),
     "bf16": ("index_k_bf16",),
 }
 
@@ -269,7 +274,10 @@ def _check_index_k_rows(
             f"[{workspace_rows}, {head_dim}] as uint8 or float8_e4m3fn, got "
             f"{index_k_fp8.dtype} {tuple(index_k_fp8.shape)}"
         )
-    if index_k_scale.dtype != torch.float32 or index_k_scale.shape != (
+    if index_k_scale.dtype not in (
+        torch.float32,
+        torch.int32,
+    ) or index_k_scale.shape != (
         workspace_rows,
         groups,
     ):
@@ -730,7 +738,7 @@ def dsa_index_candidates(
         raise ValueError("Index queries and per-head weights must match")
     query_requests = query_requests.contiguous()
     causal_lens = causal_lens.contiguous()
-    if index_k_cache.dtype != torch.uint8:
+    if index_k_cache.dtype not in (torch.uint8, torch.int8):
         raise TypeError("DSA index candidates require packed FP8 Index-K storage")
     if initial_tokens < 0 or local_tokens < 0 or initial_tokens + local_tokens > topk:
         raise ValueError("Forced windows must fit in topk")
@@ -748,6 +756,9 @@ def dsa_index_candidates(
         "dsa_index_candidates",
         _attention_format_signature(q=q, weights=weights),
         traits={
+            "index_k_format": _index_k_plane_traits(index_k_cache, q.shape[2])[
+                "index_k_format"
+            ],
             "index_heads": q.shape[1],
             "head_dim": q.shape[2],
             "page_size": page_size,
@@ -998,7 +1009,12 @@ def dsa_prefill_topk(
             head_dim=q.shape[-1],
             workspace_rows=kv_workspace_slots.numel(),
         )
-        traits.update(_index_k_rows_traits("bf16" if has_bf16_rows else "fp8_scaled"))
+        rows_format = (
+            "bf16"
+            if has_bf16_rows
+            else "mxfp8" if index_k_scale.dtype == torch.int32 else "fp8_scaled"
+        )
+        traits.update(_index_k_rows_traits(rows_format))
     else:
         raise ValueError(
             "dsa_prefill_topk needs its index keys: a plane (index_k_cache) or "

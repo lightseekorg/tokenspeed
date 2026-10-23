@@ -178,13 +178,10 @@ def declare_glm53_flash_groups(
         raise TypeError("GLM-5.3-Flash draft layers require a draft attention config")
 
     target_dsa = _require_dsa_config(attn_config, "target")
-    if target_dsa.index_k_format != "fp8_scaled":
-        # The pooled index-K rows below are planned as FP8 keys plus one
-        # scale, the plane the KPool indexer leaves read; a config naming
-        # another plane must not get a budget that disagrees with its rows.
+    if target_dsa.index_k_format not in ("fp8_scaled", "mxfp8"):
+        # Both supported scale formats occupy four bytes per 128 key values.
         raise ValueError(
-            "GLM-5.3-Flash plans its pooled index-K rows as FP8 keys with "
-            "scales (index_k_format='fp8_scaled'); got "
+            "GLM-5.3-Flash requires fp8_scaled or mxfp8 pooled index-K rows; got "
             f"{target_dsa.index_k_format!r}"
         )
     target_linear = _require_linear_config(attn_config)
@@ -266,7 +263,9 @@ def declare_glm53_flash_groups(
                 # slab space; a merged target+draft plan adds it explicitly.
                 index_plane_id,
                 (pooled_rows, index_head_dim + 4),
-                cache_dtype_name(torch.uint8),
+                cache_dtype_name(
+                    torch.int8 if target_dsa.index_k_format == "mxfp8" else torch.uint8
+                ),
                 exact_page_stride=False,
             )
         )

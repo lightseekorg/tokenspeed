@@ -53,7 +53,7 @@ _TRAITS = {
     "head_dim": frozenset({128}),
     "page_size": frozenset({16, 64}),
     "pool_size": frozenset({2, 4, 8, 16}),
-    "index_k_format": frozenset({"fp8_scaled"}),
+    "index_k_format": frozenset({"fp8_scaled", "mxfp8"}),
     "score_activation": frozenset({"relu", "none"}),
     "topk_layout": frozenset({"global_slots"}),
 }
@@ -71,7 +71,7 @@ _TRAITS = {
     traits={
         "head_dim": frozenset({128}),
         "pool_size": frozenset({2, 4, 8, 16}),
-        "index_k_format": frozenset({"fp8_scaled"}),
+        "index_k_format": frozenset({"fp8_scaled", "mxfp8"}),
         "rotate": frozenset({True}),
     },
     priority=Priority.PORTABLE,
@@ -142,7 +142,7 @@ def triton_kpool_prefill_tail_write(
     traits={
         "head_dim": frozenset({128}),
         "pool_size": frozenset({2, 4, 8, 16}),
-        "index_k_format": frozenset({"fp8_scaled"}),
+        "index_k_format": frozenset({"fp8_scaled", "mxfp8"}),
         "rotate": frozenset({True}),
     },
     priority=Priority.PERFORMANT,

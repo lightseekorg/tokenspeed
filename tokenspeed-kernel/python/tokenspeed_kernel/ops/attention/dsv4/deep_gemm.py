@@ -30,6 +30,14 @@ if _IS_HOPPER_PLUS:
     import deep_gemm
 
 
+def _request_indices(lengths: torch.Tensor) -> torch.Tensor | None:
+    return (
+        torch.arange(lengths.shape[0], device=lengths.device, dtype=torch.int32)
+        if current_platform().is_blackwell
+        else None
+    )
+
+
 def _cache_row_bytes(cache_2d: torch.Tensor, page_size: int) -> int:
     if cache_2d.ndim != 2 or cache_2d.dtype != torch.uint8:
         raise ValueError(
@@ -78,12 +86,10 @@ def _warmup_fp8_fp4_mqa_logits(
         deep_gemm.fp8_fp4_mqa_logits(
             q=(q_vals, q_scales),
             kv=(k_vals, k_scales),
-            weights=weights,
+            weights=weights.to(torch.bfloat16),
             cu_seq_len_k_start=cu_start,
             cu_seq_len_k_end=cu_end,
-            clean_logits=False,
             max_seqlen_k=max_kv_len,
-            logits_dtype=torch.float32,
         )
 
 
@@ -123,18 +129,20 @@ def _warmup_fp8_fp4_paged_mqa_logits(
             num_tokens, 1
         )
         schedule_meta = deep_gemm.get_paged_mqa_logits_metadata(
-            context_lens, cache_block_size, num_sms
+            context_lens,
+            cache_block_size,
+            num_sms,
+            indices=_request_indices(context_lens),
         )
         deep_gemm.fp8_fp4_paged_mqa_logits(
             q=(q_values.view(torch.int8).unsqueeze(1), q_scales.unsqueeze(1)),
             kv_cache=kv_cache,
-            weights=weights,
+            weights=weights.to(torch.bfloat16),
             context_lens=context_lens,
             block_table=block_table,
             schedule_meta=schedule_meta,
             max_context_len=cache_block_size,
-            clean_logits=False,
-            logits_dtype=torch.float32,
+            indices=_request_indices(context_lens),
         )
     torch.cuda.synchronize()
 

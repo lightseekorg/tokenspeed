@@ -51,7 +51,9 @@ def _kpool_cache_views(
         (page_stride, groups * 4, 1),
         cache.storage_offset() + page_size * head_dim,
     )
-    return values.view(torch.float8_e4m3fn), scales.view(torch.float32)
+    return values.view(torch.float8_e4m3fn), scales.view(
+        torch.int32 if cache.dtype == torch.int8 else torch.float32
+    )
 
 
 if current_platform().is_hopper_plus:
@@ -75,7 +77,9 @@ if current_platform().is_hopper_plus:
             "pool_size": frozenset({4}),
             "topk_pools": frozenset({512, 1024, 2048}),
             "has_prefill_plan": frozenset({True}),
-            "index_k_format": frozenset({"fp8_scaled"}),
+            "index_k_format": frozenset(
+                {"mxfp8" if current_platform().is_blackwell else "fp8_scaled"}
+            ),
             "score_activation": frozenset({"relu"}),
             "topk_layout": frozenset({"global_slots"}),
         },

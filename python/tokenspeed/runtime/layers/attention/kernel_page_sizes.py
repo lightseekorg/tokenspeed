@@ -26,7 +26,7 @@
 # FlashMLA decode kernels read the KV cache with a fixed 64-token page stride.
 FLASH_MLA_PAGE_SIZE = 64
 
-# DeepGEMM fp8_paged_mqa_logits lays out sparse-decode KV as 64-token pages
+# DeepGEMM fp8_fp4_paged_mqa_logits lays out sparse-decode KV as 64-token pages
 # (block-split FP8 payload + FP32 scales).
 DSA_SPARSE_PAGE_SIZE = 64
 

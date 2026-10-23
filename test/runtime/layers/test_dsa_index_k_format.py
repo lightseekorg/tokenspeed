@@ -85,7 +85,9 @@ def _attn_config(spec: DSAConfig) -> AttnConfig:
 
 
 def test_formats_map_to_one_plane_dtype_and_row_width_each():
-    assert INDEX_K_FORMATS == ("fp8_scaled", "bf16")
+    assert INDEX_K_FORMATS == ("fp8_scaled", "mxfp8", "bf16")
+    assert index_k_plane_dtype("mxfp8") is torch.int8
+    assert index_k_row_bytes(HEAD_DIM, "mxfp8") == dsa_index_k_row_bytes(HEAD_DIM)
     assert index_k_plane_dtype("fp8_scaled") is torch.uint8
     assert index_k_plane_dtype("bf16") is torch.bfloat16
     assert index_k_row_bytes(HEAD_DIM, "fp8_scaled") == dsa_index_k_row_bytes(HEAD_DIM)
@@ -100,6 +102,7 @@ def test_formats_map_to_one_plane_dtype_and_row_width_each():
     "index_k_format, dtype_name, width",
     [
         ("fp8_scaled", "uint8", dsa_index_k_row_bytes(HEAD_DIM)),
+        ("mxfp8", "int8", dsa_index_k_row_bytes(HEAD_DIM)),
         ("bf16", "bfloat16", HEAD_DIM),
     ],
 )
@@ -131,7 +134,16 @@ def test_the_configure_attention_hook_names_the_plane():
     configure_dsa_attention(model_config, ServerArgs(model="x"))
     # The in-tree hook keeps the FP8-with-scale plane; a plugin hook that
     # scores the checkpoint's bf16 keys overrides it after.
-    assert model_config.index_k_format == "fp8_scaled"
+    from tokenspeed_kernel.platform import current_platform
+
+    assert model_config.index_k_format == (
+        "mxfp8" if current_platform().is_blackwell else "fp8_scaled"
+    )
+    text_config.index_kpool = 4
+    configure_dsa_attention(model_config, ServerArgs(model="x"))
+    assert model_config.index_k_format == (
+        "mxfp8" if current_platform().is_blackwell else "fp8_scaled"
+    )
     # A hook that named no plane is a construction error, not a fallback.
     with pytest.raises(ValueError, match="index_k_format"):
         _dsa_spec(None)

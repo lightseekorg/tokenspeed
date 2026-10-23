@@ -24,6 +24,7 @@ index keys (KPool) and the top-k pool selection that expands to KV slots."""
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.numerics.torch.quantization import quantize_fp8_groups
 from tokenspeed_kernel.numerics.torch.transform import sylvester_hadamard
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -32,7 +33,7 @@ _FP8_MAX = 448.0
 
 
 def kpool_compress(
-    keys: torch.Tensor, gates: torch.Tensor, ape: torch.Tensor
+    keys: torch.Tensor, gates: torch.Tensor, ape: torch.Tensor, *, mxfp8: bool
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pool each group of ``pool`` index keys into one FP8 row.
 
@@ -44,9 +45,10 @@ def kpool_compress(
         keys: ``[pools, pool, dim]``.
         gates: Per-channel pool scores shaped like ``keys``.
         ape: ``[pool, dim]`` intra-pool position bias.
+        mxfp8: Use one UE8M0 scale per 32 values instead of one FP32 row scale.
 
     Returns:
-        ``(values [pools, dim] FP8, scales [pools] FP32)``.
+        FP8 values and FP32 row scales, or UE8M0 scales shaped ``[pools, dim/32]``.
     """
     dim = keys.shape[-1]
     logits = gates.float() + ape.unsqueeze(0)
@@ -54,6 +56,11 @@ def kpool_compress(
     pooled = pooled.to(torch.bfloat16).float()
     hadamard = sylvester_hadamard(dim, keys.device)
     pooled = ((pooled @ hadamard) / dim**0.5).to(torch.bfloat16).float()
+    if mxfp8:
+        values, scales = quantize_fp8_groups(
+            pooled, 32, power_of_two_scale=True, min_scale=1e-4 / _FP8_MAX
+        )
+        return values, (torch.log2(scales) + 127).to(torch.uint8)
     scale = pooled.abs().amax(dim=-1).clamp(min=1e-4) / _FP8_MAX
     values = (pooled / scale[:, None]).clamp(-_FP8_MAX, _FP8_MAX)
     return values.to(torch.float8_e4m3fn), scale
@@ -108,11 +115,12 @@ def torch_kpool_decode_append(
                 tail_k[request_slot, tail_rows].unsqueeze(0),
                 tail_gate[request_slot, tail_rows].unsqueeze(0),
                 ape,
+                mxfp8=index_scales.dtype == torch.uint8,
             )
             pool_id = position // pool
             page = int(index_block_table[req, pool_id // rows_per_page])
             index_values[page, pool_id % rows_per_page] = pooled[0]
-            index_scales[page, pool_id % rows_per_page, 0] = pooled_scale[0]
+            index_scales[page, pool_id % rows_per_page] = pooled_scale[0]
 
 
 @register_kernel(

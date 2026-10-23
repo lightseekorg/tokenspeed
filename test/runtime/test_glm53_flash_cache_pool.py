@@ -37,7 +37,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
+@pytest.mark.parametrize("index_k_format", ["fp8_scaled", "mxfp8"])
+def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail(
+    index_k_format,
+) -> None:
     text_config = Glm53FlashTextConfig(
         num_hidden_layers=4,
         layer_types=[
@@ -72,7 +75,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         index_topk=text_config.index_topk,
         index_head_dim=text_config.index_head_dim,
         index_n_heads=text_config.index_n_heads,
-        index_k_format="fp8_scaled",
+        index_k_format=index_k_format,
         index_kpool=text_config.index_kpool,
     )
     linear = LinearAttnConfig(
@@ -208,7 +211,8 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
     assert tuple(tail_gate.shape) == (10, 4, 128)
     values, scales = pool.index_k_block_views(index_k)
     assert values.dtype == torch.float8_e4m3fn
-    assert scales.dtype == torch.float32
+    assert scales.dtype == (torch.uint8 if index_k_format == "mxfp8" else torch.float32)
+    assert scales.shape[-1] == (4 if index_k_format == "mxfp8" else 1)
     assert all(
         view.untyped_storage().data_ptr() == backing_ptr
         for view in (index_k, values, scales)

@@ -47,12 +47,22 @@ def _kpool_hadamard_128(x):
 
 
 @triton.jit
-def _kpool_quantize(x):
+def _kpool_quantize(x, MX: tl.constexpr):
     x = x.to(tl.bfloat16).to(tl.float32)
     x = _kpool_hadamard_128(x).to(tl.bfloat16).to(tl.float32)
-    absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
-    scale = absmax / 448.0
-    return tl.minimum(tl.maximum(x / scale, -448.0), 448.0), scale
+    if MX:
+        groups = tl.reshape(x, (4, 32))
+        amax = tl.maximum(tl.max(tl.abs(groups), axis=1), 1e-4)
+        raw = amax * (1.0 / 448.0)
+        bits = raw.to(tl.int32, bitcast=True)
+        exponent = ((bits >> 23) & 255) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+        scale = (exponent << 23).to(tl.float32, bitcast=True)
+        quantized = tl.div_rn(groups, scale[:, None])
+        return tl.reshape(quantized, (128,)), exponent.to(tl.uint8)
+    else:
+        absmax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-4)
+        scale = absmax / 448.0
+        return tl.minimum(tl.maximum(x / scale, -448.0), 448.0), scale
 
 
 @triton.jit
@@ -120,7 +130,9 @@ def _kpool_prefill_write_kernel(
         ).to(tl.float32)
         acc += k * prob
 
-    quantized, scale = _kpool_quantize(acc / denom)
+    quantized, scale = _kpool_quantize(
+        acc / denom, index_scales_ptr.dtype.element_ty == tl.uint8
+    )
 
     write_slot = tl.load(write_slots_ptr + row).to(tl.int64)
     page = write_slot // INDEX_ROWS_PER_PAGE
@@ -133,7 +145,10 @@ def _kpool_prefill_write_kernel(
         quantized.to(index_values_ptr.dtype.element_ty),
         mask=mask & valid,
     )
-    tl.store(index_scales_ptr + scale_base, scale, mask=valid)
+    if index_scales_ptr.dtype.element_ty == tl.uint8:
+        tl.store(index_scales_ptr + scale_base + tl.arange(0, 4), scale, mask=valid)
+    else:
+        tl.store(index_scales_ptr + scale_base, scale, mask=valid)
 
 
 def _triton_kpool_prefill_write_impl(
@@ -500,7 +515,9 @@ def _kpool_decode_append_kernel(
                 )
                 acc += k_value * prob
 
-            quantized, scale = _kpool_quantize(acc / denom)
+            quantized, scale = _kpool_quantize(
+                acc / denom, index_scales_ptr.dtype.element_ty == tl.uint8
+            )
 
             pool_id = safe_before // POOL_SIZE
             table_col = pool_id // INDEX_ROWS_PER_PAGE
@@ -529,7 +546,14 @@ def _kpool_decode_append_kernel(
                 safe_index_page * index_scales_stride_page
                 + index_row * index_scales_stride_row
             )
-            tl.store(index_scales_ptr + scale_base, scale, mask=index_page_valid)
+            if index_scales_ptr.dtype.element_ty == tl.uint8:
+                tl.store(
+                    index_scales_ptr + scale_base + tl.arange(0, 4),
+                    scale,
+                    mask=index_page_valid,
+                )
+            else:
+                tl.store(index_scales_ptr + scale_base, scale, mask=index_page_valid)
 
 
 def _triton_kpool_decode_append_impl(
@@ -577,14 +601,14 @@ def _triton_kpool_decode_append_impl(
         or index_values.shape[-1] != head_dim
         or index_scales.dim() != 3
         or index_scales.shape[:2] != index_values.shape[:2]
-        or index_scales.shape[-1] < 1
+        or index_scales.shape[-1] != (4 if index_scales.dtype == torch.uint8 else 1)
     ):
         raise ValueError("invalid KPool decode cache geometry")
     if (
         gate.dtype != torch.bfloat16
         or ape.dtype != torch.float32
         or index_values.dtype != torch.float8_e4m3fn
-        or index_scales.dtype != torch.float32
+        or index_scales.dtype not in (torch.float32, torch.uint8)
     ):
         raise TypeError("invalid KPool decode cache dtype")
     if seq_lens.numel() < requests or request_slots.numel() < requests:

@@ -1287,3 +1287,26 @@ def test_index_k_scatter_mask_preserves_dummy_page(device):
     scale[1, [1, 3]] = scales[[1, 3]]
     assert torch.equal(cache, expected)
     assert torch.equal(cache[:64], before[:64])
+
+
+def test_index_k_scatter_preserves_packed_ue8m0_bits(device):
+    # Packed exponent bytes include NaN bit patterns when misread as float32.
+    scales = torch.tensor([[0x7F80817F], [-1]], dtype=torch.int32, device=device)
+    values = torch.randn(2, 128, device=device).to(torch.float8_e4m3fn)
+    slots = torch.tensor([3, 65], device=device)
+    cache = torch.zeros((128, 132), dtype=torch.int8, device=device)
+    index_k_block_split_scatter(
+        cache,
+        values,
+        scales,
+        slots,
+        page_size=64,
+        head_dim=128,
+        group_size=128,
+        write_mask=None,
+    )
+    pages = cache.view(torch.uint8).view(2, 64 * 132)
+    saved = pages[:, 64 * 128 :].view(torch.int32)
+    torch.testing.assert_close(
+        saved[torch.arange(2, device=device), slots % 64], scales[:, 0], rtol=0, atol=0
+    )

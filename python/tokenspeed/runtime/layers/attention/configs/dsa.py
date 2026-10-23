@@ -40,12 +40,17 @@ _INDEX_K_SCALE_BYTES = torch._utils._element_size(torch.float32)
 # Storage of the indexer's key rows (``tokenspeed_kernel`` DSA README, "Index-K
 # plane formats"): ``fp8_scaled`` packs FP8 keys with one fp32 scale per 128
 # elements into uint8 rows and is what the in-tree scoring leaves read;
+# ``mxfp8`` uses int8 storage and four UE8M0 scales per 128 elements.
 # ``bf16`` keeps the keys as the indexer produced them, no scale plane. The
 # model config selects one (``index_k_format``); the pool writes exactly that
 # layout and the top-k facades read it off the plane's dtype, so a plane is
 # never converted on the way in or out.
-INDEX_K_FORMATS = ("fp8_scaled", "bf16")
-_INDEX_K_PLANE_DTYPES = {"fp8_scaled": torch.uint8, "bf16": torch.bfloat16}
+INDEX_K_FORMATS = ("fp8_scaled", "mxfp8", "bf16")
+_INDEX_K_PLANE_DTYPES = {
+    "fp8_scaled": torch.uint8,
+    "mxfp8": torch.int8,
+    "bf16": torch.bfloat16,
+}
 
 
 def index_k_plane_dtype(index_k_format: str) -> torch.dtype:
@@ -72,7 +77,7 @@ def dsa_index_k_row_bytes(index_head_dim: int) -> int:
 
 def index_k_row_bytes(index_head_dim: int, index_k_format: str) -> int:
     """Bytes of one index-K row in ``index_k_format``."""
-    if index_k_format == "fp8_scaled":
+    if index_k_format in ("fp8_scaled", "mxfp8"):
         return dsa_index_k_row_bytes(index_head_dim)
     return index_head_dim * torch._utils._element_size(
         index_k_plane_dtype(index_k_format)

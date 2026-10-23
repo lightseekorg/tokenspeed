@@ -56,6 +56,24 @@ def _build_cache(num_pages: int, seed: int) -> tuple[torch.Tensor, torch.Tensor]
     return cache, quantized.float() * scales
 
 
+def _as_mxfp8_cache(cache, keys):
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+
+    values, scales = quantize_fp8(
+        keys.to(torch.bfloat16),
+        granularity="token_group",
+        group_size=32,
+        scale_encoding="ue8m0",
+    )
+    cache = torch.empty_like(cache, dtype=torch.int8)
+    cache[:, : _PAGE * _DIM] = values.view(torch.int8).reshape(cache.shape[0], -1)
+    cache[:, _PAGE * _DIM :] = scales.view(torch.int8).reshape(cache.shape[0], -1)
+    dequant = values.float().reshape(-1, 4, 32) * torch.exp2(
+        scales.float() - 127
+    ).unsqueeze(-1)
+    return cache, dequant.reshape_as(keys)
+
+
 def _build_monotonic_cache(num_rows: int) -> torch.Tensor:
     num_pages = (num_rows + _PAGE - 1) // _PAGE
     rows = num_pages * _PAGE
@@ -141,10 +159,12 @@ def _assert_selection(
 
 
 @pytest.mark.parametrize("weight_dtype", [torch.float32, torch.bfloat16])
-def test_dense_scores_match_reference(weight_dtype: torch.dtype) -> None:
+def test_dense_scores_match_reference(weight_dtype: torch.dtype, mxfp8=False) -> None:
     q, cache, pooled_k, weights, seq_lens, index_table, _ = _setup(
         [2051, 4101], seed=47
     )
+    if mxfp8:
+        cache, pooled_k = _as_mxfp8_cache(cache, pooled_k)
     req_ids = torch.arange(q.shape[0], dtype=torch.int32, device="cuda")
     weights = weights.to(weight_dtype)
     pool_lens = seq_lens // _POOL
@@ -538,10 +558,13 @@ def test_planned_prefill_expands_flat_kv() -> None:
     assert set(slots[1, :2048].tolist()) == set(range(4, 2052))
 
 
-def test_decode_cuda_graph_tracks_dynamic_lengths() -> None:
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_decode_cuda_graph_tracks_dynamic_lengths(mxfp8) -> None:
     q, cache, pooled_k, weights, seq_lens, index_table, kv_table = _setup(
         [4101], seed=41
     )
+    if mxfp8:
+        cache, pooled_k = _as_mxfp8_cache(cache, pooled_k)
     seq_lens.fill_(63)
     out = torch.empty((1, 2051), dtype=torch.int32, device="cuda")
     lens_out = torch.empty(1, dtype=torch.int32, device="cuda")
@@ -586,3 +609,7 @@ def test_decode_cuda_graph_tracks_dynamic_lengths() -> None:
     assert captured[0] is out
     assert captured[1] is lens_out
     _assert_selection(captured, expected)
+
+
+def test_mxfp8_dense_scores_match_reference():
+    test_dense_scores_match_reference(torch.float32, mxfp8=True)

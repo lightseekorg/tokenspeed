@@ -78,9 +78,15 @@ never convert a plane:
 | --- | --- | --- | --- |
 | `uint8` | `fp8_scaled` | `packed` | `[slots, head_dim + 4 * head_dim / 128]`: FP8 E4M3 keys followed by one fp32 scale per 128 elements |
 | `uint8` | `fp8_scaled` | `page_planar` | any other uint8 shape: per-page planes of keys and scales, the outer page stride possibly padded |
+| `int8` | `mxfp8` | `packed` | same byte count as `fp8_scaled`, with four UE8M0 scales per 128 elements packed into one int32 |
 | `bfloat16` | `bf16` | `packed` | `[slots, head_dim]`: the keys as the indexer produced them, no scale plane |
 
-The in-tree DeepGEMM, Triton, and Gluon leaves score `fp8_scaled` planes; a
+DeepGEMM 2.8.2 uses `mxfp8` on Blackwell and `fp8_scaled` on Hopper.
+The runtime selects that cache format before allocation. Its new MQA API takes
+explicit query scales and per-token request indices, with BF16 weights and
+logits on Blackwell. ReLU and four-lane weighted reductions also round to
+BF16; top-k consumers receive FP32 copies of those scores.
+Triton and Gluon leaves score `fp8_scaled` planes; a
 leaf scoring the checkpoint's bf16 keys (an indexer in the RL trainer's
 order) registers `index_k_format={"bf16"}`, `index_k_layout={"packed"}`, and
 the `batch_invariant` and `forced_initial_local` features, so a bf16 plane
@@ -90,8 +96,9 @@ selects it and nothing else. A plane of any other dtype is a `TypeError`.
 workspace-row order instead of a plane (the query-context-parallel history
 gather over page-sharded caches assembles them): `index_k_fp8` +
 `index_k_scale` are the rows of an `fp8_scaled` plane (`[workspace_rows,
-head_dim]` uint8 or float8_e4m3fn, `[workspace_rows, head_dim / 128]` fp32),
-`index_k_bf16` the rows of a `bf16` one (`[workspace_rows, head_dim]` bf16),
+head_dim]` uint8 or float8_e4m3fn, `[workspace_rows, head_dim / 128]` fp32).
+For `mxfp8`, the same pair carries int32 packed UE8M0 scales.
+`index_k_bf16` carries the rows of a `bf16` plane (`[workspace_rows, head_dim]` bf16),
 each one row per entry of `kv_workspace_slots` and selecting with that
 `index_k_format` and `index_k_layout="packed"`, never together and never with
 `index_k_cache`; a call with neither a plane nor rows is a `ValueError`.

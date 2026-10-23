@@ -84,9 +84,10 @@ def _assert_encoded(
     actual_scales = actual_scales.reshape(-1)
     expected_scales = expected_scales.reshape(-1)
     torch.testing.assert_close(actual_scales, expected_scales, rtol=1e-5, atol=1e-7)
-    active = expected_scales >= 0
-    actual_values = actual_values.reshape(-1, _DIM)[active]
-    expected_values = expected_values.reshape(-1, _DIM)[active]
+    mx = expected_scales.dtype == torch.uint8
+    active = expected_scales != 255 if mx else expected_scales >= 0
+    actual_values = actual_values.reshape(-1, 32 if mx else _DIM)[active]
+    expected_values = expected_values.reshape(-1, 32 if mx else _DIM)[active]
     quantum_distance = _fp8_quantum_distance(actual_values, expected_values)
     max_distance = int(quantum_distance.max().item())
     assert max_distance <= _MAX_FP8_QUANTUM_DISTANCE, (
@@ -166,7 +167,12 @@ class _CacheState:
 
 
 def _state(
-    requests: int, *, tail_size: int = 7, table_cols: int = 2, seed: int = 0
+    requests: int,
+    *,
+    tail_size: int = 7,
+    table_cols: int = 2,
+    seed: int = 0,
+    mxfp8: bool = False,
 ) -> _CacheState:
     generator = torch.Generator(device="cuda").manual_seed(seed)
     block_table = (
@@ -191,9 +197,9 @@ def _state(
             device="cuda",
         ),
         index_scales=torch.full(
-            (num_pages, _ROWS_PER_PAGE, 1),
-            -1.0,
-            dtype=torch.float32,
+            (num_pages, _ROWS_PER_PAGE, 4 if mxfp8 else 1),
+            255 if mxfp8 else -1.0,
+            dtype=torch.uint8 if mxfp8 else torch.float32,
             device="cuda",
         ),
         ape=torch.randn(
@@ -229,7 +235,8 @@ def _reference_append(
     return expected
 
 
-def test_prefill_write_matches_reference() -> None:
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_prefill_write_matches_reference(mxfp8) -> None:
     generator = torch.Generator(device="cuda").manual_seed(7)
     keys = _random((32, _POOL, _DIM), generator, 0.3)
     gates = _random((32, _POOL, _DIM), generator, 1.5)
@@ -241,16 +248,19 @@ def test_prefill_write_matches_reference() -> None:
         4, _ROWS_PER_PAGE, _DIM, dtype=torch.float8_e4m3fn, device="cuda"
     )
     scales = torch.full(
-        (4, _ROWS_PER_PAGE, 1), -1.0, dtype=torch.float32, device="cuda"
+        (4, _ROWS_PER_PAGE, 4 if mxfp8 else 1),
+        255 if mxfp8 else -1.0,
+        dtype=torch.uint8 if mxfp8 else torch.float32,
+        device="cuda",
     )
 
     kpool_prefill_write(keys, gates, write_slots, values, scales, ape)
 
-    expected_values, expected_scales = kpool_compress(keys, gates, ape)
+    expected_values, expected_scales = kpool_compress(keys, gates, ape, mxfp8=mxfp8)
     pages = write_slots // _ROWS_PER_PAGE
     rows = write_slots % _ROWS_PER_PAGE
     _assert_encoded(
-        values[pages, rows], scales[pages, rows, 0], expected_values, expected_scales
+        values[pages, rows], scales[pages, rows], expected_values, expected_scales
     )
 
 
@@ -488,8 +498,9 @@ def test_prefill_tail_write_graph_replay_tracks_live_counts() -> None:
     assert not torch.equal(tail_gate[0], initial_gate[0])
 
 
-def test_decode_append_matches_reference() -> None:
-    state = _state(4, seed=11)
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_decode_append_matches_reference(mxfp8) -> None:
+    state = _state(4, seed=11, mxfp8=mxfp8)
     keys = _random((4, 3, _DIM), state.generator, 0.3)
     gates = _random((4, 3, _DIM), state.generator, 1.5)
     seq_lens = torch.tensor([63, 64, 65, 68], dtype=torch.int32, device="cuda")
@@ -561,6 +572,7 @@ def test_decode_append_defers_unmaterialized_pool() -> None:
         torch.cat((committed_k.unsqueeze(0), accepted_k[0])).unsqueeze(0),
         torch.cat((committed_gate.unsqueeze(0), accepted_gate[0])).unsqueeze(0),
         state.ape,
+        mxfp8=False,
     )
     assert torch.equal(state.tail_k[1, draft_slots], accepted_k[0])
     _assert_encoded(

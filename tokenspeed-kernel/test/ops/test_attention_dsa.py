@@ -46,6 +46,8 @@ torch.manual_seed(42)
 def _pack_index_k_cache(
     index_k: torch.Tensor,
     page_size: int,
+    *,
+    mxfp8: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     head_dim = index_k.shape[1]
     num_groups = head_dim // 128
@@ -57,6 +59,21 @@ def _pack_index_k_cache(
         device=index_k.device,
         dtype=torch.uint8,
     )
+    if mxfp8:
+        values, scales = quantize_fp8(
+            index_k.to(torch.bfloat16),
+            granularity="token_group",
+            group_size=32,
+            scale_encoding="ue8m0",
+        )
+        raw = packed.view(num_pages, -1)
+        raw[:, : page_size * head_dim].copy_(
+            values.view(torch.uint8).reshape(num_pages, -1)
+        )
+        raw[:, page_size * head_dim :].copy_(scales.contiguous().reshape(num_pages, -1))
+        dequant = values.float().reshape(num_slots, head_dim // 32, 32)
+        dequant *= torch.exp2(scales.float() - 127).unsqueeze(-1)
+        return packed.view(torch.int8), dequant.reshape_as(index_k)
     x = index_k.float().reshape(num_slots, num_groups, 128)
     scale = x.abs().amax(dim=-1, keepdim=True).clamp_min(1.0e-6) / 448.0
     x_fp8 = (x / scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
@@ -847,20 +864,42 @@ def test_deep_gemm_sharded_index_candidates_global_windows(device, degree):
     q = torch.randn(3, heads, dim, device=device, dtype=torch.bfloat16)
     weights = torch.randn(3, heads, device=device)
     full, dequant = _pack_index_k_cache(
-        torch.randn(10 * page_size, dim, device=device), page_size
+        torch.randn(10 * page_size, dim, device=device),
+        page_size,
+        mxfp8=current_platform().is_blackwell,
     )
     logical_k = dequant.reshape(10, page_size, dim)[table[0].long()].reshape(-1, dim)
     quantized, scales = quantize_fp8(
         q.reshape(-1, dim),
         granularity="token_group",
-        group_size=128,
-        scale_encoding="float32",
+        group_size=32 if current_platform().is_blackwell else 128,
+        scale_encoding="ue8m0" if current_platform().is_blackwell else "float32",
     )
-    dequant_q = quantized.float().reshape_as(q) * scales[: 3 * heads].reshape(
-        3, heads, 1
-    )
+    if current_platform().is_blackwell:
+        dequant_q = quantized.float().reshape(3, heads, 4, 32)
+        dequant_q *= torch.exp2(scales.float() - 127).reshape(3, heads, 4, 1)
+        dequant_q = dequant_q.reshape_as(q)
+    else:
+        dequant_q = quantized.float().reshape_as(q) * scales[: 3 * heads].reshape(
+            3, heads, 1
+        )
     reference = torch.einsum("thd,sd->ths", dequant_q, logical_k).relu()
-    reference = (reference * weights.unsqueeze(-1)).sum(1) * 0.1
+    if current_platform().is_blackwell:
+        # Current MX MQA rounds ReLU and each four-lane reduction to BF16.
+        weighted = (weights * 0.1).to(torch.bfloat16).float()
+        scores_bf16 = reference.to(torch.bfloat16).float()
+        partials = torch.zeros(3, 4, reference.shape[-1], device=device)
+        for head in range(heads):
+            lane = head % 4
+            partials[:, lane] = (
+                (partials[:, lane] + scores_bf16[:, head] * weighted[:, head, None])
+                .to(torch.bfloat16)
+                .float()
+            )
+        pairs = (partials[:, :2] + partials[:, 2:]).to(torch.bfloat16).float()
+        reference = (pairs[:, 0] + pairs[:, 1]).to(torch.bfloat16).float()
+    else:
+        reference = (reference * weights.unsqueeze(-1)).sum(1) * 0.1
     positions = torch.arange(logical_k.shape[0], device=device)
     reference.masked_fill_(
         (positions < 4) | (positions >= causal_lens[:, None] - 8), float("inf")
@@ -954,7 +993,9 @@ def test_deep_gemm_index_candidates_graph_and_empty_rows(device, heads):
     assert lengths.flatten().tolist() == [129, 0, 0, 0, 0]
     q = torch.randn(5, heads, 128, dtype=torch.bfloat16, device=device)
     weights = torch.randn(5, heads, device=device)
-    cache, _ = _pack_index_k_cache(torch.randn(256, 128, device=device), 64)
+    cache, _ = _pack_index_k_cache(
+        torch.randn(256, 128, device=device), 64, mxfp8=current_platform().is_blackwell
+    )
 
     def run():
         return dsa_index_candidates(
@@ -1015,7 +1056,12 @@ def test_deep_gemm_index_candidates_empty_shard_large_batch(device, tokens):
         pytest.skip("DeepGEMM requires Hopper or newer")
     q = torch.zeros(tokens, 16, 128, device=device, dtype=torch.bfloat16)
     weights = torch.ones(tokens, 16, device=device)
-    cache = torch.zeros(64, 132, device=device, dtype=torch.uint8)
+    cache = torch.zeros(
+        64,
+        132,
+        device=device,
+        dtype=torch.int8 if current_platform().is_blackwell else torch.uint8,
+    )
     table = torch.full((1, 1), -1, device=device, dtype=torch.int32)
     requests = torch.zeros(tokens, device=device, dtype=torch.int32)
     lengths = torch.ones_like(requests)

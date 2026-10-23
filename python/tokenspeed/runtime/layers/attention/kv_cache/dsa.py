@@ -69,10 +69,12 @@ def split_index_k_rows(
             f"packed {index_k_format} index-K rows are {packed.shape[1]} bytes "
             f"wide, not {row_bytes}"
         )
-    if index_k_format == "fp8_scaled":
+    if index_k_format in ("fp8_scaled", "mxfp8"):
         return (
             packed[:, :index_head_dim],
-            packed[:, index_head_dim:].view(torch.float32),
+            packed[:, index_head_dim:].view(
+                torch.int32 if index_k_format == "mxfp8" else torch.float32
+            ),
         )
     return packed.view(index_k_plane_dtype(index_k_format)), None
 
@@ -133,7 +135,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 f"{plane_dtype} of index_k_format={index_k_format!r}"
             )
         head_dim = self.index_head_dim
-        if index_k_format != "fp8_scaled":
+        if index_k_format not in ("fp8_scaled", "mxfp8"):
             # A plain plane: the row is the key's bytes.
             return buf.reshape(-1, head_dim)[slots].view(torch.uint8)
         page_size = int(self.arena.kv_page_size)
@@ -146,7 +148,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
         scale = pages[:, page_size * head_dim :].view(num_pages, page_size, scale_bytes)
         page = torch.div(slots, page_size, rounding_mode="floor")
         offset = slots - page * page_size
-        return torch.cat((fp8[page, offset], scale[page, offset]), dim=1)
+        return torch.cat((fp8[page, offset], scale[page, offset]), dim=1).view(
+            torch.uint8
+        )
 
     def set_index_k_buffer(
         self,
@@ -175,17 +179,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 rows = torch.where(write_mask.unsqueeze(1), rows, buf[slots])
             buf[slots] = rows
             return
-        if buf.dtype != torch.uint8:
+        if buf.dtype not in (torch.uint8, torch.int8):
             raise TypeError(
                 f"index-K plane dtype {buf.dtype} has no write path: uint8 "
-                "(fp8_scaled) or bfloat16 (bf16)"
+                "(fp8_scaled), int8 (mxfp8), or bfloat16 (bf16)"
             )
         index_k_fp8, index_k_scale = quantize_fp8(
             index_k,
             granularity="token_group",
-            group_size=_INDEX_K_FP8_GROUP_SIZE,
-            scale_encoding="float32",
+            group_size=32 if buf.dtype == torch.int8 else _INDEX_K_FP8_GROUP_SIZE,
+            scale_encoding="ue8m0" if buf.dtype == torch.int8 else "float32",
         )
+
+        if buf.dtype == torch.int8:
+            index_k_scale = index_k_scale.contiguous().view(torch.int32)
 
         # Fused scatter; (page, slot_in_page) is derived from loc in-kernel.
         index_k_block_split_scatter(

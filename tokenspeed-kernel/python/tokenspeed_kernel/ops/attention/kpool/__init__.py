@@ -140,7 +140,9 @@ def kpool_prefill_write(
     traits = {
         "head_dim": int(head_dim),
         "pool_size": int(pool_size),
-        "index_k_format": "fp8_scaled",
+        "index_k_format": (
+            "mxfp8" if index_scales.dtype == torch.uint8 else "fp8_scaled"
+        ),
         "rotate": True,
     }
     signature = _attention_format_signature(slot_k=slot_k)
@@ -289,7 +291,9 @@ def kpool_decode_append(
     traits = {
         "head_dim": int(head_dim),
         "pool_size": int(pool_size),
-        "index_k_format": "fp8_scaled",
+        "index_k_format": (
+            "mxfp8" if index_scales.dtype == torch.uint8 else "fp8_scaled"
+        ),
         "rotate": True,
     }
     signature = _attention_format_signature(k=k)
@@ -391,7 +395,9 @@ def kpool_decode_topk(
         "page_size": int(page_size),
         "pool_size": int(pool_size),
         "topk_pools": int(topk_pools),
-        "index_k_format": "fp8_scaled",
+        "index_k_format": (
+            "mxfp8" if pooled_k_cache.dtype == torch.int8 else "fp8_scaled"
+        ),
         "score_activation": "relu" if apply_relu else "none",
         "topk_layout": "global_slots",
     }
@@ -530,7 +536,9 @@ def kpool_prefill_topk(
         "pool_size": int(pool_size),
         "topk_pools": int(topk_pools),
         "has_prefill_plan": has_prefill_plan,
-        "index_k_format": "fp8_scaled",
+        "index_k_format": (
+            "mxfp8" if pooled_k_cache.dtype == torch.int8 else "fp8_scaled"
+        ),
         "score_activation": "relu" if apply_relu else "none",
         "topk_layout": "global_slots",
     }

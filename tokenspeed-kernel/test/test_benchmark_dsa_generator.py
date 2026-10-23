@@ -152,6 +152,7 @@ def test_dsa_generator_rejects_unsupported_validation() -> None:
 )
 def test_kpool_generator_selection_traits_match_operation_api(
     monkeypatch: pytest.MonkeyPatch,
+    b200_platform,
     mode: str,
     prepare: Any,
     shape: dict[str, object],
@@ -169,9 +170,10 @@ def test_kpool_generator_selection_traits_match_operation_api(
     request = _request(mode, {**_GLM53_CONFIG, **shape})
 
     with pytest.raises(RuntimeError, match="selection captured"):
-        prepare(request, None)
+        prepare(request, b200_platform)
 
     assert captured[trait_name] == trait_value
+    assert captured["index_k_format"] == "mxfp8"
 
 
 def test_dsa_generator_builds_page_aligned_prefill_metadata() -> None:
@@ -202,7 +204,8 @@ def test_dsa_generator_builds_page_aligned_prefill_metadata() -> None:
     assert metadata["max_num_pools"] == 17
 
 
-def test_dsa_generator_uses_configured_index_page_stride(monkeypatch) -> None:
+@pytest.mark.parametrize("mxfp8", [False, True])
+def test_dsa_generator_uses_configured_index_page_stride(monkeypatch, mxfp8) -> None:
     original_empty = torch.empty
     config = _config()
 
@@ -220,14 +223,16 @@ def test_dsa_generator_uses_configured_index_page_stride(monkeypatch) -> None:
         3,
         config=config,
         generator=torch.Generator(device="cpu"),
+        mxfp8=mxfp8,
     )
 
     assert cache.shape == (3, 2112)
     assert cache.stride() == (23296, 1)
     assert values.shape == (3, 16, 128)
-    assert scales.shape == (3, 16, 1)
+    assert scales.shape == (3, 16, 4 if mxfp8 else 1)
+    assert cache.dtype == (torch.int8 if mxfp8 else torch.uint8)
     assert values.stride(0) == 23296
-    assert scales.stride(0) == 5824
+    assert scales.stride(0) == (23296 if mxfp8 else 5824)
 
 
 def test_dsa_generator_reuses_runtime_history_table_for_index_and_kv() -> None:

@@ -13,6 +13,16 @@ The GLM-5.3-Flash specialization has fixed geometry:
 - BF16 queries, signed BF16 or FP32 head weights, and scaled FP8 E4M3 keys
 - weighted per-head ReLU scoring and global FlatKV-slot output
 
+Blackwell stores MXFP8 keys with one UE8M0 exponent per 32 values. The four
+exponent bytes occupy the same space as the former FP32 scale, so each row
+remains 132 bytes. Its cache plane is `int8`; Hopper and AMD retain `uint8`
+FP8 planes with one FP32 scale per 128 values. The fused pool writers preserve
+the BF16 pooling and Hadamard boundaries before quantizing to this format.
+
+Planned Blackwell prefill uses DeepGEMM's current MX MQA API, including BF16
+weights, ReLU, weighted reduction and logits. Portable decode reads the
+exponent plane directly and retains FP32 score reduction.
+
 ## Prefill selection
 
 The hybrid Gluon implementation keeps one orchestration path across AMD

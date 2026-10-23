@@ -3084,8 +3084,8 @@ def index_k_block_split_scatter(
     if buf.storage_offset() % 4 or page_bytes % 4:
         raise ValueError("Index-K pages must be float32 aligned")
 
-    fp8_buf = buf
-    scale_buf = buf.view(torch.float32)  # aliases the same storage
+    fp8_buf = buf.view(torch.uint8)
+    scale_buf = buf.view(index_k_scale.dtype)  # aliases the same storage
     k_fp8 = index_k_fp8.reshape(-1, head_dim).contiguous().view(torch.uint8)
     k_scale = index_k_scale.reshape(-1, ng).contiguous()
 

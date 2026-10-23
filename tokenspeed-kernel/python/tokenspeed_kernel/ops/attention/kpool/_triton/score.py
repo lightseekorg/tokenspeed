@@ -47,6 +47,7 @@ def _kpool_score_prefill_chunk_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     num_groups: tl.constexpr,
+    MX: tl.constexpr,
     pool_size: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -69,9 +70,10 @@ def _kpool_score_prefill_chunk_kernel(
         block_table + req * block_table_stride + page_idx, mask=valid, other=0
     ).to(tl.int64)
     fp8_base = page * cache_page_stride_bytes + page_offset * head_dim
+    scale_bytes: tl.constexpr = 1 if MX else 4
     scale_base = (
-        page * (cache_page_stride_bytes // 4)
-        + (page_size * head_dim) // 4
+        page * (cache_page_stride_bytes // scale_bytes)
+        + (page_size * head_dim) // scale_bytes
         + page_offset * num_groups
     )
 
@@ -90,10 +92,12 @@ def _kpool_score_prefill_chunk_kernel(
             other=0.0,
         ).to(tl.float32)
         k_scale = tl.load(
-            pooled_k_scale + scale_base + dim_start // 128,
+            pooled_k_scale + scale_base + dim_start // BLOCK_D,
             mask=valid,
             other=0.0,
         ).to(tl.float32)
+        if MX:
+            k_scale = tl.exp2(k_scale - 127.0)
         scores += tl.sum(k_vals * k_scale[:, None] * q_vals[None, :], axis=1)
 
     tl.store(
@@ -170,6 +174,7 @@ def _kpool_score_dense_mma_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     num_groups: tl.constexpr,
+    MX: tl.constexpr,
     pool_size: tl.constexpr,
     softmax_scale: tl.constexpr,
     APPLY_RELU: tl.constexpr,
@@ -201,9 +206,10 @@ def _kpool_score_dense_mma_kernel(
             other=0,
         ).to(tl.int64)
         fp8_base = page * cache_page_stride_bytes + page_offset * head_dim
+        scale_bytes: tl.constexpr = 1 if MX else 4
         scale_base = (
-            page * (cache_page_stride_bytes // 4)
-            + (page_size * head_dim) // 4
+            page * (cache_page_stride_bytes // scale_bytes)
+            + (page_size * head_dim) // scale_bytes
             + page_offset * num_groups
         )
 
@@ -226,6 +232,8 @@ def _kpool_score_dense_mma_kernel(
                 mask=valid_pool,
                 other=0.0,
             ).to(tl.float32)
+            if MX:
+                group_scale = tl.exp2(group_scale - 127.0)
             head_scores += (
                 tl.dot(k_tile, tl.trans(q_tile), out_dtype=tl.float32)
                 * group_scale[:, None]
@@ -334,14 +342,15 @@ def select_kpool_chunked(
         Request-local selected pool ids.
     """
     num_tokens, num_heads, head_dim = q.shape
-    num_groups = head_dim // 128
+    mx = pooled_k_cache.dtype == torch.int8
+    num_groups = head_dim // (32 if mx else 128)
 
     chunk_pools = max(int(chunk_pools), int(topk_pools))
     chunk_pools = min(triton.next_power_of_2(chunk_pools), max(max_num_pools, 1))
     chunk_pools = triton.next_power_of_2(chunk_pools)
     block_n = min(chunk_pools, 256)
     cache_fp8 = pooled_k_cache.view(torch.float8_e4m3fn)
-    cache_fp32 = pooled_k_cache.view(torch.float32)
+    cache_fp32 = pooled_k_cache.view(torch.uint8 if mx else torch.float32)
     result = torch.empty((num_tokens, topk_pools), dtype=torch.int32, device=q.device)
     if num_tokens == 0:
         return result
@@ -405,9 +414,10 @@ def select_kpool_chunked(
                 num_heads=num_heads,
                 head_dim=head_dim,
                 num_groups=num_groups,
+                MX=mx,
                 pool_size=pool_size,
                 BLOCK_N=block_n,
-                BLOCK_D=min(head_dim, 128),
+                BLOCK_D=32 if mx else min(head_dim, 128),
                 num_warps=4,
                 num_stages=1,
             )
@@ -518,7 +528,8 @@ def score_kpool_dense(
         FP32 scores shaped ``[tokens, max_num_pools]``.
     """
     num_tokens, num_heads, head_dim = q.shape
-    num_groups = head_dim // 128
+    mx = pooled_k_cache.dtype == torch.int8
+    num_groups = head_dim // (32 if mx else 128)
     max_num_pools = int(max_num_pools)
     if max_num_pools <= 0:
         raise ValueError(f"max_num_pools must be positive, got {max_num_pools}")
@@ -554,7 +565,7 @@ def score_kpool_dense(
     _kpool_score_dense_mma_kernel[(num_tokens, num_workers)](
         q,
         pooled_k_cache.view(torch.float8_e4m3fn),
-        pooled_k_cache.view(torch.float32),
+        pooled_k_cache.view(torch.uint8 if mx else torch.float32),
         weights,
         causal_lens,
         req_ids,
@@ -568,13 +579,14 @@ def score_kpool_dense(
         num_heads=num_heads,
         head_dim=head_dim,
         num_groups=num_groups,
+        MX=mx,
         pool_size=pool_size,
         softmax_scale=float(softmax_scale),
         APPLY_RELU=bool(apply_relu),
         NUM_WORKERS=num_workers,
         BLOCK_M=block_m,
         BLOCK_H=block_h,
-        BLOCK_D=128,
+        BLOCK_D=32 if mx else 128,
         num_warps=8,
         num_stages=2,
     )

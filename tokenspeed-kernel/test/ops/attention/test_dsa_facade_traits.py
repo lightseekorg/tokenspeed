@@ -705,3 +705,31 @@ def test_topk_passes_preallocated_buffers_and_forced_window_policy(topk_leaves, 
     call = bf16[mode][0]
     assert call["out"] is out and call["lens_out"] is lens
     assert call["initial_tokens"] == 1 and call["local_tokens"] == 2
+
+
+def test_mxfp8_plane_and_workspace_rows_select_the_scale_format(topk_leaves):
+    fp8, bf16 = topk_leaves
+    decode = _register_topk_leaf(
+        "dsa_decode_topk",
+        "mx_decode",
+        index_k_format="mxfp8",
+        layouts=("packed",),
+        workspace_rows=False,
+    )
+    prefill = _register_topk_leaf(
+        "dsa_prefill_topk",
+        "mx_prefill",
+        index_k_format="mxfp8",
+        layouts=("packed",),
+        workspace_rows=True,
+    )
+    _decode_topk(torch.zeros((128, FP8_ROW_BYTES), dtype=torch.int8))
+    scales = torch.zeros((16, 1), dtype=torch.int32)
+    _prefill_topk(
+        None,
+        index_k_fp8=torch.zeros((16, HEAD_DIM), dtype=torch.uint8),
+        index_k_scale=scales,
+    )
+    assert len(decode) == len(prefill) == 1
+    assert prefill[0]["index_k_scale"] is scales
+    assert not fp8["dsa_decode_topk"] and not bf16["dsa_decode_topk"]

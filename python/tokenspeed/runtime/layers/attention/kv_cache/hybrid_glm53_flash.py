@@ -151,7 +151,7 @@ class HybridGlm53FlashTokenToKVPool(HybridKDATokenToKVPool):
             (buf.shape[0], rows_per_page, num_groups * scale_bytes),
             (page_stride, num_groups * scale_bytes, 1),
             buf.storage_offset() + rows_per_page * self.index_head_dim,
-        ).view(torch.float32)
+        ).view(torch.uint8 if buf.dtype == torch.int8 else torch.float32)
         return values, scales
 
     def get_mla_kv_buffer(
