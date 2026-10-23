@@ -31,9 +31,8 @@ unsafe extern "C" fn create(
     devices: *const c_char,
 ) -> *mut c_void {
     // SAFETY: Engine::start holds each C string for the call.
-    let arguments = [host, metadata, protocol, devices].map(|value| unsafe {
-        CStr::from_ptr(value).to_str().unwrap().to_owned()
-    });
+    let arguments = [host, metadata, protocol, devices]
+        .map(|value| unsafe { CStr::from_ptr(value).to_str().unwrap().to_owned() });
     Box::into_raw(Box::new(arguments)).cast()
 }
 

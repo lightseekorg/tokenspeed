@@ -859,8 +859,8 @@ standard or grouped-query attention in the target and draft, respectively.
 
 Mooncake KV transfer selects `ascend_direct` on Ascend NPU and `rdma` on
 GPU platforms. Install a Mooncake build that supports the selected transport
-and exposes `TransferEngine.batch_transfer_sync_write_pages`. The page API
-is required; TokenSpeed does not expand page transfers through an older API.
+and provides the TokenSpeed C entry points in `libtokenspeed_transfer_engine.so`,
+including `ts_mooncake_write_pages` for page transfers.
 Both Prefill and Decode engines select their transport from the detected
 platform. Startup settings pass this protocol to the Rust transfer peer,
 which keeps it when recreating a session after a memory resume.

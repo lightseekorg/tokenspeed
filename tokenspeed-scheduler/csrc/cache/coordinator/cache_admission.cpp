@@ -973,7 +973,16 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             }
             if (step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand) {
                 FatalCheck(allocator.AcquireStateLive(pool_, table), "admission plan no longer fits the block pool");
-                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(table.Blocks()[1]->Location()));
+                const std::int32_t live = allocator.ResolveCacheBlockId(table.Blocks()[1]->Location());
+                if (step.kind == StateStep::Kind::kLand && state_prefix_cached) {
+                    // The peer omits this state transfer. A bootstrap token
+                    // can finish the request before any decode writes live.
+                    _assert(static_cast<bool>(table.Blocks()[0]), "an exact state hit must have an input checkpoint");
+                    result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(table.Blocks()[0]->Location()),
+                                                         live);
+                } else {
+                    result.new_page_ids[i].push_back(live);
+                }
             }
             if (step.checkpoint) {
                 _assert(step.kind == StateStep::Kind::kRotate, "an in-forward checkpoint rides a prefill chunk");
