@@ -46,6 +46,7 @@ import torch
 from tokenspeed_kernel.ops.attention.gdn import (
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
+    GdnStateCheckpoints,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.l2norm import l2norm_fwd
 from tokenspeed_kernel.platform import (
@@ -129,6 +130,7 @@ if is_available():
             "num_v_gte_num_q": frozenset({True}),
             "output_h": frozenset({False, True}),
             "qk_l2norm": frozenset({False, True}),
+            "state_checkpoints": frozenset({False, True}),
         },
     )
     def flashinfer_gdn_chunk_prefill(
@@ -144,6 +146,7 @@ if is_available():
         qk_l2norm: bool = False,
         output_final_state: bool = True,
         output_h: bool = False,
+        state_checkpoints: GdnStateCheckpoints | None = None,
     ):
         """Run one chunked GDN prefill on Hopper or Blackwell.
 
@@ -167,6 +170,10 @@ if is_available():
 
         The caller indexes directly with flashinfer-native offsets rather than
         rebuilding the FLA h tensor.
+
+        ``state_checkpoints`` hands the kernel a caller-owned float32 buffer
+        and its cumulative counts instead (``GdnStateCheckpoints``): no host
+        synchronization, any interval that is a multiple of 64.
         """
         batched = q.dim() == 4
         q3 = q.squeeze(0) if batched else q
@@ -187,8 +194,25 @@ if is_available():
         # only a dtype cast + contiguity are needed, no transpose.
         fi_initial_state = initial_state.float().contiguous()
 
-        state_checkpoints = None
+        checkpoint_every_n_tokens = CHUNK_SIZE if output_h else 0
+        checkpoint_states = None
         checkpoint_cu_starts = None
+        if state_checkpoints is not None:
+            if output_h:
+                raise ValueError("output_h and state_checkpoints are exclusive")
+            if (
+                state_checkpoints.every_n_tokens <= 0
+                or state_checkpoints.every_n_tokens % CHUNK_SIZE
+            ):
+                raise ValueError(
+                    "state checkpoint interval must be a positive multiple of "
+                    f"{CHUNK_SIZE}, got {state_checkpoints.every_n_tokens}"
+                )
+            if state_checkpoints.states.dtype != torch.float32:
+                raise ValueError("state checkpoints are stored as float32")
+            checkpoint_every_n_tokens = state_checkpoints.every_n_tokens
+            checkpoint_states = state_checkpoints.states
+            checkpoint_cu_starts = state_checkpoints.cu_starts
         if output_h:
             per_seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)
             # flashinfer-native checkpoint count: only full chunks emit a checkpoint.
@@ -197,7 +221,7 @@ if is_available():
             H_state = fi_initial_state.shape[1]
             V_state = fi_initial_state.shape[-2]
             K_state = fi_initial_state.shape[-1]
-            state_checkpoints = torch.empty(
+            checkpoint_states = torch.empty(
                 total_h_ckpts,
                 H_state,
                 V_state,
@@ -222,9 +246,9 @@ if is_available():
             initial_state=fi_initial_state,
             output_final_state=output_final_state,
             cu_seqlens=cu_seqlens,
-            state_checkpoints=state_checkpoints,
+            state_checkpoints=checkpoint_states,
             checkpoint_cu_starts=checkpoint_cu_starts,
-            checkpoint_every_n_tokens=CHUNK_SIZE if output_h else 0,
+            checkpoint_every_n_tokens=checkpoint_every_n_tokens,
             # WORKAROUND: FlashInfer 0.6.18's CP cache uses the stale
             # cute.compile[...] syntax, which CUTLASS DSL 4.7.1 no longer
             # supports. Remove this when custom_compile_cache is fixed
@@ -250,7 +274,7 @@ if is_available():
         return GdnChunkPrefillResult(
             out=out,
             final_state=final_state,
-            h=state_checkpoints,
+            h=checkpoint_states,
             h_cu_starts=checkpoint_cu_starts,
             h_layout=GdnCheckpointLayout.FLASHINFER,
         )

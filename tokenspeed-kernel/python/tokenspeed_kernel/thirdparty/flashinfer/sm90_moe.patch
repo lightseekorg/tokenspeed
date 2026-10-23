@@ -169,17 +169,20 @@ index 8aced03878c5d2058da77d393d7cd20d8bb97798..c1127e1189331a62209ce5afd393290d
 +                   enable_pdl, static_cast<ActivationType>(base_activation_type), workspace_buffer,
 +                   expected_m);
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
-index fbdc902972668033d6bd8653d60c875dd51889f7..9177735f0ee0288bb7393570211ba024522a3d0c 100644
+index fbdc902972668033d6bd8653d60c875dd51889f7..b7643e075a95d6930b80478ac1f55a31a6b5df6e 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/compiler.cuh
-@@ -268 +268,20 @@
+@@ -268 +268,23 @@ class Compiler {
 -    std::filesystem::path path = getCacheDir() / name;
 +    // The caller selects a module at initialization, never process-wide state.
 +#ifdef FLASHINFER_SM90_GROUPED_MOE_OPTIMIZATIONS
-+    // Reserve a conservative shared-memory budget for scheduler metadata.
++    // Reserve a conservative shared-memory budget for scheduler metadata (tile prefix and map, warp
++    // totals, and a copy of the expert offsets).
 +    // CUDA permits at most 32 warps per block; round static storage up for alignment.
 +    const size_t scheduler_smem =
-+        ((static_cast<size_t>(num_groups) * 3 + 1 + 32) * sizeof(uint32_t) + 127) / 128 * 128;
++        ((static_cast<size_t>(num_groups) * 3 + 1 + 32) * sizeof(uint32_t) +
++         (static_cast<size_t>(num_groups) + 1) * sizeof(int64_t) + 127) /
++        128 * 128;
 +    const bool prefix_scheduler =
 +        swapAB && gemm_type == deep_gemm::GemmType::GroupedWithOffset &&
 +        scheduler_smem + get_smem_size(num_stages, shape_k, block_m, block_n, block_k, true) <=
@@ -194,28 +197,62 @@ index fbdc902972668033d6bd8653d60c875dd51889f7..9177735f0ee0288bb7393570211ba024
 +    else if (prefix_scheduler)
 +      path /= "prefix_scheduler";
 +    path /= name;
-@@ -288,0 +308,2 @@
+@@ -288,0 +311,2 @@ class Compiler {
 +    if (prefix_scheduler) flags.push_back("-DMOE_MBU_PREFIX_SCHEDULER=1");
 +    if (tile_map_scheduler) flags.push_back("-DMOE_MBU_TILE_MAP_SCHEDULER=1");
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
-index ae03a82216126c5554e49ca491c874484573d325..dbfb06d3c6f1e55d38e8a73a820157af2d206f75 100644
+index ae03a82216126c5554e49ca491c874484573d325..3b8b0c743569eb3c1a6ce8c07af87e97a6c9ed6f 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
-@@ -571,0 +572,59 @@
+@@ -471,0 +472,6 @@ __global__ void __launch_bounds__(
++  // The TMA thread prefetches each tile's weight scales with a bulk copy when a scale row is a
++  // multiple of 16 bytes, into one of two buffers that alternate between tiles; otherwise the math
++  // threads read them at the start of each tile.
++  static constexpr uint32_t SMEM_SCALES_A_ROW_SIZE = SHAPE_K_SCALES * sizeof(float);
++  static constexpr bool kPrefetchScalesA = SMEM_SCALES_A_ROW_SIZE % 16 == 0;
++  static constexpr uint32_t kNumScalesABuffers = kPrefetchScalesA ? 2 : 1;
+@@ -473 +479 @@ __global__ void __launch_bounds__(
+-      ceil_div<uint32_t>(SHAPE_K_SCALES * sizeof(float), sizeof(Barrier)) *
++      ceil_div<uint32_t>(kNumScalesABuffers * SMEM_SCALES_A_ROW_SIZE, sizeof(Barrier)) *
+@@ -474,0 +481,3 @@ __global__ void __launch_bounds__(
++  // Weights are streamed once per call: evict them first, so they recycle their own L2 lines instead
++  // of evicting (and writing back) what earlier kernels left in L2 while this GEMM runs.
++  static constexpr auto kWeightCacheHint = cute::TMA::CacheHintSm90::EVICT_FIRST;
+@@ -548,0 +558,9 @@ __global__ void __launch_bounds__(
++#ifdef MOE_MBU_PREFIX_SCHEDULER
++  // Issue the expert offset loads of the first scan chunk now; their latency overlaps the barrier.
++  int64_t first_offset = 0, first_boundary = 0;
++  if (threadIdx.x < kNumGroups) {
++    first_offset = __ldg(problem_input.problem_n_offsets + threadIdx.x);
++    first_boundary = __ldg(problem_input.problem_n_offsets + threadIdx.x + 1);
++  }
++#endif
++
+@@ -571,0 +590,60 @@ __global__ void __launch_bounds__(
 +#ifdef MOE_MBU_PREFIX_SCHEDULER
 +  __shared__ uint32_t tile_prefix[kNumGroups + 1];
 +  __shared__ uint32_t warp_totals[kNumThreads / 32];
-+  if (threadIdx.x == 0) tile_prefix[0] = 0;
-+  __syncthreads();
++  // Expert offsets, read once here; the scheduler reads them from shared memory for every tile.
++  __shared__ int64_t smem_offsets[kNumGroups + 1];
++#ifdef MOE_MBU_TILE_MAP_SCHEDULER
++  // Bounded shared lookup; larger inputs keep the prefix binary search.
++  __shared__ uint32_t tile_groups[2 * kNumGroups];
++#endif
 +  // Scan chunks so expert count need not match block or warp size.
 +  for (uint32_t base = 0; base < kNumGroups; base += kNumThreads) {
 +    const uint32_t group = base + threadIdx.x;
++    int64_t offset = first_offset, boundary = first_boundary;
++    if (base != 0 and group < kNumGroups) {
++      offset = __ldg(problem_input.problem_n_offsets + group);
++      boundary = __ldg(problem_input.problem_n_offsets + group + 1);
++    }
 +    uint32_t partial = 0;
 +    if (group < kNumGroups) {
-+      const auto rows = problem_input.problem_n_offsets[group + 1] -
-+                        problem_input.problem_n_offsets[group];
-+      partial = ceil_div(rows, static_cast<int64_t>(BLOCK_N));
++      partial = ceil_div(boundary - offset, static_cast<int64_t>(BLOCK_N));
++      smem_offsets[group] = offset;
++      if (group == kNumGroups - 1) smem_offsets[kNumGroups] = boundary;
 +    }
++    const uint32_t tiles = partial;
 +#pragma unroll
 +    for (int delta = 1; delta < 32; delta *= 2) {
 +      const uint32_t other = __shfl_up_sync(0xffffffff, partial, delta);
@@ -233,72 +270,125 @@ index ae03a82216126c5554e49ca491c874484573d325..dbfb06d3c6f1e55d38e8a73a820157af
 +      if (lane_idx < kNumThreads / 32) warp_totals[lane_idx] = total;
 +    }
 +    __syncthreads();
++    // tile_prefix[base] is written by the previous chunk (or is 0) and read only after a barrier
++    const uint32_t chunk_start = base == 0 ? 0 : tile_prefix[base];
 +    if (group < kNumGroups) {
-+      tile_prefix[group + 1] = tile_prefix[base] + partial +
-+                               (warp_idx ? warp_totals[warp_idx - 1] : 0);
++      const uint32_t end = chunk_start + partial + (warp_idx ? warp_totals[warp_idx - 1] : 0);
++      tile_prefix[group + 1] = end;
++      if (group == 0) tile_prefix[0] = 0;
++#ifdef MOE_MBU_TILE_MAP_SCHEDULER
++      for (uint32_t tile = end - tiles; tile < min(end, 2 * kNumGroups); ++tile)
++        tile_groups[tile] = group;
++#endif
 +    }
 +    __syncthreads();
 +  }
 +#ifdef MOE_MBU_TILE_MAP_SCHEDULER
-+  // Bounded shared lookup; larger inputs keep the prefix binary search.
-+  __shared__ uint32_t tile_groups[2 * kNumGroups];
-+  const uint32_t mapped_tiles = min(tile_prefix[kNumGroups], 2 * kNumGroups);
-+  for (uint32_t tile = threadIdx.x; tile < mapped_tiles; tile += kNumThreads) {
-+    uint32_t low = 0;
-+    uint32_t high = kNumGroups;
-+    while (low < high) {
-+      const uint32_t mid = (low + high) / 2;
-+      if (tile_prefix[mid + 1] <= tile)
-+        low = mid + 1;
-+      else
-+        high = mid;
-+    }
-+    tile_groups[tile] = low;
-+  }
-+  __syncthreads();
-+  auto scheduler = SchedulerType(problem_input, tile_prefix, tile_groups);
++  auto scheduler = SchedulerType(problem_input, tile_prefix, smem_offsets, tile_groups);
 +#else
-+  auto scheduler = SchedulerType(problem_input, tile_prefix);
++  auto scheduler = SchedulerType(problem_input, tile_prefix, smem_offsets);
 +#endif
 +#else
-@@ -572,0 +632 @@
+@@ -572,0 +651 @@ __global__ void __launch_bounds__(
 +#endif
+@@ -596,2 +675,3 @@ __global__ void __launch_bounds__(
+-            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
+-                     scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
++            tma_copy<1, kWeightCacheHint>(
++                &tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
++                scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
+@@ -615,0 +696,15 @@ __global__ void __launch_bounds__(
++            // The weight scales of the whole tile arrive with its first stage
++            uint32_t scales_a_bytes = 0;
++            if constexpr (kPrefetchScalesA) {
++              if (k_iter == 0 and s == 0) {
++                auto scale_row = scheduler.get_global_scales_a_idx(ceil_div(SHAPE_M, BLOCK_K), 0,
++                                                                   0, n_block_idx) +
++                                 (m_block_idx * BLOCK_M) / BLOCK_K;
++                bulk_copy_g2s(scales_a + scale_row * SHAPE_K_SCALES,
++                              reinterpret_cast<uint64_t*>(&full_barrier),
++                              smem_scales_a + (scheduler.current_iter & 1) * SHAPE_K_SCALES,
++                              SMEM_SCALES_A_ROW_SIZE);
++                scales_a_bytes = SMEM_SCALES_A_ROW_SIZE;
++              }
++            }
++
+@@ -617 +712 @@ __global__ void __launch_bounds__(
+-                                              SMEM_SCALES_B_SIZE_PER_STAGE);
++                                              SMEM_SCALES_B_SIZE_PER_STAGE + scales_a_bytes);
+@@ -653,2 +748,2 @@ __global__ void __launch_bounds__(
+-      // Load A scales with math warp-groups (weight scales)
+-      if (threadIdx.x >= 32) {
++      // Load A scales with math warp-groups (weight scales) unless the TMA thread prefetched them
++      if (not kPrefetchScalesA and threadIdx.x >= 32) {
+@@ -663 +758,3 @@ __global__ void __launch_bounds__(
+-      cutlass::arch::NamedBarrier(kNumMathThreads).sync();
++      if constexpr (not kPrefetchScalesA) cutlass::arch::NamedBarrier(kNumMathThreads).sync();
++      float const* smem_tile_scales =
++          smem_scales_a + (kPrefetchScalesA ? (scheduler.current_iter & 1) * SHAPE_K_SCALES : 0);
+@@ -686,4 +783 @@ __global__ void __launch_bounds__(
+-          // Read weight scales (A scales)
+-          float scale_a_0 = ld_shared(smem_scales_a + k_iter * kNumStages + s);
+-
+-          // Wait TMA arrivals
++          // Wait TMA arrivals (prefetched weight scales arrive with the tile's first stage)
+@@ -691,0 +786,3 @@ __global__ void __launch_bounds__(
++          // Read weight scales (A scales)
++          float scale_a_0 = ld_shared(smem_tile_scales + k_iter * kNumStages + s);
++
+@@ -752,0 +850,3 @@ __global__ void __launch_bounds__(
++      // Without the barrier at the start of the tile (scales are prefetched), wait here until
++      // thread 0 has finished storing the previous tile from smem_d before overwriting it.
++      if constexpr (kPrefetchScalesA) cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
-index 8e26486d4d5596e4ef2b244cec59987c798216c0..2e1a838884bb6dca28d6ac0ed548c854a4d4aa02 100644
+index 8e26486d4d5596e4ef2b244cec59987c798216c0..115cf07b5565e0be23775cd8d465a7712b53a22b 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/jit_utils.cuh
-@@ -66 +66 @@
+@@ -66 +66 @@ GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint32_t sha
 -                                bool swap_ab);
 +                                bool swap_ab, int max_num_stages);
-@@ -139 +139,2 @@
+@@ -110,0 +111,2 @@ inline int get_smem_size(int num_stages, int k, int block_m, int block_n, int bl
++    // Weight-scale rows that are a multiple of 16 bytes are prefetched into two alternating buffers.
++    int scale_buffers = div_up(k, block_k) * 4 % 16 == 0 ? 2 : 1;
+@@ -112,2 +114,2 @@ inline int get_smem_size(int num_stages, int k, int block_m, int block_n, int bl
+-    int smem_a_per_stage = block_m * block_k;              // weight
+-    int smem_scales_a_per_stage = div_up(k, block_k) * 4;  // weight scales
++    int smem_a_per_stage = block_m * block_k;                              // weight
++    int smem_scales_a_per_stage = scale_buffers * div_up(k, block_k) * 4;  // weight scales
+@@ -139 +141,2 @@ inline GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint3
 -                                       bool is_grouped_contiguous = false, bool swap_ab = false) {
 +                                       bool is_grouped_contiguous = false, bool swap_ab = false,
 +                                       int max_num_stages = -1) {
-@@ -205,0 +207,3 @@
+@@ -205,0 +209,3 @@ inline GemmConfig get_best_gemm_config(uint32_t shape_m, uint32_t shape_n, uint3
 +    if (max_num_stages > 0 && num_stages > max_num_stages) {
 +      continue;
 +    }
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
-index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c39a7ffca8f3fdd34e92511a5dbb585a501eee57 100644
+index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c7f3c67623a62154bc1dc688369c6a03df975f19 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/scheduler.cuh
-@@ -451,0 +452,15 @@
+@@ -451,0 +452,20 @@ struct GroupedWithOffsetSchedulerSwapAB {
 +#ifdef MOE_MBU_PREFIX_SCHEDULER
 +  uint32_t const* tile_prefix;
++  // Shared-memory copy of problem_n_offsets made by the kernel's prologue scan
++  int64_t const* offsets;
 +#ifdef MOE_MBU_TILE_MAP_SCHEDULER
 +  uint32_t const* tile_groups;
 +  __device__ __forceinline__ GroupedWithOffsetSchedulerSwapAB(Input& input, uint32_t const* prefix,
++                                                              int64_t const* smem_offsets,
 +                                                              uint32_t const* groups)
-+      : GroupedWithOffsetSchedulerSwapAB(input, prefix) {
++      : GroupedWithOffsetSchedulerSwapAB(input, prefix, smem_offsets) {
 +    tile_groups = groups;
 +  }
 +#endif
-+  __device__ __forceinline__ GroupedWithOffsetSchedulerSwapAB(Input& input, uint32_t const* prefix)
++  __device__ __forceinline__ GroupedWithOffsetSchedulerSwapAB(Input& input, uint32_t const* prefix,
++                                                              int64_t const* smem_offsets)
 +      : GroupedWithOffsetSchedulerSwapAB(input) {
 +    tile_prefix = prefix;
++    offsets = smem_offsets;
 +  }
 +#endif
-@@ -490,0 +506,27 @@
+@@ -490,0 +511,27 @@ struct GroupedWithOffsetSchedulerSwapAB {
 +#ifdef MOE_MBU_PREFIX_SCHEDULER
 +    const uint32_t global_n_tile = next_block_idx / kNumMBlocks;
 +    if (global_n_tile >= tile_prefix[kNumGroups]) return false;
@@ -322,15 +412,38 @@ index 15a624af4233f45eb95ad4b0cc39fbf010d4ce1e..c39a7ffca8f3fdd34e92511a5dbb585a
 +#endif
 +    curr_cumsum = tile_prefix[curr_group_idx];
 +    num_n_blocks = tile_prefix[curr_group_idx + 1] - curr_cumsum;
-+    n_offset = __ldg(problem_n_offsets + curr_group_idx);
-+    n_boundary = __ldg(problem_n_offsets + curr_group_idx + 1);
++    n_offset = offsets[curr_group_idx];
++    n_boundary = offsets[curr_group_idx + 1];
 +    n_padded_4_offset = compute_padded_offset(n_offset, curr_group_idx);
 +#else
-@@ -506,0 +549,2 @@
-+
+@@ -507,0 +555,2 @@ struct GroupedWithOffsetSchedulerSwapAB {
 +#endif
++
+diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh
+index 173998b089af816e873dac5d67ae12f3ab1acc30..74c5957e8f88867648da03a3545b9dcdeca74c52 100644
+--- a/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh
++++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/tma_utils.cuh
+@@ -115 +115,2 @@ CUtensorMap make_2d_tma_copy_desc(T* global_address, uint64_t gmem_dim[2], uint6
+-template <uint32_t kNumTMAMulticast = 1>
++template <uint32_t kNumTMAMulticast = 1,
++          cute::TMA::CacheHintSm90 kCacheHint = cute::TMA::CacheHintSm90::EVICT_NORMAL>
+@@ -119 +120 @@ __device__ __forceinline__ void tma_copy(void const* desc_ptr, uint64_t* barrier
+-  constexpr auto cache_hint = static_cast<uint64_t>(cute::TMA::CacheHintSm90::EVICT_NORMAL);
++  constexpr auto cache_hint = static_cast<uint64_t>(kCacheHint);
+@@ -127,0 +129,11 @@ __device__ __forceinline__ void tma_copy(void const* desc_ptr, uint64_t* barrier
++// Bulk copy of a contiguous global range into shared memory that completes on `barrier_ptr`.
++// Same PTX as cute::SM90_BULK_COPY_G2S, which the JIT build's cute subset (nvrtc_cutlass.cuh) lacks.
++__device__ __forceinline__ void bulk_copy_g2s(void const* gmem_ptr, uint64_t* barrier_ptr,
++                                              void* smem_ptr, uint32_t num_bytes) {
++  asm volatile(
++      "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n" ::"r"(
++          cute::cast_smem_ptr_to_uint(smem_ptr)),
++      "l"(gmem_ptr), "r"(num_bytes), "r"(cute::cast_smem_ptr_to_uint(barrier_ptr))
++      : "memory");
++}
++
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
-index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..426e570591ebc749e5350192757c1026563d2586 100644
+index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ca3394ec7c1720eb00118f4153bc679c94578cc1 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
 @@ -20,0 +21,2 @@
@@ -363,21 +476,29 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..426e570591ebc749e5350192757c1026
 @@ -140 +160 @@
 -                         problem_m_offsets, num_problems, expected_m_, max_shape_m_4_align_,
 +                         problem_m_offsets, num_problems, effective_m, max_shape_m_4_align_,
-@@ -142 +162 @@
+@@ -142 +162,2 @@
 -                         internal_quantize_a, internal_quantize_b);
-+                         internal_quantize_a, internal_quantize_b, max_num_stages);
-@@ -148,2 +168,2 @@
++                         internal_quantize_a, internal_quantize_b, max_num_stages,
++                         shape_m_4_align_);
+@@ -148,2 +169,3 @@
 -                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
 -                         shape_k, stream, internal_quantize_a, internal_quantize_b);
 +                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
-+                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages);
-@@ -155,2 +175,2 @@
++                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
++                         shape_m_4_align_);
+@@ -155,2 +177,3 @@
 -                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
 -                         shape_k, stream, internal_quantize_a, internal_quantize_b);
 +                         effective_m, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
-+                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages);
++                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
++                         shape_m_4_align_);
+@@ -219,0 +243,4 @@
++  // The workspace keeps the largest M requested so far. The grouped input quantization is
++  // launched for this call's M instead, so a small call after a large batch keeps its small
++  // grid and binary search; neither changes the quantized values or their layout.
++  shape_m_4_align_ = int64_t(div_up(max_shape_m, 4) * 4);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
-index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..9b9a0d3045216214c7a502ac6367922ae825c1d3 100644
+index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..937854fd9bb4352d434a244b38603d4bc3ef3c8b 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
 @@ -40,0 +41,6 @@
@@ -402,24 +523,45 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..9b9a0d3045216214c7a502ac6367922a
 -               float const* scales_a = nullptr, float const* scales_b = nullptr) override;
 +               float const* scales_a = nullptr, float const* scales_b = nullptr,
 +               int64_t expected_m = -1, int max_num_stages = -1) override;
+@@ -121,0 +136,2 @@
++  // This call's M, 4-aligned; sizes only the grouped input quantization launch.
++  int64_t shape_m_4_align_ = 0;
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..af21a026679fba9e93790c4aa17ed54ed6cffcad 100644
+index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..5c91ef819d30ca316aafc3479c97b049c23331df 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-@@ -1465 +1465,2 @@
+@@ -1465 +1465,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -                           cudaStream_t stream, int num_device_sms = kNumDeviceSMs) {
 +                           cudaStream_t stream, int max_num_stages,
 +                           int num_device_sms = kNumDeviceSMs) {
-@@ -1476 +1477 @@
+@@ -1476 +1477 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -                                             num_device_sms);
 +                                             num_device_sms, false, false, max_num_stages);
-@@ -1490 +1491 @@
+@@ -1490 +1491,5 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -                                             num_device_sms, false, true);
 +                                             num_device_sms, false, true, max_num_stages);
-@@ -1509 +1510 @@
++    // The kernel prefetches 16-byte weight-scale rows with bulk copies.
++    TLLM_CHECK_WITH_INFO(div_up(shape_k, block_k) * sizeof(float) % 16 != 0 ||
++                             reinterpret_cast<uintptr_t>(scales_b) % 16 == 0,
++                         "weight scales must be 16-byte aligned");
+@@ -1509 +1514,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          bool internal_quantize_a = true, bool internal_quantize_b = true) {
-+                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages) {
-@@ -1553 +1554 @@
++                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages,
++                          int64_t quant_shape_m) {
+@@ -1521,3 +1527,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+-    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs),
+-                              div_up(max_shape_m * scales_dim_x, NumThreads / 32));
+-    // Binary search is expected to have lower complexity when max_shape_m is small
++    // Size the launch from this call's rows (quant_shape_m), not the runner's high-water mark
++    // max_shape_m; the kernel reads the real row count from problem_m_offsets either way.
++    int num_blocks = std::max<int64_t>(
++        1, std::min(static_cast<int64_t>(kNumDeviceSMs),
++                    div_up(quant_shape_m * scales_dim_x, NumThreads / 32)));
++    // Binary search is expected to have lower complexity when quant_shape_m is small
+@@ -1525 +1534 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+-        static_cast<double>(max_shape_m) * scales_dim_x /
++        static_cast<double>(quant_shape_m) * scales_dim_x /
+@@ -1553 +1562 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          stream);
 +                          stream, max_num_stages);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h

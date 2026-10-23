@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill_capturable,
+    gdn_chunk_prefill_stores_state_checkpoints,
     gdn_decode_supports,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
@@ -63,13 +64,24 @@ class GdnAttnBackend(CapacityPrefillBackend):
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)
         linear_attn = config.component(LinearAttnConfig)
+        scan_geometry = {
+            "head_dim": linear_attn.head_k_dim,
+            "value_head_dim": linear_attn.head_v_dim,
+            "num_q_heads": linear_attn.num_k_heads // linear_attn.tp_size,
+            "num_v_heads": linear_attn.num_v_heads // linear_attn.tp_size,
+            "qk_l2norm": True,
+        }
         self._prefill_capturable = gdn_chunk_prefill_capturable(
-            config.dtype,
-            head_dim=linear_attn.head_k_dim,
-            value_head_dim=linear_attn.head_v_dim,
-            num_q_heads=linear_attn.num_k_heads // linear_attn.tp_size,
-            num_v_heads=linear_attn.num_v_heads // linear_attn.tp_size,
-            qk_l2norm=True,
+            config.dtype, **scan_geometry
+        )
+        # In-forward checkpoints sit at prefix-page multiples of a chunk start,
+        # so the scan must store at that granularity.
+        self._stores_in_forward_state_checkpoints = (
+            gdn_chunk_prefill_stores_state_checkpoints(
+                config.dtype,
+                **scan_geometry,
+                interval_granularity=config.prefix_granularity,
+            )
         )
 
         self._head_k_dim = linear_attn.head_k_dim

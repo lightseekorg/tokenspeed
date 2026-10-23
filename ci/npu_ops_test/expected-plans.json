@@ -1,5 +1,5 @@
 {
-  "manifest_sha256": "c1b0bbe462c128db7c3ad80fd279389811f55eea983a7deb0eaa546e6a71a944",
+  "manifest_sha256": "96b4a6357c9264f072140319c8eecf08b1b000c45f14df6114543b67c5eb2287",
   "operators": {
     "scatter": {
       "accuracy": [

@@ -20,13 +20,18 @@
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
+import tokenspeed_kernel.ops.embedding.triton as embedding_triton
 import torch
 from tokenspeed_kernel.ops.embedding import (
     apply_k_rope,
     apply_rope,
     apply_rope_mla,
 )
+from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])
@@ -389,6 +394,170 @@ def test_rope_mla_quantize(
     assert key_fp8.dtype == torch.float8_e4m3fn
     torch.testing.assert_close(query_fp8.float(), q_ref.float(), rtol=0, atol=0.5)
     torch.testing.assert_close(key_fp8.float(), k_ref.float(), rtol=0, atol=0.5)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("scales", ["unit", "float", "tensor"])
+@pytest.mark.parametrize(
+    "layout, num_heads, nope_dim, rope_dim, token_counts",
+    [
+        # forward_normal_chunked_kv_prepare (Kimi-K3 prefill): per-head K from
+        # kv_b_proj, the latent's single RoPE row expanded over the heads.
+        ("expanded", 96, 128, 64, (1, 3, 128, 4095, 4096)),
+        # The absorbed FP8-cache prologue: one latent K row per token, also
+        # with a single query head (one head per program).
+        ("absorbed", 6, 512, 64, (1, 3, 128, 4095, 4096)),
+        ("absorbed", 1, 512, 64, (1, 3, 128, 4095, 4096)),
+        # Per-head k_nope with a single-head k_rope, and per-head K throughout,
+        # also with feature widths that are not powers of two.
+        ("single_k_rope", 20, 128, 64, (1, 3, 128, 4095, 4096)),
+        ("single_k_rope", 7, 72, 24, (1, 3, 128, 4095, 4096)),
+        ("per_head", 3, 64, 32, (1, 3, 128, 4095, 4096)),
+        ("per_head", 5, 96, 40, (1, 3, 128, 4095, 4096)),
+        # RoPE rows far wider than the NoPE rows: the RoPE tile bounds the
+        # heads per program (128 heads of 16384 columns exceed Triton's
+        # largest tile).
+        ("per_head", 65, 16, 8200, (1, 3, 128)),
+    ],
+)
+def test_nope_mla_quantize_is_exact_for_any_token_count(
+    device: str,
+    layout: str,
+    num_heads: int,
+    nope_dim: int,
+    rope_dim: int,
+    token_counts: tuple[int, ...],
+    scales: str,
+    dtype: torch.dtype,
+    require,
+) -> None:
+    """Every output byte is ``(x.float() * scale).clamp(-448, 448)`` cast to
+    e4m3, for any token count and without a recompile; nothing outside the
+    output views is written."""
+    require("embedding", "rope_mla", "triton", dtype, "q_rope")
+    rank, pad = 512, 16
+    kv_heads = 1 if layout == "absorbed" else num_heads
+    scale_q, scale_kv = {
+        "unit": (1.0, 1.0),
+        "float": (0.37, 3.0),
+        "tensor": (
+            torch.tensor([0.5], device=device),
+            torch.tensor([6.5], device=device),
+        ),
+    }[scales]
+    generator = torch.Generator(device=device).manual_seed(5)
+
+    for i, num_tokens in enumerate(token_counts):
+        # The compile key holds no token count: the variants the first count
+        # compiles (fresh and strided outputs) serve every later count.
+        with (
+            assert_no_triton_compile(embedding_triton._mla_nope_quantize_fp8_kernel)
+            if i
+            else contextlib.nullcontext()
+        ):
+            # |x| <= 64 keeps every scaled value inside e4m3's range.
+            q, kv, latent, k = (
+                torch.randn(shape, device=device, generator=generator)
+                .mul_(16)
+                .clamp_(-64, 64)
+                .to(dtype)
+                for shape in (
+                    (num_tokens, num_heads, nope_dim + rope_dim),
+                    (num_tokens, num_heads, 2 * nope_dim),
+                    (num_tokens, 1, rank + rope_dim),
+                    (num_tokens, num_heads, nope_dim + rope_dim),
+                )
+            )
+            q_nope, q_rope = q[..., :nope_dim], q[..., nope_dim:]
+            if layout == "expanded":
+                k_nope = kv[..., :nope_dim]
+                k_rope = latent[..., rank:].expand(-1, num_heads, -1)
+            elif layout == "absorbed":
+                k_nope, k_rope = latent[..., :nope_dim], latent[..., rank:]
+            else:
+                k_nope = k[..., :nope_dim]
+                k_rope = (
+                    k[:, :1, nope_dim:]
+                    if layout == "single_k_rope"
+                    else k[..., nope_dim:]
+                )
+            if current_platform().is_nvidia:
+                # Past e4m3's range NVIDIA's cvt.rn.satfinite saturates to +-448.
+                specials = torch.tensor(
+                    [1e4, -1e4, float("inf"), -float("inf")], device=device
+                )
+                q[0, :, :4] = specials
+                k_nope[0, :, :4] = specials
+
+            query, key = apply_rope_mla(
+                positions=None,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                q_nope=q_nope,
+                k_nope=k_nope,
+                cos_sin_cache=None,
+                is_neox=False,
+                quant_scale_q=scale_q,
+                quant_scale_kv=scale_kv,
+                solution="triton",
+            )
+            # Strided outputs inside NaN-filled buffers (0x7F) with a spare head
+            # and spare columns, which must come back untouched.
+            query_buf, key_buf = (
+                torch.full(
+                    (num_tokens, heads + 1, nope_dim + rope_dim + pad),
+                    0x7F,
+                    dtype=torch.uint8,
+                    device=device,
+                )
+                for heads in (num_heads, kv_heads)
+            )
+            query_out, key_out = (
+                buf.view(torch.float8_e4m3fn)[:, :heads]
+                for buf, heads in ((query_buf, num_heads), (key_buf, kv_heads))
+            )
+            apply_rope_mla(
+                positions=None,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                q_nope=q_nope,
+                k_nope=k_nope,
+                cos_sin_cache=None,
+                is_neox=False,
+                quant_scale_q=scale_q,
+                quant_scale_kv=scale_kv,
+                q_nope_out=query_out[..., :nope_dim],
+                q_rope_out=query_out[..., nope_dim : nope_dim + rope_dim],
+                k_nope_out=key_out[..., :nope_dim],
+                k_rope_out=key_out[..., nope_dim : nope_dim + rope_dim],
+                solution="triton",
+            )
+
+            want_query, want_key = (
+                (
+                    torch.cat(
+                        (nope, rope.expand(-1, nope.shape[1], -1)), dim=-1
+                    ).float()
+                    * torch.as_tensor(scale, dtype=torch.float32, device=device)
+                )
+                .clamp(-448, 448)
+                .to(torch.float8_e4m3fn)
+                .view(torch.uint8)
+                for nope, rope, scale in (
+                    (q_nope, q_rope, scale_q),
+                    (k_nope, k_rope, scale_kv),
+                )
+            )
+            for got, want in (
+                (query, want_query),
+                (key, want_key),
+                (query_out[..., : nope_dim + rope_dim], want_query),
+                (key_out[..., : nope_dim + rope_dim], want_key),
+            ):
+                assert torch.equal(got.view(torch.uint8), want)
+            for buf, heads in ((query_buf, num_heads), (key_buf, kv_heads)):
+                assert bool((buf[:, heads:] == 0x7F).all())
+                assert bool((buf[..., -pad:] == 0x7F).all())
 
 
 @pytest.mark.parametrize("solution", ["triton", "cuda"])

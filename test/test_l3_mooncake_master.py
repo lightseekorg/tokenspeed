@@ -187,6 +187,7 @@ class _Host:
     def __init__(self, *, nbytes: int, page: int):
         self.host_buffer = _PtrBuffer(nbytes)
         self._page = int(page)
+        self.host_cache_block_bytes = (self._page,)
 
     def host_block_range(self, group_index: int, block_id: int) -> tuple[int, int]:
         del group_index
@@ -370,6 +371,73 @@ class TestMooncakeMasterLiveTest:
             assert reader.backend.remove_by_prefix(key)
         finally:
             reader.close(timeout_s=10)
+
+    def test_l3_sharded_object_restores_through_a_different_client(self) -> None:
+        from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+        from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+        from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+
+        hosts = [_Host(nbytes=4096, page=64) for _ in range(2)]
+        clients = []
+        try:
+            for rank, host in zip((1, 0), hosts, strict=True):
+                backend = create_storage_backend(
+                    "mooncake",
+                    json.dumps(self._extra_config()),
+                    host_buffer=host.host_buffer,
+                    tp_size=2,
+                    pp_size=1,
+                )
+                clients.append(
+                    L3Executor(
+                        backend,
+                        host,
+                        key_prefix="live-cp",
+                        rank=rank,
+                        ownership=BlockOwnerTranslation(
+                            shard_counts=(2,),
+                            device_virtual_counts=(129,),
+                            host_virtual_counts=(129,),
+                            rank=rank,
+                        ),
+                        config=StorageRuntimeConfig.from_extra_config(
+                            None, host_blocks=64, prefix_granularity=64
+                        ),
+                        prefix_for_weight_version=None,
+                        clock=time.monotonic,
+                    )
+                )
+            writer, reader = clients
+
+            def run(client, op_id, kind, block):
+                keys, offsets, sizes = client._page_ranges([(0, block, "shared", 1)])
+                client.submit(
+                    StorageJob(op_id, kind, tuple(keys), tuple(offsets), tuple(sizes))
+                )
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline:
+                    results = client.poll().completions
+                    if results:
+                        assert len(results) == 1 and results[0].retired
+                        return results[0]
+                    time.sleep(0.01)
+                pytest.fail("native CP storage did not complete")
+
+            payload = bytes(range(64))
+            hosts[0].host_buffer[:64] = payload
+            assert writer._object_key("shared", 0, 1) == reader._object_key(
+                "shared", 0, 1
+            )
+            assert run(writer, 1, "put", 2).success == (True,)
+            assert run(reader, 2, "get", 5).success == (True,)
+            assert bytes(hosts[1].host_buffer[128:192]) == payload
+            assert sum(row.success_bytes for row in reader.snapshot().operations) == 64
+            assert writer.delete_namespace()
+            result = run(reader, 3, "get", 5)
+            assert result.success == (False,) and result.object_failures == (True,)
+        finally:
+            for client in reversed(clients):
+                client.close(timeout_s=10)
 
     def test_l3_executor_round_trips_through_mooncake_master(self) -> None:
         from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig

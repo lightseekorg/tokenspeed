@@ -534,11 +534,15 @@ class RuntimeStates:
         nothing, the contract graph padding rows already follow, so a
         forward dispatched behind the one that ended a request leaves the
         request's live state block as that forward found it.
+
+        The tables are this step's own upload, so the rows are padded in
+        place: they stay views of the one packed upload, which the attention
+        routers unpack in a single launch.
         """
         stopped_rows = self.stopped.index_select(0, req_pool_indices)[:, None]
         tables = dict(block_tables)
         for group_id in state_group_ids:
-            tables[group_id] = tables[group_id].masked_fill(stopped_rows, -1)
+            tables[group_id].masked_fill_(stopped_rows, -1)
         return tables
 
     def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:

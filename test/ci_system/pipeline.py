@@ -69,6 +69,7 @@ SUPPORTED_RUNNER_GROUPS = (
     "nvidia",
     "nvidia-arm",
     "nvidia-x86",
+    "npu",
 )
 SUPPORTED_MULTI_NODE_FILTERS = ("all", "only", "exclude")
 _PRIORITY_ORDER = {value: index for index, value in enumerate(SUPPORTED_PRIORITIES)}
@@ -127,6 +128,10 @@ def is_amd_runner(runner: str) -> bool:
     return runner.startswith(AMD_RUNNER_PREFIXES)
 
 
+def is_npu_runner(runner: str) -> bool:
+    return runner == "tokenspeed-npu-arm64"
+
+
 def is_cpu_only_runner(runner: str) -> bool:
     return CPU_ONLY_RUNNER_MARKER in runner
 
@@ -138,6 +143,10 @@ def is_nvidia_arm_runner(runner: str) -> bool:
 def runner_matches_group(runner: str, runner_group: str) -> bool:
     if runner_group == "all":
         return True
+    if runner_group == "npu":
+        return is_npu_runner(runner)
+    if is_npu_runner(runner):
+        return False
     if runner_group == "amd":
         return is_amd_runner(runner)
     if runner_group == "amd-mi450":
@@ -784,6 +793,9 @@ def setup_runner(
         return local_env, pgm
     if setup_mode != "ci":
         raise ValueError(f"unsupported setup mode: {setup_mode!r}")
+    if is_npu_runner(runner):
+        # The existing NPU entry owns its deployed environment and host lock.
+        return local_env, pgm
 
     if is_gb200_runner(runner):
         pgm = make_manager()
@@ -1863,6 +1875,8 @@ def execute_task(
         )
     declared_runner = runner
     runner = apply_slurm_runner_override(declared_runner, runner_override, setup_mode)
+    if is_npu_runner(runner) and (task["type"] != "ut" or setup_mode != "ci"):
+        raise ValueError("NPU operator tasks require type=ut and --setup-mode=ci")
     targets = summarize_task_targets(task, repo_root)
 
     env = merge_env(task.get("env", {}))
@@ -2110,7 +2124,7 @@ def execute_task(
         if enable_perf_diagnostics:
             run_perf_diagnostics("before cleanup", runner_env, repo_root, dry_run)
         _stop_managed_server()
-        if setup_mode == "ci" and not keep_runner_state:
+        if setup_mode == "ci" and not keep_runner_state and not is_npu_runner(runner):
             cleanup_runner(runner_env, repo_root, dry_run, pgm)
         if enable_perf_diagnostics:
             run_perf_diagnostics("after cleanup", runner_env, repo_root, dry_run)

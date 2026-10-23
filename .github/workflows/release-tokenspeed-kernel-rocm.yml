@@ -42,7 +42,7 @@ env:
 jobs:
   metadata:
     name: Resolve release metadata
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.metadata.outputs.version }}
       version_date: ${{ steps.metadata.outputs.version_date }}
@@ -122,7 +122,7 @@ jobs:
   build-wheel:
     name: Build ROCm 7.2 x64 wheel for Python ${{ matrix.python.version }}
     needs: metadata
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -256,7 +256,7 @@ jobs:
   build-sdist:
     name: Build source distribution
     needs: metadata
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -299,7 +299,7 @@ jobs:
       group: wheelhouse-publication
       cancel-in-progress: false
     needs: [metadata, build-wheel, build-sdist]
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
