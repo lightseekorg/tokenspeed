@@ -161,9 +161,10 @@ def _resolve_heterogeneous_draft_family(
     if draft_family is None or draft_family == target_family:
         return None
     if target_family == "kimi_k3":
-        if draft_family != "mla":
+        if draft_family not in ("mla", "mha"):
             raise RuntimeError(
-                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+                "Kimi-K3 unified cache hosts MLA or MHA draft views, got "
+                f"{draft_family!r}"
             )
         return draft_family
     if target_family == "inkling":

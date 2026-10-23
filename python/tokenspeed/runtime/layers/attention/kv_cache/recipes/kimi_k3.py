@@ -29,6 +29,9 @@ Kimi-K3.1 (a DSA target config) adds one index-K plane per MLA target layer
 in the full-attention group, beside its latent plane: the index keys share
 the latent rows' pages, prefix matches, transfers and lifetime. Index-K
 planes hold no KDA state, so they do not change the packing.
+
+A draft's layers join the full-attention group: MLA latent planes for an MLA
+draft, K and V planes for a GQA (MHA) block draft.
 """
 
 from __future__ import annotations
@@ -45,7 +48,9 @@ from tokenspeed.runtime.layers.attention.configs.dsa import (
     dsa_history_gather_workspace_bytes,
     dsa_kvp_history_prefill,
 )
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
@@ -60,6 +65,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
     index_k_field,
+    mha_layer_fields,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -96,8 +102,9 @@ def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, .
 class KimiK3Recipe(CacheRecipe):
     """Kimi-K3: MLA full-attention layers plus three KDA state groups.
 
-    Draft MLA layers are continuation layers of the one big model and join the
-    target's full-attention group, sharing its packing and page-id space.
+    Draft layers are continuation layers of the one big model and join the
+    target's full-attention group, sharing its packing and page-id space:
+    an MLA draft as latent planes, a GQA block draft as K and V planes.
     """
 
     family = "kimi_k3"
@@ -264,6 +271,12 @@ class KimiK3Recipe(CacheRecipe):
                 if layer_id < self.num_target_layers
                 else self.draft_attn_config
             )
+            if isinstance(config.component(SoftmaxAttnConfig), MHAConfig):
+                # A GQA block draft (the target's layers are always MLA): K
+                # and V pages in planes of their own, at this plan's page size.
+                return mha_layer_fields(
+                    config, self.prefix_granularity, layer_id, occurrence
+                )
             spec = config.component(MLAConfig)
             latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             latent = CacheFieldSpec(
