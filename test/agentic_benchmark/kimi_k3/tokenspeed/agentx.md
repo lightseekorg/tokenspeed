@@ -48,7 +48,9 @@ top of `agentx.slurm`. The default sweeps TP8/MoE TP8 and TP8/MoE EP8 at
 C1/C2/C4/C8/C16 for 3600 seconds per point, with ten warmup requests per lane.
 For a short smoke run, select one config, C1, duration 180 and one warmup request.
 
-From the repository root, launch against a held two-node allocation:
+From the repository root, launch against a held allocation with at least two
+four-GPU nodes. The launcher selects the first two nodes for the server and runs
+the client on the first selected node:
 
 ```bash
 SLURM_JOB_ID=YOUR_HELD_JOB_ID \
@@ -74,7 +76,9 @@ environment must match the compute container's Python and architecture.
 
 Server settings live in `configs/attn_tp8_moe_{tp8,ep8}.sh`. They use EAGLE3
 with synthetic acceptance length 3.7, text-only serving, and ports 8000 (API)
-and 8010 (metrics). Synthetic output is for performance measurement.
+and 8010 (metrics). Both configs explicitly capture every decode batch size from
+1 through 64 with graph padding disabled. Synthetic output is for performance
+measurement.
 
 InferenceX replays recorded assistant responses. Concurrency counts root lanes;
 child agents can add concurrent HTTP requests. The server stays alive across

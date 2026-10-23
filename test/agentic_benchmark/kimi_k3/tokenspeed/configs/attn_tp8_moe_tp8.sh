@@ -10,6 +10,7 @@ exec ts serve \
     --max-num-seqs 64 \
     --gpu-memory-utilization 0.9 \
     --disable-cuda-graph-padding \
+    --cudagraph-capture-sizes {1..64} \
     --trust-remote-code \
     --attention-backend tokenspeed_mla \
     --kda-backend cutedsl_kda \
@@ -27,6 +28,7 @@ exec ts serve \
     --language-model-only \
     --disable-health-check \
     --enable-metrics \
+    --metrics-host 0.0.0.0 \
     --metrics-port 8010 \
     --reasoning-parser passthrough \
     --tool-call-parser passthrough \

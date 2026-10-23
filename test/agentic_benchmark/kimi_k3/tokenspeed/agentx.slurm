@@ -43,6 +43,9 @@ export HF_HUB_CACHE="${HF_HUB_CACHE:?shared HF Hub cache}"
 export NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
 mapfile -t NODES < <(scontrol show hostnames "$(squeue -h -j "$JOBID" -o '%N')")
+(( ${#NODES[@]} >= 2 )) || { echo 'K3 TP8 requires two four-GPU nodes' >&2; exit 2; }
+NODES=("${NODES[@]:0:2}")
+SERVER_NODES="${NODES[0]},${NODES[1]}"
 HEAD="${NODES[0]}"
 BASE_URL="http://${HEAD}:8000"
 METRICS_URL="http://${HEAD}:8010/metrics"
@@ -83,7 +86,7 @@ stop_steps() {
 }
 
 launch_server() {
-    "${SRUN[@]}" --nodes="${#NODES[@]}" --ntasks-per-node=1 \
+    "${SRUN[@]}" --nodes="${#NODES[@]}" --ntasks="${#NODES[@]}" --nodelist="$SERVER_NODES" --ntasks-per-node=1 \
         --cpus-per-task=64 --gpus-per-node=4 --mpi=pmix --kill-on-bad-exit=1 \
         --job-name="$SERVER_STEP" "${SRUN_ARGS[@]}" \
         bash -x "$SCRIPT_DIR/configs/${CONFIG}.sh" > "$RUN_DIR/server.log" 2>&1 &
@@ -111,7 +114,7 @@ run_benchmark() {
     AIPERF_SERVER_URL="$BASE_URL" AIPERF_SERVER_METRICS_URLS="$METRICS_URL" \
     RESULT_DIR="$RUN_DIR/c${CONCURRENCY}/client" CONC="$CONCURRENCY" EP_SIZE="$ep_size" \
     TOTAL_CPU_DRAM_GB="$TOTAL_CPU_DRAM_GB" \
-        "${SRUN[@]}" --nodes=1 --ntasks=1 --cpus-per-task=8 --job-name="$CLIENT_STEP" \
+        "${SRUN[@]}" --nodes=1 --nodelist="$HEAD" --ntasks=1 --cpus-per-task=8 --job-name="$CLIENT_STEP" \
         "${SRUN_ARGS[@]}" timeout --signal=INT --kill-after=45 8400 \
         bash -se -o pipefail > "$RUN_DIR/c${CONCURRENCY}/client.log" 2>&1 <<'CLIENT' &
 mkdir "$RESULT_DIR"
