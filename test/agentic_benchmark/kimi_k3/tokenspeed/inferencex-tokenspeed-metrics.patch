@@ -1,0 +1,87 @@
+diff --git a/infx/results/agentic/backends/__init__.py b/infx/results/agentic/backends/__init__.py
+index 0cde104f..e9994246 100644
+--- a/infx/results/agentic/backends/__init__.py
++++ b/infx/results/agentic/backends/__init__.py
+@@ -4,6 +4,8 @@ from __future__ import annotations
+
+ from typing import Any
+
++from infx.results.agentic.backends.tokenspeed import TokenSpeedBackend
++
+ from .atom import AtomBackend
+ from .base import ServerMetricsBackend
+ from .dynamo_vllm import DynamoVllmBackend
+@@ -13,6 +15,7 @@ from .vllm import VllmBackend
+
+ BACKENDS: tuple[ServerMetricsBackend, ...] = (
+     TrtllmBackend(),
++    TokenSpeedBackend(),
+     DynamoVllmBackend(),
+     AtomBackend(),
+     SglangBackend(),
+diff --git a/infx/results/agentic/backends/tokenspeed.py b/infx/results/agentic/backends/tokenspeed.py
+new file mode 100644
+index 00000000..bfe0f442
+--- /dev/null
++++ b/infx/results/agentic/backends/tokenspeed.py
+@@ -0,0 +1,60 @@
++"""TokenSpeed server metrics; prefix hits include all cache tiers."""
++
++from __future__ import annotations
++
++from typing import Any
++
++from infx.results.agentic.backends.base import ServerMetricsBackend, counter_int
++from infx.results.agentic.common import gauge_stat, normalize_fraction, rate, sum_stat
++
++
++def _counter(metrics: dict[str, dict[str, Any]], stem: str) -> float | None:
++    for name in (f"tokenspeed:{stem}", f"tokenspeed:{stem}_total"):
++        value = sum_stat(metrics, name, preferred_keys=("total", "sum", "max", "avg"))
++        if value is not None:
++            return value
++    return None
++
++
++class TokenSpeedBackend(ServerMetricsBackend):
++    name = "tokenspeed"
++
++    def matches(self, metrics: dict[str, dict[str, Any]], framework: str) -> bool:
++        return any(name.startswith("tokenspeed:") for name in metrics) or (
++            not metrics and framework.lower() == "tokenspeed"
++        )
++
++    def populate(
++        self,
++        metrics: dict[str, dict[str, Any]],
++        flat: dict[str, Any],
++        nested: dict[str, Any],
++    ) -> None:
++        prompt = _counter(metrics, "prompt_tokens")
++        generation = _counter(metrics, "generation_tokens")
++        cached = _counter(metrics, "prefix_cache_hits")
++        overall_hit = rate(cached, prompt)
++        gpu_usage = normalize_fraction(
++            gauge_stat(
++                metrics,
++                "tokenspeed:kv_cache_usage_perc",
++                preferred_keys=("max", "avg", "total"),
++                combine="max",
++            )
++        )
++        flat["total_prompt_tokens"] = counter_int(prompt)
++        flat["total_generation_tokens"] = counter_int(generation)
++        flat["server_overall_cache_hit_rate"] = overall_hit
++        flat["gpu_kv_cache_usage_pct"] = gpu_usage
++        nested["cache"].update(
++            overall_cache_hit_rate=overall_hit,
++            prefix_cache_hits=cached,
++            prefix_cache_queries=prompt,
++        )
++        nested["kv_cache"]["gpu_usage_pct"] = gpu_usage
++        nested["tokens"].update(
++            prompt_total=flat["total_prompt_tokens"],
++            generation_total=flat["total_generation_tokens"],
++        )
++        if prompt is not None and cached is not None:
++            nested["tokens"]["prompt_by_source"]["computed"] = max(prompt - cached, 0.0)
