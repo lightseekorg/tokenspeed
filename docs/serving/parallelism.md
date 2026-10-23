@@ -191,9 +191,9 @@ without attention DP drop the pin.
 
 Disaggregated prefill and decode engines each honor their own rank pin.
 The `bootstrap_room` still identifies the prefill KV source:
-`room % prefill_dp_size` must match the selected prefill rank. The decode
-rank can differ from the room residue. Without a pin, PD requests follow
-`room % dp_size`.
+`room % prefill_dp_size` must match the selected prefill rank; conflicting
+prefill pins are rejected at ingress. The decode rank can differ from the room
+residue. Without a pin, PD requests follow `room % dp_size`.
 
 With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 `ts serve` to enable per-rank affinity routing. This requires bundled smg

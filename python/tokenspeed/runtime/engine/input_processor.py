@@ -391,6 +391,17 @@ class InputProcessor:
                 self._verify_prompt_logprobs_servable(input_ids, multimodal_inputs)
 
         if isinstance(obj, GenerateReqInput):
+            if (
+                obj.data_parallel_rank is not None
+                and self.engine.server_args.disaggregation_mode == "prefill"
+            ):
+                dp_size = self.engine.server_args.mapping.attn.dp_size
+                if obj.data_parallel_rank != obj.bootstrap_room % dp_size:
+                    raise ValueError(
+                        f"Prefill data_parallel_rank={obj.data_parallel_rank} must "
+                        f"match bootstrap_room % dp_size "
+                        f"({obj.bootstrap_room % dp_size})"
+                    )
             return TokenizedGenerateReqInput(
                 rid=obj.rid,
                 input_text=input_text,
