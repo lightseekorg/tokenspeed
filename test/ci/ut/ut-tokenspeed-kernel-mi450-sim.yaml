@@ -106,8 +106,8 @@ env:
     # GLM-5.2 DSA: FP8 top-k decode and prefill, rank-128 BF16 dense cache.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_trivial_q2_2048]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_short_512]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-decode]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-bf16-decode]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-bf16-prefill]
     # GLM-5.3-Flash full attention: 256-wide NoPE scores, rank-512 values, the
     # 2051-slot KPool-plus-tail ABI in both stages, standard-cache graph replay.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_glm53_flash_bf16_split_matrix[16]
@@ -132,8 +132,8 @@ env:
     # valid length in both stages, prefill top-k over ragged row ranges.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache[q_bf16-decode]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache[q_e4m3-prefill]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e4m3-decode]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e4m3-prefill]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-e4m3-decode]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-e4m3-prefill]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_prefill_uses_workspace_rows_not_global_slots[32-q_dtype0-weight_dtype0]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_fp8_ignores_poisoned_unselected_rows[decode]
