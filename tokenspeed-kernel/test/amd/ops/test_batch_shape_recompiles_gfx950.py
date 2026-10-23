@@ -252,7 +252,7 @@ def test_iris_allreduce_sizes():
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
-    policy = comm.iris_cache_policy()
+    policy = comm.iris_arch_policy()
     common = dict(RANK=0, WORLD_SIZE=8)
     common.update(WORDS_PER_LANE=2, ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
     common.update(

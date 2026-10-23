@@ -25,9 +25,11 @@ import math
 import torch
 from tokenspeed_kernel._triton import gl, gluon
 from tokenspeed_kernel.ops.communication._iris import allocation_bytes
-from tokenspeed_kernel.ops.communication._iris.all_reduce import ProducerPull
+from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+    ProducerPull,
+    iris_arch_policy,
+)
 from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel_amd._synchronization import wait_vmem
 
 REDUCE_PROGRAMS = 24
 GATHER_PROGRAMS = 128
@@ -42,9 +44,10 @@ def _row_partition_store_completion(
     epoch,
     RANK: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Complete local stores, update ready flags, and wait for peer completion."""
-    wait_vmem(args=[], constraints="=r,~{memory}")
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)
@@ -217,6 +220,7 @@ def iris_k3moe_push_gather(
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     PREFIX_IS_SHARDED: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Add K3 routed/shared outputs and residual, then push rows to every peer.
 
@@ -275,7 +279,9 @@ def iris_k3moe_push_gather(
                 mask,
                 cache=".wt",
             )
-    _row_partition_store_completion(flags, peer_flags, block_id, epoch, RANK, NUM_WARPS)
+    _row_partition_store_completion(
+        flags, peer_flags, block_id, epoch, RANK, NUM_WARPS, WAIT_STORES=WAIT_STORES
+    )
 
 
 def _reduce_metadata(grid, kernel, args):
@@ -402,6 +408,7 @@ def iris_k3attn_push_gather(
     BLOCK_ELEMENTS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Push mixed K3 attn rows to every peer.
 
@@ -439,7 +446,9 @@ def iris_k3attn_push_gather(
                 mask,
                 cache=".wt",
             )
-    _row_partition_store_completion(flags, peers, pid, epoch, RANK, NUM_WARPS)
+    _row_partition_store_completion(
+        flags, peers, pid, epoch, RANK, NUM_WARPS, WAIT_STORES=WAIT_STORES
+    )
 
 
 @gluon.jit(launch_metadata=_mix_gather_metadata, do_not_specialize=["LOCAL_ROWS"])
@@ -468,6 +477,7 @@ def iris_k3attn_mix_push_gather(
     OUTPUT_EPS: gl.constexpr,
     NUM_PROGRAMS: gl.constexpr,
     NUM_WARPS: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
 ):
     """Mix K3 prefixes with AttnRes history, then push normalized rows.
 
@@ -522,7 +532,9 @@ def iris_k3attn_mix_push_gather(
                 mask,
                 cache=".wt",
             )
-    _row_partition_store_completion(flags, peers, pid, epoch, RANK, NUM_WARPS)
+    _row_partition_store_completion(
+        flags, peers, pid, epoch, RANK, NUM_WARPS, WAIT_STORES=WAIT_STORES
+    )
 
 
 def _overlaps(tensor: torch.Tensor, buffer: torch.Tensor) -> bool:
@@ -573,6 +585,7 @@ class IrisAllReduceShardedState:
         )
 
     def __init__(self, pull: ProducerPull, *, max_rows: int) -> None:
+        self._arch = iris_arch_policy()
         inputs = pull.producer.data
         assert inputs.numel() >= max_rows * (7168 + 3584)
         assert pull.scratch is not None
@@ -712,6 +725,7 @@ class IrisAllReduceShardedState:
             NUM_WARPS=4,
             PREFIX_IS_SHARDED=prefix_is_sharded,
             num_warps=4,
+            WAIT_STORES=self._arch.wait_stores,
         )
         return output
 
@@ -859,6 +873,7 @@ class IrisAllReduceShardedState:
                 NUM_PROGRAMS=gather_programs,
                 NUM_WARPS=num_subgroups,
                 num_warps=num_subgroups,
+                WAIT_STORES=self._arch.wait_stores,
             )
         else:
             # Longer histories favor the existing mixer without persistent peer
@@ -887,5 +902,6 @@ class IrisAllReduceShardedState:
                 NUM_PROGRAMS=gather_programs,
                 NUM_WARPS=4,
                 num_warps=4,
+                WAIT_STORES=self._arch.wait_stores,
             )
         return prefix, output

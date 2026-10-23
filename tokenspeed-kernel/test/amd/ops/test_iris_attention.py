@@ -62,6 +62,13 @@ def test_attention_row_vector_codegen(rank, operation, has_residual, tmp_path):
     }
     if operation == "reduce":
         constants["HAS_RESIDUAL"] = has_residual
+    else:
+        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            iris_arch_policy,
+        )
+        from tokenspeed_kernel.platform import ArchVersion
+
+        constants["WAIT_STORES"] = iris_arch_policy(ArchVersion(9, 5)).wait_stores
     signature = {}
     for name in fn.arg_names:
         if name in constants:
