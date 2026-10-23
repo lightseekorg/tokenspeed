@@ -6514,7 +6514,7 @@ _CASES = [
         "cdna4",
         "gemm",
         "mm",
-        "triton_mm_fp8_blockscale",
+        "gluon_mm_fp8_blockscale_gfx950",
         lambda: _mm_mxfp8(4),
     ),
     *[
