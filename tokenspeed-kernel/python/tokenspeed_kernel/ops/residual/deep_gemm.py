@@ -54,6 +54,7 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -103,6 +104,7 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(

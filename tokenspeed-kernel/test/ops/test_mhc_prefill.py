@@ -23,12 +23,14 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
+from tokenspeed_kernel.ops.residual import mhc_pre
 from tokenspeed_kernel.ops.residual.triton import triton_mhc_pre
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def test_tiled_hc4_prefill_matches_reference() -> None:
+@pytest.mark.parametrize("implementation", [triton_mhc_pre, mhc_pre])
+def test_tiled_hc4_prefill_matches_reference(implementation) -> None:
     generator = torch.Generator(device="cuda").manual_seed(123)
     residual = torch.randn(
         (257, 4, 64), device="cuda", dtype=torch.bfloat16, generator=generator
@@ -38,7 +40,7 @@ def test_tiled_hc4_prefill_matches_reference() -> None:
     hc_base = torch.randn(24, device="cuda", dtype=torch.float32, generator=generator)
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-5, 3)
 
-    actual = triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
+    actual = implementation(*args, norm_weight=None, norm_eps=None)
     expected = torch_mhc_pre(*args, None, None)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):

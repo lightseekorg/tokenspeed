@@ -139,6 +139,8 @@ def _make_dense_leaf(
     # kernel-solution map only knows its own names) — the 'dsa' name that
     # selected THIS wrapper must not leak through.
     dense_spec = dataclasses.replace(spec, backend_name=None)
+    if platform.is_nvidia and platform.arch_version.major == 12:
+        return MLAAttnBackend(config, dense_spec, kernel_page_size=kernel_page_size)
     if platform.is_nvidia:
         return TRTLLMMLABackend(config, dense_spec, kernel_page_size=kernel_page_size)
     if platform.is_amd:
@@ -214,6 +216,12 @@ class DSABackend(PagedAttentionBackend):
         # (docs/design/numerics.md, invariance.batch).
         self.slot_order: str = global_server_args_dict["dsa_slot_order"]
         self.kernel_solution: str | None = None
+        if (
+            not self.batch_invariant
+            and platform.is_nvidia
+            and platform.arch_version.major == 12
+        ):
+            self.kernel_solution = "triton"
         self.prefill_kernel_plan = None
         self.decode_kernel_plan = None
         if self.batch_invariant:

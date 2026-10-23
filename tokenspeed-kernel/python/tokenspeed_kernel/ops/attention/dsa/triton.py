@@ -23,7 +23,11 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.quantization import quantize_fp8
-from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
+from tokenspeed_kernel.platform import (
+    ArchVersion,
+    CapabilityRequirement,
+    current_platform,
+)
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
@@ -232,48 +236,12 @@ def _dsa_dense_kv_kernel(
     valid_len = tl.load(topk_lens + token).to(tl.int32)
     max_score = tl.full((), -float("inf"), tl.float32)
 
-    for start in range(0, topk, BLOCK_TOPK):
-        cols = start + topk_offsets
-        valid = cols < valid_len
-        slots = tl.load(
-            topk_indices + token * topk + cols,
-            mask=valid,
-            other=0,
-        ).to(tl.int64)
-        valid = valid & (slots >= 0)
-        kv_rows = (slots // PAGE_SIZE) * page_stride + (
-            slots % PAGE_SIZE
-        ) * token_stride
-        score = tl.zeros((BLOCK_TOPK,), tl.float32)
-
-        for k_start in range(0, kv_lora_rank, BLOCK_K):
-            ks = k_start + k_offsets
-            q_vals = tl.load(q + q_nope_base + ks).to(tl.float32)
-            k_vals = tl.load(
-                kv + kv_rows[:, None] + ks[None, :] * channel_stride,
-                mask=valid[:, None],
-                other=0.0,
-            ).to(tl.float32)
-            score += tl.sum(k_vals * q_vals[None, :], axis=1)
-
-        k_rope = tl.load(
-            kv
-            + kv_rows[:, None]
-            + (kv_lora_rank + rope_offsets[None, :]) * channel_stride,
-            mask=valid[:, None] & (rope_offsets[None, :] < qk_rope_head_dim),
-            other=0.0,
-        ).to(tl.float32)
-        score += tl.sum(k_rope * q_rope[None, :], axis=1)
-        score *= softmax_scale
-        score = tl.where(valid, score, -float("inf"))
-        max_score = tl.maximum(max_score, tl.max(score, axis=0))
-
     denom = tl.full((), 0.0, tl.float32)
     acc = tl.zeros((BLOCK_V,), tl.float32)
     v_mask = v_offsets < kv_lora_rank
-    for start in range(0, topk, BLOCK_TOPK):
+    for start in range(0, tl.minimum(valid_len, topk), BLOCK_TOPK):
         cols = start + topk_offsets
-        valid = cols < valid_len
+        valid = (cols < valid_len) & (cols < topk)
         slots = tl.load(
             topk_indices + token * topk + cols,
             mask=valid,
@@ -305,9 +273,14 @@ def _dsa_dense_kv_kernel(
         score += tl.sum(k_rope * q_rope[None, :], axis=1)
         score *= softmax_scale
         score = tl.where(valid, score, -float("inf"))
-        probs = tl.exp(score - max_score)
-        probs = tl.where(valid, probs, 0.0)
-        denom += tl.sum(probs, axis=0)
+        # Update softmax and output together instead of recomputing QK.
+        next_max = tl.maximum(max_score, tl.max(score, axis=0))
+        safe_max = tl.where(next_max == -float("inf"), 0.0, next_max)
+        alpha = tl.exp(max_score - safe_max)
+        probs = tl.exp(score - safe_max)
+        denom = denom * alpha + tl.sum(probs, axis=0)
+        acc *= alpha
+        max_score = next_max
 
         v_vals = tl.load(
             kv + kv_rows[:, None] + v_offsets[None, :] * channel_stride,
@@ -388,6 +361,30 @@ def _run_dense_kv(
     qk_rope_head_dim: int,
     return_lse: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    # Keep the portable scalar path for other devices and dtypes.
+    platform = current_platform()
+    if (
+        platform.is_nvidia
+        and platform.arch_version in (ArchVersion(9, 0), ArchVersion(12, 0))
+        and q.dtype == torch.bfloat16
+        and kv_cache.dtype == torch.bfloat16
+    ):
+        from tokenspeed_kernel.ops.attention.dsa._triton.bf16_tiled import (
+            run_bf16_tiled,
+        )
+
+        result = run_bf16_tiled(
+            q,
+            kv_cache,
+            topk_indices,
+            topk_lens,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            scale=softmax_scale,
+            return_lse=return_lse,
+            out=None,
+        )
+        return result if return_lse else (result, None)
     if kv_cache.dim() == 4:
         kv_cache = (
             kv_cache.squeeze(1) if kv_cache.shape[1] == 1 else kv_cache.squeeze(2)
@@ -493,7 +490,7 @@ def _run_dsa(
         )
 
     if out is not None:
-        out.reshape_as(result).copy_(result)
+        out.copy_(result.reshape(out.shape))
         result = out
     return (result, lse) if return_lse else result
 
@@ -545,7 +542,8 @@ def triton_dsa_decode(
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    del kv_seq_lens
+    # Preserve the portable fallback contract: use ordinary launches even with PDL.
+    del kv_seq_lens, enable_pdl
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,
@@ -608,7 +606,8 @@ def triton_dsa_prefill(
     out: torch.Tensor | None = None,
     enable_pdl: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    del kv_seq_lens
+    # Preserve the portable fallback contract: use ordinary launches even with PDL.
+    del kv_seq_lens, enable_pdl
     return _run_dsa(
         q=q,
         kv_cache=kv_cache,

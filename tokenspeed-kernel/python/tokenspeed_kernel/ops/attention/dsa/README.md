@@ -241,3 +241,53 @@ For non-cluster PDL grids with no more rows than SMs, the launcher selects a
 one-block register budget to reduce packing of waiting CTAs. Larger grids keep
 the two-block budget. Launch bounds guide register allocation; they are not a
 hard limit on resident CTAs. Both variants use the same radix algorithm.
+
+## BF16 dense-KV tiled attention
+
+The existing `triton_dsa_prefill` and `triton_dsa_decode` entries share
+`_run_dsa` and `_run_dense_kv`. On SM90 and SM120, BF16 queries with BF16 KV use a tiled
+Tensor Core implementation internally for all registered latent/RoPE dimensions.
+Other dtypes and architectures retain the portable implementation; packed KV
+still uses its existing path. No separate tiled registration or environment
+override is needed.
+
+The shared tiled implementation supports latent dimensions 128/512 and RoPE
+dimensions 0/64. RoPE contributes to QK scores only; output retains the latent
+dimension. All four dimension combinations are covered by numerical and registered-entry
+tests. End-to-end performance and task accuracy have only been measured for
+GLM-5.3-Flash on SM120 (512-wide latent, zero RoPE). H20 (SM90) has paired
+operator-level measurements and numerical/CUDA Graph coverage. SM100 remains
+outside the automatic tiled dispatch. This dispatch applies after the Triton
+DSA entry is selected; it does not change Hopper's default backend selection.
+
+The tiled kernel shares a KV tile across 16 query heads, uses BF16 QK/PV
+products with FP32 accumulation and online softmax, and merges split outputs
+using their LSE. Softmax probabilities round to BF16 before PV; results are not
+bitwise equivalent to the scalar fallback. Selected slots and KV storage are
+unchanged. The selection already encodes causality, so no second mask is applied.
+
+Query-row buckets use 16 splits up to four rows, four splits up to 32 rows, and
+one split otherwise. Each split retains its boundaries but stops at the row's
+live length, skipping fully masked trailing tiles. Live lengths stay on the
+GPU and can change during CUDA Graph replay. Small selections or non-unit
+channel strides use 32-key tiles; other inputs use 64-key tiles. These are fixed
+choices, not an autotuner. As with the original portable Triton attention,
+the public entries accept but ignore `enable_pdl`: scalar, tiled and reduction
+kernels use ordinary launches. This preserves compatibility with callers that
+enable PDL globally without adding PDL overlap to these attention kernels.
+
+Both public entries retain optional natural-log LSE and caller-provided output
+buffers. The tiled helper can write directly to a contiguous output buffer;
+noncontiguous buffers use a temporary followed by an in-place copy. The public
+entries currently compute a temporary result and copy it into the supplied
+output buffer. Flat/paged KV and singleton KV-head layouts are normalized internally. Empty rows return zero
+output and negative-infinite LSE.
+
+### Portable dense-KV Triton softmax
+
+The scalar dense-KV kernel computes QK, softmax and the weighted value sum in
+one pass using online softmax. It stops at the device-provided live selection
+length and masks the final tile to the selection width. This applies to both
+zero-RoPE and RoPE layouts without an architecture-specific branch; the packed
+KV kernel is unchanged. Empty selections return zero output and negative-infinity
+LSE. The new reduction order can change floating-point rounding.

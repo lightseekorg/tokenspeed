@@ -229,6 +229,7 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset({format_signature()}),
@@ -258,6 +259,7 @@ if platform.is_hopper_plus:
         features=_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -436,6 +438,7 @@ if platform.is_hopper_plus:
         features=_PREFILL_TOPK_FEATURES,
         capability=CapabilityRequirement(
             min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
             vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
@@ -608,7 +611,9 @@ if platform.is_hopper_plus:
         solution="deep_gemm",
         priority=Priority.PERFORMANT,
         capability=CapabilityRequirement(
-            min_arch_version=ArchVersion(9, 0), vendors=frozenset({"nvidia"})
+            min_arch_version=ArchVersion(9, 0),
+            max_arch_version=ArchVersion(10, 9),
+            vendors=frozenset({"nvidia"}),
         ),
         signatures=frozenset(
             {

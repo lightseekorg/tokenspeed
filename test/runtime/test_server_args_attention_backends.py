@@ -28,7 +28,7 @@ import tempfile
 from types import SimpleNamespace
 from unittest import mock
 
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch, ModelConfig
 from tokenspeed.runtime.layers.attention import registry
@@ -289,12 +289,19 @@ class TestAttentionBackendChoices:
         )
         dense_backend = object()
 
-        for platform, cls_name in (
-            (SimpleNamespace(is_nvidia=True, is_amd=False), "TRTLLMMLABackend"),
-            (SimpleNamespace(is_nvidia=False, is_amd=True), "MLAAttnBackend"),
+        for vendor, arch, cls_name in (
+            ("nvidia", ArchVersion(9, 0), "TRTLLMMLABackend"),
+            ("nvidia", ArchVersion(10, 0), "TRTLLMMLABackend"),
+            ("nvidia", ArchVersion(12, 0), "MLAAttnBackend"),
+            ("amd", ArchVersion(9, 5), "MLAAttnBackend"),
         ):
+            platform = SimpleNamespace(
+                is_nvidia=vendor == "nvidia",
+                is_amd=vendor == "amd",
+                arch_version=arch,
+            )
             with (
-                subtests.test(name=cls_name),
+                subtests.test(vendor=vendor, arch=str(arch), name=cls_name),
                 mock.patch.object(
                     dsa_backend, cls_name, return_value=dense_backend
                 ) as create,

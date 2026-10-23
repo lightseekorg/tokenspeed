@@ -617,6 +617,46 @@ ts serve zai-org/GLM-5.3-Flash \
   --speculative-num-draft-tokens 3
 ```
 
+#### Experimental SM120
+
+The following configuration was validated on 8× RTX 6000D with BF16 KV,
+MoE TP8/EP1 and decode CUDA Graphs. It uses Triton MoE and DSA fallbacks.
+Build the native CUDA extensions for SM120 before starting the server.
+
+```bash
+ts serve zai-org/GLM-5.3-Flash \
+  --trust-remote-code \
+  --tensor-parallel-size 8 \
+  --world-size 8 \
+  --ep-size 1 \
+  --moe-backend triton \
+  --dtype bfloat16 \
+  --kv-cache-dtype bfloat16 \
+  --max-model-len 1048576 \
+  --chunked-prefill-size 8192 \
+  --max-num-seqs 32 \
+  --max-cudagraph-capture-size 32 \
+  --gpu-memory-utilization 0.80 \
+  --force-deterministic-rsag \
+  --disable-pdl \
+  --disable-prefill-graph \
+  --disable-autotune
+```
+
+`--force-deterministic-rsag` selects NCCL collectives for this configuration,
+avoiding multicast paths on systems without NVLink multicast support.
+The recipe keeps `--disable-pdl` to match the validated configuration. Triton
+DSA attention accepts but ignores `enable_pdl` and uses ordinary launches;
+it does not require disabling PDL globally. Prefill graphs,
+expert parallelism and speculative decoding are not validated by this recipe;
+do not carry over the EP/MTP flags from the preceding example.
+
+If the installed Hadamard wheel lacks an SM120 kernel, set
+`TOKENSPEED_KERNEL_OVERRIDE_TRANSFORM_HADAMARD_TRANSFORM=triton_hadamard_transform_128`
+before launching. Validation includes GSM8K accuracy and cold-cache performance
+with 512-token and 32K-token inputs at concurrency 1, 2, 4, 8 and 16.
+The 1M context setting is a launch limit, not a validated 1M workload.
+
 ### AMD
 
 On MI350X/MI355X (gfx950), use tensor parallel size 4 with expert parallelism
