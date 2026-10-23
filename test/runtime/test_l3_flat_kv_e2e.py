@@ -87,6 +87,174 @@ class TestL3FlatKvRoundTripTest:
             native_config=None,
         )
 
+    def test_cp_restores_history_on_a_new_owner_and_keeps_state_rank_local(self):
+        from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
+        from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+        from tokenspeed.runtime.cache.l3.executor import L3Executor, StorageJob
+        from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
+            CacheRuntimeContract,
+        )
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+            CacheGroupSpec,
+        )
+
+        torch = self.torch
+        specs = (
+            CacheGroupSpec(
+                "history",
+                "full_history",
+                rows_per_page=2,
+                entry_stride_tokens=1,
+                sliding_window_tokens=None,
+                replayable=False,
+                transfer_policy="full_suffix",
+                shard_count=2,
+            ),
+            CacheGroupSpec(
+                "state",
+                "state",
+                rows_per_page=None,
+                entry_stride_tokens=None,
+                sliding_window_tokens=None,
+                replayable=False,
+                transfer_policy="latest_snapshot",
+                shard_count=1,
+            ),
+        )
+        contract = CacheRuntimeContract(
+            prefix_granularity=2,
+            num_lcm_blocks=8,
+            token_capacity=16,
+            group_specs=specs,
+            group_page_counts={"history": 9, "state": 9},
+            group_packing={"history": 1, "state": 1},
+        )
+
+        class Pool:
+            def __init__(self, layout):
+                self.layout = layout
+                self.arena = SimpleNamespace(runtime_contract=contract)
+                self.load_tracker = None
+
+            def cache_transfer_layout(self):
+                return self.layout
+
+            def register_layerwise_load_tracker(self, tracker):
+                self.load_tracker = tracker
+
+        def run(l3, op_id, kind, rows):
+            keys, offsets, sizes = l3._page_ranges(rows)
+            l3.submit(
+                StorageJob(op_id, kind, tuple(keys), tuple(offsets), tuple(sizes))
+            )
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                results = l3.poll().completions
+                if results:
+                    assert len(results) == 1 and results[0].op_id == op_id
+                    assert results[0].retired and all(results[0].success)
+                    return
+                time.sleep(0.001)
+            pytest.fail("CP storage operation did not retire")
+
+        with ExitStack() as stack:
+            backend = self.MemoryKvStore()
+            ranks = []
+            for rank in range(2):
+                history = torch.zeros(72, dtype=torch.uint8, device="cuda")
+                state = torch.zeros_like(history)
+                layout = self.CacheTransferLayout(
+                    num_lcm_blocks=8,
+                    groups=(
+                        self.CacheGroupLayout(
+                            "history", 1, (self.CacheField("layer.0.kv", 0, 0, 8, 8),)
+                        ),
+                        self.CacheGroupLayout(
+                            "state", 1, (self.CacheField("layer.1.state", 1, 0, 8, 8),)
+                        ),
+                    ),
+                    buffers=(history, state),
+                    consumers=(("layer.0.kv",), ("layer.1.state",)),
+                )
+                executor = self.executor_module.HostCacheExecutor(
+                    Pool(layout),
+                    draft_pool=None,
+                    l2_tier=True,
+                    host_ratio=1.0,
+                    host_size_gb=0,
+                    snapshot_pool=RetractionPoolRequest(
+                        host_gb=0,
+                        ratio=0,
+                        max_retracted_requests=0,
+                        tail_lcm_blocks_per_request=0,
+                    ),
+                    slot_state_exporters=None,
+                    io_backend="direct",
+                    attn_tp_rank=rank,
+                    kvp_rank=rank,
+                    nprocs_per_node=1,
+                    world_cpu_group=None,
+                )
+                stack.callback(executor.shutdown)
+                ownership = BlockOwnerTranslation.for_host_pool(
+                    layout, contract, num_host_lcm_blocks=8, rank=rank
+                )
+                l3 = L3Executor(
+                    backend,
+                    executor.host_storage,
+                    key_prefix="cp-e2e",
+                    rank=rank,
+                    ownership=ownership,
+                    config=StorageRuntimeConfig.from_extra_config(
+                        None, host_blocks=8, prefix_granularity=2
+                    ),
+                    prefix_for_weight_version=None,
+                    clock=time.monotonic,
+                )
+                stack.callback(l3.close, timeout_s=5)
+                history[8:16].fill_(0x10 + rank)
+                state[32:40].fill_(0x20 + rank)
+                executor._start_writing(
+                    [7],
+                    [(0, 1, 1), (1, 4, 4)],
+                    lane=executor._pinned_write_lane,
+                    prerequisite_stream=torch.cuda.current_stream(),
+                )
+                executor.write_stream.synchronize()
+                assert [event.op_id for event in executor.poll_results()] == [7]
+                run(l3, 1, "put", [(0, rank + 1, f"h{rank}", 0), (1, 4, "state", 0)])
+                ranks.append((executor, l3, ownership, history, state))
+
+            for rank, (executor, l3, ownership, history, state) in enumerate(ranks):
+                executor.host_storage.host_buffer.zero_()
+                history.zero_()
+                state.zero_()
+                run(
+                    l3, 2, "get", [(0, 2, "h0", 0), (0, 1, "h1", 0), (1, 4, "state", 0)]
+                )
+                # Each rank reads one history object and its own state object.
+                get = next(row for row in l3.snapshot().operations if row.kind == "get")
+                assert get.success_keys == 2 and get.success_bytes == 16
+                rows = [
+                    row
+                    for _, row in ownership.owned_positions(
+                        [(0, 3, 1), (0, 4, 2), (1, 5, 4)]
+                    )
+                ]
+                executor._start_loading(
+                    [9], rows, prerequisite_stream=torch.cuda.current_stream()
+                )
+                executor.load_stream.synchronize()
+                assert [event.op_id for event in executor.poll_results()] == [9]
+                assert torch.equal(
+                    history[16:24].cpu(),
+                    torch.full((8,), 0x11 - rank, dtype=torch.uint8),
+                )
+                assert torch.equal(
+                    state[40:48].cpu(), torch.full((8,), 0x20 + rank, dtype=torch.uint8)
+                )
+
     def test_native_mooncake_survives_writer_process_exit(self):
         raw = os.environ.get("MOONCAKE_GPU_TEST_CONFIG")
         if not raw:

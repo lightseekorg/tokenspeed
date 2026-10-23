@@ -62,6 +62,9 @@ void SchedulerConfig::Validate() const {
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
     }
+    if (state_checkpoint_in_forward && disable_prefix_cache && role != Role::kD) {
+        throw std::invalid_argument("Scheduler: state_checkpoint_in_forward requires prefix caching");
+    }
     if (!enable_l3_storage && storage_config) {
         throw std::invalid_argument("StorageConfig requires L3 storage to be enabled");
     }

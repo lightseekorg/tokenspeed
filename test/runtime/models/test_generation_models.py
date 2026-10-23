@@ -3,7 +3,7 @@ Usage:
 
 To test a specific model:
 1. Add it to ALL_OTHER_MODELS
-2. Run `ONLY_RUN=Qwen/Qwen2-1.5B python3 -m pytest test/runtime/models/test_generation_models.py::TestGenerationModels::test_others`
+2. Run `ONLY_RUN=Qwen/Qwen3-0.6B python3 -m pytest test/runtime/models/test_generation_models.py::TestGenerationModels::test_others`
 """
 
 import os
@@ -93,7 +93,6 @@ CI_MODELS = [
 
 # All other models that do not run on the CI
 ALL_OTHER_MODELS = [
-    ModelCase("Qwen/Qwen2-1.5B-Instruct"),
     ModelCase("Qwen/Qwen3.5-27B"),
     ModelCase("Qwen/Qwen3.5-35B-A3B"),
     ModelCase("Qwen/Qwen3.5-122B-A10B"),

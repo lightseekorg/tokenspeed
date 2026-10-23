@@ -311,7 +311,10 @@ no object failure or transferred bytes. Their keys name the payload replica
 same object on another cyclic owner. Replicated state groups retain rank-local
 keys. Startup rejects head-partitioned fields in a page-sharded group: changing
 page owner must not change what bytes an object means. The producer namespace
-also includes KVP, QCP and linear-attention TP geometry.
+also includes KVP, QCP and linear-attention TP geometry. Page-sharded layouts
+include the ordered group shard counts: identical byte layouts with different
+replica numbering must not alias. All-replicated layouts retain their existing
+namespace. Host allocation IDs and cyclic owner ranks are never namespace inputs.
 
 The head advance applies that tick and cancellation before completion records,
 so an already expired/detached read cannot publish a late result. The scheduler

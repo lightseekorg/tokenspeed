@@ -297,6 +297,11 @@ class CapacityPrefillBackend(MambaAttnBackend):
         ):
             raise RuntimeError("cache pool changed without graph release/recapture")
         source = self.forward_metadata
+        # The capacity layout carries no in-forward State checkpoint, and a
+        # captured scan stores none: such a forward keeps its live metadata
+        # and runs this layer at its eager break.
+        if source.state_checkpoints is not None:
+            return False
         key = (token_capacity, bs)
         retained = self._prefill_metadata.get(key)
         if (
