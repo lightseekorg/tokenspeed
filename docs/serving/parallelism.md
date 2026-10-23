@@ -194,7 +194,7 @@ The `bootstrap_room` still identifies the prefill KV source:
 `room % prefill_dp_size` must match the selected prefill rank; conflicting
 prefill pins are rejected at ingress. The decode
 rank can differ from the room residue. Without a pin, the configured dispatch
-policy applies; `round_robin` continues to select `room % dp_size` in P/D mode.
+policy applies; `round_robin` continues to select `room % dp_size` in PD mode.
 
 With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 `ts serve` to enable per-rank affinity routing. This requires bundled smg
