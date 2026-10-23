@@ -28,8 +28,14 @@ remainder in its tail.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.kpool import kpool_prefill_tail_write
+from tokenspeed_kernel.ops.attention.kpool._triton.cache import (
+    _kpool_prefill_tail_write_kernel,
+)
 
 from tokenspeed.runtime.layers.attention.kpool import build_kpool_prefill_plan
 
@@ -191,3 +197,55 @@ def test_plan_builds_on_device_without_synchronizing() -> None:
     assert plan.pool_workspace_slots.tolist() == workspace
     assert plan.write.pool_chunk_rows.tolist() == pools["chunk_rows"]
     assert plan.write.tail_dst_positions.tolist() == tails["dst"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_plan_shapes_do_not_recompile_the_tail_write() -> None:
+    """Triton keys pointer arguments on 16-byte alignment, so plan arrays whose
+    offset in the upload moved with the batch shape would recompile the
+    kernels reading them while serving."""
+    head_dim = 128
+    table = torch.arange(64, dtype=torch.int32, device="cuda").view(8, 8)
+    tail_k = torch.zeros(8, TAIL_ROWS, head_dim, dtype=torch.bfloat16, device="cuda")
+    tail_gate = torch.zeros_like(tail_k)
+
+    def run(starts, lengths):
+        plan = build_kpool_prefill_plan(
+            prefix_lens_cpu=torch.tensor(starts),
+            extend_lens_cpu=torch.tensor(lengths),
+            index_block_table=table[: len(starts)],
+            request_slots=torch.arange(len(starts), device="cuda"),
+            kpool=KPOOL,
+            index_rows_per_page=ROWS_PER_PAGE,
+            tail_rows_per_request=TAIL_ROWS,
+        )
+        write = plan.write
+        key = torch.randn(sum(lengths), head_dim, dtype=torch.bfloat16, device="cuda")
+        kpool_prefill_tail_write(
+            key,
+            key,
+            tail_k,
+            tail_gate,
+            write.tail_chunk_src,
+            write.tail_slots,
+            write.tail_dst_positions,
+            write.tail_write_counts,
+            pool_size=KPOOL,
+        )
+
+    run([0, 0], [7, 9])
+    with patch.object(
+        _kpool_prefill_tail_write_kernel,
+        "_do_compile",
+        wraps=_kpool_prefill_tail_write_kernel._do_compile,
+    ) as compiles:
+        for starts, lengths in (
+            ([1, 2, 3], [5, 6, 7]),
+            ([0], [3]),
+            ([2, 5, 1, 0, 3], [9, 2, 7, 1, 6]),
+            ([3, 1], [13, 22]),
+            ([0, 1, 2, 3, 0, 1, 2], [1, 2, 3, 5, 6, 7, 9]),
+        ):
+            run(starts, lengths)
+        torch.cuda.synchronize()
+    assert compiles.call_count == 0
