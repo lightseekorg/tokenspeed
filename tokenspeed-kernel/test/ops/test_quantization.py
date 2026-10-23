@@ -598,16 +598,12 @@ def test_quantize_fp8_with_scale_token_group(
         .clamp_min(1.0e-10)
         / _FP8_FINFO.max
     )
-    torch.testing.assert_close(scale, expected_scale, rtol=1e-5, atol=1e-12)
+    torch.testing.assert_close(scale, expected_scale, rtol=2**-21, atol=0)
     assert torch.isfinite(scale).all()
     assert torch.isfinite(out.float()).all()
     assert (out.float().abs() <= _FP8_FINFO.max).all()
     assert _bitwise_equal(
         out.reshape(-1, 128)[0], torch.zeros(128, device=device).to(_FP8_DTYPE)
-    )
-    assert _bitwise_equal(
-        scale.reshape(-1)[0],
-        torch.tensor(1e-10 / _FP8_FINFO.max, device=device),
     )
     assert _bitwise_equal(out.reshape(-1, 128)[2], x.reshape(-1, 128)[2].to(_FP8_DTYPE))
     reference_out = (
