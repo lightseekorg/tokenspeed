@@ -267,7 +267,30 @@ backend serves the layer. A per-token-head cache keeps the activation dtype.
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
 
-Ascend native DSA exposes BF16 KV cache storage in the runtime.
+Ascend native DSA exposes BF16 KV cache storage in the runtime. Prefill
+keeps each CP rank's token rows, computes every attention head, and uses full
+QB/KC/VC/O weights prepared at load time. Decode retains the original sharded
+weights and native prologue. The common cache writer is unchanged.
+
+One AICPU communication stream serves both Index-K and latent KV. Historical
+owner cache planes are gathered during the preceding KDA layers. As soon as
+local Index-K is produced, its current rows are gathered directly into the
+prepared current receive region. After the MLA query/latent prologue, current
+KV is gathered on that same stream while the main stream runs Indexer.
+Indexer waits only for Index-K; sparse attention then waits for KV. Completion
+events preserve these dependencies without a host synchronize. The workspace
+is not reused until sparse attention finishes reading it.
+
+Device metadata prepares one compact page table and request numbering shared
+by Indexer and sparse attention; requests without local query rows are omitted.
+Complete aligned current pages map directly to their final rank-major receive
+addresses. Only pages crossing a request, prefix, or rank
+boundary are stitched into historical pages. A DSA-specific copy kernel also
+commits this rank's persistent owner rows. There is no full received-plane
+copy, query/output AllToAll, page deduplication, dynamic count readback, or
+CPU copy plan. Sanitization applies before communication when required by
+the cache target. Cache sizing reserves historical receives, bounded current
+receives, and uneven-row send padding before allocating the cache arena.
 
 ## MLA shapes
 

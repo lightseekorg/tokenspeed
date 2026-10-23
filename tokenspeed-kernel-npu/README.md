@@ -41,6 +41,30 @@ composed implementation, not
 a fallback when the fused decode kernel rejects a shape. Official GMM's BF16
 epilogue has different intermediate rounding from fused vector dequantization.
 
+Ascend BF16 DSA Prefill uses `mlp_lightning_indexer` (FP32 score weights)
+and `sparse_mla_attention_prefill`. Build both OPP operators alongside the
+existing Decode operators. Prefill keeps token-local queries and all heads;
+there is no query/output AllToAll or TopK/LSE exchange. Persistent KV remains
+owner-sharded.
+
+The CANN 9.0/A2 CP runtime additionally loads ABI 2
+`libdsa_cp_prefill.so`, built from the operator repository's standalone
+`cann-flash-ops/src/dsa_cp_prefill` CMake project. Set
+`TOKENSPEED_DSA_CP_LIBRARY` to its absolute library path before cache binding.
+One AICPU communicator and stream gather directly into preallocated receive
+planes. Index-K is submitted after its producer; current KV communication
+runs while Indexer computes. Sparse attention waits for KV. The preceding KDA
+layers can overlap historical gathers; cold Prefill skips those transfers.
+
+One device metadata launch prepares the compact page table shared by Indexer
+and sparse attention, cumulative lengths, causal scans and current-page aliases.
+Complete aligned pages are read directly at their receive address; only
+boundary pages are stitched. The DSA copy kernel also commits persistent owner
+rows. No CPU page plan, unique-page scan, count readback or full receive-plane
+repacking is used. Reserve history/current receive planes and bounded uneven-row
+send padding before sizing the cache arena. Decode and the shared cache writer
+keep their existing contracts.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash

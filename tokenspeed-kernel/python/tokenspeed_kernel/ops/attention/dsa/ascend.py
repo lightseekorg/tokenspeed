@@ -66,6 +66,13 @@ def ascend_dsa_kernels():
     return _kernels
 
 
+def ascend_prefill_cache_metadata(*args, **kwargs):
+    """Map owner pages and current receives without loading Indexer operators."""
+    from tokenspeed_kernel_npu.ops.dsa import AscendDSAKernels
+
+    return AscendDSAKernels.prefill_metadata(*args, **kwargs)
+
+
 if platform.is_npu:
 
     @register_kernel(
