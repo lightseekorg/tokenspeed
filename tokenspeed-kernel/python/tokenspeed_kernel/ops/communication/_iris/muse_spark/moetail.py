@@ -72,7 +72,6 @@ def _iris_muse_moetail_project(
 def _iris_muse_moetail_send(
     x_ptr,
     weight_ptr,
-    region,
     epochs,
     regions,
     program,
@@ -113,8 +112,11 @@ def _iris_muse_moetail_send(
         WORLD_SIZE,
         PEER_SIGNAL_STORE_CACHE,
     )
-    # Write through: the reducer may poll the own slot from another XCD.
-    gl.amd.cdna4.buffer_store(values, region + offset, offsets, cache=".wt")
+    # Write through: the reducer may poll the own slot from another XCD. Like
+    # the peer bases, the hinted own base keeps every 32-bit word one store at
+    # any specialization; split halves could expose a stale low half.
+    own = gl.multiple_of(regions[RANK].to(gl.pointer_type(gl.bfloat16)), 16)
+    gl.amd.cdna4.buffer_store(values, own + offset, offsets, cache=".wt")
 
 
 @gluon.jit
@@ -177,7 +179,7 @@ def _iris_muse_moetail_reduce(
         + within // 2
     )
     mailbox = gl.multiple_of(base, WORDS)[:, None] + word[None, :]
-    words_ptr = region.to(gl.pointer_type(gl.uint32), bitcast=True)
+    words_ptr = gl.multiple_of(region.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
     # One reader per word. Payloads never hold negative zero and 32-bit words
     # are written whole, so a word is empty exactly when its high half is 0x8000.
     words = gl.amd.cdna4.buffer_load(words_ptr, mailbox, cache=".cv")
@@ -289,7 +291,6 @@ def iris_fused_gemv_lamport_allgather_muse_moetail(
         _iris_muse_moetail_send(
             x_ptr,
             weight_ptr,
-            region,
             epochs,
             regions,
             program,

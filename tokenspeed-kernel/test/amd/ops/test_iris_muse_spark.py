@@ -970,8 +970,12 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _compile_gfx950(fn, types, constexprs, num_warps):
-    """Compile a Gluon kernel for gfx950 without launching it."""
+def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
+    """Compile a Gluon kernel for gfx950 without launching it.
+
+    Arguments named in unspecialized get no 16-byte divisibility, as when a
+    caller passes them in do_not_specialize or compiles ahead of time.
+    """
     from tokenspeed_kernel._triton import gluon, triton
 
     attrs = {}
@@ -983,7 +987,7 @@ def _compile_gfx950(fn, types, constexprs, num_warps):
                     for peer in range(len(types[name]))
                 }
             )
-        elif name in types:
+        elif name in types and name not in unspecialized:
             attrs[(index,)] = [["tt.divisibility", 16]]
     source = gluon._runtime.GluonASTSource(
         fn,
@@ -1179,7 +1183,9 @@ def test_moetail_lamport_codegen():
     Each sender's eight 8-byte packets (seven peers and its own slot) must
     issue back to back; a wait after each would expose seven remote write
     latencies. The reducer rereads its 16-byte mailbox words on every retry
-    and branches on the subgroup's lane mask.
+    and branches on the subgroup's lane mask. The mailbox pointer is compiled
+    without alignment specialization: no 32-bit word may be split into 16-bit
+    accesses.
     """
     from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
@@ -1221,6 +1227,7 @@ def test_moetail_lamport_codegen():
             ).peer_signal_store,
         },
         num_warps=16,
+        unspecialized=("region",),
     )
     assembly = kernel.asm["amdgcn"]
     lines = assembly.splitlines()
