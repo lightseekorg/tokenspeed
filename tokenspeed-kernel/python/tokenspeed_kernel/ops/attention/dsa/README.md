@@ -95,6 +95,11 @@ distinct under CUDA fast math. Cluster ranks reduce every refinement histogram
 together before collecting candidates. Equal reduced histograms and counts keep
 every rank's refinement rounds and cluster barriers in sync.
 
+Cluster launches check the kernel's supported cluster size before submission.
+This keeps the cluster-16 to cluster-8 or single-CTA fallback valid during CUDA
+Graph capture, where an unsupported launch otherwise fails only when the graph
+is instantiated. Eager execution and graph replay use the same selection rule.
+
 ## Index-K plane formats
 
 `dsa_prefill_topk` and `dsa_decode_topk` read the storage of the index-key

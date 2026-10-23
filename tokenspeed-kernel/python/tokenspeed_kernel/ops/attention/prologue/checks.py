@@ -472,6 +472,18 @@ def _check_latent_cache(
             f"per-token-head planes are not dense [slots, 1, ·] of {kv_lora_rank} "
             f"latent, 1 scale and {rope_dim} RoPE channels"
         )
+    elif cache.format is KVCacheFormat.FP8_FLASHMLA:
+        if (
+            activation.dtype != torch.bfloat16
+            or kv_lora_rank != 512
+            or rope_dim not in (0, 64)
+        ):
+            raise ValueError(
+                "FlashMLA KV requires BF16 activations, latent width 512 "
+                "and RoPE width 0 or 64"
+            )
+        rows = ((cache.kv_cache, 656),)
+        malformed = "FlashMLA KV requires dense uint8 rows of 656 bytes"
     else:
         rows = ((cache.kv_cache, kv_lora_rank + rope_dim),)
         malformed = (

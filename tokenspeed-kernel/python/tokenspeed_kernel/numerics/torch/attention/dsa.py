@@ -211,12 +211,15 @@ def torch_dsa_sparse_attention(
     topk_slots: torch.Tensor,
     topk_lens: torch.Tensor,
     softmax_scale: float,
-) -> torch.Tensor:
+    *,
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """MLA of each query row over its selected latent cache slots.
 
     Logits are ``q[:, :rank] . latent + q[:, rank:] . rope`` (no rope part
     when ``rope`` is None); the latent is also the value. Negative slots and
-    slots past ``topk_lens`` are ignored; a row with none returns zeros.
+    slots past ``topk_lens`` are ignored; a row with none returns zeros and
+    has ``-inf`` LSE.
 
     Args:
         q: ``[tokens, heads, rank (+ rope_dim)]``.
@@ -224,27 +227,37 @@ def torch_dsa_sparse_attention(
         rope: ``[slots, rope_dim]`` or None.
         topk_slots: ``[tokens, topk]``.
         topk_lens: ``[tokens]``.
+        softmax_scale: Logit scale.
+        return_lse: Also return the FP32 log-sum-exp of the scaled logits.
 
     Returns:
-        ``[tokens, heads, rank]`` BF16.
+        ``[tokens, heads, rank]`` BF16, with ``[tokens, heads]`` FP32 LSE
+        when requested.
     """
     rank = latent.shape[1]
     refs = []
+    lses = []
     for token in range(q.shape[0]):
         slots = topk_slots[token, : int(topk_lens[token])].long()
         slots = slots[slots >= 0]
         q_nope = q[token, :, :rank].float()
         if slots.numel() == 0:
             refs.append(torch.zeros_like(q_nope))
+            if return_lse:
+                lses.append(torch.full_like(q_nope[:, 0], -float("inf")))
             continue
         k_nope = latent.index_select(0, slots).float()
         scores = torch.einsum("hd,kd->hk", q_nope, k_nope)
         if rope is not None:
             k_rope = rope.index_select(0, slots).float()
             scores += torch.einsum("hd,kd->hk", q[token, :, rank:].float(), k_rope)
-        probs = torch.softmax(scores * softmax_scale, dim=-1)
+        scores *= softmax_scale
+        probs = torch.softmax(scores, dim=-1)
         refs.append(probs @ k_nope)
-    return torch.stack(refs).to(torch.bfloat16)
+        if return_lse:
+            lses.append(torch.logsumexp(scores, dim=-1))
+    output = torch.stack(refs).to(torch.bfloat16)
+    return (output, torch.stack(lses)) if return_lse else output
 
 
 @register_kernel(

@@ -44,6 +44,7 @@ def _recipe(
     *,
     tp_size: int,
     mla_cache_dtype: torch.dtype,
+    kv_cache_quant_method: str,
     draft_layers: int = 0,
     linear_tp_size: int | None = None,
     pd_disaggregation_enabled: bool = False,
@@ -82,7 +83,7 @@ def _recipe(
         device="cpu",
         dtype=torch.bfloat16,
         kv_cache_dtype=mla_cache_dtype,
-        kv_cache_quant_method="none",
+        kv_cache_quant_method=kv_cache_quant_method,
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=16,
@@ -134,6 +135,7 @@ def _layout(
         tp_size=tp_size,
         linear_tp_size=linear_tp_size,
         mla_cache_dtype=mla_cache_dtype,
+        kv_cache_quant_method="none",
         draft_layers=draft_layers,
     )
     groups = recipe.groups()
@@ -208,6 +210,7 @@ def test_dsa_and_kda_components_own_independent_tp_geometry() -> None:
         tp_size=4,
         linear_tp_size=8,
         mla_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
     )
     groups = recipe.groups()
     full_packing = recipe.packing(groups)[FULL_ATTENTION]
@@ -240,6 +243,7 @@ def test_disaggregated_serving_requires_private_tail_transfer_bridge() -> None:
     recipe = _recipe(
         tp_size=4,
         mla_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
         pd_disaggregation_enabled=True,
     )
     with pytest.raises(NotImplementedError, match="request-local KPool tail"):
@@ -249,13 +253,22 @@ def test_disaggregated_serving_requires_private_tail_transfer_bridge() -> None:
 def test_pooled_index_rows_are_planned_for_the_fp8_plane_only() -> None:
     # The recipe sizes the pooled index-K rows as FP8 keys plus a scale; a
     # config naming the bf16 plane must be refused, not silently misbudgeted.
-    recipe = _recipe(tp_size=4, mla_cache_dtype=torch.bfloat16, index_k_format="bf16")
+    recipe = _recipe(
+        tp_size=4,
+        mla_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        index_k_format="bf16",
+    )
     with pytest.raises(ValueError, match="fp8_scaled"):
         recipe.groups()
 
 
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
-    recipe = _recipe(tp_size=8, mla_cache_dtype=torch.float8_e4m3fn)
+    recipe = _recipe(
+        tp_size=8,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        kv_cache_quant_method="none",
+    )
     groups = recipe.groups()
     layout = pack(
         groups,
@@ -306,7 +319,12 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     )
     token_limit = 131_072
     expected = CacheRecipe.parents_needed(
-        _recipe(tp_size=4, mla_cache_dtype=torch.bfloat16, draft_layers=1),
+        _recipe(
+            tp_size=4,
+            mla_cache_dtype=torch.bfloat16,
+            kv_cache_quant_method="none",
+            draft_layers=1,
+        ),
         layout,
         token_limit,
     )
@@ -329,3 +347,23 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     recipe.token_limit = token_limit
 
     assert Glm53FlashRecipe.num_lcm_blocks(recipe, layout) == expected
+
+
+@pytest.mark.parametrize("tp_size", [1, 2, 4, 8])
+@pytest.mark.parametrize("draft_layers", [0, 1])
+def test_packed_fp8_rows_fit_the_hybrid_arena(tp_size, draft_layers):
+    recipe = _recipe(
+        tp_size=tp_size,
+        mla_cache_dtype=torch.float8_e4m3fn,
+        draft_layers=draft_layers,
+        kv_cache_quant_method="flashmla",
+    )
+    setup = recipe.setup()
+    plan = setup.spec.memory_plan
+    latent = [f for f in plan.fields if f.field_id.endswith(".latent_kv")]
+    assert len(latent) == len(_FULL_LAYER_IDS) + draft_layers
+    for field in latent:
+        assert field.shape == (64, 1, 656)
+        assert field.payload_bytes == 64 * 656
+        assert field.page_stride_bytes == field.payload_bytes
+    assert plan.arena_bytes + setup.fixed_workspace_bytes <= recipe.cache_budget_bytes

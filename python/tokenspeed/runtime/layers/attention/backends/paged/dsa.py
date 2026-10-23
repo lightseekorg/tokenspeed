@@ -200,9 +200,13 @@ class DSABackend(PagedAttentionBackend):
         self.qk_nope_head_dim = spec.qk_nope_head_dim
         self.qk_rope_head_dim = spec.qk_rope_head_dim
         self.v_head_dim = spec.v_head_dim
-        self.kv_cache_dim = spec.kv_cache_dim
+        self.kv_cache_dim = spec.cache_storage_dim(config)
         self.scaling = spec.scaling
-        self.data_type = config.kv_cache_dtype
+        self.data_type = (
+            torch.uint8
+            if config.kv_cache_quant_method == "flashmla"
+            else config.kv_cache_dtype
+        )
         self.q_data_type = config.dtype
         self.num_attention_heads = spec.num_attention_heads
         self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
@@ -223,8 +227,8 @@ class DSABackend(PagedAttentionBackend):
                 "kv_lora_rank": self.kv_lora_rank,
                 "qk_rope_head_dim": self.qk_rope_head_dim,
                 "page_size": self.kernel_page_size,
-                "has_kv_cache": True,
-                "has_sparse_kv_cache": False,
+                "has_kv_cache": not self.packed_kv,
+                "has_sparse_kv_cache": self.packed_kv,
                 "logit_cap": False,
                 "topk_layout": "global_slots",
                 "slot_order": self.slot_order,
@@ -285,6 +289,11 @@ class DSABackend(PagedAttentionBackend):
         self.cuda_graph_support = self.cuda_graph_support & CudaGraphSupport.from_plans(
             prefill=self.prefill_kernel_plan, decode=self.decode_kernel_plan
         )
+
+    @property
+    def packed_kv(self) -> bool:
+        """FlashMLA's mixed E4M3/FP32/BF16 rows are stored as bytes."""
+        return self.data_type == torch.uint8
 
     def _probe_history_gather_topk_leaf(self, spec: DSAConfig) -> None:
         """Select, at construction, the indexer leaf the sharded extend arm
@@ -1007,8 +1016,8 @@ class DSABackend(PagedAttentionBackend):
                 topk_indices=topk_indices,
                 topk_lens=topk_lens,
             )
-        if len(self.kvp_group) > 1:
-            raise ValueError("Sharded DSA decode requires global top-k selection")
+        if self.packed_kv or len(self.kvp_group) > 1:
+            raise ValueError("Packed or sharded DSA decode requires top-k selection")
         metadata = self.forward_decode_metadata
         if metadata is not None and metadata.seq_lens_k is not None:
             num_extends = int(metadata.num_extends or 0)
@@ -1131,8 +1140,8 @@ class DSABackend(PagedAttentionBackend):
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_prefill(
             q=q_view,
-            kv_cache=kv_cache,
-            sparse_kv_cache=None,
+            kv_cache=None if self.packed_kv else kv_cache,
+            sparse_kv_cache=kv_cache if self.packed_kv else None,
             topk_slots=topk_slots,
             topk_lens=topk_lens.to(device=q.device, dtype=torch.int32).contiguous(),
             kv_seq_lens=(
@@ -1359,8 +1368,8 @@ class DSABackend(PagedAttentionBackend):
                 q_view = gather_query_heads(q_view, self.kvp_group)
         out = dsa_decode(
             q=q_view,
-            kv_cache=kv_cache,
-            sparse_kv_cache=None,
+            kv_cache=None if self.packed_kv else kv_cache,
+            sparse_kv_cache=kv_cache if self.packed_kv else None,
             topk_slots=topk_slots,
             topk_lens=topk_lens,
             max_seqlen_k=max_seqlen_k,

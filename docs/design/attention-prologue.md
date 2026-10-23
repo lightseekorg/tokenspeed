@@ -260,9 +260,19 @@ the `scaled-fp8` cache signature: trtllm-gen folds `k_scale` into the logit
 scale and `v_scale` into the output's. A cache of another dtype ignores the
 scales. MLA caches run at unit scale.
 
-An MLA layer reads its query in the activation dtype, except that an FP8
+An MLA layer reads its query in the activation dtype, except that a plain FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA
 backend serves the layer. A per-token-head cache keeps the activation dtype.
+
+Hopper DSA uses the packed FlashMLA FP8 format: 512 E4M3 latent values,
+four FP32 scales (one per 128 values), and 64 BF16 RoPE values, totaling
+656 bytes per row. NoPE models write zero into the RoPE tail. Its query stays
+BF16. The composite MLA prologue rotates the inputs and stores these packed
+rows; the ordinary and GLM-5.3-Flash cache recipes account for the complete
+row. Sparse prefill reads the same packed cache through the FlashMLA sparse
+decode kernel with one query per row. Decode and speculative verification
+use that kernel with their actual query count. Query context parallelism
+continues to require the BF16 cache.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
