@@ -84,6 +84,7 @@ def test_qwen4_exp_prefetch_starts_at_preceding_layer(
         for layer_id in range(4)
     )
     model.hyper_connection_mixer = _RecordingMixer()
+    model.megakernels = None
     capture = _RecordingCapture() if capturing else None
     monkeypatch.setattr(
         qwen4_exp_module.BreakableCapture,

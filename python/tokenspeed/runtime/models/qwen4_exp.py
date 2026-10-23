@@ -75,6 +75,11 @@ from tokenspeed.runtime.models.qwen3_5_moe import (
     Qwen3_5MoeMLP,
     Qwen3_5MoeSparseMoeBlock,
 )
+from tokenspeed.runtime.models.qwen4_exp_megakernel import (
+    MegakernelStep,
+    Qwen4ExpMegakernels,
+    enable_decode_megakernels,
+)
 from tokenspeed.runtime.models.utils import validate_attention_partition
 from tokenspeed.runtime.moe.expert_location import ModelConfigForExpertLocation
 from tokenspeed.runtime.utils import add_prefix
@@ -525,11 +530,21 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = GatedResidualSimple(hc_config, use_combine=False)
+        # The decode megakernels (--decode-megakernel), packed after loading
+        # by enable_decode_megakernels. None runs every step on the regular
+        # path.
+        self.megakernels: Qwen4ExpMegakernels | None = None
         self.qsa_indexers = tuple(
             layer.indexer
             for layer in self.layers
             if getattr(layer, "indexer", None) is not None
         )
+
+    @staticmethod
+    def _prefetches_ple(layer, layer_id: int, step: MegakernelStep | None) -> bool:
+        """Whether ``layer`` has a PLE block whose lookup TokenSpeed runs; a
+        decode megakernel does its own lookup."""
+        return layer.ple is not None and (step is None or step.layer(layer_id) is None)
 
     def _start_ple_prefetch(
         self, ple: Qwen4ExpPLELayer, input_ids: torch.Tensor, ctx: ForwardContext
@@ -554,15 +569,23 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
         hidden_states = (
             self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         )
-        if self.layers and self.layers[0].ple is not None:
+        # Decode megakernels: a plan for this forward, or None for the
+        # regular path. A planned layer runs as one launch (step.layer).
+        step = (
+            None
+            if self.megakernels is None
+            else self.megakernels.plan(hidden_states.shape[0], ctx)
+        )
+        if self.layers and self._prefetches_ple(self.layers[0], 0, step):
             self._start_ple_prefetch(self.layers[0].ple, input_ids, ctx)
         residual = None
         for layer_id, layer in enumerate(self.layers):
             if layer_id + 1 < len(self.layers):
-                next_ple = self.layers[layer_id + 1].ple
-                if next_ple is not None:
-                    self._start_ple_prefetch(next_ple, input_ids, ctx)
-            hidden_states, residual = layer(
+                next_layer = self.layers[layer_id + 1]
+                if self._prefetches_ple(next_layer, layer_id + 1, step):
+                    self._start_ple_prefetch(next_layer.ple, input_ids, ctx)
+            launch = None if step is None else step.layer(layer_id)
+            hidden_states, residual = (launch or layer)(
                 positions=positions,
                 hidden_states=hidden_states,
                 residual=residual,
@@ -585,6 +608,11 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                 ].repeat(1, self.config.hc_count)
                 hidden_states.add_(deepstack)
 
+        if step is not None:
+            if step.lm_head_input is not None:
+                # The last layer's launch also ran the final mixer.
+                return step.lm_head_input, [hidden_states]
+            step.finish()
         if self.layers and self.layers[-1].comm_manager.needs_final_all_gather():
             if residual is not None:
                 hidden_states = self.layers[-1].mlp_hyper_connection.combine(
@@ -803,6 +831,9 @@ class Qwen4ExpForCausalLM(BaseCausalLM):
             self, self.config, self.mapping, weights, include_visual=False
         )
 
+    def post_quant_warmup(self) -> None:
+        enable_decode_megakernels(self.model, required=True)
+
     @classmethod
     def get_model_config_for_expert_location(cls, config):
         config = getattr(config, "text_config", config)
@@ -846,6 +877,9 @@ class Qwen4ExpForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             weights,
             include_visual=self.is_multimodal_active,
         )
+
+    def post_quant_warmup(self) -> None:
+        enable_decode_megakernels(self.model, required=True)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

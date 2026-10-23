@@ -1941,3 +1941,40 @@ below 49,152 groups, and 256 groups and eight warps from there.
 Query normalization can be fused with position-dependent SSMax scaling while
 preserving the rounding of the separate operations. The positional scale
 applies only to queries; keys retain ordinary RMS normalization.
+
+## Megakernels
+
+A decode megakernel runs one decoder layer's decode step as one persistent
+launch. The stages of the layer run as tasks on fixed CTAs, and they give
+values to each other through tagged mailbox pairs in a scratch buffer. The
+invariants are in `docs/design/megakernel.md`. The steps to add a model are
+in `tokenspeed_kernel/ops/megakernel/README.md`.
+
+### gfx950 decode megakernels
+
+`ops/gfx950/megakernel/` holds the building blocks: the plan, the device
+schedule, the mailboxes, the MXFP4 GEMV and the trace. Each model has its
+stages and layer kernels in a subdirectory.
+[`gfx950/megakernel/README.md`](gfx950/megakernel/README.md) describes the
+building blocks, the rules for writing a stage and the ISA checklist. Each
+model directory has a README for its layer kernels.
+
+#### Contract
+
+- The host passes the layer's plan as one compile-time string, so a kernel
+  compiles once for each row count and chain length. Every per-step value is
+  a runtime argument.
+- All CTAs of the launch must be resident at the same time: one CTA per CU,
+  no spills, and no other kernel on the GPU during the launch.
+- The caller owns the mailbox scratch buffer and a device step counter, and
+  every layer of a step uses them. Nothing clears the buffer. The tag of a
+  launch comes from the step and the layer.
+- The kernels read and write the regular path's caches and layouts. A
+  speculative verify writes only the verify buffers.
+
+#### Algorithm
+
+Each CTA walks the stages in plan order and runs its tasks of each stage. A
+stage reads only regions that earlier stages write, so the launch cannot
+deadlock. A task issues its weight loads before it polls its
+inputs. Thus weights stream while earlier stages compute.
