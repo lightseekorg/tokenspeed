@@ -59,10 +59,13 @@ use ts_control::{
     grammar::{GrammarConfig, Grammars},
     ingress::{IngressLimits, LogprobServability},
     kv_events::{KvEventPublisher, KvEventsConfig},
+    l3::StorageLimits,
     output::{FinishLog, OutputProcessor, Role},
     transport::{EngineTransport, TransportError},
 };
-use ts_metrics::{EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, MetricsConfig};
+use ts_metrics::{
+    EngineLabels, EngineMetrics, Exporter, KvTransferMetrics, L3Labels, L3Metrics, MetricsConfig,
+};
 use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
 
@@ -165,8 +168,8 @@ struct HostConfig {
     kv_events: bool,
     /// Where this rank publishes them, if it does.
     kv_events_publisher: Option<KvEventsConfig>,
-    /// The L3 storage tier is on.
-    l3_storage: bool,
+    /// With the L3 storage tier, the scheduler's storage credits.
+    l3: Option<StorageLimits>,
     /// `--enable-eplb`: the rebalance's settings.
     eplb: Option<Eplb>,
     /// An EPD prefill node: it receives image embeddings from encode
@@ -231,7 +234,12 @@ struct Metrics {
     engine: bool,
     /// The PD transfer metrics, on every rank of a disaggregated engine.
     transfer: bool,
+    /// The L3 tier's metrics, on every rank with the tier.
+    l3: bool,
     labels: EngineLabels,
+    /// The L3 metrics' extra labels: the attention-TP rank and the role.
+    tp_rank: i64,
+    engine_role: String,
 }
 
 impl Metrics {
@@ -246,11 +254,30 @@ impl Metrics {
             },
             engine: config.getattr("engine_metrics")?.extract()?,
             transfer: config.getattr("transfer_metrics")?.extract()?,
+            l3: config.getattr("l3_metrics")?.extract()?,
             labels: EngineLabels {
                 model_name: config.getattr("metrics_model_name")?.extract()?,
                 app_key: config.getattr("metrics_app_key")?.extract()?,
                 dp_rank: config.getattr("dp_rank")?.extract()?,
             },
+            tp_rank: config.getattr("attn_tp_rank")?.extract()?,
+            engine_role: config.getattr("engine_role")?.extract()?,
+        })
+    }
+
+    /// The L3 tier's metrics, on a rank that reports them.
+    fn l3_metrics(&self, exporter: Option<&Arc<Exporter>>) -> Option<L3Metrics> {
+        exporter.filter(|_| self.l3).map(|exporter| {
+            L3Metrics::new(
+                exporter,
+                &L3Labels {
+                    model_name: self.labels.model_name.clone(),
+                    app_key: self.labels.app_key.clone(),
+                    dp_rank: self.labels.dp_rank,
+                    tp_rank: self.tp_rank,
+                    engine_role: self.engine_role.clone(),
+                },
+            )
         })
     }
 
@@ -258,7 +285,7 @@ impl Metrics {
     fn exporter(&self) -> Result<Option<Arc<Exporter>>, ts_metrics::MetricsError> {
         let any_output =
             self.outputs.prometheus_dir.is_some() || self.outputs.relay_endpoint.is_some();
-        if !any_output || !(self.engine || self.transfer) {
+        if !any_output || !(self.engine || self.transfer || self.l3) {
             return Ok(None);
         }
         Exporter::new(&self.outputs).map(Some)
@@ -325,7 +352,17 @@ impl HostConfig {
                 memory_regions: config.getattr("memory_regions")?.extract()?,
                 l3_weight_version: config.getattr("l3_weight_version")?.extract()?,
             },
-            l3_storage: config.getattr("l3_storage")?.extract()?,
+            l3: {
+                let l3 = config.getattr("l3")?;
+                if l3.is_none() {
+                    None
+                } else {
+                    Some(StorageLimits {
+                        max_operations: l3.getattr("max_operations")?.extract()?,
+                        max_keys_per_operation: l3.getattr("max_keys_per_operation")?.extract()?,
+                    })
+                }
+            },
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
             epd_prefill: config.getattr("epd_prefill")?.extract()?,
             grammar: {
@@ -536,7 +573,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         controls: config.controls.clone(),
         batch_log: config.batch_log.clone(),
         kv_events: config.kv_events,
-        l3_storage: config.l3_storage,
+        l3: config.l3,
         epd_prefill: config.epd_prefill,
         eager_grammar: config.eager_grammar,
     };
@@ -583,6 +620,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
             kv_events,
             eplb,
             grammars,
+            l3_metrics: config.metrics.l3_metrics(exporter.as_ref()),
         },
     );
     let served = event_loop.run(&stop);

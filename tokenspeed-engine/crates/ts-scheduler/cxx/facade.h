@@ -35,25 +35,30 @@ struct RequestSpec;
 struct ForwardEvent;
 struct CacheEvent;
 struct CacheOpView;
+struct StorageOpView;
 struct ForwardBatchView;
 struct SchedulerAbortView;
 struct SchedulerSizes;
 struct CacheGroupPages;
 struct KvEventView;
-struct CacheKeyView;
+struct StorageTickView;
+struct StorageCancellationView;
+struct StorageDoneView;
+struct StorageStatsView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
 std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler);
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events);
-void advance_cache(tokenspeed::Scheduler& scheduler, rust::Slice<const CacheEvent> events);
+void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
+                  rust::Slice<const StorageCancellationView> cancellations,
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
 rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);
-rust::Vec<rust::String> prefix_hashes_for_tokens(const tokenspeed::Scheduler& scheduler,
-                                                 rust::Slice<const std::int32_t> tokens);
-rust::Vec<CacheKeyView> expand_prefix_keys(const tokenspeed::Scheduler& scheduler,
-                                           rust::Slice<const rust::String> content_hashes);
-void register_storage_keys(tokenspeed::Scheduler& scheduler, rust::Slice<const CacheKeyView> keys);
+std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
+bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id);
+bool storage_pending(const tokenspeed::Scheduler& scheduler);
+StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler);
 bool clear_cache(tokenspeed::Scheduler& scheduler);
 bool clear_l1_cache(tokenspeed::Scheduler& scheduler);
 bool can_clear_cache(const tokenspeed::Scheduler& scheduler);
@@ -65,5 +70,6 @@ rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& 
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);
 
 }  // namespace ts_scheduler

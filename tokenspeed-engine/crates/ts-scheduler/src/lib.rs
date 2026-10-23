@@ -134,8 +134,30 @@ mod ffi {
         SnapshotStore,
         /// A retracted request's restore (`SnapshotRestoreBatch`).
         SnapshotRestore,
-        /// An L3 fetch into Host pages before admission (`PrefetchBatch`).
-        Prefetch,
+    }
+
+    /// The kind of a plan's storage operation.
+    #[derive(Debug)]
+    enum StorageOpKind {
+        /// Which keys the store holds (`StorageQueryOperation`).
+        Query,
+        /// Fetch keys into Host blocks (`StorageGetOperation`).
+        Get,
+        /// Store Host blocks under keys (`StoragePutOperation`).
+        Put,
+        /// Cancel an earlier operation (`StorageCancelOperation`).
+        Cancel,
+    }
+
+    /// A storage operation a plan starts on the cache owners' executors.
+    #[derive(Debug, Clone, PartialEq)]
+    struct StorageOpView {
+        /// What it does.
+        kind: StorageOpKind,
+        /// Its id; a cancel names the operation it cancels.
+        op_id: u64,
+        /// The keys it names; 0 for a cancel.
+        num_keys: usize,
     }
 
     /// One cache op a plan puts in flight; each is acknowledged on its own.
@@ -154,8 +176,6 @@ mod ffi {
         WriteBackDone,
         /// A load-back landed (`cache::LoadBackDone`).
         LoadBackDone,
-        /// A prefetch finished (`cache::PrefetchDone`).
-        PrefetchDone,
         /// A snapshot store finished (`cache::SnapshotDone`).
         SnapshotDone,
         /// A restore finished (`cache::RestoreDone`).
@@ -169,8 +189,85 @@ mod ffi {
         kind: CacheEventKind,
         /// The op it acknowledges.
         op_id: u32,
-        /// PrefetchDone: the leading prefix pages that landed; 0 otherwise.
-        landed_pages: i32,
+    }
+
+    /// The round's storage clock, permissions and queue pressure
+    /// (`cache::StorageTick`), as the cache owners agreed on them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct StorageTickView {
+        /// The clock, in microseconds.
+        now_us: i64,
+        /// Whether the scheduler may plan forwards.
+        allow_forward: bool,
+        /// Whether it may start storage operations.
+        allow_storage: bool,
+        /// `StoragePressure`: operations queued in the executors.
+        queued_operations: i64,
+        /// `StoragePressure`: bytes queued in the executors.
+        queued_bytes: i64,
+        /// `StoragePressure`: the oldest queued operation's age.
+        oldest_operation_us: i64,
+    }
+
+    /// A cancelled request on the storage path: detached from its storage
+    /// work (`cache::StorageDetach`), or aborted outright when it holds no
+    /// pages yet (`forward::Abort`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StorageCancellationView {
+        /// The request.
+        request_id: String,
+        /// Abort it; else detach it.
+        abort: bool,
+    }
+
+    /// A storage operation every cache owner completed (`cache::StorageDone`).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StorageDoneView {
+        /// The operation.
+        op_id: u64,
+        /// Per key: it succeeded on every owner.
+        success: Vec<u8>,
+        /// Every owner retired the native I/O.
+        retired: bool,
+        /// Per key: an owner confirmed the object missing or invalid.
+        object_failures: Vec<u8>,
+    }
+
+    /// The scheduler's storage observations (`StorageStats`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    struct StorageStatsView {
+        /// Storage operations in flight.
+        operations: u64,
+        /// Host blocks storage operations hold.
+        held_blocks: u64,
+        /// Host blocks quarantined after unproven retirement.
+        quarantined: u64,
+        /// Keys known to be absent from the store.
+        negative_keys: u64,
+        /// Published blocks waiting to be backed up.
+        backup_candidates: u64,
+        /// Requests waiting on their storage preparation.
+        waiting_requests: u64,
+        /// Requests whose preparation is ready.
+        ready_requests: u64,
+        /// Preparations that timed out waiting, cumulative.
+        wait_timeouts: u64,
+        /// Ready preparations that expired, cumulative.
+        ready_expirations: u64,
+        /// The pressure gate is closed.
+        pressure_gate_closed: bool,
+        /// Preparations bypassed by pressure, cumulative.
+        pressure_bypasses: u64,
+        /// Backup candidates dropped by pressure, cumulative.
+        pressure_dropped_backup_keys: u64,
+        /// Backup candidates dropped on overflow, cumulative.
+        overflow_dropped_backup_keys: u64,
+        /// Backup candidates dropped with Host memory unavailable.
+        unavailable_dropped_backup_keys: u64,
+        /// Backup candidates dropped with writes disabled, cumulative.
+        disabled_dropped_backup_keys: u64,
+        /// Backup candidates dropped on cleanup, cumulative.
+        cleanup_dropped_backup_keys: u64,
     }
 
     /// Request and page counts.
@@ -213,18 +310,6 @@ mod ffi {
         block_size: i32,
     }
 
-    /// A prefix page of one cache group (`CacheKey`): the content hash of the
-    /// prefix it ends and its page within the hash's block.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    struct CacheKeyView {
-        /// The cache group.
-        group_id: u32,
-        /// The prefix's content hash.
-        content_hash: String,
-        /// The page within the block.
-        page_offset: i32,
-    }
-
     /// One cache group's page counts.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct CacheGroupPages {
@@ -245,16 +330,20 @@ mod ffi {
         fn submit_requests(scheduler: Pin<&mut Scheduler>, specs: &[RequestSpec]);
         fn next_execution_plan(scheduler: Pin<&mut Scheduler>) -> UniquePtr<ExecutionPlan>;
         fn advance(scheduler: Pin<&mut Scheduler>, events: &[ForwardEvent]) -> Result<()>;
-        fn advance_cache(scheduler: Pin<&mut Scheduler>, events: &[CacheEvent]) -> Result<()>;
+        fn advance_head(
+            scheduler: Pin<&mut Scheduler>,
+            ticks: &[StorageTickView],
+            cancellations: &[StorageCancellationView],
+            done: &[StorageDoneView],
+            cache_events: &[CacheEvent],
+        ) -> Result<()>;
         fn sizes(scheduler: &Scheduler) -> SchedulerSizes;
         fn cache_group_pages(scheduler: &Scheduler, group_id: &str) -> CacheGroupPages;
         fn drain_kv_events(scheduler: Pin<&mut Scheduler>) -> Vec<KvEventView>;
-        fn prefix_hashes_for_tokens(scheduler: &Scheduler, tokens: &[i32]) -> Vec<String>;
-        fn expand_prefix_keys(
-            scheduler: &Scheduler,
-            content_hashes: &[String],
-        ) -> Vec<CacheKeyView>;
-        fn register_storage_keys(scheduler: Pin<&mut Scheduler>, keys: &[CacheKeyView]);
+        fn request_token_size(scheduler: &Scheduler, request_id: &str) -> i32;
+        fn can_abort_before_admission(scheduler: &Scheduler, request_id: &str) -> bool;
+        fn storage_pending(scheduler: &Scheduler) -> bool;
+        fn storage_stats(scheduler: &Scheduler) -> StorageStatsView;
         fn clear_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn clear_l1_cache(scheduler: Pin<&mut Scheduler>) -> bool;
         fn can_clear_cache(scheduler: &Scheduler) -> bool;
@@ -266,14 +355,29 @@ mod ffi {
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
+        fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
     }
 }
 
 pub use ffi::{
-    CacheEvent, CacheEventKind, CacheGroupPages, CacheKeyView, CacheOpKind, CacheOpView,
-    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView,
-    SchedulerSizes,
+    CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView, ForwardBatchView,
+    ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView, SchedulerSizes,
+    StorageCancellationView, StorageDoneView, StorageOpKind, StorageOpView, StorageStatsView,
+    StorageTickView,
 };
+
+/// What advances the scheduler at the head of a round: with L3, the agreed
+/// storage clock, the cancellations and the storage completions; then the
+/// Host copies' acknowledgments.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StorageRound {
+    /// The agreed clock and permissions; `None` without L3.
+    pub tick: Option<StorageTickView>,
+    /// Requests cancelled since the last round, in order.
+    pub cancellations: Vec<StorageCancellationView>,
+    /// Storage operations every owner completed, by op id.
+    pub done: Vec<StorageDoneView>,
+}
 
 extern "C" {
     fn PyInit_tokenspeed_scheduler_ext() -> *mut pyffi::PyObject;
@@ -373,9 +477,21 @@ impl Scheduler {
         ffi::advance(self.pinned(), events)
     }
 
-    /// Feed cache-op acknowledgments back, as one event batch.
-    pub fn advance_cache(&mut self, events: &[CacheEvent]) -> Result<(), cxx::Exception> {
-        ffi::advance_cache(self.pinned(), events)
+    /// Feed the round head's storage events and cache-op acknowledgments
+    /// back, as one event batch.
+    pub fn advance_head(
+        &mut self,
+        storage: &StorageRound,
+        cache_events: &[CacheEvent],
+    ) -> Result<(), cxx::Exception> {
+        let ticks: &[StorageTickView] = storage.tick.as_slice();
+        ffi::advance_head(
+            self.pinned(),
+            ticks,
+            &storage.cancellations,
+            &storage.done,
+            cache_events,
+        )
     }
 
     /// Request and page counts.
@@ -388,20 +504,26 @@ impl Scheduler {
         ffi::cache_group_pages(self.get(), group_id)
     }
 
-    /// The content hashes of `tokens`' full-block prefixes, as the
-    /// scheduler keys its caches.
-    pub fn prefix_hashes_for_tokens(&self, tokens: &[i32]) -> Vec<String> {
-        ffi::prefix_hashes_for_tokens(self.get(), tokens)
+    /// The request's token count, or a negative value for a request the
+    /// scheduler does not hold.
+    pub fn request_token_size(&self, request_id: &str) -> i32 {
+        ffi::request_token_size(self.get(), request_id)
     }
 
-    /// Every cache group's pages under `content_hashes`.
-    pub fn expand_prefix_keys(&self, content_hashes: &[String]) -> Vec<CacheKeyView> {
-        ffi::expand_prefix_keys(self.get(), content_hashes)
+    /// Whether the request holds no pages yet, so an abort can finish it
+    /// without the forward or PD completion fence.
+    pub fn can_abort_before_admission(&self, request_id: &str) -> bool {
+        ffi::can_abort_before_admission(self.get(), request_id)
     }
 
-    /// Record pages the L3 store holds, for prefetch before admission.
-    pub fn register_storage_keys(&mut self, keys: &[CacheKeyView]) {
-        ffi::register_storage_keys(self.pinned(), keys);
+    /// Whether storage operations are in flight.
+    pub fn storage_pending(&self) -> bool {
+        ffi::storage_pending(self.get())
+    }
+
+    /// The scheduler's storage observations.
+    pub fn storage_stats(&self) -> StorageStatsView {
+        ffi::storage_stats(self.get())
     }
 
     /// The prefix-cache mutations since the last drain, in order; empty
@@ -470,6 +592,12 @@ impl ExecutionPlan {
     /// The cache ops the plan puts in flight, in plan order.
     pub fn cache_ops(&self) -> Vec<CacheOpView> {
         ffi::plan_cache_ops(&self.0)
+    }
+
+    /// The storage operations the plan starts, in plan order; the data plane
+    /// runs them on the cache owners' storage executors.
+    pub fn storage_ops(&self) -> Vec<StorageOpView> {
+        ffi::plan_storage_ops(&self.0)
     }
 
     /// Hand the plan to Python as a `tokenspeed_scheduler.ExecutionPlan`.

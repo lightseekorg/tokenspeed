@@ -26,16 +26,19 @@ data plane still fills the token bitmasks, and on the capturable path
 advances the matchers inside the forward; it reaches them through the C
 entries the host hands over at startup (``set_grammar_entries``), which a
 ``HostGrammar`` wraps in the grammar interface the data plane takes
-(``BaseGrammarObject``).
+(``BaseGrammarObject``). The capturable path's host node calls the same
+entries from C++ (``grammar_host``).
 """
 
 from __future__ import annotations
 
 import ctypes
+from typing import Any
 
 import torch
 
 from tokenspeed.runtime.grammar.base_grammar_backend import BaseGrammarObject
+from tokenspeed.runtime.grammar.grammar_host import load_grammar_host_ext
 
 
 class HostGrammarEntries:
@@ -46,10 +49,9 @@ class HostGrammarEntries:
     """
 
     def __init__(self, addresses: dict[str, int]) -> None:
-        # The calls keep the GIL: each is short, and on the capturable path
-        # they run on the CUDA callback thread, where releasing the GIL per
-        # call would hand it to another thread and wait a switch interval to
-        # get it back (see ``GrammarHostBuffers``).
+        # The calls keep the GIL: each takes microseconds, and releasing the
+        # GIL per call would hand it to another thread for up to a switch
+        # interval (5 ms).
         def entry(name: str, restype, *argtypes):
             return ctypes.PYFUNCTYPE(restype, *argtypes)(addresses[name])
 
@@ -67,6 +69,16 @@ class HostGrammarEntries:
             "traverse_draft_tree", i32, u64, usize, usize, usize, i64, usize, i64
         )
         self.free = entry("free", None, u64)
+        self._addresses = addresses
+        # The entries for the capturable grammar's host node, made on first use.
+        self._native: Any | None = None
+
+    def native(self) -> Any:
+        """The entries as the capturable grammar's host node calls them,
+        without the GIL (``grammar_host.Entries``)."""
+        if self._native is None:
+            self._native = load_grammar_host_ext().Entries(self._addresses)
+        return self._native
 
 
 class HostGrammar(BaseGrammarObject):
@@ -86,6 +98,18 @@ class HostGrammar(BaseGrammarObject):
         self.stop_token_ids = stop_token_ids
         self.finished = False
         self.accepted_tokens: list[int] = []
+        # The capturable grammar's C++ reference to the matcher, made on first use.
+        self._native_matcher: Any | None = None
+
+    def native_matcher(self) -> Any:
+        """The matcher for the capturable grammar's host node, which calls
+        it without the GIL. It holds the handle, and each forward's batch
+        holds it until the node is done with that forward."""
+        if self._native_matcher is None:
+            self._native_matcher = load_grammar_host_ext().Matcher(
+                self._entries.native(), self.handle, sorted(self.stop_token_ids)
+            )
+        return self._native_matcher
 
     def _check(self, status: int, what: str) -> int:
         if status < 0:
@@ -157,5 +181,7 @@ class HostGrammar(BaseGrammarObject):
         )
 
     def release(self) -> None:
-        """Drop the data plane's hold on the matcher."""
+        """Drop the request's holds on the matcher; queued forwards keep
+        theirs (``native_matcher``)."""
+        self._native_matcher = None
         self._entries.free(self.handle)

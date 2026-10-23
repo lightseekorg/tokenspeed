@@ -25,8 +25,11 @@
 //! state at commit; the data plane fills token bitmasks from it and, on the
 //! capturable path, advances it inside the forward. Both reach the same
 //! matcher, serialized by its lock. The data plane gets the entries'
-//! addresses (`entries`) and calls them from Python; it frees a handle once
-//! no queued forward can still use it.
+//! addresses (`entries`) and calls them from Python and from the capturable
+//! path's host node. A handle is counted like a reference: the request holds
+//! it until its release, and each queued forward that still uses the matcher
+//! takes its own hold (`retain`), so the handle outlives the release while
+//! one does.
 
 use std::{
     collections::HashMap,
@@ -41,20 +44,30 @@ use crate::Matcher;
 /// A matcher both planes share.
 pub type SharedMatcher = Arc<Mutex<Matcher>>;
 
-fn table() -> &'static Mutex<HashMap<u64, SharedMatcher>> {
-    static TABLE: OnceLock<Mutex<HashMap<u64, SharedMatcher>>> = OnceLock::new();
+/// A registered matcher and the holds on its handle.
+struct Entry {
+    matcher: SharedMatcher,
+    holds: usize,
+}
+
+fn table() -> &'static Mutex<HashMap<u64, Entry>> {
+    static TABLE: OnceLock<Mutex<HashMap<u64, Entry>>> = OnceLock::new();
     TABLE.get_or_init(Mutex::default)
 }
 
-/// Register `matcher`; its handle and the shared matcher.
+/// Register `matcher`, held once for its request; its handle and the shared
+/// matcher.
 pub fn register(matcher: Matcher) -> (u64, SharedMatcher) {
     static NEXT: AtomicU64 = AtomicU64::new(1);
     let handle = NEXT.fetch_add(1, Ordering::Relaxed);
     let shared = Arc::new(Mutex::new(matcher));
-    table()
-        .lock()
-        .expect("grammar table lock")
-        .insert(handle, shared.clone());
+    table().lock().expect("grammar table lock").insert(
+        handle,
+        Entry {
+            matcher: shared.clone(),
+            holds: 1,
+        },
+    );
     (handle, shared)
 }
 
@@ -63,7 +76,7 @@ fn matcher(handle: u64) -> Option<SharedMatcher> {
         .lock()
         .expect("grammar table lock")
         .get(&handle)
-        .cloned()
+        .map(|entry| entry.matcher.clone())
 }
 
 fn with<R>(handle: u64, failed: R, run: impl FnOnce(&mut Matcher) -> R) -> R {
@@ -149,12 +162,31 @@ extern "C" fn ts_grammar_traverse_draft_tree(
     })
 }
 
-/// Forget a handle; its matcher lives on while the control plane holds it.
-extern "C" fn ts_grammar_free(handle: u64) {
-    table().lock().expect("grammar table lock").remove(&handle);
+/// Take another hold on a handle: 0 done, -1 an unknown handle.
+extern "C" fn ts_grammar_retain(handle: u64) -> i32 {
+    match table().lock().expect("grammar table lock").get_mut(&handle) {
+        Some(entry) => {
+            entry.holds += 1;
+            0
+        }
+        None => -1,
+    }
 }
 
-/// The C entries, by name, for the data plane to call (`HostGrammar`).
+/// Drop a hold on a handle; the last one forgets it. The matcher lives on
+/// while the control plane holds it.
+extern "C" fn ts_grammar_free(handle: u64) {
+    let mut table = table().lock().expect("grammar table lock");
+    if let Some(entry) = table.get_mut(&handle) {
+        entry.holds -= 1;
+        if entry.holds == 0 {
+            table.remove(&handle);
+        }
+    }
+}
+
+/// The C entries, by name, for the data plane to call (`HostGrammar` and the
+/// capturable grammar's host node).
 pub fn entries() -> Vec<(&'static str, usize)> {
     vec![
         (
@@ -174,6 +206,7 @@ pub fn entries() -> Vec<(&'static str, usize)> {
             "traverse_draft_tree",
             ts_grammar_traverse_draft_tree as *const () as usize,
         ),
+        ("retain", ts_grammar_retain as *const () as usize),
         ("free", ts_grammar_free as *const () as usize),
     ]
 }

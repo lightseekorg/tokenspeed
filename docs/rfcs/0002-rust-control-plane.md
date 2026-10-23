@@ -131,8 +131,8 @@ boundary, as an enum of submissions:
 * **FIFO order is preserved.** Today `DeviceHandle` methods enqueue closures
   on `ForwardThread`; the Rust FIFO carries the same operations in the same
   order, so the same-round ordering contract in "Anatomy of a round" (stores,
-  device copies, zeroing, prefetches, load-backs, restores, remote streams,
-  batch) holds unchanged.
+  device copies, zeroing, load-backs, restores, remote streams, batch) holds
+  unchanged.
 * **Named operations only.** The enum is closed. A new device interaction is
   a new variant, reviewed against the same rules as a new `DeviceHandle`
   method today. There is no "run this callable" variant.
@@ -235,7 +235,7 @@ their release, ordered behind the forward that captured them, as today.
 | --- | --- | --- |
 | Scheduling round, in-flight queue, advance call sites | all | — |
 | L2 / snapshot cache ops | op adaptation, ACK polling, replica intersection | the `HostCacheExecutor` and its streams |
-| L3 | existence probe aggregation, prefetch convergence, namespace / weight-version gates | storage backend clients (including the Mooncake store), the prefetch lane |
+| L3 | the per-round storage agreement (clock, permissions, completions, pressure), cancellations, namespace / weight-version gates | the Host-only L3 executor and its storage backend clients (including the Mooncake store) |
 | PD | bootstrap server, request registration, the Mooncake transfer engine: memory registration, transfer submission, status polling | KV packing into staging buffers (GPU copies), landing |
 | EPD | admission controller, completion agreement | receive pools, reassembly, encoder |
 | Pause / memory saver | state machine, drain gates | release/wake regions |
@@ -266,8 +266,8 @@ TokenSpeed uses: the transfer engine (`transfer_engine_c.h`, the
   (`batch_transfer_sync_write_pages`) has no C entry yet; it gets one in the
   same build, rather than being re-expressed as per-descriptor submissions.
 * **Store (L3).** The store client stays where it is, behind
-  `KvStoreStorage` on the data plane's prefetch lane, with the in-memory test
-  backend beside it. It keeps its own transfer engine inside the store
+  `KvStoreStorage` on the data plane's Host-only L3 executor, with the
+  in-memory test backend beside it. It keeps its own transfer engine inside the store
   client, as today, so it does not share an instance with PD. The control
   plane reaches it only through the named L3 operations. The C API makes a
   later move possible but nothing in this RFC needs it.

@@ -49,6 +49,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from multiprocessing import Pipe
@@ -60,6 +61,7 @@ import torch.distributed as dist
 from tokenspeed_kernel.compile_monitor import compile_stats
 from tokenspeed_scheduler import Scheduler
 
+from tokenspeed.runtime.cache.l3.factory import create_l3_executor
 from tokenspeed.runtime.distributed.nccl_suspend import nccl_suspend_supported
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
@@ -83,6 +85,7 @@ from tokenspeed.runtime.engine.rank_setup import (
 )
 from tokenspeed.runtime.engine.scheduler_utils import (
     cache_event_to_payload,
+    cache_ops_from_plan,
     engram_context_len,
     resolve_dspark_prefix_replay_tokens,
     should_use_overlap_schedule,
@@ -333,6 +336,20 @@ class EplbSettings:
 
 
 @dataclass(frozen=True)
+class L3Settings:
+    """The scheduler's storage credits the control plane's L3 agreement
+    checks reports against (``StorageConfig``).
+
+    Attributes:
+        max_operations: Storage operations in flight.
+        max_keys_per_operation: Keys one operation names.
+    """
+
+    max_operations: int
+    max_keys_per_operation: int
+
+
+@dataclass(frozen=True)
 class HostConfig:
     """What the host's control plane is configured from.
 
@@ -400,8 +417,12 @@ class HostConfig:
         kv_events_publisher: Where this rank publishes them (the ZMQ
             publisher's fields), on the attention-TP group's first rank; else
             None.
-        l3_storage: The L3 storage tier is on.
-        l3_weight_version: With it, the namespace its pages publish under
+        l3: With the L3 storage tier, its storage credits; else None.
+        l3_metrics: This rank reports the L3 tier's metrics: with the tier
+            and ``--enable-metrics``.
+        attn_tp_rank: This rank's attention-TP rank, an L3 metrics label.
+        engine_role: ``--disaggregation-mode``, an L3 metrics label.
+        l3_weight_version: With L3, the namespace its pages publish under
             (``--weight-version``); else None.
         eplb: With ``--enable-eplb``, the rebalance's settings; else None.
         epd_prefill: An EPD prefill node: requests whose images an encode
@@ -452,7 +473,10 @@ class HostConfig:
     log_request_stats: bool
     kv_events: bool
     kv_events_publisher: KVEventsConfig | None
-    l3_storage: bool
+    l3: L3Settings | None
+    l3_metrics: bool
+    attn_tp_rank: int
+    engine_role: str
     l3_weight_version: str | None
     eplb: EplbSettings | None
     epd_prefill: bool
@@ -518,6 +542,7 @@ class DataPlanePump:
     def __init__(
         self,
         handle,
+        l3,
         transfer_peer,
         profiler: Profiler,
         regions,
@@ -528,6 +553,9 @@ class DataPlanePump:
         epd_admission,
     ) -> None:
         self._device = handle
+        # The Host-only L3 executor (``cache/l3/executor.py``): it runs the
+        # plans' storage operations; None without the tier.
+        self._l3 = l3
         # Its ``weight_version`` follows the L3 namespace.
         self._server_args = server_args
         # The control plane exports the serving-time compilations.
@@ -696,7 +724,14 @@ class DataPlanePump:
             # Every handshaked image this forward scatters was received at
             # admission; one that was not is a bug, not a cue to encode.
             assert_embeddings_received(self._epd, planned.multimodal_context)
-        pending = self._device.execute(plan, planned)
+        # Each op once, validated before any owner runs one: the storage
+        # operations go to the L3 executor, the Host copies to the device.
+        cache_ops = cache_ops_from_plan(plan)
+        if cache_ops.storage:
+            if self._l3 is None:
+                raise RuntimeError("cache storage operations require an L3 executor")
+            self._l3.submit_operations(cache_ops.storage)
+        pending = self._device.execute(plan, planned, cache_ops=cache_ops.device)
         if idle_forward:
             self._device.run_idle_forward(dp_metadata)
         self._gc_hooks.note_round(forwarded=pending is not None or idle_forward)
@@ -759,20 +794,82 @@ class DataPlanePump:
             _logprob_lists(results),
         )
 
-    def poll_cache_events(self) -> tuple[list[tuple[str, int, int]], bool]:
+    def poll_cache_events(self) -> list[tuple[str, int]]:
         """The cache ops acknowledged since the last poll, in the order they
-        landed: ``(kind, op_id, landed_pages)`` each, as
-        ``cache_event_to_payload`` names them; 0 pages but for a prefetch.
-        Then whether an L3 backup failed since: the control plane fails the
-        whole replica after its poll collective, never this rank alone."""
-        payloads = [
-            cache_event_to_payload(event) for event in self._device.poll_cache_results()
+        landed: ``(kind, op_id)`` each, as ``cache_event_to_payload`` names
+        them."""
+        return [
+            (payload["kind"], payload["op_id"])
+            for payload in map(
+                cache_event_to_payload, self._device.poll_cache_results()
+            )
         ]
-        events = [
-            (payload["kind"], payload["op_id"], payload.get("landed_pages", 0))
-            for payload in payloads
+
+    def poll_storage(self) -> tuple[
+        int,
+        list[tuple[int, list[bool], bool, list[bool]]],
+        tuple[int, int, int],
+        str | None,
+    ]:
+        """The L3 executor since the last poll: the storage clock in
+        microseconds, the finished operations ``(op_id, success, retired,
+        object_failures)``, the queue pressure ``(operations, bytes, oldest
+        operation's age in microseconds)``, and None -- or, instead of the
+        facts, why the poll failed: every rank still joins the control
+        plane's agreement, and every rank fails with it."""
+        try:
+            poll = self._l3.poll()
+            pressure = (
+                poll.queued_operations,
+                poll.queued_bytes,
+                poll.oldest_operation_us,
+            )
+            if any(type(value) is not int for value in pressure):
+                raise ValueError("Invalid L3 pressure observation")
+            completions = []
+            for item in poll.completions:
+                if (
+                    type(item.op_id) is not int
+                    or type(item.retired) is not bool
+                    or any(type(flag) is not bool for flag in item.success)
+                    or any(type(flag) is not bool for flag in item.object_failures)
+                ):
+                    raise ValueError("Malformed L3 completion")
+                completions.append(
+                    (
+                        item.op_id,
+                        list(item.success),
+                        item.retired,
+                        list(item.object_failures),
+                    )
+                )
+            error = None
+        except Exception as exc:  # noqa: BLE001 - joins the agreement instead
+            completions, pressure, error = [], (0, 0, 0), str(exc)[:512]
+        return time.monotonic_ns() // 1000, completions, pressure, error
+
+    def storage_snapshot(self) -> tuple[list[tuple], str, int, bool]:
+        """The L3 executor's counters for the metrics: per operation kind
+        ``(kind, events, success_keys, failed_keys, success_bytes,
+        queue_seconds, backend_seconds, operations by state, bytes by
+        state)``, then the backend's health state and epoch, and whether
+        native retirement is unproven."""
+        snapshot = self._l3.snapshot()
+        rows = [
+            (
+                row.kind,
+                [(event, float(value)) for event, value in row.events],
+                float(row.success_keys),
+                float(row.failed_keys),
+                float(row.success_bytes),
+                float(row.queue_seconds),
+                float(row.backend_seconds),
+                [(state, float(value)) for state, value in row.operations],
+                [(state, float(value)) for state, value in row.bytes],
+            )
+            for row in snapshot.operations
         ]
-        return events, self._device.consume_l3_backup_poll_failure()
+        return rows, snapshot.health.state, snapshot.health.epoch, snapshot.unsafe_io
 
     def release(self, rids: list[str]) -> None:
         """Forget requests that ended. Their shared-memory features go once
@@ -902,46 +999,15 @@ class DataPlanePump:
             },
         )
 
-    def query_l3_storage(self, pages: list[tuple[int, str, int]]) -> list[bool]:
-        """Which prefix pages ``(group_id, content_hash, page_offset)`` the L3
-        store holds. A failed probe reports misses, so the replica still
-        reduces the same vector."""
-        try:
-            exists = self._device.query_l3_storage(
-                [
-                    (group_id, 0, content_hash, page_offset)
-                    for group_id, content_hash, page_offset in pages
-                ]
-            )
-        except Exception:
-            logger.exception(
-                "L3 existence probe failed; treating keys as misses so replica "
-                "ranks can converge"
-            )
-            return [False] * len(pages)
-        if exists is None:
-            return [False] * len(pages)
-        return [bool(present) for present in exists]
-
-    def l3_prefetch_progress(self) -> list[tuple[int, bool, int]]:
-        """This rank's in-flight L3 prefetches: ``(op_id, done, landed_pages)``."""
-        return [
-            (op_id, bool(done), int(landed))
-            for op_id, (done, landed) in self._device.l3_prefetch_progress().items()
-        ]
-
-    def complete_l3_prefetch(self, op_id: int, landed_pages: int) -> None:
-        """A prefetch's replica-agreed landing."""
-        self._device.complete_l3_prefetch(op_id, landed_pages)
-
     def delete_l3_namespace(self) -> bool:
         """Delete the L3 objects under the current namespace."""
-        return bool(self._device.delete_l3_namespace())
+        return self._l3 is None or bool(self._l3.delete_namespace())
 
     def set_l3_weight_version(self, version: str) -> None:
         """Publish subsequent Host pages under ``version``."""
+        if self._l3 is not None:
+            self._l3.set_weight_version(version)
         self._server_args.weight_version = version
-        self._device.set_l3_weight_version(version)
 
 
 class HostBootstrap:
@@ -992,7 +1058,6 @@ class HostBootstrap:
                 draft_model_config = None
             ngram_context_len = engram_context_len(model_config.hf_text_config)
             if ngram_context_len and mapping.has_pp:
-                # As ``EventLoop.__init__``.
                 raise NotImplementedError(
                     "Engram input history requires PP=1 and in-flight depth <= 1"
                 )
@@ -1040,11 +1105,26 @@ class HostBootstrap:
                     build_host_peer, outbox=pd_outbox
                 ),
             )
+            # The Host-only L3 executor, built outside the device side over
+            # its shared Host resources; None without a storage backend.
+            self._l3 = create_l3_executor(
+                server_args,
+                model_config,
+                draft_model_config,
+                host_cache=device.host_cache,
+                world_cpu_group=(
+                    pg_manager.get_process_group("gloo", mapping.world_group)
+                    if mapping.world_size > 1
+                    else None
+                ),
+            )
+            storage_config = self._l3.config.scheduler if self._l3 is not None else None
             specs = device.specs
             geometry = specs.cache_geometry
             scheduler_config = scheduler_config_from_args(
                 server_args,
                 specs,
+                storage_config=storage_config,
                 max_scheduled_tokens=server_args.chunked_prefill_size,
                 max_batch_size=max_batch_size,
                 decode_input_tokens=decode_input_tokens,
@@ -1233,7 +1313,17 @@ class HostBootstrap:
                     if server_args.enable_eplb
                     else None
                 ),
-                l3_storage=scheduler_config.enable_l3_storage,
+                l3=(
+                    L3Settings(
+                        max_operations=storage_config.max_operations,
+                        max_keys_per_operation=storage_config.max_keys_per_operation,
+                    )
+                    if storage_config is not None
+                    else None
+                ),
+                l3_metrics=storage_config is not None and server_args.enable_metrics,
+                attn_tp_rank=attn_tp_rank,
+                engine_role=server_args.disaggregation_mode,
                 l3_weight_version=(
                     str(server_args.weight_version)
                     if server_args.kvstore_storage_backend is not None
@@ -1249,6 +1339,7 @@ class HostBootstrap:
             self.transfer_peer = device.transfer
             self.pump = DataPlanePump(
                 device.handle,
+                self._l3,
                 device.transfer,
                 Profiler(
                     server_args=server_args,
@@ -1321,8 +1412,13 @@ class HostBootstrap:
         freeze_startup_heap()
 
     def close(self) -> None:
-        """Release the device side's caches; the pump is stopped."""
-        self._device.shutdown_cache()
+        """Release the device side's caches, then the L3 executor's; the
+        pump is stopped."""
+        try:
+            self._device.shutdown_cache()
+        finally:
+            if self._l3 is not None:
+                self._l3.close(timeout_s=5.0)
 
 
 def bootstrap(control_fd: int, pd_outbox) -> HostBootstrap:

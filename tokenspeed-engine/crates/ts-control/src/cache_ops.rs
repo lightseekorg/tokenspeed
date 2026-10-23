@@ -55,11 +55,6 @@ pub enum CacheOpError {
     /// A peer's acknowledgments did not decode.
     #[error("rank {0} sent malformed cache acknowledgments")]
     Malformed(usize),
-    /// A rank's L3 backup of written-back pages failed. Every rank of the
-    /// replica fails together, after the poll's collective, so none is left
-    /// waiting in the next one.
-    #[error("an L3 backup failed on a replica rank")]
-    L3BackupFailed,
     /// The replica could not agree.
     #[error(transparent)]
     Collective(#[from] ts_collective::Error),
@@ -71,17 +66,15 @@ fn kind_name(kind: CacheEventKind) -> &'static str {
     match kind {
         CacheEventKind::WriteBackDone => "WriteBackDoneEvent",
         CacheEventKind::LoadBackDone => "LoadBackDoneEvent",
-        CacheEventKind::PrefetchDone => "PrefetchDoneEvent",
         CacheEventKind::SnapshotDone => "SnapshotDoneEvent",
         CacheEventKind::RestoreDone => "RestoreDoneEvent",
         _ => unreachable!("a cache event kind the bridge does not define"),
     }
 }
 
-const KINDS: [CacheEventKind; 5] = [
+const KINDS: [CacheEventKind; 4] = [
     CacheEventKind::WriteBackDone,
     CacheEventKind::LoadBackDone,
-    CacheEventKind::PrefetchDone,
     CacheEventKind::SnapshotDone,
     CacheEventKind::RestoreDone,
 ];
@@ -92,9 +85,9 @@ fn key(event: &CacheEvent) -> Key {
     (event.op_id, kind_name(event.kind))
 }
 
-/// Acknowledgments as one rank shares them: kind, op id, landed pages.
+/// Acknowledgments as one rank shares them: kind, op id.
 fn encode(events: &[CacheEvent]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(events.len() * 9);
+    let mut out = Vec::with_capacity(events.len() * 5);
     for event in events {
         let code = KINDS
             .iter()
@@ -102,34 +95,23 @@ fn encode(events: &[CacheEvent]) -> Vec<u8> {
             .expect("a bridge kind");
         out.push(code as u8);
         out.extend_from_slice(&event.op_id.to_le_bytes());
-        out.extend_from_slice(&event.landed_pages.to_le_bytes());
     }
     out
 }
 
 fn decode(bytes: &[u8]) -> Option<Vec<CacheEvent>> {
-    if bytes.len() % 9 != 0 {
+    if bytes.len() % 5 != 0 {
         return None;
     }
     bytes
-        .chunks_exact(9)
+        .chunks_exact(5)
         .map(|chunk| {
             Some(CacheEvent {
                 kind: *KINDS.get(usize::from(chunk[0]))?,
                 op_id: u32::from_le_bytes(chunk[1..5].try_into().ok()?),
-                landed_pages: i32::from_le_bytes(chunk[5..9].try_into().ok()?),
             })
         })
         .collect()
-}
-
-/// One poll of the data plane's cache ops.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct CachePoll {
-    /// The acknowledgments since the last poll, in the order they landed.
-    pub events: Vec<CacheEvent>,
-    /// An L3 backup of written-back pages failed since the last poll.
-    pub l3_backup_failed: bool,
 }
 
 /// The cache ops dispatched and not acknowledged yet.
@@ -164,19 +146,16 @@ impl CacheOps {
         self.in_flight += ops.len();
     }
 
-    /// Take one poll's acknowledgments and return those every rank of
-    /// `replica` holds, for the scheduler. Every member must call this in
-    /// the same rounds, which it does while [`CacheOps::open`] is non-zero.
+    /// Take one poll's acknowledgments, in the order they landed, and return
+    /// those every rank of `replica` holds, for the scheduler. Every member
+    /// must call this in the same rounds, which it does while
+    /// [`CacheOps::open`] is non-zero.
     pub fn acknowledged(
         &mut self,
-        poll: CachePoll,
+        polled: Vec<CacheEvent>,
         mesh: &mut Mesh,
         replica: &Group,
     ) -> Result<Vec<CacheEvent>, CacheOpError> {
-        let CachePoll {
-            events: polled,
-            l3_backup_failed,
-        } = poll;
         if polled.len() > self.in_flight {
             return Err(CacheOpError::Unaccounted {
                 acknowledged: polled.len(),
@@ -196,25 +175,15 @@ impl CacheOps {
         }
 
         if replica.size() == 1 {
-            if l3_backup_failed {
-                return Err(CacheOpError::L3BackupFailed);
-            }
             // Nothing to agree on: what landed is ready, in landing order.
             let ready = std::mem::take(&mut self.pending);
             self.open -= ready.len();
             return Ok(ready);
         }
         // Completions are not lock-step across ranks, so the ranks agree on
-        // whether any has work, and on a backup failure, before gathering.
+        // whether any has work before gathering.
         let local_work = self.in_flight != 0 || !self.pending.is_empty();
-        let agreed = mesh.all_reduce(
-            replica,
-            &[i64::from(local_work), i64::from(l3_backup_failed)],
-            Reduce::Max,
-        )?;
-        if agreed[1] != 0 {
-            return Err(CacheOpError::L3BackupFailed);
-        }
+        let agreed = mesh.all_reduce(replica, &[i64::from(local_work)], Reduce::Max)?;
         if agreed[0] == 0 {
             return Ok(Vec::new());
         }
@@ -256,18 +225,7 @@ mod tests {
     }
 
     fn ack(kind: CacheEventKind, op_id: u32) -> CacheEvent {
-        CacheEvent {
-            kind,
-            op_id,
-            landed_pages: 0,
-        }
-    }
-
-    fn poll(events: Vec<CacheEvent>) -> CachePoll {
-        CachePoll {
-            events,
-            l3_backup_failed: false,
-        }
+        CacheEvent { kind, op_id }
     }
 
     fn alone() -> (Mesh, Group) {
@@ -291,7 +249,7 @@ mod tests {
             ack(CacheEventKind::WriteBackDone, 1),
         ];
         let ready = ops
-            .acknowledged(poll(polled.clone()), &mut mesh, &replica)
+            .acknowledged(polled.clone(), &mut mesh, &replica)
             .unwrap();
         assert_eq!(ready, polled);
         assert_eq!(ops.open(), 1);
@@ -306,9 +264,7 @@ mod tests {
             ack(CacheEventKind::LoadBackDone, 7),
             ack(CacheEventKind::LoadBackDone, 8),
         ];
-        let error = ops
-            .acknowledged(poll(polled), &mut mesh, &replica)
-            .unwrap_err();
+        let error = ops.acknowledged(polled, &mut mesh, &replica).unwrap_err();
         assert!(matches!(
             error,
             CacheOpError::Unaccounted {
@@ -365,7 +321,7 @@ mod tests {
                     ]);
                     let rounds: Vec<Vec<CacheEvent>> = polls
                         .into_iter()
-                        .map(|polled| ops.acknowledged(poll(polled), &mut mesh, &replica).unwrap())
+                        .map(|polled| ops.acknowledged(polled, &mut mesh, &replica).unwrap())
                         .collect();
                     (rounds, ops.open())
                 })
@@ -382,41 +338,6 @@ mod tests {
                 ]
             );
             assert_eq!(open, 0);
-        }
-    }
-
-    /// One rank's L3 backup failed: both ranks fail in the same poll.
-    #[test]
-    fn a_backup_failure_on_one_rank_fails_the_replica() {
-        let listeners: Vec<_> = (0..2)
-            .map(|_| Listener::bind("127.0.0.1").unwrap())
-            .collect();
-        let addresses: Vec<String> = listeners
-            .iter()
-            .map(|listener| format!("127.0.0.1:{}", listener.port().unwrap()))
-            .collect();
-        let threads: Vec<_> = listeners
-            .into_iter()
-            .enumerate()
-            .map(|(rank, listener)| {
-                let addresses = addresses.clone();
-                thread::spawn(move || {
-                    let mut mesh =
-                        Mesh::connect(rank, listener, &addresses, Duration::from_secs(5)).unwrap();
-                    let replica = Group::new(0, vec![0, 1], rank).unwrap();
-                    let mut ops = CacheOps::new();
-                    ops.dispatched(&[op(CacheOpKind::WriteBack, 1)]);
-                    let polled = CachePoll {
-                        events: vec![ack(CacheEventKind::WriteBackDone, 1)],
-                        l3_backup_failed: rank == 1,
-                    };
-                    ops.acknowledged(polled, &mut mesh, &replica)
-                })
-            })
-            .collect();
-        for thread in threads {
-            let failed = thread.join().unwrap().unwrap_err();
-            assert!(matches!(failed, CacheOpError::L3BackupFailed));
         }
     }
 }

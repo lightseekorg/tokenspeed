@@ -283,28 +283,3 @@ def test_cache_plan_keeps_storage_cancel_before_the_next_query():
     ]
     assert prepared.storage[0].op_id == original.op_id
     assert prepared.storage[1].op_id > original.op_id
-
-
-def test_storage_commands_cannot_partially_enter_gpu_completion_accounting():
-    from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks
-
-    class Device:
-        def poll_cache_results(self):
-            raise AssertionError("there is no submitted GPU ticket")
-
-    scheduler = storage_scheduler()
-    storage = cache_ops_from_plan(scheduler.next_execution_plan()).storage
-    hooks = CacheOpHooks(
-        Device(),
-        speculative_algorithm=None,
-        attn_tp_rank=0,
-        attn_tp_size=1,
-        attn_tp_cpu_group=None,
-        pp_size=1,
-        pp_cpu_group=None,
-        global_rank=0,
-    )
-    snapshot = SnapshotOp(42, "victim", 1, 1, ())
-    with pytest.raises(TypeError, match="Device-copy operations"):
-        hooks.count_ops((snapshot, *storage))
-    assert hooks.poll_ready_events() == []

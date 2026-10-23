@@ -315,8 +315,10 @@ impl Controls {
     }
 
     /// After a weight load succeeded on every rank, the L3 namespace new
-    /// pages publish under: `Ok(None)` keeps
-    /// the current one, `Err` refuses the load.
+    /// pages publish under: `Ok(None)` keeps the current one, `Err` refuses
+    /// the load. Re-sending the current version keeps it too: the namespace
+    /// already names it, and the storage executor refuses a namespace change
+    /// while it has unretired operations.
     pub fn commit_l3_weight_version(
         &mut self,
         op: &ControlRequest,
@@ -327,11 +329,13 @@ impl Controls {
         if let Some(refusal) = self.l3_version_refusal(op) {
             return Err(refusal);
         }
-        let version = requested_weight_version(op);
-        if let Some(version) = &version {
-            self.l3_weight_version = Some(version.clone());
+        match requested_weight_version(op) {
+            Some(version) if self.l3_weight_version.as_ref() != Some(&version) => {
+                self.l3_weight_version = Some(version.clone());
+                Ok(Some(version))
+            }
+            _ => Ok(None),
         }
-        Ok(version)
     }
 
     /// New requests are withheld from the scheduler.
@@ -830,9 +834,10 @@ mod tests {
             successes(&l3.take_replies()),
             [("UpdateWeightsFromMooncakeReqOutput", false)]
         );
+        // Re-sending the current version changes nothing.
         assert_eq!(
             l3.commit_l3_weight_version(&mooncake_load(false, Some("7"))),
-            Ok(Some("7".to_owned()))
+            Ok(None)
         );
         assert_eq!(
             l3.commit_l3_weight_version(&mooncake_load(false, None)),

@@ -461,8 +461,9 @@ the same plan). The restore is one op: on the load stream behind the
 zeroing, the L2-tier rows, the pool-tier rows, the slot-state import, one
 event — no layerwise tracker, because the request is `Restoring` and
 unschedulable until the ACK. Three ACK kinds ride the one cache poll
-(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and `CacheOpHooks`
-replica-intersects them alike; a readmission needs both store ACKs.
+(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and the control plane
+(`ts-control`'s `cache_ops`) replica-intersects them alike; a readmission
+needs both store ACKs.
 
 **Slot-state image.** Device state keyed by `req_pool_index` that lives in no
 cache group must travel with the pages or the continuation is not exact: the
@@ -517,7 +518,8 @@ owners is an error, and a replicated group translates to the identity. Each
 Host tier holds one translation (same Device bound, its own Host bound,
 `1 + host_lcm_blocks × packing × shard_count`). An op whose every row belongs
 to other ranks is still acknowledged by this rank from an empty copy; the
-hooks' replica intersection completes the op only once every owner has. The
+control plane's replica intersection completes the op only once every owner
+has. The
 scheduler side (residue-class allocation for every tier transfer, the Host
 pools registered with each group's `shard_count`) is what makes the
 translation exact, so both Host tiers serve a KV-page-sharded engine. L3

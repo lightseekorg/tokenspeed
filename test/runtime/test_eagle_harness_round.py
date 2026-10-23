@@ -53,11 +53,10 @@ register_cuda_ci(
     disabled_on_runners_reason="the eagle_harness policy kernels are NVIDIA-only",
 )
 
+from test.runtime.scheduler_driver import advance_scheduler  # noqa: E402
+
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
-from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
-    advance_scheduler,
-    make_config,
-)
+from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
 from tokenspeed.runtime.execution.context import ForwardContext  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import EagleDraftInput  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (  # noqa: E402

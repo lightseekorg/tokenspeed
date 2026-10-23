@@ -218,7 +218,7 @@ def test_decode_override_clears_only_consumed_flags_without_host_sync(buffers):
     runtime.spec_candidates_ready.fill_(True)
     states = {"a": _state([10, 11, 12], []), "b": _state([20, 21, 22], [])}
     op = _op(states, ["a", "b"], [2, 4], [1, 1], [], [], [12, -1])
-    snapshot = ngram_inputs_for_forward(op, states, 3)
+    snapshot = _ngram_inputs(op, states, 3)
     on_cuda = torch.device(ib.device).type == "cuda"
     previous = torch.cuda.get_sync_debug_mode() if on_cuda else None
     try:

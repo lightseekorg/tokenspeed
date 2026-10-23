@@ -32,6 +32,7 @@ import signal
 import stat
 import sys
 import textwrap
+import time
 from contextlib import nullcontext
 
 import msgspec
@@ -44,6 +45,8 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=60, suite="runtime-1gpu")
 
+from test.l3_test_utils import storage_scheduler  # noqa: E402
+
 from tokenspeed_scheduler import (  # noqa: E402
     AttnKind,
     Cache,
@@ -53,6 +56,9 @@ from tokenspeed_scheduler import (  # noqa: E402
     SchedulerConfig,
 )
 
+from tokenspeed.runtime.cache.l3.backend import MemoryKvStore  # noqa: E402
+from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
+from tokenspeed.runtime.cache.l3.executor import L3Executor  # noqa: E402
 from tokenspeed.runtime.engine.profiler import Profiler  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: E402
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
@@ -97,14 +103,7 @@ def test_unsupported_subsystems_are_named():
 def test_the_subsystems_ported_to_the_host_are_served():
     served = [
         ServerArgs(model="x", enable_metrics=True, enable_log_request_stats=True),
-        ServerArgs(
-            model="x",
-            kvstore_storage_backend="memory",
-            kvstore_prefetch_min_pages=2,
-            kvstore_prefetch_timeout_base_s=1.0,
-            kvstore_prefetch_timeout_per_page_s=0.0,
-            kvstore_prefetch_batch_pages=128,
-        ),
+        ServerArgs(model="x", kvstore_storage_backend="memory"),
         ServerArgs(model="x", kv_events_config='{"enable_kv_cache_events": true}'),
         ServerArgs(
             model="x",
@@ -196,8 +195,10 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(tmp_path):
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
     binary = _fake_host(tmp_path, "connection.recv()\nsys.exit(3)\n")
     proc, reader = start_rust_host(binary, *_rank_args(0), nullcontext(), None)
-    with pytest.raises(RuntimeError, match="exited with code 3"):
+    with pytest.raises(RuntimeError, match="Scheduler process 0"):
         receive_ready_messages([reader], [proc])
+    proc.join(timeout=10)
+    assert proc.exitcode == 3
 
 
 def test_request_length_limits_reserve_the_first_decode_window():
@@ -227,7 +228,9 @@ class _CpuExecutor:
     records what each forward was given."""
 
     def __init__(self) -> None:
-        self.forward_thread = ForwardThread("cpu")
+        self.forward_thread = ForwardThread(
+            "cpu", settle=self.complete_pending_drafting
+        )
         self.forwards: list[tuple[list[str], list, tuple]] = []
         self.dp_metadata: list = []
         self.idle_forwards: list = []
@@ -289,6 +292,10 @@ class _CpuExecutor:
     def execute_idle_forward(self, dp_metadata) -> None:
         self.idle_forwards.append(dp_metadata)
 
+    def complete_pending_drafting(self) -> None:
+        # No drafter: no round is ever pending.
+        pass
+
     def zero_cache_pages(self, pages) -> None:
         pass
 
@@ -322,12 +329,14 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _pump(handle: DeviceHandle) -> DataPlanePump:
-    """A text-only, aggregated rank's pump over ``handle``."""
+def _pump(handle: DeviceHandle, l3: L3Executor | None = None) -> DataPlanePump:
+    """A text-only, aggregated rank's pump over ``handle``, with the L3
+    executor ``l3`` when given."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
     return DataPlanePump(
         handle,
+        l3,
         None,
         Profiler(
             server_args=server_args,
@@ -475,15 +484,10 @@ class _HostCache:
 
     def __init__(self, landed) -> None:
         self.landed = landed
-        self.backup_failed = False
 
     def poll_results(self) -> list:
         landed, self.landed = self.landed, []
         return landed
-
-    def consume_backup_poll_failure(self) -> bool:
-        failed, self.backup_failed = self.backup_failed, False
-        return failed
 
 
 def test_the_pump_reports_cache_acknowledgments_in_landing_order(executor):
@@ -491,22 +495,62 @@ def test_the_pump_reports_cache_acknowledgments_in_landing_order(executor):
     snapshot.op_id = 7
     write_back = Cache.WriteBackDoneEvent()
     write_back.op_id = 3
-    landed = [snapshot, write_back, Cache.PrefetchDoneEvent(op_id=9, landed_pages=2)]
+    landed = [snapshot, write_back, Cache.LoadBackDoneEvent(9)]
     host_cache = _HostCache(landed)
     pump = _pump(DeviceHandle(executor, host_cache_executor=host_cache))
-    assert pump.poll_cache_events() == (
-        [
-            ("SnapshotDoneEvent", 7, 0),
-            ("WriteBackDoneEvent", 3, 0),
-            ("PrefetchDoneEvent", 9, 2),
-        ],
-        False,
+    assert pump.poll_cache_events() == [
+        ("SnapshotDoneEvent", 7),
+        ("WriteBackDoneEvent", 3),
+        ("LoadBackDoneEvent", 9),
+    ]
+    assert pump.poll_cache_events() == []
+
+
+class _HostAllocation:
+    """The CPU stand-in for the L3 executor's pinned Host allocation."""
+
+    def __init__(self, data: bytearray) -> None:
+        self.host_buffer = data
+
+
+def test_the_pump_runs_a_plans_storage_operations_on_the_l3_executor(executor):
+    l3 = L3Executor(
+        MemoryKvStore(),
+        _HostAllocation(bytearray(64)),
+        key_prefix="test",
+        rank=0,
+        ownership=None,
+        config=StorageRuntimeConfig.from_extra_config(
+            None, host_blocks=8, prefix_granularity=2
+        ),
+        prefix_for_weight_version=None,
     )
-    assert pump.poll_cache_events() == ([], False)
-    # A failed L3 backup is reported once, for the replica to fail together.
-    host_cache.backup_failed = True
-    assert pump.poll_cache_events() == ([], True)
-    assert pump.poll_cache_events() == ([], False)
+    try:
+        pump = _pump(DeviceHandle(executor), l3)
+        # The waiting request's probe: a storage operation, and no forward.
+        assert (
+            pump.execute(
+                storage_scheduler().next_execution_plan(), None, None, None, None, None
+            )
+            is None
+        )
+        deadline = time.monotonic() + 3
+        completions = []
+        while not completions and time.monotonic() < deadline:
+            now_us, completions, pressure, error = pump.poll_storage()
+        assert error is None and type(now_us) is int
+        assert all(type(value) is int for value in pressure)
+        # An empty store holds neither key, and the probe retired.
+        ((op_id, success, retired, object_failures),) = completions
+        assert type(op_id) is int
+        assert (success, retired, object_failures) == (
+            [False, False],
+            True,
+            [False, False],
+        )
+        assert pump.poll_storage()[1] == []
+    finally:
+        l3.close(timeout_s=5.0)
 
 
 def test_a_released_request_is_forgotten(executor):

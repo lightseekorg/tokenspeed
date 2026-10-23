@@ -41,12 +41,13 @@ use pyo3::{
 };
 use ts_control::eplb::SlotMoves;
 use ts_control::{
-    cache_ops::CachePoll,
     event_loop::{DataPlane, DataPlaneError, Dispatch, DpRound},
     ingress::Admission,
+    l3::{StorageCompletion, StoragePoll, StoragePressure},
     output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, TopLogprobs},
 };
-use ts_scheduler::{CacheEvent, CacheEventKind, CacheKeyView, ExecutionPlan};
+use ts_metrics::{L3ExecutorSnapshot, L3OperationSnapshot};
+use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
 /// A forward the pump dispatched, by dispatch order.
@@ -72,7 +73,13 @@ enum Op {
         reply: mpsc::SyncSender<Result<ForwardResult, String>>,
     },
     PollCache {
-        reply: mpsc::SyncSender<Result<CachePoll, String>>,
+        reply: mpsc::SyncSender<Result<Vec<CacheEvent>, String>>,
+    },
+    PollStorage {
+        reply: mpsc::SyncSender<Result<StoragePoll, String>>,
+    },
+    StorageSnapshot {
+        reply: mpsc::SyncSender<Result<L3ExecutorSnapshot, String>>,
     },
     /// Answers once everything queued before it ran.
     Barrier {
@@ -107,7 +114,7 @@ enum Op {
     /// One of the L3 storage tier's operations.
     L3 {
         request: L3Request,
-        reply: mpsc::SyncSender<Result<L3Reply, String>>,
+        reply: mpsc::SyncSender<Result<bool, String>>,
     },
     SnapshotExpertLoad {
         reply: mpsc::SyncSender<Result<ExpertLoad, String>>,
@@ -132,19 +139,10 @@ enum Op {
 /// under.
 type ExpertLoad = (Vec<Vec<i64>>, Vec<Vec<i32>>);
 
-/// The L3 operations (`DataPlanePump.l3_*`).
+/// The L3 operations (`DataPlanePump.*_l3_*`).
 enum L3Request {
-    Query(Vec<CacheKeyView>),
-    Progress,
-    Complete { op_id: u32, landed_pages: i64 },
     DeleteNamespace,
     SetWeightVersion(String),
-}
-
-enum L3Reply {
-    Exists(Vec<bool>),
-    Progress(Vec<(u32, bool, i64)>),
-    Done(bool),
 }
 
 struct AdmitRow {
@@ -320,8 +318,16 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::Complete { forward, reply })
     }
 
-    fn poll_cache_events(&mut self) -> Result<CachePoll, DataPlaneError> {
+    fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
         self.ask(|reply| Op::PollCache { reply })
+    }
+
+    fn poll_storage(&mut self) -> Result<StoragePoll, DataPlaneError> {
+        self.ask(|reply| Op::PollStorage { reply })
+    }
+
+    fn storage_snapshot(&mut self) -> Result<L3ExecutorSnapshot, DataPlaneError> {
+        self.ask(|reply| Op::StorageSnapshot { reply })
     }
 
     fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
@@ -364,39 +370,8 @@ impl DataPlane for PythonDataPlane {
         self.ask(|reply| Op::ResumeMemory { tags, reply })
     }
 
-    fn query_l3_storage(&mut self, pages: &[CacheKeyView]) -> Result<Vec<bool>, DataPlaneError> {
-        match self.l3(L3Request::Query(pages.to_vec()))? {
-            L3Reply::Exists(exists) => Ok(exists),
-            _ => Err(DataPlaneError("an L3 probe got another reply".to_owned())),
-        }
-    }
-
-    fn l3_prefetch_progress(&mut self) -> Result<Vec<(u32, bool, i64)>, DataPlaneError> {
-        match self.l3(L3Request::Progress)? {
-            L3Reply::Progress(progress) => Ok(progress),
-            _ => Err(DataPlaneError(
-                "an L3 progress read got another reply".to_owned(),
-            )),
-        }
-    }
-
-    fn complete_l3_prefetch(
-        &mut self,
-        op_id: u32,
-        landed_pages: i64,
-    ) -> Result<(), DataPlaneError> {
-        self.l3(L3Request::Complete {
-            op_id,
-            landed_pages,
-        })
-        .map(drop)
-    }
-
     fn delete_l3_namespace(&mut self) -> Result<bool, DataPlaneError> {
-        match self.l3(L3Request::DeleteNamespace)? {
-            L3Reply::Done(deleted) => Ok(deleted),
-            _ => Err(DataPlaneError("an L3 delete got another reply".to_owned())),
-        }
+        self.l3(L3Request::DeleteNamespace)
     }
 
     fn set_l3_weight_version(&mut self, version: &str) -> Result<(), DataPlaneError> {
@@ -445,7 +420,7 @@ impl DataPlane for PythonDataPlane {
 }
 
 impl PythonDataPlane {
-    fn l3(&mut self, request: L3Request) -> Result<L3Reply, DataPlaneError> {
+    fn l3(&mut self, request: L3Request) -> Result<bool, DataPlaneError> {
         self.ask(|reply| Op::L3 { request, reply })
     }
 }
@@ -503,6 +478,12 @@ fn pump_loop(
                     let _ = reply.send(Err(failure));
                 }
                 Op::PollCache { reply } => {
+                    let _ = reply.send(Err(failure));
+                }
+                Op::PollStorage { reply } => {
+                    let _ = reply.send(Err(failure));
+                }
+                Op::StorageSnapshot { reply } => {
                     let _ = reply.send(Err(failure));
                 }
                 Op::Barrier { reply }
@@ -642,6 +623,12 @@ fn run(
         Op::PollCache { reply } => {
             answer(reply, poll_cache(py, pump))?;
         }
+        Op::PollStorage { reply } => {
+            answer(reply, poll_storage(py, pump))?;
+        }
+        Op::StorageSnapshot { reply } => {
+            answer(reply, storage_snapshot(py, pump))?;
+        }
         Op::Barrier { reply } => {
             answer(reply, Ok(()))?;
         }
@@ -695,32 +682,12 @@ fn run(
         }
         Op::L3 { request, reply } => {
             let done = match request {
-                L3Request::Query(pages) => {
-                    let pages: Vec<(u32, String, i32)> = pages
-                        .into_iter()
-                        .map(|key| (key.group_id, key.content_hash, key.page_offset))
-                        .collect();
-                    pump.call_method1("query_l3_storage", (pages,))
-                        .and_then(|exists| exists.extract())
-                        .map(L3Reply::Exists)
-                }
-                L3Request::Progress => pump
-                    .call_method0("l3_prefetch_progress")
-                    .and_then(|progress| progress.extract())
-                    .map(L3Reply::Progress),
-                L3Request::Complete {
-                    op_id,
-                    landed_pages,
-                } => pump
-                    .call_method1("complete_l3_prefetch", (op_id, landed_pages))
-                    .map(|_| L3Reply::Done(true)),
                 L3Request::DeleteNamespace => pump
                     .call_method0("delete_l3_namespace")
-                    .and_then(|deleted| deleted.extract())
-                    .map(L3Reply::Done),
+                    .and_then(|deleted| deleted.extract()),
                 L3Request::SetWeightVersion(version) => pump
                     .call_method1("set_l3_weight_version", (version,))
-                    .map(|_| L3Reply::Done(true)),
+                    .map(|_| true),
             };
             answer(reply, done.map_err(python))?;
         }
@@ -790,32 +757,114 @@ fn answer<T>(
 
 /// The acknowledgments landed since the last poll, as
 /// `cache_event_to_payload` names them.
-fn poll_cache(py: Python<'_>, pump: &Bound<'_, PyAny>) -> Result<CachePoll, String> {
-    let (polled, l3_backup_failed): (Vec<(String, u32, i32)>, bool) = pump
+fn poll_cache(py: Python<'_>, pump: &Bound<'_, PyAny>) -> Result<Vec<CacheEvent>, String> {
+    let polled: Vec<(String, u32)> = pump
         .call_method0("poll_cache_events")
         .and_then(|events| events.extract())
         .map_err(|error| describe(py, &error))?;
-    let events = polled
+    polled
         .into_iter()
-        .map(|(kind, op_id, landed_pages)| {
+        .map(|(kind, op_id)| {
             let kind = match kind.as_str() {
                 "WriteBackDoneEvent" => CacheEventKind::WriteBackDone,
                 "LoadBackDoneEvent" => CacheEventKind::LoadBackDone,
-                "PrefetchDoneEvent" => CacheEventKind::PrefetchDone,
                 "SnapshotDoneEvent" => CacheEventKind::SnapshotDone,
                 "RestoreDoneEvent" => CacheEventKind::RestoreDone,
                 _ => return Err(format!("unknown cache event {kind}")),
             };
-            Ok(CacheEvent {
-                kind,
-                op_id,
-                landed_pages,
-            })
+            Ok(CacheEvent { kind, op_id })
         })
-        .collect::<Result<_, String>>()?;
-    Ok(CachePoll {
-        events,
-        l3_backup_failed,
+        .collect()
+}
+
+/// One finished storage operation: `(op_id, success, retired,
+/// object_failures)`.
+type Completion = (u64, Vec<bool>, bool, Vec<bool>);
+
+/// The L3 executor's poll (`DataPlanePump.poll_storage`).
+fn poll_storage(py: Python<'_>, pump: &Bound<'_, PyAny>) -> Result<StoragePoll, String> {
+    let (now_us, completions, pressure, error): (
+        i64,
+        Vec<Completion>,
+        (i64, i64, i64),
+        Option<String>,
+    ) = pump
+        .call_method0("poll_storage")
+        .and_then(|poll| poll.extract())
+        .map_err(|error| describe(py, &error))?;
+    Ok(StoragePoll {
+        now_us,
+        completions: completions
+            .into_iter()
+            .map(
+                |(op_id, success, retired, object_failures)| StorageCompletion {
+                    op_id,
+                    success,
+                    retired,
+                    object_failures,
+                },
+            )
+            .collect(),
+        pressure: StoragePressure {
+            queued_operations: pressure.0,
+            queued_bytes: pressure.1,
+            oldest_operation_us: pressure.2,
+        },
+        error,
+    })
+}
+
+/// One operation kind's counters: `(kind, events, success_keys,
+/// failed_keys, success_bytes, queue_seconds, backend_seconds, operations,
+/// bytes)`.
+type OperationRow = (
+    String,
+    Vec<(String, f64)>,
+    f64,
+    f64,
+    f64,
+    f64,
+    f64,
+    Vec<(String, f64)>,
+    Vec<(String, f64)>,
+);
+
+/// The L3 executor's counters (`DataPlanePump.storage_snapshot`).
+fn storage_snapshot(py: Python<'_>, pump: &Bound<'_, PyAny>) -> Result<L3ExecutorSnapshot, String> {
+    let (rows, health_state, health_epoch, unsafe_io): (Vec<OperationRow>, String, i64, bool) =
+        pump.call_method0("storage_snapshot")
+            .and_then(|snapshot| snapshot.extract())
+            .map_err(|error| describe(py, &error))?;
+    Ok(L3ExecutorSnapshot {
+        operations: rows
+            .into_iter()
+            .map(
+                |(
+                    kind,
+                    events,
+                    success_keys,
+                    failed_keys,
+                    success_bytes,
+                    queue_seconds,
+                    backend_seconds,
+                    operations,
+                    bytes,
+                )| L3OperationSnapshot {
+                    kind,
+                    events,
+                    success_keys,
+                    failed_keys,
+                    success_bytes,
+                    queue_seconds,
+                    backend_seconds,
+                    operations,
+                    bytes,
+                },
+            )
+            .collect(),
+        health_state,
+        health_epoch: health_epoch as f64,
+        unsafe_io,
     })
 }
 

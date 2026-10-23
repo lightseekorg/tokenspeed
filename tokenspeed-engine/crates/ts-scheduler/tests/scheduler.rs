@@ -26,7 +26,9 @@ use std::{ffi::CString, sync::Once};
 
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
-    CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind, RequestSpec, Scheduler,
+    CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind, RequestSpec,
+    Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind, StorageRound,
+    StorageTickView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -253,11 +255,13 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
     }
     let store = store.expect("the forced retraction never came");
     scheduler
-        .advance_cache(&[CacheEvent {
-            kind: CacheEventKind::SnapshotDone,
-            op_id: store,
-            landed_pages: 0,
-        }])
+        .advance_head(
+            &StorageRound::default(),
+            &[CacheEvent {
+                kind: CacheEventKind::SnapshotDone,
+                op_id: store,
+            }],
+        )
         .unwrap();
 
     // The restore comes back as its own op; once acknowledged, the request
@@ -271,11 +275,13 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
             .find(|op| op.kind == CacheOpKind::SnapshotRestore)
         {
             scheduler
-                .advance_cache(&[CacheEvent {
-                    kind: CacheEventKind::RestoreDone,
-                    op_id: op.op_id,
-                    landed_pages: 0,
-                }])
+                .advance_head(
+                    &StorageRound::default(),
+                    &[CacheEvent {
+                        kind: CacheEventKind::RestoreDone,
+                        op_id: op.op_id,
+                    }],
+                )
                 .unwrap();
             restored = true;
             break;
@@ -284,4 +290,109 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
     assert!(restored, "the retracted request was never restored");
     let sizes = scheduler.sizes();
     assert_eq!((sizes.decoding, sizes.retracted), (1, 0));
+}
+
+/// A small scheduler with the L3 tier and its storage credits.
+const STORAGE_SCHEDULER: &str = r#"
+import tokenspeed_scheduler as ts
+cfg = ts.SchedulerConfig()
+cfg.role = ts.SchedulerConfig.Role.Fused
+cfg.prefix_granularity = 2
+cfg.num_device_pages = 32
+cfg.num_host_pages = 8
+cfg.num_snapshot_pages = 1
+cfg.max_scheduled_tokens = 8
+cfg.max_batch_size = 4
+cfg.disable_l2_cache = False
+cfg.enable_l3_storage = True
+cfg.storage_config = ts.StorageConfig(
+    8, 8, 4, 4, 32, 1, 1000, 1000,
+    ts.StoragePressure(8, 65536, 1000),
+    ts.StoragePressure(4, 32768, 500),
+)
+cfg.cache_groups = [ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)]
+result = ts.Scheduler(cfg)
+"#;
+
+/// A round head that allows forwards and storage at `now_us`.
+fn tick(now_us: i64) -> StorageRound {
+    StorageRound {
+        tick: Some(StorageTickView {
+            now_us,
+            allow_forward: true,
+            allow_storage: true,
+            queued_operations: 0,
+            queued_bytes: 0,
+            oldest_operation_us: 0,
+        }),
+        ..StorageRound::default()
+    }
+}
+
+#[test]
+fn storage_operations_stay_out_of_the_device_cache_ops() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
+    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler.submit_requests(&[spec("waiting", vec![1, 2, 3, 4])]);
+
+    // The prompt's probe runs on the storage executors: the device's cache
+    // ops never count it, and the request waits for its answer.
+    let plan = scheduler.next_execution_plan();
+    assert!(plan.cache_ops().is_empty());
+    let ops = plan.storage_ops();
+    assert_eq!(ops.len(), 1);
+    assert_eq!(ops[0].kind, StorageOpKind::Query);
+    assert!(plan
+        .forward_batches()
+        .iter()
+        .all(|b| b.request_ids.is_empty()));
+    assert!(scheduler.storage_pending());
+
+    // No owner holds a key: the request admits without a stored prefix.
+    let keys = ops[0].num_keys;
+    let done = StorageRound {
+        done: vec![StorageDoneView {
+            op_id: ops[0].op_id,
+            success: vec![0; keys],
+            retired: true,
+            object_failures: vec![0; keys],
+        }],
+        ..tick(2)
+    };
+    scheduler.advance_head(&done, &[]).unwrap();
+    let plan = scheduler.next_execution_plan();
+    assert!(plan
+        .forward_batches()
+        .iter()
+        .any(|b| b.request_ids == ["waiting"]));
+}
+
+#[test]
+fn a_detached_request_cancels_its_storage_operation() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
+    scheduler.advance_head(&tick(1), &[]).unwrap();
+    scheduler.submit_requests(&[spec("waiting", vec![1, 2, 3, 4])]);
+    let query = scheduler.next_execution_plan().storage_ops()[0].clone();
+
+    let detach = StorageRound {
+        cancellations: vec![StorageCancellationView {
+            request_id: "waiting".to_owned(),
+            abort: false,
+        }],
+        ..tick(2)
+    };
+    scheduler.advance_head(&detach, &[]).unwrap();
+    scheduler.submit_requests(&[spec("next", vec![5, 6, 7, 8])]);
+    // The cancel goes out before the next request's probe.
+    let ops = scheduler.next_execution_plan().storage_ops();
+    assert_eq!(
+        ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+        [StorageOpKind::Cancel, StorageOpKind::Query]
+    );
+    assert_eq!(ops[0].op_id, query.op_id);
+    assert!(ops[1].op_id > query.op_id);
 }

@@ -129,10 +129,11 @@ fn the_c_entries_drive_a_registered_matcher() {
     let entries: std::collections::HashMap<&str, usize> =
         ts_grammar::table::entries().into_iter().collect();
     // SAFETY: the addresses are the entries' own, with these signatures.
-    let (is_terminated, accept, free) = unsafe {
+    let (is_terminated, accept, retain, free) = unsafe {
         (
             std::mem::transmute::<usize, extern "C" fn(u64) -> i32>(entries["is_terminated"]),
             std::mem::transmute::<usize, extern "C" fn(u64, i32) -> i32>(entries["accept_token"]),
+            std::mem::transmute::<usize, extern "C" fn(u64) -> i32>(entries["retain"]),
             std::mem::transmute::<usize, extern "C" fn(u64)>(entries["free"]),
         )
     };
@@ -144,6 +145,12 @@ fn the_c_entries_drive_a_registered_matcher() {
     assert_eq!(is_terminated(handle), 1);
     // The control plane's view is the same matcher.
     assert!(shared.lock().unwrap().is_terminated());
+    // A queued forward's hold keeps the handle past the request's release;
+    // the last hold forgets it.
+    assert_eq!(retain(handle), 0);
+    free(handle);
+    assert_eq!(is_terminated(handle), 1);
     free(handle);
     assert_eq!(is_terminated(handle), -1);
+    assert_eq!(retain(handle), -1);
 }

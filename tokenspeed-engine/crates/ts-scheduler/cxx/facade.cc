@@ -114,18 +114,49 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
     scheduler.Advance(execution_event);
 }
 
-void advance_cache(tokenspeed::Scheduler& scheduler, rust::Slice<const CacheEvent> events) {
+void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
+                  rust::Slice<const StorageCancellationView> cancellations,
+                  rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events) {
+    // One batch, in the order the Python hooks built it: the storage clock,
+    // the cancellations, the storage completions, then the Host copies' ACKs.
     tokenspeed::ExecutionEvent execution_event;
-    for (const CacheEvent& event : events) {
+    for (const StorageTickView& tick : ticks) {
+        execution_event.With(tokenspeed::cache::StorageTick{
+            .now_us = tick.now_us,
+            .allow_forward = tick.allow_forward,
+            .allow_storage = tick.allow_storage,
+            .pressure =
+                tokenspeed::StoragePressure{
+                    .queued_operations = tick.queued_operations,
+                    .queued_bytes = tick.queued_bytes,
+                    .oldest_operation_us = tick.oldest_operation_us,
+                },
+        });
+    }
+    for (const StorageCancellationView& cancellation : cancellations) {
+        std::string request_id(cancellation.request_id);
+        if (cancellation.abort) {
+            execution_event.With(tokenspeed::forward::Abort{.request_id = std::move(request_id)});
+        } else {
+            execution_event.With(tokenspeed::cache::StorageDetach{.request_id = std::move(request_id)});
+        }
+    }
+    for (const StorageDoneView& completion : done) {
+        execution_event.With(tokenspeed::cache::StorageDone{
+            .op_id = completion.op_id,
+            .success = std::vector<std::uint8_t>(completion.success.begin(), completion.success.end()),
+            .retired = completion.retired,
+            .object_failures = std::vector<std::uint8_t>(completion.object_failures.begin(),
+                                                         completion.object_failures.end()),
+        });
+    }
+    for (const CacheEvent& event : cache_events) {
         switch (event.kind) {
             case CacheEventKind::WriteBackDone:
                 execution_event.With(tokenspeed::cache::WriteBackDone{.op_id = event.op_id});
                 break;
             case CacheEventKind::LoadBackDone:
                 execution_event.With(tokenspeed::cache::LoadBackDone{.op_id = event.op_id});
-                break;
-            case CacheEventKind::PrefetchDone:
-                execution_event.With(tokenspeed::cache::PrefetchDone(event.op_id, event.landed_pages));
                 break;
             case CacheEventKind::SnapshotDone:
                 execution_event.With(tokenspeed::cache::SnapshotDone{.op_id = event.op_id});
@@ -183,43 +214,36 @@ rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler) {
     return views;
 }
 
-rust::Vec<rust::String> prefix_hashes_for_tokens(const tokenspeed::Scheduler& scheduler,
-                                                 rust::Slice<const std::int32_t> tokens) {
-    const std::vector<std::int32_t> owned(tokens.begin(), tokens.end());
-    rust::Vec<rust::String> hashes;
-    for (const auto& hash : scheduler.PrefixHashesForTokens(owned)) {
-        hashes.push_back(rust::String(hash));
-    }
-    return hashes;
+std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {
+    return scheduler.RequestTokenSize(std::string(request_id));
 }
 
-rust::Vec<CacheKeyView> expand_prefix_keys(const tokenspeed::Scheduler& scheduler,
-                                           rust::Slice<const rust::String> content_hashes) {
-    std::vector<std::string> owned;
-    owned.reserve(content_hashes.size());
-    for (const auto& hash : content_hashes) owned.emplace_back(hash);
-    rust::Vec<CacheKeyView> keys;
-    for (const auto& key : scheduler.ExpandPrefixKeys(owned)) {
-        keys.push_back(CacheKeyView{
-            .group_id = key.group_id,
-            .content_hash = rust::String(key.content_hash),
-            .page_offset = key.page_offset,
-        });
-    }
-    return keys;
+bool can_abort_before_admission(const tokenspeed::Scheduler& scheduler, rust::Str request_id) {
+    return scheduler.CanAbortBeforeAdmission(std::string(request_id));
 }
 
-void register_storage_keys(tokenspeed::Scheduler& scheduler, rust::Slice<const CacheKeyView> keys) {
-    std::vector<tokenspeed::CacheKey> owned;
-    owned.reserve(keys.size());
-    for (const auto& key : keys) {
-        owned.push_back(tokenspeed::CacheKey{
-            .group_id = key.group_id,
-            .content_hash = std::string(key.content_hash),
-            .page_offset = key.page_offset,
-        });
-    }
-    scheduler.RegisterStorageKeys(owned);
+bool storage_pending(const tokenspeed::Scheduler& scheduler) { return scheduler.StoragePending(); }
+
+StorageStatsView storage_stats(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::StorageStats stats = scheduler.GetStorageStats();
+    return StorageStatsView{
+        .operations = stats.operations,
+        .held_blocks = stats.held_blocks,
+        .quarantined = stats.quarantined,
+        .negative_keys = stats.negative_keys,
+        .backup_candidates = stats.backup_candidates,
+        .waiting_requests = stats.waiting_requests,
+        .ready_requests = stats.ready_requests,
+        .wait_timeouts = stats.wait_timeouts,
+        .ready_expirations = stats.ready_expirations,
+        .pressure_gate_closed = stats.pressure_gate_closed,
+        .pressure_bypasses = stats.pressure_bypasses,
+        .pressure_dropped_backup_keys = stats.pressure_dropped_backup_keys,
+        .overflow_dropped_backup_keys = stats.overflow_dropped_backup_keys,
+        .unavailable_dropped_backup_keys = stats.unavailable_dropped_backup_keys,
+        .disabled_dropped_backup_keys = stats.disabled_dropped_backup_keys,
+        .cleanup_dropped_backup_keys = stats.cleanup_dropped_backup_keys,
+    };
 }
 
 bool clear_cache(tokenspeed::Scheduler& scheduler) { return scheduler.ClearCache(); }
@@ -318,8 +342,9 @@ rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan)
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
     rust::Vec<CacheOpView> out;
     // One acknowledgment per op id, whatever the batch kind: an L2 batch
-    // lists its ops, and a snapshot, restore or prefetch batch has one op
-    // per request.
+    // lists its ops, and a snapshot or restore batch has one op per request.
+    // Storage operations are the L3 executor's, completed through the
+    // storage agreement instead.
     auto append = [&out](CacheOpKind kind, const std::vector<std::uint32_t>& op_ids) {
         for (std::uint32_t op_id : op_ids) {
             out.push_back(CacheOpView{.kind = kind, .op_id = op_id});
@@ -342,11 +367,41 @@ rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan) {
                 } else if constexpr (std::is_same_v<Batch, tokenspeed::SnapshotRestoreBatch>) {
                     append(CacheOpKind::SnapshotRestore, batch.op_ids);
                 } else {
-                    static_assert(std::is_same_v<Batch, tokenspeed::PrefetchBatch>, "a new cache batch kind");
-                    append(CacheOpKind::Prefetch, batch.op_ids);
+                    static_assert(std::is_same_v<Batch, tokenspeed::StorageOperation>, "a new cache batch kind");
                 }
             },
             *cache);
+    }
+    return out;
+}
+
+rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<StorageOpView> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        const auto* cache = std::get_if<tokenspeed::CacheOperation>(&operation);
+        if (cache == nullptr) {
+            continue;
+        }
+        const auto* storage = std::get_if<tokenspeed::StorageOperation>(cache);
+        if (storage == nullptr) {
+            continue;
+        }
+        std::visit(
+            [&out](const auto& op) {
+                using Op = std::decay_t<decltype(op)>;
+                if constexpr (std::is_same_v<Op, tokenspeed::StorageCancelOperation>) {
+                    out.push_back(StorageOpView{.kind = StorageOpKind::Cancel, .op_id = op.op_id, .num_keys = 0});
+                } else {
+                    StorageOpKind kind = StorageOpKind::Query;
+                    if constexpr (std::is_same_v<Op, tokenspeed::StorageGetOperation>) {
+                        kind = StorageOpKind::Get;
+                    } else if constexpr (std::is_same_v<Op, tokenspeed::StoragePutOperation>) {
+                        kind = StorageOpKind::Put;
+                    }
+                    out.push_back(StorageOpView{.kind = kind, .op_id = op.op_id, .num_keys = op.keys.size()});
+                }
+            },
+            *storage);
     }
     return out;
 }

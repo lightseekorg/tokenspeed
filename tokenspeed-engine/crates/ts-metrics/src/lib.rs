@@ -673,3 +673,330 @@ impl KvTransferMetrics {
         self.failures.inc(&[&self.labels[0], &self.labels[1]], 1.0);
     }
 }
+
+/// The L3 metrics' labels: the engine's, plus the attention-TP rank and the
+/// engine's role (`--disaggregation-mode`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct L3Labels {
+    /// `--served-model-name`.
+    pub model_name: String,
+    /// `--app-key`, empty when unset.
+    pub app_key: String,
+    /// The attention-DP rank.
+    pub dp_rank: i64,
+    /// The attention-TP rank.
+    pub tp_rank: i64,
+    /// `null`, `prefill` or `decode`.
+    pub engine_role: String,
+}
+
+const L3_LABELS: [&str; 5] = ["model_name", "app_key", "dp_rank", "tp_rank", "engine_role"];
+
+/// One operation kind's counters in an L3 executor snapshot
+/// (`OperationSnapshot`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L3OperationSnapshot {
+    /// `query`, `get`, `put` or `cancel`.
+    pub kind: String,
+    /// Cumulative event counts, by event.
+    pub events: Vec<(String, f64)>,
+    /// Keys reported successful, cumulative.
+    pub success_keys: f64,
+    /// Keys reported failed, cumulative.
+    pub failed_keys: f64,
+    /// Successful adapter bytes, cumulative.
+    pub success_bytes: f64,
+    /// Queue time, cumulative seconds.
+    pub queue_seconds: f64,
+    /// Adapter call time, cumulative seconds.
+    pub backend_seconds: f64,
+    /// Jobs now, by state.
+    pub operations: Vec<(String, f64)>,
+    /// Job bytes now, by state.
+    pub bytes: Vec<(String, f64)>,
+}
+
+/// An L3 executor snapshot (`ExecutorSnapshot`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct L3ExecutorSnapshot {
+    /// Per operation kind.
+    pub operations: Vec<L3OperationSnapshot>,
+    /// Backend health: `healthy`, `open` or `half_open`.
+    pub health_state: String,
+    /// The backend health epoch.
+    pub health_epoch: f64,
+    /// Native retirement unproven: new I/O disabled until restart.
+    pub unsafe_io: bool,
+}
+
+/// The scheduler's storage observations (`StorageStats`), mirrored on every
+/// rank of a replica.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct L3SchedulerStats {
+    /// Storage operations the scheduler has in flight.
+    pub operations: f64,
+    /// Host blocks storage operations hold.
+    pub held_blocks: f64,
+    /// Host blocks quarantined after unproven retirement.
+    pub quarantined: f64,
+    /// Keys known to be absent from the store.
+    pub negative_keys: f64,
+    /// Published blocks waiting to be backed up.
+    pub backup_candidates: f64,
+    /// Requests waiting on their storage preparation.
+    pub waiting_requests: f64,
+    /// Requests whose preparation is ready.
+    pub ready_requests: f64,
+    /// Preparations that timed out waiting, cumulative.
+    pub wait_timeouts: f64,
+    /// Ready preparations that expired, cumulative.
+    pub ready_expirations: f64,
+    /// The pressure gate is closed.
+    pub pressure_gate_closed: bool,
+    /// Preparations bypassed by pressure, cumulative.
+    pub pressure_bypasses: f64,
+    /// Backup candidates dropped by pressure, cumulative.
+    pub pressure_dropped_backup_keys: f64,
+    /// Backup candidates dropped on overflow, cumulative.
+    pub overflow_dropped_backup_keys: f64,
+    /// Backup candidates dropped with Host memory unavailable, cumulative.
+    pub unavailable_dropped_backup_keys: f64,
+    /// Backup candidates dropped with writes disabled, cumulative.
+    pub disabled_dropped_backup_keys: f64,
+    /// Backup candidates dropped on cleanup, cumulative.
+    pub cleanup_dropped_backup_keys: f64,
+}
+
+/// The L3 storage tier's metrics (`L3Metrics`), on every rank with L3 and
+/// `--enable-metrics`. Snapshots carry cumulative counters; each export adds
+/// only what grew since the last one.
+#[derive(Debug)]
+pub struct L3Metrics {
+    labels: [String; 5],
+    events: Metric,
+    keys: Metric,
+    bytes: Metric,
+    seconds: Metric,
+    operations: Metric,
+    held_bytes: Metric,
+    health: Metric,
+    epoch: Metric,
+    unsafe_io: Metric,
+    resources: Metric,
+    expirations: Metric,
+    pressure_bypasses: Metric,
+    pressure_drops: Metric,
+    backup_drops: Metric,
+    /// Counter totals already exported, by counter and extra labels.
+    exported: HashMap<(&'static str, Vec<String>), f64>,
+}
+
+impl L3Metrics {
+    /// The metrics, exported through `exporter`.
+    pub fn new(exporter: &Arc<Exporter>, labels: &L3Labels) -> Self {
+        let with = |extra: &[&'static str]| -> Vec<&'static str> {
+            L3_LABELS.iter().chain(extra).copied().collect()
+        };
+        Self {
+            labels: [
+                labels.model_name.clone(),
+                labels.app_key.clone(),
+                labels.dp_rank.to_string(),
+                labels.tp_rank.to_string(),
+                labels.engine_role.clone(),
+            ],
+            events: Metric::counter(
+                exporter,
+                "tokenspeed:l3_io_events",
+                "Local executor events; backend_calls counts adapter invocations, not native \
+                 transfers.",
+                &with(&["kind", "event"]),
+            ),
+            keys: Metric::counter(
+                exporter,
+                "tokenspeed:l3_io_keys",
+                "Reported per-key outcomes, including query misses and rejected/cancelled jobs.",
+                &with(&["kind", "result"]),
+            ),
+            bytes: Metric::counter(
+                exporter,
+                "tokenspeed:l3_io_adapter_bytes",
+                "Successful adapter bytes, including existing PUT objects; not network bytes.",
+                &with(&["kind"]),
+            ),
+            seconds: Metric::counter(
+                exporter,
+                "tokenspeed:l3_io_seconds",
+                "Cumulative local queue and adapter call durations.",
+                &with(&["kind", "stage"]),
+            ),
+            operations: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_io_operations",
+                "Local jobs, including completed facts not yet polled.",
+                &with(&["kind", "state"]),
+            ),
+            held_bytes: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_io_buffer_bytes",
+                "Job byte ranges; excludes C++ Ready and quarantined ownership after poll.",
+                &with(&["kind", "state"]),
+            ),
+            health: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_backend_state",
+                "Backend health: healthy=0, open=1, half_open=2. Quarantine is separate.",
+                &L3_LABELS,
+            ),
+            epoch: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_backend_epoch",
+                "Local backend health epoch.",
+                &L3_LABELS,
+            ),
+            unsafe_io: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_io_quarantined",
+                "Local native retirement unproven; new I/O disabled until restart.",
+                &L3_LABELS,
+            ),
+            resources: Metric::gauge(
+                exporter,
+                "tokenspeed:l3_scheduler_resources",
+                "Mirrored C++ resource counts; do not sum across TP ranks.",
+                &with(&["resource"]),
+            ),
+            expirations: Metric::counter(
+                exporter,
+                "tokenspeed:l3_preparation_expirations",
+                "Mirrored scheduler deadline expirations; do not sum across TP ranks.",
+                &with(&["phase"]),
+            ),
+            pressure_bypasses: Metric::counter(
+                exporter,
+                "tokenspeed:l3_pressure_bypasses",
+                "Mirrored preparation attempts bypassed by pressure; do not sum TP ranks.",
+                &L3_LABELS,
+            ),
+            pressure_drops: Metric::counter(
+                exporter,
+                "tokenspeed:l3_pressure_dropped_backup_keys",
+                "Mirrored backup candidates dropped by pressure; do not sum TP ranks.",
+                &L3_LABELS,
+            ),
+            backup_drops: Metric::counter(
+                exporter,
+                "tokenspeed:l3_dropped_backup_keys",
+                "Mirrored backup candidates discarded by reason; do not sum TP ranks.",
+                &with(&["reason"]),
+            ),
+            exported: HashMap::new(),
+        }
+    }
+
+    fn label_values<'a>(&'a self, extra: &[&'a str]) -> Vec<&'a str> {
+        self.labels
+            .iter()
+            .map(String::as_str)
+            .chain(extra.iter().copied())
+            .collect()
+    }
+
+    /// Export a cumulative counter's growth since its last export; a total
+    /// that went backwards restarted, and counts in full.
+    fn increment(&mut self, counter: &'static str, value: f64, extra: &[&str]) {
+        let key = (
+            counter,
+            extra.iter().map(|&label| label.to_owned()).collect(),
+        );
+        let previous = self.exported.get(&key).copied().unwrap_or(0.0);
+        let delta = if value >= previous {
+            value - previous
+        } else {
+            value
+        };
+        if delta > 0.0 {
+            let metric = match counter {
+                "events" => &self.events,
+                "keys" => &self.keys,
+                "bytes" => &self.bytes,
+                "seconds" => &self.seconds,
+                "expirations" => &self.expirations,
+                "pressure_bypasses" => &self.pressure_bypasses,
+                "pressure_drops" => &self.pressure_drops,
+                "backup_drops" => &self.backup_drops,
+                _ => unreachable!("an L3 counter"),
+            };
+            metric.inc(&self.label_values(extra), delta);
+        }
+        self.exported.insert(key, value);
+    }
+
+    /// Export one snapshot and the scheduler's observations; no request or
+    /// key identifier becomes a label.
+    pub fn record(&mut self, io: &L3ExecutorSnapshot, scheduler: &L3SchedulerStats) {
+        for row in &io.operations {
+            let kind = row.kind.as_str();
+            for (event, value) in &row.events {
+                self.increment("events", *value, &[kind, event.as_str()]);
+            }
+            self.increment("keys", row.success_keys, &[kind, "success"]);
+            self.increment("keys", row.failed_keys, &[kind, "failure"]);
+            self.increment("bytes", row.success_bytes, &[kind]);
+            self.increment("seconds", row.queue_seconds, &[kind, "queue"]);
+            self.increment("seconds", row.backend_seconds, &[kind, "backend"]);
+            for (state, value) in &row.operations {
+                self.operations
+                    .set(&self.label_values(&[kind, state.as_str()]), *value);
+            }
+            for (state, value) in &row.bytes {
+                self.held_bytes
+                    .set(&self.label_values(&[kind, state.as_str()]), *value);
+            }
+        }
+        let health = match io.health_state.as_str() {
+            "healthy" => 0.0,
+            "open" => 1.0,
+            _ => 2.0,
+        };
+        self.health.set(&self.label_values(&[]), health);
+        self.epoch.set(&self.label_values(&[]), io.health_epoch);
+        self.unsafe_io
+            .set(&self.label_values(&[]), f64::from(u8::from(io.unsafe_io)));
+        for (resource, value) in [
+            ("operations", scheduler.operations),
+            ("held_blocks", scheduler.held_blocks),
+            ("quarantined", scheduler.quarantined),
+            ("negative_keys", scheduler.negative_keys),
+            ("backup_candidates", scheduler.backup_candidates),
+            ("waiting_requests", scheduler.waiting_requests),
+            ("ready_requests", scheduler.ready_requests),
+            (
+                "pressure_gate_closed",
+                f64::from(u8::from(scheduler.pressure_gate_closed)),
+            ),
+        ] {
+            self.resources.set(&self.label_values(&[resource]), value);
+        }
+        self.increment("expirations", scheduler.wait_timeouts, &["waiting"]);
+        self.increment("expirations", scheduler.ready_expirations, &["ready"]);
+        self.increment("pressure_bypasses", scheduler.pressure_bypasses, &[]);
+        self.increment(
+            "pressure_drops",
+            scheduler.pressure_dropped_backup_keys,
+            &[],
+        );
+        for (reason, count) in [
+            ("pressure", scheduler.pressure_dropped_backup_keys),
+            ("overflow", scheduler.overflow_dropped_backup_keys),
+            (
+                "host_unavailable",
+                scheduler.unavailable_dropped_backup_keys,
+            ),
+            ("write_disabled", scheduler.disabled_dropped_backup_keys),
+            ("cleanup", scheduler.cleanup_dropped_backup_keys),
+        ] {
+            self.increment("backup_drops", count, &[reason]);
+        }
+    }
+}

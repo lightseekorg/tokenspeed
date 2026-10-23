@@ -20,7 +20,8 @@
 
 """The capturable grammar's host node writes the eager walk's masks.
 
-Real xgrammar matchers on a small vocabulary. The eager producer walks the
+Real xgrammar matchers on a small vocabulary, behind the engine host's
+grammar entries (``grammar_test_utils``). The eager producer walks the
 draft chain position by position; the host node, C++ that calls the
 matchers without the GIL, fills it with one matcher call and resets only
 the rows it wrote before. Both must give the same bits on every bound row,
@@ -48,11 +49,10 @@ register_cuda_ci(
     disabled_on_runners_reason="the host node builds against the CUDA runtime",
 )
 
+from test.runtime.grammar_test_utils import host_grammar  # noqa: E402
+
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
-)
-from tokenspeed.runtime.grammar.base_grammar_backend import (  # noqa: E402
-    BaseGrammarObject,
 )
 from tokenspeed.runtime.grammar.capturable_grammar import (  # noqa: E402
     CapturableGrammarExecutor,
@@ -75,39 +75,6 @@ for _id, _text in ((BRACE, "}"), (C, "c"), (BC, "bc")):
 W = 4
 
 
-class _Grammar(BaseGrammarObject):
-    """A real xgrammar matcher behind the grammar interface the data plane
-    drives (in serving, ``HostGrammar`` over the matcher the Rust host owns)."""
-
-    def __init__(self, matcher) -> None:
-        self.matcher = matcher
-        self.stop_token_ids = frozenset(matcher.stop_token_ids)
-        self.finished = False
-
-    def is_terminated(self) -> bool:
-        return self.matcher.is_terminated()
-
-    def accept_token(self, token: int) -> None:
-        if not self.is_terminated() and not self.matcher.accept_token(token):
-            raise ValueError(f"Tokens not accepted: {token}")
-
-    def try_accept_token(self, token: int) -> bool:
-        return not self.is_terminated() and self.matcher.accept_token(token)
-
-    def rollback(self, k: int) -> None:
-        self.matcher.rollback(k)
-
-    def fill_vocab_mask(self, vocab_mask, idx: int) -> None:
-        self.matcher.fill_next_token_bitmask(vocab_mask, idx)
-
-    def fill_vocab_masks_along_drafts(
-        self, vocab_masks, draft_tokens, next_node, next_sibling
-    ) -> None:
-        self.matcher.traverse_draft_tree(
-            next_node, next_sibling, draft_tokens, vocab_masks
-        )
-
-
 @pytest.fixture(scope="module")
 def compiled():
     info = xgr.TokenizerInfo(VOCAB, stop_token_ids=[EOS])
@@ -115,10 +82,7 @@ def compiled():
 
 
 def _grammar(compiled, accepted):
-    grammar = _Grammar(xgr.GrammarMatcher(compiled))
-    for token in accepted:
-        grammar.accept_token(token)
-    return grammar
+    return host_grammar(compiled, accepted)
 
 
 # (accepted so far, drafts; column 0 is the last accepted token) per request.

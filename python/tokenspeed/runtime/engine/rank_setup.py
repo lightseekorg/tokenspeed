@@ -23,6 +23,7 @@ model config, the process groups, the request length limits and the C++
 scheduler's config. ``rust_host.bootstrap`` runs them in this order."""
 
 import torch
+from tokenspeed_scheduler import StorageConfig
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.engine.scheduler_utils import make_config
@@ -194,6 +195,7 @@ def scheduler_config_from_args(
     server_args,
     specs,
     *,
+    storage_config: StorageConfig | None,
     max_scheduled_tokens: int,
     max_batch_size: int,
     decode_input_tokens: int,
@@ -201,16 +203,14 @@ def scheduler_config_from_args(
     enable_kv_cache_events: bool,
     prefix_replay_tokens: int,
 ):
-    """The C++ scheduler's config from the server arguments and the device build.
-
-    One place turns the two into ``make_config``'s arguments, so the knobs an
-    engine does not have -- the L3 prefetch threshold without an L3 store --
-    are translated here, not left as None for the binding.
+    """Build scheduler config from Device facts and separate Host-storage limits.
 
     Args:
         server_args: The resolved server arguments.
         specs: The ``DeviceSpecs`` of the built device side: the cache
             geometry, the cache groups and the Host tiers' page counts.
+        storage_config: Shared storage scheduling limits, or None
+            when no storage backend is configured.
         max_scheduled_tokens: Per-step prefill token budget.
         max_batch_size: Rank-local batch slots.
         decode_input_tokens: Verify width per decode step.
@@ -231,8 +231,7 @@ def scheduler_config_from_args(
         role=server_args.disaggregation_mode,
         num_snapshot_pages=specs.num_snapshot_pages,
         max_retracted_requests=specs.max_retracted_requests,
-        # The threshold is unset (None) without a store; the binding takes 0.
-        l3_prefetch_min_pages=server_args.kvstore_prefetch_min_pages if has_l3 else 0,
+        storage_config=storage_config,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,
@@ -241,4 +240,5 @@ def scheduler_config_from_args(
         prefix_replay_tokens=prefix_replay_tokens,
         cache_groups=specs.cache_groups,
         enable_mixed_prefill_decode=server_args.enable_mixed_batch,
+        state_checkpoint_in_forward=server_args.writes_state_checkpoints_in_forward,
     )

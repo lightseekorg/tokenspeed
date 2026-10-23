@@ -9,20 +9,15 @@ on:
       - "python/tokenspeed/runtime/cache/host_storage.py"
       - "python/tokenspeed/runtime/cache/transfer/ownership.py"
       - "python/tokenspeed/runtime/cache/transfer/layout.py"
-      - "python/tokenspeed/runtime/engine/l3_cache_hooks.py"
-      - "python/tokenspeed/runtime/engine/event_loop.py"
+      - "python/tokenspeed/runtime/engine/rust_host.py"
       - "python/tokenspeed/runtime/execution/device.py"
       - "python/tokenspeed/runtime/utils/server_args.py"
-      - "python/tokenspeed/runtime/metrics/events.py"
-      - "python/tokenspeed/runtime/metrics/reporter.py"
       - "tokenspeed-scheduler/**"
       - "test/test_async_l3_*.py"
       - "test/l3_test_utils.py"
-      - "test/test_l3_metrics.py"
       - "test/test_host_cache_storage.py"
       - "test/test_l3_tail_roundtrip.py"
       - "test/test_l3_kvp_ownership.py"
-      - "test/runtime/test_l3_storage_hits.py"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
@@ -34,20 +29,15 @@ on:
       - "python/tokenspeed/runtime/cache/host_storage.py"
       - "python/tokenspeed/runtime/cache/transfer/ownership.py"
       - "python/tokenspeed/runtime/cache/transfer/layout.py"
-      - "python/tokenspeed/runtime/engine/l3_cache_hooks.py"
-      - "python/tokenspeed/runtime/engine/event_loop.py"
+      - "python/tokenspeed/runtime/engine/rust_host.py"
       - "python/tokenspeed/runtime/execution/device.py"
       - "python/tokenspeed/runtime/utils/server_args.py"
-      - "python/tokenspeed/runtime/metrics/events.py"
-      - "python/tokenspeed/runtime/metrics/reporter.py"
       - "tokenspeed-scheduler/**"
       - "test/test_async_l3_*.py"
       - "test/l3_test_utils.py"
-      - "test/test_l3_metrics.py"
       - "test/test_host_cache_storage.py"
       - "test/test_l3_tail_roundtrip.py"
       - "test/test_l3_kvp_ownership.py"
-      - "test/runtime/test_l3_storage_hits.py"
       - "test/test_l3_mooncake_master.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
@@ -118,15 +108,15 @@ jobs:
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install psutil prometheus-client -e 'tokenspeed-scheduler[test]'
 
-      - name: Run asynchronous storage and replica agreement tests
+      # The replica agreement and the L3 metrics run in the engine host's
+      # control plane (ts-control, ts-metrics), tested by
+      # tokenspeed-engine-test.yml.
+      - name: Run asynchronous storage tests
         env:
           PYTHONPATH: python
         run: |
           python -m pytest -q \
             test/test_async_l3_executor.py \
-            test/test_async_l3_agreement.py \
-            test/test_l3_metrics.py \
             test/test_host_cache_storage.py \
             test/test_l3_tail_roundtrip.py \
-            test/test_l3_kvp_ownership.py \
-            test/runtime/test_l3_storage_hits.py
+            test/test_l3_kvp_ownership.py

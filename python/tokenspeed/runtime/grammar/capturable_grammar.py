@@ -37,7 +37,7 @@ its own per-step CPU tensor produced by ``.to('cpu')`` in
 execute_forward_op, so step N+1 overwriting pinned does not race with
 commit(N).
 
-The host node is C++ that calls the xgrammar matchers without the GIL.
+The host node is C++ that calls the engine host's matchers without the GIL.
 ``add_batch`` adds one batch per replay and each execution pops one.
 """
 
@@ -193,11 +193,7 @@ class CapturableGrammarExecutor:
 
         self.accept_lengths = torch.zeros((max_bs,), dtype=torch.int32, pin_memory=True)
 
-        # Imported here, so only processes that build this executor load xgrammar.
-        from tokenspeed.runtime.grammar.xgrammar_backend import matcher_method_handles
-
         self.host = load_grammar_host_ext().Host(
-            matcher_method_handles(),
             self.host_bitmask.data_ptr(),
             max_bs,
             n,
@@ -491,10 +487,10 @@ def setup_grammar_step(
 
     ``grammar_runtime`` is one of:
       - ``CapturableGrammarExecutor`` (CUDA): enqueues an ``add_batch`` so
-        the side-stream hostfunc fills the bitmask in parallel with the
+        the side-stream host node fills the bitmask in parallel with the
         forward. Returns the per-step ``GrammarStepCompletion``.
       - ``EagerGrammarBuffers`` (non-CUDA fallback): syncs, runs the
-        xgrammar fill on host, H2Ds the bitmask. Returns ``None``.
+        matcher fill on host, H2Ds the bitmask. Returns ``None``.
       - ``None``: grammar disabled, no-op.
     """
     if grammar_runtime is None:
@@ -550,3 +546,24 @@ def setup_grammar_step(
     else:
         eager_buffers.vocab_mask_buf[:bs].fill_(-1)
     return None
+
+
+def resolve_grammar_completion(model_execution_results) -> list[int] | None:
+    """Where the data plane advanced a forward's grammar matchers (the
+    capturable path), each row's index of the kept token that ended its
+    grammar, or -1; None when the commit advances them.
+
+    The next forward's host node normally advances the matchers; this waits
+    briefly for it and otherwise advances them on the host (no next forward
+    may come: the last live request finished). Exactly one of the two
+    advances: a host advance that loses waits for the host node.
+    """
+    completion = model_execution_results.grammar_completion
+    if completion is None:
+        return None
+    if not completion.wait(timeout=0.005):
+        completion.advance_on_host(
+            model_execution_results.output_tokens.tolist(),
+            model_execution_results.output_lengths.tolist(),
+        )
+    return completion.terminated_at()

@@ -13,7 +13,7 @@ asynchronous implementation; there is no second synchronous scheduling mode.
 | C++ scheduler and `StorageTransferManager` | Request preparation, prefix boundaries, pressure admission, soft deadlines, operation IDs, credits, Host references, publication, cancellation and quarantine |
 | `CacheCoordinator` | Group matching, allocation and pinning; ordinary probes see published Device/Host data only |
 | Python `L3Executor` | Immutable Host jobs, backend and Host-buffer lifetime, bounded query/read/write queues, completion/pressure facts, and backend health monitoring |
-| `L3CacheHooks` | Replica agreement on time, permissions and completion facts; feedback to the existing event-loop head |
+| The control plane's `l3` module (`ts-control`) | Replica agreement on time, permissions and completion facts; feedback to the existing event-loop head |
 | `HostCacheStorage` | Shared pinned Host allocation and CPU-only block geometry; holds no device buffers or transfer layout |
 | `DeviceHandle` / `HostCacheExecutor` | Ordered D2H/H2D and device completion fences |
 
@@ -34,12 +34,13 @@ target/draft versions. Checkpoint agreement uses the caller's explicit CPU group
 Device construction retains responsibility for L2 copies and their Device
 buffers, streams and slot-state exporters.
 
-The control plane adapts `plan.cache` once. Its immutable `CacheOperations`
-snapshot preserves order within the Device and storage subsets. The loop
-submits storage operations to L3 and passes the Device subset to both cache-op
-accounting and `DeviceHandle.execute`. The two executors depend on scheduler
-tickets rather than their submission order. Completions enter the existing
-head feedback point, including during frozen and DP-idle rounds.
+The data plane adapts `plan.cache` once. Its immutable `CacheOperations`
+snapshot preserves order within the Device and storage subsets. The rank's
+data plane submits storage operations to L3 and passes the Device subset to
+`DeviceHandle.execute`; the control plane counts the same Device operations
+from the plan. The two executors depend on scheduler tickets rather than
+their submission order. Completions enter the existing head feedback point,
+including during frozen and DP-idle rounds.
 
 Configuration follows the same ownership boundary. `StorageConfig` is the
 read-only scheduling contract for credits, deadlines and pressure watermarks.
@@ -240,8 +241,8 @@ L3 exports use the shared metric adapter and process-local metrics service.
 Local I/O remains labeled by TP rank; exporters do not make storage admission
 or retirement decisions.
 
-Hooks MAX-reduce these durations and counts across cache owners through the
-existing fixed CPU header. C++ closes a shared read/write admission gate when
+The control plane MAX-reduces these durations and counts across cache owners
+through the fixed CPU header. C++ closes a shared read/write admission gate when
 any high watermark is reached and reopens it only when all observations reach
 their low watermarks. Local wall-clock timestamps never cross this boundary.
 The gate is independent of pause/freeze, backend health and quarantine. It does
@@ -281,8 +282,9 @@ and a successful backend call does not override C++ pressure admission.
 
 ## Completion agreement and ordering
 
-Every attention-TP owner sends its newly completed records once over the CPU
-group. Hooks retain partial-owner records until the other owners finish.
+Every attention-TP owner sends its newly completed records once over the
+replica's collective mesh. The control plane retains partial-owner records
+until the other owners finish.
 Each round first exchanges a named CPU header: the TP leader's monotonic clock,
 forward/storage permissions, completion count, an error flag and the three
 pressure observations. Buffer width follows these fields, independently of
@@ -411,8 +413,9 @@ read deduplication or layer-wise GET publication.
 Scheduler tests exercise mixed block granularities, sliding windows, sparse
 state, partial results, deadline expiry, cancellation, ID reuse and ownership.
 Executor tests cover bounded queues, health epochs, queued cancellation,
-shared-store byte round trips and quarantine. Two-process Gloo tests cover
-out-of-order owner agreement and collective error handling. GPU H2D/D2H and
+shared-store byte round trips and quarantine. Multi-rank tests over
+the control plane's TCP mesh (`ts-control`'s `l3` module) cover out-of-order
+owner agreement and collective error handling. GPU H2D/D2H and
 real Mooncake/RDMA validation are distinct from these CPU protocol tests.
 
 The Mooncake CI workflow defines CPU KVP owner-relocation tests and scheduler
@@ -448,7 +451,7 @@ token (TTFT), compared with recomputation when the tested prefix is absent
 from both Device and Host caches. Report the prefix actually used by admission,
 remaining prefill work and fallback frequency alongside TTFT. Separate remote
 DRAM hits, SSD hits with warm or cold file caches, and misses. Concurrent decode
-time per output token (TPOT) is an interference check; reducing idle L3 hook
+time per output token (TPOT) is an interference check; reducing idle L3 agreement
 overhead does not establish a prefill benefit. A storage call overlapping GPU
 work also does not establish how much latency was hidden on the request's
 critical path. PD measurements must include transfer and decode-side
@@ -470,8 +473,8 @@ centralized feedback points.
 
 ## Disabled storage and scope
 
-Without a storage backend, startup creates no L3 executor or SDK client, hooks
-return without I/O or owner agreement, and the scheduler skips storage
+Without a storage backend, startup creates no L3 executor or SDK client, the
+control plane runs no storage poll or owner agreement, and the scheduler skips storage
 preparation and reference-handoff scans. Ordinary Device/Host matching,
 admission and execution remain the same path. The runtime requires the
 scheduler built from matching source even when storage is disabled.

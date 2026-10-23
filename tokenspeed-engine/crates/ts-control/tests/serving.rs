@@ -44,7 +44,6 @@ use ts_client::{
 use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     batch_log::BatchLogConfig,
-    cache_ops::CachePoll,
     control::ControlConfig,
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, SlotMoves},
     event_loop::{
@@ -52,12 +51,13 @@ use ts_control::{
     },
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
+    l3::{StorageCompletion, StorageLimits, StoragePoll},
     output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role},
     pd::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer},
     transport::EngineTransport,
 };
 use ts_scheduler::{
-    CacheEvent, CacheEventKind, CacheKeyView, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
+    CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler, StorageOpKind,
 };
 use ts_wire::{
     codec::Dict,
@@ -105,7 +105,7 @@ enum Tiers {
     /// A Host L2 tier that published prefixes are written back to.
     HostL2,
     /// A Host L2 tier backed by an L3 store, which holds every prefix page
-    /// a probe asks for.
+    /// a query asks for.
     L3,
 }
 
@@ -128,7 +128,10 @@ fn new_scheduler(tiers: Tiers, role: Role) -> Scheduler {
             "cfg.disable_l2_cache = False\n\
              cfg.num_host_pages = 1025\n\
              cfg.enable_l3_storage = True\n\
-             cfg.l3_prefetch_min_pages = 1"
+             cfg.storage_config = ts.StorageConfig(\n\
+                 8, 8, 64, 64, 1024, 1, 10**9, 10**9,\n\
+                 ts.StoragePressure(64, 2**40, 10**9),\n\
+                 ts.StoragePressure(32, 2**39, 5 * 10**8))"
         }
     };
     let code = format!(
@@ -239,14 +242,17 @@ struct FakeDevice {
     ngram: Arc<Mutex<Vec<NgramRow>>>,
     /// Every token-history seed: (slot, prefix).
     history: Arc<Mutex<Vec<HistorySeed>>>,
-    /// L3: the pages a prefetch lands here, `None` without a store.
-    l3_landed_pages: Option<i64>,
-    /// L3: in-flight prefetches and how often each was polled.
-    prefetches: Vec<(u32, u32)>,
-    /// L3: completed prefetches' acknowledgments, for the next cache poll.
-    prefetched: Vec<CacheEvent>,
-    /// L3: what each probe found, per request prompt length.
-    l3_probes: Arc<Mutex<Vec<usize>>>,
+    /// L3: the leading keys of a get that land here, `None` for all of them.
+    l3_landed_keys: Option<usize>,
+    /// L3: polls a storage operation stays unfinished here.
+    l3_delay_polls: u32,
+    /// L3: storage operations started and unfinished, with their key counts
+    /// and the polls they waited.
+    storage: Vec<(u64, StorageOpKind, usize, u32)>,
+    /// L3: the storage clock.
+    storage_now_us: i64,
+    /// L3: every storage operation started, by kind.
+    storage_ops: Arc<Mutex<Vec<StorageOpKind>>>,
     /// PD: the transfers this engine's peer node sees.
     wire: Option<Arc<Mutex<Wire>>>,
     /// PD: each admitted request's room.
@@ -454,11 +460,22 @@ impl DataPlane for FakeDevice {
             .lock()
             .unwrap()
             .extend(ops.iter().map(|op| op.kind));
-        for op in ops {
-            if op.kind == CacheOpKind::Prefetch {
-                self.prefetches.push((op.op_id, 0));
-            } else {
-                self.unacknowledged.push(op);
+        self.unacknowledged.extend(ops);
+        for op in plan.storage_ops() {
+            self.storage_ops.lock().unwrap().push(op.kind);
+            match op.kind {
+                // A cancelled operation finishes at once, landing nothing.
+                StorageOpKind::Cancel => {
+                    if let Some(started) = self
+                        .storage
+                        .iter_mut()
+                        .find(|(op_id, ..)| *op_id == op.op_id)
+                    {
+                        started.1 = StorageOpKind::Cancel;
+                        started.3 = u32::MAX;
+                    }
+                }
+                kind => self.storage.push((op.op_id, kind, op.num_keys, 0)),
             }
         }
         if let Some(wire) = &self.wire {
@@ -525,8 +542,8 @@ impl DataPlane for FakeDevice {
         Ok(pending)
     }
 
-    fn poll_cache_events(&mut self) -> Result<CachePoll, DataPlaneError> {
-        let mut events = std::mem::take(&mut self.prefetched);
+    fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
+        let mut events = Vec::new();
         for op in self.unacknowledged.drain(..) {
             let kind = match op.kind {
                 CacheOpKind::WriteBack => CacheEventKind::WriteBackDone,
@@ -538,13 +555,9 @@ impl DataPlane for FakeDevice {
             events.push(CacheEvent {
                 kind,
                 op_id: op.op_id,
-                landed_pages: 0,
             });
         }
-        Ok(CachePoll {
-            events,
-            l3_backup_failed: false,
-        })
+        Ok(events)
     }
 
     fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
@@ -605,43 +618,45 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
-    fn query_l3_storage(&mut self, pages: &[CacheKeyView]) -> Result<Vec<bool>, DataPlaneError> {
-        self.l3_probes.lock().unwrap().push(pages.len());
-        Ok(vec![self.l3_landed_pages.is_some(); pages.len()])
-    }
-
-    /// A prefetch is done at its second poll, having landed this rank's
-    /// share of the store's pages.
-    fn l3_prefetch_progress(&mut self) -> Result<Vec<(u32, bool, i64)>, DataPlaneError> {
-        let landed = self.l3_landed_pages.unwrap_or(0);
-        Ok(self
-            .prefetches
-            .iter_mut()
-            .map(|(op_id, polls)| {
+    /// The store holds every key; a get lands its leading
+    /// `l3_landed_keys` here, a put stores everything, and an operation
+    /// finishes once it waited `l3_delay_polls` polls (a cancelled one at
+    /// once, landing nothing).
+    fn poll_storage(&mut self) -> Result<StoragePoll, DataPlaneError> {
+        self.storage_now_us += 1_000;
+        let mut completions = Vec::new();
+        let (landed, delay) = (self.l3_landed_keys, self.l3_delay_polls);
+        self.storage.retain_mut(|(op_id, kind, keys, polls)| {
+            if *polls != u32::MAX {
                 *polls += 1;
-                let done = *polls >= 2;
-                (*op_id, done, if done { landed } else { 0 })
-            })
-            .collect())
+                if *polls <= delay {
+                    return true;
+                }
+            }
+            let success: Vec<bool> = (0..*keys)
+                .map(|key| match *kind {
+                    StorageOpKind::Cancel => false,
+                    StorageOpKind::Get => landed.is_none_or(|landed| key < landed),
+                    _ => true,
+                })
+                .collect();
+            completions.push(StorageCompletion {
+                op_id: *op_id,
+                object_failures: vec![false; success.len()],
+                success,
+                retired: true,
+            });
+            false
+        });
+        Ok(StoragePoll {
+            now_us: self.storage_now_us,
+            completions,
+            ..StoragePoll::default()
+        })
     }
 
-    fn complete_l3_prefetch(
-        &mut self,
-        op_id: u32,
-        landed_pages: i64,
-    ) -> Result<(), DataPlaneError> {
-        let index = self
-            .prefetches
-            .iter()
-            .position(|&(id, _)| id == op_id)
-            .ok_or_else(|| DataPlaneError(format!("no prefetch {op_id} in flight")))?;
-        self.prefetches.remove(index);
-        self.prefetched.push(CacheEvent {
-            kind: CacheEventKind::PrefetchDone,
-            op_id,
-            landed_pages: landed_pages.try_into().unwrap(),
-        });
-        Ok(())
+    fn storage_snapshot(&mut self) -> Result<ts_metrics::L3ExecutorSnapshot, DataPlaneError> {
+        Ok(ts_metrics::L3ExecutorSnapshot::default())
     }
 
     fn delete_l3_namespace(&mut self) -> Result<bool, DataPlaneError> {
@@ -765,7 +780,7 @@ struct Rank {
     idle_forwards: Arc<Mutex<usize>>,
     ngram: Arc<Mutex<Vec<NgramRow>>>,
     history: Arc<Mutex<Vec<HistorySeed>>>,
-    l3_probes: Arc<Mutex<Vec<usize>>>,
+    storage_ops: Arc<Mutex<Vec<StorageOpKind>>>,
     landed: Arc<Mutex<Vec<Landing>>>,
     device_ops: Arc<Mutex<Vec<String>>>,
     applied: Applied,
@@ -792,6 +807,17 @@ struct Engine {
 }
 
 impl Engine {
+    /// The storage operations rank 0 started, of `kind`.
+    fn storage_ops(&self, kind: StorageOpKind) -> usize {
+        self.ranks[0]
+            .storage_ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|seen| **seen == kind)
+            .count()
+    }
+
     fn cache_ops(&self, kind: CacheOpKind) -> usize {
         self.ranks[0]
             .cache_ops
@@ -908,8 +934,11 @@ struct Setup {
     logprobs: bool,
     /// The model reads request token history.
     request_token_history: bool,
-    /// L3 (`Tiers::L3`): the pages a prefetch lands on each rank.
-    l3_landed_pages: Option<fn(usize) -> i64>,
+    /// L3 (`Tiers::L3`): the leading keys of a get that land on each rank;
+    /// all of them when unset.
+    l3_landed_keys: Option<fn(usize) -> usize>,
+    /// L3: polls a storage operation stays unfinished.
+    l3_delay_polls: u32,
 }
 
 async fn start_ranks_with(
@@ -927,7 +956,8 @@ async fn start_ranks_with(
         grammar_timeouts,
         logprobs,
         request_token_history,
-        l3_landed_pages,
+        l3_landed_keys,
+        l3_delay_polls,
     } = setup;
     let (world, tp_size, num_engines) = match layout {
         Layout::Single => (1, 1, 1),
@@ -966,7 +996,8 @@ async fn start_ranks_with(
                 ep_rank: rank,
                 // The trivial initial placement: slot p holds expert p % 4.
                 placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
-                l3_landed_pages: l3_landed_pages.map(|landed| landed(rank)),
+                l3_landed_keys: l3_landed_keys.map(|landed| landed(rank)),
+                l3_delay_polls,
                 ..Default::default()
             };
             let handle = Rank {
@@ -976,7 +1007,7 @@ async fn start_ranks_with(
                 idle_forwards: device.idle_forwards.clone(),
                 ngram: device.ngram.clone(),
                 history: device.history.clone(),
-                l3_probes: device.l3_probes.clone(),
+                storage_ops: device.storage_ops.clone(),
                 landed: device.landed.clone(),
                 device_ops: device.device_ops.clone(),
                 applied: device.applied.clone(),
@@ -1051,7 +1082,10 @@ async fn start_ranks_with(
                         log_spec_accept_lengths: false,
                     },
                     kv_events: false,
-                    l3_storage: matches!(tiers, Tiers::L3),
+                    l3: matches!(tiers, Tiers::L3).then_some(StorageLimits {
+                        max_operations: 8,
+                        max_keys_per_operation: 8,
+                    }),
                     epd_prefill,
                     // The fake device fills bitmasks from the committed
                     // matcher state, as the eager path does.
@@ -1110,6 +1144,7 @@ async fn start_ranks_with(
                             }
                             grammars
                         }),
+                        l3_metrics: None,
                     },
                 );
                 event_loop.run(&stop).unwrap();
@@ -1478,15 +1513,16 @@ async fn written_back_prefixes_are_acknowledged() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_l3_prefetch_admits_the_prefix_every_rank_landed() {
-    // Rank 0 lands the whole 4-page prefix, rank 1 only its first 2 pages:
-    // the ranks agree on 2 pages and load back the same rows.
+async fn an_l3_get_admits_the_prefix_every_owner_landed() {
+    // The store holds the whole 4-page prefix; rank 0 lands every page of
+    // the get, rank 1 only the first 2: the owners agree on 2 pages, and
+    // both load back the same rows.
     let engine = start_ranks_with(
         Layout::Tp(2),
         1,
         Tiers::L3,
         Setup {
-            l3_landed_pages: Some(|rank| if rank == 0 { 4 } else { 2 }),
+            l3_landed_keys: Some(|rank| if rank == 0 { 4 } else { 2 }),
             ..Setup::default()
         },
     )
@@ -1502,13 +1538,53 @@ async fn an_l3_prefetch_admits_the_prefix_every_rank_landed() {
     .await;
     assert_eq!(tokens(&chunks[0]), [1000, 1001, 1002, 1003]);
     assert_eq!(chunks[0].last().unwrap().cached_tokens, 32);
-    assert_eq!(engine.cache_ops(CacheOpKind::Prefetch), 1);
+    assert_eq!(engine.storage_ops(StorageOpKind::Query), 1);
+    assert_eq!(engine.storage_ops(StorageOpKind::Get), 1);
     assert!(engine.cache_ops(CacheOpKind::LoadBack) > 0);
-    for rank in 0..2 {
-        assert_eq!(*engine.ranks[rank].l3_probes.lock().unwrap(), [4]);
-    }
     engine.settle().await;
     assert_eq!(engine.released_on(1), engine.released_on(0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abort_while_storage_prepares_finishes_the_request() {
+    // The store answers slowly; the client gives up while the request still
+    // waits on its storage query. Every rank finishes it at the next round's
+    // head and releases it without a forward.
+    let engine = start_ranks_with(
+        Layout::Tp(2),
+        1,
+        Tiers::L3,
+        Setup {
+            l3_delay_polls: 1_000_000,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let prompt: Vec<i32> = (1..=65).collect();
+    let stream = engine
+        .client
+        .generate(TokenizedGenerateReqInput {
+            input_ids: Some(prompt),
+            ..request("r0", 1, budget(4))
+        })
+        .await
+        .unwrap();
+    // The query went out, so the request waits in storage preparation.
+    while engine.storage_ops(StorageOpKind::Query) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The engine streams nothing more for a client's own abort.
+    assert!(engine.client.abort("r0").await.unwrap());
+    drop(stream);
+    for _ in 0..500 {
+        if engine.released_on(0).len() == 1 && engine.released_on(1).len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(engine.released_on(0), [("r0".to_owned(), 0)]);
+    assert_eq!(engine.released_on(1), engine.released_on(0));
+    assert_eq!(engine.storage_ops(StorageOpKind::Get), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

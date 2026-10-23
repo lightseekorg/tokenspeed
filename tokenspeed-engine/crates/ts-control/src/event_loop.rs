@@ -53,10 +53,10 @@ use std::{
 };
 
 use ts_collective::{Group, Mesh, Reduce};
-use ts_metrics::EngineMetrics;
+use ts_metrics::{EngineMetrics, L3ExecutorSnapshot, L3Metrics};
 use ts_scheduler::{
-    CacheKeyView, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
-    Scheduler,
+    CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
+    Scheduler, StorageRound,
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
@@ -65,12 +65,13 @@ use ts_wire::{
 
 use crate::{
     batch_log::{BatchLogConfig, BatchLogger, RoundStats},
-    cache_ops::{CacheOpError, CacheOps, CachePoll},
+    cache_ops::{CacheOpError, CacheOps},
     control::{self, ControlConfig, Controls, Drain, Effect},
     eplb::{self, InternalOp, SlotMoves},
     grammar::{self as grammar_cache, GrammarKey, Grammars, InvalidGrammar, Lookup},
     ingress::{self, Admission, Admitted, IngressLimits},
     kv_events::KvEventPublisher,
+    l3::{L3Error, StorageLimits, StoragePoll, L3},
     output::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
         LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput,
@@ -179,9 +180,8 @@ pub trait DataPlane {
     fn complete(&mut self, pending: Self::Pending) -> Result<ForwardResult, DataPlaneError>;
 
     /// The cache ops acknowledged since the last poll, in the order they
-    /// landed, and whether an L3 backup failed since; never waits on the
-    /// device.
-    fn poll_cache_events(&mut self) -> Result<CachePoll, DataPlaneError>;
+    /// landed; never waits on the device.
+    fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError>;
 
     /// Forget requests that ended.
     fn release(&mut self, rids: &[String]) -> Result<(), DataPlaneError>;
@@ -216,18 +216,13 @@ pub trait DataPlane {
     /// Restore these memory regions, in order.
     fn resume_memory(&mut self, tags: &[String]) -> Result<(), DataPlaneError>;
 
-    /// L3: which of `pages` the store holds, one flag each; a probe that
-    /// failed reports misses, so the replica still agrees.
-    fn query_l3_storage(&mut self, pages: &[CacheKeyView]) -> Result<Vec<bool>, DataPlaneError>;
+    /// L3: this rank's storage executor since the last poll -- the storage
+    /// clock, the finished operations, the queue pressure -- or why the poll
+    /// failed, which the replica's agreement carries; never waits on I/O.
+    fn poll_storage(&mut self) -> Result<StoragePoll, DataPlaneError>;
 
-    /// L3: the prefetches in flight on this rank, by op id: whether each is
-    /// done and, if so, the prefix pages it landed.
-    fn l3_prefetch_progress(&mut self) -> Result<Vec<(u32, bool, i64)>, DataPlaneError>;
-
-    /// L3: a prefetch's replica-agreed landing; its acknowledgment follows
-    /// on the next cache poll.
-    fn complete_l3_prefetch(&mut self, op_id: u32, landed_pages: i64)
-        -> Result<(), DataPlaneError>;
+    /// L3: the storage executor's counters, for the metrics.
+    fn storage_snapshot(&mut self) -> Result<L3ExecutorSnapshot, DataPlaneError>;
 
     /// L3: delete the store's objects under the current namespace; whether
     /// they are gone.
@@ -270,10 +265,6 @@ pub trait DataPlane {
         moves: &[SlotMoves],
     ) -> Result<(), DataPlaneError>;
 }
-
-/// "Not landed yet" in the replica's MIN of a prefetch's landed pages: one
-/// rank still fetching keeps the common prefix unknown.
-const L3_UNLANDED: i64 = (1 << 31) - 1;
 
 /// What a round hands the data plane besides its plan.
 #[derive(Debug, Clone, Copy, Default)]
@@ -396,6 +387,9 @@ pub enum LoopError {
     /// The PD transfer peer failed.
     #[error(transparent)]
     Transfer(#[from] PdError),
+    /// The replica could not agree on its L3 storage reports.
+    #[error(transparent)]
+    Storage(#[from] L3Error),
     /// The ranks disagree on a control operation.
     #[error("control: {0}")]
     Control(String),
@@ -425,9 +419,10 @@ pub struct LoopConfig {
     /// The scheduler records KV cache events: every rank drains them each
     /// round, and the rank with a publisher sends them.
     pub kv_events: bool,
-    /// The L3 storage tier is on: admissions probe it, its prefetches
-    /// converge across the replica, and flushes delete its namespace.
-    pub l3_storage: bool,
+    /// With the L3 storage tier, the scheduler's storage credits: the
+    /// replica agrees on the storage executors' reports every round, and
+    /// flushes delete the tier's namespace. `None` without the tier.
+    pub l3: Option<StorageLimits>,
     /// An EPD prefill node: a request whose images an encode worker embeds
     /// waits for the embeddings before it is scheduled.
     pub epd_prefill: bool,
@@ -451,6 +446,8 @@ pub struct Subsystems {
     pub eplb: Option<eplb::Controller>,
     /// Grammar compilation and its cache (`--grammar-backend xgrammar`).
     pub grammars: Option<Grammars>,
+    /// The L3 tier's metrics, with L3 and `--enable-metrics`.
+    pub l3_metrics: Option<L3Metrics>,
 }
 
 /// One rank's scheduling loop.
@@ -466,6 +463,9 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     kv_events: Option<KvEventPublisher>,
     eplb: Option<eplb::Controller>,
     grammars: Option<Grammars>,
+    /// The replica's L3 storage agreement, with the tier.
+    l3: Option<L3>,
+    l3_metrics: Option<L3Metrics>,
     /// Admissions waiting for their grammars to compile, in arrival order.
     grammar_queue: Vec<(Submission, GrammarKey, Instant)>,
     batch_logger: BatchLogger,
@@ -503,6 +503,8 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             controls: Controls::new(config.controls.clone()),
             batch_logger: BatchLogger::new(config.batch_log.clone()),
             history: config.request_token_history.then(HistoryRows::default),
+            l3: config.l3.map(L3::new),
+            l3_metrics: subsystems.l3_metrics,
             scheduler,
             data_plane,
             frontend,
@@ -543,6 +545,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             && sizes.prefilling == 0
             && sizes.decoding == 0
             && sizes.retracted == 0
+            && !self.scheduler.storage_pending()
     }
 
     /// One round, with this rank's stop request. Returns whether the ranks
@@ -566,36 +569,59 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // flushes and weight operations they run together.
         self.gate()?;
 
-        // L3 prefetches converge first, so a finished one is acknowledged in
-        // this round's poll and its request admissible in this round's plan.
-        if self.config.l3_storage && self.cache_ops.open() > 0 {
-            self.converge_prefetches()?;
-        }
-        // Cache-op acknowledgments advance at the head of the round, so this
-        // round's plan sees them.
-        if self.cache_ops.open() > 0 {
+        // The storage agreement and the cache-op acknowledgments advance at
+        // the head of the round, so this round's plan sees them. With L3 the
+        // replica agrees every round, if only on the clock and permissions.
+        let storage = match self.l3.as_mut() {
+            Some(l3) => {
+                let poll = self.data_plane.poll_storage()?;
+                let allowed = !self.controls.forward_blocked();
+                l3.round(
+                    poll,
+                    allowed,
+                    allowed,
+                    &mut self.ranks.mesh,
+                    &self.ranks.replica,
+                )?
+            }
+            None => StorageRound::default(),
+        };
+        let ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
-            let ready =
-                self.cache_ops
-                    .acknowledged(polled, &mut self.ranks.mesh, &self.ranks.replica)?;
+            self.cache_ops
+                .acknowledged(polled, &mut self.ranks.mesh, &self.ranks.replica)?
+        } else {
+            Vec::new()
+        };
+        if storage.tick.is_some() || !ready.is_empty() {
             if !ready.is_empty() {
                 tracing::debug!(
                     ?ready,
                     open = self.cache_ops.open(),
                     "cache ops acknowledged"
                 );
-                self.scheduler
-                    .advance_cache(&ready)
-                    .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
             }
+            self.scheduler
+                .advance_head(&storage, &ready)
+                .map_err(|error| LoopError::Scheduler(error.what().to_owned()))?;
         }
+        self.record_storage_metrics()?;
 
         let mut events = Vec::new();
         if self.controls.forward_blocked() {
-            // Frozen: what is dispatched commits, nothing is planned, and the
-            // attention-DP ranks stay in step. With memory released not even
-            // an idle forward may run: the weights are unmapped.
+            // Frozen: what is dispatched commits, no forward is planned, and
+            // the attention-DP ranks stay in step. With memory released not
+            // even an idle forward may run: the weights are unmapped.
             self.commit_down_to(0, &mut events, &mut outputs, &mut released)?;
+            if self.l3.is_some() {
+                // Storage still progresses: the agreed tick forbade forwards,
+                // so the plan carries cache and storage work only.
+                let plan = self.scheduler.next_execution_plan();
+                self.cache_ops.dispatched(&plan.cache_ops());
+                if plan.needs_device() {
+                    self.data_plane.execute(plan, &Dispatch::default())?;
+                }
+            }
             if let Some(dp) = self.dp_round(None, &mut stop)? {
                 if dp.idle_forward && !self.controls.memory_released() {
                     self.data_plane.idle_forward(&dp)?;
@@ -1137,10 +1163,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
             specs.push(submission.spec);
         }
-        if self.config.l3_storage {
-            self.register_l3_storage_hits(&specs)?;
-        }
         self.scheduler.submit_requests(&specs);
+        Ok(())
+    }
+
+    /// Sample the L3 tier's metrics: at most once a second, and whenever
+    /// storage turns pending or idle. Observations never feed the agreement
+    /// or the scheduler.
+    fn record_storage_metrics(&mut self) -> Result<(), LoopError> {
+        let (Some(l3), Some(metrics)) = (self.l3.as_mut(), self.l3_metrics.as_mut()) else {
+            return Ok(());
+        };
+        if !l3.metrics_due(self.scheduler.storage_pending()) {
+            return Ok(());
+        }
+        let snapshot = self.data_plane.storage_snapshot()?;
+        metrics.record(
+            &snapshot,
+            &crate::l3::scheduler_stats(self.scheduler.storage_stats()),
+        );
         Ok(())
     }
 
@@ -1184,82 +1225,6 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         Ok(agreed)
-    }
-
-    /// Tell the scheduler which prefix pages of `specs` the L3 store holds:
-    /// only those every replica rank found, so the mirrored schedulers prefetch
-    /// the same pages.
-    fn register_l3_storage_hits(
-        &mut self,
-        specs: &[ts_scheduler::RequestSpec],
-    ) -> Result<(), LoopError> {
-        let mut seen = std::collections::HashSet::new();
-        let mut hashes = Vec::new();
-        for spec in specs {
-            for hash in self.scheduler.prefix_hashes_for_tokens(&spec.tokens) {
-                if seen.insert(hash.clone()) {
-                    hashes.push(hash);
-                }
-            }
-        }
-        if hashes.is_empty() {
-            return Ok(());
-        }
-        let keys = self.scheduler.expand_prefix_keys(&hashes);
-        let mut local = self.data_plane.query_l3_storage(&keys)?;
-        if local.len() != keys.len() {
-            tracing::error!(
-                flags = local.len(),
-                keys = keys.len(),
-                "the L3 existence probe is not aligned with the cache keys; treating all as misses"
-            );
-            local = vec![false; keys.len()];
-        }
-        let present = self.replica_min(local.iter().map(|&hit| i64::from(hit)).collect())?;
-        let hits: Vec<CacheKeyView> = keys
-            .into_iter()
-            .zip(present)
-            .filter_map(|(key, present)| (present != 0).then_some(key))
-            .collect();
-        if !hits.is_empty() {
-            self.scheduler.register_storage_keys(&hits);
-        }
-        Ok(())
-    }
-
-    /// Agree on every in-flight L3 prefetch across the replica
-    /// (`converge_prefetches`): per op, done and the pages landed, MIN-
-    /// reduced in op-id order; a converged op completes on the device with
-    /// the common prefix.
-    fn converge_prefetches(&mut self) -> Result<(), LoopError> {
-        let mut progress = self.data_plane.l3_prefetch_progress()?;
-        if progress.is_empty() {
-            return Ok(());
-        }
-        progress.sort_by_key(|&(op_id, _, _)| op_id);
-        let local: Vec<i64> = progress
-            .iter()
-            .flat_map(|&(_, done, landed)| {
-                [i64::from(done), if done { landed } else { L3_UNLANDED }]
-            })
-            .collect();
-        let reduced = self.replica_min(local)?;
-        for (index, &(op_id, _, landed_here)) in progress.iter().enumerate() {
-            let (done, landed) = (reduced[2 * index], reduced[2 * index + 1]);
-            if done == 0 {
-                continue;
-            }
-            self.data_plane.complete_l3_prefetch(op_id, landed)?;
-            if landed < landed_here {
-                tracing::warn!(
-                    op_id,
-                    landed,
-                    landed_here,
-                    "an L3 prefetch landed less on a replica peer; the common prefix is admitted"
-                );
-            }
-        }
-        Ok(())
     }
 
     /// The same-round gate: standalone cache
@@ -1366,7 +1331,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         }
         // The L3 objects go first, in a phase of its own: a store that
         // fails to delete must leave every rank's indexes untouched.
-        if self.config.l3_storage {
+        if self.config.l3.is_some() {
             let deleted = self.data_plane.delete_l3_namespace()?;
             if !self.converge(deleted)? {
                 return Ok(false);
@@ -1894,6 +1859,19 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 EngineRequest::Abort(rids) => {
                     for rid in rids {
                         self.outputs.mark_abort(&rid, false);
+                        // On the storage path the abort detaches the request
+                        // from its storage work at the next round's head; one
+                        // that holds no pages yet finishes there, and no
+                        // forward will reap it.
+                        let reaped = match self.l3.as_mut() {
+                            Some(l3) => l3.cancel(&self.scheduler, &rid),
+                            None => false,
+                        };
+                        if reaped {
+                            let committed = self.outputs.reap_unscheduled(&rid);
+                            outputs.extend(committed.outputs);
+                            released.extend(committed.released);
+                        }
                     }
                 }
                 EngineRequest::Add(request) => {

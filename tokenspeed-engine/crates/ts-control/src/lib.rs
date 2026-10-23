@@ -32,6 +32,7 @@ pub mod event_loop;
 pub mod grammar;
 pub mod ingress;
 pub mod kv_events;
+pub mod l3;
 pub mod output;
 pub mod pd;
 pub mod relay;
