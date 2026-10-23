@@ -353,8 +353,14 @@ def test_input_allocation_covers_decode(
         pass
 
     def check_allocation(
-        max_bs, max_num_tokens, state_write_padding_pool_index, device
+        max_bs,
+        max_num_tokens,
+        state_write_padding_pool_index,
+        device,
+        *,
+        writes_mrope_positions,
     ):
+        assert writes_mrope_positions is False
         assert max_bs == 160 // dp_size
         assert max_num_tokens == capacity
         raise AllocationChecked
@@ -373,6 +379,7 @@ def test_input_allocation_covers_decode(
         max_req_pool_size=161,
         spec_algo="EAGLE" if width > 1 else None,
         spec_num_tokens=width,
+        model_is_mrope=False,
     )
     with pytest.raises(AllocationChecked):
         ModelExecutor(

@@ -143,18 +143,24 @@ def _reference_rmsnorm_kernel(
     O0,
     N: tl.constexpr,
     EPS: tl.constexpr,
+    WEIGHT_OFFSET: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, BLOCK)
     mask = d < N
     x = tl.load(X + row * X0 + d, mask, 0.0).to(tl.float32)
-    weight = tl.load(W + d, mask, 0.0).to(tl.float32)
+    weight = tl.load(W + d, mask, 0.0).to(tl.float32) + WEIGHT_OFFSET
     tl.store(OUT + row * O0 + d, reference_rmsnorm_row(x, weight, EPS, N), mask)
 
 
 def reference_rmsnorm(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, out: torch.Tensor | None
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    out: torch.Tensor | None,
+    *,
+    weight_offset: float,
 ) -> torch.Tensor:
     """RMSNorm ``x`` with the cast order of the eager FP32 reference.
 
@@ -164,10 +170,13 @@ def reference_rmsnorm(
         eps: Variance epsilon added to the FP32 mean of squares.
         out: Contiguous destination shaped like ``x`` in ``x``'s dtype, or
             None to allocate one.
+        weight_offset: Added to the FP32 weight: 0.0 for a plain RMSNorm,
+            1.0 for a Gemma RMSNorm (multiplier ``1 + weight``).
 
     Returns:
-        ``out``: ``(weight.float() * (x.float() * rsqrt(mean(x.float()**2) +
-        eps))).to(x.dtype)`` row by row, rounded once at the store.
+        ``out``: ``((weight.float() + weight_offset) * (x.float() *
+        rsqrt(mean(x.float()**2) + eps))).to(x.dtype)`` row by row, rounded
+        once at the store.
     """
     n = x.shape[-1]
     if x.ndim < 1 or x.stride(-1) != 1:
@@ -188,6 +197,7 @@ def reference_rmsnorm(
             n,
             N=n,
             EPS=eps,
+            WEIGHT_OFFSET=weight_offset,
             BLOCK=triton.next_power_of_2(n),
             num_warps=8 if n >= 4096 else 4,
             enable_fp_fusion=False,

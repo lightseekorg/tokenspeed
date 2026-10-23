@@ -344,7 +344,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
             accept_lengths=torch.ones(3, dtype=torch.int64),
             query_shard=plan,
         )
-        ids, gather_ids = drafter._get_first_step_input(draft_input, 3, total)
+        ids, gather_ids = drafter._get_first_step_input(draft_input, 3, total, None)
         assert ids.shape[0] == plan.local_rows
         patched = shifted.clone()
         patched[torch.tensor(rows)] = sampled

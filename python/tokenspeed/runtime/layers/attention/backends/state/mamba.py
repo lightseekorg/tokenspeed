@@ -53,7 +53,9 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
 )
 from tokenspeed_kernel.ops.attention.kda.triton import (
     commit_state_pages,
+    verify_commit_resolve,
     verify_state_blocks,
+    verify_state_blocks_groups,
 )
 from tokenspeed_kernel.ops.conv import (
     causal_conv1d_fn,
@@ -319,6 +321,13 @@ class MambaAttnBackend(AttentionBackend):
         # and indexed by ``bs - 1``.
         self.state_in_by_group: dict[str, list[torch.Tensor]] = {}
         self.state_out_by_group: dict[str, list[torch.Tensor]] = {}
+        # For every bs, the state_in buffers above are the rows of one
+        # [groups, bs] stack, and a second stack holds each request's live
+        # page (slot 1) per group, which a verify refresh records. A chain
+        # verify's commit reads both stacks in one launch
+        # (verify_commit_resolve) instead of this forward's block tables.
+        self.state_in_stacks: list[torch.Tensor] = []
+        self.live_page_stacks: list[torch.Tensor] = []
         self._verify_seed_dst_cache: dict[tuple[int, int, int], torch.Tensor] = {}
         self._verify_grid_cache: dict[tuple[int, int], torch.Tensor] = {}
         self._chain_ancestors_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -472,22 +481,26 @@ class MambaAttnBackend(AttentionBackend):
         bs: int,
         block_tables: Mapping[str, torch.Tensor],
         *,
-        pages_out: Mapping[str, torch.Tensor],
+        pages_out: torch.Tensor,
+        live_out: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         """Target-verify state paging: per-group committed-state pages.
 
         Verify reads the committed state from the input slot (slot 0 when it
         holds a block, else the live slot 1); speculative outputs stay out of
         the state slab, and the accepted state is committed back to slot 1 by
-        ``commit_speculative_state_after_verify``. Writes each group's in
-        pages into ``pages_out[group][:bs]`` and returns the per-group tables
-        (kept for the commit's page resolve).
+        ``commit_speculative_state_after_verify``. Writes group ``g``'s in
+        pages into ``pages_out[g, :bs]`` and its live pages into
+        ``live_out[g, :bs]``, and returns the per-group tables (kept for the
+        commit's page resolve).
         """
-        tables: dict[str, torch.Tensor] = {}
-        for group_id in self._state_groups():
-            rows = self._state_rows(block_tables, group_id)
-            verify_state_blocks(rows, batch_size=bs, pages_out=pages_out[group_id])
-            tables[group_id] = rows
+        tables = {
+            group_id: self._state_rows(block_tables, group_id)
+            for group_id in self._state_groups()
+        }
+        verify_state_blocks_groups(
+            list(tables.values()), batch_size=bs, pages_out=pages_out, live_out=live_out
+        )
         return tables
 
     def _ensure_verify_scratch(self, bs: int, draft_token_num: int) -> None:
@@ -774,7 +787,7 @@ class MambaAttnBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Resolve the pending verify's write pages (every group's live slot)
         in the supplied group order, and the clamped accepted step counts."""
-        tables, draft_token_num, _ = self._verify_commit_ctx
+        tables, draft_token_num, _, _ = self._verify_commit_ctx
         bs = accepted_length.shape[0]
         write_stack = torch.empty(
             (len(group_ids), bs), dtype=torch.int32, device=accepted_length.device
@@ -808,6 +821,65 @@ class MambaAttnBackend(AttentionBackend):
             draft_blocker="draft-tree lanes have no linear-attention path",
         )
 
+    def _commit_verified_chain(
+        self, accepted_length: torch.Tensor, draft_token_num: int, graph_bs: int
+    ) -> None:
+        """Commit a chain verify's accepted prefix: one launch resolves every
+        row (verify_commit_resolve) from the refresh's page stacks, then the
+        conv rows copy and the recurrent state replays (or copies)."""
+        bs = accepted_length.shape[0]
+        copy_tables = self._verify_copy_tables_get()
+        layers = copy_tables["num_layers"]
+        rows = torch.empty(
+            bs + 3 * layers * bs, dtype=torch.int32, device=accepted_length.device
+        )
+        steps = rows[:bs]
+        src_rows, dst_rows, read_rows = rows[bs:].view(3, layers * bs).unbind(0)
+        verify_commit_resolve(
+            accepted_length,
+            self.live_page_stacks[graph_bs - 1],
+            self.state_in_stacks[graph_bs - 1],
+            copy_tables["group_sel"],
+            verify_width=draft_token_num,
+            steps_out=steps,
+            src_rows=src_rows,
+            dst_rows=dst_rows,
+            read_rows=read_rows,
+        )
+        copy_state_rows(
+            copy_tables["conv_scratch"],
+            copy_tables["conv_comp"],
+            src_rows,
+            dst_rows,
+            row_bytes=copy_tables["conv_bytes"],
+            src_row_strides=copy_tables["conv_scratch_stride"],
+            dst_row_strides=copy_tables["conv_comp_stride"],
+        )
+        if self.replay_ssm:
+            replay = self._gdn_replay
+            self._replay_commit(
+                replay.payload,
+                replay.parameters,
+                state_addresses=copy_tables["ssm_comp"],
+                state_row_strides=copy_tables["ssm_element_stride"],
+                read_indices=read_rows.view(layers, bs),
+                write_indices=dst_rows.view(layers, bs),
+                accepted_length=steps,
+                draft_token_num=draft_token_num,
+                geometry=replay.geometry,
+                state_dtype=replay.state_dtype,
+            )
+        else:
+            copy_state_rows(
+                copy_tables["ssm_scratch"],
+                copy_tables["ssm_comp"],
+                src_rows,
+                dst_rows,
+                row_bytes=copy_tables["ssm_bytes"],
+                src_row_strides=copy_tables["ssm_scratch_stride"],
+                dst_row_strides=copy_tables["ssm_comp_stride"],
+            )
+
     def commit_verified_state(
         self, accepted_length: torch.Tensor, *, accepted_path: torch.Tensor | None
     ) -> None:
@@ -816,8 +888,12 @@ class MambaAttnBackend(AttentionBackend):
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
-        _, draft_token_num, read_pages_by_group = ctx
+        _, draft_token_num, read_pages_by_group, graph_bs = ctx
         bs = accepted_length.shape[0]
+        if accepted_path is None:
+            self._commit_verified_chain(accepted_length, draft_token_num, graph_bs)
+            self._verify_commit_ctx = None
+            return
         group_ids = self._state_groups()
         write_stack, steps = self._resolve_verify_commit_pages(
             accepted_length, group_ids
@@ -1038,14 +1114,26 @@ class MambaAttnBackend(AttentionBackend):
                 torch.empty((i + 2,), dtype=torch.int32, device=self.device)
             )
             # Keep one graph-stable (state_in, state_out) buffer pair per state group.
-            for gid in self._state_group_ids:
+            groups = len(self._state_group_ids)
+            self.state_in_stacks.append(
+                torch.full(
+                    (groups, i + 1),
+                    self.pad_slot_id,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            self.live_page_stacks.append(
+                torch.full(
+                    (groups, i + 1),
+                    self.pad_slot_id,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            )
+            for g, gid in enumerate(self._state_group_ids):
                 self.state_in_by_group.setdefault(gid, []).append(
-                    torch.full(
-                        (i + 1,),
-                        self.pad_slot_id,
-                        dtype=torch.int32,
-                        device=self.device,
-                    )
+                    self.state_in_stacks[i][g]
                 )
                 self.state_out_by_group.setdefault(gid, []).append(
                     torch.full(
@@ -1250,12 +1338,16 @@ class MambaAttnBackend(AttentionBackend):
             if real_bs > 0:
                 # The commit runs before the next refresh, so it may read the captured pages.
                 verify_tables = self._verify_state_blocks(
-                    real_bs, block_tables, pages_out=state_in_blocks_by_group
+                    real_bs,
+                    block_tables,
+                    pages_out=self.state_in_stacks[bs - 1],
+                    live_out=self.live_page_stacks[bs - 1],
                 )
                 self._verify_commit_ctx = (
                     verify_tables,
                     draft_token_num,
                     state_in_blocks_by_group,
+                    bs,
                 )
             else:
                 self._verify_commit_ctx = None

@@ -135,8 +135,11 @@ def fused_decode_input_prep_kernel(
     # Outputs
     positions_ptr,  # [batch_size * uniform_input_length]
     seq_lens_out_ptr,  # [batch_size]
+    mrope_positions_ptr,  # [3, >= batch_size * uniform_input_length] (MROPE)
+    mrope_stride,
     # Scalars
     uniform_input_length,
+    MROPE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """One launch fuses the decode-uniform path's small prep kernels.
@@ -145,6 +148,7 @@ def fused_decode_input_prep_kernel(
       valid_cache_lengths.index_select(0, req_pool_indices)
       compute_position_triton (decode branch)
       torch.add(input_lengths, valid_cache_lengths, out=seq_lens)
+      (MROPE) the text-only M-RoPE positions: the positions on all 3 rows
 
     Each program handles one request. We do one GMEM read of
     `valid_cache_lengths[pool_idx]` (runtime state is pool-indexed) and reuse
@@ -171,6 +175,16 @@ def fused_decode_input_prep_kernel(
             cache_start + token_offsets,
             mask=mask,
         )
+        if MROPE:
+            for row in tl.static_range(3):
+                tl.store(
+                    mrope_positions_ptr
+                    + row * mrope_stride
+                    + output_offset
+                    + token_offsets,
+                    cache_start + token_offsets,
+                    mask=mask,
+                )
 
 
 def fused_decode_input_prep(
@@ -179,11 +193,19 @@ def fused_decode_input_prep(
     req_pool_indices: torch.Tensor,  # [batch_size]
     valid_cache_lengths: torch.Tensor,  # [req_pool_size+1]
     uniform_input_length: int,
+    *,
+    mrope_positions_out: torch.Tensor | None,
 ) -> None:
     """Decode-only fast path: one Triton launch writes positions and
     seq_lens, reading `valid_cache_lengths[pool_idx]` directly so the
-    per-iter indexSelect + add are gone too.
+    per-iter indexSelect + add are gone too. When ``mrope_positions_out``
+    (``[3, >= tokens]`` int64, unit columns) is set, its rows receive the
+    positions too: a text-only decode's M-RoPE positions.
     """
+    if mrope_positions_out is not None and (
+        mrope_positions_out.shape[0] != 3 or mrope_positions_out.stride(1) != 1
+    ):
+        raise ValueError("mrope_positions_out must be [3, tokens] with unit columns")
     batch_size = req_pool_indices.shape[0]
     BLOCK_SIZE = 128
     grid = (batch_size,)
@@ -192,7 +214,10 @@ def fused_decode_input_prep(
         valid_cache_lengths,
         positions_ptr,
         seq_lens_out_ptr,
+        positions_ptr if mrope_positions_out is None else mrope_positions_out,
+        0 if mrope_positions_out is None else mrope_positions_out.stride(0),
         uniform_input_length,
+        MROPE=mrope_positions_out is not None,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 

@@ -150,24 +150,6 @@ def test_cuda_graph_req_pool_padding_uses_reserved_sink_row():
     assert padded_indices.tolist() == [7, 8, 21, 21]
 
 
-def test_cuda_graph_state_write_padding_uses_reserved_sink_row():
-    wrapper = ForwardStepRunner.__new__(ForwardStepRunner)
-    wrapper.config = SimpleNamespace(max_req_pool_size=99)
-    wrapper.input_buffers = SimpleNamespace(
-        state_write_req_pool_indices_buf=torch.full((4,), -1, dtype=torch.int64)
-    )
-    active_indices = torch.tensor([7, 8], dtype=torch.int64)
-
-    wrapper._set_graph_state_write_indices(active_indices, 4)
-
-    assert wrapper.input_buffers.state_write_req_pool_indices_buf.tolist() == [
-        7,
-        8,
-        99,
-        99,
-    ]
-
-
 def test_cuda_graph_route_uses_global_batch_for_dp_idle_rank():
     ctx = ForwardContext(
         attn_backend=None,

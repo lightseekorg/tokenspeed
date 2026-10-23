@@ -135,7 +135,10 @@ class _Engine:
             req_pool_size=_POOL, vocab_size=_VOCAB, output_length=width
         )
         self.buffers = InputBuffers(
-            max_bs=_POOL, max_num_tokens=256, state_write_padding_pool_index=_POOL
+            max_bs=_POOL,
+            max_num_tokens=256,
+            state_write_padding_pool_index=_POOL,
+            writes_mrope_positions=False,
         )
         self.processor = OutputProcesser(
             _Sender(),

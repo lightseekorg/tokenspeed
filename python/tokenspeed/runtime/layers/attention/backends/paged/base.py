@@ -429,6 +429,16 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """A leaf without the sharded extend arm has nothing to gather into."""
         del workspace
 
+    def draft_seq_lens_targets(self, bs: int) -> list[torch.Tensor] | None:
+        # A leaf whose hook is this class's copy; a subclass's own hook may
+        # do more than the copy.
+        if (
+            type(self).advance_draft_forward_metadata
+            is not PagedAttentionBackend.advance_draft_forward_metadata
+        ):
+            return None
+        return [self.decode_seq_lens_buffer[:bs]]
+
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Publish a drafter's in-graph seq_lens edits into this leaf's own
         cache-seqlens buffer (one token per request per step)."""

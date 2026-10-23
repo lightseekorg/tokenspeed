@@ -460,7 +460,9 @@ def _norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
     if x.is_cuda:
         from tokenspeed_kernel.ops.layernorm import reference_rmsnorm
 
-        return reference_rmsnorm(x, norm.weight, norm.variance_epsilon, None)
+        return reference_rmsnorm(
+            x, norm.weight, norm.variance_epsilon, None, weight_offset=0.0
+        )
     values = x.float()
     values = values * torch.rsqrt(
         values.square().mean(-1, keepdim=True) + norm.variance_epsilon

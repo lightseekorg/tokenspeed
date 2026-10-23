@@ -138,6 +138,239 @@ def _unpack_group_kernel(
         )
 
 
+@triton.jit(
+    do_not_specialize=[
+        "nb0",
+        "nb1",
+        "nb2",
+        "nb3",
+        "st0",
+        "st1",
+        "st2",
+        "st3",
+        "actual_bs",
+    ],
+    do_not_specialize_on_alignment=["t0", "t1", "t2", "t3"],
+)
+def _unpack_groups_kernel(
+    t0,
+    t1,
+    t2,
+    t3,  # each group's raw table [>= actual_bs, num_blocks] int32
+    dst_ptr,  # the stack [G, max_bs, stack_max_num_pages] int32
+    nb0,
+    nb1,
+    nb2,
+    nb3,  # each group's scheduler blocks per request
+    st0,
+    st1,
+    st2,
+    st3,  # each group's raw-table row stride
+    dst_stride_g,
+    dst_stride_b,
+    stack_max_num_pages,
+    actual_bs,
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    R2: tl.constexpr,
+    R3: tl.constexpr,
+    P0: tl.constexpr,
+    P1: tl.constexpr,
+    P2: tl.constexpr,
+    P3: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """``_unpack_group_kernel`` for up to four groups in one launch: program
+    ``(b, g)`` expands request ``b`` of group ``g``. The ratios (``R``) and
+    page caps (``P``) are the groups' static geometry; the widths and strides
+    change every step."""
+    b = tl.program_id(0)
+    g = tl.program_id(1)
+    src_ptr = tl.where(g == 0, t0, tl.where(g == 1, t1, tl.where(g == 2, t2, t3)))
+    num_blocks = tl.where(
+        g == 0, nb0, tl.where(g == 1, nb1, tl.where(g == 2, nb2, nb3))
+    )
+    src_stride_b = tl.where(
+        g == 0, st0, tl.where(g == 1, st1, tl.where(g == 2, st2, st3))
+    )
+    ratio = tl.where(g == 0, R0, tl.where(g == 1, R1, tl.where(g == 2, R2, R3)))
+    max_num_pages = tl.where(g == 0, P0, tl.where(g == 1, P1, tl.where(g == 2, P2, P3)))
+    live = b < actual_bs
+    col_off = tl.arange(0, BLOCK_COLS)
+    for col0 in range(0, stack_max_num_pages, BLOCK_COLS):
+        col = col0 + col_off
+        block = col // ratio
+        in_table = live & (block < num_blocks) & (col < max_num_pages)
+        raw = tl.load(
+            src_ptr + b.to(tl.int64) * src_stride_b + block, mask=in_table, other=0
+        )
+        page = tl.maximum(raw, 0).to(tl.int64) * ratio + col % ratio
+        page = tl.where(raw > 0, page, 0)
+        vals = tl.where(in_table, page, 0)
+        tl.store(
+            dst_ptr + g.to(tl.int64) * dst_stride_g + b * dst_stride_b + col,
+            vals.to(tl.int32),
+            mask=col < stack_max_num_pages,
+        )
+
+
+@triton.jit(
+    do_not_specialize=[
+        "nb0",
+        "nb1",
+        "nb2",
+        "nb3",
+        "st0",
+        "st1",
+        "st2",
+        "st3",
+        "actual_bs",
+        "tokens_per_req",
+    ],
+    do_not_specialize_on_alignment=["t0", "t1", "t2", "t3"],
+)
+def _fill_decode_kernel(
+    t0,
+    t1,
+    t2,
+    t3,  # each group's raw table [>= actual_bs, num_blocks] int32
+    nb0,
+    nb1,
+    nb2,
+    nb3,  # each group's scheduler blocks per request
+    st0,
+    st1,
+    st2,
+    st3,  # each group's raw-table row stride
+    dst_ptr,  # the stack [G, max_bs, stack_max_num_pages] int32
+    dst_stride_g,
+    dst_stride_b,
+    stack_max_num_pages,
+    actual_bs,
+    seq_lens_ptr,  # [>= bs] int32
+    locs_ptr,  # decode write slots [G, cap] int32
+    locs_stride_g,
+    tokens_per_req,
+    sl0,
+    sl1,
+    sl2,
+    sl3,  # each leaf target's seq_lens [>= bs] int32
+    pt0,
+    pt1,
+    pt2,
+    pt3,  # each leaf target's page table [>= bs, P] int32
+    pts0,
+    pts1,
+    pts2,
+    pts3,  # each leaf target page table's row stride
+    R0: tl.constexpr,
+    R1: tl.constexpr,
+    R2: tl.constexpr,
+    R3: tl.constexpr,
+    P0: tl.constexpr,
+    P1: tl.constexpr,
+    P2: tl.constexpr,
+    P3: tl.constexpr,
+    PS0: tl.constexpr,
+    PS1: tl.constexpr,
+    PS2: tl.constexpr,
+    PS3: tl.constexpr,
+    F0: tl.constexpr,
+    F1: tl.constexpr,
+    F2: tl.constexpr,
+    F3: tl.constexpr,
+    T0: tl.constexpr,
+    T1: tl.constexpr,
+    T2: tl.constexpr,
+    T3: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    """A decode refresh of up to four groups in one launch: program
+    ``(b, g)`` expands request ``b`` of group ``g`` into the stack (as
+    ``_unpack_group_kernel``), computes its decode write slots (as
+    ``_decode_locs_kernel``, from the raw table so no program reads another's
+    stores) and, when group ``g`` has a leaf target (``F > 0``), copies the
+    row (when ``T``) and ``max(seq_lens[b], F)`` into the leaf's buffers.
+    ``R``, ``P``, ``PS``, ``F`` and ``T`` are the groups' static geometry,
+    seq_lens floors and table flags."""
+    b = tl.program_id(0)
+    g = tl.program_id(1)
+    src_ptr = tl.where(g == 0, t0, tl.where(g == 1, t1, tl.where(g == 2, t2, t3)))
+    num_blocks = tl.where(
+        g == 0, nb0, tl.where(g == 1, nb1, tl.where(g == 2, nb2, nb3))
+    )
+    src_stride_b = tl.where(
+        g == 0, st0, tl.where(g == 1, st1, tl.where(g == 2, st2, st3))
+    )
+    ratio = tl.where(g == 0, R0, tl.where(g == 1, R1, tl.where(g == 2, R2, R3)))
+    max_num_pages = tl.where(g == 0, P0, tl.where(g == 1, P1, tl.where(g == 2, P2, P3)))
+    page_size = tl.where(g == 0, PS0, tl.where(g == 1, PS1, tl.where(g == 2, PS2, PS3)))
+    floor = tl.where(g == 0, F0, tl.where(g == 1, F1, tl.where(g == 2, F2, F3)))
+    seq_dst = tl.where(g == 0, sl0, tl.where(g == 1, sl1, tl.where(g == 2, sl2, sl3)))
+    table_dst = tl.where(g == 0, pt0, tl.where(g == 1, pt1, tl.where(g == 2, pt2, pt3)))
+    table_dst_stride = tl.where(
+        g == 0, pts0, tl.where(g == 1, pts1, tl.where(g == 2, pts2, pts3))
+    )
+    has_target = floor > 0
+    has_table = (
+        tl.where(g == 0, T0, tl.where(g == 1, T1, tl.where(g == 2, T2, T3))) != 0
+    )
+    live = b < actual_bs
+    src_row = src_ptr + b.to(tl.int64) * src_stride_b
+    col_off = tl.arange(0, BLOCK_COLS)
+    for col0 in range(0, stack_max_num_pages, BLOCK_COLS):
+        col = col0 + col_off
+        block = col // ratio
+        in_table = live & (block < num_blocks) & (col < max_num_pages)
+        raw = tl.load(src_row + block, mask=in_table, other=0)
+        page = tl.maximum(raw, 0).to(tl.int64) * ratio + col % ratio
+        page = tl.where(raw > 0, page, 0)
+        vals = tl.where(in_table, page, 0).to(tl.int32)
+        tl.store(
+            dst_ptr + g.to(tl.int64) * dst_stride_g + b * dst_stride_b + col,
+            vals,
+            mask=col < stack_max_num_pages,
+        )
+        tl.store(
+            table_dst + b.to(tl.int64) * table_dst_stride + col,
+            vals,
+            mask=has_table & (col < max_num_pages),
+        )
+    seq_len = tl.load(seq_lens_ptr + b)
+    tl.store(seq_dst + b, tl.maximum(seq_len, floor), mask=has_target)
+    # The decode window: positions seq_len - n .. seq_len - 1.
+    step = tl.arange(0, BLOCK_TOKENS)
+    in_window = step < tokens_per_req
+    pos = tl.maximum(seq_len.to(tl.int64) - tokens_per_req + step, 0)
+    page_idx = pos // page_size
+    overflow = page_idx >= max_num_pages
+    block = page_idx // ratio
+    raw = tl.load(
+        src_row + block,
+        mask=in_window & live & (block < num_blocks) & ~overflow,
+        other=0,
+    )
+    page = tl.where(raw > 0, raw.to(tl.int64) * ratio + page_idx % ratio, 0)
+    loc = tl.where(overflow | (page <= 0), 0, page * page_size + pos % page_size)
+    tl.store(
+        locs_ptr + g * locs_stride_g + b * tokens_per_req + step,
+        loc.to(tl.int32),
+        mask=in_window,
+    )
+
+
+@dataclass(frozen=True)
+class DecodeFillTarget:
+    """A leaf's decode buffers that :meth:`GroupTableStacks.fill_decode`
+    writes: ``max(seq_lens, seq_lens_floor)``, and the group's table rows
+    when ``page_table`` is set."""
+
+    seq_lens: torch.Tensor
+    page_table: torch.Tensor | None
+    seq_lens_floor: int
+
+
 class GroupTableStacks:
     """Stacked kernel page tables and decode write slots for a router's groups.
 
@@ -290,6 +523,29 @@ class GroupTableStacks:
         if self.tables.is_cuda:
             stack_max_num_pages = self.tables.shape[2]
             block_cols = 128 if stack_max_num_pages >= 128 else 64
+            if 1 < len(srcs) <= 4 and all(src.stride(1) == 1 for src in srcs):
+                # Every group in one launch; unused group slots repeat the
+                # first table and get no programs.
+                pad = 4 - len(srcs)
+                _unpack_groups_kernel[(bs, len(srcs))](
+                    *srcs,
+                    *([srcs[0]] * pad),
+                    self.tables,
+                    *(src.shape[1] for src in srcs),
+                    *([0] * pad),
+                    *(src.stride(0) for src in srcs),
+                    *([0] * pad),
+                    self.tables.stride(0),
+                    self.tables.stride(1),
+                    stack_max_num_pages,
+                    actual_bs,
+                    *self._ratios,
+                    *([1] * pad),
+                    *self._max_num_pages,
+                    *([0] * pad),
+                    BLOCK_COLS=block_cols,
+                )
+                return
             for i, src in enumerate(srcs):
                 if src.stride(1) != 1:
                     src = src.contiguous()
@@ -331,6 +587,113 @@ class GroupTableStacks:
             dst[:actual_bs, :num_pages].copy_(live[:, :num_pages])
             dst[:actual_bs, num_pages:].zero_()
             dst[actual_bs:bs].zero_()
+
+    def fill_decode(
+        self,
+        bs: int,
+        actual_bs: int,
+        block_tables: Mapping[str, torch.Tensor],
+        seq_lens: torch.Tensor,
+        tokens_per_req: int,
+        targets: Mapping[str, DecodeFillTarget | None],
+    ) -> bool:
+        """:meth:`fill`, then :meth:`compute_decode_locations`, then each
+        target's copies, in one launch. Returns False, having done nothing,
+        when the launch cannot serve the step (a host stack, more than four
+        groups, an idle step, a strided table or target); the caller then
+        runs the three steps.
+
+        Args:
+            bs, actual_bs, block_tables: As :meth:`fill`.
+            seq_lens: ``[>= bs]`` int32 lengths, as
+                :meth:`compute_decode_locations`.
+            tokens_per_req: The decode window width.
+            targets: ``group_id -> target`` for the groups whose leaf takes
+                the copies (None for the others).
+        """
+        n = max(int(tokens_per_req), 1)
+        groups = len(self.group_ids)
+        if (
+            not self.tables.is_cuda
+            or groups > 4
+            or actual_bs <= 0
+            or not 0 < bs <= self.max_bs
+            or actual_bs > bs
+            or n > self.max_tokens_per_req
+            or seq_lens.dtype != torch.int32
+        ):
+            return False
+        srcs = [block_tables[gid] for gid in self.group_ids]
+        if any(
+            src.ndim != 2
+            or src.dtype != torch.int32
+            or src.shape[0] < actual_bs
+            or src.stride(1) != 1
+            for src in srcs
+        ):
+            return False
+        leaf_targets = [targets.get(gid) for gid in self.group_ids]
+        for i, target in enumerate(leaf_targets):
+            if target is None:
+                continue
+            if (
+                target.seq_lens.dtype != torch.int32
+                or target.seq_lens.shape[0] < bs
+                or target.seq_lens_floor < 1
+            ):
+                return False
+            table = target.page_table
+            if table is not None and (
+                table.dtype != torch.int32
+                or table.stride(1) != 1
+                or table.shape[1] != self._max_num_pages[i]
+                or table.shape[0] < bs
+            ):
+                return False
+        pad = 4 - groups
+        # Groups without a target point at the (static) stack, never written:
+        # a per-step tensor there would key new binaries on its alignment.
+        seq_dst = [seq_lens if t is None else t.seq_lens for t in leaf_targets]
+        tables = [None if t is None else t.page_table for t in leaf_targets]
+        table_dst = [self.tables if t is None else t for t in tables]
+        table_dst_strides = [0 if t is None else t.stride(0) for t in tables]
+        stack_max_num_pages = self.tables.shape[2]
+        _fill_decode_kernel[(bs, groups)](
+            *srcs,
+            *([srcs[0]] * pad),
+            *(src.shape[1] for src in srcs),
+            *([0] * pad),
+            *(src.stride(0) for src in srcs),
+            *([0] * pad),
+            self.tables,
+            self.tables.stride(0),
+            self.tables.stride(1),
+            stack_max_num_pages,
+            actual_bs,
+            seq_lens,
+            self.decode_locs,
+            self.decode_locs.stride(0),
+            n,
+            *seq_dst,
+            *([seq_lens] * pad),
+            *table_dst,
+            *([self.tables] * pad),
+            *table_dst_strides,
+            *([0] * pad),
+            *self._ratios,
+            *([1] * pad),
+            *self._max_num_pages,
+            *([0] * pad),
+            *(self._specs[gid].kernel_page_size for gid in self.group_ids),
+            *([1] * pad),
+            *(0 if t is None else t.seq_lens_floor for t in leaf_targets),
+            *([0] * pad),
+            *(int(t is not None) for t in tables),
+            *([0] * pad),
+            BLOCK_COLS=128 if stack_max_num_pages >= 128 else 64,
+            BLOCK_TOKENS=triton.next_power_of_2(self.max_tokens_per_req),
+        )
+        return True
 
     def compute_decode_locations(
         self, bs: int, seq_lens: torch.Tensor, tokens_per_req: int

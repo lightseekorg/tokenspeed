@@ -42,6 +42,7 @@ from tokenspeed_kernel.ops.communication.trtllm import (
 from tokenspeed_kernel.ops.layernorm import (
     add_rmsnorm,
     nvfp4_copy_supported,
+    reference_rmsnorm,
     rmsnorm,
 )
 from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm
@@ -275,22 +276,24 @@ class GemmaRMSNorm(torch.nn.Module):
                 return x
 
         if _is_amd:
-            if x.shape[0] == 0:
-                if residual is not None:
-                    return x, residual
-                else:
-                    return x
+            if residual is None:
+                # One launch in the eager arithmetic order below: FP32 rows
+                # times rsqrt(mean(x**2) + eps), times the FP32 1 + weight.
+                return reference_rmsnorm(
+                    x,
+                    self.weight,
+                    self.variance_epsilon,
+                    None,
+                    weight_offset=self.weight_offset,
+                )
             orig_dtype = x.dtype
-            if residual is not None:
-                x = x + residual
-                residual = x
-
+            x = x + residual
+            residual = x
             x = x.float()
             variance = x.pow(2).mean(dim=-1, keepdim=True)
             x = x * torch.rsqrt(variance + self.variance_epsilon)
             x = x * (1.0 + self.weight.float())
-            x = x.to(orig_dtype)
-            return x if residual is None else (x, residual)
+            return x.to(orig_dtype), residual
         else:
             if residual is not None:
                 gemma_fused_add_rmsnorm(

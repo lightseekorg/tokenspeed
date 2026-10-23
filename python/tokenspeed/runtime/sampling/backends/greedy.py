@@ -27,7 +27,10 @@ from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.cuda import (
     verify_chain_greedy as _verify_chain_greedy_cuda,
 )
-from tokenspeed_kernel.ops.sampling.triton import verify_tree
+from tokenspeed_kernel.ops.sampling.triton import (
+    verify_chain_target_sampled,
+    verify_tree,
+)
 from tokenspeed_kernel.registry import error_fn
 
 from tokenspeed.runtime.sampling.backends.base import (
@@ -47,16 +50,17 @@ if TYPE_CHECKING:
 
 def _verify_chain_greedy_torch(
     predicts: torch.Tensor,  # [bs * N] int32, in/out
-    accept_index: torch.Tensor,  # [bs, N] int32, in/out (-1-filled on entry)
+    accept_index: torch.Tensor,  # [bs, N] int32, out (-1 past the accepted prefix)
     accept_token_num: torch.Tensor,  # [bs] int32, out
     candidates: torch.Tensor,  # [bs, N] int32
     target_predict: torch.Tensor,  # [bs, N] int64 (argmax output)
     batch_size: int,
     num_draft_tokens: int,
+    count_bonus: bool,
 ) -> None:
     """Pure-torch equivalent of tokenspeed_kernel.verify_chain_greedy.
 
-    Used on non-CUDA devices and when the CUDA kernel is unavailable.
+    Used on CPU tensors.
     """
 
     bs = batch_size
@@ -82,7 +86,7 @@ def _verify_chain_greedy_torch(
     flat_idx = (batch_off + pos).to(torch.int32)  # [bs, n]
     valid = pos <= num_accepted.unsqueeze(1)  # [bs, n]
     accept_index.copy_(torch.where(valid, flat_idx, torch.full_like(accept_index, -1)))
-    accept_token_num.copy_(num_accepted)
+    accept_token_num.copy_(num_accepted + int(count_bonus))
 
 
 def _verify_chain_greedy(
@@ -93,10 +97,15 @@ def _verify_chain_greedy(
     target_predict: torch.Tensor,
     batch_size: int,
     num_draft_tokens: int,
+    count_bonus: bool,
 ) -> None:
-
+    """Greedy chain verify: ``accept_token_num`` counts the accepted draft
+    tokens, plus the bonus token when ``count_bonus``; ``accept_index`` is
+    written whole (-1 past the accepted prefix)."""
     # Prefer the CUDA kernel when available AND the tensors are on CUDA.
     if _verify_chain_greedy_cuda is not error_fn and candidates.is_cuda:
+        # It writes only the accepted entries of accept_index.
+        accept_index.fill_(-1)
 
         _verify_chain_greedy_cuda(
             predicts=predicts,
@@ -106,6 +115,20 @@ def _verify_chain_greedy(
             target_predict=target_predict,
             batch_size=batch_size,
             num_draft_tokens=num_draft_tokens,
+        )
+        if count_bonus:
+            accept_token_num += 1
+        return
+    if candidates.is_cuda:
+        # The Triton kernel does the same verify on any GPU in one launch
+        # (the torch path takes about ten).
+        verify_chain_target_sampled(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates,
+            target_sampled=target_predict,
+            count_bonus=count_bonus,
         )
         return
 
@@ -117,6 +140,7 @@ def _verify_chain_greedy(
         target_predict=target_predict,
         batch_size=batch_size,
         num_draft_tokens=num_draft_tokens,
+        count_bonus=count_bonus,
     )
 
 
@@ -201,10 +225,9 @@ class GreedySamplingBackend(SamplingBackend):
         num_tokens_per_req = candidates.shape[1]
 
         predict = self._predict_buf[: bs * num_tokens_per_req]
-        accept_index = (
-            self._accept_index_buf[: bs * num_tokens_per_req]
-            .view(bs, num_tokens_per_req)
-            .fill_(-1)
+        # _verify_chain_greedy writes every entry (-1 past the accepted prefix).
+        accept_index = self._accept_index_buf[: bs * num_tokens_per_req].view(
+            bs, num_tokens_per_req
         )
         accept_length = self._accept_length_buf[:bs]
 
@@ -224,6 +247,7 @@ class GreedySamplingBackend(SamplingBackend):
         ).reshape(bs, num_tokens_per_req)
 
         if tree is not None:
+            accept_index.fill_(-1)
             # The accepted path rides in accept_index so the TP broadcast below carries it.
             verify_tree(
                 predict,
@@ -242,6 +266,7 @@ class GreedySamplingBackend(SamplingBackend):
                 target_predict=target_predict,
                 batch_size=bs,
                 num_draft_tokens=num_tokens_per_req,
+                count_bonus=True,
             )
             # Retain normal verification cost before forcing benchmark acceptance.
             if self.config.synthetic_acceptance_length is not None:
@@ -259,8 +284,8 @@ class GreedySamplingBackend(SamplingBackend):
                     accept_index,
                     accept_length,
                 )
-
-            accept_length += 1
+                # write_synthetic_outputs leaves the count without the bonus.
+                accept_length += 1
 
         # TP-rank sync on the full verify-output triple, mirrors
         # FlashInferSamplingBackend.verify. Per-rank argmax / accept-length

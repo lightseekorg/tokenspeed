@@ -667,5 +667,7 @@ from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noq
 )
 from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
     commit_state_pages,
+    verify_commit_resolve,
     verify_state_blocks,
+    verify_state_blocks_groups,
 )

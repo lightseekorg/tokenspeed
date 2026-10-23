@@ -340,7 +340,7 @@ def test_reference_rmsnorm_matches_eager_cast_order(
     x[1] *= 1e3
     weight = (torch.rand(hidden_size, device=device) + 0.5).to(torch.bfloat16)
     expected = torch_rmsnorm(x, weight, eps)
-    out = reference_rmsnorm(x, weight, eps, None)
+    out = reference_rmsnorm(x, weight, eps, None, weight_offset=0.0)
     if dtype == torch.float32:
         torch.testing.assert_close(out, expected, rtol=2e-6, atol=0)
     else:
@@ -353,21 +353,39 @@ def test_reference_rmsnorm_matches_eager_cast_order(
     wide = torch.randn(9, 3 * hidden_size, device=device, dtype=dtype)
     destination = torch.empty(9, hidden_size, device=device, dtype=dtype)
     got = reference_rmsnorm(
-        wide[:, hidden_size : 2 * hidden_size], weight, eps, destination
+        wide[:, hidden_size : 2 * hidden_size],
+        weight,
+        eps,
+        destination,
+        weight_offset=0.0,
     )
     assert got is destination
     torch.testing.assert_close(
         got,
         reference_rmsnorm(
-            wide[:, hidden_size : 2 * hidden_size].contiguous(), weight, eps, None
+            wide[:, hidden_size : 2 * hidden_size].contiguous(),
+            weight,
+            eps,
+            None,
+            weight_offset=0.0,
         ),
         rtol=0,
         atol=0,
     )
     with pytest.raises(ValueError):
-        reference_rmsnorm(x.t(), weight, eps, None)
+        reference_rmsnorm(x.t(), weight, eps, None, weight_offset=0.0)
     with pytest.raises(ValueError):
-        reference_rmsnorm(x, weight[:-1], eps, None)
+        reference_rmsnorm(x, weight[:-1], eps, None, weight_offset=0.0)
+    # A Gemma norm adds 1 to the FP32 weight, as 1.0 + weight.float() does.
+    gemma = reference_rmsnorm(x, weight, eps, None, weight_offset=1.0)
+    values = x.float() * torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + eps)
+    gemma_expected = (values * (1.0 + weight.float())).to(dtype)
+    if dtype == torch.float32:
+        torch.testing.assert_close(gemma, gemma_expected, rtol=2e-6, atol=0)
+    else:
+        torch.testing.assert_close(
+            gemma.float(), gemma_expected.float(), rtol=ulp, atol=0
+        )
 
 
 @pytest.mark.parametrize("hidden_size", [128, 2560, 4096, 5120])
