@@ -290,6 +290,11 @@ own prefix cache holds the state for the prompt end -- a state hit counts
 only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
 and both sides omit the group from the manifest (`pd/cache_protocol.py`).
+The decode admission copies this immutable input checkpoint into its private
+live block before consuming the bootstrap result, since that result can finish
+the request without another forward. KDA convolution history may use either
+channel-major or channels-last storage; the PD schema partitions the channel
+axis in each layout, preserving its separate Q/K/V channel segments.
 
 Speculative KDA verification stores no per-position recurrent states: it
 captures each window's raw projections in a compact payload and commits by
