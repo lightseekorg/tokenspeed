@@ -6,16 +6,20 @@ in the same named container; the client uses a separate Python environment.
 
 ## Prepare
 
-Run preparation inside the compute container. Use shared, absolute paths without
-spaces for the repository, client and Hugging Face cache, and mount them at the
-same paths on both nodes. The container must already provide TokenSpeed.
+Run preparation from the TokenSpeed repository root inside the compute container.
+Use shared, absolute paths without spaces for the repository, client and Hugging
+Face cache, and mount them at the same paths on both nodes. The container must
+already provide TokenSpeed.
 
 ```bash
+SOURCE_ROOT="$PWD"
 BENCH_ROOT=/path/to/shared/benchmark
 CLIENT_ROOT="$BENCH_ROOT/agentx-client"
 mkdir -p "$CLIENT_ROOT"
 git clone https://github.com/SemiAnalysisAI/InferenceX.git "$CLIENT_ROOT/inferencex"
 git -C "$CLIENT_ROOT/inferencex" checkout ebedc2bbac4ff3e51ea9acb1f95093d017162809
+git -C "$CLIENT_ROOT/inferencex" apply \
+  "$SOURCE_ROOT/test/agentic_benchmark/kimi_k3/tokenspeed/inferencex-tokenspeed-metrics.patch"
 git clone https://github.com/SemiAnalysisAI/aiperf.git "$CLIENT_ROOT/aiperf"
 git -C "$CLIENT_ROOT/aiperf" checkout 754356e9a39acc6cc6afb242d123bb57c3fb6f75
 # AIPerf #1540 fixes child-branch cleanup when the replay stops.
@@ -37,6 +41,11 @@ hf download nvidia/Kimi-K3-NVFP4 --cache-dir "$HF_HUB_CACHE"
 hf download lightseekorg/kimi-k3-eagle3-mla --cache-dir "$HF_HUB_CACHE"
 hf download --repo-type dataset semianalysisai/cc-traces-weka-062126 --cache-dir "$HF_HUB_CACHE"
 ```
+
+The bundled [InferenceX patch](inferencex-tokenspeed-metrics.patch) adds the
+TokenSpeed server-metrics adapter required by this pinned revision to generate
+`inferencex_result.json`. Replay and request-level
+throughput/latency calculations use the existing InferenceX implementation.
 
 Reuse this client environment and the same model and dataset revisions across runs.
 The launcher installs no packages.
@@ -95,3 +104,10 @@ Outputs are written under `outputs/agentx_<timestamp>/<config>/`:
 Native reporting counts one aggregate eight-GPU worker, even though it spans
 two physical nodes. DRAM offloading is reported as TokenSpeed Host L2, with total
 capacity taken from the ranks' startup allocation logs and rounded to whole GB.
+
+The pinned AIPerf server-counter export includes warmup in its totals. For a
+measurement-only cache-hit ratio, filter `profile_export.jsonl` to
+`metadata.benchmark_phase == "profiling"`, then divide the sum of
+`metrics.usage_prompt_cache_read_tokens.value` by the sum of
+`metrics.usage_prompt_tokens.value`. The adapter preserves the exported server
+counters and leaves the GPU/CPU cache-hit split unknown.
