@@ -68,14 +68,54 @@ _STAGES = 2
 
 
 @gluon.jit
-def _stage_slots(
-    slots_smem,
+def _load_slots(
     swa_slots,
     swa_row,
     swa_width,
     global_slots,
     global_row,
     global_width,
+    SLOT_TILES: gl.constexpr,
+    SWA_TILES: gl.constexpr,
+    TILE_K: gl.constexpr,
+    HAS_GLOBAL: gl.constexpr,
+):
+    """Load a query row's SWA then global slots as [SLOT_TILES, TILE_K].
+
+    Row ``r < SWA_TILES`` holds SWA tile ``r``, row ``SWA_TILES + j`` global
+    tile ``j``; positions past a width read -1. The loads are unmasked, at
+    clamped positions: a mask on a tile row is uniform per register and
+    would become a branch around every load.
+    """
+    layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
+    tiles = gl.arange(0, SLOT_TILES, layout=gl.SliceLayout(1, layout))
+    is_swa = (tiles < SWA_TILES)[:, None]
+    positions = (gl.where(tiles < SWA_TILES, tiles, tiles - SWA_TILES) * TILE_K)[
+        :, None
+    ] + gl.arange(0, TILE_K, layout=gl.SliceLayout(0, layout))[None, :]
+    width = swa_width
+    pointers = swa_slots + swa_row + gl.minimum(positions, swa_width - 1)
+    if HAS_GLOBAL:
+        # With no global slots, every row reads the SWA slots and is masked.
+        use_global = (~is_swa) & (global_width > 0)
+        width = gl.where(use_global, global_width, gl.where(is_swa, swa_width, 0))
+        pointers = gl.where(
+            use_global,
+            global_slots + global_row + gl.minimum(positions, global_width - 1),
+            pointers,
+        )
+    else:
+        width = gl.where(is_swa, swa_width, 0)
+    slot = gl.where(positions < width, gl.load(pointers), -1)
+    return slot, positions, is_swa
+
+
+@gluon.jit
+def _stage_slots(
+    slots_smem,
+    slot,
+    positions,
+    is_swa,
     gather_rows_smem,
     swa_len,
     swa_capacity,
@@ -83,34 +123,12 @@ def _stage_slots(
     global_len,
     global_capacity,
     global_rows_per_page,
-    SWA_TILES: gl.constexpr,
-    TILE_K: gl.constexpr,
-    HAS_GLOBAL: gl.constexpr,
 ):
-    """Copy a query row's SWA then global slots into LDS rows of TILE_K.
+    """Store loaded slots into LDS rows of TILE_K.
 
-    Row ``r < SWA_TILES`` holds SWA tile ``r``, row ``SWA_TILES + j`` global
-    tile ``j``; positions past a width read -1. gather_rows_smem gets each
-    position's value row in the TDM row view of its cache, -1 if unusable.
+    gather_rows_smem gets each position's value row in the TDM row view of
+    its cache, -1 if unusable.
     """
-    layout: gl.constexpr = gl.BlockedLayout([1, 1], [1, 32], [4, 1], [1, 0])
-    tiles = gl.arange(0, slots_smem.shape[0], layout=gl.SliceLayout(1, layout))
-    is_swa = (tiles < SWA_TILES)[:, None]
-    positions = (gl.where(tiles < SWA_TILES, tiles, tiles - SWA_TILES) * TILE_K)[
-        :, None
-    ] + gl.arange(0, TILE_K, layout=gl.SliceLayout(0, layout))[None, :]
-    slot = gl.load(
-        swa_slots + swa_row + positions,
-        mask=is_swa & (positions < swa_width),
-        other=-1,
-    )
-    if HAS_GLOBAL:
-        global_slot = gl.load(
-            global_slots + global_row + positions,
-            mask=(tiles >= SWA_TILES)[:, None] & (positions < global_width),
-            other=-1,
-        )
-        slot = gl.where(is_swa, slot, global_slot)
     slots_smem.store(slot)
     length = gl.where(is_swa, swa_len, global_len)
     capacity = gl.where(is_swa, swa_capacity, global_capacity)
@@ -449,6 +467,11 @@ def _attend_tile(
 
 
 @gluon.jit
+def _bit_or(a, b):
+    return a | b
+
+
+@gluon.jit
 def _inverse_rope(values, dims, rows, rope_row, dim_base, ROPE_DIM: gl.constexpr):
     """Rotate the interleaved RoPE tail of BF16 [rows, dims] output tiles.
 
@@ -561,7 +584,6 @@ def gluon_dsv41_selected_attention_gfx1250(
         reg_bases=[],
         instr_shape=[16, 16, 32],
     )
-    q_layout: gl.constexpr = gl.BlockedLayout([1, 16], [1, 32], [4, 1], [1, 0])
     # SWA rows dequantize as [TILE_K, 16, 2, 16]: a lane owns 16 bytes of one
     # 32-dim E8M0 scale group.
     swa_raw_layout: gl.constexpr = gl.BlockedLayout(
@@ -602,17 +624,50 @@ def gluon_dsv41_selected_attention_gfx1250(
     head_block = gl.program_id(axis=2)
     head_base = head_block * (HEAD_GROUPS * BLOCK_H)
     single = num_splits == 1
+    swa_row = token_idx.to(tl.int64) * swa_slot_stride
+    if HAS_GLOBAL:
+        global_row = token_idx.to(tl.int64) * global_slot_stride
+    else:
+        global_row = token_idx.to(tl.int64) * 0
+    # The zero-query check reads every group's query as int32 words at once.
+    # A mask on the head rows is uniform per register and would become a
+    # branch around every load, so out-of-range rows load a clamped head and
+    # are dropped.
+    slot, slot_positions, slot_is_swa = _load_slots(
+        swa_slots,
+        swa_row,
+        swa_width,
+        global_slots,
+        global_row,
+        global_width,
+        SLOT_TILES,
+        SWA_TILES,
+        TILE_K,
+        HAS_GLOBAL,
+    )
+    check_layout: gl.constexpr = gl.BlockedLayout(
+        [HEAD_GROUPS * BLOCK_H // 4, 4], [1, 32], [4, 1], [1, 0]
+    )
+    check_rows = gl.arange(
+        0, HEAD_GROUPS * BLOCK_H, layout=gl.SliceLayout(1, check_layout)
+    )
+    check_heads = head_base + check_rows
+    check_words = gl.arange(0, HEAD_DIM // 2, layout=gl.SliceLayout(0, check_layout))
+    q_words = gl.load(
+        q.to(gl.pointer_type(gl.int32), bitcast=True)
+        + token_idx.to(tl.int64) * (stride_q_t // 2)
+        + gl.minimum(check_heads, num_heads - 1)[:, None].to(tl.int64)
+        * (stride_q_h // 2)
+        + check_words[None, :]
+    )
     swa_len = gl.minimum(gl.maximum(gl.load(swa_lens + token_idx), 0), swa_width)
     swa_tiles = gl.cdiv(swa_len, TILE_K)
-    swa_row = token_idx.to(tl.int64) * swa_slot_stride
     if HAS_GLOBAL:
         global_len = gl.minimum(
             gl.maximum(gl.load(global_lens + token_idx), 0), global_width
         )
-        global_row = token_idx.to(tl.int64) * global_slot_stride
     else:
         global_len = 0
-        global_row = token_idx.to(tl.int64) * 0
     total_tiles = swa_tiles + gl.cdiv(global_len, TILE_K)
     tile_begin = split_idx * total_tiles // num_splits
     tile_end = (split_idx + 1) * total_tiles // num_splits
@@ -641,12 +696,9 @@ def gluon_dsv41_selected_attention_gfx1250(
     )
     _stage_slots(
         slots_table,
-        swa_slots,
-        swa_row,
-        swa_width,
-        global_slots,
-        global_row,
-        global_width,
+        slot,
+        slot_positions,
+        slot_is_swa,
         gather_rows_table,
         swa_len,
         swa_capacity,
@@ -654,9 +706,6 @@ def gluon_dsv41_selected_attention_gfx1250(
         global_len,
         global_capacity,
         (global_page_stride // 256).to(gl.int32),
-        SWA_TILES,
-        TILE_K,
-        HAS_GLOBAL,
     )
     swa_values_ring = gl.allocate_shared_memory(
         gl.uint8, [STAGES, TILE_K, 512], layout=raw_shared_2d
@@ -721,27 +770,28 @@ def gluon_dsv41_selected_attention_gfx1250(
             HAS_GLOBAL,
             gather_row_layout,
         )
-    q_heads = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, q_layout))
-    q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_layout))
-    q_base = q + token_idx.to(tl.int64) * stride_q_t + q_dims[None, :]
     # Bit g of active_groups marks a head group with a nonzero query, which
-    # needs its own pass over the selected rows.
-    active_groups = 0
-    for group in gl.static_range(HEAD_GROUPS):
-        heads = head_base + group * BLOCK_H + q_heads
-        q_group = gl.load(
-            q_base + heads[:, None].to(tl.int64) * stride_q_h,
-            mask=(heads < num_heads)[:, None],
-            other=0.0,
-        )
-        nonzero = gl.sum(gl.sum((q_group != 0.0).to(gl.int32), axis=1), axis=0)
-        active_groups += gl.where(nonzero > 0, 1 << group, 0)
+    # needs its own pass over the selected rows. A -0.0 counts as nonzero,
+    # which only costs that group the full pass.
+    row_bits = gl.reduce(q_words, 1, _bit_or)
+    active_groups = gl.reduce(
+        gl.where(
+            (row_bits != 0) & (check_heads < num_heads),
+            1 << (check_rows // BLOCK_H),
+            0,
+        ),
+        0,
+        _bit_or,
+    )
     need_row_sum = active_groups != (1 << HEAD_GROUPS) - 1
     kv_shared = gl.allocate_shared_memory(
         gl.bfloat16, [TILE_K, HEAD_DIM], layout=kv_shared_layout
     )
 
-    out_base = out + token_idx.to(tl.int64) * stride_o_t + q_dims[None, :]
+    # Outputs and partials store straight from the WMMA layout, where a lane
+    # holds 8 contiguous dims of one head row.
+    out_row = out + token_idx.to(tl.int64) * stride_o_t
+    acc_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, wmma))
     # Partial rows are [token, split, head] ([token, split] for row sums).
     part_row = (token_idx * num_splits + split_idx).to(tl.int64)
     row_sum = gl.zeros([BLOCK_H, HEAD_DIM], dtype=gl.float32, layout=wmma)
@@ -754,7 +804,6 @@ def gluon_dsv41_selected_attention_gfx1250(
         # closed-form output below needs.
         if active or group == 0:
             with_row_sum = need_row_sum and group == 0
-            heads = head_base + group * BLOCK_H + q_heads
             dot_heads = (
                 head_base
                 + group * BLOCK_H
@@ -922,11 +971,11 @@ def gluon_dsv41_selected_attention_gfx1250(
                 if single:
                     scale = gl.where(denominator > 0.0, 1.0 / denominator, 0.0)
                     gl.store(
-                        out_base + heads[:, None].to(tl.int64) * stride_o_h,
-                        gl.convert_layout(
-                            (accumulator * scale[:, None]).to(gl.bfloat16), q_layout
-                        ),
-                        mask=(heads < num_heads)[:, None],
+                        out_row
+                        + score_heads[:, None].to(tl.int64) * stride_o_h
+                        + acc_dims[None, :],
+                        (accumulator * scale[:, None]).to(gl.bfloat16),
+                        mask=valid_heads[:, None],
                     )
                 else:
                     stats = part_stats + (part_row * num_heads + score_heads) * 2
@@ -934,10 +983,10 @@ def gluon_dsv41_selected_attention_gfx1250(
                     gl.store(stats + 1, denominator, mask=valid_heads)
                     gl.store(
                         part_acc
-                        + (part_row * num_heads + heads[:, None]) * HEAD_DIM
-                        + q_dims[None, :],
-                        gl.convert_layout(accumulator, q_layout),
-                        mask=(heads < num_heads)[:, None],
+                        + (part_row * num_heads + score_heads[:, None]) * HEAD_DIM
+                        + acc_dims[None, :],
+                        accumulator,
+                        mask=valid_heads[:, None],
                     )
 
     if need_row_sum:
@@ -961,23 +1010,23 @@ def gluon_dsv41_selected_attention_gfx1250(
                     weight = gl.exp(-frame)
                     total = count * weight + gl.exp(sink - frame)
                     coefficient = gl.where(total > 0.0, weight / total, 0.0)
-                    heads = head_base + group * BLOCK_H + q_heads
                     gl.store(
-                        out_base + heads[:, None].to(tl.int64) * stride_o_h,
-                        gl.convert_layout(
-                            (row_sum * coefficient[:, None]).to(gl.bfloat16), q_layout
-                        ),
-                        mask=(heads < num_heads)[:, None],
+                        out_row
+                        + score_heads[:, None].to(tl.int64) * stride_o_h
+                        + acc_dims[None, :],
+                        (row_sum * coefficient[:, None]).to(gl.bfloat16),
+                        mask=(score_heads < num_heads)[:, None],
                     )
         else:
             # Every row of row_sum holds the same sum; head row 0 is stored.
+            sum_heads = gl.arange(0, BLOCK_H, layout=head_layout)
             gl.store(
                 part_row_sum
                 + part_row * HEAD_DIM
-                + q_dims[None, :]
-                + q_heads[:, None] * 0,
-                gl.convert_layout(row_sum, q_layout),
-                mask=(q_heads == 0)[:, None],
+                + acc_dims[None, :]
+                + sum_heads[:, None] * 0,
+                row_sum,
+                mask=(sum_heads == 0)[:, None],
             )
             gl.store(part_count + part_row, row_count)
     if not single:
