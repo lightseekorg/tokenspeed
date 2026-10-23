@@ -472,7 +472,16 @@ def _reference_committed_states(harness, pages, inputs, accepted):
         if materialized_producers:
             from tokenspeed_kernel.ops.attention.kda import kda_verify_conv_update
 
-            if raw_gate is None:
+            if (
+                raw_gate is None
+                and harness.backend._replay_active
+                and torch.version.hip
+            ):
+                # AMD's fused verify projects the gate in FP32 and rounds it
+                # once to the activation dtype; a BLAS GEMM may round a few
+                # channels the other way.
+                gate = gate.to(inputs["f_a_out"].dtype).float()
+            elif raw_gate is None:
                 gate = torch.nn.functional.linear(
                     inputs["f_a_out"], params["f_b_weight"]
                 ).float()

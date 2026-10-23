@@ -1187,8 +1187,8 @@ A null destination leaves retention to the caller. Padding pages do not write
 retained rows. When the caller supplies low-rank gate inputs, GFX950 projects
 inside verify for up to 64 total input rows and uses a separate GEMM above that.
 MI355 measurements at T1 and T4 place the crossover between 64 and 128 rows.
-A supplied raw gate is used directly. GFX1250 retains the separate gate producer.
-Both save the gate used by verify. For one-token windows, each GFX950 value split
+GFX1250 projects inside verify at every row count. A supplied raw gate is used
+directly. Both save the gate used by verify. On both targets, each value split
 starts its first checkpoint-panel load before preparing the token vectors.
 Without value splits, one-token verify keeps 64 state rows in flight after
 preparation.

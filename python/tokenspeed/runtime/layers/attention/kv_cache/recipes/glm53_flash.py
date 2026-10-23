@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
@@ -187,6 +188,23 @@ def declare_glm53_flash_groups(
             f"{target_dsa.index_k_format!r}"
         )
     target_linear = _require_linear_config(attn_config)
+    # Batched KDA replay walks every layer's state pages with one stride. A
+    # target-only plan leaves the last KDA plane without an MLA tenant, so a
+    # KDA page narrower than an MLA plane is padded to that plane's width.
+    mla_plane_bytes = (
+        glm53_flash_packing_counts(
+            tp_size=target_dsa.attn_tp_size,
+            mla_element_size=attn_config.kv_cache_dtype.itemsize,
+        )[FULL_ATTENTION]
+        * GLM53_FLASH_LOGICAL_BLOCK_TOKENS
+        * (target_dsa.kv_lora_rank + target_dsa.qk_rope_head_dim)
+        * attn_config.kv_cache_dtype.itemsize
+    )
+    kda_page_bytes = (
+        math.prod(target_linear.conv_state_shape) * torch.bfloat16.itemsize
+        + math.prod(target_linear.temporal_state_shape) * torch.float32.itemsize
+    )
+    kda_page_alignment = mla_plane_bytes if kda_page_bytes < mla_plane_bytes else 1
     target_layer_types = _target_layer_types(attn_config, num_target_layers)
     group_ids = (
         tuple(split_recurrent_state_groups(target_layer_types))
@@ -230,6 +248,7 @@ def declare_glm53_flash_groups(
                 target_linear.conv_state_shape,
                 cache_dtype_name(torch.bfloat16),
                 exact_page_stride=False,
+                page_stride_alignment_bytes=kda_page_alignment,
             ),
             CacheFieldSpec(
                 f"layer.{layer_id}.recurrent_state",
@@ -237,6 +256,7 @@ def declare_glm53_flash_groups(
                 target_linear.temporal_state_shape,
                 cache_dtype_name(torch.float32),
                 exact_page_stride=False,
+                page_stride_alignment_bytes=kda_page_alignment,
             ),
         )
 

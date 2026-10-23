@@ -247,14 +247,17 @@ class KdaAttnBackend(CapacityPrefillBackend):
 
     @staticmethod
     def _layer_pools_are_uniform(kv_pool: CachePool) -> bool:
-        shapes = {
-            (
-                tuple(kv_pool.get_component(layer_id, "conv_state").shape[1:]),
-                tuple(kv_pool.get_component(layer_id, "recurrent_state").shape[1:]),
+        geometries = {
+            tuple(
+                (tuple(component.shape[1:]), component.stride(0))
+                for component in (
+                    kv_pool.get_component(layer_id, "conv_state"),
+                    kv_pool.get_component(layer_id, "recurrent_state"),
+                )
             )
             for layer_id in kv_pool.state_group_by_layer
         }
-        return len(shapes) == 1
+        return len(geometries) == 1
 
     @override
     def validate_cache_pool(self, cache_pool: CachePool) -> None:

@@ -726,7 +726,12 @@ def test_verify_derived_records_with_serving_producers(
     torch.testing.assert_close(payloads[0], raw, atol=0, rtol=0)
     assert torch.isnan(retained[rows:]).all()
     assert torch.isnan(retained[:rows, 3 * channels :]).all()
-    if entry == "split" and not project_gate and not with_conv_bias and lower_bound is not None:
+    if (
+        entry == "split"
+        and not project_gate
+        and not with_conv_bias
+        and lower_bound is not None
+    ):
         from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
             fused_kda_verify_conv_update_kernel,
         )
