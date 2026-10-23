@@ -254,6 +254,13 @@ class Qwen4ExpBackend(AttentionBackend):
             return self.attention_backend.full_attn_backend
         return self.attention_backend
 
+    @property
+    def linear_attn_backend(self) -> AttentionBackend:
+        """The Gated DeltaNet layers' backend (the hybrid composite's child)."""
+        if not isinstance(self.attention_backend, HybridLinearAttnBackend):
+            raise RuntimeError("this Qwen4-Exp view has no Gated DeltaNet layers")
+        return self.attention_backend.linear_attn_backend
+
     # Drafter length-edit hooks fan out to the attention child (a hybrid
     # composite forwards them to its full-attention router) and the indexer.
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
