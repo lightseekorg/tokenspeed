@@ -222,6 +222,7 @@ if _AVAILABLE:
         projection_rows: int,
         projection_scale: float,
         weights_independent: bool,
+        packed_up_weight: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run down, SiLU, up and gate/output in one tiled CuTe kernel.
 

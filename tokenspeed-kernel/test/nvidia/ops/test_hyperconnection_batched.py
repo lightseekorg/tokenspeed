@@ -616,3 +616,146 @@ def test_dynamic_tail_preserves_output_guards(rows, dtype):
         assert torch.all(storage[:2] == 123)
         assert torch.all(storage[-2:] == 123)
     check(result, reference(values, 0.25), dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("has_inject", [False, True])
+@torch.inference_mode()
+def test_prefill_up_mix_dynamic_graph(dtype, enable_pdl, has_inject):
+    from tokenspeed_kernel.ops.residual import (
+        pad_gated_residual_projection_weight,
+        prepare_gated_residual_up_weight,
+        select_gated_residual_mix_kernel,
+    )
+    from tokenspeed_kernel.ops.residual.cute_dsl import supports_up_mix
+
+    if not supports_up_mix(torch.device("cuda")):
+        pytest.skip("requires SM107 and CuTe DSL")
+    pdl_enabled(enable_pdl)
+    x, projection, up = inputs(16385, dtype, has_inject)
+    logical_rows = projection.shape[0]
+    projection = pad_gated_residual_projection_weight(
+        projection, projection_rows=logical_rows
+    )
+    packed = prepare_gated_residual_up_weight(up, 4, 2560, 320)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def invoke(value, override):
+        return gated_residual_mix(
+            value,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            projection_rows=logical_rows,
+            weights_independent=True,
+            projection_scale=0.25,
+            packed_up_weight=packed,
+            override=override,
+        )
+
+    # Only warm the first large shape. Unseen tails must capture without JIT.
+    with torch.cuda.stream(stream):
+        invoke(x[:4096], None)
+    stream.synchronize()
+    for rows in (4095, 4096, 4097, 8192, 16385):
+        value = x[:rows]
+        kernel, _ = select_gated_residual_mix_kernel(
+            value,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            weights_independent=True,
+            packed_up_weight=packed,
+            override=None,
+            solution=None,
+        )
+        expected_name = (
+            "triton_hyperconnection_mix"
+            if rows < 4096
+            else "cute_dsl_prefill_hyperconnection_mix"
+        )
+        assert kernel.name == expected_name
+        if rows < 4096:
+            invoke(value, None)
+            continue
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = invoke(value, None)
+        for scale in (1.0, 8.0):
+            value.normal_().mul_(scale)
+            graph.replay()
+            expected = invoke(value, "triton_hyperconnection_mix")
+            torch.cuda.synchronize()
+            for actual, wanted in zip(outputs, expected):
+                if wanted is None:
+                    assert actual is None
+                else:
+                    assert torch.isfinite(actual).all()
+                    torch.testing.assert_close(actual, wanted, rtol=0.005, atol=0.002)
+        graph.reset()
+
+
+@torch.inference_mode()
+def test_prefill_up_mix_fallback_contract():
+    from tokenspeed_kernel.ops.residual import (
+        prepare_gated_residual_up_weight,
+        select_gated_residual_mix_kernel,
+    )
+    from tokenspeed_kernel.ops.residual.cute_dsl import supports_up_mix
+
+    if not supports_up_mix(torch.device("cuda")):
+        pytest.skip("requires SM107 and CuTe DSL")
+    value, projection, up = inputs(4097, torch.bfloat16, True)
+    packed = prepare_gated_residual_up_weight(up, 4, 2560, 320)
+    storage = torch.empty(packed.numel() + 1, dtype=packed.dtype, device=packed.device)
+    unaligned = storage[1:].reshape_as(packed).copy_(packed)
+    strided = torch.empty(4097, 20480, device=value.device, dtype=value.dtype)[:, ::2]
+    strided.copy_(value)
+    expected = gated_residual_mix(
+        value,
+        projection,
+        up,
+        4,
+        2560,
+        320,
+        projection_rows=324,
+        weights_independent=True,
+        override="triton_hyperconnection_mix",
+    )
+    for x, prepared, independent in (
+        (value, None, True),
+        (value, packed, False),
+        (value, unaligned, True),
+        (strided, packed, True),
+    ):
+        kernel, _ = select_gated_residual_mix_kernel(
+            x,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            weights_independent=independent,
+            packed_up_weight=prepared,
+            override=None,
+            solution=None,
+        )
+        assert kernel.name == "triton_hyperconnection_mix"
+        actual = gated_residual_mix(
+            x,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            weights_independent=independent,
+            packed_up_weight=prepared,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0.005, atol=0.002)

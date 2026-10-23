@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.residual import (
     gated_residual_combine,
     gated_residual_mix,
     pad_gated_residual_projection_weight,
+    prepare_gated_residual_up_weight,
 )
 from torch import nn
 
@@ -155,6 +156,7 @@ class GatedResidualSimple(nn.Module):
         )
         if self.mix_inject_proj is not None:
             self.mix_inject_proj.weight.weight_loader = self._load_projection_shard
+        self.register_buffer("packed_up_weight", None, persistent=False)
         self.input_mix_weight_up = (
             nn.Linear(config.hc_lowrank, hc_size, bias=False) if use_mix else None
         )
@@ -170,6 +172,7 @@ class GatedResidualSimple(nn.Module):
                 weight.data, projection_rows=module._projection_rows
             )
             module.mix_inject_proj.out_features = weight.shape[0]
+            module._prepare_up_weight()
 
     def _load_up_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         """Load the fixed-shape up projection."""
@@ -179,6 +182,22 @@ class GatedResidualSimple(nn.Module):
                 f"{tuple(param.shape)}, loaded {tuple(loaded_weight.shape)}"
             )
         param.data.copy_(loaded_weight)
+        self._prepare_up_weight()
+
+    def _prepare_up_weight(self) -> None:
+        packed = prepare_gated_residual_up_weight(
+            self.input_mix_weight_up.weight.data,
+            self.hc_count,
+            self.hidden_size,
+            self.hc_lowrank,
+        )
+        if packed is None:
+            self.packed_up_weight = None
+        elif self.packed_up_weight is None:
+            self.packed_up_weight = packed
+        else:
+            # Captured graphs retain this address across checkpoint reloads.
+            self.packed_up_weight.copy_(packed)
 
     def _load_projection_shard(
         self,
@@ -276,6 +295,7 @@ class GatedResidualSimple(nn.Module):
             projection_rows=self._projection_rows,
             projection_scale=self._projection_scale,
             weights_independent=True,
+            packed_up_weight=self.packed_up_weight,
         )
         mixed = mixed.to(self.config.params_dtype)
         return mixed, (

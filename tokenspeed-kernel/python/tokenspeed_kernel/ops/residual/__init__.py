@@ -328,6 +328,34 @@ def pad_gated_residual_projection_weight(
         )
 
 
+def prepare_gated_residual_up_weight(
+    weight: _torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+) -> _torch.Tensor | None:
+    """Prepare an optional derived Up weight once during model loading.
+
+    Args:
+        weight: Canonical ``[hc_count * hidden_size, lowrank]`` Up weight.
+        hc_count: Number of residual branches.
+        hidden_size: Width of one branch.
+        lowrank: Mix gate bottleneck rank.
+
+    Returns:
+        A packed tensor for supported prefill kernels, or None. Its owner must
+        refresh it whenever ``weight`` changes, preserving storage during graph
+        replay. Other kernels continue to consume the canonical weight.
+    """
+    from tokenspeed_kernel.ops.residual.cute_dsl import prepare_up_mix_weight
+
+    if weight.shape != (hc_count * hidden_size, lowrank):
+        raise ValueError(
+            "up weight shape must match hc_count * hidden_size and lowrank"
+        )
+    return prepare_up_mix_weight(weight, hc_count, hidden_size, lowrank)
+
+
 def select_gated_residual_mix_kernel(
     flat: _torch.Tensor,
     projection_weight: _torch.Tensor,
@@ -339,6 +367,7 @@ def select_gated_residual_mix_kernel(
     weights_independent: bool,
     override: str | None,
     solution: str | None,
+    packed_up_weight: _torch.Tensor | None = None,
 ):
     """Select the ``gated_residual_mix`` kernel for validated 2-D inputs.
 
@@ -346,6 +375,7 @@ def select_gated_residual_mix_kernel(
         flat: Normalized residual streams shaped ``[rows, hc_count * hidden_size]``.
         projection_weight: Fused down/inject weight (see ``gated_residual_mix``).
         up_weight: Mix-up weight shaped ``[hc_count * hidden_size, lowrank]``.
+        packed_up_weight: Optional load-time layout of up_weight for prefill.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
@@ -361,6 +391,11 @@ def select_gated_residual_mix_kernel(
     rows = int(flat.shape[0])
 
     traits = {
+        "prefill_up_mix": (
+            rows >= 4096
+            and packed_up_weight is not None
+            and packed_up_weight.data_ptr() % 16 == 0
+        ),
         "weights_independent": weights_independent,
         "fused_grid_supported": supports_fused_hc(flat.device),
         "fused_tma_aligned": all(
@@ -407,6 +442,7 @@ def gated_residual_mix(
     projection_scale: float = 1.0,
     override: str | None = None,
     solution: str | None = None,
+    packed_up_weight: _torch.Tensor | None = None,
 ) -> tuple[_torch.Tensor, _torch.Tensor | None]:
     """Mix normalized hyperconnection branches and optionally form inject logits.
 
@@ -424,6 +460,9 @@ def gated_residual_mix(
             by :func:`pad_gated_residual_projection_weight` during loading.
         up_weight: Mix-up weight shaped
             ``[hc_count * hidden_size, lowrank]``.
+        packed_up_weight: Optional output of prepare_gated_residual_up_weight
+            for the current up_weight contents. Kernels without packed-weight
+            support use up_weight; this does not force an implementation.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
@@ -475,6 +514,15 @@ def gated_residual_mix(
         )
     _same_tensor_contract(flat, projection_weight, "projection_weight")
     _same_tensor_contract(flat, up_weight, "up_weight")
+    if packed_up_weight is not None:
+        _same_tensor_contract(flat, packed_up_weight, "packed_up_weight")
+        if (
+            packed_up_weight.shape != up_weight.shape
+            or not packed_up_weight.is_contiguous()
+        ):
+            raise ValueError(
+                "packed_up_weight must have the up weight shape and contiguous storage"
+            )
     if not flat.is_cuda:
         raise ValueError("gated_residual_mix requires GPU tensors")
 
@@ -496,6 +544,7 @@ def gated_residual_mix(
         hidden_size,
         lowrank,
         weights_independent=weights_independent,
+        packed_up_weight=packed_up_weight,
         override=override,
         solution=solution,
     )
@@ -519,6 +568,7 @@ def gated_residual_mix(
             projection_rows,
             projection_scale,
             weights_independent,
+            packed_up_weight=packed_up_weight,
         )
     mixed = mixed.reshape(*leading_shape, hidden_size)
     if inject is not None:
