@@ -641,6 +641,27 @@ enough rows, each row stays in one program. The span is a multiple of the
 tile and a runtime argument, so batch-size changes do not recompile the
 scorer. Only the first program of a KPool row writes its `row_ends_out`.
 
+### gfx950 selected-slot sparse attention
+
+For dense BF16, E4M3, and E5M2 query and KV rows with 512 latent values,
+the Gluon kernel computes score and value products in four 128-column
+phases. Matching dtypes retain their native matrix format; mixed inputs
+convert to BF16. Inside the key loop, it reuses selected indices staged in
+shared memory for the KV gather. The first tile loads gather indices directly,
+so one-tile rows avoid an initial shared-index handoff. The configured width fixes
+the launch and compile shape; device-resident selected lengths skip unused
+tiles and mask live rows across graph replays. Optional 64-value RoPE inputs
+add a separate score product. Rank-128 and packed KV layouts retain their
+existing implementations.
+
+Separate helpers contain the four-phase score/value products and normalized
+output stores. Matching dtypes use two shared buffers and asynchronous
+direct-to-shared transfers. Mixed inputs require conversion and refill their
+shared buffer after each tile. Tile partitioning, selection masks, online
+softmax, and split reduction are shared across these inputs. Ordinary
+shared-memory stores and loads use compiler-inferred synchronization, including
+the selected-index and single-buffer KV handoffs.
+
 ### DeepSeek V4 attention
 
 The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also

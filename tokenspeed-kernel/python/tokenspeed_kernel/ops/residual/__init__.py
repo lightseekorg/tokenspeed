@@ -608,6 +608,34 @@ def gated_residual_combine(
 # ===-----------------------------------------------------------------------===#
 
 
+def mhc_init(
+    hidden: _torch.Tensor, hc_mult: int
+) -> tuple[_torch.Tensor, _torch.Tensor]:
+    """Initialize independent mHC streams and their first-stream input mix.
+
+    Args:
+        hidden: Floating point token embeddings ``[rows, hidden_size]``.
+            Strided embeddings are supported.
+        hc_mult: Positive number of residual streams to replicate.
+
+    Returns:
+        Contiguous embeddings ``[rows, hc_mult, hidden_size]`` and FP32
+        one-hot input coefficients ``[rows, hc_mult]`` selecting stream zero.
+        Both outputs are owned by this invocation, with no retained scratch.
+    """
+    if hidden.ndim != 2 or hidden.shape[1] == 0 or hc_mult < 1:
+        raise ValueError("mhc_init requires [rows, hidden_size > 0] and hc_mult > 0")
+    kernel = select_kernel(
+        "residual",
+        "mhc_init",
+        format_signature(hidden=dense_tensor_format(hidden.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(hidden, hc_mult)
+
+
 def mhc_mixes(
     residual: _torch.Tensor,
     weight: _torch.Tensor,
@@ -991,6 +1019,7 @@ __all__ = [
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",
+    "mhc_init",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",

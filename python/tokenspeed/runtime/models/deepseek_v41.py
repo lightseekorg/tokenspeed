@@ -1908,9 +1908,14 @@ class DeepseekV41Model(nn.Module):
         h = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         if h.shape != (input_ids.numel(), self.config.hidden_size):
             raise ValueError("V4.1 input embeddings have the wrong shape")
-        h = h.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
-        pre_mix = torch.zeros(h.shape[:2], dtype=torch.float32, device=h.device)
-        pre_mix[:, 0] = 1
+        if h.is_cuda:
+            from tokenspeed_kernel.ops.residual import mhc_init
+
+            h, pre_mix = mhc_init(h, self.config.hc_mult)
+        else:
+            h = h.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
+            pre_mix = torch.zeros(h.shape[:2], dtype=torch.float32, device=h.device)
+            pre_mix[:, 0] = 1
         state = V41RowState(
             h, pre_mix, positions, image_mask, hashes, engram_token_mask, []
         )
