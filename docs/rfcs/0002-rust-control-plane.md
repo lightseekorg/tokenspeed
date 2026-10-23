@@ -9,7 +9,7 @@ Rewrite the engine control plane — everything above the data plane except the
 C++ scheduler — in Rust: the scheduler event loop and its hooks, request
 state and output processing, the data-parallel controller, and the frontend
 client that `AsyncLLM` is today. Each rank becomes a Rust host process that
-embeds CPython only for the data plane (`ForwardThread`, `DeviceHandle`,
+embeds CPython only for the data plane (the forward thread, `DeviceHandle`,
 models, kernels). SMG and Dynamo talk to the rank processes directly over the
 existing msgpack wire protocol, with no Python on the request path. The
 Python `Engine` API stays, as a PyO3 wrapper over the Rust client.
@@ -73,6 +73,8 @@ Non-goals:
    process**, not in the rank process (see Metrics).
 7. **Copy-event wait: native event handles waited on through
    `tokenspeed-kernel` C entries** (see the control/data plane boundary).
+   Implemented differently: the control thread waits on the data plane's
+   torch event (see the deviations under Phase 4).
 8. **The NPU path is in scope** (see NPU).
 
 ## Target architecture
@@ -143,7 +145,9 @@ boundary, as an enum of submissions:
   from the scheduler is handed to Python by reference, without a copy or a
   second schema. The control plane's own access goes through a `cxx` facade
   over the same library.
-* **Commit waits on the copy event without CUDA in the control plane.** The
+* **Commit waits on the copy event without CUDA in the control plane.**
+  (Implemented differently, with the control thread's completion queries:
+  see the deviations under Phase 4.) The
   result's D2H copy lands in pinned buffers the data plane allocated at
   startup and registered with the host. The data plane records the copy
   event as today and posts its native handle (CUDA or HIP event, Ascend
@@ -310,8 +314,8 @@ The Ascend path adopts the Rust host like the GPU paths. Little in the
 control plane is vendor-specific:
 
 * The data plane is embedded unchanged, `torch_npu` included.
-* The copy-event entries get an ACL implementation (`aclrtSynchronizeEvent`,
-  `aclrtQueryEventStatus`).
+* The copy-event wait goes through `torch_npu`'s event, as the CUDA and ROCm
+  waits go through torch's (see the deviations under Phase 4).
 * PD on Ascend selects Mooncake's Ascend transport through the same C API.
 * The Ascend CI hosts are ARM, so the host binary is built and released for
   aarch64 Linux as well as x86-64.
@@ -412,11 +416,12 @@ Status: steps 1–3 are in `tokenspeed-engine/` (`ts-scheduler`,
 `ts-control`, `ts-host`) and `engine/rust_host.py`, behind
 `TOKENSPEED_RUST_HOST` in the headless launcher. One rank serves token for
 token like the Python loop at in-flight depth 0 and 1, with chunked prefill,
-prefix-cache hits, seeded sampling and stop tokens. The pump thread is a
-Rust thread attached to the interpreter, and commit still waits through it
-on `PendingExecution.result()`; the native event wait comes with folding the
-pump into `ForwardThread`. The Host L2 tier and the retraction snapshot
-pool, both on by default, are served too: the Phase 2 exit runs the model
+prefix-cache hits, seeded sampling and stop tokens. The pump thread has
+since been folded into the forward thread: one Rust thread attached to the
+interpreter runs every data-plane operation in queue order, and the Python
+`ForwardThread` is gone; commit waits on the copy event from the control
+thread (see the deviations under Phase 4). The Host L2 tier and the
+retraction snapshot pool, both on by default, are served too: the Phase 2 exit runs the model
 CI jobs with their defaults, so their cache ops moved here from Phase 3.
 The control thread counts each plan's cache ops and, while any is open,
 polls their acknowledgments at the head of the round, before it plans, as
@@ -479,7 +484,7 @@ controller, the engine core client and pickle IPC, the Python headless
 transport, the Python PD transfer executors and the EPD prefill hooks are
 deleted, and `docs/design/event-loop.md` describes the Rust loop. `ts-py`
 (`tokenspeed_engine._native`) is the Python frontend's connection to the ranks.
-Two deviations from the plan above:
+Three deviations from the plan above:
 
 * `AsyncLLM` stays, as the in-process frontend over `ts-py`: tokenization,
   detokenization, stop strings, `n > 1` fan-out and the `Engine` API stay in
@@ -491,6 +496,17 @@ Two deviations from the plan above:
   top-k/prompt logprobs. `ts serve --headless` serves SMG's msgpack mode as
   before. Moving `ts serve` onto it, and deleting the servicer, waits for
   SMG.
+* The control thread calls into Python for the data plane's completion
+  queries, and only for those: it waits on a launched forward's copy event
+  through the torch event the data plane records (vendor-neutral, as the
+  data plane already is; the wait releases the GIL), reads the landed
+  results, and polls the cache acknowledgments and the L3 executor, under a
+  dispatch guard that rejects device work. Queued behind
+  the forward thread instead, these would wait for every forward still being
+  launched; the native event entries would need an implementation per
+  vendor. The cost is the GIL on the commit path: a query can wait for the
+  forward thread's Python, up to the interpreter's switch interval, as the
+  Python event loop's commit did.
 
 While Phases 2–3 are open, a change to the Python control plane must land
 with its Rust counterpart, or in the Rust plane's backlog with a test that
@@ -520,7 +536,8 @@ not be long.
 
 The decisions above rest on these facts, which are not yet checked. Each is
 checked in the phase that first depends on it (1–2 in Phase 2, 3–4 in
-Phase 3):
+Phase 3); 1 and 2 went with the native event wait (see the deviations under
+Phase 4):
 
 1. Each vendor's torch exposes the native event handle: `torch.cuda.Event`
    on CUDA and ROCm builds, and the `torch_npu` event for Ascend.

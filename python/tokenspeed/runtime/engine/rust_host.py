@@ -30,10 +30,12 @@ interpreter runs, plus the launcher's side:
 * ``bootstrap`` builds the rank inside the host: the model config,
   distributed init, ``build_device_side`` and the scheduler. The Rust side
   takes the scheduler and ``HostConfig``.
-* ``DataPlanePump`` is what the host's pump thread calls each round: it
-  turns a plan into the ``PlannedForward`` the existing ``DeviceHandle``
-  runs, a finished forward into plain lists, and the cache ops' completions
-  into acknowledgment payloads.
+* ``HostDataPlane`` is what the host runs the data plane through. Its
+  forward thread runs each operation the control thread queued (a plan
+  becomes the ``PlannedForward`` that ``DeviceHandle`` launches); its control
+  thread runs the completion queries itself (a launched forward's landed
+  results as plain lists, the cache ops' acknowledgments, the L3 probe and
+  progress).
 
 The host covers TP, attention-DP and pipeline ranks and both PD roles (its
 own Rust transfer peer over ``pd/host_peer.py``); ``rust_host_refusals`` and
@@ -49,6 +51,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -103,8 +106,8 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.types import (
     DpForwardMetadata,
     InputLogprobPlan,
+    ModelExecutionResult,
     NGramInputs,
-    PendingExecution,
     PlannedForward,
     RequestHistorySeeds,
     StopCriteria,
@@ -501,9 +504,9 @@ class _AdmittedRequest:
 
 @dataclass(frozen=True)
 class _Dispatched:
-    """A dispatched forward as the host holds it until its commit."""
+    """A launched forward as the host holds it until its commit."""
 
-    pending: PendingExecution
+    results: ModelExecutionResult
     forward_mode: ForwardMode
 
 
@@ -531,12 +534,16 @@ def _logprob_lists(results) -> tuple | None:
     )
 
 
-class DataPlanePump:
-    """The data plane as the host's pump thread drives it.
+class HostDataPlane:
+    """The data plane as the host drives it.
 
-    The pump calls these in the order the control thread queued the
-    operations, so a request is admitted before any plan names it and
-    released only after the last forward that does was dispatched.
+    Two threads call in. The host's forward thread runs every operation but
+    the completion queries, one at a time in the order the control thread
+    queued them, so a request is admitted before any plan names it and
+    released only after the last forward that does was launched. The control
+    thread runs the completion queries -- ``complete``, ``poll_cache_events``
+    and the L3 probe, progress and completion -- under its dispatch guard:
+    they read what landed and touch no stream.
     """
 
     def __init__(
@@ -582,10 +589,22 @@ class DataPlanePump:
         self._gc_hooks = GcHooks(full_collection_interval=FULL_COLLECTION_INTERVAL)
 
     @staticmethod
-    def control_plane_guard() -> AbstractContextManager:
-        """What the pump thread runs under for its whole life: device work
-        crosses only through the handle (``maybe_control_plane_guard``)."""
+    def control_thread_guard() -> AbstractContextManager:
+        """What the host's control thread runs under while it serves: it runs
+        the completion queries only, and device work crosses only through the
+        forward thread (``maybe_control_plane_guard``)."""
         return maybe_control_plane_guard()
+
+    def enter_forward_thread(self) -> None:
+        """Called once by the host's forward thread, before its first
+        operation."""
+        threading.current_thread().name = "tokenspeed::forward"
+        self._device.bind_forward_thread()
+
+    def exit_forward_thread(self) -> None:
+        """The forward thread's last call, once nothing more is queued:
+        finish a drafter's pending round before the caches close."""
+        self._device.settle()
 
     def admit(
         self,
@@ -731,14 +750,14 @@ class DataPlanePump:
             if self._l3 is None:
                 raise RuntimeError("cache storage operations require an L3 executor")
             self._l3.submit_operations(cache_ops.storage)
-        pending = self._device.execute(plan, planned, cache_ops=cache_ops.device)
+        results = self._device.execute(plan, planned, cache_ops=cache_ops.device)
         if idle_forward:
             self._device.run_idle_forward(dp_metadata)
-        self._gc_hooks.note_round(forwarded=pending is not None or idle_forward)
-        if pending is None:
+        self._gc_hooks.note_round(forwarded=results is not None or idle_forward)
+        if results is None:
             return None
         return _Dispatched(
-            pending,
+            results,
             ForwardMode.from_num_extends(
                 planned.forward_op.num_extends(), len(planned.forward_op.request_ids)
             ),
@@ -754,18 +773,19 @@ class DataPlanePump:
         list[int] | None,
         tuple | None,
     ]:
-        """Wait for a forward; its sampled tokens, kept lengths, logprobs,
-        NaN flags and, on the P role, each row's bootstrap payload
-        (``next_input_ids``), as the commit reads them; then, when the host
-        exports metrics, the serving-time kernel compilations and their
-        seconds so far; where this side advanced the grammar matchers, each
-        row's index of the token that ended its grammar; and, when the
-        forward computed any, its planned prompt rows' logprobs, their top-k
-        alternatives and the prefill rows' sampled-token alternatives
-        (values and ids each), None for those it did not."""
-        results = dispatched.pending.result()
-        # A committed forward counts toward a profile's steps.
-        self._profiler.note_forward(dispatched.forward_mode)
+        """Wait for a forward's host copies to land (the control thread: the
+        event wait releases the interpreter lock), and return its sampled
+        tokens, kept lengths, logprobs, NaN flags and, on the P role, each
+        row's bootstrap payload (``next_input_ids``), as the commit reads
+        them; then, when the host exports metrics, the serving-time kernel
+        compilations and their seconds so far; where this side advanced the
+        grammar matchers, each row's index of the token that ended its
+        grammar; and, when the forward computed any, its planned prompt
+        rows' logprobs, their top-k alternatives and the prefill rows'
+        sampled-token alternatives (values and ids each), None for those it
+        did not."""
+        results = dispatched.results
+        results.sync()
         compiles = compile_stats() if self._report_compiles else None
         return (
             results.output_tokens.tolist(),
@@ -793,6 +813,12 @@ class DataPlanePump:
             resolve_grammar_completion(results),
             _logprob_lists(results),
         )
+
+    def note_committed(self, dispatched: _Dispatched) -> None:
+        """A committed forward counts toward a profile's steps. The forward
+        thread runs this, after the commit's ``complete``: the profiler
+        starts and stops on the thread whose launches it traces."""
+        self._profiler.note_forward(dispatched.forward_mode)
 
     def poll_cache_events(self) -> list[tuple[str, int]]:
         """The cache ops acknowledged since the last poll, in the order they
@@ -872,20 +898,34 @@ class DataPlanePump:
         return rows, snapshot.health.state, snapshot.health.epoch, snapshot.unsafe_io
 
     def release(self, rids: list[str]) -> None:
-        """Forget requests that ended. Their shared-memory features go once
-        no queued forward can read them: behind those forwards."""
-        for rid in rids:
-            request = self._requests.pop(rid)
+        """Forget requests that ended. Their grammar matchers and
+        shared-memory features go behind every forward launched before this,
+        the ones that may read them."""
+        requests = [(rid, self._requests.pop(rid)) for rid in rids]
+        if any(
+            request.grammar is not None
+            or (
+                request.multimodal_inputs is not None
+                and request.multimodal_inputs.has_pending_shm_features()
+            )
+            for _, request in requests
+        ):
+            # A release is a data-plane task: it runs behind a drafter's
+            # pending round.
+            self._device.settle()
+        for rid, request in requests:
             if request.grammar is not None:
-                self._device.release_grammars([request.grammar])
+                request.grammar.release()
             features = request.multimodal_inputs
-            if features is not None:
-                if features.has_pending_shm_features():
-                    self._device.run_multimodal_work(
-                        features.release_shm_features, wait=False
-                    )
-                else:
+            if features is not None and features.has_pending_shm_features():
+                try:
                     features.release_shm_features()
+                except Exception:
+                    # Nothing waits on the release: log the leak rather than
+                    # stop serving.
+                    logger.exception(
+                        f"releasing the shared-memory features of {rid} failed"
+                    )
             if self._transfer_peer is not None:
                 self._transfer_peer.release(rid)
 
@@ -952,18 +992,22 @@ class DataPlanePump:
 
     def epd_stage(self, rids: list[str]) -> None:
         """EPD: start receiving these admitted requests' image embeddings
-        from their encode workers."""
+        from their encode workers. Like every EPD step, a data-plane task:
+        behind a drafter's pending round."""
+        self._device.settle()
         for rid in rids:
             self._epd.stage(rid, self._requests[rid].multimodal_inputs.mm_items)
 
     def epd_poll(self) -> list[int]:
         """EPD: every staged receive's state on this rank, in staging order
         (0 failed or timed out, 1 receiving, 2 done)."""
+        self._device.settle()
         return self._epd.poll_codes()
 
     def epd_settle(self, codes: list[int]) -> None:
         """EPD: act on the replica-agreed states: reassemble the done
         receives' embeddings, release the failed ones."""
+        self._device.settle()
         self._epd.settle(codes)
 
     def snapshot_expert_load(self) -> tuple[list[list[int]], list[list[int]]]:
@@ -1011,8 +1055,8 @@ class DataPlanePump:
 
 
 class HostBootstrap:
-    """One rank, built: the scheduler and config for the control thread,
-    the pump for the pump thread."""
+    """One rank, built: the scheduler and config for the control thread, and
+    the data plane the forward and control threads call."""
 
     def __init__(
         self,
@@ -1202,7 +1246,6 @@ class HostBootstrap:
                         "gloo", mapping.attn.tp_group
                     ),
                     pg_manager=pg_manager,
-                    run_device_work=device.handle.run_multimodal_work,
                 )
                 if server_args.disaggregation_mode != "null"
                 else None
@@ -1337,7 +1380,7 @@ class HostBootstrap:
             #: The PD peer the host starts its own from, None outside
             #: disaggregation.
             self.transfer_peer = device.transfer
-            self.pump = DataPlanePump(
+            self.data_plane = HostDataPlane(
                 device.handle,
                 self._l3,
                 device.transfer,
@@ -1412,8 +1455,8 @@ class HostBootstrap:
         freeze_startup_heap()
 
     def close(self) -> None:
-        """Release the device side's caches, then the L3 executor's; the
-        pump is stopped."""
+        """Release the device side's caches, then the L3 executor's, once
+        the forward thread has stopped."""
         try:
             self._device.shutdown_cache()
         finally:

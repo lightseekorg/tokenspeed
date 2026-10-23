@@ -30,13 +30,13 @@
 //! The rank's arguments arrive on `--control-fd`, and readiness goes back
 //! on it. The embedded interpreter builds the data plane and the scheduler;
 //! the ranks then connect their collective mesh, the replica's first member
-//! connects to the frontend, and the main thread runs the
-//! scheduling loop without the GIL while a pump thread runs the data plane
-//! (`pump`).
+//! connects to the frontend, and the main thread runs the scheduling loop
+//! while the forward thread runs the data plane; the main thread takes the
+//! GIL only for the data plane's completion queries (`data_plane`).
 
+mod data_plane;
 mod interpreter;
 mod pd;
-mod pump;
 
 use std::{
     process::ExitCode,
@@ -69,7 +69,7 @@ use ts_metrics::{
 use ts_scheduler::Scheduler;
 use ts_wire::EngineCoreReadyResponse;
 
-use crate::pump::PythonDataPlane;
+use crate::data_plane::PythonDataPlane;
 
 /// How long the host waits for the frontend's INIT and for the other ranks
 /// to connect.
@@ -90,6 +90,8 @@ enum HostError {
     Interpreter(String),
     #[error("python:\n{0}")]
     Python(String),
+    #[error("data plane: {0}")]
+    DataPlane(String),
     #[error("the ready response does not decode: {0}")]
     Ready(#[from] ts_wire::Error),
     #[error("frontend: {0}")]
@@ -107,7 +109,7 @@ enum HostError {
 }
 
 fn python_error(py: Python<'_>, error: PyErr) -> HostError {
-    HostError::Python(pump::describe(py, &error))
+    HostError::Python(data_plane::describe(py, &error))
 }
 
 struct Args {
@@ -447,50 +449,52 @@ fn serve(args: &Args) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, scheduler, config, pump, role, transfer, exporter) = Python::attach(|py| {
-        let built = (|| {
-            // Before anything imports the scheduler package.
-            ts_scheduler::alias_builtin_module(py)?;
-            let outbox = Bound::new(py, pd::Outbox::new())?;
-            let bootstrap = py
-                .import("tokenspeed.runtime.engine.rust_host")?
-                .call_method1("bootstrap", (args.control_fd, outbox.clone()))?;
-            let scheduler = Scheduler::from_python(&bootstrap.getattr("scheduler")?)?;
-            let python_config = bootstrap.getattr("config")?;
-            let metrics = Metrics::from_python(&python_config)?;
-            let exporter = metrics
-                .exporter()
-                .map_err(|error| pyo3::exceptions::PyRuntimeError::new_err(error.to_string()))?;
-            let transfer_metrics = exporter
-                .as_ref()
-                .filter(|_| metrics.transfer)
-                .map(|exporter| {
-                    Arc::new(KvTransferMetrics::new(
-                        exporter,
-                        &metrics.labels.model_name,
-                        &metrics.labels.app_key,
-                    ))
-                });
-            let (role, transfer) = pd::start(
-                py,
-                bootstrap.getattr("transfer_peer")?,
-                outbox.get(),
-                transfer_metrics,
-            )?;
-            let config = HostConfig::from_python(&python_config, transfer.is_some(), role)?;
-            let pump = bootstrap.getattr("pump")?.unbind();
-            Ok((
-                bootstrap.unbind(),
-                scheduler,
-                config,
-                pump,
-                role,
-                transfer,
-                exporter,
-            ))
-        })();
-        built.map_err(|error| python_error(py, error))
-    })?;
+    let (bootstrap, scheduler, config, data_plane, role, transfer, exporter) =
+        Python::attach(|py| {
+            let built = (|| {
+                // Before anything imports the scheduler package.
+                ts_scheduler::alias_builtin_module(py)?;
+                let outbox = Bound::new(py, pd::Outbox::new())?;
+                let bootstrap = py
+                    .import("tokenspeed.runtime.engine.rust_host")?
+                    .call_method1("bootstrap", (args.control_fd, outbox.clone()))?;
+                let scheduler = Scheduler::from_python(&bootstrap.getattr("scheduler")?)?;
+                let python_config = bootstrap.getattr("config")?;
+                let metrics = Metrics::from_python(&python_config)?;
+                let exporter = metrics.exporter().map_err(|error| {
+                    pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+                })?;
+                let transfer_metrics =
+                    exporter
+                        .as_ref()
+                        .filter(|_| metrics.transfer)
+                        .map(|exporter| {
+                            Arc::new(KvTransferMetrics::new(
+                                exporter,
+                                &metrics.labels.model_name,
+                                &metrics.labels.app_key,
+                            ))
+                        });
+                let (role, transfer) = pd::start(
+                    py,
+                    bootstrap.getattr("transfer_peer")?,
+                    outbox.get(),
+                    transfer_metrics,
+                )?;
+                let config = HostConfig::from_python(&python_config, transfer.is_some(), role)?;
+                let data_plane = bootstrap.getattr("data_plane")?.unbind();
+                Ok((
+                    bootstrap.unbind(),
+                    scheduler,
+                    config,
+                    data_plane,
+                    role,
+                    transfer,
+                    exporter,
+                ))
+            })();
+            built.map_err(|error| python_error(py, error))
+        })?;
 
     // The ranks find each other through the data plane's rendezvous, then
     // connect: every rank is past startup once the mesh is up.
@@ -551,12 +555,13 @@ fn serve(args: &Args) -> Result<(), HostError> {
         // The data plane drives the matchers through these.
         Python::attach(|py| {
             let entries: Vec<(&str, usize)> = ts_grammar::table::entries();
-            pump.call_method1(py, "set_grammar_entries", (entries,))
+            data_plane
+                .call_method1(py, "set_grammar_entries", (entries,))
                 .map(drop)
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane = PythonDataPlane::start(pump)?;
+    let data_plane = PythonDataPlane::start(data_plane).map_err(HostError::DataPlane)?;
     let outputs = OutputProcessor::new(
         config.spec_num_tokens,
         config.stream_interval,
@@ -624,7 +629,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         },
     );
     let served = event_loop.run(&stop);
-    // Stops the pump and tells the frontend the engine is gone.
+    // Stops the forward thread and tells the frontend the engine is gone.
     drop(event_loop);
     call("close")?;
     Ok(served?)

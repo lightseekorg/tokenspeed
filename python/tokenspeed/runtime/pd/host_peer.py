@@ -27,9 +27,9 @@ read off the plan's remote streams, and the copies one request's transfer
 makes. Nothing here starts a thread, opens a socket or moves a byte.
 
 ``DeviceHandle`` drives a peer through the same execution face as the Python
-executors (``execute``, ``prepare_prefill``); the host's pump binds requests
-to their rooms (``track``, ``release``), and its PD threads call the rest
-with the interpreter lock held. Work for the host leaves through ``outbox``,
+executors (``execute``, ``prepare_prefill``); the host's forward thread binds
+requests to their rooms (``track``, ``release``), and its PD threads call the
+rest with the interpreter lock held. Work for the host leaves through ``outbox``,
 an object the host provides:
 
 * ``outbox.send(rid, room, bootstrap_token, spec_candidate_ids)``: a Prefill

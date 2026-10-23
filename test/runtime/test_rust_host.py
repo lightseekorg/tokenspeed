@@ -32,6 +32,7 @@ import signal
 import stat
 import sys
 import textwrap
+import threading
 import time
 from contextlib import nullcontext
 
@@ -62,13 +63,12 @@ from tokenspeed.runtime.cache.l3.executor import L3Executor  # noqa: E402
 from tokenspeed.runtime.engine.profiler import Profiler  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import request_length_limits  # noqa: E402
 from tokenspeed.runtime.engine.rust_host import (  # noqa: E402
-    DataPlanePump,
+    HostDataPlane,
     rust_host_refusals,
     start_rust_host,
 )
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
-from tokenspeed.runtime.execution.forward_thread import ForwardThread  # noqa: E402
 from tokenspeed.runtime.execution.types import (  # noqa: E402
     InputLogprobPlan,
     ModelExecutionResult,
@@ -217,10 +217,14 @@ def test_request_length_limits_reserve_the_first_decode_window():
 
 
 class _LandedCopy:
-    """The CPU stand-in for a result's copy event: already landed."""
+    """The CPU stand-in for a result's copy event: already landed; counts
+    the waits on it."""
+
+    def __init__(self) -> None:
+        self.waits = 0
 
     def synchronize(self) -> None:
-        pass
+        self.waits += 1
 
 
 class _CpuExecutor:
@@ -228,9 +232,7 @@ class _CpuExecutor:
     records what each forward was given."""
 
     def __init__(self) -> None:
-        self.forward_thread = ForwardThread(
-            "cpu", settle=self.complete_pending_drafting
-        )
+        self.device = "cpu"
         self.forwards: list[tuple[list[str], list, tuple]] = []
         self.dp_metadata: list = []
         self.idle_forwards: list = []
@@ -329,12 +331,12 @@ def _resolved(rid: str, **fields) -> SamplingParams:
     return params
 
 
-def _pump(handle: DeviceHandle, l3: L3Executor | None = None) -> DataPlanePump:
-    """A text-only, aggregated rank's pump over ``handle``, with the L3
+def _data_plane(handle: DeviceHandle, l3: L3Executor | None = None) -> HostDataPlane:
+    """A text-only, aggregated rank's data plane over ``handle``, with the L3
     executor ``l3`` when given."""
     server_args = ServerArgs(model="x")
     server_args.mapping.rank = 0
-    return DataPlanePump(
+    return HostDataPlane(
         handle,
         l3,
         None,
@@ -356,15 +358,13 @@ def _pump(handle: DeviceHandle, l3: L3Executor | None = None) -> DataPlanePump:
 
 @pytest.fixture
 def executor():
-    executor = _CpuExecutor()
-    yield executor
-    executor.forward_thread.shutdown()
+    return _CpuExecutor()
 
 
-def test_the_pump_runs_a_plan_with_the_admitted_requests(executor):
-    pump = _pump(DeviceHandle(executor))
+def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
+    plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1", temperature=0.0, max_new_tokens=8, stop_token_ids={9})
-    pump.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None, None)])
+    plane.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None, None)])
     scheduler = _scheduler()
     spec = RequestSpec()
     spec.request_id = "r1"
@@ -372,7 +372,7 @@ def test_the_pump_runs_a_plan_with_the_admitted_requests(executor):
     spec.max_new_tokens = 8
     scheduler.submit_requests([spec])
 
-    pending = pump.execute(
+    pending = plane.execute(
         scheduler.next_execution_plan(),
         None,
         None,
@@ -382,7 +382,7 @@ def test_the_pump_runs_a_plan_with_the_admitted_requests(executor):
     )
 
     assert pending is not None
-    assert pump.complete(pending) == ([100], [1], [-0.5], None, None, None, None, None)
+    assert plane.complete(pending) == ([100], [1], [-0.5], None, None, None, None, None)
     ((rids, sampling_params, stop_criteria),) = executor.forwards
     assert rids == ["r1"]
     assert sampling_params == [params]
@@ -392,15 +392,15 @@ def test_the_pump_runs_a_plan_with_the_admitted_requests(executor):
     ]
 
 
-def test_the_pump_hands_the_logprob_plan_to_the_forward(executor):
-    pump = _pump(DeviceHandle(executor))
-    pump.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
+def test_the_data_plane_hands_the_logprob_plan_to_the_forward(executor):
+    plane = _data_plane(DeviceHandle(executor))
+    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
 
-    pending = pump.execute(
+    pending = plane.execute(
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
     )
 
-    *_, logprobs = pump.complete(pending)
+    *_, logprobs = plane.complete(pending)
     ((plan, sampled_top_k),) = executor.logprob_plans
     assert plan == InputLogprobPlan(
         row_starts=(0,), counts=(2,), position_starts=(0,), top_k=2
@@ -423,10 +423,10 @@ def _plan_with_one_request(rid: str):
 
 
 def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
-    pump = _pump(DeviceHandle(executor))
-    pump.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
+    plane = _data_plane(DeviceHandle(executor))
+    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
 
-    pending = pump.execute(
+    pending = plane.execute(
         _plan_with_one_request("r1"),
         ([3, 0], [1, 0], [1, 0], False),
         None,
@@ -435,7 +435,7 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
         None,
     )
 
-    assert pump.complete(pending)[0] == [100]
+    assert plane.complete(pending)[0] == [100]
     (metadata,) = executor.dp_metadata
     assert metadata.global_num_tokens == [3, 0]
     assert metadata.global_forward_mode == [
@@ -447,12 +447,12 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
 
 
 def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
-    pump = _pump(DeviceHandle(executor))
-    pump.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
+    plane = _data_plane(DeviceHandle(executor))
+    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
 
     # This rank's plan has a batch, but the control plane decided it idles.
     assert (
-        pump.execute(
+        plane.execute(
             _plan_with_one_request("r1"),
             ([0, 6], [0, 2], [0, 0], True),
             None,
@@ -471,9 +471,9 @@ def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
 
 
 def test_a_plan_without_a_batch_runs_no_forward(executor):
-    pump = _pump(DeviceHandle(executor))
+    plane = _data_plane(DeviceHandle(executor))
     assert (
-        pump.execute(_scheduler().next_execution_plan(), None, None, None, None, None)
+        plane.execute(_scheduler().next_execution_plan(), None, None, None, None, None)
         is None
     )
     assert executor.forwards == []
@@ -490,20 +490,20 @@ class _HostCache:
         return landed
 
 
-def test_the_pump_reports_cache_acknowledgments_in_landing_order(executor):
+def test_the_data_plane_reports_cache_acknowledgments_in_landing_order(executor):
     snapshot = Cache.SnapshotDoneEvent()
     snapshot.op_id = 7
     write_back = Cache.WriteBackDoneEvent()
     write_back.op_id = 3
     landed = [snapshot, write_back, Cache.LoadBackDoneEvent(9)]
     host_cache = _HostCache(landed)
-    pump = _pump(DeviceHandle(executor, host_cache_executor=host_cache))
-    assert pump.poll_cache_events() == [
+    plane = _data_plane(DeviceHandle(executor, host_cache_executor=host_cache))
+    assert plane.poll_cache_events() == [
         ("SnapshotDoneEvent", 7),
         ("WriteBackDoneEvent", 3),
         ("LoadBackDoneEvent", 9),
     ]
-    assert pump.poll_cache_events() == []
+    assert plane.poll_cache_events() == []
 
 
 class _HostAllocation:
@@ -513,7 +513,9 @@ class _HostAllocation:
         self.host_buffer = data
 
 
-def test_the_pump_runs_a_plans_storage_operations_on_the_l3_executor(executor):
+def test_the_data_plane_runs_a_plans_storage_operations_on_the_l3_executor(
+    executor,
+):
     l3 = L3Executor(
         MemoryKvStore(),
         _HostAllocation(bytearray(64)),
@@ -526,10 +528,10 @@ def test_the_pump_runs_a_plans_storage_operations_on_the_l3_executor(executor):
         prefix_for_weight_version=None,
     )
     try:
-        pump = _pump(DeviceHandle(executor), l3)
+        plane = _data_plane(DeviceHandle(executor), l3)
         # The waiting request's probe: a storage operation, and no forward.
         assert (
-            pump.execute(
+            plane.execute(
                 storage_scheduler().next_execution_plan(), None, None, None, None, None
             )
             is None
@@ -537,7 +539,7 @@ def test_the_pump_runs_a_plans_storage_operations_on_the_l3_executor(executor):
         deadline = time.monotonic() + 3
         completions = []
         while not completions and time.monotonic() < deadline:
-            now_us, completions, pressure, error = pump.poll_storage()
+            now_us, completions, pressure, error = plane.poll_storage()
         assert error is None and type(now_us) is int
         assert all(type(value) is int for value in pressure)
         # An empty store holds neither key, and the probe retired.
@@ -548,15 +550,55 @@ def test_the_pump_runs_a_plans_storage_operations_on_the_l3_executor(executor):
             True,
             [False, False],
         )
-        assert pump.poll_storage()[1] == []
+        assert plane.poll_storage()[1] == []
     finally:
         l3.close(timeout_s=5.0)
 
 
 def test_a_released_request_is_forgotten(executor):
-    pump = _pump(DeviceHandle(executor))
+    plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1")
-    pump.admit([("r1", msgspec.msgpack.encode(params), [], 10, None, None)])
-    pump.release(["r1"])
+    plane.admit([("r1", msgspec.msgpack.encode(params), [], 10, None, None)])
+    plane.release(["r1"])
     with pytest.raises(KeyError):
-        pump.release(["r1"])
+        plane.release(["r1"])
+
+
+def test_a_forward_lands_once_and_counts_toward_a_profile_at_its_note(executor):
+    """The commit waits on the copy event exactly once; the profiler counts
+    the forward only when the forward thread runs its committed note."""
+    profiled = _data_plane(DeviceHandle(executor))
+    profiled.admit(
+        [("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)]
+    )
+    launched = profiled.execute(
+        _plan_with_one_request("r1"), None, None, None, (None, 0), None
+    )
+
+    assert profiled.complete(launched)[0] == [100]
+    assert launched.results.copy_event.waits == 1
+    with pytest.raises(RuntimeError, match="exactly once"):
+        profiled.complete(launched)
+    assert profiled._profiler.forward_ct == 0
+    profiled.note_committed(launched)
+    assert profiled._profiler.forward_ct == 1
+
+
+def test_a_result_without_a_copy_event_cannot_land():
+    results = ModelExecutionResult(output_tokens=torch.tensor([7], dtype=torch.int32))
+    with pytest.raises(RuntimeError, match="copy_event is required"):
+        results.sync()
+
+
+def test_the_forward_thread_is_named_for_its_role(executor):
+    data_plane = _data_plane(DeviceHandle(executor))
+    names = []
+
+    def forward_thread():
+        data_plane.enter_forward_thread()
+        names.append(threading.current_thread().name)
+
+    thread = threading.Thread(target=forward_thread)
+    thread.start()
+    thread.join()
+    assert names == ["tokenspeed::forward"]

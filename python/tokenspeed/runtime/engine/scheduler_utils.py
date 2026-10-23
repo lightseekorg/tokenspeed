@@ -304,8 +304,8 @@ def resolve_dspark_prefix_replay_tokens(
 
 
 def cache_event_to_payload(event) -> dict:
-    """A cache ACK as the payload the host's pump reports
-    (``DataPlanePump.poll_cache_events``).
+    """A cache ACK as the payload the host's data plane reports
+    (``HostDataPlane.poll_cache_events``).
 
     ``(kind, op_id)`` identifies a completed Host copy.
     """

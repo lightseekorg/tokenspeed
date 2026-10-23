@@ -20,27 +20,26 @@
 
 """The cross-plane contract, at the places that can break it.
 
-Two halves, both stated in ``execution/forward_thread.py``. What the control
-plane hands over travels in a closure and is frozen once submitted; and the
-device side is not reachable from the control plane at all, because the loop
-holds a ``DeviceHandle`` rather than the executor behind it.
+Two halves, both stated in the capture contract of ``execution/device.py``.
+What a launched forward reads is frozen; and the device side is not
+reachable from the control plane at all, because the data plane holds a
+``DeviceHandle`` rather than the executor behind it.
 
-The first half is easy to lose in three specific spots, so each gets a test:
-the PD completion path (device writes issued straight from an event handler),
-the multimodal gather (a live request struct captured by reference), and the
-SHM release (a resource freed while a queued forward may still read it).
+The first half is easy to lose in specific spots, so each gets a test: the
+PD completion path (device writes issued straight from an event handler)
+and the multimodal gather (a live request struct captured by reference).
 
-The second half is exercised the way the loop experiences it: the tests build
-a real ``DeviceHandle`` over a stub executor and drive its operations,
-asserting the work that crosses to the device side and the facts that come
-back.
+The second half is exercised the way the forward thread experiences it: the
+tests build a real ``DeviceHandle`` over a stub executor and drive its
+operations, asserting the work that reaches the device side, in order, and
+the facts that come back.
 """
 
 from __future__ import annotations
 
 import functools
 import json
-from concurrent.futures import Future
+import threading
 from contextlib import nullcontext
 from dataclasses import replace
 from types import SimpleNamespace
@@ -70,7 +69,6 @@ from tokenspeed.runtime.engine import scheduler_utils as scheduler_utils_module
 from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
 from tokenspeed.runtime.execution.device import DeviceHandle, EncoderModelFacts
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
-from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.types import PlannedForward
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
@@ -241,34 +239,6 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         assert events[-1] == ("capture", 0, None)
 
 
-class _ForwardThread:
-    """Records what crossed to the data plane, and in what order.
-
-    Mirrors the real contract: ``submit`` returns a future resolved with the
-    callable's result or exception (never raising at the call site), ``run``
-    blocks and re-raises.
-    """
-
-    def __init__(self, trace) -> None:
-        self._trace = trace
-
-    def submit(self, fn):
-        self._trace.append("submit")
-        future: Future = Future()
-        try:
-            future.set_result(fn())
-        except BaseException as exc:  # noqa: BLE001 — mirrored to the future
-            future.set_exception(exc)
-        return future
-
-    # The real thread's submit_forward only skips its settle hook.
-    submit_forward = submit
-
-    def run(self, fn):
-        self._trace.append("run")
-        return fn()
-
-
 def _peer(trace=None):
     """A P-role transfer peer the handle will recognize by type."""
 
@@ -289,8 +259,9 @@ def _peer(trace=None):
 def _handle(trace, **kwargs):
     return DeviceHandle(
         SimpleNamespace(
-            forward_thread=_ForwardThread(trace),
+            device="cpu",
             execute_forward_op=lambda *a, **k: trace.append("forward"),
+            complete_pending_drafting=lambda: None,
             execution_stream="execution-stream",
             default_stream="default-stream",
             write_remote_spec_candidate_ids=lambda idx, ids: trace.append(
@@ -460,8 +431,7 @@ def _profile_batch(mode):
 )
 def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
     batch = _profile_batch(mode)
-    trace = []
-    result = SimpleNamespace(sync=lambda: trace.append("sync"))
+    result = object()
 
     def cpu_forward(op, sampling_params, **kwargs):
         assert op is batch
@@ -470,20 +440,12 @@ def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
             torch.ones(2, device="cpu").add_(1)
         return result
 
-    handle = DeviceHandle(
-        SimpleNamespace(
-            forward_thread=_ForwardThread(trace),
-            execute_forward_op=cpu_forward,
-        )
-    )
+    handle = DeviceHandle(SimpleNamespace(device="cpu", execute_forward_op=cpu_forward))
     planned = replace(_planned(num_extends=batch.num_extends()), forward_op=batch)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU]
     ) as profiler:
-        assert (
-            handle._submit_forward(planned, capture_next_input_ids=True).result()
-            is result
-        )
+        assert handle._launch_forward(planned, capture_next_input_ids=True) is result
     ranges = [
         event
         for event in profiler.events()
@@ -513,7 +475,6 @@ def test_forward_profile_range_preserves_real_batch_metadata_and_result(mode):
     assert inner.thread == ranges[0].thread
     assert inner.time_range.start >= ranges[0].time_range.start
     assert inner.time_range.end <= ranges[0].time_range.end
-    assert trace == ["submit", "sync"]
 
 
 def test_profile_range_closes_and_propagates_original_forward_exception():
@@ -523,19 +484,13 @@ def test_profile_range_closes_and_propagates_original_forward_exception():
     def cpu_forward(*args, **kwargs):
         raise failure
 
-    handle = DeviceHandle(
-        SimpleNamespace(
-            forward_thread=_ForwardThread([]),
-            execute_forward_op=cpu_forward,
-        )
-    )
+    handle = DeviceHandle(SimpleNamespace(device="cpu", execute_forward_op=cpu_forward))
     planned = replace(_planned(num_extends=1), forward_op=batch)
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CPU]
     ) as profiler:
-        pending = handle._submit_forward(planned)
         with pytest.raises(RuntimeError) as raised:
-            pending.result()
+            handle._launch_forward(planned)
         assert raised.value is failure
         with torch.profiler.record_function("after_failed_forward"):
             pass
@@ -560,24 +515,24 @@ def test_unprofiled_forward_never_reads_profile_metadata(monkeypatch, missing_st
         assert not torch.autograd.profiler._is_profiler_enabled
     trace = []
     handle = _handle(trace)
-    handle._submit_forward(_planned(num_extends=0))
-    assert trace == ["submit", "forward"]
+    handle._launch_forward(_planned(num_extends=0))
+    assert trace == ["forward"]
 
 
 # ----------------------------------------------------------------------
-# PD completion: device writes belong to the data plane, in one submission.
+# PD completion: device writes belong to the data plane, in order.
 # ----------------------------------------------------------------------
 
 
 def test_remote_prefill_landing_writes_both_on_the_device():
     trace: list = []
     _handle(trace).run_remote_prefill_landing((7, [11, 12]), 7)
-    # One crossing, not two, and the candidates precede the readiness arm:
-    # hydration reads the row the candidates were just written into.
-    assert trace == ["run", ("candidates", 7, [11, 12]), ("ready", 7)]
+    # The candidates precede the readiness arm: hydration reads the row the
+    # candidates were just written into.
+    assert trace == [("candidates", 7, [11, 12]), ("ready", 7)]
 
 
-def test_a_landing_without_device_work_submits_nothing():
+def test_a_landing_without_device_work_touches_nothing():
     trace: list = []
     _handle(trace).run_remote_prefill_landing(None, None)
     assert trace == []
@@ -588,7 +543,7 @@ def test_an_aborted_request_lands_its_candidates_without_arming():
     # moved: the candidates still land, the slot is not armed.
     trace: list = []
     _handle(trace).run_remote_prefill_landing((7, [11, 12]), None)
-    assert trace == ["run", ("candidates", 7, [11, 12])]
+    assert trace == [("candidates", 7, [11, 12])]
 
 
 # ----------------------------------------------------------------------
@@ -599,8 +554,8 @@ def test_an_aborted_request_lands_its_candidates_without_arming():
 
 
 def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
-    """The FIFO carries the correctness order for same-round page reuse: the
-    write-backs are submitted ahead of the new owner's zeroing (a
+    """The plan's order is the correctness order for same-round page reuse:
+    the write-backs are submitted ahead of the new owner's zeroing (a
     stream-ordered snapshot copy lands its fence on the default stream the
     zeroing runs on), and the load-backs target zeroed pages. Every stream is
     named: the copies are told which stream wrote the pages and which one
@@ -629,24 +584,20 @@ def test_one_plan_orders_write_backs_zeroing_then_load_backs(wire_ops):
     _execute(handle, plan, None)
 
     assert trace == [
-        "submit",
         ("write_backs", (store, load), "execution-stream", "default-stream"),
-        "submit",
         ("zero", {"kv": (3, 4)}),
-        "submit",
         ("load_backs", (store, load), "default-stream"),
     ]
-    # Polling never touches the FIFO — the round head must not wait on it.
+    # Polling only reads the acknowledgments: it submits nothing.
     assert handle.poll_cache_results() == ["done"]
-    assert trace[-1] != "submit"
+    assert len(trace) == 3
 
 
 def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
     """A prefix hit's private copy (or an owner's move off its published
-    block) rides the same FIFO: after the stores' fence, before the zeroing
-    -- its source may be re-granted and zeroed by this very plan -- and only
-    when some group has pairs. Groups without pairs never reach the
-    executor."""
+    block) goes after the stores' fence, before the zeroing -- its source may
+    be re-granted and zeroed by this very plan -- and only when some group
+    has pairs. Groups without pairs never reach the executor."""
     trace: list = []
     store = _WriteBackOp("store")
     plan = _plan(
@@ -675,26 +626,22 @@ def test_page_copies_follow_the_stores_and_precede_the_zeroing(wire_ops):
     _execute(handle, plan, None)
 
     assert trace == [
-        "submit",
         ("write_backs", (store,)),
-        "submit",
         ("copy", {"kv": [[3, 8], [5, 9]]}),
-        "submit",
         ("zero", {"kv": (3,)}),
-        "submit",
         ("load_backs", (store,)),
     ]
 
-    # A plan with no pairs submits no copy at all.
+    # A plan with no pairs runs no copy at all.
     trace.clear()
     _execute(handle, _plan(pages_to_zero=[2], pages_to_copy={"kv": []}), None)
-    assert trace == ["submit", ("zero", {"kv": (2,)})]
+    assert trace == [("zero", {"kv": (2,)})]
 
 
-def test_a_failed_page_copy_surfaces_at_the_next_round(wire_ops):
-    """The copy has no completion event, so its exception would otherwise
-    vanish on the data plane; ``execute`` settles the previous round's copy
-    submissions before enqueueing anything."""
+def test_a_failed_page_copy_fails_the_plan(wire_ops):
+    """The copy has no completion event, so its failure raises from the
+    plan's ``execute`` itself, before the zeroing and the forward behind it
+    run."""
     trace: list = []
     handle = _handle(trace)
 
@@ -702,9 +649,14 @@ def test_a_failed_page_copy_surfaces_at_the_next_round(wire_ops):
         raise IndexError("local block ID 99 outside [0, 8)")
 
     handle._executor.copy_cache_pages = failing_copy
-    _execute(handle, _plan(pages_to_copy={"kv": [(1, 99)]}), None)
-    with pytest.raises(RuntimeError, match="page copy submission failed"):
-        _execute(handle, _plan(), None)
+    handle._executor.zero_cache_pages = lambda pages: trace.append("zero")
+    with pytest.raises(IndexError, match="99"):
+        _execute(
+            handle,
+            _plan(pages_to_zero=[3], pages_to_copy={"kv": [(1, 99)]}),
+            _planned(num_extends=0),
+        )
+    assert trace == []
 
 
 def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
@@ -744,12 +696,12 @@ def test_snapshot_stores_fence_before_zeroing_and_restores_follow_it(wire_ops):
 
     _execute(handle, plan, None)
 
-    kinds = [entry[0] if isinstance(entry, tuple) else entry for entry in trace]
-    assert kinds == ["submit", "write_backs", "submit", "zero", "submit", "load_backs"]
-    # Stores precede the zeroing on the FIFO, and the fence they record lands
-    # on the stream the zeroing runs on.
-    stores = trace[1][1]
-    assert trace[1][2] == "default-stream"
+    kinds = [entry[0] for entry in trace]
+    assert kinds == ["write_backs", "zero", "load_backs"]
+    # Stores precede the zeroing, and the fence they record lands on the
+    # stream the zeroing runs on.
+    stores = trace[0][1]
+    assert trace[0][2] == "default-stream"
     assert [type(op).__name__ for op in stores] == [
         "_WriteBackOp",
         "SnapshotOp",
@@ -801,11 +753,10 @@ def test_a_victims_slot_regranted_in_the_same_plan_is_read_behind_the_fence(
 
     _execute(handle, plan, planned)
 
-    order = [entry for entry in trace if entry != "submit"]
-    assert order == [("store", [6]), "zero", "load_backs", ("forward", [6])]
+    assert trace == [("store", [6]), "zero", "load_backs", ("forward", [6])]
 
 
-def test_page_zeroing_without_l2_submits_only_zeroing():
+def test_page_zeroing_without_l2_runs_only_zeroing():
     trace: list = []
     handle = _handle(trace)
     handle._executor.zero_cache_pages = lambda pages: trace.append(
@@ -814,10 +765,10 @@ def test_page_zeroing_without_l2_submits_only_zeroing():
 
     _execute(handle, _plan(pages_to_zero=[3, 4]), None)
 
-    assert trace == ["submit", ("zero", {"kv": (3, 4)})]
+    assert trace == [("zero", {"kv": (3, 4)})]
 
 
-def test_a_plan_with_no_device_work_submits_nothing():
+def test_a_plan_with_no_device_work_touches_nothing():
     trace: list = []
     handle = _handle(trace, host_cache_executor=SimpleNamespace())
 
@@ -826,9 +777,9 @@ def test_a_plan_with_no_device_work_submits_nothing():
     assert trace == []
 
 
-def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
-    """A submission that raised produces no completion acks; swallowing it
-    would leave its ops counted in flight forever."""
+def test_a_failed_cache_submission_fails_the_plan(wire_ops):
+    """A submission that raised produces no completion acks; it raises from
+    the plan's ``execute``, so its ops never sit counted in flight."""
     trace: list = []
 
     def exploding(ops, *, prerequisite_stream, fence_stream):
@@ -838,22 +789,18 @@ def test_a_failed_cache_submission_surfaces_at_the_next_poll(wire_ops):
         trace,
         host_cache_executor=SimpleNamespace(
             submit_write_backs=exploding,
-            submit_load_backs=lambda ops, *, prerequisite_stream: None,
-            poll_results=lambda: [],
+            submit_load_backs=lambda ops, *, prerequisite_stream: trace.append(
+                "load_backs"
+            ),
         ),
     )
 
-    # Submission itself never raises (fire-and-forget)...
-    _execute(handle, _plan(cache=[_WriteBackOp("op")]), None)
-    # ...the failure re-raises at the round head, data-plane cause chained.
-    with pytest.raises(RuntimeError, match="cache-plan submission failed") as info:
-        handle.poll_cache_results()
-    assert isinstance(info.value.__cause__, ValueError)
+    with pytest.raises(ValueError, match="bad cache op"):
+        _execute(handle, _plan(cache=[_WriteBackOp("op")]), None)
+    assert trace == []
 
 
-def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
-    from concurrent.futures import Future
-
+def test_shutdown_cache_closes_the_host_cache():
     trace: list = []
     handle = _handle(
         trace,
@@ -861,53 +808,12 @@ def test_shutdown_cache_joins_submissions_then_closes_on_the_forward_thread():
             shutdown=lambda: trace.append("l2_shutdown"),
         ),
     )
-    for queue in (
-        handle._l2_submissions,
-        handle._transfer_submissions,
-        handle._copy_submissions,
-    ):
-        pending = Future()
-        pending.set_result(None)
-        queue.append(pending)
 
     handle.shutdown_cache()
+    # Without a Host cache there is nothing to close.
+    _handle(trace).shutdown_cache()
 
-    assert list(handle._l2_submissions) == []
-    assert list(handle._transfer_submissions) == []
-    assert list(handle._copy_submissions) == []
-    assert trace == ["run", "l2_shutdown"]
-
-
-def test_shutdown_cache_surfaces_a_failed_final_round_copy_without_a_host_cache():
-    """A copy or transfer queued by the last round has no next round to settle
-    it; shutdown joins it and re-raises even with no Host cache to close."""
-    from concurrent.futures import Future
-
-    handle = _handle([])
-    failed = Future()
-    failed.set_exception(IndexError("local block ID 99 outside [0, 8)"))
-    handle._copy_submissions.append(failed)
-    settled = Future()
-    settled.set_result(None)
-    handle._transfer_submissions.append(settled)
-
-    with pytest.raises(IndexError, match="99"):
-        handle.shutdown_cache()
-    assert list(handle._copy_submissions) == []
-    assert list(handle._transfer_submissions) == []
-
-
-def test_shutdown_cache_finishes_the_last_pending_round_without_a_host_cache():
-    """With no Host cache to close, shutdown still runs a forward-thread task,
-    which finishes the last forward's pending draft round."""
-    pending = ["round"]
-    thread = ForwardThread(torch.device("cpu"), settle=pending.clear)
-    handle = DeviceHandle(SimpleNamespace(forward_thread=thread))
-    try:
-        handle.shutdown_cache()
-    finally:
-        thread.shutdown()
-    assert pending == []
+    assert trace == ["l2_shutdown"]
 
 
 def test_cache_polling_without_kvstore_refuses_loudly():
@@ -927,10 +833,10 @@ def test_an_unrecognized_transfer_peer_is_refused():
         _handle([], kv_transfer=SimpleNamespace())
 
 
-def test_the_remote_decode_and_the_arming_ride_the_fifo():
+def test_the_remote_decode_and_the_arming_keep_the_forward_order():
     """The send walks KV-pool device memory the forwards wrote, and the
     arming must precede the forward it arms. Both orderings come from the
-    FIFO, not from the loop's scheduling rules."""
+    forward thread's order, not from the loop's scheduling rules."""
     trace: list = []
     handle = _handle(trace, kv_transfer=_peer(trace))
 
@@ -940,12 +846,11 @@ def test_the_remote_decode_and_the_arming_ride_the_fifo():
     _execute(handle, _plan(), chunk)
     _execute(handle, _plan(remote_decode=remote_decode), None)
 
-    # Arming is enqueued before the forward it arms; the send follows the
-    # forwards whose KV it reads (the scheduler emits a remote decode only
-    # after its final chunk's result landed), submitted asynchronously like
-    # the forwards themselves.
-    assert trace[:3] == ["submit", ("arm", chunk.forward_op), "submit"]
-    assert trace[-2:] == ["submit", ("send", remote_decode)]
+    # Arming goes before the forward it arms; the send follows the forwards
+    # whose KV it reads (the scheduler emits a remote decode only after its
+    # final chunk's result landed), handed over without waiting, like the
+    # forwards themselves.
+    assert trace == [("arm", chunk.forward_op), "forward", ("send", remote_decode)]
 
 
 # ----------------------------------------------------------------------
@@ -1096,8 +1001,35 @@ def test_gather_resolves_the_decode_delta_on_the_live_struct():
 
 
 # ----------------------------------------------------------------------
-# The dispatch guard: device work on the pump thread raises.
+# The forward thread's device; the dispatch guard: device work on the
+# control thread raises.
 # ----------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="needs a second GPU to tell devices apart"
+)
+def test_the_forward_thread_takes_the_device_the_handle_was_built_on():
+    """Torch starts every new thread on device 0; the handle resolves an
+    index-less device on the building thread and gives it to the forward
+    thread."""
+    seen = []
+
+    def forward_thread(handle):
+        seen.append(torch.cuda.current_device())
+        handle.bind_forward_thread()
+        seen.append(torch.cuda.current_device())
+
+    previous = torch.cuda.current_device()
+    torch.cuda.set_device(1)
+    try:
+        handle = DeviceHandle(SimpleNamespace(device="cuda"))
+    finally:
+        torch.cuda.set_device(previous)
+    thread = threading.Thread(target=forward_thread, args=(handle,))
+    thread.start()
+    thread.join()
+    assert seen == [0, 1]
 
 
 def test_the_guard_rejects_cuda_factories_before_they_run():
@@ -1147,21 +1079,13 @@ def test_metadata_only_ops_are_recognized_by_schema():
     assert not _only_aliases_inputs(torch.ops.aten.copy_.default)
 
 
-def test_epd_receive_allocation_crosses_through_the_runner(monkeypatch):
-    """The job's device steps run wherever the runner says — the engine
-    passes ``DeviceHandle.run_multimodal_work``, so they land on the forward
-    thread; ``None`` (the blocking test wrapper) runs them inline."""
+def test_epd_receive_registers_its_own_buffer_without_the_pool(monkeypatch):
+    """With no receive pool, the job allocates the item's receive buffer and
+    registers it with the transfer engine itself."""
     from tokenspeed.runtime.epd import prefill_admission
 
-    # Force the legacy path: with no pool, the receive buffer must be
-    # allocated through the runner.
     monkeypatch.setattr(prefill_admission, "_get_pool", lambda engine, device: None)
-
-    ran: list = []
-
-    def runner(work):
-        ran.append(work)
-        return work()
+    registered: list = []
 
     item = SimpleNamespace(
         encode_handshake={
@@ -1182,26 +1106,28 @@ def test_epd_receive_allocation_crosses_through_the_runner(monkeypatch):
 
     job = prefill_admission.EmbeddingReceiveJob(
         [item],
-        SimpleNamespace(engine=SimpleNamespace(register=lambda *a: None)),
+        SimpleNamespace(
+            engine=SimpleNamespace(
+                register=lambda ptr, nbytes: registered.append((ptr, nbytes))
+            )
+        ),
         hidden=8,
         num_deepstack=0,
         dtype=torch.float32,
         device="cpu",
         receiver_factory=_Receiver,
-        run_device_work=runner,
     )
 
-    assert len(ran) == 1  # exactly the recv-buffer allocation
-    assert job._items[0].recv_main.shape == (4, 8)
+    recv_main = job._items[0].recv_main
+    assert recv_main.shape == (4, 8)
+    assert registered == [(recv_main.data_ptr(), 4 * 8 * 4)]
 
 
-def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
-    tmp_path,
-):
-    """The load counters are zeroed and read back through the forward thread,
-    on the execution stream the routing kernels bump them on, and the dump is
-    this rank's record alone: no collective, so a profile stop that reaches
-    attention-DP workers independently cannot deadlock."""
+def test_expert_load_reset_and_dump_ride_the_execution_stream(tmp_path):
+    """The load counters are zeroed and read back on the execution stream the
+    routing kernels bump them on, and the dump is this rank's record alone:
+    no collective, so a profile stop that reaches attention-DP workers
+    independently cannot deadlock."""
     import contextlib
 
     from tokenspeed.runtime.moe import expert_location
@@ -1215,7 +1141,6 @@ def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
     )
     placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
-    trace: list = []
     streams: list = []
 
     class _DeviceModule:
@@ -1226,9 +1151,10 @@ def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
 
     handle = DeviceHandle(
         SimpleNamespace(
-            forward_thread=_ForwardThread(trace),
+            device="cpu",
             device_module=_DeviceModule(),
             execution_stream="execution-stream",
+            complete_pending_drafting=lambda: None,
         )
     )
     expert_location.set_global_expert_location_metadata(placement)
@@ -1240,7 +1166,6 @@ def test_expert_load_reset_and_dump_ride_the_data_plane_on_the_execution_stream(
         handle.reset_expert_load()
     finally:
         expert_location.set_global_expert_location_metadata(None)
-    assert trace == ["run", "run"]
     assert streams == ["execution-stream", "execution-stream"]
     saved = torch.load(tmp_path / "load.pt", weights_only=True)
     assert torch.equal(saved["physical_count"], record["physical_count"])
@@ -1295,9 +1220,9 @@ def test_expert_load_counters_start_serving_at_zero_after_the_startup_forwards()
 
 
 def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
-    """The online rebalance's window boundary: one data-plane crossing that
-    copies the counters to the host and zeroes them on the execution stream,
-    with no collective (the gate reduces the result afterwards)."""
+    """The online rebalance's window boundary: one operation that copies the
+    counters to the host and zeroes them on the execution stream, with no
+    collective (the gate reduces the result afterwards)."""
     import contextlib
 
     from tokenspeed.runtime.moe import expert_location
@@ -1311,7 +1236,6 @@ def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
     )
     placement.enable_load_recording(Mapping(rank=1, world_size=2, moe_ep_size=2))
     placement.physical_load.copy_(torch.tensor([[3, 1, 2, 5], [0, 4, 0, 4]]))
-    trace: list = []
     streams: list = []
 
     class _DeviceModule:
@@ -1322,9 +1246,10 @@ def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
 
     handle = DeviceHandle(
         SimpleNamespace(
-            forward_thread=_ForwardThread(trace),
+            device="cpu",
             device_module=_DeviceModule(),
             execution_stream="execution-stream",
+            complete_pending_drafting=lambda: None,
         )
     )
     expert_location.set_global_expert_location_metadata(placement)
@@ -1335,7 +1260,7 @@ def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
             snapshot = handle.snapshot_expert_load()
     finally:
         expert_location.set_global_expert_location_metadata(None)
-    assert trace == ["run"] and streams == ["execution-stream"]
+    assert streams == ["execution-stream"]
     assert snapshot.physical_count.tolist() == [[3, 1, 2, 5], [0, 4, 0, 4]]
     assert snapshot.logical_count.tolist() == [[8, 1, 2], [0, 8, 0]]
     assert torch.equal(
@@ -1345,10 +1270,10 @@ def test_expert_load_snapshot_reads_then_zeroes_on_the_execution_stream():
 
 
 def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream():
-    """A chunk is one blocking data-plane crossing: the updater moves the
-    weights and switches the tables inside the execution stream, and the
-    stream is synchronized before the call returns so a P2P failure surfaces
-    in the op's reply. Without --enable-eplb there is no updater to run."""
+    """A chunk is one blocking operation: the updater moves the weights and
+    switches the tables inside the execution stream, and the stream is
+    synchronized before the call returns so a P2P failure surfaces in the
+    op's reply. Without --enable-eplb there is no updater to run."""
     import contextlib
 
     from tokenspeed.runtime.moe.expert_rebalance import SlotMoves
@@ -1374,23 +1299,24 @@ def test_expert_placement_chunk_applies_then_synchronizes_the_execution_stream()
     rows = torch.tensor([[0, 0, 1, 2]])
     handle = DeviceHandle(
         SimpleNamespace(
-            forward_thread=_ForwardThread(trace),
+            device="cpu",
             device_module=_DeviceModule(),
             execution_stream=stream,
             model_runner=SimpleNamespace(expert_location_updater=_Updater()),
+            complete_pending_drafting=lambda: None,
         )
     )
     handle.apply_expert_placement((0,), rows, moves)
     assert trace == [
-        "run",
         ("stream", stream),
         ("apply", (0,), [[0, 0, 1, 2]], moves),
         "synchronize",
     ]
     handle = DeviceHandle(
         SimpleNamespace(
-            forward_thread=_ForwardThread([]),
+            device="cpu",
             model_runner=SimpleNamespace(expert_location_updater=None),
+            complete_pending_drafting=lambda: None,
         )
     )
     with pytest.raises(RuntimeError, match="--enable-eplb"):
@@ -1434,8 +1360,33 @@ def test_device_consumes_the_explicit_snapshot_without_reading_plan_cache():
     assert plan.reads == 1 and trace == []
 
 
+def test_every_task_but_a_forward_runs_behind_a_pending_draft_round():
+    """A drafter may leave its round pending after a forward; the next forward
+    finishes it itself, and every other forward-thread task finishes it
+    first."""
+    trace: list = []
+    handle = _handle(trace)
+    handle._executor.complete_pending_drafting = lambda: trace.append("settle")
+    handle._executor.zero_cache_pages = lambda pages: trace.append("zero")
+    handle._executor.execute_idle_forward = lambda dp: trace.append("idle")
+    handle._executor.device_module = SimpleNamespace(
+        synchronize=lambda: trace.append("synchronize")
+    )
+
+    _execute(handle, _plan(), _planned(num_extends=0))
+    assert trace == ["forward"]
+    trace.clear()
+    _execute(handle, _plan(pages_to_zero=[3]), _planned(num_extends=0))
+    assert trace == ["settle", "zero", "forward"]
+    trace.clear()
+    handle.run_idle_forward(None)
+    handle.synchronize()
+    handle.run_remote_prefill_landing(None, 4)
+    assert trace == ["settle", "idle", "settle", "synchronize", "settle", ("ready", 4)]
+
+
 # ----------------------------------------------------------------------
-# Memory-saver release/wake: what surrounds the unmap runs on the data plane.
+# Memory-saver release/wake: what surrounds the unmap, in order.
 # ----------------------------------------------------------------------
 
 
@@ -1468,9 +1419,13 @@ class _SleepExecutor:
     """Only what the release/wake operations read off the executor."""
 
     def __init__(self, trace) -> None:
-        self.forward_thread = _ForwardThread(trace)
+        self.device = "cpu"
         self.device_module = _SleepDeviceModule(trace)
         self.token_to_kv_pool = _SleepPool(trace)
+
+    def complete_pending_drafting(self) -> None:
+        # No drafter.
+        pass
 
 
 class _RegisteringDecodePeer:
@@ -1491,17 +1446,16 @@ class _RegisteringDecodePeer:
         self._trace.append("peer.register")
 
 
-def test_kv_release_quiesces_copies_and_deregisters_the_peer_on_the_forward_thread():
+def test_kv_release_quiesces_copies_and_deregisters_the_peer():
     trace = []
     handle = DeviceHandle(
         _SleepExecutor(trace), kv_transfer=_RegisteringDecodePeer(trace)
     )
 
     handle.prepare_kv_release()
-    # One blocking submission: the offload copy streams, then the device, then
-    # the registration that pins the pages about to be unmapped.
+    # The offload copy streams, then the device, then the registration that
+    # pins the pages about to be unmapped.
     assert trace == [
-        "run",
         "arena.synchronize",
         "device.synchronize",
         "peer.deregister",
@@ -1510,7 +1464,7 @@ def test_kv_release_quiesces_copies_and_deregisters_the_peer_on_the_forward_thre
 
     handle.finish_kv_resume()
     # Zero the re-mapped garbage before a peer can write into it again.
-    assert trace == ["run", "clear_kv_buffers", "peer.register"]
+    assert trace == ["clear_kv_buffers", "peer.register"]
 
 
 def test_kv_release_without_a_peer_only_quiesces_and_repairs():
@@ -1522,17 +1476,14 @@ def test_kv_release_without_a_peer_only_quiesces_and_repairs():
     handle.synchronize()
 
     assert trace == [
-        "run",
         "arena.synchronize",
         "device.synchronize",
-        "run",
         "clear_kv_buffers",
-        "run",
         "device.synchronize",
     ]
 
 
-def test_nccl_suspend_and_resume_ride_the_forward_thread(monkeypatch):
+def test_nccl_suspend_and_resume_reach_the_communicators(monkeypatch):
     from tokenspeed.runtime.execution import device as device_module
 
     trace = []
@@ -1547,4 +1498,4 @@ def test_nccl_suspend_and_resume_ride_the_forward_thread(monkeypatch):
     handle.suspend_nccl()
     handle.resume_nccl()
 
-    assert trace == ["run", "suspend", "run", "resume"]
+    assert trace == ["suspend", "resume"]

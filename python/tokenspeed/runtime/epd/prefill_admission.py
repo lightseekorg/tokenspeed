@@ -128,10 +128,10 @@ class _RecvBufferPool:
     tenant's data, so failed slots sit in quarantine until the transfer layer's
     timeouts have expired.
 
-    Two threads touch the freelists: leases and sweeps run on the scheduler
-    loop, while ``release_after_copy`` runs inside the drain's data-plane
-    closure (the event must be recorded right after the clone, on the forward
-    thread's stream). The lock covers every freelist mutation.
+    Leases and sweeps run in the admission's operations, and
+    ``release_after_copy`` inside the drain right after the clone (its event
+    must be recorded on the forward thread's stream); the forward thread runs
+    them all. The lock covers every freelist mutation.
     """
 
     def __init__(self, engine: Any, device: Any, slot_bytes: int, n_slots: int):
@@ -353,14 +353,8 @@ class EmbeddingReceiveJob:
         receiver_factory: ReceiverFactory | None = None,
         shard_rank: int = 0,
         shard_size: int = 1,
-        run_device_work: Any = None,
     ):
         self.manager = manager
-        # Device steps (buffer allocation, publish clone/scatter, shard
-        # reassembly) go through here — DeviceHandle.run_multimodal_work in
-        # the engine, so they land on the forward thread. None (tests, the
-        # blocking receive_encoded_embeddings wrapper) runs them inline.
-        self._run_device = run_device_work or (lambda work: work())
         self.hidden = hidden
         self.num_deepstack = num_deepstack
         # Row sharding across the attn-TP group: with shard_size > 1 this rank
@@ -483,10 +477,8 @@ class EmbeddingReceiveJob:
                     )
                     pool = None
         if recv_main is None:
-            recv_main = self._run_device(
-                lambda: torch.empty(
-                    (packed_tokens, self.hidden), dtype=self.dtype, device=device
-                )
+            recv_main = torch.empty(
+                (packed_tokens, self.hidden), dtype=self.dtype, device=device
             )
             # Legacy fallback (pool disabled/exhausted, oversized item, or
             # deepstack present): register per request; the deregister is DEFERRED
@@ -499,12 +491,10 @@ class EmbeddingReceiveJob:
                 )
         recv_deepstack: torch.Tensor | None = None
         if self.num_deepstack > 0:
-            recv_deepstack = self._run_device(
-                lambda: torch.empty(
-                    (packed_tokens, self.hidden * self.num_deepstack),
-                    dtype=self.dtype,
-                    device=device,
-                )
+            recv_deepstack = torch.empty(
+                (packed_tokens, self.hidden * self.num_deepstack),
+                dtype=self.dtype,
+                device=device,
             )
             if packed_tokens > 0:
                 self.manager.engine.register(
@@ -620,43 +610,34 @@ class EmbeddingReceiveJob:
                 # before releasing it. When sharded the buffer is packed (this
                 # rank's rows only), so scatter into a full-layout tensor at each
                 # image's absolute offset (reassemble fills the rest); when not
-                # sharded the buffer is already full -> clone it. The clone and
-                # the slot-release event are device work: they run on the data
-                # plane, and blocking here keeps item.encoded set before the
-                # admission returns (the dispatch-time assert reads it).
-                def _publish_pooled(it=it, any_sharded=any_sharded):
-                    encoded = (
-                        self._packed_to_full(it, it.recv_main, self.hidden)
-                        if any_sharded
-                        else it.recv_main.clone()
-                    )
-                    it.pool.release_after_copy(it.pool_slot, encoded)
-                    return encoded
-
-                it.item.encoded = self._run_device(_publish_pooled)
+                # sharded the buffer is already full -> clone it. item.encoded
+                # is set before the admission returns (the dispatch-time assert
+                # reads it).
+                encoded = (
+                    self._packed_to_full(it, it.recv_main, self.hidden)
+                    if any_sharded
+                    else it.recv_main.clone()
+                )
+                it.pool.release_after_copy(it.pool_slot, encoded)
+                it.item.encoded = encoded
                 it.item.encoded_deepstack = None
             else:
                 # Legacy path. When sharded, the packed buffers are smaller than
                 # the image and cannot alias item.encoded, so build separate full
-                # tensors (device work -> data plane); when not sharded, hand the
-                # (full) buffers over directly — a pure reference handoff.
+                # tensors; when not sharded, hand the (full) buffers over
+                # directly — a pure reference handoff.
                 if any_sharded:
-
-                    def _publish_legacy(it=it):
-                        encoded = self._packed_to_full(it, it.recv_main, self.hidden)
-                        deep = (
-                            self._packed_to_full(
-                                it,
-                                it.recv_deepstack,
-                                self.hidden * self.num_deepstack,
-                            )
-                            if it.recv_deepstack is not None
-                            else None
+                    it.item.encoded = self._packed_to_full(
+                        it, it.recv_main, self.hidden
+                    )
+                    it.item.encoded_deepstack = (
+                        self._packed_to_full(
+                            it,
+                            it.recv_deepstack,
+                            self.hidden * self.num_deepstack,
                         )
-                        return encoded, deep
-
-                    it.item.encoded, it.item.encoded_deepstack = self._run_device(
-                        _publish_legacy
+                        if it.recv_deepstack is not None
+                        else None
                     )
                 else:
                     it.item.encoded = it.recv_main
@@ -702,11 +683,9 @@ class EmbeddingReceiveJob:
         consumes ``item.encoded``: until then each rank's buffer holds only its
         own shard rows, the rest is uninitialized memory. All ranks iterate the
         identical items/images in identical order issuing identical collectives
-        — and the broadcasts run through the device-work runner, i.e. on the
-        forward thread, the same single thread that issues the model's
-        collectives, which is what keeps the cross-rank launch order identical
-        across communicators (NCCL's requirement). Before the forward-thread
-        split this had to lean on the NON-overlap loop instead.
+        — and the broadcasts run on the forward thread, the same single thread
+        that issues the model's collectives, which is what keeps the cross-rank
+        launch order identical across communicators (NCCL's requirement).
 
         ``group_ranks`` is the attn-TP group as GLOBAL ranks
         (``mapping.attn.tp_group``): ``dist.broadcast`` takes a global src rank,
@@ -754,7 +733,7 @@ class EmbeddingReceiveJob:
                             )
                     cursor += span
 
-        self._run_device(_broadcast_shards)
+        _broadcast_shards()
 
     def _clear_receivers(self) -> None:
         """Release each receiver's per-room manager bookkeeping (terminal paths only;
@@ -815,7 +794,6 @@ def start_embedding_receive(
     receiver_factory: ReceiverFactory | None = None,
     shard_rank: int = 0,
     shard_size: int = 1,
-    run_device_work: Any = None,
 ) -> EmbeddingReceiveJob:
     """Begin (non-blocking) the per-item EPD embedding receive for one request.
 
@@ -837,7 +815,6 @@ def start_embedding_receive(
         receiver_factory=receiver_factory,
         shard_rank=shard_rank,
         shard_size=shard_size,
-        run_device_work=run_device_work,
     )
 
 
@@ -926,8 +903,8 @@ class EpdPrefillAdmission:
     Owns the encode->prefill embedding sink (MooncakeEmbeddingManagerPrefill), the
     set of requests whose per-image embeddings are still arriving (``_pending``),
     and the optional NCCL row-shard reassembly. Exists ONLY on a multimodal prefill
-    node, where the data plane holds one and the control plane polls it every
-    round.
+    node, where the data plane holds one and polls it each round the control
+    plane asks.
 
     DECIDE/ACT split: ``drain()`` polls the staged receives, applies the rank-
     lockstep MIN all-reduce + reassembly, and RETURNS ``(admitted, failed)``
@@ -950,16 +927,12 @@ class EpdPrefillAdmission:
         attn_tp_cpu_group,
         attn_tp_group,
         pg_manager,
-        run_device_work=None,
     ):
         self._manager = manager
         self._device = device
-        # Device steps cross to the data plane through this; None (tests)
-        # runs them inline. See EmbeddingReceiveJob.
-        self._run_device_work = run_device_work
         # Build the lifetime-MR receive pool NOW, on the startup thread:
-        # lazily it would be a multi-GB CUDA allocation inside the event
-        # loop on the first EPD request — device work on the control plane.
+        # lazily it would be a multi-GB CUDA allocation (and its memory
+        # registration) stalling the forward thread on the first EPD request.
         _get_pool(manager.engine, device)
         self._hidden = hidden
         self._num_deepstack = num_deepstack
@@ -984,9 +957,9 @@ class EpdPrefillAdmission:
 
         # EPD embedding row-sharding: each attn-TP rank receives only 1/N of every
         # image's rows over the wire; the full embedding is rebuilt by an NCCL
-        # all-gather in drain() (job.reassemble), which runs on the prefill's
-        # NON-overlap loop so the drain and the forward launch from one thread in
-        # the same order on every rank -- the cross-rank launch-order consistency
+        # all-gather in drain() (job.reassemble), which runs on the forward
+        # thread, so the drain and the forward launch from one thread in the
+        # same order on every rank -- the cross-rank launch-order consistency
         # NCCL requires across communicators.
         self._shard_embeddings = False
         self._nccl_group = None
@@ -1038,7 +1011,6 @@ class EpdPrefillAdmission:
             device=self._device,
             shard_rank=self._attn_tp_rank,
             shard_size=self._attn_tp_size if self._shard_embeddings else 1,
-            run_device_work=self._run_device_work,
         )
         self._pending.append((request_id, job, time.time()))
 
@@ -1187,7 +1159,6 @@ def make_epd_prefill_admission(
     attn_tp_size,
     attn_tp_cpu_group,
     pg_manager,
-    run_device_work=None,
 ):
     """Build the EPD-prefill admission controller, or None for non-EPD nodes.
 
@@ -1226,7 +1197,6 @@ def make_epd_prefill_admission(
         attn_tp_cpu_group=attn_tp_cpu_group,
         attn_tp_group=mapping.attn.tp_group,
         pg_manager=pg_manager,
-        run_device_work=run_device_work,
     )
     if mapping.has_pp:
         return PipelineEpdPrefillAdmission(

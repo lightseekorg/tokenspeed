@@ -20,12 +20,11 @@
 
 """The profiler a scheduler process runs on request (``ProfileReq``).
 
-Shared by both control planes: the Python request handler drives it from the
-event loop, and the Rust engine host's data-plane pump drives it from the
-control thread's operations (``engine/rust_host.py``). Either way it counts
-each committed forward (``note_forward``), so ``start_step`` and
-``num_steps`` count forwards, and the attention-TP peers rendezvous over a
-CPU group around each trace they write.
+The Rust engine host's forward thread drives it (``engine/rust_host.py``):
+the control plane's profile requests and the note of each committed forward
+(``note_forward``) reach it in the control plane's order, so ``start_step``
+and ``num_steps`` count forwards, and the attention-TP peers rendezvous over
+a CPU group around each trace they write.
 
 Profilers: torch (CPU, GPU), CUDA_PROFILER, MEM snapshots, EXPERT_LOAD
 counters, viztracer and Proton. Proton must be driven from the scheduler
@@ -108,9 +107,8 @@ class Profiler:
         self.attn_tp_size = sync_size
         self.attn_tp_cpu_group = sync_group
         self.profile_rank_tag = _profile_rank_tag(attn_mapping)
-        # Rendezvous buffer for _profile_sync. Preallocated because the stage
-        # transitions run on the control-plane thread, where allocating is what
-        # Principle 1 forbids -- see _profile_sync.
+        # Rendezvous buffer for _profile_sync, allocated once -- see
+        # _profile_sync.
         self._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
         self.init_profiler()
 
@@ -340,19 +338,12 @@ class Profiler:
     def _profile_sync(self) -> None:
         """Rendezvous the attention TP peers without touching the device.
 
-        ``torch.distributed.barrier`` cannot be used here. It prefers
+        Not ``torch.distributed.barrier``: it prefers
         ``group.bound_device_id`` over its CPU branch, and
         ``DistributedInitializer`` binds ``cuda:N`` to every group -- including
-        the gloo ones -- to force eager NCCL init. A gloo barrier therefore
-        allocates ``aten.empty`` on CUDA, and these calls run on the
-        control-plane thread (stage transitions arrive through
-        ``_profile_batch_predicate``), where ``_NoDeviceWork`` rejects exactly
-        that. The result was every rank dying mid-profile with "control-plane
-        thread ran CUDA factory".
-
-        An all-reduce over a preallocated CPU tensor rendezvouses identically
-        and allocates nothing, matching how the loop's other in-round
-        collectives are written.
+        the gloo ones -- to force eager NCCL init, so a gloo barrier allocates
+        ``aten.empty`` on CUDA. An all-reduce over a preallocated CPU tensor
+        rendezvouses identically and allocates nothing.
         """
         if self.attn_tp_size == 1:
             return

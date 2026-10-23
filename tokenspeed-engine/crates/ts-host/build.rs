@@ -18,10 +18,14 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The binary finds the libpython it was built against at run time.
+//! The binary, and its unit tests, find the libpython it was built against
+//! at run time; the tests also need the interpreter's home.
 
 fn main() {
     if let Ok(lib_dir) = std::env::var("DEP_TS_SCHEDULER_PYTHON_LIB_DIR") {
-        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{lib_dir}");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+    }
+    if let Ok(home) = std::env::var("DEP_TS_SCHEDULER_PYTHON_HOME") {
+        println!("cargo:rustc-env=TS_HOST_TEST_PYTHONHOME={home}");
     }
 }

@@ -18,7 +18,7 @@ embeds CPython for the data plane. The design rules of the loop are in
 | `ts-metrics` | The engine's metrics: Prometheus' multiprocess files, written directly, and the events the node's plugin relay runs output plugins on. |
 | `ts-mooncake` | The Mooncake transfer engine through its C API, loaded at runtime from the `tokenspeed-mooncake` wheel. |
 | `ts-pd` | The PD transfer peer: the P/D handshake, room states, transfer workers and the per-round agreement on transfer progress. |
-| `ts-host` | The rank binary: it embeds the interpreter, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop with a pump thread driving the data plane. |
+| `ts-host` | The rank binary: it embeds the interpreter, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
 
 ## Wire conformance
 

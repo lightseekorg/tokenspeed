@@ -28,7 +28,6 @@ cache. Run with CUDA_VISIBLE_DEVICES selecting an available GPU.
 
 import os
 import sys
-from concurrent.futures import Future
 from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -1156,26 +1155,18 @@ def test_history_views_replay_after_batch_shrink_and_idle(buffers):
     assert not mask.any()
 
 
-def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
+def test_the_forward_reads_a_snapshot_that_does_not_alias_request_state():
     states = {"a": _state([1, 2, 3], [])}
     op = _op(states, ["a"], [1], [1], [], [], [-1])
     snapshot = _ngram_inputs(op, states, 3)
-    submitted, consumed = [], []
-
-    def submit(fn):
-        future = Future()
-        submitted.append((future, fn))
-        return future
+    consumed = []
 
     def execute(forward_op, sampling_params_list, **kwargs):
         consumed.append(kwargs["ngram_inputs"])
-        return SimpleNamespace(sync=lambda: None)
+        return SimpleNamespace()
 
     handle = DeviceHandle(
-        SimpleNamespace(
-            forward_thread=SimpleNamespace(submit=submit, submit_forward=submit),
-            execute_forward_op=execute,
-        ),
+        SimpleNamespace(device="cpu", execute_forward_op=execute),
         host_cache_executor=None,
         kv_transfer=None,
     )
@@ -1191,13 +1182,10 @@ def test_dispatch_owns_snapshot_until_forward_thread_consumes_it():
         sampled_top_k=0,
         stop_criteria=(),
     )
-    pending = handle._submit_forward(planned, capture_next_input_ids=False)
+    handle._launch_forward(planned, capture_next_input_ids=False)
+    # Later edits to the request's state cannot reach what the forward read.
     states["a"].prompt_input_ids.clear()
     states.clear()
-    assert not consumed
-    future, fn = submitted.pop()
-    future.set_result(fn())
-    pending.result()
     assert consumed == [NGramInputs(tokens=((3, 2, 1, -1),), positions=(2,))]
 
 

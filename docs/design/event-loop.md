@@ -14,9 +14,8 @@ One engine rank is one `ts-host` process. Its threads:
 
 | thread | runs | holds |
 | --- | --- | --- |
-| control (`ts-host` main) | `ts_control::event_loop::EventLoop`: the frontend wire, the collectives between ranks, the C++ scheduler, commit post-processing, control operations | the scheduler, every request's state, the collective mesh; never the GIL |
-| pump (`ts-pump`) | the Python `DataPlanePump`, one queued operation at a time | the `DeviceHandle`; takes the GIL per operation |
-| forward (`tokenspeed::forward`) | `ForwardThread`: everything that touches CUDA | the executor, models, KV pools, CUDA graphs |
+| control (`ts-host` main) | `ts_control::event_loop::EventLoop`: the frontend wire, the collectives between ranks, the C++ scheduler, commit post-processing, control operations; the data plane's completion queries | the scheduler, every request's state, the collective mesh; the GIL only during a completion query |
+| forward (`ts-forward`) | the Python `HostDataPlane`'s operations, one at a time in queue order: everything that touches CUDA | the `DeviceHandle`, behind it the executor, models, KV pools, CUDA graphs; takes the GIL per operation |
 
 Peripheral threads stay off the round: the wire's Tokio runtime
 (`ts_control::transport`), the PD transfer peer's workers (`ts-pd`), the
@@ -44,28 +43,36 @@ no event loop.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
-The event loop is the **control plane**. `ForwardThread`
-(`execution/forward_thread.py`) is the **data plane**: one thread per rank,
-FIFO, everything that touches CUDA. A control-plane round is microseconds, so
-the cross-rank collectives that keep the redundant schedulers aligned always
-find every rank promptly, however deep the GPUs are in queued work — a stage's
-launch-queue backpressure stalls only its own forward thread, never the round.
+The event loop is the **control plane**. The forward thread is the **data
+plane**: one thread per rank, FIFO, everything that touches CUDA. A
+control-plane round is microseconds, so the cross-rank collectives that keep
+the redundant schedulers aligned always find every rank promptly, however
+deep the GPUs are in queued work — a stage's launch-queue backpressure stalls
+only its own forward thread, never the round.
 
-The control thread cannot run device work by construction: it is Rust, holds
-no torch object and never takes the GIL. Its only way to the device is the
-`DataPlane` trait (`event_loop.rs`), which `ts-host`'s `PythonDataPlane`
-implements by queueing operations for the pump thread. Only `complete`, the
-cache poll and a DP idle forward wait for the pump, because the loop needs
-their answers; every other operation is fire-and-forget, so a slow pump delays
-nothing but its own queue. A round with nothing for the device (no batch, no
-cache op, no remote stream: `plan.needs_device()`) does not reach the pump at
-all: a loop waiting on a transfer would otherwise hand the interpreter an
-empty plan per round and starve the device side's own Python threads of the
-GIL.
+The control thread cannot run device work by construction: it is Rust and
+holds no torch object. Its only way to the device is the `DataPlane` trait
+(`event_loop.rs`), which `ts-host`'s `PythonDataPlane` (`data_plane.rs`)
+implements over the Python `HostDataPlane` (`engine/rust_host.py`): every
+operation that issues or orders device work, or changes the data plane's
+state, is queued for the forward thread, and fire-and-forget unless the loop
+needs its answer (a DP idle forward, the low-rate control operations), so a
+slow forward thread delays nothing but its own queue. The completion
+queries — a launched forward's results, the cache acknowledgments, the L3
+probe, progress and completion — read what landed and touch no stream, and
+the control thread calls them itself, taking the GIL for the call: queued,
+the round head would wait for every forward still being launched. A commit
+waits for the forward thread to have launched its forward, then on the
+forward's copy event, which releases the GIL while it waits. Taking the GIL
+can wait for the forward thread's Python, up to the interpreter's switch
+interval; its launches and NCCL waits release it. A round with nothing for
+the device (no batch, no cache op, no remote stream: `plan.needs_device()`)
+queues nothing: a loop waiting on a transfer would otherwise hand the forward
+thread an empty plan per round, each costing a turn of the GIL.
 
-The pump thread is the control plane's Python half, and it runs under a
-thread-local dispatch guard (`maybe_control_plane_guard` in `device.py`, on
-by default): any CUDA tensor op from it raises. Event waits — the inbound
+The control thread's Python calls run under a thread-local dispatch guard
+(`maybe_control_plane_guard` in `device.py`, on by default), entered while
+it serves: any CUDA tensor op from it raises. Event waits — the inbound
 channel — and metadata-only view ops pass untouched. Neither submits device
 work. `TOKENSPEED_GUARD_CONTROL_PLANE=0` is the escape hatch for a deployment
 that trips on an unrouted op (report it).
@@ -85,13 +92,13 @@ how long the caller may hold each piece:
 | | what it is | lifetime |
 | --- | --- | --- |
 | `DeviceSpecs` | plain values the control plane plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
-| `DeviceHandle` | the running handle: the complete list of what the control plane may ask of the device side | held by the pump only |
+| `DeviceHandle` | the running handle: the complete list of what the control plane may ask of the device side | held by the data plane (`HostDataPlane`) only |
 | `transfer` | the PD planner the Rust transfer peer calls (`pd/host_peer.py`), or None outside PD | handed to `ts-pd` at startup |
 | `host_cache` | shared Host resources, the CPU cache layout and the resolved attention choices; no Device buffers or executor | consumed at startup, by the L3 executor's construction |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
 `HostBootstrap` (`rust_host.py`) turns the build into what the Rust side
-takes: the scheduler, a plain `HostConfig`, and the pump (holding the
+takes: the scheduler, a plain `HostConfig`, and the data plane (holding the
 handle and, with L3, the Host-only L3 executor). Nothing else of the build
 crosses.
 
@@ -138,8 +145,8 @@ planning (an L3 object is fetched into Host before its request is admitted,
 so no planned forward or remote stream depends on a fetch that can miss).
 The transfer itself is the Rust peer's (`ts-pd`, over the Mooncake C API):
 its workers write KV-pool device memory over RDMA, ordered against forwards
-and page zeroing because the pump hands each remote stream to the peer from
-the same queue position as the plan's other work. Its control face — request
+and page zeroing because the forward thread hands each remote stream to the
+peer in the plan's own order, behind the forwards and the zeroing. Its control face — request
 registration and abort, the per-round agreement on transfer progress — is the
 loop's `TransferPeer` (`pd.rs`), where it feeds Principle 3's tail advance.
 
@@ -151,27 +158,25 @@ Consequences:
   builder**; it belongs on `DeviceHandle` (and the `DataPlane` trait) only
   when the running loop genuinely needs it — the second widens what the loop
   can do to the GPU mid-flight. Hand over the capability, never the object.
-* Every method on the handle is a **named operation**, with one registered
-  exception: `run_multimodal_work`, because multimodal feature lifecycle is a
-  state machine reached from several points (EPD admission's stage/drain
-  device half; the release of a request's SHM features). A generic "run this
-  closure" slot is the hole this whole design closes, so a second KIND of
-  user does not join it — it gets its own name.
+* Every method on the handle is a **named operation**; a generic "run this
+  closure" slot is the hole this whole design closes. The multimodal feature
+  lifecycle needs none: EPD admission and the release of a request's SHM
+  features are data-plane operations themselves, run on the forward thread.
   L3 is constructed separately at startup by `cache/l3/factory.py`, using
   the builder's Host resource and CPU-only payload facts. `DeviceBuild` does
   not create an L3 schema, namespace, backend or workers, and `DeviceSpecs`
   carries no L3 settings. The factory derives the schema and deployment
   identity from neutral Host resources and model configuration; see
-  [asynchronous L3](async-l3-cache.md#ownership). The pump holds the
+  [asynchronous L3](async-l3-cache.md#ownership). The data plane holds the
   resulting Host-only executor; its CPU workers cannot reach the device
-  handle. The pump submits the storage subset of `plan.cache` to it
+  handle. The data plane submits the storage subset of `plan.cache` to it
   independently from device work, and its completion facts enter the head
   feedback point. The
   retraction snapshot pool adds no operation at all: its stores ride
   `execute` with the write-backs, its restores with the load-backs, its ACKs
   `poll_cache_results`, and `shutdown_cache` closes it with L2 -- one
   `HostCacheExecutor` behind the handle, two Host buffers inside it. The
-  plan's cache ops are adapted once, by the pump, through
+  plan's cache ops are adapted once, by the data plane, through
   `scheduler_utils.cache_ops_from_plan`: the L2 batches (`Cache.WriteBackOp`,
   `Cache.LoadBackOp`) pass through, and the scheduler's batched
   `Cache.SnapshotOp` / `Cache.RestoreOp` become one per-request `SnapshotOp`
@@ -207,30 +212,30 @@ Consequences:
   remote op on its own plan stream, the batch needs no per-role reading at
   all: a `ForwardBatch` is model work, full stop, and a DP rank counts work
   by asking whether the batch has tokens.
-* On the per-round path only commit waits, through `PendingExecution.result()`:
-  join the forward thread's future (launches issued), then its copy event (D2H
-  landed). Dispatch never waits — it submits model forwards and the peer's
-  remote prefills/decodes alike fire-and-forget, which is what keeps a
-  backpressured stage off the control plane. A raise is for broken invariants
-  only: a transfer worker or another Prefill rank can fail a request's
-  transfer while its submission waits, and that submission then does nothing
-  for the request, whose failure arrives as its transfer state. The handle's
-  remaining `run_*` methods do block, deliberately — the DP idle forward, the
-  landing of a completed remote prefill, the KV repair after a wake, the RL
-  weight sync — but each is a low-rate path whose caller cannot proceed
-  without the result (the landing's failure must surface BEFORE the
-  scheduler advances the request into decode). A new blocking operation on
-  the per-round path is a bug.
+* On the per-round path only commit waits: for the forward thread to have
+  launched the forward, then on its copy event (D2H landed). Dispatch never
+  waits — it queues model forwards and the peer's remote prefills/decodes
+  alike, which is what keeps a backpressured stage off the control plane. A
+  raise is for broken invariants only: a transfer worker or another Prefill
+  rank can fail a request's transfer while its submission waits, and that
+  submission then does nothing for the request, whose failure arrives as its
+  transfer state. The loop waits for the DP idle forward and the low-rate
+  control operations (memory release and resume, the RL weight sync, the
+  expert rebalance's steps, profiling), whose callers cannot proceed without
+  the result; on the forward thread, the landing of a completed remote
+  prefill and the KV repair after a wake complete before anything queued
+  behind them runs. A new blocking operation on the per-round path is a bug.
 * Keep per-forward state resets asynchronous on the execution stream too.
   Use device-side scalar fills for indexed flags: assigning a Python scalar
   through tensor indexing can stage a CPU tensor and introduce a hidden
   synchronous H2D copy, blocking further forward launches.
 
-EPD prefill admission's device half — receive-buffer allocation, the publish
-clone/scatter, and the NCCL shard reassembly — crosses through
-`DeviceHandle.run_multimodal_work`, so it runs on the forward thread, which
-also puts the reassembly broadcasts on the same issuing thread as the model's
-collectives and keeps the cross-rank launch order.
+EPD prefill admission is the data plane's own (the `epd_stage`, `epd_poll`
+and `epd_settle` operations), so its device half — receive-buffer
+allocation, the publish clone/scatter, and the NCCL shard reassembly — runs
+on the forward thread, which also puts the reassembly broadcasts on the same
+issuing thread as the model's collectives and keeps the cross-rank launch
+order.
 
 With pipeline parallelism, only PP0 receives encoder payloads and reserves
 the receive pool. PP0's attention TP group first agrees on completion;
@@ -252,14 +257,14 @@ synchronization it performs — `.cpu()`, `.item()`, `.tolist()`,
 the step in flight, so the next step's prologue and graph launch slip
 behind the current step's completion and `in_flight_depth` degrades to 0
 however it is configured. Results cross back through pinned non-blocking
-copies and an event the pump waits on. Torch's sync-debug mode enforces this
+copies and an event the commit waits on. Torch's sync-debug mode enforces this
 rule, and `HostBootstrap.enter_serving` arms it once the rank finished
 startup and the frontend handshake (weight loading, tuning, capture, the
 transfer and L2 builders all synchronize on purpose):
 `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=warn` reports each offending site with its
 Python location, `error` raises there. CI runs the serving paths with
-`error`; the pump's event wait and non-blocking copies pass unflagged, so a
-report is always a real stall.
+`error`; the commit's event wait and the non-blocking copies pass
+unflagged, so a report is always a real stall.
 
 One named exception: a drafter may leave its round pending after the forward
 (`BaseDrafter.finish_round`) and finish it in the next forward's `settle`,
@@ -303,8 +308,9 @@ round waits on the whole group, each rank's collection stalls every rank. So
 `enter_serving` calls `freeze_startup_heap` (`engine/gc_hooks.py`) after the
 JIT mark: it collects once, freezes the survivors (`gc.freeze`: no later
 collection walks them) and raises the generation-2 threshold far enough that
-CPython does not start full collections by itself. The pump's `GcHooks` runs
-one every `FULL_COLLECTION_INTERVAL` forwarded rounds, a count that is the
+CPython does not start full collections by itself. The data plane's
+`GcHooks` runs one on the forward thread every `FULL_COLLECTION_INTERVAL`
+forwarded rounds, a count that is the
 same on every rank, so the ranks collect in the same round and each
 collection walks only what serving keeps alive. The young generations still
 collect automatically.
@@ -323,24 +329,21 @@ of silently producing an incomplete trace.
 
 ### The capture contract
 
-Information crosses to the data plane **only** inside the submitted closure,
-and freezes once submitted: no attribute rebinding, no in-place edit, no
-releasing a resource the closure captured. Capture plain values or a snapshot,
-and bind at capture time rather than closing over a variable the caller later
-rebinds. Results cross back **only** through `PendingExecution.result()`.
+Information crosses to the data plane **only** as a queued operation's
+arguments: plain values (lists, bytes, the scheduler's plan moved into a
+Python object), from which the forward thread builds what a forward reads.
+What a launched forward reads freezes: no attribute rebinding, no in-place
+edit, no releasing a resource it holds while it may still run. Results cross
+back **only** as the launched forward's result, which the commit reads once
+its copy event landed, as plain lists built from the landed host copies.
 
-Between the two Rust and Python halves the same holds by construction: an
-operation's arguments are plain values (lists, bytes, the scheduler's plan
-moved into a Python object), and a forward's results come back as plain
-lists the pump builds from the landed host copies.
+The plan's cache ops follow the same capture rule: the data plane adapts
+them once into immutable Device and storage tuples. `DeviceHandle.execute`
+runs copies from the supplied Device tuple. L3 CPU workers receive only Host
+jobs, with no GPU stream or forward-thread access. Their results return to
+the control plane through the executor's completion poll.
 
-The plan's cache ops follow the same capture rule: the pump adapts them once
-into immutable Device and storage tuples. `DeviceHandle.execute` queues
-copies from the supplied Device tuple. L3 CPU workers receive only Host jobs,
-with no GPU stream or forward-thread access. Their results return to the
-control plane through the executor's completion poll.
-
-`execution/forward_thread.py` states this in full, including the registered
+`execution/device.py` states this in full, including the registered
 exceptions — grammar matchers, whose ownership splits by path and whose
 overlap the drain rules in Principle 4 break instead, and multimodal items.
 
@@ -429,9 +432,8 @@ dependency was real. The right fix was upstream, not a drain.
 Depth ≥ 1 also means the loop plans a round *before* the previous round's
 commit, so a batch can contain a request that commit is about to finish.
 Anything the data plane frees when a request ends — its grammar matcher, its
-shared multimodal features — is released through the pump's queue, behind the
-forward that captured it, and the handle orders the device-side release on
-the FIFO, not inline.
+shared multimodal features — is released through the forward thread's queue,
+behind the forwards that read it.
 
 Only a pipeline's last stage samples. Each of its ranks shares the forward's
 results with the other stages of its pipeline before they commit
@@ -491,7 +493,8 @@ attention-DP agreement (an idle forward when a peer runs one, but not while
 memory is released: the weights are unmapped). A memory release drains like
 `wait`, then frees its regions — one release/resume pair per tag, whose
 data-plane half (quiescing copies, the transfer engine's registration, the KV
-repair, NCCL suspend) runs on the pump — and freezes until they are resumed.
+repair, NCCL suspend) runs on the forward thread — and freezes until they are
+resumed.
 A disaggregated engine refuses new requests while a release is draining or
 memory is released: their transfer registration would name memory the
 release unmaps. On release the prefill peer deregisters its cache regions and
@@ -562,7 +565,7 @@ everywhere and an idle replica polls nothing.
 **L3** (`l3`, `--kvstore-storage-backend`). The C++ scheduler owns each
 request's storage transaction: it plans QUERY, GET, PUT and CANCEL
 operations in `plan.cache` ([asynchronous L3](async-l3-cache.md)), which the
-pump runs on the Host-only L3 executor, apart from device work. A QUERY and
+data plane runs on the Host-only L3 executor, apart from device work. A QUERY and
 GET run before admission, only with a storage backend: a request waiting for
 its preparation is skipped before local prefix hashing, so an idle round does
 not rehash a long prompt while native I/O is outstanding. Every round with
@@ -628,12 +631,12 @@ For orientation, one `EventLoop::round`:
    grammar advances), committing the queue first if the dispatch depends on
    a pending commit (Principle 4).
 4. **One `DataPlane::execute(plan, dispatch)` per round** that has device
-   work. The pump adapts the plan's cache ops once (`cache_ops_from_plan`),
-   submits the storage subset to the L3 executor (Host workers: no stream,
-   no Device page, nothing on the FIFO) and turns the rest into one
+   work. The forward thread adapts the plan's cache ops once
+   (`cache_ops_from_plan`), submits the storage subset to the L3 executor
+   (Host workers: no stream, no Device page) and turns the rest into one
    `DeviceHandle.execute(plan, planned, cache_ops=...)`, which submits in an
-   order that is itself a correctness contract for same-round page reuse.
-   On the FIFO: the Host-bound stores first --
+   order that is itself a correctness contract for same-round page reuse:
+   the Host-bound stores first --
    `WriteBackOp` and `SnapshotOp`, a retraction image's two legs (the
    stream-ordered L2 write-back of the victim's hash-complete pages and the
    snapshot store of its tail pages and slot state) must read the reused
@@ -663,7 +666,7 @@ For orientation, one `EventLoop::round`:
    forward, and every forward is enqueued behind the store fence, so the
    slot-state export reads the victim's bytes; a restore names the resumed
    request's new slot. The rebalance controller notes whether this rank
-   forwarded, and so does the pump's garbage-collection hook. Then commit
+   forwarded, and so does the data plane's garbage-collection hook. Then commit
    from the queue head down to the effective depth (a pipeline's stages
    adopting the last stage's results first) and poll the PD transfers.
 5. **Advance the scheduler (tail)** with the round's `events`, publish KV
@@ -703,8 +706,8 @@ cleanup runs outside the callback.
   feature code.
 * Never advance the scheduler or publish KV events from a helper or
   subsystem module.
-* Never issue CUDA work from the pump, or hand the control plane something
-  that can.
+* Never issue CUDA work from the control thread, or hand it something that
+  can.
 * Never synchronize with the device from the data plane's per-round path;
   run with `TOKENSPEED_DATA_PLANE_SYNC_DEBUG=error` while developing on it.
 * Never let a kernel's compile key follow the batch shape; run with

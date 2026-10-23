@@ -119,11 +119,11 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
 
 def _device_handle(runner, drafter=None) -> DeviceHandle:
     handle = DeviceHandle.__new__(DeviceHandle)
-    handle._executor = SimpleNamespace(model_runner=runner, drafter=drafter)
+    # No drafter round is pending for ``settle`` to finish.
+    handle._executor = SimpleNamespace(
+        model_runner=runner, drafter=drafter, complete_pending_drafting=lambda: None
+    )
     handle._l2 = None
-    # The real forward thread orders the call against forwards; here it only
-    # has to run it.
-    handle._thread = SimpleNamespace(run=lambda fn: fn())
     return handle
 
 

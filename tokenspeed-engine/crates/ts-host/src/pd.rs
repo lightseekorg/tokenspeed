@@ -238,7 +238,7 @@ impl PrefillPlanner for Planner {
             let items = self
                 .peer
                 .call_method1(py, "plan_send", (room, session_id))
-                .map_err(|error| crate::pump::describe(py, &error))?;
+                .map_err(|error| crate::data_plane::describe(py, &error))?;
             planned_items(items.bind(py))
         })?;
         copies(items)
@@ -253,7 +253,7 @@ impl PrefillPlanner for Planner {
             let plans = self
                 .peer
                 .call_method1(py, "plan_layerwise", (chunk_id, sessions.to_vec()))
-                .map_err(|error| crate::pump::describe(py, &error))?;
+                .map_err(|error| crate::data_plane::describe(py, &error))?;
             let plans = plans
                 .bind(py)
                 .cast::<PyList>()
