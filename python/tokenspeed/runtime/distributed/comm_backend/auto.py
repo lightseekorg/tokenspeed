@@ -60,11 +60,20 @@ def ordered_fold_sum(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
     The association order depends only on the rank axis, never on the payload
     shape, so a row's folded value is bitwise identical at any batch size.
+    GPU partials whose last axis is contiguous fold in one kernel with the
+    same order and rounding.
     """
+    if parts.is_cuda and parts.stride(-1) == 1 and out.stride(-1) == 1:
+        from tokenspeed_kernel.ops.communication.triton import rank_ordered_fold
+
+        width = out.shape[-1] if out.dim() else 1
+        rank_ordered_fold(parts.reshape(parts.shape[0], -1, width), out.view(-1, width))
+        return out
     accumulator = parts[0].to(torch.float32)
     for rank in range(1, parts.shape[0]):
         accumulator = accumulator + parts[rank].to(torch.float32)
-    out.copy_(accumulator.to(out.dtype))
+    # A -0.0 sum leaves as +0.0, as the kernel stores it.
+    out.copy_((accumulator + 0.0).to(out.dtype))
     return out
 
 
@@ -149,16 +158,29 @@ class AutoBackend(CommBackend):
         Every element folds rank 0..n-1 left to right in fp32 with one final
         rounding, independent of the tensor's shape -- unlike a ring
         all-reduce, whose per-element association order follows the
-        size-dependent chunking. In-place like the NCCL all-reduce.
+        size-dependent chunking. An armed trtllm workspace that holds the
+        rows folds the same way in one kernel and returns a new tensor; the
+        gather path works in place like the NCCL all-reduce.
         """
         if op is not None and op != torch.distributed.ReduceOp.SUM:
             raise ValueError("batch-invariant collectives fold SUM reductions only")
         world_size = len(group)
         if world_size == 1:
             return tensor
-        gathered = self._nccl.all_gather(tensor, group, dim=0)
-        parts = gathered.view((world_size, *tensor.shape))
-        return ordered_fold_sum(parts, tensor)
+        if not self._force_deterministic_rsag() and self._trtllm_ar.has_trtllm_ar(
+            group
+        ):
+            folded = self._trtllm_ar.ordered_all_reduce(tensor, group)
+            if folded is not None:
+                return folded
+        rows = tensor.contiguous().view(-1, tensor.shape[-1] if tensor.dim() else 1)
+        # Last-dim gather on the multicast kernels: [rows, world * width], rank-major.
+        gathered = self.all_gather(rows, group, dim=-1)
+        parts = gathered.view(rows.shape[0], world_size, rows.shape[1]).transpose(0, 1)
+        ordered_fold_sum(parts, rows)
+        if rows.data_ptr() != tensor.data_ptr():
+            tensor.copy_(rows.view(tensor.shape))
+        return tensor
 
     def _ordered_fold_reduce_scatter(
         self, tensor: torch.Tensor, group: Group
