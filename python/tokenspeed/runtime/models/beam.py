@@ -921,6 +921,8 @@ class BeamVendorMoE(BeamMoE):
     precision policy and registry selection, with precomputed FP32 routes.
     Explicit backend selection is passed through to the registry. Routing
     applies the routed scale once; experts use their standard default arithmetic.
+    NVIDIA SM90 has no vendor kernel for these experts; its FP8 per-channel
+    experts take the same default-policy path (the Triton FP8 per-channel MoE).
     """
 
     def __init__(
@@ -936,10 +938,18 @@ class BeamVendorMoE(BeamMoE):
             raise NotImplementedError("Beam's vendor MoE requires normalized routes")
         fmt = None if quant_config is None else beam_checkpoint_format(quant_config)
         platform = current_platform()
-        amd_default = platform.is_cdna4
         if platform.is_amd and fmt == "nvfp4":
             raise ValueError("Beam NVFP4 experts require NVIDIA vendor MoE")
-        if amd_default:
+        if platform.is_hopper and fmt in (None, "nvfp4"):
+            raise ValueError(
+                f"Beam has no vendor MoE for {fmt or 'BF16'} experts on NVIDIA "
+                "SM90: BF16 experts run on BeamMoE (--moe-backend auto or "
+                "triton) and NVFP4 experts need NVIDIA SM100 to SM103"
+            )
+        default_policy = platform.is_cdna4 or (
+            platform.is_hopper and fmt == "fp8_channel"
+        )
+        if default_policy:
             policy = "default"
         elif fmt == "mxfp4":
             raise ValueError("Beam MXFP4 experts require AMD gfx950")
@@ -951,25 +961,25 @@ class BeamVendorMoE(BeamMoE):
             }[fmt]
         adapted = copy(config)
         adapted.moe_precision_policy = policy
-        if amd_default:
+        if default_policy:
             # Beam owns grouped selection and folds the routed scale into its
             # FP32 coefficients once, independent of the selected expert backend.
             adapted.moe_routing_mode = "precomputed_topk"
         adapted.moe_output_scale = 1.0
         self._init_moe(adapted, mapping, layer_id, prefix, quant_config)
         experts = self.experts
-        if amd_default:
+        if default_policy:
             # Beam consumes finalized output, even when the selected kernel
             # also supports separate routes for other models' combiners.
             experts.plan["supports_deferred_finalize"] = False
         self.kernel_routing = experts.support_routing
         if (
-            (not amd_default and experts.plan.get("precision_policy") != policy)
+            (not default_policy and experts.plan.get("precision_policy") != policy)
             or experts.plan.get("output_scale", 1.0) != adapted.moe_output_scale
             or experts.supports_deferred_finalize
             or self.kernel_routing != self.topk.topk_config.output_format.is_bypassed()
             or (
-                amd_default
+                default_policy
                 and (self.kernel_routing or not experts.supports_precomputed_topk)
             )
         ):
@@ -1062,19 +1072,21 @@ def beam_moe_class(quantized_experts: bool = False) -> type[BeamMoE]:
     ``--moe-backend flashinfer_trtllm`` (Beam's model default on NVIDIA SM100 to
     SM103 where the policy starts) selects :class:`BeamVendorMoE`; every other
     backend keeps BeamMoE. AMD gfx950 uses the finalized default-policy path
-    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry.
+    for BF16, FP8 and MXFP4 experts, with backend selection left to the registry;
+    NVIDIA SM90 uses it for quantized (FP8 per-channel) experts.
     Unsupported quantized backends fail before loading.
     """
     if get_moe_backend().value == "flashinfer_trtllm":
         return BeamVendorMoE
     platform = current_platform()
-    if platform.is_cdna4:
+    if platform.is_cdna4 or (quantized_experts and platform.is_hopper):
         return BeamVendorMoE
     if quantized_experts:
         raise ValueError(
             "Beam runs FP8 experts on AMD gfx950 with --moe-backend auto, triton "
-            "or gluon (BF16 projection operands); "
-            "NVFP4 and NVIDIA FP8 experts use the vendor MoE, which needs "
+            "or gluon (BF16 projection operands) and on NVIDIA SM90 with "
+            "--moe-backend auto or triton; NVFP4 experts, and FP8 experts on "
+            "NVIDIA SM100 to SM103, use the vendor MoE, which needs "
             "--moe-backend flashinfer_trtllm (Beam's default on NVIDIA SM100 "
             f"to SM103 where it applies), not {get_moe_backend().value}"
         )
