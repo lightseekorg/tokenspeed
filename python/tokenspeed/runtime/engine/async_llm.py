@@ -474,12 +474,17 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 self._send_one_request(tmp_obj, warmup_obj, created_time)
                 await self._wait_one_response(tmp_obj).__anext__()
 
-            # Expand requests, assign new rids for them, and send them
+            # Expand requests and send them. Replica k of prompt i keeps the
+            # caller's rid ``obj.rid[i * n + k]``, so an abort by it lands.
+            num = obj.parallel_sample_num
             for i in range(batch_size):
-                for replica_index in range(obj.parallel_sample_num):
+                for replica_index in range(num):
                     tmp_obj = copy.copy(objs[i])
                     replica_obj = prepare_parallel_sampling_replica(
-                        tmp_obj, tokenized_objs[i], replica_index
+                        tmp_obj,
+                        tokenized_objs[i],
+                        replica_index,
+                        obj.rid[i * num + replica_index],
                     )
                     self._send_one_request(tmp_obj, replica_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj))
