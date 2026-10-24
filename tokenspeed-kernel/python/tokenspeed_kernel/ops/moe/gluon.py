@@ -1153,11 +1153,12 @@ if platform.is_amd:
             "activation": frozenset({"silu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({True}),
+            "deferred_output_is_token_order": frozenset({True}),
             "supports_prequantized_input": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ep_size": frozenset({4, 8}),
-            "ispp": frozenset({4096}),
+            "ep_size": frozenset({1, 4, 8}),
+            "ispp": frozenset({512, 4096}),
             "internal_activation_dtype": frozenset({"mxfp4"}),
             "supports_bias": frozenset({False}),
         },
@@ -1176,7 +1177,7 @@ if platform.is_amd:
         enable_pdl: bool = False,
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
-        """Run the gfx950 dynamic-A4W4 EP4/EP8 path with optional finalization.
+        """Run gfx950 dynamic-A4W4 experts with optional finalization.
 
         Args:
             plan: Kernel plan selected by the MoE registry.
@@ -1241,7 +1242,6 @@ if platform.is_amd:
         if (
             w.hidden_size != 4096
             or w.intermediate_size != 4096
-            or w.num_local_experts not in (32, 64)
             or w.num_experts != 256
             or w.top_k != 8
             or _swiglu_args(w) != (1.0, 0.0, 0.0)
@@ -1253,6 +1253,13 @@ if platform.is_amd:
             _extract_gluon_raw_w(w.w2_weight_triton_tensor),
             _extract_gluon_raw_s(w.w2_precision_config.b_mx_scale),
         )
+        # The processed W13 bank holds the local intermediate shard.
+        if (w.num_local_experts, tensors[0].shape[-1] // 2) not in (
+            (32, 4096),
+            (64, 4096),
+            (256, 512),
+        ):
+            return
         device = tensors[0].device
         if device.type != "cuda":
             return
@@ -1319,8 +1326,8 @@ if platform.is_amd:
                 packed = torch.zeros((rows, 2048), device=device, dtype=torch.uint8)
                 scales = empty_swizzled_cdna4_mxfp4_scale(rows, 128, device=device)
                 scales.fill_(127)
-                # Global token routes are replicated. Each rank computes only
-                # the slots whose expert IDs belong to its local weights.
+                # Routes are replicated; EP filters by expert, TP computes
+                # each route's local intermediate shard.
                 ids = torch.arange(rows * 8, device=device, dtype=torch.int32)
                 ids = ids.remainder(256).view(rows, 8)
                 weights = torch.full(
