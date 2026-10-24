@@ -1417,6 +1417,14 @@ path, with no flag. Use these supported Hub revisions:
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
 
+For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
+per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or
+dense gate/up projection. This reuses the BF16-rounded norm output and its
+existing quantizer contract. The consumer accepts at most 64 rows; other
+shapes and checkpoint formats retain their existing path. No extra flag is
+required. If the fused collective declines, the second norm fills the same
+buffers before the projection consumes them.
+
 The command below runs one TP8 replica over two 4-GPU nodes, as in the
 recipe's GB200 measurements. Run it on both nodes, changing only
 `--node-rank`, and point `--dist-init-addr` at node 0, the only rank that
