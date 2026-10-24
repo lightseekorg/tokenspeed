@@ -127,9 +127,7 @@ def test_glm_workspace_budget_includes_kda_and_shared_kpool_tails(width):
     # The tail allocation is shared by target/draft views; count its storage
     # once, together with the verify buffers owned by the target backend.
     tail_bytes = pool._kpool_tail_workspace.storage.nbytes
-    verify_bytes = (
-        backend.preallocate_verify_workspace(config.max_bs, width) if width > 1 else 0
-    )
+    verify_bytes = backend.preallocate_verify_workspace(config.max_bs, width)
     assert setup.fixed_workspace_bytes == tail_bytes + verify_bytes
 
 

@@ -50,7 +50,7 @@ DATASETS = {
         "dataset_args": {"dataset_id": "math-ai/aime26"},
     },
     "gpqa_diamond": {
-        "count": 2,
+        "count": 3,
         "dataset_args": json.loads(GPQA_HUGGINGFACE_DATASET_ARGS)["gpqa_diamond"],
     },
     "gsm8k": {
@@ -175,17 +175,39 @@ def test_evalscope_configs_use_expected_dataset_sources():
     assert counts == expected_counts, f"expected {expected_counts}, found {counts}"
 
 
-def test_gpt_oss_gpqa_uses_runner_specific_batch_sizes_and_retries():
-    path = EVAL_CONFIG_DIR / "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml"
-    task = yaml.safe_load(path.read_text(encoding="utf-8"))
+@pytest.mark.parametrize(
+    "config,runner,model,batch_size,trigger",
+    [
+        (
+            "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond.yaml",
+            "b200-2gpu",
+            "openai/gpt-oss-120b",
+            "64",
+            "post-submit",
+        ),
+        # MI35x has hit GPU memory-access faults at eval batch size 64.
+        (
+            "gpt-oss-120b-mxfp4-evalscope-gpqa-diamond-amd.yaml",
+            "amd-mi35x-2gpu-test",
+            "amd/gpt-oss-120b-w-mxfp4-a-fp8",
+            "16",
+            "post-submit",
+        ),
+    ],
+)
+def test_gpt_oss_gpqa_uses_runner_specific_configuration(
+    config, runner, model, batch_size, trigger
+):
+    task = yaml.safe_load((EVAL_CONFIG_DIR / config).read_text(encoding="utf-8"))
+    server = shlex.split(task["server"]["command"])
     command = shlex.split(task["eval"]["command"])
 
     assert task["retries"] == 1
-    assert task["runner"]["env"]["b200-2gpu"]["GPT_OSS_EVAL_BATCH_SIZE"] == "64"
-    assert (
-        task["runner"]["env"]["amd-mi35x-2gpu-test"]["GPT_OSS_EVAL_BATCH_SIZE"] == "16"
-    )
-    assert flag_value(command, "--eval-batch-size") == "${GPT_OSS_EVAL_BATCH_SIZE:-64}"
+    assert task["triggers"] == [trigger, "manual"]
+    assert task["runner"]["labels"] == [runner]
+    assert flag_value(server, "--model") == model
+    assert flag_value(command, "--model") == model
+    assert flag_value(command, "--eval-batch-size") == batch_size
 
 
 @pytest.mark.parametrize("world_size", MUSE_SPARK_AIME26_CONFIGS)

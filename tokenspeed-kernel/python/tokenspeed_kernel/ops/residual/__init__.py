@@ -626,6 +626,34 @@ def gated_residual_combine(
 # ===-----------------------------------------------------------------------===#
 
 
+def mhc_init(
+    hidden: _torch.Tensor, hc_mult: int
+) -> tuple[_torch.Tensor, _torch.Tensor]:
+    """Initialize independent mHC streams and their first-stream input mix.
+
+    Args:
+        hidden: Floating point token embeddings ``[rows, hidden_size]``.
+            Strided embeddings are supported.
+        hc_mult: Positive number of residual streams to replicate.
+
+    Returns:
+        Contiguous embeddings ``[rows, hc_mult, hidden_size]`` and FP32
+        one-hot input coefficients ``[rows, hc_mult]`` selecting stream zero.
+        Both outputs are owned by this invocation, with no retained scratch.
+    """
+    if hidden.ndim != 2 or hidden.shape[1] == 0 or hc_mult < 1:
+        raise ValueError("mhc_init requires [rows, hidden_size > 0] and hc_mult > 0")
+    kernel = select_kernel(
+        "residual",
+        "mhc_init",
+        format_signature(hidden=dense_tensor_format(hidden.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(hidden, hc_mult)
+
+
 def mhc_mixes(
     residual: _torch.Tensor,
     weight: _torch.Tensor,
@@ -683,6 +711,84 @@ def mhc_mixes(
         solution=None,
     )
     return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
+
+
+def try_mhc_shifted_post_pre_norm(
+    x: _torch.Tensor,
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    post: _torch.Tensor,
+    comb: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: _torch.Tensor,
+    norm_eps: float,
+) -> (
+    tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor]
+    | None
+):
+    """Fuse HC post, shifted input/RMSNorm, and the next HC coefficients.
+
+    Args:
+        x: BF16 sublayer output [T,H], already reduced across ranks.
+        residual: BF16 residual before that sublayer [T,4,H].
+        pre: FP32 previous pre-mix [T,4], used to collapse the new residual.
+        post: FP32 sublayer output mix [T,4].
+        comb: FP32 residual mix [T,4,4], with input then output HC axes.
+        weight: FP32 next mixing projection [24,4*H].
+        scale: FP32 next pre/post/combine scales [3].
+        base: FP32 next mixing biases [24].
+        rms_eps: Epsilon for next coefficient RMS normalization.
+        hc_eps: Epsilon for pre-mix and Sinkhorn normalization.
+        sinkhorn_iters: Positive number of Sinkhorn iterations.
+        norm_weight: BF16 input RMSNorm weight [H].
+        norm_eps: Input RMSNorm epsilon.
+
+    Returns:
+        New BF16 residual [T,4,H], BF16 normalized input [T,H], and FP32 next
+        pre/post/comb [T,4], [T,4], [T,4,4]; or None for unsupported inputs.
+        The input uses ``pre``, not the newly generated pre-mix. All tensors
+        must be contiguous and colocated on an SM100-family GPU, with H a
+        positive multiple of 1024 and 0<T<=2**20. Inputs are never mutated.
+        Not safe under CUDA graph replay: split barriers can read the previous
+        replay's partials.
+    """
+    from tokenspeed_kernel.ops.residual.deep_gemm import mega_mhc_eligible
+
+    if not mega_mhc_eligible(
+        x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
+    ):
+        return None
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_shifted_post_pre_norm",
+            format_signature(residual=dense_tensor_format(residual.dtype)),
+            traits=None,
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
 
 
 def mhc_apply_pre(
@@ -1009,6 +1115,7 @@ __all__ = [
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",
+    "mhc_init",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
@@ -1016,6 +1123,7 @@ __all__ = [
     "post_norm_residual_pre_norm",
     "post_norm_residual_pre_norm_bf16",
     "residual_gate_coefficients",
+    "try_mhc_shifted_post_pre_norm",
 ]
 
 

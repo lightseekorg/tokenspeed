@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from pipeline import is_amd_runner, is_nvidia_arm_runner, load_yaml
+from pipeline import is_amd_runner, is_npu_runner, is_nvidia_arm_runner, load_yaml
 
 RUNNER_GROUPS = (
     "amd-mi350",
@@ -234,6 +234,8 @@ def runner_label_in_group(label: str, runner_group: str) -> bool:
     Mirrors the matrix filters in each workflow's scan job: the ARM workflow
     drops ``slurm-*`` labels, which only the Slurm workflows pick up.
     """
+    if is_npu_runner(label):
+        return False
     if runner_group == "amd-mi450":
         return label.startswith(("amd-mi450-", "amd-mi45x-"))
     if runner_group == "amd-mi350":

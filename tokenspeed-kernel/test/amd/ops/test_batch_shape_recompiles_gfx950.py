@@ -324,29 +324,35 @@ def test_kda_fused_replay_batch_size():
     def compile_for(batch):
         pages = torch.zeros(2, batch, dtype=torch.int32, device=DEVICE)
         accepted = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+        metadata = torch.zeros(batch, 3, dtype=torch.int64, device=DEVICE)
+        stamps = torch.zeros(layers, batch, 4, 2, dtype=torch.int64, device=DEVICE)
+        activation_ref = torch.empty(0, dtype=torch.bfloat16, device=DEVICE)
         decode.gluon_kda_fused_replay_gfx950.warmup(
             descriptors,
             groups,
             pages,
             pages,
             accepted,
+            metadata,
+            stamps,
+            activation_ref,
+            activation_ref,
+            BATCH=batch,
+            qkv_stride=4608,
+            conv_stride=13824,
+            state_stride=196608,
+            u_stride=1536,
+            kg_stride=3072,
+            record_slots=batch,
+            stamp_layer_stride=stamps.stride(0),
+            lower_bound=-5.0,
             H=12,
             D=128,
-            TOKENS_PER_SEQUENCE=4,
-            MIXED_ROW_STRIDE=4608,
-            CONV_WEIGHT_ROW_STRIDE=4,
-            CONV_WEIGHT_COL_STRIDE=1,
-            CONV_POOL_PAGE_STRIDE=13824,
-            CONV_POOL_CHANNEL_STRIDE=3,
-            CONV_POOL_HISTORY_STRIDE=1,
-            GATE_ROW_STRIDE=1536,
-            BETA_ROW_STRIDE=12,
-            STATE_POOL_PAGE_STRIDE=196608,
-            HAS_LOWER_BOUND=True,
-            LOWER_BOUND=-5.0,
-            BATCH_SIZE=batch,
+            T=4,
+            CAPACITY=4,
+            BOUNDED=True,
             num_warps=4,
-            num_stages=2,
+            debug=True,
             grid=(1,),
         )
 

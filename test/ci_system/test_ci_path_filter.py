@@ -166,6 +166,13 @@ def test_deleted_kernel_solution_file_keeps_its_vendor(tmp_path):
     ("labels", "expected"),
     [
         (["amd-mi35x-1gpu-test", "amd-mi355-1gpu-bench"], {"amd-mi350"}),
+        (["amd-mi450-1gpu", "amd-mi45x-cpu-test"], {"amd-mi450"}),
+        (["tokenspeed-npu-arm64"], set()),
+        (["tokenspeed-npu-arm64", "b200-1gpu"], {"nvidia-x86"}),
+        (
+            ["tokenspeed-npu-arm64", "amd-mi35x-1gpu-test", "amd-mi450-1gpu"],
+            {"amd-mi350", "amd-mi450"},
+        ),
         (["b200-4gpu", "h100-1gpu"], {"nvidia-x86"}),
         (["gb200-4gpu"], {"nvidia-arm"}),
         (["slurm-gb200-4gpu"], {"nvidia-gb200-slurm"}),

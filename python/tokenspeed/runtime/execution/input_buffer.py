@@ -55,8 +55,14 @@ class InputBuffers:
         max_num_tokens: int,
         state_write_padding_pool_index: int,
         device: str = "cuda",
+        reads_state_checkpoints: bool = False,
     ):
         self.device = device
+        # Whether the scheduler may give extend rows in-forward State
+        # checkpoints (--enable-state-checkpoint-in-forward), so the batch
+        # carries extend_state_checkpoint_lens (a scheduler build without the
+        # option has no such field).
+        self.reads_state_checkpoints = reads_state_checkpoints
         self.max_num_tokens = max_num_tokens
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
@@ -120,6 +126,9 @@ class InputBuffers:
         # and each request's whole prompt length (whether this chunk ends it).
         self.extend_replay_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_prompt_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        # Host-only: tokens of each extend row's chunk before its in-forward
+        # State checkpoint, 0 for none.
+        self.extend_state_checkpoint_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
 
     def prepare_request_token_history_inputs(
@@ -460,6 +469,10 @@ class InputBuffers:
             self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.prefill_lengths[:num_extends], dtype=torch.int32
             )
+            if self.reads_state_checkpoints:
+                self.extend_state_checkpoint_lens_cpu[:num_extends] = torch.as_tensor(
+                    forward_op.extend_state_checkpoint_lens, dtype=torch.int32
+                )
             ext_prefix_cpu, ext_seq_cpu, ext_prompt_cpu = self._bulk_pinned(
                 (num_extends, torch.int32),
                 (num_extends, torch.int32),
