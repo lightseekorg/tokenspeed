@@ -473,12 +473,9 @@ def _muse_collective_policy_worker(rank, world_size, device):
     def sequence():
         outputs = []
         for index, values in enumerate(inputs):
-            if index % 2 and state.can_reduce_borrowed(values):
-                outputs.append(state.reduce_borrowed(values).clone())
-            else:
-                branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
-                branch.copy_(values)
-                outputs.append(state.reduce_outputs((branch,))[0].clone())
+            branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
+            branch.copy_(values)
+            outputs.append(state.reduce_outputs((branch,))[0].clone())
             if index == 5:
                 boundary_branch = state.all_reduce.acquire_outputs(((26, 8192),))[0]
                 boundary_branch.copy_(boundary_values)
@@ -550,10 +547,10 @@ def _muse_collective_policy_worker(rank, world_size, device):
             ordinary = torch.full(
                 (rows, 8192), rank + 1, device=device, dtype=torch.bfloat16
             )
-            output = state.reduce_borrowed(ordinary)
+            result = state.reduce(ordinary)
             torch.testing.assert_close(
-                output,
-                torch.full_like(output, world_size * (world_size + 1) // 2),
+                result,
+                torch.full_like(result, world_size * (world_size + 1) // 2),
                 rtol=0,
                 atol=0,
             )
@@ -568,17 +565,6 @@ def _muse_collective_policy_worker(rank, world_size, device):
             )
     for numel in (512, 44 * 4096, 129 * 8192):
         ordinary = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)
-        borrowed = state.reduce_borrowed(ordinary)
-        assert borrowed.data_ptr() != ordinary.data_ptr()
-        torch.testing.assert_close(
-            borrowed,
-            torch.full_like(borrowed, world_size * (world_size + 1) // 2),
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            ordinary, torch.full_like(ordinary, rank + 1), rtol=0, atol=0
-        )
         result = state.reduce(ordinary)
         assert result.data_ptr() == ordinary.data_ptr()
         torch.testing.assert_close(
@@ -1554,7 +1540,11 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
                 routed = state.all_reduce_routed_rmsnorm_sum(
                     routes, mapping, rows, 8, route_weights, norm, 1e-5, 1.0
                 ).clone()
-                raw = [state.reduce_borrowed(value).clone() for value in raw_inputs]
+                raw = []
+                for value in raw_inputs:
+                    branch = state.all_reduce.acquire_outputs((tuple(value.shape),))[0]
+                    branch.copy_(value)
+                    raw.append(state.reduce_outputs((branch,))[0].clone())
                 outputs.append((boundary, packed, scales, routed, raw))
             return outputs
 
@@ -2103,6 +2093,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                None,
             )
             output = state.all_reduce.acquire_outputs((tuple(combined.shape),))[0]
             output.copy_(combined)

@@ -245,6 +245,7 @@ def triton_routed_input_scale_rmsnorm_sum(
     eps: float,
     weight_offset: float,
     enable_pdl: bool,
+    output: torch.Tensor | None,
 ) -> torch.Tensor:
     """Triton kernel of :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum`."""
     if routes.ndim != 3:
@@ -259,7 +260,25 @@ def triton_routed_input_scale_rmsnorm_sum(
     block = _routed_sum_block(routes, num_tokens, topk, route_weights, norm_weight)
     routes_values = routes.contiguous()
     weights_values = route_weights.contiguous()
-    output = torch.empty((num_tokens, width), dtype=routes.dtype, device=routes.device)
+    if output is None:
+        output = torch.empty(
+            (num_tokens, width), dtype=routes.dtype, device=routes.device
+        )
+    elif (
+        output.shape != (num_tokens, width)
+        or output.dtype != routes.dtype
+        or output.device != routes.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "output must be contiguous [tokens, width] matching routes' dtype"
+        )
+    elif output.numel():
+        output_end = output.data_ptr() + output.numel() * output.element_size()
+        for source in (routes_values, weights_values):
+            source_end = source.data_ptr() + source.numel() * source.element_size()
+            if source.data_ptr() < output_end and output.data_ptr() < source_end:
+                raise ValueError("output must not overlap routes or route weights")
     if num_tokens == 0:
         return output
     _launch_routed_input_scale_sum(

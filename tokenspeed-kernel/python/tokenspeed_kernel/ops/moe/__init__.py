@@ -1601,6 +1601,7 @@ def bf16_moe_routes(
     w2: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_start: int,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Return unweighted BF16 SwiGLU outputs for every selected local expert.
 
@@ -1610,12 +1611,49 @@ def bf16_moe_routes(
         w2: Local down weights ``[experts, hidden, I]``.
         topk_ids: Global selected expert ids ``[tokens, topk]``.
         expert_start: First global expert represented by ``w13`` and ``w2``.
+        output: Optional caller-owned contiguous destination of
+            ``tokens * topk * hidden`` elements with ``x``'s dtype that overlaps
+            no input; every route row is overwritten.
 
     Returns:
-        Route outputs ``[tokens, topk, hidden]``; routes to other ranks' experts are zero.
+        Route outputs ``[tokens, topk, hidden]`` (a view of ``output`` when
+        given); routes to other ranks' experts are zero.
     """
+    if output is not None:
+        _check_bf16_route_destination(x, w13, w2, topk_ids, output)
+        output = output.view(topk_ids.numel(), x.shape[1])
     kernel = select_kernel("moe", "routes", dense_format_signature(("x",), (x.dtype,)))
-    return kernel(x, w13, w2, topk_ids, expert_start)
+    return kernel(x, w13, w2, topk_ids, expert_start, output=output)
+
+
+def _check_bf16_route_destination(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Reject a route destination that is ill-shaped or overlaps a route input."""
+    if (
+        output.dtype != x.dtype
+        or output.device != x.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("route destination must be contiguous and match x")
+    if output.numel() != topk_ids.numel() * x.shape[1]:
+        raise ValueError("route destination must hold tokens * topk * hidden values")
+    start = output.data_ptr()
+    end = start + output.numel() * output.element_size()
+    for tensor in (x, w13, w2, topk_ids):
+        # Each kernel streams these inputs while it writes routes.
+        first = tensor.data_ptr()
+        if (
+            output.numel()
+            and tensor.numel()
+            and first < end
+            and start < first + tensor.numel() * tensor.element_size()
+        ):
+            raise ValueError("route destination must not overlap the route inputs")
 
 
 def moe_plan(

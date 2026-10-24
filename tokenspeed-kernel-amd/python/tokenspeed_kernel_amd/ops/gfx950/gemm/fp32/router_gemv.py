@@ -139,7 +139,7 @@ def launch_gluon_fp32_router_gemv_gfx950(
 ) -> torch.Tensor:
     """Project up to ``MAX_ROWS`` FP32 decode rows through a transposed router weight.
 
-    More rows, or rows longer than ``MAX_K``, take ``torch.matmul``.
+    More rows, or rows longer than ``MAX_K``, take BLAS with ``multiplier`` as alpha.
 
     Args:
         x: Contiguous FP32 ``[M, K]`` rows.
@@ -171,7 +171,11 @@ def launch_gluon_fp32_router_gemv_gfx950(
     if rows == 0:
         return x.new_empty((0, weight.shape[0]))
     if rows > MAX_ROWS or k > MAX_K:
-        return torch.matmul(x, weight.T) * multiplier
+        # hipBLASLt applies alpha once to the finished FP32 dot product, which
+        # matches a separate multiply bit for bit without its extra launch.
+        return torch.addmm(
+            x.new_empty((rows, weight.shape[0])), x, weight.T, beta=0, alpha=multiplier
+        )
     out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
     gluon_fp32_router_gemv_gfx950[(weight.shape[0],)](
         x,
