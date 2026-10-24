@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.gemm import (
 )
 from tokenspeed_kernel.ops.gemm import (
     mm,
+    mm_fp8_blockscale_reads_mn_major_scales,
 )
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.weights import get_weight_broker
@@ -43,6 +44,8 @@ from tokenspeed.runtime.layers.quantization.base_config import LinearMethodBase
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
 from tokenspeed.runtime.layers.quantization.utils import convert_to_channelwise
 from tokenspeed.runtime.utils.env import global_server_args_dict
+
+_MN_MAJOR_SCALES = frozenset({"mn_major_scales"})
 
 
 class Fp8LinearMethod(LinearMethodBase):
@@ -271,16 +274,6 @@ class Fp8LinearMethod(LinearMethodBase):
         input_2d = x.view(-1, x.shape[-1])
         output_shape = [*x.shape[:-1], layer.weight.shape[0]]
         output_dtype = output_dtype or x.dtype
-        if block_scale is None:
-            scale_encoding = (
-                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
-            )
-            input_2d, block_scale = quantize_fp8(
-                input_2d,
-                granularity="token_group",
-                group_size=self.quant_config.weight_block_size[1],
-                scale_encoding=scale_encoding,
-            )
         solution = None
         if global_server_args_dict["dense_gemm_backend"] in (
             "trtllm_cutedsl",
@@ -290,6 +283,26 @@ class Fp8LinearMethod(LinearMethodBase):
             128,
         ):
             solution = global_server_args_dict["dense_gemm_backend"]
+        if block_scale is None:
+            scale_encoding = (
+                "ue8m0" if layer.weight_scale_inv.dtype == torch.uint8 else "float32"
+            )
+            # The small-M auto GEMM reads MN-major scales; quantizing straight
+            # into that layout skips a per-call scale transpose.
+            mn_major = (
+                solution is None
+                and input_2d.dtype == torch.bfloat16
+                and scale_encoding == "float32"
+                and tuple(self.quant_config.weight_block_size) == (128, 128)
+                and mm_fp8_blockscale_reads_mn_major_scales(*input_2d.shape)
+            )
+            input_2d, block_scale = quantize_fp8(
+                input_2d,
+                granularity="token_group",
+                group_size=self.quant_config.weight_block_size[1],
+                scale_encoding=scale_encoding,
+                required_features=_MN_MAJOR_SCALES if mn_major else None,
+            )
         output = mm(
             input_2d,
             layer.weight,

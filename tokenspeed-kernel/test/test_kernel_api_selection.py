@@ -528,11 +528,11 @@ def _dsv4_linear_fp32() -> torch.Tensor:
     return kernel_dsv4_linear_fp32(hidden_states, weight)
 
 
-def _mm_mxfp8(m: int) -> torch.Tensor:
-    a = torch.empty((m, 128), dtype=_fp8_dtype())
-    b = torch.empty((128, 128), dtype=_fp8_dtype())
-    a_scales = torch.empty((m, 1), dtype=torch.float32)
-    b_scales = torch.empty((1, 1), dtype=torch.float32)
+def _mm_mxfp8(m: int, k: int = 128) -> torch.Tensor:
+    a = torch.empty((m, k), dtype=_fp8_dtype())
+    b = torch.empty((128, k), dtype=_fp8_dtype())
+    a_scales = torch.empty((m, k // 128), dtype=torch.float32)
+    b_scales = torch.empty((1, k // 128), dtype=torch.float32)
     return kernel_mm(
         a,
         b,
@@ -5411,6 +5411,24 @@ _CASES = [
             id_suffix=f"fp8-rows-{m}",
         )
         for m in (16, 17, 24, 32, 33)
+    ],
+    *[
+        _case(
+            _is_blackwell_sm100,
+            "blackwell-sm100",
+            "gemm",
+            "mm",
+            # With K a multiple of 256, TRT-LLM-Gen serves up to 64 rows,
+            # including the 17..32 rows the CUTLASS kernel mis-reads.
+            (
+                "flashinfer_trtllm_mm_fp8_blockscale"
+                if m <= 64
+                else "flashinfer_mm_fp8_blockscale"
+            ),
+            partial(_mm_mxfp8, m, 256),
+            id_suffix=f"fp8-k256-rows-{m}",
+        )
+        for m in (4, 17, 32, 64, 65)
     ],
     # Attention API x architecture golden cases.
     _case(

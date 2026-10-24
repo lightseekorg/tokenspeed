@@ -204,6 +204,121 @@ if gemm_fp8_nt_groupwise is not error_fn:
         return output
 
 
+# Above this M the CUTLASS kernel is faster than TRT-LLM-Gen on the dense
+# block-FP8 shapes measured on B300. Both apply the same 1x128 and 128x128
+# FP32 scales; only the FP32 accumulation order differs.
+FLASHINFER_TRTLLM_FP8_BLOCKSCALE_MAX_M = 64
+
+
+def _supports_flashinfer_trtllm_fp8_blockscale(m: int, _n: int, k: int) -> bool:
+    # TRT-LLM-Gen has no tactic for K an odd multiple of 128.
+    return m <= FLASHINFER_TRTLLM_FP8_BLOCKSCALE_MAX_M and k % 256 == 0
+
+
+def flashinfer_trtllm_fp8_blockscale_serves(m: int, k: int) -> bool:
+    """Whether ``mm`` auto-selects the TRT-LLM-Gen block-FP8 GEMM for ``m x k``.
+
+    That kernel reads MN-major activation scales; a caller that quantizes its
+    own activations can request them (``mn_major_scales``) to skip a layout
+    copy. Other layouts stay correct, the kernel converts them.
+    """
+    return (
+        gemm_fp8_nt_groupwise is not error_fn
+        and platform.is_nvidia
+        and ArchVersion(10, 0) <= platform.arch_version <= ArchVersion(10, 3)
+        and _supports_flashinfer_trtllm_fp8_blockscale(m, 0, k)
+    )
+
+
+if gemm_fp8_nt_groupwise is not error_fn:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="flashinfer_trtllm_mm_fp8_blockscale",
+        solution="flashinfer_trtllm",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=_MXFP8_FORMAT_SIGNATURES,
+        traits={
+            "n_align": frozenset({128}),
+            "k_align": frozenset({128}),
+            "mnk_problem_filter": frozenset(
+                {_supports_flashinfer_trtllm_fp8_blockscale}
+            ),
+            "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+        },
+        priority=Priority.SPECIALIZED + 4,
+    )
+    def flashinfer_trtllm_mm_fp8_blockscale(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None = None,
+        block_size: list[int] | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run the TRT-LLM-Gen FlashInfer FP8 GEMM for small-M block scales.
+
+        Args:
+            A: E4M3 activations ``[M, K]`` with ``M`` at most
+                ``FLASHINFER_TRTLLM_FP8_BLOCKSCALE_MAX_M`` and ``K`` a
+                multiple of 256.
+            B: E4M3 weights ``[N, K]``.
+            A_scales: FP32 ``[M, K // 128]`` activation scales, read MN-major:
+                strides ``(1, M)`` (the MN-major quantizer's view) are used as
+                is, any other layout is converted first.
+            B_scales: Canonical FP32 ``[N // 128, K // 128]`` weight scales.
+            out_dtype: Output dtype.
+            alpha: Unsupported; must be None.
+            block_size: Unused; the selector guarantees 128x128 blocks.
+            out: Optional ``[M, N]`` output buffer.
+
+        Returns:
+            The ``[M, N]`` product, written into ``out`` when given.
+        """
+        if A_scales is None or B_scales is None:
+            raise ValueError("TRT-LLM-Gen FP8 block-scale GEMM requires both scales")
+        if alpha is not None:
+            raise ValueError("TRT-LLM-Gen FP8 block-scale GEMM takes no alpha")
+        m = A.shape[0]
+        if not _supports_flashinfer_trtllm_fp8_blockscale(m, B.shape[0], A.shape[1]):
+            raise ValueError(
+                "TRT-LLM-Gen FP8 block-scale GEMM serves M <= "
+                f"{FLASHINFER_TRTLLM_FP8_BLOCKSCALE_MAX_M} and K % 256 == 0, "
+                f"got M={m}, K={A.shape[1]}"
+            )
+        if A_scales.shape[0] != m:
+            A_scales = A_scales[:m]
+        # The kernel reads one dense M-long scale column per K block.
+        if A_scales.stride(0) != 1 or A_scales.stride(1) != m:
+            A_scales = A_scales.t().contiguous().t()
+        if not B_scales.is_contiguous():
+            B_scales = B_scales.contiguous()
+        direct_out = (
+            out is not None and out.is_contiguous() and out.shape == (m, B.shape[0])
+        )
+        output = gemm_fp8_nt_groupwise(
+            A,
+            B,
+            A_scales,
+            B_scales.t(),
+            out=out if direct_out else None,
+            out_dtype=out_dtype,
+            backend="trtllm",
+        )
+        if out is not None and not direct_out:
+            out.copy_(output)
+            return out
+        return output
+
+
 # ===-----------------------------------------------------------------------===#
 # MXFP8 (1x32 UE8M0): FlashInfer CuTe DSL (NVIDIA SM100)
 # ===-----------------------------------------------------------------------===#
