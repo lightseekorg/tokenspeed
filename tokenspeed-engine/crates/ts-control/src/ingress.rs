@@ -265,43 +265,34 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         });
     }
     let refusal = invalid
-        .map(|reason| (format!("Invalid request: {reason}"), None))
+        .map(|reason| format!("Invalid request: {reason}"))
         .or_else(|| {
             request
                 .session_params
                 .as_ref()
                 .and_then(|session| session.id.as_ref())
-                .map(|id| {
-                    (
-                        format!("Invalid request: session id {id} does not exist"),
-                        None,
-                    )
-                })
+                .map(|id| format!("Invalid request: session id {id} does not exist"))
         })
         .or_else(|| {
             (state.wants_input_logprobs() && limits.logprobs.lm_head_tp_under_dp).then(|| {
-                (
-                    "Invalid request: prompt logprobs (logprob_start_len) are not available \
-                     with --lm-head-tp-size > 1 under attention DP"
-                        .to_owned(),
-                    None,
-                )
+                "Invalid request: prompt logprobs (logprob_start_len) are not available \
+                 with --lm-head-tp-size > 1 under attention DP"
+                    .to_owned()
             })
         })
-        .or_else(|| too_many_stop_token_ids(&state, &params).map(|message| (message, Some(400))))
+        .or_else(|| too_many_stop_token_ids(&state, &params))
         .or_else(|| {
             (limits.requires_bootstrap && bootstrap.is_none()).then(|| {
-                (
-                    "Invalid request: a disaggregated engine needs the request's bootstrap \
-                     host, port and room"
-                        .to_owned(),
-                    None,
-                )
+                "Invalid request: a disaggregated engine needs the request's bootstrap \
+                 host, port and room"
+                    .to_owned()
             })
         });
-    if let Some((message, status_code)) = refusal {
+    if let Some(message) = refusal {
         tracing::warn!(rid, %message, "refusing request");
-        state.abort(&message, true, status_code);
+        // Every refusal is the request's own error, which the frontend
+        // answers as a client one (400).
+        state.abort(&message, true, Some(400));
         return Some(Admitted::Refused {
             rid,
             state: Box::new(state),
@@ -546,7 +537,15 @@ mod tests {
     fn refused_message(admitted: Admitted) -> String {
         match admitted {
             Admitted::Refused { state, .. } => match state.finished_reason {
-                Some(FinishReason::Abort { message, .. }) => message,
+                Some(FinishReason::Abort {
+                    message,
+                    status_code,
+                    ..
+                }) => {
+                    // Every refusal is a client error.
+                    assert_eq!(status_code, Some(400), "{message}");
+                    message
+                }
                 other => panic!("expected an abort, got {other:?}"),
             },
             Admitted::Run(admission) => panic!("expected a refusal, admitted {}", admission.rid),
@@ -763,6 +762,25 @@ mod tests {
             refused_message(admit(prompt("f", vec![1, 2]), &lm_head_tp).unwrap())
                 .contains("--lm-head-tp-size")
         );
+    }
+
+    #[test]
+    fn sessions_and_requests_without_a_bootstrap_are_refused() {
+        let session = TokenizedGenerateReqInput {
+            session_params: Some(ts_wire::SessionParams {
+                id: Some("s-1".to_owned()),
+                ..Default::default()
+            }),
+            ..request("a", vec![1], SamplingParams::default())
+        };
+        assert!(refused_message(admit(session, &limits()).unwrap()).contains("session id s-1"));
+
+        let disaggregated = IngressLimits {
+            requires_bootstrap: true,
+            ..limits()
+        };
+        let plain = request("b", vec![1], SamplingParams::default());
+        assert!(refused_message(admit(plain, &disaggregated).unwrap()).contains("bootstrap"));
     }
 
     #[test]
