@@ -328,6 +328,86 @@ def test_merge_all_ranks_aligns_timelines_and_namespaces_flow_ids(tmp_path):
     assert all(isinstance(event["id"], int) for event in flow_events)
 
 
+@pytest.mark.parametrize(
+    "pids",
+    [
+        (4242, 4242),
+        (10000, 10001),
+        (4242, 4242, 10003),
+    ],
+)
+def test_merge_all_ranks_keeps_colliding_processes_separate(tmp_path, pids):
+    pairs = []
+    for rank, pid in enumerate(pids):
+        report = _rank_viztracer_report(base_time_ns=VIZTRACER_BASE_NS, pid=pid)
+        report["traceEvents"][0]["name"] = f"forward TP{rank}"
+        report["traceEvents"].extend(
+            [
+                {
+                    "ph": "M",
+                    "pid": pid,
+                    "tid": pid,
+                    "name": "process_name",
+                    "args": {"name": f"Scheduler TP{rank}"},
+                },
+                {
+                    "ph": "M",
+                    "pid": pid,
+                    "tid": pid,
+                    "name": "thread_name",
+                    "args": {"name": "forward thread"},
+                },
+            ]
+        )
+        _add_viztracer_proton_flow(report, 42)
+        report["traceEvents"][-1].update(pid=pid, tid=pid)
+        trace = _rank_proton_trace(base_time_ns=PROTON_BASE_NS)
+        _add_proton_cpu_scope(trace, 42)
+        pairs.append(
+            (
+                rank,
+                _write(tmp_path, f"run-TP{rank}.viztracer.json", report),
+                _write(tmp_path, f"run-TP{rank}.proton.chrome_trace", trace),
+            )
+        )
+
+    output_path = tmp_path / "all-ranks.json"
+    merge_all_ranks(pairs, output_path)
+    events = json.loads(output_path.read_text())["traceEvents"]
+    forwards = [event for event in events if event["name"].startswith("forward TP")]
+    forward_pids = [event["pid"] for event in forwards]
+    proton_pids = {
+        event["pid"] for event in events if event["name"] == "gemm.mm[triton_mm]"
+    }
+    assert len(set(forward_pids)) == len(pids)
+    assert set(forward_pids).isdisjoint(proton_pids)
+    assert [event["tid"] for event in forwards] == list(pids)
+    assert [event["ts"] for event in forwards] == [100.0] * len(pids)
+    if len(pids) == 3:
+        # Remapping an earlier collision must not steal a later rank's PID.
+        assert forward_pids[2] == 10003
+
+    process_metadata = [
+        event
+        for event in events
+        if event["name"] == "process_name"
+        and event["args"]["name"].startswith("Scheduler TP")
+    ]
+    thread_metadata = [event for event in events if event["name"] == "thread_name"]
+    assert [event["pid"] for event in process_metadata] == forward_pids
+    assert {
+        event["pid"]
+        for event in thread_metadata
+        if event["args"]["name"] == "forward thread"
+    } == set(forward_pids)
+    flow_starts = [
+        event
+        for event in events
+        if event["name"] == "viztracer->proton" and event["ph"] == "s"
+    ]
+    assert [event["pid"] for event in flow_starts] == forward_pids
+
+
 def test_merge_all_ranks_namespaces_viztracer_proton_flows(tmp_path):
     scope_id = 42
     rank0_report = _rank_viztracer_report(base_time_ns=VIZTRACER_BASE_NS, pid=4242)
