@@ -636,6 +636,14 @@ class MoELayer(torch.nn.Module):
         return self.plan["supports_deferred_finalize"]
 
     @property
+    def deferred_output_is_token_order(self) -> bool:
+        """Whether deferred row ``token * topk + slot`` holds that route.
+
+        Only owned routes are written; with EP > 1 the other rows are stale.
+        """
+        return self.plan["deferred_output_is_token_order"]
+
+    @property
     def supports_deferred_cuda_finalize(self) -> bool:
         """Whether callers can defer to ``moe_finalize_fuse_shared``.
 

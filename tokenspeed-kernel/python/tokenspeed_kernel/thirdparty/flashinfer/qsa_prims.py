@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import cache
 from weakref import WeakValueDictionary
 
 import torch
@@ -35,6 +36,7 @@ from flashinfer.attention.prims_ts.q_token_kv_block_sparse_metadata import (
     get_q_token_kv_block_sparse_workspace_size,
 )
 from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata, QSAWorkspace
+from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens, is_autotuning
 from tokenspeed_kernel.workspace import retain_for_capture
 
 
@@ -49,6 +51,39 @@ def _group_offsets(offsets: tuple[int, ...], group_size: int) -> tuple[int, ...]
         for begin, end in zip(offsets, offsets[1:])
         for offset in range(begin, end, group_size)
     ) + (offsets[-1],)
+
+
+@cache
+def _warmup_group_sizes(q_heads: int, kv_heads: int, max_rows: int) -> tuple[int, ...]:
+    """Cache native-legal groups for one head geometry and startup row budget."""
+    # Keep the private policy dependency inside startup group enumeration.
+    from flashinfer.attention.prims_ts._q_token_kv_block_sparse_policy import (
+        SUPPORTED_GROUP_SIZES,
+    )
+    from flashinfer.attention.prims_ts.decode import (
+        validate_q_token_kv_block_sparse_group_size,
+    )
+
+    offsets = torch.tensor([0, max_rows], dtype=torch.int32, device="cpu")
+    # Validate the geometry before filtering unsupported groups, so invalid
+    # model heads or row budgets still raise instead of returning no groups.
+    validate_q_token_kv_block_sparse_group_size(
+        offsets, max_rows, q_heads, kv_heads, group_size=1
+    )
+    groups = []
+    # The public validator owns the membership and head-tile limits; do not
+    # copy them into the adapter.
+    for group in SUPPORTED_GROUP_SIZES:
+        if group > max_rows:
+            continue
+        try:
+            validate_q_token_kv_block_sparse_group_size(
+                offsets, max_rows, q_heads, kv_heads, group_size=group
+            )
+        except ValueError:
+            continue
+        groups.append(group)
+    return tuple(groups)
 
 
 @dataclass
@@ -75,6 +110,87 @@ class _PrimTSQSARunner:
         self._captured_plans: WeakValueDictionary[tuple, _PrimTSQSAPlan] = (
             WeakValueDictionary()
         )
+        self._warmed: set[tuple] = set()
+
+    def warmup(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: QSASparseMetadata,
+        *,
+        max_rows: int,
+    ) -> None:
+        """Prepare native group and scheduler variants without binding model KV."""
+        q_heads, head_dim = q.shape[1:]
+        kv_heads = k_cache.shape[1]
+        topk = metadata.selected_blocks.shape[1]
+        key = (
+            q_heads,
+            kv_heads,
+            head_dim,
+            q.dtype,
+            k_cache.dtype,
+            v_cache.dtype,
+            metadata.page_size,
+            metadata.block_size,
+            topk,
+            metadata.block_table.shape[1],
+            metadata.query_positions.dtype,
+            max_rows,
+        )
+        if key in self._warmed:
+            return
+
+        # Packed batch sizes are dynamic. One route and more than one SM wave
+        # cover the native static/persistent scheduler choices. Every request
+        # has one query so short groups also cover ragged batches at every G.
+        route_counts = sorted({1, min(max_rows, self._sm_count + 1)})
+        rows = route_counts[-1]
+        scratch_q = torch.zeros(
+            (rows, q_heads, head_dim), dtype=q.dtype, device=self._device
+        )
+        scratch_k = torch.zeros(
+            (metadata.page_size, kv_heads, head_dim),
+            dtype=k_cache.dtype,
+            device=self._device,
+        )
+        scratch_v = torch.zeros_like(scratch_k, dtype=v_cache.dtype)
+        table = torch.zeros(
+            (rows, metadata.block_table.shape[1]),
+            dtype=torch.int32,
+            device=self._device,
+        )
+        blocks = torch.full((rows, topk), -1, dtype=torch.int32, device=self._device)
+        requests = torch.arange(rows, dtype=torch.int32, device=self._device)
+        positions = torch.zeros(
+            rows, dtype=metadata.query_positions.dtype, device=self._device
+        )
+        # Keep scratch plans and their workspace out of serving/graph state.
+        scratch_runner = _PrimTSQSARunner(self._device)
+        scratch_workspace = QSAWorkspace()
+        for group_size in _warmup_group_sizes(q_heads, kv_heads, max_rows):
+            for routes in route_counts:
+                scratch_metadata = QSASparseMetadata(
+                    blocks[:routes],
+                    table[:routes],
+                    requests[:routes],
+                    positions[:routes],
+                    tuple(range(routes + 1)),
+                    metadata.page_size,
+                    metadata.block_size,
+                    scratch_workspace,
+                )
+                scratch_runner._run(
+                    scratch_q[:routes],
+                    scratch_k,
+                    scratch_v,
+                    scratch_metadata,
+                    group_size=group_size,
+                    scale=1.0,
+                    v_scale=1.0,
+                )
+        self._warmed.add(key)
 
     def run(
         self,
@@ -86,12 +202,6 @@ class _PrimTSQSARunner:
         scale: float,
         v_scale: float,
     ) -> torch.Tensor:
-        q = q.contiguous()
-        page_size = metadata.page_size
-        # HND is the logical ABI; PrimTS accepts the underlying NHD strides.
-        cache_shape = (-1, page_size, k_cache.shape[1], k_cache.shape[2])
-        k = k_cache.view(cache_shape).permute(0, 2, 1, 3)
-        v = v_cache.view(cache_shape).permute(0, 2, 1, 3)
         lengths = tuple(
             end - begin
             for begin, end in zip(
@@ -104,13 +214,41 @@ class _PrimTSQSARunner:
             max(lengths),
             topk * metadata.block_size + metadata.block_size - 1,
             q.shape[1],
-            k.shape[1],
+            k_cache.shape[1],
             self._sm_count,
             head_dim=q.shape[2],
             q_data_type=q.dtype,
             split_kv=False,
             kv_block_size=metadata.block_size,
         )
+        return self._run(
+            q,
+            k_cache,
+            v_cache,
+            metadata,
+            group_size=group_size,
+            scale=scale,
+            v_scale=v_scale,
+        )
+
+    def _run(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        metadata: QSASparseMetadata,
+        *,
+        group_size: int,
+        scale: float,
+        v_scale: float,
+    ) -> torch.Tensor:
+        q = q.contiguous()
+        page_size = metadata.page_size
+        # HND is the logical ABI; PrimTS accepts the underlying NHD strides.
+        cache_shape = (-1, page_size, k_cache.shape[1], k_cache.shape[2])
+        k = k_cache.view(cache_shape).permute(0, 2, 1, 3)
+        v = v_cache.view(cache_shape).permute(0, 2, 1, 3)
+        topk = metadata.selected_blocks.shape[1]
         key = (
             _tensor_layout(q),
             _tensor_layout(k),
@@ -243,6 +381,9 @@ def qsa_attention(
     Returns:
         A new BF16 output tensor with the query shape.
     """
-    return _get_runner(metadata.workspace, q.device).run(
-        q, k_cache, v_cache, metadata, scale=scale, v_scale=v_scale
-    )
+    runner = _get_runner(metadata.workspace, q.device)
+    if is_autotuning():
+        runner.warmup(
+            q, k_cache, v_cache, metadata, max_rows=get_autotune_max_num_tokens()
+        )
+    return runner.run(q, k_cache, v_cache, metadata, scale=scale, v_scale=v_scale)

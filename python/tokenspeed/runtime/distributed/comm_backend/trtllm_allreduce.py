@@ -114,6 +114,30 @@ class TrtllmAllReduceBackend(CommBackend):
         except Exception:
             return False
 
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        resource = self._resources.get(group)
+        if resource is None:
+            return False
+        from tokenspeed_kernel.ops.communication.trtllm import (
+            supports_allreduce_mhc_post_norm,
+        )
+
+        return supports_allreduce_mhc_post_norm(
+            x, norm_weight, resource["device_group"]
+        )
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        resource = self._resources[group]
+        from tokenspeed_kernel.ops.communication.trtllm import allreduce_mhc_post_norm
+
+        return allreduce_mhc_post_norm(
+            x, residual, post, comb, pre, weight, eps, resource["device_group"]
+        )
+
     def has_trtllm_ar(self, group: Group) -> bool:
         return group in self._resources
 

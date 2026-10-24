@@ -52,6 +52,7 @@ _HEADS = 4
 _HEAD_DIM = 128
 _TOPK = 512
 _COMPILED = {}
+_WARMED = set()
 
 
 @dataclass(frozen=True)
@@ -229,6 +230,68 @@ def _compile(
         )
         return score, merge
     return (score,)
+
+
+def warmup(
+    query, keys, request_indices, *, max_capacity, max_partial_bytes, enable_pdl
+):
+    """Warm algorithm/capacity buckets without reading request-owned cache rows.
+
+    Args:
+        query: BF16 query prototype supplying the CUDA device.
+        keys: Existing compressed key cache, unchanged by warmup.
+        request_indices: Prototype supplying the request-index dtype.
+        max_capacity: Maximum compressed-block capacity; capped at 131072.
+        max_partial_bytes: Caller budget for selection scratch.
+        enable_pdl: Programmatic dependent launch setting to compile.
+
+    Returns:
+        None. Compiled configurations remain cached for subsequent calls.
+    """
+    max_capacity = min(max_capacity, 131072)
+    key = (
+        query.device.index,
+        request_indices.dtype,
+        max_capacity,
+        max_partial_bytes,
+        enable_pdl,
+    )
+    if key in _WARMED:
+        return
+    capacities = {max_capacity}
+    capacity = 64
+    while capacity <= max_capacity:
+        capacities.add(capacity)
+        capacity *= 2
+    configurations = {}
+    # Cover _configuration's row policies: singleton, both ends of 2..8,
+    # the first row above 8, and the small-grid limit 128. Above that limit,
+    # cover both aligned and partial query groups. Try ragged and
+    # whole-request ownership for each row count.
+    for capacity in sorted(capacities):
+        for rows in (1, 2, 8, 9, 128, 135, 136):
+            for width in (None, rows):
+                config = _configuration(rows, capacity, width, max_partial_bytes)
+                if config is not None:
+                    configurations.setdefault(config, (rows, capacity, width))
+    sample = query.new_zeros((136, _HEADS, _HEAD_DIM))
+    table = torch.zeros((1, max_capacity // 64), dtype=torch.int32, device=query.device)
+    requests = request_indices.new_zeros(136)
+    complete = requests.new_zeros(136, dtype=torch.int32)
+    for rows, capacity, width in configurations.values():
+        kernel(
+            sample[:rows],
+            keys,
+            table[:, : capacity // 64],
+            requests[:rows],
+            complete[:rows],
+            page_size=64,
+            block_topk=_TOPK,
+            queries_per_request=width,
+            max_partial_bytes=max_partial_bytes,
+            enable_pdl=enable_pdl,
+        )
+    _WARMED.add(key)
 
 
 def kernel(

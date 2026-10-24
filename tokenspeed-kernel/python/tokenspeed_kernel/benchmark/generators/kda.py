@@ -896,8 +896,9 @@ def prepare_kda_fused_paged_verify(
 ) -> PreparedBenchmark:
     """Prepare fused KDA target verify over ``draft_token_num`` rows per request.
 
-    With ``capture_replay`` the kernel also writes the Q/K/V, raw decay-gate
-    and beta rows that a later replay commit consumes.
+    No-store verification captures FP32 corrections and K/raw gates on both
+    vendors. Producer work is timed with
+    verification; allocations remain outside the measured invocation.
     """
 
     common = _fused_common(request)
@@ -913,12 +914,18 @@ def prepare_kda_fused_paged_verify(
         "head_dim": profile.head_dim,
         "paged_state": True,
         "recurrent_layout": common["recurrent_layout"],
-        "split_producers": False,
         "store_states": store_states,
     }
 
     load_builtin_kernels()
     spec = _select_registration(request, platform, traits)
+    records = not store_states
+    split_producers = spec.traits.get("split_producers") == frozenset({True})
+    if records and not capture_replay:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "Records verification requires capture_replay=True",
+        )
 
     rows = batch * draft_token_num
     width = profile.heads * profile.head_dim
@@ -939,33 +946,91 @@ def prepare_kda_fused_paged_verify(
     _fill_state_pages(
         conv_pool, state_pool, read_indices.to(torch.int64), generator=generator
     )
-    replay_payload = (
-        {
-            "replay_mixed_qkv": torch.empty_like(mixed_qkv),
-            "replay_gate": torch.empty((rows, width), dtype=dtype, device="cuda"),
-            "replay_beta": torch.empty(
-                (rows, profile.heads), dtype=dtype, device="cuda"
-            ),
-        }
-        if capture_replay
-        else {}
-    )
 
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
+    record_payload = None
+    raw_qkv = None
+    if records:
+        metadata = torch.zeros((batch, 3), dtype=torch.int64, device="cuda")
+        metadata[:, 0] = torch.arange(batch, device="cuda")
+        raw_qkv = torch.empty_like(mixed_qkv)
+        record_payload = kda_ops.KdaReplayRecords(
+            original_qkv=None if split_producers else raw_qkv,
+            correction=torch.empty(
+                batch,
+                draft_token_num,
+                profile.heads,
+                profile.head_dim,
+                dtype=torch.float32,
+                device="cuda",
+            ).transpose(1, 2),
+            key_gate=torch.empty(
+                batch,
+                draft_token_num,
+                profile.heads,
+                2 * profile.head_dim,
+                dtype=dtype,
+                device="cuda",
+            ).transpose(1, 2),
+            metadata=metadata,
+            stamps=torch.full(
+                (batch, draft_token_num, 2), -1, dtype=torch.int64, device="cuda"
+            ),
+            query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+            * draft_token_num,
+        )
+    conv_scratch = conv_pool
+    state_scratch = None
+    if store_states:
+        conv_scratch = torch.empty(
+            (rows, *conv_pool.shape[1:]), dtype=conv_pool.dtype, device="cuda"
+        )
+        state_scratch = torch.empty(
+            (rows, *state_pool.shape[1:]), dtype=state_pool.dtype, device="cuda"
+        )
+        write_indices = torch.arange(rows, dtype=torch.int32, device="cuda").view(
+            batch, draft_token_num
+        )
+
     def invoke() -> object:
+        producers = {}
+        if records:
+            producers = {
+                "g_raw": (
+                    torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
+                    if split_producers
+                    else None
+                ),
+                "conv_qkv": (
+                    kda_ops.kda_verify_conv_update(
+                        mixed_qkv,
+                        weights.conv_weights,
+                        conv_pool,
+                        read_indices,
+                        num_heads=profile.heads,
+                        head_dim=profile.head_dim,
+                        draft_token_num=draft_token_num,
+                        recurrent_layout=common["recurrent_layout"],
+                        bias=None,
+                        original_qkv=raw_qkv,
+                    )
+                    if split_producers
+                    else None
+                ),
+            }
         return kda_ops.try_kda_fused_paged_verify(
             mixed_qkv,
             weights.conv_weights,
             conv_pool,
-            conv_pool,
+            conv_scratch,
             projection.f_a_out,
             weights.f_b_weight,
             projection.beta_logits,
             weights.a_log,
             weights.dt_bias,
             state_pool=state_pool,
-            state_scratch=None,
+            state_scratch=state_scratch,
             read_indices=read_indices,
             write_indices=write_indices,
             num_heads=profile.heads,
@@ -973,10 +1038,11 @@ def prepare_kda_fused_paged_verify(
             draft_token_num=draft_token_num,
             lower_bound=common["lower_bound"],
             recurrent_layout=common["recurrent_layout"],
-            override=request.registration,
+            override=spec.name,
             solution=request.solution,
             store_states=store_states,
-            **replay_payload,
+            replay_records=record_payload,
+            **producers,
         )
 
     return PreparedBenchmark(
@@ -999,10 +1065,9 @@ def prepare_kda_replay_commit(
 ) -> PreparedBenchmark:
     """Prepare the batched KDA replay commit across every KDA layer.
 
-    One launch replays each request's accepted verify rows from the captured
-    payload and commits the resulting convolution and recurrent state for all
-    layers. Commits write separate pages so every replay reads the same
-    inputs.
+    Inputs are records produced by a real verify before timing on both
+    vendors. Commits write separate
+    pages so repeated measurements read the same checkpoint and records.
     """
 
     common = _fused_common(request)
@@ -1024,11 +1089,6 @@ def prepare_kda_replay_commit(
             BenchmarkStatus.INVALID_CASE,
             "KDA layers must divide evenly into state_groups",
         )
-    if common["lower_bound"] is None:
-        raise BenchmarkCaseError(
-            BenchmarkStatus.INVALID_CASE,
-            "Batched KDA replay requires a lower_bound",
-        )
     _require_state_pages(common["state_pages"], 2 * batch + 1)
     traits = {
         "batched_layers": True,
@@ -1040,14 +1100,18 @@ def prepare_kda_replay_commit(
     load_builtin_kernels()
     spec = _select_registration(request, platform, traits)
     kernel = KernelRegistry.get().get_impl(spec.name)
+    from tokenspeed_kernel.ops.attention import kda as kda_ops
 
     rows = batch * draft_token_num
     width = profile.heads * profile.head_dim
     generator = _generator(request.seed)
-    # Replay payloads stack one [rows, width] slab per layer.
-    payload_qkv, payload_f_a, payload_beta, payload_gate = (
-        _randn((layers, rows, columns), dtype=dtype, generator=generator)
-        for columns in (3 * width, profile.head_dim, profile.heads, width)
+    payload_qkv = torch.empty(layers, rows, 3 * width, dtype=dtype, device="cuda")
+    payload_f_a = torch.empty(layers, rows, width, dtype=torch.float32, device="cuda")
+    payload_beta = torch.empty(layers, rows, 2 * width, dtype=dtype, device="cuda")
+    record_metadata = torch.zeros(batch, 3, dtype=torch.int64, device="cuda")
+    record_metadata[:, 0] = torch.arange(batch, device="cuda")
+    record_stamps = torch.full(
+        (layers, batch, draft_token_num, 2), -1, dtype=torch.int64, device="cuda"
     )
     read_pages = torch.arange(1, batch + 1, dtype=torch.int32, device="cuda")
     layer_tensors = []
@@ -1066,18 +1130,87 @@ def prepare_kda_replay_commit(
             conv_pool, state_pool, read_pages.to(torch.int64), generator=generator
         )
         layer_tensors.append((weights, conv_pool, state_pool))
+        projection = _fused_projection(rows, profile, dtype=dtype, generator=generator)
+        split_producers = kda_ops.kda_fused_paged_verify_uses_split_producers(
+            dtype,
+            store_states=False,
+            recurrent_layout=common["recurrent_layout"],
+            num_heads=profile.heads,
+            head_dim=profile.head_dim,
+        )
+        record_payload = kda_ops.KdaReplayRecords(
+            original_qkv=None if split_producers else payload_qkv[layer],
+            correction=payload_f_a[layer]
+            .view(batch, draft_token_num, profile.heads, profile.head_dim)
+            .transpose(1, 2),
+            key_gate=payload_beta[layer]
+            .view(batch, draft_token_num, profile.heads, 2 * profile.head_dim)
+            .transpose(1, 2),
+            metadata=record_metadata,
+            stamps=record_stamps[layer],
+            query_start_loc=torch.arange(batch + 1, dtype=torch.int32, device="cuda")
+            * draft_token_num,
+        )
+        output = kda_ops.try_kda_fused_paged_verify(
+            projection.mixed_qkv,
+            weights.conv_weights,
+            conv_pool,
+            conv_pool,
+            projection.f_a_out,
+            weights.f_b_weight,
+            projection.beta_logits,
+            weights.a_log,
+            weights.dt_bias,
+            state_pool=state_pool,
+            state_scratch=None,
+            read_indices=read_pages,
+            write_indices=read_pages,
+            num_heads=profile.heads,
+            head_dim=profile.head_dim,
+            draft_token_num=draft_token_num,
+            lower_bound=common["lower_bound"],
+            recurrent_layout=common["recurrent_layout"],
+            store_states=False,
+            replay_records=record_payload,
+            g_raw=(
+                torch.nn.functional.linear(projection.f_a_out, weights.f_b_weight)
+                if split_producers
+                else None
+            ),
+            conv_qkv=(
+                kda_ops.kda_verify_conv_update(
+                    projection.mixed_qkv,
+                    weights.conv_weights,
+                    conv_pool,
+                    read_pages,
+                    num_heads=profile.heads,
+                    head_dim=profile.head_dim,
+                    draft_token_num=draft_token_num,
+                    recurrent_layout=common["recurrent_layout"],
+                    bias=None,
+                    original_qkv=payload_qkv[layer],
+                )
+                if split_producers
+                else None
+            ),
+        )
+        if output is None:
+            raise BenchmarkCaseError(
+                BenchmarkStatus.NOT_APPLICABLE,
+                "Records commit requires a matching verify kernel",
+            )
         descriptor_rows.append(
             [
                 payload_qkv[layer].data_ptr(),
                 weights.conv_weights.data_ptr(),
                 conv_pool.data_ptr(),
                 payload_f_a[layer].data_ptr(),
-                weights.f_b_weight.data_ptr(),
+                0,
                 payload_beta[layer].data_ptr(),
                 weights.a_log.data_ptr(),
                 weights.dt_bias.data_ptr(),
                 state_pool.data_ptr(),
-                payload_gate[layer].data_ptr(),
+                0,
             ]
         )
     descriptors = torch.tensor(descriptor_rows, dtype=torch.uint64, device="cuda")
@@ -1092,7 +1225,15 @@ def prepare_kda_replay_commit(
 
     def invoke() -> object:
         # Hold every layer's tensors: the descriptors only record addresses.
-        _ = layer_tensors
+        _ = layer_tensors, payload_qkv, payload_f_a, payload_beta
+        payload_args = {
+            "correction_stride": payload_f_a.stride(1),
+            "key_gate_stride": payload_beta.stride(1),
+            "activation_dtype": dtype,
+            "conv_state_dtype": first_conv.dtype,
+            "record_metadata": record_metadata,
+            "record_stamps": record_stamps,
+        }
         return kernel(
             descriptors=descriptors,
             group_indices=group_indices,
@@ -1102,15 +1243,12 @@ def prepare_kda_replay_commit(
             draft_token_num=draft_token_num,
             num_heads=profile.heads,
             head_dim=profile.head_dim,
-            f_a_dim=profile.head_dim,
             qkv_stride=payload_qkv.stride(1),
             conv_stride=first_conv.stride(0),
-            f_a_stride=payload_f_a.stride(1),
-            beta_stride=payload_beta.stride(1),
             state_stride=first_state.stride(0),
-            gate_stride=payload_gate.stride(1),
             conv_width=common["conv_kernel_size"],
             lower_bound=common["lower_bound"],
+            **payload_args,
         )
 
     return PreparedBenchmark(

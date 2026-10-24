@@ -231,5 +231,53 @@ def test_sandwich_rmsnorm_is_the_two_triton_calls(calls):
     )
 
 
+def _fp8_buffers(tokens=8):
+    return (
+        torch.empty(tokens, HIDDEN, dtype=torch.float8_e4m3fn),
+        torch.empty(tokens, 1, dtype=torch.float32),
+    )
+
+
+def test_token_fp8_out_reaches_the_fused_launch(calls):
+    """Per-token FP8 buffers go to the fused launch with the BF16 call's
+    arguments; nothing else runs."""
+    calls.fused_result = ("out", "residual_out")
+    buffers = _fp8_buffers()
+    out, _ = _run(x_scale=0.5, residual_scale=0.75, token_fp8_out=buffers)
+    assert out == ("out", "residual_out")
+    ((kind, _, kwargs),) = calls.log
+    assert kind == "fused"
+    assert kwargs.pop("token_fp8_out") is buffers
+    assert kwargs == dict(eps=1e-5, x_scale=0.5, residual_scale=0.75, max_token_num=64)
+
+
+@pytest.mark.parametrize("fusion", [True, False])
+def test_token_fp8_out_reaches_the_unfused_second_norm(calls, monkeypatch, fusion):
+    """A declined (or unfused) call writes the codes in the second Triton
+    norm, the one whose output they quantize; the first norm and the rest of
+    the chain keep the BF16 call's arguments."""
+    monkeypatch.setitem(global_server_args_dict, "enable_allreduce_fusion", fusion)
+    buffers = _fp8_buffers()
+    _, inputs = _run(x_scale=0.5, residual_scale=0.75, token_fp8_out=buffers)
+    if fusion:
+        assert calls.log[0][2]["token_fp8_out"] is buffers
+    assert calls.log[-1][4].pop("token_fp8_out") is buffers
+    _assert_unfused(calls, inputs, reduced=True, pair=(0.5, 0.75))
+
+
+def test_sandwich_rmsnorm_passes_token_fp8_out_to_the_second_norm(calls):
+    x = torch.randn(4, HIDDEN).to(torch.bfloat16)
+    residual = torch.randn(4, HIDDEN).to(torch.bfloat16)
+    post, norm = _norm(1e-6), _norm(1e-5)
+    buffers = _fp8_buffers(4)
+    layernorm.sandwich_rmsnorm(
+        x, residual, post, norm, x_scale=2.0, residual_scale=0.5, token_fp8_out=buffers
+    )
+    assert calls.log[-1][4].pop("token_fp8_out") is buffers
+    _assert_unfused(
+        calls, (x, residual, post, norm), reduced=False, pair=(2.0, 0.5), post_eps=1e-6
+    )
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

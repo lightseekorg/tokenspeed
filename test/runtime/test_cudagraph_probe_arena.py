@@ -609,33 +609,20 @@ def test_a_probe_arena_cannot_also_carry_a_reserve() -> None:
 def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -> None:
     from tokenspeed_kernel.ops.attention import kda as kda_ops
 
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-        kda_verify_scratch_in_pool,
-    )
-
     for family in sorted(_RECIPES):
         assert _RECIPES[family]().verify_scratch_in_pool() is False, family
-
-    plain = _kimi_k3_recipe()
-    speculative = _kimi_k3_recipe(
-        speculative_algorithm="eagle", speculative_num_draft_tokens=2
-    )
     monkeypatch.setattr(kda_ops, "kda_replay_commit_supported", lambda *a, **k: True)
-    for raw_gate in (True, False):
-        monkeypatch.setattr(
-            kda_ops, "kda_batched_replay_uses_raw_gate", lambda *a, _r=raw_gate, **k: _r
-        )
-        assert speculative.verify_scratch_in_pool() is raw_gate
-        # Without speculation the kernel answer is never consulted.
-        assert kda_verify_scratch_in_pool(plain.server_args, plain.attn_config) is False
-
-    # A PD prefill role plans no verify workspace, so its pool stages none.
     monkeypatch.setattr(
-        kda_ops, "kda_batched_replay_uses_raw_gate", lambda *a, **k: True
+        kda_ops, "kda_fused_paged_verify_uses_split_producers", lambda *a, **k: True
     )
-    speculative.server_args.disaggregation_mode = "prefill"
-    assert speculative.workspace_bytes() == 0
-    assert speculative.verify_scratch_in_pool() is False
+    for algorithm in (None, "eagle"):
+        recipe = _kimi_k3_recipe(
+            speculative_algorithm=algorithm, speculative_num_draft_tokens=2
+        )
+        assert recipe.verify_scratch_in_pool() is False
+        assert recipe.workspace_bytes() > 0
+        recipe.server_args.disaggregation_mode = "prefill"
+        assert recipe.workspace_bytes() == 0
 
     def arena_bytes(max_bs: int) -> int:
         recipe = _kimi_k3_recipe(
@@ -643,14 +630,11 @@ def test_pool_staged_verify_scratch_keeps_the_serving_concurrency(monkeypatch) -
         )
         recipe.cache_budget_bytes = 0
         recipe.probe_batch_rows = 2
-        assert recipe.verify_scratch_in_pool() is True
+        assert recipe.verify_scratch_in_pool() is False
         return recipe.setup().spec.memory_plan.arena_bytes
 
-    monkeypatch.setattr(
-        kda_ops, "kda_batched_replay_uses_raw_gate", lambda *a, **k: True
-    )
-    # Its verify scratch is a row per request of the bound pool, probe or not.
-    assert arena_bytes(8) < arena_bytes(64)
+    # The pool can use probe rows; records are budgeted outside that arena.
+    assert arena_bytes(8) == arena_bytes(64)
 
 
 def test_each_refusal_turns_the_probe_off_and_names_itself() -> None:

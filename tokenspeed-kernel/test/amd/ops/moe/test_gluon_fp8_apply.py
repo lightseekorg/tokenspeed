@@ -25,16 +25,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
+from utils import is_cdna4
+
+pytestmark = pytest.mark.skipif(not is_cdna4(), reason="requires AMD gfx950 GPU")
 
 
-def _requires_gfx950() -> None:
-    if torch.version.hip is None or torch.cuda.get_device_capability() != (9, 5):
-        pytest.skip("requires gfx950")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_gluon_block_fp8_dequantize_matches_torch() -> None:
-    _requires_gfx950()
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
         gluon_fp8_block_dequantize,
     )
@@ -52,11 +48,9 @@ def test_gluon_block_fp8_dequantize_matches_torch() -> None:
     torch.testing.assert_close(actual.float(), expected, rtol=0.005, atol=0.005)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_gluon_block_fp8_large_batch_uses_bf16_prefill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _requires_gfx950()
     import tokenspeed_kernel.ops.moe.gluon as gluon_moe
     from tokenspeed_kernel.ops.moe.gluon import (
         gluon_fp8_block_precomputed_moe_apply,
@@ -105,11 +99,9 @@ def test_gluon_block_fp8_large_batch_uses_bf16_prefill(
     assert actual is sentinel
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _requires_gfx950()
     import tokenspeed_kernel.ops.moe.gluon as gluon_moe
 
     num_tokens = 64
@@ -148,7 +140,6 @@ def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
     assert actual is sentinel
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize(
     ("num_tokens", "expected_block_m"),
     ((16, 16), (64, 16), (128, 32), (256, 32), (512, 64)),
@@ -156,7 +147,6 @@ def test_gluon_block_fp8_medium_batch_uses_exact_mfma(
 def test_gluon_block_fp8_exact_mfma_route_block_size(
     num_tokens: int, expected_block_m: int
 ) -> None:
-    _requires_gfx950()
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.exact_mfma import (
         _select_route_block_size,
     )
@@ -166,12 +156,16 @@ def test_gluon_block_fp8_exact_mfma_route_block_size(
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize("num_tokens", [1, 8, 32, 64])
-def test_gluon_block_fp8_decode_matches_torch(num_tokens: int) -> None:
-    _requires_gfx950()
+@pytest.mark.parametrize("packed_weights", [False, True], ids=["linear", "packed"])
+def test_gluon_block_fp8_decode_matches_torch(
+    num_tokens: int, packed_weights: bool
+) -> None:
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
         gluon_fp8_block_warp_decode_moe,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+        pack_fp8_weight_n16k32,
     )
 
     generator = torch.Generator(device="cuda").manual_seed(11)
@@ -232,7 +226,15 @@ def test_gluon_block_fp8_decode_matches_torch(num_tokens: int) -> None:
     )
 
     actual = gluon_fp8_block_warp_decode_moe(
-        x, w13, w2, w13_scale, w2_scale, topk_ids, topk_weights, 7.0
+        x,
+        pack_fp8_weight_n16k32(w13) if packed_weights else w13,
+        pack_fp8_weight_n16k32(w2) if packed_weights else w2,
+        w13_scale,
+        w2_scale,
+        topk_ids,
+        topk_weights,
+        7.0,
+        packed_weights=packed_weights,
     )
     dequant_w13 = w13.float() * w13_scale.repeat_interleave(128, 1).repeat_interleave(
         128, 2
@@ -260,9 +262,7 @@ def test_gluon_block_fp8_decode_matches_torch(num_tokens: int) -> None:
     torch.testing.assert_close(actual.float(), expected, rtol=0.08, atol=0.04)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_gluon_block_fp8_exact_mfma_matches_materialized_bf16() -> None:
-    _requires_gfx950()
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
         gluon_fp8_block_dequantize,
         gluon_fp8_block_exact_mfma_moe,
@@ -316,7 +316,6 @@ def test_gluon_block_fp8_exact_mfma_matches_materialized_bf16() -> None:
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 @pytest.mark.parametrize(
     ("block_n", "block_k"), ((64, 64), (64, 128), (128, 64), (128, 128))
 )
@@ -324,7 +323,6 @@ def test_gluon_block_fp8_stage2_aligned_scale_matches_materialized_bf16(
     block_n: int, block_k: int
 ) -> None:
     """Aligned scale tiles preserve exact BF16 stage-2 arithmetic."""
-    _requires_gfx950()
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
         gluon_fp8_block_dequantize,
     )
@@ -408,10 +406,8 @@ def test_gluon_block_fp8_stage2_aligned_scale_matches_materialized_bf16(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
 def test_gluon_block_fp8_decode_ep_filters_nonlocal_routes() -> None:
     """EP decode remaps local experts and leaves remote routes for all-reduce."""
-    _requires_gfx950()
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
         gluon_fp8_block_warp_decode_moe,
     )
@@ -471,6 +467,7 @@ def test_gluon_block_fp8_decode_ep_filters_nonlocal_routes() -> None:
         7.0,
         expert_start,
         True,
+        packed_weights=False,
     )
     dequant_w13 = w13.float() * w13_scale.repeat_interleave(128, 1).repeat_interleave(
         128, 2
@@ -497,3 +494,135 @@ def test_gluon_block_fp8_decode_ep_filters_nonlocal_routes() -> None:
             expert_output.float() * topk_weights[token_ids, slots, None],
         )
     torch.testing.assert_close(actual.float(), expected, rtol=0.08, atol=0.04)
+
+
+@pytest.mark.parametrize("packed_weights", [False, True], ids=["linear", "packed"])
+@pytest.mark.parametrize(
+    ("rows", "ep_size", "rank", "intermediate"),
+    [(1, 1, 0, 512), (4, 4, 3, 2048), (3, 4, 1, 1536)],
+)
+def test_gluon_block_fp8_warp_routed_reference(
+    rows: int,
+    ep_size: int,
+    rank: int,
+    intermediate: int,
+    packed_weights: bool,
+    record_property,
+) -> None:
+    from test_gluon_fp8_packed_small import (
+        _assert_numerics,
+        _fixture,
+        _reference,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
+        gluon_fp8_block_warp_decode_moe,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+        pack_fp8_weight_n16k32,
+    )
+
+    x, w13, w2, s13, s2, ids, weights = _fixture(
+        rows, ep_size, rank, True, 4096, intermediate
+    )
+    expert_start = rank * w13.shape[0]
+    expected = _reference(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        ids,
+        weights,
+        expert_start,
+        7.0,
+        quantized_activations=False,
+    )[0]
+    actual = gluon_fp8_block_warp_decode_moe(
+        x,
+        pack_fp8_weight_n16k32(w13) if packed_weights else w13,
+        pack_fp8_weight_n16k32(w2) if packed_weights else w2,
+        s13,
+        s2,
+        ids,
+        weights,
+        7.0,
+        expert_start,
+        ep_size > 1,
+        packed_weights=packed_weights,
+    )
+    _assert_numerics(actual, expected, record_property)
+    if ep_size > 1:
+        ids.fill_(-1)
+        empty = gluon_fp8_block_warp_decode_moe(
+            x,
+            pack_fp8_weight_n16k32(w13) if packed_weights else w13,
+            pack_fp8_weight_n16k32(w2) if packed_weights else w2,
+            s13,
+            s2,
+            ids,
+            weights,
+            7.0,
+            expert_start,
+            True,
+            packed_weights=packed_weights,
+        )
+        assert not empty.any()
+
+
+@pytest.mark.parametrize("rows", [1, 2, 3, 4])
+@pytest.mark.parametrize("stress", ["normal", "outlier", "cancellation"])
+def test_gluon_block_fp8_packed_warp_stress(
+    rows: int, stress: str, record_property
+) -> None:
+    from test_gluon_fp8_packed_small import (
+        _assert_numerics,
+        _fixture,
+        _reference,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
+        gluon_fp8_block_warp_decode_moe,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+        pack_fp8_weight_n16k32,
+    )
+
+    x, w13, w2, s13, s2, ids, weights = _fixture(
+        rows, 1, 0, stress == "outlier", 4096, 512
+    )
+    if stress == "cancellation":
+        x[:, 1::2] = x[:, ::2]
+        x[:, 0] += 0.125
+        w13[:, :, 1::2] = (-w13[:, :, ::2].float()).to(w13.dtype)
+    expected = _reference(
+        x,
+        w13,
+        w2,
+        s13,
+        s2,
+        ids,
+        weights,
+        0,
+        7.0,
+        quantized_activations=False,
+    )[0]
+    raw = gluon_fp8_block_warp_decode_moe(
+        x, w13, w2, s13, s2, ids, weights, 7.0, packed_weights=False
+    )
+    actual = gluon_fp8_block_warp_decode_moe(
+        x,
+        pack_fp8_weight_n16k32(w13),
+        pack_fp8_weight_n16k32(w2),
+        s13,
+        s2,
+        ids,
+        weights,
+        7.0,
+        packed_weights=True,
+    )
+    _assert_numerics(actual, expected, record_property)
+    delta = (actual.float() - raw.float()).flatten()
+    record_property("versus_raw_max_abs", delta.abs().max().item())
+    record_property(
+        "versus_raw_relative_l2",
+        (delta.norm() / raw.float().norm().clamp_min(1.0e-12)).item(),
+    )

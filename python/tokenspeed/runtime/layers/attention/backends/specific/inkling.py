@@ -280,7 +280,7 @@ class InklingAttnBackend(AttentionBackend):
         self._init_pool_binding()
         # Registered lazily by the model's four ShortConv sites. The buffers
         # are fixed LCM field views; a target verify publishes the accepted
-        # window into them after acceptance (commit_speculative_state_after_verify).
+        # window into them after acceptance (commit_state_after_acceptance).
         self._checkpoint_streams: dict[
             tuple[int, int, int, str], tuple[torch.Tensor, ...]
         ] = {}
@@ -460,7 +460,7 @@ class InklingAttnBackend(AttentionBackend):
             current,
         )
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_acceptance(
         self,
         accepted_lengths: torch.Tensor,
         *,

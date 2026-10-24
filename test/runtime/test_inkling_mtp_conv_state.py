@@ -125,7 +125,7 @@ class TestInklingCacheContract:
         )
 
         # Two of the four candidates were accepted: the frontier is 130.
-        backend.commit_speculative_state_after_verify(
+        backend.commit_state_after_acceptance(
             torch.tensor([2], dtype=torch.int32), num_extends=0, accepted_path=None
         )
         expected = torch.tensor([[127.0, -127.0], [128.0, -128.0], [129.0, -129.0]])
@@ -133,7 +133,7 @@ class TestInklingCacheContract:
         assert torch.equal(checkpoints[:5], torch.zeros(5, 3, 2))
 
         # An extend round commits nothing: its chunk end is the frontier.
-        backend.commit_speculative_state_after_verify(
+        backend.commit_state_after_acceptance(
             torch.tensor([4], dtype=torch.int32), num_extends=1, accepted_path=None
         )
         assert torch.equal(checkpoints[5], expected)
