@@ -164,6 +164,112 @@ def test_incomplete_amd_quark_metadata_is_not_promoted(monkeypatch) -> None:
     assert quant_config.is_w4a8_fp8 is False
 
 
+def _mxfp8_activation_config(*, is_dynamic: bool = True) -> dict:
+    """Quark W4A8 MX metadata as the Qwen3.8 MXFP4 converter writes it.
+
+    MXFP4 (``fp4_e2m1``) weights, MXFP8 activations (E4M3 with one E8M0
+    scale per 32 values), and no ``export`` section.
+    """
+    mx = {"qscheme": "per_group", "group_size": 32, "scale_format": "e8m0"}
+    return {
+        "quant_method": "quark",
+        "global_quant_config": {
+            "weight": {**mx, "dtype": "fp4_e2m1", "is_dynamic": False},
+            "input_tensors": {**mx, "dtype": "fp8_e4m3", "is_dynamic": is_dynamic},
+            "output_tensors": None,
+        },
+        "layer_quant_config": {},
+        "exclude": [
+            "*.linear_attn.in_proj_b",
+            "*.linear_attn.in_proj_a",
+            "*.mlp.gate",
+            "*hyper_connection*",
+            "*fc_embedding",
+            "lm_head",
+        ],
+    }
+
+
+def test_amd_quark_mxfp8_activations_without_export_select_mxfp4(
+    monkeypatch,
+) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
+    config = _mxfp8_activation_config()
+
+    assert Mxfp4Config.override_quantization_method(config, None) == "mxfp4"
+    quant_config = Mxfp4Config.from_config(config)
+    assert quant_config.is_checkpoint_mxfp4_serialized is True
+    assert quant_config.use_dynamic_mxfp8_activations is True
+    assert quant_config.use_dynamic_mxfp4_activations is False
+    # Per-group MXFP8 inputs are not the per-tensor FP8 W4A8 scheme.
+    assert quant_config.is_w4a8_fp8 is False
+    assert quant_config.linear_activation_format == "mxfp8"
+
+    ignored = quant_config.ignored_layers
+    assert should_ignore_quant_layer("model.layers.0.linear_attn.in_proj_b", ignored)
+    assert should_ignore_quant_layer("model.layers.0.mlp.gate", ignored)
+    assert should_ignore_quant_layer(
+        "model.layers.3.attn_hyper_connection.mix_inject_proj", ignored
+    )
+    assert not should_ignore_quant_layer(
+        "model.layers.0.linear_attn.in_proj_qkvz", ignored
+    )
+    assert not should_ignore_quant_layer("model.layers.3.qkv_proj", ignored)
+
+
+def test_amd_quark_mxfp8_activations_accept_reorder_export(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
+    config = _mxfp8_activation_config()
+    config["export"] = {"pack_method": "reorder", "weight_format": "real_quantized"}
+
+    quant_config = Mxfp4Config.from_config(config)
+    assert quant_config.use_dynamic_mxfp8_activations is True
+    assert quant_config.linear_activation_format == "mxfp8"
+
+    # Another export layout is not the packed layout the kernels read.
+    config["export"] = {"pack_method": "order", "weight_format": "real_quantized"}
+    assert Mxfp4Config.override_quantization_method(config, None) is None
+
+
+def test_amd_quark_static_mxfp8_activations_are_not_promoted(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
+    config = _mxfp8_activation_config(is_dynamic=False)
+
+    assert Mxfp4Config.override_quantization_method(config, None) is None
+    quant_config = Mxfp4Config.from_config(config)
+    assert quant_config.use_dynamic_mxfp8_activations is False
+    assert quant_config.is_w4a8_fp8 is False
+    assert quant_config.linear_activation_format is None
+
+
+def test_existing_quark_schemes_keep_their_activation_formats(monkeypatch) -> None:
+    _mock_platform(monkeypatch, is_amd=True)
+    mxfp4 = Mxfp4Config.from_config(
+        _amd_quark_mxfp4_config(_fp4_e8m0_per_group(is_dynamic=True))
+    )
+    assert mxfp4.linear_activation_format == "mxfp4"
+    assert mxfp4.use_dynamic_mxfp8_activations is False
+
+    fp8 = Mxfp4Config.from_config(_amd_quark_mxfp4_config({"dtype": "fp8_e4m3"}))
+    assert fp8.is_w4a8_fp8 is True
+    assert fp8.use_dynamic_mxfp8_activations is False
+    assert fp8.linear_activation_format is None
+
+    # Both schemes still require the export section.
+    for input_tensors in (_fp4_e8m0_per_group(is_dynamic=True), {"dtype": "fp8"}):
+        config = _amd_quark_mxfp4_config(input_tensors)
+        del config["export"]
+        assert Mxfp4Config.override_quantization_method(config, None) is None
+
+
+def test_mxfp4_config_rejects_two_activation_formats() -> None:
+    with pytest.raises(ValueError, match="MXFP4 or MXFP8"):
+        Mxfp4Config(
+            use_dynamic_mxfp4_activations=True,
+            use_dynamic_mxfp8_activations=True,
+        )
+
+
 def _fp8_per_channel_w8a8() -> dict:
     """Per-layer FP8 attention override (static per-channel W, per-token A)."""
     return {

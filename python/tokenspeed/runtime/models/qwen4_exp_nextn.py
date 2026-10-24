@@ -236,11 +236,27 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 
-    def set_embed_and_head(self, embed, head):
+    def set_embed_and_head_module(
+        self, embed: torch.Tensor, lm_head: nn.Module
+    ) -> None:
+        """Share the target's embedding and its LM head.
+
+        The draft adopts the target's whole head module, quantized or not
+        (``--lm-head-mxfp4``), when it builds the same kind of head. With
+        attention DP it keeps its replicated head and shares the BF16 weight.
+        """
         del self.model.embed_tokens.weight
-        del self.lm_head.weight
         self.model.embed_tokens.weight = embed
-        self.lm_head.weight = head
+        if isinstance(self.lm_head, ParallelLMHead):
+            self.lm_head = lm_head
+        else:
+            if lm_head.weight.dtype == torch.uint8:  # packed MXFP4
+                raise ValueError(
+                    "an MTP draft with attention DP needs the target's BF16 LM "
+                    "head; drop --lm-head-mxfp4"
+                )
+            del self.lm_head.weight
+            self.lm_head.weight = lm_head.weight
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 

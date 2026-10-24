@@ -138,8 +138,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             raise ValueError("Qwen4-Exp heads_per_ngram must be positive")
         if self.embedding_dim % self.ngram_heads:
             raise ValueError(
-                "ple_embed_dim must be divisible by "
-                "(ngram_size - 1) * heads_per_ngram"
+                "ple_embed_dim must be divisible by (ngram_size - 1) * heads_per_ngram"
             )
 
         self.head_dim = self.embedding_dim // self.ngram_heads
@@ -400,16 +399,18 @@ class Qwen4ExpPLELayer(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("kv_proj", prefix),
         )
+        # Every kv_proj parameter stacks the key rows over the value rows: the
+        # weight and, for MXFP4 checkpoints, its per-row ``weight_scale``.
         # Unquantized ReplicatedLinear hands back a plain Parameter whose
         # weight_loader is a writable attribute, while a quantized one returns a
         # BaseWeightParameter exposing it as a read-only property. Write to
         # whichever storage exists; picking the wrong one either raises or
         # silently drops the shard routing.
-        weight = self.kv_proj.weight
-        if hasattr(weight, "_weight_loader"):
-            weight._weight_loader = self._load_kv_proj_shard
-        else:
-            weight.weight_loader = self._load_kv_proj_shard
+        for param in self.kv_proj.parameters(recurse=False):
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = self._load_kv_proj_shard
+            else:
+                param.weight_loader = self._load_kv_proj_shard
         self.norm_key = GroupedGemmaRMSNorm(
             self.hc_hidden_size,
             config.rms_norm_eps,
@@ -456,6 +457,10 @@ class Qwen4ExpPLELayer(nn.Module):
             "value": (self.hc_hidden_size, self.hidden_size),
         }
         start, size = offsets[shard_id]
+        if param.dtype == torch.uint8 and loaded_weight.element_size() == 1:
+            # Packed MXFP4 codes and E8M0 scales (stored as uint8 or
+            # float8_e8m0fnu) are copied as raw bytes.
+            loaded_weight = loaded_weight.view(torch.uint8)
         if loaded_weight.shape[0] != size or param.shape[0] != (
             self.hc_hidden_size + self.hidden_size
         ):

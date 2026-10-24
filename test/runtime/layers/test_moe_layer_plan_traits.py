@@ -188,3 +188,15 @@ def test_fp32_correction_bias_requires_deepseek_v3_routing(monkeypatch):
                 "routing_method_type": RoutingMethodType.MiniMax2,
             },
         )
+
+
+def test_mxfp8_activation_checkpoint_plans_mxfp8_experts(monkeypatch):
+    # A Quark W4A8 MX checkpoint's routed experts quantize activations to
+    # MXFP8, which the plan states as the internal activation dtype.
+    quant_config = Mxfp4Config(
+        ignored_layers=[],
+        is_checkpoint_mxfp4_serialized=True,
+        use_dynamic_mxfp8_activations=True,
+    )
+    plan = _plan_kwargs(monkeypatch, activation="silu", quant_config=quant_config)
+    assert plan["internal_activation_dtype"] == "mxfp8"

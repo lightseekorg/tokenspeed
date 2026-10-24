@@ -586,6 +586,8 @@ class ServerArgs:
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
+    # Quantize the BF16 LM head to MXFP4 weights at load (MXFP8 activations).
+    lm_head_mxfp4: bool = False
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -3258,6 +3260,16 @@ class ServerArgs:
                 "attention-TP rank holds a host shard and keeps the all-reduce "
                 "(anonymous mapping, huge-page friendly). auto: sharded when "
                 "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
+            "--lm-head-mxfp4",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.lm_head_mxfp4,
+            help=(
+                "Quantize the LM head to MXFP4 weights at load and run it with "
+                "MXFP8 activations (gfx950). Reads a quarter of the BF16 head's "
+                "bytes per decode step; changes logits by the MXFP4 rounding."
             ),
         )
         parser.add_argument(

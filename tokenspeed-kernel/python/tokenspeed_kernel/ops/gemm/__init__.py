@@ -977,8 +977,13 @@ def bmm(
 
 
 # ===-----------------------------------------------------------------------===#
-# MXFP4 linear with dynamic MXFP4 activations
+# MXFP4-weight linear with dynamic MXFP4 or MXFP8 activations
 # ===-----------------------------------------------------------------------===#
+
+
+# Activation formats of the MXFP4 linears, quantized inside the kernel with
+# one UE8M0 scale per 32 K values: E2M1 (``quantize_mxfp4`` recipe) or E4M3.
+MXFP4_LINEAR_ACTIVATION_FORMATS = ("mxfp4", "mxfp8")
 
 
 @dataclass(frozen=True)
@@ -990,17 +995,32 @@ class Mxfp4LinearWeight:
         weight_scale: UE8M0 ``[N, K/32]`` uint8, one scale per 32 K values.
         layout: Weight layout the selected kernels read; the ``weight_layout``
             trait of their registrations.
+        activation_format: Activation format the weight was prepared for
+            (one of ``MXFP4_LINEAR_ACTIVATION_FORMATS``).
     """
 
     weight: torch.Tensor
     weight_scale: torch.Tensor
     layout: str
+    activation_format: str
 
 
-def _mxfp4_linear_traits(n: int, k: int, layout: str | None) -> dict[str, object]:
+def _mxfp4_linear_traits(
+    n: int, k: int, layout: str | None, activation_format: str
+) -> dict[str, object]:
+    if activation_format not in MXFP4_LINEAR_ACTIVATION_FORMATS:
+        raise ValueError(
+            "MXFP4 linear activation_format must be one of "
+            f"{MXFP4_LINEAR_ACTIVATION_FORMATS}, got {activation_format!r}"
+        )
     # ``weight_elements`` lets kernels bound the weight size (for example by
     # 32-bit buffer offsets) at selection, before the weight is prepared.
-    traits: dict[str, object] = {"n": n, "k": k, "weight_elements": n * k}
+    traits: dict[str, object] = {
+        "n": n,
+        "k": k,
+        "weight_elements": n * k,
+        "activation_format": activation_format,
+    }
     if layout is not None:
         traits["weight_layout"] = layout
     return traits
@@ -1019,6 +1039,7 @@ def prepare_mxfp4_linear(
     weight_scale: torch.Tensor,
     *,
     swiglu: bool,
+    activation_format: str,
     solution: str | None = None,
 ) -> Mxfp4LinearWeight:
     """Prepare a checkpoint MXFP4 weight for ``mxfp4_linear``.
@@ -1032,6 +1053,9 @@ def prepare_mxfp4_linear(
         swiglu: Whether the layer runs ``mxfp4_swiglu_linear`` (``weight``
             stacks the gate rows over the up rows) instead of
             ``mxfp4_linear``.
+        activation_format: ``"mxfp4"`` or ``"mxfp8"``, the format the kernel
+            quantizes the BF16 activations to; it restricts selection to
+            kernels supporting it.
         solution: Optional registered solution to restrict selection to.
 
     Returns:
@@ -1042,7 +1066,7 @@ def prepare_mxfp4_linear(
         "gemm",
         "mxfp4_swiglu_linear" if swiglu else "mxfp4_linear",
         MXFP4_LINEAR_SIGNATURE,
-        traits=_mxfp4_linear_traits(n, k, None),
+        traits=_mxfp4_linear_traits(n, k, None, activation_format),
         solution=solution,
     )
     (layout,) = KernelRegistry.get().get_by_name(kernel.name).traits["weight_layout"]
@@ -1050,6 +1074,7 @@ def prepare_mxfp4_linear(
         weight=_prepare_mxfp4_weight_layout(layout, weight),
         weight_scale=weight_scale,
         layout=layout,
+        activation_format=activation_format,
     )
 
 
@@ -1057,6 +1082,7 @@ def _run_mxfp4_linear(
     mode: str,
     x: torch.Tensor,
     weight: Mxfp4LinearWeight,
+    activation_format: str,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     n, k = weight.weight.shape[0], weight.weight.shape[1] * 2
@@ -1064,11 +1090,16 @@ def _run_mxfp4_linear(
         raise ValueError(
             f"{mode} expects BF16 [M, {k}] activations, got {x.dtype} {tuple(x.shape)}"
         )
+    if activation_format != weight.activation_format:
+        raise ValueError(
+            f"{mode} got activation_format {activation_format!r} for a weight "
+            f"prepared for {weight.activation_format!r}"
+        )
     kernel = select_kernel(
         "gemm",
         mode,
         MXFP4_LINEAR_SIGNATURE,
-        traits=_mxfp4_linear_traits(n, k, weight.layout),
+        traits=_mxfp4_linear_traits(n, k, weight.layout, activation_format),
     )
     shape_params = {"M": x.shape[0], "N": n, "K": k}
     ShapeCapture.get().record("gemm", mode, kernel.name, x.dtype, shape_params)
@@ -1080,35 +1111,47 @@ def _run_mxfp4_linear(
         **shape_params,
         has_out=out is not None,
     ):
-        return kernel(x, weight.weight, weight.weight_scale, out=out)
+        return kernel(
+            x,
+            weight.weight,
+            weight.weight_scale,
+            activation_format=activation_format,
+            out=out,
+        )
 
 
 def mxfp4_linear(
     x: torch.Tensor,
     weight: Mxfp4LinearWeight,
     *,
+    activation_format: str,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Dense MXFP4 linear with dynamic MXFP4 activations.
+    """Dense MXFP4-weight linear with dynamic MXFP4 or MXFP8 activations.
 
-    Computes ``mxfp4(x) @ W.T`` where ``mxfp4`` quantizes each 32-value group
-    of ``x`` to E2M1 with a UE8M0 scale (the ``quantize_mxfp4`` recipe).
+    Computes ``q(x) @ W.T`` where ``q`` quantizes each 32-value group of
+    ``x`` with a UE8M0 scale: to E2M1 with the ``quantize_mxfp4`` recipe
+    (``"mxfp4"``), or to E4M3 (``"mxfp8"``) with the scale exponent of
+    ``amax / 448`` rounded up.
 
     Args:
         x: BF16 ``[M, K]`` activations with unit inner stride.
         weight: Weight from ``prepare_mxfp4_linear(..., swiglu=False)``.
+        activation_format: ``"mxfp4"`` or ``"mxfp8"``; must be the format
+            ``weight`` was prepared for.
         out: Optional BF16 ``[M, N]`` destination with unit inner stride.
 
     Returns:
         BF16 ``[M, N]``; ``out`` when provided.
     """
-    return _run_mxfp4_linear("mxfp4_linear", x, weight, out)
+    return _run_mxfp4_linear("mxfp4_linear", x, weight, activation_format, out)
 
 
 def mxfp4_swiglu_linear(
     x: torch.Tensor,
     weight: Mxfp4LinearWeight,
     *,
+    activation_format: str,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Dense MXFP4 gate/up projection followed by ``silu(gate) * up``.
@@ -1120,12 +1163,14 @@ def mxfp4_swiglu_linear(
         x: BF16 ``[M, K]`` activations with unit inner stride.
         weight: Weight from ``prepare_mxfp4_linear(..., swiglu=True)``; its
             rows ``[0, N/2)`` are the gate and ``[N/2, N)`` the up projection.
+        activation_format: ``"mxfp4"`` or ``"mxfp8"``; must be the format
+            ``weight`` was prepared for.
         out: Optional BF16 ``[M, N/2]`` destination with unit inner stride.
 
     Returns:
         BF16 ``[M, N/2]``; ``out`` when provided.
     """
-    return _run_mxfp4_linear("mxfp4_swiglu_linear", x, weight, out)
+    return _run_mxfp4_linear("mxfp4_swiglu_linear", x, weight, activation_format, out)
 
 
 # ===-----------------------------------------------------------------------===#

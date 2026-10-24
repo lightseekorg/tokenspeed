@@ -274,16 +274,19 @@ arrival counter, and a reduction in split order by the last arrival, so
 results are deterministic and the launch is HIP-graph safe. An XCD remap
 keeps the M tiles that share a weight tile on one XCD's L2.
 
-### gfx950 dense MXFP4 linear (dynamic MXFP4 activations)
+### gfx950 dense MXFP4 linear (dynamic MXFP4 or MXFP8 activations)
 
 `gluon_mxfp4_linear_gfx950` and `gluon_mxfp4_swiglu_linear_gfx950` run the
 dense layers (for example MoE shared experts) of MXFP4 checkpoints whose
-activations are quantized to MXFP4 at runtime, from decode to prefill batch
-sizes.
+activations are quantized at runtime, from decode to prefill batch sizes.
+The activation format is an explicit argument (`activation_format`, the
+`activation_format` registry trait): `"mxfp4"` (E2M1) or `"mxfp8"` (E4M3),
+each with one UE8M0 scale per 32 K values. Both read the same preshuffled
+weight bytes.
 
 #### Contract
 
-- `mxfp4_linear` computes `mxfp4(x) @ W.T` from a BF16 `x [M, K]` with unit
+- `mxfp4_linear` computes `q(x) @ W.T` from a BF16 `x [M, K]` with unit
   inner stride and a packed E2M1 weight `[N, K/2]` (low nibble first) with
   uint8 UE8M0 scales `[N, K/32]` (unit inner stride). `N % 16 == 0`,
   `K % 64 == 0`, `N * K < 2**31`. Output is BF16 `[M, N]`; a caller-owned
@@ -295,10 +298,13 @@ sizes.
   the same order as the MoE `(16, 16)` tiles), prepared once at load by
   `prepare_mxfp4_linear`; the registry trait `weight_layout` keeps the
   prepared layout and the selected kernel consistent.
-- Numerics match quantize-then-GEMM bit for bit up to FP32 summation order:
-  each 32-value group of `x` gets the `mxfp4_quantize` scale (amax rounded up
-  at the third mantissa bit, minus two exponents, clamped to `[0, 254]`) and
-  round-to-nearest-even E2M1 values. The SwiGLU epilogue rounds gate and up
+- Numerics match quantize-then-GEMM bit for bit up to FP32 summation order.
+  MXFP4: each 32-value group of `x` gets the `mxfp4_quantize` scale (amax
+  rounded up at the third mantissa bit, minus two exponents, clamped to
+  `[0, 254]`) and round-to-nearest-even E2M1 values. MXFP8: the biased scale
+  exponent is that of `amax * (1/448)` in FP32, plus one when that product
+  has mantissa bits, clamped to `[1, 254]`; values are `x / 2**(E - 127)`
+  rounded to nearest-even E4M3FN. The SwiGLU epilogue rounds gate and up
   to BF16, computes `gate * (1 / (1 + exp(-gate))) * up` in FP32 (the
   `silu_and_mul` order) and rounds to BF16; the down projection quantizes
   that output on load, as the unfused path did.
@@ -323,9 +329,10 @@ eight BF16 values per lane with consecutive lanes on consecutive 16-byte
 runs and rows spread over all warps, so no warp repeats another's
 quantization work. A group's amax is a packed 16-bit integer max of the
 sign-cleared BF16 bits across the four lanes holding it (`v_pk_max_u16`,
-two DPP steps), and `v_cvt_scalef32_pk_fp4_bf16` divides by the scale,
-rounds and packs. The packed tile and its scales then move through LDS into
-the scaled-MFMA operand layouts. The preshuffled weight feeds the B operand
+two DPP steps), and `v_cvt_scalef32_pk_fp4_bf16` (or `..._fp8_bf16` for
+MXFP8) divides by the scale, rounds and packs. The quantized tile and its
+scales then move through LDS into the scaled-MFMA operand layouts; an E4M3
+tile holds twice the bytes of an E2M1 one. The preshuffled weight feeds the B operand
 directly from global memory, one contiguous KiB per warp load.
 `v_mfma_scale_f32_16x16x128_f8f6f4` accumulates in FP32.
 
@@ -1438,13 +1445,23 @@ grows about linearly; the `G` cap sits below their crossover, and larger routes
 use the torch route. Five trailing programs write the block offsets and
 schedules, one per block size.
 
-### MXFP8 SiTU experts
+### MXFP8 SiTU and SiLU experts
 
 On gfx950, the MoE API selects Gluon kernels with MXFP8 activations and MXFP4
 weights for EP8 SiTU experts with a 3072-wide intermediate and supported clamp
 settings. The `input` activation policy selects
 BF16-activation decode for eligible batches of up to four tokens; explicit
 `fp8` uses MXFP8 throughout.
+
+The same pipeline (`mxfp8_moe_prefill`, the gated activation an explicit
+`activation` argument) serves SiLU experts of checkpoints with dynamic MXFP8
+activations (`internal_activation_dtype="mxfp8"`, for example Quark W4A8 MX)
+as `gluon_mxfp4_a8w4_silu_precomputed_moe_apply`: precomputed top-k, no EP,
+every batch size including decode. Its epilogue rounds gate and up to BF16
+and computes `SiLU(gate) * up` in FP32, as the dense SwiGLU linear does. The
+down GEMM tiles the intermediate by 256, so the weight preprocessor first pads
+narrower experts (Qwen3.8-Flash-Next's 640 becomes 768) with zero codes and
+unit scales, which add exactly zero.
 
 Weight preparation interleaves gate/up weights and arranges weights and scales
 for tiled loads. MXFP8 and BF16-activation kernels share one prepared
@@ -1459,8 +1476,9 @@ Starting from BF16 activations and precomputed top-k expert IDs and weights:
 2. **Quantize inputs** to E4M3 values with one E8M0 scale per 32 values.
    Values remain in token order; only scales are gathered into sorted-route
    order.
-3. **Gate/up GEMM + SiTU** uses scaled matrix instructions and FP32
-   accumulation, fusing the activation into a BF16 token-slot intermediate.
+3. **Gate/up GEMM + SiTU (or SiLU)** uses scaled matrix instructions and
+   FP32 accumulation, fusing the activation into a BF16 token-slot
+   intermediate.
 4. **Quantize intermediates** to MXFP8, keeping values in token-slot
    order and scales in sorted-route order.
 5. **Down GEMM + weighted combine** accumulates in FP32, applies route

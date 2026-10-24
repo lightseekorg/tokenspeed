@@ -708,7 +708,7 @@ else:
 
 
 # ===-----------------------------------------------------------------------===#
-# MXFP4 linear with dynamic MXFP4 activations: Gluon (AMD gfx950)
+# MXFP4-weight linear with dynamic MXFP4/MXFP8 activations: Gluon (AMD gfx950)
 # ===-----------------------------------------------------------------------===#
 
 
@@ -748,6 +748,7 @@ if platform.is_amd:
             "k_align": frozenset({64}),
             "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
             "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
+            "activation_format": frozenset({"mxfp4", "mxfp8"}),
         },
     )
     def gluon_mxfp4_linear_gfx950(
@@ -755,15 +756,23 @@ if platform.is_amd:
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         *,
+        activation_format: str,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
-        """``mxfp4(x) @ W.T`` with in-kernel activation quantization."""
+        """``q(x) @ W.T`` with in-kernel activation quantization."""
         counters = zeroed_state(
             _mxfp4_linear_counters(x.shape[0], weight.shape[0], x.shape[1], False),
             dtype=torch.int32,
             device=x.device,
         )
-        return _mxfp4_linear_impl(x, weight, weight_scale, counters=counters, out=out)
+        return _mxfp4_linear_impl(
+            x,
+            weight,
+            weight_scale,
+            activation_format=activation_format,
+            counters=counters,
+            out=out,
+        )
 
     @register_kernel(
         "gemm",
@@ -778,6 +787,7 @@ if platform.is_amd:
             "k_align": frozenset({64}),
             "weight_elements_max": frozenset({_MXFP4_LINEAR_MAX_WEIGHT_ELEMENTS}),
             "weight_layout": frozenset({MXFP4_LINEAR_MFMA_LAYOUT}),
+            "activation_format": frozenset({"mxfp4", "mxfp8"}),
         },
     )
     def gluon_mxfp4_swiglu_linear_gfx950(
@@ -785,16 +795,22 @@ if platform.is_amd:
         weight: torch.Tensor,
         weight_scale: torch.Tensor,
         *,
+        activation_format: str,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
-        """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` fused into one GEMM."""
+        """``silu(gate) * up`` of ``q(x) @ W.T`` fused into one GEMM."""
         counters = zeroed_state(
             _mxfp4_linear_counters(x.shape[0], weight.shape[0], x.shape[1], True),
             dtype=torch.int32,
             device=x.device,
         )
         return _mxfp4_swiglu_linear_impl(
-            x, weight, weight_scale, counters=counters, out=out
+            x,
+            weight,
+            weight_scale,
+            activation_format=activation_format,
+            counters=counters,
+            out=out,
         )
 
 else:

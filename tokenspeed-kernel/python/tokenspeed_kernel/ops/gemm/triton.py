@@ -263,7 +263,10 @@ MXFP4_LINEAR_SIGNATURES = frozenset({MXFP4_LINEAR_SIGNATURE})
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=MXFP4_LINEAR_SIGNATURES,
-    traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    traits={
+        "weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT}),
+        "activation_format": frozenset({"mxfp4"}),
+    },
     priority=Priority.PORTABLE,
 )
 def triton_mxfp4_linear(
@@ -271,9 +274,14 @@ def triton_mxfp4_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
+    activation_format: str,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """``mxfp4(x) @ W.T``: quantize ``x`` to MXFP4, then the MXFP4 GEMM."""
+    if activation_format != "mxfp4":
+        raise ValueError(
+            f"triton_mxfp4_linear supports MXFP4 activations, got {activation_format!r}"
+        )
     x_fp4, x_scale = mxfp4_quantize(x)
     return triton_mm_mxfp4(x_fp4, weight, x_scale, weight_scale, x.dtype, out=out)
 
@@ -285,7 +293,10 @@ def triton_mxfp4_linear(
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"amd"})),
     signatures=MXFP4_LINEAR_SIGNATURES,
-    traits={"weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT})},
+    traits={
+        "weight_layout": frozenset({MXFP4_LINEAR_LINEAR_LAYOUT}),
+        "activation_format": frozenset({"mxfp4"}),
+    },
     priority=Priority.PORTABLE,
 )
 def triton_mxfp4_swiglu_linear(
@@ -293,10 +304,13 @@ def triton_mxfp4_swiglu_linear(
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     *,
+    activation_format: str,
     out: torch.Tensor | None,
 ) -> torch.Tensor:
     """``silu(gate) * up`` of ``mxfp4(x) @ W.T`` with stacked [gate; up] rows."""
-    gate_up = triton_mxfp4_linear(x, weight, weight_scale, out=None)
+    gate_up = triton_mxfp4_linear(
+        x, weight, weight_scale, activation_format=activation_format, out=None
+    )
     if out is None:
         out = torch.empty(
             (x.shape[0], weight.shape[0] // 2), dtype=x.dtype, device=x.device

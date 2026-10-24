@@ -957,10 +957,11 @@ if platform.is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.n16_weights import (
         n16_mxfp4_shape,
+        pad_mxfp4_moe_intermediate,
         preprocess_n16_mxfp4_weights,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.prefill_mxfp8 import (
-        mxfp8_situ_prefill,
+        mxfp8_moe_prefill,
     )
     from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.situ_decode import (
         _supports_a16w4_warp_decode_ep_gfx950,
@@ -1545,7 +1546,7 @@ if platform.is_amd:
                 == "interleaved",
                 routed_out=getattr(w, "_situ_output_buffer", None),
             )
-        return mxfp8_situ_prefill(
+        return mxfp8_moe_prefill(
             x,
             w.w13_weight,
             w.w13_weight_scale,
@@ -1553,6 +1554,7 @@ if platform.is_amd:
             w.w2_weight_scale,
             topk_ids,
             topk_weights,
+            activation="situ",
             situ_beta=float(getattr(w, "activation_situ_beta", 1.0)),
             situ_linear_beta=float(situ_linear_beta),
             out=getattr(w, "_situ_output_buffer", None),
@@ -2106,6 +2108,102 @@ if platform.is_amd:
             w.w2_weight_scale,
             topk_weights,
             topk_ids,
+        )
+
+    # The MXFP8 pipeline tiles the down GEMM's K (the intermediate) by 256.
+    _MXFP8_INTERMEDIATE_MULTIPLE = 256
+
+    def gluon_mxfp4_a8w4_silu_moe_weights(plan: dict, w: torch.nn.Module) -> None:
+        del plan
+        pad_mxfp4_moe_intermediate(w, _MXFP8_INTERMEDIATE_MULTIPLE)
+        preprocess_n16_mxfp4_weights(w)
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_a8w4_silu_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_a8w4_silu_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"silu"}),
+            "activation_clamped": frozenset({False}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({False}),
+            "supports_all_to_all_ep": frozenset({False}),
+            # The weight preprocessor pads the intermediate to 256.
+            "ispp_alignment": frozenset({32}),
+            "hidden_alignment": frozenset({256}),
+            "internal_activation_dtype": frozenset({"mxfp8"}),
+            "supports_bias": frozenset({False}),
+            "combine_order": frozenset({"rank"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_a8w4_silu_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply SiLU experts with dynamic MXFP8 activations and MXFP4 weights.
+
+        Both GEMMs are E4M3 x E2M1 scaled MFMAs over the N16 bank; tokens and
+        the SiLU intermediate are quantized to MXFP8 (one E8M0 scale per 32
+        values). Every batch size, decode included, runs the same pipeline.
+
+        Args:
+            plan: MoE plan from ``moe_plan``.
+            x: BF16 hidden states ``[tokens, hidden]``.
+            w: Module holding the padded N16 banks written by the weight
+                preprocessor.
+            router_logits: Unused; routing must be precomputed.
+            topk_weights: Route weights ``[tokens, top_k]``.
+            topk_ids: Expert ids ``[tokens, top_k]``.
+            num_tokens_global: Unused; expert parallelism is unsupported.
+            max_num_tokens_per_gpu: Unused token-capacity hint.
+            do_finalize: Must be true.
+            enable_pdl: Unused launch hint.
+
+        Returns:
+            BF16 output ``[tokens, hidden]``.
+        """
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del enable_pdl
+        if not do_finalize:
+            raise ValueError("gfx950 A8W4 SiLU MoE cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("gfx950 A8W4 SiLU MoE requires precomputed top-k")
+        if _swiglu_args(w) != (1.0, 0.0, 0.0):
+            raise ValueError("gfx950 A8W4 SiLU MoE supports only standard SiLU")
+        num_experts = int(w.w13_weight.shape[0])
+        return mxfp8_moe_prefill(
+            x,
+            w.w13_weight,
+            w.w13_weight_scale,
+            w.w2_weight,
+            w.w2_weight_scale,
+            topk_ids,
+            topk_weights,
+            activation="silu",
+            situ_beta=None,
+            situ_linear_beta=None,
+            out=None,
+            expert_start=0,
+            global_experts=num_experts,
         )
 
     @register_kernel(

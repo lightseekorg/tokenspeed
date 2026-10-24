@@ -104,7 +104,10 @@ from tokenspeed.runtime.layers.paged_attention import PagedAttention
 from tokenspeed.runtime.layers.ple_lookup import PLELookup
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
-from tokenspeed.runtime.layers.quantization.utils import should_exclude_quant_module
+from tokenspeed.runtime.layers.quantization.utils import (
+    should_exclude_quant_module,
+    should_ignore_quant_layer,
+)
 from tokenspeed.runtime.layers.qwen4_exp_ple import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     Qwen4ExpNGramEmbedding,
@@ -189,6 +192,25 @@ def test_qwen4_exp_nextn_drops_quark_quantization_for_excluded_mtp() -> None:
 
     quantized = Mxfp4Config(ignored_layers=["lm_head"])
     assert qwen4_exp_nextn._resolve_mtp_quant_config(quantized) is quantized
+
+
+def test_qwen4_exp_nextn_keeps_quantized_mtp_with_bf16_fc() -> None:
+    # The W4A8 MX conversion quantizes the MTP layer's linears and keeps only
+    # its fc projections (and the hyper-connections) in BF16.
+    config = Mxfp4Config.from_config(
+        {
+            "quant_method": "quark",
+            "exclude": ["*fc_embedding", "*fc_hidden", "*hyper_connection*", "lm_head"],
+        }
+    )
+    assert qwen4_exp_nextn._resolve_mtp_quant_config(config) is config
+    ignored = config.ignored_layers
+    assert should_ignore_quant_layer("mtp.fc_embedding", ignored)
+    assert should_ignore_quant_layer("mtp.fc_hidden", ignored)
+    assert should_ignore_quant_layer(
+        "mtp.layers.0.attn_hyper_connection.mix_inject_proj", ignored
+    )
+    assert not should_ignore_quant_layer("mtp.layers.0.qkv_proj", ignored)
 
 
 def test_qwen4_exp_gdn_norm_uses_sigmoid_output_gate() -> None:

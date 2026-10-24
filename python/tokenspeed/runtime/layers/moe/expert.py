@@ -267,6 +267,12 @@ class MoELayer(torch.nn.Module):
                 internal_activation_dtype = "fp8"
             elif getattr(self.quant_config, "use_dynamic_mxfp4_activations", False):
                 internal_activation_dtype = "mxfp4"
+            elif (
+                isinstance(self.quant_config, Mxfp4Config)
+                and self.quant_config.use_dynamic_mxfp8_activations
+            ):
+                # E4M3 activations with one E8M0 scale per 32 values.
+                internal_activation_dtype = "mxfp8"
         # --moe-mxfp4-fp8-activation: FP8 activations for every MXFP4 routed
         # expert layer in the model. "fp8" matches only the FlashInfer cutlass
         # W4A8 registration, so the flag fails closed where that kernel is
