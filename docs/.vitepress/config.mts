@@ -38,6 +38,7 @@ export default defineConfig({
         items: [
           { text: "Getting Started", link: "/guides/getting-started" },
           { text: "Launching a Server", link: "/guides/launching" },
+          { text: "Adding a New Model", link: "/guides/adding-a-model" },
           { text: "InstantTensor Loading", link: "/guides/instanttensor" }
         ]
       },

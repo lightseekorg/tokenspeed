@@ -30,6 +30,9 @@ people and average people is more than tenfold.
   where it might be tricky for humans to understand. Keep project- and
   component-level (design) docs focused on the high-level picture. Put docs in
   the right place and avoid duplicating the same content across many places.
+* When adding or onboarding a model, follow
+  [.skills/add-new-model.md](.skills/add-new-model.md) and
+  [docs/guides/adding-a-model.md](docs/guides/adding-a-model.md).
 * For code comments, use common/existing terms for easy human understanding;
   avoid obscure terms or coining unnecessary new concepts.
 * Parameters that select execution paths, algorithms, or correctness-critical
