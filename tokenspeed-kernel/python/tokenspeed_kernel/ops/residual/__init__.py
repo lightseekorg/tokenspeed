@@ -736,7 +736,8 @@ def try_mhc_shifted_post_pre_norm(
         The input uses ``pre``, not the newly generated pre-mix. All tensors
         must be contiguous and colocated on an SM100-family GPU, with H a
         positive multiple of 1024 and 0<T<=2**20. Inputs are never mutated.
-        Warm up on the execution stream before CUDA graph capture.
+        Not safe under CUDA graph replay: split barriers can read the previous
+        replay's partials.
     """
     from tokenspeed_kernel.ops.residual.deep_gemm import mega_mhc_eligible
 
