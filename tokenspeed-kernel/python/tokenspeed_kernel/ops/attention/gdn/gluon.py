@@ -107,6 +107,7 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({128}),
+            "tree": frozenset({False}),
             "separate_output_state": frozenset({False, True}),
             "strided_qkv": frozenset({False, True}),
         },

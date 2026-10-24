@@ -208,9 +208,19 @@ def prepare_gdn_decode_mtp(
             "GDN state_writes must be one of: "
             f"{', '.join(sorted(_IMPLEMENTED_STATE_WRITES))}"
         )
-    spec = _select_registration(request, platform, {"head_dim": profile.head_dim})
-    inputs = _decode_inputs(request.seed, batch, tokens, profile)
     per_token = state_writes == "per_token"
+    spec = _select_registration(
+        request,
+        platform,
+        {
+            "head_dim": profile.head_dim,
+            "value_head_dim": profile.value_head_dim,
+            "verify_tokens": tokens,
+            "output_only": not per_token,
+            "tree": False,
+        },
+    )
+    inputs = _decode_inputs(request.seed, batch, tokens, profile)
     # Committed rows first, then one scratch row per verified position.
     state = _state_pool(batch * (1 + tokens) if per_token else batch, profile)
     initial_indices = torch.arange(batch, device="cuda", dtype=torch.int32)

@@ -610,11 +610,12 @@ def gdn_decode_mtp(
             without it (ReplaySSM verify) the pool is left untouched, which
             needs ``disable_state_update``, and an ``intermediate_states_buffer``
             is given exactly when ``gdn_tree_verify_needs_node_states(T)``.
-            Runs the Triton solution; ``None`` is a chain.
+            Kernel selection requires tree support; ``None`` is a chain.
         replay_payload: Optional contiguous ``[B * T, num_q_heads * head_dim +
             num_v_heads * head_v_dim + 2 * num_v_heads]`` ReplaySSM payload, in
             the inputs' dtype, that a chunked ReplaySSM tree verify fills with
-            each token's ``[k | v | a | b]`` as read.
+            each token's ``[k | v | a | b]`` as read. The CuTe DSL solution
+            also fills this payload for a chain.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -680,15 +681,19 @@ def gdn_decode_mtp(
                     "intermediate_states_buffer exactly when "
                     "gdn_tree_verify_needs_node_states"
                 )
-        if solution not in (None, "triton"):
-            raise ValueError(
-                f"draft-tree GDN verify runs the Triton solution, got {solution}"
-            )
-        solution = "triton"
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
-    traits = {"head_dim": head_dim}
+    traits = {
+        "head_dim": head_dim,
+        "value_head_dim": v.shape[-1],
+        "verify_tokens": q.shape[1],
+        "tree": tree_ancestors is not None,
+        "output_only": disable_state_update
+        and intermediate_states_buffer is None
+        and output_state_indices is None
+        and output_state is None,
+    }
     if output_state is not None:
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
@@ -700,6 +705,19 @@ def gdn_decode_mtp(
         traits=traits,
         solution=solution,
         override=override,
+    )
+    ShapeCapture.get().record(
+        "attention",
+        "gdn_decode_mtp",
+        kernel.name,
+        q.dtype,
+        {
+            "batch_size": q.shape[0],
+            "seq_len": q.shape[1],
+            "num_v_heads": v.shape[-2],
+            "head_dim": head_dim,
+            "head_v_dim": v.shape[-1],
+        },
     )
     with kernel_scope(
         "attention",
@@ -790,7 +808,7 @@ def gdn_decode_supports(
     op: str,
     dtype: torch.dtype,
     *,
-    head_dim: int,
+    traits: dict[str, int | bool],
     trait: str,
     solution: str | None,
 ) -> bool:
@@ -800,7 +818,9 @@ def gdn_decode_supports(
     Args:
         op: ``"gdn_decode_step"`` or ``"gdn_decode_mtp"``.
         dtype: q/k/v dtype.
-        head_dim: Key head dimension.
+        traits: The same geometry and execution traits as the actual decode
+            call. MTP includes ``head_dim``, ``value_head_dim``,
+            ``verify_tokens``, ``output_only`` and ``tree``.
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
             ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
             ``q | k | v`` row, with contiguous heads; such kernels read a/b by
@@ -818,14 +838,14 @@ def gdn_decode_supports(
             "attention",
             op,
             signature,
-            traits={"head_dim": head_dim},
+            traits=traits,
             solution=solution,
         )
         featured = select_kernel(
             "attention",
             op,
             signature,
-            traits={"head_dim": head_dim, trait: True},
+            traits={**traits, trait: True},
             solution=solution,
         )
     except NoKernelFoundError:
@@ -1012,6 +1032,7 @@ def gdn_replay_commit_supported(
 import tokenspeed_kernel.ops.attention.gdn.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gdn.triton  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.gdn.cute_dsl  # noqa: E402,F401
 
 # isort: on
 

@@ -1,10 +1,88 @@
 # GDN kernels
 
+## CuTe DSL WY verification
+
+`gdn_decode_mtp` selects the output-only TF32 MMA kernel for ReplaySSM through
+the normal registry. It accepts BF16/FP16 Q/K/V with K=V=128, grouped value
+heads, BF16/FP16/FP32 K-last initial states, and 1–16 tokens. Chains and trees
+share the same WY computation; the facade's existing tree workspace contract
+restricts its output-only trees to 8–16 nodes.
+
+The registration constrains platform, dtype, head dimensions, token count and
+output-only execution; its specialized priority wins over general recurrence
+on supported NVIDIA geometry, for both BF16 and FP32 state. Tree support is a
+trait, so chain-only kernels are excluded without forcing a solution. Explicit
+`solution` and `override` requests still apply. Cache-pool capability queries
+use the same execution traits when checking for packed projection views.
+
+State-writing verify and ordinary decode retain the BF16 padding-safe Triton
+policy. Read-only verify uses normal selection, including fallback kernels for
+unsupported WY geometry. It may read the reserved null page for padding, but
+never writes it; padded outputs are ignored.
+
+The leaf reads the committed state once per value tile, forms the small WY
+output transform and computes every token's output without writing the state
+pool or materializing node states. An optional payload receives exact raw
+`[k | v | a | b]` rows for the existing replay commit. State-writing options
+are rejected. Q/K/V and gates may be strided; state-pool rows may have padding.
+
+Products use native `mma.sync.m16n8k8` TF32 input rounding and FP32
+accumulation; normalization uses native FP32 reciprocal square root, and gates
+and WY coefficients stay FP32. For four tokens, backward query propagation
+produces the same initial-state coefficient
+and value weights without forming Gram matrices or running a triangular solve.
+Tests compare against an independent FP64 token recurrence at atol=1e-4,
+rtol=2^-7, including strong path gates and unit-scale states. This leaf makes
+no bitwise-numerics claim.
+
+Token bounds are bucketed to 4/8/16; MMA reductions use at least eight elements.
+Short windows transpose the products to put values along the 16-row MMA axis.
+Value tiles use 64 or 128 columns according to window length, state dtype and
+the coarse number of request/head pairs. Eight-token windows with at most 64
+request/head pairs interleave two FP32 accumulators within each 128-element
+TF32 reduction. Other shapes retain one accumulator. This bounded choice is
+part of the compilation key; batch and token counts themselves are runtime.
+Actual batch size, token count, strides and scale remain runtime arguments.
+Warm each selected bucket/dtype/model geometry before CUDA Graph capture;
+replays consume updated inputs, parameters, state rows and ancestor masks.
+The kernel supports PDL and keeps PDL compilation variants separate.
+
+Q/K/V use four-element vector reads when the physical row has a unit inner
+stride and eight-byte alignment. Both conditions are checked on the device;
+arbitrary strides and unaligned rows use scalar reads. Normalization and raw
+payload stores reuse the loaded values. Four-token 64-value tiles also
+issue raw gate and parameter reads before Q/K normalization,
+then convert and consume them in the normal FP32 gate computation.
+
+TF32 products share one accumulation loop for both one- and two-accumulator
+variants, preserving their reduction order. Four-token windows allocate only
+the backward-propagation workspace; larger windows initialize the Gram tiles
+directly through MMA.
+
+Checkpoint tiles retain their source dtype in shared memory. Aligned rows use
+16-byte asynchronous copies issued before Q/K preparation and completed before
+the first checkpoint product. Row alignment is evaluated on the device, so
+odd physical row strides and changed indices in a graph use the scalar copy
+where needed. Negative indices zero-fill the tile. This changes state transport
+without reducing the precision of any matrix product.
+
+Release validation on SM103 covers 64 chain/tree, BF16/FP32,
+warm/cold-cache and PDL configurations, with B=1–64, T=4/8/16 and H/HV=8/24,
+16/32 or 8/32. Blackwell 13–16-token chains already use chunked verification,
+so comparisons include that path in addition to the serial Triton leaf.
+The facade and model's ReplaySSM verify use the same registry selection.
+
 ## FlashInfer PDL adapters
 
 The FlashInfer adapter retains the upstream launch geometry and runtime ABI,
 while wrapping device bodies with PDL synchronization. Adapted functions and
 in-memory compilation caches live in private namespaces.
+
+The MTP registration declares K=V=128, the geometry supported by both its BF16
+and FP32 state paths. Other value widths use portable verification. Direct
+BF16-state calls outside that geometry are rejected before the FP32-only
+adapter. Runtime tests cover non-square states, padding and accepted-prefix
+commit; WY tests cover 4/8/16-token wide value tiles with BF16 and FP16 state.
 
 Decode and prefill explicitly select FlashInfer's CuTe backend. FlashInfer
 0.7.0's automatic backend selection can use Cake GDN for supported shapes,

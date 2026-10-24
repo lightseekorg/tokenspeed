@@ -143,30 +143,22 @@ def _reject_skip_term(D: torch.Tensor | None) -> None:
         raise ValueError("the GDN/KDA recurrence has no D skip term")
 
 
-def _prepare_gdn_decode_state_path(
-    ssm_states: torch.Tensor,
-    initial_state_indices: torch.Tensor,
-    output_state_indices: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor | None, str | None]:
-    """Select a safe decode solution while preserving graph padding indices.
+def gdn_decode_solution(
+    ssm_dtype: torch.dtype, *, disable_state_update: bool
+) -> str | None:
+    """Select a safe solution without remapping negative padding indices.
 
     FlashInfer's FP32 kernels skip negative state rows, and the portable Triton
     kernels guard negative reads and writes for both FP32 and BF16 state. The
     FlashInfer BF16 path instead redirects padding to row 0 — the arena's
     reserved null page, which must stay zero for every fresh-state read.
-    Until that kernel supports a padding mask, route BF16 state through
-    Triton and keep ``-1`` unchanged.
+    Until that kernel supports a padding mask, route BF16 state writes through
+    Triton and keep ``-1`` unchanged. Read-only verify can use normal selection:
+    padding outputs are ignored and the null page stays untouched.
     """
     return (
-        initial_state_indices,
-        output_state_indices,
-        gdn_decode_solution(ssm_states.dtype),
+        "triton" if ssm_dtype == torch.bfloat16 and not disable_state_update else None
     )
-
-
-def gdn_decode_solution(ssm_dtype: torch.dtype) -> str | None:
-    """The GDN decode/verify solution forced for a state dtype (see above)."""
-    return "triton" if ssm_dtype == torch.bfloat16 else None
 
 
 def _build_cu_extend_seq_lens_cpu(
@@ -1677,15 +1669,6 @@ class MambaAttnBackend(AttentionBackend):
             ``[1, B, Hv, V]`` layer output.
         """
         _reject_skip_term(D)
-        (
-            decode_initial_indices,
-            decode_output_indices,
-            decode_solution,
-        ) = _prepare_gdn_decode_state_path(
-            ssm_states,
-            read_indices,
-            write_indices,
-        )
         core_attn_out = gdn_decode_step(
             q=query,
             k=key,
@@ -1695,11 +1678,11 @@ class MambaAttnBackend(AttentionBackend):
             dt_bias=dt_bias,
             b=b.unsqueeze(1),
             initial_state=ssm_states,
-            initial_state_indices=decode_initial_indices,
+            initial_state_indices=read_indices,
             # Write to the out page, not the possibly shared input page.
-            output_state_indices=decode_output_indices,
+            output_state_indices=write_indices,
             use_qk_l2norm=True,
-            solution=decode_solution,
+            solution=gdn_decode_solution(ssm_states.dtype, disable_state_update=False),
         )
         # [B, 1, Hv, V] (pool/indices-major) -> [1, B, Hv, V], this backend's
         # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
@@ -2158,15 +2141,6 @@ class MambaAttnBackend(AttentionBackend):
                 batch_size, draft_token_num
             )
             output_state_indices = output_indices
-        (
-            mtp_initial_indices,
-            mtp_output_indices,
-            mtp_solution,
-        ) = _prepare_gdn_decode_state_path(
-            initial_state,
-            initial_indices,
-            output_state_indices,
-        )
         return gdn_decode_mtp(
             query_b,
             key_b,
@@ -2176,9 +2150,9 @@ class MambaAttnBackend(AttentionBackend):
             dt_bias=dt_bias,
             b=b_b,
             initial_state=initial_state,
-            initial_state_indices=mtp_initial_indices,
+            initial_state_indices=initial_indices,
             use_qk_l2norm=True,
-            output_state_indices=mtp_output_indices,
+            output_state_indices=output_state_indices,
             output_state=output_state,
             intermediate_states_buffer=intermediate_states,
             tree_ancestors=self._verify_ancestors(
@@ -2186,7 +2160,9 @@ class MambaAttnBackend(AttentionBackend):
             ),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
-            solution=mtp_solution,
+            solution=gdn_decode_solution(
+                initial_state.dtype, disable_state_update=self.replay_ssm
+            ),
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     def _prefill_scan(

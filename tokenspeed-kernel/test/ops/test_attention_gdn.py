@@ -1914,14 +1914,15 @@ def test_gdn_decode_mtp_chunked_tree_keeps_extreme_gates_finite(
 
 
 @pytest.mark.parametrize("regime", ["correlated_keys", "mixed_gates", "raw_qk"])
-def test_gdn_decode_mtp_chunked_tree_matches_float64_within_one_ulp(
-    device: str, regime: str, require
+@pytest.mark.parametrize("solution", ["triton", "cute_dsl"])
+def test_gdn_decode_mtp_chunked_tree_hard_regimes_match_float64(
+    device: str, regime: str, solution: str, require
 ):
     """Hard regimes for the chunked form: near-parallel keys at full write strength
     and no decay (the solve), large root-path gates over O(1) segments (the decays),
     and q/k taken without the in-kernel L2 norm; Qwen3.8's 3 value heads per key head.
     """
-    require("attention", "gdn_decode_mtp", "triton", torch.bfloat16, "q")
+    require("attention", "gdn_decode_mtp", solution, torch.bfloat16, "q")
     T = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
     q, k, v, a, b, A_log, dt_bias, pool = _make_decode_inputs(
         device=device,
@@ -1961,6 +1962,7 @@ def test_gdn_decode_mtp_chunked_tree_matches_float64_within_one_ulp(
         initial_state_indices=read_idx,
         scale=scale,
         use_qk_l2norm=use_qk_l2norm,
+        solution=solution,
     )
 
     out, _ = _tree_verify(q, k, v, pool, parents, rows=False, **common)
@@ -1978,9 +1980,13 @@ def test_gdn_decode_mtp_chunked_tree_matches_float64_within_one_ulp(
         parents,
         use_qk_l2norm=use_qk_l2norm,
     )
-    # Within one bf16 ulp of the float64 recurrence.
-    ulp = 2.0 ** (torch.floor(torch.log2(want.abs())) - 7)
-    assert ((out.double() - want).abs() <= ulp + 1e-6).all()
+    if solution == "triton":
+        # Preserve the portable kernel's one-bf16-ulp accuracy guarantee.
+        ulp = 2.0 ** (torch.floor(torch.log2(want.abs())) - 7)
+        assert ((out.double() - want).abs() <= ulp + 1e-6).all()
+    else:
+        # Native TF32 products use the WY leaf's documented error bound.
+        torch.testing.assert_close(out.double(), want, atol=1e-4, rtol=2**-7)
 
 
 def test_gdn_tree_verify_wide_tiles_match_narrow_bit_for_bit(device: str, require):
@@ -2002,7 +2008,7 @@ def test_gdn_tree_verify_wide_tiles_match_narrow_bit_for_bit(device: str, requir
     gen = torch.Generator().manual_seed(7)
     parents = [_random_tree(T, gen) for _ in range(wide_batch)]
     indices = torch.arange(wide_batch, device=device, dtype=torch.int32)
-    common = dict(A_log=A_log, dt_bias=dt_bias, use_qk_l2norm=True)
+    common = dict(A_log=A_log, dt_bias=dt_bias, use_qk_l2norm=True, solution="triton")
     wide, _ = _tree_verify(
         q,
         k,
@@ -2070,6 +2076,7 @@ def test_gdn_tree_verify_compiles_once_across_batch_sizes(device: str, require):
             b=b,
             initial_state_indices=torch.arange(batch, device=device, dtype=torch.int32),
             use_qk_l2norm=True,
+            solution="triton",
             **replay,
         )
 

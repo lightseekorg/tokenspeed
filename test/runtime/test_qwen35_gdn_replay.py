@@ -433,8 +433,16 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     backend.set_kv_pool(pool)
 
     def supports(op, trait):
+        traits = {"head_dim": HEAD_K_DIM}
+        if op == "gdn_decode_mtp":
+            traits.update(
+                value_head_dim=HEAD_V_DIM,
+                verify_tokens=DRAFT_TOKENS,
+                output_only=False,
+                tree=False,
+            )
         return gdn_decode_supports(
-            op, torch.bfloat16, head_dim=HEAD_K_DIM, trait=trait, solution=None
+            op, torch.bfloat16, traits=traits, trait=trait, solution=None
         )
 
     assert backend._verify_reads_committed_recurrent_state == supports(

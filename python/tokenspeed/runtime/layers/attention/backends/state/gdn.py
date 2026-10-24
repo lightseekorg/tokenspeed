@@ -28,6 +28,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill_capturable,
     gdn_chunk_prefill_stores_state_checkpoints,
     gdn_decode_supports,
+    gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 
@@ -85,6 +86,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
         )
 
         self._head_k_dim = linear_attn.head_k_dim
+        self._head_v_dim = linear_attn.head_v_dim
         # Resolved when a pool binds (its state dtype picks the verify kernel).
         self._verify_reads_committed_recurrent_state = False
         self._verify_packed_qkv_views = False
@@ -98,22 +100,47 @@ class GdnAttnBackend(CapacityPrefillBackend):
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
         ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
-        solution = gdn_decode_solution(ssm_dtype)
-
-        def supports(op: str, trait: str) -> bool:
-            return gdn_decode_supports(
-                op,
-                self.dtype,
-                head_dim=self._head_k_dim,
-                trait=trait,
-                solution=solution,
-            )
-
-        self._verify_reads_committed_recurrent_state = not self.replay_ssm and supports(
-            "gdn_decode_mtp", "separate_output_state"
+        decode_solution = gdn_decode_solution(ssm_dtype, disable_state_update=False)
+        verify_solution = gdn_decode_solution(
+            ssm_dtype, disable_state_update=self.replay_ssm
         )
-        self._verify_packed_qkv_views = supports("gdn_decode_mtp", "strided_qkv")
-        self._decode_packed_qkv_views = supports("gdn_decode_step", "strided_qkv")
+        decode_traits = {"head_dim": self._head_k_dim}
+        verify_traits = {
+            **decode_traits,
+            "value_head_dim": self._head_v_dim,
+            "verify_tokens": self.speculative_num_draft_tokens,
+            "tree": self.draft_tree,
+            "output_only": self.replay_ssm
+            and not (
+                self.draft_tree
+                and gdn_tree_verify_needs_node_states(self.speculative_num_draft_tokens)
+            ),
+        }
+
+        self._verify_reads_committed_recurrent_state = (
+            not self.replay_ssm
+            and gdn_decode_supports(
+                "gdn_decode_mtp",
+                self.dtype,
+                trait="separate_output_state",
+                traits=verify_traits,
+                solution=verify_solution,
+            )
+        )
+        self._verify_packed_qkv_views = gdn_decode_supports(
+            "gdn_decode_mtp",
+            self.dtype,
+            trait="strided_qkv",
+            traits=verify_traits,
+            solution=verify_solution,
+        )
+        self._decode_packed_qkv_views = gdn_decode_supports(
+            "gdn_decode_step",
+            self.dtype,
+            trait="strided_qkv",
+            traits=decode_traits,
+            solution=decode_solution,
+        )
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_capturable

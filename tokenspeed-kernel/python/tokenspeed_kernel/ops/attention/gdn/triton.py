@@ -885,6 +885,7 @@ def _launch_gdn_tree_verify_chunked(
     ),
     priority=Priority.PORTABLE,
     traits={
+        "tree": frozenset({False, True}),
         "separate_output_state": frozenset({False, True}),
         "strided_qkv": frozenset({False, True}),
     },
