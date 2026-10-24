@@ -360,6 +360,10 @@ Publication also registers every non-replayable sliding window at that
 checkpoint's boundary before the request reclaims expired table blocks. The
 forward's final window may start later and cannot replace this earlier window,
 even when the forward ends on a full page.
+Conversely, `--drop-dead-state-checkpoints` skips the natural checkpoints a
+next turn that re-renders the end of the previous prompt cannot resume at,
+with their KV tails: a prompt end inside the page whose start holds the
+pre-tail checkpoint, and a fused finish past the prompt end (same section).
 No scan is split into body and tail, and no state group declares a token
 span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
@@ -1077,7 +1081,7 @@ Its responsibilities:
   pattern, without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
-  admission, or a junction cut) queues its tail and state checkpoint too;
+  admission, or a junction cut) queues the tail and state it publishes too;
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the

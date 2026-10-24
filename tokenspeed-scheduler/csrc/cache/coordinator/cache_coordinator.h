@@ -774,6 +774,11 @@ public:
     // content hash identify the boundary.
     enum class BoundaryResidency { kNone, kPartial, kComplete };
     BoundaryResidency DeviceBoundaryResidency(const CacheKey& boundary, std::int32_t tail_tokens) const;
+    // Whether every State group caches its checkpoint published under the
+    // chain hash content_hash, on the Device or the Host, as the probe takes
+    // each from whichever tier holds it (false for a model without State
+    // groups).
+    bool HoldsStateCheckpoint(const std::string& content_hash) const;
     // The cache keys one boundary holds in each group that publishes it:
     // BlocksPerBoundary of them for a chain hash (tail_tokens 0), a tail's
     // blocks from FirstTailBlockNeeded on (tail_tokens = T mod P), one for a

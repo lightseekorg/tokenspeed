@@ -127,6 +127,7 @@ def make_config(
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
     max_kv_page_num: int = 0,
+    drop_dead_state_checkpoints: bool = False,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -182,6 +183,12 @@ def make_config(
             ``ceil((cached prefix + current chunk) / prefix_granularity)``
             across requests. 0 leaves the budget unbounded. Derived from
             ``--chunk-prefill-kv-size``.
+        drop_dead_state_checkpoints:
+            ``--drop-dead-state-checkpoints``: publish no KV tail and no State
+            checkpoint at a prompt end the pre-tail checkpoint covers (prefill
+            and fused roles) or at a fused finish past the prompt end.
+            Requires prefix caching, except on the decode role, which ignores
+            it.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
@@ -229,6 +236,9 @@ def make_config(
         # turning the option on raises AttributeError here instead of being
         # ignored.
         cfg.state_checkpoint_in_forward = True
+    if drop_dead_state_checkpoints:
+        # Set only when on, for the same reason.
+        cfg.drop_dead_state_checkpoints = True
     cfg.disable_l2_cache = disable_l2_cache
     cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 

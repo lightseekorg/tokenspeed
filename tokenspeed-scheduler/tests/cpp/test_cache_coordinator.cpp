@@ -5354,6 +5354,107 @@ TEST(SwaRegistrationTest, UnalignedEndpointPublishesTrailingFullPages) {
     coord.Free(tables);
 }
 
+// The window behind an in-forward State checkpoint is published as an
+// endpoint's, like the checkpoint, even by a chunk end, so eviction does not
+// take it ahead of the chunk ends' windows: the chunk end at 10 that publishes
+// the checkpoint at 8 registers the window behind 8 (rows [5, 8), block 1)
+// as an endpoint; without the checkpoint it registers it as a chunk end's.
+TEST(SwaRegistrationTest, TheWindowBehindAnInForwardStateCheckpointIsPublishedAsAnEndpoint) {
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kSlidingWindow,
+         .sliding_window = 4,
+         .cache_blocks_per_lcm_block = 1,
+         .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    const std::vector<std::string> hashes = ContentHashes({{0, 0, 0, 0}, {1, 1, 1, 1}});
+    for (const bool checkpoint : {false, true}) {
+        SCOPED_TRACE(checkpoint);
+        BlockPool pool(32, {1, 1});
+        CacheCoordinator coord = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                                                 /*snapshot_pool=*/nullptr,
+                                                 /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        std::vector<BlockTable> tables(coord.NumGroups());
+        std::vector<GroupDemand> demands = {
+            {.table = &tables[0], .extent = DenseGrowth{10}},
+            {.table = &tables[1], .extent = StateStep{.kind = StateStep::Kind::kRotate, .checkpoint = checkpoint}},
+        };
+        std::optional<CacheCoordinator::AdmissionResult> admission = coord.Admit(
+            coord.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, /*evict_blocks_past_segments=*/false);
+        ASSERT_TRUE(admission);
+        const RequestProgress chunk_end{
+            .completed_pages =
+                CompletedPages{
+                    .prefix_hashes = hashes,
+                    .state_checkpoint_pages = checkpoint ? 2 : 0,
+                    .state_checkpoint_blocks = admission->state_checkpoint_blocks,
+                    .boundary_kind = CacheBoundaryKind::kChunk,
+                },
+            .num_computed_tokens = 10,
+        };
+        coord.CacheCompletedBlocks(tables, chunk_end, NextTestAccessEpoch());
+        const auto window = coord.GroupPrefixIndex(0).MetadataFor(pool, tables[0].Blocks()[1]->Location());
+        ASSERT_TRUE(window);
+        EXPECT_EQ(window->boundary_kind, checkpoint ? CacheBoundaryKind::kEndpoint : CacheBoundaryKind::kChunk);
+        EXPECT_EQ(coord.GroupPrefixIndex(1).Contains(pool, Key(hashes[1], 1)), checkpoint);
+        coord.Free(tables);
+    }
+}
+
+// drop_dead_state_checkpoints drops a prompt end only when a probe can resume
+// at the earlier checkpoint, and a probe takes each State group's checkpoint
+// from whichever tier holds it (the Host-suffix rule): a hash counts as held
+// when every State group holds its state under it on the Device or on Host,
+// one group's on each tier included, never when a group holds none. With the
+// KV of all four pages on the Device, the probe resumes at the third page's
+// boundary, whose two checkpoints sit on different tiers, and not at the
+// fourth's, where one group has none. A model without State groups holds
+// none.
+TEST(CacheCoordinatorStateCheckpointTest, EveryStateGroupMustHoldTheCheckpointOnEitherTier) {
+    BlockPool pool(16, {1, 1, 1});
+    BlockPool host_pool(8, {1, 1, 1});
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kState, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    const std::vector<std::string> hashes =
+        ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}});
+    const auto cache_on_host = [&](const std::string& hash, std::uint32_t group_id) {
+        CacheBlockRef block = coordinator.AcquireHostBlock(group_id, /*bucket=*/0);
+        ASSERT_TRUE(block);
+        coordinator.CacheHostBlock(block, Key(hash, group_id), std::nullopt);
+    };
+    for (const std::string& hash : hashes) {
+        CacheForGroup(coordinator, pool, hash, /*group_id=*/0);
+    }
+    CacheForGroup(coordinator, pool, hashes[0], /*group_id=*/1);
+    CacheForGroup(coordinator, pool, hashes[0], /*group_id=*/2);
+    cache_on_host(hashes[1], /*group_id=*/1);
+    cache_on_host(hashes[1], /*group_id=*/2);
+    CacheForGroup(coordinator, pool, hashes[2], /*group_id=*/1);
+    cache_on_host(hashes[2], /*group_id=*/2);
+    CacheForGroup(coordinator, pool, hashes[3], /*group_id=*/1);
+
+    EXPECT_TRUE(coordinator.HoldsStateCheckpoint(hashes[0])) << "the Device holds both";
+    EXPECT_TRUE(coordinator.HoldsStateCheckpoint(hashes[1])) << "Host holds both";
+    EXPECT_TRUE(coordinator.HoldsStateCheckpoint(hashes[2])) << "one group on each tier";
+    EXPECT_FALSE(coordinator.HoldsStateCheckpoint(hashes[3])) << "one group only";
+    const CacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    EXPECT_EQ(probe.host.num_common_tokens, 12) << "one checkpoint from each tier";
+
+    BlockPool full_pool(8, {1});
+    CacheCoordinator full_only =
+        MakeCoordinator(std::span<const CacheGroupSpec>(specs).first(1), 4, full_pool, /*enable_l3_storage=*/false,
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false);
+    CacheForGroup(full_only, full_pool, hashes[0], /*group_id=*/0);
+    EXPECT_FALSE(full_only.HoldsStateCheckpoint(hashes[0]));
+}
+
 // ---- Bounded replay --------------------------------------------------------
 //
 // A sliding group declared replayable (CacheGroupSpec::replayable) leaves

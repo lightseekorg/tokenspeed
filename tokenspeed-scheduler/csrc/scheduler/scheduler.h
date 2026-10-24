@@ -280,6 +280,12 @@ private:
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    // SchedulerConfig::drop_dead_state_checkpoints (outside_event_handler.cpp):
+    // whether the pre-tail State checkpoint covers a request's prompt end, its
+    // computed frontier, so no tail and no state is published there; and
+    // whether a finishing request publishes its frontier like a chunk end.
+    bool promptEndIsCoveredByCheckpoint(const Request& request, const fsm::CacheProgress& progress) const;
+    bool finishCheckpointIsDead(const Request& request, const fsm::CacheProgress& progress) const;
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);
