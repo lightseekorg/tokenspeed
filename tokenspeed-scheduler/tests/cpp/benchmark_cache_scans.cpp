@@ -38,6 +38,7 @@ namespace {
 constexpr std::int32_t kDemand = 4;
 constexpr std::int32_t kPacking = 4;
 constexpr std::array<std::int32_t, 3> kPoolSizes{1000, 10000, 100000};
+constexpr std::array<std::int32_t, 4> kHostPoolSizes{1000, 10000, 100000, 1000000};
 constexpr std::int32_t kRepeats = 5;
 
 std::uint64_t ConsumeLocations(const std::vector<CacheBlockRef>& blocks) {
@@ -305,7 +306,68 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         coordinator.CacheHostBlock(
             batch.blocks.front(),
             CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(next_key), .page_offset = 0});
-        return static_cast<std::uint64_t>(batch.stats.same_group_scans + batch.stats.cross_group_scans);
+        return static_cast<std::uint64_t>(batch.stats.allocated);
+    });
+}
+
+// Most parents are pinned, unpublished transfer destinations, so only one
+// cached entry can be replaced. Isolate work unrelated to the candidate count.
+void MeasureSparseHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations) {
+    BlockPool pool(1, {1, 1});
+    BlockPool host_pool(pool_size, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+    std::vector<CacheBlockRef> pins = host_pool.AcquireBlocks(0, pool_size - 1);
+    CacheBlockRef cached = host_pool.AcquireBlock(1);
+    coordinator.CacheHostBlock(cached, CacheKey{.group_id = 1, .content_hash = "initial", .page_offset = 0});
+    cached.reset();
+    std::uint64_t next_key = 0;
+    Measure("acquire_host_blocks_sparse_evictable", pool_size, 1, iterations, [&] {
+        CacheBlockRef replacement = coordinator.AcquireHostBlock(1, /*bucket=*/0);
+        if (!replacement) {
+            std::abort();
+        }
+        coordinator.CacheHostBlock(
+            replacement, CacheKey{.group_id = 1, .content_hash = std::to_string(++next_key), .page_offset = 0});
+        return static_cast<std::uint64_t>(replacement->Location().lcm_block_id);
+    });
+}
+
+// Both groups replace entries in a full cache, requiring parent aggregation
+// even though the single-group case can omit its own parents entirely.
+void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations) {
+    BlockPool pool(1, {1, 1});
+    BlockPool host_pool(pool_size, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+    for (std::int32_t i = 0; i < pool_size; ++i) {
+        const auto group_id = static_cast<std::uint32_t>(i % 2);
+        CacheBlockRef block = host_pool.AcquireBlock(group_id);
+        coordinator.CacheHostBlock(block,
+                                   CacheKey{.group_id = group_id, .content_hash = std::to_string(i), .page_offset = 0});
+    }
+    const std::array<std::uint32_t, 2> group_ids{0, 1};
+    const std::array<std::int32_t, 2> buckets{0, 0};
+    std::uint64_t next_key = static_cast<std::uint64_t>(pool_size);
+    Measure("acquire_host_blocks_multi_group_full_cache", pool_size, 2, iterations, [&] {
+        CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(group_ids, buckets);
+        if (batch.stats.allocated != group_ids.size()) {
+            std::abort();
+        }
+        for (std::size_t i = 0; i < group_ids.size(); ++i) {
+            coordinator.CacheHostBlock(
+                batch.blocks[i],
+                CacheKey{.group_id = group_ids[i], .content_hash = std::to_string(++next_key), .page_offset = 0});
+        }
+        return static_cast<std::uint64_t>(batch.stats.allocated);
     });
 }
 
@@ -325,7 +387,12 @@ int main() {
         tokenspeed::MeasureAdmission(pool_size, iterations);
         tokenspeed::MeasurePinnedAdmission(pool_size, std::min(iterations, 100));
         tokenspeed::MeasureAvailableLcmBlocks(pool_size, iterations);
+    }
+    for (const std::int32_t pool_size : tokenspeed::kHostPoolSizes) {
+        const std::int32_t iterations = std::max(3, 1000000 / pool_size);
         tokenspeed::MeasureHostBlockAcquisition(pool_size, iterations);
+        tokenspeed::MeasureSparseHostBlockAcquisition(pool_size, iterations);
+        tokenspeed::MeasureMultiGroupHostBlockAcquisition(pool_size, iterations);
     }
     return 0;
 }
