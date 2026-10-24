@@ -1570,9 +1570,12 @@ weights:
    accumulates in FP32, and scatters into each token's output row, followed by
    the weighted top-k reduction.
 
-With MXFP4 activations, step 2 quantizes the input to MXFP4 instead, the
-gate/up GEMM stores a BF16 intermediate, and a second quantizer pass converts
-it to MXFP4 before the down GEMM.
+With MXFP4 activations, step 2 quantizes the input to MXFP4 instead, in extra
+programs of a step 1 launch: the one-launch route when it covers the batch (up
+to 3072 rows when it also quantizes), otherwise stage 4 of the staged route.
+Single-token batches keep the standalone quantizer. The gate/up epilogue
+quantizes its FP32 result and stores it as MXFP4 directly, in the layout the
+down GEMM reads.
 
 Decode (a few routed rows per expert) uses a separate kernel that streams
 each touched expert's weights once, so its tiles target HBM streaming rather
@@ -1599,9 +1602,10 @@ The launcher resolves the row tile from the gathered row count and expert
 count unless the caller pins it. The kernels mask ragged M and N edges rather
 than peeling them, so a trailing partial tile loads only the rows that exist.
 
-Routes of up to 2048 rows build all metadata in one launch, as a stable
-counting sort by expert: the gather, scatter and gate rows match a stable
-argsort, and invalid ids sort last with a zero gate and count in no slice. Each
+Routes of up to 2048 rows, or 3072 when the launch also quantizes the MXFP4
+input, build all metadata in one launch, as a stable counting sort by expert:
+the gather, scatter and gate rows match a stable argsort, and invalid ids sort
+last with a zero gate and count in no slice. Each
 program first builds the whole expert histogram with LDS atomics; one atomic
 per row also counts the rows before the program's chunk in its high 16 bits.
 `cdiv(rows, 64)` programs then place 64 rows each. A row lands after the rows
@@ -1619,6 +1623,8 @@ expert IDs separately and excludes invalid IDs from every group.
 The subsequent prefix scan processes eight adjacent experts per four-warp
 block, coalescing accesses to the row-major chunk-count buffer. Each expert
 retains an independent scan over chunks, with partial expert groups masked.
+When the layer quantizes an MXFP4 input, the placement stage adds one program
+per 8 x 512 tile of it after its routing programs.
 
 ### Causal MLA verification on gfx950
 
