@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.gdn.triton import (
     build_causal_conv1d_capacity_metadata,
     refresh_causal_conv1d_capacity_metadata,
 )
+from tokenspeed_kernel.ops.copy import zero_rows_after
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.mamba import (
@@ -91,13 +92,12 @@ class CapacityPrefillMetadata(MambaForwardMetadata):
         boundary, which the refresh pads with the live total), never from a
         Python int the capture would freeze.
         """
-        live_total = self.query_start_loc[-1]
+        live_total = self.query_start_loc[-1:]
         for tensor in tensors:
-            if tensor is None:
-                continue
-            rows = torch.arange(tensor.shape[0], device=tensor.device)
-            padding = (rows >= live_total).view(-1, *([1] * (tensor.ndim - 1)))
-            tensor.masked_fill_(padding, 0)
+            if tensor is not None:
+                # Touches only the padding rows: a whole-bucket masked fill
+                # rewrites every live row of an 8k bucket on each call.
+                zero_rows_after(tensor, live_total)
 
 
 def _capacity_metadata(source, bucket):
