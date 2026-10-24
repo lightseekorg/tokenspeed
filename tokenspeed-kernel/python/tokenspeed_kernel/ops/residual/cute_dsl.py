@@ -50,7 +50,7 @@ _PLAN_LOCK = threading.Lock()
 
 
 def supports_up_mix(device: torch.device) -> bool:
-    """Whether the device supports this kernel's shared-memory requirement."""
+    """Whether CuTe DSL and the SM107 target required by this kernel are available."""
     return (
         _AVAILABLE
         and device.type == "cuda"

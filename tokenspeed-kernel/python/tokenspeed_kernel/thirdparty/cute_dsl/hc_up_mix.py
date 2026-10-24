@@ -54,7 +54,8 @@ def mix_epilogue(
     x_state,
     x_pipeline,
 ):
-    epi_tile = (128, 32)
+    epi_tile = (gemm.x_tile[0], 32)
+    pieces = gemm.x_tile[1] // epi_tile[1]
     acc = gemm_utils.transform_partitioned_tensor_layout(acc_base)
     gates = gemm_utils.transform_partitioned_tensor_layout(gate_base)
     coords = gemm_utils.transform_partitioned_tensor_layout(coord_base)
@@ -72,7 +73,7 @@ def mix_epilogue(
     ss = thr.partition_D(cute.flat_divide(sx, epi_tile))
     a = acc_parts[(None, None, None, None, None, state.index)]
     mixed = cute.make_rmem_tensor(reg.shape, cutlass.Float32)
-    value = cute.make_rmem_tensor((*reg.shape, 4), gemm.c_dtype)
+    value = cute.make_rmem_tensor((*reg.shape, gemm.hc_count), gemm.c_dtype)
     result = cute.make_rmem_tensor(reg.shape, gemm.c_dtype)
     atom = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(), gemm.c_dtype, num_bits_per_copy=128
@@ -82,27 +83,27 @@ def mix_epilogue(
 
     acc_pipeline.consumer_wait(state)
     x_pipeline.consumer_wait(x_state)
-    for piece in range(2):
+    for piece in range(pieces):
         mixed.fill(0.0)
         cc = c[(None, None, None, 0, piece)]
         for mi in cutlass.range_constexpr(reg.shape[1]):
             for ni in cutlass.range_constexpr(reg.shape[2]):
                 pred[0, mi, ni] = cc[0, mi, ni][0] < rows
-        for branch in cutlass.range_constexpr(4):
+        for branch in cutlass.range_constexpr(gemm.hc_count):
             cute.copy(
                 atom,
-                ss[(None, None, None, 0, branch * 2 + piece)],
+                ss[(None, None, None, 0, branch * pieces + piece)],
                 value[(None, None, None, branch)],
             )
-        for branch in cutlass.range_constexpr(4):
+        for branch in cutlass.range_constexpr(gemm.hc_count):
             vx = value[(None, None, None, branch)]
-            cute.copy(copy_t2r, a[(None, None, None, 0, branch * 2 + piece)], reg)
+            cute.copy(copy_t2r, a[(None, None, None, 0, branch * pieces + piece)], reg)
             for i in cutlass.range_constexpr(cute.size(reg)):
                 # Preserve the unfused GEMM store rounding before sigmoid.
                 gate = reg[i].to(gemm.c_dtype).to(cutlass.Float32)
                 weight = cute.arch.rcp_approx(1.0 + cute.exp(-gate, fastmath=True))
                 mixed[i] = mixed[i] + weight * vx[i].to(cutlass.Float32)
-        result.store((mixed.load() * 0.25).to(gemm.c_dtype))
+        result.store((mixed.load() * (1.0 / gemm.hc_count)).to(gemm.c_dtype))
         cute.copy(atom, result, oo[(None, None, None, 0, piece)], pred=pred)
     cute.arch.fence_view_async_tmem_load()
     # All SMEM reads have been consumed by the math before these arrivals.
@@ -134,6 +135,14 @@ class HcUpMixKernel:
         self.swizzle_size = 1
         self.raster_along = "m"
         self.mma_tiler = (256, 256, 64)
+        self.hc_count = 4
+        self.hidden_size = 2560
+        # Each CTA loads one X plane per branch for its share of the GEMM tile.
+        self.x_tile = (
+            self.mma_tiler[0] // self.cluster_shape_mn[0],
+            self.mma_tiler[1] // self.hc_count,
+            1,
+        )
         self.arch = "sm_100"
         self.cta_group = tcgen05.CtaGroup.TWO
         self.epilogue_warp_id = (0, 1, 2, 3)
@@ -197,7 +206,7 @@ class HcUpMixKernel:
         self.is_a_mcast = self.num_mcast_ctas_a > 1
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
-        # Compute A/B/C shared memory layout
+        # Compute A/B shared memory layout
         self.a_smem_layout_staged = utils.sm100.make_smem_layout_a(
             tiled_mma, self.mma_tiler, self.a_dtype, self.num_ab_stage
         )
@@ -221,7 +230,7 @@ class HcUpMixKernel:
         stream: cuda.CUstream,
     ):
         # Virtual gate tensor supplies only GEMM shape/coordinate metadata.
-        # No full gate output is allocated or stored by the fused candidate.
+        # No full gate output is allocated or stored.
         c = cute.make_tensor(
             out.iterator,
             cute.make_layout((a.shape[0], b.shape[0], 1), stride=(b.shape[0], 1, 0)),
@@ -294,14 +303,14 @@ class HcUpMixKernel:
         self.num_tma_load_bytes = (a_copy_size + b_copy_size) * atom_thr_size
 
         # One descriptor loads each original-layout 128x64 X branch plane.
-        # The shared-pointer swizzle is expressed in bytes, as in the probe.
+        # The shared-pointer swizzle is expressed in bytes.
         x_plane_layout = cute.make_composed_layout(
             cute.make_swizzle(3, 4, 3),
             0,
-            cute.make_layout((128, 64, 1), stride=(64, 1, 0)),
+            cute.make_layout(self.x_tile, stride=(self.x_tile[1], 1, 0)),
         )
         tma_atom_x, tma_tensor_x = cpasync.make_tiled_tma_atom(
-            cpasync.CopyBulkTensorTileG2SOp(), x, x_plane_layout, cta_tiler=(128, 64, 1)
+            cpasync.CopyBulkTensorTileG2SOp(), x, x_plane_layout, cta_tiler=self.x_tile
         )
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
@@ -313,7 +322,7 @@ class HcUpMixKernel:
             max_active_clusters,
         )
 
-        # Launch the kernel synchronously
+        # Launch on the caller's stream.
         self.kernel(
             tiled_mma,
             tma_atom_a,
@@ -416,12 +425,16 @@ class HcUpMixKernel:
         ).make_participants()
 
         # X is CTA-local; each of the 128 consumers releases after its last read.
+        x_rows, x_cols, _ = self.x_tile
+        x_plane_elements = x_rows * x_cols
+        x_slot_elements = x_plane_elements * self.hc_count
+        branch_tiles = self.hidden_size // x_cols
         x_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.x_mbar_ptr.data_ptr(),
             num_stages=self.num_x_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 128),
-            tx_count=128 * 64 * 4 * self.c_dtype.width // 8,
+            tx_count=x_slot_elements * self.c_dtype.width // 8,
             enable_multicast_signaling=True,
             defer_sync=True,
         )
@@ -459,7 +472,7 @@ class HcUpMixKernel:
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
-        # Setup smem tensor A/B/C
+        # Setup smem tensors A/B/X
 
         # (MMA, MMA_M, MMA_K, STAGE)
         sA = smem.allocate_tensor(
@@ -479,7 +492,10 @@ class HcUpMixKernel:
         # X slots are independent of the A/B and accumulator rings.
         sX = smem.allocate_tensor(
             element_type=self.c_dtype,
-            layout=cute.make_layout((128, (64, 4), 2), stride=(64, (1, 8192), 32768)),
+            layout=cute.make_layout(
+                (x_rows, (x_cols, self.hc_count), self.num_x_stage),
+                stride=(x_cols, (1, x_plane_elements), x_slot_elements),
+            ),
             byte_alignment=128,
             swizzle=cute.make_swizzle(3, 4, 3),
         )
@@ -526,7 +542,8 @@ class HcUpMixKernel:
         out_view = cute.make_tensor(
             mOut.iterator,
             cute.make_layout(
-                (mOut.shape[0], (64, 4, 40), 1), stride=(2560, (1, 0, 64), 0)
+                (mOut.shape[0], (x_cols, self.hc_count, branch_tiles), 1),
+                stride=(self.hidden_size, (1, 0, x_cols), 0),
             ),
         )
         tCgOut = thr_mma.partition_C(
@@ -621,7 +638,7 @@ class HcUpMixKernel:
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
                 ]
 
-                # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt
+                # Check availability of the first A/B stage.
                 ab_producer.reset()
                 peek_ab_empty_status = ab_producer.try_acquire()
 
@@ -647,7 +664,7 @@ class HcUpMixKernel:
                         mcast_mask=b_full_mcast_mask,
                     )
 
-                    # Peek (try_wait) AB buffer empty for k_tile = prefetch_k_tile_cnt + k_tile + 1
+                    # Check availability of the next A/B stage.
                     peek_ab_empty_status = cutlass.Boolean(1)
                     if handle.count + 1 < k_tile_cnt:
                         peek_ab_empty_status = ab_producer.try_acquire()
@@ -671,19 +688,21 @@ class HcUpMixKernel:
                 cluster_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
                 x_pipeline.producer_acquire(x_producer_state)
                 x_barrier = x_pipeline.producer_get_barrier(x_producer_state)
-                for branch in cutlass.range_constexpr(4):
+                for branch in cutlass.range_constexpr(self.hc_count):
                     gx = cute.local_tile(
                         mX,
-                        (128, 64, 1),
+                        self.x_tile,
                         (
-                            cluster_m * 2 + mma_tile_coord_v,
-                            cur_tile_coord[1] + branch * 40,
+                            cluster_m * self.cluster_shape_mn[0] + mma_tile_coord_v,
+                            cur_tile_coord[1] + branch * branch_tiles,
                             0,
                         ),
                     )
                     sx = cute.make_tensor(
-                        sX.iterator + x_producer_state.index * 32768 + branch * 8192,
-                        cute.make_layout((128, 64, 1), stride=(64, 1, 0)),
+                        sX.iterator
+                        + x_producer_state.index * x_slot_elements
+                        + branch * x_plane_elements,
+                        cute.make_layout(self.x_tile, stride=(x_cols, 1, 0)),
                     )
                     sx_part, gx_part = cpasync.tma_partition(
                         tma_atom_x,

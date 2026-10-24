@@ -165,14 +165,17 @@ class GatedResidualSimple(nn.Module):
 
     @staticmethod
     def process_weights_after_loading(module: GatedResidualSimple) -> None:
-        """Align mix GEMM storage once, including dummy/sharded loading."""
+        """Prepare mix weights, including dummy/sharded loading."""
         if module.use_mix:
-            weight = module.mix_inject_proj.weight
-            weight.data = pad_gated_residual_projection_weight(
-                weight.data, projection_rows=module._projection_rows
-            )
-            module.mix_inject_proj.out_features = weight.shape[0]
+            module._pad_projection_weight()
             module._prepare_up_weight()
+
+    def _pad_projection_weight(self) -> None:
+        weight = self.mix_inject_proj.weight
+        weight.data = pad_gated_residual_projection_weight(
+            weight.data, projection_rows=self._projection_rows
+        )
+        self.mix_inject_proj.out_features = weight.shape[0]
 
     def _load_up_weight(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         """Load the fixed-shape up projection."""
@@ -226,7 +229,8 @@ class GatedResidualSimple(nn.Module):
         param.data[start : start + size].copy_(weight.to(param.device, param.dtype))
         # Allocate padding on the first shard only. Later shards and reloads
         # write directly into the same parameter storage used by CUDA graphs.
-        self.process_weights_after_loading(self)
+        if self.use_mix:
+            self._pad_projection_weight()
 
     def _inject_logits(self, normalized: torch.Tensor):
         """Inject logits alone, for residual rows ``mix`` never saw."""

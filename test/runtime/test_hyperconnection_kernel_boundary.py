@@ -742,7 +742,7 @@ def test_mtp_tail_fusion_preserves_narrowed_residual_rows() -> None:
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @torch.inference_mode()
-def test_prefill_up_weight_reload_preserves_graph(dtype):
+def test_prefill_weight_reload_preserves_graph(dtype):
     from tokenspeed_kernel.ops.residual.cute_dsl import supports_up_mix
 
     if not supports_up_mix(torch.device("cuda")):
@@ -760,6 +760,7 @@ def test_prefill_up_weight_reload_preserves_graph(dtype):
     up = mixer.input_mix_weight_up.weight
     up.weight_loader(up, torch.randn_like(up) * 0.01)
     storage = mixer.packed_up_weight.data_ptr()
+    projection_storage = param.data_ptr()
     value = torch.randn(4097, 10240, device="cuda", dtype=dtype)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -768,12 +769,19 @@ def test_prefill_up_weight_reload_preserves_graph(dtype):
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        result, _ = mixer.mix(value, normalized=value)
-    for _ in range(2):
-        up.weight_loader(up, torch.randn_like(up) * 0.05)
+        result, residuals = mixer.mix(value, normalized=value)
+    # Exercise each weight update separately while reusing the captured graph.
+    for shard in ("mix", "inject", "up") * 2:
+        if shard == "up":
+            up.weight_loader(up, torch.randn_like(up) * 0.05)
+        else:
+            replacement = torch.randn_like(projection) * 0.01
+            weight = replacement[:320] if shard == "mix" else replacement[320:]
+            param.weight_loader(param, weight, shard)
         assert mixer.packed_up_weight.data_ptr() == storage
+        assert param.data_ptr() == projection_storage
         graph.replay()
-        expected, _ = gated_residual_mix(
+        expected, expected_inject = gated_residual_mix(
             value,
             param,
             up,
@@ -786,4 +794,7 @@ def test_prefill_up_weight_reload_preserves_graph(dtype):
         )
         torch.cuda.synchronize()
         torch.testing.assert_close(result, expected, rtol=0.005, atol=0.002)
+        torch.testing.assert_close(
+            residuals[2], expected_inject, rtol=0.005, atol=0.002
+        )
     graph.reset()
