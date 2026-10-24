@@ -21,6 +21,7 @@
 
 """Muse Spark protocol selection, ownership, and changed-input graph replay."""
 
+import re
 import socket
 import traceback
 from functools import partial
@@ -30,7 +31,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_cdna4, reason="Muse Iris fusions require gfx950"
@@ -960,6 +961,93 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
                 )
     torch.cuda.synchronize()
     dist.barrier()
+
+
+@pytest.mark.parametrize("rank", [0, 5])
+def test_routed_lamport_polling_codegen(rank):
+    """Keep the mailbox reads batched and on the retry path.
+
+    Compile without launching. Each retry must issue all seven 16-byte
+    cache-bypassing peer reads before waiting for any of them; one wait per
+    read would serialize seven memory round trips.
+    """
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
+        iris_fused_lamport_allreduce_routed_rmsnorm_sum as fn,
+    )
+
+    types = {
+        "routes": "*bf16",
+        "route_map": "*i32",
+        "route_weights": "*fp32",
+        "norm_weight": "*bf16",
+        "output": "*bf16",
+        "region": "*bf16",
+        "epochs": "*i32",
+        "regions": ("i64",) * 8,
+        "row_stride": "i32",
+    }
+    attrs = {}
+    for index, name in enumerate(fn.arg_names):
+        if name == "regions":
+            attrs.update(
+                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
+            )
+        elif name in types:
+            attrs[(index,)] = [["tt.divisibility", 16]]
+    source = gluon._runtime.GluonASTSource(
+        fn,
+        {name: types[name] for name in fn.arg_names if name in types},
+        constexprs={
+            "RANK": rank,
+            "WIDTH": 4096,
+            "EPS": 1e-5,
+            "MAX_ELEMENTS": 43 * 4096,
+            "PORTABLE_MATH": False,
+            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        attrs=attrs,
+    )
+    kernel = triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 1},
+    )
+    assembly = kernel.asm["amdgcn"]
+    lines = assembly.splitlines()
+    labels = {
+        match[1]: index
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(\.LBB\w+):", line))
+    }
+    cycles = []
+    for index, line in enumerate(lines):
+        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
+        if match and labels[match[1]] < index:
+            cycles.append(lines[labels[match[1]] : index + 1])
+    assert cycles, "polling loop was removed"
+
+    def batched_peer_reads(cycle):
+        reads = [
+            index
+            for index, line in enumerate(cycle)
+            if "buffer_load_dwordx4" in line and "sc0 sc1" in line
+        ]
+        return len(reads) == 7 and not any(
+            "s_waitcnt vmcnt(0)" in line for line in cycle[reads[0] : reads[-1]]
+        )
+
+    assert any(
+        batched_peer_reads(cycle) for cycle in cycles
+    ), "all seven system-cache reads must issue together on a retry"
+    assert (
+        sum("buffer_store_dwordx4" in line and "sc0 sc1" in line for line in lines)
+        == 14
+    ), "publication and reset must use 16-byte system-cache stores"
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
 def _muse_routed_lamport_worker(rank, world_size, device):
