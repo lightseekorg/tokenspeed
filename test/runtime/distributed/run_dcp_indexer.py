@@ -27,6 +27,65 @@ Exercises the production collectives, candidate selection and attention merge.
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 
+
+def check_attention_merge(group) -> None:
+    import torch
+    import torch.distributed as dist
+    from tokenspeed_kernel.ops.attention.dsv4._triton.dcp import (
+        dcp_apply_sink,
+        dcp_weight_for_reduce_scatter,
+    )
+
+    from tokenspeed.runtime.distributed.comm_backend.registry import get_global_backend
+    from tokenspeed.runtime.distributed.comm_ops import reduce_scatter
+    from tokenspeed.runtime.layers.attention.dcp.comm import combine_attention_partials
+
+    rank = dist.get_rank()
+    backend = get_global_backend()
+    for tokens in (1, 4, 16):
+        torch.manual_seed(981 + rank)
+        output = torch.randn(tokens, 64, 512, device="cuda", dtype=torch.bfloat16)
+        # Strided FP32 LSE, including empty shards and non-finite entries.
+        lse = torch.randn(tokens, 128, device="cuda")[:, ::2]
+        lse[0, :4] = torch.tensor(
+            [-torch.inf, torch.inf, float("nan"), -0.0], device="cuda"
+        )
+        sink = torch.randn(64 // len(group), device="cuda")
+
+        def merge():
+            return combine_attention_partials(
+                output, lse, group=group, rank=rank, sink=sink, keep_all_heads=False
+            )
+
+        def reference():
+            gathered = backend.nccl.all_gather(
+                lse.unsqueeze(0).contiguous(), group, dim=0
+            )
+            weighted, global_lse = dcp_weight_for_reduce_scatter(
+                output, gathered, rank
+            )
+            reduced = reduce_scatter(weighted, group).movedim(0, 1)
+            return dcp_apply_sink(
+                reduced, global_lse, sink, dtype=output.dtype
+            )
+
+        expected = reference()
+        torch.testing.assert_close(merge(), expected, rtol=0, atol=0, equal_nan=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = merge()
+        for _ in range(3):
+            lse.add_(0.125 * (rank + 1))
+            graph.replay()
+            torch.testing.assert_close(
+                actual, reference(), rtol=0, atol=0, equal_nan=True
+            )
+    print(
+        f"rank {rank}: DCP merge and graph replay matched FP32 NCCL reference",
+        flush=True,
+    )
+
+
 def main() -> None:
     import os
 
@@ -62,6 +121,7 @@ def main() -> None:
         speculative_algorithm=None,
     )
     initialize_comm_backend(use_pynccl=False)
+    check_attention_merge(group)
     torch.manual_seed(912)
     page_size, topk, pages = 64, 512, 17
     keys = torch.randn(pages * page_size, 128, device="cuda", dtype=torch.bfloat16)
