@@ -1038,11 +1038,12 @@ These are sampler tests with constructed logits, not full-model acceptance tests
 ### Outputs are persistent-buffer slices on both paths
 
 `sample()` and `verify()` land their outputs in each sampling backend's
-persistent output buffers, on eager and replay alike. The FlashInfer backend
-packs tokens and accept lengths into one region (`_output_pack_buf`), so its
-`get_packed_output_d2h` collapses the two device-to-host copies into one; the
-Triton backends return separate token and length buffers and take the
-executor's two-copy path (`get_packed_output_d2h` returns None).
+persistent output buffers, on eager and replay alike. Verify outputs share
+one packed region (`_output_pack_buf`) in every backend, so
+`get_packed_output_d2h` collapses the two device-to-host copies into one
+whenever the outputs alias it; outputs held elsewhere (for example the
+Triton backends' `sample()` buffers) take the executor's two-copy path
+(`get_packed_output_d2h` returns None).
 
 ### Logits capture state follows the tensor's device
 
@@ -1057,7 +1058,7 @@ plain gather, without entering CUDA APIs on another device.
 
 Enumerated residue in `ForwardStepRunner.__call__`, all tied to the mechanics
 of replaying a recorded graph: input-buffer padding to the ladder bs plus the
-DFLASH sentinel req-pool rows, `_set_graph_state_write_indices`, the DeepEP
+DFLASH sentinel req-pool rows, the DeepEP
 dispatch-mode restore (`deepep_adapter.replay()`), the sampler-variant
 `graph_key` lookup, the `TOKENSPEED_GRAPH_DEBUG` metadata verify,
 output-buffer re-slicing, the `ctx.bs` save/restore, and the replay itself
@@ -1298,17 +1299,20 @@ table expanded to its leaf's `kernel_page_size` and padded to the leaf's
 `[G, max_bs * N]` decode write-location stack. Both are allocated once and
 refilled in place: leaves copy their view out, while the decode write-slot
 views and the block drafters' `draft_history_view` read the stack storage
-inside captured graphs. A leaf whose decode refresh is only that copy,
-`seq_lens` clamped to its `decode_seq_lens_floor` (`decode_buffer_targets`,
-then `publish_decode_metadata`), is filled by the
-router together with every other such leaf in one batched copy, since at
-bs=1 each separate stream copy costs a few microseconds. QSA's indexer
-owns separate stacks for its two raw groups using the same fill at ratio
-one. The fill is one expand
-launch for every group when the tables are row-major views of one storage,
-as the bridge uploads them, and one launch per group otherwise. Its
-arguments are plain scalars (each group's offset in the upload and block
-count, live requests) — no device-side metadata tensor, because the
+inside captured graphs. A leaf whose decode refresh is only that copy
+(`decode_buffer_targets` with `seq_lens` raised to its
+`decode_seq_lens_floor`, then `publish_decode_metadata`) is filled by the
+router's table launch. A decode refresh of up to four groups is one launch
+(`GroupTableStacks.fill_decode`): it expands every group's table, computes
+the decode write window, and writes those leaves' buffers, since at bs=1
+each separate launch costs a few microseconds. Other refreshes fall back to
+the expand, the window and one batched copy. The expand is one launch for
+every group when the tables are row-major views of one storage, as the
+bridge uploads them, and one launch per group otherwise. QSA's indexer owns
+separate stacks for its two raw groups using the same fill at ratio one,
+with its clamped lengths as a lengths-only target. The fills take plain
+scalar arguments (each group's offset in the upload, scheduler block count,
+source stride, live requests) — no device-side metadata tensor, because the
 per-step pinned staging + H2D it would need lands on the bs=1 latency path;
 padding requests (`[actual_bs, bs)`) and each group's column tail resolve to
 null page 0.

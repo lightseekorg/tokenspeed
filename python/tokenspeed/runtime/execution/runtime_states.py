@@ -25,7 +25,10 @@ import itertools
 from collections.abc import Mapping, Sequence
 
 import torch
-from tokenspeed_kernel.ops.metadata import apply_stop_conditions
+from tokenspeed_kernel.ops.metadata import (
+    apply_stop_conditions,
+    mask_stopped_state_tables_,
+)
 
 from tokenspeed.runtime.execution.request_token_history import RequestTokenHistoryView
 from tokenspeed.runtime.execution.slot_state import (
@@ -539,10 +542,12 @@ class RuntimeStates:
         place: they stay views of the one packed upload, which the attention
         routers unpack in a single launch.
         """
-        stopped_rows = self.stopped.index_select(0, req_pool_indices)[:, None]
         tables = dict(block_tables)
-        for group_id in state_group_ids:
-            tables[group_id].masked_fill_(stopped_rows, -1)
+        mask_stopped_state_tables_(
+            [tables[group_id] for group_id in state_group_ids],
+            self.stopped,
+            req_pool_indices,
+        )
         return tables
 
     def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:

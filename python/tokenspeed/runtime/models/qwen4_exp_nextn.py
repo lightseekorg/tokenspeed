@@ -28,6 +28,11 @@ from typing import Any
 
 import torch
 from tokenspeed_kernel.ops.activation.triton import sigmoid_mul
+from tokenspeed_kernel.ops.megakernel import (
+    qwen4_exp_mtp_front,
+    select_qwen4_exp_mtp_front,
+)
+from tokenspeed_kernel.ops.megakernel.triton import MTP_FRONT_ROWS
 from torch import nn
 
 from tokenspeed.runtime.distributed.mapping import Mapping
@@ -49,6 +54,7 @@ from tokenspeed.runtime.models.qwen4_exp import (
     Qwen4ExpModel,
     load_qwen4_exp_weights,
 )
+from tokenspeed.runtime.models.qwen4_exp_megakernel import enable_decode_megakernels
 from tokenspeed.runtime.utils import add_prefix
 
 
@@ -220,6 +226,10 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         for indexer in self.model.qsa_indexers:
             indexer.share_topk_for_mtp_iteration = self.index_share_for_mtp_iteration
         self.lm_head = _build_mtp_lm_head(config, mapping, quant_config, prefix)
+        # Set by post_quant_warmup when the draft layer runs the decode
+        # megakernel: the kernel that runs _fuse_inputs in one launch for a
+        # decode step's rows.
+        self.front_kernel: Any | None = None
         self.logits_processor = LogitsProcessor(
             config,
             skip_all_gather=mapping.attn.has_dp,
@@ -232,6 +242,31 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
 
     def get_hot_token_id(self):
         return None
+
+    def post_quant_warmup(self) -> None:
+        # The draft steps after the first are one-row decode steps of the
+        # draft layer, which the QSA megakernel serves. Steps that reuse the
+        # first step's top-k keep the regular path: the megakernel selects
+        # its own.
+        if not self.index_share_for_mtp_iteration:
+            enable_decode_megakernels(self.model, required=False)
+        if self.model.megakernels is not None and self._front_fusable():
+            self.front_kernel = select_qwen4_exp_mtp_front(MTP_FRONT_ROWS)
+
+    def _front_fusable(self) -> bool:
+        """Whether the fused front reads this model's weights as they are:
+        4 streams, an unsharded embedding and BF16 linears without
+        quantization."""
+        linears = (self.fc_embedding, self.fc_hidden)
+        return (
+            self.hc_count == 4
+            and self.model.embed_tokens.tp_size == 1
+            and all(
+                linear.weight.dtype == torch.bfloat16
+                and linear.weight.shape == (self.hidden_size, self.hidden_size)
+                for linear in linears
+            )
+        )
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
@@ -290,9 +325,33 @@ class Qwen4ExpForCausalLMNextN(nn.Module):
         else:
             if input_embeds is not None:
                 raise ValueError("Qwen4-Exp MTP does not accept input_embeds")
-            fused = self._fuse_inputs(
-                self.model.embed_tokens(input_ids), captured_hidden_states
-            )
+            rows = input_ids.shape[0]
+            if (
+                self.front_kernel is not None
+                and ctx.forward_mode.is_decode()
+                and rows <= MTP_FRONT_ROWS
+            ):
+                # A decode step's rows: the norms, linears and stream add in
+                # one launch (the same math as _fuse_inputs).
+                fused = captured_hidden_states.new_empty(
+                    rows, self.hc_count * self.hidden_size
+                )
+                qwen4_exp_mtp_front(
+                    self.front_kernel,
+                    input_ids,
+                    self.model.embed_tokens.weight,
+                    captured_hidden_states.contiguous(),
+                    self.pre_fc_norm_embedding.weight,
+                    self.pre_fc_norm_hidden.weight,
+                    self.fc_embedding.weight,
+                    self.fc_hidden.weight,
+                    self.pre_fc_norm_embedding.variance_epsilon,
+                    fused,
+                )
+            else:
+                fused = self._fuse_inputs(
+                    self.model.embed_tokens(input_ids), captured_hidden_states
+                )
         with report_collective_sizing(ctx, ctx.bs, ctx.global_bs):
             hidden_states, aux_hidden_states = self.model(
                 input_ids,

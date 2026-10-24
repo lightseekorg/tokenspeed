@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.gemm import (
+    Mxfp4LinearWeight,
     mxfp4_linear,
     mxfp4_swiglu_linear,
     prepare_mxfp4_linear,
 )
+from tokenspeed_kernel.ops.quantization import quantize_mxfp4
 from torch.nn.parameter import Parameter
 
 from tokenspeed.runtime.layers.quantization.base_config import QuantizeMethodBase
@@ -150,6 +152,60 @@ class Mxfp4LinearMethod(QuantizeMethodBase):
         return output.reshape(*x.shape[:-1], layer.output_size_per_partition // 2)
 
 
+# Rows of an LM head quantized per call, to bound the temporary memory.
+_LM_HEAD_CHUNK_ROWS = 16384
+
+
+class Mxfp4LMHead(torch.nn.Module):
+    """An MXFP4 copy of a BF16 LM head, for logits that only a draft reads.
+
+    Every 32 weights share one UE8M0 scale (OCP MX rounding, as
+    ``quantize_mxfp4`` does), and ``mxfp4_linear`` quantizes each input row to
+    MXFP4. The copy reads a quarter of the BF16 head's bytes per call; the
+    logits change by the MXFP4 rounding of both operands. The head keeps the
+    vocabulary shard of its source.
+    """
+
+    def __init__(self, source: torch.nn.Module) -> None:
+        """Quantize ``source``'s weight into a new MXFP4 weight.
+
+        Args:
+            source: A vocabulary-parallel LM head with a 2-D float ``weight``
+                ``[rows, hidden]``. It is not changed.
+        """
+        super().__init__()
+        weight = source.weight.data
+        if weight.dim() != 2 or not weight.dtype.is_floating_point:
+            raise ValueError(
+                f"LM head weight must be a 2-D float tensor, got {weight.dtype}"
+            )
+        rows, hidden = weight.shape
+        _validate_mxfp4_partition(hidden)
+        packed = torch.empty(rows, hidden // 2, dtype=torch.uint8, device=weight.device)
+        scales = torch.empty(
+            rows, hidden // MXFP4_BLOCK, dtype=torch.uint8, device=weight.device
+        )
+        for start in range(0, rows, _LM_HEAD_CHUNK_ROWS):
+            chunk = weight[start : start + _LM_HEAD_CHUNK_ROWS].to(torch.bfloat16)
+            q, s = quantize_mxfp4(chunk, scale_layout="linear")
+            packed[start : start + chunk.shape[0]] = q
+            scales[start : start + chunk.shape[0]] = s.view(torch.uint8).view(
+                chunk.shape[0], -1
+            )
+        # The fields Mxfp4LinearMethod reads from a linear layer.
+        self.input_size_per_partition = hidden
+        self.output_size_per_partition = rows
+        self.mxfp4_swiglu = False
+        self.mxfp4_linear_weight: Mxfp4LinearWeight | None = None
+        self.weight = Parameter(packed, requires_grad=False)
+        self.weight_scale = Parameter(scales, requires_grad=False)
+        # The fields LogitsProcessor reads from a vocabulary-parallel head.
+        self.num_embeddings_per_partition = source.num_embeddings_per_partition
+        self.shard_indices = source.shard_indices
+        self.quant_method = Mxfp4LinearMethod(quant_config=None)
+        self.quant_method.process_weights_after_loading(self)
+
+
 def _validate_mxfp4_partition(input_size_per_partition: int) -> None:
     if input_size_per_partition % 2 != 0:
         raise ValueError(
@@ -180,5 +236,6 @@ def _wrap_e8m0_scale_loader(weight_loader):
 
 
 __all__ = [
+    "Mxfp4LMHead",
     "Mxfp4LinearMethod",
 ]

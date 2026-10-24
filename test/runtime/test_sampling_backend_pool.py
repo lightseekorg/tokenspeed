@@ -455,9 +455,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            count_bonus,
             enable_pdl=False,
         ):
-            del accept_index, candidates, target_sampled, enable_pdl
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 
@@ -517,9 +518,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            count_bonus,
             enable_pdl=False,
         ):
-            del accept_index, candidates, target_sampled, enable_pdl
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 
@@ -595,9 +597,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            count_bonus,
             enable_pdl=False,
         ):
-            del accept_index, candidates, target_sampled, enable_pdl
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 
@@ -680,9 +683,10 @@ class TestTritonRouteSelection:
             candidates,
             target_sampled,
             *,
+            count_bonus,
             enable_pdl=False,
         ):
-            del accept_index, candidates, target_sampled, enable_pdl
+            del accept_index, candidates, target_sampled, count_bonus, enable_pdl
             predicts.fill_(0)
             accept_token_num.fill_(0)
 

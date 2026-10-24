@@ -32,6 +32,7 @@ class _FakeInputBuffers:
         self.max_num_tokens = capacity
         self.positions_buf = torch.arange(capacity, dtype=torch.int64)
         self.mrope_positions_buf = torch.zeros(3, capacity, dtype=torch.int64)
+        self.mrope_positions_ready = False
 
 
 class _FakeForwardOp:
@@ -87,6 +88,17 @@ def test_decode_text_only_short_circuits_to_base_positions():
     out = rt.build_positions_override(op, None, 2)
     assert out.shape == (3, 2)
     assert torch.equal(out, ib.positions_buf[:2].unsqueeze(0).expand(3, -1))
+
+
+def test_decode_text_only_keeps_positions_the_fill_wrote():
+    """A decode-only fill already wrote the text-only M-RoPE positions; the
+    override returns them as they are."""
+    rt, ib = _runtime()
+    ib.mrope_positions_buf[:, :2] = torch.tensor([[4, 5], [4, 5], [4, 5]])
+    ib.mrope_positions_ready = True
+    out = rt.build_positions_override(_FakeForwardOp([1, 1]), None, 2)
+    assert out.data_ptr() == ib.mrope_positions_buf.data_ptr()
+    assert out.tolist() == [[4, 5], [4, 5], [4, 5]]
 
 
 def test_decode_applies_scalar_delta_per_request():

@@ -21,12 +21,20 @@
 """Generic CUDA-graph replay metadata prep (the "prep tape")."""
 
 from tokenspeed_kernel.ops.metadata.accepted_frontier import advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata.draft_prologue import (
+    eagle_chain_prologue,
+    eagle_chain_step,
+)
 from tokenspeed_kernel.ops.metadata.prep_tape import PrepTape, Reg
+from tokenspeed_kernel.ops.metadata.state_tables import mask_stopped_state_tables_
 from tokenspeed_kernel.ops.metadata.stop_conditions import apply_stop_conditions
 
 __all__ = [
+    "eagle_chain_prologue",
+    "eagle_chain_step",
     "PrepTape",
     "Reg",
     "advance_accepted_frontier",
     "apply_stop_conditions",
+    "mask_stopped_state_tables_",
 ]

@@ -128,3 +128,29 @@ def test_verify_lands_all_three_outputs_in_the_pack(monkeypatch) -> None:
     # accept_index is an offset table into the flat predict rows.
     assert index[: bs * n].view(bs, n).tolist() == [[0, 1, 2], [3, 4, -1]]
     assert len(sent) == 1 and sent[0].data_ptr() == backend._output_pack_buf.data_ptr()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="pinned host copies need CUDA"
+)
+def test_verify_outputs_reach_the_host_in_one_copy() -> None:
+    """The views verify() returns come back through one D2H of the pack;
+    tensors outside it take the two-copy fallback (None)."""
+    backend = _backend("cuda")
+    bs, n = 3, 2
+    predict, lengths, _ = _pack_regions(backend)
+    predict[: bs * n] = torch.arange(bs * n, dtype=torch.int32, device="cuda") + 20
+    lengths[:bs] = torch.tensor([2, 1, 2], dtype=torch.int32, device="cuda")
+
+    packed = backend.get_packed_output_d2h(
+        backend._predict_buf[: bs * n], backend._accept_length_buf[:bs]
+    )
+    torch.cuda.synchronize()
+    assert packed is not None
+    assert packed[0].tolist() == [20, 21, 22, 23, 24, 25]
+    assert packed[1].tolist() == [2, 1, 2]
+    elsewhere = torch.zeros(bs, dtype=torch.int32, device="cuda")
+    assert (
+        backend.get_packed_output_d2h(elsewhere, backend._accept_length_buf[:bs])
+        is None
+    )

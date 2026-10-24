@@ -190,6 +190,25 @@ def _checkpoint_architectures(
     return list(architectures) if isinstance(architectures, list) else []
 
 
+# Checkpoint architectures with decode megakernels (--decode-megakernel). A
+# model adds its architecture here with its megakernel seam.
+DECODE_MEGAKERNEL_ARCHITECTURES = (
+    "Qwen4ExpForCausalLM",
+    "Qwen4ExpForConditionalGeneration",
+)
+
+
+def decode_megakernel_refusal(architectures: list[str]) -> str | None:
+    """Why ``--decode-megakernel`` cannot serve a checkpoint of
+    ``architectures``, or None when a megakernel exists for one of them."""
+    if any(a in DECODE_MEGAKERNEL_ARCHITECTURES for a in architectures):
+        return None
+    return (
+        f"--decode-megakernel: no decode megakernel for {architectures or 'this model'} "
+        f"(models with one: {', '.join(DECODE_MEGAKERNEL_ARCHITECTURES)})"
+    )
+
+
 def str_to_bool(value: str | bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -586,6 +605,12 @@ class ServerArgs:
     engram_host_table: bool = False
     engram_host_table_dir: str | None = None
     engram_host_table_layout: str = "auto"
+    # Run each eligible decoder layer's decode step as one persistent
+    # megakernel launch (DECODE_MEGAKERNEL_ARCHITECTURES). Off by default.
+    decode_megakernel: bool = False
+    # Run an MTP draft's LM head from an MXFP4 copy of the target's head.
+    # Off by default.
+    draft_lm_head_mxfp4: bool = False
 
     # Grammar backend. None means the checkpoint default has not been resolved.
     grammar_backend: str | None = None
@@ -812,6 +837,10 @@ class ServerArgs:
         hold yet; engine setup calls this again with ``download``.
         """
         architectures = _checkpoint_architectures(self.model, self.revision, download)
+        if self.decode_megakernel and architectures is not None:
+            refusal = decode_megakernel_refusal(architectures)
+            if refusal is not None:
+                raise ValueError(refusal)
         self._beam_checkpoint = (
             None if architectures is None else "BeamForCausalLM" in architectures
         )
@@ -3258,6 +3287,31 @@ class ServerArgs:
                 "attention-TP rank holds a host shard and keeps the all-reduce "
                 "(anonymous mapping, huge-page friendly). auto: sharded when "
                 "attention TP > 1, else shared."
+            ),
+        )
+        parser.add_argument(
+            "--decode-megakernel",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.decode_megakernel,
+            help=(
+                "Run each decoder layer's decode step as one persistent "
+                "megakernel launch, for small batches (decode and speculative "
+                "verify of up to 4 token rows). Models: "
+                f"{', '.join(DECODE_MEGAKERNEL_ARCHITECTURES)} on gfx950, "
+                "without attention or expert parallelism. Startup fails when "
+                "the model has no megakernel layer. Larger steps keep the "
+                "regular path."
+            ),
+        )
+        parser.add_argument(
+            "--draft-lm-head-mxfp4",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.draft_lm_head_mxfp4,
+            help=(
+                "Run the draft's LM head from an MXFP4 copy of the target's "
+                "BF16 head (about a quarter of its size), for drafts that "
+                "share the target's head. The target's logits do not change; "
+                "the draft's tokens, and so the accept rate, can."
             ),
         )
         parser.add_argument(

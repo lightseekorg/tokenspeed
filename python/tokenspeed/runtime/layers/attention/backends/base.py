@@ -542,6 +542,14 @@ class AttentionBackend(CachePoolBinding, ABC):
             **kwargs,
         )
 
+    def draft_seq_lens_targets(self, bs: int) -> list[torch.Tensor] | None:
+        """The buffers :meth:`advance_draft_forward_metadata` copies the
+        draft's lengths into, when those copies are the whole hook, so a
+        composite can fill them with its siblings' in one launch; None when
+        the hook does more (or nothing is known)."""
+        del bs
+        return None
+
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Publish a drafter's in-graph seq_lens edits (Eagle chains); nodes
         without per-request decode lengths ignore it."""

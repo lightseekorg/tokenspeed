@@ -24,6 +24,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 import tokenspeed.runtime.layers.attention.backends  # noqa: F401  # trigger register_backend() calls
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
@@ -33,9 +35,11 @@ from tokenspeed.runtime.execution.model_executor import (
 )
 from tokenspeed.runtime.execution.model_runner import ModelRunner
 from tokenspeed.runtime.layers.attention.configs.base import is_block_drafter
+from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LMHead
 from tokenspeed.runtime.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
+from tokenspeed.runtime.layers.vocab_parallel_embedding import ParallelLMHead
 from tokenspeed.runtime.models.target_capture import TargetCaptureConfigurator
 from tokenspeed.runtime.sampling.registry import create_sampling_backend
 from tokenspeed.runtime.utils.nvtx import set_nvtx_enabled
@@ -115,6 +119,32 @@ def _share_target_embed_and_head(model_runner: ModelRunner, draft_model) -> None
         _refuse_aliased_quantized_head(model_runner.model, draft_model, head)
     if embed is None:
         _require_draft_embedding(draft_model)
+
+
+def _use_mxfp4_draft_lm_head(target_model, draft_model) -> None:
+    """``--draft-lm-head-mxfp4``: give the draft an MXFP4 copy of its head.
+
+    The draft's head must be its own module that aliases the target's BF16
+    weight, so the copy leaves the target's head (and the target's logits) as
+    they are.
+    """
+    draft_head = draft_model.lm_head
+    if draft_head is target_model.lm_head:
+        raise ValueError(
+            "--draft-lm-head-mxfp4 needs a draft with its own LM head module; "
+            f"{type(draft_model).__name__} adopts the target's"
+        )
+    if not isinstance(draft_head, ParallelLMHead):
+        raise ValueError(
+            "--draft-lm-head-mxfp4 needs a vocabulary-parallel draft LM head, "
+            f"got {type(draft_head).__name__}"
+        )
+    if draft_head.weight.dtype != torch.bfloat16:
+        raise ValueError(
+            "--draft-lm-head-mxfp4 needs a BF16 LM head, got "
+            f"{draft_head.weight.dtype}"
+        )
+    draft_model.lm_head = Mxfp4LMHead(draft_head)
 
 
 def _refuse_aliased_quantized_head(target_model, draft_model, head) -> None:
@@ -211,8 +241,16 @@ def configure_draft_target(
         draft_model.configure_target(
             model_runner.model, model_runner.model_config.hf_text_config
         )
+    if server_args.draft_lm_head_mxfp4:
+        if not DrafterImpl.shares_target_embed_head:
+            raise ValueError(
+                f"--draft-lm-head-mxfp4 needs a draft that shares the target's "
+                f"LM head; {DrafterImpl.__name__} does not"
+            )
     if DrafterImpl.shares_target_embed_head:
         _share_target_embed_and_head(model_runner, draft_model)
+        if server_args.draft_lm_head_mxfp4:
+            _use_mxfp4_draft_lm_head(model_runner.model, draft_model)
     if server_args.speculative_algorithm in AUX_CAPTURE_SPEC_ALGORITHMS and hasattr(
         model_runner.model, "set_eagle3_layers_to_capture"
     ):

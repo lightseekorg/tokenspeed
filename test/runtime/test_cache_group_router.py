@@ -298,6 +298,97 @@ class TestGroupTableStacksTest:
             device=device,
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+    @pytest.mark.parametrize("actual_bs", [1, 3, 4])
+    @pytest.mark.parametrize("tokens_per_req", [1, 2])
+    def test_fill_decode_matches_the_separate_steps(self, actual_bs, tokens_per_req):
+        """One launch gives the stacks, the decode window and the leaf
+        buffers (seq_lens raised to the leaf's floor) of fill, then
+        compute_decode_locations, then the copies."""
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            DecodeFillTarget,
+        )
+
+        raw = {
+            FULL: torch.tensor(
+                [[5, 6, -1], [9, 0, 2], [7, 1, 3], [4, 0, 8]],
+                dtype=torch.int32,
+                device="cuda",
+            ),
+            SWA: torch.tensor(
+                [[3, 4], [0, 2], [6, 1], [8, 9]], dtype=torch.int32, device="cuda"
+            ),
+        }
+        # Lengths that land on every page, past the table and on holes.
+        seq_lens = torch.tensor([9, 5, 12, 1], dtype=torch.int32, device="cuda")
+
+        def targets():
+            return {
+                FULL: DecodeFillTarget(
+                    torch.full((4,), -5, dtype=torch.int32, device="cuda"),
+                    torch.full((4, 3), -5, dtype=torch.int32, device="cuda"),
+                    3,
+                ),
+                # A lengths-only target leaves no table copy.
+                SWA: DecodeFillTarget(
+                    torch.full((4,), -5, dtype=torch.int32, device="cuda"), None, 6
+                ),
+            }
+
+        fused, fused_targets = self._stacks(device="cuda"), targets()
+        assert fused.fill_decode(
+            4, actual_bs, raw, seq_lens, tokens_per_req, fused_targets
+        )
+
+        reference, reference_targets = self._stacks(device="cuda"), targets()
+        reference.fill(4, actual_bs, raw)
+        reference.compute_decode_locations(4, seq_lens, tokens_per_req)
+        target = reference_targets[FULL]
+        torch.clamp_min(seq_lens, 3, out=target.seq_lens)
+        target.page_table.copy_(reference.table(FULL, 4))
+        torch.clamp_min(seq_lens, 6, out=reference_targets[SWA].seq_lens)
+
+        n = 4 * tokens_per_req
+        assert torch.equal(fused.tables, reference.tables)
+        assert torch.equal(fused.decode_locs[:, :n], reference.decode_locs[:, :n])
+        assert torch.equal(fused_targets[FULL].seq_lens, target.seq_lens)
+        assert torch.equal(fused_targets[FULL].page_table, target.page_table)
+        assert torch.equal(fused_targets[SWA].seq_lens, reference_targets[SWA].seq_lens)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+    def test_fill_decode_compiles_once(self):
+        """Batch sizes, table offsets and widths change every step; none may
+        key a new binary."""
+        from unittest.mock import patch
+
+        from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+            DecodeFillTarget,
+            _fill_decode_kernel,
+        )
+
+        base = torch.randint(0, 9, (64,), dtype=torch.int32, device="cuda")
+        seq_lens = torch.full((4,), 6, dtype=torch.int32, device="cuda")
+        stacks = self._stacks(device="cuda")
+        target = DecodeFillTarget(
+            torch.empty(4, dtype=torch.int32, device="cuda"),
+            torch.empty(4, 3, dtype=torch.int32, device="cuda"),
+            2,
+        )
+
+        def run(rows, offset, width, n):
+            table = base[offset:].as_strided((rows, width), (width, 1))
+            assert stacks.fill_decode(
+                rows, rows, {FULL: table, SWA: table}, seq_lens, n, {FULL: target}
+            )
+
+        run(2, 0, 3, 1)
+        with patch.object(
+            _fill_decode_kernel, "_do_compile", wraps=_fill_decode_kernel._do_compile
+        ) as compiles:
+            for rows, offset, width, n in ((1, 1, 2, 2), (4, 3, 3, 1), (3, 16, 1, 2)):
+                run(rows, offset, width, n)
+        assert compiles.call_count == 0
+
     def test_fill_expands_pads_and_nulls_holes(self):
         stacks = self._stacks()
         raw = {
@@ -629,6 +720,31 @@ class TestCacheGroupRouterTest:
             SWA: base,
             "linear_attention_0": torch.ones((bs, 2), dtype=torch.int32),
         }
+
+    def test_draft_lengths_go_to_every_leaf_buffer_the_hook_copies_into(self):
+        """The router names its leaves' length buffers when every leaf's
+        draft hook is the plain copy; a leaf with its own hook makes the
+        router keep the hook path."""
+        router, leaves = self._router(is_draft=True)
+        targets = router.draft_seq_lens_targets(3)
+        assert [t.data_ptr() for t in targets] == [
+            leaves[FULL].seq_lens_buf.data_ptr(),
+            leaves[SWA].seq_lens_buf.data_ptr(),
+        ]
+        assert all(t.shape == (3,) for t in targets)
+        lengths = torch.tensor([7, 8, 9], dtype=torch.int32)
+        torch._foreach_copy_(targets, [lengths] * len(targets))
+        router.advance_draft_forward_metadata(lengths + 1)
+        # The copy into the targets is the hook's own result.
+        for leaf in leaves.values():
+            assert leaf.seq_lens_buf[:3].tolist() == [8, 9, 10]
+
+        class _OwnHookLeaf(_StubLeaf):
+            def advance_draft_forward_metadata(self, seq_lens):
+                super().advance_draft_forward_metadata(seq_lens)
+
+        leaves[SWA].__class__ = _OwnHookLeaf
+        assert router.draft_seq_lens_targets(3) is None
 
     def test_window_support_is_forwarded_from_the_leaves(self):
         router, leaves = self._router()

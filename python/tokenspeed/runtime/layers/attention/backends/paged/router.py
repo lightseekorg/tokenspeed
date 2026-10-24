@@ -65,6 +65,7 @@ from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry imp
     learn_cache_group_geometry,
 )
 from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+    DecodeFillTarget,
     GroupTableSpec,
     GroupTableStacks,
 )
@@ -771,35 +772,54 @@ class CacheGroupRouter(AttentionBackend):
                 f"refresh_decode_metadata serves decode only ({forward_mode})"
             )
         self._check_live_delivery(actual_bs, block_tables)
-        self.stacks.fill(bs, actual_bs, block_tables)
+        targets = {
+            gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
+        }
+        fill_targets = {
+            gid: DecodeFillTarget(
+                pair[0], pair[1], self.leaves[gid].decode_seq_lens_floor
+            )
+            for gid, pair in targets.items()
+            if pair is not None
+        }
+        n = self._decode_tokens_per_req
+        # One launch fills the stacks, the decode window and the leaf
+        # buffers when it can (each separate launch costs ~4 us at bs=1).
+        fused = self.stacks.fill_decode(
+            bs, actual_bs, block_tables, seq_lens, n, fill_targets
+        )
+        if fused:
+            self._publish_decode_locations(bs, n)
+        else:
+            self.stacks.fill(bs, actual_bs, block_tables)
+            self._refresh_decode_locations(bs, seq_lens)
         # The window covers every request; DECODE reads skip the extend
         # requests a MIXED round's draft refresh carries (num_extends is 0 on
         # targets).
         self._decode_request_offset = num_extends
-        self._refresh_decode_locations(bs, seq_lens)
         if num_extends and self._extend_write_locations is not None:
             self._append_decode_rows(bs, num_extends)
-        targets = {
-            gid: leaf.decode_buffer_targets(bs) for gid, leaf in self.leaves.items()
-        }
-        batched = [gid for gid, pair in targets.items() if pair is not None]
-        if batched:
+        if not fused and fill_targets:
             # One launch fills every such leaf (plus one clamp per seq_lens
             # floor); two stream copies per leaf cost ~4 us each at bs=1.
             floored = {}
-            for gid in batched:
-                floor = self.leaves[gid].decode_seq_lens_floor
+            for target in fill_targets.values():
+                floor = target.seq_lens_floor
                 if floor not in floored:
                     floored[floor] = (
                         seq_lens[:bs] if floor <= 1 else seq_lens[:bs].clamp_min(floor)
                     )
             torch._foreach_copy_(
-                [buf for gid in batched for buf in targets[gid]],
+                [
+                    buf
+                    for target in fill_targets.values()
+                    for buf in (target.seq_lens, target.page_table)
+                ],
                 [
                     src
-                    for gid in batched
+                    for gid, target in fill_targets.items()
                     for src in (
-                        floored[self.leaves[gid].decode_seq_lens_floor],
+                        floored[target.seq_lens_floor],
                         self.stacks.table(gid, bs),
                     )
                 ],
@@ -949,6 +969,15 @@ class CacheGroupRouter(AttentionBackend):
         self._publish_decode_locations(bs, num_tokens)
         i = self._draft_history_index()
         return self.stacks.decode_locs[i, : bs * num_tokens]
+
+    def draft_seq_lens_targets(self, bs: int) -> list[torch.Tensor] | None:
+        targets = []
+        for leaf in self.leaves.values():
+            leaf_targets = leaf.draft_seq_lens_targets(bs)
+            if leaf_targets is None:
+                return None
+            targets.extend(leaf_targets)
+        return targets
 
     def advance_draft_forward_metadata(self, seq_lens: torch.Tensor) -> None:
         """Eagle chain step: republish the leaves' seq_lens, in-graph.

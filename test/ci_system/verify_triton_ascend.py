@@ -97,8 +97,22 @@ def main() -> None:
     cache_lengths = torch.tensor([9, 4, 13], device="npu", dtype=torch.int32)
     decode_positions = torch.empty(12, device="npu", dtype=torch.int64)
     decode_seq_lens = torch.empty(3, device="npu", dtype=torch.int32)
+    future_ids = torch.arange(12, device="npu", dtype=torch.int32).view(3, 4)
+    decode_ids = torch.empty(12, device="npu", dtype=torch.int32)
     fused_decode_input_prep(
-        decode_positions, decode_seq_lens, pool_indices, cache_lengths, 4
+        decode_positions,
+        decode_seq_lens,
+        pool_indices,
+        cache_lengths,
+        4,
+        input_ids_out=decode_ids,
+        future_input_map=future_ids,
+        vocab_size=10,
+        mrope_positions_out=None,
+    )
+    torch.testing.assert_close(
+        decode_ids.cpu(),
+        torch.tensor([8, 9, 9, 9, 0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32),
     )
     torch.testing.assert_close(
         decode_positions.cpu(),

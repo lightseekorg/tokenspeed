@@ -1152,6 +1152,7 @@ class PrefillGraph:
         ib.extend_replay_lens_cpu[:bs].zero_()
         ib.extend_prompt_lens_cpu[:bs].copy_(seq_lens_cpu)
         ib.input_lengths_buf[:bs].copy_(seq_lens_gpu)
+        ib.mark_tails_dirty()
         ib.prepare_request_token_history_inputs(
             batch_size=bs, num_extends=bs, decode_width=1
         )
