@@ -98,7 +98,9 @@ from tokenspeed.runtime.utils.process import (
     kill_process_tree,
     receive_ready_messages,
     register_child_failure_signals,
+    run_with_parent_death_signal,
     start_process_with_ready_pipe,
+    stop_processes,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -621,6 +623,37 @@ def _scheduler_ranks(server_args: ServerArgs) -> range:
     return range(rank_start, rank_start + server_args.mapping.nprocs_per_node)
 
 
+def _stop_schedulers_on_signal(scheduler_procs: list[mp.Process]) -> None:
+    """Make a node of rank >= 1 stop its schedulers before a signal ends it.
+
+    Nothing else stops them when the node exits, so they would keep their
+    GPUs. On SIGTERM, SIGINT or SIGUSR1 (sent by a failing scheduler) the
+    schedulers get SIGTERM and TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT
+    seconds to exit before they are killed; the node then still ends by
+    the signal it received.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return  # Signal handlers can only be set from the main thread.
+    timeout = envs.TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT.get()
+    stopping = False
+
+    def stop_schedulers_and_exit(signum, _frame):
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        logger.info(f"Received signal {signum!s}; stopping scheduler processes")
+        try:
+            stop_processes(scheduler_procs, timeout)
+        finally:
+            # Whatever is left still gets the parent-death signal.
+            signal.signal(signum, signal.SIG_DFL)
+            signal.raise_signal(signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
+        signal.signal(signum, stop_schedulers_and_exit)
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
@@ -644,6 +677,17 @@ def _launch_subprocesses(
 
     metrics_service.start(server_args, port_args)
 
+    # A node of rank >= 1 that blocks below is the only owner of its
+    # schedulers: they must not outlive it, even when it is SIGKILLed.
+    owns_schedulers = (
+        server_args.node_rank >= 1 and envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get()
+    )
+
+    def with_parent_death_signal(target, *args):
+        if owns_schedulers:
+            return run_with_parent_death_signal, (os.getpid(), target, *args)
+        return target, args
+
     scheduler_procs = []
     if not server_args.mapping.attn.has_dp:
         # Launch tensor parallel scheduler processes
@@ -658,18 +702,24 @@ def _launch_subprocesses(
             rank_server_args.mapping = copy.deepcopy(server_args.mapping)
             rank_server_args.mapping.rank = rank
 
+            target, args = with_parent_death_signal(
+                run_event_loop, rank_server_args, port_args
+            )
             proc, reader = start_process_with_ready_pipe(
-                run_event_loop,
-                (rank_server_args, port_args),
+                target,
+                args,
                 memory_saver_adapter.configure_subprocess(),
             )
             scheduler_procs.append(proc)
             scheduler_pipe_readers.append(reader)
     else:
         # Launch the data parallel controller
+        target, args = with_parent_death_signal(
+            run_data_parallel_controller_process, server_args, port_args
+        )
         proc, reader = start_process_with_ready_pipe(
-            run_data_parallel_controller_process,
-            (server_args, port_args),
+            target,
+            args,
             contextlib.nullcontext(),
         )
         scheduler_pipe_readers = [reader]
@@ -678,6 +728,8 @@ def _launch_subprocesses(
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
         # so they can just wait here.
+        if owns_schedulers:
+            _stop_schedulers_on_signal(scheduler_procs)
 
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
@@ -685,7 +737,7 @@ def _launch_subprocesses(
                     "Initialization failed. Please see the error messages above."
                 )
 
-        if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
+        if not owns_schedulers:
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 
