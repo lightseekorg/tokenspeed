@@ -819,22 +819,8 @@ class AscendDSABackend(DSABackend):
             )
         kernels = self.attention_kernels(is_prefill=is_prefill)
         if not selection.context_parallel:
-            # TND accepts 32/64 query heads. TP can leave fewer Q heads on
-            # each rank; repeat those heads locally and keep only the first
-            # copy of the result. MLA's single latent KV head stays intact.
-            live_heads = selection.query.shape[1]
-            if live_heads < 1:
-                raise ValueError("Ascend DSA needs at least one query head")
-            if live_heads > 64:
-                raise ValueError("Ascend DSA supports at most 64 local query heads")
-            padded_heads = 32 if live_heads <= 32 else 64
-            query = selection.query
-            if live_heads != padded_heads:
-                copies = (padded_heads + live_heads - 1) // live_heads
-                query = query.repeat(1, copies, 1)[:, :padded_heads]
-            result = kernels.attention(
-                query[..., : spec.kv_lora_rank].contiguous(),
-                query[..., spec.kv_lora_rank :].contiguous(),
+            return kernels.attention_packed(
+                selection.query,
                 kv_cache,
                 selection.indices,
                 selection.valid_chunks,
@@ -842,12 +828,7 @@ class AscendDSABackend(DSABackend):
                 selection.kv_lengths,
                 selection.table,
                 layer.scaling,
-            )
-            result = result[:, :live_heads].contiguous()
-            return (
-                result.transpose(0, 1).contiguous()
-                if head_major_output
-                else result.flatten(1)
+                head_major_output=head_major_output,
             )
 
         if not selection.fused:
