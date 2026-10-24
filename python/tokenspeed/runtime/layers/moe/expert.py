@@ -462,11 +462,7 @@ class MoELayer(torch.nn.Module):
             if self.ep_size > 1:
                 routing_mode = "precomputed_topk"
         elif precision_policy in ("nvfp4_vendor_fp32_route", "fp8ch_vendor_fp32_route"):
-            # The vendor policy's contract on FlashInfer's TRT-LLM NVFP4 or FP8
-            # per-channel (fp8_channel) experts, always on precomputed routes
-            # (the caller's top-k folds the routed scale into the FP32 route
-            # weights): the kernel quantizes its BF16 input itself and the
-            # output is finalized with the FP32 route weights.
+            # Prepared grouped kernels and separate EP/fallback routes keep FP32 weights.
             quant_kind, label = (
                 ("nvfp4", "NVFP4")
                 if precision_policy == "nvfp4_vendor_fp32_route"
@@ -481,15 +477,20 @@ class MoELayer(torch.nn.Module):
                 or moe_backend != "flashinfer_trtllm"
                 or combine_order != "rank"
                 or output_scale != 1.0
-                or routing_mode not in {None, "precomputed_topk"}
             ):
                 raise ValueError(
                     f"{precision_policy} requires {label} SiLU experts on "
-                    "--moe-backend flashinfer_trtllm and precomputed top-k, "
+                    "--moe-backend flashinfer_trtllm, "
                     "without all-to-all, bias, slot combine or an output scale; "
                     f"the layer has {self._quant_kind} {self.activation} experts"
                 )
-            routing_mode = "precomputed_topk"
+            self._fp32_correction_bias = True
+            if (
+                self.ep_size > 1
+                or self._routing_method_type != RoutingMethodType.DeepSeekV3
+                or self._n_group <= 1
+            ):
+                routing_mode = "precomputed_topk"
         elif output_scale != 1.0:
             raise ValueError("MoE output_scale requires an explicit precision policy")
         self.plan = kernel_moe_plan(

@@ -907,15 +907,7 @@ class BeamVendorMoE(BeamMoE):
     whole experts and its output sums only its local routes; the all-reduce
     after the MoE adds the ranks.
 
-    Given a ModelOpt NVFP4 ``quant_config``, the checkpoint's NVFP4 experts
-    run on FlashInfer's TRT-LLM NVFP4 routed kernel (``nvfp4_vendor_fp32_route``),
-    always on Beam's routes, on the input :meth:`forward` quantizes: the call the
-    kernel makes itself, moved off the route's critical path onto ``alt_stream``
-    under CUDA graph capture. Given a compressed-tensors FP8 dynamic W8A8
-    ``quant_config``, the FP8 per-channel experts run on FlashInfer's TRT-LLM
-    FP8 per-channel routed kernel (``fp8ch_vendor_fp32_route``), always on
-    Beam's routes with their FP32 weights; the kernel quantizes its input per
-    token.
+    NVFP4 (``nvfp4_vendor_fp32_route``) and per-channel FP8 (``fp8ch_vendor_fp32_route``) use the same capability-gated FP32 selection and keep FP32 route weights through finalization, as does their separate-router fallback. NVFP4 input quantization remains on ``alt_stream`` during capture; FP8 input quantization remains per token in the facade.
 
     On AMD gfx950, BF16, FP8 per-channel and Quark MXFP4 experts use the default
     precision policy and registry selection, with precomputed FP32 routes.

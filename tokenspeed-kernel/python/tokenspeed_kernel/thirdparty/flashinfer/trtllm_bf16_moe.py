@@ -38,6 +38,8 @@ second copy of the TRT-LLM MoE module whose routing source carries
 flashinfer-ai/flashinfer#5557's edit, plus the 64-aligned launcher when it
 applies. It is built the same way under its own operator names; a FlashInfer
 whose routing already has that edit is used as is.
+
+A separate private namespace serves NVFP4 and per-channel FP8 experts with FP32 selection and FP32 coefficients through expert finalization. BF16 experts retain their existing coefficient storage.
 """
 
 from __future__ import annotations
@@ -117,6 +119,8 @@ _EXP_SIGMOID = re.compile(
 _DISPATCH = {
     "trtllm_bf16_moe": {"get_trtllm_moe_sm100_module"},
     "trtllm_bf16_routed_moe": {"get_trtllm_moe_sm100_module"},
+    "trtllm_fp4_block_scale_moe": {"get_trtllm_moe_sm100_module"},
+    "trtllm_fp8_per_channel_scale_moe": {"get_trtllm_moe_sm100_module"},
     "get_trtllm_moe_sm100_module": {"_get_trtllm_moe_sm100_module_impl"},
     "_get_trtllm_moe_sm100_module_impl": {
         "gen_trtllm_gen_fused_moe_sm100_module",
@@ -217,6 +221,119 @@ def _fp32_routing_bias_spec(*args, **kwargs):
     return _patched_sources_spec(transforms, "fp32_routing_bias", *args, **kwargs)
 
 
+_QUANTIZED_FP32_OPERATORS = "tokenspeed_flashinfer_fp32_quantized_routes"
+
+
+def _replace_once(source: str, old: str, new: str) -> str:
+    if source.count(old) != 1:
+        raise RuntimeError(
+            "Unsupported quantized routing source; expected one matching statement"
+        )
+    return source.replace(old, new)
+
+
+def _fp32_quantized_routing(source: str) -> str:
+    source = _keep_routing_bias_fp32(source)
+    return _replace_once(
+        source,
+        "auto finalScore = OutputT{scoreNorm * params.mRouteScale / (redNorm + params.mSumEpsilon)};",
+        """if constexpr (sizeof(OutputT) == sizeof(float)) {
+        // Match the contiguous eight-element FP32 reduction and scale after division.
+        if (params.mTopK == 8) {
+          float sum = scoreNorm;
+          for (int offset = 4; offset > 0; offset /= 2) {
+            sum = __fadd_rn(sum, __shfl_down_sync(0xffffffff, sum, offset));
+          }
+          redNorm = __shfl_sync(0xffffffff, sum, 0);
+        }
+      }
+      auto finalScore = OutputT{__fmul_rn(
+          __fdiv_rn(scoreNorm, __fadd_rn(redNorm, params.mSumEpsilon)), params.mRouteScale)};""",
+    )
+
+
+def _fp32_quantized_dispatch(source: str) -> str:
+    return _replace_once(
+        source,
+        "btg::Dtype::Bfloat16;               // for DeepSeek, the expW is currently always bfloat16",
+        "routingLogits != nullptr && dtypeLogits == btg::Dtype::Fp32\n"
+        "            ? btg::Dtype::Fp32 : btg::Dtype::Bfloat16;",
+    )
+
+
+def _fp32_quantized_launcher(source: str) -> str:
+    source = _replace_once(
+        source,
+        "  void prepare_routing_common() {",
+        """  bool fp32_grouped_routes() const {
+    return routing_logits.has_value() && routing_logits.value().dtype() == dl_float32 &&
+           static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::DeepSeekV3 &&
+           args->n_group > 1;
+  }
+
+  void prepare_routing_common() {""",
+    )
+    source = _replace_once(
+        source,
+        "alloc_tensor({args->num_tokens, totalExpertsPerToken}, dl_int32, hidden_states.device());",
+        "alloc_tensor({args->num_tokens, totalExpertsPerToken},\n"
+        "                     fp32_grouped_routes() ? dl_int64 : dl_int32, hidden_states.device());",
+    )
+    start = source.index("class Fp8PerChannelLauncher :")
+    end = source.index("class Fp8BlockScaleLauncher :", start)
+    body = source[start:end]
+    body = _replace_once(
+        body,
+        "alloc_tensor({args->num_tokens, args->top_k}, dl_bfloat16, hidden_states.device());",
+        "alloc_tensor({args->num_tokens, args->top_k},\n"
+        "                       fp32_grouped_routes() ? dl_float32 : dl_bfloat16, hidden_states.device());\n"
+        "      args->mDtypeExpW = expert_weights_dtype(FusedMoeLauncher::expert_weights);",
+    )
+    source = source[:start] + body + source[end:]
+    start = source.index("class FP4BlockScaleLauncher :")
+    body = source[start:]
+    body = _replace_once(
+        body,
+        "    workspace.routing_expert_indexes = static_cast<int*>(const_cast<void*>(topk_ids.data_ptr()));",
+        """    if (fp32_grouped_routes()) {
+      // FP32 packed scores need eight bytes per route; keep the caller's BF16 buffers untouched.
+      topk_ids = expert_indexes;
+      FusedMoeLauncher::expert_weights = alloc_tensor(
+          {args->num_tokens, args->top_k + args->num_fused_shared_experts},
+          dl_float32, hidden_states.device());
+      topk_weights = FusedMoeLauncher::expert_weights;
+      args->mDtypeExpW = btg::Dtype::Fp32;
+    }
+    workspace.routing_expert_indexes = static_cast<int*>(const_cast<void*>(topk_ids.data_ptr()));""",
+    )
+    return source[:start] + body
+
+
+def _fp32_quantized_spec(*args, **kwargs):
+    return _patched_sources_spec(
+        {
+            _ROUTING: _fp32_quantized_routing,
+            "trtllm_fused_moe_routing_runner.cu": _fp32_quantized_dispatch,
+            _LAUNCHER: _fp32_quantized_launcher,
+        },
+        "fp32_quantized_routes",
+        *args,
+        **kwargs,
+    )
+
+
+@functools.cache
+def fp32_quantized_routing_ready() -> bool:
+    try:
+        _entrypoints(_fp32_quantized_spec, _QUANTIZED_FP32_OPERATORS)[
+            "get_trtllm_moe_sm100_module"
+        ]()
+    except Exception as error:
+        logger.warning(f"FP32 quantized routing is unavailable: {error}")
+        return False
+    return True
+
+
 def _require_jit_compiler() -> None:
     """Raise unless FlashInfer's JIT can compile the private module.
 
@@ -247,6 +364,27 @@ def _entrypoints(spec=_relaxed_spec, prefix: str = _OPERATORS) -> dict:
             f"FlashInfer no longer defines {missing}; review the BF16 MoE adapter."
         )
     namespace = dict(vars(core))
+    if spec is _fp32_quantized_spec:
+
+        def unpack_owned_routes(
+            intermediate_output,
+            output,
+            do_finalize,
+            gemm1_lora_delta,
+            expert_weights=None,
+        ):
+            # An empty native slot denotes borrowed weights, including ungrouped FP4 routes.
+            if not do_finalize and intermediate_output[1] is not None:
+                expert_weights = None
+            return core._unpack_trtllm_moe_output(
+                intermediate_output,
+                output,
+                do_finalize,
+                gemm1_lora_delta,
+                expert_weights,
+            )
+
+        namespace["_unpack_trtllm_moe_output"] = unpack_owned_routes
     namespace["gen_trtllm_gen_fused_moe_sm100_module"] = spec
     for name in ("register_custom_op", "register_fake_op"):
         namespace[name] = functools.partial(
@@ -365,3 +503,21 @@ def trtllm_bf16_fp32_routing_bias_moe(*args, **kwargs):
     """
     namespace = _entrypoints(_fp32_routing_bias_spec, _FP32_BIAS_OPERATORS)
     return namespace["trtllm_bf16_moe"](*args, **kwargs)
+
+
+def trtllm_fp4_fp32_routing_bias_moe(*args, **kwargs):
+    """Run NVFP4 experts with FP32 bias selection and grouped FP32 routes.
+
+    Arguments and returns follow FlashInfer's ``trtllm_fp4_block_scale_moe``.
+    """
+    namespace = _entrypoints(_fp32_quantized_spec, _QUANTIZED_FP32_OPERATORS)
+    return namespace["trtllm_fp4_block_scale_moe"](*args, **kwargs)
+
+
+def trtllm_fp8_fp32_routing_bias_moe(*args, **kwargs):
+    """Run per-channel FP8 experts with FP32 bias selection and grouped FP32 routes.
+
+    Arguments and returns follow ``trtllm_fp8_per_channel_scale_moe``.
+    """
+    namespace = _entrypoints(_fp32_quantized_spec, _QUANTIZED_FP32_OPERATORS)
+    return namespace["trtllm_fp8_per_channel_scale_moe"](*args, **kwargs)

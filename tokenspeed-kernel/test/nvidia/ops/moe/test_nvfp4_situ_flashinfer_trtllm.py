@@ -741,6 +741,7 @@ def test_nvfp4_route_padding_is_initialized_on_every_replay(
             do_finalize=finalize,
             enable_pdl=enable_pdl,
             routed=routed,
+            fp32_correction_bias=False,
             activation_type=ActivationType.Situ,
             output=None,
         )
