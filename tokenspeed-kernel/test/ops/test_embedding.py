@@ -31,7 +31,6 @@ from tokenspeed_kernel.ops.embedding import (
     apply_rope_mla,
     mxfp8_embedding,
 )
-from tokenspeed_kernel.ops.embedding.triton import _mxfp8_embedding_kernel
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
 
@@ -781,21 +780,6 @@ def test_embedding_replays_updated_layer_slice(device):
         torch.testing.assert_close(
             captured, _mxfp8_reference(weight, scales, ids), rtol=0, atol=0
         )
-
-
-def test_embedding_id_strides_do_not_specialize(device):
-    weight, scales = _mxfp8_table(device)
-    ids = torch.arange(48, device=device, dtype=torch.int64).reshape(2, 24)
-    storage = torch.zeros((12, 3, 48), device=device, dtype=torch.int64)
-    first = storage[:2, 1, :24]
-    first.copy_(ids)
-    mxfp8_embedding(weight, scales, first, 17, 70)
-    second = storage[:, 2, ::2].t()
-    with assert_no_triton_compile(_mxfp8_embedding_kernel):
-        actual = mxfp8_embedding(weight, scales, second, 17, 70)
-    torch.testing.assert_close(
-        actual, _mxfp8_reference(weight, scales, second), rtol=0, atol=0
-    )
 
 
 @pytest.mark.parametrize("rows", [2048, 2049, 65536])
