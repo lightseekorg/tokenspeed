@@ -230,7 +230,9 @@ def run_dsv41_csa2_index_topk(
             index_q[start:end], weights[start:end], process_group
         )
         table = page_table[start:end].contiguous()
-        visible = visible_lens[start:end].clamp(0, int(table.shape[1]) * _PAGE_SIZE)
+        # Consumers bound raw int64 lengths before narrowing. A dense input
+        # needs no launch here; preserve the previous strided-input support.
+        visible = visible_lens[start:end].contiguous()
         candidates = (
             None
             if candidate_blocks is None
@@ -281,6 +283,7 @@ def run_dsv41_csa2_index_topk(
                     int(candidate_topk),
                     block_out[output_begin:output_end],
                     block_lens[output_begin:output_end],
+                    visible_capacity=int(table.shape[1]) * _PAGE_SIZE,
                 )
     return out
 
