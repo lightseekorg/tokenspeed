@@ -173,7 +173,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("prefix_replay_tokens", &tokenspeed::SchedulerConfig::prefix_replay_tokens)
         .def_rw("state_checkpoint_in_forward", &tokenspeed::SchedulerConfig::state_checkpoint_in_forward)
         .def_rw("checkpoint_retention_requests", &tokenspeed::SchedulerConfig::checkpoint_retention_requests)
-        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance);
+        .def_rw("checkpoint_retention_leaf_distance", &tokenspeed::SchedulerConfig::checkpoint_retention_leaf_distance)
+        .def_rw("drop_dead_state_checkpoints", &tokenspeed::SchedulerConfig::drop_dead_state_checkpoints);
 
     // The config-only sizing model. Python builds it from a SchedulerConfig
     // whose page counts are still zero, sizes the pool from its answers, and
