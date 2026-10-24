@@ -234,9 +234,11 @@ def test_bf16_moe_routes_beyond_int32_expert_stride(device: str) -> None:
         [[experts, experts], [0, experts + 1]], device=device, dtype=torch.int32
     )
 
-    routes = bf16_moe_routes(x.contiguous(), w13, w2, ids, 1)
+    routes = bf16_moe_routes(x.contiguous(), w13, w2, ids, 1, batch_invariant=False)
 
-    assert torch.equal(routes, bf16_moe_routes(x.contiguous(), w13, w2, ids, 1))
+    assert torch.equal(
+        routes, bf16_moe_routes(x.contiguous(), w13, w2, ids, 1, batch_invariant=False)
+    )
     assert not torch.isnan(routes.float()).any()
     assert not routes[1].any()
     top = experts - 1
@@ -285,7 +287,7 @@ def test_portable_kernels_capture_and_replay_with_fresh_inputs(device: str) -> N
             None,
             1,
         )
-        routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1)
+        routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1, batch_invariant=False)
         combined = routed_input_scale_rmsnorm_sum(
             routes, route_weights, norm_weight, 1e-8, 1.0, False, None
         )
@@ -420,13 +422,15 @@ def test_bf16_moe_routes_write_a_supplied_destination(device: str) -> None:
     ids = torch.tensor(
         [[1, 2], [3, 4], [5, 1], [2, 2], [4, 3]], device=device, dtype=torch.int32
     )
-    expected = bf16_moe_routes(x, w13, w2, ids, 1)
+    expected = bf16_moe_routes(x, w13, w2, ids, 1, batch_invariant=False)
 
     storage = torch.full(
         (tokens * topk + 2, width), 7.0, device=device, dtype=torch.bfloat16
     )
     destination = storage[1:-1]
-    actual = bf16_moe_routes(x, w13, w2, ids, 1, output=destination)
+    actual = bf16_moe_routes(
+        x, w13, w2, ids, 1, output=destination, batch_invariant=False
+    )
 
     assert actual.data_ptr() == destination.data_ptr()
     assert actual.shape == (tokens, topk, width)
@@ -441,6 +445,7 @@ def test_bf16_moe_routes_write_a_supplied_destination(device: str) -> None:
             ids,
             1,
             output=w2.view(-1)[: tokens * topk * width].view(tokens * topk, width),
+            batch_invariant=False,
         )
 
 
