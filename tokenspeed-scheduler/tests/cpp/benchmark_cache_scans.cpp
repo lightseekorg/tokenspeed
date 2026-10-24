@@ -305,7 +305,7 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         coordinator.CacheHostBlock(
             batch.blocks.front(),
             CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(next_key), .page_offset = 0});
-        return static_cast<std::uint64_t>(batch.stats.same_group_scans + batch.stats.cross_group_scans);
+        return static_cast<std::uint64_t>(batch.stats.group_scans);
     });
 }
 

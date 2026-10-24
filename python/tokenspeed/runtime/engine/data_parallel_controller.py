@@ -406,7 +406,7 @@ class DataParallelController:
         back to the normal policy on a bad pin, never raise.
         """
         rank = getattr(req, "data_parallel_rank", None)
-        if rank is not None and self.server_args.disaggregation_mode == "null":
+        if rank is not None:
             # bool/float/list must degrade here, not raise mid-comparison.
             if (
                 isinstance(rank, int)

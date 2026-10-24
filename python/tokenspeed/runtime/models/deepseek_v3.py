@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any
 
@@ -47,6 +48,7 @@ from tokenspeed_kernel.ops.gemm.cuda import dsv3_router_gemm
 from tokenspeed_kernel.ops.gemm.trtllm import dsv3_fused_a_gemm
 from tokenspeed_kernel.ops.moe.cuda import moe_finalize_fuse_shared
 from tokenspeed_kernel.ops.quantization.flashinfer import fp4_quantize
+from tokenspeed_kernel.ops.tuning import autotune_max_rows, is_autotuning
 from tokenspeed_kernel.platform import current_platform
 from torch import nn
 from transformers import PretrainedConfig
@@ -92,6 +94,7 @@ from tokenspeed.runtime.execution.forward_step import (
     get_is_cuda_graph_phase,
 )
 from tokenspeed.runtime.layers.activation import SiluAndMul
+from tokenspeed.runtime.layers.attention.chunk import get_max_chunk_capacity
 from tokenspeed.runtime.layers.dense.nvfp4 import Nvfp4LinearMethod
 from tokenspeed.runtime.layers.layernorm import FusedRMSNorm, RMSNorm
 from tokenspeed.runtime.layers.linear import (
@@ -1597,6 +1600,15 @@ class DeepseekV3AttentionMLA(nn.Module):
             return output
         return mla_project_value(attn_output, self.w_vc, gate=gate, out=output)
 
+    def _project_expanded_kv(self, latent: torch.Tensor) -> torch.Tensor:
+        tuning = (
+            autotune_max_rows(max(latent.shape[0], get_max_chunk_capacity()))
+            if is_autotuning()
+            else nullcontext()
+        )
+        with tuning:
+            return self.kv_b_proj(latent)[0]
+
     def forward_normal_chunked_kv_prepare(
         self,
         positions: torch.Tensor,
@@ -1614,7 +1626,9 @@ class DeepseekV3AttentionMLA(nn.Module):
         _reject_query_shard(ctx, "the expanded MLA prefill prologue")
         q = q.view(-1, self.num_local_heads, self.qk_head_dim)
         # kv_b_proj's fp8 online-quant GEMM needs a contiguous latent, not this strided slice.
-        kv = self.kv_b_proj(latent_cache[..., : self.kv_lora_rank].contiguous())[0]
+        kv = self._project_expanded_kv(
+            latent_cache[..., : self.kv_lora_rank].contiguous()
+        )
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
         return self.attn_mha.latent_prologue(
@@ -1680,7 +1694,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         )
         for loop_idx, (kv_a_normed, k_pe) in enumerate(history):
             kv_a_normed = kv_a_normed.squeeze(1)
-            kv = self.kv_b_proj(kv_a_normed)[0]
+            kv = self._project_expanded_kv(kv_a_normed)
             kv = kv.view(
                 -1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim
             )

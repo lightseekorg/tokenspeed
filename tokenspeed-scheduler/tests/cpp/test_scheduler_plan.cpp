@@ -264,6 +264,31 @@ TEST_F(SchedulerKvCacheEventTestSuite, PublishesStoredBlockAndDrainsItOnce) {
     EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
 }
 
+TEST_F(SchedulerKvCacheEventTestSuite, PartialPrefillRetractionUsesItsActualTailParent) {
+    config_.device_allocator.total_pages = 16;
+    config_.cache_groups.front().total_pages = 16;
+    config_.max_scheduled_tokens = 3;
+    config_.debug_force_retraction_interval = -1;
+    SetTestSnapshotPool(config_);
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit(RequestSpec{.request_id = "partial", .tokens = {1, 2, 3, 4, 5, 6, 7, 8, 9}});
+    const ExecutionPlan first = PlanOnce();
+    ASSERT_NE(FindForwardBatch(first), nullptr);
+    EXPECT_EQ(FindForwardBatch(first)->input_lengths, std::vector<std::int32_t>{3});
+    SendForwardDone("partial");
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(retraction), nullptr);
+    const std::vector<KvCacheEvent> events = scheduler_->DrainKvEvents();
+    ASSERT_EQ(events.size(), 2u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[0]));
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(events[1]));
+    const auto& page = std::get<KvBlockStoredEvent>(events[0]);
+    const auto& tail = std::get<KvBlockStoredEvent>(events[1]);
+    EXPECT_EQ(page.token_ids, (std::vector<std::int32_t>{1, 2}));
+    EXPECT_EQ(tail.token_ids, std::vector<std::int32_t>{3});
+    EXPECT_EQ(tail.parent_block_hash, page.block_hashes.front());
+}
+
 TEST_F(SchedulerKvCacheEventTestSuite, PublishesRemovalWhenAdmissionEvictsBlock) {
     Submit(MakeRequestSpec("seed", 1));
     PlanOnce();
@@ -680,6 +705,28 @@ protected:
         return spec;
     }
 };
+
+TEST_F(HybridJunctionCutTestSuite, PublishesAndRemovesAnUnalignedCheckpointEvent) {
+    config_.enable_kv_cache_events = true;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit(RequestSpec{.request_id = "seed", .tokens = {1, 2, 3}});
+    PlanOnce();
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+
+    const std::vector<KvCacheEvent> stored = scheduler_->DrainKvEvents();
+    ASSERT_EQ(stored.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockStoredEvent>(stored.front()));
+    const auto& checkpoint = std::get<KvBlockStoredEvent>(stored.front());
+    EXPECT_EQ(checkpoint.token_ids, std::vector<std::int32_t>{3});
+    EXPECT_TRUE(scheduler_->DrainKvEvents().empty());
+
+    ASSERT_TRUE(scheduler_->ClearCache());
+    const std::vector<KvCacheEvent> removed = scheduler_->DrainKvEvents();
+    ASSERT_EQ(removed.size(), 1u);
+    ASSERT_TRUE(std::holds_alternative<KvBlockRemovedEvent>(removed.front()));
+    EXPECT_EQ(std::get<KvBlockRemovedEvent>(removed.front()).block_hashes, checkpoint.block_hashes);
+}
 
 // The seed publishes KV and state at its prompt end (11) only. The second
 // request shares the first 8 tokens: KV reaches 8, no state does, so its first

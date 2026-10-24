@@ -283,8 +283,13 @@ def causal_conv1d_fn(
     validate_data=False,
     *,
     prefill_metadata: CausalConv1dPrefillMetadata,
+    out: torch.Tensor | None = None,
 ):
-    """Select a prefill convolution leaf while preserving the original ABI."""
+    """Run prefill convolution, optionally into equal channel partitions.
+
+    ``out`` is contiguous ``[partitions, tokens, channels / partitions]``.
+    Without it, allocate and return the ordinary ``[channels, tokens]`` output.
+    """
     kernel = select_kernel(
         "conv",
         "causal_conv1d_prefill",
@@ -306,6 +311,7 @@ def causal_conv1d_fn(
         pad_slot_id=pad_slot_id,
         validate_data=validate_data,
         prefill_metadata=prefill_metadata,
+        out=out,
     )
 
 

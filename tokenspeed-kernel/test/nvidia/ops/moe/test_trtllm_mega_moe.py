@@ -252,6 +252,25 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
         output = run()
     torch.cuda.synchronize()
     _check(output, expected, "eager")
+
+    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
+
+    runner = get_runner(plan, w)
+    q_buffer, sf_buffer, id_buffer, weight_buffer = runner.input_buffers(
+        tokens, capacity
+    )
+    assert id_buffer.dtype == torch.int32
+    external_inputs = (x, ids, weights)
+    for destination, source in zip(
+        (q_buffer, sf_buffer, id_buffer, weight_buffer), (*x, ids, weights)
+    ):
+        destination[: source.shape[0], : source.shape[1]].copy_(source)
+    x, ids, weights = (q_buffer, sf_buffer[:tokens]), id_buffer, weight_buffer
+    _check(run(), expected, "producer-owned input buffers")
+    x, ids, weights = external_inputs
+    ids = ids.to(torch.int64)
+    _check(run(), expected, "external int64 routes")
+    x, ids, weights = external_inputs
     if tune:
         tuner = AutoTuner.get()
         tactics = {
@@ -296,9 +315,6 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
     torch.cuda.synchronize()
     _check(output, expected, "uneven/idle rank")
 
-    from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
-
-    runner = get_runner(plan, w)
     arena = runner.workspace
     pointers = (
         arena.storage.data_ptr(),

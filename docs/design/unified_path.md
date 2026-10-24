@@ -1633,6 +1633,14 @@ builder. Decode-only refresh/capture remains unchanged and carries no
 prefill convolution schedule. Breakable prefill graphs consume the live
 metadata in the eager attention break, as ordinary eager forwards do.
 
+The convolution reads row-strided fused projection slices directly. It writes
+packed token rows by default, or a caller-owned buffer of equal channel
+partitions. On Blackwell, equal-width Q/K/V prefill uses three partitions so
+the recurrent scan receives contiguous tensors without a split copy. Padding
+is scrubbed in every partition before the scan. Convolution-state updates and
+verification replay retain their existing contracts; the model does not compact
+the projection before the attention break.
+
 Prefill state staging fuses resumed conv-window copying, recurrent-state
 gather/zero, and history flags in one kernel. It preserves scheduler-owned
 block ids and arbitrary cache strides. Fresh rows never read null or stale
@@ -1726,7 +1734,11 @@ bucket can use the next existing token bucket, otherwise the ordinary fallback
 remains. Startup autotuning uses the same dummy-batch builder with an explicit
 minimum request count, `ceil(num_tokens / context_len)`, independent of the
 configured capture request counts. Its token budget also respects rank-local
-request capacity. Request counts exceeding captured capacity retain the
+request capacity. Operators whose inputs can exceed the new-token budget declare
+their row capacity during that traversal: MLA KV expansion uses its cached
+history chunk capacity. This widens only that operator's startup tuning sweep;
+its serving bucket map is unchanged, including after loading persisted tactics.
+Request counts exceeding captured capacity retain the
 ordinary attention break and eager KDA. Replay refresh includes
 `scan_query_start_loc`, which the recurrent dispatcher consumes, as well as
 the convolution boundary and existing int64 mirror. Unifying metadata does not

@@ -361,6 +361,7 @@ class MLAAttnBackend(PagedAttentionBackend):
             chunked_seq_len,
             cu_chunked_seq_len,
             max_chunk_len_per_loop,
+            _chunk_bounds_cpu,
         ) = build_chunked_prefill_metadata_arrays(
             extend_prefix_lens,
             extend_prefix_lens_cpu,

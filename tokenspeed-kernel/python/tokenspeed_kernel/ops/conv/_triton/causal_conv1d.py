@@ -40,8 +40,8 @@ PAD_SLOT_ID = -1
 
 
 @triton.jit(
-    do_not_specialize=["seqlen"],
-    do_not_specialize_on_alignment=["token_chunk_offset_ptr"],
+    do_not_specialize=["seqlen", "stride_o_partition"],
+    do_not_specialize_on_alignment=["token_chunk_offset_ptr", "stride_o_partition"],
 )
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
@@ -71,6 +71,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     stride_o_seq: tl.constexpr,
     stride_o_dim: tl.constexpr,
     stride_o_token,
+    stride_o_partition,
     # others
     pad_slot_id: tl.constexpr,
     # Meta-parameters
@@ -85,6 +86,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    PARTITION_CHANNELS: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
@@ -402,10 +404,17 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
         mask_1d = (idx_token < segment_len) & (
             idx_feats < dim
         )  # token-index  # feature-index
+        if PARTITION_CHANNELS < dim:
+            output_feature = idx_feats % PARTITION_CHANNELS
+            output_partition = idx_feats // PARTITION_CHANNELS
+        else:
+            output_feature = idx_feats
+            output_partition = 0
         o_ptrs = (
             o_ptr
             + (sequence_start_index + token_offset + idx_token) * stride_o_token
-            + (idx_feats * stride_o_dim)
+            + (output_feature * stride_o_dim)
+            + (output_partition * stride_o_partition)
         )
 
         tl.store(o_ptrs, acc, mask=mask_1d)

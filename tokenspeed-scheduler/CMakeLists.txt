@@ -121,6 +121,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_cache_coordinator.cpp
         tests/cpp/test_storage_query.cpp
         tests/cpp/test_state_checkpoints.cpp
+        tests/cpp/test_checkpoint_retention.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp
         tests/cpp/test_prefill_chunk.cpp

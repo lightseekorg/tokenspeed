@@ -21,6 +21,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 
 #include "cache/coordinator/group_geometry.h"
+#include "cache/coordinator/cache_eviction.h"
 
 #include <algorithm>
 #include <array>
@@ -40,6 +41,7 @@ namespace {
 struct AdmissionPlan {
     CacheCoordinator::PrefixProbe prefix;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
+    std::uint64_t demoted_victims{0};
 };
 
 // The table shape a restore rebuilds before its dense demand is placed: how
@@ -73,9 +75,9 @@ class AdmissionPlanner {
 public:
     AdmissionPlanner(const std::vector<CacheGroup>& groups, std::span<const GroupGeometry> geometry,
                      std::int32_t prefix_granularity, const BlockPool& pool, const BlockPool* host_pool,
-                     std::span<const GroupDemand> demands, std::optional<std::int32_t> num_computed_tokens,
-                     const CompletedPages* completed, const CacheCoordinator::PrefixProbe& prefix,
-                     std::span<const PlannedShape> shapes,
+                     const CheckpointTree& checkpoints, std::span<const GroupDemand> demands,
+                     std::optional<std::int32_t> num_computed_tokens, const CompletedPages* completed,
+                     const CacheCoordinator::PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
                      std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims)
         : groups_{groups},
@@ -83,6 +85,7 @@ public:
           prefix_granularity_{prefix_granularity},
           pool_{pool},
           host_pool_{host_pool},
+          eviction_{groups, pool, checkpoints, /*history_eviction_drops_checkpoint=*/true},
           demands_{demands},
           num_computed_tokens_{num_computed_tokens},
           completed_{completed},
@@ -90,7 +93,6 @@ public:
           shapes_{shapes},
           claimed_{claimed},
           victims_{victims},
-          local_free_slots_by_bucket_(groups.size()),
           shape_need_(groups.size()),
           blocks_needed_(groups.size()) {}
 
@@ -106,11 +108,14 @@ public:
 
         collectCandidates();
         while (!fits()) {
-            const std::optional<VictimCandidate> candidate = nextVictimCandidate();
+            const auto candidate = eviction_.Next();
             if (!candidate) {
                 return false;
             }
-            removeOccupant(candidate->group_id, candidate->location);
+            if (eviction_.IsDemoted(*candidate)) {
+                demoted_selections_.insert(candidate->location);
+            }
+            eviction_.Remove(candidate->group_id, candidate->location);
             victims_.emplace_back(candidate->group_id, candidate->location);
         }
 
@@ -120,9 +125,9 @@ public:
         required_victims.reserve(victims_.size());
         for (std::size_t i = victims_.size(); i > 0; --i) {
             const auto& [group_id, location] = victims_[i - 1];
-            restoreOccupant(group_id, location);
+            eviction_.Restore(group_id, location);
             if (!fits()) {
-                removeOccupant(group_id, location);
+                eviction_.Remove(group_id, location);
                 required_victims.emplace_back(group_id, location);
             }
         }
@@ -131,48 +136,12 @@ public:
         return true;
     }
 
+    std::uint64_t DemotedVictims() const {
+        return static_cast<std::uint64_t>(std::ranges::count_if(
+            victims_, [&](const auto& victim) { return demoted_selections_.contains(victim.second); }));
+    }
+
 private:
-    // Current prefix hits are protected before candidates reach this policy.
-    // A request-only block with no CacheEntry is reclaimed first. Cached
-    // entries then compare request access epoch, followed within one epoch by
-    // the tier order below. Position keeps the deeper unproven non-closed
-    // boundary, while a closed prefix is reclaimed from its suffix.
-    enum class EvictionTier {
-        kUncached,  // physically allocated, but owned only by the request table
-        kProbationaryBoundary,
-        kEstablishedBoundary,
-        kClosedPrefix,
-    };
-
-    struct VictimCandidate {
-        std::uint32_t group_id;
-        CacheBlockLocation location;
-        std::uint64_t last_access_epoch;
-        EvictionTier eviction_tier;
-        std::int64_t position_rank;
-    };
-
-    static auto evictionKey(const VictimCandidate& candidate) {
-        return std::tuple{candidate.last_access_epoch, candidate.eviction_tier,         candidate.position_rank,
-                          candidate.group_id,          candidate.location.lcm_block_id, candidate.location.slot_index};
-    }
-
-    static bool shouldEvictFirst(const VictimCandidate& lhs, const VictimCandidate& rhs) {
-        return evictionKey(lhs) < evictionKey(rhs);
-    }
-
-    struct CacheGroupVictimCandidates {
-        explicit CacheGroupVictimCandidates(std::uint32_t id) : group_id{id} {}
-
-        const VictimCandidate& CurrentCandidate() const { return candidates[next_candidate_index]; }
-
-        std::uint32_t group_id;
-        bool index_exhausted{false};
-        PrefixCacheIndex::EvictionCursor index_cursor;
-        std::vector<VictimCandidate> candidates;
-        std::size_t next_candidate_index{0};
-    };
-
     void initializeCapacity() {
         _assert(demands_.size() == groups_.size(), "demands/groups size mismatch");
         _assert(shapes_.empty() || shapes_.size() == groups_.size(), "shapes/groups size mismatch");
@@ -210,13 +179,7 @@ private:
                 }
                 shape_need_[i] = shapes_[i].blocks_by_bucket;
             }
-            const std::span<const std::int64_t> holes = pool_.FreeSlotsByBucket(static_cast<std::uint32_t>(i));
-            local_free_slots_by_bucket_[i].assign(holes.begin(), holes.end());
-            if (local_free_slots_by_bucket_[i].empty()) {
-                local_free_slots_by_bucket_[i].assign(buckets, 0);  // never allocated: no bound parent
-            }
         }
-        empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
     // Blocks a tail costs this group beyond the growth demand. A table never
@@ -361,71 +324,30 @@ private:
         }
     }
 
-    VictimCandidate makeVictimCandidate(std::uint32_t group_id, CacheBlockLocation location,
-                                        const std::optional<PrefixCacheIndex::CachedBlockMetadata>& metadata) const {
-        const std::uint64_t last_access_epoch = metadata ? metadata->last_access_epoch : 0;
-        const std::int32_t logical_block_index = metadata ? metadata->logical_block_index : -1;
-        const CacheBoundaryKind boundary_kind = metadata ? metadata->boundary_kind : CacheBoundaryKind::kChunk;
-        const bool is_prefix_closed = groups_[group_id].Matcher().IsPrefixClosed();
-        const bool is_probationary_boundary = !is_prefix_closed && boundary_kind == CacheBoundaryKind::kChunk &&
-                                              !(metadata && metadata->was_acquired) && logical_block_index >= 0;
-        const EvictionTier eviction_tier = [&] {
-            if (last_access_epoch == 0) {
-                return EvictionTier::kUncached;
-            }
-            if (is_probationary_boundary) {
-                return EvictionTier::kProbationaryBoundary;
-            }
-            return is_prefix_closed ? EvictionTier::kClosedPrefix : EvictionTier::kEstablishedBoundary;
-        }();
-        std::int64_t position_rank = 0;
-        if (is_probationary_boundary) {
-            // Retain the longer unproven frontier.
-            position_rank = logical_block_index;
-        } else if (is_prefix_closed && logical_block_index >= 0) {
-            // Reclaim a closed prefix from its suffix.
-            position_rank = -static_cast<std::int64_t>(logical_block_index);
-        }
-        return VictimCandidate{
-            .group_id = group_id,
-            .location = location,
-            // Access epochs start at one. Zero puts an uncached block ahead of
-            // every reusable cache entry.
-            .last_access_epoch = last_access_epoch,
-            .eviction_tier = eviction_tier,
-            .position_rank = position_rank,
-        };
-    }
-
     void collectCandidates() {
         for (std::size_t i = 0; i < groups_.size(); ++i) {
             const std::vector<CacheBlockLocation> hits = groups_[i].Index().MatchedLocations(
                 pool_, prefix_.group_keys[i], /*begin_blocks=*/0, prefix_.device.per_group[i]);
-            protected_locations_.insert(hits.begin(), hits.end());
+            for (auto location : hits) eviction_.Protect(location);
             if (const auto& tail = prefix_.device.tail; tail && !tail->group_keys[i].empty()) {
                 const std::vector<CacheBlockLocation> tail_hits = groups_[i].Index().MatchedLocations(
                     pool_, tail->group_keys[i], /*begin_blocks=*/0, tail->per_group[i]);
-                protected_locations_.insert(tail_hits.begin(), tail_hits.end());
+                for (auto location : tail_hits) eviction_.Protect(location);
             }
             if (const auto& state = prefix_.state_at_prompt_end; state && !state->group_keys[i].empty()) {
                 const std::vector<CacheBlockLocation> state_hits = groups_[i].Index().MatchedLocations(
                     pool_, state->group_keys[i], /*begin_blocks=*/0, state->per_group[i]);
-                protected_locations_.insert(state_hits.begin(), state_hits.end());
+                for (auto location : state_hits) eviction_.Protect(location);
             }
         }
         protectDedupedTail();
         for (const auto& [group_id, location] : claimed_) {
             (void)group_id;
-            protected_locations_.insert(location);
+            eviction_.Protect(location);
         }
 
         if (num_computed_tokens_) {
             collectRequestReclaimCandidates(*num_computed_tokens_);
-        }
-
-        cache_group_candidates_.reserve(groups_.size());
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            cache_group_candidates_.emplace_back(static_cast<std::uint32_t>(i));
         }
     }
 
@@ -451,7 +373,7 @@ private:
                 const CacheBlockRef block = groups_[i].Index().Find(
                     pool_, CacheKey{.group_id = groups_[i].Id(), .content_hash = tail.hash, .page_offset = offset});
                 if (block) {
-                    protected_locations_.insert(block->Location());
+                    eviction_.Protect(block->Location());
                 }
             }
         }
@@ -477,147 +399,20 @@ private:
                                                                                  expired_blocks);
             }
             for (CacheBlockLocation location : reclaimable) {
-                if (protected_locations_.contains(location)) {
-                    continue;
-                }
-                const bool first_occurrence = request_reclaim_locations_.insert(location).second;
-                if (!first_occurrence) {
-                    continue;
-                }
-                request_reclaim_candidates_.push_back(
-                    makeVictimCandidate(group_id, location, groups_[i].Index().MetadataFor(pool_, location)));
+                if (!eviction_.IsProtected(location)) eviction_.AddRequestCandidate(group_id, location);
             }
-        }
-        std::ranges::sort(request_reclaim_candidates_, shouldEvictFirst);
-    }
-
-    bool ensureGroupCandidateAvailable(CacheGroupVictimCandidates& group) {
-        if (group.next_candidate_index < group.candidates.size()) {
-            return true;
-        }
-        group.candidates.clear();
-        group.next_candidate_index = 0;
-        while (!group.index_exhausted) {
-            epoch_scratch_.clear();
-            const bool found_epoch =
-                groups_[group.group_id].Index().NextEvictionEpoch(pool_, group.index_cursor, epoch_scratch_);
-            if (!found_epoch) {
-                group.index_exhausted = true;
-                break;
-            }
-            for (const PrefixCacheIndex::EvictionCandidate& entry : epoch_scratch_) {
-                if (protected_locations_.contains(entry.location) ||
-                    request_reclaim_locations_.contains(entry.location)) {
-                    continue;
-                }
-                group.candidates.push_back(makeVictimCandidate(group.group_id, entry.location, entry.metadata));
-            }
-            // Index order breaks epoch ties by location; eviction policy also
-            // considers boundary tier and logical position, so sort the whole epoch.
-            if (!group.candidates.empty()) {
-                std::ranges::sort(group.candidates, shouldEvictFirst);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    std::optional<VictimCandidate> nextVictimCandidate() {
-        CacheGroupVictimCandidates* selected_group = nullptr;
-        for (CacheGroupVictimCandidates& group : cache_group_candidates_) {
-            if (!ensureGroupCandidateAvailable(group)) {
-                continue;
-            }
-            if (selected_group == nullptr ||
-                shouldEvictFirst(group.CurrentCandidate(), selected_group->CurrentCandidate())) {
-                selected_group = &group;
-            }
-        }
-
-        if (next_request_candidate_index_ < request_reclaim_candidates_.size()) {
-            const VictimCandidate& request_candidate = request_reclaim_candidates_[next_request_candidate_index_];
-            if (selected_group == nullptr || shouldEvictFirst(request_candidate, selected_group->CurrentCandidate())) {
-                ++next_request_candidate_index_;
-                return request_candidate;
-            }
-        }
-        if (selected_group == nullptr) {
-            return std::nullopt;
-        }
-        const VictimCandidate candidate = selected_group->CurrentCandidate();
-        ++selected_group->next_candidate_index;
-        return candidate;
-    }
-
-    // Shadow holes follow the pool's own bookkeeping: a parent whose last
-    // occupant leaves takes its holes with it into the empty FIFO, and every
-    // bucket owned packing / shard_count of them.
-    void removeOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        _assert(pool_.BoundGroup(location.lcm_block_id) == group_id,
-                "released admission location belongs to another group");
-        auto it =
-            remaining_occupied_.try_emplace(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id)).first;
-        std::int32_t& occupied = it->second;
-        _assert(occupied > 0, "admission released the same location twice");
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        std::vector<std::int64_t>& holes = local_free_slots_by_bucket_[group_id];
-        const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
-        if (occupied == 1) {
-            const std::int64_t per_bucket = allocator.CacheBlocksPerLcmBlock() / allocator.ShardCount();
-            for (std::int64_t& bucket_holes : holes) {
-                bucket_holes -= per_bucket;
-            }
-            ++holes[bucket];
-            occupied = 0;
-            ++empty_parent_count_;
-        } else {
-            --occupied;
-            ++holes[bucket];
         }
     }
 
-    void restoreOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        auto it = remaining_occupied_.find(location.lcm_block_id);
-        _assert(it != remaining_occupied_.end(), "restored admission victim has no shadow occupancy");
-        std::int32_t& occupied = it->second;
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        const std::int32_t slots = allocator.CacheBlocksPerLcmBlock();
-        std::vector<std::int64_t>& holes = local_free_slots_by_bucket_[group_id];
-        const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
-        if (occupied == 0) {
-            _assert(empty_parent_count_ > 0, "restoring an admission victim underflowed empty parents");
-            --empty_parent_count_;
-            occupied = 1;
-            const std::int64_t per_bucket = slots / allocator.ShardCount();
-            for (std::int64_t& bucket_holes : holes) {
-                bucket_holes += per_bucket;
-            }
-            --holes[bucket];
-        } else {
-            _assert(occupied < slots, "restoring an admission victim overflowed its parent");
-            ++occupied;
-            --holes[bucket];
-        }
-    }
-
-    // One fit formula for both transactions: the bucket-constrained demand
-    // shares the parents it opens, the dense demand takes any hole, and an
-    // admission with no bucket demand reduces to holes plus parents times
-    // packing.
-    bool fits() const {
-        std::int64_t parents_needed = 0;
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            parents_needed += ParentsNeededForBuckets(shape_need_[i], local_free_slots_by_bucket_[i], blocks_needed_[i],
-                                                      groups_[i].Allocator().CacheBlocksPerLcmBlock());
-        }
-        return parents_needed <= empty_parent_count_;
-    }
+    bool fits() const { return eviction_.Fits(shape_need_, blocks_needed_); }
 
     const std::vector<CacheGroup>& groups_;
     std::span<const GroupGeometry> geometry_;
     std::int32_t prefix_granularity_;
     const BlockPool& pool_;
     const BlockPool* host_pool_;
+    CacheEvictionPlan eviction_;
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> demoted_selections_;
     std::span<const GroupDemand> demands_;
     std::optional<std::int32_t> num_computed_tokens_;
     // The publication this admission carries (nullptr when none): an owner
@@ -629,30 +424,22 @@ private:
     // from eviction like the probe's prefix hits.
     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
-    std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
     // Per group: holes per bucket in bound parents, the bucket-constrained
     // blocks (a restore's rebuilt slots; an admission's Host-hit destinations
     // and tail copies), and the dense blocks wanted in any bucket.
-    std::vector<std::vector<std::int64_t>> local_free_slots_by_bucket_;
     std::vector<std::vector<std::int64_t>> shape_need_;
     std::vector<std::int64_t> blocks_needed_;
     // Whether an owner's copy-in reads a canonical block in another bucket
     // than its own (collectOwnerCopyBuckets, protectDedupedTail).
     bool owner_copy_changes_bucket_{false};
-    std::int64_t empty_parent_count_{0};
-    std::vector<VictimCandidate> request_reclaim_candidates_;
-    std::size_t next_request_candidate_index_{0};
-    std::vector<CacheGroupVictimCandidates> cache_group_candidates_;
-    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> protected_locations_;
-    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> request_reclaim_locations_;
-    std::vector<PrefixCacheIndex::EvictionCandidate> epoch_scratch_;
 };
 
 std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups,
                                            std::span<const GroupGeometry> geometry, std::int32_t prefix_granularity,
                                            const BlockPool& pool, const BlockPool* host_pool,
-                                           CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
-                                           const RequestProgress& progress, std::span<const PlannedShape> shapes,
+                                           const CheckpointTree& checkpoints, CacheCoordinator::PrefixProbe&& prefix,
+                                           std::span<const GroupDemand> demands, const RequestProgress& progress,
+                                           std::span<const PlannedShape> shapes,
                                            std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
@@ -662,6 +449,7 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
                              prefix_granularity,
                              pool,
                              host_pool,
+                             checkpoints,
                              demands,
                              progress.num_computed_tokens,
                              progress.completed_pages ? &*progress.completed_pages : nullptr,
@@ -672,7 +460,9 @@ std::optional<AdmissionPlan> planAdmission(const std::vector<CacheGroup>& groups
     if (!planner.Plan()) {
         return std::nullopt;
     }
-    return AdmissionPlan{.prefix = std::move(prefix), .victims = std::move(victims)};
+    const auto demoted_victims = planner.DemotedVictims();
+    return AdmissionPlan{
+        .prefix = std::move(prefix), .victims = std::move(victims), .demoted_victims = demoted_victims};
 }
 
 // The same progress without the tail it would publish: the full pages still
@@ -765,13 +555,13 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     const bool copies_in =
         progress.completed_pages && progress.completed_pages->owner_continues && progress.completed_pages->tail;
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_,
+        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, checkpoints_,
                       copies_in ? PrefixProbe{prefix} : PrefixProbe{std::move(prefix)}, demands, effective,
                       /*shapes=*/{}, /*claimed=*/{});
     if (!candidate && copies_in) {
         effective = withoutTailPublication(progress);
-        candidate = planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix),
-                                  demands, effective, /*shapes=*/{}, /*claimed=*/{});
+        candidate = planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, checkpoints_,
+                                  std::move(prefix), demands, effective, /*shapes=*/{}, /*claimed=*/{});
     }
     if (!candidate) {
         return std::nullopt;
@@ -901,7 +691,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
     }
     if (effective.completed_pages) {
-        recordPublishedTail(*effective.completed_pages);
+        recordPublication(*effective.completed_pages);
     }
     for (const auto& [group_id, location] : prospective_victims) {
         if (!evictCachedBlock(group_id, location)) {
@@ -1007,6 +797,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 groups_[i].Allocator().ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
         }
     }
+    device_demoted_victims_ += plan.demoted_victims;
     return result;
 }
 
@@ -1052,8 +843,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     }
 
     std::optional<AdmissionPlan> candidate =
-        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}), demands,
-                      RequestProgress{}, shapes, protected_locations);
+        planAdmission(groups_, geometry_, prefix_granularity_, pool_, host_pool_, checkpoints_, ProbePrefix({}),
+                      demands, RequestProgress{}, shapes, protected_locations);
     if (!candidate) {
         return std::nullopt;
     }
@@ -1136,6 +927,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
                 allocator.ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
         }
     }
+    device_demoted_victims_ += candidate->demoted_victims;
     return result;
 }
 

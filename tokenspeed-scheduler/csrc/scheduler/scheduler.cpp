@@ -241,6 +241,7 @@ bool Scheduler::clearCache(bool include_host) {
                      include_host ? "" : "L1 ", has_pd_transfers, has_tier_transfers, suspended);
         return false;
     }
+    const auto retention = coordinator_.CheckpointRetentionStats();
     const bool cleared = include_host ? coordinator_.ClearCache() : coordinator_.ClearDeviceCache();
     if (!cleared) {
         spdlog::info("[Scheduler] flush {}cache rejected: cached blocks are still pinned", include_host ? "" : "L1 ");
@@ -248,6 +249,14 @@ bool Scheduler::clearCache(bool include_host) {
     }
     if (include_host && storage_transfers_) storage_transfers_->ClearMetadata();
     spdlog::info("[Scheduler] flush {}cache completed", include_host ? "" : "L1 ");
+    if (retention.checkpoint_nodes != 0 || retention.device_demoted_victims != 0 ||
+        retention.host_demoted_victims != 0) {
+        spdlog::info(
+            "[Scheduler] checkpoint retention before flush: device_demoted_victims={} host_demoted_victims={} "
+            "checkpoint_nodes={} prefix_segments={}",
+            retention.device_demoted_victims, retention.host_demoted_victims, retention.checkpoint_nodes,
+            retention.prefix_segments);
+    }
     return true;
 }
 
@@ -296,9 +305,10 @@ void Scheduler::registerKvEventPublication(const Request& request, std::span<con
     }
     const auto full_pages = static_cast<std::int32_t>(prefix_hashes.size());
     const KvEventHashProgress& progress = kv_event_hash_progress_.at(request.Id());
-    _assert(progress.block_hashes.size() == prefix_hashes.size(), "the tail's parent page has its KV event hash");
+    // Admission can hash beyond an early junction or retraction frontier.
+    _assert(progress.block_hashes.size() >= prefix_hashes.size(), "the tail's parent page has its KV event hash");
     const std::optional<std::uint64_t> parent_hash =
-        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes.back()};
+        full_pages == 0 ? std::nullopt : std::optional<std::uint64_t>{progress.block_hashes[full_pages - 1]};
     const std::span<const std::int32_t> tail_tokens =
         request.TokenSlice(full_pages * config_.prefix_granularity, completed.tail->tail_tokens);
     const CacheKey key{.content_hash = completed.tail->hash};

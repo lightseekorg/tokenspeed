@@ -260,14 +260,17 @@ class HostCacheExecutor:
         share_bytes = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
-        # Each buffer takes the power of two its pinned allocation rounds to.
+        # Size each buffer using the effective pinned allocator configuration.
         pool_pinned_bytes = pinned_host_bytes(snapshot_bytes) + pinned_host_bytes(
             arena_bytes
         )
         # The L2 blocks every rank's share holds beside the pool. Agreeing on
         # it is also a barrier: no rank pins before every rank read its share.
         fitting_l2_blocks = _min_over_ranks(
-            largest_pinned_fit(share_bytes - pool_pinned_bytes) // host_lcm_block_bytes,
+            largest_pinned_fit(
+                share_bytes - pool_pinned_bytes, block_bytes=host_lcm_block_bytes
+            )
+            // host_lcm_block_bytes,
             world_cpu_group,
         )
         if l2_tier and host_size_gb <= 0 and 0 < fitting_l2_blocks < host_lcm_blocks:
@@ -281,7 +284,7 @@ class HostCacheExecutor:
                 "rank, the most every rank's share of its node holds: "
                 f"--kvstore-ratio {host_ratio} asks for more. The "
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
-                "and each pinned buffer takes a power of two; this rank's share "
+                "under the pinned allocator settings; this rank's share "
                 f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
                 "memory over its ranks, less "
                 f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
@@ -289,10 +292,17 @@ class HostCacheExecutor:
             host_lcm_blocks = fitting_l2_blocks
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
+        l2_pinned_bytes = pinned_host_bytes(l2_bytes)
         check_host_memory(
-            pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
+            l2_pinned_bytes + pool_pinned_bytes,
             share_bytes=share_bytes,
             purpose="the compact Host cache",
+        )
+        logger.info(
+            f"Host pinned memory budget: L2 payload={l2_bytes / 1e9:.2f} GB, "
+            f"L2 reservation={l2_pinned_bytes / 1e9:.2f} GB, "
+            f"snapshot reservation={pool_pinned_bytes / 1e9:.2f} GB, "
+            f"rank share={share_bytes / 1e9:.2f} GB"
         )
 
         self.host_storage: HostCacheStorage | None = None

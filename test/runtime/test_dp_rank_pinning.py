@@ -144,20 +144,26 @@ class TestGenerateReqInputPlumbing:
 
 
 class TestIngressValidation:
-    def test_colocated_out_of_range_raises(self):
-        processor = _make_input_processor(dp_size=8)
-        obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=8)
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    @pytest.mark.parametrize("rank", [-1, 8])
+    def test_out_of_range_raises(self, mode, rank):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
+        obj = GenerateReqInput(
+            text="hello", sampling_params={}, data_parallel_rank=rank
+        )
         with pytest.raises((ValueError), match=(r"\[0, 8\)")):
             processor.validate_request(obj)
 
-    def test_colocated_in_range_kept(self):
-        processor = _make_input_processor(dp_size=8)
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    def test_in_range_kept(self, mode):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=7)
         processor.validate_request(obj)
         assert (obj.data_parallel_rank) == (7)
 
-    def test_no_attn_dp_pin_dropped_silently(self):
-        processor = _make_input_processor(has_attn_dp=False)
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    def test_no_attn_dp_pin_dropped_silently(self, mode):
+        processor = _make_input_processor(has_attn_dp=False, disaggregation_mode=mode)
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=3)
         processor.validate_request(obj)
         assert (obj.data_parallel_rank) is None
@@ -166,7 +172,7 @@ class TestIngressValidation:
         # bool passes a bare range compare and floats/lists fail the int|None
         # typed msgpack decode downstream — reject at the choke point.
         for bad in (True, 1.5, "3"):
-            for mode in ("null", "prefill"):
+            for mode in ("null", "prefill", "decode"):
                 processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
                 obj = GenerateReqInput(
                     text="hello", sampling_params={}, data_parallel_rank=bad
@@ -175,8 +181,9 @@ class TestIngressValidation:
                     with pytest.raises((ValueError), match=("must be an int")):
                         processor.validate_request(obj)
 
-    def test_colocated_batch_list_out_of_range_raises(self):
-        processor = _make_input_processor(dp_size=8)
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    def test_batch_list_out_of_range_raises(self, mode):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
         obj = GenerateReqInput(
             text=["a", "b"],
             sampling_params=[{}, {}],
@@ -185,8 +192,9 @@ class TestIngressValidation:
         with pytest.raises((ValueError), match=("99")):
             processor.validate_request(obj)
 
-    def test_colocated_batch_list_partial_pin_kept(self):
-        processor = _make_input_processor(dp_size=8)
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    def test_batch_list_partial_pin_kept(self, mode):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
         obj = GenerateReqInput(
             text=["a", "b"],
             sampling_params=[{}, {}],
@@ -195,76 +203,21 @@ class TestIngressValidation:
         processor.validate_request(obj)
         assert (obj.data_parallel_rank) == ([None, 3])
 
-    def test_disagg_room_authoritative_conflict_warns_and_drops(self, subtests):
-        for mode in ("prefill", "decode"):
-            with subtests.test(mode=mode):
-                processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
-                obj = GenerateReqInput(
-                    text="hello",
-                    sampling_params={},
-                    bootstrap_room=10,  # 10 % 8 == 2
-                    data_parallel_rank=5,
-                )
-                processor.validate_request(obj)
-                assert (obj.data_parallel_rank) is None
-                processor.engine.logger.warning.assert_called_once()
-
-    def test_disagg_consistent_pin_dropped_without_warning(self, subtests):
-        for mode in ("prefill", "decode"):
-            with subtests.test(mode=mode):
-                processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
-                obj = GenerateReqInput(
-                    text="hello",
-                    sampling_params={},
-                    bootstrap_room=10,
-                    data_parallel_rank=2,  # == 10 % 8, consistent
-                )
-                processor.validate_request(obj)
-                assert (obj.data_parallel_rank) is None
-                processor.engine.logger.warning.assert_not_called()
-
-    def test_disagg_non_int_room_warns_and_drops_never_raises(self):
-        # A pinning gateway with a room-format bug must not turn into
-        # request rejections on disaggregation engines (never-reject
-        # contract) — the room is unverifiable, so warn + drop the pin.
-        processor = _make_input_processor(dp_size=8, disaggregation_mode="prefill")
-        obj = GenerateReqInput(
-            text="hello",
-            sampling_params={},
-            bootstrap_room="oops",
-            data_parallel_rank=2,
-        )
-        processor.validate_request(obj)
-        assert (obj.data_parallel_rank) is None
-        processor.engine.logger.warning.assert_called_once()
-
-    def test_disagg_unequal_lists_still_warn(self):
-        # A dangling rank with no room to check against is itself a
-        # conflict signal — padding must surface it, not zip-truncate it.
-        processor = _make_input_processor(dp_size=8, disaggregation_mode="prefill")
-        obj = GenerateReqInput(
-            text=["a", "b", "c"],
-            sampling_params=[{}, {}, {}],
-            bootstrap_room=[16, 8],  # both ≡ 0 (mod 8)
-            data_parallel_rank=[0, 0, 5],
-        )
-        processor.validate_request(obj)
-        assert (obj.data_parallel_rank) is None
-        processor.engine.logger.warning.assert_called_once()
-
-    def test_disagg_scalar_pin_checked_against_every_room(self):
-        # zip truncation would pair a scalar pin only with rooms[0]; the
-        # conflict against rooms[1] must still warn.
-        processor = _make_input_processor(dp_size=8, disaggregation_mode="prefill")
+    @pytest.mark.parametrize(("mode", "rank"), [("prefill", 2), ("decode", 7)])
+    def test_disagg_scalar_pin_and_rooms_survive_batch_normalization(self, mode, rank):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
         obj = GenerateReqInput(
             text=["a", "b"],
             sampling_params=[{}, {}],
-            bootstrap_room=[10, 11],  # 10 % 8 == 2 matches, 11 % 8 == 3 conflicts
-            data_parallel_rank=2,
+            bootstrap_room=[10, 18],
+            data_parallel_rank=rank,
         )
         processor.validate_request(obj)
-        assert (obj.data_parallel_rank) is None
-        processor.engine.logger.warning.assert_called_once()
+        obj.normalize_batch_and_arguments()
+        assert obj.data_parallel_rank == [rank, rank]
+        assert obj.bootstrap_room == [10, 18]
+        assert obj[0].data_parallel_rank == rank
+        assert obj[1].data_parallel_rank == rank
 
 
 class _RecordingWorker:
@@ -378,35 +331,75 @@ class TestControllerPinnedDispatch:
         assert (controller.dispatching.received) == ([unpinned])
         assert (controller.workers[3].sent) == ([pinned])
 
-    def test_out_of_range_pin_falls_back_never_raises(self):
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    def test_out_of_range_pin_falls_back_never_raises(self, mode):
         # The dispatch loop is fed by a fire-and-forget PUSH socket with no
         # per-request error path; a bad pin must degrade, not kill the loop.
-        controller = _make_controller(dp_size=4)
+        controller = _make_controller(dp_size=4, disaggregation_mode=mode)
         req = _tokenized(data_parallel_rank=4)
         controller.dispatch_generate_request(req)
         assert (controller.dispatching.received) == ([req])
 
-    def test_malformed_pin_payload_degrades_never_raises(self, subtests):
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    def test_malformed_pin_payload_degrades_never_raises(self, mode, subtests):
         # bool passes a bare range compare; a list raises TypeError on it —
         # both must fall back to the policy, not escape the dispatch loop.
         for bad in (True, [1], 2.5):
             with subtests.test(bad=bad):
-                controller = _make_controller(dp_size=4)
+                controller = _make_controller(dp_size=4, disaggregation_mode=mode)
                 req = _tokenized(data_parallel_rank=bad)
                 controller.dispatch_generate_request(req)
                 assert (controller.dispatching.received) == ([req])
                 for worker in controller.workers:
                     assert (worker.sent) == ([])
 
-    def test_disagg_mode_ignores_pin(self):
-        controller = _make_controller(disaggregation_mode="prefill")
-        req = _tokenized(data_parallel_rank=1, bootstrap_room=7)
-        controller.dispatch_generate_request(req)
-        assert (controller.dispatching.received) == ([req])
-        assert (controller.workers[1].sent) == ([])
+    @pytest.mark.parametrize(
+        ("prefill_size", "decode_size", "prefill_rank", "decode_rank", "room"),
+        [(16, 16, 3, 7, 19), (8, 16, 3, 11, 19), (1, 16, None, 7, 16)],
+    )
+    def test_pd_sides_dispatch_independently_with_the_same_room(
+        self, prefill_size, decode_size, prefill_rank, decode_rank, room
+    ):
+        for mode, size, rank in [
+            ("prefill", prefill_size, prefill_rank),
+            ("decode", decode_size, decode_rank),
+        ]:
+            controller = _make_controller(dp_size=size, disaggregation_mode=mode)
+            controller.dispatching = controller.round_robin_scheduler
+            controller.init_dispatcher()
+            req = TokenizedGenerateReqInput(
+                rid=mode,
+                input_ids=[1, 2, 3],
+                sampling_params=SamplingParams(),
+                stream=False,
+                data_parallel_rank=rank,
+                bootstrap_room=room,
+            )
+            controller._request_dispatcher(req)
+            selected = rank if rank is not None else room % size
+            for index, worker in enumerate(controller.workers):
+                assert worker.sent == ([req] if index == selected else [])
+            assert req.bootstrap_room == room
 
-    def test_pin_notes_budget_reservation(self):
-        controller = _make_controller(dp_size=2)
+    @pytest.mark.parametrize("mode", ["prefill", "decode"])
+    def test_unpinned_pd_round_robin_keeps_room_placement(self, mode):
+        controller = _make_controller(dp_size=8, disaggregation_mode=mode)
+        controller.dispatching = controller.round_robin_scheduler
+        controller.init_dispatcher()
+        req = TokenizedGenerateReqInput(
+            rid="unpinned",
+            input_ids=[1],
+            sampling_params=SamplingParams(),
+            stream=False,
+            bootstrap_room=19,
+        )
+        controller._request_dispatcher(req)
+        for index, worker in enumerate(controller.workers):
+            assert worker.sent == ([req] if index == 3 else [])
+
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
+    def test_pin_notes_budget_reservation(self, mode):
+        controller = _make_controller(dp_size=2, disaggregation_mode=mode)
         loads = [
             GetLoadReqOutput(dp_rank=0, num_reqs=0),
             GetLoadReqOutput(dp_rank=1, num_reqs=0),
@@ -440,12 +433,13 @@ class TestDPBudgetPinnedDispatch:
 
 
 class TestTokenizeBridge:
+    @pytest.mark.parametrize("mode", ["null", "prefill", "decode"])
     @pytest.mark.asyncio(loop_scope="function")
-    async def test_pin_reaches_tokenized_request(self):
+    async def test_pin_reaches_tokenized_request(self, mode):
         # The only bridge that puts the pin onto the wire is
         # tokenize_one_request copying obj.data_parallel_rank into
         # TokenizedGenerateReqInput.
-        processor = _make_input_processor(dp_size=8)
+        processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
         engine = processor.engine
         engine.server_args.enable_prefix_caching = False
         engine.server_args.language_model_only = False
@@ -464,11 +458,14 @@ class TestTokenizeBridge:
             input_ids=[1, 2, 3],
             sampling_params={"max_new_tokens": 4},
             data_parallel_rank=6,
+            bootstrap_room=14,
         )
+        processor.validate_request(obj)
         obj.normalize_batch_and_arguments()
         tokenized = await processor.tokenize_one_request(obj)
         assert isinstance((tokenized), (TokenizedGenerateReqInput))
         assert (tokenized.data_parallel_rank) == (6)
+        assert tokenized.bootstrap_room == 14
 
 
 class TestSingleWorkerIdRange:

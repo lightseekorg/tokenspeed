@@ -29,6 +29,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Generator
+from contextvars import ContextVar
 from pathlib import Path
 
 import torch.distributed as dist
@@ -40,6 +41,8 @@ except ImportError:
 
 __all__ = [
     "autotune",
+    "autotune_max_rows",
+    "get_autotune_max_rows",
     "autotune_cache_path",
     "get_autotune_max_num_tokens",
     "is_autotuning",
@@ -57,6 +60,9 @@ _AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
 
 _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 _autotune_process_group: dist.ProcessGroup | None = None
+_autotune_max_rows: ContextVar[int | None] = ContextVar(
+    "autotune_max_rows", default=None
+)
 
 
 @contextlib.contextmanager
@@ -226,6 +232,33 @@ def get_autotune_max_num_tokens() -> int:
         The value set by :func:`set_autotune_max_num_tokens`, or the default floor.
     """
     return _autotune_max_num_tokens
+
+
+def get_autotune_max_rows() -> int:
+    """Largest row count to enumerate for the current operator at startup."""
+    maximum = _autotune_max_rows.get()
+    return max(get_autotune_max_num_tokens(), maximum or 0)
+
+
+@contextlib.contextmanager
+def autotune_max_rows(max_rows: int) -> Generator[None]:
+    """Widen an operator's startup row range without changing serving buckets.
+
+    Args:
+        max_rows: Positive maximum input row count for the scoped operator.
+            Nested scopes may widen the range. Outside startup tuning this
+            context has no effect.
+    """
+    if max_rows <= 0:
+        raise ValueError("Autotuning row capacity must be positive")
+    if not is_autotuning():
+        yield
+        return
+    token = _autotune_max_rows.set(max(max_rows, get_autotune_max_rows()))
+    try:
+        yield
+    finally:
+        _autotune_max_rows.reset(token)
 
 
 @contextlib.contextmanager

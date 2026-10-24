@@ -635,6 +635,18 @@ Perception rules per directory:
   (`Scheduler.tail_cap_evictions`). The probe enumerates it to find the
   candidate boundaries inside a page; eviction of a tail's block removes its
   entry.
+* **`CheckpointTree`** (`checkpoint_tree.h`) — the ancestry of natural state
+  checkpoints, observed only at publication. It uses chained prefix hashes and
+  token prefixes, never client branch identifiers. A checkpoint is demoted only
+  while two complete descendant checkpoint sets remain in the same tier along
+  one observed continuation chain. Forks stop that walk. Metadata for vanished
+  boundaries is pruned; unary paths are compressed while preserving any forgotten
+  fork as a barrier. Metadata contains no owning cache references and cannot pin
+  storage. Immutable hashed prefix segments are shared across checkpoint
+  paths and reference-counted independently of physical cache blocks. Metadata
+  scales with the union of indexed prefixes, not the sum of conversation turns.
+  An indexed checkpoint stores its last full segment and a partial tail; binary
+  ancestor links support prefix comparisons without copying whole prompts.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
@@ -955,7 +967,9 @@ Its responsibilities:
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially, or not
   resident is the coordinator's answer (`DeviceBoundaryResidency`, read off
-  the group indexes), so the scheduler keeps no residency counters of its own
+  the group indexes). At a partial boundary, each State group contributes its
+  single checkpoint block at offset zero, without token-span arithmetic.
+  The scheduler keeps no residency counters of its own
   — only the token descriptor the event carries and whether that event is
   currently out. A mutation only marks its boundary for reconcile;
   `DrainKvEvents` reconciles each marked boundary against its residency and
@@ -963,6 +977,10 @@ Its responsibilities:
   descriptors of boundaries with no cached child. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
+  Admission may pre-hash the rest of a prompt before it is computed. An early
+  junction or retraction tail names the parent at its published frontier, not
+  the last page in that hash memo.
+
 Replica-agreed D2H ACKs publish Host entries and release Device sources
 without waiting for L3. Backup candidates are nonowning; PUT dispatch pins
 resident Host sources until all cache owners report native retirement.
@@ -981,12 +999,37 @@ must be evicted for this admission to fit, while protecting the current
 prefix hits?* The algorithm: first check whether existing local holes plus
 empty parents fit with zero eviction; otherwise select eviction candidates
 until the plan fits. Request-reclaimable candidates are collected and sorted
-once; each cache group loads and sorts one epoch of eligible candidates at a
+once; each history group loads and sorts one epoch of eligible candidates at a
 time, skipping epochs whose entries are all protected or already listed for
-request reclaim. Selection compares the next candidate from each group with
-the next request-reclaimable candidate using one policy: LRU access epoch,
-then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
+request reclaim. State groups consider all eligible checkpoints because a newer
+checkpoint can have lower retention priority than an older one. Selection
+compares the next candidate from each group with
+the next request-reclaimable candidate using one policy: uncached request-only
+blocks first, then state checkpoints demoted by the two-descendant rule, then
+ordinary cached entries. Within each class it compares LRU access epoch, then
+boundary tier (probationary → established → suffix of a closed prefix).
+Fork history follows surviving prefix ancestry, including when an evicted
+branch shares an earlier fork with a surviving sibling. Fork positions beyond
+every retained checkpoint prefix are discarded with that ancestry.
+State candidates are reordered when a planned victim removes a descendant;
+proposed victims do not count as resident replacements. Demotion decisions are
+cached between checkpoint-residency changes rather than recomputed in sorting
+comparators. The rule is an eviction-time preference, not a reservation: a
+subsequent allocation may also evict the retained descendants. Complete means
+all State groups at that checkpoint; ordinary hybrid prefix matching still
+requires the associated history coverage and remains the authority on reuse.
+Current-prefix claims and pins remain protected. Host allocation and Device
+admission share candidate ordering, checkpoint demotion, owner-bucket capacity,
+and reverse minimization through `CacheEvictionPlan`. Host allocations compare
+across groups from the first victim, so old State entries cannot reserve capacity
+while newer KV entries replace one another. Host preserves candidate order and
+partial allocation: an impossible row stays empty, and its unsatisfied demand
+never causes cache eviction. Device hits
+refresh existing Host copies without pinning or allocating them; a lifetime
+`was_acquired` bit does not outweigh recency on Host. Successful flushes
+report demoted victim selections and ancestry metadata sizes for the preceding
+interval; Device and Host counters reset when their respective tier is cleared.
+Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
 minimal eviction set in `victims`.
 
@@ -997,6 +1040,13 @@ pass: their index and pool must remain alive, and entries must not be inserted,
 erased, or re-keyed during traversal. Commit-time index mutations happen after
 the planner is destroyed. A full traversal costs O(N), including pinned entries,
 without a separate tree lookup per epoch.
+
+Host history selection uses the same ordered cursors and shadow occupancy.
+It stops once the accepted rows fit, then restores every unnecessary victim
+before committing. Only an empty parent can move between groups. Selection
+finishes before eviction mutates an index; no whole-pool parent scan is needed.
+Host-only entries without a Device position retain an unknown position; they
+still participate in the same recency and deterministic location ordering.
 
 ## The cache pipeline: layers → group → pack → bind
 
@@ -1317,7 +1367,14 @@ backend base reads a local cache in place and rebuilds one dealt over owners
 by all-gathering each owner's rows as raw cache-dtype bytes, bitwise the
 unsharded read; a leaf declaring `supports_mla_dcp` only hands it each
 prefill's prefix loops and host page table (`_prepare_prefix_history`), so
-planning the gathers never waits on the device. The gathers run on a named
+planning the gathers never waits on the device. Chunk planning shares the fixed
+history-expansion capacity among requests with remaining prefix rows. Finished
+requests release their share to the others; the total expansion never exceeds
+the existing buffer capacity. Both local slot reads and owner-count planning
+consume the same host per-request boundaries, including partial pages. Small
+partitions (an initial share below 1024 rows) retain equal-width chunks to avoid
+amplifying FP8 attention rounding when changing the softmax partitioning.
+The gathers run on a named
 copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse

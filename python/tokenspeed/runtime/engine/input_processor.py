@@ -150,13 +150,8 @@ class InputProcessor:
         - non-integer pins (bool/float/str) are a caller error and raise on
           EVERY engine shape — checked first, before the mode branches below.
         - engines without attention DP: the pin is meaningless; drop it.
-        - disaggregation engines: the bootstrap_room residue is the
-          authoritative rank carrier on BOTH the prefill and decode sides
-          (pd/mooncake must re-derive the same rank from the room), so the
-          pin is dropped; a conflicting pin is logged, never rejected —
-          rejecting would turn gateway/room version skew into a 400 storm.
-        - colocated attention-DP engines: an out-of-range pin is a caller
-          error and raises (surfacing as a request-level failure).
+        - attention-DP engines, including prefill and decode: an out-of-range
+          pin is a caller error and raises; a valid pin is preserved.
         """
         ranks = getattr(obj, "data_parallel_rank", None)
         if ranks is None:
@@ -177,41 +172,6 @@ class InputProcessor:
             obj.data_parallel_rank = None
             return
         dp_size = mapping.attn.dp_size
-
-        if server_args.disaggregation_mode != "null":
-            rooms = obj.bootstrap_room
-            room_list = rooms if isinstance(rooms, list) else [rooms]
-            # Broadcast whichever side is scalar so a scalar pin is checked
-            # against EVERY room residue (and vice versa), then pad the
-            # shorter side with None — zip truncation would silently skip
-            # conflicts past the shorter list, and a rank with no room to
-            # check against is itself a conflict signal.
-            width = max(len(rank_list), len(room_list), 1)
-            if len(rank_list) == 1:
-                rank_list = rank_list * width
-            if len(room_list) == 1:
-                room_list = room_list * width
-            rank_list = rank_list + [None] * (width - len(rank_list))
-            room_list = room_list + [None] * (width - len(room_list))
-            for rank, room in zip(rank_list, room_list):
-                if rank is None:
-                    continue
-                # A non-int room (gateway format bug) is unverifiable — take
-                # the warn+drop path, never raise: on disaggregation engines
-                # a pin must not turn room skew into request rejections.
-                if (
-                    not isinstance(room, int)
-                    or isinstance(room, bool)
-                    or room % dp_size != rank
-                ):
-                    self.engine.logger.warning(
-                        f"data_parallel_rank={rank!s} conflicts with bootstrap_room "
-                        f"residue (room={room!s}, dp_size={dp_size:d}); the room stays "
-                        "authoritative on disaggregation engines — pin ignored.",
-                    )
-                    break
-            obj.data_parallel_rank = None
-            return
 
         for rank in rank_list:
             if rank is not None and not 0 <= rank < dp_size:

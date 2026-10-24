@@ -1921,6 +1921,7 @@ class MambaAttnBackend(AttentionBackend):
 
         query_start_loc = self.forward_metadata.query_start_loc
 
+        prefill_outputs = None
         if is_target_verify:
             draft_token_num = self.speculative_num_draft_tokens
             batch_size = seq_len // draft_token_num
@@ -2014,7 +2015,14 @@ class MambaAttnBackend(AttentionBackend):
                 ] = (mixed_qkv[rows].transpose(1, 2).to(conv_states.dtype))
 
             mixed_qkv_t = mixed_qkv.transpose(0, 1)
-            mixed_qkv = causal_conv1d_fn(
+            conv_output = None
+            if key_dim == value_dim and current_platform().is_blackwell:
+                conv_output = torch.empty(
+                    (3, mixed_qkv.shape[0], key_dim // attn_tp_size),
+                    dtype=mixed_qkv.dtype,
+                    device=mixed_qkv.device,
+                )
+            convolved = causal_conv1d_fn(
                 mixed_qkv_t,
                 conv_weights,
                 bias,
@@ -2024,12 +2032,19 @@ class MambaAttnBackend(AttentionBackend):
                 cache_indices=conv_cache_indices,
                 query_start_loc=query_start_loc,
                 prefill_metadata=self.forward_metadata.conv_prefill_metadata,
-            ).transpose(0, 1)[:seq_len]
+                out=conv_output,
+            )
+            if conv_output is None:
+                mixed_qkv = convolved.transpose(0, 1)[:seq_len]
+            else:
+                prefill_outputs = tuple(t[:seq_len] for t in convolved.unbind(0))
             if extend_seq_lens_cpu is not None:
                 # The convolution allocates its output uninitialized and gives
                 # the padded rows no work, so the rows a capacity scan reads
                 # past the live tokens are zeroed again here.
-                self.forward_metadata.scrub_padding(mixed_qkv)
+                self.forward_metadata.scrub_padding(
+                    *((mixed_qkv,) if prefill_outputs is None else prefill_outputs)
+                )
 
         key_split_dim = key_dim // attn_tp_size
         value_split_dim = value_dim // attn_tp_size
@@ -2065,7 +2080,11 @@ class MambaAttnBackend(AttentionBackend):
         # KDA's verify consumes zero-copy strided views. When recurrent-state
         # replay is enabled, the split kernel also saves the persistent inputs
         # needed to reconstruct accepted state later.
-        if (
+        if prefill_outputs is not None:
+            query = prefill_outputs[0].view(1, seq_len, num_heads, head_k_dim)
+            key = prefill_outputs[1].view(1, seq_len, num_heads, head_k_dim)
+            value = prefill_outputs[2].view(1, seq_len, num_value_heads, head_v_dim)
+        elif (
             (self._verify_packed_qkv_views or scan_replay is not None)
             and replay_inputs is None
             and mixed_qkv.stride(-1) == 1

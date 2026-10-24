@@ -182,6 +182,8 @@ struct TailPublication {
 // range, a tail, or a state checkpoint. The request owns the storage behind
 // the spans.
 struct CompletedPages {
+    // The completed token prefix, used only to establish checkpoint ancestry.
+    std::span<const std::int32_t> tokens{};
     std::span<const std::string> prefix_hashes{};
     std::int32_t first_new_prefix_page{0};
     // The partial page at this publication point, absent when the point is

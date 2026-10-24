@@ -194,6 +194,7 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     if (first_new_prefix_page < static_cast<std::int32_t>(cache_progress.prefix_hashes.size()) || tail || state_only ||
         state_checkpoint_pages > 0) {
         progress.completed_pages = CompletedPages{
+            .tokens = request.TokenSlice(0, num_computed_tokens),
             .prefix_hashes = cache_progress.prefix_hashes,
             .first_new_prefix_page = first_new_prefix_page,
             .tail = tail,

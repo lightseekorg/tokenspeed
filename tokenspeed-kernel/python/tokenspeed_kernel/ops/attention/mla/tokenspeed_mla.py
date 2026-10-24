@@ -246,6 +246,10 @@ elif current_platform().is_nvidia:
     except ImportError:
         pass
     else:
+        if current_platform().is_blackwell:
+            from tokenspeed_kernel.ops.attention.mla._triton.kv_pack import (
+                triton_mla_kv_pack_quantize_fp8 as _mla_kv_pack_quantize_fp8,
+            )
         mla_kv_pack_quantize_fp8 = _with_pdl_default(_mla_kv_pack_quantize_fp8, 8)
         tokenspeed_mla_decode = _with_pdl_default(_tokenspeed_mla_decode, 14)
         tokenspeed_mla_prefill = _with_pdl_default(_tokenspeed_mla_prefill, 12)

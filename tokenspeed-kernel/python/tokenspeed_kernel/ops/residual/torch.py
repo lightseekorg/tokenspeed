@@ -55,6 +55,8 @@ def torch_attn_res_fwd(
         layer_residual.add_(delta)
     if block_write_idx >= 0:
         block_residual[block_write_idx].copy_(layer_residual)
+    if layer_residual.numel() == 0:
+        return torch.empty_like(layer_residual)
 
     # Candidates [N, T, H] = blocks then layer; RMSNorm + softmax score + mix in
     # fp32 (this sits on the global residual backbone), bf16 out.

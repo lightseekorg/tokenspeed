@@ -64,6 +64,7 @@ private:
 public:
     // Read-only admission snapshot from one index lookup; owns no block.
     struct CachedBlockMetadata {
+        ContentHash content_hash{};
         std::uint64_t last_access_epoch{0};
         std::int32_t logical_block_index{-1};
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
@@ -341,6 +342,23 @@ public:
         return match;
     }
 
+    void TouchMatched(const BlockPool& pool, std::span<const CacheKey> keys, std::int32_t begin_blocks,
+                      const GroupPrefixProbe& probe, std::uint64_t access_epoch) {
+        CacheEntries* entries = findCacheEntries(pool);
+        if (entries == nullptr) {
+            return;
+        }
+        for (std::size_t i = 0; i < probe.hits.size(); ++i) {
+            if (probe.hits[i] == 0) {
+                continue;
+            }
+            auto entry = findEntry(*entries, keys[static_cast<std::size_t>(begin_blocks) + i]);
+            if (entry != entries->entries.end()) {
+                touchEntry(*entries, entry, std::max(entry->last_access_epoch, access_epoch));
+            }
+        }
+    }
+
     std::vector<CacheBlockLocation> MatchedLocations(const BlockPool& pool, std::span<const CacheKey> keys,
                                                      std::int32_t begin_blocks, const GroupPrefixProbe& probe) const {
         _assert(begin_blocks >= 0 && static_cast<std::size_t>(begin_blocks) + probe.hits.size() <= keys.size(),
@@ -388,6 +406,7 @@ private:
 
     static CachedBlockMetadata metadataOf(const CacheEntry& cache_entry) noexcept {
         return CachedBlockMetadata{
+            .content_hash = cache_entry.key.content_hash,
             .last_access_epoch = cache_entry.last_access_epoch,
             .logical_block_index = cache_entry.logical_block_index,
             .boundary_kind = cache_entry.boundary_kind,

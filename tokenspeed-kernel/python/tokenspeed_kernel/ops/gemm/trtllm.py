@@ -25,6 +25,8 @@
 
 from __future__ import annotations
 
+from importlib.util import find_spec
+
 import torch
 from tokenspeed_kernel.platform import (
     ArchVersion,
@@ -174,7 +176,7 @@ def cublaslt_mm_nvfp4(
     priority=Priority.REFERENCE,
 )
 def trtllm_cutedsl_mm_fp8_blockscale(
-    A, B, A_scales, B_scales, out_dtype, *, alpha, block_size, **kwargs
+    A, B, A_scales, B_scales, out_dtype, *, alpha, block_size, out=None
 ):
     """Compute FP8 A @ B.T using canonical FP32 1x128 and 128x128 scales.
 
@@ -186,12 +188,17 @@ def trtllm_cutedsl_mm_fp8_blockscale(
         out_dtype: BF16 output type.
         alpha: Must be None; additional scaling is unsupported.
         block_size: Must be [128,128].
-        kwargs: Optional preallocated contiguous BF16 output named out.
+        out: Optional preallocated contiguous BF16 output.
     Returns:
         BF16 result [M,N], using out when provided.
     """
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import blockwise_gemm
 
+    out = _blockwise_output(A, B, A_scales, B_scales, out_dtype, alpha, block_size, out)
+    return blockwise_gemm(A, B, A_scales, B_scales, out)
+
+
+def _blockwise_output(A, B, A_scales, B_scales, out_dtype, alpha, block_size, out):
     if (
         alpha is not None
         or tuple(block_size) != (128, 128)
@@ -218,7 +225,6 @@ def trtllm_cutedsl_mm_fp8_blockscale(
         raise ValueError(
             "TRT-LLM CuTe-DSL requires canonical FP32 scales on the input device"
         )
-    out = kwargs.get("out")
     if out is None:
         out = torch.empty((m, n), device=A.device, dtype=out_dtype)
     if (
@@ -228,4 +234,82 @@ def trtllm_cutedsl_mm_fp8_blockscale(
         or not out.is_contiguous()
     ):
         raise ValueError("Invalid TRT-LLM CuTe-DSL output buffer")
-    return blockwise_gemm(A, B, A_scales, B_scales, out)
+    return out
+
+
+if current_platform().is_nvidia and find_spec("cutlass") is not None:
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="trtllm_tuned_mm_fp8_blockscale",
+        solution="trtllm_tuned",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 0),
+            max_arch_version=ArchVersion(10, 3),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=format_signatures(
+            ("a", "b"),
+            "mxfp8",
+            {torch.float8_e4m3fn},
+            scale=ScaleFormat(
+                storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
+            ),
+        ),
+        traits={
+            "n_align": frozenset({128}),
+            "k_align": frozenset({128}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "a_scales_inner_stride_one": frozenset({True}),
+            "b_scales_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+        },
+        priority=Priority.SPECIALIZED + 4,
+    )
+    def trtllm_tuned_mm_fp8_blockscale(
+        A, B, A_scales, B_scales, out_dtype, *, alpha, block_size, out=None
+    ):
+        """Run aligned block-FP8 GEMM with a cached startup-selected implementation.
+
+        Arguments and outputs match :func:`trtllm_cutedsl_mm_fp8_blockscale`.
+        The existing implementation remains a candidate and the untuned fallback.
+        Explicit backend overrides retain their original selection.
+        """
+        from tokenspeed_kernel.thirdparty.trtllm_blockwise.tuning import (
+            tuned_blockwise_gemm,
+        )
+
+        if (
+            not A.is_contiguous()
+            or not B.is_contiguous()
+            or (A_scales is not None and not A_scales.is_contiguous())
+            or (B_scales is not None and not B_scales.is_contiguous())
+            or (out is not None and not out.is_contiguous())
+        ):
+            from tokenspeed_kernel.ops.gemm.flashinfer import (
+                flashinfer_mm_fp8_blockscale,
+            )
+            from tokenspeed_kernel.ops.gemm.triton import triton_mm_fp8_blockscale
+
+            kernel = (
+                triton_mm_fp8_blockscale
+                if 17 <= A.shape[0] <= 32
+                else flashinfer_mm_fp8_blockscale
+            )
+            return kernel(
+                A,
+                B,
+                A_scales,
+                B_scales,
+                out_dtype,
+                alpha=alpha,
+                block_size=block_size,
+                out=out,
+            )
+        out = _blockwise_output(
+            A, B, A_scales, B_scales, out_dtype, alpha, block_size, out
+        )
+        return tuned_blockwise_gemm(A, B, A_scales, B_scales, out, allow_existing=True)

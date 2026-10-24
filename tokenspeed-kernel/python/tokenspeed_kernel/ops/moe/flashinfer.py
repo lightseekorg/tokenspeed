@@ -4258,3 +4258,134 @@ if not platform.is_nvidia:
     ) -> PreparedNvfp4Routing:
         """Split routing exists only for the NVIDIA flashinfer kernel."""
         raise NotImplementedError("split routing needs the NVIDIA flashinfer NVFP4 MoE")
+
+
+# ===-----------------------------------------------------------------------===#
+# Kimi-K3 latent input projections
+# ===-----------------------------------------------------------------------===#
+
+
+if (
+    platform.is_nvidia
+    and platform.arch_version == ArchVersion(10, 3)
+    and platform.sm_count == 152
+):
+    from tokenspeed_kernel.thirdparty.cuda.flashinfer_kimi_k3 import (
+        latent_front,
+        latent_front_available,
+    )
+
+    if latent_front_available():
+
+        @register_kernel(
+            "moe",
+            "latent_input",
+            name="flashinfer_latent_input",
+            solution="flashinfer",
+            capability=CapabilityRequirement(
+                min_arch_version=ArchVersion(10, 3),
+                max_arch_version=ArchVersion(10, 3),
+                vendors=frozenset({"nvidia"}),
+            ),
+            signatures=format_signatures(
+                (
+                    "hidden_states",
+                    "router_weight",
+                    "routed_weight",
+                    "shared_gate_up_weight",
+                ),
+                "dense",
+                {torch.bfloat16},
+            ),
+            priority=Priority.SPECIALIZED,
+            traits={
+                "tokens_min": frozenset({2048}),
+                "tokens_max": frozenset({16384}),
+                "gate_clamp": frozenset({4.0}),
+                "hidden_size": frozenset({7168}),
+                "inputs_contiguous": frozenset({True}),
+                "latent_size": frozenset({3584}),
+                "num_experts": frozenset({896}),
+                "shared_size": frozenset({6144}),
+                "up_clamp": frozenset({25.0}),
+            },
+        )
+        def flashinfer_latent_input(
+            hidden_states: torch.Tensor,
+            router_weight: torch.Tensor,
+            routed_weight: torch.Tensor,
+            shared_gate_up_weight: torch.Tensor,
+            *,
+            gate_clamp: float,
+            up_clamp: float | None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if gate_clamp != 4.0 or up_clamp != 25.0:
+                raise ValueError(
+                    "FlashInfer Kimi-K3 front requires SiTU clamps 4 and 25"
+                )
+            return latent_front(
+                hidden_states, router_weight, routed_weight, shared_gate_up_weight
+            )
+
+
+if platform.is_nvidia and platform.arch_version == ArchVersion(10, 3):
+    from tokenspeed_kernel.thirdparty.cuda.flashinfer_kimi_k3 import (
+        fused_router,
+        fused_router_available,
+    )
+
+    if fused_router_available():
+
+        @register_kernel(
+            "moe",
+            "sigmoid_bias_topk",
+            name="flashinfer_kimi3_sigmoid_bias_topk",
+            solution="flashinfer",
+            capability=CapabilityRequirement(
+                min_arch_version=ArchVersion(10, 3),
+                max_arch_version=ArchVersion(10, 3),
+                vendors=frozenset({"nvidia"}),
+            ),
+            signatures=format_signatures("router_logits", "dense", {torch.float32}),
+            priority=Priority.SPECIALIZED,
+            traits={
+                "tokens_min": frozenset({3072}),
+                "tokens_max": frozenset({8192}),
+                "experts": frozenset({896}),
+                "topk": frozenset({16}),
+                "bias_dtype": frozenset({torch.float32}),
+                "inputs_contiguous": frozenset({True}),
+                "normalize_topk_weights": frozenset({True}),
+                "routed_scaling_factor": frozenset({1.0}),
+                "weights_dtype": frozenset({torch.float32}),
+                "ids_dtype": frozenset({torch.int32}),
+                "supports_output_buffers": frozenset({True}),
+            },
+        )
+        def flashinfer_kimi3_sigmoid_bias_topk(
+            *,
+            router_logits: torch.Tensor,
+            correction_bias: torch.Tensor,
+            topk: int,
+            routed_scaling_factor: float,
+            normalize_topk_weights: bool,
+            weights_dtype: torch.dtype,
+            out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            """Route normalized top-16 scores into FP32 weights and INT32 ids.
+
+            Args follow ``_moe_sigmoid_bias_topk``. Optional caller-owned
+            outputs are returned in place; omission allocates both outputs.
+            """
+            if (
+                topk != 16
+                or routed_scaling_factor != 1.0
+                or not normalize_topk_weights
+                or (out[0].dtype if out is not None else weights_dtype) != torch.float32
+                or (out is not None and out[1].dtype != torch.int32)
+            ):
+                raise ValueError(
+                    "FlashInfer Kimi-K3 routing requires normalized top-16 "
+                    "weights with scale 1, FP32 weights, and INT32 ids"
+                )
+            return fused_router(router_logits, correction_bias, out=out)

@@ -89,6 +89,7 @@ def triton_causal_conv1d_prefill(
     validate_data=False,
     *,
     prefill_metadata: CausalConv1dPrefillMetadata,
+    out: torch.Tensor | None = None,
 ):
     """support varlen + continuous batching when x is 2D tensor
 
@@ -133,13 +134,32 @@ def triton_causal_conv1d_prefill(
         Read-only program mapping built once with this forward's sequence
         boundaries and shared by all recurrent-attention layers.
 
-    out: same shape as `x`
+    out: optional contiguous [partitions, tokens, channels / partitions] buffer.
+        Without it, return the shape of `x` with contiguous channels per token.
     """
     enable_pdl = pdl_enabled()
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    out = torch.empty_like(x)
+    partition_channels = x.shape[0]
+    stride_o_partition = 0
+    if out is None:
+        out = torch.empty((x.shape[1], x.shape[0]), dtype=x.dtype, device=x.device).T
+    else:
+        if (
+            out.ndim != 3
+            or out.shape[0] < 1
+            or out.shape[1] != x.shape[1]
+            or out.shape[0] * out.shape[2] != x.shape[0]
+            or out.dtype != x.dtype
+            or out.device != x.device
+            or not out.is_contiguous()
+        ):
+            raise ValueError(
+                "convolution output must be contiguous [partitions, tokens, channels / partitions] with the input dtype and device"
+            )
+        partition_channels = out.shape[2]
+        stride_o_partition = out.stride(0)
     batch_ptr = prefill_metadata.batch_indices
     token_chunk_offset_ptr = prefill_metadata.chunk_offsets
     if batch_ptr.device != x.device or token_chunk_offset_ptr.device != x.device:
@@ -182,9 +202,9 @@ def triton_causal_conv1d_prefill(
         stride_o_dim = out.stride(0)
         stride_o_token = out.stride(1)
     else:
-        stride_o_seq = out.stride(0)
-        stride_o_dim = out.stride(1)
-        stride_o_token = out.stride(2)
+        stride_o_seq = 0
+        stride_o_dim = out.stride(2)
+        stride_o_token = out.stride(1)
 
     if validate_data:
         assert x.dim() == 2
@@ -235,6 +255,7 @@ def triton_causal_conv1d_prefill(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
+        stride_o_partition,
         # others
         pad_slot_id,
         # META
@@ -250,6 +271,7 @@ def triton_causal_conv1d_prefill(
         BLOCK_N=256,
         num_stages=2,
         ENABLE_PDL=enable_pdl,
+        PARTITION_CHANNELS=partition_channels,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return out

@@ -88,6 +88,7 @@ from tokenspeed_kernel.ops.gemm import (
 from tokenspeed_kernel.ops.moe import (
     latent_moe_decode_pipeline_available,
     latent_moe_input_projections,
+    try_latent_moe_input_projections,
 )
 from tokenspeed_kernel.ops.moe._cute_dsl.latent_down import KimiK3LatentDownOp
 from tokenspeed_kernel.ops.quantization import quantize_fp8_with_gate
@@ -2623,8 +2624,27 @@ class KimiLinearMoE(nn.Module):
                     fork.record_checkpoint()
                     shared_output = self.shared_experts(shared_input, down_out=None)
 
+            shared_activated = None
             if num_tokens > 0:
-                router_logits = self.gate(hidden_states)
+                fused_inputs = None
+                if (
+                    shared_communication is None
+                    and hidden_states.is_cuda
+                    and self.shared_experts.gate_up_proj.weight.dtype
+                    == hidden_states.dtype
+                ):
+                    fused_inputs = try_latent_moe_input_projections(
+                        hidden_states,
+                        self.gate.weight,
+                        self.routed_expert_down_proj.weight,
+                        self.shared_experts.gate_up_proj.weight,
+                        gate_clamp=self.shared_experts.act_fn.beta,
+                        up_clamp=self.shared_experts.act_fn.linear_beta,
+                    )
+                if fused_inputs is None:
+                    router_logits = self.gate(hidden_states)
+                else:
+                    router_logits, routed_input, shared_activated = fused_inputs
                 topk = self.topk(
                     hidden_states,
                     router_logits,
@@ -2633,7 +2653,8 @@ class KimiLinearMoE(nn.Module):
                     expert_location_dispatch_info=None,
                     out=routing_out,
                 )
-                routed_input, _ = self.routed_expert_down_proj(hidden_states)
+                if fused_inputs is None:
+                    routed_input, _ = self.routed_expert_down_proj(hidden_states)
                 topk_ids = topk.topk_ids
                 topk_weights = topk.topk_weights
             else:
@@ -2760,9 +2781,14 @@ class KimiLinearMoE(nn.Module):
             if shared_communication is None:
                 with fork.branch():
                     if num_tokens > 0:
-                        shared_output = self.shared_experts(
-                            hidden_states, down_out=None
-                        )
+                        if shared_activated is None:
+                            shared_output = self.shared_experts(
+                                hidden_states, down_out=None
+                            )
+                        else:
+                            shared_output = kimi3_shared_down_projection(
+                                shared_activated, self.shared_experts.down_proj.weight
+                            )
 
         if num_tokens == 0:
             return prefix_sum

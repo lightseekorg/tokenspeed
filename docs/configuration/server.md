@@ -1187,13 +1187,20 @@ Mooncake Store (L3)
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
-allocator rounds every allocation up to a power of two, so a 140 GB L2
-takes 274.88 GB. A ratio size larger than that share is capped to the
-largest L2 every rank's share holds beside its snapshot pool -- the whole
-LCM blocks in the largest power of two that fits, and one size on every
-rank, since the ranks' schedulers mirror each other -- and each rank logs a
-warning with the requested and the capped size. An explicit
+headroom per rank. Each buffer counts at the size its configured pinned
+allocator reserves. With PyTorch's default power-of-two rounding, a 140 GB
+L2 takes 274.88 GB. On CUDA/ROCm, the check reads the effective allocator
+rounding and caching limits. For example,
+`PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:1024` keeps rounding for
+allocations up to 1 GiB and uses the exact requested size above that limit.
+A `pinned_max_cached_size_mb` limit also disables rounding above its threshold.
+Set these before starting the server. Device backends without allocator
+snapshots retain the conservative power-of-two estimate.
+
+A ratio size larger than a rank's share is capped to the largest whole-LCM
+buffer that fits under those allocator settings beside its snapshot pool,
+with one size agreed across ranks. Each rank logs the requested and capped
+size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
 startup, as is a share without room for a single LCM block.
 
