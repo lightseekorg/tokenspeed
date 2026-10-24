@@ -108,30 +108,38 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
-### gfx950 single-row BF16 GEMV
+### gfx950 single- and few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
-`x @ w.T` for one BF16 row with one program per output: program `n` streams
-weight row `n` (`.cg`) against `x` in `BLOCK_K` chunks, keeps per-lane FP32
-partial sums and reduces them once. `N` programs per launch keep many
-independent weight streams in flight per CU, which suits cold weights.
+`x @ w.T` for one or a few BF16 input rows with cold weights.
 
-- `x` is a contiguous `[1, K]` row, `w` a contiguous `[N, K]` matrix and `out`
-  a contiguous `[1, N]` destination, all BF16. `K` is a compile-time constant.
-- `BLOCK_K` and the wave count follow `K` (one wave of 16-byte loads for
-  `K <= 1536`, wider programs above), except for the `(N, K)` shapes in
-  `_CONFIGS`, whose geometry measured faster in cold-cache sweeps.
-- `gemm.mv` takes it for any single row with `N, K >= 128`. `gemm.mm` hands a
-  single row to this GEMV only for the `(N, K)` shapes in
-  `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or
-  hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
-  measured shapes route single rows to `mv` separately.
-- `gluon_gated_rowcta_bf16_gemv_gfx950` projects one row through a per-head
-  weightless RMSNorm x sigmoid(gate) prologue that every program recomputes. It
-  keeps the Triton gated norm's layout and this GEMV's reduction, so it is
-  bitwise identical to both launches.
-  `gemm.mv_weightless_rmsnorm_gated_sigmoid` takes it for the `(N, K, heads)`
-  shapes in `_GATED_SHAPES` when neither selection is overridden.
+#### Contract
+
+- `x` is a contiguous `[M, K]` matrix, `w` a contiguous `[N, K]` matrix and
+  `out` a contiguous `[M, N]` destination, all BF16. `K` is a compile-time
+  constant.
+- `gemm.mv` takes any single row with `N, K >= 128`. `gemm.mm` hands a single
+  row to this GEMV only for the `(N, K)` shapes in `_PREFERRED_SHAPES`.
+  The dense decode GEMV routes its own measured single-row shapes to `mv`.
+- Multiple input rows require an `(N, K)` bucket in `_ROWS_CONFIGS`. Each row
+  is bitwise the single-row GEMV of that row; `M` is a runtime argument and
+  each power-of-two bucket uses one binary.
+- `gluon_gated_rowcta_bf16_gemv_gfx950` fuses per-head weightless RMSNorm and
+  sigmoid gating into a single-row projection. It matches the separate
+  Triton gated norm and GEMV bitwise. `gemm.mv_weightless_rmsnorm_gated_sigmoid`
+  takes it for measured `_GATED_SHAPES` when the separate gated-norm and GEMV
+  providers match.
+
+#### Algorithm
+
+A single-row program streams one weight row in `BLOCK_K` chunks and reduces
+its FP32 partial sums once. `BLOCK_K` and the subgroup count follow `K`,
+except for the measured `(N, K)` entries in `_CONFIGS`.
+
+A few-row program streams a tile of weight rows, reusing each load across
+its input rows. Each (input row, output) keeps the single-row reduction;
+FMA throughput limits this path to a few rows. The gated projection
+recomputes its normalized, gated input in every program.
 
 ### gfx950 FP32 router GEMV
 
