@@ -447,6 +447,24 @@ Notes:
   identity-weight norm.
 - Under tensor parallelism, the TP ranks reduce the draft's final row-parallel
   MLP output before `final_norm` and shared target-head sampling.
+- DSpark drafts saved by the `speculators` library, such as
+  `RedHatAI/Kimi-K3-speculator.dspark`, load directly. TokenSpeed converts
+  their config to the DFlash layout at load time: draft layers from
+  `transformer_layer_config`, target taps one below each
+  `aux_hidden_state_layer_ids` entry, and the mask token. Their
+  sliding-window layers attend causally within the proposal block (unless
+  `sliding_window_non_causal` is set), so serve them with a drafter backend
+  that supports causal blocks (`--drafter-attention-backend mha`). The
+  checkpoint's own embedding row for the mask token replaces the target's,
+  which never trains that reserved token. Its `block_size` is the number of
+  drafted tokens, so the verify window is one larger:
+
+  ```bash
+  --speculative-algorithm DSPARK \
+  --speculative-draft-model-path RedHatAI/Kimi-K3-speculator.dspark \
+  --speculative-num-draft-tokens 9 \
+  --drafter-attention-backend mha
+  ```
 - The vision encoder has 12 attention heads. For an 8-way text TP deployment,
   use `--mm-encoder-tp-mode data` so each rank runs the vision encoder at TP1
   on a different whole image.

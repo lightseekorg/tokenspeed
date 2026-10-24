@@ -446,6 +446,10 @@ class K3DSparkModel(nn.Module, TargetCaptureConfigurator):
         """Number of captured target streams, independent of draft block count."""
         return len(self.target_capture_layer_ids)
 
+    def own_mask_embedding(self) -> torch.Tensor | None:
+        """None: this draft embeds its block with the target's table."""
+        return None
+
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Concatenated target taps -> draft hidden space."""
         if self.fc_norm is not None:

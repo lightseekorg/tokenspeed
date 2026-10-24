@@ -31,8 +31,7 @@ from tokenspeed_kernel.ops.conv import dflash2_grouped_conv
 from torch import nn
 
 from tokenspeed.runtime.distributed.comm_manager import CommManager
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
-from tokenspeed.runtime.distributed.mapping import Mapping, MappingBase
+from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.linear import ReplicatedLinear
@@ -43,6 +42,7 @@ from tokenspeed.runtime.models.dflash import (
     DFlashDecoderLayer,
     DFlashDraftModel,
     _get_dflash_layer_sliding_window,
+    reduce_norm,
 )
 from tokenspeed.runtime.models.kimi_k3_dspark import K3DSparkAttention
 from tokenspeed.runtime.utils import add_prefix
@@ -265,25 +265,6 @@ class CandidateSelector(nn.Module):
         )
 
 
-def _reduce_norm(
-    norm: torch.nn.Module,
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    tp: MappingBase,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reduce a shard-local partial, then norm.
-
-    Deliberately the unfused path, matching
-    ``K3DSparkDecoderLayer._norm_with_allreduce``: the fused variant is sized
-    from the target's shapes and the draft's block forward is a different
-    width. This puts the reduction where that fusion can absorb it once it has
-    been verified at this width.
-    """
-    if tp.tp_size <= 1:
-        return norm(hidden_states, residual)
-    return norm(all_reduce(hidden_states, tp.tp_group), residual)
-
-
 class DFlash2DecoderLayer(DFlashDecoderLayer):
     """DFlash layer with dynamic convolutions around attention and the MLP."""
 
@@ -376,7 +357,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             # afterwards. The conv is linear in its input and its coefficients
             # come from an already-reduced hidden, so the reduction commutes
             # with it and lands here, where the norm can absorb it.
-            hidden_states, residual = _reduce_norm(
+            hidden_states, residual = reduce_norm(
                 self.input_layernorm,
                 hidden_states,
                 residual,
@@ -393,7 +374,7 @@ class DFlash2DecoderLayer(DFlashDecoderLayer):
             attention_kwargs["comm_manager"] = self.comm_manager
         hidden_states = self.self_attn(**attention_kwargs)
         hidden_states = self.attention_conv.finish(hidden_states, coefficients)
-        hidden_states, residual = _reduce_norm(
+        hidden_states, residual = reduce_norm(
             self.post_attention_layernorm,
             hidden_states,
             residual,
@@ -444,7 +425,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         """The last layer hands back its MLP conv's partial; reduce it here."""
         if residual is None:
             return self.norm(hidden_states)
-        hidden_states, _ = _reduce_norm(
+        hidden_states, _ = reduce_norm(
             self.norm,
             hidden_states,
             residual,

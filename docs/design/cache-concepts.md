@@ -1220,6 +1220,12 @@ therefore follows the same KVP ownership contract as attention writes; the
 architecture alone must not reject KVP. Backend capability and shared-group
 storage checks still apply.
 
+Kimi K3 also hosts a GQA block draft (a Qwen3-shaped DSpark draft) in the
+same MLA history group: each draft layer adds a K and a V plane at K3's
+P=128 beside the MLA latent planes, chosen from the draft config's type, and
+the KDA packing stays sized off the MLA plane. The draft's cache is an MHA
+view over the one arena, so it carries the MHA backends' KVP gate.
+
 Capacity has three shapes, all on the base class. The default is the flat
 product (`parents × tightest packing × P`). A probe arena is the third and
 narrowest: `probe_batch_rows` says how many requests the CUDA-graph probe

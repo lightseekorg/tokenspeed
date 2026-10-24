@@ -91,6 +91,10 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
     # in one decode forward (see block_decode_active / block_decode_expansion);
     # set from config by leaves that support it.
     draft_block_decode: bool = False
+    # Whether this leaf can run a block draft's rows causally
+    # (AttnConfig.draft_block_causal); create_paged_router refuses the
+    # config for a leaf that cannot.
+    supports_causal_block_decode: bool = False
     # PD layerwise transfer counter, installed by the router; the MLA
     # leaves record the step inside their chunked prefill.
     step_counter = None

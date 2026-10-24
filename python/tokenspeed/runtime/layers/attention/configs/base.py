@@ -67,6 +67,16 @@ def is_block_drafter(speculative_algorithm: str | None, is_draft: bool) -> bool:
     return bool(is_draft and speculative_algorithm in ("DFLASH", "DSPARK"))
 
 
+def resolve_draft_block_causal(hf_config) -> bool:
+    """Whether a block draft's rows attend causally within the block.
+
+    A DFlash/DSpark checkpoint declares it as ``dflash_config.causal``; one
+    that omits it keeps the original DFlash non-causal block.
+    """
+    dflash_config = getattr(hf_config, "dflash_config", None) or {}
+    return bool(dflash_config.get("causal", False))
+
+
 def resolve_cache_layer_types(
     hf_config,
     *,
@@ -195,6 +205,10 @@ class AttnConfig:
     # per request) instead of Eagle/MTP's per-step single-token decode. Backends
     # use this to expand decode metadata to spec_num_tokens rows per request.
     draft_block_decode: bool = False
+    # Under block decode, whether row i of the block attends only to the
+    # block's first i + 1 positions (and the context) instead of the whole
+    # block; see resolve_draft_block_causal.
+    draft_block_causal: bool = False
     # KV parallelism (page-cyclic KV page sharding over a consecutive subgroup
     # of attention TP): one topology for target and continuation/MTP views;
     # KVP does not add ranks. Decode attends the owned pages and merges the

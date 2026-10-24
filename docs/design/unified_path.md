@@ -549,8 +549,9 @@ on it exist:
   graph re-runs the recorded schedule-builds, one per edit, against the live
   seq_lens buffer. The object lives on the backend, not on the decode views.
 * DFLASH block-arm seeding (`not for_graph_replay or actual_bs == 0`): the
-  drafter's recorded `fill_block_decode_seq_lens` rewrites the block-end
-  lengths inside every replay, so only eager steps and the capture-time
+  drafter's recorded `fill_block_decode_seq_lens` rewrites the block lengths
+  (the block end for every row, or each row's own position for a causal
+  draft) inside every replay, so only eager steps and the capture-time
   seeding fill them from Python.
 
 Do not branch on this flag for anything a shared in-place refresh can

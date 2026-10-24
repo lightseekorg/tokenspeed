@@ -309,6 +309,70 @@ def _restore_raw_glm_dsa_fields(config: PretrainedConfig, raw_config: dict) -> N
             setattr(config, key, raw_config[key])
 
 
+def _is_speculators_dspark_config(raw_config: dict) -> bool:
+    """Whether ``raw_config`` is a DSpark draft saved by the ``speculators``
+    library (e.g. ``RedHatAI/Kimi-K3-speculator.dspark``)."""
+    return raw_config.get("speculators_model_type") == "dspark"
+
+
+def _convert_speculators_dspark_config(raw_config: dict) -> dict:
+    """Flatten a ``speculators`` DSpark config into the DFlash layout.
+
+    ``speculators`` nests the draft layers' Qwen3 config under
+    ``transformer_layer_config`` and names its target taps in hidden-states
+    index form (index 0 is the embedding output), where DFlash's
+    ``target_layer_ids`` name the layer whose output is tapped: one less.
+    Its sliding-window layers attend causally within the proposal block
+    unless ``sliding_window_non_causal`` says otherwise.
+    """
+    layer_config = raw_config["transformer_layer_config"]
+    if layer_config.get("model_type") != "qwen3":
+        raise ValueError(
+            "speculators DSpark drafts are supported with Qwen3 draft layers; "
+            f"got transformer_layer_config.model_type="
+            f"{layer_config.get('model_type')!r}."
+        )
+    layer_types = set(layer_config.get("layer_types") or ())
+    if layer_types == {"sliding_attention"}:
+        causal = not bool(raw_config["sliding_window_non_causal"])
+    elif layer_types == {"full_attention"}:
+        causal = False
+    else:
+        # One proposal block has one mask; a per-layer mix needs per-layer
+        # block metadata, which the block-decode path does not carry.
+        raise ValueError(
+            "speculators DSpark drafts must use one attention type for every "
+            f"layer; got layer_types={sorted(layer_types)}."
+        )
+    if not raw_config.get("sample_from_anchor", False):
+        raise ValueError(
+            "TokenSpeed's DSpark drafter samples the first proposal from the "
+            "anchor row; this checkpoint sets sample_from_anchor=false."
+        )
+    converted = dict(layer_config)
+    converted["architectures"] = list(raw_config["architectures"])
+    converted["dflash_config"] = {
+        "mask_token_id": int(raw_config["mask_token_id"]),
+        "target_layer_ids": [
+            int(index) - 1 for index in raw_config["aux_hidden_state_layer_ids"]
+        ],
+        "causal": causal,
+    }
+    for key in (
+        "block_size",
+        "markov_rank",
+        "markov_head_type",
+        "enable_confidence_head",
+        "confidence_head_with_markov",
+        "target_hidden_size",
+        "draft_vocab_size",
+        "tie_word_embeddings",
+    ):
+        if key in raw_config:
+            converted[key] = raw_config[key]
+    return converted
+
+
 def _restore_raw_dflash_fields(config: PretrainedConfig, raw_config: dict) -> None:
     """Re-assert a DFLASH/DSpark draft's sliding window.
 
@@ -352,10 +416,17 @@ def get_config(
     racing across tensor-parallel worker processes.
     """
 
-    def load_raw_config(model_path: str) -> dict[str, Any]:
+    def load_raw_config(model_path: str) -> tuple[dict[str, Any], bool]:
+        """Read ``config.json``; returns the config and whether it was
+        converted from the ``speculators`` layout."""
         try:
             with open(os.path.join(model_path, "config.json")) as file:
-                return json.load(file)
+                raw = json.load(file)
+                # Converted before parsing: the checkpoint's own config code
+                # imports the speculators package.
+                if _is_speculators_dspark_config(raw):
+                    return _convert_speculators_dspark_config(raw), True
+                return raw, False
         except FileNotFoundError:
             raise RuntimeError(
                 f"Config file not found in {model}. Please check the path."
@@ -368,6 +439,7 @@ def get_config(
 
     config = None
     raw_config = None
+    raw_config_converted = False
     is_remote_model = not os.path.isdir(model)
     if is_remote_model:
         from tokenspeed.runtime.model_loader.weight_utils import get_lock
@@ -384,7 +456,7 @@ def get_config(
                 f"downloading metadata of {model}",
                 download_metadata,
             )
-            raw_config = load_raw_config(model_path)
+            raw_config, raw_config_converted = load_raw_config(model_path)
 
             # Local snapshot parsing is mandatory for ordinary configs: a
             # second remote config lookup can silently construct defaults (as
@@ -429,11 +501,13 @@ def get_config(
         model_path = model
 
     if raw_config is None:
-        raw_config = load_raw_config(model_path)
+        raw_config, raw_config_converted = load_raw_config(model_path)
 
     if config is None:
         config_class = _resolve_registered_config(raw_config)
-        if config_class is not None:
+        if config_class is not None and raw_config_converted:
+            config = config_class.from_dict(raw_config)
+        elif config_class is not None:
             config = config_class.from_pretrained(model_path)
         else:
             config = AutoConfig.from_pretrained(

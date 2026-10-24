@@ -111,6 +111,8 @@ class MHAAttnBackend(PagedAttentionBackend):
 
     # Every kernel call site forwards layer.sliding_window_size.
     supports_layer_sliding_window: bool = True
+    # Block rows are single-query decode rows with their own seq_len.
+    supports_causal_block_decode: bool = True
 
     def __init__(self, config: AttnConfig, spec: MHAConfig, *, kernel_page_size: int):
         super().__init__(config, spec, kernel_page_size=kernel_page_size)
@@ -143,9 +145,15 @@ class MHAAttnBackend(PagedAttentionBackend):
             solution=self.kernel_solution,
         )
         # DFLASH draft: the whole block in one decode forward, with one
-        # decode metadata entry per block position and uniform non-causal
-        # seq_lens (block_decode_expansion).
+        # decode metadata entry per block position (block_decode_expansion).
+        # Every entry shares the block-end seq_len (non-causal), or, for a
+        # causal draft, entry i stops at block position i.
         self.draft_block_decode = bool(config.draft_block_decode)
+        self.block_causal_offsets: torch.Tensor | None = None
+        if config.draft_block_causal and self.block_decode_active:
+            self.block_causal_offsets = torch.arange(
+                1 - self.spec_num_tokens, 1, dtype=torch.int32, device=self.device
+            )
 
         self.forward_decode_metadata: MHADecodeMetadata | None = None
         self.forward_extend_metadata: MHAExtendMetadata | None = None
@@ -258,6 +266,21 @@ class MHAAttnBackend(PagedAttentionBackend):
             )
             self._decode_views_by_bs[bs] = metadata
         return metadata
+
+    def fill_block_decode_seq_lens(self, bs: int, block_seq_lens: torch.Tensor) -> None:
+        if self.block_causal_offsets is None:
+            super().fill_block_decode_seq_lens(bs, block_seq_lens)
+            return
+        # Block position i sits at block_end - (width - 1 - i); a causal row
+        # reads the cache up to and including itself. Each row's sliding
+        # window, if any, then ends at that row as well.
+        expansion = self.block_decode_expansion
+        self.decode_seq_lens_buffer[: bs * expansion].view(bs, expansion).copy_(
+            block_seq_lens[:bs]
+            .clamp(self.spec_num_tokens, self.max_context_len)
+            .unsqueeze(1)
+            + self.block_causal_offsets
+        )
 
     def refresh_decode_metadata(
         self,

@@ -154,9 +154,10 @@ def _resolve_heterogeneous_draft_family(
     if draft_family is None or draft_family == target_family:
         return None
     if target_family == "kimi_k3":
-        if draft_family != "mla":
+        if draft_family not in ("mla", "mha"):
             raise RuntimeError(
-                "Kimi-K3 unified cache currently requires an ordinary MLA draft view"
+                "Kimi-K3 unified cache hosts MLA or MHA draft views, got "
+                f"{draft_family!r}"
             )
         return draft_family
     if target_family not in _ORDINARY_CACHE_FAMILIES:
@@ -622,6 +623,12 @@ def create_paged_router(
         # names the WRAPPER; the leaf under it auto-resolves from the arch.
         name = None
     leaf_cls = _get_backend_cls(name, arch)
+    if config.draft_block_causal and not leaf_cls.supports_causal_block_decode:
+        raise ValueError(
+            f"attention backend {name!r} cannot run a block draft whose rows "
+            "attend causally within the block (dflash_config.causal); serve "
+            "this draft with --drafter-attention-backend mha"
+        )
 
     def leaf_factory(group_id: str, block_granularity: int):
         del group_id

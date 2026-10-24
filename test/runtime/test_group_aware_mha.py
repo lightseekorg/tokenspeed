@@ -59,6 +59,7 @@ class TestRouterOverMhaLeavesTest:
             kv_cache_dtype=torch.bfloat16,
             kv_cache_mxfp8=False,
             draft_block_decode=False,
+            draft_block_causal=False,
             max_bs=8,
             kernel_page_size=None,
         )

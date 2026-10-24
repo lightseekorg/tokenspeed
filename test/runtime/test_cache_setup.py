@@ -936,12 +936,17 @@ def test_heterogeneous_draft_guards_fail_fast() -> None:
         _resolve_heterogeneous_draft_family("mla", "mha", draft_family_declared=False)
         == "mha"
     )
-    assert (
-        _resolve_heterogeneous_draft_family(
-            "kimi_k3", "mla", draft_family_declared=False
+    for draft_family in ("mla", "mha"):
+        assert (
+            _resolve_heterogeneous_draft_family(
+                "kimi_k3", draft_family, draft_family_declared=False
+            )
+            == draft_family
         )
-        == "mla"
-    )
+    with pytest.raises(RuntimeError, match="hosts MLA or MHA draft views"):
+        _resolve_heterogeneous_draft_family(
+            "kimi_k3", "dsa", draft_family_declared=False
+        )
     with pytest.raises(RuntimeError, match="require an MHA draft"):
         _resolve_heterogeneous_draft_family("mha", "mla", draft_family_declared=False)
     with pytest.raises(RuntimeError, match="support ordinary drafts only"):

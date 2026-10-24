@@ -32,6 +32,7 @@ def kimi_recipe(
     text_config=None,
     tp_size: int = 8,
     draft_layers: int = 0,
+    draft_attn: str = "mla",
     pd_enabled: bool = False,
     max_bs: int = 1,
     max_scheduled_tokens: int = 128,
@@ -51,6 +52,7 @@ def kimi_recipe(
     from tokenspeed.runtime.layers.attention.configs.linear_attn import (
         LinearAttnConfig,
     )
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.recipes.kimi_k3 import (
         KimiK3Recipe,
@@ -96,12 +98,34 @@ def kimi_recipe(
         speculative_num_draft_tokens=speculative_num_draft_tokens,
         components=(mla, linear_attn),
     )
-    # The real K3 draft is BF16 MLA over the FP8 target arena.
-    draft_attn_config = (
-        dataclasses.replace(attn_config, kv_cache_dtype=torch.bfloat16)
-        if draft_layers
-        else None
-    )
+    # The real K3 drafts are BF16 over the FP8 target arena: MLA (Inferact
+    # DSpark) or a GQA block draft (RedHatAI speculators DSpark, 96 query and
+    # 16 KV heads of 64). The GQA draft's own config keeps the default page
+    # size; the K3 plan must still lay its pages out at P=128.
+    if not draft_layers:
+        draft_attn_config = None
+    elif draft_attn == "mla":
+        draft_attn_config = dataclasses.replace(
+            attn_config, kv_cache_dtype=torch.bfloat16
+        )
+    elif draft_attn == "mha":
+        gqa = MHAConfig(
+            backend_name="mha",
+            num_attention_heads=96,
+            num_kv_heads=16,
+            head_dim=64,
+            attn_tp_size=tp_size,
+        )
+        draft_attn_config = dataclasses.replace(
+            attn_config,
+            kv_cache_dtype=torch.bfloat16,
+            prefix_granularity=64,
+            is_draft=True,
+            draft_block_decode=True,
+            components=(gqa,),
+        )
+    else:
+        raise ValueError(f"unknown draft_attn {draft_attn!r}")
     return KimiK3Recipe(
         server_args=SimpleNamespace(
             kv_offload_config=None,

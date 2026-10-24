@@ -274,22 +274,33 @@ def _config_layer_fields(
             _index_k_field(config, layer_id),
         )
     if isinstance(spec, MSAConfig):
-        fields = _mha_layer_fields(config, layer_id, occurrence)
+        fields = mha_layer_fields(
+            config, layer_id, occurrence, prefix_granularity=config.prefix_granularity
+        )
         if local_layer_id in spec.sparse_layer_ids:
             fields += (_index_k_field(config, layer_id),)
         return fields
     if isinstance(spec, MLAConfig):
         return _mla_layer_fields(config, layer_id, occurrence)
     if isinstance(spec, MHAConfig):
-        return _mha_layer_fields(config, layer_id, occurrence)
+        return mha_layer_fields(
+            config, layer_id, occurrence, prefix_granularity=config.prefix_granularity
+        )
     raise TypeError(f"no ordinary cache recipe for {type(spec).__name__}")
 
 
-def _mha_layer_fields(config, layer_id: int, occurrence: int):
-    """One MHA layer's K/V pages, with mxfp8 scale planes when enabled."""
+def mha_layer_fields(
+    config, layer_id: int, occurrence: int, *, prefix_granularity: int
+):
+    """One MHA layer's K/V pages, with mxfp8 scale planes when enabled.
+
+    ``prefix_granularity`` is the page size of the plan the layer joins: the
+    layer's own config for an ordinary model, the host recipe's for a draft
+    hosted by a custom family.
+    """
     spec = config.component(SoftmaxAttnConfig)
     mxfp8 = bool(config.kv_cache_mxfp8)
-    if mxfp8 and config.prefix_granularity != MXFP8_KV_SCALE_TILE_TOKENS:
+    if mxfp8 and prefix_granularity != MXFP8_KV_SCALE_TILE_TOKENS:
         raise AssertionError(
             "mxfp8 KV cache requires --prefix-granularity "
             f"{MXFP8_KV_SCALE_TILE_TOKENS} (the attention kernel consumes "
@@ -297,9 +308,9 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
         )
     kv_heads = max(spec.num_kv_heads // spec.attn_tp_size, 1)
     head_dim = spec.head_dim
-    if config.prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
+    if prefix_granularity <= 0 or kv_heads <= 0 or head_dim <= 0:
         raise ValueError("MHA full-attention geometry must be positive")
-    shape = (config.prefix_granularity, kv_heads, head_dim)
+    shape = (prefix_granularity, kv_heads, head_dim)
     kv_dtype = (
         # MXFP8 writes go through dtype-aware kernels, so the arena keeps the
         # fp8 view; the scatter-written paths fall back to uint8.
@@ -318,7 +329,7 @@ def _mha_layer_fields(config, layer_id: int, occurrence: int):
         occurrence=occurrence,
         kv_heads=kv_heads,
         head_dim=head_dim,
-        prefix_granularity=config.prefix_granularity,
+        prefix_granularity=prefix_granularity,
     )
 
 

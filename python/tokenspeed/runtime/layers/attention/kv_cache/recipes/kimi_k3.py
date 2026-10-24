@@ -23,7 +23,9 @@
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
 are dense and pin the smallest packing whose plane width covers one per-layer
 KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
-byte width so no parent is wasted.
+byte width so no parent is wasted. A draft's layers join the full-attention
+group: MLA latent planes for an MLA draft, K and V planes for a GQA (MHA)
+block draft.
 """
 
 from __future__ import annotations
@@ -35,7 +37,9 @@ from functools import cached_property
 import torch
 from typing_extensions import override
 
+from tokenspeed.runtime.layers.attention.configs.base import SoftmaxAttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
+from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
@@ -46,6 +50,9 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
     kda_replay_supported,
     kda_verify_workspace_bytes,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+    mha_layer_fields,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     CacheFieldSpec,
@@ -82,8 +89,9 @@ def _one_based_layers(value: object, name: str, num_layers: int) -> tuple[int, .
 class KimiK3Recipe(CacheRecipe):
     """Kimi-K3: MLA full-attention layers plus three KDA state groups.
 
-    Draft MLA layers are continuation layers of the one big model and join the
-    target's full-attention group, sharing its packing and page-id space.
+    Draft layers are continuation layers of the one big model and join the
+    target's full-attention group, sharing its packing and page-id space:
+    an MLA draft as latent planes, a GQA block draft as K and V planes.
     """
 
     family = "kimi_k3"
@@ -197,8 +205,8 @@ class KimiK3Recipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        # A draft adds MLA planes of its own; the target-only bound would
-        # reject the wider arena they imply.
+        # A draft adds planes of its own; the target-only bound would reject
+        # the wider arena they imply.
         return float("inf") if self.num_draft_layers else 0.25
 
     # ---- fields ----
@@ -237,6 +245,16 @@ class KimiK3Recipe(CacheRecipe):
                 if layer_id < self.num_target_layers
                 else self.draft_attn_config
             )
+            if isinstance(config.component(SoftmaxAttnConfig), MHAConfig):
+                # A GQA block draft (the target's layers are always MLA): K
+                # and V pages in planes of their own, at this plan's page
+                # size rather than the draft config's.
+                return mha_layer_fields(
+                    config,
+                    layer_id,
+                    occurrence,
+                    prefix_granularity=self.prefix_granularity,
+                )
             spec = config.component(MLAConfig)
             latent_width = spec.kv_lora_rank + spec.qk_rope_head_dim
             return (
@@ -271,7 +289,9 @@ class KimiK3Recipe(CacheRecipe):
     def packing(self, groups: tuple[CacheGroupDeclaration, ...]) -> Mapping[str, int]:
         fields_by_group = {spec.group_id: fields for spec, fields in groups}
         mla_page_bytes = next(
-            field.payload_bytes for field in fields_by_group[FULL_ATTENTION]
+            field.payload_bytes
+            for field in fields_by_group[FULL_ATTENTION]
+            if field.field_id.endswith(".latent_kv")
         )
         first_state = f"{LINEAR_ATTENTION}_0"
         linear_plane_bytes = sum(
@@ -295,21 +315,25 @@ class KimiK3Recipe(CacheRecipe):
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        """One plane per MLA layer, plus one per draft layer -- no more.
+        """The full-attention group's planes and no others.
 
         The KDA state groups pack to the MLA plane's byte width precisely so
         they ride inside those planes; a plane of their own means the packing
         did not divide and the parent grew.
         """
-        num_mla_layers = sum(
-            group_id == FULL_ATTENTION for group_id in self.target_group_ids
-        )
-        expected = num_mla_layers + self.num_draft_layers
-        if len(layout.plane_bytes) != expected:
+        full_planes = {
+            field.plane_id
+            for spec, fields in self.groups()
+            if spec.group_id == FULL_ATTENTION
+            for field in fields
+        }
+        layout_planes = {plane_id for plane_id, _ in layout.plane_bytes}
+        if layout_planes != full_planes:
             raise ValueError(
-                f"Kimi-K3 LCM requires {num_mla_layers} target planes (one per "
-                f"MLA layer) plus {self.num_draft_layers} draft planes, got "
-                f"{len(layout.plane_bytes)}"
+                "Kimi-K3 LCM requires exactly the full-attention group's "
+                f"{len(full_planes)} planes (MLA layers and draft layers), got "
+                f"{len(layout_planes)}; extra planes: "
+                f"{sorted(layout_planes - full_planes)}"
             )
 
     # ---- extras ----

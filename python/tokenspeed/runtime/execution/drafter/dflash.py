@@ -43,7 +43,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     CaptureHiddenMode,
     ForwardMode,
 )
-from tokenspeed.runtime.execution.forward_step import get_is_cuda_graph_phase
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
@@ -168,6 +167,21 @@ class DFlash(BaseDrafter):
         # Legacy alias: callers that predate the verify/draft split.
         self.block_size = self.verify_width
         self.hidden_size = int(getattr(cfg, "hidden_size"))
+        # The block's embeddings are vocab-parallel partials that the draft's
+        # first layer all-reduces over the dense TP group, so a draft-owned
+        # mask row enters as the whole row on rank 0 and zeros elsewhere.
+        own_mask_embedding = self.model.own_mask_embedding()
+        self.mask_embedding_partial: torch.Tensor | None = None
+        if own_mask_embedding is not None:
+            self.mask_embedding_partial = (
+                own_mask_embedding
+                if self.model.mapping.dense.tp_rank == 0
+                else torch.zeros_like(own_mask_embedding)
+            )
+            logger.info(
+                "Block draft uses its own embedding for mask token "
+                f"{self.mask_token_id}."
+            )
         self._init_native_buffers()
         self._validate_draft_attention_window()
         self._greedy_gathered_max: torch.Tensor | None = None
@@ -967,18 +981,16 @@ class DFlash(BaseDrafter):
     def _overlap_allowed(self, ctx: ForwardContext) -> bool:
         """Whether this round's draft KV write may run on the aux stream
         alongside the target / the draft: decode-only rows (the target's
-        verify window is the round's full write vector), the fused writer,
-        and not the graph warmup phase — capture-only auxiliary branches warm
-        serially there and are recorded only under capture."""
-        capturing = (
-            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
-        )
+        verify window is the round's full write vector) and the fused writer.
+
+        The graph warmup phase takes the same branch as capture, so the aux
+        stream's GEMMs run before capture records them: on ROCm, hipBLASLt's
+        first call on a stream is not capture-safe."""
         return (
             ctx.dspark_context_producer is None
             and ctx.num_extends == 0
             and self._fused_kv_enabled
             and self._kv_aux_stream is not None
-            and (capturing or not get_is_cuda_graph_phase())
         )
 
     @override
@@ -1214,6 +1226,11 @@ class DFlash(BaseDrafter):
 
         flat_ids = block_ids.reshape(-1)
         input_embeds = self.embed_tokens(flat_ids, reduce_results=False)
+        if self.mask_embedding_partial is not None:
+            # Row 0 is the anchor; every later row is the mask token.
+            input_embeds.view(bs, self.draft_query_width, -1)[:, 1:].copy_(
+                self.mask_embedding_partial
+            )
 
         with torch.inference_mode():
             logits_output = self.draft_model_runner.forward(
