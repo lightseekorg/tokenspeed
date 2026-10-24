@@ -1242,6 +1242,7 @@ def test_quantized_combined_prepares_routing_once_per_token_count(
     """The experts get the prepared routing when it exists; otherwise one is prepared for next time."""
     moe = _stub(MuseSparkMoE)
     moe.expert_quant_kind = "nvfp4"
+    moe.iris_state = None
     moe.tp_size, moe.ep_size = 1, 1
     moe.topk, moe.prepared_routing = 2, {}
     moe.ep_group = None

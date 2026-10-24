@@ -1154,6 +1154,7 @@ if platform.is_amd:
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({True}),
             "deferred_output_is_token_order": frozenset({True}),
+            "supports_deferred_out": frozenset({True}),
             "supports_prequantized_input": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
@@ -1176,6 +1177,7 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+        deferred_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
         """Run gfx950 dynamic-A4W4 experts with optional finalization.
 
@@ -1192,6 +1194,9 @@ if platform.is_amd:
             do_finalize: Whether to combine weighted routes into hidden states.
             enable_pdl: Unused launch hint.
             x_quantized: Optional packed E2M1 input and CDNA4 E8M0 scales.
+            deferred_out: Optional contiguous BF16 ``[tokens * top_k, hidden]``
+                destination for unweighted routes with ``do_finalize=False``.
+                It must not overlap inputs; the route map marks defined rows.
 
         Returns:
             Final hidden states when ``do_finalize`` is true; otherwise the
@@ -1200,6 +1205,8 @@ if platform.is_amd:
 
         del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
         del enable_pdl
+        if do_finalize and deferred_out is not None:
+            raise ValueError("deferred_out requires do_finalize=False")
         if topk_weights is None or topk_ids is None:
             raise ValueError("gfx950 dynamic A4W4 EP requires precomputed top-k")
         num_local_experts = int(getattr(w, "num_local_experts"))
@@ -1227,6 +1234,7 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             out=getattr(w, "_situ_output_buffer", None) if do_finalize else None,
+            deferred_out=deferred_out,
         )
 
     def _warmup_a4w4_ep_deferred(plan: dict, w: torch.nn.Module) -> None:
