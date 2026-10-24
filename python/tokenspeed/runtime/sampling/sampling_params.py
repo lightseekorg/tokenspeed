@@ -127,7 +127,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
             self.top_k = _TOP_K_DISABLED
 
     def verify(self, vocab_size: int) -> None:
-        if self.temperature < 0.0:
+        # Written as ``not >=`` so NaN is rejected too.
+        if not self.temperature >= 0.0:
             raise ValueError(
                 f"temperature must be non-negative, got {self.temperature}."
             )
@@ -173,6 +174,10 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                     f"min_new_tokens must be in (0, max_new_tokens({self.max_new_tokens})], got "
                     f"{self.min_new_tokens}."
                 )
+        if self.stream_interval is not None and self.stream_interval < 1:
+            raise ValueError(
+                f"stream_interval must be at least 1, got {self.stream_interval}."
+            )
         if self.logit_bias is not None:
             for token_id in self.logit_bias:
                 if not 0 <= int(token_id) < vocab_size:
