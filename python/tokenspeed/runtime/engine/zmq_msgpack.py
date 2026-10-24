@@ -11,24 +11,38 @@
 #
 # The adapters below expose ``recv_pyobj``/``send_pyobj`` so the existing
 # RequestHandler and OutputProcesser drive them unchanged; only the wire codec
-# differs. This module is additive and only reached when ``--zmq-msgpack`` is on.
+# differs. A control call off the wire (``zmq_wire.REQ_TYPE_CONTROL``) becomes
+# the scheduler's own control request here and its output goes back as the
+# call's reply (``ControlCalls``). This module is additive and only reached
+# when ``--zmq-msgpack`` is on.
 
 from __future__ import annotations
 
 import collections
+import dataclasses
 import logging
+import math
 import struct
+import time
+from collections.abc import Callable
 
+import msgspec
 import zmq
 
 from tokenspeed.runtime.engine import zmq_wire
 from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOut,
     BatchTokenIDOutSlim,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     MsgpackEncoder,
+    ProfileReq,
+    ProfileReqOutput,
+    ProfileReqType,
     TokenizedGenerateReqInput,
 )
 from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
+from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +55,240 @@ _INIT_POLL_SLICE_MS = 30_000
 # Raw single-frame sentinel SMG's output loop treats as terminal: the worker
 # is marked dead instead of staying healthy-idle after this engine exits.
 ENGINE_CORE_DEAD = b"ENGINE_CORE_DEAD"
+
+# A control call's cache flush is the frontend's retry loop moved onto the
+# scheduler's own thread. The scheduler refuses a flush while any request pins
+# blocks, and a finished request is retired a round after its last token was
+# streamed, so one attempt made right after a completion is refused although
+# nothing is in flight: the attempt is repeated every FLUSH_RETRY_INTERVAL_S
+# until it is accepted or max(timeout_s, FLUSH_RETIRE_GRACE_S) has passed
+# since the call arrived, and the call gets exactly one answer.
+FLUSH_RETRY_INTERVAL_S = 0.05
+FLUSH_RETIRE_GRACE_S = 2.0
+
+# The positional structs the send adapter emits, by tag, declared in the
+# engine's ready response (``positional_layouts``) so the frontend learns from
+# the handshake that this wire answers control calls and which columns its
+# output batches carry.
+OUTPUT_LAYOUTS: dict[str, list[str]] = {
+    zmq_wire.wire_tag(struct): zmq_wire.positional_layout(struct)
+    for struct in (BatchTokenIDOutSlim, zmq_wire.ControlReplySlim)
+}
+
+
+class ControlCallError(ValueError):
+    """A control call this transport cannot turn into a scheduler request;
+    answered under its call id so the frontend's caller does not wait out its
+    timeout."""
+
+    def __init__(self, call_id: int, message: str) -> None:
+        super().__init__(message)
+        self.call_id = call_id
+
+
+def _flush_timeout_s(call: zmq_wire.ControlCall) -> float:
+    """The ``timeout_s`` of a ``flush_cache`` call (0 when not given)."""
+    if not call.args:
+        return 0.0
+    try:
+        timeout_s = float(call.args[0])
+    except (TypeError, ValueError) as exc:
+        raise ControlCallError(
+            call.call_id,
+            f"flush_cache: timeout_s must be a number, got {call.args[0]!r}",
+        ) from exc
+    if not math.isfinite(timeout_s) or timeout_s < 0:
+        raise ControlCallError(
+            call.call_id, "flush_cache: timeout_s must be finite and non-negative"
+        )
+    return timeout_s
+
+
+# The ``start_profile`` options this engine takes (``ProfileReq``'s fields the
+# in-process ``AsyncLLM.start_profile`` exposes). A key outside this set is
+# refused, never silently dropped: a frontend would otherwise read success
+# while its option did nothing.
+_START_PROFILE_OPTIONS = frozenset(
+    {
+        "output_dir",
+        "start_step",
+        "num_steps",
+        "activities",
+        "with_stack",
+        "record_shapes",
+        "profile_by_stage",
+        "profile_id",
+    }
+)
+
+
+def _profile_option(options: dict, name: str, types: tuple[type, ...], call_id: int):
+    """One ``start_profile`` option, None when absent, refused when mistyped."""
+    value = options.get(name)
+    if value is None:
+        return None
+    # bool is an int subclass; an integer option does not take a flag.
+    if not isinstance(value, types) or (bool not in types and isinstance(value, bool)):
+        expected = " | ".join(t.__name__ for t in types)
+        raise ControlCallError(
+            call_id, f"start_profile: {name} must be {expected}, got {value!r}"
+        )
+    return value
+
+
+def _start_profile_request(call: zmq_wire.ControlCall, rid: str) -> ProfileReq:
+    """The scheduler's ``ProfileReq`` for a ``start_profile`` call.
+
+    The options take the defaults the in-process frontend applies
+    (``AsyncLLM.start_profile``): the stack is recorded unless the caller or
+    ``TOKENSPEED_PROFILE_WITH_STACK`` says no, an unnamed profile is named by
+    its start time, and the handler fills ``activities`` and ``output_dir``.
+    """
+    options = call.args[0] if call.args else {}
+    if not isinstance(options, dict):
+        raise ControlCallError(
+            call.call_id, f"start_profile: options must be a map, got {options!r}"
+        )
+    unknown = sorted(str(key) for key in options.keys() - _START_PROFILE_OPTIONS)
+    if unknown:
+        raise ControlCallError(
+            call.call_id,
+            f"start_profile: unknown options {unknown!r}; this engine takes "
+            f"{sorted(_START_PROFILE_OPTIONS)!r}",
+        )
+    activities = _profile_option(options, "activities", (list,), call.call_id)
+    if activities is not None and not all(isinstance(a, str) for a in activities):
+        raise ControlCallError(
+            call.call_id,
+            f"start_profile: activities must be strings, got {activities!r}",
+        )
+    with_stack = _profile_option(options, "with_stack", (bool,), call.call_id)
+    env_with_stack = envs.TOKENSPEED_PROFILE_WITH_STACK.get()
+    profile_id = _profile_option(options, "profile_id", (str,), call.call_id)
+    return ProfileReq(
+        rid=rid,
+        type=ProfileReqType.START_PROFILE,
+        output_dir=_profile_option(options, "output_dir", (str,), call.call_id),
+        start_step=_profile_option(options, "start_step", (int,), call.call_id),
+        num_steps=_profile_option(options, "num_steps", (int,), call.call_id),
+        activities=list(activities) if activities else None,
+        with_stack=not (with_stack is False or env_with_stack is False),
+        record_shapes=_profile_option(options, "record_shapes", (bool,), call.call_id),
+        profile_by_stage=bool(
+            _profile_option(options, "profile_by_stage", (bool,), call.call_id)
+        ),
+        profile_id=profile_id or time.strftime("%Y%m%d-%H%M%S"),
+    )
+
+
+@dataclasses.dataclass
+class _FlushCall:
+    """A ``flush_cache`` call in flight: its deadline and attempt count."""
+
+    call_id: int
+    deadline: float
+    attempts: int = 1
+    # When a refused attempt is re-issued; None while one is with the scheduler.
+    retry_at: float | None = None
+
+
+class ControlCalls:
+    """The control calls in flight on this rank's wire.
+
+    Shared by the receive and send adapters, which both run on the scheduler
+    thread. ``requests_for`` turns a decoded call into the scheduler's own
+    control request with the call id in its ``rid``; ``reply_for`` turns that
+    request's output back into the ``ControlReplySlim`` the frontend awaits;
+    ``due_requests`` re-issues a refused flush once its retry interval has
+    passed (the receiver asks at every drain). ``send_reply`` is bound by the
+    send adapter so a call refused at decode time is answered at once.
+    """
+
+    def __init__(self, *, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._flushes: dict[str, _FlushCall] = {}
+        self.send_reply: Callable[[int, bool, str | None], None] | None = None
+
+    def requests_for(self, call: zmq_wire.ControlCall) -> list:
+        """The scheduler request(s) ``call`` becomes, to hand to the handler now.
+
+        Raises:
+            ControlCallError: an unknown method or malformed arguments; the
+                caller answers it under the call id.
+        """
+        rid = zmq_wire.control_rid(call.call_id)
+        if call.method == "flush_cache":
+            timeout_s = _flush_timeout_s(call)
+            self._flushes[rid] = _FlushCall(
+                call_id=call.call_id,
+                deadline=self._clock() + max(timeout_s, FLUSH_RETIRE_GRACE_S),
+            )
+            return [FlushCacheReqInput(rid=rid)]
+        if call.method == "start_profile":
+            return [_start_profile_request(call, rid)]
+        if call.method == "stop_profile":
+            return [ProfileReq(rid=rid, type=ProfileReqType.STOP_PROFILE)]
+        raise ControlCallError(call.call_id, f"unknown control method {call.method!r}")
+
+    def due_requests(self) -> list:
+        """The refused flushes whose retry interval has passed, re-issued."""
+        now = self._clock()
+        due = []
+        for rid, flush in self._flushes.items():
+            if flush.retry_at is not None and now >= flush.retry_at:
+                flush.retry_at = None
+                flush.attempts += 1
+                due.append(FlushCacheReqInput(rid=rid))
+        return due
+
+    def refuse(self, call_id: int, message: str) -> None:
+        """Answer a call that never reached the scheduler."""
+        if self.send_reply is None:
+            logger.warning(
+                f"msgpack input: control call {call_id:d} refused with no sender bound: "
+                f"{message!s}"
+            )
+            return
+        self.send_reply(call_id, False, message)
+
+    def reply_for(
+        self, output: FlushCacheReqOutput | ProfileReqOutput, *, engine_index: int
+    ) -> zmq_wire.ControlReplySlim | None:
+        """The reply ``output`` earns now, or None: a refused flush inside its
+        deadline is re-armed instead (answered later), and an output of no call
+        of the frontend's (rid None: the scheduler's own) earns none."""
+        call_id = zmq_wire.control_call_id(output.rid)
+        if call_id is None:
+            return None
+        if isinstance(output, ProfileReqOutput):
+            return zmq_wire.ControlReplySlim(
+                call_id=call_id,
+                success=bool(output.success),
+                message=output.message,
+                engine_index=engine_index,
+            )
+        flush = self._flushes.get(output.rid)
+        if flush is None:
+            return None
+        if output.success:
+            del self._flushes[output.rid]
+            return zmq_wire.ControlReplySlim(
+                call_id=call_id, success=True, message=None, engine_index=engine_index
+            )
+        now = self._clock()
+        if now < flush.deadline:
+            flush.retry_at = now + FLUSH_RETRY_INTERVAL_S
+            return None
+        del self._flushes[output.rid]
+        return zmq_wire.ControlReplySlim(
+            call_id=call_id,
+            success=False,
+            message=(
+                "Cache flush refused: requests still in flight after "
+                f"{flush.attempts:d} attempts"
+            ),
+            engine_index=engine_index,
+        )
 
 
 def _engine_identity(engine_index: int) -> bytes:
@@ -67,6 +315,11 @@ class MsgpackRecvSocket:
     dropped — that would hang the frontend's stream with no terminal frame. It
     is marked via ``validation_error`` so RequestHandler admits it pre-finished
     (FINISH_ABORT) and OutputProcesser emits a terminal "abort" output.
+
+    A control call becomes the scheduler's own control request through
+    ``control`` (shared with the send adapter, which answers the request's
+    output under the call id); a call this side cannot place is answered as
+    refused rather than dropped.
     """
 
     def __init__(
@@ -76,11 +329,13 @@ class MsgpackRecvSocket:
         *,
         enable_output_logprobs: bool,
         supports_prompt_logprobs: bool,
+        control: ControlCalls,
     ) -> None:
         self._socket = socket
         self._vocab_size = vocab_size
         self._enable_output_logprobs = enable_output_logprobs
         self._supports_prompt_logprobs = supports_prompt_logprobs
+        self._control = control
         self._pending: collections.deque = collections.deque()
 
     def _validation_error(self, obj: TokenizedGenerateReqInput) -> str | None:
@@ -133,6 +388,12 @@ class MsgpackRecvSocket:
 
     def recv_pyobj(self, flags: int = 0):
         while not self._pending:
+            # A refused flush whose retry interval has passed goes back to the
+            # scheduler before the socket is read, so it is re-attempted
+            # whether or not the frontend sent anything new this round.
+            self._pending.extend(self._control.due_requests())
+            if self._pending:
+                break
             # Raises zmq.Again (a zmq.ZMQError) under NOBLOCK when idle, which
             # the caller catches to end the drain loop.
             frames = self._socket.recv_multipart(flags)
@@ -150,6 +411,15 @@ class MsgpackRecvSocket:
                 )
                 continue
             for obj in decoded:
+                if isinstance(obj, zmq_wire.ControlCall):
+                    try:
+                        self._pending.extend(self._control.requests_for(obj))
+                    except ControlCallError as exc:
+                        logger.warning(
+                            f"msgpack input: control call {exc.call_id:d} refused: {exc!s}"
+                        )
+                        self._control.refuse(exc.call_id, str(exc))
+                    continue
                 # AbortReq carries no sampling_params; only generate requests
                 # are validated. A rejected request still flows, pre-marked.
                 # The wire layer may have marked it already (e.g. n != 1).
@@ -171,18 +441,24 @@ class MsgpackRecvSocket:
 class MsgpackSendSocket:
     """Adapts a PUSH output socket to the ``send_pyobj`` contract.
 
-    Only ``BatchTokenIDOut`` is on SMG's output path; it is sliced down to the
-    tagged ``BatchTokenIDOutSlim`` (the frontend detokenizes itself, so the
-    incremental-detokenization columns would be dead weight every step).
-    Control replies (Profile/GetLoad/...) have no SMG consumer in this mode
-    and are dropped with a warning rather than crashing the scheduler.
+    ``BatchTokenIDOut`` is sliced down to the tagged ``BatchTokenIDOutSlim``
+    (the frontend detokenizes itself, so the incremental-detokenization
+    columns would be dead weight every step). The output of a control call's
+    request (``FlushCacheReqOutput``, ``ProfileReqOutput`` under the call's
+    rid) goes out as the call's ``ControlReplySlim``. Every other control
+    reply (GetLoad/...) has no SMG consumer in this mode and is dropped with
+    a warning rather than crashing the scheduler.
     """
 
-    def __init__(self, socket: zmq.Socket, engine_index: int = 0) -> None:
+    def __init__(
+        self, socket: zmq.Socket, engine_index: int = 0, *, control: ControlCalls
+    ) -> None:
         self._socket = socket
         self._engine_index = engine_index
         self._encoder = MsgpackEncoder()
         self._load_snapshot = (0, 0, 0, 0)
+        self._control = control
+        control.send_reply = self._send_control_reply
 
     def set_load_snapshot(
         self,
@@ -223,11 +499,31 @@ class MsgpackSendSocket:
                 kv_total_pages=kv_total_pages,
             )
             self._socket.send_multipart(self._encoder.encode(slim), copy=False)
+        elif isinstance(obj, (FlushCacheReqOutput, ProfileReqOutput)):
+            # None: a refused flush re-armed for another attempt (answered
+            # later), or an output of no call of the frontend's.
+            reply = self._control.reply_for(obj, engine_index=self._engine_index)
+            if reply is not None:
+                self._socket.send(zmq_wire.encode(reply))
         else:
             logger.warning(
                 "msgpack output: dropping unsupported control reply "
                 f"{type(obj).__name__!s}",
             )
+
+    def _send_control_reply(
+        self, call_id: int, success: bool, message: str | None
+    ) -> None:
+        self._socket.send(
+            zmq_wire.encode(
+                zmq_wire.ControlReplySlim(
+                    call_id=call_id,
+                    success=success,
+                    message=message,
+                    engine_index=self._engine_index,
+                )
+            )
+        )
 
     def send_engine_dead(self) -> None:
         """Best-effort ENGINE_CORE_DEAD sentinel on engine shutdown/crash.
@@ -279,10 +575,16 @@ def connect_msgpack_engine(
       1. HELLO on the handshake DEALER (identity = engine index).
       2. recv INIT -> learn SMG's input/output addresses.
       3. READY on the handshake DEALER.
-      4. connect the input DEALER, register with the ready response.
+      4. connect the input DEALER, register with the ready response, which
+         declares the output structs this transport emits (``OUTPUT_LAYOUTS``)
+         beside the caller's own entries.
       5. connect the output PUSH.
     """
     identity = _engine_identity(engine_index)
+    ready_response = msgspec.structs.replace(
+        ready_response,
+        positional_layouts={**OUTPUT_LAYOUTS, **ready_response.positional_layouts},
+    )
 
     handshake = context.socket(zmq.DEALER)
     handshake.setsockopt(zmq.IDENTITY, identity)
@@ -324,14 +626,16 @@ def connect_msgpack_engine(
 
     handshake.close()
     logger.info(f"msgpack handshake: complete (engine_index={engine_index!s})")
+    control = ControlCalls()
     return (
         MsgpackRecvSocket(
             input_socket,
             vocab_size,
             enable_output_logprobs=enable_output_logprobs,
             supports_prompt_logprobs=supports_prompt_logprobs,
+            control=control,
         ),
-        MsgpackSendSocket(output_socket, engine_index=engine_index),
+        MsgpackSendSocket(output_socket, engine_index=engine_index, control=control),
     )
 
 

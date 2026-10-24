@@ -390,7 +390,7 @@ class RequestHandler:
     def process_requests(self, recv_reqs: list):
         """Dispatch control requests and return new generate request specs and states."""
         new_req_specs, req_states, bootstrap_infos, abort_rids = [], [], [], []
-        pending_flush_outputs = 0
+        pending_flushes: list[FlushCacheReqInput] = []
         for recv_req in recv_reqs:
             if isinstance(recv_req, TokenizedGenerateReqInput):
                 req_spec, req_state, bootstrap_info = self.handle_generate_request(
@@ -403,12 +403,15 @@ class RequestHandler:
             elif isinstance(recv_req, ProfileReq):
                 output = self.control_request_dispatcher(recv_req)
                 if output is not None:
+                    # The answer names the request it answers: the frontend's
+                    # call id on the direct wire, None in-process.
+                    output.rid = recv_req.rid
                     self.send_func.send_pyobj(output)
             elif isinstance(recv_req, AbortReq):
                 logger.debug(f"AbortReq for rid={recv_req.rid!s}")
                 abort_rids.append(recv_req.rid)
             elif isinstance(recv_req, FlushCacheReqInput):
-                pending_flush_outputs += 1
+                pending_flushes.append(recv_req)
             elif isinstance(recv_req, PauseSchedulerReqInput):
                 # State change + reply (abort/wait replies are deferred by the
                 # controller until the event loop observes a drained scheduler).
@@ -474,7 +477,7 @@ class RequestHandler:
             else:
                 raise NotImplementedError(f"Unsupported request type: {type(recv_req)}")
         flush_success, ready_op, ready_internal = self._rendezvous_replica_flush(
-            pending_flush_outputs=pending_flush_outputs
+            pending_flushes=pending_flushes
         )
         if ready_op is not None:
             self._complete_weight_update(ready_op, flush_success=flush_success)
@@ -558,7 +561,7 @@ class RequestHandler:
             "and in-flight writebacks cannot land in the new namespace",
         )
 
-    def _rendezvous_replica_flush(self, *, pending_flush_outputs: int):
+    def _rendezvous_replica_flush(self, *, pending_flushes: list[FlushCacheReqInput]):
         """Enter flush collectives from every rank on every round; gate weight ops.
 
         ``FlushCacheReqInput`` and the weight ops are sent separately to each
@@ -581,7 +584,8 @@ class RequestHandler:
 
         A head is popped only when every rank has one; the flush intent of
         a load op then counts because every rank reads it off its own copy
-        of the same op. Standalone flushes reply here. When both FIFOs are
+        of the same op. Standalone flushes reply here, each answer under its
+        request's rid (the frontend's call id on the direct wire). When both FIFOs are
         ready, the frontend op completes this round and the internal op
         waits for the next: one blocking device call per round.
 
@@ -602,7 +606,7 @@ class RequestHandler:
         head_code = 0 if head is None else _WEIGHT_OP_CODES[type(head)]
         internal = self._pending_internal_ops[0] if self._pending_internal_ops else None
         internal_code = 0 if internal is None else _INTERNAL_OP_CODES[type(internal)]
-        want_standalone_flush = pending_flush_outputs > 0
+        want_standalone_flush = len(pending_flushes) > 0
         all_have_head = head is not None
         all_have_internal = internal is not None
         if self.attn_dp_size > 1 and self.attn_dp_cpu_group is not None:
@@ -647,8 +651,10 @@ class RequestHandler:
         flush_success = True
         if want_flush:
             flush_success = self._try_clear_replica_cache()
-        for _ in range(pending_flush_outputs):
-            self.send_func.send_pyobj(FlushCacheReqOutput(success=flush_success))
+        for flush in pending_flushes:
+            self.send_func.send_pyobj(
+                FlushCacheReqOutput(success=flush_success, rid=flush.rid)
+            )
         return flush_success, ready_op, ready_internal
 
     def _complete_weight_update(self, recv_req, *, flush_success: bool) -> None:

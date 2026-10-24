@@ -11,6 +11,9 @@ from tokenspeed.runtime.distributed.process_group_manager import process_group_m
 from tokenspeed.runtime.engine.io_struct import (
     FlushCacheReqInput,
     FlushCacheReqOutput,
+    ProfileReq,
+    ProfileReqOutput,
+    ProfileReqType,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
 )
@@ -80,6 +83,34 @@ class TestRequestHandlerFlushCache:
                 handler.clear_cache_fn.assert_called_once_with()
                 output = handler.send_func.send_pyobj.call_args.args[0]
                 assert (output.success) == (success)
+
+    def test_control_outputs_name_their_requests(self):
+        # The direct frontend wire places its control calls with the call id
+        # in the rid and answers each output under it; in-process requests
+        # carry no rid and their outputs none.
+        handler = self._handler(can_clear=True, clear_result=True)
+
+        handler.process_requests(
+            [
+                FlushCacheReqInput(rid="smg-control-3"),
+                FlushCacheReqInput(),
+                ProfileReq(type=ProfileReqType.STOP_PROFILE, rid="smg-control-4"),
+            ]
+        )
+
+        outputs = [call.args[0] for call in handler.send_func.send_pyobj.call_args_list]
+        profile_outputs = [o for o in outputs if isinstance(o, ProfileReqOutput)]
+        flush_outputs = [o for o in outputs if isinstance(o, FlushCacheReqOutput)]
+        # One flush per round answers every pending request.
+        handler.clear_cache_fn.assert_called_once_with()
+        assert [(o.rid, o.success) for o in flush_outputs] == [
+            ("smg-control-3", True),
+            (None, True),
+        ]
+        [profile_output] = profile_outputs
+        assert profile_output.rid == "smg-control-4"
+        assert not profile_output.success
+        assert "not in progress" in profile_output.message
 
     def test_failed_preflight_does_not_clear(self):
         groups_seen = []
