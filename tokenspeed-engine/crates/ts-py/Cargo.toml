@@ -1,6 +1,6 @@
 [package]
 name = "ts-py"
-description = "Python bindings: the frontend of the Python Engine API over ts-client, and the L3 executor"
+description = "Python bindings: the frontend of the Python Engine API over ts-client, the L3 executor and the disaggregation bootstrap server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -20,6 +20,7 @@ pyo3-async-runtimes = { version = "0.30", features = ["tokio-runtime"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 ts-client = { path = "../ts-client" }
 ts-l3 = { path = "../ts-l3", features = ["python"] }
+ts-pd = { path = "../ts-pd" }
 ts-wire = { path = "../ts-wire" }
 
 [lints]

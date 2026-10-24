@@ -24,7 +24,10 @@
 //!
 //! Threads: one connects requests to their routes (the bootstrap server's
 //! HTTP lookups), one handles the status socket, one watches the Prefill
-//! nodes' health. The scheduling loop only registers requests and polls.
+//! nodes' health. The scheduling loop only registers requests and polls;
+//! the forward thread hands over each plan's remote prefill
+//! ([`DecodeOutbox`]). Routes and manifests are planned here, over the
+//! rank's cache transfer contract ([`crate::layout`]).
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -37,10 +40,17 @@ use std::{
 };
 
 use ts_collective::{Group, Mesh, Reduce};
-use ts_control::pd::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer};
 
 use crate::{
-    http, sleep_or_stop,
+    batch::{BatchRows, Staged},
+    control::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer},
+    http,
+    layout::{
+        contract::Contract,
+        manifest::{build_manifest, validate_manifest},
+        registration::{plan_route, PrefillRoute},
+    },
+    sleep_or_stop,
     status::{RoomTable, TransferPoll},
     wire::{self, StatusMessage},
     PeerConfig, StartError, Transport,
@@ -52,38 +62,14 @@ const SOCKET_POLL: Duration = Duration::from_millis(100);
 /// How long a bootstrap-server lookup may take.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The Prefill ranks a request of this rank reads from, planned from the
-/// bootstrap server's description of the Prefill node.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrefillRoute {
-    /// The ranks to register with and send each request's manifest to,
-    /// sorted.
-    pub target_tp_ranks: Vec<i64>,
-    /// Those of them that send no data and only join the Prefill node's
-    /// status agreement; they get an empty manifest.
-    pub dummy_tp_ranks: Vec<i64>,
-    /// The ranks whose completion a request waits for.
-    pub expected_prefill_ranks: Vec<i64>,
-    /// The Prefill node's attention DP size; a room picks its DP group.
-    pub prefill_dp_size: i64,
-}
-
-/// The layout-dependent half of a Decode rank's PD work, from the data
-/// plane (`HostDecodePeer`). Called from the peer's threads, never from the
-/// scheduling loop.
-pub trait DecodePlanner: Send + Sync {
-    /// The route given the bootstrap server's Prefill description (its
-    /// `engine_rank=-1` JSON).
-    fn plan_route(&self, prefill_info: &str) -> Result<PrefillRoute, String>;
-}
-
 /// A Decode rank's settings.
 #[derive(Debug, Clone)]
 pub struct DecodeConfig {
     /// What both roles share.
     pub peer: PeerConfig,
     /// What this rank registers with a Prefill rank: its cache arena base,
-    /// its layout's wire bytes, and its attention TP size and rank.
+    /// its cache transfer contract's wire bytes (with its landing
+    /// addresses), and its attention TP size and rank.
     pub arena_base: u64,
     /// See `arena_base`.
     pub layout: Vec<u8>,
@@ -127,6 +113,8 @@ struct State {
     /// keep state: a late report, connection or admission of a room the
     /// loop forgot must not bring it back.
     tracked: HashSet<u64>,
+    /// The tracked requests' rooms, by request.
+    rooms_by_rid: HashMap<String, u64>,
     expected: HashMap<u64, BTreeSet<i64>>,
     responses: HashMap<u64, BTreeSet<i64>>,
     pending: HashMap<u64, Landed>,
@@ -309,12 +297,13 @@ impl State {
 
 struct Shared {
     transport: Arc<Transport>,
-    planner: Arc<dyn DecodePlanner>,
     state: Mutex<State>,
     local_ip: String,
     engine_rank: i64,
     arena_base: u64,
-    layout: Vec<u8>,
+    /// The contract's wire bytes, as registered.
+    layout_wire: Vec<u8>,
+    layout: Contract,
     tp_size: i64,
     tp_rank: i64,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
@@ -338,7 +327,9 @@ impl Shared {
             tracing::error!(addr, error, "cannot fetch the prefill parallel info");
             format!("Could not fetch prefill parallel info from bootstrap_addr: {addr}")
         })?;
-        let route = Arc::new(self.planner.plan_route(&info)?);
+        let route = Arc::new(
+            plan_route(&info, &self.layout, self.tp_size, self.tp_rank).map_err(|error| error.0)?,
+        );
         self.state().routes.insert(addr.to_owned(), route.clone());
         Ok(route)
     }
@@ -400,7 +391,7 @@ impl Shared {
                             self.transport.sockets.port(),
                             &session_id,
                             self.arena_base,
-                            &self.layout,
+                            &self.layout_wire,
                             self.tp_size,
                             self.tp_rank,
                         ),
@@ -462,11 +453,19 @@ impl Shared {
     }
 }
 
-/// Where the data plane hands a Decode rank's peer its work, from the
-/// forward thread; never waits.
+/// Where the forward thread hands a Decode rank's peer its work; never
+/// waits for a transfer.
+///
+/// A plan's remote prefill is staged when the plan goes to the data plane
+/// ([`DecodeOutbox::stage_remote_prefill`]) and handed over by the data plane
+/// once the plan's page zeroing finished
+/// ([`DecodeOutbox::hand_over_remote_prefill`]): the Prefill ranks' writes
+/// are not ordered with the device's, so the pages they land in must be
+/// sanitized first.
 #[derive(Clone)]
 pub struct DecodeOutbox {
     shared: Arc<Shared>,
+    staged: Staged,
 }
 
 impl DecodeOutbox {
@@ -493,9 +492,54 @@ impl DecodeOutbox {
         Ok(())
     }
 
+    /// Stage a plan's remote prefill: the prompts whose pages it admitted.
+    pub fn stage_remote_prefill(&self, rows: BatchRows) -> Result<(), String> {
+        self.staged.stage(rows)
+    }
+
+    /// Whether a staged remote prefill still waits to be handed over.
+    pub fn remote_prefill_pending(&self) -> bool {
+        self.staged.is_pending()
+    }
+
+    /// The staged remote prefill's pages are sanitized: send each admitted
+    /// prompt's manifest to its Prefill ranks (`HostDecodePeer.execute`).
+    /// Every row is planned before any goes out.
+    pub fn hand_over_remote_prefill(&self) -> Result<(), String> {
+        let rows = self.staged.take()?;
+        if rows.num_extends != rows.request_ids.len() {
+            return Err("CachePD Decode admission does not support mixed batches".to_owned());
+        }
+        let layout = &self.shared.layout;
+        let mut pending = Vec::new();
+        for (index, rid) in rows.request_ids.iter().enumerate() {
+            let Some(room) = self.shared.state().rooms_by_rid.get(rid).copied() else {
+                continue;
+            };
+            let manifest = build_manifest(
+                &rows.tables,
+                layout,
+                index,
+                i64::from(rows.extend_prefix_lens[index]),
+                i64::from(rows.prefill_lengths[index]),
+                rows.state_prefix_cached[index],
+            )
+            .and_then(|manifest| {
+                validate_manifest(&manifest, layout, "destination")?;
+                manifest.to_wire()
+            })
+            .map_err(|error| error.0)?;
+            pending.push((rid, room, rows.request_pool_indices[index], manifest));
+        }
+        for (rid, room, request_pool_index, manifest) in pending {
+            self.receive(rid, room, request_pool_index, &manifest);
+        }
+        Ok(())
+    }
+
     /// A request's pages are admitted: send its manifest to its Prefill
     /// ranks; its KV lands at `request_pool_index`.
-    pub fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
+    fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
         let targets = {
             let mut state = self.shared.state();
             if !state.tracked.contains(&room) {
@@ -559,20 +603,18 @@ pub struct DecodePeer {
 impl DecodePeer {
     /// Start the transfer engine, register the cache, open the status
     /// socket and start the threads.
-    pub fn start(
-        config: DecodeConfig,
-        planner: Arc<dyn DecodePlanner>,
-    ) -> Result<(Self, DecodeOutbox), StartError> {
+    pub fn start(config: DecodeConfig) -> Result<(Self, DecodeOutbox), StartError> {
+        let layout = Contract::from_wire(&config.layout)?;
         let (incoming, messages) = mpsc::channel::<Vec<bytes::Bytes>>();
         let transport = Transport::start(&config.peer, incoming)?;
         let shared = Arc::new(Shared {
             transport,
-            planner,
             state: Mutex::new(State::default()),
             local_ip: config.peer.local_ip.clone(),
             engine_rank: config.peer.engine_rank,
             arena_base: config.arena_base,
-            layout: config.layout,
+            layout_wire: config.layout,
+            layout,
             tp_size: config.tp_size,
             tp_rank: config.tp_rank,
             metrics: config.peer.metrics.clone(),
@@ -627,6 +669,7 @@ impl DecodePeer {
         }
         let outbox = DecodeOutbox {
             shared: shared.clone(),
+            staged: Staged::default(),
         };
         Ok((
             Self {
@@ -658,7 +701,9 @@ impl DecodePeer {
             return;
         };
         self.order.retain(|tracked| tracked != rid);
-        self.shared.state().clear(receiver.room, &receiver.addr);
+        let mut state = self.shared.state();
+        state.clear(receiver.room, &receiver.addr);
+        state.rooms_by_rid.remove(rid);
     }
 }
 
@@ -684,6 +729,7 @@ impl TransferPeer for DecodePeer {
         {
             let mut state = self.shared.state();
             state.tracked.insert(room);
+            state.rooms_by_rid.insert(rid.to_owned(), room);
             state.rooms.update(room, TransferPoll::Bootstrapping);
         }
         if self

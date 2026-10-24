@@ -449,7 +449,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, scheduler, config, data_plane, role, transfer, exporter) =
+    let (bootstrap, scheduler, config, data_plane, role, (transfer, streams), exporter) =
         Python::attach(|py| {
             let built = (|| {
                 // Before anything imports the scheduler package.
@@ -475,12 +475,13 @@ fn serve(args: &Args) -> Result<(), HostError> {
                                 &metrics.labels.app_key,
                             ))
                         });
-                let (role, transfer) = pd::start(
+                let (role, peer) = pd::start(
                     py,
                     bootstrap.getattr("transfer_peer")?,
                     outbox.get(),
                     transfer_metrics,
                 )?;
+                let (transfer, streams) = peer.unzip();
                 let config = HostConfig::from_python(&python_config, transfer.is_some(), role)?;
                 let data_plane = bootstrap.getattr("data_plane")?.unbind();
                 Ok((
@@ -489,7 +490,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
                     config,
                     data_plane,
                     role,
-                    transfer,
+                    (transfer, streams),
                     exporter,
                 ))
             })();
@@ -561,7 +562,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
                 .map_err(|error| python_error(py, error))
         })?;
     }
-    let data_plane = PythonDataPlane::start(data_plane).map_err(HostError::DataPlane)?;
+    let data_plane = PythonDataPlane::start(data_plane, streams).map_err(HostError::DataPlane)?;
     let outputs = OutputProcessor::new(
         config.spec_num_tokens,
         config.stream_interval,

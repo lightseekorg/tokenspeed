@@ -263,8 +263,8 @@ TokenSpeed uses: the transfer engine (`transfer_engine_c.h`, the
   twice. The Rust host owns it through the C API: initialization,
   registration of the addresses the data plane allocated (KV pools, pack
   scratch), the session id, transfer submission and status polling. The data
-  plane keeps the GPU side of PD (`pd/mooncake/pack.py` packing into staging
-  buffers, landing) and hands the host addresses and descriptors. The Python
+  plane keeps the GPU side of PD (the cache contract, the device fences a
+  transfer waits on, landing) and hands the host addresses. The Python
   transfer worker threads go away with it. The page-batch write that
   TokenSpeed's Mooncake build adds to the Python binding
   (`batch_transfer_sync_write_pages`) has no C entry yet; it gets one in the
@@ -458,9 +458,12 @@ matrix and the e2e regression matrix pass on the Rust control plane.
 
 Status: every subsystem runs on the Rust control plane. PD runs on the
 `ts-pd` transfer peer, which owns the Mooncake transfer engine through its C
-API (`ts-mooncake`), with the KV bootstrap server and the cache-layout
-planning left in Python (`pd/host_peer.py`); layerwise streaming reads the
-producer's step counter directly. The memory saver's release deregisters
+API (`ts-mooncake`) and plans every route, block manifest, layerwise chunk
+and copy over the cache transfer contract the data plane builds at startup
+(`pd/host_peer.py` keeps only the settings and the device fences); the
+bootstrap server is `ts-pd`'s too, which the launcher hosts through
+`tokenspeed_engine`. Layerwise streaming reads the producer's step counter
+directly. The memory saver's release deregisters
 the prefill peer's cache regions and registers them again on resume, and
 gives the decode peer a fresh transfer session. EPD prefill admission keeps
 its device half in Python and agrees on landed embeddings each round. L3

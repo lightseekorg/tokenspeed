@@ -75,6 +75,9 @@ from tokenspeed.runtime.utils.jit_compile_check import (
 
 logger = get_colorful_logger(__name__)
 
+# The bootstrap server this rank hosts, kept for the process.
+_BOOTSTRAP_SERVERS: list = []
+
 
 def _submit_encode_requests(
     worker: EncodeWorker,
@@ -169,10 +172,11 @@ def _build_manager_args(server_args, mapping):
 def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     """Assemble the encode worker: model + Mooncake manager + bootstrap server +
     executor + scheduler + cache, driven from the real ServerArgs."""
+    from tokenspeed_engine import BootstrapServer
+
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.epd.encode_executor import DisaggEncodeExecutor
     from tokenspeed.runtime.epd.entities import EmbeddingArgs
-    from tokenspeed.runtime.epd.mooncake.conn import MooncakeEmbeddingBootstrapServer
     from tokenspeed.runtime.epd.mooncake.encode import MooncakeEmbeddingManagerEncode
     from tokenspeed.runtime.execution.distributed_initializer import (
         DistributedConfig,
@@ -235,7 +239,12 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     # look up the encode rank it pairs with (contiguous blocks of prefill ranks
     # share one encode rank; encode_tp=1 -> all prefill ranks pair encode rank 0).
     if attn_tp_rank == 0:
-        MooncakeEmbeddingBootstrapServer(server_args.disaggregation_bootstrap_port)
+        # Serves for the process's life: the encode loop never returns.
+        _BOOTSTRAP_SERVERS.append(
+            BootstrapServer(
+                server_args.disaggregation_bootstrap_port, cache_layouts=False
+            )
+        )
     manager = MooncakeEmbeddingManagerEncode(manager_args, embedding_args)
     executor = DisaggEncodeExecutor(manager, model, device=device)
 

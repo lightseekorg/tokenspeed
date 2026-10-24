@@ -26,9 +26,9 @@ use std::{ffi::CString, sync::Once};
 
 use pyo3::{prelude::*, types::PyDict};
 use ts_scheduler::{
-    CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind, RequestSpec,
-    Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind, StorageRound,
-    StorageTickView,
+    BlockTableView, CacheEvent, CacheEventKind, CacheOpKind, ForwardEvent, ForwardEventKind,
+    RequestSpec, Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind, StorageRound,
+    StorageTickView, TransferBatchView,
 };
 
 /// Start the interpreter once per test process, with the scheduler module
@@ -401,4 +401,166 @@ fn a_detached_request_cancels_its_storage_operation() {
     );
     assert_eq!(ops[0].op_id, query.op_id);
     assert!(ops[1].op_id > query.op_id);
+}
+
+/// A small scheduler of `role` whose one group transfers its suffix.
+fn pd_scheduler(role: &str) -> String {
+    NEW_SCHEDULER.replace(
+        "result = ts.Scheduler(cfg)",
+        &format!(
+            "cfg.role = ts.SchedulerConfig.Role.{role}\n\
+             cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix\n\
+             result = ts.Scheduler(cfg)"
+        ),
+    )
+}
+
+/// What the data plane reads off a plan's batch `stream`: its block tables
+/// (padded with -1, as `block_tables_arrays` views them) and transfer
+/// columns, in the shape of [`TransferBatchView`].
+fn python_transfer_view(plan: ts_scheduler::ExecutionPlan, stream: &str) -> TransferBatchView {
+    Python::attach(|py| {
+        let globals = PyDict::new(py);
+        globals
+            .set_item("plan", plan.into_python(py).unwrap())
+            .unwrap();
+        let code = format!(
+            "batch = plan.{stream}\n\
+             tables = batch.block_tables\n\
+             candidates = [list(ids) for ids in batch.spec_candidate_ids]\n\
+             offsets = [0]\n\
+             for ids in candidates:\n    offsets.append(offsets[-1] + len(ids))\n\
+             result = (list(batch.request_ids), list(batch.request_pool_indices),\n\
+                       list(batch.input_lengths), list(batch.prefill_lengths),\n\
+                       list(batch.extend_prefix_lens), [bool(c) for c in batch.state_prefix_cached],\n\
+                       list(batch.decode_input_ids), [i for ids in candidates for i in ids], offsets,\n\
+                       batch.num_extends(),\n\
+                       [(g, len(rows[0]) if rows else 0, [b for row in rows for b in row])\n\
+                        for g, rows in sorted(tables.items())])"
+        );
+        py.run(&CString::new(code).unwrap(), Some(&globals), None)
+            .unwrap();
+        #[allow(clippy::type_complexity)]
+        let (
+            request_ids,
+            request_pool_indices,
+            input_lengths,
+            prefill_lengths,
+            extend_prefix_lens,
+            state_prefix_cached,
+            decode_input_ids,
+            spec_candidate_ids,
+            spec_candidate_offsets,
+            num_extends,
+            tables,
+        ): (
+            Vec<String>,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<bool>,
+            Vec<i32>,
+            Vec<i32>,
+            Vec<usize>,
+            usize,
+            Vec<(String, usize, Vec<i32>)>,
+        ) = globals
+            .get_item("result")
+            .unwrap()
+            .unwrap()
+            .extract()
+            .unwrap();
+        TransferBatchView {
+            request_ids,
+            request_pool_indices,
+            input_lengths,
+            prefill_lengths,
+            extend_prefix_lens,
+            state_prefix_cached,
+            decode_input_ids,
+            spec_candidate_ids,
+            spec_candidate_offsets,
+            num_extends,
+            block_tables: tables
+                .into_iter()
+                .map(|(group_id, columns, blocks)| BlockTableView {
+                    group_id,
+                    columns,
+                    blocks,
+                })
+                .collect(),
+        }
+    })
+}
+
+#[test]
+fn a_remote_prefill_carries_what_the_data_plane_reads() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("D"))).unwrap());
+    scheduler.submit_requests(&[spec("r1", (1..=40).collect())]);
+    scheduler.next_execution_plan();
+    scheduler
+        .advance(&[event(ForwardEventKind::PdBootstrapped, "r1", Vec::new())])
+        .unwrap();
+    let plan = scheduler.next_execution_plan();
+    let rows = plan
+        .remote_prefill_transfer()
+        .expect("the admission's stream");
+    assert_eq!(rows.request_ids, ["r1"]);
+    assert_eq!(
+        (rows.num_extends, rows.prefill_lengths.clone()),
+        (1, vec![40])
+    );
+    let [table] = &rows.block_tables[..] else {
+        panic!("one group's table: {:?}", rows.block_tables);
+    };
+    assert_eq!(table.group_id, "full_attention");
+    // 40 tokens over 16-token blocks: three real blocks.
+    assert_eq!(table.blocks.len(), table.columns);
+    assert!(table.blocks[..3].iter().all(|&block| block > 0));
+    assert!(plan.remote_decode_transfer().is_none());
+    assert_eq!(python_transfer_view(plan, "remote_prefill"), rows);
+}
+
+#[test]
+fn a_remote_decode_carries_the_first_token_and_the_prompt_blocks() {
+    interpreter();
+    let mut scheduler =
+        Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("P"))).unwrap());
+    scheduler.submit_requests(&[spec("r1", (1..=20).collect())]);
+    scheduler.next_execution_plan();
+    scheduler
+        .advance(&[event(ForwardEventKind::PdBootstrapped, "r1", Vec::new())])
+        .unwrap();
+    let prefill = scheduler.next_execution_plan();
+    let forward = prefill.forward_transfer().expect("the prompt's batch");
+    assert_eq!(
+        (forward.num_extends, forward.input_lengths.clone()),
+        (1, vec![20])
+    );
+    assert_eq!(python_transfer_view(prefill, "forward[0]"), forward);
+    scheduler
+        .advance(&[ForwardEvent {
+            spec_candidate_ids: vec![42, 7, 8],
+            ..event(ForwardEventKind::ExtendResult, "r1", vec![42])
+        }])
+        .unwrap();
+    let plan = scheduler.next_execution_plan();
+    let rows = plan
+        .remote_decode_transfer()
+        .expect("the prompt's KV goes out");
+    assert_eq!(rows.request_ids, ["r1"]);
+    assert_eq!(rows.num_extends, 0);
+    assert_eq!(rows.decode_input_ids, [42]);
+    assert_eq!(
+        (
+            rows.spec_candidate_ids.clone(),
+            rows.spec_candidate_offsets.clone()
+        ),
+        (vec![42, 7, 8], vec![0, 3])
+    );
+    assert_eq!(rows.block_tables[0].blocks, forward.block_tables[0].blocks);
+    assert_eq!(python_transfer_view(plan, "remote_decode"), rows);
 }

@@ -38,7 +38,7 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 
 # CPU-only test (builds pools on CPU, no kernels) scheduled in runtime-1gpu
-# because it imports the full runtime; mirrors test_cache_pd_manifest.py.
+# because it imports the full runtime; mirrors test_cache_pd_contract.py.
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=20, suite="runtime-1gpu")
@@ -187,7 +187,9 @@ def test_mla_pool_advertises_pd_contract_when_enabled() -> None:
     contract, base_addr = build_arena_cache_transfer_contract(pool.arena)
     assert base_addr == pool.arena.buffer.data_ptr()
     field_ids = {
-        field.field_id for field in contract.fields_for_group("full_attention")
+        field.field_id
+        for field in contract.plan.fields
+        if field.group_id == "full_attention"
     }
     assert field_ids == {f"layer.{i}.latent_kv" for i in range(_NUM_LAYERS)}
 
@@ -201,7 +203,9 @@ def test_dsa_pool_contract_covers_latent_and_index_k() -> None:
     assert pool.arena.supports_disaggregation is True
     contract, base_addr = build_arena_cache_transfer_contract(pool.arena)
     assert base_addr == pool.arena.buffer.data_ptr()
-    fields = contract.fields_for_group("full_attention")
+    fields = [
+        field for field in contract.plan.fields if field.group_id == "full_attention"
+    ]
     field_ids = {field.field_id for field in fields}
     # DSA packs BOTH latent_kv and index_k for every layer into the one
     # history group; the legacy per-buffer path dropped/mis-strided these.

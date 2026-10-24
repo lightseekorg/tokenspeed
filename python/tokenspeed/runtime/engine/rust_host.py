@@ -38,9 +38,10 @@ interpreter runs, plus the launcher's side:
   in the host (``ts-l3``), from the ``L3Settings`` bootstrap resolves.
 
 The host covers TP, attention-DP and pipeline ranks and both PD roles (its
-own Rust transfer peer over ``pd/host_peer.py``); ``rust_host_refusals`` and
-the checks in ``bootstrap`` refuse what it does not serve instead of serving
-it partially. An EPD encode node runs ``epd/encode_loop.py`` instead.
+own Rust transfer peer, started from ``pd/host_peer.py``'s settings);
+``rust_host_refusals`` and the checks in ``bootstrap`` refuse what it does not
+serve instead of serving it partially. An EPD encode node runs
+``epd/encode_loop.py`` instead.
 """
 
 from __future__ import annotations
@@ -536,7 +537,6 @@ class HostDataPlane:
     def __init__(
         self,
         handle,
-        transfer_peer,
         profiler: Profiler,
         regions,
         report_compiles: bool,
@@ -547,8 +547,6 @@ class HostDataPlane:
         self._device = handle
         # The control plane exports the serving-time compilations.
         self._report_compiles = report_compiles
-        # The PD peer (``pd/host_peer.py``), None outside disaggregation.
-        self._transfer_peer = transfer_peer
         self._profiler = profiler
         # Tag -> MemoryRegion (``memory_occupation.memory_regions``).
         self._regions = regions
@@ -588,16 +586,16 @@ class HostDataPlane:
 
     def admit(
         self,
-        requests: list[tuple[str, bytes, list[int], int, int | None, list | None]],
+        requests: list[tuple[str, bytes, list[int], int, list | None]],
     ) -> None:
         """Register requests: ``(rid, sampling params, stop token ids, token
-        limit, PD bootstrap room, multimodal frames)`` each. The control
-        plane already resolved the parameters (``is_normalized`` is set), so
-        decoding them changes nothing. The multimodal frames are a generate
-        request on the wire carrying only the request's multimodal inputs,
-        whose features this side owns from here on."""
+        limit, multimodal frames)`` each. The control plane already resolved
+        the parameters (``is_normalized`` is set), so decoding them changes
+        nothing. The multimodal frames are a generate request on the wire
+        carrying only the request's multimodal inputs, whose features this
+        side owns from here on."""
         carriers = []
-        for rid, encoded, stop_token_ids, token_limit, room, multimodal in requests:
+        for rid, encoded, stop_token_ids, token_limit, multimodal in requests:
             carrier = (
                 zmq_wire.decode_request_frames(multimodal)[0]
                 if multimodal is not None
@@ -614,8 +612,6 @@ class HostDataPlane:
                     carrier.multimodal_inputs if carrier is not None else None
                 ),
             )
-            if room is not None:
-                self._transfer_peer.track(rid, room)
         if carriers:
             # Every attention-TP rank admits the same requests in the same
             # order, so the shared-memory reachability exchange pairs up.
@@ -837,8 +833,6 @@ class HostDataPlane:
                     logger.exception(
                         f"releasing the shared-memory features of {rid} failed"
                     )
-            if self._transfer_peer is not None:
-                self._transfer_peer.release(rid)
 
     def land(
         self,
@@ -1275,7 +1269,6 @@ class HostBootstrap:
             self.transfer_peer = device.transfer
             self.data_plane = HostDataPlane(
                 device.handle,
-                device.transfer,
                 Profiler(
                     server_args=server_args,
                     device=device.handle,
@@ -1353,7 +1346,7 @@ class HostBootstrap:
 
 def bootstrap(control_fd: int, pd_outbox) -> HostBootstrap:
     """Build this host's rank from the arguments the launcher sends on
-    ``control_fd``; with PD, its transfer peer hands the host work through
+    ``control_fd``; with PD, its transfer peer reaches the host through
     ``pd_outbox`` (see ``pd/host_peer.py``)."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()

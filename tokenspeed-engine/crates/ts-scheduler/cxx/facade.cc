@@ -275,6 +275,48 @@ ForwardBatchView batch_view(const tokenspeed::ForwardBatch& batch) {
     };
 }
 
+TransferBatchView transfer_view(const tokenspeed::ForwardBatch& batch) {
+    TransferBatchView view;
+    view.request_ids.reserve(batch.request_ids.size());
+    for (const std::string& id : batch.request_ids) {
+        view.request_ids.push_back(rust::String(id));
+    }
+    view.request_pool_indices = to_rust(batch.request_pool_indices);
+    view.input_lengths = to_rust(batch.input_lengths);
+    view.prefill_lengths = to_rust(batch.prefill_lengths);
+    view.extend_prefix_lens = to_rust(batch.extend_prefix_lens);
+    view.state_prefix_cached.reserve(batch.state_prefix_cached.size());
+    for (const bool cached : batch.state_prefix_cached) {
+        view.state_prefix_cached.push_back(cached);
+    }
+    view.decode_input_ids = to_rust(batch.decode_input_ids);
+    view.spec_candidate_offsets.push_back(0);
+    for (const std::vector<std::int32_t>& candidates : batch.spec_candidate_ids) {
+        for (const std::int32_t id : candidates) {
+            view.spec_candidate_ids.push_back(id);
+        }
+        view.spec_candidate_offsets.push_back(view.spec_candidate_ids.size());
+    }
+    view.num_extends = batch.NumExtends();
+    const std::size_t rows = batch.request_ids.size();
+    for (const auto& [group_id, blocks] : batch.block_tables_contig) {
+        view.block_tables.push_back(BlockTableView{
+            .group_id = rust::String(group_id),
+            .columns = rows == 0 ? 0 : blocks.size() / rows,
+            .blocks = to_rust(blocks),
+        });
+    }
+    return view;
+}
+
+rust::Vec<TransferBatchView> optional_transfer(const std::optional<tokenspeed::ForwardBatch>& batch) {
+    rust::Vec<TransferBatchView> out;
+    if (batch.has_value()) {
+        out.push_back(transfer_view(*batch));
+    }
+    return out;
+}
+
 rust::Vec<ForwardBatchView> optional_batch(const std::optional<tokenspeed::ForwardBatch>& batch) {
     rust::Vec<ForwardBatchView> out;
     if (batch.has_value()) {
@@ -332,6 +374,25 @@ rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& 
 
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan) {
     return optional_batch(plan.remote_prefill);
+}
+
+rust::Vec<TransferBatchView> plan_forward_transfer(const tokenspeed::ExecutionPlan& plan) {
+    rust::Vec<TransferBatchView> out;
+    for (const tokenspeed::Operation& operation : plan.Operations()) {
+        if (const auto* batch = std::get_if<tokenspeed::ForwardBatch>(&operation)) {
+            out.push_back(transfer_view(*batch));
+            break;
+        }
+    }
+    return out;
+}
+
+rust::Vec<TransferBatchView> plan_remote_decode_transfer(const tokenspeed::ExecutionPlan& plan) {
+    return optional_transfer(plan.remote_decode);
+}
+
+rust::Vec<TransferBatchView> plan_remote_prefill_transfer(const tokenspeed::ExecutionPlan& plan) {
+    return optional_transfer(plan.remote_prefill);
 }
 
 rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan) {

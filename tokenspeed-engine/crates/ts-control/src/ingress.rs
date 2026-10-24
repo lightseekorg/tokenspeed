@@ -27,11 +27,11 @@
 
 use std::collections::BTreeSet;
 
+use ts_pd::BootstrapInfo;
 use ts_scheduler::RequestSpec;
 use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
-    pd::BootstrapInfo,
     request::{LogprobRequest, RequestState, MAX_STOP_TOKEN_IDS},
     sampling,
 };

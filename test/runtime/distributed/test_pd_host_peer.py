@@ -18,21 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU-only tests for the data plane's half of PD under the Rust host.
-
-The host peers (``pd/host_peer.py``) plan what the Rust transfer peer moves.
-A transfer they plan must move exactly the bytes the Python sender moves for
-the same registration and manifests; the outbox stands in for the host, and
-the Python sender's Mooncake engine for RDMA.
-"""
+"""CPU-only tests for the data plane's half of PD under the Rust host
+(``pd/host_peer.py``, ``pd/factory.py``): the KV arena facts and settings the
+host starts its transfer peer from, and the device fences that hand it each
+plan's remote stream. The host's bootstrap server (``ts-pd``) stands in for
+the Rust side that reads the contract this side publishes."""
 
 from __future__ import annotations
 
 import json
 import os
 import sys
+import urllib.request
+from dataclasses import replace
+from types import SimpleNamespace
 
-import numpy as np
 import pytest
 
 # CPU-only tests scheduled in runtime-1gpu because they import the full runtime.
@@ -44,40 +44,26 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-from test.runtime.cache_pd_test_utils import block_manifest as make_block_manifest
 from test.runtime.cache_pd_test_utils import group as make_group  # noqa: E402
-from test.runtime.cache_pd_test_utils import layout as make_layout
-from test.runtime.cache_pd_test_utils import operation as make_operation
-from test.runtime.cache_pd_test_utils import segment as make_segment
+from test.runtime.cache_pd_test_utils import layout as make_layout  # noqa: E402
+from test.runtime.cache_pd_test_utils import segment as make_segment  # noqa: E402
+
+from tokenspeed_engine import BootstrapServer  # noqa: E402
 
 from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
-    CachePDBlockManifest,
-    build_cache_block_manifest,
+    build_cache_fields_by_producer_step,
 )
+from tokenspeed.runtime.pd.factory import KVArgs  # noqa: E402
 from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
     DecodeSettings,
     HostDecodePeer,
     HostPrefillPeer,
     PeerSettings,
-    PrefillSettings,
-)
-from tokenspeed.runtime.pd.mooncake.entities import (  # noqa: E402
-    KVArgs,
-    KVArgsRegisterInfo,
-)
-from tokenspeed.runtime.pd.mooncake.pack import (  # noqa: E402
-    PackedCopy,
-    PageFieldCopies,
-    expand_packed_copy,
-)
-from tokenspeed.runtime.pd.mooncake.prefill import (  # noqa: E402
-    cache_transfer_blocks,
-    prepare_decode_registration,
+    _prefill_settings,
 )
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 
 _SOURCE = 0x1000
-_DESTINATION = 0x9000
 
 
 def _layout():
@@ -100,20 +86,46 @@ def _layout():
     )
 
 
-def _kv_args(layout) -> KVArgs:
+def _field_ids(layout) -> tuple[str, ...]:
+    return tuple(field.field_id for field in layout.plan.fields)
+
+
+def _kv_args(rank: int, *, schedule: bool = True) -> KVArgs:
+    """A rank's KV args: its arena's landing addresses are its own."""
+    layout = _layout()
+    bound = replace(
+        layout,
+        field_addresses={
+            name: 0x1000 * (rank + 1) + position * 128
+            for position, name in enumerate(_field_ids(layout))
+        },
+    )
     return KVArgs(
-        engine_rank=0,
+        engine_rank=rank,
         kv_data_ptr=_SOURCE,
         ib_device="",
-        gpu_id=0,
-        cache_layout=layout,
-        cache_fields_by_stage=(tuple(field.field_id for field in layout.plan.fields),),
+        gpu_id=rank,
+        cache_layout=bound,
+        cache_fields_by_stage=(_field_ids(layout),),
+        cache_producer_schedule=(
+            build_cache_fields_by_producer_step(
+                layout.plan,
+                producer_fields_by_step=tuple((field,) for field in _field_ids(layout)),
+            )
+            if schedule
+            else None
+        ),
     )
 
 
-def _topology() -> PDParallelTopology:
+def _topology(tp_rank: int) -> PDParallelTopology:
     return PDParallelTopology(
-        tp_size=1, tp_rank=0, dp_size=1, dp_rank=0, world_size=1, global_rank=0
+        tp_size=2,
+        tp_rank=tp_rank,
+        dp_size=1,
+        dp_rank=0,
+        world_size=2,
+        global_rank=tp_rank,
     )
 
 
@@ -127,265 +139,207 @@ def _settings() -> PeerSettings:
     )
 
 
-def _op(*, request_id: str = "request-0"):
-    # The remote-decode (P) or remote-prefill (D) op of one prompt of 5
-    # tokens, 2 of them cached: history blocks 1-3, the prompt-end state in
-    # block 6.
-    return make_operation(
-        {
-            "history": np.asarray([[1, 2, 3]], dtype=np.int32),
-            "state": np.asarray([[0, 6, -1]], dtype=np.int32),
-        },
-        request_ids=[request_id],
-        request_pool_indices=[7],
-        extend_prefix_lens=[2],
-        prefill_lengths=[5],
-        num_extends=lambda: 1,
-        decode_input_ids=[42],
-        spec_candidate_ids=[[42, 43]],
-        state_prefix_cached=[False],
+def _server_args(bootstrap_port: int) -> SimpleNamespace:
+    # ``_prefill_settings`` reads only where the bootstrap server listens.
+    return SimpleNamespace(
+        dist_init_addr="127.0.0.1:5000",
+        disaggregation_bootstrap_port=bootstrap_port,
     )
 
 
-def _destination_manifest() -> CachePDBlockManifest:
-    return make_block_manifest(
-        ("history", (10, 11)), ("state", (12,)), prefix=2, prompt=5
+def _http(url: str, *, body: dict | None = None) -> tuple[int, str]:
+    request = urllib.request.Request(
+        url,
+        data=None if body is None else json.dumps(body).encode(),
+        method="GET" if body is None else "PUT",
+        headers={"Content-Type": "application/json"},
     )
-
-
-def _registration_frames(layout) -> list[bytes]:
-    return [
-        b"None",
-        b"127.0.0.1",
-        b"9000",
-        b"decode:7000",
-        np.asarray([_DESTINATION], dtype=np.uint64).tobytes(),
-        layout.to_wire_bytes(),
-        b"1",
-        b"0",
-    ]
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, response.read().decode()
+    except urllib.error.HTTPError as error:
+        return error.code, error.read().decode()
 
 
 class _Outbox:
     """Stands in for the Rust host: records what the peer hands it."""
 
     def __init__(self) -> None:
-        self.sent: list[tuple] = []
-        self.unplanned: list[tuple] = []
-        self.received: list[tuple] = []
+        self.calls: list[str] = []
 
-    def send(self, rid, room, bootstrap_token, spec_candidate_ids) -> None:
-        self.sent.append((rid, room, bootstrap_token, spec_candidate_ids))
+    def remote_stream_ready(self) -> None:
+        self.calls.append("remote_stream_ready")
 
-    def send_unplanned(self, rid, room) -> None:
-        self.unplanned.append((rid, room))
+    def release_registration(self) -> None:
+        self.calls.append("release_registration")
 
-    def receive(self, rid, room, request_pool_index, manifest) -> None:
-        self.received.append((rid, room, request_pool_index, manifest))
+    def restore_registration(self) -> None:
+        self.calls.append("restore_registration")
 
 
-def _prefill_peer(layout, outbox) -> HostPrefillPeer:
-    return HostPrefillPeer(
-        _kv_args(layout),
-        _topology(),
+def test_prefill_settings_publish_the_logical_layout_and_keep_the_landing_one():
+    server = BootstrapServer(0, cache_layouts=True)
+    try:
+        payloads = []
+        for rank in range(2):
+            kv_args = _kv_args(rank)
+            settings = _prefill_settings(
+                _server_args(server.port), kv_args, _topology(rank), "127.0.0.1"
+            )
+            # The host plans copies against this rank's landing addresses;
+            # every rank registers the same logical layout without them.
+            assert settings.layout == kv_args.cache_layout.to_wire_bytes()
+            assert json.loads(settings.wire_layout)["field_addresses"] is None
+            assert settings.fields_by_stage == (_field_ids(_layout()),)
+            assert settings.fields_by_step == (("layer.0.kv",), ("layer.1.state",))
+            # Stage-major: the rank Decode counts this one's completion as.
+            assert (settings.tp_rank, settings.pp_rank, settings.status_rank) == (
+                rank,
+                0,
+                rank,
+            )
+            payload = json.loads(settings.bootstrap_payload)
+            assert payload["cache_layout"] == settings.wire_layout.decode("ascii")
+            payloads.append(payload)
+            assert settings.bootstrap_url == f"http://127.0.0.1:{server.port}/route"
+            # The host's bootstrap server parses the contract and accepts the
+            # rank's registration once the host added its control port.
+            status, _ = _http(
+                settings.bootstrap_url, body={**payload, "rank_port": 7000 + rank}
+            )
+            assert status == 200
+        assert payloads[0]["cache_layout"] == payloads[1]["cache_layout"]
+        status, info = _http(
+            f"http://127.0.0.1:{server.port}/route?engine_rank=-1&target_dp_group=-1"
+        )
+        assert status == 200
+        info = json.loads(info)
+        assert (info["prefill_tp_size"], info["prefill_dp_size"]) == (2, 1)
+        assert info["cache_layout"] == payloads[0]["cache_layout"]
+        assert info["cache_fields_by_stage"] == [list(_field_ids(_layout()))]
+        status, rank = _http(
+            f"http://127.0.0.1:{server.port}/route?engine_rank=1&target_dp_group=0"
+        )
+        assert (status, json.loads(rank)) == (
+            200,
+            {"rank_ip": "127.0.0.1", "rank_port": 7001},
+        )
+    finally:
+        server.close()
+
+
+def test_a_peer_hands_its_streams_and_sleeps_to_the_host():
+    kv_args = _kv_args(0)
+    outbox = _Outbox()
+    prefill = HostPrefillPeer(
         outbox,
         _settings(),
-        PrefillSettings(
-            status_rank=0,
-            bootstrap_url="http://127.0.0.1:8998/route",
-            bootstrap_payload="{}",
-            bootstrap_timeout_s=120.0,
-            failed_session_ttl_s=30.0,
-            transfer_workers=4,
-        ),
+        _prefill_settings(_server_args(8998), kv_args, _topology(0), "127.0.0.1"),
     )
-
-
-def _spans(items) -> list[tuple[int, int, int]]:
-    """Every (source, destination, length) span a host plan writes, in order,
-    as the host expands it."""
-    spans = []
-    for kind, a, b, c in items:
-        if kind == "pages":
-            src_pages = np.frombuffer(a, dtype="<i8")
-            dst_pages = np.frombuffer(b, dtype="<i8")
-            fields = np.frombuffer(c, dtype="<i8").reshape(-1, 5)
-            for src_base, src_stride, dst_base, dst_stride, length in fields:
-                for page, peer in zip(src_pages, dst_pages, strict=True):
-                    spans.append(
-                        (
-                            int(src_base + page * src_stride),
-                            int(dst_base + peer * dst_stride),
-                            int(length),
-                        )
-                    )
-        else:
-            assert kind == "spans"
-            spans.extend(
-                zip(
-                    np.frombuffer(a, dtype="<u8").tolist(),
-                    np.frombuffer(b, dtype="<u8").tolist(),
-                    np.frombuffer(c, dtype="<u8").tolist(),
-                    strict=True,
-                )
-            )
-    return spans
-
-
-def _planner_spans(layout, frames, source_manifest, destination_manifest):
-    """The copies the transfer planner (``cache_transfer_blocks``) gives for
-    the same transfer, expanded to spans."""
-    kv_args = _kv_args(layout)
-    registration = prepare_decode_registration(
-        kv_args, _topology(), KVArgsRegisterInfo.from_zmq(frames)
-    )
-    (items,) = cache_transfer_blocks(
-        kv_args,
-        dst_ptr=registration.dst_kv_ptr,
-        dst_tp_rank=registration.decode_tp_rank,
-        src_block_manifest=source_manifest,
-        dst_block_manifest=destination_manifest,
-        transfer_fragments=registration.transfer_fragments,
-        owner_filters=registration.transfer_owner_filters,
-        dst_cache_layout=registration.peer_cache_layout,
-        step_field_ids=(None,),
-    )
-    spans = []
-    for item in items:
-        if isinstance(item, PageFieldCopies):
-            for (
-                src_base,
-                src_stride,
-                dst_base,
-                dst_stride,
-                length,
-            ) in item.fields.tolist():
-                for page, peer in zip(
-                    item.src_pages.tolist(), item.dst_pages.tolist(), strict=True
-                ):
-                    spans.append(
-                        (
-                            src_base + page * src_stride,
-                            dst_base + peer * dst_stride,
-                            length,
-                        )
-                    )
-        elif isinstance(item, PackedCopy):
-            spans.extend(expand_packed_copy(item))
-        else:
-            spans.append(tuple(item))
-    return spans
-
-
-def test_a_planned_send_hands_the_host_the_planners_copies():
-    layout = _layout()
-    outbox = _Outbox()
-    peer = _prefill_peer(layout, outbox)
-    frames = _registration_frames(layout)
-
-    assert peer.prepare_registration(frames) == (
-        "127.0.0.1",
-        9000,
-        "decode:7000",
-        1,
-        0,
-        False,
-        [0],
-    )
-    preallocation = [b"9", b"decode:7000", _destination_manifest().to_wire_bytes()]
-    assert peer.accept_preallocation(preallocation) is False
-    with pytest.raises(ValueError, match="duplicate"):
-        peer.accept_preallocation(preallocation)
-
-    # The remote decode hands the request over with its bootstrap payload.
-    peer.track("request-0", 9)
-    peer.execute(_op())
-    assert outbox.sent == [("request-0", 9, 42, [42, 43])]
-
-    planned = _spans(peer.plan_send(9, "decode:7000"))
-    source_manifest = build_cache_block_manifest(
-        _op(),
-        layout=layout,
-        request_row=0,
-        prefix_len=2,
-        prompt_len=5,
-        state_prefix_cached=False,
-    )
-    expected = _planner_spans(layout, frames, source_manifest, _destination_manifest())
-    assert planned and planned == expected
-    # Every span reads this rank's arena and lands in the peer's.
-    assert all(
-        source >= _SOURCE and target >= _DESTINATION for source, target, _ in planned
-    )
-
-    # An ended request takes its room's manifests with it.
-    peer.release("request-0")
-    with pytest.raises(KeyError):
-        peer.plan_send(9, "decode:7000")
-
-
-def test_a_remote_decode_without_destinations_is_handed_over_unplanned():
-    outbox = _Outbox()
-    peer = _prefill_peer(_layout(), outbox)
-    peer.track("request-0", 9)
-    # Untracked requests are not this peer's to hand over.
-    peer.execute(_op(request_id="other"))
-    peer.execute(_op())
-    assert outbox.unplanned == [("request-0", 9)]
-    assert outbox.sent == []
-
-
-def test_a_conflicting_registration_is_refused():
-    layout = _layout()
-    peer = _prefill_peer(layout, _Outbox())
-    frames = _registration_frames(layout)
-    peer.prepare_registration(frames)
-    moved = list(frames)
-    moved[4] = np.asarray([_DESTINATION + 0x100], dtype=np.uint64).tobytes()
-    with pytest.raises(ValueError, match="conflicting"):
-        peer.prepare_registration(moved)
-    # Once the host rejected the session, a new registration is planned.
-    peer.reject_registration("decode:7000")
-    assert peer.prepare_registration(moved)[2] == "decode:7000"
-
-
-def test_a_decode_peer_routes_and_publishes_each_admitted_manifest():
-    layout = _layout()
-    outbox = _Outbox()
-    peer = HostDecodePeer(
-        _kv_args(layout),
-        _topology(),
+    assert prefill.mode == "prefill"
+    # The device fence passed: the host reads the stream off the plan it
+    # staged.
+    prefill.execute(object())
+    prefill.release_cache_registration()
+    prefill.restore_cache_registration()
+    decode = HostDecodePeer(
         outbox,
         _settings(),
         DecodeSettings(
             arena_base=_SOURCE,
-            layout=layout.to_wire_bytes(),
-            tp_size=1,
+            layout=kv_args.cache_layout.to_wire_bytes(),
+            tp_size=2,
             tp_rank=0,
             waiting_timeout_s=300.0,
             heartbeat_interval_s=5.0,
             heartbeat_max_failures=2,
         ),
     )
-    prefill_info = json.dumps(
-        {
-            "prefill_tp_size": 1,
-            "prefill_dp_size": 1,
-            "prefill_pp_size": 1,
-            "cache_layout": _kv_args(layout)
-            .wire_layout.to_wire_bytes()
-            .decode("ascii"),
-            "cache_fields_by_stage": [list(_kv_args(layout).cache_fields_by_stage[0])],
-        }
-    )
-    assert peer.plan_route(prefill_info) == ([0], [], [0], 1)
-    with pytest.raises(RuntimeError, match="non-cache-transfer"):
-        peer.plan_route(json.dumps({"prefill_tp_size": 1, "prefill_dp_size": 1}))
+    assert decode.mode == "decode"
+    decode.execute(object())
+    assert outbox.calls == [
+        "remote_stream_ready",
+        "release_registration",
+        "restore_registration",
+        "remote_stream_ready",
+    ]
 
-    peer.track("request-0", 9)
-    peer.execute(_op())
-    ((rid, room, slot, manifest),) = outbox.received
-    assert (rid, room, slot) == ("request-0", 9, 7)
-    manifest = CachePDBlockManifest.from_wire_bytes(manifest)
-    assert [group.block_ids for group in manifest.groups] == [(2, 3), (6,)]
-    assert (manifest.prefix_len, manifest.prompt_len) == (2, 5)
+
+def test_layerwise_streaming_registers_its_step_counter():
+    settings = _prefill_settings(
+        _server_args(8998), _kv_args(0), _topology(0), "127.0.0.1"
+    )
+    peer = HostPrefillPeer(_Outbox(), _settings(), settings)
+    assert (peer.layerwise_step_address, peer.layerwise_interval) == (None, 0)
+    counter = SimpleNamespace(
+        h_ready_cache_step=SimpleNamespace(data_ptr=lambda: 0xBEEF)
+    )
+    peer.register_layerwise_step_counter(counter, 0)
+    assert (peer.layerwise_step_address, peer.layerwise_interval) == (0xBEEF, 1)
+
+    unscheduled = _prefill_settings(
+        _server_args(8998), _kv_args(0, schedule=False), _topology(0), "127.0.0.1"
+    )
+    peer = HostPrefillPeer(_Outbox(), _settings(), unscheduled)
+    with pytest.raises(ValueError, match="producer schedule"):
+        peer.register_layerwise_step_counter(counter, 2)
+
+
+def test_cache_factory_exposes_only_typed_arena() -> None:
+    import torch
+
+    from tokenspeed.runtime.pd.factory import get_kv_args
+
+    layout = _layout()
+    buffer = torch.zeros(layout.plan.arena_bytes, dtype=torch.uint8)
+    pool = SimpleNamespace(
+        arena=SimpleNamespace(
+            supports_disaggregation=True,
+            plan=layout.plan,
+            cache_group_specs=layout.group_specs,
+            contract_binding=lambda: buffer,
+            field_address=lambda name: (
+                buffer.data_ptr() + layout.plan.field_page_byte_offset(name, 0)
+            ),
+            registration_regions=lambda: ((buffer.data_ptr(), buffer.nbytes),),
+        ),
+    )
+
+    kv_args = get_kv_args(
+        0,
+        0,
+        "mlx5_0",
+        pool,
+        draft_model_config=None,
+        cache_fields_by_stage=(_field_ids(layout),),
+        producer_fields_by_step=tuple((field,) for field in _field_ids(layout)),
+        logical_plan=None,
+        model_config=SimpleNamespace(
+            num_attention_layers=2,
+            num_key_value_heads=1,
+            hf_config=SimpleNamespace(),
+            hf_text_config=SimpleNamespace(),
+        ),
+    )
+
+    assert kv_args.engine_rank == 0
+    assert kv_args.kv_data_ptr == buffer.data_ptr()
+    assert kv_args.ib_device == "mlx5_0"
+    assert kv_args.gpu_id == 0
+    assert kv_args.cache_layout.plan == layout.plan
+    assert kv_args.cache_layout.group_specs == layout.group_specs
+    assert kv_args.cache_layout.transfer_schema == layout.transfer_schema
+    assert kv_args.cache_layout.field_addresses == {
+        field.field_id: buffer.data_ptr()
+        + layout.plan.field_page_byte_offset(field.field_id, 0)
+        for field in layout.plan.fields
+    }
+    assert kv_args.wire_layout.field_addresses is None
+    assert kv_args.cache_producer_schedule.fields_by_step == (
+        ("layer.0.kv",),
+        ("layer.1.state",),
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

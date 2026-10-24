@@ -50,9 +50,6 @@ class _PrefillPeer:
     def execute(self, op) -> None:
         self._trace.append(("send-kv", op))
 
-    def prepare_prefill(self, op) -> None:
-        self._trace.append("prepare")
-
 
 class _DecodePeer:
     """A D-role transfer peer; see _PrefillPeer."""
@@ -214,11 +211,10 @@ def test_prefill_node_captures_next_input_ids_for_the_bootstrap_payload():
     pending = _execute(_handle(trace, peer), _plan(), _planned(num_extends=1))
 
     assert pending is not None
-    # The layerwise arming goes BEFORE the forward it arms, without waiting:
-    # the per-round path never blocks. It is a task: a pending draft round
-    # finishes first.
-    assert trace[:2] == ["settle", "prepare"]
-    assert trace[2][2]["capture_next_input_ids"] is True
+    # A pending draft round finishes before the prefill chunk; the host
+    # armed the chunk's layerwise streaming when it handed the plan over.
+    assert trace[0] == "settle"
+    assert trace[1][2]["capture_next_input_ids"] is True
 
 
 def test_a_failed_transfer_submission_fails_the_plan():

@@ -72,36 +72,20 @@ class TransferBackend(Enum):
     MOONCAKE = "mooncake"
 
 
-def bootstrap_server_class(transfer_backend: TransferBackend):
-    """The KV bootstrap server a prefill deployment runs for ``transfer_backend``:
-    decode ranks look up the prefill ranks holding a request's KV through it."""
-    if TransferBackend(transfer_backend) == TransferBackend.MOONCAKE:
-        from tokenspeed.runtime.pd.mooncake.conn import MooncakeKVBootstrapServer
-
-        return MooncakeKVBootstrapServer
-    raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
-
-
 class StepCounter:
+    """The device half of layerwise PD streaming's producer-step counter.
+
+    The attention backends tick it as each producer step's KV lands; the
+    pinned host copy is what the host's transfer workers poll. The host
+    counts the steps it armed itself (``ts-pd``'s ``PrefillOutbox``), modulo
+    ``COUNT_NUM_MAX``.
+    """
+
     COUNT_NUM_MAX: int = 2**62
 
     def __init__(self, device: str, gpu_id: int):
-        # utilities for cache step
         self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
         self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
-        self.cache_step: int = 0
-
-        # utilities for aux step
-        self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
-        self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
-        self.aux_step: int = 0
-
-    def current_step(self) -> tuple[int, int]:
-        return self.cache_step, self.aux_step
-
-    def advance_step(self, delta_cache_step: int, delta_aux_step: int):
-        self.cache_step = (self.cache_step + delta_cache_step) % self.COUNT_NUM_MAX
-        self.aux_step = (self.aux_step + delta_aux_step) % self.COUNT_NUM_MAX
 
     def record_cache(self):
         self.d_ready_cache_step = (self.d_ready_cache_step + 1) % self.COUNT_NUM_MAX

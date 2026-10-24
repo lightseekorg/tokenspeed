@@ -19,171 +19,154 @@
 // SOFTWARE.
 
 //! A Prefill peer and a Decode peer in one process run the whole handshake
-//! against a stand-in bootstrap server, and the KV crosses over RDMA.
+//! through the bootstrap server, and the KV crosses over RDMA.
 //!
 //! Needs an RDMA device and `TS_MOONCAKE_LIBRARY` naming
 //! `libtokenspeed_transfer_engine.so`; without the variable the tests return
-//! at once. The planners stand in for the data plane: one region per side,
-//! one span per transfer.
+//! at once. Each side's arena is one 4 KiB buffer holding a one-group cache
+//! of two fields in two planes; the tests stand in for the forward thread,
+//! staging the plans' remote streams and handing them over.
 
 use std::{
-    collections::HashMap,
-    io::{BufRead, BufReader, Read, Write},
-    net::TcpListener,
+    collections::BTreeMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
 
 use bytes::Bytes;
+use serde_json::{json, Value};
 use ts_collective::{Group, Listener, Mesh};
-use ts_control::pd::{BootstrapInfo, PdEvent, RemotePrefill, TransferPeer};
 use ts_pd::{
-    Copy, DecodeConfig, DecodePeer, DecodePlanner, PeerConfig, PrefillConfig, PrefillPeer,
-    PrefillPlanner, PrefillRoute, Registration,
+    layout::{contract::Contract, manifest::BlockTable},
+    BatchRows, BootstrapInfo, BootstrapServer, DecodeConfig, DecodePeer, Layerwise, PdEvent,
+    PeerConfig, PrefillConfig, PrefillLayout, PrefillPeer, Registry, RemotePrefill, StatusMessage,
+    TransferPeer, TransferPoll,
 };
 
 const BYTES: usize = 4096;
+
+/// Where each plane's pages 1-3 sit in an arena: page 0 is the null page,
+/// which no transfer touches.
+const PAGES: [std::ops::Range<usize>; 2] = [512..2048, 2560..4096];
 
 fn library() -> Option<PathBuf> {
     std::env::var_os("TS_MOONCAKE_LIBRARY").map(PathBuf::from)
 }
 
-/// A bootstrap server: Prefill ranks register, Decode ranks look them up.
-fn bootstrap_server() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let ranks: Arc<Mutex<Option<serde_json::Value>>> = Arc::default();
-    thread::spawn(move || {
-        for stream in listener.incoming() {
-            let mut stream = stream.unwrap();
-            let mut reader = BufReader::new(stream.try_clone().unwrap());
-            let mut request_line = String::new();
-            reader.read_line(&mut request_line).unwrap();
-            let mut length = 0;
-            loop {
-                let mut header = String::new();
-                reader.read_line(&mut header).unwrap();
-                if header == "\r\n" || header.is_empty() {
-                    break;
-                }
-                if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:") {
-                    length = value.trim().parse().unwrap();
-                }
-            }
-            let mut body = vec![0; length];
-            reader.read_exact(&mut body).unwrap();
-            let target = request_line.split_whitespace().nth(1).unwrap_or_default();
-            let reply = if request_line.starts_with("PUT /route") {
-                *ranks.lock().unwrap() = Some(serde_json::from_slice(&body).unwrap());
-                "OK".to_owned()
-            } else if target.starts_with("/route?engine_rank=-1") {
-                r#"{"prefill_tp_size":1,"prefill_dp_size":1,"prefill_pp_size":1}"#.to_owned()
-            } else if target.starts_with("/route?") {
-                let registered = ranks.lock().unwrap().clone().unwrap();
-                serde_json::json!({
-                    "rank_ip": registered["rank_ip"],
-                    "rank_port": registered["rank_port"],
-                })
-                .to_string()
-            } else {
-                "OK".to_owned()
-            };
-            let _ = write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-                 Connection: close\r\n\r\n{reply}",
-                reply.len()
-            );
-        }
+/// The test cache's contract: one 16-token-block group of three pages and
+/// the null page, a 512-byte field per plane; with the fields' landing
+/// addresses for an arena at `base`.
+fn layout(base: Option<u64>) -> String {
+    let addresses = base.map_or(
+        Value::Null,
+        |base| json!({"layer.0.kv": base, "layer.1.kv": base + 2048}),
+    );
+    json!({
+        "plan": {
+            "prefix_granularity": 16,
+            "lcm_block_bytes": 1024,
+            "num_lcm_blocks": 3,
+            "groups": [{"group_id": "history", "cache_blocks_per_lcm_block": 1, "page_count": 4}],
+            "planes": [
+                {"plane_id": "p0", "bytes_per_lcm_block": 512, "arena_offset_bytes": 0},
+                {"plane_id": "p1", "bytes_per_lcm_block": 512, "arena_offset_bytes": 2048}
+            ],
+            "fields": [
+                {"group_id": "history", "field_id": "layer.0.kv", "plane_id": "p0",
+                 "shape": [256], "dtype": "bfloat16", "field_offset_bytes": 0,
+                 "page_stride_bytes": 512},
+                {"group_id": "history", "field_id": "layer.1.kv", "plane_id": "p1",
+                 "shape": [256], "dtype": "bfloat16", "field_offset_bytes": 0,
+                 "page_stride_bytes": 512}
+            ],
+            "resident_block_bytes": null
+        },
+        "group_specs": [{"group_id": "history", "attn_kind": "full_history", "rows_per_page": 16,
+                         "entry_stride_tokens": 1, "sliding_window_tokens": null,
+                         "replayable": false, "transfer_policy": "full_suffix", "shard_count": 1}],
+        "transfer_schema": {"fields": []},
+        "field_addresses": addresses
+    })
+    .to_string()
+}
+
+const FIELDS: [&str; 2] = ["layer.0.kv", "layer.1.kv"];
+
+/// The prompt every test request carries: three blocks.
+const PROMPT: i32 = 48;
+
+fn tables() -> ts_pd::layout::manifest::BlockTables {
+    BTreeMap::from([(
+        "history".to_owned(),
+        BlockTable::from_rows(&[vec![1, 2, 3]], 3),
+    )])
+}
+
+/// A Decode plan's remote prefill: `rid`'s three pages admitted at slot 3.
+fn admission(rid: &str) -> BatchRows {
+    BatchRows {
+        request_ids: vec![rid.to_owned()],
+        request_pool_indices: vec![3],
+        input_lengths: vec![PROMPT],
+        prefill_lengths: vec![PROMPT],
+        extend_prefix_lens: vec![0],
+        state_prefix_cached: vec![false],
+        num_extends: 1,
+        tables: tables(),
+        ..BatchRows::default()
+    }
+}
+
+/// A Prefill plan's remote decode: `rid`'s prompt done, `token` its first
+/// output.
+fn remote_decode(rid: &str, token: i32, candidates: Vec<i32>) -> BatchRows {
+    BatchRows {
+        request_ids: vec![rid.to_owned()],
+        request_pool_indices: vec![0],
+        input_lengths: vec![1],
+        prefill_lengths: vec![PROMPT],
+        decode_input_ids: vec![token],
+        spec_candidate_ids: vec![candidates],
+        tables: tables(),
+        ..BatchRows::default()
+    }
+}
+
+/// A Prefill plan's forward: `rid`'s whole prompt in one chunk.
+fn prompt_forward(rid: &str) -> BatchRows {
+    BatchRows {
+        request_ids: vec![rid.to_owned()],
+        request_pool_indices: vec![0],
+        input_lengths: vec![PROMPT],
+        prefill_lengths: vec![PROMPT],
+        extend_prefix_lens: vec![0],
+        state_prefix_cached: vec![false],
+        num_extends: 1,
+        tables: tables(),
+        ..BatchRows::default()
+    }
+}
+
+/// Push `frames` to a peer's control socket, as a foreign peer would.
+fn push(port: u16, frames: Vec<Bytes>) {
+    use zeromq::{Socket, SocketSend};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let mut socket = zeromq::PushSocket::new();
+        socket
+            .connect(&format!("tcp://127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        socket
+            .send(zeromq::ZmqMessage::try_from(frames).unwrap())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
     });
-    port
-}
-
-/// One span per transfer: the whole source region to the session's region.
-struct Planner {
-    source: u64,
-    destinations: Mutex<HashMap<String, u64>>,
-    refuse_preallocation: bool,
-}
-
-impl PrefillPlanner for Planner {
-    fn prepare_registration(&self, frames: &[Bytes]) -> Result<Registration, String> {
-        let session_id = String::from_utf8(frames[3].to_vec()).unwrap();
-        let base = u64::from_ne_bytes(frames[4].as_ref().try_into().unwrap());
-        self.destinations
-            .lock()
-            .unwrap()
-            .insert(session_id.clone(), base);
-        Ok(Registration {
-            endpoint: String::from_utf8(frames[1].to_vec()).unwrap(),
-            port: std::str::from_utf8(&frames[2]).unwrap().parse().unwrap(),
-            session_id,
-            decode_tp_size: 1,
-            decode_tp_rank: 0,
-            is_dummy: false,
-            expected_decode_ranks: vec![0],
-        })
-    }
-
-    fn reject_registration(&self, _session_id: &str) {}
-
-    fn accept_preallocation(&self, frames: &[Bytes]) -> Result<bool, String> {
-        if self.refuse_preallocation {
-            return Err("the manifest disagrees with the registration".to_owned());
-        }
-        Ok(frames[2].is_empty())
-    }
-
-    fn plan_send(&self, _room: u64, session_id: &str) -> Result<Vec<Copy>, String> {
-        let destination = self.destinations.lock().unwrap()[session_id];
-        Ok(vec![Copy::Spans {
-            sources: vec![self.source],
-            destinations: vec![destination],
-            lengths: vec![BYTES as u64],
-        }])
-    }
-
-    /// Two intervals, each the source's half.
-    fn plan_layerwise(
-        &self,
-        _chunk_id: u64,
-        sessions: &[String],
-    ) -> Result<Vec<Vec<Vec<Copy>>>, String> {
-        let half = (BYTES / 2) as u64;
-        Ok(sessions
-            .iter()
-            .map(|session| {
-                let destination = self.destinations.lock().unwrap()[session];
-                (0..2)
-                    .map(|interval| {
-                        vec![Copy::Spans {
-                            sources: vec![self.source + interval * half],
-                            destinations: vec![destination + interval * half],
-                            lengths: vec![half],
-                        }]
-                    })
-                    .collect()
-            })
-            .collect())
-    }
-
-    fn drop_room(&self, _room: u64) {}
-}
-
-struct Route;
-
-impl DecodePlanner for Route {
-    fn plan_route(&self, prefill_info: &str) -> Result<PrefillRoute, String> {
-        assert!(prefill_info.contains("prefill_tp_size"));
-        Ok(PrefillRoute {
-            target_tp_ranks: vec![0],
-            dummy_tp_ranks: vec![],
-            expected_prefill_ranks: vec![0],
-            prefill_dp_size: 1,
-        })
-    }
 }
 
 fn single_rank() -> (Mesh, Group) {
@@ -210,73 +193,68 @@ struct Pair {
     decode: DecodePeer,
     decode_outbox: ts_pd::DecodeOutbox,
     bootstrap: BootstrapInfo,
+    _server: BootstrapServer,
 }
 
-fn pair(
-    library: PathBuf,
-    source: &[u8],
-    destination: &[u8],
-    refuse_preallocation: bool,
-    bootstrap_timeout: Duration,
-) -> Pair {
-    pair_with(
-        library,
-        source,
-        destination,
-        refuse_preallocation,
-        bootstrap_timeout,
-        None,
-    )
+fn pair(library: PathBuf, source: &[u8], destination: &[u8], bootstrap_timeout: Duration) -> Pair {
+    pair_with(library, source, destination, bootstrap_timeout, None)
 }
 
 fn pair_with(
     library: PathBuf,
     source: &[u8],
     destination: &[u8],
-    refuse_preallocation: bool,
     bootstrap_timeout: Duration,
-    layerwise_step_address: Option<usize>,
+    step_address: Option<usize>,
 ) -> Pair {
-    let port = bootstrap_server();
-    let planner = Arc::new(Planner {
-        source: source.as_ptr() as u64,
-        destinations: Mutex::default(),
-        refuse_preallocation,
-    });
-    let (prefill, prefill_outbox) = PrefillPeer::start(
-        PrefillConfig {
-            peer: peer_config(library.clone(), source),
-            status_rank: 0,
-            bootstrap_url: format!("http://127.0.0.1:{port}/route"),
-            bootstrap_payload: serde_json::json!({
-                "role": "Prefill",
-                "world_size": 1,
-                "dp_size": 1,
-                "pp_size": 1,
-                "rank_ip": "127.0.0.1",
-                "engine_rank": 0,
-            }),
-            bootstrap_timeout,
-            failed_session_ttl: Duration::from_secs(30),
-            transfer_workers: 2,
-            layerwise_step_address,
-        },
-        planner,
-    )
-    .unwrap();
-    let (decode, decode_outbox) = DecodePeer::start(
-        DecodeConfig {
-            peer: peer_config(library, destination),
-            arena_base: destination.as_ptr() as u64,
-            layout: b"layout".to_vec(),
+    let server = BootstrapServer::start(0, Registry::CacheLayouts).unwrap();
+    let port = server.port();
+    let source_base = source.as_ptr() as u64;
+    let parse = |wire: String| Contract::from_wire(wire.as_bytes()).unwrap();
+    let (prefill, prefill_outbox) = PrefillPeer::start(PrefillConfig {
+        peer: peer_config(library.clone(), source),
+        layout: PrefillLayout {
+            local: parse(layout(Some(source_base))),
+            wire: parse(layout(None)),
+            arena_base: source_base,
             tp_size: 1,
             tp_rank: 0,
-            waiting_timeout: Duration::from_secs(60),
-            heartbeat_interval: Duration::from_secs(2),
-            heartbeat_max_failures: 2,
+            pp_rank: 0,
+            fields_by_stage: vec![FIELDS.map(str::to_owned).to_vec()],
         },
-        Arc::new(Route),
-    )
+        status_rank: 0,
+        bootstrap_url: format!("http://127.0.0.1:{port}/route"),
+        bootstrap_payload: json!({
+            "role": "Prefill",
+            "world_size": 1,
+            "dp_size": 1,
+            "pp_size": 1,
+            "rank_ip": "127.0.0.1",
+            "engine_rank": 0,
+            "cache_layout": layout(None),
+            "cache_fields_by_stage": [FIELDS],
+        }),
+        bootstrap_timeout,
+        failed_session_ttl: Duration::from_secs(30),
+        transfer_workers: 2,
+        layerwise: step_address.map(|step_address| Layerwise {
+            step_address,
+            fields_by_step: FIELDS.map(|field| vec![field.to_owned()]).to_vec(),
+            interval: 1,
+        }),
+    })
+    .unwrap();
+    let destination_base = destination.as_ptr() as u64;
+    let (decode, decode_outbox) = DecodePeer::start(DecodeConfig {
+        peer: peer_config(library, destination),
+        arena_base: destination_base,
+        layout: layout(Some(destination_base)).into_bytes(),
+        tp_size: 1,
+        tp_rank: 0,
+        waiting_timeout: Duration::from_secs(60),
+        heartbeat_interval: Duration::from_secs(2),
+        heartbeat_max_failures: 2,
+    })
     .unwrap();
     Pair {
         prefill,
@@ -288,7 +266,37 @@ fn pair_with(
             port,
             room: 4242,
         },
+        _server: server,
     }
+}
+
+impl Pair {
+    /// The forward thread hands over a Decode plan admitting `rid`.
+    fn admit(&self, rid: &str) {
+        self.decode_outbox
+            .stage_remote_prefill(admission(rid))
+            .unwrap();
+        self.decode_outbox.hand_over_remote_prefill().unwrap();
+    }
+
+    /// The forward thread hands over a Prefill plan's remote decode of
+    /// `rid`.
+    fn send(&self, rid: &str, token: i32, candidates: Vec<i32>) -> Result<(), String> {
+        self.prefill_outbox
+            .stage_remote_decode(remote_decode(rid, token, candidates))
+            .unwrap();
+        self.prefill_outbox.hand_over_remote_decode()
+    }
+}
+
+/// The transferred pages of `destination` hold `source`'s bytes; the null
+/// pages are untouched.
+fn landed(destination: &[u8], source: &[u8]) -> bool {
+    PAGES
+        .iter()
+        .all(|pages| destination[pages.clone()] == source[pages.clone()])
+        && destination[..512].iter().all(|&byte| byte == 0)
+        && destination[2048..2560].iter().all(|&byte| byte == 0)
 }
 
 /// Poll until `peer` reports an event.
@@ -305,21 +313,20 @@ fn next_event(peer: &mut dyn TransferPeer, mesh: &mut Mesh, group: &Group) -> Pd
     }
 }
 
+/// An arena's bytes: a pattern, page by page.
+fn pattern() -> Vec<u8> {
+    (0..BYTES).map(|i| (i % 251) as u8 + 1).collect()
+}
+
 #[test]
 fn a_request_bootstraps_transfers_and_lands() {
     let Some(library) = library() else {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source: Vec<u8> = (0..BYTES).map(|i| (i % 251) as u8).collect();
+    let source = pattern();
     let destination = vec![0u8; BYTES];
-    let mut pair = pair(
-        library,
-        &source,
-        &destination,
-        false,
-        Duration::from_secs(60),
-    );
+    let mut pair = pair(library, &source, &destination, Duration::from_secs(60));
     let (mut mesh, group) = single_rank();
     let rid = "req-0";
 
@@ -332,15 +339,14 @@ fn a_request_bootstraps_transfers_and_lands() {
         PdEvent::Bootstrapped(rid.to_owned())
     );
     // The scheduler admits the pages; the manifest goes out.
-    pair.decode_outbox.receive(rid, 4242, 3, b"manifest");
+    pair.admit(rid);
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
     // The prompt's last chunk commits, then its remote decode runs.
     pair.prefill.record_usage(rid, 128, Some(-0.5));
-    pair.prefill_outbox
-        .send(rid, 4242, 777, Some(vec![1, 2, 3]));
+    pair.send(rid, 777, vec![1, 2, 3]).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Succeeded(rid.to_owned())
@@ -356,7 +362,7 @@ fn a_request_bootstraps_transfers_and_lands() {
             request_pool_index: 3,
         })
     );
-    assert_eq!(destination, source);
+    assert!(landed(&destination, &source));
     // Both sides forgot the request.
     assert!(pair.prefill.poll(&mut mesh, &group).unwrap().is_empty());
     assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
@@ -379,12 +385,12 @@ fn transfer_one(pair: &mut Pair, rid: &str, room: u64, mesh: &mut Mesh, group: &
         next_event(&mut pair.decode, mesh, group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    pair.decode_outbox.receive(rid, room, 3, b"manifest");
+    pair.admit(rid);
     assert_eq!(
         next_event(&mut pair.prefill, mesh, group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    pair.prefill_outbox.send(rid, room, 777, None);
+    pair.send(rid, 777, Vec::new()).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, mesh, group),
         PdEvent::Succeeded(rid.to_owned())
@@ -401,18 +407,12 @@ fn a_sleeping_pair_deregisters_and_wakes_to_transfer_again() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source: Vec<u8> = (0..BYTES).map(|i| (i % 251) as u8).collect();
+    let source = pattern();
     let mut destination = vec![0u8; BYTES];
-    let mut pair = pair(
-        library,
-        &source,
-        &destination,
-        false,
-        Duration::from_secs(60),
-    );
+    let mut pair = pair(library, &source, &destination, Duration::from_secs(60));
     let (mut mesh, group) = single_rank();
     transfer_one(&mut pair, "before", 4242, &mut mesh, &group);
-    assert_eq!(destination, source);
+    assert!(landed(&destination, &source));
 
     let session = pair.decode.session_id();
     pair.prefill_outbox.release_registration().unwrap();
@@ -424,7 +424,7 @@ fn a_sleeping_pair_deregisters_and_wakes_to_transfer_again() {
     assert_ne!(pair.decode.session_id(), session);
     destination.iter_mut().for_each(|byte| *byte = 0);
     transfer_one(&mut pair, "after", 4244, &mut mesh, &group);
-    assert_eq!(destination, source);
+    assert!(landed(&destination, &source));
 }
 
 #[test]
@@ -433,15 +433,15 @@ fn layerwise_chunks_follow_the_producer_steps() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source: Vec<u8> = (0..BYTES).map(|i| (i % 251) as u8).collect();
+    let source = pattern();
     let destination = vec![0u8; BYTES];
-    // The counter the device would update; the peer polls it.
-    let steps = Box::new(std::sync::atomic::AtomicI64::new(10));
+    // The counter the device would update; the peer polls it. Each field is
+    // one producer step, and one transfer interval.
+    let steps = Box::new(std::sync::atomic::AtomicI64::new(0));
     let mut pair = pair_with(
         library,
         &source,
         &destination,
-        false,
         Duration::from_secs(60),
         Some(steps.as_ptr() as usize),
     );
@@ -453,34 +453,36 @@ fn layerwise_chunks_follow_the_producer_steps() {
         next_event(&mut pair.decode, &mut mesh, &group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    pair.decode_outbox.receive(rid, 4242, 3, b"manifest");
+    pair.admit(rid);
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    // The final chunk arms with intervals complete at steps 11 and 12: the
-    // counter passes a step once that step's KV landed.
+    // The prompt's only chunk arms ahead of its forward: its intervals are
+    // complete once the counter passes steps 0 and 1.
+    assert!(pair.prefill_outbox.streams_layerwise());
     pair.prefill_outbox
-        .send_layerwise(rid, 4242, 0, vec![11, 12], true);
-    let half = BYTES / 2;
+        .arm_layerwise(&prompt_forward(rid))
+        .unwrap();
     thread::sleep(Duration::from_millis(50));
     assert!(
         destination.iter().all(|&byte| byte == 0),
         "nothing before its step"
     );
-    steps.store(12, std::sync::atomic::Ordering::Release);
+    steps.store(1, std::sync::atomic::Ordering::Release);
+    let first = PAGES[0].clone();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while std::hint::black_box(destination.as_slice())[..half] != source[..half] {
-        assert!(Instant::now() < deadline, "the first interval never landed");
+    while std::hint::black_box(destination.as_slice())[first.clone()] != source[first.clone()] {
+        assert!(Instant::now() < deadline, "the first field never landed");
         thread::sleep(Duration::from_millis(5));
     }
-    assert!(destination[half..].iter().all(|&byte| byte == 0));
-    steps.store(13, std::sync::atomic::Ordering::Release);
+    assert!(destination[PAGES[1].clone()].iter().all(|&byte| byte == 0));
+    steps.store(2, std::sync::atomic::Ordering::Release);
     // The room reports done only once its remote decode brings the payload.
     thread::sleep(Duration::from_millis(50));
     assert!(pair.prefill.poll(&mut mesh, &group).unwrap().is_empty());
     pair.prefill.record_usage(rid, 0, None);
-    pair.prefill_outbox.send(rid, 4242, 99, None);
+    pair.send(rid, 99, Vec::new()).unwrap();
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Succeeded(rid.to_owned())
@@ -489,7 +491,7 @@ fn layerwise_chunks_follow_the_producer_steps() {
         PdEvent::RemotePrefillDone(done) => assert_eq!(done.bootstrap_token, 99),
         other => panic!("expected the landing, got {other:?}"),
     }
-    assert_eq!(destination, source);
+    assert!(landed(&destination, &source));
 }
 
 #[test]
@@ -498,15 +500,9 @@ fn a_refused_preallocation_fails_both_sides() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source = vec![1u8; BYTES];
+    let source = pattern();
     let destination = vec![0u8; BYTES];
-    let mut pair = pair(
-        library,
-        &source,
-        &destination,
-        true,
-        Duration::from_secs(60),
-    );
+    let mut pair = pair(library, &source, &destination, Duration::from_secs(60));
     let (mut mesh, group) = single_rank();
     let rid = "req-1";
 
@@ -516,7 +512,17 @@ fn a_refused_preallocation_fails_both_sides() {
         next_event(&mut pair.decode, &mut mesh, &group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    pair.decode_outbox.receive(rid, 4242, 0, b"manifest");
+    // The registered Decode session pre-allocates a manifest naming a block
+    // outside its own layout.
+    let manifest = br#"{"groups":[{"group_id":"history","block_ids":[1,2,9]}],"prefix_len":0,"prompt_len":48,"state_prefix_cached":false}"#;
+    push(
+        pair.prefill.port(),
+        vec![
+            Bytes::from("4242"),
+            Bytes::from(pair.decode.session_id()),
+            Bytes::from_static(manifest),
+        ],
+    );
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Failed(rid.to_owned())
@@ -525,9 +531,9 @@ fn a_refused_preallocation_fails_both_sides() {
         next_event(&mut pair.decode, &mut mesh, &group),
         PdEvent::Failed(rid.to_owned())
     );
-    // A late send for the failed room is dropped.
-    pair.prefill_outbox.send(rid, 4242, 5, None);
-    assert!(pair.prefill_outbox.send_unplanned(rid, 4242).is_ok());
+    // A late remote decode of the failed room sends nothing.
+    pair.send(rid, 5, Vec::new()).unwrap();
+    thread::sleep(Duration::from_millis(50));
     assert!(destination.iter().all(|&byte| byte == 0));
 }
 
@@ -537,15 +543,9 @@ fn a_room_no_decode_rank_reaches_times_out() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source = vec![1u8; BYTES];
+    let source = pattern();
     let destination = vec![0u8; BYTES];
-    let mut pair = pair(
-        library,
-        &source,
-        &destination,
-        false,
-        Duration::from_millis(200),
-    );
+    let mut pair = pair(library, &source, &destination, Duration::from_millis(200));
     let (mut mesh, group) = single_rank();
 
     pair.prefill.register("lonely", &pair.bootstrap).unwrap();
@@ -553,7 +553,8 @@ fn a_room_no_decode_rank_reaches_times_out() {
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Failed("lonely".to_owned())
     );
-    // A room still bootstrapping has no destinations to send to.
+    // A room still bootstrapping has no destinations to send to: a remote
+    // decode of it breaks an invariant.
     pair.prefill
         .register(
             "pending",
@@ -563,7 +564,11 @@ fn a_room_no_decode_rank_reaches_times_out() {
             },
         )
         .unwrap();
-    assert!(pair.prefill_outbox.send_unplanned("pending", 9).is_err());
+    let error = pair.send("pending", 5, Vec::new()).unwrap_err();
+    assert!(
+        error.contains("destination metadata is unavailable"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -572,15 +577,9 @@ fn rooms_no_request_claimed_neither_hold_a_sleep_nor_linger() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source = vec![1u8; BYTES];
+    let source = pattern();
     let destination = vec![0u8; BYTES];
-    let mut pair = pair(
-        library,
-        &source,
-        &destination,
-        false,
-        Duration::from_millis(500),
-    );
+    let mut pair = pair(library, &source, &destination, Duration::from_millis(500));
     let (mut mesh, group) = single_rank();
     // The Prefill rank failed a request before it registered there (an EPD
     // embedding timeout).
@@ -593,7 +592,7 @@ fn rooms_no_request_claimed_neither_hold_a_sleep_nor_linger() {
         next_event(&mut pair.decode, &mut mesh, &group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    pair.decode_outbox.receive(rid, 4242, 3, b"manifest");
+    pair.admit(rid);
     thread::sleep(Duration::from_millis(100));
     // Neither room sends anything, so neither holds a sleep.
     pair.prefill_outbox.release_registration().unwrap();
@@ -612,18 +611,12 @@ fn an_admission_after_its_request_ended_is_not_sent() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source = vec![1u8; BYTES];
+    let source = pattern();
     let destination = vec![0u8; BYTES];
-    let mut pair = pair(
-        library,
-        &source,
-        &destination,
-        false,
-        Duration::from_secs(60),
-    );
+    let mut pair = pair(library, &source, &destination, Duration::from_secs(60));
     let (mut mesh, group) = single_rank();
     // No bootstrap server listens there: the room's route lookup fails.
-    let unreachable = TcpListener::bind("127.0.0.1:0")
+    let unreachable = std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -640,7 +633,7 @@ fn an_admission_after_its_request_ended_is_not_sent() {
     );
     // The admission the loop planned before the failure reaches the outbox
     // only after it: the room stays forgotten, and a sleep proceeds.
-    pair.decode_outbox.receive("lost", 9, 3, b"manifest");
+    pair.admit("lost");
     pair.decode_outbox.release_registration().unwrap();
     assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
 }
@@ -651,15 +644,9 @@ fn a_landing_without_its_first_token_fails_the_request() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let source = vec![1u8; BYTES];
+    let source = pattern();
     let destination = vec![0u8; BYTES];
-    let mut pair = pair(
-        library,
-        &source,
-        &destination,
-        false,
-        Duration::from_secs(60),
-    );
+    let mut pair = pair(library, &source, &destination, Duration::from_secs(60));
     let (mut mesh, group) = single_rank();
     let rid = "tokenless";
     pair.prefill.register(rid, &pair.bootstrap).unwrap();
@@ -668,16 +655,66 @@ fn a_landing_without_its_first_token_fails_the_request() {
         next_event(&mut pair.decode, &mut mesh, &group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    pair.decode_outbox.receive(rid, 4242, 3, b"manifest");
+    pair.admit(rid);
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
         PdEvent::Bootstrapped(rid.to_owned())
     );
-    // An older or foreign Prefill peer reports the KV sent with no token.
-    pair.prefill_outbox.send(rid, 4242, -1, None);
+    // This rank refuses to send a prompt without its first token...
+    let error = pair.send(rid, -1, Vec::new()).unwrap_err();
+    assert!(error.contains("bootstrap token is unavailable"), "{error}");
+    // ...but an older or foreign Prefill peer reports the KV sent with none.
+    push(
+        pair.decode.port(),
+        StatusMessage::bare(4242, TransferPoll::Success, 0).to_frames(),
+    );
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+}
+
+#[test]
+fn a_conflicting_registration_rejects_its_session() {
+    let Some(library) = library() else {
+        eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
+        return;
+    };
+    let source = pattern();
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair(library, &source, &destination, Duration::from_secs(60));
+    let (mut mesh, group) = single_rank();
+    let rid = "req-2";
+    pair.prefill.register(rid, &pair.bootstrap).unwrap();
+    pair.decode.register(rid, &pair.bootstrap).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.to_owned())
+    );
+    pair.admit(rid);
     assert_eq!(
         next_event(&mut pair.prefill, &mut mesh, &group),
-        PdEvent::Succeeded(rid.to_owned())
+        PdEvent::Bootstrapped(rid.to_owned())
+    );
+    // The same session registers again with its arena elsewhere: the
+    // Prefill rank no longer trusts it, and fails the rooms it serves.
+    let moved = destination.as_ptr() as u64 + 0x10000;
+    push(
+        pair.prefill.port(),
+        vec![
+            Bytes::from_static(b"None"),
+            Bytes::from("127.0.0.1"),
+            Bytes::from(pair.decode.port().to_string()),
+            Bytes::from(pair.decode.session_id()),
+            Bytes::copy_from_slice(&moved.to_ne_bytes()),
+            Bytes::from(layout(Some(moved))),
+            Bytes::from("1"),
+            Bytes::from("0"),
+        ],
+    );
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
     );
     assert_eq!(
         next_event(&mut pair.decode, &mut mesh, &group),

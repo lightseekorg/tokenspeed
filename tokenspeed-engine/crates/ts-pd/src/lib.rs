@@ -23,13 +23,20 @@
 //!
 //! The peer owns the Mooncake transfer engine, the P/D handshake over ZMQ,
 //! the bootstrap-server HTTP calls, the room states, the transfer workers
-//! and the per-round agreement on transfer progress. What needs the rank's
-//! cache layout (route plans, block manifests, the copies one transfer
-//! makes) comes from a planner the data plane provides; the peer's threads
-//! call it, never the scheduling loop. The wire formats are unchanged from
-//! the Python peers this crate replaced, so nodes of either version
-//! interoperate.
+//! and the per-round agreement on transfer progress. It also plans
+//! everything that needs the ranks' cache layouts ([`layout`]): the routes
+//! between unequal Prefill and Decode rank sets, the block manifests read
+//! off the plans' block tables, and the copies one transfer makes. The data
+//! plane only builds the rank's cache transfer contract at startup and
+//! tells the forward thread when a plan's remote stream may go out
+//! ([`PrefillOutbox`], [`DecodeOutbox`]). The bootstrap server the nodes
+//! rendezvous through is here too ([`bootstrap`]). The wire formats are
+//! unchanged from the Python peers this crate replaced, so nodes of either
+//! version interoperate.
 
+mod batch;
+pub mod bootstrap;
+mod control;
 mod decode;
 mod http;
 pub mod layout;
@@ -44,9 +51,16 @@ use std::{
     time::Duration,
 };
 
-pub use decode::{DecodeConfig, DecodeOutbox, DecodePeer, DecodePlanner, PrefillRoute};
+pub use batch::BatchRows;
+pub use bootstrap::{BootstrapServer, Registry};
+pub use control::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer};
+pub use decode::{DecodeConfig, DecodeOutbox, DecodePeer};
+pub use layout::{
+    registration::{PrefillLayout, PrefillRoute},
+    LayoutError,
+};
 pub use net::NetError;
-pub use prefill::{PrefillConfig, PrefillOutbox, PrefillPeer, PrefillPlanner, Registration};
+pub use prefill::{Layerwise, PrefillConfig, PrefillOutbox, PrefillPeer};
 pub use status::TransferPoll;
 use ts_mooncake::{Engine, PageGrid};
 pub use wire::StatusMessage;
@@ -82,6 +96,9 @@ pub enum StartError {
     /// A thread did not start.
     #[error("starting a PD thread: {0}")]
     Thread(#[from] std::io::Error),
+    /// The rank's cache transfer contract is malformed.
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
 }
 
 /// What both roles start from.

@@ -549,9 +549,10 @@ class DeviceHandle:
         # so they go out even on a DP-idle round that runs no batch.
         if remote_decode is not None:
             # P role: the prompt's decode happens on the peer, so its KV goes
-            # out. The scheduler emits this only after the final chunk's
-            # result landed, so the forwards that wrote the KV were launched
-            # before it.
+            # out, behind the drafter's pending round (settled above), whose
+            # KV goes too. The scheduler emits this only after the final
+            # chunk's result landed, so the forwards that wrote the KV were
+            # launched before it.
             peer.execute(remote_decode)
         if remote_prefill is not None:
             # D role: the prompt prefills on the peer; pull its KV into the
@@ -562,10 +563,8 @@ class DeviceHandle:
             return None
 
         if self._role is DeviceRole.PD_PREFILL:
-            # A prefill chunk. Its layerwise KV streaming is armed ahead of
-            # the forward it arms, without waiting for anything (a wait would
-            # collapse the PP chunk pipeline to lockstep on every chunk).
-            peer.prepare_prefill(planned.forward_op)
+            # A prefill chunk; the host armed its layerwise KV streaming, if
+            # on, when it handed this plan over.
             return self._launch_forward(planned, capture_next_input_ids=True)
 
         # Plain engine, or a D-role decode (the D role runs no local prefill:
@@ -1566,7 +1565,8 @@ class TransferPeer(Protocol):
     """What ``DeviceHandle`` asks of a PD transfer peer.
 
     ``mode`` is the peer's role, a ``DeviceRole`` value (``"prefill"`` or
-    ``"decode"``); ``execute`` takes the plan's remote stream of that role.
+    ``"decode"``); ``execute`` takes the plan's remote stream of that role
+    once the stream's device prerequisites are met, and sends it.
     """
 
     mode: str

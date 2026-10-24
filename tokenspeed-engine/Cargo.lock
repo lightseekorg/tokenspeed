@@ -1382,6 +1382,7 @@ dependencies = [
  "ts-grammar",
  "ts-l3",
  "ts-metrics",
+ "ts-pd",
  "ts-scheduler",
  "ts-wire",
  "zeromq",
@@ -1459,7 +1460,6 @@ dependencies = [
  "tokio",
  "tracing",
  "ts-collective",
- "ts-control",
  "ts-metrics",
  "ts-mooncake",
  "ureq",
@@ -1476,6 +1476,7 @@ dependencies = [
  "tokio",
  "ts-client",
  "ts-l3",
+ "ts-pd",
  "ts-wire",
 ]
 

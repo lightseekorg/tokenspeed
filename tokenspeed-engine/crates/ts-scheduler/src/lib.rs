@@ -114,6 +114,47 @@ mod ffi {
         num_extends: usize,
     }
 
+    /// One cache group's block table over a batch's rows.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct BlockTableView {
+        /// The group.
+        group_id: String,
+        /// Block-table slots per row.
+        columns: usize,
+        /// The rows' scheduler block ids, row-major, padded with -1.
+        blocks: Vec<i32>,
+    }
+
+    /// What a PD transfer reads off a batch: its rows, their PD columns
+    /// and their block tables.
+    #[derive(Debug, Clone, PartialEq)]
+    struct TransferBatchView {
+        /// Request ids, one row each; extend rows first.
+        request_ids: Vec<String>,
+        /// Each row's request slot.
+        request_pool_indices: Vec<i32>,
+        /// Tokens each row feeds this forward.
+        input_lengths: Vec<i32>,
+        /// Each row's prompt length.
+        prefill_lengths: Vec<i32>,
+        /// Extend rows: tokens already in the cache ahead of this chunk.
+        extend_prefix_lens: Vec<i32>,
+        /// Extend rows, the D role's admission: every state group's
+        /// prompt-end checkpoint was found locally.
+        state_prefix_cached: Vec<bool>,
+        /// Decode rows: the token each feeds; on the P role's remote decode,
+        /// the request's first output token.
+        decode_input_ids: Vec<i32>,
+        /// Decode rows' drafter candidates, concatenated.
+        spec_candidate_ids: Vec<i32>,
+        /// Where each decode row's candidates start, and the end.
+        spec_candidate_offsets: Vec<usize>,
+        /// Extend rows.
+        num_extends: usize,
+        /// Every cache group's table.
+        block_tables: Vec<BlockTableView>,
+    }
+
     /// A request the scheduler finished while building a plan.
     #[derive(Debug, Clone, PartialEq)]
     struct SchedulerAbortView {
@@ -367,6 +408,9 @@ mod ffi {
         fn plan_needs_device(plan: &ExecutionPlan) -> bool;
         fn plan_remote_decode(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
         fn plan_remote_prefill(plan: &ExecutionPlan) -> Vec<ForwardBatchView>;
+        fn plan_forward_transfer(plan: &ExecutionPlan) -> Vec<TransferBatchView>;
+        fn plan_remote_decode_transfer(plan: &ExecutionPlan) -> Vec<TransferBatchView>;
+        fn plan_remote_prefill_transfer(plan: &ExecutionPlan) -> Vec<TransferBatchView>;
         fn plan_aborts(plan: &ExecutionPlan) -> Vec<SchedulerAbortView>;
         fn plan_cache_ops(plan: &ExecutionPlan) -> Vec<CacheOpView>;
         fn plan_storage_ops(plan: &ExecutionPlan) -> Vec<StorageOpView>;
@@ -374,10 +418,10 @@ mod ffi {
 }
 
 pub use ffi::{
-    CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView, ForwardBatchView,
-    ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView, SchedulerSizes,
-    StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind, StorageOpView,
-    StorageStatsView, StorageTickView,
+    BlockTableView, CacheEvent, CacheEventKind, CacheGroupPages, CacheOpKind, CacheOpView,
+    ForwardBatchView, ForwardEvent, ForwardEventKind, KvEventView, RequestSpec, SchedulerAbortView,
+    SchedulerSizes, StorageCancellationView, StorageDoneView, StorageKeyView, StorageOpKind,
+    StorageOpView, StorageStatsView, StorageTickView, TransferBatchView,
 };
 
 /// What advances the scheduler at the head of a round: with L3, the agreed
@@ -597,6 +641,26 @@ impl ExecutionPlan {
     /// node's KV.
     pub fn remote_prefill(&self) -> Option<ForwardBatchView> {
         ffi::plan_remote_prefill(&self.0).into_iter().next()
+    }
+
+    /// The first model batch, with what a PD transfer reads off it (the P
+    /// role's layerwise streaming).
+    pub fn forward_transfer(&self) -> Option<TransferBatchView> {
+        ffi::plan_forward_transfer(&self.0).into_iter().next()
+    }
+
+    /// [`ExecutionPlan::remote_decode`], with what a PD transfer reads off
+    /// it.
+    pub fn remote_decode_transfer(&self) -> Option<TransferBatchView> {
+        ffi::plan_remote_decode_transfer(&self.0).into_iter().next()
+    }
+
+    /// [`ExecutionPlan::remote_prefill`], with what a PD transfer reads off
+    /// it.
+    pub fn remote_prefill_transfer(&self) -> Option<TransferBatchView> {
+        ffi::plan_remote_prefill_transfer(&self.0)
+            .into_iter()
+            .next()
     }
 
     /// Requests the scheduler finished while planning.

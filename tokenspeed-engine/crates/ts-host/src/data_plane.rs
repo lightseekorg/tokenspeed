@@ -56,6 +56,8 @@ use ts_control::{
 use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
+use crate::pd::Streams;
+
 /// A forward the forward thread launched, by launch order.
 pub type ForwardId = u64;
 
@@ -135,7 +137,6 @@ struct AdmitRow {
     sampling_params: Bytes,
     stop_token_ids: Vec<i32>,
     token_limit: i64,
-    room: Option<u64>,
     multimodal: Option<Vec<Bytes>>,
 }
 
@@ -222,8 +223,9 @@ pub struct PythonDataPlane {
 impl PythonDataPlane {
     /// Start the forward thread over a Python `HostDataPlane`, and enter the
     /// dispatch guard on the calling thread, the control thread, which must
-    /// also drop the data plane.
-    pub fn start(plane: Py<PyAny>) -> Result<Self, String> {
+    /// also drop the data plane. With PD, the forward thread stages each
+    /// plan's remote stream with the transfer peer (`streams`).
+    pub fn start(plane: Py<PyAny>, streams: Option<Streams>) -> Result<Self, String> {
         let guard = Python::attach(|py| {
             plane
                 .call_method0(py, "control_thread_guard")
@@ -252,7 +254,7 @@ impl PythonDataPlane {
                         shared.fail(error);
                         return;
                     }
-                    forward_loop(py, plane, queue, &shared);
+                    forward_loop(py, plane, queue, &shared, streams.as_ref());
                 })
             })
             .map_err(|error| format!("starting the forward thread: {error}"))?;
@@ -343,7 +345,6 @@ impl DataPlane for PythonDataPlane {
                 sampling_params,
                 stop_token_ids: stop.stop_token_ids,
                 token_limit: stop.token_limit,
-                room: request.bootstrap.as_ref().map(|bootstrap| bootstrap.room),
                 multimodal: request.multimodal.clone(),
             });
         }
@@ -541,6 +542,7 @@ fn forward_loop(
     plane: &Bound<'_, PyAny>,
     mut queue: mpsc::Receiver<Op>,
     shared: &Shared,
+    streams: Option<&Streams>,
 ) {
     loop {
         // Wait without the GIL: the control thread and the transfer peer's
@@ -592,7 +594,7 @@ fn forward_loop(
             }
             continue;
         }
-        if let Err(error) = run(py, plane, op, shared) {
+        if let Err(error) = run(py, plane, op, shared, streams) {
             tracing::error!("the data plane failed:\n{error}");
             shared.fail(error);
         }
@@ -600,7 +602,13 @@ fn forward_loop(
 }
 
 /// Run one operation; a failure ends the data plane.
-fn run(py: Python<'_>, plane: &Bound<'_, PyAny>, op: Op, shared: &Shared) -> Result<(), String> {
+fn run(
+    py: Python<'_>,
+    plane: &Bound<'_, PyAny>,
+    op: Op,
+    shared: &Shared,
+    streams: Option<&Streams>,
+) -> Result<(), String> {
     let python = |error: PyErr| describe(py, &error);
     match op {
         Op::Admit(rows) => {
@@ -614,7 +622,6 @@ fn run(py: Python<'_>, plane: &Bound<'_, PyAny>, op: Op, shared: &Shared) -> Res
                             PyBytes::new(py, &row.sampling_params).into_any(),
                             PyList::new(py, row.stop_token_ids)?.into_any(),
                             row.token_limit.into_pyobject(py)?.into_any(),
-                            row.room.into_pyobject(py)?.into_any(),
                             match &row.multimodal {
                                 Some(frames) => PyList::new(
                                     py,
@@ -640,6 +647,11 @@ fn run(py: Python<'_>, plane: &Bound<'_, PyAny>, op: Op, shared: &Shared) -> Res
                 logprobs,
                 history,
             } = *execution;
+            // The plan's remote stream goes out from the data plane's
+            // execution, once its device prerequisites are met.
+            if let Some(streams) = streams {
+                streams.before_execute(&plan, forward.is_some())?;
+            }
             let plan = plan.into_python(py).map_err(python)?;
             // `(prompt rows (row starts, counts, positions, top k) or None,
             // sampled top k)`, None for a plan without a batch.
@@ -672,6 +684,9 @@ fn run(py: Python<'_>, plane: &Bound<'_, PyAny>, op: Op, shared: &Shared) -> Res
                     (plan, dp, ngram, grammar_advance, logprobs, history),
                 )
                 .map_err(python)?;
+            if let Some(streams) = streams {
+                streams.after_execute()?;
+            }
             match (forward, launched.is_none()) {
                 (Some(forward), false) => shared.launch(forward, launched.unbind()),
                 (None, true) => {}
@@ -982,7 +997,7 @@ result = (Plane(), ts.Scheduler(cfg))
     }
 
     fn start(plane: &Py<PyAny>) -> PythonDataPlane {
-        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py))).unwrap()
+        PythonDataPlane::start(Python::attach(|py| plane.clone_ref(py)), None).unwrap()
     }
 
     /// A one-row batch: the stand-in launches whatever it is handed.

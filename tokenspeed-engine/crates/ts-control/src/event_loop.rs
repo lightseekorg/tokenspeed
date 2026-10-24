@@ -56,6 +56,7 @@ use std::{
 
 use ts_collective::{Group, Mesh, Reduce};
 use ts_metrics::{EngineMetrics, L3Metrics};
+use ts_pd::{PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
     Scheduler, StorageRound, StorageTickView,
@@ -79,7 +80,6 @@ use crate::{
         CommitStats, Committed, ForwardResult, HistoryRows, HistorySeeds, InputLogprobPlan,
         LogprobPlan, NgramWindows, OutputProcessor, StreamedOutput,
     },
-    pd::{PdError, PdEvent, TransferPeer},
     relay::{self, RelayError},
     request::RequestGrammar,
 };
@@ -146,7 +146,7 @@ const IDLE_WAIT: Duration = Duration::from_millis(10);
 struct Submission {
     rid: String,
     spec: ts_scheduler::RequestSpec,
-    bootstrap: Option<crate::pd::BootstrapInfo>,
+    bootstrap: Option<ts_pd::BootstrapInfo>,
     /// EPD: it waits for its images' embeddings.
     epd: bool,
 }

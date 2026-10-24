@@ -59,7 +59,7 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 import torch
 import uvloop
 import zmq
-from tokenspeed_engine import FrontendListener
+from tokenspeed_engine import BootstrapServer, FrontendListener
 
 from tokenspeed.runtime.cache.l3.identity import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
@@ -88,7 +88,7 @@ from tokenspeed.runtime.engine.rust_host import (
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
 from tokenspeed.runtime.epd.encode_loop import run_encode_process
-from tokenspeed.runtime.pd.utils import DisaggregationMode, bootstrap_server_class
+from tokenspeed.runtime.pd.utils import DisaggregationMode, TransferBackend
 from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
     configure_logger,
@@ -890,8 +890,11 @@ def _start_kv_bootstrap_server(server_args: ServerArgs):
     mode = DisaggregationMode(server_args.disaggregation_mode)
     if mode != DisaggregationMode.PREFILL or server_args.node_rank != 0:
         return None
-    server_class = bootstrap_server_class(server_args.disaggregation_transfer_backend)
-    return server_class(server_args.disaggregation_bootstrap_port)
+    # Mooncake is the only transfer backend.
+    TransferBackend(server_args.disaggregation_transfer_backend)
+    return BootstrapServer(
+        server_args.disaggregation_bootstrap_port, cache_layouts=True
+    )
 
 
 def _supervise_schedulers(

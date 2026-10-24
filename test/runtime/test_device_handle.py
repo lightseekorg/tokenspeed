@@ -249,10 +249,6 @@ def _peer(trace=None):
             if trace is not None:
                 trace.append(("send", op))
 
-        def prepare_prefill(self, op) -> None:
-            if trace is not None:
-                trace.append(("arm", op))
-
     return _Peer()
 
 
@@ -833,10 +829,10 @@ def test_an_unrecognized_transfer_peer_is_refused():
         _handle([], kv_transfer=SimpleNamespace())
 
 
-def test_the_remote_decode_and_the_arming_keep_the_forward_order():
-    """The send walks KV-pool device memory the forwards wrote, and the
-    arming must precede the forward it arms. Both orderings come from the
-    forward thread's order, not from the loop's scheduling rules."""
+def test_the_remote_decode_keeps_the_forward_order():
+    """The send walks KV-pool device memory the forwards wrote: it follows
+    them in the forward thread's order, not by the loop's scheduling
+    rules."""
     trace: list = []
     handle = _handle(trace, kv_transfer=_peer(trace))
 
@@ -846,11 +842,10 @@ def test_the_remote_decode_and_the_arming_keep_the_forward_order():
     _execute(handle, _plan(), chunk)
     _execute(handle, _plan(remote_decode=remote_decode), None)
 
-    # Arming goes before the forward it arms; the send follows the forwards
-    # whose KV it reads (the scheduler emits a remote decode only after its
-    # final chunk's result landed), handed over without waiting, like the
-    # forwards themselves.
-    assert trace == [("arm", chunk.forward_op), "forward", ("send", remote_decode)]
+    # The send follows the forwards whose KV it reads (the scheduler emits a
+    # remote decode only after its final chunk's result landed), handed over
+    # without waiting, like the forwards themselves.
+    assert trace == ["forward", ("send", remote_decode)]
 
 
 # ----------------------------------------------------------------------

@@ -18,120 +18,157 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The PD transfer peer of a disaggregated rank, over the data plane's
-//! planner (`pd/host_peer.py`).
+//! The PD transfer peer of a disaggregated rank (`ts_pd`), started from the
+//! settings the data plane's peer object carries (`pd/host_peer.py`).
 //!
-//! The Python peer reaches the Rust one through [`Outbox`], which the
-//! bootstrap hands it before the peer exists; the Rust peer's threads call
-//! the Python one as its planner, with the GIL. The control thread does
-//! neither.
+//! The forward thread stages each plan's remote stream before it hands the
+//! plan to the data plane ([`Streams`]); the data plane hands the stream
+//! over through [`Outbox`] once its device prerequisites are met (the
+//! drafter's pending round on a Prefill rank, the page zeroing on a Decode
+//! rank), and the peer plans and sends it. Nothing in the peer calls into
+//! Python.
 
-use std::{
-    path::PathBuf,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
-use bytes::Bytes;
-use pyo3::{
-    exceptions::PyRuntimeError,
-    prelude::*,
-    types::{PyBytes, PyList},
-};
-use ts_control::{output::Role, pd::TransferPeer};
-use ts_mooncake::PageGrid;
+use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyBytes};
+use ts_control::output::Role;
 use ts_pd::{
-    Copy, DecodeConfig, DecodeOutbox, DecodePeer, DecodePlanner, PeerConfig, PrefillConfig,
-    PrefillOutbox, PrefillPeer, PrefillPlanner, PrefillRoute, Registration,
+    layout::{
+        contract::Contract,
+        manifest::{BlockTable, BlockTables},
+    },
+    BatchRows, DecodeConfig, DecodeOutbox, DecodePeer, Layerwise, PeerConfig, PrefillConfig,
+    PrefillLayout, PrefillOutbox, PrefillPeer, TransferPeer,
 };
+use ts_scheduler::{ExecutionPlan, TransferBatchView};
 
-enum Inner {
+/// The forward thread's face of the peer.
+#[derive(Clone)]
+pub enum Streams {
+    /// A Prefill rank's: remote decodes and layerwise chunks.
     Prefill(PrefillOutbox),
+    /// A Decode rank's: remote prefills.
     Decode(DecodeOutbox),
 }
 
-/// Where the Python peer hands the host its work (see `pd/host_peer.py`).
+/// A plan's batch as the peer reads it.
+fn rows(view: TransferBatchView) -> BatchRows {
+    let spec_candidate_ids = view
+        .spec_candidate_offsets
+        .windows(2)
+        .map(|bounds| view.spec_candidate_ids[bounds[0]..bounds[1]].to_vec())
+        .collect();
+    let tables: BlockTables = view
+        .block_tables
+        .into_iter()
+        .map(|table| {
+            let blocks = table.blocks.into_iter().map(i64::from).collect();
+            (
+                table.group_id,
+                BlockTable {
+                    columns: table.columns,
+                    blocks,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    BatchRows {
+        request_ids: view.request_ids,
+        request_pool_indices: view.request_pool_indices,
+        input_lengths: view.input_lengths,
+        prefill_lengths: view.prefill_lengths,
+        extend_prefix_lens: view.extend_prefix_lens,
+        state_prefix_cached: view.state_prefix_cached,
+        decode_input_ids: view.decode_input_ids,
+        spec_candidate_ids,
+        num_extends: view.num_extends,
+        tables,
+    }
+}
+
+impl Streams {
+    /// Before the data plane runs `plan`: stage its remote stream and, on a
+    /// layerwise Prefill rank whose round launches a forward, arm the
+    /// forward's chunks.
+    pub fn before_execute(
+        &self,
+        plan: &ExecutionPlan,
+        launches_forward: bool,
+    ) -> Result<(), String> {
+        match self {
+            Streams::Prefill(outbox) => {
+                if launches_forward && outbox.streams_layerwise() {
+                    if let Some(forward) = plan.forward_transfer() {
+                        outbox.arm_layerwise(&rows(forward))?;
+                    }
+                }
+                if let Some(remote_decode) = plan.remote_decode_transfer() {
+                    outbox.stage_remote_decode(rows(remote_decode))?;
+                }
+            }
+            Streams::Decode(outbox) => {
+                if let Some(remote_prefill) = plan.remote_prefill_transfer() {
+                    outbox.stage_remote_prefill(rows(remote_prefill))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// After the data plane ran the plan: it handed the remote stream over.
+    pub fn after_execute(&self) -> Result<(), String> {
+        let pending = match self {
+            Streams::Prefill(outbox) => outbox.remote_decode_pending(),
+            Streams::Decode(outbox) => outbox.remote_prefill_pending(),
+        };
+        if pending {
+            return Err("the data plane never handed the plan's remote stream over".to_owned());
+        }
+        Ok(())
+    }
+}
+
+/// Where the data plane's peer hands the host its work (see
+/// `pd/host_peer.py`).
 #[pyclass(frozen, name = "PdOutbox")]
 pub struct Outbox {
-    inner: OnceLock<Inner>,
+    streams: std::sync::OnceLock<Streams>,
 }
 
 impl Outbox {
     /// An outbox whose peer starts later.
     pub fn new() -> Self {
         Self {
-            inner: OnceLock::new(),
+            streams: std::sync::OnceLock::new(),
         }
     }
 
-    fn inner(&self) -> PyResult<&Inner> {
-        self.inner
+    fn streams(&self) -> PyResult<&Streams> {
+        self.streams
             .get()
             .ok_or_else(|| PyRuntimeError::new_err("the host's PD peer has not started"))
     }
 }
 
-fn wrong_role(method: &str) -> PyErr {
-    PyRuntimeError::new_err(format!("PdOutbox.{method} is not this role's"))
-}
-
 #[pymethods]
 impl Outbox {
-    /// Prefill: a request's KV is ready to go to its destinations.
-    #[pyo3(signature = (rid, room, bootstrap_token, spec_candidate_ids))]
-    fn send(
-        &self,
-        rid: &str,
-        room: u64,
-        bootstrap_token: i64,
-        spec_candidate_ids: Option<Vec<i32>>,
-    ) -> PyResult<()> {
-        match self.inner()? {
-            Inner::Prefill(outbox) => {
-                outbox.send(rid, room, bootstrap_token, spec_candidate_ids);
-                Ok(())
-            }
-            Inner::Decode(_) => Err(wrong_role("send")),
+    /// The plan's remote stream may go out: its device prerequisites are
+    /// met. The forward thread runs this, inside the plan's execution.
+    fn remote_stream_ready(&self) -> PyResult<()> {
+        match self.streams()? {
+            Streams::Prefill(outbox) => outbox.hand_over_remote_decode(),
+            Streams::Decode(outbox) => outbox.hand_over_remote_prefill(),
         }
-    }
-
-    /// Prefill, layerwise streaming: a prefill chunk is armed; its
-    /// intervals' KV is complete at `target_steps`.
-    fn send_layerwise(
-        &self,
-        rid: &str,
-        room: u64,
-        chunk_id: u64,
-        target_steps: Vec<u64>,
-        is_last: bool,
-    ) -> PyResult<()> {
-        match self.inner()? {
-            Inner::Prefill(outbox) => {
-                outbox.send_layerwise(rid, room, chunk_id, target_steps, is_last);
-                Ok(())
-            }
-            Inner::Decode(_) => Err(wrong_role("send_layerwise")),
-        }
-    }
-
-    /// Prefill: a request reached its remote decode with no destination on
-    /// record.
-    fn send_unplanned(&self, rid: &str, room: u64) -> PyResult<()> {
-        match self.inner()? {
-            Inner::Prefill(outbox) => outbox
-                .send_unplanned(rid, room)
-                .map_err(PyRuntimeError::new_err),
-            Inner::Decode(_) => Err(wrong_role("send_unplanned")),
-        }
+        .map_err(PyRuntimeError::new_err)
     }
 
     /// A sleep releases the cache: deregister it from the transfer engine
     /// (refused while transfers are in flight). Blocks without the GIL.
     fn release_registration(&self, py: Python<'_>) -> PyResult<()> {
-        let inner = self.inner()?;
-        py.detach(|| match inner {
-            Inner::Prefill(outbox) => outbox.release_registration(),
-            Inner::Decode(outbox) => outbox.release_registration(),
+        let streams = self.streams()?;
+        py.detach(|| match streams {
+            Streams::Prefill(outbox) => outbox.release_registration(),
+            Streams::Decode(outbox) => outbox.release_registration(),
         })
         .map_err(PyRuntimeError::new_err)
     }
@@ -139,223 +176,12 @@ impl Outbox {
     /// A wake re-mapped the cache: register it again (a Decode rank under a
     /// fresh session). Blocks without the GIL.
     fn restore_registration(&self, py: Python<'_>) -> PyResult<()> {
-        let inner = self.inner()?;
-        py.detach(|| match inner {
-            Inner::Prefill(outbox) => outbox.restore_registration(),
-            Inner::Decode(outbox) => outbox.restore_registration(),
+        let streams = self.streams()?;
+        py.detach(|| match streams {
+            Streams::Prefill(outbox) => outbox.restore_registration(),
+            Streams::Decode(outbox) => outbox.restore_registration(),
         })
         .map_err(PyRuntimeError::new_err)
-    }
-
-    /// Decode: a request's pages are admitted; `manifest` goes to its
-    /// Prefill ranks.
-    fn receive(
-        &self,
-        rid: &str,
-        room: u64,
-        request_pool_index: i32,
-        manifest: &Bound<'_, PyBytes>,
-    ) -> PyResult<()> {
-        match self.inner()? {
-            Inner::Decode(outbox) => {
-                outbox.receive(rid, room, request_pool_index, manifest.as_bytes());
-                Ok(())
-            }
-            Inner::Prefill(_) => Err(wrong_role("receive")),
-        }
-    }
-}
-
-/// The Python peer as the planner.
-struct Planner {
-    peer: Py<PyAny>,
-}
-
-fn message(error: PyErr) -> String {
-    error.to_string()
-}
-
-fn frames_list<'py>(py: Python<'py>, frames: &[Bytes]) -> PyResult<Bound<'py, PyList>> {
-    PyList::new(py, frames.iter().map(|frame| PyBytes::new(py, frame)))
-}
-
-/// A column of little-endian 8-byte values.
-fn column<T>(bytes: &[u8], decode: fn([u8; 8]) -> T) -> Result<Vec<T>, String> {
-    if bytes.len() % 8 != 0 {
-        return Err("a copy column is not 8-byte values".to_owned());
-    }
-    Ok(bytes
-        .chunks_exact(8)
-        .map(|chunk| decode(chunk.try_into().expect("8 bytes")))
-        .collect())
-}
-
-impl PrefillPlanner for Planner {
-    fn prepare_registration(&self, frames: &[Bytes]) -> Result<Registration, String> {
-        Python::attach(|py| {
-            type Planned = (String, u16, String, i64, i64, bool, Vec<i64>);
-            let planned: Planned = self
-                .peer
-                .call_method1(py, "prepare_registration", (frames_list(py, frames)?,))?
-                .extract(py)?;
-            let (endpoint, port, session_id, decode_tp_size, decode_tp_rank, is_dummy, expected) =
-                planned;
-            Ok(Registration {
-                endpoint,
-                port,
-                session_id,
-                decode_tp_size,
-                decode_tp_rank,
-                is_dummy,
-                expected_decode_ranks: expected,
-            })
-        })
-        .map_err(message)
-    }
-
-    fn reject_registration(&self, session_id: &str) {
-        let rejected = Python::attach(|py| {
-            self.peer
-                .call_method1(py, "reject_registration", (session_id,))
-                .map(drop)
-        });
-        if let Err(error) = rejected {
-            tracing::error!(%error, "the data plane did not forget a rejected session");
-        }
-    }
-
-    fn accept_preallocation(&self, frames: &[Bytes]) -> Result<bool, String> {
-        Python::attach(|py| {
-            self.peer
-                .call_method1(py, "accept_preallocation", (frames_list(py, frames)?,))?
-                .extract(py)
-        })
-        .map_err(message)
-    }
-
-    fn plan_send(&self, room: u64, session_id: &str) -> Result<Vec<Copy>, String> {
-        let items = Python::attach(|py| {
-            let items = self
-                .peer
-                .call_method1(py, "plan_send", (room, session_id))
-                .map_err(|error| crate::data_plane::describe(py, &error))?;
-            planned_items(items.bind(py))
-        })?;
-        copies(items)
-    }
-
-    fn plan_layerwise(
-        &self,
-        chunk_id: u64,
-        sessions: &[String],
-    ) -> Result<Vec<Vec<Vec<Copy>>>, String> {
-        let plans: Vec<Vec<Vec<Planned>>> = Python::attach(|py| {
-            let plans = self
-                .peer
-                .call_method1(py, "plan_layerwise", (chunk_id, sessions.to_vec()))
-                .map_err(|error| crate::data_plane::describe(py, &error))?;
-            let plans = plans
-                .bind(py)
-                .cast::<PyList>()
-                .map_err(|error| error.to_string())?;
-            plans
-                .iter()
-                .map(|session| {
-                    let intervals = session
-                        .cast::<PyList>()
-                        .map_err(|error| error.to_string())?;
-                    intervals
-                        .iter()
-                        .map(|items| planned_items(&items))
-                        .collect::<Result<Vec<_>, String>>()
-                })
-                .collect::<Result<Vec<_>, String>>()
-        })?;
-        plans
-            .into_iter()
-            .map(|session| session.into_iter().map(copies).collect())
-            .collect()
-    }
-
-    fn drop_room(&self, room: u64) {
-        let dropped =
-            Python::attach(|py| self.peer.call_method1(py, "drop_room", (room,)).map(drop));
-        if let Err(error) = dropped {
-            tracing::error!(%error, room, "the data plane did not drop a room");
-        }
-    }
-}
-
-/// One planned copy: its kind and three byte columns.
-type Planned = (String, Vec<u8>, Vec<u8>, Vec<u8>);
-
-/// A Python list of planned copies (`host_peer._copy_items`).
-fn planned_items(items: &Bound<'_, PyAny>) -> Result<Vec<Planned>, String> {
-    let items = items.cast::<PyList>().map_err(|error| error.to_string())?;
-    items
-        .iter()
-        .map(|item| {
-            let (kind, a, b, c): (String, Bound<PyBytes>, Bound<PyBytes>, Bound<PyBytes>) =
-                item.extract().map_err(message)?;
-            Ok((
-                kind,
-                a.as_bytes().to_vec(),
-                b.as_bytes().to_vec(),
-                c.as_bytes().to_vec(),
-            ))
-        })
-        .collect()
-}
-
-/// Planned copies as the transfer engine takes them.
-fn copies(items: Vec<Planned>) -> Result<Vec<Copy>, String> {
-    items
-        .into_iter()
-        .map(|(kind, a, b, c)| match kind.as_str() {
-            "pages" => {
-                let fields = column(&c, i64::from_le_bytes)?;
-                if fields.len() % 5 != 0 {
-                    return Err("a page grid's fields are not five-wide".to_owned());
-                }
-                Ok(Copy::Pages(PageGrid {
-                    src_pages: column(&a, i64::from_le_bytes)?,
-                    dst_pages: column(&b, i64::from_le_bytes)?,
-                    fields: fields
-                        .chunks_exact(5)
-                        .map(|field| field.try_into().expect("five values"))
-                        .collect(),
-                }))
-            }
-            "spans" => Ok(Copy::Spans {
-                sources: column(&a, u64::from_le_bytes)?,
-                destinations: column(&b, u64::from_le_bytes)?,
-                lengths: column(&c, u64::from_le_bytes)?,
-            }),
-            other => Err(format!("unknown copy kind {other}")),
-        })
-        .collect()
-}
-
-impl DecodePlanner for Planner {
-    fn plan_route(&self, prefill_info: &str) -> Result<PrefillRoute, String> {
-        Python::attach(|py| {
-            let (target_tp_ranks, dummy_tp_ranks, expected_prefill_ranks, prefill_dp_size): (
-                Vec<i64>,
-                Vec<i64>,
-                Vec<i64>,
-                i64,
-            ) = self
-                .peer
-                .call_method1(py, "plan_route", (prefill_info,))?
-                .extract(py)?;
-            Ok(PrefillRoute {
-                target_tp_ranks,
-                dummy_tp_ranks,
-                expected_prefill_ranks,
-                prefill_dp_size,
-            })
-        })
-        .map_err(message)
     }
 }
 
@@ -363,16 +189,25 @@ fn seconds(value: f64) -> Duration {
     Duration::from_secs_f64(value.max(0.0))
 }
 
-/// The rank's role and PD peer, started from the Python peer the bootstrap
-/// built (`HostBootstrap.transfer_peer`), with its work routed through
-/// `outbox` and its outcomes counted in `metrics`. `Role::Plain` and no peer
-/// outside disaggregation.
+fn contract(settings: &Bound<'_, PyAny>, name: &str) -> PyResult<Contract> {
+    let wire = settings.getattr(name)?.cast_into::<PyBytes>()?;
+    Contract::from_wire(wire.as_bytes()).map_err(|error| PyRuntimeError::new_err(error.0))
+}
+
+/// What a peer runs: its control face, for the scheduling loop, and its
+/// forward-thread face.
+pub type Started = (Role, Option<(Box<dyn TransferPeer + Send>, Streams)>);
+
+/// The rank's role and PD peer, started from the settings of the peer
+/// object the bootstrap built (`HostBootstrap.transfer_peer`), its outcomes
+/// counted in `metrics`; `outbox` reaches it from then on. `Role::Plain`
+/// and no peer outside disaggregation.
 pub fn start(
     py: Python<'_>,
     peer: Bound<'_, PyAny>,
     outbox: &Outbox,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
-) -> PyResult<(Role, Option<Box<dyn TransferPeer + Send>>)> {
+) -> PyResult<Started> {
     if peer.is_none() {
         return Ok((Role::Plain, None));
     }
@@ -387,15 +222,30 @@ pub fn start(
         metrics,
     };
     let mode: String = peer.getattr("mode")?.extract()?;
-    let planner = Arc::new(Planner {
-        peer: peer.clone().unbind(),
-    });
     let failed = |error: ts_pd::StartError| PyRuntimeError::new_err(error.to_string());
     match mode.as_str() {
         "prefill" => {
             let payload: String = role_settings.getattr("bootstrap_payload")?.extract()?;
+            let step_address: Option<usize> = peer.getattr("layerwise_step_address")?.extract()?;
+            let layerwise = match step_address {
+                Some(step_address) => Some(Layerwise {
+                    step_address,
+                    fields_by_step: role_settings.getattr("fields_by_step")?.extract()?,
+                    interval: peer.getattr("layerwise_interval")?.extract()?,
+                }),
+                None => None,
+            };
             let config = PrefillConfig {
                 peer: config,
+                layout: PrefillLayout {
+                    local: contract(&role_settings, "layout")?,
+                    wire: contract(&role_settings, "wire_layout")?,
+                    arena_base: role_settings.getattr("arena_base")?.extract()?,
+                    tp_size: role_settings.getattr("tp_size")?.extract()?,
+                    tp_rank: role_settings.getattr("tp_rank")?.extract()?,
+                    pp_rank: role_settings.getattr("pp_rank")?.extract()?,
+                    fields_by_stage: role_settings.getattr("fields_by_stage")?.extract()?,
+                },
                 status_rank: role_settings.getattr("status_rank")?.extract()?,
                 bootstrap_url: role_settings.getattr("bootstrap_url")?.extract()?,
                 bootstrap_payload: serde_json::from_str(&payload)
@@ -407,20 +257,18 @@ pub fn start(
                     role_settings.getattr("failed_session_ttl_s")?.extract()?,
                 ),
                 transfer_workers: role_settings.getattr("transfer_workers")?.extract()?,
-                layerwise_step_address: peer.getattr("layerwise_step_address")?.extract()?,
+                layerwise,
             };
-            // The peer's threads take the GIL as soon as a Decode rank
-            // registers, so it starts without it.
-            let (peer, prefill_outbox) = py
-                .detach(|| PrefillPeer::start(config, planner))
-                .map_err(failed)?;
+            let (peer, prefill_outbox) =
+                py.detach(|| PrefillPeer::start(config)).map_err(failed)?;
             tracing::info!(
                 port = peer.port(),
                 session = peer.session_id(),
                 "PD prefill peer up"
             );
-            let _ = outbox.inner.set(Inner::Prefill(prefill_outbox));
-            Ok((Role::Prefill, Some(Box::new(peer))))
+            let streams = Streams::Prefill(prefill_outbox);
+            let _ = outbox.streams.set(streams.clone());
+            Ok((Role::Prefill, Some((Box::new(peer), streams))))
         }
         "decode" => {
             let config = DecodeConfig {
@@ -441,16 +289,15 @@ pub fn start(
                     .getattr("heartbeat_max_failures")?
                     .extract()?,
             };
-            let (peer, decode_outbox) = py
-                .detach(|| DecodePeer::start(config, planner))
-                .map_err(failed)?;
+            let (peer, decode_outbox) = py.detach(|| DecodePeer::start(config)).map_err(failed)?;
             tracing::info!(
                 port = peer.port(),
                 session = peer.session_id(),
                 "PD decode peer up"
             );
-            let _ = outbox.inner.set(Inner::Decode(decode_outbox));
-            Ok((Role::Decode, Some(Box::new(peer))))
+            let streams = Streams::Decode(decode_outbox);
+            let _ = outbox.streams.set(streams.clone());
+            Ok((Role::Decode, Some((Box::new(peer), streams))))
         }
         other => Err(PyRuntimeError::new_err(format!(
             "no PD peer for mode {other}"

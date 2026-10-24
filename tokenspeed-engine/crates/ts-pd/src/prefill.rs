@@ -25,7 +25,11 @@
 //! Threads: one handles the control socket (registrations and
 //! pre-allocations), a few run transfers, sharded by destination session so
 //! one session's transfers stay ordered. The scheduling loop only registers
-//! requests, records usage and polls.
+//! requests, records usage and polls; the forward thread hands over each
+//! plan's remote decode and arms layerwise chunks ([`PrefillOutbox`]).
+//!
+//! Every route, manifest and copy is planned here, over the rank's cache
+//! transfer contract ([`crate::layout`]).
 
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
@@ -39,10 +43,19 @@ use std::{
 
 use bytes::Bytes;
 use ts_collective::{Group, Mesh, Reduce};
-use ts_control::pd::{BootstrapInfo, PdError, PdEvent, TransferPeer};
 
 use crate::{
+    batch::{BatchRows, Staged},
+    control::{BootstrapInfo, PdError, PdEvent, TransferPeer},
     http,
+    layout::{
+        contract::Contract,
+        copies::{Source, Transfer},
+        manifest::{build_manifest, build_selection, validate_manifest, Manifest, Selection},
+        registration::{
+            plan_registration, PlannedRegistration, Preallocation, PrefillLayout, RegistrationInfo,
+        },
+    },
     status::{RoomTable, TransferPoll},
     wire::{self, StatusMessage},
     Copy, PeerConfig, StartError, Transport,
@@ -55,53 +68,55 @@ const BOOTSTRAP_STALL: Duration = Duration::from_secs(10);
 const SOCKET_POLL: Duration = Duration::from_millis(100);
 
 /// A Decode rank's planned registration with this rank.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Registration {
+#[derive(Debug, Clone, PartialEq)]
+struct Registration {
     /// Where the Decode rank's control socket listens.
-    pub endpoint: String,
+    endpoint: String,
     /// Its port.
-    pub port: u16,
+    port: u16,
     /// Its transfer session.
-    pub session_id: String,
+    session_id: String,
     /// The Decode node's attention TP size.
-    pub decode_tp_size: i64,
+    decode_tp_size: i64,
     /// The Decode rank's attention TP rank.
-    pub decode_tp_rank: i64,
-    /// This rank sends it no data and only joins the status agreement.
-    pub is_dummy: bool,
-    /// The Decode ranks one room's pre-allocations come from, sorted.
-    pub expected_decode_ranks: Vec<i64>,
+    decode_tp_rank: i64,
+    /// Its arena base.
+    arena_base: u64,
+    /// Its contract, with its landing addresses.
+    layout: Arc<Contract>,
+    /// The route this rank planned to it.
+    planned: Arc<PlannedRegistration>,
 }
 
-/// The layout-dependent half of a Prefill rank's PD work, from the data
-/// plane (`HostPrefillPeer`). Called from the peer's threads, never from the
-/// scheduling loop.
-pub trait PrefillPlanner: Send + Sync {
-    /// Plan a Decode rank's registration (its frames as received) and keep
-    /// its route. Fails when the registration is malformed, misrouted, or
-    /// conflicts with the session's registration on record.
-    fn prepare_registration(&self, frames: &[Bytes]) -> Result<Registration, String>;
+impl Registration {
+    fn is_dummy(&self) -> bool {
+        self.planned.is_dummy
+    }
+}
 
-    /// Forget a rejected session's registration.
-    fn reject_registration(&self, session_id: &str);
+/// Layerwise streaming: each prefill chunk's KV goes out an interval of
+/// producer steps at a time, as the forward writes it.
+#[derive(Debug, Clone)]
+pub struct Layerwise {
+    /// The pinned host word the device updates with the last producer step
+    /// whose KV landed (`StepCounter`).
+    pub step_address: usize,
+    /// The fields each producer step makes ready, in step order
+    /// (`CacheProducerSchedule`).
+    pub fields_by_step: Vec<Vec<String>>,
+    /// Producer steps per transfer interval.
+    pub interval: usize,
+}
 
-    /// Validate a pre-allocation against its session's registration and keep
-    /// its manifest. Returns whether it is a dummy (no manifest).
-    fn accept_preallocation(&self, frames: &[Bytes]) -> Result<bool, String>;
-
-    /// The copies that move `room`'s blocks to `session_id`.
-    fn plan_send(&self, room: u64, session_id: &str) -> Result<Vec<Copy>, String>;
-
-    /// Layerwise streaming: an armed chunk's copies to each of `sessions`,
-    /// per transfer interval; the planner forgets the chunk.
-    fn plan_layerwise(
-        &self,
-        chunk_id: u64,
-        sessions: &[String],
-    ) -> Result<Vec<Vec<Vec<Copy>>>, String>;
-
-    /// Forget a room's manifests.
-    fn drop_room(&self, room: u64);
+impl Layerwise {
+    /// Each transfer interval's fields.
+    fn interval_fields(&self) -> Vec<Option<BTreeSet<String>>> {
+        let interval = self.interval.max(1);
+        self.fields_by_step
+            .chunks(interval)
+            .map(|steps| Some(steps.iter().flatten().cloned().collect()))
+            .collect()
+    }
 }
 
 /// A Prefill rank's settings.
@@ -109,6 +124,8 @@ pub trait PrefillPlanner: Send + Sync {
 pub struct PrefillConfig {
     /// What both roles share.
     pub peer: PeerConfig,
+    /// What this rank plans its routes and copies with.
+    pub layout: PrefillLayout,
     /// This rank in Decode's completion-tracking rank space.
     pub status_rank: i64,
     /// The bootstrap server's registration route.
@@ -123,17 +140,23 @@ pub struct PrefillConfig {
     pub failed_session_ttl: Duration,
     /// Transfer workers.
     pub transfer_workers: usize,
-    /// Layerwise streaming: the pinned host word the data plane updates with
-    /// the last producer step whose KV landed (`StepCounter`); `None`
-    /// without it.
-    pub layerwise_step_address: Option<usize>,
+    /// Layerwise streaming, when on.
+    pub layerwise: Option<Layerwise>,
 }
 
 /// One destination of a room.
 #[derive(Debug, Clone)]
 struct Destination {
     session_id: String,
-    is_dummy: bool,
+    /// Its manifest of the request's blocks; `None` from a rank this one
+    /// only joins the status agreement with.
+    manifest: Option<Arc<Manifest>>,
+}
+
+impl Destination {
+    fn is_dummy(&self) -> bool {
+        self.manifest.is_none()
+    }
 }
 
 /// Work for a transfer worker.
@@ -141,6 +164,9 @@ enum Chunk {
     /// A room's whole KV is written: send it.
     Full {
         room: u64,
+        /// This rank's manifest of the request's blocks; `None` when every
+        /// destination is a dummy.
+        source: Option<Arc<Manifest>>,
         bootstrap_token: i64,
         spec_candidate_ids: Option<Vec<i32>>,
     },
@@ -149,7 +175,8 @@ enum Chunk {
     /// its bootstrap payload arrived.
     Layerwise {
         room: u64,
-        chunk_id: u64,
+        /// The blocks the chunk makes ready.
+        selection: Arc<Selection>,
         /// The producer step each interval's KV is complete at.
         target_steps: Vec<u64>,
         is_last: bool,
@@ -188,6 +215,8 @@ struct State {
     /// The rooms of the requests the scheduling loop tracks: a sleep may
     /// not release the cache while one may still send.
     tracked: HashSet<u64>,
+    /// The tracked requests' rooms, by request.
+    rooms_by_rid: HashMap<String, u64>,
     /// Rooms no request here has claimed, since when: a Decode rank
     /// pre-allocated for one before (or without) its request registering
     /// here, or this rank failed one first (an EPD embedding timeout). One
@@ -245,7 +274,7 @@ impl State {
                 notices.extend(
                     destinations
                         .iter()
-                        .filter(|destination| !destination.is_dummy)
+                        .filter(|destination| !destination.is_dummy())
                         .filter_map(|destination| self.route_of(&destination.session_id))
                         .map(|route| (route, room)),
                 );
@@ -282,17 +311,12 @@ impl State {
         let sizes: BTreeSet<_> = registrations.iter().map(|r| r.decode_tp_size).collect();
         let expected: BTreeSet<_> = registrations
             .iter()
-            .map(|r| r.expected_decode_ranks.clone())
+            .map(|r| r.planned.expected_decode_ranks.clone())
             .collect();
         if sizes.len() != 1 || expected.len() != 1 {
             return Err("Cache-transfer room has inconsistent TP metadata".to_owned());
         }
-        let expected: BTreeSet<i64> = expected
-            .into_iter()
-            .next()
-            .expect("one set")
-            .into_iter()
-            .collect();
+        let expected: BTreeSet<i64> = expected.into_iter().next().expect("one set");
         let actual: BTreeSet<i64> = registrations.iter().map(|r| r.decode_tp_rank).collect();
         if destinations.len() != expected.len() || actual != expected {
             return Err(
@@ -306,12 +330,14 @@ impl State {
 
 struct Shared {
     transport: Arc<Transport>,
-    planner: Arc<dyn PrefillPlanner>,
+    layout: PrefillLayout,
     state: Mutex<State>,
     status_rank: i64,
     failed_session_ttl: Duration,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
-    layerwise_step_address: Option<usize>,
+    layerwise: Option<Layerwise>,
+    /// Layerwise: each transfer interval's fields.
+    interval_fields: Vec<Option<BTreeSet<String>>>,
     /// Signaled when a layerwise room's bootstrap payload arrives.
     metadata_ready: Condvar,
 }
@@ -351,7 +377,7 @@ impl Shared {
             let destinations = state.destinations.remove(&room).unwrap_or_default();
             destinations
                 .iter()
-                .filter(|destination| !destination.is_dummy)
+                .filter(|destination| !destination.is_dummy())
                 .filter_map(|destination| {
                     let route = state.route_of(&destination.session_id);
                     if route.is_none() {
@@ -368,7 +394,6 @@ impl Shared {
         for route in routes {
             self.notify_failed(route, room);
         }
-        self.planner.drop_room(room);
     }
 
     fn handle(&self, frames: &[Bytes]) {
@@ -379,15 +404,40 @@ impl Shared {
         }
     }
 
+    /// Plan the route a Decode rank's registration asks of this rank.
+    fn plan_registration(&self, frames: &[Bytes]) -> Result<Registration, String> {
+        let info = RegistrationInfo::from_frames(frames).map_err(|error| error.0)?;
+        let planned = plan_registration(&self.layout, &info).map_err(|error| error.0)?;
+        Ok(Registration {
+            endpoint: info.endpoint,
+            port: info.port,
+            session_id: info.session_id,
+            decode_tp_size: info.tp_size,
+            decode_tp_rank: info.tp_rank,
+            arena_base: info.arena_base,
+            layout: Arc::new(info.layout),
+            planned: Arc::new(planned),
+        })
+    }
+
     fn handle_registration(&self, frames: &[Bytes]) {
-        match self.planner.prepare_registration(frames) {
-            Ok(registration) => {
-                let mut state = self.state();
-                let session_id = registration.session_id.clone();
-                state.rejected.remove(&session_id);
-                state.failed_sessions.remove(&session_id);
-                state.registrations.insert(session_id, registration);
+        let registered = self.plan_registration(frames).and_then(|registration| {
+            let mut state = self.state();
+            let session_id = registration.session_id.clone();
+            if state
+                .registrations
+                .get(&session_id)
+                .is_some_and(|previous| *previous != registration)
+            {
+                return Err("conflicting registration for an active CachePD session".to_owned());
             }
+            state.rejected.remove(&session_id);
+            state.failed_sessions.remove(&session_id);
+            state.registrations.insert(session_id, registration);
+            Ok(())
+        });
+        match registered {
+            Ok(()) => {}
             Err(reason) => {
                 tracing::error!(reason, "rejecting a CachePD Decode registration");
                 if let Ok((endpoint, port, session_id)) = wire::registration_route(frames) {
@@ -416,14 +466,11 @@ impl Shared {
                 &format!("Decode session {session_id} registration rejected: {reason}"),
             );
         }
-        {
-            let mut state = self.state();
-            state.registrations.remove(session_id);
-            state
-                .rejected
-                .insert(session_id.to_owned(), (endpoint, port));
-        }
-        self.planner.reject_registration(session_id);
+        let mut state = self.state();
+        state.registrations.remove(session_id);
+        state
+            .rejected
+            .insert(session_id.to_owned(), (endpoint, port));
     }
 
     fn handle_preallocation(&self, frames: &[Bytes]) {
@@ -461,7 +508,14 @@ impl Shared {
             self.notify_failed(route, room);
             return Ok(());
         }
-        let is_dummy = self.planner.accept_preallocation(frames)?;
+        let preallocation = Preallocation::from_frames(frames).map_err(|error| error.0)?;
+        if preallocation.manifest.is_none() != registration.is_dummy() {
+            return Err("CachePD request kind disagrees with its registration".to_owned());
+        }
+        if let Some(manifest) = &preallocation.manifest {
+            validate_manifest(manifest, &registration.layout, "destination")
+                .map_err(|error| error.0)?;
+        }
         let mut state = self.state();
         let mut destinations = state.destinations.get(&room).cloned().unwrap_or_default();
         if destinations
@@ -472,9 +526,9 @@ impl Shared {
         }
         destinations.push(Destination {
             session_id: session_id.to_owned(),
-            is_dummy,
+            manifest: preallocation.manifest.map(Arc::new),
         });
-        let expected = registration.expected_decode_ranks.len();
+        let expected = registration.planned.expected_decode_ranks.len();
         if destinations.len() > expected {
             return Err("pre-allocation exceeds destination fanout".to_owned());
         }
@@ -509,9 +563,6 @@ impl Shared {
         }
         for (route, room) in notices {
             self.notify_failed(route, room);
-        }
-        for room in expired {
-            self.planner.drop_room(room);
         }
     }
 
@@ -549,16 +600,50 @@ impl Shared {
         match chunk {
             Chunk::Full {
                 room,
+                source,
                 bootstrap_token,
                 spec_candidate_ids,
-            } => self.transfer_full(*room, *bootstrap_token, spec_candidate_ids),
+            } => self.transfer_full(
+                *room,
+                source.as_deref(),
+                *bootstrap_token,
+                spec_candidate_ids,
+            ),
             Chunk::Layerwise {
                 room,
-                chunk_id,
+                selection,
                 target_steps,
                 is_last,
-            } => self.transfer_layerwise(*room, *chunk_id, target_steps, *is_last),
+            } => self.transfer_layerwise(*room, selection, target_steps, *is_last),
         }
+    }
+
+    /// The copies that move `source` to one Decode rank, per entry of
+    /// `steps` (the fields each moves; `None`: every field).
+    fn plan_copies(
+        &self,
+        registration: &Registration,
+        source: Source<'_>,
+        destination: &Destination,
+        steps: &[Option<BTreeSet<String>>],
+    ) -> Result<Vec<Vec<Copy>>, String> {
+        let manifest = destination
+            .manifest
+            .as_deref()
+            .ok_or("a dummy destination has no manifest to send to")?;
+        Transfer {
+            layout: &self.layout.local,
+            arena_base: self.layout.arena_base,
+            destination_base: registration.arena_base,
+            destination_tp_rank: registration.decode_tp_rank,
+            destination_layout: &registration.layout,
+            source,
+            destination: manifest,
+            fragments: &registration.planned.fragments,
+            owner_filters: &registration.planned.owner_filters,
+        }
+        .copies(steps)
+        .map_err(|error| error.0)
     }
 
     /// The live destinations' registrations, failing if one's session failed.
@@ -674,12 +759,14 @@ impl Shared {
     fn transfer_layerwise(
         &self,
         room: u64,
-        chunk_id: u64,
+        selection: &Selection,
         target_steps: &[u64],
         is_last: bool,
     ) -> Result<(), String> {
         let address = self
-            .layerwise_step_address
+            .layerwise
+            .as_ref()
+            .map(|layerwise| layerwise.step_address)
             .ok_or("Cache-transfer layerwise transfer has no producer step counter")?;
         let destinations: Vec<Destination> = self
             .state()
@@ -688,17 +775,28 @@ impl Shared {
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .filter(|destination| !destination.is_dummy)
+            .filter(|destination| !destination.is_dummy())
             .collect();
         if destinations.is_empty() {
             return Err("CachePD transfer room has no destinations".to_owned());
         }
         let registrations = self.live_registrations(&destinations)?;
         let sessions: Vec<String> = destinations.iter().map(|d| d.session_id.clone()).collect();
-        let plans = self.planner.plan_layerwise(chunk_id, &sessions)?;
+        // Every peer's copies of every interval, planned once, before any DMA.
+        let plans = registrations
+            .iter()
+            .zip(&destinations)
+            .map(|(registration, destination)| {
+                self.plan_copies(
+                    registration,
+                    Source::Selection(selection),
+                    destination,
+                    &self.interval_fields,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         for (interval, &target) in target_steps.iter().enumerate() {
             self.wait_for_step(address, target, room, &sessions)?;
-            // Every peer's copies of this interval are planned before any DMA.
             for (registration, plan) in registrations.iter().zip(&plans) {
                 let copies = plan
                     .get(interval)
@@ -710,7 +808,6 @@ impl Shared {
         }
         tracing::debug!(
             room,
-            chunk_id,
             intervals = target_steps.len(),
             is_last,
             "layerwise chunk sent"
@@ -740,6 +837,7 @@ impl Shared {
     fn transfer_full(
         &self,
         room: u64,
+        source: Option<&Manifest>,
         bootstrap_token: i64,
         spec_candidate_ids: &Option<Vec<i32>>,
     ) -> Result<(), String> {
@@ -750,7 +848,7 @@ impl Shared {
             .cloned()
             .filter(|destinations| !destinations.is_empty())
             .ok_or("CachePD transfer room has no destinations")?;
-        if destinations.iter().any(|destination| destination.is_dummy) {
+        if destinations.iter().any(Destination::is_dummy) {
             // This rank only joins the status agreement for the room.
             let mut state = self.state();
             if state.rooms.get(room).is_some() {
@@ -760,9 +858,18 @@ impl Shared {
             return Ok(());
         }
         let registrations = self.live_registrations(&destinations)?;
+        let source = source.ok_or("Cache-transfer source manifest is unavailable")?;
         let mut prepared = Vec::with_capacity(destinations.len());
         for (destination, registration) in destinations.iter().zip(registrations) {
-            let copies = self.planner.plan_send(room, &destination.session_id)?;
+            let copies = self
+                .plan_copies(
+                    &registration,
+                    Source::Manifest(source),
+                    destination,
+                    &[None],
+                )?
+                .pop()
+                .unwrap_or_default();
             prepared.push((registration, copies));
         }
         for (registration, copies) in &prepared {
@@ -796,12 +903,22 @@ impl Shared {
     }
 }
 
-/// Where the data plane hands a Prefill rank's peer its work, from the
-/// forward thread; never waits.
+/// Where the forward thread hands a Prefill rank's peer its work; never
+/// waits for a transfer.
+///
+/// A plan's remote decode is staged when the plan goes to the data plane
+/// ([`PrefillOutbox::stage_remote_decode`]) and handed over by the data plane
+/// once the drafter's pending round finished
+/// ([`PrefillOutbox::hand_over_remote_decode`]): the KV it sends includes
+/// what that round writes.
 #[derive(Clone)]
 pub struct PrefillOutbox {
     shared: Arc<Shared>,
     queues: Arc<Vec<mpsc::Sender<Chunk>>>,
+    staged: Staged,
+    /// Layerwise: the producer steps armed so far, modulo `STEP_COUNT_MAX`
+    /// (the host half of `StepCounter`).
+    armed_steps: Arc<Mutex<u64>>,
 }
 
 impl PrefillOutbox {
@@ -826,14 +943,116 @@ impl PrefillOutbox {
         self.shared.transport.restore_regions(false)
     }
 
-    /// A request's KV is written and its manifest kept: send it to its
-    /// destinations (`add_transfer_request`).
-    pub fn send(
+    /// Whether prefill chunks stream their KV layerwise.
+    pub fn streams_layerwise(&self) -> bool {
+        self.shared.layerwise.is_some()
+    }
+
+    /// Stage a plan's remote decode: the prompts whose KV goes out now.
+    pub fn stage_remote_decode(&self, rows: BatchRows) -> Result<(), String> {
+        self.staged.stage(rows)
+    }
+
+    /// Whether a staged remote decode still waits to be handed over.
+    pub fn remote_decode_pending(&self) -> bool {
+        self.staged.is_pending()
+    }
+
+    /// The staged remote decode's device prerequisites are met: send each
+    /// prompt's KV to its destinations (`HostPrefillPeer.execute`). A room
+    /// that streams layerwise already sends; it only gets its bootstrap
+    /// payload.
+    pub fn hand_over_remote_decode(&self) -> Result<(), String> {
+        let rows = self.staged.take()?;
+        for (index, rid) in rows.request_ids.iter().enumerate() {
+            let Some(room) = self.shared.state().rooms_by_rid.get(rid).copied() else {
+                continue;
+            };
+            let token = *rows
+                .decode_input_ids
+                .get(index)
+                .ok_or("a remote decode row has no first token")?;
+            if token < 0 {
+                return Err("Cache-transfer bootstrap token is unavailable".to_owned());
+            }
+            let spec_candidate_ids = rows
+                .spec_candidate_ids
+                .get(index)
+                .filter(|ids| !ids.is_empty())
+                .cloned();
+            let source = {
+                let state = self.shared.state();
+                let destinations = state.destinations.get(&room).map_or(&[][..], Vec::as_slice);
+                if destinations.is_empty() {
+                    drop(state);
+                    self.send_unplanned(rid, room)?;
+                    continue;
+                }
+                let windows: Vec<&Manifest> = destinations
+                    .iter()
+                    .filter_map(|destination| destination.manifest.as_deref())
+                    .collect();
+                match windows.first() {
+                    Some(window) if !state.layerwise_rooms.contains(&room) => {
+                        same_prompt_window(&windows)?;
+                        Some(Arc::new(
+                            build_manifest(
+                                &rows.tables,
+                                &self.shared.layout.local,
+                                index,
+                                window.prefix_len,
+                                window.prompt_len,
+                                window.state_prefix_cached,
+                            )
+                            .map_err(|error| error.0)?,
+                        ))
+                    }
+                    _ => None,
+                }
+            };
+            self.send(rid, room, i64::from(token), spec_candidate_ids, source);
+        }
+        Ok(())
+    }
+
+    /// Layerwise streaming: arm one chunk per extend row of the forward the
+    /// plan launches whose request has a destination, ahead of the forward
+    /// (`HostPrefillPeer.prepare_prefill`). Every row is planned before any
+    /// is armed, and the forward's producer steps are counted once.
+    pub fn arm_layerwise(&self, forward: &BatchRows) -> Result<(), String> {
+        let Some(layerwise) = &self.shared.layerwise else {
+            return Ok(());
+        };
+        if forward.num_extends == 0 {
+            return Ok(());
+        }
+        let chunks = layerwise_chunks(&self.shared.state(), &self.shared.layout.local, forward)?;
+        // The attention backends record one producer range per forward, even
+        // when its chunk completes no block.
+        let step_count = layerwise.fields_by_step.len() as u64;
+        let begin = {
+            let mut armed = self.armed_steps.lock().expect("the step lock is poisoned");
+            let begin = *armed;
+            *armed = (begin + step_count) % STEP_COUNT_MAX;
+            begin
+        };
+        let targets = interval_targets(begin, step_count, layerwise.interval.max(1) as u64);
+        for (rid, room, is_last, selection) in chunks {
+            self.send_layerwise(&rid, room, Arc::new(selection), targets.clone(), is_last);
+        }
+        Ok(())
+    }
+
+    /// A request's KV is written: send it to its destinations
+    /// (`add_transfer_request`), or, for a room streaming layerwise, give its
+    /// final chunk the bootstrap payload.
+    fn send(
         &self,
         rid: &str,
         room: u64,
         bootstrap_token: i64,
         spec_candidate_ids: Option<Vec<i32>>,
+        source: Option<Arc<Manifest>>,
     ) {
         {
             let mut state = self.shared.state();
@@ -852,28 +1071,35 @@ impl PrefillOutbox {
             rid,
             Chunk::Full {
                 room,
+                source,
                 bootstrap_token,
                 spec_candidate_ids,
             },
         );
     }
 
-    /// Layerwise streaming: a prefill chunk of `room`'s request was armed
-    /// (`send_layerwise`); its intervals are complete at `target_steps`.
-    pub fn send_layerwise(
+    /// Layerwise streaming: queue one armed chunk of `room`'s request; its
+    /// intervals are complete at `target_steps`.
+    fn send_layerwise(
         &self,
         rid: &str,
         room: u64,
-        chunk_id: u64,
+        selection: Arc<Selection>,
         target_steps: Vec<u64>,
         is_last: bool,
     ) {
-        self.shared.state().layerwise_rooms.insert(room);
+        {
+            let mut state = self.shared.state();
+            if state.ended(room) {
+                return;
+            }
+            state.layerwise_rooms.insert(room);
+        }
         self.enqueue(
             rid,
             Chunk::Layerwise {
                 room,
-                chunk_id,
+                selection,
                 target_steps,
                 is_last,
             },
@@ -908,7 +1134,7 @@ impl PrefillOutbox {
     /// A request reached its remote decode with no destination on record:
     /// fine for a room that already failed or ended, a broken invariant
     /// otherwise.
-    pub fn send_unplanned(&self, rid: &str, room: u64) -> Result<(), String> {
+    fn send_unplanned(&self, rid: &str, room: u64) -> Result<(), String> {
         if self.shared.state().ended(room) {
             return Ok(());
         }
@@ -916,6 +1142,95 @@ impl PrefillOutbox {
             "Cache-transfer destination metadata is unavailable for {rid} (room {room})"
         ))
     }
+}
+
+/// One forward's layerwise chunks: for each extend row whose request has a
+/// destination, the blocks its chunk makes ready and whether it ends the
+/// prompt. A room's first chunk also carries the blocks this rank found in
+/// its cache that the Decode rank still needs; later ones start at their
+/// own boundary, so nothing goes twice. A chunk that completes no block is
+/// skipped, but for the prompt's last.
+fn layerwise_chunks(
+    state: &State,
+    layout: &Contract,
+    forward: &BatchRows,
+) -> Result<Vec<(String, u64, bool, Selection)>, String> {
+    let mut chunks = Vec::new();
+    for index in 0..forward.num_extends {
+        let rid = &forward.request_ids[index];
+        let Some(&room) = state.rooms_by_rid.get(rid) else {
+            continue;
+        };
+        let windows: Vec<&Manifest> = state
+            .destinations
+            .get(&room)
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .filter_map(|destination| destination.manifest.as_deref())
+            .collect();
+        // A dummy-only room completes after the forward like any other.
+        let Some(window) = windows.first() else {
+            continue;
+        };
+        same_prompt_window(&windows)?;
+        let chunk_begin = i64::from(forward.extend_prefix_lens[index]);
+        let chunk_end = chunk_begin + i64::from(forward.input_lengths[index]);
+        if chunk_end > window.prompt_len {
+            return Err(
+                "Cache-transfer Prefill chunk extends past Decode's prompt manifest".to_owned(),
+            );
+        }
+        let is_last = chunk_end == window.prompt_len;
+        let mut selection_start = chunk_begin;
+        if !state.layerwise_rooms.contains(&room) {
+            selection_start = selection_start.min(window.prefix_len);
+        }
+        let selection = build_selection(
+            &forward.tables,
+            layout,
+            index,
+            window.prefix_len,
+            window.prompt_len,
+            selection_start,
+            chunk_end,
+            window.state_prefix_cached,
+        )
+        .map_err(|error| error.0)?;
+        if !is_last
+            && selection
+                .groups
+                .iter()
+                .all(|group| group.source_block_ids.is_empty())
+        {
+            continue;
+        }
+        chunks.push((rid.clone(), room, is_last, selection));
+    }
+    Ok(chunks)
+}
+
+/// The producer step each transfer interval of a forward is complete at,
+/// for a forward of `step_count` steps after the first `begin`: its last.
+fn interval_targets(begin: u64, step_count: u64, interval: u64) -> Vec<u64> {
+    (0..step_count)
+        .step_by(interval as usize)
+        .map(|first| (begin + (first + interval).min(step_count) - 1) % STEP_COUNT_MAX)
+        .collect()
+}
+
+/// Every destination of a room describes the same prompt window.
+fn same_prompt_window(windows: &[&Manifest]) -> Result<(), String> {
+    let Some(first) = windows.first() else {
+        return Ok(());
+    };
+    if windows.iter().any(|other| {
+        other.prefix_len != first.prefix_len
+            || other.prompt_len != first.prompt_len
+            || other.state_prefix_cached != first.state_prefix_cached
+    }) {
+        return Err("Cache-transfer destinations disagree on the prompt window".to_owned());
+    }
+    Ok(())
 }
 
 /// One request's transfer as the scheduling loop tracks it.
@@ -942,21 +1257,24 @@ pub struct PrefillPeer {
 impl PrefillPeer {
     /// Start the transfer engine, register the cache, open the control
     /// socket, start the threads and register with the bootstrap server.
-    pub fn start(
-        config: PrefillConfig,
-        planner: Arc<dyn PrefillPlanner>,
-    ) -> Result<(Self, PrefillOutbox), StartError> {
+    pub fn start(config: PrefillConfig) -> Result<(Self, PrefillOutbox), StartError> {
         let (incoming, messages) = mpsc::channel();
         let transport = Transport::start(&config.peer, incoming)?;
         let port = transport.sockets.port();
+        let interval_fields = config
+            .layerwise
+            .as_ref()
+            .map(Layerwise::interval_fields)
+            .unwrap_or_default();
         let shared = Arc::new(Shared {
             transport,
-            planner,
+            layout: config.layout,
             state: Mutex::new(State::default()),
             status_rank: config.status_rank,
             failed_session_ttl: config.failed_session_ttl,
             metrics: config.peer.metrics.clone(),
-            layerwise_step_address: config.layerwise_step_address,
+            layerwise: config.layerwise,
+            interval_fields,
             metadata_ready: Condvar::new(),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -1008,6 +1326,8 @@ impl PrefillPeer {
         let outbox = PrefillOutbox {
             shared: shared.clone(),
             queues: Arc::new(queues),
+            staged: Staged::default(),
+            armed_steps: Arc::new(Mutex::new(0)),
         };
         Ok((
             Self {
@@ -1065,7 +1385,9 @@ impl PrefillPeer {
             return;
         };
         self.order.retain(|tracked| tracked != rid);
-        self.shared.state().clear(sender.room);
+        let mut state = self.shared.state();
+        state.clear(sender.room);
+        state.rooms_by_rid.remove(rid);
     }
 }
 
@@ -1087,6 +1409,7 @@ impl TransferPeer for PrefillPeer {
             // request's now.
             state.unclaimed.remove(&room);
             state.tracked.insert(room);
+            state.rooms_by_rid.insert(rid.to_owned(), room);
         }
         if self
             .senders
@@ -1234,6 +1557,8 @@ mod tests {
     #[test]
     fn unclaimed_rooms_expire_and_their_decode_ranks_are_told() {
         let mut state = State::default();
+        let layout =
+            Contract::from_wire(crate::layout::contract::tests::wire().as_bytes()).unwrap();
         state.registrations.insert(
             "s0".to_owned(),
             Registration {
@@ -1242,14 +1567,25 @@ mod tests {
                 session_id: "s0".to_owned(),
                 decode_tp_size: 1,
                 decode_tp_rank: 0,
-                is_dummy: false,
-                expected_decode_ranks: vec![0],
+                arena_base: 0x1000,
+                layout: Arc::new(layout),
+                planned: Arc::new(PlannedRegistration {
+                    fragments: Vec::new(),
+                    owner_filters: Default::default(),
+                    is_dummy: false,
+                    expected_decode_ranks: BTreeSet::from([0]),
+                }),
             },
         );
         let destination = || {
             vec![Destination {
                 session_id: "s0".to_owned(),
-                is_dummy: false,
+                manifest: Some(Arc::new(Manifest {
+                    groups: Vec::new(),
+                    prefix_len: 0,
+                    prompt_len: 1,
+                    state_prefix_cached: false,
+                })),
             }]
         };
         // Pre-allocated by a Decode rank; its request never registers here.
@@ -1275,5 +1611,161 @@ mod tests {
         assert!(!state.destinations.contains_key(&1));
         assert_eq!(state.rooms.get(2), None);
         assert!(state.destinations.contains_key(&3));
+    }
+
+    /// A history group of 2-token blocks and two state groups.
+    fn grouped_layout() -> Contract {
+        let group = |id: &str| serde_json::json!({"group_id": id, "cache_blocks_per_lcm_block": 1, "page_count": 32});
+        let field = |group: &str, field: &str, offset: i64| {
+            serde_json::json!({"group_id": group, "field_id": field, "plane_id": "p0",
+                               "shape": [4], "dtype": "bfloat16", "field_offset_bytes": offset,
+                               "page_stride_bytes": 32})
+        };
+        let state = |id: &str| {
+            serde_json::json!({"group_id": id, "attn_kind": "state", "replayable": false,
+                               "transfer_policy": "latest_snapshot", "shard_count": 1})
+        };
+        let wire = serde_json::json!({
+            "plan": {
+                "prefix_granularity": 2,
+                "lcm_block_bytes": 32,
+                "num_lcm_blocks": 31,
+                "groups": [group("history"), group("state-a"), group("state-b")],
+                "planes": [{"plane_id": "p0", "bytes_per_lcm_block": 32, "arena_offset_bytes": 0}],
+                "fields": [field("history", "layer.0.kv", 0), field("state-a", "layer.2.state", 8),
+                           field("state-b", "layer.4.state", 16)],
+                "resident_block_bytes": null
+            },
+            "group_specs": [
+                {"group_id": "history", "attn_kind": "full_history", "rows_per_page": 2,
+                 "entry_stride_tokens": 1, "replayable": false, "transfer_policy": "full_suffix",
+                 "shard_count": 1},
+                state("state-a"),
+                state("state-b")
+            ],
+            "transfer_schema": {"fields": []},
+            "field_addresses": null
+        });
+        Contract::from_wire(wire.to_string().as_bytes()).unwrap()
+    }
+
+    /// `rid`'s room `room`, pre-allocated by one Decode rank whose manifest
+    /// spans `prefix..prompt`.
+    fn destined(state: &mut State, rid: &str, room: u64, prefix: i64, prompt: i64) {
+        state.rooms_by_rid.insert(rid.to_owned(), room);
+        state.destinations.insert(
+            room,
+            vec![Destination {
+                session_id: "decode:7000".to_owned(),
+                manifest: Some(Arc::new(Manifest {
+                    groups: Vec::new(),
+                    prefix_len: prefix,
+                    prompt_len: prompt,
+                    state_prefix_cached: false,
+                })),
+            }],
+        );
+    }
+
+    fn chunk_forward(rows: &[(&str, i32, i32)], tables: &[(&str, Vec<Vec<i64>>)]) -> BatchRows {
+        BatchRows {
+            request_ids: rows.iter().map(|row| row.0.to_owned()).collect(),
+            extend_prefix_lens: rows.iter().map(|row| row.1).collect(),
+            input_lengths: rows.iter().map(|row| row.2).collect(),
+            num_extends: rows.len(),
+            tables: tables
+                .iter()
+                .map(|(group, rows)| {
+                    let columns = rows[0].len();
+                    (
+                        (*group).to_owned(),
+                        crate::layout::manifest::BlockTable::from_rows(rows, columns),
+                    )
+                })
+                .collect(),
+            ..BatchRows::default()
+        }
+    }
+
+    #[test]
+    fn a_forward_arms_a_chunk_per_destined_row_only_when_every_row_plans() {
+        let layout = grouped_layout();
+        let mut state = State::default();
+        destined(&mut state, "request-0", 9, 0, 4);
+        destined(&mut state, "request-1", 10, 0, 4);
+        let mut tables = vec![
+            ("history", vec![vec![1, 2], vec![3, 4]]),
+            ("state-a", vec![vec![5, 6], vec![7, 8]]),
+            ("state-b", vec![vec![9, 10], vec![11, 12]]),
+        ];
+        let rows = [
+            ("request-0", 0, 4),
+            ("request-1", 0, 4),
+            ("untracked", 0, 4),
+        ];
+        let chunks = layerwise_chunks(&state, &layout, &chunk_forward(&rows, &tables)).unwrap();
+        let armed: Vec<(&str, u64, bool, Vec<i64>)> = chunks
+            .iter()
+            .map(|(rid, room, is_last, selection)| {
+                (
+                    rid.as_str(),
+                    *room,
+                    *is_last,
+                    selection.groups[1].source_block_ids.clone(),
+                )
+            })
+            .collect();
+        // The whole prompt in one chunk: the state groups' live slots go too.
+        assert_eq!(
+            armed,
+            [
+                ("request-0", 9, true, vec![6]),
+                ("request-1", 10, true, vec![8])
+            ]
+        );
+        // A later bad row refuses the whole forward.
+        tables[0].1[1][0] = 0;
+        let error = layerwise_chunks(&state, &layout, &chunk_forward(&rows, &tables)).unwrap_err();
+        assert!(error.contains("invalid block ID"), "{error}");
+    }
+
+    #[test]
+    fn a_rooms_first_chunk_carries_a_deeper_prefill_cache_hit() {
+        let layout = grouped_layout();
+        let mut state = State::default();
+        // Decode holds 2 tokens of the 9-token prompt; this rank's cache 4.
+        destined(&mut state, "request-0", 9, 2, 9);
+        let tables = [
+            ("history", vec![vec![1, 2, 3, 4, 5]]),
+            ("state-a", vec![vec![6, 7]]),
+            ("state-b", vec![vec![11, 12]]),
+        ];
+        let history = |state: &State, begin, length| {
+            let forward = chunk_forward(&[("request-0", begin, length)], &tables);
+            let (_, _, is_last, selection) = layerwise_chunks(state, &layout, &forward)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let group = selection.groups[0].clone();
+            (is_last, group.source_block_ids, group.destination_positions)
+        };
+        // The first chunk, [4, 7), also sends the history blocks of [2, 4)
+        // Decode lacks.
+        assert_eq!(history(&state, 4, 3), (false, vec![2, 3], vec![0, 1]));
+        state.layerwise_rooms.insert(9);
+        // The last starts at its own boundary.
+        assert_eq!(history(&state, 7, 2), (true, vec![4, 5], vec![2, 3]));
+    }
+
+    #[test]
+    fn each_interval_completes_at_its_last_producer_step() {
+        assert_eq!(interval_targets(0, 5, 2), [1, 3, 4]);
+        // Every forward counts its whole range: the next starts after it.
+        assert_eq!(interval_targets(0, 3, 1), [0, 1, 2]);
+        assert_eq!(interval_targets(3, 3, 1), [3, 4, 5]);
+        assert_eq!(
+            interval_targets(STEP_COUNT_MAX - 1, 2, 1),
+            [STEP_COUNT_MAX - 1, 0]
+        );
     }
 }

@@ -37,6 +37,7 @@ struct CacheEvent;
 struct CacheOpView;
 struct StorageOpView;
 struct ForwardBatchView;
+struct TransferBatchView;
 struct SchedulerAbortView;
 struct SchedulerSizes;
 struct CacheGroupPages;
@@ -68,6 +69,9 @@ rust::Vec<ForwardBatchView> plan_forward_batches(const tokenspeed::ExecutionPlan
 bool plan_needs_device(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_decode(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<ForwardBatchView> plan_remote_prefill(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<TransferBatchView> plan_forward_transfer(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<TransferBatchView> plan_remote_decode_transfer(const tokenspeed::ExecutionPlan& plan);
+rust::Vec<TransferBatchView> plan_remote_prefill_transfer(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<SchedulerAbortView> plan_aborts(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<CacheOpView> plan_cache_ops(const tokenspeed::ExecutionPlan& plan);
 rust::Vec<StorageOpView> plan_storage_ops(const tokenspeed::ExecutionPlan& plan);

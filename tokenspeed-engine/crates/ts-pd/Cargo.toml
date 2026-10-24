@@ -14,7 +14,6 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 ts-collective = { path = "../ts-collective" }
-ts-control = { path = "../ts-control" }
 ts-metrics = { path = "../ts-metrics" }
 ts-mooncake = { path = "../ts-mooncake" }
 ureq = { version = "2", default-features = false, features = ["json"] }

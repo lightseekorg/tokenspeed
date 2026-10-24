@@ -28,11 +28,14 @@
 * ``L3Executor`` is the L3 storage tier's executor (``ts-l3``) for callers
   outside a rank, such as tests over a data plane's Host pool; a rank's
   host runs its own.
+* ``BootstrapServer`` is a disaggregated deployment's HTTP rendezvous
+  (``ts-pd``), which the launcher hosts.
 """
 
 from pathlib import Path
 
 from tokenspeed_engine._native import (
+    BootstrapServer,
     EngineError,
     Frontend,
     FrontendListener,
@@ -41,6 +44,7 @@ from tokenspeed_engine._native import (
 )
 
 __all__ = [
+    "BootstrapServer",
     "EngineError",
     "Frontend",
     "FrontendListener",

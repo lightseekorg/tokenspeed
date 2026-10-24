@@ -94,7 +94,7 @@ how long the caller may hold each piece:
 | --- | --- | --- |
 | `DeviceSpecs` | plain values the control plane plans with: cache geometry, cache groups, speculation widths, capability flags | keep forever |
 | `DeviceHandle` | the running handle: the complete list of what the control plane may ask of the device side | held by the data plane (`HostDataPlane`) only |
-| `transfer` | the PD planner the Rust transfer peer calls (`pd/host_peer.py`), or None outside PD | handed to `ts-pd` at startup |
+| `transfer` | the PD peer's settings and device fences (`pd/host_peer.py`): what the Rust transfer peer starts from, and what hands it each plan's remote stream; None outside PD | handed to `ts-pd` at startup, held by the handle |
 | `host_cache` | shared Host resources, the CPU cache layout and the resolved attention choices; no Device buffers or executor | consumed at startup, by the L3 settings (`cache/l3/factory.py`) |
 | `encoder_model_facts` | a callable resolving the encoder facts EPD admission needs (raises on text-only) | consumed at startup, past the EPD gate |
 
@@ -114,8 +114,21 @@ remains model work on the forward thread, after all required items and prefill
 ranks have completed admission.
 
 `build_device_side` builds the device side **complete**, not built-then-wired:
-it constructs the transfer planner from its prepared components and startup
+it constructs the transfer peer from its prepared components and startup
 arguments, and reads the engine's role off it once, at construction.
+
+The transfer itself is the host's (`ts-pd`): the routes between unequal rank
+sets, the block manifests read off each plan's block tables, the layerwise
+chunks and the copies are planned there, over the cache transfer contract the
+data plane built at startup. The forward thread stages each plan's remote
+stream with the peer before it hands the plan to the data plane; the data
+plane hands the stream over (`execute`) once its device prerequisites are
+met -- on a Prefill rank behind the drafter's pending round, whose KV goes
+too; on a Decode rank behind the plan's page zeroing, as the Prefill ranks'
+writes are not ordered with the device's -- and the forward thread checks it
+did. On a Prefill rank streaming layerwise, the forward thread arms the
+forward's chunks when it hands the plan over and counts the producer steps;
+the attention backends only tick the device counter (`StepCounter`).
 
 Common MoE weight processing reserves persistent DeepEP communication
 storage, before attention/cache construction profiles available memory. The

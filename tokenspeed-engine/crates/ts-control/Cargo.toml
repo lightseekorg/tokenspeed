@@ -18,6 +18,7 @@ ts-collective = { path = "../ts-collective" }
 ts-grammar = { path = "../ts-grammar" }
 ts-l3 = { path = "../ts-l3" }
 ts-metrics = { path = "../ts-metrics" }
+ts-pd = { path = "../ts-pd" }
 ts-scheduler = { path = "../ts-scheduler" }
 ts-wire = { path = "../ts-wire" }
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
