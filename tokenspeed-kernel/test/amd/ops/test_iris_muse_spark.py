@@ -1318,9 +1318,33 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             num_warps=1,
         )
 
+    # The fused path ends at the one-shot mailbox capacity, or earlier where
+    # TP8's two-shot plus the separate routed norm is faster; above it the
+    # model normalizes locally and reduces through the generic policy.
+    max_rows = state.routed_lamport_max_rows
+    # This heap prepares the two-shot on 8 ranks only; pin the policy value.
+    assert max_rows == (32 if world_size == 8 else 43)
+    probe = torch.zeros((max_rows + 1) * 8, 4096, dtype=torch.bfloat16, device=device)
+    probe_map = torch.zeros((max_rows + 1) * 8, dtype=torch.int32, device=device)
+    probe_weights = torch.zeros(max_rows + 1, 8, device=device)
+    probe_norm = torch.zeros(4096, dtype=torch.bfloat16, device=device)
+    for count, eligible in ((max_rows, True), (max_rows + 1, False)):
+        assert (
+            state.can_all_reduce_routed_rmsnorm_sum(
+                probe[: count * 8],
+                probe_map[: count * 8],
+                count,
+                8,
+                probe_weights[:count],
+                probe_norm,
+                1.0,
+            )
+            == eligible
+        )
+
     state.all_reduce.producer_pull.ready_flags.fill_(-4)
     state.all_reduce.peers.ctx.device_barrier()
-    for rows in (16, 43, 1, 17):
+    for rows in (16, max_rows, 1, 17):
         torch.manual_seed(1300 + rows)
         values = torch.randn(rows * 8, 4096, device=device).bfloat16()
         routes = torch.empty_like(values)
@@ -1391,7 +1415,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             return actual, expected
 
         update(0)
-        if rows in (16, 43):
+        if rows in (16, max_rows):
             run()
         else:
             with assert_no_triton_compile(
