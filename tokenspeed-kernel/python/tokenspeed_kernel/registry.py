@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterable
 if TYPE_CHECKING:
     import torch
 
+    from tokenspeed_kernel.op_profile import OpProfile
     from tokenspeed_kernel.selection import SelectedKernel
 
 from tokenspeed_kernel.platform import CapabilityRequirement, PlatformInfo
@@ -397,6 +398,7 @@ def register_kernel(
     traits: dict[str, frozenset[Any]] | None = None,
     priority: Priority | int = Priority.PERFORMANT + 2,
     weight_preprocessor: Callable | tuple[tuple[str, ...], Callable] | None = None,
+    profile: OpProfile | None = None,
 ) -> Callable:
     """Decorator to register a kernel function or stateful kernel class.
 
@@ -411,6 +413,9 @@ def register_kernel(
     ``weight_preprocessor`` is a pair of source attribute names and a function
     accepting those tensors and returning the transformed tensors. Plain
     layer-mutating callbacks remain supported until their backends migrate.
+
+    ``profile`` opts synchronous functions into op/layer host metadata collection.
+    Omission leaves the implementation unchanged; stateful classes are not yet supported.
 
     Example::
 
@@ -453,6 +458,12 @@ def register_kernel(
             weight_preprocessor=normalized_weight_preprocessor,
         )
 
+        if profile is not None:
+            from tokenspeed_kernel.op_profile import wrap_registered_op
+
+            impl = wrap_registered_op(
+                impl, family=family, mode=mode, name=kernel_name, profile=profile
+            )
         KernelRegistry.get().register(spec, impl)
         return impl
 
