@@ -609,6 +609,8 @@ private:
     std::vector<std::size_t> match_order_;
     BlockPool& pool_;
     BlockPool* host_pool_{nullptr};
+    std::shared_ptr<PrefixCacheIndex::HostParentIndex> host_parent_index_{
+        std::make_shared<PrefixCacheIndex::HostParentIndex>()};
     // Request-private retraction images: never prefix-indexed, never evicted.
     BlockPool* snapshot_pool_{nullptr};
     bool stream_device_cache_to_host_{false};

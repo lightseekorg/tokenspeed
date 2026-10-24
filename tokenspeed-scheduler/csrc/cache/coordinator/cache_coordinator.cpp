@@ -26,7 +26,6 @@
 #include <limits>
 #include <memory>
 #include <optional>
-#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <deque>
@@ -68,6 +67,8 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         if (host_pool_ != nullptr) {
             host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
+            groups_[i].Index().EnableHostRetention(*host_pool_, host_parent_index_, spec.cache_blocks_per_lcm_block,
+                                                   spec.shard_count);
         }
         // The same packing and shard count as the Device pool, so a snapshot
         // block's virtual id has the same owner as the Device block it images.
@@ -1071,96 +1072,48 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         }
     }
 
-    // Retention value of one Host cache entry: keep what a request has already
-    // proven useful, then the most recently accessed, then a stable tie-break.
-    const auto value = [](std::uint32_t candidate_group, CacheBlockLocation location,
-                          const PrefixCacheIndex::CachedBlockMetadata& metadata) {
-        return std::tuple{metadata.was_acquired, metadata.last_access_epoch, candidate_group, location.lcm_block_id,
-                          location.slot_index};
-    };
-    const auto lookup_value = [&](std::uint32_t candidate_group, CacheBlockLocation location) {
-        const auto metadata = groups_[candidate_group].Index().MetadataFor(*host_pool_, location);
-        _assert(metadata.has_value(), "evictable Host block has no cache metadata");
-        return value(candidate_group, location, *metadata);
-    };
-    using HostCacheValue = decltype(lookup_value(std::uint32_t{}, CacheBlockLocation{}));
-
     for (std::uint32_t group_id : group_order) {
         std::vector<std::size_t>& unresolved = unresolved_by_group[group_id];
         if (unresolved.empty()) {
             continue;
         }
         ++batch.stats.same_group_scans;
-        // Host retention ranks was_acquired before epoch, unlike the eviction
-        // index, so finding the best victims needs a full group scan; each
-        // unresolved block then evicts the least valuable entry in its own
-        // bucket, which is exactly the hole it needs.
-        std::vector<PrefixCacheIndex::EvictionCandidate> local_victims =
-            groups_[group_id].Index().EvictableCandidates(*host_pool_);
-        std::ranges::sort(local_victims, {}, [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
-            return value(group_id, candidate.location, candidate.metadata);
-        });
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        std::vector<bool> consumed(local_victims.size(), false);
+        std::vector<std::optional<PrefixCacheIndex::HostRetentionOrder>> cursors(
+            static_cast<std::size_t>(groups_[group_id].Allocator().ShardCount()));
         std::erase_if(unresolved, [&](std::size_t index) {
             const std::int32_t bucket = buckets[index];
-            for (std::size_t v = 0; v < local_victims.size(); ++v) {
-                if (consumed[v] || allocator.BucketOf(local_victims[v].location) != bucket) {
-                    continue;
-                }
-                consumed[v] = true;
-                _assert(evictHostCachedBlock(group_id, local_victims[v].location),
-                        "selected Host child is not evictable");
-                batch.blocks[index] = acquire_in_bucket(group_id, bucket);
-                _assert(static_cast<bool>(batch.blocks[index]), "evicting a Host child did not free its bucket");
-                return true;
+            const auto victim = groups_[group_id].Index().NextHostVictim(*host_pool_, bucket,
+                                                                         cursors[static_cast<std::size_t>(bucket)]);
+            if (!victim) {
+                return false;
             }
-            return false;
+            _assert(evictHostCachedBlock(group_id, *victim), "selected Host child is not evictable");
+            batch.blocks[index] = acquire_in_bucket(group_id, bucket);
+            _assert(static_cast<bool>(batch.blocks[index]), "evicting a Host child did not free its bucket");
+            return true;
         });
     }
     const bool has_unresolved = std::ranges::any_of(
         unresolved_by_group, [](const std::vector<std::size_t>& unresolved) { return !unresolved.empty(); });
     if (has_unresolved) {
         ++batch.stats.cross_group_scans;
-        std::vector<std::pair<HostCacheValue, std::int32_t>> victim_parents;
-        victim_parents.reserve(static_cast<std::size_t>(host_pool_->NumLcmBlocks()));
-        for (std::int32_t parent_id = 1; parent_id <= host_pool_->NumLcmBlocks(); ++parent_id) {
-            const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(parent_id);
-            if (!bound_group ||
-                !groups_[*bound_group].Index().ParentIsFullyEvictable(
-                    *host_pool_, parent_id, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
-                continue;
-            }
-            std::optional<HostCacheValue> parent_value;
-            for (std::int32_t slot = 0; slot < groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock(); ++slot) {
-                const CacheBlockLocation location{.lcm_block_id = parent_id, .slot_index = slot};
-                if (!host_pool_->IsOccupied(location)) {
-                    continue;
-                }
-                const auto child_value = lookup_value(*bound_group, location);
-                parent_value = parent_value ? std::max(*parent_value, child_value) : child_value;
-            }
-            _assert(parent_value.has_value(), "evictable Host parent has no children");
-            victim_parents.emplace_back(*parent_value, parent_id);
-        }
-        std::ranges::sort(victim_parents);
-
-        std::size_t victim_index = 0;
-        for (std::size_t result_index = 0; result_index < group_ids.size() && victim_index < victim_parents.size();
+        // Only fully evictable parents are indexed across groups. Advance
+        // before erasing the selected parent's children.
+        auto victim = host_parent_index_->begin();
+        for (std::size_t result_index = 0; result_index < group_ids.size() && victim != host_parent_index_->end();
              ++result_index) {
             if (batch.blocks[result_index]) {
                 continue;
             }
             const std::uint32_t target_group = group_ids[result_index];
             std::vector<std::size_t>& unresolved = unresolved_by_group[target_group];
-            while (!unresolved.empty() && victim_index < victim_parents.size()) {
-                const std::int32_t victim_parent = victim_parents[victim_index++].second;
+            while (!unresolved.empty() && victim != host_parent_index_->end()) {
+                const std::int32_t victim_parent = (victim++)->lcm_block_id;
                 const std::optional<std::uint32_t> bound_group = host_pool_->BoundGroup(victim_parent);
-                if (!bound_group ||
-                    !groups_[*bound_group].Index().ParentIsFullyEvictable(
-                        *host_pool_, victim_parent, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock())) {
-                    continue;
-                }
+                _assert(bound_group &&
+                            groups_[*bound_group].Index().ParentIsFullyEvictable(
+                                *host_pool_, victim_parent, groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock()),
+                        "Host parent index contains an ineligible parent");
                 const std::int32_t victim_packing = groups_[*bound_group].Allocator().CacheBlocksPerLcmBlock();
                 for (std::int32_t slot = 0; slot < victim_packing; ++slot) {
                     const CacheBlockLocation location{.lcm_block_id = victim_parent, .slot_index = slot};

@@ -55,6 +55,7 @@ public:
 
     CacheBlockLocation Location() const noexcept { return location_; }
     bool IsOwnedBy(const BlockPool& pool) const noexcept { return pool_ == &pool; }
+    void NotifyOwnershipChange() const noexcept;
 
 private:
     BlockPool* pool_{nullptr};

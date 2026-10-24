@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "cache/core/block_pool.h"
@@ -309,10 +310,77 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
     });
 }
 
+// Isolate saturated store latency at production-sized indexes. Publication and
+// release are included. Cross-group turns target the only uncached group,
+// so every call must rebind a parent rather than recycle its own child.
+void MeasureHostRetention(std::int32_t pool_size, bool cross_group, std::int32_t pinned_percent) {
+    BlockPool device(1, {1, 1});
+    BlockPool host(pool_size, {1, 1});
+    const std::array specs{
+        CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        CacheGroupSpec{.cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+    };
+    auto coordinator = MakeCoordinator(specs, 4, device, false, &host, nullptr, false);
+    std::vector<CacheBlockRef> pins;
+    for (std::int32_t i = 0; i < pool_size; ++i) {
+        auto block = host.AcquireBlock(0);
+        coordinator.GroupPrefixIndex(0).Register(
+            host, block, CacheKey{.group_id = 0, .content_hash = std::to_string(i), .page_offset = 0}, i, -1,
+            CacheBoundaryKind::kChunk, nullptr);
+        if (i < pool_size * pinned_percent / 100) pins.push_back(std::move(block));
+    }
+    std::vector<double> times;
+    std::uint64_t checksum = 0;
+    for (std::int32_t iteration = 0; iteration < 200; ++iteration) {
+        const std::uint32_t group = cross_group ? 1 : 0;
+        const auto begin = std::chrono::steady_clock::now();
+        auto block = coordinator.AcquireHostBlock(group, 0);
+        if (!block) std::abort();
+        checksum += block->Location().lcm_block_id;
+        coordinator.GroupPrefixIndex(group).Register(
+            host, block,
+            CacheKey{.group_id = group, .content_hash = "new-" + std::to_string(iteration), .page_offset = 0},
+            pool_size + iteration, -1, CacheBoundaryKind::kChunk, nullptr);
+        block.reset();
+        const auto end = std::chrono::steady_clock::now();
+        times.push_back(std::chrono::duration<double, std::micro>(end - begin).count());
+        if (cross_group) {
+            // Evict the one newly published entry outside the timing and fill
+            // that parent in the other group, keeping all capacity saturated.
+            const CacheKey key{.group_id = group, .content_hash = "new-" + std::to_string(iteration), .page_offset = 0};
+            auto cached = coordinator.FindHostCachedBlock(key);
+            const auto location = cached->Location();
+            cached.reset();
+            coordinator.GroupPrefixIndex(group).Evict(host, location);
+            auto replacement = host.AcquireBlock(1 - group);
+            coordinator.GroupPrefixIndex(1 - group).Register(
+                host, replacement,
+                CacheKey{.group_id = 1 - group,
+                         .content_hash = "replacement-" + std::to_string(iteration),
+                         .page_offset = 0},
+                pool_size + iteration, -1, CacheBoundaryKind::kChunk, nullptr);
+        }
+    }
+    std::ranges::sort(times);
+    std::cout << pool_size << ',' << cross_group << ',' << pinned_percent << ',' << times.size() << ','
+              << (times[(times.size() - 1) / 2] + times[times.size() / 2]) / 2.0 << ','
+              << times[(times.size() * 99 - 1) / 100] << ',' << times.back() << ',' << checksum << '\n';
+}
+
 }  // namespace
 }  // namespace tokenspeed
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--host-retention") {
+        std::cout << "parents,cross_group,pinned_percent,iterations,p50_us,p99_us,max_us,checksum\n";
+        for (const std::int32_t size : {1000, 10000, 100000, 466033}) {
+            tokenspeed::MeasureHostRetention(size, false, 0);
+            tokenspeed::MeasureHostRetention(size, true, 0);
+            tokenspeed::MeasureHostRetention(size, false, 50);
+            tokenspeed::MeasureHostRetention(size, false, 90);
+        }
+        return 0;
+    }
     std::cout << "workload,pool_size,demand,iterations,ns_per_op_median,checksum\n";
     for (const std::int32_t pool_size : tokenspeed::kPoolSizes) {
         const std::int32_t iterations = tokenspeed::IterationsFor(pool_size);

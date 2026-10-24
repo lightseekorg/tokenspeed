@@ -33,12 +33,19 @@ CacheBlock::~CacheBlock() noexcept {
     pool_->Release(location_);
 }
 
+void CacheBlock::NotifyOwnershipChange() const noexcept {
+    pool_->NotifyBlockChange(location_);
+}
+
 namespace internal_cache_block_ref {
 
 void CacheBlockControl::retain() noexcept {
     FatalCheck(strong_count_ != 0 && strong_count_ != std::numeric_limits<std::uint32_t>::max(),
                "cannot retain a destroyed or saturated CacheBlockControl");
     ++strong_count_;
+    if (strong_count_ == 2) {
+        object_.NotifyOwnershipChange();
+    }
 }
 
 void CacheBlockControl::release() noexcept {
@@ -46,6 +53,8 @@ void CacheBlockControl::release() noexcept {
     --strong_count_;
     if (strong_count_ == 0) {
         delete this;
+    } else if (strong_count_ == 1) {
+        object_.NotifyOwnershipChange();
     }
 }
 

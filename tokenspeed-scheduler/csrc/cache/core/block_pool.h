@@ -71,6 +71,28 @@ inline std::int64_t ParentsNeededForBuckets(std::span<const std::int64_t> need_b
 // CacheBlock pointer, or ownership count.
 class BlockPool {
 public:
+    // A non-owning subscriber to occupancy and 1 <-> 2 reference transitions.
+    // The subscriber must detach before destruction and must not acquire refs.
+    class BlockObserver {
+    public:
+        virtual ~BlockObserver() = default;
+        virtual void BlockChanged(CacheBlockLocation location) = 0;
+    };
+
+    void SetBlockObserver(std::uint32_t group_id, BlockObserver* observer) const {
+        auto& slot = placement(group_id).observer;
+        _assert(observer == nullptr || slot == nullptr, "group already has a block observer");
+        slot = observer;
+    }
+
+    void NotifyBlockChange(CacheBlockLocation location) const {
+        if (const auto group = BoundGroup(location.lcm_block_id)) {
+            if (auto* observer = placement(*group).observer) {
+                observer->BlockChanged(location);
+            }
+        }
+    }
+
     explicit BlockPool(std::int32_t num_lcm_blocks, std::vector<std::int32_t> slots_per_group)
         : lcm_blocks_(checkedLcmBlockCount(num_lcm_blocks)), group_availability_(slots_per_group.size()) {
         for (std::size_t group_id = 0; group_id < slots_per_group.size(); ++group_id) {
@@ -263,11 +285,15 @@ public:
             first = std::min(first, location.slot_index);
             addAvailability(group, parent, location.lcm_block_id);
         }
+        if (group.observer) {
+            group.observer->BlockChanged(location);
+        }
     }
 
 private:
     using ParentOrder = std::pair<std::int32_t, std::int32_t>;  // -occupancy, parent ID
     struct GroupAvailability {
+        mutable BlockObserver* observer{nullptr};
         std::int32_t packing{0};
         // Holes in bound parents, per bucket (slot % shard_count); empty
         // parents remain pool-wide. The group total is derived from this, so
@@ -421,6 +447,7 @@ private:
         // location before publishing its RAII owner: CacheBlock destruction
         // releases this location and therefore requires it to be occupied.
         occupy(group_id, slots_per_parent, location);
+        NotifyBlockChange(location);
         return CacheBlockRef{*control};
     }
 

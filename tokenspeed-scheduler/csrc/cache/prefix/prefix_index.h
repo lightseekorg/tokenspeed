@@ -25,7 +25,9 @@
 #include <iterator>
 #include <list>
 #include <map>
+#include <memory>
 #include <optional>
+#include <set>
 #include <span>
 #include <unordered_map>
 #include <utility>
@@ -62,6 +64,19 @@ private:
     using EvictionOrderMap = std::map<EvictionOrder, CacheEntryIterator>;
 
 public:
+    // Host retention differs from Device admission: proven reuse precedes age.
+    // The maximum child value ranks a parent when it must change groups.
+    struct HostRetentionOrder {
+        bool was_acquired{false};
+        std::uint64_t last_access_epoch{0};
+        std::uint32_t group_id{0};
+        std::int32_t lcm_block_id{0};
+        std::int32_t slot_index{0};
+
+        auto operator<=>(const HostRetentionOrder&) const noexcept = default;
+    };
+    using HostParentIndex = std::set<HostRetentionOrder>;
+
     // Read-only admission snapshot from one index lookup; owns no block.
     struct CachedBlockMetadata {
         std::uint64_t last_access_epoch{0};
@@ -92,6 +107,47 @@ public:
     PrefixCacheIndex(PrefixCacheIndex&&) = default;
     PrefixCacheIndex& operator=(PrefixCacheIndex&&) = default;
 
+    // All Host groups share the parent index; shared ownership keeps it stable
+    // when a coordinator or group is moved. Existing publications are indexed
+    // once here, before allocation can traverse the new ordering.
+    void EnableHostRetention(const BlockPool& pool, std::shared_ptr<HostParentIndex> parents, std::int32_t packing,
+                             std::int32_t shard_count) {
+        _assert(parents && packing > 0 && shard_count > 0 && packing % shard_count == 0,
+                "Host retention needs valid packing and bucket geometry");
+        CacheEntries& entries = cacheEntries(pool);
+        _assert(!entries.host_parents, "Host retention is already configured");
+        // Reject another subscriber before marking this state for detachment.
+        pool.SetBlockObserver(group_id_, &entries);
+        entries.host_parents = std::move(parents);
+        entries.host_pool = &pool;
+        entries.group_id = group_id_;
+        entries.host_packing = packing;
+        entries.host_by_bucket.resize(static_cast<std::size_t>(shard_count));
+        for (auto entry = entries.entries.begin(); entry != entries.entries.end(); ++entry) {
+            insertHostEntry(entries, entry);
+            const auto parent = entry->block_ref->Location().lcm_block_id;
+            if (!entries.host_parent_values.contains(parent)) {
+                refreshHostParent(entries, parent);
+            }
+        }
+    }
+
+    // A fresh cursor per bucket and allocation batch. Reference transitions
+    // keep pinned entries out of this non-owning ordering.
+    std::optional<CacheBlockLocation> NextHostVictim(const BlockPool& pool, std::int32_t bucket,
+                                                     std::optional<HostRetentionOrder>& cursor) const {
+        const CacheEntries* entries = findCacheEntries(pool);
+        _assert(entries != nullptr && entries->host_parents, "Host retention is not configured");
+        const auto& order = entries->host_by_bucket.at(static_cast<std::size_t>(bucket));
+        auto next = cursor ? order.upper_bound(*cursor) : order.begin();
+        if (next != order.end()) {
+            cursor = next->first;
+            _assert(next->second->block_ref.unique(), "Host victim index contains a pinned entry");
+            return next->second->block_ref->Location();
+        }
+        return std::nullopt;
+    }
+
     // Registers block_ref under key. If key already has a canonical block,
     // block_ref is replaced with a reference to that block.
     void Register(const BlockPool& pool, CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch,
@@ -108,7 +164,7 @@ public:
             if (existing_it->boundary_kind < boundary_kind) {
                 existing_it->boundary_kind = boundary_kind;
             }
-            touchEntry(cache_index, existing_it, access_epoch);
+            touchEntry(cache_index, existing_it, access_epoch, /*acquired=*/false);
             return;
         }
         CacheEntryIterator canonical_it = findEntry(cache_index, key);
@@ -116,7 +172,7 @@ public:
             if (canonical_it->boundary_kind < boundary_kind) {
                 canonical_it->boundary_kind = boundary_kind;
             }
-            touchEntry(cache_index, canonical_it, access_epoch);
+            touchEntry(cache_index, canonical_it, access_epoch, /*acquired=*/false);
             block_ref = canonical_it->block_ref;
             return;
         }
@@ -132,6 +188,8 @@ public:
         cache_index.by_key.emplace(entry_it->key, entry_it);
         cache_index.by_location.emplace(entry_it->block_ref->Location(), entry_it);
         cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        insertHostEntry(cache_index, entry_it);
+        refreshHostParent(cache_index, entry_it->block_ref->Location().lcm_block_id);
         if (newly_cached != nullptr) {
             newly_cached->emplace_back(key, block_ref);
         }
@@ -334,8 +392,7 @@ public:
             CacheEntryIterator entry_it = findEntry(*cache_index, keys[static_cast<std::size_t>(begin_blocks) + i]);
             _assert(entry_it != cache_index->entries.end(),
                     "cached block disappeared between match probe and acquisition");
-            entry_it->was_acquired = true;
-            touchEntry(*cache_index, entry_it, access_epoch);
+            touchEntry(*cache_index, entry_it, access_epoch, /*acquired=*/true);
             match.blocks[i] = entry_it->block_ref;
         }
         return match;
@@ -374,7 +431,25 @@ private:
         bool was_acquired{false};
     };
 
-    struct CacheEntries {
+    struct CacheEntries : BlockPool::BlockObserver {
+        ~CacheEntries() override {
+            if (host_pool) {
+                host_pool->SetBlockObserver(group_id, nullptr);
+                for (const auto& [parent, value] : host_parent_values) {
+                    host_parents->erase(value);
+                }
+            }
+        }
+
+        void BlockChanged(CacheBlockLocation location) override {
+            const auto child = by_location.find(location);
+            if (child != by_location.end()) {
+                eraseHostEntry(*this, *child->second);
+                insertHostEntry(*this, child->second);
+            }
+            refreshHostParent(*this, location.lcm_block_id);
+        }
+
         // Owns each CacheEntry once. The maps are non-owning secondary indices
         // into stable list nodes. by_eviction_order additionally keeps the
         // entries sorted by age, so a caller reaches the oldest ones without
@@ -384,6 +459,12 @@ private:
         std::unordered_map<CacheKey, CacheEntryIterator, CacheKeyHash> by_key;
         std::unordered_map<CacheBlockLocation, CacheEntryIterator, CacheBlockLocationHash> by_location;
         EvictionOrderMap by_eviction_order;
+        std::shared_ptr<HostParentIndex> host_parents;
+        const BlockPool* host_pool{nullptr};
+        std::uint32_t group_id{0};
+        std::int32_t host_packing{0};
+        std::vector<std::map<HostRetentionOrder, CacheEntryIterator>> host_by_bucket;
+        std::unordered_map<std::int32_t, HostParentIndex::iterator> host_parent_values;
     };
 
     static CachedBlockMetadata metadataOf(const CacheEntry& cache_entry) noexcept {
@@ -407,13 +488,72 @@ private:
     // exchange for admission's ordered traversal and early exit. Continued
     // requests can republish under an older epoch, so moving entries to the
     // back of an LRU list would not preserve this order.
-    void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
-        if (entry_it->last_access_epoch == access_epoch) {
+    void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch, bool acquired) {
+        if (entry_it->last_access_epoch == access_epoch && (!acquired || entry_it->was_acquired)) {
             return;
         }
-        cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
-        entry_it->last_access_epoch = access_epoch;
-        cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        eraseHostEntry(cache_index, *entry_it);
+        if (entry_it->last_access_epoch != access_epoch) {
+            cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
+            entry_it->last_access_epoch = access_epoch;
+            cache_index.by_eviction_order.emplace(evictionOrder(*entry_it), entry_it);
+        }
+        entry_it->was_acquired |= acquired;
+        insertHostEntry(cache_index, entry_it);
+        refreshHostParent(cache_index, entry_it->block_ref->Location().lcm_block_id);
+    }
+
+    static HostRetentionOrder hostOrder(const CacheEntry& entry) {
+        const auto location = entry.block_ref->Location();
+        return {entry.was_acquired, entry.last_access_epoch, entry.key.group_id, location.lcm_block_id,
+                location.slot_index};
+    }
+    static void insertHostEntry(CacheEntries& entries, CacheEntryIterator entry) {
+        if (entries.host_parents && entry->block_ref.unique()) {
+            const auto bucket =
+                static_cast<std::size_t>(entry->block_ref->Location().slot_index) % entries.host_by_bucket.size();
+            entries.host_by_bucket[bucket].emplace(hostOrder(*entry), entry);
+        }
+    }
+    static void eraseHostEntry(CacheEntries& entries, const CacheEntry& entry) {
+        if (entries.host_parents) {
+            const auto bucket =
+                static_cast<std::size_t>(entry.block_ref->Location().slot_index) % entries.host_by_bucket.size();
+            entries.host_by_bucket[bucket].erase(hostOrder(entry));
+        }
+    }
+    // Only this parent's fixed packing is visited, never the whole Host pool.
+    // Occupancy and ownership notifications also cover unpublished transfer
+    // destinations, their completion/publication, and cancellation.
+    static void refreshHostParent(CacheEntries& entries, std::int32_t parent) {
+        if (!entries.host_parents) {
+            return;
+        }
+        auto previous = entries.host_parent_values.find(parent);
+        std::optional<HostRetentionOrder> value;
+        for (std::int32_t slot = 0; slot < entries.host_packing; ++slot) {
+            if (!entries.host_pool->IsOccupied({.lcm_block_id = parent, .slot_index = slot})) {
+                continue;
+            }
+            const auto child = entries.by_location.find({.lcm_block_id = parent, .slot_index = slot});
+            if (child == entries.by_location.end() || !child->second->block_ref.unique()) {
+                value.reset();
+                break;
+            }
+            const auto order = hostOrder(*child->second);
+            value = value ? std::max(*value, order) : order;
+        }
+        if (previous != entries.host_parent_values.end()) {
+            if (value && *previous->second == *value) {
+                return;
+            }
+            entries.host_parents->erase(previous->second);
+        }
+        if (value) {
+            entries.host_parent_values.insert_or_assign(parent, entries.host_parents->insert(*value).first);
+        } else if (previous != entries.host_parent_values.end()) {
+            entries.host_parent_values.erase(previous);
+        }
     }
 
     CacheEntries& cacheEntries(const BlockPool& pool) {
@@ -450,10 +590,13 @@ private:
         return index_it == cache_index.by_location.end() ? cache_index.entries.end() : index_it->second;
     }
     void eraseEntry(CacheEntries& cache_index, CacheEntryIterator entry_it) {
+        const std::int32_t parent = entry_it->block_ref->Location().lcm_block_id;
+        eraseHostEntry(cache_index, *entry_it);
         cache_index.by_eviction_order.erase(evictionOrder(*entry_it));
         cache_index.by_key.erase(entry_it->key);
         cache_index.by_location.erase(entry_it->block_ref->Location());
         cache_index.entries.erase(entry_it);
+        refreshHostParent(cache_index, parent);
     }
 
     std::uint32_t group_id_;
