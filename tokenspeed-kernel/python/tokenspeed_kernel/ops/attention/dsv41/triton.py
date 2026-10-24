@@ -2756,7 +2756,10 @@ def finish_selection(
     return output
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["selected_stride", "candidate_stride", "K", "C"],
+    do_not_specialize_on_alignment=["selected_stride", "candidate_stride", "K", "C"],
+)
 def _write_selection(
     Selected,
     Candidates,
@@ -2764,10 +2767,10 @@ def _write_selection(
     Lengths,
     Blocks,
     BlockLengths,
-    selected_stride: tl.constexpr,
-    candidate_stride: tl.constexpr,
-    K: tl.constexpr,
-    C: tl.constexpr,
+    selected_stride,
+    candidate_stride,
+    K,
+    C,
     ROW_BLOCK: tl.constexpr,
     CANDIDATE_BLOCK: tl.constexpr,
 ):
@@ -2790,7 +2793,11 @@ def _write_selection(
 
 
 def write_selection(selected, candidates, out):
-    """Copy logical selections and count valid IDs in caller-owned output tiles."""
+    """Copy logical selections and count valid IDs in caller-owned output tiles.
+
+    Selection and candidate widths are runtime data; only their power-of-two
+    tiles specialize.
+    """
     rows, lengths, blocks, block_lengths = out
     if selected.shape[0] == 0:
         return
