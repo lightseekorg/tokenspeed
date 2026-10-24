@@ -7,6 +7,10 @@ on:
       - "python/tokenspeed/runtime/cache/l3/**"
       - "python/tokenspeed/runtime/cache/l2/executor.py"
       - "python/tokenspeed/runtime/cache/host_storage.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/__init__.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/_triton.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/platform.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/profiling.py"
       - "python/tokenspeed/runtime/cache/transfer/ownership.py"
       - "python/tokenspeed/runtime/cache/transfer/layout.py"
       - "python/tokenspeed/runtime/engine/rust_host.py"
@@ -28,6 +32,10 @@ on:
       - "python/tokenspeed/runtime/cache/l3/**"
       - "python/tokenspeed/runtime/cache/l2/executor.py"
       - "python/tokenspeed/runtime/cache/host_storage.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/__init__.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/_triton.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/platform.py"
+      - "tokenspeed-kernel/python/tokenspeed_kernel/profiling.py"
       - "python/tokenspeed/runtime/cache/transfer/ownership.py"
       - "python/tokenspeed/runtime/cache/transfer/layout.py"
       - "python/tokenspeed/runtime/engine/rust_host.py"
@@ -133,7 +141,9 @@ jobs:
       - name: Install CPU protocol test dependencies
         run: |
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install psutil prometheus-client -e 'tokenspeed-scheduler[test]'
+          # Importing tokenspeed_kernel (on PYTHONPATH below) needs tokenspeed_triton.
+          python -m pip install psutil prometheus-client tokenspeed-triton \
+            -e 'tokenspeed-scheduler[test]'
 
       - name: Install the Rust toolchain
         run: |
@@ -153,7 +163,8 @@ jobs:
       # Mooncake the native tail round trips skip.
       - name: Run asynchronous storage tests
         env:
-          PYTHONPATH: python:tokenspeed-engine/python
+          # HostCacheStorage allocates through tokenspeed_kernel's platform.
+          PYTHONPATH: python:tokenspeed-engine/python:tokenspeed-kernel/python
         run: |
           python -m pytest -q \
             test/test_host_cache_storage.py \

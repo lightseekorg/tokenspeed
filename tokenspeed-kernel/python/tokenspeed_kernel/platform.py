@@ -27,7 +27,8 @@ import math
 import os
 import site
 import sys
-from collections.abc import Iterator, Mapping
+import weakref
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import cache, lru_cache
 from pathlib import Path
@@ -232,6 +233,125 @@ class PlatformInfo:
         )
         if int(status) != 0:
             raise RuntimeError(f"cudaHostRegister failed with {status!s}")
+
+    def empty_pinned_host_tensor(self, nbytes: int) -> torch.Tensor:
+        """Allocate an uninitialized Host buffer pinned at exactly its size.
+
+        ``pin_memory=True`` buffers come from PyTorch's caching pinned
+        allocator, which rounds every allocation up to a power of two. On
+        NVIDIA and AMD this buffer comes instead straight from the GPU runtime
+        (``cudaHostAlloc`` / ``hipHostMalloc``, as that allocator calls it) at
+        exactly ``nbytes``, and is freed once the returned tensor and every
+        view of it are released. Unlike PyTorch's allocator, nothing defers
+        that free until queued copies finish: keep a view alive while GPU work
+        uses the buffer. On Ascend NPUs the buffer comes from torch_npu's
+        pinned allocator (see :meth:`pinned_host_bytes`).
+
+        Args:
+            nbytes: The buffer's size in bytes.
+
+        Returns:
+            A 1-D uint8 CPU tensor of ``nbytes`` elements, page-locked: valid
+            for asynchronous copies and, through
+            :meth:`device_visible_data_ptr`, for direct GPU access.
+        """
+        if nbytes < 0:
+            raise ValueError(f"nbytes must be >= 0, got {nbytes}")
+        if nbytes == 0:
+            return torch.empty(0, dtype=torch.uint8)
+        if self.is_npu:
+            return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+        address, free = self._alloc_pinned_host_memory(nbytes)
+        finalizer: weakref.finalize | None = None
+        try:
+            memory = (ctypes.c_uint8 * nbytes).from_address(address)
+            # The tensor and every view of it hold ``memory``; releasing the
+            # last one frees it. At process exit the driver frees what is left.
+            finalizer = weakref.finalize(memory, free)
+            finalizer.atexit = False
+            return torch.frombuffer(memory, dtype=torch.uint8)
+        except BaseException:
+            # Free exactly once: through the finalizer if it exists.
+            if finalizer is None:
+                free()
+            else:
+                finalizer()
+            raise
+
+    def pinned_host_bytes(self, nbytes: int) -> int:
+        """The Host memory :meth:`empty_pinned_host_tensor` pins for ``nbytes``.
+
+        Exactly ``nbytes`` on NVIDIA and AMD. On Ascend NPUs the buffer comes
+        from torch_npu's pinned allocator, which may round it up to a power of
+        two as PyTorch's does, so it counts as that power of two.
+
+        Args:
+            nbytes: The buffer's size in bytes.
+
+        Returns:
+            The bytes of Host memory the buffer pins.
+        """
+        if self.is_npu and nbytes > 0:
+            return 1 << (nbytes - 1).bit_length()
+        return nbytes
+
+    def largest_pinned_host_fit(self, room_bytes: int) -> int:
+        """The largest buffer whose :meth:`pinned_host_bytes` fits in ``room_bytes``.
+
+        Args:
+            room_bytes: The Host memory left for the buffer; may be negative.
+
+        Returns:
+            The buffer's size in bytes, 0 without room.
+        """
+        if room_bytes <= 0:
+            return 0
+        if self.is_npu:
+            return 1 << (room_bytes.bit_length() - 1)
+        return room_bytes
+
+    def _alloc_pinned_host_memory(self, nbytes: int) -> tuple[int, Callable[[], None]]:
+        """Page-lock ``nbytes`` of new Host memory with the GPU runtime.
+
+        ``cudaHostAlloc`` / ``hipHostMalloc`` with default flags, as PyTorch's
+        pinned allocator calls them.
+
+        Args:
+            nbytes: The size in bytes, positive.
+
+        Returns:
+            The memory's address and the function that frees it, under the
+            device current here on whichever thread drops the last view: a
+            thread that never selected a device would create a context on
+            device 0.
+        """
+        if self.is_amd:
+            runtime = _get_hip_runtime()
+            alloc, free = runtime.hipHostMalloc, runtime.hipHostFree
+            describe = runtime.hipGetErrorString
+        else:
+            runtime = _get_cuda_runtime()
+            alloc, free = runtime.cudaHostAlloc, runtime.cudaFreeHost
+            describe = runtime.cudaGetErrorString
+        device = torch.cuda.current_device()
+        address = ctypes.c_void_p()
+        status = alloc(ctypes.byref(address), nbytes, 0)
+        if status != 0:
+            raise RuntimeError(
+                f"{alloc.__name__} of {nbytes} bytes failed: "
+                f"{describe(status).decode()}"
+            )
+
+        def free_memory() -> None:
+            with torch.cuda.device(device):
+                free_status = free(address)
+            if free_status != 0:
+                raise RuntimeError(
+                    f"{free.__name__} of {nbytes} bytes at 0x{address.value:x} "
+                    f"failed: {describe(free_status).decode()}"
+                )
+
+        return address.value, free_memory
 
     def device_visible_data_ptr(self, tensor: torch.Tensor) -> int:
         """Return a pointer value that is valid to dereference from GPU kernels."""
@@ -818,6 +938,28 @@ def _check_nvlink_available() -> bool:
 
 
 @lru_cache(maxsize=1)
+def _get_cuda_runtime():
+    # PyTorch links the CUDA runtime dynamically: opening it by its soname
+    # returns the copy PyTorch loaded, so both share one runtime state.
+    lib_name = f"libcudart.so.{torch.version.cuda.split('.')[0]}"
+    try:
+        lib = ctypes.CDLL(lib_name)
+    except OSError as exc:
+        raise RuntimeError(f"Failed to load {lib_name}") from exc
+    lib.cudaHostAlloc.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    lib.cudaHostAlloc.restype = ctypes.c_int
+    lib.cudaFreeHost.argtypes = [ctypes.c_void_p]
+    lib.cudaFreeHost.restype = ctypes.c_int
+    lib.cudaGetErrorString.argtypes = [ctypes.c_int]
+    lib.cudaGetErrorString.restype = ctypes.c_char_p
+    return lib
+
+
+@lru_cache(maxsize=1)
 def _get_hip_runtime():
     lib_name = "libamdhip64.so"
     candidates = []
@@ -836,6 +978,14 @@ def _get_hip_runtime():
                 ctypes.c_uint,
             ]
             lib.hipHostGetDevicePointer.restype = ctypes.c_int
+            lib.hipHostMalloc.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.c_size_t,
+                ctypes.c_uint,
+            ]
+            lib.hipHostMalloc.restype = ctypes.c_int
+            lib.hipHostFree.argtypes = [ctypes.c_void_p]
+            lib.hipHostFree.restype = ctypes.c_int
             if hasattr(lib, "hipGetErrorString"):
                 lib.hipGetErrorString.argtypes = [ctypes.c_int]
                 lib.hipGetErrorString.restype = ctypes.c_char_p

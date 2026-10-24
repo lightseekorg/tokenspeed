@@ -1170,13 +1170,20 @@ fused role,
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
-allocator rounds every allocation up to a power of two, so a 140 GB L2
-takes 274.88 GB. A ratio size larger than that share is capped to the
-largest L2 every rank's share holds beside its snapshot pool -- the whole
-LCM blocks in the largest power of two that fits, and one size on every
-rank, since the ranks' schedulers mirror each other -- and each rank logs a
-warning with the requested and the capped size. An explicit
+headroom per rank. Each buffer counts at the size it pins. On NVIDIA and AMD
+GPUs that is exactly its size: the L2, the snapshot pool and the pool's
+slot-state arena each come straight from the GPU runtime's pinned
+allocation (`cudaHostAlloc` / `hipHostMalloc`), not from PyTorch's pinned
+allocator, which rounds every allocation up to a power of two (a 140 GB L2
+would take 274.88 GB). Ascend NPUs keep torch_npu's pinned allocator, so
+there each buffer counts as that power of two. A ratio size larger than
+that share is capped to the largest L2 every rank's share holds beside its
+snapshot pool -- the whole LCM blocks that fit, and one size on every rank,
+since the ranks' schedulers mirror each other -- and each rank logs a
+warning with the requested and the capped size. A capped L2 fills the
+share, so Host memory allocated after this check, such as the segment a
+Mooncake worker mounts (`global_segment_size` split over its ranks), must
+fit in the headroom; set `--kvstore-size` to leave more room. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
 startup, as is a share without room for a single LCM block. Every rank
 must also resolve the same page counts: startup compares them across the
