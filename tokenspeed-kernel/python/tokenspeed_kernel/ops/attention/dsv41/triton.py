@@ -2805,7 +2805,7 @@ def _gather_candidates(
 
 
 @triton.jit(
-    do_not_specialize=["I0", "S0", "NC", "W"],
+    do_not_specialize=["I0", "S0", "NC", "K", "W"],
 )
 def _finish_selection(
     I,
@@ -2816,7 +2816,7 @@ def _finish_selection(
     I0,
     S0,
     NC,
-    K: tl.constexpr,
+    K,
     W,
     BLOCK_SIZE: tl.constexpr,
     HAS_CANDIDATES: tl.constexpr,
@@ -2978,7 +2978,10 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
 def finish_selection(
     indices, scores, lengths, candidates, width, block_size, sort_positions
 ):
-    """Filter masked native selections and return logical IDs with -1 padding."""
+    """Filter masked native selections and return logical IDs with -1 padding.
+
+    Selection width is runtime data; only its power-of-two tile specializes.
+    """
     output = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
     _finish_selection[(indices.shape[0],)](
         indices,
