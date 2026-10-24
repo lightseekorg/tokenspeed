@@ -200,6 +200,7 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
         127,
         128,
         129,
+        160,
         192,
         193,
         207,
@@ -252,6 +253,51 @@ def test_fp16_optional_inject_and_pdl(rows, enable_pdl, has_inject):
     values = inputs(rows, torch.float16, has_inject)
     pdl_enabled(enable_pdl)
     check(mix(values, 1.0, False), reference(values, 1.0), torch.float16)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("has_inject", [False, True])
+def test_up_activation_reuse_across_token_tiles(
+    dtype, enable_pdl, has_inject, monkeypatch
+):
+    _reset_caches(monkeypatch)
+    # Limit residency to one worker so its activation slot is overwritten for
+    # five token tiles, including a tail, within each launch.
+    monkeypatch.setattr(
+        cute_fused,
+        "_capacity",
+        lambda compiled, kernel, device, stream: kernel.clusters,
+    )
+    values = inputs(129, dtype, has_inject)
+    pdl_enabled(enable_pdl)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mix(values, 0.25, True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = [mix(values, 0.25, True) for _ in range(2)]
+    atol, rtol = (0.002, 0.008) if dtype == torch.bfloat16 else (0.0005, 0.002)
+    for factor in (0.75, -0.5):
+        values[0].mul_(factor)
+        for output in outputs:
+            for tensor in output:
+                if tensor is not None:
+                    tensor.fill_(float("nan"))
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        expected = reference(values, 0.25)
+        for output in outputs:
+            for tensor, wanted in zip(output, expected):
+                if wanted is None:
+                    assert tensor is None
+                else:
+                    torch.testing.assert_close(
+                        tensor.cpu().double(), wanted, atol=atol, rtol=rtol
+                    )
 
 
 @pytest.mark.parametrize(
