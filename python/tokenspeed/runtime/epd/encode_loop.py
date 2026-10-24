@@ -28,10 +28,12 @@ Instead ``run_event_loop`` branches here when ``disaggregation_mode == "encode"`
 
 The assembly is: load the model, stand up the Mooncake encode manager + bootstrap
 server, the DisaggEncodeExecutor, and the EncodeWorker, reusing the SAME request
-IPC the LM scheduler uses: a ZMQ PULL
-on ``port_args.scheduler_input_ipc_name``. The smg grpc_servicer's TokenSpeedEncoder
-handler sends an :class:`EncodeRequest` (msgpack, tagged) over that channel; the loop
-drains them into ``EncodeWorker.submit`` and runs ``step`` to encode + transfer.
+channel the LM scheduler uses: the ZMQ PULL on
+``port_args.scheduler_input_ipc_name`` in-process, or, under ``--zmq-msgpack``,
+the frontend-bound msgpack wire the scheduler dials (``connect_frontend``). The
+smg grpc_servicer's TokenSpeedEncoder handler sends an :class:`EncodeRequest`
+(msgpack, tagged) over that channel; the loop drains them into
+``EncodeWorker.submit`` and runs ``step`` to encode + transfer.
 
 TP: the vision tower is TP-sharded, so all encode ranks run each batch in lockstep
 -- rank 0 owns the gateway ZMQ and broadcasts every batch to the TP group. The
@@ -238,12 +240,63 @@ def _build_encode_worker(server_args, port_args, gpu_id, global_rank):
     )
 
 
+def connect_frontend(
+    server_args,
+    context: zmq.Context,
+    *,
+    context_len: int,
+    dtype,
+    vocab_size: int,
+    multimodal_encoder_dtype: str | None,
+    attn_tp_size: int,
+):
+    """Dial the frontend that drives this encode worker over the msgpack wire.
+
+    The same handshake the LM scheduler runs (``zmq_msgpack.connect_msgpack_engine``),
+    with the encode role's ready response: no KV cache (``num_gpu_blocks`` stays
+    0), no prompt scoring, and ``request_types`` = encode only, so the frontend
+    sends this worker encode requests and nothing else. Returns the (receive,
+    send) adapters; the loop drains the receiver, and the sender, kept alive by
+    the receiver's call table, answers a stray control call as not served.
+    """
+    from tokenspeed.runtime.engine import zmq_msgpack, zmq_wire
+    from tokenspeed.version import __version__
+
+    ready_response = zmq_wire.WireEngineCoreReadyResponse(
+        max_model_len=context_len,
+        dtype=zmq_wire.wire_dtype(dtype),
+        multimodal_encoder_dtype=multimodal_encoder_dtype,
+        vllm_version=f"tokenspeed-{__version__}",
+        world_size=server_args.mapping.world_size,
+        tensor_parallel_size=attn_tp_size,
+        max_num_seqs=server_args.max_num_seqs,
+        max_num_batched_tokens=max(0, server_args.chunked_prefill_size),
+        instance_id=server_args.served_model_name or server_args.model,
+    )
+    return zmq_msgpack.connect_msgpack_engine(
+        context,
+        server_args.zmq_handshake_endpoint(),
+        server_args.zmq_engine_index,
+        ready_response,
+        vocab_size,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=False,
+        top_logprobs_unservable=(
+            "top_logprobs_num > 0 is not served by the encode role: it runs no "
+            "language model."
+        ),
+        request_types=zmq_msgpack.ENCODE_REQUEST_TYPES,
+    )
+
+
 def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
     """Run the encode-worker loop until the parent process exits.
 
-    Drains :class:`EncodeRequest`s off the shared scheduler-input ZMQ channel into
-    EncodeWorker.submit, then runs EncodeWorker.step to encode + ship each pending
-    item over Mooncake. Synchronous; no KV, no LM forward.
+    Drains :class:`EncodeRequest`s off the gateway channel (the shared
+    scheduler-input PULL, or the frontend-bound msgpack wire under
+    ``--zmq-msgpack``) into EncodeWorker.submit, then runs EncodeWorker.step to
+    encode + ship each pending item over Mooncake. Synchronous; no KV, no LM
+    forward.
     """
     worker, model_config, multimodal_encoder_dtype = _build_encode_worker(
         server_args, port_args, gpu_id, global_rank
@@ -273,11 +326,26 @@ def run_encode_loop(server_args, port_args, pipe_writer, gpu_id, global_rank):
     context = zmq.Context(2)
     recv_from_gateway = None
     if attn_tp_rank == 0:
-        from tokenspeed.runtime.engine.io_struct import IpcReceiver
+        if server_args.zmq_msgpack:
+            # The frontend binds the sockets and this worker dials in; the
+            # send adapter stays alive through the receiver's control table.
+            recv_from_gateway, _ = connect_frontend(
+                server_args,
+                context,
+                context_len=model_config.context_len,
+                dtype=model_config.dtype,
+                vocab_size=model_config.vocab_size,
+                multimodal_encoder_dtype=multimodal_encoder_dtype,
+                attn_tp_size=attn_tp_size,
+            )
+        else:
+            from tokenspeed.runtime.engine.io_struct import IpcReceiver
 
-        recv_from_gateway = IpcReceiver(
-            get_zmq_socket(context, zmq.PULL, port_args.scheduler_input_ipc_name, False)
-        )
+            recv_from_gateway = IpcReceiver(
+                get_zmq_socket(
+                    context, zmq.PULL, port_args.scheduler_input_ipc_name, False
+                )
+            )
 
     # Unblock the launcher. The encode role has no KV pool, so the token/seq
     # fields are nominal (kept for envelope compatibility with the LM ready msg).
