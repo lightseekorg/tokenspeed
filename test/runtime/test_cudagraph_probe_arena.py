@@ -431,6 +431,7 @@ def _startup_charge(monkeypatch, *, init_keeps, tune_keeps, enforce_eager, is_nv
     monkeypatch.setattr(device, "_rebind_under_reserve", rebind)
     server_args = SimpleNamespace(
         disaggregation_mode="null",
+        enable_encoder_disaggregation=False,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
