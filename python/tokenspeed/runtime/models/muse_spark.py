@@ -37,6 +37,8 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
     mv,
+    mv_weightless_rmsnorm_gated_sigmoid,
+    mv_weightless_rmsnorm_gated_sigmoid_supported,
 )
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
@@ -807,21 +809,17 @@ class MuseSparkAttention(nn.Module):
         )
         self.iris_state: MuseIrisState | None = None
 
-    def _project_output(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project ``x`` and defer the TP reduction to the consuming operation."""
+    def _acquire_projection_output(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Borrow the all-reduce producer buffer for the projection, if compatible."""
         linear = self.o_proj
-        if linear.tp_size == 1:
-            return RowParallelLinear.forward(linear, x)[0]
-        output = (
+        return (
             _acquire_all_reduce_output(
                 (x.shape[0], linear.output_size),
                 x,
                 linear.tp_group,
             )
-            if type(linear.quant_method) is UnquantizedLinearMethod
+            if linear.tp_size > 1
+            and type(linear.quant_method) is UnquantizedLinearMethod
             and linear.bias is None
             and linear.input_is_parallel
             and not linear.reduce_results
@@ -829,6 +827,14 @@ class MuseSparkAttention(nn.Module):
             and not _gemm_dispatch_required()
             else None
         )
+
+    def _project_output(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project ``x`` and defer the TP reduction to the consuming operation."""
+        linear = self.o_proj
+        output = self._acquire_projection_output(x)
         return (
             RowParallelLinear.forward(linear, x)[0]
             if output is None
@@ -882,8 +888,28 @@ class MuseSparkAttention(nn.Module):
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
             )
             output = self.attn(q, k, v, positions, ctx)
+        output = output.contiguous()
+        # One row normalizes and gates inside the output projection's GEMV.
+        projection_out = (
+            self._acquire_projection_output(output)
+            if output.shape[0] == 1
+            and mv_weightless_rmsnorm_gated_sigmoid_supported(
+                output, output_gate, self.o_proj.weight, self.num_heads, self.head_dim
+            )
+            else None
+        )
+        if projection_out is not None:
+            projected = mv_weightless_rmsnorm_gated_sigmoid(
+                output,
+                output_gate,
+                self.o_proj.weight,
+                self.num_heads,
+                self.rms_norm_eps,
+                projection_out,
+            )
+            return projected, None, 1
         output = weightless_rmsnorm_gated_sigmoid(
-            output.contiguous(),
+            output,
             output_gate,
             self.num_heads,
             self.head_dim,
