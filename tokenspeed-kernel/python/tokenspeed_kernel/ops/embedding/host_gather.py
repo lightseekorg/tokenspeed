@@ -32,7 +32,7 @@ import torch
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
-__all__ = ["uint8_row_gather"]
+__all__ = ["uint8_row_gather", "fp8_e8m0_rows"]
 
 
 def uint8_row_gather(
@@ -84,3 +84,33 @@ def uint8_row_gather(
         override=None,
     )
     return kernel(table, indices, out)
+
+
+def fp8_e8m0_rows(codes: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """Decode row-wise E4M3 bytes with E8M0 scales per32 values to BF16.
+
+    Arbitrary leading dimensions are preserved. Ascend keeps storage and
+    decoding in supported byte/float32 dtypes; CPU/CUDA use native casts.
+    """
+    if codes.shape[-1] % 32 or scales.shape != (
+        *codes.shape[:-1],
+        codes.shape[-1] // 32,
+    ):
+        raise ValueError("FP8 rows require one E8M0 scale per32 elements")
+    if codes.device != scales.device:
+        raise ValueError("FP8 codes and scales must share one device")
+    if codes.device.type == "npu":
+        kernel = select_kernel(
+            "embedding",
+            "fp8_e8m0_rows",
+            format_signature(x=dense_tensor_format(torch.uint8)),
+            features=None,
+            platform=None,
+            traits=None,
+            solution=None,
+            override=None,
+        )
+        return kernel(codes.view(torch.uint8), scales.view(torch.uint8))
+    values = codes.view(torch.uint8).view(torch.float8_e4m3fn).float()
+    scale = scales.view(torch.uint8).view(torch.float8_e8m0fnu).float()
+    return (values.unflatten(-1, (-1, 32)) * scale.unsqueeze(-1)).flatten(-2).bfloat16()

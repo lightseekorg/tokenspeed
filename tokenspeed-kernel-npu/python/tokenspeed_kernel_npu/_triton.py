@@ -24,7 +24,7 @@ from types import SimpleNamespace
 
 import triton
 from triton import language as tl
-from triton.language.extra import libdevice
+from triton.language.extra.cann import libdevice
 
 try:
     from triton import profiler as proton
@@ -52,17 +52,17 @@ triton.jit = _jit_with_ascend_compatibility
 
 
 @triton.jit
-def _unsupported_pdl_noop():
-    """Keep disabled CUDA PDL branches parseable on Triton-Ascend."""
-    pass
+def _unsupported_pdl():
+    """Disabled CUDA PDL branches parse; attempting to execute one fails."""
+    tl.static_assert(False, "CUDA PDL is not supported on Ascend")
 
 
 if not hasattr(tl.extra, "cuda"):
     tl.extra.cuda = SimpleNamespace()
 if not hasattr(tl.extra.cuda, "gdc_wait"):
-    tl.extra.cuda.gdc_wait = _unsupported_pdl_noop
+    tl.extra.cuda.gdc_wait = _unsupported_pdl
 if not hasattr(tl.extra.cuda, "gdc_launch_dependents"):
-    tl.extra.cuda.gdc_launch_dependents = _unsupported_pdl_noop
+    tl.extra.cuda.gdc_launch_dependents = _unsupported_pdl
 
 
 __all__ = ["libdevice", "proton", "tl", "triton"]

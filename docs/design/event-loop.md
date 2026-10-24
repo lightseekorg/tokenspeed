@@ -677,3 +677,25 @@ termination and constructor-error cleanup share one process-local shutdown
 latch: once cleanup starts, later worker notifications cannot interrupt it.
 Signal callbacks do not log or enumerate processes; cleanup runs outside the
 callback.
+
+## Forward-side CPU collectives
+
+A model forward that exchanges host metadata must use a process group created
+for the forward thread during model construction. It must not reuse the
+scheduler's Gloo group merely because its ranks match. With scheduling overlap,
+these two threads may enter different collectives in opposite rank-local orders;
+sharing a sequence space can corrupt messages or abort Gloo. V4.1 DP decoder-row
+exchange owns such a group; decode keeps using the already agreed row table.
+
+## NPU output completion
+
+NPU output copies use a stream leased exclusively to one pending result.
+It waits for that forward's execution stream; the execution stream then waits
+for the copies before reusing sampler or diagnostic buffers. The result holds
+its source tensors until commit synchronizes the copy stream. Only then does
+the stream return to a thread-safe pool. Eager and graph forwards use this same
+boundary, and the number of leased streams follows the in-flight depth.
+
+Commit must not synchronize the execution stream or a copy stream shared with
+later pending results: those can wait on a subsequent forward whose peers
+have not dispatched yet. CUDA retains its existing event completion path.

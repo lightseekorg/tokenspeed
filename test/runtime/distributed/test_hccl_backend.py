@@ -90,7 +90,21 @@ def test_small_int64_max_preserves_every_bit_and_output_buffer(
     )
 
 
-@pytest.mark.parametrize("counts", [[8] * 8, [0] * 8, [8], [2, 1, 3], [0, 2, 1]])
+@pytest.mark.parametrize(
+    "counts",
+    [
+        [8] * 8,
+        [0] * 8,
+        [8],
+        [2, 1, 3],
+        [0, 2, 1],
+        [1] * 6 + [0, 0],
+        [2, 2, 1, 0],
+        [2, 0, 2, 0],
+        [2, 1, 2, 0],
+        [0, 0, 2, 2],
+    ],
+)
 def test_token_all_gather_preserves_rank_order_without_repacking_equal_shards(
     monkeypatch, counts
 ):
@@ -123,8 +137,13 @@ def test_token_all_gather_preserves_rank_order_without_repacking_equal_shards(
 
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     assert output.is_contiguous()
-    if len(set(counts)) == 1:
-        assert output is gathered_buffers[0]
+    if gathered_buffers:
+        packed_prefix = all(
+            count == min(max(counts), max(0, sum(counts) - rank * max(counts)))
+            for rank, count in enumerate(counts)
+        )
+        if packed_prefix:
+            assert output.data_ptr() == gathered_buffers[0].data_ptr()
 
 
 @pytest.mark.parametrize("counts", [[8] * 8, [16] * 8, [0] * 8, [2, 1, 3], [0, 2, 1]])
@@ -160,10 +179,7 @@ def test_token_reduce_scatter_preserves_rows_and_skips_equal_shard_packing(
         # Simulate reduction of identical peer inputs, selecting this rank's chunk.
         output.copy_(input.chunk(len(counts))[current_rank] * len(counts))
 
-    # Older torch-npu deployments install this collective alias at startup.
-    monkeypatch.setattr(
-        hccl_module.dist, "reduce_scatter_single", reduce_scatter, raising=False
-    )
+    monkeypatch.setattr(hccl_module.dist, "reduce_scatter_tensor", reduce_scatter)
     monkeypatch.setattr(hccl_module.dist, "get_rank", lambda: group[current_rank])
     for current_rank in range(len(counts)):
         output = backend.token_reduce_scatter(tensor, group, counts)
@@ -175,9 +191,7 @@ def test_token_reduce_scatter_preserves_rows_and_skips_equal_shard_packing(
 
 def test_single_rank_token_reduce_scatter_needs_no_collective(monkeypatch):
     reduce_scatter = Mock()
-    monkeypatch.setattr(
-        hccl_module.dist, "reduce_scatter_single", reduce_scatter, raising=False
-    )
+    monkeypatch.setattr(hccl_module.dist, "reduce_scatter_tensor", reduce_scatter)
     tensor = torch.ones(8, 4)
     output = HcclBackend().token_reduce_scatter(tensor, (2,), [8])
     torch.testing.assert_close(output, tensor)

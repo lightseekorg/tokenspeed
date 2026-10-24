@@ -60,6 +60,7 @@ _platform = current_platform()
 if _platform.is_npu:
     from tokenspeed_kernel.ops.layernorm.ascend import qk_rmsnorm as _qk_rmsnorm
     from tokenspeed_kernel.ops.layernorm.ascend import rmsnorm as _rmsnorm
+    from tokenspeed_kernel_npu.ops.dsv41_pointwise import reference_rmsnorm
 elif _platform.is_amd:
     from tokenspeed_kernel.ops.layernorm.triton import qk_rmsnorm as _qk_rmsnorm
     from tokenspeed_kernel.ops.layernorm.triton import rmsnorm as triton_rmsnorm

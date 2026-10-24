@@ -65,9 +65,15 @@ class BaseWeightParameter(Parameter):
     def weight_loader(self) -> Callable:
         return self._weight_loader
 
+    def copy_weight(
+        self, destination: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        """Copy a selected shard; subclasses may decode checkpoint dtypes here."""
+        destination.copy_(loaded_weight)
+
     def _assert_and_load(self, loaded_weight: torch.Tensor) -> None:
         _check_shape_match(self.data.shape, loaded_weight.shape)
-        self.data.copy_(loaded_weight)
+        self.copy_weight(self.data, loaded_weight)
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         self._assert_and_load(loaded_weight)
@@ -105,7 +111,7 @@ class _ColumnParallelWeightParameter(BaseWeightParameter):
                 self.output_dim, tp_rank * shard_size, shard_size
             )
         _check_shape_match(self.data.shape, loaded_weight.shape)
-        self.data.copy_(loaded_weight)
+        self.copy_weight(self.data, loaded_weight)
 
     def load_merged_column_weight(
         self, loaded_weight: torch.Tensor, tp_rank: int, **kwargs
@@ -129,7 +135,7 @@ class _ColumnParallelWeightParameter(BaseWeightParameter):
                 self.output_dim, tp_rank * shard_size, shard_size
             )
         _check_shape_match(param_data.shape, loaded_weight.shape)
-        param_data.copy_(loaded_weight)
+        self.copy_weight(param_data, loaded_weight)
 
     def load_qkv_weight(
         self,
@@ -161,7 +167,7 @@ class _ColumnParallelWeightParameter(BaseWeightParameter):
             )
 
         _check_shape_match(param_data.shape, loaded_weight.shape)
-        param_data.copy_(loaded_weight)
+        self.copy_weight(param_data, loaded_weight)
 
 
 class RowParallelWeightParameter(BaseWeightParameter):
@@ -191,7 +197,7 @@ class RowParallelWeightParameter(BaseWeightParameter):
             loaded_weight = loaded_weight.reshape(1)
 
         _check_shape_match(self.data.shape, loaded_weight.shape)
-        self.data.copy_(loaded_weight)
+        self.copy_weight(self.data, loaded_weight)
 
 
 class ModelWeightParameter(_ColumnParallelWeightParameter, RowParallelWeightParameter):

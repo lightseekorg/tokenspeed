@@ -24,14 +24,23 @@ import torch
 
 
 class StreamFork:
-    def __init__(self, aux_stream: torch.cuda.Stream | None):
+    """Fork on the supplied stream device, with explicit producer/consumer events."""
+
+    def __init__(self, aux_stream: torch.Stream | None):
         self.aux_stream = aux_stream
-        self.fork_event = torch.cuda.Event() if aux_stream is not None else None
-        self.join_event = torch.cuda.Event() if aux_stream is not None else None
-        self.checkpoint_event = torch.cuda.Event() if aux_stream is not None else None
+        self.device_module = (
+            torch.get_device_module(aux_stream.device)
+            if aux_stream is not None
+            else None
+        )
+        self.fork_event = self.device_module.Event() if aux_stream is not None else None
+        self.join_event = self.device_module.Event() if aux_stream is not None else None
+        self.checkpoint_event = (
+            self.device_module.Event() if aux_stream is not None else None
+        )
         self._active = False
         self._overlap = True
-        self._current: torch.cuda.Stream | None = None
+        self._current: torch.Stream | None = None
 
     @contextmanager
     def scope(self, *, enable: bool, overlap: bool = True):
@@ -48,7 +57,7 @@ class StreamFork:
         self._active = enable and self.aux_stream is not None
         self._overlap = overlap
         if self._active:
-            self._current = torch.cuda.current_stream()
+            self._current = self.device_module.current_stream()
             self.fork_event.record(self._current)
         try:
             yield self
@@ -96,7 +105,7 @@ class StreamFork:
         if not self._active:
             yield
             return
-        with torch.cuda.stream(self.aux_stream):
+        with self.device_module.stream(self.aux_stream):
             self.fork_event.wait(self.aux_stream)
             yield
             self.join_event.record(self.aux_stream)

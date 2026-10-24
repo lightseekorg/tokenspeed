@@ -313,6 +313,23 @@ def dspark_block_greedy_step(
     if rows == 0:
         return
 
+    if base_logits.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.dspark_block import score_step
+
+        score_step(
+            base_logits,
+            step,
+            anchor_ids,
+            candidates,
+            embedding,
+            projection,
+            vocab_start,
+            num_valid,
+            partials,
+            output,
+        )
+        return
+
     previous_out = output[:, step - 1] if step > 0 else output[:, 0]
     grid = (n_tiles, triton.cdiv(rows, _ROWS))
     _block_step_kernel[grid](
@@ -372,6 +389,11 @@ def dspark_block_greedy_resolve(
         raise ValueError(f"step {step} is outside the output block")
     _check_output_column(output, rows, output.shape[1])
     if rows == 0:
+        return
+    if candidates.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.dspark_block import resolve
+
+        resolve(candidates, output, step)
         return
     _block_resolve_kernel[(triton.cdiv(rows, _ROWS),)](
         candidates,

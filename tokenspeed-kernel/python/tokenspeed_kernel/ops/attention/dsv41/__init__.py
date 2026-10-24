@@ -372,6 +372,8 @@ def selected_attention(
     prefill_indices: torch.Tensor | None,
     *,
     lse: torch.Tensor | None,
+    pa_mode: str | None = None,
+    pa_context: object | None = None,
 ) -> torch.Tensor:
     """Joint SWA/global softmax with one zero-valued sink, returning BF16.
 
@@ -400,6 +402,9 @@ def selected_attention(
 
         lse: Optional contiguous FP32 [T, H] natural-log LSE destination.
             Requires attn_sink=None for distributed partial attention.
+
+        pa_mode: Ascend compact/direct mode resolved at initialization; None on GPU.
+        pa_context: Pool-owned direct-PA constants; required for direct mode.
 
     Returns:
         Output shaped like q; all-invalid selections return zero. SWA/global
@@ -439,6 +444,13 @@ def selected_attention(
         solution=None,
         override=None,
     )
+    npu_options = {}
+    if q.device.type == "npu":
+        if pa_mode not in ("compact", "direct"):
+            raise ValueError("Ascend attention requires an explicit PA mode")
+        npu_options = dict(pa_mode=pa_mode, pa_context=pa_context)
+    elif pa_mode is not None or pa_context is not None:
+        raise ValueError("PA context and mode require Ascend attention")
     return kernel(
         q,
         swa_cache,
@@ -455,6 +467,7 @@ def selected_attention(
         prefill_kv,
         prefill_indices,
         **({"lse": lse} if lse is not None else {}),
+        **npu_options,
     )
 
 
@@ -748,8 +761,10 @@ def _validate_rope(values, positions, cos_sin_cache):
         raise ValueError(
             "V4.1 RoPE values must be BF16/FP16 [tokens,dim] or [tokens,heads,dim]"
         )
-    if not values.is_cuda or values.stride(-1) != 1:
-        raise ValueError("V4.1 RoPE requires CUDA values with contiguous head channels")
+    if values.device.type not in ("cuda", "npu") or values.stride(-1) != 1:
+        raise ValueError(
+            "V4.1 RoPE requires CUDA/NPU values with contiguous head channels"
+        )
     if positions.shape != values.shape[:1] or positions.dtype not in (
         torch.int32,
         torch.int64,
@@ -912,8 +927,24 @@ def dspark_anchors(
     for tensor in (output_tokens, accept_lengths, positions, start_pos):
         if tensor.dtype not in (torch.int32, torch.int64) or not tensor.is_contiguous():
             raise ValueError("DSpark anchor inputs must be contiguous integers")
+    if positions.device.type == "npu" and bs <= 8 and 0 < next_tokens.shape[1] <= 8:
+        from tokenspeed_kernel_npu.ops.dsv41_dspark_metadata import (
+            dspark_anchors as impl,
+        )
+
+        impl(
+            output_tokens,
+            accept_lengths,
+            positions,
+            num_extends,
+            num_prefill_outputs,
+            width,
+            next_tokens,
+            start_pos,
+        )
+        return
     if not positions.is_cuda:
-        rows = torch.arange(num_decodes)
+        rows = torch.arange(num_decodes, device=positions.device)
         accepted = accept_lengths[num_extends:].to(torch.int64).clamp(1, width)
         verify = num_prefill_outputs + rows * width + accepted - 1
         next_tokens[:num_prefill_outputs].copy_(
@@ -968,18 +999,44 @@ def dspark_block(
             raise ValueError("DSpark block inputs must be int32/int64")
     if history_slots.stride(1) != 1:
         raise ValueError("DSpark history slots need a unit column stride")
+    if (
+        bonus.device.type == "npu"
+        and 4 <= bonus.numel() <= 8
+        and 0 < history_slots.shape[1] <= 256
+        and hc_mult in (1, 2, 4, 8)
+        and block_size <= 8
+    ):
+        from tokenspeed_kernel_npu.ops.dsv41_dspark_metadata import dspark_block as impl
+
+        return impl(
+            bonus,
+            start_pos,
+            history_slots,
+            noise_token,
+            rows_per_page,
+            hc_mult,
+            block_size,
+        )
     if not bonus.is_cuda:
         n, window = history_slots.shape
         device = bonus.device
         ids = torch.full((n, block_size), noise_token, dtype=torch.int32, device=device)
         ids[:, 0] = bonus
-        positions = start_pos.to(torch.int64)[:, None] + 1 + torch.arange(block_size)
-        pre_mix = torch.zeros((n * block_size, hc_mult), dtype=torch.float32)
+        positions = (
+            start_pos.to(torch.int64)[:, None]
+            + 1
+            + torch.arange(block_size, device=device)
+        )
+        pre_mix = torch.zeros(
+            (n * block_size, hc_mult), dtype=torch.float32, device=device
+        )
         pre_mix[:, 0] = 1
-        request_indices = torch.arange(n).repeat_interleave(block_size)
+        request_indices = torch.arange(n, device=device).repeat_interleave(block_size)
         slots = history_slots.clamp_min(0).long()
         width = window + block_size
-        indices = torch.arange(n * width, dtype=torch.int32).view(n, width)
+        indices = torch.arange(n * width, dtype=torch.int32, device=device).view(
+            n, width
+        )
         indices[:, :window].masked_fill_(history_slots < 0, -1)
         indices = indices[:, None, :].expand(-1, block_size, -1).reshape(-1, width)
         return (
@@ -1038,7 +1095,7 @@ def decode_rows(
         raise ValueError("decode row vectors must be contiguous")
     if any(tensor.device != positions.device for tensor in tensors):
         raise ValueError("decode row vectors must share a device")
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         lengths.zero_()
         lengths[:actual_bs].copy_(seq_lens[:actual_bs].clamp_min(width))
         positions.view(bs, width).copy_(
@@ -1083,7 +1140,7 @@ def decode_window(
     history is resident is the scheduler's retention contract, not checked
     here. Returns None.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
             bounded_group_slots,
         )
@@ -1116,7 +1173,7 @@ def global_slots(rows, positions, requests, table, ratio, pages):
     Query coordinates [N] determine causality, ratio is raw tokens per global
     row, and pages bounds the LCM field. Invalid/null addresses resolve to -1.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         from tokenspeed_kernel.ops.attention.mla._triton.page_table import (
             bounded_group_slots,
         )
@@ -1139,7 +1196,7 @@ def selection_table(positions, requests, table, ratio):
     Returns int32 table[N,table_width] with null/invalid request entries -1,
     and int32 visible lengths[N]. ratio is raw tokens per global cache row.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         out = torch.full((positions.numel(), table.shape[1]), -1, dtype=torch.int32)
         if table.numel():
             values = table[requests.clamp(0, table.shape[0] - 1)]
@@ -1181,7 +1238,7 @@ def compressor_metadata(
     in place, including padding, so callers can reuse storage under CUDA graphs.
     Returns None. Inputs and destinations must not alias.
     """
-    if not positions.is_cuda:
+    if positions.device.type == "cpu":
         active.copy_((positions >= 0) & (positions % 2 == 1))
         pair_positions.copy_((positions - 1).masked_fill(~active, -1))
         pair_requests.copy_(requests.masked_fill(~active, -1))
@@ -1259,6 +1316,7 @@ def merge_index_candidates(packed, rows, lengths):
 
 # Backend registration (side-effect imports)
 # isort: off
+import tokenspeed_kernel.ops.attention.dsv41.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41._triton.rope  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.dsv41.gluon  # noqa: E402,F401
@@ -1314,7 +1372,7 @@ def index_select_all(page_table, visible_lens, pages, candidate_block_size, out)
             raise ValueError(
                 "All-history outputs must be contiguous int32 destinations"
             )
-    if page_table.is_cuda:
+    if page_table.device.type != "cpu":
         return _kernel("index_select_all", page_table)(
             page_table, visible_lens, pages, candidate_block_size, out
         )
@@ -1374,3 +1432,75 @@ def compact_slots(slots: torch.Tensor, lengths: torch.Tensor):
         packed = slots.masked_fill(~valid, -1).gather(1, order)
         return packed, valid.sum(dim=-1, dtype=torch.int32)
     return _kernel("compact_slots", slots)(slots, lengths)
+
+
+def store_index_bf16(rows, cache, slots, *, quantize):
+    """Write an LCM-owned BF16 index plane with explicit FP4 QDQ policy."""
+    kernel = select_kernel(
+        "attention",
+        "dsv41_store_index_bf16",
+        format_signature(x=dense_tensor_format(rows.dtype)),
+        features=None,
+        platform=None,
+        traits=None,
+        solution=None,
+        override=None,
+    )
+    return kernel(rows, cache, slots, quantize)
+
+
+def index_topk_bf16(
+    index_q,
+    weights,
+    index_cache,
+    page_table,
+    visible_lens,
+    candidate_blocks,
+    topk,
+    candidate_topk,
+    candidate_block_size,
+    query_chunk_size,
+    score_chunk_size,
+    process_group,
+    out,
+    solution,
+    *,
+    quantize_query,
+    prepared_reindex=None,
+):
+    """Select V4.1 rows using a contiguous BF16 index plane.
+
+    The BF16 cache is validated directly and owned/transferred by LCM.
+    quantize_query explicitly chooses FP4 QDQ or the unquantized BF16 query.
+    prepared_reindex is an optional empty dict owned by one forward's candidate
+    record. On the NPU native candidate path it retains only key/metadata
+    preparation. Callers must discard it at each metadata refresh; query QDQ,
+    scores and selection always run independently. Unsupported paths reject it.
+    """
+    kernel = select_kernel(
+        "attention",
+        "dsv41_index_topk_bf16",
+        format_signature(x=dense_tensor_format(index_q.dtype)),
+        features=None,
+        platform=None,
+        traits=None,
+        solution=solution,
+        override=None,
+    )
+    return kernel(
+        index_q,
+        weights,
+        index_cache,
+        page_table,
+        visible_lens,
+        candidate_blocks,
+        topk,
+        candidate_topk,
+        candidate_block_size,
+        query_chunk_size,
+        score_chunk_size,
+        process_group,
+        out,
+        quantize_query,
+        prepared_reindex,
+    )

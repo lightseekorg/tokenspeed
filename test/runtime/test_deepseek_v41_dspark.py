@@ -99,7 +99,8 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.layer_hash_index = layer_id - 37
 
-        def forward(self, hidden, hashes, mask):
+        def forward(self, hidden, hashes, mask, *, global_num_tokens):
+            assert global_num_tokens is None
             events.append(("engram", self.layer_id))
             assert hashes.tolist() == [[self.layer_hash_index] * 3] * 2
             assert mask.tolist() == [True, True]
@@ -131,6 +132,7 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
         engram_n_heads=1,
     )
     target.model.ced_decoder_start = 20
+    target.model.dp_replicated_rows = False
     target.model.decoder_uses_engram = True
     target.model.layers = nn.ModuleList(Layer(i) for i in range(40))
     target.model.norm = SimpleNamespace(weight=torch.ones(2), variance_epsilon=1e-6)

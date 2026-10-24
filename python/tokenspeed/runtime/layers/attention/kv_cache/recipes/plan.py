@@ -485,9 +485,16 @@ class CacheFieldSpec:
     # stride to satisfy an alignment constraint (for example, a TMA row
     # stride). The planner applies this in bytes after group packing.
     page_stride_alignment_bytes: int = 1
+    field_offset_alignment_bytes: int = 1
 
     def __post_init__(self) -> None:
         cache_dtype_bytes(self.dtype)
+        if (
+            isinstance(self.field_offset_alignment_bytes, bool)
+            or not isinstance(self.field_offset_alignment_bytes, int)
+            or self.field_offset_alignment_bytes <= 0
+        ):
+            raise ValueError("field offset alignment must be a positive integer")
 
     @property
     def element_size(self) -> int:
@@ -820,7 +827,10 @@ def pack(
         for group_id, group_fields in by_group.items():
             offset = 0
             for field in group_fields:
-                offset = _align_up(offset, field.element_size)
+                offset = _align_up(
+                    offset,
+                    math.lcm(field.element_size, field.field_offset_alignment_bytes),
+                )
                 field_offsets[field.field_id] = offset
                 offset += field.payload_bytes
             group_plane_bytes[group_id][plane_id] = offset

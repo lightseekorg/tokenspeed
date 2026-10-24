@@ -426,9 +426,10 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
     """Gather BF16 embeddings from a row shard of an MXFP8 table.
 
     Args:
-        weight: FP8 E4M3 codes [local_capacity,D], with contiguous columns.
+        weight: FP8 E4M3 codes [local_capacity,D], with contiguous columns;
+            Ascend may store the same codes as uint8.
         scales: E8M0 exponent bytes [local_capacity,D/32].
-        indices: Contiguous integer IDs of any shape, on the table's GPU.
+        indices: Contiguous integer IDs of any shape, on the table's device.
         row_start: Global ID of the first locally owned row.
         row_end: Exclusive end of locally owned rows, before capacity padding.
 
@@ -436,7 +437,12 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         BF16 embeddings [*indices.shape,D]; nonlocal IDs produce zero rows.
         The caller owns any collective needed to combine shards.
     """
-    if weight.ndim != 2 or weight.shape[1] % 32 or weight.dtype != torch.float8_e4m3fn:
+    byte_storage = weight.device.type == "npu" and weight.dtype == torch.uint8
+    if (
+        weight.ndim != 2
+        or weight.shape[1] % 32
+        or (weight.dtype != torch.float8_e4m3fn and not byte_storage)
+    ):
         raise ValueError(
             "MXFP8 embedding weight must be E4M3 [rows,D] with D divisible by 32"
         )
@@ -448,7 +454,7 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
     if not 0 <= row_start <= row_end <= row_start + weight.shape[0]:
         raise ValueError("MXFP8 embedding shard range exceeds table capacity")
     if (
-        not indices.is_cuda
+        not (indices.is_cuda or indices.device.type == "npu")
         or indices.dtype not in (torch.int32, torch.int64)
         or not indices.is_contiguous()
         or weight.stride(1) != 1

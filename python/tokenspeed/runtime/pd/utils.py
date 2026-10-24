@@ -152,13 +152,16 @@ class StepCounter:
         )
 
     def __init__(self, device: str, gpu_id: int):
+        target = torch.device(device)
+        if target.index is None:
+            target = torch.device(target.type, gpu_id)
         # utilities for cache step
-        self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
+        self.d_ready_cache_step = torch.tensor(0, dtype=torch.int64, device=target)
         self.h_ready_cache_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.cache_step: int = 0
 
         # utilities for aux step
-        self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64).cuda(gpu_id)
+        self.d_ready_aux_step = torch.tensor(0, dtype=torch.int64, device=target)
         self.h_ready_aux_step = torch.tensor(0, dtype=torch.int64, pin_memory=True)
         self.aux_step: int = 0
 

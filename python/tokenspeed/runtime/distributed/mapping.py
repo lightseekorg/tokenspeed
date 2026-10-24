@@ -570,9 +570,9 @@ def _resolve_lm_head_tp_size(
     """Resolve the LM-head TP width against the attention layout.
 
     The default is today's layout: the attention TP width without attention
-    DP, replicated (1) with it. An explicit width under attention DP needs
-    attention TP 1 (the logits path gathers whole rows from each rank) and
-    must tile the stage world; without DP it must equal the attention TP.
+    DP, replicated (1) with it. Under attention DP a head can shard within
+    each attention TP group, or across distinct rows when attention TP is 1.
+    Other mixed groups are unsupported; without DP it follows attention TP.
     """
     if lm_head_tp_size is None:
         return 1 if attn.has_dp else attn.tp_size
@@ -590,9 +590,10 @@ def _resolve_lm_head_tp_size(
                 f"attn_tp_size={attn.tp_size}"
             )
         return lm_head_tp_size
-    if lm_head_tp_size > 1 and attn.tp_size != 1:
+    if lm_head_tp_size > 1 and attn.tp_size not in (1, lm_head_tp_size):
         raise ValueError(
-            "LM head TP under attention DP needs attention TP 1, got "
+            "LM head TP under attention DP needs attention TP 1 or the same "
+            "width as attention TP, got "
             f"attn_tp_size={attn.tp_size}"
         )
     if attn.world_size % lm_head_tp_size:
@@ -705,6 +706,18 @@ class Mapping(MappingBase):
         assert gpu_id_step > 0
         self.base_gpu_id = base_gpu_id
         self.gpu_id_step = gpu_id_step
+
+    @property
+    def lm_head_crosses_attention_dp(self) -> bool:
+        """The head group holds different request rows and needs a transpose."""
+        return self.attn.has_dp and self.attn.tp_size == 1 and self.lm_head.has_tp
+
+    @property
+    def lm_head_skip_all_gather(self) -> bool:
+        """Replicated and cross-DP heads already return each rank's vocabulary."""
+        return self.attn.has_dp and (
+            not self.lm_head.has_tp or self.lm_head_crosses_attention_dp
+        )
 
     def _on_rank_initialized(self, rank: int):
         self.attn.rank = rank

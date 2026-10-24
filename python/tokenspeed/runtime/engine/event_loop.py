@@ -350,6 +350,10 @@ class EventLoop:
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
+        # Older PyTorch releases use the pre-rename collective API.
+        self._dp_all_gather = getattr(dist, "all_gather_single", None)
+        if self._dp_all_gather is None:
+            self._dp_all_gather = dist.all_gather_into_tensor
         if self.has_dp:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
@@ -1079,7 +1083,7 @@ class EventLoop:
         self._dp_local_info[0, 3] = (
             batch_size - forward_op.num_extends() if executes_model_forward else 0
         )
-        dist.all_gather_single(
+        self._dp_all_gather(
             self._dp_global_info,
             self._dp_local_info,
             group=self.world_cpu_group,

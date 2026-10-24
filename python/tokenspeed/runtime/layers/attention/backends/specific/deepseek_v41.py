@@ -198,6 +198,9 @@ class V41Candidates:
     request_indices: torch.Tensor
     block_ids: torch.Tensor
     lengths: torch.Tensor
+    # Owned by this forward's candidate record, never by the backend globally.
+    # Capture records the first preparation once; replay updates its live data.
+    prepared_reindex: tuple[torch.Tensor, torch.Tensor, dict] | None = None
 
 
 @dataclass
@@ -249,6 +252,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
     # decoder stages separately around the eager narrowing layer, attention
     # staying at its breaks in both.
     cuda_graph_support = CudaGraphSupport(decode_graph=True, prefill_graph=True)
+
+    def npu_graph_requires_host_lengths(self) -> bool:
+        # Compact SFA uses device selection masks; direct PA additionally uses
+        # a constant physical arena span. Neither uses host FIA lengths.
+        # The DSpark backend is this same leaf with its own device metadata.
+        return False
+
     supports_layer_sliding_window = True
 
     skips_incomplete_prefill_outputs = True
@@ -285,6 +295,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 "V4.1 selection sizes exceed the budgeted Top-512/2048 capacities"
             )
         self.spec = spec
+        self.index_solution = "torch_npu" if spec.bf16_index_cache else None
         rows = spec.row_layout()
         # The kernel format names the cache rows are packed in. One choice for
         # the whole pool: the recipe sized the fields from the same record.
@@ -593,7 +604,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         the round in flight drains; pinned staging makes it stream-ordered
         and asynchronous. CPU backends (tests) take the plain path.
         """
-        if torch.device(self.device).type != "cuda":
+        if torch.device(self.device).type not in ("cuda", "npu"):
             return torch.tensor(values, dtype=torch.int64, device=self.device)
         return torch.tensor(values, dtype=torch.int64, pin_memory=True).to(
             self.device, non_blocking=True
@@ -1050,7 +1061,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         slots = self.cache_slots(
             V41_COMPRESSOR_TAIL_GROUP_ID, positions, request_indices, forward_mode
         )
-        if content.is_cuda:
+        if content.device.type != "cpu":
             from tokenspeed_kernel.ops.attention import dsv41
 
             dsv41.compressor_tail_scatter(content, scores, tail, slots)
@@ -1096,7 +1107,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Read before any writes: a scheduler-reused tail page must not destroy
         # the odd-prefix input needed by the first completed pair in this chunk.
         tail = self.cache_pool.compressor_tail(owner)
-        if content.is_cuda:
+        if content.device.type != "cpu":
             from tokenspeed_kernel.ops.attention import dsv41
 
             pooled = dsv41.compressor_pool(
@@ -1130,13 +1141,13 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 pooled[start:stop] = (
                     weights[:, 0] * prior_content + weights[:, 1] * content[start:stop]
                 ).masked_fill(~active[start:stop, None], 0)
-        if not content.is_cuda and norm_weight is not None:
+        if content.device.type == "cpu" and norm_weight is not None:
             normalized = pooled.to(torch.bfloat16).float()
             normalized = normalized * torch.rsqrt(
                 normalized.square().mean(-1, keepdim=True) + norm_eps
             )
             pooled = (normalized * norm_weight.float()).to(torch.bfloat16)
-        if content.is_cuda:
+        if content.device.type != "cpu":
             dsv41.compressor_tail_scatter(content, scores, tail, write_slots)
         else:
             live = write_slots >= 0
@@ -1207,7 +1218,7 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 slots,
             )
         if isinstance(index_k, dsv41.IndexKeyInput):
-            if self.index_format == "index":
+            if self.index_format == "index" and not self.spec.bf16_index_cache:
                 dsv41.index_key_norm_rope_scatter(
                     index_k.values,
                     index_k.norm_weight,
@@ -1225,9 +1236,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 index_k.cos_sin_cache,
                 index_k.norm_eps,
             )
-        dsv41.cache_scatter(
-            index_k, self.cache_pool.index_k(owner), slots, self.index_format
-        )
+        # Both NPU modes read the BF16 plane; its writer applies QDQ when
+        # requested. The packed field is retained only for shared page geometry.
+        if not self.spec.bf16_index_cache:
+            dsv41.cache_scatter(
+                index_k, self.cache_pool.index_k(owner), slots, self.index_format
+            )
+        if self.spec.bf16_index_cache:
+            dsv41.store_index_bf16(
+                index_k,
+                self.cache_pool.index_k(owner),
+                slots,
+                quantize=self.spec.quantize_bf16_index,
+            )
 
     def _selection_rows(self, record, positions, requests):
         if positions is record.positions and requests is record.request_indices:
@@ -1465,7 +1486,15 @@ class DeepseekV41AttentionBackend(AttentionBackend):
         # Query tiling bounds both score scratch and replicated table rows. Do
         # not index_select the table for the entire prefill (T * context pages).
         canonical_prefill = window is not None
-        query_tile = 1024 if canonical_prefill else 256
+        # A DSpark C32 verify step has 192 independent queries. The native
+        # BF16 indexer handles this whole tile, avoiding six repeated table
+        # preparations and head gathers. Preserve the prefill tile/path.
+        npu_decode_tile = 192 if self.spec.bf16_index_cache else 32
+        query_tile = (
+            1024
+            if canonical_prefill
+            else (npu_decode_tile if positions.device.type == "npu" else 256)
+        )
         windows = (
             [
                 (span.offset, span.offset + span.count, span)
@@ -1493,6 +1522,14 @@ class DeepseekV41AttentionBackend(AttentionBackend):
             and dsv41.local_index_supported(
                 index_q, index_cache, candidates.block_ids if reindex else None
             )
+        )
+        reuse_preparation = (
+            reindex
+            and same_candidate_rows
+            and forward_mode.is_decode()
+            and positions.device.type == "npu"
+            and self.spec.bf16_index_cache
+            and 0 < n <= npu_decode_tile
         )
         for start, stop, span in windows:
             selection_kind = self._index_selection_kind(
@@ -1566,6 +1603,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     span,
                     forward_mode,
                 )
+                if reuse_preparation and candidates.prepared_reindex is None:
+                    candidates.prepared_reindex = (geometry.table, geometry.lengths, {})
             cb = None
             if reindex and selection_kind == "candidates":
                 if same_candidate_rows:
@@ -1603,7 +1642,18 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 packed = all_gather(packed, self.kvp_group, dim=1)
                 dsv41.merge_index_candidates(packed, rows[start:stop], lens[start:stop])
                 continue
-            dsv41.index_topk(
+            select_index = dsv41.index_topk
+            index_options = {}
+            extra_metadata = (geometry.kernel_metadata,)
+            if self.spec.bf16_index_cache:
+                select_index = dsv41.index_topk_bf16
+                extra_metadata = ()
+                index_options = dict(
+                    quantize_query=self.spec.quantize_bf16_index,
+                )
+                if reuse_preparation:
+                    index_options["prepared_reindex"] = candidates.prepared_reindex[2]
+            select_index(
                 index_q[start:stop],
                 index_weights[start:stop],
                 scoring_cache,
@@ -1614,11 +1664,12 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 candidate_capacity if produce_candidates else 0,
                 self.spec.candidate_block_size,
                 query_tile,
-                256,
+                2048 if positions.device.type == "npu" else 256,
                 index_process_group,
                 outputs,
-                None,
-                geometry.kernel_metadata,
+                self.index_solution,
+                *extra_metadata,
+                **index_options,
             )
             del scoring_cache
         if partition is not None:
@@ -2024,6 +2075,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     None,
                     None,
                     lse=lse,
+                    pa_mode=self.spec.pa_mode,
+                    pa_context=self.cache_pool.pa_context,
                 )
                 partial, lse = normalize_dcp_partials(
                     partial, lse, local_swa_lens, local_counts
@@ -2070,15 +2123,19 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 None,
                 None,
                 lse=None,
+                pa_mode=self.spec.pa_mode,
+                pa_context=self.cache_pool.pa_context,
             )
         plan = self._swa_query_plan(positions, request_indices, forward_mode)
-        # Quantize current rows exactly as cache storage, without publishing them
-        # until every request has read its old sliding prefix.
+        # Match the current rows to cache storage without publishing them until
+        # every request has read its old sliding prefix.
         prefixes = [
             dsv41.cache_gather(cache, request.prefix_slots, self.swa_format, None)
             for request in plan.requests
         ]
-        if swa_rope_cache is None:
+        if self.swa_format == "swa_bf16" and swa_rope_cache is None:
+            current = swa_kv.to(torch.bfloat16)
+        elif swa_rope_cache is None:
             current = dsv41.cache_unpack(
                 dsv41.cache_pack(swa_kv, self.swa_format, None), self.swa_format, None
             )
@@ -2214,6 +2271,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                     workspace[:, None, :],
                     indices.contiguous(),
                     lse=None,
+                    pa_mode=self.spec.pa_mode,
+                    pa_context=self.cache_pool.pa_context,
                 )
             if output is None:
                 out[rows] = result

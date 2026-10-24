@@ -18,6 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -61,6 +62,9 @@ class DeepseekV41Config(SoftmaxAttnConfig):
     attention_query_group: tuple[int, ...]
     indexer_query_rank: int
     indexer_query_group: tuple[int, ...]
+
+    kv_cache_mode: str
+    pa_mode: str | None
 
     @classmethod
     def generate(cls, server_args, model_config, is_draft: bool) -> AttnConfig:
@@ -143,6 +147,28 @@ class DeepseekV41Config(SoftmaxAttnConfig):
         attention_group = (
             attn.tp_group if attention_size > 1 else (attn.tp_group[attn.tp_rank],)
         )
+
+        platform = current_platform()
+        cache_format = "v4" if platform.is_hopper else "v41"
+        kv_cache_mode = "quantized"
+        pa_mode = None
+        if platform.is_npu:
+            pa_mode = os.getenv("TS_V41_PA_MODE") or "compact"
+            if pa_mode not in ("compact", "direct"):
+                raise ValueError("TS_V41_PA_MODE must be compact or direct")
+            kv_cache_mode = server_args.npu_v41_kv_cache
+            index_cache_mode = server_args.npu_v41_index_cache
+            if kv_cache_mode not in ("bf16-qdq", "bf16") or index_cache_mode not in (
+                "bf16-qdq",
+                "bf16",
+            ):
+                raise ValueError("NPU V4.1 supports bf16-qdq or bf16 cache modes only")
+            cache_format = f"v41_index_{index_cache_mode}"
+        elif any(
+            value is not None
+            for value in (server_args.npu_v41_kv_cache, server_args.npu_v41_index_cache)
+        ):
+            raise ValueError("NPU V4.1 cache options require an NPU")
         spec = cls(
             backend_name="deepseek_v41",
             num_attention_heads=model_config.num_attention_heads,
@@ -173,7 +199,9 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             # reader exists for them. Hopper's FlashMLA reads the V4 layout but
             # not V4.1, and the portable kernels read either, so sm90 stores the
             # wider V4 rows and trades token capacity for the native reader.
-            cache_format="v4" if current_platform().is_hopper else "v41",
+            cache_format=cache_format,
+            kv_cache_mode=kv_cache_mode,
+            pa_mode=pa_mode,
         )
         return AttnConfig(
             components=(spec,),
@@ -181,9 +209,28 @@ class DeepseekV41Config(SoftmaxAttnConfig):
             **kwargs,
         )
 
+    @property
+    def bf16_kv_cache(self) -> bool:
+        return self.kv_cache_mode in ("bf16-qdq", "bf16")
+
+    @property
+    def bf16_index_cache(self) -> bool:
+        return self.cache_format in ("v41_index_bf16-qdq", "v41_index_bf16")
+
+    @property
+    def quantize_bf16_index(self) -> bool:
+        return self.cache_format == "v41_index_bf16-qdq"
+
     def row_layout(self):
         """Return the row widths and packing tables this cache format uses."""
-        layout = V41_CACHE_FORMATS.get(self.cache_format)
+        if self.kv_cache_mode not in ("quantized", "bf16-qdq", "bf16"):
+            raise ValueError(f"unsupported NPU V4.1 KV mode: {self.kv_cache_mode!r}")
+        storage_format = "v41" if self.bf16_index_cache else self.cache_format
+        if self.bf16_kv_cache:
+            storage_format = (
+                "v41_bf16" if self.kv_cache_mode == "bf16" else "v41_bf16_qdq"
+            )
+        layout = V41_CACHE_FORMATS.get(storage_format)
         if layout is None:
             raise ValueError(
                 f"unsupported V4.1 cache format: {self.cache_format!r}; "

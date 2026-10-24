@@ -122,13 +122,17 @@ def _deepseek_v41_pool(
     rank: int,
     field_layer_offset: int,
 ) -> CachePool:
-    del spec, config
+    del spec
+    from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
+        DeepseekV41Config,
+    )
     from tokenspeed.runtime.layers.attention.kv_cache.deepseek_v41 import (
         DeepseekV41CachePool,
     )
 
     return DeepseekV41CachePool(
         arena=arena,
+        pa_mode=config.component(DeepseekV41Config).pa_mode,
         layer_num=num_layers,
         rank=rank,
         field_layer_offset=field_layer_offset,

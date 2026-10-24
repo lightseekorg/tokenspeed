@@ -70,7 +70,7 @@ def upload_packed(
         parts: Dense CPU tensors, including scalars, empty tensors and
             noncontiguous views. Their values, shapes and dtypes are preserved;
             their strides are not. An empty tuple produces an empty tuple.
-        device: Destination for the shared storage. CUDA transfers use pinned
+        device: Destination for the shared storage. CUDA and NPU transfers use pinned
             host memory and are asynchronous on the current stream.
 
     Returns:
@@ -93,7 +93,9 @@ def upload_packed(
         total_bytes = (total_bytes + alignment - 1) // alignment * alignment
         offsets.append(total_bytes)
         total_bytes += part.numel() * alignment
-    host = torch.empty(total_bytes, dtype=torch.uint8, pin_memory=device.type == "cuda")
+    host = torch.empty(
+        total_bytes, dtype=torch.uint8, pin_memory=device.type in ("cuda", "npu")
+    )
     for part, offset in zip(parts, offsets):
         data = part.reshape(-1).view(torch.uint8)
         host[offset : offset + data.numel()].copy_(data)

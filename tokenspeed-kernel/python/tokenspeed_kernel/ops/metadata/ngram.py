@@ -362,8 +362,31 @@ def prepare_ngram_inputs(
     ``total`` are dead padding. Uniform positive request length selects direct
     indexing; zero selects ragged indexing. All modes use this same operation.
     """
+    if ids.device.type == "npu":
+        from tokenspeed_kernel_npu.ops.ngram import prepare_ngram
+
+        prepare_ngram(
+            snapshots,
+            positions,
+            reset,
+            slots,
+            cache_lengths,
+            request_ends,
+            tail,
+            needs_seed,
+            ids,
+            previous,
+            token_mask,
+            prefix,
+            hashes,
+            total,
+            vocab_size,
+            uniform_length,
+            hash_params,
+        )
+        return
     bs = slots.numel()
-    if not ids.is_cuda:
+    if ids.device.type == "cpu":
         seed = reset.bool() | needs_seed[slots]
         delta = cache_lengths[slots] - positions
         torch._assert_async(
@@ -475,14 +498,20 @@ def _commit_ngram(
         tl.maximum(start + tl.cumsum(sizes) - sizes + delta - 1, 0), capacity - 1
     )
     advancing = live & (delta > 0)
-    raw = tl.load(ids + last, advancing, other=-1).to(tl.int64)
-    mask = tl.load(token_mask + last, advancing, other=False)
-    current = tl.where(mask, raw, -1)
-    past = tl.load(
-        previous + last[:, None] * 3 + cols[None, :] - 1,
-        advancing[:, None] & (cols[None, :] > 0) & (cols[None, :] < 3),
-        other=-1,
-    )
+    # Empty inputs have null storage; avoid even masked accesses to those
+    # pointers on Ascend. Zero acceptance still commits the prepared prefix.
+    if capacity > 0:
+        raw = tl.load(ids + last, advancing, other=-1).to(tl.int64)
+        mask = tl.load(token_mask + last, advancing, other=False).to(tl.int1)
+        current = tl.where(mask, raw, -1)
+        past = tl.load(
+            previous + last[:, None] * 3 + cols[None, :] - 1,
+            advancing[:, None] & (cols[None, :] > 0) & (cols[None, :] < 3),
+            other=-1,
+        )
+    else:
+        current = tl.full((ROWS,), -1, tl.int64)
+        past = tl.full((ROWS, 4), -1, tl.int64)
     initial = tl.load(
         prefix + rows[:, None] * 3 + cols[None, :],
         live[:, None] & (delta[:, None] == 0) & (cols[None, :] < 3),
@@ -525,7 +554,7 @@ def commit_ngram_inputs(
     must remain alive through commit, including after embedding IDs are clamped.
     """
     bs = slots.numel()
-    if not ids.is_cuda:
+    if ids.device.type == "cpu":
         rows = torch.arange(bs, device=slots.device)
         delta = torch.where(rows < num_extends, lengths, accepted)
         live = slots != padding_slot

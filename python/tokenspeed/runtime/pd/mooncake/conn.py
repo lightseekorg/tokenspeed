@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.metrics.collector import KVTransferMetrics
 from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.pd.base.bootstrap import DisaggBootstrapServerBase
@@ -71,6 +73,7 @@ class MooncakeKVManagerBase(DisaggManagerBase):
             hostname=get_local_ip_by_remote(),
             gpu_id=kv_args.gpu_id,
             ib_device=kv_args.ib_device,
+            transport="ascend_direct" if current_platform().is_npu else "rdma",
         )
         super().__init__(engine=engine)
 

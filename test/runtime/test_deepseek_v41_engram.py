@@ -355,6 +355,20 @@ def test_bounded_shard_loading_and_four_way_lookup(tmp_path, monkeypatch):
     assert len(calls) == 22
 
 
+def test_ceil_divided_empty_row_shard(monkeypatch):
+    monkeypatch.setattr(engram, "all_reduce", lambda tensor, **kwargs: tensor)
+    embed = RowShardedEngramEmbedding(
+        72, 32, _mapping(15, 16, 16), "cpu", False, "gpu", 1
+    )
+    codes, scales = _weights(72, 32)
+    embed.weight_loader(embed.weight, codes)
+    embed.weight_loader(embed.scale, scales)
+    assert embed.row_start == embed.row_end == 72
+    assert torch.all(embed.weight.view(torch.uint8) == 0)
+    output = embed(torch.tensor([[0, 71, 72, 75, -1]]))
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
 def test_scale_bytes_and_loader_validation():
     embed = RowShardedEngramEmbedding(8, 256, _mapping(0, 1, 1), "cpu", False, "gpu", 1)
     codes = torch.ones(8, 256).to(torch.float8_e4m3fn)
@@ -442,7 +456,7 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
     monkeypatch, config_class, hopper
 ):
     monkeypatch.setattr(
-        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper)
+        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper, is_npu=False)
     )
     quant = config_class.from_config(
         {
@@ -481,6 +495,71 @@ def test_quantized_projection_loader_aliases_and_real_table_metadata(
         assert large.scale.shape == (96004171, 8)
         assert large.weight.element_size() == large.scale.element_size() == 1
         assert large.row_end <= 384016682
+
+
+@pytest.mark.parametrize("attn_tp,dense_tp", [(16, 8), (8, 8), (4, 8)])
+def test_npu_column_projection_loads_checkpoint_scales_and_preserves_order(
+    monkeypatch, attn_tp, dense_tp
+):
+    # CPU supplies the weights and local GEMMs; real HCCL gather/replay is
+    # validated on NPU. Each DP replica must retain its own projection group.
+    platform = SimpleNamespace(is_npu=True, is_hopper=False)
+    monkeypatch.setattr(engram, "current_platform", lambda: platform)
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    quant = Mxfp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [32, 32],
+            "scale_fmt": "ue8m0",
+        }
+    )
+    codes, _ = _weights(160, 192)
+    scales = (torch.arange(30).reshape(5, 6) % 4 + 125).to(torch.uint8)
+    expanded = scales.repeat_interleave(32, dim=0)
+    weight = (
+        (
+            codes.float().unflatten(-1, (6, 32))
+            * expanded.view(torch.float8_e8m0fnu).float().unsqueeze(-1)
+        )
+        .flatten(-2)
+        .bfloat16()
+    )
+    x = torch.arange(6 * 192).remainder(5).bfloat16().reshape(6, 192)
+    expected = F.linear(x.float(), weight.float()).bfloat16()
+    outputs = {}
+    for rank in range(16):
+        mapping = Mapping(
+            rank=rank,
+            world_size=16,
+            attn_tp_size=attn_tp,
+            attn_dp_size=16 // attn_tp,
+            dense_tp_size=dense_tp,
+            moe_tp_size=1,
+            moe_ep_size=16,
+        )
+        model = DeepseekV41Engram(
+            _config(),
+            1,
+            mapping,
+            v41_mxfp8_config(quant),
+            "model.layers.1.engram",
+            "cpu",
+            False,
+            "gpu",
+        )
+        model.wkv.weight.weight_loader(model.wkv.weight, codes)
+        model.wkv.weight_scale_inv.weight_loader(model.wkv.weight_scale_inv, scales)
+        model.wkv.quant_method.process_weights_after_loading(model.wkv)
+        # Disable only the unavailable CPU collective, retaining the real
+        # column loader and Linear forward for each member of the group.
+        model.wkv.gather_output = False
+        local, _ = model.wkv(x)
+        outputs.setdefault(model.wkv.tp_group, []).append((model.wkv.tp_rank, local))
+        assert set(model.wkv.tp_group) <= set(mapping.attn.tp_group)
+    for parts in outputs.values():
+        actual = torch.cat([value for _, value in sorted(parts)], dim=-1)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

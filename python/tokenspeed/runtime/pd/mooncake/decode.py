@@ -142,6 +142,7 @@ class MooncakeKVManagerDecode(MooncakeKVManagerBase):
             hostname=old_engine.hostname,
             gpu_id=old_engine.gpu_id,
             ib_device=old_engine.ib_device,
+            transport=old_engine.transport,
         )
         super().restore_buffer_registration()
         with self.connection_lock:

@@ -51,6 +51,7 @@ from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from torch import nn
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -246,6 +247,8 @@ class _DenseFFN(nn.Module):
         self.use_mega_moe = False
         self.owns_ep_communication = False
 
+        self.dp_replicated_rows = False
+
     def forward(
         self,
         x,
@@ -287,8 +290,9 @@ class _Backend:
         ).sum(1)
         output = torch.zeros_like(content)
         output[1:cutoff:2] = pooled
-        row_positions, row_requests = torch.full_like(positions, -1), torch.full_like(
-            requests, -1
+        row_positions, row_requests = (
+            torch.full_like(positions, -1),
+            torch.full_like(requests, -1),
         )
         row_positions[1:cutoff:2] = positions[:cutoff:2]
         row_requests[1:cutoff:2] = requests[:cutoff:2]
@@ -523,7 +527,24 @@ def test_scale_expansion_then_tp_and_merged_sharding():
     assert quant.weight_block_size == [1, 32]
 
 
-@pytest.mark.parametrize("hopper", [False, True])
+class _Fp8CastSizes(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.sizes: list[int] = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if (
+            func == torch.ops.aten._to_copy.default
+            and args[0].dtype == torch.float8_e4m3fn
+            and kwargs.get("dtype") == torch.bfloat16
+        ):
+            self.sizes.append(args[0].numel())
+        return func(*args, **kwargs)
+
+
+@pytest.mark.parametrize("platform", ["other", "hopper", "npu"])
+@pytest.mark.parametrize("presharded", [False, True])
 @pytest.mark.parametrize(
     ("kind", "rank"),
     [
@@ -537,11 +558,15 @@ def test_scale_expansion_then_tp_and_merged_sharding():
     ],
 )
 def test_reference_linear_construction_preserves_checkpoint_loading(
-    monkeypatch, hopper, kind, rank
+    monkeypatch, platform, presharded, kind, rank
 ):
-    # Exercise both storage contracts without requiring a Hopper allocation.
+    # Exercise checkpoint loading on CPU without a Hopper or Ascend allocation.
     monkeypatch.setattr(
-        v41, "current_platform", lambda: SimpleNamespace(is_hopper=hopper)
+        v41,
+        "current_platform",
+        lambda: SimpleNamespace(
+            is_hopper=platform == "hopper", is_npu=platform == "npu"
+        ),
     )
     quant = v41_mxfp8_config(_quant())
     kwargs = dict(
@@ -551,7 +576,12 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
         prefix="model.proj",
     )
     if kind != "replicated":
-        kwargs.update(tp_rank=rank, tp_size=4, tp_group=(0, 1, 2, 3))
+        kwargs.update(
+            tp_rank=rank,
+            tp_size=4,
+            tp_group=(0, 1, 2, 3),
+            use_presharded_weights=presharded,
+        )
     if kind == "merged":
         cls = v41.MergedColumnParallelLinear
         kwargs["output_sizes"] = [128, 128]
@@ -564,7 +594,8 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
         }[kind]
     layer = cls(quant_config=quant, **kwargs)
     assert isinstance(layer.quant_method, v41._ReferenceFp8LinearMethod)
-    assert layer.weight.dtype == (torch.bfloat16 if hopper else torch.float8_e4m3fn)
+    bf16 = platform in ("hopper", "npu")
+    assert layer.weight.dtype == (torch.bfloat16 if bf16 else torch.float8_e4m3fn)
     expected_weights, expected_scales = [], []
     for shard in range(2 if kind == "merged" else 1):
         codes = ((torch.arange(128 * 128).reshape(128, 128) % 17) - 8 + shard).to(
@@ -572,9 +603,20 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
         )
         scales = (torch.arange(16).reshape(4, 4) % 7 + 120 + shard).to(torch.uint8)
         shard_args = (shard,) if kind == "merged" else ()
-        layer.weight.weight_loader(layer.weight, codes, *shard_args)
+        loaded_codes, loaded_scales = codes, scales
+        if presharded and kind != "replicated":
+            dim = 1 if kind == "row" else 0
+            loaded_codes = codes.chunk(4, dim=dim)[rank]
+            loaded_scales = scales.chunk(4, dim=dim)[rank]
+        with _Fp8CastSizes() as casts:
+            layer.weight.weight_loader(layer.weight, loaded_codes, *shard_args)
+        if platform == "npu":
+            # Each rank converts only its shard, not the full checkpoint tensor.
+            assert casts.sizes == [codes.numel() // (1 if kind == "replicated" else 4)]
         layer.weight_scale_inv.weight_loader(
-            layer.weight_scale_inv, scales.view(torch.float8_e8m0fnu), *shard_args
+            layer.weight_scale_inv,
+            loaded_scales.view(torch.float8_e8m0fnu),
+            *shard_args,
         )
         values = codes.float()
         expanded = scales.repeat_interleave(32, dim=0)
@@ -590,7 +632,7 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
     expected_scale = torch.cat(expected_scales)
     torch.testing.assert_close(layer.weight.float(), expected_weight, rtol=0, atol=0)
     torch.testing.assert_close(layer.weight_scale_inv, expected_scale, rtol=0, atol=0)
-    if hopper:
+    if bf16:
         layer.quant_method.process_weights_after_loading(layer)
         expected = (
             (
@@ -605,7 +647,8 @@ def test_reference_linear_construction_preserves_checkpoint_loading(
         torch.testing.assert_close(layer.weight, expected, rtol=0, atol=0)
 
 
-def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
+@pytest.mark.parametrize("replicated_rows", [False, True])
+def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch, replicated_rows):
     monkeypatch.setattr(v41, "DeepseekV41MoE", _DenseFFN)
     config = _config()
     config.engram_layer_ids = []
@@ -629,6 +672,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
         for i in (0, 1)
     ]
     for layer in layers:
+        layer.ffn.dp_replicated_rows = replicated_rows
         _initialize(layer)
         layer.hc_attn_scale.data.fill_(1)
         layer.hc_ffn_scale.data.fill_(1)
@@ -638,7 +682,7 @@ def test_single_pass_two_layer_chain_and_comb_orientation(monkeypatch):
     actual, expected = initial.clone(), initial.clone()
     actual_pre, expected_pre = pre.clone(), pre.clone()
     for layer in layers:
-        actual, actual_pre = layer(actual, actual_pre, positions, torch.arange(3), ctx)
+        actual, actual_pre = layer(actual, actual_pre, positions, None, ctx)
         for sublayer, norm, name in (
             (layer.attn, layer.attn_norm, "attn"),
             (layer.ffn, layer.ffn_norm, "ffn"),
@@ -2318,7 +2362,7 @@ def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tm
         expected = (raw * scales).bfloat16().chunk(4, 0)[rank]
         torch.testing.assert_close(layer.attn.wo_a.weight, expected, rtol=0, atol=0)
         codes = weights[a + ".wq_b.weight"].chunk(4, 0)[rank]
-        if current_platform().is_hopper:
+        if current_platform().is_hopper or current_platform().is_npu:
             # Loaded straight into BF16; scales fold in after loading.
             assert layer.attn.wq_b.weight.dtype == torch.bfloat16
             torch.testing.assert_close(
@@ -2741,3 +2785,143 @@ def test_short_history_skips_query_projections_but_preserves_keys(
     assert bool(backend.global_writes) == (layer_id in (2, 20))
     if layer_id in (2, 20):
         assert backend.global_writes[layer_id][1].numel() > 0
+
+
+@pytest.mark.parametrize("defer_reduce", [False, True])
+def test_npu_wide_tp_output_projection_preserves_grouped_rounding(
+    monkeypatch, defer_reduce
+):
+    config = _config()
+    config.o_groups = 2
+    monkeypatch.setattr(
+        v41, "current_platform", lambda: SimpleNamespace(is_npu=True, is_hopper=False)
+    )
+    generator = torch.Generator().manual_seed(149)
+    heads = torch.randn(3, 4, 64, generator=generator).bfloat16()
+    wa = torch.randn(64, 128, generator=generator).bfloat16() * 0.1
+    wb = torch.randn(128, 64, generator=generator).bfloat16() * 0.1
+
+    def gather_projection_partials(tensor, group, dim):
+        weight = wa[32 * (group[0] // 2) : 32 * (group[0] // 2 + 1)]
+        return torch.cat(
+            [
+                (
+                    tensor
+                    if peer == rank
+                    else torch.nn.functional.linear(
+                        heads[:, peer].float(),
+                        weight[:, local * 64 : (local + 1) * 64].float(),
+                    )
+                )
+                for local, peer in enumerate(group)
+            ],
+            dim=0,
+        )
+
+    # The CPU test supplies the unavailable collective and NPU fusion only.
+    monkeypatch.setattr(
+        v41,
+        "dsv4_linear_fp32",
+        lambda x, weight, **kwargs: F.linear(x.float(), weight.float()),
+    )
+    monkeypatch.setattr(v41, "all_gather", gather_projection_partials)
+    monkeypatch.setattr(
+        v41,
+        "sum_token_shards",
+        lambda tensor, shards: tensor.reshape(shards, 3, -1).sum(0).bfloat16(),
+    )
+
+    def reduce_fp32(tensor, **kwargs):
+        assert not defer_reduce, "Deferred projection must not enter a collective"
+        assert tensor.dtype == torch.float32
+        return tensor
+
+    monkeypatch.setattr(v41, "all_reduce", reduce_fp32)
+    partials = []
+    for rank in range(4):
+        mapping = v41.Mapping(
+            rank=rank,
+            world_size=4,
+            attn_tp_size=4,
+            dense_tp_size=2,
+            moe_tp_size=1,
+            moe_ep_size=4,
+        )
+        layer = DeepseekV41Attention(
+            config, mapping, 0, 20, None, "model.layers.0.attn", aux_stream=None
+        )
+        assert layer.gather_output_heads and layer.wo_a.tp_rank == rank // 2
+        owner = SimpleNamespace(
+            mapping=mapping, model=SimpleNamespace(layers=[SimpleNamespace(attn=layer)])
+        )
+        DeepseekV41ForCausalLM._load_wo_a(owner, "layers.0.attn.wo_a.weight", wa, {})
+        layer.wo_b.weight.weight_loader(layer.wo_b.weight, wb)
+        partial = layer._project_output(
+            heads[:, rank : rank + 1], reduce_output=not defer_reduce
+        )
+        if rank % 2:
+            assert torch.count_nonzero(partial) == 0
+        else:
+            hidden = torch.nn.functional.linear(
+                heads[:, 2 * (rank // 2) : 2 * (rank // 2) + 2].reshape(3, 128),
+                wa[32 * (rank // 2) : 32 * (rank // 2 + 1)],
+            )
+            expected = torch.nn.functional.linear(
+                hidden, wb[:, 32 * (rank // 2) : 32 * (rank // 2 + 1)]
+            )
+            torch.testing.assert_close(partial, expected, rtol=0, atol=0)
+        partials.append(partial)
+    assert torch.isfinite(torch.stack(partials).sum(0)).all()
+    invalid = v41.Mapping(
+        rank=0,
+        world_size=4,
+        attn_tp_size=4,
+        dense_tp_size=4,
+        moe_tp_size=1,
+        moe_ep_size=4,
+    )
+    with pytest.raises(ValueError, match="dense-tp-size 2"):
+        v41._npu_wide_tp_projection(config, invalid)
+
+
+def test_npu_wide_tp_shared_expert_has_only_one_contributing_cohort(monkeypatch):
+    calls = []
+
+    def parent(self, hidden_states, ctx, comm_manager):
+        calls.append(self.shared_projection_active)
+        return hidden_states
+
+    monkeypatch.setattr(v4.DeepseekV4MoE, "_forward_shared_experts", parent)
+    for active in (True, False):
+        module = v41.DeepseekV41MoE.__new__(v41.DeepseekV41MoE)
+        torch.nn.Module.__init__(module)
+        module.shared_projection_active = active
+        x = torch.ones(2, 4)
+        result = module._forward_shared_experts(x)
+        assert (result is x) if active else result is None
+    assert calls == [True]
+
+
+def test_checkpoint_loader_releases_replaced_expert_weights(monkeypatch, tmp_path):
+    import weakref
+
+    config = _loader_config()
+    model = _loader_model(monkeypatch, config, 0, "cpu")
+    processed = []
+
+    def convert(module, _):
+        for name in ("w13_weight", "w2_weight"):
+            old = weakref.ref(getattr(module, name))
+            replacement = torch.nn.Parameter(
+                torch.empty_like(getattr(module, name)), requires_grad=False
+            )
+            setattr(module, name, replacement)
+            assert (
+                old() is None
+            ), "Checkpoint loader retained an obsolete expert parameter"
+        processed.append(module.layer_index)
+
+    monkeypatch.setattr(MoELayer, "process_weights_after_loading", convert)
+    weights = _bind_engram_tables(model, _checkpoint(config), tmp_path)
+    model.load_weights(weights.items())
+    assert len(processed) == config.num_hidden_layers

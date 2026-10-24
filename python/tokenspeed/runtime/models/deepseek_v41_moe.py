@@ -310,7 +310,10 @@ class DeepseekV4MoE(nn.Module):
                     "DeepSeek V4 normal EP does not support redundant experts "
                     "with precomputed routing."
                 )
-            if mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size):
+            if (
+                mapping.attn.tp_size not in (1, mapping.moe.tp_ep_size)
+                and not self._uses_replicated_dp_rows()
+            ):
                 raise ValueError(
                     "DeepSeek V4 normal EP requires attention TP size 1 or "
                     "attention TP size equal to the MoE TPxEP size."
@@ -393,6 +396,9 @@ class DeepseekV4MoE(nn.Module):
             if not self.experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")
             warmup(self.experts.plan, self.experts)
+
+    def _uses_replicated_dp_rows(self) -> bool:
+        return False
 
     def _routing_inputs(
         self,

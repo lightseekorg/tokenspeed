@@ -23,6 +23,7 @@ from __future__ import annotations
 import gc
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
@@ -55,6 +56,7 @@ from tokenspeed.runtime.execution.accept_simulation import (
 )
 from tokenspeed.runtime.execution.breakable_cuda_graph import active_forward
 from tokenspeed.runtime.execution.context import ForwardContext, InputLogprobRows
+from tokenspeed.runtime.execution.copy_completion import CopyStreamPool
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
     EagleHarnessConfig,
@@ -787,6 +789,11 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
+        self._output_copy_pool = (
+            CopyStreamPool(self.device_module, self.device)
+            if torch.device(self.device).type == "npu"
+            else None
+        )
         # The data plane: every CUDA-touching operation after startup is
         # submitted here and runs in FIFO order on one thread. The event loop
         # (control plane) never waits on the GPU along the per-round path —
@@ -1109,8 +1116,9 @@ class ModelExecutor:
         tic = time.time()
         set_autotune_process_group(cpu_group)
         # Capture later refreshes the metadata created here in place.
-        with torch.no_grad(), autotune(
-            tune_mode=True, tuning_buckets=None, round_up=None
+        with (
+            torch.no_grad(),
+            autotune(tune_mode=True, tuning_buckets=None, round_up=None),
         ):
             # Dummy forwards must not borrow live Engram history or masks.
             ib.fill_dummy_decode_buffers(
@@ -2600,70 +2608,91 @@ class ModelExecutor:
                     num_extends=num_extends,
                     output_layout=ctx.output_layout,
                 )
-            with nvtx_range("output_d2h", color="green"):
-                output_d2h_start = time.perf_counter() if timing_enabled else 0.0
-                next_input_ids = None
-                spec_candidate_tokens = None
-                if (
-                    capture_next_input_ids
-                    and self.drafter is not None
-                    and num_extends > 0
-                ):
-                    next_input_ids = self.runtime_states.future_input_map.index_select(
-                        0, self.input_buffers.req_pool_indices_buf[:num_extends]
-                    ).to("cpu", non_blocking=True)
-
-                # The candidate-vs-target compare reads the window as a chain.
-                if (
-                    LOG_SPEC_ACCEPT_LENGTHS
-                    and self.config.spec_algo is not None
-                    and num_extends == 0
-                    and self.tree_spec is None
-                ):
-                    spec_candidate_tokens = self.input_buffers.input_ids_buf[
-                        : bs * self.config.spec_num_tokens
-                    ].to("cpu", non_blocking=True)
-
-                # Defensive clamp into the valid vocab range (kept from the
-                # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
-                # value surfaced by the intermittent spec-decode decode-state race
-                # -- would otherwise reach the detokenizer, whose HF
-                # tokenizer.decode raises a fatal OverflowError on ids outside
-                # [0, vocab) and tears down the whole server process tree.
-                # It must run on-GPU *before* the non_blocking D2H: clamping the
-                # CPU result afterwards would race the in-flight copy. In-place
-                # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
-                # the get_packed_output_d2h data_ptr fast-path still fires -- and
-                # in-place on the forward's inference tensors is only legal inside
-                # inference mode, so re-enter it (maybe_inference_mode mirrors the
-                # forward and reduces to no_grad when inference mode is disabled,
-                # where output_tokens isn't an inference tensor anyway).
-                vocab_size = self.runtime_states.vocab_size
-                with maybe_inference_mode():
-                    output_tokens.clamp_(0, vocab_size - 1)
-
-                packed = self.sampling_backend.get_packed_output_d2h(
-                    output_tokens, output_lengths
+            copy_completion = (
+                self._output_copy_pool.copy_after(
+                    self.execution_stream,
+                    (
+                        output_tokens,
+                        output_lengths,
+                        output_logprobs,
+                        forward_logprobs,
+                    ),
                 )
-                if packed is not None:
-                    output_tokens, output_lengths = packed
-                else:
-                    output_tokens = output_tokens.to("cpu", non_blocking=True)
-                    output_lengths = output_lengths.to("cpu", non_blocking=True)
+                if self._output_copy_pool is not None
+                else None
+            )
+            with copy_completion if copy_completion is not None else nullcontext():
+                with nvtx_range("output_d2h", color="green"):
+                    output_d2h_start = time.perf_counter() if timing_enabled else 0.0
+                    next_input_ids = None
+                    spec_candidate_tokens = None
+                    if (
+                        capture_next_input_ids
+                        and self.drafter is not None
+                        and num_extends > 0
+                    ):
+                        next_input_ids = (
+                            self.runtime_states.future_input_map.index_select(
+                                0, self.input_buffers.req_pool_indices_buf[:num_extends]
+                            ).to("cpu", non_blocking=True)
+                        )
 
-                if output_logprobs is not None:
-                    output_logprobs = output_logprobs.to("cpu", non_blocking=True)
-                if forward_logprobs is not None:
-                    forward_logprobs = forward_logprobs.to_host()
-                else:
-                    forward_logprobs = ForwardLogprobs()
+                    # The candidate-vs-target compare reads the window as a chain.
+                    if (
+                        LOG_SPEC_ACCEPT_LENGTHS
+                        and self.config.spec_algo is not None
+                        and num_extends == 0
+                        and self.tree_spec is None
+                    ):
+                        spec_candidate_tokens = self.input_buffers.input_ids_buf[
+                            : bs * self.config.spec_num_tokens
+                        ].to("cpu", non_blocking=True)
 
-                output_nan_flags = self.nan_guard.flags_cpu
+                    # Defensive clamp into the valid vocab range (kept from the
+                    # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
+                    # value surfaced by the intermittent spec-decode decode-state race
+                    # -- would otherwise reach the detokenizer, whose HF
+                    # tokenizer.decode raises a fatal OverflowError on ids outside
+                    # [0, vocab) and tears down the whole server process tree.
+                    # It must run on-GPU *before* the non_blocking D2H: clamping the
+                    # CPU result afterwards would race the in-flight copy. In-place
+                    # (clamp_) so output_tokens keeps aliasing _output_pack_buf and
+                    # the get_packed_output_d2h data_ptr fast-path still fires -- and
+                    # in-place on the forward's inference tensors is only legal inside
+                    # inference mode, so re-enter it (maybe_inference_mode mirrors the
+                    # forward and reduces to no_grad when inference mode is disabled,
+                    # where output_tokens isn't an inference tensor anyway).
+                    vocab_size = self.runtime_states.vocab_size
+                    with maybe_inference_mode():
+                        output_tokens.clamp_(0, vocab_size - 1)
 
-                copy_event = self.device_module.Event()
-                copy_event.record()
-                if timing_enabled:
-                    output_d2h_ms = (time.perf_counter() - output_d2h_start) * 1000.0
+                    packed = self.sampling_backend.get_packed_output_d2h(
+                        output_tokens, output_lengths
+                    )
+                    if packed is not None:
+                        output_tokens, output_lengths = packed
+                    else:
+                        output_tokens = output_tokens.to("cpu", non_blocking=True)
+                        output_lengths = output_lengths.to("cpu", non_blocking=True)
+
+                    if output_logprobs is not None:
+                        output_logprobs = output_logprobs.to("cpu", non_blocking=True)
+                    if forward_logprobs is not None:
+                        forward_logprobs = forward_logprobs.to_host()
+                    else:
+                        forward_logprobs = ForwardLogprobs()
+
+                    output_nan_flags = self.nan_guard.flags_cpu
+
+                    if copy_completion is None:
+                        copy_event = self.device_module.Event()
+                        copy_event.record()
+                    else:
+                        copy_event = copy_completion
+                    if timing_enabled:
+                        output_d2h_ms = (
+                            time.perf_counter() - output_d2h_start
+                        ) * 1000.0
 
             # Enqueued behind the output copies; the next forward or task completes the rest.
             if self.drafter is not None and total_tokens > 0:
