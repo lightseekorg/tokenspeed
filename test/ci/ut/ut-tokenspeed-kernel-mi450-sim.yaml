@@ -280,6 +280,8 @@ env:
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_cuda_graph_replay[24]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[1792-5120-129]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[4096-1280-129]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-129]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-2048]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-32-gluon_mm_mxfp8_ue8m0_largem_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-True-32-gluon_mm_mxfp8_ue8m0_largem_gfx1250]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[17-128-6144]

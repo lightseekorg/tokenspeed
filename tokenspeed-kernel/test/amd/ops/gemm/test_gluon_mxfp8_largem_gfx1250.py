@@ -31,9 +31,6 @@ if not is_cdna5():
     pytest.skip("AMD CDNA5 is required", allow_module_level=True)
 
 from tokenspeed_kernel.ops.gemm import mm  # noqa: E402
-from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (  # noqa: E402
-    gluon_wmma_dense_reduce_gfx1250,
-)
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.mxfp8 import (  # noqa: E402
     launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250,
 )
@@ -72,7 +69,15 @@ def _run(a, b, a_scales, b_scales) -> torch.Tensor:
 @pytest.mark.parametrize("m", [17, 32, 33, 80, 96, 128, 129, 848, 2048, 8192])
 @pytest.mark.parametrize(
     "n,k",
-    [(1792, 5120), (4096, 1280), (8192, 1280), (5120, 2048), (1152, 5120), (5120, 576)],
+    [
+        (1792, 5120),
+        (4096, 1280),
+        (8192, 1280),
+        (5120, 2048),
+        (1152, 5120),
+        (5120, 576),
+        (25600, 6144),
+    ],
 )
 def test_mxfp8_largem_matches_dequantized_reference(m: int, n: int, k: int) -> None:
     operands = _operands(m, n, k, seed=m + n + k)
@@ -83,7 +88,7 @@ def test_mxfp8_largem_matches_dequantized_reference(m: int, n: int, k: int) -> N
     )
 
 
-@pytest.mark.parametrize("m", [24, 96])
+@pytest.mark.parametrize("m", [24, 96, 4096])
 def test_mxfp8_largem_cuda_graph_replay(m: int) -> None:
     n, k = 1792, 5120
     a, b, a_scales, b_scales = _operands(m, n, k, seed=7)
@@ -111,10 +116,12 @@ def test_mxfp8_largem_varying_rows_reuse_compiled_kernels() -> None:
         a, _, a_scales, _ = _operands(m, 16, k, seed=m)
         _run(a, b, a_scales, b_scales)
 
-    for m in (17, 24, 32, 48, 64, 96, 128, 512, 1024, 2048, 4096):
+    for m in (17, 24, 32, 48, 64, 96, 128, 512, 1024, 2048, 4096, 6000):
         run(m)
     with assert_no_triton_compile(
-        largem_mod.gluon_mm_mxfp8_ue8m0_largem_gfx1250, gluon_wmma_dense_reduce_gfx1250
+        largem_mod.gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250,
+        largem_mod.gluon_mm_mxfp8_ue8m0_largem_bk256_gfx1250,
+        largem_mod._mxfp8_split_reduce_gfx1250,
     ):
         for m in (18, 31, 40, 63, 72, 112, 200, 848, 1000, 3000, 8192):
             run(m)
