@@ -41,8 +41,8 @@ from utils import (
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
     or current_platform().vendor != "nvidia"
-    or not (10, 0) <= torch.cuda.get_device_capability() <= (10, 3),
-    reason="the BF16x3 GEMM is registered for SM100 to SM103",
+    or not (9, 0) <= torch.cuda.get_device_capability() <= (10, 3),
+    reason="the BF16x3 GEMM is registered for SM90 to SM103",
 )
 
 U = 2.0**-24
