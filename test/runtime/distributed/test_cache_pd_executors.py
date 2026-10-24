@@ -1144,13 +1144,27 @@ def test_page_field_copies_validates_its_grid() -> None:
         list(flatten_transfer_blocks([item]))
 
 
+@pytest.mark.parametrize(
+    ("vendor", "protocol"),
+    [("nvidia", "rdma"), ("amd", "rdma"), ("ascend", "ascend_direct")],
+)
 def test_engine_wrapper_requires_and_forwards_the_page_gathered_write(
     monkeypatch: pytest.MonkeyPatch,
+    vendor: str,
+    protocol: str,
 ) -> None:
     import sys
     import types
+    from dataclasses import replace
 
+    from tokenspeed_kernel.platform import current_platform
+
+    from tokenspeed.runtime.pd.base import mooncake_engine
     from tokenspeed.runtime.pd.base.mooncake_engine import MooncakeTransferEngine
+
+    # Hardware discovery is unavailable on the host running this test.
+    platform = replace(current_platform(), vendor=vendor)
+    monkeypatch.setattr(mooncake_engine, "current_platform", lambda: platform)
 
     class FakeTransferEngine:
         def __init__(self) -> None:
@@ -1174,7 +1188,7 @@ def test_engine_wrapper_requires_and_forwards_the_page_gathered_write(
     FakeTransferEngine.batch_transfer_sync_write_pages = lambda self, *a: 0
     engine = MooncakeTransferEngine("10.0.0.1", gpu_id=0, ib_device="mlx5_0")
     assert engine.session_id == "10.0.0.1:4321"
-    assert engine.engine.initialized == ("10.0.0.1", "P2PHANDSHAKE", "rdma", "mlx5_0")
+    assert engine.engine.initialized == ("10.0.0.1", "P2PHANDSHAKE", protocol, "mlx5_0")
 
     src = np.asarray([1, 2], dtype=np.int64)
     dst = np.asarray([3, 4], dtype=np.int64)
