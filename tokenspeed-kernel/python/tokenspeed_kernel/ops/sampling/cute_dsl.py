@@ -575,12 +575,38 @@ if _CUTE_AVAILABLE:
             world_size: int = 1,
             rank: int = 0,
             skip_ping_pong: bool = False,
+            policy=None,
         ):
             super().__init__(dtype, N, use_redux=use_redux)
             self.world_size = world_size
             self.rank = rank
             self.dist_tp_enabled = world_size > 1
             self.skip_ping_pong = skip_ping_pong
+            self.policy = policy
+            self.invalid_index = 0xFFFFFFFF if policy is None else policy.invalid_index
+
+        @cute.jit
+        def _warp_argmax(self, value: cutlass.Float32, idx: Int32):
+            if cutlass.const_expr(self.policy is not None):
+                return self.policy.warp_argmax(value, idx, self.use_redux)
+            elif cutlass.const_expr(self.use_redux):
+                return warp_argmax_redux(value, idx)
+            else:
+                return warp_reduce_argmax(value, idx)
+
+        @cute.jit
+        def _index_to_scratch(self, idx: Int32):
+            if cutlass.const_expr(self.policy is not None):
+                return self.policy.index_to_scratch(idx)
+            else:
+                return idx.to(cutlass.Float32)
+
+        @cute.jit
+        def _index_from_scratch(self, value: cutlass.Float32):
+            if cutlass.const_expr(self.policy is not None):
+                return self.policy.index_from_scratch(value)
+            else:
+                return value.to(Int32)
 
         @cute.jit
         def __call__(
@@ -701,22 +727,26 @@ if _CUTE_AVAILABLE:
             x = tXrX.load().to(cute.Float32)
 
             current_max = -tXsX.element_type.inf
-            current_argmax = Int32(0xFFFFFFFF)
+            current_argmax = Int32(self.invalid_index)
 
             for i in cutlass.range_constexpr(thr_cX.shape[0]):
                 for j in cutlass.range_constexpr(thr_cX.shape[1]):
                     col_idx = thr_cX[i, j][1]
                     linear_idx = i + j * thr_cX.shape[0]
                     element_value1 = x[linear_idx]
-                    if element_value1 > current_max:
-                        current_max = element_value1
-                        current_argmax = Int32(col_idx)
+                    if cutlass.const_expr(self.policy is not None):
+                        if col_idx < shape[1] and self.policy.wins(
+                            element_value1, Int32(col_idx), current_max, current_argmax
+                        ):
+                            current_max = element_value1
+                            current_argmax = Int32(col_idx)
+                    else:
+                        if element_value1 > current_max:
+                            current_max = element_value1
+                            current_argmax = Int32(col_idx)
 
             lane_idx, warp_idx = cute.arch.lane_idx(), cute.arch.warp_idx()
-            if cutlass.const_expr(self.use_redux):
-                warp_max, warp_argmax = warp_argmax_redux(current_max, current_argmax)
-            else:
-                warp_max, warp_argmax = warp_reduce_argmax(current_max, current_argmax)
+            warp_max, warp_argmax = self._warp_argmax(current_max, current_argmax)
 
             if cutlass.const_expr(self.cluster_n == 1):
                 warps_per_row = cute.size(reduction_buffer.shape[1])
@@ -727,28 +757,23 @@ if _CUTE_AVAILABLE:
 
                 if lane_idx == 0:
                     reduction_buffer[row_idx_buf, col_idx_buf, 0, 0] = warp_max
-                    reduction_buffer[row_idx_buf, col_idx_buf, 0, 1] = warp_argmax.to(
-                        cutlass.Float32
+                    reduction_buffer[row_idx_buf, col_idx_buf, 0, 1] = (
+                        self._index_to_scratch(warp_argmax)
                     )
 
                 cute.arch.barrier()
                 block_reduce_max = -tXsX.element_type.inf
-                block_reduce_argmax = Int32(0xFFFFFFFF)
+                block_reduce_argmax = Int32(self.invalid_index)
 
                 if lane_idx < warps_per_row:
                     block_reduce_max = reduction_buffer[row_idx_buf, lane_idx, 0, 0]
-                    block_reduce_argmax = reduction_buffer[
-                        row_idx_buf, lane_idx, 0, 1
-                    ].to(cutlass.Int32)
+                    block_reduce_argmax = self._index_from_scratch(
+                        reduction_buffer[row_idx_buf, lane_idx, 0, 1]
+                    )
 
-                if cutlass.const_expr(self.use_redux):
-                    warp_max, warp_argmax = warp_argmax_redux(
-                        block_reduce_max, block_reduce_argmax
-                    )
-                else:
-                    warp_max, warp_argmax = warp_reduce_argmax(
-                        block_reduce_max, block_reduce_argmax
-                    )
+                warp_max, warp_argmax = self._warp_argmax(
+                    block_reduce_max, block_reduce_argmax
+                )
             else:
                 cute.arch.cluster_wait()
                 warps_per_row, cluster_n = reduction_buffer.shape[1]
@@ -784,7 +809,7 @@ if _CUTE_AVAILABLE:
                         peer_cta_rank_in_cluster=lane_idx,
                     )
                     store_shared_remote(
-                        warp_argmax.to(cutlass.Float32),
+                        self._index_to_scratch(warp_argmax),
                         elem_pointer(
                             reduction_buffer,
                             (row_idx_buf, (col_idx_buf, cta_rank_in_cluster), 0, 1),
@@ -795,31 +820,36 @@ if _CUTE_AVAILABLE:
 
                 cute.arch.mbarrier_wait(mbar_ptr, phase=0)
                 block_reduce_val = -tXsX.element_type.inf
-                block_reduce_argmax = Int32(0xFFFFFFFF)
+                block_reduce_argmax = Int32(self.invalid_index)
                 num_iter = cute.ceil_div(warps_per_row * cluster_n, cute.arch.WARP_SIZE)
 
                 for i in cutlass.range_constexpr(num_iter):
                     idx = lane_idx + i * cute.arch.WARP_SIZE
                     if idx < cute.size(reduction_buffer, mode=[1]):
                         element_max = reduction_buffer[row_idx_buf, idx, 0, 0]
-                        element_argmax = reduction_buffer[row_idx_buf, idx, 0, 1].to(
-                            cutlass.Int32
+                        element_argmax = self._index_from_scratch(
+                            reduction_buffer[row_idx_buf, idx, 0, 1]
                         )
-                        if element_max > block_reduce_val:
-                            block_reduce_val = element_max
-                            block_reduce_argmax = element_argmax
-                        elif element_max == block_reduce_val:
-                            if element_argmax < block_reduce_argmax:
+                        if cutlass.const_expr(self.policy is not None):
+                            if self.policy.wins(
+                                element_max,
+                                element_argmax,
+                                block_reduce_val,
+                                block_reduce_argmax,
+                            ):
+                                block_reduce_val = element_max
                                 block_reduce_argmax = element_argmax
+                        else:
+                            if element_max > block_reduce_val:
+                                block_reduce_val = element_max
+                                block_reduce_argmax = element_argmax
+                            elif element_max == block_reduce_val:
+                                if element_argmax < block_reduce_argmax:
+                                    block_reduce_argmax = element_argmax
 
-                if cutlass.const_expr(self.use_redux):
-                    warp_max, warp_argmax = warp_argmax_redux(
-                        block_reduce_val, block_reduce_argmax
-                    )
-                else:
-                    warp_max, warp_argmax = warp_reduce_argmax(
-                        block_reduce_val, block_reduce_argmax
-                    )
+                warp_max, warp_argmax = self._warp_argmax(
+                    block_reduce_val, block_reduce_argmax
+                )
 
             row_idx = tXcX[0][0]
             warps_per_row = tv_layout.shape[0][0] // cute.arch.WARP_SIZE
@@ -849,13 +879,16 @@ if _CUTE_AVAILABLE:
 
                     if lane_idx == 0:
                         global_idx = Int32(self.rank * self.N) + warp_argmax
-                        if warp_argmax == Int32(0xFFFFFFFF):
+                        if warp_argmax == Int32(self.invalid_index):
                             global_idx = Int32(0x7FFFFFFF)
                         packed = pack_argmax_payload_u64(warp_max, global_idx)
                         mc_addr = slot_multicast_ptr + (
                             band_off_u64 + cutlass.Int64(self.rank)
                         ) * cutlass.Int64(8)
                         ptx_multimem_st_release_u64(mc_addr, packed)
+
+                    if cutlass.const_expr(self.policy is not None):
+                        self.policy.after_publish()
 
                     local_pad = ptx_ld_acquire_sys_u64(
                         slot_ptrs + cutlass.Int64(self.rank) * cutlass.Int64(8)
@@ -875,10 +908,7 @@ if _CUTE_AVAILABLE:
                         peer_val, peer_idx = unpack_argmax_payload_u64(v)
                         ptx_atomic_and_relaxed_sys_u64(slot_addr, clear_mask)
 
-                    if cutlass.const_expr(self.use_redux):
-                        warp_max, warp_argmax = warp_argmax_redux(peer_val, peer_idx)
-                    else:
-                        warp_max, warp_argmax = warp_reduce_argmax(peer_val, peer_idx)
+                    warp_max, warp_argmax = self._warp_argmax(peer_val, peer_idx)
                     # A row whose elements never beat -inf (all-NaN / all -inf) leaves
                     # the argmax at its 0xFFFFFFFF sentinel; emit the in-range index 0.
                     if warp_argmax == Int32(0x7FFFFFFF):
@@ -923,6 +953,8 @@ class DistArgmaxState:
     warps_done_gpu: torch.Tensor
     use_redux: bool
     skip_ping_pong: bool = False
+    # Compile-time policy instances must be stateless: the cache keys their type.
+    policy: object = None
 
 
 def _build_dist_argmax_state(
@@ -934,6 +966,7 @@ def _build_dist_argmax_state(
     skip_ping_pong: bool = False,
     *,
     strict: bool,
+    policy,
 ) -> DistArgmaxState | None:
     assert dtype in (
         torch.bfloat16,
@@ -963,21 +996,27 @@ def _build_dist_argmax_state(
     warps_done_gpu = torch.zeros(1, dtype=torch.int32, device=device)
     torch.cuda.current_stream().synchronize()
     hdl = _symm_mem.rendezvous(slots, group=group)
-    assert hdl.rank == rank_in_group and hdl.world_size == world_size, (
-        f"symm-mem handle reports rank={hdl.rank}, world_size={hdl.world_size}, "
-        f"but state was constructed with rank_in_group={rank_in_group}, "
-        f"world_size={world_size}"
-    )
-    if not hdl.multicast_ptr:
-        if not strict:
+    if policy is not None:
+        if not policy.validate_handle(
+            hdl, rank_in_group, world_size, group, device, strict
+        ):
             return None
-        raise RuntimeError(
-            f"distributed_argmax requires CUDA multicast / NVLS, but the "
-            f"symm-mem handle on device {device} reports multicast_ptr="
-            f"{hdl.multicast_ptr}. The kernel uses multimem.st.release.sys "
-            f"which needs NVSwitch + sm_90+ multicast support; non-NVLS "
-            f"hardware (PCIe-only, passthrough, etc.) cannot run this op."
+    else:
+        assert hdl.rank == rank_in_group and hdl.world_size == world_size, (
+            f"symm-mem handle reports rank={hdl.rank}, world_size={hdl.world_size}, "
+            f"but state was constructed with rank_in_group={rank_in_group}, "
+            f"world_size={world_size}"
         )
+        if not hdl.multicast_ptr:
+            if not strict:
+                return None
+            raise RuntimeError(
+                f"distributed_argmax requires CUDA multicast / NVLS, but the "
+                f"symm-mem handle on device {device} reports multicast_ptr="
+                f"{hdl.multicast_ptr}. The kernel uses multimem.st.release.sys "
+                f"which needs NVSwitch + sm_90+ multicast support; non-NVLS "
+                f"hardware (PCIe-only, passthrough, etc.) cannot run this op."
+            )
     _dist.barrier(group=group, device_ids=[device.index])
     return DistArgmaxState(
         group=group,
@@ -992,6 +1031,7 @@ def _build_dist_argmax_state(
         warps_done_gpu=warps_done_gpu,
         use_redux=use_redux,
         skip_ping_pong=skip_ping_pong,
+        policy=policy,
     )
 
 
@@ -1022,7 +1062,14 @@ def create_dist_argmax_state(
         RuntimeError: The group has no CUDA multicast / NVLS support.
     """
     return _build_dist_argmax_state(
-        group, rank_in_group, max_M, dtype, device, skip_ping_pong, strict=True
+        group,
+        rank_in_group,
+        max_M,
+        dtype,
+        device,
+        skip_ping_pong,
+        strict=True,
+        policy=None,
     )
 
 
@@ -1055,7 +1102,14 @@ def try_create_dist_argmax_state(
         verdict follows from the group's fabric, so every rank agrees on it.
     """
     return _build_dist_argmax_state(
-        group, rank_in_group, max_M, dtype, device, skip_ping_pong, strict=False
+        group,
+        rank_in_group,
+        max_M,
+        dtype,
+        device,
+        skip_ping_pong,
+        strict=False,
+        policy=None,
     )
 
 
@@ -1113,6 +1167,7 @@ def _dist_argmax_invoke_kernel(
         state.world_size,
         state.rank_in_group,
         state.skip_ping_pong,
+        type(state.policy) if state.policy is not None else None,
     )
     round_id_ptr = state.round_id_gpu.data_ptr()
     warps_done_ptr = state.warps_done_gpu.data_ptr()
@@ -1125,6 +1180,7 @@ def _dist_argmax_invoke_kernel(
             world_size=state.world_size,
             rank=state.rank_in_group,
             skip_ping_pong=state.skip_ping_pong,
+            policy=state.policy,
         )
         compiled = cute.compile(
             kernel,

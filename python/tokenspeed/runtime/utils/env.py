@@ -58,6 +58,8 @@ global_server_args_dict: dict = {
     "disable_pdl": ServerArgs.disable_pdl,
     "disable_autotune": ServerArgs.disable_autotune,
     "enable_prefix_caching": ServerArgs.enable_prefix_caching,
+    "enable_kvstore": ServerArgs.enable_kvstore,
+    "load_format": ServerArgs.load_format,
     "mla_disable_ragged": ServerArgs.mla_disable_ragged,
     "chunked_prefill_size": ServerArgs.chunked_prefill_size,
     "mla_chunk_multiplier": ServerArgs.mla_chunk_multiplier,
@@ -120,6 +122,8 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "disable_pdl": server_args.disable_pdl,
             "disable_autotune": server_args.disable_autotune,
             "enable_prefix_caching": server_args.enable_prefix_caching,
+            "enable_kvstore": server_args.enable_kvstore,
+            "load_format": server_args.load_format,
             "mla_disable_ragged": server_args.mla_disable_ragged,
             "chunked_prefill_size": server_args.chunked_prefill_size,
             "mla_chunk_multiplier": server_args.mla_chunk_multiplier,
@@ -358,6 +362,7 @@ class Envs:
     # fails at startup instead of silently turning the simulation off.
     TOKENSPEED_SPEC_SIMULATED_ACCEPT_LEN = EnvStr("")
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
+    TOKENSPEED_LONGCAT_LAYER_ENGINE = EnvBool(False)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
     # Rollout escape hatch: revert engine IPC (frontend <-> controller <->

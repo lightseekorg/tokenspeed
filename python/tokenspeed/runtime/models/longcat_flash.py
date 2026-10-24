@@ -34,6 +34,10 @@ from tokenspeed_kernel.thirdparty.cuda import (
 )
 from transformers import PretrainedConfig as _PretrainedConfig
 
+from tokenspeed.runtime.configs.longcat_config import (
+    _LONGCAT_ARCHITECTURES,
+    get_longcat_model_profile,
+)
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.configs.utils import get_rope_theta as _get_rope_theta
 from tokenspeed.runtime.distributed.comm_manager import CommManager as _CommManager
@@ -343,8 +347,9 @@ class _RuntimeLongcatMoE(nn.Module):
             ep_rank=self.mapping.moe.ep_rank,
             ep_size=self.mapping.moe.ep_size,
             zero_expert_num=config.zero_expert_num,
-            # LongCat applies its own zero-expert routing to gated SiLU experts.
-            activation="swiglu",
+            activation=(
+                "silu" if get_longcat_model_profile(config) is not None else "swiglu"
+            ),
             routing_mode="precomputed_topk",
             routing_config={
                 "routed_scaling_factor": self.routed_scaling_factor,
@@ -959,6 +964,7 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
     # The MoE layers size their slots from the placement and route through
     # its tables; load_weights fills every placed replica.
     supports_expert_placement = True
+    _longcat_pro: bool = False
 
     def __init__(
         self,
@@ -970,6 +976,9 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
     ) -> None:
         _ensure_longcat_config(config)
         self._model_override = model
+        self._longcat_pro = get_longcat_model_profile(config) is not None
+        if self._longcat_pro and self.model_profile(config) is None:
+            raise ValueError("LongCat Pro requires a primary LongCat architecture")
         super().__init__(
             config=config,
             mapping=mapping,
@@ -986,12 +995,69 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
     ) -> _RuntimeLongcatModel:
         if self._model_override is not None:
             return self._model_override
-        return self.model_cls(
+        if self._longcat_pro:
+            from tokenspeed.runtime.models.longcat.model import LongcatProModel
+
+            model_cls = LongcatProModel
+        else:
+            model_cls = self.model_cls
+        return model_cls(
             config,
             mapping=mapping,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
+
+    def resolve_logits_processor(self, config: _PretrainedConfig):
+        if not self._longcat_pro:
+            return super().resolve_logits_processor(config)
+        from tokenspeed.runtime.models.longcat.logits import LongCatLogitsProcessor
+
+        return LongCatLogitsProcessor(
+            config,
+            skip_all_gather=self.mapping.attn.has_dp,
+            tp_rank=self.mapping.lm_head.tp_rank,
+            tp_size=self.mapping.lm_head.tp_size,
+            tp_group=self.mapping.lm_head.tp_group,
+            dp_lm_head_tp=self.mapping.attn.has_dp and self.mapping.lm_head.has_tp,
+        )
+
+    @classmethod
+    def model_profile(cls, hf_config):
+        architecture = (getattr(hf_config, "architectures", None) or [None])[0]
+        if architecture not in _LONGCAT_ARCHITECTURES:
+            return None
+        return get_longcat_model_profile(hf_config)
+
+    def prepare_model_kwargs(self, ctx, input_ids, kwargs):
+        model_kwargs = super().prepare_model_kwargs(ctx, input_ids, kwargs)
+        if self._longcat_pro:
+            model_kwargs["request_token_history"] = kwargs.get("request_token_history")
+        return model_kwargs
+
+    def begin_weight_update(self) -> None:
+        if self._longcat_pro:
+            from tokenspeed.runtime.models.longcat.model import engines_requested
+
+            if engines_requested():
+                raise RuntimeError("LongCat engine weights do not support live updates")
+        super().begin_weight_update()
+        if self._longcat_pro:
+            self.model.weight_state.reset_pairing()
+
+    def end_weight_update(self) -> None:
+        if self._longcat_pro:
+            try:
+                self.model.weight_state.validate_update()
+            except RuntimeError:
+                self.abort_weight_update()
+                raise
+        super().end_weight_update()
+
+    def abort_weight_update(self) -> None:
+        super().abort_weight_update()
+        if self._longcat_pro:
+            self.model.weight_state.reset_pairing()
 
     def post_init(self) -> None:
         # Pipeline stages hold PPMissingLayer slots for the other stages'
@@ -1025,6 +1091,21 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         else:
             self.model.layers_to_capture = {val + 1 for val in layer_ids}
 
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]) -> None:
+        if not self._longcat_pro:
+            return super().set_dflash_layers_to_capture(layer_ids)
+        num_layers = len(self.model.layers)
+        if len(set(layer_ids)) != len(layer_ids) or any(
+            index < 0 or index >= num_layers for index in layer_ids
+        ):
+            raise ValueError("DFLASH target_layer_ids must be unique target layer ids")
+        self.capture_aux_hidden_states = True
+        captures = sorted(index + 1 for index in layer_ids)
+        self.model.layers_to_capture = set(captures)
+        self.model._dflash_capture_idx_map = {
+            layer: index for index, layer in enumerate(captures)
+        }
+
     def get_param(self, params_dict, name):
         if name in params_dict:
             return params_dict[name]
@@ -1040,6 +1121,20 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         return None
 
     def load_weights(self, weights: _Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if not self._longcat_pro:
+            return self._load_main_weights(weights)
+        from tokenspeed.runtime.models.longcat.model import engines_requested
+
+        state = self.model.weight_state
+        if state.initialized and engines_requested():
+            raise RuntimeError("LongCat engine weights do not support live updates")
+        loaded: set[str] = set()
+        loaded |= self._load_main_weights(state.intercept(self, weights, loaded))
+        return loaded
+
+    def _load_main_weights(
+        self, weights: _Iterable[tuple[str, torch.Tensor]]
+    ) -> set[str]:
         """Load a (possibly partial) checkpoint stream.
 
         Returns the ``named_parameters()`` names that received data (the
@@ -1170,6 +1265,8 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         Under ``--mla-lora-scale runtime`` there is no fold at all: the
         attention multiplies the scales in its forward.
         """
+        if self._longcat_pro:
+            self.model.weight_state.prepare_derivation(self)
         reloaded = self._weight_update_loaded_names
         param_names = (
             {id(param): name for name, param in self.named_parameters()}
@@ -1226,7 +1323,38 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
                     ):
                         self_attn.kv_a_layernorm.weight.data *= kv_scale
 
+        if self._longcat_pro:
+            self.model.initialize_engines()
+
+    def get_input_embeddings(self) -> nn.Module | None:
+        if not self._longcat_pro:
+            return self.model.embed_tokens
+        from tokenspeed.runtime.models.longcat.over_embedding import (
+            LongCatOverEmbedding,
+        )
+
+        embedding = self.model.embed_tokens
+        return (
+            embedding.word_embedding
+            if isinstance(embedding, LongCatOverEmbedding)
+            else embedding
+        )
+
+    def checkpoint_weight_name_filter(self, name: str) -> bool:
+        return not (name.startswith(("mtp.", "model.mtp.")) or ".mtp." in name)
+
     def set_embed_and_head(self, embed, head):
+        if self._longcat_pro:
+            embedding = self.get_input_embeddings()
+            if embedding is None:
+                raise RuntimeError("LongCat Pro requires a local embedding")
+            del embedding.weight
+            del self.lm_head.weight
+            embedding.weight = embed
+            self.lm_head.weight = head
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            return
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
@@ -1245,4 +1373,10 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
 
 
 FLASHForCausalLM = LongcatFlashForCausalLM
-EntryClass = LongcatFlashForCausalLM
+
+
+class LongcatCausalLM(LongcatFlashForCausalLM):
+    """LongCat-2.0 checkpoint architecture alias."""
+
+
+EntryClass = [LongcatFlashForCausalLM, LongcatCausalLM]

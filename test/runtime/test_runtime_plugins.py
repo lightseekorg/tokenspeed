@@ -292,6 +292,24 @@ def test_profile_resolution_follows_the_checkpoint(isolated) -> None:
     assert registry.resolve_model_profile(["Unknown"], FixtureConfig()) is None
 
 
+def test_profile_resolution_skips_declined_profile(isolated) -> None:
+    class DecliningFixture(FixtureForCausalLM):
+        @classmethod
+        def model_profile(cls, hf_config):
+            return None
+
+    registry.register_model(DecliningFixture)
+    config = FixtureConfig()
+    assert registry.resolve_model_profile(["DecliningFixture"], config) is None
+
+    registry.register_model(FixtureForCausalLM)
+    architecture, profile = registry.resolve_model_profile(
+        ["DecliningFixture", "FixtureForCausalLM"], config
+    )
+    assert architecture == "FixtureForCausalLM"
+    assert profile.linear_attention == "fixture_linear"
+
+
 def test_profile_rejects_missing_facts() -> None:
     with pytest.raises(ValueError, match="cache_family"):
         _profile(cache_family="")

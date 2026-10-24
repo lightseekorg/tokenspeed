@@ -553,8 +553,9 @@ def get_config(
     from tokenspeed.runtime.plugins.registry import registered_model
 
     entry = registered_model(resolve_architecture(config))
-    if entry is not None:
-        if entry.cls.model_profile(config).is_multimodal:
+    profile = entry.cls.model_profile(config) if entry is not None else None
+    if profile is not None:
+        if profile.is_multimodal:
             return config
         # A composite checkpoint can register a text-only draft. Keep its
         # selected entry architecture when returning the language config.
