@@ -57,7 +57,12 @@ from tokenspeed.runtime.engine.io_struct import (
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT, FINISH_LENGTH
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
-from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
+from tokenspeed.runtime.multimodal.inputs import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 _ENCODER = MsgpackEncoder()
@@ -485,6 +490,7 @@ def test_recv_socket_aborts_request_with_invalid_sampling_params():
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
 
     io_bad = recv.recv_pyobj()
@@ -521,6 +527,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     io = recv_off.recv_pyobj()
     assert io.rid == "r1"
@@ -534,6 +541,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     io = recv_on.recv_pyobj()
     assert io.validation_error is None
@@ -565,6 +573,7 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     io = recv.recv_pyobj()
     assert io.validation_error and needle in io.validation_error
@@ -578,6 +587,7 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     assert recv.recv_pyobj().validation_error is None
 
@@ -612,6 +622,7 @@ def test_recv_socket_takes_top_logprobs_under_the_engines_rules():
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     for rid in ("echo", "score"):
         io = recv.recv_pyobj()
@@ -655,6 +666,7 @@ def test_recv_socket_refuses_top_logprobs_the_launch_cannot_compute():
         top_logprobs_unservable=reason,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     assert recv.recv_pyobj().validation_error == reason
     assert "max_new_tokens set to 0 or 1" in recv.recv_pyobj().validation_error
@@ -694,6 +706,7 @@ def test_recv_socket_names_the_engine_capability_before_the_wire_limit():
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     io = recv.recv_pyobj()
     assert io.validation_error and "not supported by this engine" in io.validation_error
@@ -714,6 +727,7 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     io = recv.recv_pyobj()
     assert io.rid == "good"
@@ -731,6 +745,7 @@ def test_recv_socket_verify_does_not_apply_to_abort():
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
         request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=None,
     )
     a1 = recv.recv_pyobj()
     a2 = recv.recv_pyobj()
@@ -911,6 +926,7 @@ def _control_pair(
     clock: _Clock | None = None,
     engine_index: int = 0,
     request_types: tuple[str, ...] = zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+    mrope_hf_config: object | None = None,
 ):
     """A receive/send adapter pair over fake sockets sharing one call table,
     as ``connect_msgpack_engine`` builds them."""
@@ -923,6 +939,7 @@ def _control_pair(
         top_logprobs_unservable=None,
         control=control,
         request_types=request_types,
+        mrope_hf_config=mrope_hf_config,
     )
     out = _FakeOutputSocket()
     send = zmq_msgpack.MsgpackSendSocket(
@@ -1368,6 +1385,234 @@ def test_scheduler_role_drops_an_encode_request(caplog):
 
 
 # --------------------------------------------------------------------------
+# MRoPE positions filled on the engine side
+# --------------------------------------------------------------------------
+
+
+class _VisionConfig:
+    spatial_merge_size = 2
+
+
+class _MRoPEConfig:
+    """The Qwen3.5 shape of ``test_multimodal_mrope.py``: an MRoPE architecture
+    with the placeholder ids the position function reads."""
+
+    architectures = ["Qwen3_5ForConditionalGeneration"]
+    image_token_id = 151655
+    video_token_id = 151656
+    vision_start_token_id = 151652
+    model_type = "qwen3_5"
+    vision_config = _VisionConfig()
+
+
+class _TextConfig:
+    architectures = ["LlamaForCausalLM"]
+    model_type = "llama"
+
+
+_PAD = 7
+
+
+def _mm_request(
+    rid: str,
+    unpadded_ids: list[int],
+    items: list[MultimodalDataItem],
+) -> TokenizedGenerateReqInput:
+    """A multimodal generate request as a frontend sends it: the placeholders
+    substituted by the item's pad value in ``input_ids``, the un-padded ids
+    beside them, the three MRoPE slots empty."""
+    config = _MRoPEConfig()
+    padded = [
+        _PAD if tid in (config.image_token_id, config.video_token_id) else tid
+        for tid in unpadded_ids
+    ]
+    return _make_request(
+        rid=rid,
+        input_ids=padded,
+        input_ids_unpadded=unpadded_ids,
+        multimodal_inputs=MultimodalInputs(
+            mm_items=items,
+            im_token_id=config.image_token_id,
+            video_token_id=config.video_token_id,
+        ),
+    )
+
+
+def _image_item(offsets: list[tuple[int, int]], grid: list[int]) -> MultimodalDataItem:
+    return MultimodalDataItem(
+        modality=Modality.IMAGE,
+        pad_value=_PAD,
+        offsets=offsets,
+        model_specific_data={"image_grid_thw": torch.tensor([grid])},
+    )
+
+
+def _video_item(offsets: list[tuple[int, int]], grid: list[int]) -> MultimodalDataItem:
+    return MultimodalDataItem(
+        modality=Modality.VIDEO,
+        pad_value=_PAD,
+        offsets=offsets,
+        model_specific_data={"video_grid_thw": torch.tensor([grid])},
+    )
+
+
+def _mrope_image_request(rid: str) -> tuple[TokenizedGenerateReqInput, list[int]]:
+    config = _MRoPEConfig()
+    ids = [10, config.vision_start_token_id, *([config.image_token_id] * 6), 11]
+    return _mm_request(rid, ids, [_image_item([(2, 7)], [1, 4, 6])]), ids
+
+
+def _mrope_video_request(rid: str) -> tuple[TokenizedGenerateReqInput, list[int]]:
+    config = _MRoPEConfig()
+    ids = [
+        10,
+        config.vision_start_token_id,
+        *([config.video_token_id] * 4),
+        11,
+        config.vision_start_token_id,
+        *([config.video_token_id] * 4),
+        12,
+    ]
+    return _mm_request(rid, ids, [_video_item([(2, 5), (8, 11)], [2, 4, 4])]), ids
+
+
+def _mrope_mixed_request(rid: str) -> tuple[TokenizedGenerateReqInput, list[int]]:
+    config = _MRoPEConfig()
+    ids = [
+        10,
+        config.vision_start_token_id,
+        *([config.image_token_id] * 6),
+        11,
+        config.vision_start_token_id,
+        *([config.video_token_id] * 4),
+        12,
+    ]
+    items = [_image_item([(2, 7)], [1, 4, 6]), _video_item([(10, 13)], [1, 4, 4])]
+    return _mm_request(rid, ids, items), ids
+
+
+def _mm_frames(req: TokenizedGenerateReqInput) -> list[bytes]:
+    return [zmq_wire.REQ_TYPE_ADD, *_ENCODER.encode(req)]
+
+
+def _recv_one(req: TokenizedGenerateReqInput, hf_config: object | None):
+    recv, _send, _out = _control_pair([_mm_frames(req)], mrope_hf_config=hf_config)
+    io = recv.recv_pyobj()
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+    return io
+
+
+@pytest.mark.parametrize(
+    "build", [_mrope_image_request, _mrope_video_request, _mrope_mixed_request]
+)
+def test_empty_mrope_slots_are_filled_by_the_engines_own_function(build):
+    """An image, a split video and a mixed request on the engine's own MRoPE
+    test shapes: the three slots come out as ``compute_mrope_positions``
+    gives them over the un-padded ids."""
+    req, ids = build("mm")
+    io = _recv_one(req, _MRoPEConfig())
+    assert io.validation_error is None
+    expected_positions, expected_delta = compute_mrope_positions(
+        _MRoPEConfig(), ids, req.multimodal_inputs.mm_items
+    )
+    filled = io.multimodal_inputs
+    assert filled.mrope_positions.dtype == torch.int64
+    assert tuple(filled.mrope_positions.shape) == (3, len(ids))
+    assert torch.equal(filled.mrope_positions, expected_positions)
+    assert torch.equal(filled.mrope_position_delta, expected_delta)
+    assert filled.mrope_position_delta_scalar == int(expected_delta.flatten()[0])
+    # The ids themselves are untouched: padded for the embed splice, the
+    # un-padded ones beside them.
+    assert io.input_ids == req.input_ids and io.input_ids_unpadded == ids
+
+
+def test_filled_mrope_slots_are_kept_as_sent():
+    req, ids = _mrope_image_request("mm")
+    sent_positions = torch.full((3, len(ids)), 42, dtype=torch.int64)
+    sent_delta = torch.tensor([[-9]], dtype=torch.int64)
+    req.multimodal_inputs.mrope_positions = sent_positions
+    req.multimodal_inputs.mrope_position_delta = sent_delta
+    req.multimodal_inputs.mrope_position_delta_scalar = -9
+    io = _recv_one(req, _MRoPEConfig())
+    assert io.validation_error is None
+    assert torch.equal(io.multimodal_inputs.mrope_positions, sent_positions)
+    assert torch.equal(io.multimodal_inputs.mrope_position_delta, sent_delta)
+    assert io.multimodal_inputs.mrope_position_delta_scalar == -9
+
+
+def test_mrope_slots_stay_empty_where_there_is_nothing_to_compute():
+    # A text request has no multimodal inputs; a non-MRoPE model has no
+    # positions to compute; a transport without a config (the encode role)
+    # leaves the slots as sent.
+    text = _recv_one(_make_request(rid="t"), _MRoPEConfig())
+    assert text.validation_error is None and text.multimodal_inputs is None
+
+    req, _ids = _mrope_image_request("mm")
+    on_text_model = _recv_one(req, _TextConfig())
+    assert on_text_model.validation_error is None
+    assert on_text_model.multimodal_inputs.mrope_positions is None
+    assert on_text_model.multimodal_inputs.mrope_position_delta is None
+    assert on_text_model.multimodal_inputs.mrope_position_delta_scalar is None
+
+    req, _ids = _mrope_image_request("mm")
+    without_config = _recv_one(req, None)
+    assert without_config.validation_error is None
+    assert without_config.multimodal_inputs.mrope_positions is None
+
+
+def test_mrope_positions_come_from_the_unpadded_ids():
+    # The frontend substitutes pad values into input_ids before sending; the
+    # placeholders the function locates are in input_ids_unpadded.
+    req, ids = _mrope_image_request("mm")
+    assert req.input_ids != ids
+    io = _recv_one(req, _MRoPEConfig())
+    expected_positions, _ = compute_mrope_positions(
+        _MRoPEConfig(), ids, req.multimodal_inputs.mm_items
+    )
+    assert torch.equal(io.multimodal_inputs.mrope_positions, expected_positions)
+
+
+def test_a_multimodal_request_without_unpadded_ids_is_refused_on_an_mrope_model():
+    # Over the padded ids the function finds no placeholders and returns
+    # linear positions without complaint: filled slots nobody could tell
+    # apart from real ones. The request is refused instead.
+    req, _ids = _mrope_image_request("mm")
+    req.input_ids_unpadded = None
+    assert (
+        compute_mrope_positions(
+            _MRoPEConfig(), req.input_ids, req.multimodal_inputs.mm_items
+        )[0]
+        is not None
+    )
+    io = _recv_one(req, _MRoPEConfig())
+    assert "needs input_ids_unpadded" in io.validation_error
+    assert io.multimodal_inputs.mrope_positions is None
+    # A non-MRoPE model needs no positions, so nothing is asked of it.
+    req, _ids = _mrope_image_request("mm")
+    req.input_ids_unpadded = None
+    io = _recv_one(req, _TextConfig())
+    assert io.validation_error is None
+    assert io.multimodal_inputs.mrope_positions is None
+
+
+def test_a_grid_the_position_function_rejects_aborts_the_request():
+    # Six placeholders against a 24-token grid: the function raises, as it
+    # does in-process (a 400 there). On the wire the request is marked, so
+    # it ends with a terminal abort instead of killing the drain loop.
+    config = _MRoPEConfig()
+    ids = [10, config.vision_start_token_id, *([config.image_token_id] * 6), 11]
+    req = _mm_request("mm", ids, [_image_item([(2, 7)], [1, 8, 12])])
+    with pytest.raises(RuntimeError):
+        compute_mrope_positions(config, ids, req.multimodal_inputs.mm_items)
+    io = _recv_one(req, config)
+    assert io.rid == "mm"
+    assert io.validation_error is not None
+    assert io.validation_error.startswith("mrope positions: ")
+    assert io.multimodal_inputs.mrope_positions is None
+
+
+# --------------------------------------------------------------------------
 # Transport loopback (engine CONNECTs; frontend BINDs)
 # --------------------------------------------------------------------------
 
@@ -1480,6 +1725,7 @@ def test_connect_and_data_plane_roundtrip():
                 supports_prompt_logprobs=True,
                 top_logprobs_unservable=None,
                 request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+                mrope_hf_config=_MRoPEConfig(),
             )
             engine_holder["recv"] = recv
             engine_holder["send"] = send
@@ -1510,6 +1756,8 @@ def test_connect_and_data_plane_roundtrip():
         assert layouts["BatchTokenIDOutSlim"][:2] == ["rids", "output_ids"]
         # ... and the request types this role serves.
         assert frontend.ready_response["request_types"] == ["add", "abort", "control"]
+        # ... and that empty MRoPE position slots are filled here.
+        assert frontend.ready_response["computes_mrope_positions"] is True
 
         # ADD -> the engine decodes a TokenizedGenerateReqInput.
         sp = SamplingParams(temperature=0.5, max_new_tokens=8)
@@ -1520,6 +1768,20 @@ def test_connect_and_data_plane_roundtrip():
         assert io.rid == "req-1"
         assert io.input_ids == [5, 6, 7]
         assert io.sampling_params.max_new_tokens == 8
+
+        # A multimodal ADD with empty position slots arrives positioned.
+        mm_req, mm_ids = _mrope_image_request("req-mm")
+        frontend.send_add(mm_req)
+        mm_io = recv.recv_pyobj()
+        assert mm_io.rid == "req-mm" and mm_io.validation_error is None
+        expected_positions, expected_delta = compute_mrope_positions(
+            _MRoPEConfig(), mm_ids, mm_req.multimodal_inputs.mm_items
+        )
+        assert torch.equal(mm_io.multimodal_inputs.mrope_positions, expected_positions)
+        assert torch.equal(mm_io.multimodal_inputs.mrope_position_delta, expected_delta)
+        assert mm_io.multimodal_inputs.mrope_position_delta_scalar == int(
+            expected_delta.flatten()[0]
+        )
 
         # ABORT of two ids -> two AbortReq, one per recv_pyobj call.
         frontend.send_abort(["req-1", "req-2"])
@@ -1595,6 +1857,7 @@ def test_two_dp_ranks_connect_with_distinct_identities():
                 supports_prompt_logprobs=True,
                 top_logprobs_unservable=None,
                 request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
+                mrope_hf_config=None,
             )
         except Exception as exc:
             errors[index] = exc
@@ -1713,10 +1976,12 @@ def test_encode_loop_dials_the_frontend_and_takes_encode_requests():
         ready = frontend.ready_response
         assert ready["request_types"] == ["encode"]
         # No generate requests served here, so no output batches are
-        # declared; the control reply is, since a stray call is answered.
+        # declared (the control reply is, since a stray call is answered)
+        # and no MRoPE positions are filled.
         assert ready["positional_layouts"] == {
             "ControlReplySlim": ["call_id", "success", "message", "engine_index"]
         }
+        assert ready["computes_mrope_positions"] is False
         assert ready["num_gpu_blocks"] == 0
         assert (ready["max_model_len"], ready["dtype"]) == (4096, "bfloat16")
         assert ready["multimodal_encoder_dtype"] == "bfloat16"

@@ -133,6 +133,13 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     # encode. Empty from an engine that predates it, which serves add and
     # abort (and control when ``positional_layouts`` names the reply).
     request_types: list[str] = []
+    # Whether this engine fills a multimodal request's MRoPE position slots
+    # (``multimodal_inputs`` positions, delta, delta scalar) with its own
+    # position function when the frontend sends them empty. False from an
+    # engine that predates it: that engine runs an MRoPE model on linear
+    # positions when the slots arrive empty, so a frontend fills them itself
+    # or refuses the request.
+    computes_mrope_positions: bool = False
 
 
 # ----------------------------------------------------------------------------
