@@ -499,6 +499,54 @@ def test_dsv41_finish_selection_width(with_candidates, sort_positions):
             run(k)
 
 
+@pytest.mark.parametrize("with_candidates", [False, True])
+def test_dsv41_write_selection_width(with_candidates):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    def run(k, c):
+        selected = torch.arange(k, dtype=torch.int32, device=DEVICE).repeat(2, 1)
+        selected[0, ::2] = -1
+        selected[1, 1::3] = -1
+        candidates = None
+        if with_candidates:
+            candidates = torch.arange(c, dtype=torch.int32, device=DEVICE)
+            candidates = candidates.repeat(2, 1)
+            candidates[0, ::3] = -1
+            candidates[1, 1::4] = -1
+        rows = torch.full((2, k), -2, dtype=torch.int32, device=DEVICE)
+        lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        blocks = torch.full((2, c), -2, dtype=torch.int32, device=DEVICE)
+        block_lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        implementation.write_selection(
+            selected, candidates, (rows, lengths, blocks, block_lengths)
+        )
+        torch.testing.assert_close(rows, selected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            lengths, (selected >= 0).sum(1).to(torch.int32), rtol=0, atol=0
+        )
+        if with_candidates:
+            sentinel = torch.iinfo(torch.int32).max
+            expected = torch.where(candidates >= 0, candidates, sentinel)
+            expected = expected.sort(dim=1).values
+            expected = torch.where(expected == sentinel, -1, expected)
+            torch.testing.assert_close(blocks, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                block_lengths,
+                (candidates >= 0).sum(1).to(torch.int32),
+                rtol=0,
+                atol=0,
+            )
+        else:
+            torch.testing.assert_close(
+                block_lengths, torch.zeros_like(block_lengths), rtol=0, atol=0
+            )
+
+    run(65, 65 if with_candidates else 0)
+    with assert_no_triton_compile(implementation._write_selection):
+        for k in (72, 80, 96, 104, 112, 127):
+            run(k, k if with_candidates else 0)
+
+
 def test_dsv41_page_table_geometry():
     """The dsv41 address kernels take the page table's rows, columns and
     strides as runtime scalars. Rows follow the batch and columns the longest
