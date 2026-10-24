@@ -1663,7 +1663,11 @@ class DeepseekV41DecoderLayer(nn.Module):
         )
         if x is None:
             x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-        ffn_overlap = can_overlap and ffn_mixes is None
+        ffn_overlap = (
+            can_overlap
+            and ffn_mixes is None
+            and (decode_hc or not is_breakable_capture_active())
+        )
         defer_moe = (
             decode_hc
             and allow_ffn_reduce_fusion
