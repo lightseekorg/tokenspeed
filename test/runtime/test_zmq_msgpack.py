@@ -43,7 +43,12 @@ from tokenspeed.runtime.engine.io_struct import (
     AbortReq,
     BatchTokenIDOut,
     BatchTokenIDOutSlim,
+    FlushCacheReqInput,
+    FlushCacheReqOutput,
     MsgpackEncoder,
+    ProfileReq,
+    ProfileReqOutput,
+    ProfileReqType,
     TokenizedGenerateReqInput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT, FINISH_LENGTH
@@ -400,6 +405,7 @@ def test_recv_socket_aborts_request_with_invalid_sampling_params():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        control=zmq_msgpack.ControlCalls(),
     )
 
     io_bad = recv.recv_pyobj()
@@ -433,6 +439,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        control=zmq_msgpack.ControlCalls(),
     )
     io = recv_off.recv_pyobj()
     assert io.rid == "r1"
@@ -443,6 +450,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=True,
+        control=zmq_msgpack.ControlCalls(),
     )
     io = recv_on.recv_pyobj()
     assert io.validation_error is None
@@ -471,6 +479,7 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=True,
+        control=zmq_msgpack.ControlCalls(),
     )
     io = recv.recv_pyobj()
     assert io.validation_error and needle in io.validation_error
@@ -481,6 +490,7 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=True,
+        control=zmq_msgpack.ControlCalls(),
     )
     assert recv.recv_pyobj().validation_error is None
 
@@ -502,6 +512,7 @@ def test_recv_socket_names_the_engine_capability_before_the_wire_limit():
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=False,
+        control=zmq_msgpack.ControlCalls(),
     )
     io = recv.recv_pyobj()
     assert io.validation_error and "not supported by this engine" in io.validation_error
@@ -519,6 +530,7 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        control=zmq_msgpack.ControlCalls(),
     )
     io = recv.recv_pyobj()
     assert io.rid == "good"
@@ -533,6 +545,7 @@ def test_recv_socket_verify_does_not_apply_to_abort():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        control=zmq_msgpack.ControlCalls(),
     )
     a1 = recv.recv_pyobj()
     a2 = recv.recv_pyobj()
@@ -566,7 +579,9 @@ def _decode_last_slim_output(socket: _FakeOutputSocket) -> BatchTokenIDOutSlim:
 
 def test_send_socket_uses_zero_load_tail_before_observation():
     socket = _FakeOutputSocket()
-    sender = zmq_msgpack.MsgpackSendSocket(socket, engine_index=5)
+    sender = zmq_msgpack.MsgpackSendSocket(
+        socket, engine_index=5, control=zmq_msgpack.ControlCalls()
+    )
 
     sender.send_pyobj(_make_batch_out())
 
@@ -582,7 +597,7 @@ def test_send_socket_uses_zero_load_tail_before_observation():
 
 def test_send_socket_load_snapshot_setter_sends_no_frame():
     socket = _FakeOutputSocket()
-    sender = zmq_msgpack.MsgpackSendSocket(socket)
+    sender = zmq_msgpack.MsgpackSendSocket(socket, control=zmq_msgpack.ControlCalls())
 
     sender.set_load_snapshot(1, 2, 3, 4)
 
@@ -591,7 +606,7 @@ def test_send_socket_load_snapshot_setter_sends_no_frame():
 
 def test_send_socket_next_output_uses_latest_load_snapshot():
     socket = _FakeOutputSocket()
-    sender = zmq_msgpack.MsgpackSendSocket(socket)
+    sender = zmq_msgpack.MsgpackSendSocket(socket, control=zmq_msgpack.ControlCalls())
     sender.set_load_snapshot(1, 2, 3, 4)
     sender.set_load_snapshot(5, 6, 7, 8)
 
@@ -609,7 +624,7 @@ def test_send_socket_next_output_uses_latest_load_snapshot():
 def test_direct_load_snapshot_sink_maps_active_pages_without_transport():
     """The direct sink ignores used pages and only updates the next batch."""
     socket = _FakeOutputSocket()
-    sender = zmq_msgpack.MsgpackSendSocket(socket)
+    sender = zmq_msgpack.MsgpackSendSocket(socket, control=zmq_msgpack.ControlCalls())
     sink = load_snapshot_module.DirectLoadSnapshotSink(sender.set_load_snapshot)
 
     sink.observe((5, 6, 7, 18, 20))
@@ -630,12 +645,14 @@ def test_send_socket_engine_dead_sentinel():
     # The frontend's output loop treats the raw ENGINE_CORE_DEAD frame as
     # terminal; the transport sends it on engine shutdown/crash cleanup.
     sock = _FakeOutputSocket()
-    zmq_msgpack.MsgpackSendSocket(sock).send_engine_dead()
+    zmq_msgpack.MsgpackSendSocket(
+        sock, control=zmq_msgpack.ControlCalls()
+    ).send_engine_dead()
     assert sock.sent == [[zmq_msgpack.ENGINE_CORE_DEAD]]
 
     # Best-effort: a dead socket on the cleanup path must not raise.
     zmq_msgpack.MsgpackSendSocket(
-        _FakeOutputSocket(raise_on_send=True)
+        _FakeOutputSocket(raise_on_send=True), control=zmq_msgpack.ControlCalls()
     ).send_engine_dead()
 
 
@@ -683,6 +700,300 @@ def test_init_decode_ignores_unknown_fields():
 
 
 # --------------------------------------------------------------------------
+# Control calls (flush_cache / start_profile / stop_profile)
+# --------------------------------------------------------------------------
+
+
+class _Clock:
+    """A settable monotonic clock for the flush retry schedule."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _control_frames(call_id: int, method: str, args: list) -> list[bytes]:
+    return [zmq_wire.REQ_TYPE_CONTROL, msgspec.msgpack.encode([call_id, method, args])]
+
+
+def _control_pair(
+    messages: list[list[bytes]], clock: _Clock | None = None, engine_index: int = 0
+):
+    """A receive/send adapter pair over fake sockets sharing one call table,
+    as ``connect_msgpack_engine`` builds them."""
+    control = zmq_msgpack.ControlCalls(clock=clock or _Clock())
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(messages),
+        vocab_size=32,
+        enable_output_logprobs=False,
+        supports_prompt_logprobs=True,
+        control=control,
+    )
+    out = _FakeOutputSocket()
+    send = zmq_msgpack.MsgpackSendSocket(
+        out, engine_index=engine_index, control=control
+    )
+    return recv, send, out
+
+
+def _control_replies(out: _FakeOutputSocket) -> list[zmq_wire.ControlReplySlim]:
+    decoder = msgspec.msgpack.Decoder(zmq_wire.ControlReplySlim)
+    return [decoder.decode(frames[-1]) for frames in out.sent]
+
+
+def test_control_call_decodes_to_the_call():
+    [call] = zmq_wire.decode_request_frames(_control_frames(7, "flush_cache", [1.5]))
+    assert isinstance(call, zmq_wire.ControlCall)
+    assert (call.call_id, call.method, call.args) == (7, "flush_cache", [1.5])
+
+
+def test_control_reply_is_the_tagged_positional_tuple():
+    """The reply's bytes are the frontend's SGLang plugin's: one reader there."""
+    reply = zmq_wire.ControlReplySlim(
+        call_id=7, success=True, message=None, engine_index=1
+    )
+    encoded = zmq_wire.encode(reply)
+    assert encoded == bytes.fromhex("95b0436f6e74726f6c5265706c79536c696d07c3c001")
+    assert msgspec.msgpack.decode(encoded) == ["ControlReplySlim", 7, True, None, 1]
+    assert zmq_wire.positional_layout(zmq_wire.ControlReplySlim) == [
+        "call_id",
+        "success",
+        "message",
+        "engine_index",
+    ]
+    assert zmq_wire.control_call_id(zmq_wire.control_rid(42)) == 42
+    assert zmq_wire.control_call_id("r1") is None
+    assert zmq_wire.control_call_id(None) is None
+
+
+def test_ready_response_declares_the_emitted_output_structs():
+    layouts = zmq_msgpack.OUTPUT_LAYOUTS
+    assert layouts["ControlReplySlim"] == [
+        "call_id",
+        "success",
+        "message",
+        "engine_index",
+    ]
+    assert layouts["BatchTokenIDOutSlim"][:8] == [
+        "rids",
+        "output_ids",
+        "finished_reasons",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_tokens",
+        "output_token_logprobs_val",
+        "output_token_logprobs_idx",
+    ]
+    raw = msgspec.msgpack.decode(
+        zmq_wire.encode(
+            zmq_wire.WireEngineCoreReadyResponse(positional_layouts=layouts)
+        )
+    )
+    assert raw["positional_layouts"] == layouts
+
+
+def test_flush_call_is_the_scheduler_flush_and_its_output_the_reply():
+    recv, send, out = _control_pair(
+        [_control_frames(7, "flush_cache", [1.5])], engine_index=3
+    )
+    io = recv.recv_pyobj()
+    assert isinstance(io, FlushCacheReqInput)
+    assert io.rid == "smg-control-7"
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+
+    send.send_pyobj(FlushCacheReqOutput(success=True, rid=io.rid))
+    [reply] = _control_replies(out)
+    assert (reply.call_id, reply.success, reply.message, reply.engine_index) == (
+        7,
+        True,
+        None,
+        3,
+    )
+
+
+def test_refused_flush_is_retried_until_accepted():
+    # The scheduler refuses a flush while requests pin blocks (a finished
+    # request is retired a round after its last token); the frontend's retry
+    # loop lives here now: no answer, another attempt after the interval.
+    clock = _Clock()
+    recv, send, out = _control_pair(
+        [_control_frames(7, "flush_cache", [])], clock=clock
+    )
+    first = recv.recv_pyobj()
+    send.send_pyobj(FlushCacheReqOutput(success=False, rid=first.rid))
+    assert out.sent == []
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+
+    clock.advance(zmq_msgpack.FLUSH_RETRY_INTERVAL_S)
+    retry = recv.recv_pyobj(zmq.NOBLOCK)
+    assert isinstance(retry, FlushCacheReqInput)
+    assert retry.rid == first.rid
+    send.send_pyobj(FlushCacheReqOutput(success=True, rid=retry.rid))
+    [reply] = _control_replies(out)
+    assert (reply.call_id, reply.success, reply.message) == (7, True, None)
+
+
+def test_refused_flush_answers_once_the_deadline_passes():
+    # timeout_s below the retire grace: the grace bounds the wait, and the
+    # refusal names the attempts made.
+    clock = _Clock()
+    start = clock.now
+    recv, send, out = _control_pair(
+        [_control_frames(8, "flush_cache", [0.3])], clock=clock
+    )
+    io = recv.recv_pyobj()
+    attempts = 1
+    send.send_pyobj(FlushCacheReqOutput(success=False, rid=io.rid))
+    while not out.sent:
+        clock.advance(zmq_msgpack.FLUSH_RETRY_INTERVAL_S)
+        io = recv.recv_pyobj(zmq.NOBLOCK)
+        attempts += 1
+        send.send_pyobj(FlushCacheReqOutput(success=False, rid=io.rid))
+
+    [reply] = _control_replies(out)
+    assert (reply.call_id, reply.success) == (8, False)
+    assert reply.message == (
+        f"Cache flush refused: requests still in flight after {attempts} attempts"
+    )
+    assert attempts > 1
+    assert clock.now - start >= zmq_msgpack.FLUSH_RETIRE_GRACE_S
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+
+
+def test_flush_timeout_above_the_grace_extends_the_wait():
+    clock = _Clock()
+    recv, send, out = _control_pair(
+        [_control_frames(9, "flush_cache", [5.0])], clock=clock
+    )
+    io = recv.recv_pyobj()
+    clock.advance(4.9)
+    send.send_pyobj(FlushCacheReqOutput(success=False, rid=io.rid))
+    assert out.sent == []
+    clock.advance(0.2)
+    io = recv.recv_pyobj(zmq.NOBLOCK)
+    send.send_pyobj(FlushCacheReqOutput(success=False, rid=io.rid))
+    [reply] = _control_replies(out)
+    assert reply.success is False
+    assert "after 2 attempts" in reply.message
+
+
+@pytest.mark.parametrize("args", [[-1.0], [float("nan")], ["soon"]])
+def test_flush_timeout_must_be_a_finite_non_negative_number(args):
+    recv, _send, out = _control_pair([_control_frames(5, "flush_cache", args)])
+    # Nothing reaches the scheduler; the call is answered, not dropped.
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+    [reply] = _control_replies(out)
+    assert (reply.call_id, reply.success) == (5, False)
+    assert "timeout_s" in reply.message
+
+
+def test_profile_calls_become_the_scheduler_profile_requests():
+    options = {
+        "output_dir": "/tmp/traces",
+        "num_steps": 3,
+        "activities": ["CPU", "GPU"],
+        "record_shapes": True,
+        "profile_by_stage": False,
+        "profile_id": "p1",
+    }
+    recv, send, out = _control_pair(
+        [
+            _control_frames(11, "start_profile", [options]),
+            _control_frames(12, "stop_profile", []),
+        ],
+        engine_index=2,
+    )
+    start = recv.recv_pyobj()
+    assert isinstance(start, ProfileReq)
+    assert start.type is ProfileReqType.START_PROFILE
+    assert start.rid == "smg-control-11"
+    assert (start.output_dir, start.start_step, start.num_steps) == (
+        "/tmp/traces",
+        None,
+        3,
+    )
+    assert start.activities == ["CPU", "GPU"]
+    assert (start.record_shapes, start.profile_by_stage, start.profile_id) == (
+        True,
+        False,
+        "p1",
+    )
+    # The frontend's default: the stack is recorded unless told otherwise.
+    assert start.with_stack is True
+    stop = recv.recv_pyobj()
+    assert isinstance(stop, ProfileReq)
+    assert stop.type is ProfileReqType.STOP_PROFILE
+    assert stop.rid == "smg-control-12"
+
+    send.send_pyobj(ProfileReqOutput(success=True, message="Succeeded", rid=start.rid))
+    not_running = "Profiling is not in progress. Call /start_profile first."
+    send.send_pyobj(ProfileReqOutput(success=False, message=not_running, rid=stop.rid))
+    replies = _control_replies(out)
+    assert [(r.call_id, r.success, r.message, r.engine_index) for r in replies] == [
+        (11, True, "Succeeded", 2),
+        (12, False, not_running, 2),
+    ]
+
+
+def test_start_profile_defaults_and_refusals():
+    recv, _send, out = _control_pair(
+        [
+            _control_frames(1, "start_profile", []),
+            _control_frames(2, "start_profile", [{"with_stack": False}]),
+            _control_frames(3, "start_profile", ["not-a-map"]),
+            _control_frames(4, "start_profile", [{"num_steps": "three"}]),
+            _control_frames(5, "pause", []),
+            _control_frames(6, "start_profile", [{"profile_id": "p2", "warm": 1}]),
+        ]
+    )
+    # No options: the handler fills output_dir and activities, the profile is
+    # named by its start time, the stack is recorded.
+    bare = recv.recv_pyobj()
+    assert (bare.output_dir, bare.activities, bare.profile_by_stage) == (
+        None,
+        None,
+        False,
+    )
+    assert bare.profile_id
+    assert bare.with_stack is True
+    assert recv.recv_pyobj().with_stack is False
+    # The malformed calls place nothing and are each answered; an option this
+    # engine does not know is refused, never dropped behind a success.
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+    replies = _control_replies(out)
+    assert [(r.call_id, r.success) for r in replies] == [
+        (3, False),
+        (4, False),
+        (5, False),
+        (6, False),
+    ]
+    assert "options must be a map" in replies[0].message
+    assert "num_steps" in replies[1].message
+    assert "unknown control method 'pause'" in replies[2].message
+    assert "unknown options ['warm']" in replies[3].message
+
+
+def test_control_outputs_of_no_call_are_not_answered():
+    _recv, send, out = _control_pair([])
+    # The scheduler's own control outputs carry no call id; a call this side
+    # never issued has none either.
+    send.send_pyobj(FlushCacheReqOutput(success=True))
+    send.send_pyobj(ProfileReqOutput(success=True, message="Succeeded"))
+    send.send_pyobj(FlushCacheReqOutput(success=True, rid="smg-control-99"))
+    assert out.sent == []
+
+
+# --------------------------------------------------------------------------
 # Transport loopback (engine CONNECTs; frontend BINDs)
 # --------------------------------------------------------------------------
 
@@ -705,6 +1016,8 @@ class _FakeSmgFrontend:
         self.output.bind(self.output_addr)
 
         self.engine_id: bytes | None = None
+        # The engine's ready response, as registered on the input socket.
+        self.ready_response: dict | None = None
         self._encoder = MsgpackEncoder()
 
     def run_handshake(self) -> None:
@@ -725,6 +1038,7 @@ class _FakeSmgFrontend:
         reg_id, reg_payload = self.input.recv_multipart()
         assert reg_id == engine_id
         assert len(reg_payload) > 0
+        self.ready_response = msgspec.msgpack.decode(reg_payload)
 
     def send_add(self, req: TokenizedGenerateReqInput) -> None:
         frames = self._encoder.encode(req)
@@ -735,10 +1049,24 @@ class _FakeSmgFrontend:
             [self.engine_id, zmq_wire.REQ_TYPE_ABORT, msgspec.msgpack.encode(rids)]
         )
 
+    def send_control(self, call_id: int, method: str, args: list) -> None:
+        self.input.send_multipart(
+            [
+                self.engine_id,
+                zmq_wire.REQ_TYPE_CONTROL,
+                msgspec.msgpack.encode([call_id, method, args]),
+            ]
+        )
+
     def recv_output(self) -> BatchTokenIDOutSlim:
         assert self.output.poll(10_000, zmq.POLLIN), "no output from engine"
         frames = self.output.recv_multipart()
         return msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(frames[-1])
+
+    def recv_control_reply(self) -> zmq_wire.ControlReplySlim:
+        assert self.output.poll(10_000, zmq.POLLIN), "no control reply from engine"
+        frames = self.output.recv_multipart()
+        return msgspec.msgpack.Decoder(zmq_wire.ControlReplySlim).decode(frames[-1])
 
     def close(self) -> None:
         for sock in (self.handshake, self.input, self.output):
@@ -784,6 +1112,16 @@ def test_connect_and_data_plane_roundtrip():
     try:
         # Engine identity is the 2-byte LE index the frontend routes by.
         assert frontend.engine_id == struct.pack("<H", 0)
+        # The registration declares the output structs this wire emits, so
+        # the frontend knows it answers control calls.
+        layouts = frontend.ready_response["positional_layouts"]
+        assert layouts["ControlReplySlim"] == [
+            "call_id",
+            "success",
+            "message",
+            "engine_index",
+        ]
+        assert layouts["BatchTokenIDOutSlim"][:2] == ["rids", "output_ids"]
 
         # ADD -> the engine decodes a TokenizedGenerateReqInput.
         sp = SamplingParams(temperature=0.5, max_new_tokens=8)
@@ -805,6 +1143,21 @@ def test_connect_and_data_plane_roundtrip():
         # NOBLOCK drain contract: zmq.Again once the buffer + socket are empty.
         with pytest.raises(zmq.Again):
             recv.recv_pyobj(zmq.NOBLOCK)
+
+        # CONTROL -> the scheduler's own flush request; its output goes back
+        # as the call's reply on the output socket.
+        frontend.send_control(7, "flush_cache", [1.0])
+        flush = recv.recv_pyobj()
+        assert isinstance(flush, FlushCacheReqInput)
+        assert flush.rid == "smg-control-7"
+        send.send_pyobj(FlushCacheReqOutput(success=True, rid=flush.rid))
+        reply = frontend.recv_control_reply()
+        assert (reply.call_id, reply.success, reply.message, reply.engine_index) == (
+            7,
+            True,
+            None,
+            0,
+        )
 
         # Output path: BatchTokenIDOut -> slim tagged struct on the PULL socket.
         send.send_pyobj(_make_batch_out())

@@ -8,8 +8,10 @@
 # duplicate wire-struct layer to keep in sync. This module keeps only the
 # transport-level pieces of the contract:
 #
-#   * the single-byte request-type frame (ADD/ABORT) that lets the receiver
-#     dispatch without decoding the payload;
+#   * the single-byte request-type frame (ADD/ABORT/CONTROL) that lets the
+#     receiver dispatch without decoding the payload;
+#   * the control call ``[call_id, method, args]`` behind the CONTROL byte and
+#     the tagged ``ControlReplySlim`` that answers it on the output socket;
 #   * the map-encoded startup-handshake structs (HELLO/INIT/READY plus the
 #     engine's ready response), which match the frontend's
 #     ``rmp_serde::to_vec_named`` codec and must NOT be positional.
@@ -28,6 +30,18 @@ from tokenspeed.runtime.engine.io_struct import (
 # payload so the receiver can dispatch without decoding first.
 REQ_TYPE_ADD = b"\x00"
 REQ_TYPE_ABORT = b"\x01"
+# A control call for the scheduler's own control requests (a cache flush, the
+# profiler's start and stop): the payload is the msgpack array ``[call_id,
+# method, args]`` and the answer rides the output socket as a
+# ``ControlReplySlim`` under the same call id. The byte and both shapes are
+# the ones the frontend already speaks to its SGLang plugin, so one encoder and
+# one reply reader drive either scheduler.
+REQ_TYPE_CONTROL = b"\x02"
+
+# The rid of the scheduler request a control call becomes: the frontend's call
+# id behind a prefix no generate request uses, so the request's output is
+# answered under that id (``control_call_id``).
+CONTROL_RID_PREFIX = "smg-control-"
 
 
 # ----------------------------------------------------------------------------
@@ -93,10 +107,79 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_events_config: dict | None = None
+    # The field order of the positional (``array_like``) structs this engine
+    # emits on the output socket, by tag: the frontend reads here whether the
+    # wire answers control calls or carries an appended output column, with
+    # no version string to compare. Empty from an engine that predates it.
+    positional_layouts: dict[str, list[str]] = {}
+
+
+# ----------------------------------------------------------------------------
+# Control structs of the data plane: the call is the input socket's CONTROL
+# payload (a plain msgpack array, decoded by ``decode_control``), the reply a
+# positional (``array_like``) tagged tuple on the output socket, like the
+# output batches. The handshake banner above does not apply to them.
+# ----------------------------------------------------------------------------
+
+
+class ControlCall(msgspec.Struct, kw_only=True):
+    """One control call off the input socket: ``[call_id, method, args]``.
+
+    ``method`` is ``flush_cache`` (args ``[timeout_s]``), ``start_profile``
+    (args ``[options]``, a map of the profiler's start options) or
+    ``stop_profile`` (no args). The transport turns the call into the
+    scheduler's own control request and answers its output under the call id
+    (``zmq_msgpack.ControlCalls``).
+    """
+
+    call_id: int
+    method: str
+    args: list
+
+
+class ControlReplySlim(msgspec.Struct, tag=True, array_like=True):
+    """The answer to a control call, on the output socket:
+    ``["ControlReplySlim", call_id, success, message, engine_index]``.
+
+    ``message`` is None for an accepted cache flush and the scheduler's own
+    words otherwise; ``engine_index`` names the answering rank as the output
+    batches do (the PULL side carries no routing identity).
+    """
+
+    call_id: int
+    success: bool
+    message: str | None = None
+    engine_index: int = 0
+
+
+def control_rid(call_id: int) -> str:
+    """The rid the scheduler request of control call ``call_id`` carries."""
+    return f"{CONTROL_RID_PREFIX}{call_id:d}"
+
+
+def control_call_id(rid: object) -> int | None:
+    """The call id a control request's rid carries; None for any other rid."""
+    if not isinstance(rid, str) or not rid.startswith(CONTROL_RID_PREFIX):
+        return None
+    try:
+        return int(rid[len(CONTROL_RID_PREFIX) :])
+    except ValueError:
+        return None
+
+
+def wire_tag(struct_type: type[msgspec.Struct]) -> str:
+    """The tag string a tagged positional struct carries at element 0."""
+    return struct_type.__struct_config__.tag
+
+
+def positional_layout(struct_type: type[msgspec.Struct]) -> list[str]:
+    """The field names of a positional struct in wire order, tag excluded."""
+    return [field.name for field in msgspec.structs.fields(struct_type)]
 
 
 _ENC = msgspec.msgpack.Encoder()
 _DEC_ABORT = msgspec.msgpack.Decoder(list[str])
+_DEC_CONTROL = msgspec.msgpack.Decoder(tuple[int, str, list])
 _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
 # Native tagged request decode, tensor/aux-frame aware for multimodal payloads.
 _DEC_ADD = MsgpackDecoder(TokenizedGenerateReqInput)
@@ -140,13 +223,20 @@ def wire_dtype(dtype) -> str:
 
 
 def encode(obj: msgspec.Struct) -> bytes:
-    """Encode a handshake struct to a msgpack payload."""
+    """Encode a wire struct to a msgpack payload: a handshake map, or a
+    positional data-plane struct such as ``ControlReplySlim``."""
     return _ENC.encode(obj)
 
 
 def decode_abort(payload: bytes) -> list[str]:
     """Decode an ABORT payload (a msgpack array of request ids)."""
     return _DEC_ABORT.decode(payload)
+
+
+def decode_control(payload: bytes) -> ControlCall:
+    """Decode a CONTROL payload (the msgpack array ``[call_id, method, args]``)."""
+    call_id, method, args = _DEC_CONTROL.decode(payload)
+    return ControlCall(call_id=call_id, method=method, args=args)
 
 
 def decode_init(payload: bytes) -> WireHandshakeInitMessage:
@@ -182,9 +272,9 @@ def decode_request_frames(frames: list[bytes]) -> list:
     """Decode a ``[type_byte, payload, *aux]`` request into io_structs.
 
     Returns a list because a single ABORT frame may carry several request ids;
-    an ADD always yields exactly one ``TokenizedGenerateReqInput``. ADD aux
-    frames hold out-of-band tensor buffers (frame indices are relative to the
-    payload, which is buffer 0).
+    an ADD always yields exactly one ``TokenizedGenerateReqInput`` and a
+    CONTROL exactly one ``ControlCall``. ADD aux frames hold out-of-band tensor
+    buffers (frame indices are relative to the payload, which is buffer 0).
     """
     if len(frames) < 2:
         raise ValueError(
@@ -197,4 +287,6 @@ def decode_request_frames(frames: list[bytes]) -> list:
         return [io]
     if type_byte == REQ_TYPE_ABORT:
         return [AbortReq(rid=rid) for rid in decode_abort(frames[1])]
+    if type_byte == REQ_TYPE_CONTROL:
+        return [decode_control(frames[1])]
     raise ValueError(f"unknown msgpack request type byte: {type_byte!r}")
