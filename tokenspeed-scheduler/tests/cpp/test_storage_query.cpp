@@ -86,7 +86,8 @@ public:
     QueryCache(std::int32_t grain, std::vector<CacheGroupSpec> specs, std::int32_t parents)
         : device{parents, Packing(specs)},
           host{parents, Packing(specs)},
-          coordinator{MakeCoordinator(specs, grain, device, true, &host, nullptr, true)},
+          coordinator{
+              MakeCoordinator(specs, grain, device, true, &host, nullptr, true, /*write_back_evictions=*/false)},
           storage{coordinator,
                   StorageConfig{8, 256, parents, 256, 8192, 1, 1000, 1000, {8, 1048576, 1000}, {4, 524288, 500}}} {}
 

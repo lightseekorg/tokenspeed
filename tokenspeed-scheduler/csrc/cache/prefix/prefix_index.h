@@ -199,6 +199,18 @@ public:
         }
         return entry_it->key;
     }
+    // The key of the entry at `location` on this tier, if one is there.
+    std::optional<CacheKey> KeyOf(const BlockPool& pool, CacheBlockLocation location) const {
+        const CacheEntries* cache_index = findCacheEntries(pool);
+        if (cache_index == nullptr) {
+            return std::nullopt;
+        }
+        ConstCacheEntryIterator entry_it = findEntry(*cache_index, location);
+        if (entry_it == cache_index->entries.end()) {
+            return std::nullopt;
+        }
+        return entry_it->key;
+    }
 
     std::optional<CachedBlockMetadata> MetadataFor(const BlockPool& pool, CacheBlockLocation location) const {
         const CacheEntries* cache_index = findCacheEntries(pool);

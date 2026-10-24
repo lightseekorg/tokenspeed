@@ -36,6 +36,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <random>
 #include <span>
 #include <string>
@@ -124,7 +125,7 @@ TEST(JointMatchInvariantsTest, HitImpliesWarmUnderRandomCacheEvictSequences) {
             CacheCoordinator coordinator =
                 MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                                 /*snapshot_pool=*/nullptr,
-                                /*stream_device_cache_to_host=*/false);
+                                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
             // Random per-group caching: each group caches a random prefix
             // subset of the request's blocks (front-truncated to mimic the
             // sliding group's reclaim of slid-out blocks).
@@ -202,7 +203,7 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
         CacheCoordinator coordinator =
             MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                             /*snapshot_pool=*/nullptr,
-                            /*stream_device_cache_to_host=*/false);
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
         std::uniform_int_distribution<std::int32_t> depth_dist(0, kBlocks);
         const std::int32_t full_depth = depth_dist(rng);
         for (std::int32_t i = 0; i < full_depth; ++i) {
@@ -276,9 +277,10 @@ TEST(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv
         for (int round = 0; round < 200; ++round) {
             BlockPool device(64, {4, 1, 1, 1});
             BlockPool host(64, {4, 1, 1, 1});
-            CacheCoordinator coordinator = MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/l3, &host,
-                                                           /*snapshot_pool=*/nullptr,
-                                                           /*stream_device_cache_to_host=*/true);
+            CacheCoordinator coordinator =
+                MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/l3, &host,
+                                /*snapshot_pool=*/nullptr,
+                                /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
             const bool gapless_device = round % 2 == 0;
             const std::int32_t tail_page = page_dist(rng);
             const std::int32_t tail_page_tokens = tail_page * kP;
@@ -440,6 +442,155 @@ TEST(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv
     }
 }
 
+// Evicting by segments keeps the Device's coverage closed from the root:
+// whatever the mix of sessions -- forked from earlier ones at random pages,
+// resumed on Device hits, published at a chunk end and at the finish, each with
+// its checkpoints, ending on a tail or a page -- and whatever the admissions
+// under pressure evict, every page the Device holds has its parent page there,
+// and every tail its prior page. K3 shape (P = 4; a Full group, one block per
+// page, four per parent; three State groups) in a Device pool of 24 parents.
+TEST(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderSegmentEviction) {
+    constexpr std::int32_t kP = 4;
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    BlockPool device(24, {4, 1, 1, 1});
+    BlockPool host(1, {4, 1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/false, &host,
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                                                   /*write_back_evictions=*/true);
+    struct Session {
+        std::vector<std::int32_t> tokens;
+        std::vector<std::string> hashes;
+        std::optional<TailPublication> tail;
+    };
+    std::vector<Session> sessions;
+    std::mt19937 rng(20261024);
+    std::uniform_int_distribution<std::int32_t> length_dist(2 * kP, 9 * kP - 1);
+    std::bernoulli_distribution coin(0.5);
+    std::bernoulli_distribution flood(0.1);
+    std::int32_t hits = 0;
+    std::int32_t chunked = 0;
+    std::int32_t floods = 0;
+    for (int round = 0; round < 200; ++round) {
+        const std::int32_t num_tokens = length_dist(rng);
+        Session session{.tokens = test::MakeTokens(num_tokens, 1000 * (round + 1))};
+        if (!sessions.empty() && coin(rng)) {
+            const Session& base = sessions[std::uniform_int_distribution<std::size_t>(0, sessions.size() - 1)(rng)];
+            const auto max_pages = static_cast<std::int32_t>(std::min(base.tokens.size(), session.tokens.size())) / kP;
+            const std::int32_t shared = std::uniform_int_distribution<std::int32_t>(1, max_pages)(rng) * kP;
+            std::copy_n(base.tokens.begin(), shared, session.tokens.begin());
+        }
+        const std::int32_t full_pages = num_tokens / kP;
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::int32_t page = 0; page < full_pages; ++page) {
+            pages.emplace_back(session.tokens.data() + page * kP, kP);
+        }
+        session.hashes = ComputePrefixHashes(pages, "");
+        if (num_tokens % kP != 0) {
+            session.tail = TailPublication{
+                .tail_tokens = num_tokens % kP,
+                .hash = HashPrefixPage(
+                    std::span<const std::int32_t>(session.tokens).subspan(static_cast<std::size_t>(full_pages * kP)),
+                    session.hashes.back())};
+        }
+
+        // Resume on what the Device holds, below the last token.
+        const std::int32_t max_tokens = num_tokens - 1;
+        const CacheCoordinator::PromptPrefix prompt{
+            .prefix_hashes =
+                std::span<const std::string>(session.hashes).first(static_cast<std::size_t>(max_tokens / kP)),
+            .tokens = session.tokens,
+            .max_tokens = max_tokens};
+        CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+        const std::int32_t hit = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+        hits += hit > 0 ? 1 : 0;
+        // A chunk end with its checkpoint at a page past the hit, before the
+        // finish.
+        const std::int32_t first_new = hit / kP;
+        const std::int32_t last_chunk_page = session.tail ? full_pages : full_pages - 1;
+        std::optional<std::int32_t> chunk_pages;
+        if (first_new + 1 <= last_chunk_page && coin(rng)) {
+            chunk_pages = std::uniform_int_distribution<std::int32_t>(first_new + 1, last_chunk_page)(rng);
+        }
+        std::vector<BlockTable> tables(4);
+        const std::int32_t first_end = chunk_pages ? *chunk_pages * kP : num_tokens;
+        if (!AdmitForTest(coordinator, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{first_end - hit}})) {
+            coordinator.Free(tables);
+            continue;
+        }
+        std::int32_t published_pages = first_new;
+        if (chunk_pages) {
+            const RequestProgress chunk_end{
+                .completed_pages =
+                    CompletedPages{
+                        .prefix_hashes =
+                            std::span<const std::string>(session.hashes).first(static_cast<std::size_t>(*chunk_pages)),
+                        .first_new_prefix_page = first_new,
+                        .publish_state = true,
+                        .boundary_kind = CacheBoundaryKind::kChunk},
+                .num_computed_tokens = first_end,
+            };
+            if (!AdmitForTest(coordinator, tables, coordinator.ProbePrefix({}),
+                              GroupDemand{.extent = DenseGrowth{num_tokens - first_end}}, chunk_end)) {
+                coordinator.Free(tables);
+                continue;
+            }
+            published_pages = *chunk_pages;
+            ++chunked;
+        }
+        coordinator.CacheCompletedBlocks(
+            tables,
+            RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = session.hashes,
+                                                              .first_new_prefix_page = published_pages,
+                                                              .tail = session.tail,
+                                                              .publish_state = true,
+                                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
+                            .num_computed_tokens = num_tokens},
+            CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        coordinator.Free(tables);
+        sessions.push_back(std::move(session));
+        // Now and then a request needs the whole pool (96 Full slots). Nothing
+        // is in use, so it fits: the candidates run out, and the pages several
+        // checkpoint boundaries share leave too.
+        if (flood(rng)) {
+            std::vector<BlockTable> flood_tables(4);
+            EXPECT_TRUE(AdmitForTest(coordinator, flood_tables, coordinator.ProbePrefix({}),
+                                     GroupDemand{.extent = DenseGrowth{96 * kP}}, RequestProgress{},
+                                     StateStep{.kind = StateStep::Kind::kKeep}))
+                << "round " << round;
+            coordinator.Free(flood_tables);
+            ++floods;
+        }
+
+        const auto on_device = [&](const std::string& hash) {
+            return coordinator.GroupPrefixIndex(0).Contains(device, KeyFor(hash, 0));
+        };
+        for (const Session& published : sessions) {
+            for (std::size_t page = 1; page < published.hashes.size(); ++page) {
+                if (on_device(published.hashes[page])) {
+                    EXPECT_TRUE(on_device(published.hashes[page - 1]))
+                        << "round " << round << ": page " << page << " outlives its parent";
+                }
+            }
+            if (published.tail && on_device(published.tail->hash)) {
+                EXPECT_TRUE(on_device(published.hashes.back())) << "round " << round << ": a tail outlives its prior";
+            }
+        }
+    }
+    // The run resumed on hits, published chunk ends, admitted floods, and
+    // evicted under pressure, middle pages with their suffix too.
+    EXPECT_GT(hits, 0);
+    EXPECT_GT(chunked, 0);
+    EXPECT_GT(floods, 0);
+    const CacheCoordinator::DeviceEvictionStats& evictions = coordinator.DeviceEvictions();
+    EXPECT_GT(evictions.admission.blocks, 0u);
+    EXPECT_GT(evictions.stranded_suffix.blocks, 0u);
+}
+
 TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     // Three groups: full target, target state-like full group with packing 2,
     // and a draft sliding group. The converged boundary must be supported by
@@ -463,7 +614,8 @@ TEST(JointMatchInvariantsTest, DraftOnlyGroupJoinsConvergenceAsOrdinaryGroup) {
     BlockPool pool(64, {1, 2, 1});
     CacheCoordinator coordinator =
         MakeCoordinator(specs, kBlockTokens, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false);
     const std::vector<std::string> hashes = MakeHashes(kBlocks);
 
     // Cache depth 6 for the full groups, but only blocks [2, 5) for the

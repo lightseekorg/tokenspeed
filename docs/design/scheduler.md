@@ -937,7 +937,9 @@ pages:
   own block, cache-only since it was freed — and protected from the planner's
   eviction like a prefix hit). Every other slot becomes one row of a single
   `SnapshotRestoreOperation`, tagged with its source tier (`HostTier::kL2`
-  rows carry their key, `kSnapshotPool` rows none). A copy fills its
+  rows carry their key, `kSnapshotPool` rows none). Under segment eviction a
+  restore whose claims leave no plan plans again claiming nothing, so every
+  slot is a row (`cache-concepts.md`, `AdmissionPlanner`). A copy fills its
   destination block whole, so — as for a Host hit's load-back — only the
   reserve pages appended beyond the imaged shape are listed in
   `plan.pages_to_zero`. The op also names the blob slot and the request's

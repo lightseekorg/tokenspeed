@@ -655,10 +655,10 @@ Perception rules per directory:
   under it (a page whose entries all left but whose successors remain is a
   *gap*), and goes with its tail hint once neither holds. An entry registered
   with no node yet (an L3 GET, a store whose Device entry left before its ACK,
-  a restore's republication) starts one without a parent. It is bookkeeping
-  kept in step with the indexes: no match reads it, and its walks follow
-  parent pointers and insertion-ordered lists, never the map, so mirrored
-  ranks agree.
+  a restore's republication) starts one without a parent. It is kept in step
+  with the indexes: no match reads it, evicting by segments selects along it
+  (`AdmissionPlanner`), and its walks follow parent pointers and
+  insertion-ordered lists, never the map, so mirrored ranks agree.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
@@ -1078,13 +1078,58 @@ time, skipping epochs whose entries are all protected or already listed for
 request reclaim. Selection compares the next candidate from each group with
 the next request-reclaimable candidate using one policy: LRU access epoch,
 then tier (uncached request-only block → probationary boundary → established
-boundary → suffix of a closed prefix). Finally, walk the selected blocks in
-reverse and restore every block that is not strictly required, yielding a
-minimal eviction set in `victims`. The shadow occupancy is a class of its own
+boundary → suffix of a closed prefix). Each candidate expands into a
+*victim set* that is selected, restored and evicted whole. Finally, walk the
+selected sets in reverse and restore every set that is not strictly
+required, yielding a minimal eviction plan in `victims`; `Admit` evicts set
+by set, oldest first, and counts the request's own released slots apart
+(`DeviceEvictionStats::request_reclaim`). The shadow occupancy is a class of its own
 (`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
 empty parents, the occupants left in each parent a victim leaves — with the
 pool's own fit formula, so a planner on any pool the coordinator registered
 its groups in tries victims the same way.
+
+A victim set is the candidate block alone unless the coordinator evicts by
+*segments* (`write_back_evictions`, the Host write-back policy). Then the set
+follows the `BoundaryTree`, so the Device's coverage stays closed from the
+root — no Device page outlives its parent — and what leaves is a checkpoint
+boundary with the pages only it depends on, which can be written back:
+
+* a request's released slots take the other released slots at their hash
+  (and, at a tail, the tail's other unpinned blocks); a sliding window's block,
+  or a block with no tree node, leaves alone;
+* a page or checkpoint more than one Device checkpoint boundary depends on is a
+  shared page: its checkpoint (a *nested* checkpoint) leaves alone with every
+  State group's at its hash, its other blocks wait for the last checkpoint
+  boundary under them (below);
+* otherwise the set is a *segment*: from the candidate's boundary, climb while
+  the Device holds the parent, it serves no other Device checkpoint boundary and
+  none of its blocks is in use, a prefix hit this admission keeps, or a released
+  slot; then take every Device block of that subtree, deepest boundary first and
+  a boundary's checkpoints before its other blocks. A block under the
+  candidate's own boundary counts as a stranded suffix
+  (`DeviceEvictionStats::stranded_suffix`). One block in use anywhere in the
+  subtree passes the whole set over, never a part of it; a branch of the
+  subtree without such a block may still leave as a set of its own.
+
+The climb reads the real checkpoint-boundary counts, not the shadow's, so two
+sibling segments chosen in one plan leave their shared pages on the Device for
+later. Only when the candidates run out before the demand fits are the shared
+pages tried again, oldest first, counting just the checkpoint boundaries no
+selected set takes whole: a page only leaving checkpoint boundaries depend on
+then leaves with everything under it, so shared pages never stall an admission
+that the segments under them, taken whole, would fund. A set that contains an
+earlier one takes it in whole, each block keeping the reason it was chosen for;
+sets of one plan are therefore disjoint, and the restore pass returns or keeps
+each one whole.
+
+A restore of a retracted request (`scheduler.md` §4) protects the blocks it
+claims like prefix hits. Under segment eviction a set holding one never
+leaves, so the claims can pin the only cache there is to evict: the
+request's own pages above a page it claims, or its own checkpoint beside
+one. When they leave no plan, the restore plans again claiming nothing;
+every imaged slot is a fresh copy, and the request's own cache leaves by
+segments like any other.
 
 Each cache group uses a non-owning cursor over its tier's eviction index.
 It advances continuously, skips fully pinned epochs, and returns complete

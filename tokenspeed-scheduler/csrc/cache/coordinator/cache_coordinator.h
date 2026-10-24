@@ -71,15 +71,19 @@ public:
     using CacheMutationSink = std::function<void(const CacheKey&, CacheMutation)>;
 
     // The Host pool is available to explicit tier operations. Streaming controls
-    // whether ordinary Device prefix publication also feeds the Host tier. The
+    // whether ordinary Device prefix publication also feeds the Host tier;
+    // write_back_evictions whether an admission evicts Device cache by
+    // segments, so what leaves can be written back (the Host write-back policy;
+    // it needs a Host pool and excludes streaming). The
     // snapshot pool holds retracted requests' private KV images (Snapshot /
     // Restore); nullptr means the engine never retracts. enable_l3_storage,
-    // host_pool, snapshot_pool and stream_device_cache_to_host have no
-    // defaults: a shorter call would convert a pool pointer to bool and
-    // silently disable a tier instead of failing to compile.
+    // host_pool, snapshot_pool, stream_device_cache_to_host and
+    // write_back_evictions have no defaults: a shorter call would convert a
+    // pool pointer to bool and silently disable a tier instead of failing to
+    // compile.
     CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                      bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
-                     bool stream_device_cache_to_host);
+                     bool stream_device_cache_to_host, bool write_back_evictions);
     std::int32_t NumGroups() const { return static_cast<std::int32_t>(groups_.size()); }
 
     std::int32_t PrefixGranularity() const noexcept { return prefix_granularity_; }
@@ -483,6 +487,12 @@ public:
     struct DeviceEvictionStats {
         // An admission's planned victims.
         DeviceEvictionCounts admission;
+        // The slots the admitted request itself releases at this step (its
+        // State input, its expired window blocks) and what they take along.
+        DeviceEvictionCounts request_reclaim;
+        // The blocks a segment takes from under its chosen victim so no Device
+        // page outlives its parent; only when evicting by segments.
+        DeviceEvictionCounts stranded_suffix;
         // A restore's planned victims.
         DeviceEvictionCounts restore;
         // ClearDeviceCache.
@@ -543,6 +553,16 @@ public:
             }
         }
     }
+    // One entry a BoundaryTree node holds on a tier: in use when anything
+    // beside the index holds its block.
+    struct NodeEntry {
+        std::uint32_t group_id{0};
+        CacheBlockLocation location;
+        bool in_use{false};
+    };
+    // The entries `pool`'s tier holds for a node's keys (ForEachBoundaryKey),
+    // State checkpoints first.
+    std::vector<NodeEntry> NodeEntries(const BlockPool& pool, const BoundaryTree::Node& node) const;
 
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped.
@@ -706,10 +726,12 @@ private:
     // under `reason`. A companion still pinned elsewhere stays.
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                           DeviceEvictionCounts DeviceEvictionStats::*reason);
-    // Device eviction of one entry without the tail cascade; the cascade
-    // calls it for the companions of the block that left.
-    bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                               DeviceEvictionCounts DeviceEvictionStats::*reason);
+    // Device eviction of one entry without its cascade, the one place a
+    // Device entry leaves the index: it reports and counts the eviction and
+    // syncs the entry's tree node. Returns the key that left, nullopt when the
+    // entry is pinned or gone.
+    std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                                  DeviceEvictionCounts DeviceEvictionStats::*reason);
     // Evicts an unpinned Host entry and, for a State checkpoint, the other
     // State groups' unpinned entries at its hash. Each entry that left counts
     // under host_evictions_.*reason, as device_resident too when the Device
@@ -758,6 +780,10 @@ private:
     // Request-private retraction images: never prefix-indexed, never evicted.
     BlockPool* snapshot_pool_{nullptr};
     bool stream_device_cache_to_host_{false};
+    // An admission evicts Device cache by segments: a checkpoint boundary with
+    // the pages only it depends on and everything under them, so the Device's
+    // coverage stays closed from the root.
+    bool write_back_evictions_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
     std::int32_t replay_window_tokens_{0};
@@ -772,8 +798,8 @@ private:
     std::vector<HostParentCandidate> host_parent_candidates_;
     std::vector<std::int32_t> host_touched_parents_;
     TailTable tails_;
-    // How the boundaries either tier indexes chain, in step with the indexes
-    // (bookkeeping: no match or eviction reads it).
+    // The tree of the boundaries either tier indexes, in step with the indexes.
+    // No match reads it; evicting by segments selects along it.
     BoundaryTree boundary_tree_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
@@ -793,5 +819,5 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec);
 // domain P while each group may use a smaller cache-page token count.
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
-                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host);
+                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host, bool write_back_evictions);
 }  // namespace tokenspeed

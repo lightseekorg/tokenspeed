@@ -41,15 +41,19 @@ namespace tokenspeed {
 
 CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t prefix_granularity, BlockPool& pool,
                                    bool enable_l3_storage, BlockPool* host_pool, BlockPool* snapshot_pool,
-                                   bool stream_device_cache_to_host)
+                                   bool stream_device_cache_to_host, bool write_back_evictions)
     : groups_{std::move(groups)},
       pool_{pool},
       host_pool_{host_pool},
       snapshot_pool_{snapshot_pool},
       stream_device_cache_to_host_{stream_device_cache_to_host && host_pool != nullptr},
+      write_back_evictions_{write_back_evictions},
       enable_l3_storage_{enable_l3_storage && host_pool != nullptr},
       prefix_granularity_{prefix_granularity} {
     _assert(prefix_granularity_ > 0, "coordinator needs positive prefix_granularity");
+    _assert(!write_back_evictions_ || host_pool_ != nullptr, "writing evictions back needs a Host pool");
+    _assert(!(stream_device_cache_to_host_ && write_back_evictions_),
+            "the Host tier is fed by publication or by eviction, not both");
     geometry_.reserve(groups_.size());
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         _assert(groups_[i].Id() == static_cast<std::uint32_t>(i), "cache group id must equal its group index");
@@ -221,6 +225,20 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
         return BoundaryResidency::kNone;
     }
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
+}
+
+std::vector<CacheCoordinator::NodeEntry> CacheCoordinator::NodeEntries(const BlockPool& pool,
+                                                                       const BoundaryTree::Node& node) const {
+    std::vector<NodeEntry> entries;
+    ForEachBoundaryKey(CacheKey{.content_hash = *node.hash}, node.tail_tokens, [&](std::size_t i, const CacheKey& key) {
+        // Find's reference is the second when only the index holds the block.
+        if (const CacheBlockRef block = groups_[i].Index().Find(pool, key)) {
+            entries.push_back(NodeEntry{
+                .group_id = groups_[i].Id(), .location = block->Location(), .in_use = block.use_count() != 2});
+        }
+    });
+    std::ranges::stable_partition(entries, [&](const NodeEntry& entry) { return GroupIsState(entry.group_id); });
+    return entries;
 }
 
 std::vector<CacheKey> CacheCoordinator::keysForGroup(std::span<const std::string> content_hashes,
@@ -1418,11 +1436,11 @@ CacheBlockRef CacheCoordinator::FindHostCachedBlock(const CacheKey& key) const {
     return groups_[key.group_id].Index().Find(*host_pool_, key);
 }
 
-bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                             DeviceEvictionCounts DeviceEvictionStats::*reason) {
+std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                                                DeviceEvictionCounts DeviceEvictionStats::*reason) {
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
     if (!removed) {
-        return false;
+        return removed;
     }
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
@@ -1434,22 +1452,16 @@ bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockL
         ++evicted.host_resident;
     }
     syncTreeNode(removed->content_hash);
-    return true;
+    return removed;
 }
 
 bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                                         DeviceEvictionCounts DeviceEvictionStats::*reason) {
-    std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
+    // Its own entry first: when that was the hash's last entry on either tier
+    // syncTreeNode drops the tail hint too, and the cascade finds nothing.
+    const std::optional<CacheKey> removed = evictCachedBlockAlone(group_id, location, reason);
     if (!removed) {
         return false;
-    }
-    if (cache_mutation_sink_) {
-        cache_mutation_sink_(*removed, CacheMutation::kRemoved);
-    }
-    DeviceEvictionCounts& evicted = device_evictions_.*reason;
-    ++evicted.blocks;
-    if (host_pool_ != nullptr && groups_[group_id].Index().Contains(*host_pool_, *removed)) {
-        ++evicted.host_resident;
     }
     if (const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(removed->content_hash)) {
         evictTailEntries(removed->content_hash, *tail_tokens, reason);
@@ -1468,7 +1480,6 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
             }
         });
     }
-    syncTreeNode(removed->content_hash);
     return true;
 }
 
@@ -2035,7 +2046,8 @@ std::unique_ptr<PrefixMatcher> MakePrefixMatcher(const CacheGroupSpec& spec) {
 
 CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int32_t prefix_granularity,
                                  BlockPool& pool, bool enable_l3_storage, BlockPool* host_pool,
-                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host) {
+                                 BlockPool* snapshot_pool, bool stream_device_cache_to_host,
+                                 bool write_back_evictions) {
     _assert(!specs.empty(), "MakeCoordinator requires at least one spec");
     _assert(prefix_granularity > 0, "prefix_granularity must be > 0");
     _assert(specs.size() <= static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max()),
@@ -2055,8 +2067,9 @@ CacheCoordinator MakeCoordinator(std::span<const CacheGroupSpec> specs, std::int
         auto allocator = std::make_unique<GroupAllocator>(spec.cache_blocks_per_lcm_block, group_id, spec.shard_count);
         groups.emplace_back(spec, std::move(allocator), MakePrefixMatcher(spec));
     }
-    return CacheCoordinator{std::move(groups), prefix_granularity,         pool, enable_l3_storage, host_pool,
-                            snapshot_pool,     stream_device_cache_to_host};
+    return CacheCoordinator{std::move(groups),           prefix_granularity,  pool,
+                            enable_l3_storage,           host_pool,           snapshot_pool,
+                            stream_device_cache_to_host, write_back_evictions};
 }
 
 CacheBlockRef CacheCoordinator::AcquireHostCachedBlock(const CacheKey& key) {

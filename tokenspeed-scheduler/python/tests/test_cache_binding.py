@@ -22,7 +22,15 @@
 
 import pytest
 import tokenspeed_scheduler as ts
-from conftest import K3_GROUP_IDS, _advance, _finish, _make_k3_config, _spec
+from conftest import (
+    K3_GROUP_IDS,
+    PAGE,
+    _advance,
+    _find_forward_op,
+    _finish,
+    _make_k3_config,
+    _spec,
+)
 from tokenspeed_scheduler import Cache, ExecutionEvent
 
 
@@ -191,6 +199,41 @@ def test_host_write_policy_round_trips():
     cfg.host_write_policy = policy.WriteThrough
     assert cfg.host_write_policy == policy.WriteThrough
     assert ts.Scheduler(cfg).host_pool_total_blocks() == 8
+
+
+def test_device_evictions_count_a_requests_own_reclaim_apart():
+    """K3 shape on twelve Device parents, a block each, a page per chunk. a
+    publishes two pages and its checkpoint at 4 (five parents); b resumes
+    there, its first chunk takes four parents more. b's second chunk rotates
+    a's checkpoint out of slot 0 and needs four parents with three free: its
+    own released checkpoint funds the fourth, counted as the request's
+    reclaim, not as an admission's victim."""
+    cfg = _make_k3_config()
+    cfg.num_device_pages = 13  # page 0 = null sentinel, 12 usable parents
+    cfg.max_scheduled_tokens = PAGE
+    for group in cfg.cache_groups:
+        group.total_pages = cfg.num_device_pages
+    scheduler = ts.Scheduler(cfg)
+    a = list(range(1, 2 * PAGE + 1))
+    for rid, tokens in (("a", a), ("b", a + list(range(50, 50 + 2 * PAGE)))):
+        spec = _spec(rid, tokens)
+        spec.max_new_tokens = 1
+        scheduler.submit_requests([spec])
+        computed = 0
+        while computed < len(tokens):
+            batch = _find_forward_op(scheduler.next_execution_plan())
+            assert list(batch.request_ids) == [rid]
+            computed = batch.extend_prefix_lens[0] + batch.input_lengths[0]
+            _advance(scheduler, rid, [101] if computed == len(tokens) else [])
+        _finish(scheduler, rid)
+
+    stats = scheduler.host_cache_stats()
+    assert stats.prefix_hits.device_hit_tokens == 2 * PAGE  # b's, at a's checkpoint
+    evictions = stats.device_evictions
+    # Each State group's released checkpoint at 4.
+    assert evictions.request_reclaim.blocks == 3
+    assert evictions.admission.blocks == 0
+    assert evictions.stranded_suffix.blocks == 0
 
 
 def test_host_cache_stats_count_publication_and_finish_stores():

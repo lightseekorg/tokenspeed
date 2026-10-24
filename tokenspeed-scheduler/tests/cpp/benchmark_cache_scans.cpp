@@ -24,13 +24,16 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
 #include <string>
 #include <vector>
 
 #include "cache/core/block_pool.h"
 #include "cache/core/block_table.h"
 #include "cache/coordinator/cache_coordinator.h"
+#include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_index.h"
+#include "cache_test_access.h"
 
 namespace tokenspeed {
 namespace {
@@ -177,7 +180,7 @@ CacheCoordinator MakeAdmissionCoordinator(BlockPool& pool) {
     };
     return MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                            /*snapshot_pool=*/nullptr,
-                           /*stream_device_cache_to_host=*/true);
+                           /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
 }
 
 void FillAdmissionCache(CacheCoordinator& coordinator, BlockPool& pool, std::int32_t pool_size) {
@@ -279,9 +282,9 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
-    CacheCoordinator coordinator =
-        MakeCoordinator(specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, &host_pool,
-                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+    CacheCoordinator coordinator = MakeCoordinator(
+        specs, /*prefix_granularity=*/4, pool, /*enable_l3_storage=*/false, &host_pool,
+        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true, /*write_back_evictions=*/false);
     for (std::int32_t i = 0; i < pool_size; ++i) {
         CacheBlockRef block = host_pool.AcquireBlock(/*group_id=*/0);
         if (!block) {
@@ -320,7 +323,8 @@ void MeasureSparseHostBlockAcquisition(std::int32_t pool_size, std::int32_t iter
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool,
-                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
+                                                   /*write_back_evictions=*/false);
     std::vector<CacheBlockRef> pins = host_pool.AcquireBlocks(0, pool_size - 1);
     CacheBlockRef cached = host_pool.AcquireBlock(1);
     coordinator.CacheHostBlock(cached, CacheKey{.group_id = 1, .content_hash = "initial", .page_offset = 0});
@@ -347,7 +351,8 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
     };
     CacheCoordinator coordinator = MakeCoordinator(specs, 4, pool, /*enable_l3_storage=*/false, &host_pool,
-                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true);
+                                                   /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/true,
+                                                   /*write_back_evictions=*/false);
     for (std::int32_t i = 0; i < pool_size; ++i) {
         const auto group_id = static_cast<std::uint32_t>(i % 2);
         CacheBlockRef block = host_pool.AcquireBlock(group_id);
@@ -369,6 +374,189 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
         }
         return static_cast<std::uint64_t>(batch.stats.allocated);
     });
+}
+
+// The K3 geometry with one session of `pages` pages that the Device holds
+// with no checkpoint under it, the whole session on the Host: what a request
+// leaves behind that resumed on the session from the Host and was aborted.
+// With every free slot held, an admission needs every page. No segment
+// climbs, so the pages leave as candidates of their own, deepest first, each
+// set taking the one under it over. Only Admit is timed; between iterations
+// the pages are published on the Device again.
+void MeasureSessionWithoutDeviceCheckpointAdmission(std::int32_t pages, std::int32_t iterations) {
+    constexpr std::int32_t kParents = 64;
+    constexpr std::int32_t kFullPacking = 89;
+    constexpr std::int32_t kP = 4;
+    BlockPool pool(kParents, {kFullPacking, 1, 1, 1});
+    BlockPool host_pool(kParents, {kFullPacking, 1, 1, 1});
+    const std::array specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = kFullPacking, .block_granularity = kP},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    std::vector<std::string> hashes;
+    for (std::int32_t page = 0; page < pages; ++page) {
+        const std::array<std::int32_t, 2> tokens{0, page};
+        hashes.push_back(HashPrefixPage(tokens, hashes.empty() ? std::string{} : hashes.back()));
+    }
+    const auto publish = [&](bool publish_state) {
+        std::vector<BlockTable> tables(4);
+        if (!AdmitForTest(coordinator, tables, pages * kP)) {
+            std::abort();
+        }
+        CacheCompletedBlocksForTest(coordinator, tables, hashes,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, pages * kP, CacheBoundaryKind::kEndpoint,
+                                    /*stream_completed_to_host=*/false, publish_state);
+        coordinator.Free(tables);
+    };
+    publish(/*publish_state=*/true);
+    // The Host holds every page and the checkpoint; the Device's checkpoint
+    // leaves, taking the other State groups' along.
+    std::vector<CacheKey> host_keys;
+    for (const std::string& hash : hashes) {
+        host_keys.push_back(CacheKey{.group_id = 0, .content_hash = hash});
+    }
+    for (std::uint32_t group = 1; group < specs.size(); ++group) {
+        host_keys.push_back(CacheKey{.group_id = group, .content_hash = hashes.back()});
+    }
+    for (const CacheKey& key : host_keys) {
+        CacheBlockRef block = host_pool.AcquireBlock(key.group_id);
+        coordinator.CacheHostBlock(block, key);
+    }
+    const std::optional<CacheBlockLocation> checkpoint = CacheCoordinatorTestAccess::DeviceLocationOf(
+        coordinator, 1, CacheKey{.group_id = 1, .content_hash = hashes.back()});
+    if (!checkpoint || !CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, 1, *checkpoint)) {
+        std::abort();
+    }
+    std::vector<double> timings;
+    timings.reserve(static_cast<std::size_t>(iterations));
+    for (std::int32_t iteration = 0; iteration < iterations; ++iteration) {
+        std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, pool.NumFreeSlots(0));
+        for (CacheBlockRef& block : pool.AcquireBlocks(/*group_id=*/1, pool.NumEmptyLcmBlocks())) {
+            held.push_back(std::move(block));
+        }
+        std::vector<BlockTable> tables(4);
+        const auto begin = std::chrono::steady_clock::now();
+        const std::optional<CacheCoordinator::AdmissionResult> result = AdmitForTest(
+            coordinator, tables, coordinator.ProbePrefix({}), GroupDemand{.extent = DenseGrowth{pages * kP}},
+            RequestProgress{}, StateStep{.kind = StateStep::Kind::kKeep});
+        const auto end = std::chrono::steady_clock::now();
+        if (!result) {
+            std::abort();
+        }
+        timings.push_back(std::chrono::duration<double, std::nano>(end - begin).count());
+        coordinator.Free(tables);
+        held.clear();
+        if (coordinator.GroupPrefixIndex(0).Contains(pool, CacheKey{.group_id = 0, .content_hash = hashes.front()})) {
+            std::abort();
+        }
+        publish(/*publish_state=*/false);
+    }
+    std::ranges::sort(timings);
+    std::cout << "admit_session_without_device_checkpoint_k3_shape," << kParents << ',' << pages << ',' << iterations
+              << ',' << timings[timings.size() / 2] << ",p99=" << timings[timings.size() * 99 / 100] << '\n';
+}
+
+// The K3 geometry: 532 Device parents, a Full group of 89 blocks per parent
+// (one per page) and three State groups (one per parent), filled with
+// sessions of 150 pages chained by SHA-256 page hashes (64 hex digits, as in
+// production), each ending in its checkpoint and published by its own
+// request. An admission whose Full demand needs `segments` sessions'
+// worth of capacity beyond six spare parents (its State tables kept) evicts
+// that many segments when evicting by segments, or the same demand block by
+// block. Only Admit is timed; between iterations the evicted sessions are
+// published again, so the oldest ones left go next, and the free capacity but
+// the six spare parents is held again.
+void MeasureSegmentAdmission(bool write_back_evictions, std::int32_t segments, std::int32_t iterations) {
+    constexpr std::int32_t kParents = 532;
+    constexpr std::int32_t kFullPacking = 89;
+    constexpr std::int32_t kPages = 150;
+    constexpr std::int32_t kP = 4;
+    constexpr std::int32_t kSpareParents = 6;
+    BlockPool pool(kParents, {kFullPacking, 1, 1, 1});
+    BlockPool host_pool(/*num_lcm_blocks=*/1, {kFullPacking, 1, 1, 1});
+    const std::array specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = kFullPacking, .block_granularity = kP},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, write_back_evictions);
+    std::vector<std::vector<std::string>> sessions;
+    const auto publish = [&](const std::vector<std::string>& hashes) {
+        std::vector<BlockTable> tables(4);
+        if (!AdmitForTest(coordinator, tables, kPages * kP)) {
+            std::abort();
+        }
+        CacheCompletedBlocksForTest(coordinator, tables, hashes,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, kPages * kP, CacheBoundaryKind::kEndpoint,
+                                    /*stream_completed_to_host=*/false, /*publish_state=*/true);
+        coordinator.Free(tables);
+    };
+    // A fresh session takes six State parents and two Full ones while it is
+    // admitted.
+    while (pool.NumEmptyLcmBlocks() >= kSpareParents + 6) {
+        std::vector<std::string> hashes;
+        for (std::int32_t page = 0; page < kPages; ++page) {
+            const std::array<std::int32_t, 2> tokens{static_cast<std::int32_t>(sessions.size()), page};
+            hashes.push_back(HashPrefixPage(tokens, hashes.empty() ? std::string{} : hashes.back()));
+        }
+        publish(hashes);
+        sessions.push_back(std::move(hashes));
+    }
+    const auto evicted = [&](const std::vector<std::string>& hashes) {
+        return !coordinator.GroupPrefixIndex(0).Contains(pool,
+                                                         CacheKey{.group_id = 0, .content_hash = hashes.back()}) ||
+               !coordinator.GroupPrefixIndex(1).Contains(pool, CacheKey{.group_id = 1, .content_hash = hashes.back()});
+    };
+    // A segment frees its 150 Full blocks and three State parents.
+    const std::int32_t demand_blocks = kSpareParents * kFullPacking + (segments - 1) * (kPages + 3 * kFullPacking) + 1;
+    std::vector<double> timings;
+    timings.reserve(static_cast<std::size_t>(iterations));
+    std::uint64_t evicted_sessions = 0;
+    for (std::int32_t iteration = 0; iteration < iterations; ++iteration) {
+        std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, pool.NumFreeSlots(0));
+        for (CacheBlockRef& block : pool.AcquireBlocks(/*group_id=*/1, pool.NumEmptyLcmBlocks() - kSpareParents)) {
+            held.push_back(std::move(block));
+        }
+        std::vector<BlockTable> tables(4);
+        const auto begin = std::chrono::steady_clock::now();
+        const std::optional<CacheCoordinator::AdmissionResult> result = AdmitForTest(
+            coordinator, tables, coordinator.ProbePrefix({}), GroupDemand{.extent = DenseGrowth{demand_blocks * kP}},
+            RequestProgress{}, StateStep{.kind = StateStep::Kind::kKeep});
+        const auto end = std::chrono::steady_clock::now();
+        if (!result) {
+            std::abort();
+        }
+        timings.push_back(std::chrono::duration<double, std::nano>(end - begin).count());
+        coordinator.Free(tables);
+        held.clear();
+        std::int32_t gone = 0;
+        for (const std::vector<std::string>& hashes : sessions) {
+            if (evicted(hashes)) {
+                publish(hashes);
+                ++gone;
+            }
+        }
+        if (write_back_evictions && gone != segments) {
+            std::abort();
+        }
+        evicted_sessions += static_cast<std::uint64_t>(gone);
+    }
+    std::ranges::sort(timings);
+    std::cout << (write_back_evictions ? "admit_by_segments_k3_shape" : "admit_by_blocks_k3_shape") << ',' << kParents
+              << ',' << segments << ',' << iterations << ',' << timings[timings.size() / 2] << ',' << evicted_sessions
+              << '\n';
 }
 
 }  // namespace
@@ -393,6 +581,14 @@ int main() {
         tokenspeed::MeasureHostBlockAcquisition(pool_size, iterations);
         tokenspeed::MeasureSparseHostBlockAcquisition(pool_size, iterations);
         tokenspeed::MeasureMultiGroupHostBlockAcquisition(pool_size, iterations);
+    }
+    // Sessions of 24K and 157K tokens at 128 tokens a page.
+    for (const std::int32_t pages : {190, 1227}) {
+        tokenspeed::MeasureSessionWithoutDeviceCheckpointAdmission(pages, /*iterations=*/pages < 1000 ? 100 : 20);
+    }
+    for (const std::int32_t segments : {1, 2, 3}) {
+        tokenspeed::MeasureSegmentAdmission(/*write_back_evictions=*/true, segments, /*iterations=*/200);
+        tokenspeed::MeasureSegmentAdmission(/*write_back_evictions=*/false, segments, /*iterations=*/200);
     }
     return 0;
 }
