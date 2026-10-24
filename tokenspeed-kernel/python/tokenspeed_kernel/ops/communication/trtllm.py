@@ -235,8 +235,15 @@ if current_platform().is_nvidia:
         that kills the next allocation. So this must be decided before trying,
         not caught afterwards.
         """
-        import socket
+        from tokenspeed_kernel.ops.communication.fabric import host_identity
 
+        # Pods on different machines can share a hostname, and containers on
+        # one machine without a shared IPC namespace cannot open each other's
+        # IPC handles, so the key is (host, IPC namespace).
+        try:
+            ipc_namespace = os.stat("/proc/self/ns/ipc").st_ino
+        except OSError:
+            ipc_namespace = 0
         try:
             world = (
                 dist.get_world_size(group)
@@ -244,19 +251,20 @@ if current_platform().is_nvidia:
                 else dist.get_world_size()
             )
             names = [None] * world
-            dist.all_gather_object(names, socket.gethostname(), group=group)
+            dist.all_gather_object(names, (host_identity(), ipc_namespace), group=group)
             return len(set(names)) > 1
         except Exception:  # noqa: BLE001 -- no distributed context: single node
             return False
 
     def group_spans_nodes(group: dist.ProcessGroup) -> bool:
-        """Whether the group's ranks live on more than one host.
+        """Whether the group's ranks live on more than one CUDA-IPC domain.
 
         Args:
-            group: process group to inspect; collective (hostname gather).
+            group: process group to inspect; collective (host identity gather).
 
         Returns:
-            True when at least two distinct hosts are present.
+            True when at least two distinct (host, IPC namespace) pairs are
+            present.
         """
         return _group_spans_nodes(group)
 
