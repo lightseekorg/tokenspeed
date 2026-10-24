@@ -183,7 +183,7 @@ def test_evalscope_configs_use_expected_dataset_sources():
             "b200-2gpu",
             "openai/gpt-oss-120b",
             "64",
-            "per-commit",
+            "post-submit",
         ),
         # MI35x has hit GPU memory-access faults at eval batch size 64.
         (

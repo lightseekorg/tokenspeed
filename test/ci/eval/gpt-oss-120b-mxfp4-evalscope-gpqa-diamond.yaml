@@ -5,7 +5,7 @@ workflow_stage: model-test
 # One extra server+eval attempt covers remaining infra crashes.
 retries: 1
 triggers:
-  - per-commit
+  - post-submit
   - manual
 runner:
   labels:
