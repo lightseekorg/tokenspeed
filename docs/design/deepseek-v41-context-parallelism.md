@@ -31,9 +31,9 @@ These are operator-local partitions. Hidden states, Engram, MoE, compressor
 work, and DSpark auxiliary states retain their existing layouts. Generic
 `--query-context-parallel-size` selects the separate model-wide QCP layout.
 V4.1 model-wide QCP currently supports eager, text-only PD prefill with
-KVP=1 and replicated attention heads. It preserves local token ownership
-through Engram, MoE and CED narrowing, gathers projected keys for cache
-publication, and gathers only sampled hidden rows at the output. It rejects
+replicated attention heads and either KVP=1 or KVP=QCP. It preserves local
+token ownership through Engram, MoE and CED narrowing, gathers projected keys
+for cache publication, and gathers only sampled hidden rows at the output. It rejects
 PP, mixed batches and prefill graphs. With DSpark, it gathers the retained
 CED hidden taps in rank order before the existing drafter writes replicated
 SWA-window fields. Empty owners join the gather; cache coordinates remain
@@ -47,6 +47,12 @@ ownership. Indexer K shares the ownership of its global KV group. Writes
 translate virtual slots to local slots and mask nonowners; logical selections
 remain valid across all owners. Prefix matching, allocation, transfer and
 eviction continue to use LCM cache groups.
+
+Model-wide QCP can use the same owner-local cache writes and per-request
+history materialization. Query ownership does not change KV page ownership;
+all ranks gather the same request history, including ranks with no local
+queries after CED narrowing. Each query owner computes attention against the
+complete gathered history, so prefill does not merge partial attention by LSE.
 
 SWA, compressor tails and DSpark state remain replicated. Prefill materializes
 one request's packed history at a time. Communication copies complete packed
@@ -100,6 +106,26 @@ requires matching KVP/DCP sizes for aggregated and PD decode engines, and
 separate prefill/decode rounds for aggregated DCP. Aggregate QCP can be enabled with
 either replicated or sharded KV. V4.1-specific restrictions are listed below.
 
+For model-wide PD prefill, use replicated heads and optionally shard the
+global cache over the query group:
+
+```text
+--query-context-parallel-size 8
+--kv-parallel-size 8
+--decode-context-parallel-size 1
+--disable-prefill-graph
+--disaggregation-mode prefill
+--disaggregation-layerwise-interval 0
+```
+
+KVP must be 1 or equal to QCP. This combination reuses the existing history
+gather path. QCP8/KVP8 prefill feeding KVP8/DCP8 decode has passed a
+five-request smoke with DSpark, decode CUDA Graph, chunked prompts and prefix
+hits. A paired 128-question LongBench-v2 run with DSpark and decode CUDA
+Graph scored 78/128 for the CP-disabled baseline, 80/128 for QCP8/KVP1,
+and 78/128 for QCP8/KVP8 prefill with KVP8/DCP8 decode. This limited
+sample does not establish statistical or token-level equivalence.
+
 PD prefill can use KVP with DCP size 1 and
 `--disaggregation-layerwise-interval 0`. V4.1 PD decode with KVP uses the existing page-owner transfer planning
 and DCP decode path. Eager PD KVP decode has smoke coverage. PD DSpark uses the same
@@ -117,6 +143,9 @@ continued repeating after the correct answer instead of stopping. Paired
 speculation/graph accuracy checks remain required.
 
 ## Validation and tradeoffs
+
+A four-GPU reduced-model test compares QCP4/KVP1 and QCP4/KVP4 sampled
+hidden outputs exactly, including empty query owners and CED narrowing.
 
 Runtime tests cover query ordering, head exchange, packed-page transport,
 cache ownership, metadata refresh and selection reuse. Kernel tests compare
