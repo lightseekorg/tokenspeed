@@ -493,21 +493,34 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         else:
             rid_to_index = {rid: i for i, rid in enumerate(rids)}
             task_map = {asyncio.create_task(gen.__anext__()): gen for gen in generators}
-            while task_map:
-                done, _ = await asyncio.wait(
-                    task_map.keys(), return_when=asyncio.FIRST_COMPLETED
-                )
+            try:
+                while task_map:
+                    done, _ = await asyncio.wait(
+                        task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
 
-                for task in done:
-                    gen = task_map.pop(task)
-                    try:
-                        result = task.result()
-                        result["index"] = rid_to_index[result["meta_info"]["id"]]
-                        yield result
-                        new_task = asyncio.create_task(gen.__anext__())
-                        task_map[new_task] = gen
-                    except StopAsyncIteration:
-                        pass
+                    for task in done:
+                        gen = task_map.pop(task)
+                        try:
+                            result = task.result()
+                            result["index"] = rid_to_index[result["meta_info"]["id"]]
+                            yield result
+                            new_task = asyncio.create_task(gen.__anext__())
+                            task_map[new_task] = gen
+                        except StopAsyncIteration:
+                            pass
+            finally:
+                # ``asyncio.wait`` does not cancel the tasks it waits on, so
+                # a consumer that is cancelled or stops iterating (client
+                # disconnect, a failed sub-request) would leave the other
+                # sub-requests running. Cancel the pending tasks, then close
+                # every generator so each unfinished one aborts its request,
+                # as ``_wait_one_response`` does for a single request.
+                for task in task_map:
+                    task.cancel()
+                await asyncio.gather(*task_map, return_exceptions=True)
+                for gen in generators:
+                    await gen.aclose()
 
     def abort_request(self, rid: str):
         if rid not in self.rid_to_state:
