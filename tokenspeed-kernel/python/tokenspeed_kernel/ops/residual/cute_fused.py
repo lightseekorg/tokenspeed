@@ -33,6 +33,7 @@ from tokenspeed_kernel.platform import (
     pdl_enabled,
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
+from tokenspeed_kernel.selection import resolve_kernel_override
 from tokenspeed_kernel.signature import format_signatures
 
 try:
@@ -54,6 +55,7 @@ _PROBE_SPLIT_K = 16
 _MAX_OVERRIDE_TOKENS = 1024
 _PLANS = {}
 _CAPACITIES = {}
+_WARMED = set()
 
 
 @cache
@@ -178,6 +180,98 @@ def _tactic(rows: int, projection_rows: int):
     if rows <= 192:
         return 4, 64, 32, 1, 1, 5, 32
     return 4, 128, 32, 1, 1, 4, 32
+
+
+def warmup(
+    normalized: torch.Tensor,
+    projection_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+    *,
+    projection_rows: int,
+    projection_scale: float,
+    weights_independent: bool,
+    override: str | None,
+    solution: str | None,
+) -> None:
+    """Warm eligible fused mix tactics, including tails and scheduling rounds.
+
+    Args:
+        normalized: Prototype supplying device, dtype and residual width.
+        projection_weight: Loaded down/inject projection weight.
+        up_weight: Loaded mix-up projection weight.
+        hc_count: Number of residual branches.
+        hidden_size: Width of each branch.
+        lowrank: Rank of the mix gate bottleneck.
+        projection_rows: Logical down/inject rows before storage padding.
+        projection_scale: Scale applied to the down/inject projection.
+        weights_independent: Whether weights are ready before the PDL wait.
+        override: Call-site kernel override. Global overrides follow dispatch
+            precedence for eligibility and the row bound.
+        solution: Explicit solution choice, preserved during selection.
+
+    Returns:
+        None. Eligible plans and workspaces remain cached for serving.
+    """
+    effective_override = resolve_kernel_override(
+        "residual", "hyperconnection_mix", override
+    )
+    if (
+        effective_override not in (None, "cute_fused", "cute_fused_hyperconnection_mix")
+        or (effective_override is None and solution not in (None, "cute_fused"))
+        or (hc_count, hidden_size, lowrank) != (4, 2560, 320)
+        or not weights_independent
+        or not supports_fused_hc(normalized.device)
+        or normalized.dtype not in (torch.bfloat16, torch.float16)
+    ):
+        return
+    from tokenspeed_kernel.ops.residual import select_gated_residual_mix_kernel
+
+    max_rows = 256 if effective_override is None else _MAX_OVERRIDE_TOKENS
+    key = (
+        normalized.device.index,
+        normalized.dtype,
+        projection_rows,
+        projection_scale,
+        weights_independent,
+        pdl_enabled(),
+        max_rows,
+        int(torch.cuda.current_stream(normalized.device).cuda_stream),
+    )
+    if key in _WARMED:
+        return
+    sample = normalized.new_zeros((max_rows, normalized.shape[1]))
+    selected, _ = select_gated_residual_mix_kernel(
+        sample[:1],
+        projection_weight,
+        up_weight,
+        hc_count,
+        hidden_size,
+        lowrank,
+        weights_independent=weights_independent,
+        override=override,
+        solution=solution,
+    )
+    if selected.name != "cute_fused_hyperconnection_mix":
+        return
+    # Row counts also select full/tail tiles and occupancy-dependent rounds.
+    # Walking the small supported range covers these without duplicating the
+    # cooperative scheduler's capacity calculation in a second planner.
+    for rows in range(1, max_rows + 1):
+        selected(
+            sample[:rows],
+            projection_weight,
+            up_weight,
+            hc_count,
+            hidden_size,
+            lowrank,
+            projection_rows,
+            projection_scale,
+            weights_independent,
+        )
+    _WARMED.add(key)
 
 
 if _AVAILABLE:

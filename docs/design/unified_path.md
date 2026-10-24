@@ -491,6 +491,21 @@ computes the stored width and consumes only logical columns, while CuTe gives
 TMA a logical view of that same storage. Eager and CUDA graph calls therefore
 share both the weight layout and its update semantics.
 
+Startup uses the ordinary dummy model traversal with `kernel_warmup` to
+prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
+normal dispatch overrides and scratch budgets, independently of optional
+FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
+
+CuTe QSA keeps query rows and selected-slot row strides dynamic; model
+geometry, selection budgets and launch configurations stay static. Warmup
+covers encountered static signatures, including aligned and partial stream
+top-k query groups; other variants compile on demand.
+
+PrimTS prepares native group/scheduler variants only during FlashInfer
+autotuning, retaining its runtime heuristic. Preparation uses scratch state
+independent of serving KV bindings and graph plans. Each actual geometry still
+needs an eager plan before graph capture.
+
 QSA logits scoring uses the same paged kernel for every query layout. A batch
 whose request lengths are all available on the host may shorten its compressed
 block-table view to the maximum prefix-plus-query length, rounded to the cache

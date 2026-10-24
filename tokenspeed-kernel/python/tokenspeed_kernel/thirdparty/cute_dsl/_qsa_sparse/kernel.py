@@ -97,6 +97,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
         private_tail_workers: int,
         cached_bf16_lookahead: bool,
         work_sync_threads: int,
+        prefix_in_cta: bool,
+        large_query_grid: bool,
     ):
         self.kv_splits = kv_splits
         self.bf16_smem_slots = bf16_smem_slots
@@ -152,6 +154,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
         self.private_tail_extra_warps = 0
         self.private_tail_workers = private_tail_workers
         self.work_sync_threads = work_sync_threads
+        self.prefix_in_cta = prefix_in_cta
+        self.large_query_grid = large_query_grid
         self.prefetch_private_kv = False
         self.prefetch_private_kv_warp = self.mma_kq_warp_id + 2
         self.overlap_private_tail = False
@@ -229,7 +233,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
         if cutlass.const_expr(self.leader_first):
             # Flags are immutable after the existing PDL wait. This sample
             # chooses a permutation, while each group's own flag owns reuse.
-            if prefix_shared.shape[0] > 0:
+            if cutlass.const_expr(not self.prefix_in_cta):
                 if prefix_shared[0] != 0:
                     group_count = cute.arch.grid_dim()[2] // (
                         self.query_group * kv_heads
@@ -1281,13 +1285,10 @@ class MixedInputFusedMultiHeadAttentionDecode:
             and self.bf16_async_ready
             and bf16_kv
         )
-        query_rows_bucket = 1 << max(
-            0, (self.problem_shape[0] * self.query_group - 1).bit_length()
-        )
         bucket_prefix = (
             eligible
             and self.original_heads_per_kv == 12
-            and (kv_heads == 1 or self.query_group != 2 or query_rows_bucket >= 256)
+            and (kv_heads == 1 or self.query_group != 2 or self.large_query_grid)
         )
         single_work512 = (
             eligible
@@ -1330,7 +1331,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             self.bf16_async_ready,
             _select_head_tile(self.original_heads_per_kv, bf16_kv, 1),
             (
-                original_query.shape[0],
+                None,
                 original_query.shape[1],
                 kv_heads,
                 key_cache.shape[0],
@@ -1372,6 +1373,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 or (bucket_prefix and kv_heads == 1 and self.head_tile == 48)
                 else 0
             ),
+            prefix_in_cta=self.prefix_in_cta,
+            large_query_grid=self.large_query_grid,
         )
 
     @cute.jit
@@ -1418,7 +1421,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 grid=(
                     1,
                     1,
-                    self.problem_shape[0] * self.query_group * self.problem_shape[2],
+                    original_query.shape[0] * self.problem_shape[2],
                 ),
                 block=[self.threads_per_cta, 1, 1],
                 max_number_threads=[self.threads_per_cta, 1, 1],
@@ -1428,7 +1431,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
                 use_pdl=self.enable_pdl,
             )
         else:
-            b, h_q, h_k, _, _ = self.problem_shape
+            _, h_q, h_k, _, _ = self.problem_shape
+            b = original_query.shape[0] // self.query_group
             self.decode(*work_args).launch(
                 grid=(
                     self.kv_splits,
@@ -1546,7 +1550,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
             # BF16 tiles are already in the MMA input format. Their shared
             # stages now stay owned until the corresponding MMA completes.
             self.cvt_stages = self.kv_stages
-        b, h_q, h_k, s_k, d = problem_shape
+        _, h_q, h_k, s_k, d = problem_shape
+        b = output_tensor.shape[0] // self.query_group
         h_r = h_q // h_k
         if cutlass.const_expr(self.direct_query):
             original_hr = self.original_heads_per_kv
@@ -1824,7 +1829,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             arena = utils.SmemAllocator().allocate_array(
                 cutlass.Int8, self.scratch_arena_bytes, byte_alignment=128
             )
-            if cutlass.const_expr(pair_prefix_shared.shape[0] == 0):
+            if cutlass.const_expr(self.prefix_in_cta):
                 shared_prefix = self._shared_prefix_in_cta(
                     pair_selected_slots, pair_row, arena, tid
                 )
@@ -1942,7 +1947,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     cutlass.Int8, self.scratch_arena_bytes, byte_alignment=128
                 )
             if cutlass.const_expr(self.original_heads_per_kv == 12):
-                if cutlass.const_expr(pair_prefix_shared.shape[0] == 0):
+                if cutlass.const_expr(self.prefix_in_cta):
                     shared_prefix = self._shared_prefix_in_cta(
                         pair_selected_slots,
                         pair_row,
@@ -2555,7 +2560,8 @@ class MixedInputFusedMultiHeadAttentionDecode:
         else:
             kv_splits, tiles_hr, tiles_hb = cute.arch.grid_dim()
             kv_split_idx, coord_hr, coord_hb = cute.arch.block_idx()
-        num_rows, num_q_heads, num_kv_heads, cache_slots, head_dim = self.problem_shape
+        _, num_q_heads, num_kv_heads, cache_slots, head_dim = self.problem_shape
+        num_rows = selected_slots.shape[0] // self.query_group
         heads_per_kv = num_q_heads // num_kv_heads
         head_tiles = cute.ceil_div(heads_per_kv, self.head_tile)
         row_base = (coord_hb // num_kv_heads) * self.query_rows_per_cta
@@ -2824,7 +2830,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
             row_idx = row_base + query_step
             coord_hb = row_idx * num_kv_heads + kv_head_idx
             valid_query = True
-            if cutlass.const_expr(num_rows % self.query_rows_per_cta != 0):
+            if cutlass.const_expr(self.query_rows_per_cta > 1):
                 valid_query = row_idx < num_rows
             if valid_query:
                 q_producer, q_consumer = pipeline.PipelineTmaAsync.create(
@@ -5434,7 +5440,7 @@ class MixedInputFusedMultiHeadAttentionDecode:
                     scratch[order_flag] = cutlass.Int32(warp_equal)
             cute.arch.sync_threads()
             if scratch[order_flag] != 0:
-                leader_work = self.problem_shape[0] * kv_heads
+                leader_work = selected_slots.shape[0] // self.query_group * kv_heads
                 query_row = (
                     query_work % leader_work
                 ) // kv_heads * self.query_group + query_work // leader_work

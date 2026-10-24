@@ -488,6 +488,24 @@ def gated_residual_mix(
         )
         return mixed, inject
 
+    from tokenspeed_kernel.ops.tuning import is_warming_up
+
+    if is_warming_up():
+        from tokenspeed_kernel.ops.residual.cute_fused import warmup
+
+        warmup(
+            flat,
+            projection_weight,
+            up_weight,
+            hc_count,
+            hidden_size,
+            lowrank,
+            projection_rows=projection_rows,
+            projection_scale=projection_scale,
+            weights_independent=weights_independent,
+            override=override,
+            solution=solution,
+        )
     kernel, traits = select_gated_residual_mix_kernel(
         flat,
         projection_weight,
