@@ -27,12 +27,6 @@ import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import cute, pipeline, utils
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.common import (
-    _copy_u128 as _copy_gmem_to_smem_u128,
-)
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.common import (
-    _query_group_bounds,
-)
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.prefill import PrefillTopK
 
 _QUERY_GROUP = 8
@@ -52,10 +46,10 @@ _MMA_WARP = _TOPK_FIRST_WARP + _QUERY_GROUP * _SELECTOR_WARPS_PER_ROW
 
 
 class SplitPrefillTopK(PrefillTopK):
-    def __init__(self, enable_pdl: bool, splits: int, has_tail: bool):
+    def __init__(self, enable_pdl: bool, splits: int, group_layout: str):
         self.splits = splits
         self.enable_pdl = enable_pdl
-        self.has_tail = has_tail
+        self.group_layout = group_layout
         self.query_group = _QUERY_GROUP
         self.stream_tile = _STREAM_TILE
         self.selector_warps_per_row = _SELECTOR_WARPS_PER_ROW
@@ -119,11 +113,6 @@ class SplitPrefillTopK(PrefillTopK):
         tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
             cpasync.CopyBulkTensorTileG2SOp(), source, page_layout, (64, 64)
         )
-        groups = query.shape[0] // self.query_group
-        if cutlass.const_expr(self.has_tail):
-            groups = (query.shape[0] // queries_per_request) * cute.ceil_div(
-                queries_per_request, self.query_group
-            )
         self._kernel(
             tiled_mma,
             smem_layout_k,
@@ -142,7 +131,11 @@ class SplitPrefillTopK(PrefillTopK):
             queries_per_request,
             page_size,
         ).launch(
-            grid=(groups * self.splits, 1, 1),
+            grid=(
+                self._group_count(query.shape[0], queries_per_request) * self.splits,
+                1,
+                1,
+            ),
             block=(self.threads, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -169,15 +162,66 @@ class SplitPrefillTopK(PrefillTopK):
         queries_per_request: cutlass.Int32,
         page_size: cutlass.Constexpr[int],
     ):
+        block_idx, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.enable_pdl and self.group_layout == "ragged"):
+            cute.arch.griddepcontrol_wait()
+        row_base, valid_rows = self._query_group(
+            request_indices,
+            query.shape[0],
+            queries_per_request,
+            block_idx // self.splits,
+        )
+        if valid_rows > 0:
+            self._run_group(
+                tiled_mma,
+                smem_layout_k,
+                smem_layout_q,
+                tma_atom,
+                tma_tensor,
+                page_layout,
+                query,
+                keys,
+                page_table,
+                request_indices,
+                complete_blocks,
+                selected,
+                q_stride_row,
+                q_stride_head,
+                row_base,
+                valid_rows,
+                page_size,
+            )
+
+    @cute.jit
+    def _run_group(
+        self,
+        tiled_mma: cute.TiledMma,
+        smem_layout_k: cute.ComposedLayout,
+        smem_layout_q: cute.ComposedLayout,
+        tma_atom: cute.CopyAtom,
+        tma_tensor: cute.Tensor,
+        page_layout: cute.ComposedLayout,
+        query: cute.Tensor,
+        keys: cute.Tensor,
+        page_table: cute.Tensor,
+        request_indices: cute.Tensor,
+        complete_blocks: cute.Tensor,
+        selected: cute.Tensor,
+        q_stride_row: cutlass.Int32,
+        q_stride_head: cutlass.Int32,
+        row_base: cutlass.Int32,
+        valid_rows: cutlass.Int32,
+        page_size: cutlass.Constexpr[int],
+    ):
         tidx, _, _ = cute.arch.thread_idx()
         block_idx, _, _ = cute.arch.block_idx()
         lane_idx = cute.arch.lane_idx()
         warp_idx = cute.arch.make_warp_uniform(tidx // 32)
         warpgroup_idx = cute.arch.make_warp_uniform(tidx // 128)
         warpgroup_tidx = tidx % 128
-        row_base, valid_rows = _query_group_bounds(
-            block_idx // self.splits, queries_per_request, self.has_tail
-        )
+        # Preserve the aligned row arithmetic through the grouped helper.
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            row_base = (block_idx // self.splits) * self.query_group
         split = block_idx % self.splits
         split_base = split * self.stream_tile
         num_blocks = page_table.shape[1] * page_size
@@ -280,7 +324,7 @@ class SplitPrefillTopK(PrefillTopK):
 
         # Producers may release us before publishing Q or the row frontiers.
         # Wait before either read, including the asynchronous Q copy.
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.enable_pdl and self.group_layout != "ragged"):
             cute.arch.griddepcontrol_wait()
 
         if warpgroup_idx == _K_COPY_WARPGROUP:
@@ -291,13 +335,9 @@ class SplitPrefillTopK(PrefillTopK):
                 col = (vector - q_head * 16) * 8
                 q_row = q_head // _HEADS
                 head = q_head - q_row * _HEADS
-                # Keep inactive rows in the pipelines without reading past the run.
-                source_row = row_base + q_row
-                if cutlass.const_expr(self.has_tail) and q_row >= valid_rows:
-                    source_row = row_base
                 source = (
                     query.iterator
-                    + source_row * q_stride_row
+                    + (row_base + q_row) * q_stride_row
                     + head * q_stride_head
                     + col
                 )
@@ -312,7 +352,7 @@ class SplitPrefillTopK(PrefillTopK):
                     cute.AddressSpace.smem,
                     assumed_align=16,
                 )
-                _copy_gmem_to_smem_u128(destination, source)
+                self._copy_query(destination, source, q_row, valid_rows)
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
             cute.arch.fence_view_async_shared()
@@ -334,12 +374,9 @@ class SplitPrefillTopK(PrefillTopK):
                 if thread_in_row == 0:
                     for item in cutlass.range_constexpr(6):
                         scalars[row_in_group, item] = cutlass.Int32(0)
-                    row_complete = cutlass.Int32(0)
-                    if (
-                        cutlass.const_expr(not self.has_tail)
-                        or row_in_group < valid_rows
-                    ):
-                        row_complete = complete_blocks[row_base + row_in_group]
+                    row_complete = self._row_complete(
+                        complete_blocks, row_base, row_in_group, valid_rows
+                    )
                     if row_complete > num_blocks:
                         row_complete = cutlass.Int32(num_blocks)
                     row_complete -= split_base
@@ -356,9 +393,7 @@ class SplitPrefillTopK(PrefillTopK):
         request = request_indices[row_base]
         group_complete = cutlass.Int32(0)
         for query_row in cutlass.range_constexpr(self.query_group):
-            count = cutlass.Int32(0)
-            if cutlass.const_expr(not self.has_tail) or query_row < valid_rows:
-                count = complete_blocks[row_base + query_row]
+            count = self._row_complete(complete_blocks, row_base, query_row, valid_rows)
             if count > group_complete:  # noqa: PLR1730
                 group_complete = count
         if group_complete > num_blocks:
@@ -613,8 +648,10 @@ class SplitPrefillTopK(PrefillTopK):
                             )
                         else:
                             value = running_values[item] + cutlass.Int64(split_base)
-                    if (
-                        cutlass.const_expr(not self.has_tail)
-                        or row_in_group < valid_rows
-                    ):
-                        selected_row[split * _TOPK + index] = value
+                    self._store_row(
+                        selected_row,
+                        split * _TOPK + index,
+                        value,
+                        row_in_group,
+                        valid_rows,
+                    )

@@ -31,7 +31,10 @@ if not current_platform().is_blackwell:
     )
 
 import tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk as stream_topk
-from tokenspeed_kernel.ops.attention.qsa import qwen4_exp_qsa_block_topk
+from tokenspeed_kernel.ops.attention.qsa import (
+    qsa_block_topk_stream,
+    qwen4_exp_qsa_block_topk,
+)
 from tokenspeed_kernel.ops.attention.qsa.cute_dsl import (
     can_use_cute_dsl_qwen4_exp_qsa_block_topk,
 )
@@ -133,7 +136,9 @@ def _assert_matches_reference(
     )
     selected_scores = torch.gather(scores, 1, selected.clamp_min(0).long())
     selected_scores.masked_fill_(selected < 0, -float("inf"))
-    expected_scores = torch.topk(scores, block_topk, dim=1).values
+    expected_scores = torch.full_like(selected_scores, -float("inf"))
+    count = min(block_topk, scores.shape[1])
+    expected_scores[:, :count] = torch.topk(scores, count, dim=1).values
     torch.testing.assert_close(
         selected_scores.sort(dim=1, descending=True).values,
         expected_scores,
@@ -148,15 +153,160 @@ def _assert_matches_reference(
         assert torch.unique(row[row >= 0]).numel() == count
 
 
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize(
+    ("lengths", "pages", "uniform", "algorithm"),
+    [
+        pytest.param([129], 9, True, "prefill", id="uniform-prefill-tail"),
+        pytest.param([65, 65], 64, True, "dense", id="uniform-dense-tails"),
+        pytest.param([67, 67], 129, True, "overlap", id="uniform-overlap-tails"),
+        pytest.param([1] * 129, 9, True, "prefill", id="uniform-singletons"),
+        pytest.param([3, 61, 67, 7, 1], 9, False, "prefill", id="ragged-prefill"),
+        pytest.param([65, 72, 9], 64, False, "dense", id="ragged-dense"),
+        pytest.param([127, 1, 9], 129, False, "overlap", id="ragged-overlap"),
+        pytest.param(
+            [3, 2, 1], 1024, False, "overlap", id="ragged-decode-zero-scratch"
+        ),
+    ],
+)
+def test_stream_topk_request_tails_and_ragged_graph_replay(
+    device, lengths, pages, uniform, algorithm, request_dtype, enable_pdl
+):
+    torch.manual_seed(163)
+    rows = sum(lengths)
+    capacity = pages * 64
+    query = torch.randn(rows, 5, 128, device=device, dtype=torch.bfloat16)[:, :4]
+    keys = torch.randn(
+        (len(lengths) * pages + 1) * 64, 1, 128, device=device, dtype=torch.bfloat16
+    )
+    keys[:64].fill_(float("nan"))
+    table = torch.empty((len(lengths), pages + 3), device=device, dtype=torch.int32)
+    table = table[:, :pages]
+    table.copy_(
+        torch.randperm(len(lengths) * pages, device=device).reshape(len(lengths), pages)
+        + 1
+    )
+    original_requests = torch.arange(
+        len(lengths), device=device, dtype=request_dtype
+    ).repeat_interleave(torch.tensor(lengths, device=device))
+    requests = original_requests.clone()
+    complete = torch.full((rows,), capacity, device=device, dtype=torch.int32)
+
+    def invoke():
+        return qsa_block_topk_stream(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=lengths[0] if uniform else None,
+            max_partial_bytes=0,
+            enable_pdl=enable_pdl,
+            solution="cute_dsl",
+            override=None,
+        )
+
+    selected = invoke()
+    config = stream_topk._configuration(
+        rows, capacity, lengths[0] if uniform else None, 0
+    )
+    assert config is not None
+    assert config.algorithm == algorithm
+    assert config.group_layout == ("uniform" if uniform else "ragged")
+    assert (
+        query.device.index,
+        request_dtype,
+        enable_pdl,
+        config,
+    ) in stream_topk._COMPILED
+    _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        selected = invoke()
+    row_ids = torch.arange(rows, device=device)
+    frontiers = torch.tensor(
+        [0, 1, 63, 511, 512, 513, capacity - 1, capacity],
+        device=device,
+        dtype=torch.int32,
+    )
+    for step in range(3):
+        # A ragged graph must refresh ownership boundaries as well as lengths.
+        # Rolling also gives a request multiple non-adjacent runs.
+        if not uniform:
+            requests.copy_(original_requests.roll(step + 1))
+        complete.copy_(frontiers[(row_ids + step) % frontiers.numel()])
+        query.normal_()
+        graph.replay()
+        _assert_matches_reference(
+            query, keys, table, requests, complete, selected, 64, 512
+        )
+
+
+@pytest.mark.parametrize("uniform", [False, True])
+def test_stream_topk_grouped_tails_reuse_compilation(device, monkeypatch, uniform):
+    monkeypatch.setattr(stream_topk, "_COMPILED", {})
+    compile_count = 0
+    original_compile = stream_topk._compile
+
+    def counted_compile(*args):
+        nonlocal compile_count
+        compile_count += 1
+        return original_compile(*args)
+
+    monkeypatch.setattr(stream_topk, "_compile", counted_compile)
+    layouts = (
+        [([65, 65], 65), ([129], 80), ([67, 67, 67], 100)]
+        if uniform
+        else [([64, 66], 65), ([8, 129, 1], 80), ([129, 5, 67], 100)]
+    )
+    torch.manual_seed(167)
+    for lengths, pages in layouts:
+        rows = sum(lengths)
+        query = torch.randn(rows, 5, 256, device=device, dtype=torch.bfloat16)[
+            :, :4, :128
+        ]
+        keys = torch.randn(pages * 64, 1, 128, device=device, dtype=torch.bfloat16)
+        table = torch.arange(pages, device=device, dtype=torch.int32)[None].repeat(
+            len(lengths), 1
+        )
+        requests = torch.arange(
+            len(lengths), device=device, dtype=torch.int32
+        ).repeat_interleave(torch.tensor(lengths, device=device))
+        complete = torch.linspace(0, pages * 64, rows, device=device).int()
+        selected = cute_dsl_qsa_stream_topk(
+            query,
+            keys,
+            table,
+            requests,
+            complete,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=lengths[0] if uniform else None,
+            max_partial_bytes=0,
+            enable_pdl=False,
+        )
+        _assert_matches_reference(
+            query, keys, table, requests, complete, selected, 64, 512
+        )
+        configs = [key[-1] for key in stream_topk._COMPILED]
+        assert len(configs) == 1
+        assert configs[0].algorithm == "overlap"
+        assert configs[0].group_layout == ("uniform" if uniform else "ragged")
+    assert compile_count == 1
+
+
 @pytest.mark.parametrize("request_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize(
-    ("page_counts", "small_grid"),
+    ("page_counts", "small_grid", "algorithm"),
     [
-        pytest.param((9, 16, 24, 32), False, id="prefill"),
-        pytest.param((33, 40, 56, 64), False, id="dense"),
-        pytest.param((65, 80, 100, 128), False, id="overlap"),
-        pytest.param((129, 160, 200, 256), True, id="split"),
+        pytest.param((9, 16, 24, 32), False, "prefill", id="prefill"),
+        pytest.param((33, 40, 56, 64), False, "dense", id="dense"),
+        pytest.param((65, 80, 100, 128), False, "overlap", id="overlap"),
+        pytest.param((129, 160, 200, 256), True, "split", id="split"),
     ],
 )
 def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
@@ -166,6 +316,7 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
     enable_pdl: bool,
     page_counts: tuple[int, ...],
     small_grid: bool,
+    algorithm: str,
 ) -> None:
     torch.manual_seed(89)
     monkeypatch.setattr(stream_topk, "_COMPILED", {})
@@ -246,6 +397,11 @@ def test_cute_dsl_qsa_stream_topk_reuses_compile_across_layouts(
             query, keys, table, requests, complete, selected, 64, 512
         )
         assert compile_count == (1 if i < 4 else 2)
+        configs = [key[-1] for key in stream_topk._COMPILED]
+        assert {config.algorithm for config in configs} == {algorithm}
+        assert {config.group_layout for config in configs} == (
+            {"aligned"} if i < 4 else {"aligned", "uniform"}
+        )
 
 
 @pytest.mark.parametrize(
@@ -913,13 +1069,15 @@ def test_stream_topk_small_shapes_reuse_capacity_buckets(
         pytest.param(8, 8, 1025, id="split-prefill"),
         pytest.param(136, 136, 1025, id="overlap-prefill"),
         pytest.param(136, 136, 2048, id="overlap-second-window"),
+        pytest.param(129, 129, 2048, id="overlap-second-window-tail"),
+        pytest.param(137, None, 2048, id="overlap-second-window-ragged"),
         pytest.param(2, 1, 2049, id="portable-long-capacity"),
     ],
 )
 def test_stream_topk_graph_preserves_ids_above_65535(
     device: str,
     rows: int,
-    width: int,
+    width: int | None,
     pages: int,
     enable_pdl: bool,
 ) -> None:
@@ -1052,9 +1210,6 @@ def test_stream_topk_respects_global_workspace_budget(
             queries_per_request=width,
             max_partial_bytes=budget,
         )
-        if width == 1 and budget < required:
-            assert not supported
-            continue
         assert supported
         selected = cute_dsl_qsa_stream_topk(
             query,
@@ -1221,4 +1376,9 @@ def test_stream_topk_split_request_tails(device: str, remainder: int) -> None:
         max_partial_bytes=32 << 20,
         enable_pdl=True,
     )
+    config = stream_topk._configuration(rows, capacity, width, 32 << 20)
+    assert config is not None
+    assert config.algorithm == "split"
+    assert config.group_layout == "uniform"
+    assert (query.device.index, requests.dtype, True, config) in stream_topk._COMPILED
     _assert_matches_reference(query, keys, table, requests, complete, selected, 64, 512)
