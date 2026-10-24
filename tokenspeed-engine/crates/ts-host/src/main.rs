@@ -35,6 +35,7 @@
 //! GIL only for the data plane's completion queries (`data_plane`).
 
 mod data_plane;
+mod encode;
 mod interpreter;
 mod pd;
 
@@ -105,6 +106,10 @@ enum HostError {
     Storage(#[from] ts_mooncake::Error),
     #[error(transparent)]
     Loop(#[from] LoopError),
+    #[error("the EPD embedding sender: {0}")]
+    Sender(#[from] ts_pd::StartError),
+    #[error("the encode loop: {0}")]
+    Encode(#[from] ts_control::encode::EncodeError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
@@ -449,7 +454,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
     let stop = Arc::new(AtomicBool::new(false));
     watch_signals(stop.clone())?;
 
-    let (bootstrap, scheduler, config, data_plane, role, peers, exporter) = Python::attach(|py| {
+    let (bootstrap, outbox, mode) = Python::attach(|py| {
         let built = (|| {
             // Before anything imports the scheduler package.
             ts_scheduler::alias_builtin_module(py)?;
@@ -457,6 +462,19 @@ fn serve(args: &Args) -> Result<(), HostError> {
             let bootstrap = py
                 .import("tokenspeed.runtime.engine.rust_host")?
                 .call_method1("bootstrap", (args.control_fd, outbox.clone()))?;
+            let mode: String = bootstrap.getattr("mode")?.extract()?;
+            Ok((bootstrap.unbind(), outbox.unbind(), mode))
+        })();
+        built.map_err(|error| python_error(py, error))
+    })?;
+    if mode == "encode" {
+        return encode::serve(bootstrap, &stop);
+    }
+
+    let (bootstrap, scheduler, config, data_plane, role, peers, exporter) = Python::attach(|py| {
+        let built = (|| {
+            let bootstrap = bootstrap.into_bound(py);
+            let outbox = outbox.into_bound(py);
             let scheduler = Scheduler::from_python(&bootstrap.getattr("scheduler")?)?;
             let python_config = bootstrap.getattr("config")?;
             let metrics = Metrics::from_python(&python_config)?;

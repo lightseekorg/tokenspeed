@@ -18,19 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""PD and EPD transfer setup on IPv6 hosts: endpoint formatting, when a ZMQ
-socket enables IPv6, the control socket's port, and the Mooncake engine's
-MC_USE_IPV6 and session id."""
+"""PD and EPD transfer setup on IPv6 hosts: ``host:port`` brackets only IPv6
+literals, and the host's Mooncake engines start with ``MC_USE_IPV6`` on an
+IPv6 address. The transfer peers' sockets are ``ts-pd``'s."""
 
 from __future__ import annotations
 
 import os
-import socket
 import sys
-import types
 
 import pytest
-import zmq
 
 # CPU-only tests scheduled in runtime-1gpu because they import the full runtime.
 sys.path.insert(
@@ -42,11 +39,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 register_cuda_ci(est_time=5, suite="runtime-1gpu")
 
 
-from tokenspeed.runtime.pd.base.manager import (  # noqa: E402
-    enable_ipv6_for_endpoint,
-)
-from tokenspeed.runtime.pd.base.mooncake_engine import (  # noqa: E402
-    MooncakeTransferEngine,
+from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
     enable_mooncake_ipv6_for_host,
 )
 from tokenspeed.runtime.utils.network import join_host_port  # noqa: E402
@@ -67,38 +60,16 @@ def test_join_host_port_brackets_only_ipv6_literals(host, expected):
 
 
 @pytest.mark.parametrize(
-    ("host", "ipv6"),
-    [
-        ("[fd00::1]", 1),
-        ("10.0.0.1", 0),
-        ("v6-only.example", 1),
-        # With IPv6 on, libzmq resolves a name to IPv6 first and would miss an
-        # IPv4-only listener, so a dual-stack name keeps the IPv4 default.
-        ("dual-stack.example", 0),
-        ("unresolvable.example", 0),
-    ],
+    ("hostname", "expected"), [("fd00::1", "1"), ("10.0.0.1", None)]
 )
-def test_zmq_ipv6_follows_endpoint_host_address_family(monkeypatch, host, ipv6):
-    v6 = (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("fd00::1", 0, 0, 0))
-    v4 = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 0))
-    addresses = {"v6-only.example": [v6], "dual-stack.example": [v6, v4]}
-
-    def getaddrinfo(name, *args, **kwargs):
-        if name not in addresses:
-            raise socket.gaierror(socket.EAI_NONAME, "Name or service not known")
-        return addresses[name]
-
-    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
-    with zmq.Context() as context, context.socket(zmq.PUSH) as sock:
-        enable_ipv6_for_endpoint(sock, f"tcp://{host}:8998")
-        assert sock.getsockopt(zmq.IPV6) == ipv6
-
-
-def test_zmq_ipv6_stays_off_for_malformed_name():
-    # socket.getaddrinfo raises UnicodeError, not OSError, for "a..b".
-    with zmq.Context() as context, context.socket(zmq.PUSH) as sock:
-        enable_ipv6_for_endpoint(sock, "tcp://a..b:8998")
-        assert sock.getsockopt(zmq.IPV6) == 0
+def test_mooncake_ipv6_follows_the_local_address_family(
+    monkeypatch, hostname, expected
+):
+    # setenv first, so that monkeypatch also removes the value the call sets.
+    monkeypatch.setenv("MC_USE_IPV6", "")
+    monkeypatch.delenv("MC_USE_IPV6")
+    enable_mooncake_ipv6_for_host(hostname)
+    assert os.environ.get("MC_USE_IPV6") == expected
 
 
 def test_mooncake_ipv6_keeps_explicit_setting(monkeypatch):
@@ -107,54 +78,5 @@ def test_mooncake_ipv6_keeps_explicit_setting(monkeypatch):
     assert os.environ["MC_USE_IPV6"] == "on"
 
 
-@pytest.fixture
-def fake_mooncake(monkeypatch):
-    """Fake Mooncake's native engine module, which needs RDMA, and start with
-    MC_USE_IPV6 unset. Returns the (hostname, MC_USE_IPV6) each engine starts
-    with and the session ids that transfers write to."""
-    initialized, written_sessions = [], []
-    rpc_ports = iter((15123, 15432))
-
-    class TransferEngine:
-        def __init__(self) -> None:
-            self.rpc_port: int | None = None
-
-        def initialize(self, hostname, metadata_server, protocol, device_name):
-            initialized.append((hostname, os.environ.get("MC_USE_IPV6")))
-            self.rpc_port = next(rpc_ports)
-            return 0
-
-        def get_rpc_port(self):
-            return self.rpc_port
-
-        def register_memory(self, ptr, length):
-            return 0
-
-        def batch_transfer_sync_write_pages(self, session_id, *pages):
-            written_sessions.append(session_id)
-            return 0
-
-    engine_module = types.ModuleType("mooncake.engine")
-    engine_module.TransferEngine = TransferEngine
-    monkeypatch.setitem(sys.modules, "mooncake", types.ModuleType("mooncake"))
-    monkeypatch.setitem(sys.modules, "mooncake.engine", engine_module)
-    # setenv first, so that monkeypatch also removes the value an engine sets.
-    monkeypatch.setenv("MC_USE_IPV6", "")
-    monkeypatch.delenv("MC_USE_IPV6")
-    return initialized, written_sessions
-
-
-@pytest.mark.parametrize(
-    ("hostname", "mc_use_ipv6", "session_id"),
-    [
-        ("10.0.0.1", None, "10.0.0.1:15123"),
-        ("fd00::1", "1", "[fd00::1]:15123"),
-    ],
-)
-def test_mooncake_engine_follows_local_address_family(
-    fake_mooncake, hostname, mc_use_ipv6, session_id
-):
-    initialized, _ = fake_mooncake
-    engine = MooncakeTransferEngine(hostname, gpu_id=0, ib_device=None)
-    assert initialized == [(hostname, mc_use_ipv6)]
-    assert engine.session_id == session_id
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -20,7 +20,8 @@
 
 //! The engine's control plane for one rank: admitting requests, the
 //! scheduling loop, committing forward results, the control operations and
-//! the disaggregated transfers' bookkeeping.
+//! the disaggregated transfers' bookkeeping; and an EPD encode rank's loop
+//! ([`encode`]).
 
 #![forbid(unsafe_code)]
 
@@ -28,6 +29,7 @@ pub mod batch_log;
 pub mod cache_ops;
 mod codec;
 pub mod control;
+pub mod encode;
 pub mod eplb;
 pub mod event_loop;
 pub mod grammar;

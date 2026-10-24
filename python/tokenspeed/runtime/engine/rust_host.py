@@ -40,8 +40,8 @@ interpreter runs, plus the launcher's side:
 The host covers TP, attention-DP and pipeline ranks and both PD roles (its
 own Rust transfer peer, started from ``pd/host_peer.py``'s settings);
 ``rust_host_refusals`` and the checks in ``bootstrap`` refuse what it does not
-serve instead of serving it partially. An EPD encode node runs
-``epd/encode_loop.py`` instead.
+serve instead of serving it partially. An EPD encode rank runs the host's
+encode mode, whose Python half is ``epd/encode_host.py``.
 """
 
 from __future__ import annotations
@@ -94,6 +94,7 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     resolve_dspark_prefix_replay_tokens,
     should_use_overlap_schedule,
 )
+from tokenspeed.runtime.epd.encode_host import EncodeBootstrap
 from tokenspeed.runtime.epd.prefill_receive import (
     assert_embeddings_received,
     build_epd_receive,
@@ -185,6 +186,8 @@ def rust_host_refusals(server_args: ServerArgs) -> list[str]:
     """What in ``server_args`` the Rust host cannot serve yet, empty when
     it can serve all of it."""
     refusals = []
+    # An EPD encode server starts its ranks itself (``_launch_encode_server``):
+    # they take encode requests, not the engine wire.
     if server_args.disaggregation_mode not in ("null", "prefill", "decode"):
         refusals.append(f"--disaggregation-mode {server_args.disaggregation_mode}")
     if kv_events_enabled(server_args.kv_events_config):
@@ -241,7 +244,8 @@ def start_rust_host(
     The host reads its arguments from, and reports readiness on, one end of
     a socket pair; the returned end raises ``EOFError`` if the host dies
     first. Its command line starts with the rank's process title
-    (``rank_process_title``), which ``ps`` and stale-process cleanup match.
+    (``rank_process_title``; ``tokenspeed::encode_tp{rank}`` for an EPD
+    encode rank), which ``ps`` and stale-process cleanup match.
 
     Args:
         binary: The ``ts-host`` executable.
@@ -260,7 +264,11 @@ def start_rust_host(
     with start_context:
         popen = subprocess.Popen(
             [
-                rank_process_title(server_args.mapping),
+                (
+                    f"tokenspeed::encode_tp{server_args.mapping.attn.tp_rank}"
+                    if server_args.disaggregation_mode == "encode"
+                    else rank_process_title(server_args.mapping)
+                ),
                 "--python",
                 sys.executable,
                 "--control-fd",
@@ -957,6 +965,10 @@ class HostBootstrap:
     """One rank, built: the scheduler and config for the control thread, and
     the data plane the forward and control threads call."""
 
+    #: Which host mode this rank runs (``EncodeBootstrap`` is an EPD encode
+    #: rank's).
+    mode = "serve"
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -1351,12 +1363,15 @@ class HostBootstrap:
         self._device.shutdown_cache()
 
 
-def bootstrap(control_fd: int, pd_outbox) -> HostBootstrap:
+def bootstrap(control_fd: int, pd_outbox) -> HostBootstrap | EncodeBootstrap:
     """Build this host's rank from the arguments the launcher sends on
     ``control_fd``; with PD, its transfer peer reaches the host through
-    ``pd_outbox`` (see ``pd/host_peer.py``)."""
+    ``pd_outbox`` (see ``pd/host_peer.py``). An EPD encode rank runs the
+    host's encode mode instead (``epd/encode_host.py``)."""
     connection = Connection(control_fd)
     server_args, port_args, metrics_relay_endpoint = connection.recv()
+    if server_args.disaggregation_mode == "encode":
+        return EncodeBootstrap(server_args, port_args, connection)
     return HostBootstrap(
         server_args, port_args, connection, pd_outbox, metrics_relay_endpoint
     )

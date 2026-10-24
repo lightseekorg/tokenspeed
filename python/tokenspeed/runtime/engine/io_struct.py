@@ -1276,9 +1276,10 @@ def _walk_subclasses(base: type) -> list:
 def ipc_message_union():
     """The tagged union of every registered IPC message type.
 
-    Computed lazily so process roles that define extra ``BaseReq`` subclasses
-    (e.g. the EPD encode worker) are included as long as the defining module
-    is imported before the receiving socket is constructed.
+    Computed lazily so modules that define extra ``BaseReq`` subclasses
+    (e.g. ``epd/encode_worker.py``'s ``EncodeRequest``) are included as long
+    as the defining module is imported before the receiving socket is
+    constructed.
     """
     types = tuple(
         dict.fromkeys(

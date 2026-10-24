@@ -33,9 +33,9 @@ use ts_wire::{
     },
     decode_frames, encode_frames,
     handshake::STATUS_HELLO,
-    BatchTokenIDOutSlim, ControlOutput, ControlRequest, Dict, EngineCoreReadyResponse,
-    EngineOutput, EngineRequest, HandshakeAddresses, HandshakeInitMessage, Modality,
-    MultimodalDataItem, MultimodalInputs, ReadyMessage, SamplingParams, SessionParams,
+    BatchTokenIDOutSlim, ControlOutput, ControlRequest, Dict, EncodeRequest,
+    EngineCoreReadyResponse, EngineOutput, EngineRequest, HandshakeAddresses, HandshakeInitMessage,
+    Modality, MultimodalDataItem, MultimodalInputs, ReadyMessage, SamplingParams, SessionParams,
     ShmTensorHandle, StrOrList, Tensor, TokenizedGenerateReqInput, Value, Wire,
 };
 
@@ -290,6 +290,41 @@ fn generate_multimodal() {
     let frames = fixture("generate_multimodal");
     let sizes: Vec<_> = frames.iter().map(Bytes::len).collect();
     assert_eq!(sizes[2..], [512, 480]);
+}
+
+#[test]
+fn encode_request() {
+    let expected = EncodeRequest {
+        rid: None,
+        http_worker_ipc: None,
+        request_id: s("e-1"),
+        bootstrap_host: s("10.0.0.5"),
+        bootstrap_port: 9001,
+        bootstrap_room: (1 << 63) + 5,
+        items: vec![MultimodalDataItem {
+            modality: Modality::Image,
+            hash: Some(u64::MAX - 2),
+            pad_value: Some(151700),
+            offsets: Some(vec![(3, 66), (70, 73)]),
+            feature: Some(tensor(
+                "float32",
+                &[8, 16],
+                le_bytes((0..128).map(|v| v as f32), f32::to_le_bytes),
+            )),
+            feature_shm: None,
+            model_specific_data: Dict(vec![(
+                s("image_grid_thw"),
+                tensor("int64", &[1, 3], le_bytes([1i64, 4, 4], i64::to_le_bytes)),
+            )]),
+            encoded: None,
+            encoded_deepstack: None,
+            encode_handshake: None,
+        }],
+    };
+    check("encode_request", expected);
+    // The feature travels as its own frame.
+    let sizes: Vec<_> = fixture("encode_request").iter().map(Bytes::len).collect();
+    assert_eq!(sizes[1..], [512]);
 }
 
 #[test]

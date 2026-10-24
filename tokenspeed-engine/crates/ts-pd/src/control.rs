@@ -168,3 +168,47 @@ pub trait EmbeddingReceiver {
     /// Whether a landed slot still waits for its rows to be copied out.
     fn awaiting_release(&self) -> bool;
 }
+
+/// EPD, an encode rank: one item's embedding in its send slot, as the
+/// transfer engine reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingChunk {
+    /// The room the prefill ranks receive it under.
+    pub room: u64,
+    /// The rows' address.
+    pub source: u64,
+    /// The image's rows.
+    pub rows: i64,
+    /// Elements per row.
+    pub hidden: i64,
+    /// The rows' dtype (`str(torch.dtype)`).
+    pub dtype: String,
+    /// The rows' bytes.
+    pub nbytes: u64,
+    /// The deepstack rows' address; 0 without deepstack.
+    pub deepstack_source: u64,
+    /// Elements per deepstack row; 0 without deepstack.
+    pub deepstack_width: i64,
+    /// The deepstack rows' bytes.
+    pub deepstack_nbytes: u64,
+}
+
+/// EPD, an encode rank: sending each item's embedding to the prefill ranks
+/// that wait for it, as the scheduling loop drives it.
+pub trait EmbeddingSender {
+    /// `room`'s request arrived; false when another request holds the room.
+    fn begin(&mut self, room: u64) -> bool;
+
+    /// Hand over a begun room's rows: they are written once every prefill
+    /// rank of the block asked, and must stay in place until the room
+    /// concludes.
+    fn send(&mut self, chunk: EmbeddingChunk);
+
+    /// Conclude a begun room failed before its rows were handed over,
+    /// telling the prefill ranks that asked.
+    fn fail(&mut self, room: u64, reason: &str);
+
+    /// The begun rooms that concluded since the last call, sent or failed:
+    /// their rows' slots take new rows.
+    fn concluded(&mut self) -> Vec<u64>;
+}

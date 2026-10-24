@@ -52,7 +52,9 @@ pub use frames::{engine_identity, EngineOutput, EngineRequest, ENGINE_CORE_DEAD}
 pub use handshake::{
     EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
 };
-pub use multimodal::{Modality, MultimodalDataItem, MultimodalInputs, ShmTensorHandle};
+pub use multimodal::{
+    EncodeRequest, Modality, MultimodalDataItem, MultimodalInputs, ShmTensorHandle,
+};
 pub use output::{BatchTokenIDOutSlim, RequestOutput};
 pub use request::{SessionParams, TokenizedGenerateReqInput};
 pub use sampling::SamplingParams;

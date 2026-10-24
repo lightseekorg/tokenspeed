@@ -52,6 +52,7 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedGenerateReqInput,
     UpdateWeightsFromDistributedReqInput,
 )
+from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.inputs import (
     Modality,
     MultimodalDataItem,
@@ -226,6 +227,30 @@ def _generate_multimodal() -> list[bytes]:
             multimodal_inputs=multimodal_inputs,
         )
     )
+
+
+def _encode_request() -> list[bytes]:
+    request = EncodeRequest(
+        request_id="e-1",
+        bootstrap_host="10.0.0.5",
+        bootstrap_port=9001,
+        # Rooms are random 64-bit values.
+        bootstrap_room=2**63 + 5,
+        items=[
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=2**64 - 3,
+                pad_value=151700,
+                offsets=[(3, 66), (70, 73)],
+                # 512 bytes: moved to an out-of-band frame.
+                feature=torch.arange(128, dtype=torch.float32).reshape(8, 16),
+                model_specific_data={
+                    "image_grid_thw": torch.tensor([[1, 4, 4]], dtype=torch.int64)
+                },
+            )
+        ],
+    )
+    return [bytes(f) for f in _ENCODER.encode(request)]
 
 
 def _abort() -> list[bytes]:
@@ -414,6 +439,7 @@ FIXTURES = {
     "generate_minimal": _generate_minimal,
     "generate_text": _generate_text,
     "generate_multimodal": _generate_multimodal,
+    "encode_request": _encode_request,
     "abort": _abort,
     "control_pause": _control_pause,
     "control_profile": _control_profile,

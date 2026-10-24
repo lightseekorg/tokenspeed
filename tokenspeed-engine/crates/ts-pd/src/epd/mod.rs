@@ -32,8 +32,11 @@
 //!
 //! The frames are those of the Python peers this module replaced.
 
+#[cfg(test)]
+mod live_tests;
 pub mod pool;
 pub mod receiver;
+pub mod sender;
 
 use bytes::Bytes;
 

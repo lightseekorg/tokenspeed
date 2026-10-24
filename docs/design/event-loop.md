@@ -39,8 +39,9 @@ The launcher (`entrypoints/engine.py`) starts the ranks through
 gRPC servicer behind `ts serve`, and `ts serve --headless` for an external
 frontend. Each rank dials the frontend's handshake socket; the in-process
 frontend is `tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under
-`AsyncLLM`. An EPD encode node runs `epd/encode_loop.py` instead: no scheduler,
-no event loop.
+`AsyncLLM`. An EPD encode node's ranks run the host's encode mode instead
+(`ts-control`'s `encode` loop over `epd/encode_host.py`): no scheduler, no
+event loop.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
@@ -260,10 +261,17 @@ same issuing thread as the model's collectives, which keeps the cross-rank
 launch order. `epd_released`, a completion query, reports the slots whose
 copies finished, so the receiver leases them again.
 
-The encoder's TP ranks attach every pixel-SHM segment in a received batch
-before any rank submits it to the encode worker. A CPU-group rendezvous
-protects this ownership transition: submission consumes and unlinks SHM
-on both cache hits and misses, so broadcasting handles alone is insufficient.
+An EPD encode rank's loop is its own, with the same split. Each round the
+attention-TP group's first rank relays the frontend's requests to the
+others, in one exchange that also agrees on the send-ring slots free on
+every rank, so every rank forms the same vision-tower batches (the tower is
+TP-sharded); a room's send concludes on each rank at its own time and only
+frees its slot. The data plane admits requests on the forward thread: the
+ranks open every pixel-SHM segment of the round behind a CPU-group barrier
+before any consumes one, since consuming unlinks it on cache hits and misses
+alike. It embeds each batch and copies every item's rows into its send slot;
+a completion query on the control thread reports the finished copies, whose
+rows the sender (`ts-pd`'s `epd::sender`) then writes to the prefill ranks.
 
 The symmetric rule holds on the data plane: **the forward thread never
 synchronizes with the device on the per-round path.** Every host
@@ -299,7 +307,7 @@ longer: the round waits 100 ms to seconds while a kernel compiles for a new
 compile-cache key. Startup compiles on purpose (graph capture, tuning), so
 the bootstrap installs `tokenspeed_kernel.compile_monitor` before building
 anything and `enter_serving` marks the end of startup right after arming the
-sync-debug mode. The encode loop marks it after its ready message. From then
+sync-debug mode; an encode rank marks it once it reported ready. From then
 on the monitor logs every Triton compilation with its duration and cause and
 reports by name any compile-time kernel parameter that keeps taking new
 values from one call site -- a per-batch value passed as `tl.constexpr`;
@@ -629,8 +637,8 @@ bootstrap timeout is dropped, and the decode ranks that pre-allocated for it
 are told it failed. A decode room whose KV lands without the request's first
 token fails: the first decode feeds on it.
 
-**EPD prefill** (`--disaggregation-mode prefill` with encode workers). A
-request whose images an encode worker embeds is staged at admission; each
+**EPD prefill** (`--disaggregation-mode prefill` with encode nodes). A
+request whose images an encode node embeds is staged at admission; each
 round the replica MIN-reduces which staged requests' embeddings landed on
 every rank, submits those, and fails those whose receive failed or timed out
 on any. The receives settle while paused too: one that lands then is

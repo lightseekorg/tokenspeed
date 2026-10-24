@@ -22,8 +22,6 @@
 
 from __future__ import annotations
 
-import threading
-from collections import deque
 from enum import Enum
 
 import torch
@@ -38,34 +36,6 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
     ENCODE = "encode"
-
-
-class FastQueue:
-    class Empty(Exception):
-        """Exception raised when the queue is empty."""
-
-        pass
-
-    def __init__(self):
-        self._buf = deque()
-        self._cond = threading.Condition()
-
-    def put(self, item):
-        with self._cond:
-            self._buf.append(item)
-            self._cond.notify()
-
-    def get(self):
-        with self._cond:
-            while not self._buf:
-                self._cond.wait()
-            return self._buf.popleft()
-
-    def get_nowait(self):
-        with self._cond:
-            if not self._buf:
-                raise FastQueue.Empty()
-            return self._buf.popleft()
 
 
 class TransferBackend(Enum):

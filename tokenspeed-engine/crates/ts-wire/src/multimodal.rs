@@ -18,10 +18,12 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! Multimodal payloads (`multimodal/inputs.py`, `multimodal/shm_transport.py`).
+//! Multimodal payloads (`multimodal/inputs.py`, `multimodal/shm_transport.py`),
+//! and the EPD encode request that carries an item to an encode node
+//! (`epd/encode_worker.py`).
 
 use crate::{
-    codec::{Dict, Wire},
+    codec::{Dict, StrOrList, Wire},
     error::{Error, Result},
     msgpack::{Decoder, Encoder},
     tensor::Tensor,
@@ -114,5 +116,28 @@ wire_struct! {
         pub mrope_position_delta_scalar: Option<i64> = None,
         /// Retired slot kept for arity; always `None`.
         pub mrope_position_delta_repeated_cache: Option<Tensor> = None,
+    }
+}
+
+wire_struct! {
+    /// EPD: one item for an encode node to embed and ship to the prefill
+    /// ranks that wait for it under `bootstrap_room`. The first two fields
+    /// come from the Python `BaseReq` base class.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct EncodeRequest: array("EncodeRequest") {
+        /// Request id; unused, `request_id` names the request.
+        pub rid: Option<StrOrList> = None,
+        /// In-process HTTP worker address; unused across processes.
+        pub http_worker_ipc: Option<String> = None,
+        /// The gateway's id of the request.
+        pub request_id: String,
+        /// The encode node's bootstrap server, as the gateway gave it.
+        pub bootstrap_host: String,
+        /// Its port.
+        pub bootstrap_port: i64,
+        /// The room the prefill ranks receive the embedding under.
+        pub bootstrap_room: u64,
+        /// The items to embed; the gateway sends one per request.
+        pub items: Vec<MultimodalDataItem>,
     }
 }

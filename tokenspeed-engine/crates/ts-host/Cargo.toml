@@ -12,7 +12,7 @@ bytes.workspace = true
 pyo3 = "0.30"
 serde_json = "1"
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt", "signal"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ts-collective = { path = "../ts-collective" }
@@ -24,6 +24,7 @@ ts-mooncake = { path = "../ts-mooncake" }
 ts-pd = { path = "../ts-pd" }
 ts-scheduler = { path = "../ts-scheduler" }
 ts-wire = { path = "../ts-wire" }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
 
 [lints]
 workspace = true

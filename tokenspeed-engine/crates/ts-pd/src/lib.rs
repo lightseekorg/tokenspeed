@@ -55,8 +55,8 @@ use std::{
 pub use batch::BatchRows;
 pub use bootstrap::{BootstrapServer, Registry};
 pub use control::{
-    BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
-    RemotePrefill, TransferPeer,
+    BootstrapInfo, EmbeddingChunk, EmbeddingItem, EmbeddingReceiver, EmbeddingSender, LandedItem,
+    LandedRequest, PdError, PdEvent, RemotePrefill, TransferPeer,
 };
 pub use decode::{DecodeConfig, DecodeOutbox, DecodePeer};
 pub use layout::{

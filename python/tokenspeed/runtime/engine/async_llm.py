@@ -121,7 +121,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                 (``tokenspeed_engine.Frontend``); None on an EPD encode
                 server, which runs no engine ranks.
             encode_sender: On an EPD encode server, the channel to its
-                encode workers (``submit_encode``); None elsewhere.
+                encode ranks (``submit_encode``); None elsewhere.
         """
         # Parse args
         self.server_args = server_args
@@ -336,18 +336,17 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         return [bytes(frame) for frame in self._wire_encoder.encode(wire)]
 
     def submit_encode(self, encode_request) -> None:
-        """Send an EPD encode request to this encode server's workers.
+        """Send an EPD encode request to this encode server's ranks.
 
-        Fire-and-forget over the workers' request channel (each runs
-        ``run_encode_loop``). The encode worker runs the vision tower and
-        ships the embeddings to prefill over Mooncake; the gateway gets no
-        streamed response, only the gRPC ack. ``encode_request`` is an
-        ``encode_worker.EncodeRequest`` whose multimodal tensors are CPU
-        (gateway-reconstructed) and go over ZMQ directly; shm publishing of
-        the pixels is a follow-up optimization.
+        Fire-and-forget over the request channel the first encode rank binds
+        (``ts-host`` in encode mode, ``epd/encode_host.py``), which relays it
+        to the others. The ranks run the vision tower and ship the embedding
+        to prefill over Mooncake; the gateway gets no streamed response, only
+        the gRPC ack. ``encode_request`` is an ``encode_worker.EncodeRequest``
+        whose pixels ride the channel as tensors or shared-memory handles.
         """
         if self._encode_sender is None:
-            raise RuntimeError("only an EPD encode server runs encode workers")
+            raise RuntimeError("only an EPD encode server runs encode ranks")
         self._encode_sender.send_pyobj(encode_request)
 
     async def _wait_one_response(

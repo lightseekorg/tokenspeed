@@ -241,7 +241,7 @@ their release, ordered behind the forward that captured them, as today.
 | L2 / snapshot cache ops | op adaptation, ACK polling, replica intersection | the `HostCacheExecutor` and its streams |
 | L3 | the per-round storage agreement (clock, permissions, completions, pressure), cancellations, namespace / weight-version gates | the Host-only L3 executor and its storage backend clients (including the Mooncake store) |
 | PD | bootstrap server, request registration, the Mooncake transfer engine: memory registration, transfer submission, status polling | KV packing into staging buffers (GPU copies), landing |
-| EPD | the prefill receiver: encode-rank handshakes, receive slots, completion agreement | receive-pool memory, publish and reassembly, encoder |
+| EPD | the prefill receiver (encode-rank handshakes, receive slots, completion agreement); the encode rank's loop (request relay, batching, send-ring slots) and sender | receive-pool and send-ring memory, publish and reassembly, the vision tower and its embedding cache |
 | Pause / memory saver | state machine, drain gates | release/wake regions |
 | RL weight ops | the two FIFOs and the same-round gate | the weight load and NCCL group work |
 | EPLB | controller, agreements, placement solver | load snapshot, apply placement |
@@ -468,7 +468,10 @@ the prefill peer's cache regions and registers them again on resume, and
 gives the decode peer a fresh transfer session. The EPD prefill receiver is
 `ts-pd`'s too (the encode-rank handshakes, the receive slots, the agreement
 on landed embeddings); the data plane keeps the pools' memory, the publish
-copies and the shard reassembly. L3
+copies and the shard reassembly. An EPD encode rank runs `ts-host` in encode
+mode: `ts-control`'s encode loop relays, batches and leases send-ring slots,
+`ts-pd`'s sender writes the embeddings, and the data plane keeps the vision
+tower, the embedding cache and the ring copies. L3
 storage, context parallelism (which needs no control-plane logic of its
 own), pause, RL weight operations, EPLB (controller, solver and move plan),
 grammar-constrained decoding (`ts-grammar`, xgrammar's C++ library),
@@ -486,8 +489,8 @@ Status: every launch path starts `ts-host` ranks (`TOKENSPEED_HOST_BINARY`
 overrides the binary the `tokenspeed-engine` wheel installs); the Python event
 loop, its hooks, the request handler, the output processor, the data-parallel
 controller, the engine core client and pickle IPC, the Python headless
-transport, the Python PD transfer executors and the EPD prefill hooks are
-deleted, and `docs/design/event-loop.md` describes the Rust loop. `ts-py`
+transport, the Python PD transfer executors, the EPD prefill hooks and the
+Python encode loop are deleted, and `docs/design/event-loop.md` describes the Rust loop. `ts-py`
 (`tokenspeed_engine._native`) is the Python frontend's connection to the ranks.
 Four deviations from the plan above:
 

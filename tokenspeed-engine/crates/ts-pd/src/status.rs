@@ -18,7 +18,8 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! A room's transfer state (`pd/base/status.py`, `DisaggManagerBase`).
+//! A room's transfer state, as the PD and EPD peers' status messages carry
+//! it.
 
 use std::collections::HashMap;
 

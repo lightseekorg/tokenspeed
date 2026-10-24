@@ -18,9 +18,10 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The bootstrap server's HTTP routes (`pd/base/bootstrap.py`): Prefill ranks
-//! register at `PUT /route`; Decode ranks look them up at `GET /route` and
-//! watch `GET /health`. Plain HTTP; never through a proxy.
+//! The HTTP calls to the bootstrap server ([`crate::bootstrap`]): source
+//! ranks register at `PUT /route`; the ranks that read from them look them
+//! up at `GET /route` and watch `GET /health`. Plain HTTP; never through a
+//! proxy.
 
 use std::time::Duration;
 

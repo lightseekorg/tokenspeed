@@ -87,7 +87,6 @@ from tokenspeed.runtime.engine.rust_host import (
     start_rust_host,
 )
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
-from tokenspeed.runtime.epd.encode_loop import run_encode_process
 from tokenspeed.runtime.pd.utils import DisaggregationMode, TransferBackend
 from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
@@ -108,7 +107,6 @@ from tokenspeed.runtime.utils.process import (
     kill_process_tree,
     receive_ready_messages,
     register_child_failure_signals,
-    start_process_with_ready_pipe,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -709,7 +707,7 @@ def _launch_subprocesses(
     Every rank is a ``ts-host`` process; its attention-TP group's first
     rank dials the frontend over the msgpack wire, so the frontend tokenizes
     and detokenizes and the ranks see token ids only. An EPD encode server
-    runs encode workers instead (``_launch_encode_server``).
+    runs encode ranks instead (``_launch_encode_server``).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -835,19 +833,18 @@ def _apply_scheduler_info(tokenizer_manager: AsyncLLM, scheduler_info: dict) -> 
 def _launch_encode_server(
     server_args: ServerArgs, port_args: PortArgs
 ) -> tuple[AsyncLLM, None, dict]:
-    """An EPD encode server: its encode workers (``run_encode_process``),
-    one per rank, and on the first node the frontend that hands them encode
-    requests. The workers run the vision tower and ship embeddings to the
-    prefill servers; no engine rank runs."""
+    """An EPD encode server: its encode ranks (``ts-host`` in encode mode,
+    ``epd/encode_host.py``) and, on the first node, the frontend that pushes
+    them encode requests. The ranks run the vision tower and ship embeddings
+    to the prefill servers; no engine rank runs."""
+    binary = host_binary()
     procs, readers = [], []
     for rank in _scheduler_ranks(server_args):
         rank_server_args = copy.copy(server_args)
         rank_server_args.mapping = copy.deepcopy(server_args.mapping)
         rank_server_args.mapping.rank = rank
-        proc, reader = start_process_with_ready_pipe(
-            run_encode_process,
-            (rank_server_args, port_args),
-            contextlib.nullcontext(),
+        proc, reader = start_rust_host(
+            binary, rank_server_args, port_args, contextlib.nullcontext(), None
         )
         procs.append(proc)
         readers.append(reader)
@@ -865,9 +862,10 @@ def _launch_encode_server(
             proc.join()
         return None, None, None
     launch_metrics_server(server_args)
+    # The first encode rank binds the request channel.
     encode_sender = IpcSender(
         get_zmq_socket(
-            zmq.Context(1), zmq.PUSH, port_args.scheduler_input_ipc_name, True
+            zmq.Context(1), zmq.PUSH, port_args.scheduler_input_ipc_name, False
         )
     )
     tokenizer_manager = AsyncLLM(server_args, None, encode_sender)
@@ -968,9 +966,9 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     kv_bootstrap_server = None
     metrics_relay = None
 
-    # SIGUSR1 reports a child's internal failure (an EPD encode worker sends
-    # it, then exits 0), so record the failure here or the supervisor would
-    # report success.
+    # SIGUSR1 reports a child's internal failure (a rank's host sends it as
+    # it fails), so record the failure here: an exit status alone may not
+    # tell the supervisor.
     child_failed = threading.Event()
     # When the first termination was requested; schedulers still running a
     # grace period later are killed with the rest of the tree.
