@@ -5,6 +5,11 @@ import torch
 import torch.nn.functional as F
 from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.moe import moe_plan as kernel_moe_plan
+from utils import (
+    assert_no_triton_compile,
+    int_specialization_class,
+    warm_specialization_classes,
+)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -92,7 +97,8 @@ def test_triton_bf16_moe_matches_torch(
 ) -> None:
     """Four tokens run 16-row tiles; with the deep pipeline 48 tokens spread one
     expert's 24 routes over two 16-row tiles and 80 (40 per expert) take 64-row
-    tiles, while a 32-wide intermediate keeps the shallow token-count rule."""
+    tiles, while a 32-wide intermediate keeps the shallow token-count rule.
+    On SM90 the three counts take the 16-, 32- and 64-row tiles."""
     if activation == "situ" and precision_policy != "default":
         pytest.skip("The opt-in precision policy supports SiLU only")
     generator = torch.Generator(device="cuda").manual_seed(0)
@@ -195,3 +201,106 @@ def test_triton_bf16_moe_matches_torch(
         rtol=0.02,
         atol=0.0002 if precision_policy != "default" else 0.01,
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_triton_bf16_moe_token_count():
+    """Token counts reuse the stage binaries of their row tile.
+
+    Small batches launch fewer persistent programs than the grid's cap, so the
+    program count must stay a runtime value.
+    """
+    from tokenspeed_kernel.ops.moe._triton import bf16
+    from tokenspeed_kernel.ops.moe._triton import common as _common
+
+    num_experts, top_k, hidden_size, intermediate_size = 4, 2, 128, 64
+    max_tokens = 300
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn(
+        max_tokens,
+        hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    weights = torch.nn.Module()
+    weights.w13_weight = (
+        torch.randn(
+            num_experts,
+            2 * intermediate_size,
+            hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.02
+    )
+    weights.w2_weight = (
+        torch.randn(
+            num_experts,
+            hidden_size,
+            intermediate_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        * 0.02
+    )
+    weights.top_k = top_k
+    first = torch.arange(max_tokens, device="cuda") % num_experts
+    topk_ids = torch.stack(((first + 1) % num_experts, first), dim=1).to(torch.int32)
+    topk_weights = torch.rand(
+        (max_tokens, top_k), device="cuda", dtype=torch.float32, generator=generator
+    )
+    plan = kernel_moe_plan(
+        "unquant",
+        input_dtype=torch.bfloat16,
+        activation="silu",
+        routing_mode="precomputed_topk",
+        ispp=intermediate_size,
+        solution="triton",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+    )
+    plan["precision_policy"] = "bf16_route_accum_fp32"
+    plan["output_scale"] = 1.0
+
+    def run(tokens):
+        return kernel_moe_apply(
+            plan,
+            x[:tokens],
+            weights,
+            torch.empty((tokens, num_experts), device="cuda"),
+            topk_weights=topk_weights[:tokens],
+            topk_ids=topk_ids[:tokens],
+        )
+
+    def tiles(tokens):
+        # The row tile on SM90 (by routes per expert) and elsewhere (by tokens).
+        routes_per_expert = tokens * top_k / num_experts
+        return routes_per_expert <= 8, routes_per_expert < 32, tokens <= 16
+
+    def key(tokens):
+        routes = tokens * top_k
+        counts = (tokens, routes)
+        return (*map(int_specialization_class, counts), *tiles(tokens), routes <= 128)
+
+    # Tokens are independent: a shorter batch is a prefix of the longest one
+    # that uses the same row tile.
+    expected = {tiles(tokens): run(tokens) for tokens in (16, 63, max_tokens)}
+    sweep = (3, 7, 12, 17, 24, 40, 62, 65, 100, 255, 299)
+    warm_specialization_classes(run, key, sweep, range(1, max_tokens))
+    with assert_no_triton_compile(
+        bf16._stage1_kernel,
+        bf16._stage2_kernel,
+        _common._routing_kernel,
+        _common._combine_kernel,
+    ):
+        for tokens in sweep:
+            torch.testing.assert_close(
+                run(tokens), expected[tiles(tokens)][:tokens], rtol=0, atol=0
+            )
