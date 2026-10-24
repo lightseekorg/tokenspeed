@@ -16,6 +16,11 @@ METRIC = {
     "d_measure": "Output Throughput (tok/s)",
 }
 
+# Prefill configs sized against a decode config of another name.
+DECODE_CONFIG = {
+    "attn_tp8_kvp8_moe_tp8": "attn_tp8_moe_tp8",
+}
+
 
 def num_gpus(config: str) -> int:
     m = re.search(r"attn_(?:tp|dp)(\d+)", config)
@@ -84,10 +89,11 @@ def sizing_helper(rows):
     print("\n== P:D sizing from measured P request throughput ==")
     for p in (r for r in rows if r["phase"] == "p_measure"):
         config = p["config"]
+        decode_config = DECODE_CONFIG.get(config, config)
         decode_rows = [
             r
             for r in rows
-            if r["config"] == config
+            if r["config"] == decode_config
             and r["phase"] == "d_measure"
             and r["Target Response Tokens"] == p["Target Response Tokens"]
         ]
@@ -102,7 +108,7 @@ def sizing_helper(rows):
         for d in sorted(decode_rows, key=lambda r: r["Conc."]):
             mu_d = d["Requests/s @ target OSL"]
             print(
-                f"{config}: P cc={p['Conc.']}, D cc={d['Conc.']}, "
+                f"{config} / {decode_config}: P cc={p['Conc.']}, D cc={d['Conc.']}, "
                 f"target OSL={output_tokens}, mu_P={mu_p:.4f} req/s, "
                 f"estimated mu_D={mu_d:.4f} req/s "
                 f"-> {mu_d / mu_p:.2f} P instances per D instance"
