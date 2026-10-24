@@ -898,7 +898,7 @@ class RequestHandler:
                 if req_state.sampling_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_len - len(req_state.prompt_input_ids) - 1,
+            self.max_req_len - len(req_state.prompt_input_ids),
         )
         req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
 

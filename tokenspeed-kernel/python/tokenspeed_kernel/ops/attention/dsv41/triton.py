@@ -2556,8 +2556,8 @@ def _gather_candidates(
 
 
 @triton.jit(
-    do_not_specialize=["I0", "S0", "NC", "W"],
-    do_not_specialize_on_alignment=["I0", "S0", "NC", "W"],
+    do_not_specialize=["I0", "S0", "NC", "K", "W"],
+    do_not_specialize_on_alignment=["I0", "S0", "NC", "K", "W"],
 )
 def _finish_selection(
     I,
@@ -2568,7 +2568,7 @@ def _finish_selection(
     I0,
     S0,
     NC,
-    K: tl.constexpr,
+    K,
     W,
     BLOCK_SIZE: tl.constexpr,
     HAS_CANDIDATES: tl.constexpr,
@@ -2731,7 +2731,10 @@ def prepare_candidate_scores(logits, lengths, candidates, block_size, alignment)
 def finish_selection(
     indices, scores, lengths, candidates, width, block_size, sort_positions
 ):
-    """Filter masked native selections and return logical IDs with -1 padding."""
+    """Filter masked native selections and return logical IDs with -1 padding.
+
+    Selection width is runtime data; only its power-of-two tile specializes.
+    """
     output = torch.empty(indices.shape, dtype=torch.int32, device=indices.device)
     _finish_selection[(indices.shape[0],)](
         indices,
@@ -2753,7 +2756,10 @@ def finish_selection(
     return output
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["selected_stride", "candidate_stride", "K", "C"],
+    do_not_specialize_on_alignment=["selected_stride", "candidate_stride", "K", "C"],
+)
 def _write_selection(
     Selected,
     Candidates,
@@ -2761,10 +2767,10 @@ def _write_selection(
     Lengths,
     Blocks,
     BlockLengths,
-    selected_stride: tl.constexpr,
-    candidate_stride: tl.constexpr,
-    K: tl.constexpr,
-    C: tl.constexpr,
+    selected_stride,
+    candidate_stride,
+    K,
+    C,
     ROW_BLOCK: tl.constexpr,
     CANDIDATE_BLOCK: tl.constexpr,
 ):
@@ -2787,7 +2793,11 @@ def _write_selection(
 
 
 def write_selection(selected, candidates, out):
-    """Copy logical selections and count valid IDs in caller-owned output tiles."""
+    """Copy logical selections and count valid IDs in caller-owned output tiles.
+
+    Selection and candidate widths are runtime data; only their power-of-two
+    tiles specialize.
+    """
     rows, lengths, blocks, block_lengths = out
     if selected.shape[0] == 0:
         return

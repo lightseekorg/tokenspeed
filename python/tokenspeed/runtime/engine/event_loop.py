@@ -599,7 +599,7 @@ class EventLoop:
         self.request_handler = RequestHandler(
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
-            max_req_len=self.max_model_len - 1,
+            max_req_len=self.max_model_len,
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,
