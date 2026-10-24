@@ -159,6 +159,15 @@ def gluon_bf16_moe(
             )
         )
 
+    # The shared sorter uses bucketed scratch, but this path's GEMM launch bounds must
+    # retain the original logical capacity. These are metadata-only views.
+    routes = num_tokens * topk
+    logical_rows = routes * block_m if decode else routes + E * block_m
+    logical_blocks = routes if decode else logical_rows // block_m + 1
+    sorted_token_ids = sorted_token_ids[:logical_rows]
+    sorted_expert_ids = sorted_expert_ids[:logical_blocks]
+    sorted_weights = sorted_weights[:logical_rows]
+
     # empty() is safe: stage 1 writes every inter row (one per (token, slot))
     # before stage 2 reads it (avoids a per-call fill kernel).
     inter = torch.empty(
