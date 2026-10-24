@@ -33,7 +33,10 @@ from tokenspeed_kernel.signature import FormatSignature
 
 logger = logging.getLogger(__name__)
 
+CandidatePolicy = Callable[[KernelSpec, dict[str, Any]], KernelSpec]
+
 __all__ = [
+    "CandidatePolicy",
     "NoKernelFoundError",
     "SelectedKernel",
     "KernelPlan",
@@ -686,6 +689,7 @@ def select_kernel(
     solution: str | None = None,
     override: str | None = None,
     ignore_layout: bool = False,
+    candidate_policy: CandidatePolicy | None = None,
 ) -> SelectedKernel:
     """Select the best kernel for an operation.
 
@@ -708,6 +712,9 @@ def select_kernel(
             a kernel that lacks a required feature.
         ignore_layout: Ignore only storage layouts when choosing preprocessing
             at initialization. Execution uses the default layout-aware matching.
+        candidate_policy: Optional pure, stable, hashable callable adapting
+            candidate specs without mutating them, before trait filtering.
+            Its identity partitions the cache.
 
     Returns:
         A :class:`SelectedKernel` that is directly callable and also
@@ -733,6 +740,8 @@ def select_kernel(
         solution,
         ignore_layout,
     )
+    if candidate_policy is not None:
+        cache_key += (id(candidate_policy), candidate_policy)
     if override is None:
         cached = registry.cache_get(cache_key)
         if cached is not None:
@@ -765,6 +774,8 @@ def select_kernel(
             f"{solution_clause} on {platform.device_name}"
         )
 
+    if candidate_policy is not None:
+        candidates = [candidate_policy(spec, traits or {}) for spec in candidates]
     if traits:
         candidates = _filter_by_traits(candidates, traits)
 

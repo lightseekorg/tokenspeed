@@ -566,6 +566,10 @@ class LogitsProcessor(nn.Module):
         )
         return bool(vote.item())
 
+    def _create_dist_argmax_state(self, **kwargs) -> DistArgmaxState | None:
+        """Select the state policy within the shared TP negotiation."""
+        return try_create_dist_argmax_state(**kwargs)
+
     def acquire_dist_argmax_state(
         self,
         lm_head: VocabParallelEmbedding,
@@ -610,7 +614,7 @@ class LogitsProcessor(nn.Module):
         if self._agree_across_tp(
             current_platform().is_nvidia and dist_argmax_available(), group, device
         ):
-            state = try_create_dist_argmax_state(
+            state = self._create_dist_argmax_state(
                 group=group,
                 rank_in_group=self.tp_rank,
                 max_M=max_M,

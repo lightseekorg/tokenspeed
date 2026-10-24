@@ -1371,6 +1371,8 @@ class DSABackend(PagedAttentionBackend):
             page_size=self.kernel_page_size,
             q_len_per_req=q_len_per_req,
             kv_seq_lens=kv_seq_lens,
+            # Structural layer adapters may omit this optional extension.
+            candidate_policy=getattr(layer, "dsa_candidate_policy", None),
             logit_cap=layer.logit_cap,
             k_scale=1.0,
             return_lse=use_dcp,

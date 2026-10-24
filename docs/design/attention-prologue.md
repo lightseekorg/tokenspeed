@@ -151,6 +151,14 @@ attention K/V either. `test/runtime/test_paged_attention_prologue.py` lists
 these writers and fails on any other model or drafter call of the step
 kernels and modules it names.
 
+LongCat's opt-in TP8 verify-eight layer engines combine the prologue and core
+attention inside the model-specific kernel program. Their ordinary prefill and
+fallback attention still use the shared MLA prologue. The engine layout assigns
+index-K writes to the indexer rank and MLA writes to worker ranks, so launches
+using these engines require prefix reuse and KVStore to be disabled. Their
+weights are fixed after initialization. The model validates these limits
+before enabling an engine; `docs/longcat.md` records the supported configuration.
+
 Write slots come from `forward_write_locations(layer, mode)`. That is
 `write_locations(layer, mode)`, except for a draft's first step over a MIXED
 round, which carries every row whether it dispatches as MIXED or as decode:

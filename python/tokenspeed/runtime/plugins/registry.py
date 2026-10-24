@@ -195,7 +195,8 @@ def register_model(
 
     Args:
         cls: The entry class. It must define a ``model_profile(hf_config)``
-            classmethod returning a :class:`ModelProfile`.
+            classmethod returning a :class:`ModelProfile`, or None to leave a
+            checkpoint on the in-tree profile path.
         architectures: HF ``architectures`` names the class serves; empty
             means the class name.
         override: Allow replacing a class already registered, in tree or by
@@ -210,7 +211,7 @@ def register_model(
     if not callable(getattr(cls, "model_profile", None)):
         raise TypeError(
             f"{cls.__name__} must define a model_profile(hf_config) classmethod "
-            "returning a ModelProfile"
+            "returning a ModelProfile or None"
         )
     for name in architectures or (cls.__name__,):
         _put(
@@ -244,9 +245,9 @@ def resolve_model_profile(
         hf_config: The checkpoint config handed to ``model_profile``.
 
     Returns:
-        ``(architecture, profile)``, or None when no candidate is registered
-        by a plugin (in-tree models still resolve through the architecture
-        tables). The loader checks that it builds the class of exactly this
+        ``(architecture, profile)``, or None when no registered candidate
+        supplies a profile for this checkpoint (in-tree models still resolve
+        through the architecture tables). The loader checks the class of this
         architecture.
     """
     for architecture in architectures:
@@ -254,6 +255,8 @@ def resolve_model_profile(
         if registered is None:
             continue
         profile = registered.cls.model_profile(hf_config)
+        if profile is None:
+            continue
         if not isinstance(profile, ModelProfile):
             raise TypeError(
                 f"{registered.cls.__name__}.model_profile returned "

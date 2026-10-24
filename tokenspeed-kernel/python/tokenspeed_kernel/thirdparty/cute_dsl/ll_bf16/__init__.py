@@ -76,6 +76,11 @@ def _cutlass_dtype(out_dtype: torch.dtype):
 class LLBf16Router:
     """Compile-once driver for the two vendored CuTe router GEMM kernels."""
 
+    max_m = MAX_M
+    max_m_dotprod = MAX_M_DOTPROD
+    block_size_for = staticmethod(block_size_for)
+    splitk_config_for = staticmethod(splitk_config_for)
+
     def __init__(self) -> None:
         # Device-keyed: a callable compiled on one GPU must not run on another.
         # PDL is part of the compiled kernel, so the process-wide policy belongs
@@ -110,7 +115,7 @@ class LLBf16Router:
         return (
             a.ndim == 2
             and b.ndim == 2
-            and 1 <= m <= MAX_M
+            and 1 <= m <= self.max_m
             and a.shape[0] == m
             and a.shape[1] > 0
             and b.shape[0] > 0
@@ -128,12 +133,13 @@ class LLBf16Router:
             and self.is_available()
             # Split-K reduces through DSMEM inside a thread block cluster.
             and (
-                m <= MAX_M_DOTPROD or torch.cuda.get_device_capability(a.device)[0] >= 9
+                m <= self.max_m_dotprod
+                or torch.cuda.get_device_capability(a.device)[0] >= 9
             )
         )
 
-    @staticmethod
-    def uses_dotprod(m: int, k: int) -> bool:
+    @classmethod
+    def uses_dotprod(cls, m: int, k: int) -> bool:
         """Whether ``[M, K]`` runs the dot-product kernel, compiled once per exact M.
 
         Every split-K cluster rank must own at least one K tile. Router
@@ -148,8 +154,8 @@ class LLBf16Router:
         Returns:
             True for the dot-product kernel, False for split-K.
         """
-        split_k, _ = splitk_config_for(m)
-        return m <= MAX_M_DOTPROD or k < split_k * _SPLITK_TILE_K
+        split_k, _ = cls.splitk_config_for(m)
+        return m <= cls.max_m_dotprod or k < split_k * _SPLITK_TILE_K
 
     def _compile_dotprod(
         self,
@@ -311,10 +317,10 @@ class LLBf16Router:
         device = a.device
         stream = self._stream(device)
         enable_pdl = enable_pdl and torch.cuda.get_device_capability(device)[0] >= 9
-        config = splitk_config_for(m)
+        config = self.splitk_config_for(m)
         if self.uses_dotprod(m, k):
             if block_size is None:
-                block_size = block_size_for(m)
+                block_size = self.block_size_for(m)
             key = (
                 device.index or 0,
                 m,

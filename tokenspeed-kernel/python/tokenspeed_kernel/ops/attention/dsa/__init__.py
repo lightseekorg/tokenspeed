@@ -21,12 +21,18 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture, kernel_scope
 from tokenspeed_kernel.registry import KernelRegistry
-from tokenspeed_kernel.selection import KernelPlan, NoKernelFoundError, select_kernel
+from tokenspeed_kernel.selection import (
+    CandidatePolicy,
+    KernelPlan,
+    NoKernelFoundError,
+    select_kernel,
+)
 from tokenspeed_kernel.signature import (
     MXFP8_BLOCK_SCALE,
     dense_tensor_format,
@@ -433,6 +439,7 @@ def dsa_decode(
     *,
     slot_order: str,
     kernel_plan: KernelPlan | None = None,
+    candidate_policy: CandidatePolicy | None = None,
 ) -> AttentionResult:
     """Sparse DSA decode over selected global KV slots.
 
@@ -462,6 +469,8 @@ def dsa_decode(
         out: Optional output buffer.
         override: Optional exact kernel override name.
         solution: Optional kernel solution to force through normal selection.
+        candidate_policy: Optional eligibility policy for dynamic selection;
+            it must leave a supplied kernel plan unchanged.
         kernel_plan: Initialization-time choice; inputs are validated without reselection.
         slot_order: The order the selected slots are reduced in, one of
             ``SLOT_ORDERS``: ``"selection"`` (as the top-k leaf emitted them;
@@ -500,6 +509,16 @@ def dsa_decode(
     }
     signature = _attention_format_signature(q=q)
     if kernel_plan is not None:
+        if (
+            candidate_policy is not None
+            and candidate_policy(
+                replace(kernel_plan.spec, traits=dict(kernel_plan.spec.traits)), traits
+            )
+            != kernel_plan.spec
+        ):
+            raise ValueError(
+                "A candidate policy cannot change a supplied DSA kernel plan"
+            )
         kernel_plan.validate(
             "attention",
             "dsa_decode",
@@ -518,6 +537,7 @@ def dsa_decode(
             traits=traits,
             solution=solution,
             override=override,
+            candidate_policy=candidate_policy,
         )
     slot_order_kwargs = _slot_order_kwargs(
         kernel, slot_order, role="core", kernel_plan=kernel_plan
@@ -1118,6 +1138,7 @@ def dsa_decode_topk(
     override: str | None = None,
     solution: str | None = None,
     kernel_plan: KernelPlan | None = None,
+    candidate_policy: CandidatePolicy | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute DSA decode top-k over a paged KV cache.
 
@@ -1171,6 +1192,8 @@ def dsa_decode_topk(
         override: Optional exact kernel override name.
         kernel_plan: Optional initialization-time provider, validated without reselection.
         solution: Optional kernel solution to force through normal selection.
+        candidate_policy: Optional eligibility policy for dynamic selection;
+            it must leave a supplied kernel plan unchanged.
 
     Implementations may accept a strided outer weight dimension, including the
     fused model projection view. q, seq_lens, and block_table must be contiguous
@@ -1252,9 +1275,20 @@ def dsa_decode_topk(
             features=frozenset(required_features) if required_features else None,
             solution=solution,
             override=override,
+            candidate_policy=candidate_policy,
         )
     else:
         traits["slot_order"] = slot_order
+        if (
+            candidate_policy is not None
+            and candidate_policy(
+                replace(kernel_plan.spec, traits=dict(kernel_plan.spec.traits)), traits
+            )
+            != kernel_plan.spec
+        ):
+            raise ValueError(
+                "A candidate policy cannot change a supplied DSA kernel plan"
+            )
         kernel_plan.validate(
             "attention",
             "dsa_decode_topk",

@@ -855,6 +855,10 @@ the draft's attention to the full history.
 Use `--attention-backend mha` and `--drafter-attention-backend mha` for
 standard or grouped-query attention in the target and draft, respectively.
 
+LongCat DFlash checkpoints may capture the final decoder layer. LongCat records
+that layer's completed residual stream before the model-level final norm,
+matching Hugging Face's `hidden_states[layer_id + 1]` convention.
+
 ## Observability
 
 | Parameter | Purpose |

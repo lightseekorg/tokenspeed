@@ -93,6 +93,9 @@ dependencies = [
 tokenspeed = "tokenspeed.cli:main"
 ts = "tokenspeed.cli:main"
 
+[project.entry-points."tokenspeed.plugins"]
+longcat = "tokenspeed.runtime.configs.longcat_config:register"
+
 [project.urls]
 "Homepage" = "https://github.com/lightseekorg/tokenspeed"
 

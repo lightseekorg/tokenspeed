@@ -28,7 +28,7 @@ decision, bound onto the layer at executor startup by
 contracts must satisfy: a group must retain every token its layers can see.
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -164,6 +164,7 @@ class PagedAttention(nn.Module):
         self.qk_norm = qk_norm
         # Per-tensor FP8 KV-cache scales (None at unit); a non-FP8 cache ignores them.
         self.fp8_kv_scales: FP8TensorScales | None = None
+        self.dsa_candidate_policy: Callable | None = None
 
     def load_kv_cache_scale(self, name: str, scale: torch.Tensor) -> None:
         """Take a checkpoint's key, value or shared KV-cache scale tensor."""
