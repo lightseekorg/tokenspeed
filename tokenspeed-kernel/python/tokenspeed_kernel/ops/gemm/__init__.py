@@ -3817,6 +3817,7 @@ def fp32_router_gemv_plan(
     output_size: int,
     dtype: torch.dtype,
     solution: str | None,
+    batch_invariant: bool,
 ) -> object:
     """Select an FP32 router GEMV and its persistent weight layout.
 
@@ -3825,6 +3826,8 @@ def fp32_router_gemv_plan(
         output_size: Number of router outputs.
         dtype: Input and canonical weight dtype, which must be FP32.
         solution: Optional implementation family override.
+        batch_invariant: Require a provider declaring the ``batch_invariant``
+            feature, as bitwise numerics envelopes do.
 
     Returns:
         An opaque plan accepted by the related process and execute APIs.
@@ -3838,6 +3841,7 @@ def fp32_router_gemv_plan(
         "gemm",
         "prepared_fp32_router_gemv",
         signature,
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         solution=solution,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)
