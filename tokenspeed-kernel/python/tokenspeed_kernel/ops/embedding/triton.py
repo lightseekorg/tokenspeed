@@ -1113,11 +1113,6 @@ def triton_embedding_rope_mla(
 
 @triton.jit(
     do_not_specialize=["index_width", "index_stride_row", "index_stride_col"],
-    do_not_specialize_on_alignment=[
-        "index_width",
-        "index_stride_row",
-        "index_stride_col",
-    ],
 )
 def _mxfp8_embedding_kernel(
     W,
