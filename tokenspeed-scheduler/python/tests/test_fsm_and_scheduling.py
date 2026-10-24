@@ -781,3 +781,38 @@ class TestDecodeInputIds:
         num_decodes = len(op.request_ids) - op.num_extends()
         assert len(op.decode_input_ids) == num_decodes
         assert all(did == -1 for did in op.decode_input_ids)
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("disable_prefix_cache", [False, True])
+def test_full_request_pool_preserves_residents_and_waiting_order(
+    mixed: bool, disable_prefix_cache: bool
+) -> None:
+    cfg = make_config(
+        max_scheduled_tokens=128,
+        max_batch_size=1,
+        prefix_granularity=16,
+        num_device_pages=1024,
+    )
+    cfg.enable_mixed_prefill_decode = mixed
+    cfg.disable_prefix_cache = disable_prefix_cache
+    cfg.enable_l3_storage = False
+    scheduler = Scheduler(cfg)
+    submit(scheduler, "resident", list(range(32)))
+    scheduler.next_execution_plan()
+    advance_forward(scheduler, "resident", [33], finish=False)
+    submit(scheduler, "first", list(range(1000, 2024)))
+    submit(scheduler, "second", list(range(3000, 4024)))
+    for token in range(34, 42):
+        if token > 34:
+            send_reserve_num_tokens(scheduler, "resident", 0)
+        plan = scheduler.next_execution_plan()
+        assert list(plan.forward[0].request_ids) == ["resident"]
+        assert plan.forward[0].num_extends() == 0
+        assert scheduler.waiting_size() == 2
+        advance_forward(scheduler, "resident", [token], finish=False)
+    advance_forward(scheduler, "resident", [], finish=True)
+    admitted = scheduler.next_execution_plan()
+    assert list(admitted.forward[0].request_ids) == ["first"]
+    assert admitted.forward[0].num_extends() == 1
+    assert scheduler.waiting_size() == 1
