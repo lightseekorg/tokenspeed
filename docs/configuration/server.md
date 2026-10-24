@@ -225,8 +225,11 @@ values. The engine computes them where the forward runs eagerly, so the
 ingress takes `top_logprobs_num` only for a request whose every token is
 sampled in its prefill (`max_new_tokens` 0 or 1, as an `echo` scoring request
 sends) and with `--logprob-order torch`; a longer generation, pipeline
-parallelism and disaggregated prefill and decode get a 400, and the direct
-msgpack scheduler drive refuses it. `token_ids_logprob` is not supported yet.
+parallelism and disaggregated prefill and decode get a 400. The direct
+msgpack scheduler drive takes `top_logprobs_num` under the same rules and
+carries the alternatives as two appended columns of its per-step output
+(`output_top_logprobs_val` / `output_top_logprobs_idx`, named in the engine's
+ready response). `token_ids_logprob` is not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see

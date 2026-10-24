@@ -41,7 +41,11 @@ from tokenspeed.runtime.engine.io_struct import (
     ProfileReqType,
     TokenizedGenerateReqInput,
 )
-from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
+from tokenspeed.runtime.engine.logprobs import (
+    resolve_logprob_start_len,
+    top_logprobs_launch_refusal,
+    top_logprobs_request_refusal,
+)
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
@@ -316,6 +320,12 @@ class MsgpackRecvSocket:
     is marked via ``validation_error`` so RequestHandler admits it pre-finished
     (FINISH_ABORT) and OutputProcesser emits a terminal "abort" output.
 
+    ``top_logprobs_unservable`` is the launch-level reason this engine computes
+    no ranked alternatives at all (None when it does); a request's
+    ``top_logprobs_num`` is taken under the rules the input processor applies
+    (``logprobs.top_logprobs_request_refusal``) and the alternatives ride the
+    slim output's appended columns.
+
     A control call becomes the scheduler's own control request through
     ``control`` (shared with the send adapter, which answers the request's
     output under the call id); a call this side cannot place is answered as
@@ -329,12 +339,14 @@ class MsgpackRecvSocket:
         *,
         enable_output_logprobs: bool,
         supports_prompt_logprobs: bool,
+        top_logprobs_unservable: str | None,
         control: ControlCalls,
     ) -> None:
         self._socket = socket
         self._vocab_size = vocab_size
         self._enable_output_logprobs = enable_output_logprobs
         self._supports_prompt_logprobs = supports_prompt_logprobs
+        self._top_logprobs_unservable = top_logprobs_unservable
         self._control = control
         self._pending: collections.deque = collections.deque()
 
@@ -347,7 +359,9 @@ class MsgpackRecvSocket:
         the engine cannot compute them (``supports_prompt_logprobs``), and
         otherwise because the slim per-step output (``BatchTokenIDOutSlim``)
         has no prompt-logprob columns -- computing them would silently drop
-        them on the wire.
+        them on the wire. ``top_logprobs_num`` takes the input processor's
+        rules (a request sampled entirely in its prefill, on a launch that
+        computes alternatives); the slim output carries them.
         """
         if obj.return_logprob and not self._enable_output_logprobs:
             return (
@@ -356,9 +370,14 @@ class MsgpackRecvSocket:
             )
         if obj.return_logprob:
             if obj.top_logprobs_num:
-                return (
-                    "top_logprobs_num > 0 (output top-k logprobs) is not supported yet"
+                reason = (
+                    top_logprobs_request_refusal(
+                        obj.top_logprobs_num, obj.sampling_params.max_new_tokens
+                    )
+                    or self._top_logprobs_unservable
                 )
+                if reason is not None:
+                    return reason
             if obj.token_ids_logprob:
                 return "token_ids_logprob is not supported yet"
             if obj.input_ids is None:
@@ -565,6 +584,7 @@ def connect_msgpack_engine(
     *,
     enable_output_logprobs: bool,
     supports_prompt_logprobs: bool,
+    top_logprobs_unservable: str | None,
 ) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
     """Run the startup handshake against SMG and return the wrapped
     data-plane sockets.
@@ -633,6 +653,7 @@ def connect_msgpack_engine(
             vocab_size,
             enable_output_logprobs=enable_output_logprobs,
             supports_prompt_logprobs=supports_prompt_logprobs,
+            top_logprobs_unservable=top_logprobs_unservable,
             control=control,
         ),
         MsgpackSendSocket(output_socket, engine_index=engine_index, control=control),
@@ -696,4 +717,5 @@ def connect_msgpack_engine_for_loop(
         loop.model_config.vocab_size,
         enable_output_logprobs=server_args.enable_output_logprobs,
         supports_prompt_logprobs=loop.supports_prompt_logprobs,
+        top_logprobs_unservable=top_logprobs_launch_refusal(server_args),
     )

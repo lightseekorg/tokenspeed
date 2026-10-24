@@ -766,6 +766,14 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     num_waiting: int = 0
     kv_active_pages: int = 0
     kv_total_pages: int = 0
+    # The ranked alternatives (``top_logprobs_num``) of each newly decoded
+    # token this step: per request, per token, the k most likely (logprob,
+    # token id) pairs, most likely first, parallel to the sampled-token
+    # columns above. Appended wire tail: an older peer's 14-element batch
+    # decodes with both empty; an empty inner list per request that asked
+    # for none keeps the columns non-ragged (always length == len(rids)).
+    output_top_logprobs_val: list[list[list[float]]] = []
+    output_top_logprobs_idx: list[list[list[int]]] = []
 
     @classmethod
     def from_full(
@@ -810,6 +818,18 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
             output_token_logprobs_idx=(
                 list(out.output_token_logprobs_idx)
                 if out.output_token_logprobs_idx is not None
+                else [[] for _ in out.rids]
+            ),
+            # stream_output ships [] for a whole frame where no request asked
+            # for alternatives; the wire keeps one (empty) row per request.
+            output_top_logprobs_val=(
+                [list(rows) for rows in out.output_top_logprobs_val]
+                if out.output_top_logprobs_val
+                else [[] for _ in out.rids]
+            ),
+            output_top_logprobs_idx=(
+                [list(rows) for rows in out.output_top_logprobs_idx]
+                if out.output_top_logprobs_idx
                 else [[] for _ in out.rids]
             ),
         )

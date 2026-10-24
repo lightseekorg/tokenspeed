@@ -261,6 +261,10 @@ def test_slim_out_from_full_roundtrip():
     assert rt.num_waiting == 0
     assert rt.kv_active_pages == 0
     assert rt.kv_total_pages == 0
+    # No request asked for alternatives: one empty row per request, not a
+    # frame-wide [] (the columns stay parallel to rids on the wire).
+    assert rt.output_top_logprobs_val == [[]]
+    assert rt.output_top_logprobs_idx == [[]]
 
 
 def test_slim_out_carries_the_producing_engine_index():
@@ -286,6 +290,70 @@ def test_slim_out_load_tail_defaults_for_older_senders(
     assert rt.num_waiting == 0
     assert rt.kv_active_pages == 0
     assert rt.kv_total_pages == 0
+    assert rt.output_top_logprobs_val == []
+    assert rt.output_top_logprobs_idx == []
+
+
+def test_slim_out_fourteen_element_batch_decodes_without_alternatives():
+    # The batch of an engine before the ranked-candidate columns: the two
+    # appended columns decode empty, nothing else moves.
+    slim = BatchTokenIDOutSlim.from_full(
+        _make_batch_out(
+            output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
+        ),
+        engine_index=2,
+        kv_total_pages=40,
+    )
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(
+        msgspec.msgpack.encode(raw[:14])
+    )
+    assert rt.output_token_logprobs_val == [[pytest.approx(-0.5)]]
+    assert (rt.engine_index, rt.kv_total_pages) == (2, 40)
+    assert rt.output_top_logprobs_val == []
+    assert rt.output_top_logprobs_idx == []
+
+
+def test_slim_out_carries_the_ranked_alternatives():
+    # Two requests this step: the first asked for top-2 and decoded two
+    # tokens, the second asked for none. stream_output ships per-request
+    # lists in a frame where some request asked.
+    out = _make_batch_out(
+        rids=["a", "b"],
+        finished_reasons=[None, None],
+        decoded_texts=["", ""],
+        decode_ids=[[10, 11], [12]],
+        read_offsets=[0, 0],
+        output_ids=[[10, 11], [12]],
+        output_multi_ids=[[], []],
+        skip_special_tokens=[True, True],
+        spaces_between_special_tokens=[True, True],
+        no_stop_trim=[False, False],
+        prompt_tokens=[3, 4],
+        completion_tokens=[2, 1],
+        cached_tokens=[0, 0],
+        spec_verify_ct=[0, 0],
+        output_token_logprobs_val=[[-0.1, -0.7], []],
+        output_token_logprobs_idx=[[10, 11], []],
+        output_top_logprobs_val=[[[-0.1, -2.3], [-0.7, -0.9]], []],
+        output_top_logprobs_idx=[[[10, 4], [11, 7]], []],
+        output_extra_infos=[{}, {}],
+    )
+    slim = BatchTokenIDOutSlim.from_full(out)
+    raw = msgspec.msgpack.decode(_encode_payload(slim))
+    assert len(raw) == 16
+    assert raw[14] == [
+        [
+            [pytest.approx(-0.1), pytest.approx(-2.3)],
+            [pytest.approx(-0.7), pytest.approx(-0.9)],
+        ],
+        [],
+    ]
+    assert raw[15] == [[[10, 4], [11, 7]], []]
+    rt = msgspec.msgpack.Decoder(BatchTokenIDOutSlim).decode(_encode_payload(slim))
+    assert rt.output_top_logprobs_idx == [[[10, 4], [11, 7]], []]
+    assert rt.output_top_logprobs_val[1] == []
+    assert len(rt.output_top_logprobs_val) == len(rt.rids)
 
 
 def test_slim_out_sources_output_ids_not_the_detok_window():
@@ -322,7 +390,8 @@ def test_slim_out_carries_logprob_columns():
 
 
 def test_slim_out_is_tagged_positional_tuple():
-    """The wire form pins SMG's exact 14-element positional contract."""
+    """The wire form pins SMG's exact 16-element positional contract (the
+    14-element prefix of older engines plus the two ranked-candidate columns)."""
     out = _make_batch_out(
         output_token_logprobs_val=[[-0.5]], output_token_logprobs_idx=[[10]]
     )
@@ -337,7 +406,7 @@ def test_slim_out_is_tagged_positional_tuple():
     raw = msgspec.msgpack.decode(_encode_payload(slim))
     assert isinstance(raw, list)
     assert raw[0] == "BatchTokenIDOutSlim"
-    assert len(raw) == 14
+    assert len(raw) == 16
     assert raw[1] == ["r1"]  # rids
     assert raw[2] == [[10, 11]]  # output_ids
     assert raw[3] == ["length"]  # finished_reasons
@@ -348,6 +417,8 @@ def test_slim_out_is_tagged_positional_tuple():
     assert raw[11] == 3  # num_waiting
     assert raw[12] == 4  # kv_active_pages
     assert raw[13] == 20  # kv_total_pages
+    assert raw[14] == [[]]  # output_top_logprobs_val (appended)
+    assert raw[15] == [[]]  # output_top_logprobs_idx (appended)
 
 
 def test_slim_out_finish_reason_none_maps_to_empty():
@@ -405,6 +476,7 @@ def test_recv_socket_aborts_request_with_invalid_sampling_params():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
 
@@ -439,6 +511,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
     io = recv_off.recv_pyobj()
@@ -450,6 +523,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
     io = recv_on.recv_pyobj()
@@ -465,7 +539,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         ({"logprob_start_len": 1}, "msgpack output wire"),
         ({"logprob_start_len": 3}, "smaller than the prompt length"),
         ({"logprob_start_len": -2}, "must be -1 or >= 0"),
-        ({"top_logprobs_num": 2}, "top_logprobs_num"),
+        ({"top_logprobs_num": 21}, "between 1 and 20"),
         ({"token_ids_logprob": [1]}, "token_ids_logprob"),
     ],
 )
@@ -479,6 +553,7 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
     io = recv.recv_pyobj()
@@ -490,9 +565,100 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
     assert recv.recv_pyobj().validation_error is None
+
+
+def test_recv_socket_takes_top_logprobs_under_the_engines_rules():
+    # The input processor's rules for the in-process path, applied here: the
+    # alternatives are computed where a forward runs eagerly, so a request
+    # sampled entirely in its prefill is served and a longer one refused. An
+    # unset max_new_tokens means unbounded on this wire (the request handler
+    # clamps it to the context), so it is refused like a long one.
+    def _frames(rid: str, max_new_tokens: int | None, k: int) -> list[bytes]:
+        return _add_frames(
+            rid,
+            SamplingParams(max_new_tokens=max_new_tokens),
+            return_logprob=True,
+            top_logprobs_num=k,
+        )
+
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [
+                _frames("echo", 1, 3),
+                _frames("score", 0, 20),
+                _frames("unset", None, 2),
+                _frames("long", 8, 3),
+                _frames("many", 1, 21),
+            ]
+        ),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
+        control=zmq_msgpack.ControlCalls(),
+    )
+    for rid in ("echo", "score"):
+        io = recv.recv_pyobj()
+        assert io.rid == rid
+        assert io.validation_error is None
+    for rid in ("unset", "long"):
+        io = recv.recv_pyobj()
+        assert io.rid == rid
+        assert "max_new_tokens set to 0 or 1" in io.validation_error
+    assert "between 1 and 20" in recv.recv_pyobj().validation_error
+
+
+def test_recv_socket_refuses_top_logprobs_the_launch_cannot_compute():
+    # A launch-level reason (another logprob order, pipeline parallelism,
+    # disaggregation) is the connect-time verdict; the request's own rules
+    # are checked first, in the input processor's order.
+    reason = "top_logprobs_num > 0 needs --logprob-order torch, not megatron."
+    recv = zmq_msgpack.MsgpackRecvSocket(
+        _FakeInputSocket(
+            [
+                _add_frames(
+                    "r1",
+                    SamplingParams(max_new_tokens=1),
+                    return_logprob=True,
+                    top_logprobs_num=3,
+                ),
+                _add_frames(
+                    "r2",
+                    SamplingParams(max_new_tokens=9),
+                    return_logprob=True,
+                    top_logprobs_num=3,
+                ),
+                _add_frames(
+                    "r3", SamplingParams(max_new_tokens=1), return_logprob=True
+                ),
+            ]
+        ),
+        vocab_size=32,
+        enable_output_logprobs=True,
+        supports_prompt_logprobs=True,
+        top_logprobs_unservable=reason,
+        control=zmq_msgpack.ControlCalls(),
+    )
+    assert recv.recv_pyobj().validation_error == reason
+    assert "max_new_tokens set to 0 or 1" in recv.recv_pyobj().validation_error
+    assert recv.recv_pyobj().validation_error is None
+
+
+def test_top_logprobs_launch_refusal_reads_the_launch():
+    from tokenspeed.runtime.engine.logprobs import top_logprobs_launch_refusal
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    server_args = ServerArgs(model="x")
+    assert top_logprobs_launch_refusal(server_args) is None
+    server_args.logprob_order = "megatron"
+    assert "--logprob-order torch" in top_logprobs_launch_refusal(server_args)
+    server_args.logprob_order = "torch"
+    server_args.disaggregation_mode = "prefill"
+    assert "disaggregated" in top_logprobs_launch_refusal(server_args)
 
 
 def test_recv_socket_names_the_engine_capability_before_the_wire_limit():
@@ -512,6 +678,7 @@ def test_recv_socket_names_the_engine_capability_before_the_wire_limit():
         vocab_size=32,
         enable_output_logprobs=True,
         supports_prompt_logprobs=False,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
     io = recv.recv_pyobj()
@@ -530,6 +697,7 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
     io = recv.recv_pyobj()
@@ -545,6 +713,7 @@ def test_recv_socket_verify_does_not_apply_to_abort():
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
     )
     a1 = recv.recv_pyobj()
@@ -732,6 +901,7 @@ def _control_pair(
         vocab_size=32,
         enable_output_logprobs=False,
         supports_prompt_logprobs=True,
+        top_logprobs_unservable=None,
         control=control,
     )
     out = _FakeOutputSocket()
@@ -778,6 +948,12 @@ def test_ready_response_declares_the_emitted_output_structs():
         "success",
         "message",
         "engine_index",
+    ]
+    # The frontend reads the appended columns' names here before it forwards
+    # a top_logprobs_num above one.
+    assert layouts["BatchTokenIDOutSlim"][-2:] == [
+        "output_top_logprobs_val",
+        "output_top_logprobs_idx",
     ]
     assert layouts["BatchTokenIDOutSlim"][:8] == [
         "rids",
@@ -1094,6 +1270,7 @@ def test_connect_and_data_plane_roundtrip():
                 vocab_size=32000,
                 enable_output_logprobs=False,
                 supports_prompt_logprobs=True,
+                top_logprobs_unservable=None,
             )
             engine_holder["recv"] = recv
             engine_holder["send"] = send
@@ -1205,6 +1382,7 @@ def test_two_dp_ranks_connect_with_distinct_identities():
                 vocab_size=32000,
                 enable_output_logprobs=False,
                 supports_prompt_logprobs=True,
+                top_logprobs_unservable=None,
             )
         except Exception as exc:
             errors[index] = exc
