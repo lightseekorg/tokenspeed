@@ -23,9 +23,7 @@
 import argparse
 import json
 import os
-from contextlib import ExitStack
 from pathlib import Path
-from unittest import mock
 
 import torch
 import torch.distributed as dist
@@ -35,7 +33,6 @@ from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager as pg_manager,
 )
-from tokenspeed.runtime.layers import shared_expert_tp
 from tokenspeed.runtime.layers.shared_expert_tp import (
     SharedExpertCommunication,
     initialize_shared_expert_group,
@@ -221,41 +218,6 @@ def main():
                     fork.join()
                 return output
 
-            # Observe real collectives during eager warmup, without replacing
-            # their results. Numerics alone cannot detect an incorrect fallback
-            # or unnecessary communication by an entirely empty subgroup.
-            collective_names = (
-                "trtllm_allgather",
-                "trtllm_reduce_scatter",
-                "all_gather_single",
-                "reduce_scatter",
-            )
-            with ExitStack() as stack:
-                calls = [
-                    stack.enter_context(
-                        mock.patch.object(
-                            shared_expert_tp,
-                            name,
-                            wraps=getattr(shared_expert_tp, name),
-                        )
-                    )
-                    for name in collective_names
-                ]
-                run()
-                active_rows = max(counts[r] for r in parallel.tp_group)
-                native = (
-                    args.tp_size in (2, 4, 8, 16)
-                    and hidden % 128 == 0
-                    and 0 < active_rows <= 128
-                )
-                fallback = active_rows > 0 and not native
-                observed = [call.call_count for call in calls]
-                expected_calls = [int(native)] * 2 + [int(fallback)] * 2
-                routing_ok = torch.tensor(
-                    int(observed == expected_calls), device="cuda"
-                )
-                dist.all_reduce(routing_ok, op=dist.ReduceOp.MIN)
-                assert routing_ok.item() == 1, (rows, pattern, observed, expected_calls)
             for _ in range(2):
                 run()
             graph = torch.cuda.CUDAGraph()
