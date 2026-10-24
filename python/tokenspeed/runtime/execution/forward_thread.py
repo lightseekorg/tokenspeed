@@ -90,13 +90,14 @@ this becomes a process the interface is already the whole interface.
 
    - Grammar matchers. ``GrammarStepInputs.grammars`` holds the control
      plane's live matcher objects, and ownership is split by path. Under
-     capturable grammar the side-stream hostfunc advances them and the
-     commit path deliberately does not; under eager grammar the data plane
-     reads them during the fill and the commit path advances them, so the
-     loop drains its in-flight queue before dispatching a grammar batch
-     (``EventLoop._dispatch_depends_on_pending_commit`` is the registry of
-     those drain rules). Copying a matcher per round is not free, which is
-     why this stays an exception rather than becoming rule 2.
+     capturable grammar the side-stream host node advances them, and the
+     commit path only when no next forward does; under eager grammar the
+     data plane reads them during the fill and the commit path advances
+     them, so the loop drains its in-flight queue before dispatching a
+     grammar batch (``EventLoop._dispatch_depends_on_pending_commit`` is
+     the registry of those drain rules). Copying a matcher per round is
+     not free, which is why this stays an exception rather than becoming
+     rule 2.
 
    - Multimodal items. The gather's snapshot is shallow on purpose: the
      ``MultimodalDataItem`` objects stay shared, and the data plane WRITES

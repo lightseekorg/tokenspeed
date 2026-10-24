@@ -450,7 +450,13 @@ class RequestState:
         )
         return unsent, self._read_offset - offset
 
-    def check_finished(self, skip_grammar_termination: bool = False):
+    def check_finished(self, grammar_terminated: bool | None = None):
+        """Set ``finished_reason`` if the last output token ends the request.
+
+        ``grammar_terminated`` says whether that token ended the grammar,
+        as a step's grammar completion reports it; ``None`` asks the
+        matcher, which only knows whether the grammar has ended by now.
+        """
 
         if self.finished:
             return
@@ -461,14 +467,13 @@ class RequestState:
             )
             return
 
-        # When the capturable-grammar hostfunc is authoritative, the
-        # caller identifies the terminating token itself (see
-        # post_process_forward_op); firing here would re-trigger on
-        # every later token and trim content via trim_matched_stop.
-        if not skip_grammar_termination and self.grammar is not None:
-            if self.grammar.is_terminated():
-                self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
-                return
+        if grammar_terminated is None:
+            grammar_terminated = (
+                self.grammar is not None and self.grammar.is_terminated()
+            )
+        if grammar_terminated:
+            self.finished_reason = FINISH_MATCHED_TOKEN(matched=self.output_ids[-1])
+            return
 
         if len(self.output_ids) >= self.sampling_params.max_new_tokens:
             self.finished_reason = FINISH_LENGTH(
@@ -782,13 +787,13 @@ class OutputProcesser:
         )
         self._emit_spec_decode_metrics(forward_op, model_execution_results)
 
-        # Wait briefly for the next step's host node to advance the
+        # Wait briefly for the next step's host node, if any, to advance the
         # matcher; if it doesn't come, advance on host. Exactly one path
         # advances: a host advance that loses waits for the host node.
         grammar_completion = model_execution_results.grammar_completion
         grammar_terminated_at = None
         if grammar_completion is not None:
-            if not grammar_completion.wait(timeout=0.005):
+            if not grammar_completion.wait(timeout=grammar_completion.host_node_wait):
                 grammar_completion.advance_on_host(
                     model_execution_results.output_tokens.tolist(),
                     model_execution_results.output_lengths.tolist(),
@@ -978,23 +983,15 @@ class OutputProcesser:
                 request_state.spec_verify_ct += 1
                 self._check_physical_extent(rid, request_state, output_length)
 
-            # With the capturable grammar pipeline the matcher is
-            # advanced by the hostfunc; here we just read which token
-            # (if any) terminated it so FINISH_MATCHED_TOKEN fires on
-            # the right token and check_finished skips the now-stale
-            # grammar.is_terminated() probe.
-            use_hostfunc = grammar_terminated_at is not None
-            advance_grammar = not use_hostfunc and request_state.grammar is not None
+            # The grammar completion advanced the matcher above and says
+            # which token (if any) ended the grammar, so FINISH_MATCHED_TOKEN
+            # fires on that token rather than on every later one.
             term_idx = (
-                grammar_terminated_at[i]
-                if use_hostfunc and request_state.grammar is not None
-                else -1
+                grammar_terminated_at[i] if grammar_terminated_at is not None else None
             )
             new_ids = []
             for j, model_output_id in enumerate(model_output_ids):
                 request_state.output_ids.append(model_output_id)
-                if advance_grammar:
-                    request_state.grammar.accept_token(model_output_id)
                 if (
                     request_state.return_logprob
                     and request_state.output_token_logprobs_val is not None
@@ -1025,15 +1022,9 @@ class OutputProcesser:
                         request_state.output_top_logprobs_idx.append(
                             model_output_top[1][j][:k]
                         )
-                if term_idx == j:
-                    # Grammar termination takes precedence over
-                    # length/EOS/stop_str at the same step (matching
-                    # check_finished's original order).
-                    request_state.finished_reason = FINISH_MATCHED_TOKEN(
-                        matched=model_output_id
-                    )
-                else:
-                    request_state.check_finished(skip_grammar_termination=use_hostfunc)
+                request_state.check_finished(
+                    grammar_terminated=None if term_idx is None else term_idx == j
+                )
                 new_ids.append(model_output_id)
                 if request_state.finished:
                     request_state.accept_draft_tokens = (

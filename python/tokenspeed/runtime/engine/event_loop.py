@@ -1166,9 +1166,9 @@ class EventLoop:
 
         - Eager grammar: ``setup_grammar_step`` reads each matcher's current
           state to fill the bitmask, and the matcher only advances at the
-          pending step's commit (``accept_token``). Capturable grammar dodges
-          this with an in-graph hostfunc; eager has no equivalent, so trade
-          the overlap away for grammar batches.
+          pending step's commit (``advance_on_host``). Capturable grammar
+          dodges this with an in-graph host node; eager has no equivalent, so
+          trade the overlap away for grammar batches.
 
         Prefer removing a dependency over registering one: the P-side remote
         decode was a rule here until the scheduler learned to hold it, and

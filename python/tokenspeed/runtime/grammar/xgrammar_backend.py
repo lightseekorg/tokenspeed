@@ -115,7 +115,7 @@ class XGrammarGrammar(BaseGrammarObject):
         self.finished = False
         self.accepted_tokens: list[int] = []
 
-        # The capturable grammar's C++ reference to ``matcher``, made on first use.
+        # The C++ grammar work's reference to ``matcher``, made on first use.
         self._native_matcher: Any | None = None
 
     def is_terminated(self):
@@ -123,8 +123,8 @@ class XGrammarGrammar(BaseGrammarObject):
         return self.matcher.is_terminated()
 
     def native_matcher(self) -> Any:
-        """``matcher`` for the capturable grammar's host node, which calls it
-        without the GIL; it holds the matcher and its stop tokens."""
+        """``matcher`` for the C++ grammar work, which calls it without the
+        GIL; it holds the matcher and its stop tokens."""
         if self._native_matcher is None:
             from tokenspeed.runtime.grammar.grammar_host import load_grammar_host_ext
 

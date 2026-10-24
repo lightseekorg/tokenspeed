@@ -405,6 +405,66 @@ def test_nan_outranks_a_client_abort_on_the_prefill_node():
     assert "prefill" not in processor.rid_to_state
 
 
+class _DecodeEndsItsGrammar:
+    """A step's grammar completion: the decode request's token at ``end``
+    ends its grammar."""
+
+    host_node_wait = 0.25
+
+    def __init__(self, end):
+        self.end = end
+        self.waited = []
+
+    def wait(self, timeout):
+        self.waited.append(timeout)
+        return True
+
+    def advance_on_host(self, output_tokens, accept_lengths):
+        raise AssertionError("the completion has advanced")
+
+    def terminated_at(self):
+        return [-1, self.end]
+
+
+class _VerifyResult(_ExecutionResult):
+    output_tokens = torch.tensor([11, 22, 23], dtype=torch.int32)
+    output_lengths = torch.tensor([1, 2], dtype=torch.int32)
+
+
+@pytest.mark.parametrize("aborted,end", [(False, 1), (True, 0)])
+def test_a_grammar_ending_keeps_check_finisheds_order(aborted, end):
+    """The token that ends the grammar finishes the request, not an earlier
+    one, unless an abort already pending on that token outranks it as
+    check_finished orders them."""
+    from tokenspeed.runtime.engine.request_types import (
+        FINISH_ABORT,
+        FINISH_MATCHED_TOKEN,
+    )
+
+    processor = OutputProcesser(
+        _Sender(), attn_tp_rank=0, spec_num_tokens=2, metrics=_Metrics()
+    )
+    processor.rid_to_state["prefill"] = _state([1, 2, 3, 4])
+    decode = _state([5, 6, 7], computed_length=3)
+    processor.rid_to_state["decode"] = decode
+    if aborted:
+        processor.mark_abort("decode", notify_client=False)
+
+    completion = _DecodeEndsItsGrammar(end)
+    result = _VerifyResult()
+    result.grammar_completion = completion
+    processor.post_process_forward_op(_ForwardOp(), result, is_prefill_instance=False)
+
+    # post_process waits for the host node as long as the completion says.
+    assert completion.waited == [0.25]
+    if aborted:
+        assert isinstance(decode.finished_reason, FINISH_ABORT)
+    else:
+        assert isinstance(decode.finished_reason, FINISH_MATCHED_TOKEN)
+        assert decode.finished_reason.matched == [22, 23][end]
+        assert decode.output_ids == [22, 23][: end + 1]
+
+
 class _RecordingLogger:
     """Capture logger.info(fmt, *args) calls as formatted strings."""
 

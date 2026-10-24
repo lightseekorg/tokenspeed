@@ -18,19 +18,20 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The host side of the capturable grammar pipeline, in C++.
+"""The per-forward grammar work, in C++.
 
-A ``Host`` owns the per-forward grammar work that runs as a CUDA host node
-(``cudaLaunchHostFunc``) on the grammar side stream: it advances the
-previous forward's matchers by that forward's sampled tokens, then fills
-this forward's bitmask rows. It calls xgrammar's ``GrammarMatcher`` methods
-through tvm-ffi's C ABI, so the node never takes the GIL; taking it, even
-for a callback that does nothing, measured ~3% of a decode step.
+It calls xgrammar's ``GrammarMatcher`` methods through tvm-ffi's C ABI, so
+it never takes the GIL; taking it in a CUDA host node, even for a callback
+that does nothing, measured ~3% of a decode step.
 
-Each forward adds one ``Batch`` and each execution of the node pops one.
-A ``Batch`` is also the forward's completion: ``wait`` blocks until its
-matchers have advanced, and ``advance_on_host`` advances them from
-post_process when no next forward comes. Exactly one of the two advances.
+Each forward makes one ``Batch``: its matchers and output layout, and also
+its completion. A ``Filler`` writes a batch's masks into a host bitmask.
+A ``Host`` runs that as a CUDA host node (``cudaLaunchHostFunc``) on the
+grammar side stream: each execution pops the next added batch, advances
+the previous one by its sampled tokens, then fills the new one. Without a
+host node the forward fills its batch before it runs. Either way
+``advance_on_host`` advances a batch from post_process, and exactly one
+advance applies: ``wait`` blocks until it has.
 
 The C++ stub is JIT-compiled on first use via
 ``torch.utils.cpp_extension.load_inline``.
@@ -46,7 +47,9 @@ _ext_lock = threading.Lock()
 
 
 _CPP_SRC = r"""
+#ifdef TOKENSPEED_GRAMMAR_HOST_NODE
 #include <cuda_runtime.h>
+#endif
 #include <dlpack/dlpack.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
@@ -369,17 +372,16 @@ class Batch {
     std::vector<int32_t> terminated_at_;
 };
 
-class Host {
+// Writes each forward's masks into a host bitmask; every other row reads -1 (allow all).
+class Filler {
   public:
-    Host(
+    Filler(
         std::vector<uintptr_t> methods,
         uintptr_t bitmask,
         int64_t max_bs,
         int64_t tokens_per_request,
         int64_t vocab_size,
-        uintptr_t candidates,
-        uintptr_t output_tokens,
-        uintptr_t accept_lengths)
+        uintptr_t candidates)
         : methods_(MakeMethods(methods)),
           bitmask_(reinterpret_cast<int32_t*>(bitmask)),
           max_bs_(max_bs),
@@ -388,8 +390,6 @@ class Host {
           width_((vocab_size + 31) / 32),
           vocab_size_(vocab_size),
           candidates_(reinterpret_cast<const int32_t*>(candidates)),
-          output_tokens_(reinterpret_cast<const int32_t*>(output_tokens)),
-          accept_lengths_(reinterpret_cast<const int32_t*>(accept_lengths)),
           bitmask_shape_{rows_, width_},
           chain_shape_{n_},
           request_mask_shape_{n_, width_},
@@ -404,49 +404,68 @@ class Host {
         bitmask_tensor_ = HostTensor(bitmask_, bitmask_shape_, 2, 32);
     }
 
-    std::shared_ptr<Batch> Add(
+    int64_t rows() const { return rows_; }
+
+    std::shared_ptr<Batch> MakeBatch(
         std::vector<std::shared_ptr<Matcher>> matchers,
         std::vector<bool> advance,
         bool has_candidates,
         int64_t num_extends,
         int64_t num_prefill_outputs,
         int64_t num_decodes,
-        int64_t decode_width) {
+        int64_t decode_width) const {
         if (static_cast<int64_t>(matchers.size()) > max_bs_) {
             throw py::value_error("the batch is larger than max_bs");
         }
-        auto batch = std::make_shared<Batch>(
+        return std::make_shared<Batch>(
             methods_, std::move(matchers), std::move(advance), has_candidates,
             num_extends, num_prefill_outputs, num_decodes, decode_width);
-        std::vector<std::shared_ptr<Batch>> retired;
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        retired.swap(retired_);
-        // Room for every batch the running and queued executions retire, so retiring never allocates.
-        retired_.reserve(running_ + queue_.size() + 1);
-        queue_.push_back(batch);
-        return batch;
     }
 
-    // Drops the batches no execution will pop, and the one the last execution left as current.
-    void Clear() {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        queue_.clear();
-        current_.reset();
-        retired_.clear();
-    }
-
-    size_t Queued() {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        return queue_.size();
-    }
-
-    void Launch(uintptr_t stream) {
-        cudaError_t error =
-            cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &Host::Execute, this);
-        if (error != cudaSuccess) {
-            throw std::runtime_error(
-                std::string("cudaLaunchHostFunc failed: ") + cudaGetErrorString(error));
+    // Writes a forward's masks; only rows written since their last reset are reset.
+    void Fill(const Batch& batch) {
+        const int64_t per_request_rows = batch.has_candidates() ? n_ : 1;
+        ++epoch_;
+        filled_rows_.clear();
+        auto filled = [this](int64_t row) {
+            filled_epoch_[row] = epoch_;
+            filled_rows_.push_back(row);
+        };
+        for (int64_t i = 0; i < batch.bs(); ++i) {
+            const Matcher* matcher = batch.matcher(i).get();
+            if (matcher == nullptr || IsTerminated(*methods_, *matcher)) {
+                continue;
+            }
+            const int64_t row = i * per_request_rows;
+            const int64_t positions = batch.OutputWidth(i);
+            // Rows are marked dirty before the matcher writes them, so a failed write is reset.
+            if (positions == 1 || (positions && !batch.has_candidates())) {
+                dirty_rows_.push_back(row);
+                if (FillRow(*matcher, row)) {
+                    filled(row);
+                }
+            } else if (positions) {
+                // Draft 0 was accepted by an earlier advance; a later advance
+                // applies whatever the sampler accepts.
+                const int32_t* drafts = candidates_ + i * n_;
+                std::copy(drafts, drafts + n_, draft_tokens_.begin());
+                for (int64_t k = 0; k < n_; ++k) {
+                    dirty_rows_.push_back(row + k);
+                }
+                if (FillAlongDrafts(*matcher, row)) {
+                    const int64_t masked = MaskedPositions(*matcher, row, drafts, positions);
+                    for (int64_t k = 0; k < masked; ++k) {
+                        filled(row + k);
+                    }
+                }
+            }
         }
+        for (int64_t row : dirty_rows_) {
+            if (filled_epoch_[row] != epoch_) {
+                std::memset(bitmask_ + row * width_, 0xff, width_ * sizeof(int32_t));
+            }
+        }
+        dirty_rows_.swap(filled_rows_);
     }
 
   private:
@@ -456,50 +475,6 @@ class Host {
         }
         return std::make_shared<const Methods>(Methods{
             Method(handles[0]), Method(handles[1]), Method(handles[2]), Method(handles[3])});
-    }
-
-    static void CUDART_CB Execute(void* self) {
-        try {
-            static_cast<Host*>(self)->Run();
-        } catch (const std::exception& error) {
-            LogError("host node", error.what());
-        } catch (...) {
-            LogError("host node", "unknown exception");
-        }
-    }
-
-    // Pops this forward's batch, advances the previous one, then fills the bitmask.
-    void Run() {
-        std::shared_ptr<Batch> batch;
-        std::shared_ptr<Batch> previous;
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (queue_.empty()) {
-                LogError("host node", "no batch was added for this forward");
-                return;
-            }
-            batch = std::move(queue_.front());
-            queue_.pop_front();
-            previous = std::exchange(current_, batch);
-            ++running_;
-        }
-        try {
-            if (previous != nullptr) {
-                previous->Advance(output_tokens_, rows_, accept_lengths_);
-            }
-            Fill(*batch);
-        } catch (...) {
-            Retire(std::move(previous));
-            throw;
-        }
-        Retire(std::move(previous));
-    }
-
-    // It may hold a matcher's last reference: the next add releases it, on a Python thread.
-    void Retire(std::shared_ptr<Batch> batch) {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        retired_.push_back(std::move(batch));
-        --running_;
     }
 
     bool FillRow(const Matcher& matcher, int64_t row) {
@@ -553,53 +528,6 @@ class Host {
         return k;
     }
 
-    // Writes this forward's masks; every other row reads -1 (allow all). Only
-    // rows written since their last reset are reset.
-    void Fill(const Batch& batch) {
-        const int64_t per_request_rows = batch.has_candidates() ? n_ : 1;
-        ++epoch_;
-        filled_rows_.clear();
-        auto filled = [this](int64_t row) {
-            filled_epoch_[row] = epoch_;
-            filled_rows_.push_back(row);
-        };
-        for (int64_t i = 0; i < batch.bs(); ++i) {
-            const Matcher* matcher = batch.matcher(i).get();
-            if (matcher == nullptr || IsTerminated(*methods_, *matcher)) {
-                continue;
-            }
-            const int64_t row = i * per_request_rows;
-            const int64_t positions = batch.OutputWidth(i);
-            // Rows are marked dirty before the matcher writes them, so a failed write is reset.
-            if (positions == 1 || (positions && !batch.has_candidates())) {
-                dirty_rows_.push_back(row);
-                if (FillRow(*matcher, row)) {
-                    filled(row);
-                }
-            } else if (positions) {
-                // Draft 0 was accepted by an earlier advance; the next forward's
-                // advance applies whatever the sampler accepts.
-                const int32_t* drafts = candidates_ + i * n_;
-                std::copy(drafts, drafts + n_, draft_tokens_.begin());
-                for (int64_t k = 0; k < n_; ++k) {
-                    dirty_rows_.push_back(row + k);
-                }
-                if (FillAlongDrafts(*matcher, row)) {
-                    const int64_t masked = MaskedPositions(*matcher, row, drafts, positions);
-                    for (int64_t k = 0; k < masked; ++k) {
-                        filled(row + k);
-                    }
-                }
-            }
-        }
-        for (int64_t row : dirty_rows_) {
-            if (filled_epoch_[row] != epoch_) {
-                std::memset(bitmask_ + row * width_, 0xff, width_ * sizeof(int32_t));
-            }
-        }
-        dirty_rows_.swap(filled_rows_);
-    }
-
     const std::shared_ptr<const Methods> methods_;
     int32_t* const bitmask_;
     const int64_t max_bs_;
@@ -608,8 +536,6 @@ class Host {
     const int64_t width_;
     const int64_t vocab_size_;
     const int32_t* const candidates_;
-    const int32_t* const output_tokens_;
-    const int32_t* const accept_lengths_;
 
     int64_t bitmask_shape_[2];
     int64_t chain_shape_[1];
@@ -624,6 +550,107 @@ class Host {
     std::vector<int64_t> filled_rows_;
     std::vector<uint64_t> filled_epoch_;
     uint64_t epoch_ = 0;
+};
+
+#ifdef TOKENSPEED_GRAMMAR_HOST_NODE
+// Runs each forward's grammar work as a CUDA host node.
+class Host {
+  public:
+    Host(std::shared_ptr<Filler> filler, uintptr_t output_tokens, uintptr_t accept_lengths)
+        : filler_(std::move(filler)),
+          output_tokens_(reinterpret_cast<const int32_t*>(output_tokens)),
+          accept_lengths_(reinterpret_cast<const int32_t*>(accept_lengths)) {}
+
+    std::shared_ptr<Batch> Add(
+        std::vector<std::shared_ptr<Matcher>> matchers,
+        std::vector<bool> advance,
+        bool has_candidates,
+        int64_t num_extends,
+        int64_t num_prefill_outputs,
+        int64_t num_decodes,
+        int64_t decode_width) {
+        auto batch = filler_->MakeBatch(
+            std::move(matchers), std::move(advance), has_candidates, num_extends,
+            num_prefill_outputs, num_decodes, decode_width);
+        std::vector<std::shared_ptr<Batch>> retired;
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        retired.swap(retired_);
+        // Room for every batch the running and queued executions retire, so retiring never allocates.
+        retired_.reserve(running_ + queue_.size() + 1);
+        queue_.push_back(batch);
+        return batch;
+    }
+
+    // Drops the batches no execution will pop, and the one the last execution left as current.
+    void Clear() {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        queue_.clear();
+        current_.reset();
+        retired_.clear();
+    }
+
+    size_t Queued() {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        return queue_.size();
+    }
+
+    void Launch(uintptr_t stream) {
+        cudaError_t error =
+            cudaLaunchHostFunc(reinterpret_cast<cudaStream_t>(stream), &Host::Execute, this);
+        if (error != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("cudaLaunchHostFunc failed: ") + cudaGetErrorString(error));
+        }
+    }
+
+  private:
+    static void CUDART_CB Execute(void* self) {
+        try {
+            static_cast<Host*>(self)->Run();
+        } catch (const std::exception& error) {
+            LogError("host node", error.what());
+        } catch (...) {
+            LogError("host node", "unknown exception");
+        }
+    }
+
+    // Pops this forward's batch, advances the previous one, then fills the bitmask.
+    void Run() {
+        std::shared_ptr<Batch> batch;
+        std::shared_ptr<Batch> previous;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (queue_.empty()) {
+                LogError("host node", "no batch was added for this forward");
+                return;
+            }
+            batch = std::move(queue_.front());
+            queue_.pop_front();
+            previous = std::exchange(current_, batch);
+            ++running_;
+        }
+        try {
+            if (previous != nullptr) {
+                previous->Advance(output_tokens_, filler_->rows(), accept_lengths_);
+            }
+            filler_->Fill(*batch);
+        } catch (...) {
+            Retire(std::move(previous));
+            throw;
+        }
+        Retire(std::move(previous));
+    }
+
+    // It may hold a matcher's last reference: the next add releases it, on a Python thread.
+    void Retire(std::shared_ptr<Batch> batch) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        retired_.push_back(std::move(batch));
+        --running_;
+    }
+
+    const std::shared_ptr<Filler> filler_;
+    const int32_t* const output_tokens_;
+    const int32_t* const accept_lengths_;
 
     std::mutex queue_mutex_;
     std::deque<std::shared_ptr<Batch>> queue_;
@@ -631,6 +658,7 @@ class Host {
     std::vector<std::shared_ptr<Batch>> retired_;
     size_t running_ = 0;
 };
+#endif
 
 }  // namespace
 
@@ -641,20 +669,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("wait", &Batch::Wait)
         .def("advance_on_host", &Batch::AdvanceOnHost)
         .def("terminated_at", &Batch::TerminatedAt);
+    py::class_<Filler, std::shared_ptr<Filler>>(m, "Filler")
+        .def(py::init<std::vector<uintptr_t>, uintptr_t, int64_t, int64_t, int64_t, uintptr_t>())
+        .def("batch", &Filler::MakeBatch)
+        // Keeps the GIL, as the matcher calls from Python do: each takes microseconds.
+        .def("fill", &Filler::Fill);
+#ifdef TOKENSPEED_GRAMMAR_HOST_NODE
     py::class_<Host, std::shared_ptr<Host>>(m, "Host")
-        .def(py::init<
-             std::vector<uintptr_t>, uintptr_t, int64_t, int64_t, int64_t, uintptr_t,
-             uintptr_t, uintptr_t>())
+        .def(py::init<std::shared_ptr<Filler>, uintptr_t, uintptr_t>())
         .def("add", &Host::Add)
         .def("clear", &Host::Clear)
         .def("__len__", &Host::Queued)
         .def("launch", &Host::Launch);
+#endif
 }
 """
 
 
 def load_grammar_host_ext() -> Any:
-    """The JIT-compiled extension: ``Host``, ``Batch`` and ``Matcher``."""
+    """The JIT-compiled extension: ``Filler``, ``Batch`` and ``Matcher``, and
+    on CUDA ``Host``, the host node. One build per process, so its types mix."""
     global _ext
     if _ext is not None:
         return _ext
@@ -665,41 +699,48 @@ def load_grammar_host_ext() -> Any:
         import os
         import sys
 
+        import torch
         from torch.utils.cpp_extension import CUDA_HOME, load_inline
         from tvm_ffi import libinfo
 
-        cuda_home = CUDA_HOME or os.environ.get("CUDA_HOME")
+        # The host node needs the CUDA runtime; elsewhere the build needs no GPU runtime.
+        host_node = torch.version.cuda is not None
+
         include_dirs = list(libinfo.include_paths())
         library_dirs = []
-        if cuda_home:
-            inc = os.path.join(cuda_home, "include")
-            lib = os.path.join(cuda_home, "lib64")
-            if os.path.isdir(inc):
-                include_dirs.append(inc)
-            if os.path.isdir(lib):
-                library_dirs.append(lib)
-        # conda-forge keeps the toolkit under <prefix>/targets/<platform>; base_prefix covers a venv.
-        for root in dict.fromkeys(
-            r for r in (cuda_home, sys.prefix, sys.base_prefix) if r
-        ):
-            include_dirs += sorted(
-                glob.glob(os.path.join(root, "targets", "*", "include"))
-            )
-            library_dirs += sorted(glob.glob(os.path.join(root, "targets", "*", "lib")))
+        cflags = ["-O2"]
+        ldflags = []
+        if host_node:
+            cuda_home = CUDA_HOME or os.environ.get("CUDA_HOME")
+            if cuda_home:
+                inc = os.path.join(cuda_home, "include")
+                lib = os.path.join(cuda_home, "lib64")
+                if os.path.isdir(inc):
+                    include_dirs.append(inc)
+                if os.path.isdir(lib):
+                    library_dirs.append(lib)
+            # conda-forge keeps the toolkit under <prefix>/targets/<platform>; base_prefix covers a venv.
+            for root in dict.fromkeys(
+                r for r in (cuda_home, sys.prefix, sys.base_prefix) if r
+            ):
+                include_dirs += sorted(
+                    glob.glob(os.path.join(root, "targets", "*", "include"))
+                )
+                library_dirs += sorted(
+                    glob.glob(os.path.join(root, "targets", "*", "lib"))
+                )
+            cflags.append("-DTOKENSPEED_GRAMMAR_HOST_NODE")
+            ldflags.append("-lcudart")
         # Link the libtvm_ffi xgrammar already loaded: the error state is per library.
         tvm_ffi_dir = os.path.dirname(libinfo.find_libtvm_ffi())
 
         _ext = load_inline(
             name="tokenspeed_grammar_host_ext",
             cpp_sources=[_CPP_SRC],
-            extra_cflags=["-O2"] + [f"-I{d}" for d in include_dirs],
+            extra_cflags=cflags + [f"-I{d}" for d in include_dirs],
             extra_ldflags=[f"-L{d}" for d in library_dirs]
-            + [
-                "-lcudart",
-                f"-L{tvm_ffi_dir}",
-                "-ltvm_ffi",
-                f"-Wl,-rpath,{tvm_ffi_dir}",
-            ],
+            + ldflags
+            + [f"-L{tvm_ffi_dir}", "-ltvm_ffi", f"-Wl,-rpath,{tvm_ffi_dir}"],
             verbose=False,
         )
         return _ext
