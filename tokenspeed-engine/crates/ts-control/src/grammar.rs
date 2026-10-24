@@ -33,6 +33,8 @@ use std::{
 use ts_grammar::{CompiledGrammar, Compiler, GrammarKind, Matcher, TokenizerInfo};
 use ts_wire::SamplingParams;
 
+use crate::codec::{Reader, Writer};
+
 /// Tokens a matcher can undo (`MAX_ROLLBACK_TOKENS`).
 const MAX_ROLLBACK_TOKENS: i32 = 200;
 
@@ -128,44 +130,32 @@ pub struct InvalidGrammar {
 /// Every queued request's [`InvalidGrammar`] on this rank, as one rank
 /// sends them to the others.
 pub(crate) fn encode_invalid(entries: &[Option<InvalidGrammar>]) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Writer::new();
     for entry in entries {
-        match entry {
-            None => out.push(0),
-            Some(invalid) => {
-                out.push(1 + u8::from(invalid.permanent));
-                out.extend_from_slice(&(invalid.message.len() as u64).to_le_bytes());
-                out.extend_from_slice(invalid.message.as_bytes());
-            }
-        }
+        out.option(entry.as_ref(), |out, invalid| {
+            out.flag(invalid.permanent);
+            out.bytes(invalid.message.as_bytes());
+        });
     }
-    out
+    out.finish()
 }
 
 /// What [`encode_invalid`] wrote for `count` requests, or `None` if `bytes`
 /// is not that.
-pub(crate) fn decode_invalid(
-    mut bytes: &[u8],
-    count: usize,
-) -> Option<Vec<Option<InvalidGrammar>>> {
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let (&tag, rest) = bytes.split_first()?;
-        bytes = rest;
-        if tag == 0 {
-            entries.push(None);
-            continue;
-        }
-        let (len, rest) = bytes.split_at_checked(8)?;
-        let len = usize::try_from(u64::from_le_bytes(len.try_into().ok()?)).ok()?;
-        let (message, rest) = rest.split_at_checked(len)?;
-        bytes = rest;
-        entries.push(Some(InvalidGrammar {
-            message: String::from_utf8(message.to_vec()).ok()?,
-            permanent: tag == 2,
-        }));
-    }
-    bytes.is_empty().then_some(entries)
+pub(crate) fn decode_invalid(bytes: &[u8], count: usize) -> Option<Vec<Option<InvalidGrammar>>> {
+    let mut reader = Reader::new(bytes);
+    let entries = (0..count)
+        .map(|_| {
+            reader.option(|reader| {
+                let permanent = reader.flag()?;
+                Some(InvalidGrammar {
+                    message: String::from_utf8(reader.bytes()?.to_vec()).ok()?,
+                    permanent,
+                })
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    reader.finish(entries)
 }
 
 impl Entry {

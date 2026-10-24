@@ -31,6 +31,7 @@ use ts_scheduler::{ForwardBatchView, ForwardEvent, ForwardEventKind, SchedulerAb
 use ts_wire::output::FinishDetails;
 
 use crate::{
+    codec::{Reader, Writer},
     request::{AbortCode, FinishReason, InputLogprobs, RequestState},
     request_stats::{self, wall_seconds, RequestTimings},
 };
@@ -110,117 +111,37 @@ impl ForwardResult {
     /// alternatives are not shared: the ingress refuses them under pipeline
     /// parallelism.
     pub fn to_bytes(&self) -> Vec<u8> {
-        fn column(out: &mut Vec<u8>, values: &[i32]) {
-            out.extend_from_slice(&(values.len() as u64).to_le_bytes());
-            for value in values {
-                out.extend_from_slice(&value.to_le_bytes());
+        let mut out = Writer::new();
+        out.i32s(&self.output_tokens);
+        out.i32s(&self.output_lengths);
+        out.option(self.output_logprobs.as_deref(), Writer::f64s);
+        out.option(self.nan_flags.as_deref(), Writer::i32s);
+        out.option(self.next_input_ids.as_deref(), |out, rows| {
+            out.count(rows.len());
+            for row in rows {
+                out.i32s(row);
             }
-        }
-        fn floats(out: &mut Vec<u8>, values: Option<&Vec<f64>>) {
-            match values {
-                Some(values) => {
-                    out.push(1);
-                    out.extend_from_slice(&(values.len() as u64).to_le_bytes());
-                    for value in values {
-                        out.extend_from_slice(&value.to_le_bytes());
-                    }
-                }
-                None => out.push(0),
-            }
-        }
-        let mut out = Vec::new();
-        column(&mut out, &self.output_tokens);
-        column(&mut out, &self.output_lengths);
-        floats(&mut out, self.output_logprobs.as_ref());
-        match &self.nan_flags {
-            Some(flags) => {
-                out.push(1);
-                column(&mut out, flags);
-            }
-            None => out.push(0),
-        }
-        match &self.next_input_ids {
-            Some(rows) => {
-                out.push(1);
-                out.extend_from_slice(&(rows.len() as u64).to_le_bytes());
-                for row in rows {
-                    column(&mut out, row);
-                }
-            }
-            None => out.push(0),
-        }
-        match &self.grammar_terminated_at {
-            Some(indices) => {
-                out.push(1);
-                column(&mut out, indices);
-            }
-            None => out.push(0),
-        }
-        floats(&mut out, self.input_token_logprobs.as_ref());
-        out
+        });
+        out.option(self.grammar_terminated_at.as_deref(), Writer::i32s);
+        out.option(self.input_token_logprobs.as_deref(), Writer::f64s);
+        out.finish()
     }
 
     /// A result [`ForwardResult::to_bytes`] wrote, or `None` if `bytes` is
     /// not one.
-    pub fn from_bytes(mut bytes: &[u8]) -> Option<Self> {
-        fn take<'a>(bytes: &mut &'a [u8], len: usize) -> Option<&'a [u8]> {
-            if bytes.len() < len {
-                return None;
-            }
-            let (taken, rest) = bytes.split_at(len);
-            *bytes = rest;
-            Some(taken)
-        }
-        fn count(bytes: &mut &[u8]) -> Option<usize> {
-            usize::try_from(u64::from_le_bytes(take(bytes, 8)?.try_into().ok()?)).ok()
-        }
-        fn column(bytes: &mut &[u8]) -> Option<Vec<i32>> {
-            let len = count(bytes)?;
-            let raw = take(bytes, len.checked_mul(4)?)?;
-            Some(
-                raw.chunks_exact(4)
-                    .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("four bytes")))
-                    .collect(),
-            )
-        }
-        fn floats(bytes: &mut &[u8]) -> Option<Option<Vec<f64>>> {
-            Some(match take(bytes, 1)?[0] {
-                0 => None,
-                _ => {
-                    let len = count(bytes)?;
-                    let raw = take(bytes, len.checked_mul(8)?)?;
-                    Some(
-                        raw.chunks_exact(8)
-                            .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("eight bytes")))
-                            .collect(),
-                    )
-                }
-            })
-        }
-        let output_tokens = column(&mut bytes)?;
-        let output_lengths = column(&mut bytes)?;
-        let output_logprobs = floats(&mut bytes)?;
-        let nan_flags = match take(&mut bytes, 1)?[0] {
-            0 => None,
-            _ => Some(column(&mut bytes)?),
-        };
-        let next_input_ids = match take(&mut bytes, 1)?[0] {
-            0 => None,
-            _ => {
-                let rows = count(&mut bytes)?;
-                Some(
-                    (0..rows)
-                        .map(|_| column(&mut bytes))
-                        .collect::<Option<Vec<_>>>()?,
-                )
-            }
-        };
-        let grammar_terminated_at = match take(&mut bytes, 1)?[0] {
-            0 => None,
-            _ => Some(column(&mut bytes)?),
-        };
-        let input_token_logprobs = floats(&mut bytes)?;
-        bytes.is_empty().then_some(Self {
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        let mut reader = Reader::new(bytes);
+        let output_tokens = reader.i32s()?;
+        let output_lengths = reader.i32s()?;
+        let output_logprobs = reader.option(Reader::f64s)?;
+        let nan_flags = reader.option(Reader::i32s)?;
+        let next_input_ids = reader.option(|reader| {
+            let rows = reader.count()?;
+            (0..rows).map(|_| reader.i32s()).collect()
+        })?;
+        let grammar_terminated_at = reader.option(Reader::i32s)?;
+        let input_token_logprobs = reader.option(Reader::f64s)?;
+        reader.finish(Self {
             output_tokens,
             output_lengths,
             output_logprobs,
@@ -677,16 +598,6 @@ impl OutputProcessor {
             return;
         };
         state.cached_tokens = cached_tokens;
-        if bootstrap_token == -1 {
-            tracing::warn!(rid, "the prefill node sent no bootstrap token");
-            if state.grammar.take().is_some() {
-                // Nothing brings this matcher in sync again, and masking from
-                // a stale state corrupts the output more quietly than not
-                // masking at all.
-                tracing::warn!(rid, "structured output is no longer enforced for it");
-            }
-            return;
-        }
         state.output_ids.push(bootstrap_token);
         if state.return_logprob {
             match bootstrap_logprob {

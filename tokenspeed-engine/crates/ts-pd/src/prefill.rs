@@ -185,6 +185,14 @@ fn ready_step(address: usize) -> u64 {
 #[derive(Default)]
 struct State {
     rooms: RoomTable,
+    /// The rooms of the requests the scheduling loop tracks: a sleep may
+    /// not release the cache while one may still send.
+    tracked: HashSet<u64>,
+    /// Rooms no request here has claimed, since when: a Decode rank
+    /// pre-allocated for one before (or without) its request registering
+    /// here, or this rank failed one first (an EPD embedding timeout). One
+    /// still unclaimed after the bootstrap timeout is dropped.
+    unclaimed: HashMap<u64, Instant>,
     registrations: HashMap<String, Registration>,
     /// Sessions whose registration was rejected: their reply route.
     rejected: HashMap<String, (String, u16)>,
@@ -208,6 +216,55 @@ impl State {
 
     fn ended(&self, room: u64) -> bool {
         matches!(self.rooms.get(room), None | Some(TransferPoll::Failed))
+    }
+
+    /// `room` gained state: start its unclaimed clock unless a request here
+    /// tracks it.
+    fn touch(&mut self, room: u64) {
+        if !self.tracked.contains(&room) {
+            self.unclaimed.entry(room).or_insert_with(Instant::now);
+        }
+    }
+
+    /// Forget the rooms unclaimed for `ttl` or longer. Returns them, and the
+    /// failure notices their pre-allocating Decode ranks are owed: a room
+    /// this rank failed already told them.
+    #[allow(clippy::type_complexity)]
+    fn take_unclaimed(&mut self, ttl: Duration) -> (Vec<u64>, Vec<((String, u16), u64)>) {
+        let mut expired: Vec<u64> = self
+            .unclaimed
+            .iter()
+            .filter(|(_, since)| since.elapsed() >= ttl)
+            .map(|(&room, _)| room)
+            .collect();
+        expired.sort_unstable();
+        let mut notices = Vec::new();
+        for &room in &expired {
+            if self.rooms.get(room) != Some(TransferPoll::Failed) {
+                let destinations = self.destinations.get(&room).map_or(&[][..], Vec::as_slice);
+                notices.extend(
+                    destinations
+                        .iter()
+                        .filter(|destination| !destination.is_dummy)
+                        .filter_map(|destination| self.route_of(&destination.session_id))
+                        .map(|route| (route, room)),
+                );
+            }
+            self.clear(room);
+        }
+        (expired, notices)
+    }
+
+    /// Forget everything kept for `room`.
+    fn clear(&mut self, room: u64) {
+        self.rooms.remove(room);
+        self.tracked.remove(&room);
+        self.unclaimed.remove(&room);
+        self.destinations.remove(&room);
+        self.cached_tokens.remove(&room);
+        self.bootstrap_logprobs.remove(&room);
+        self.layerwise_rooms.remove(&room);
+        self.prefill_metadata.remove(&room);
     }
 
     /// One complete, unique Decode-rank set.
@@ -290,6 +347,7 @@ impl Shared {
             }
             state.rooms.record_failure(room, reason);
             state.rooms.update(room, TransferPoll::Failed);
+            state.touch(room);
             let destinations = state.destinations.remove(&room).unwrap_or_default();
             destinations
                 .iter()
@@ -431,10 +489,30 @@ impl Shared {
             return Ok(());
         }
         state.destinations.insert(room, destinations);
+        state.touch(room);
         if complete {
             state.rooms.update(room, TransferPoll::Bootstrapped);
         }
         Ok(())
+    }
+
+    /// Drop the rooms no request here claimed within `ttl`, telling each
+    /// Decode rank that pre-allocated for one that it failed.
+    fn drop_unclaimed(&self, ttl: Duration) {
+        let (expired, notices) = self.state().take_unclaimed(ttl);
+        if !expired.is_empty() {
+            tracing::warn!(
+                rooms = ?expired,
+                ?ttl,
+                "dropping rooms no request on this rank claimed"
+            );
+        }
+        for (route, room) in notices {
+            self.notify_failed(route, room);
+        }
+        for room in expired {
+            self.planner.drop_room(room);
+        }
     }
 
     fn session_failed(&self, session_id: &str) -> bool {
@@ -728,12 +806,14 @@ pub struct PrefillOutbox {
 
 impl PrefillOutbox {
     /// A sleep releases the cache: deregister it from the transfer engine,
-    /// refused while a request's KV may still go out.
+    /// refused while a tracked request's KV may still go out. A room no
+    /// request here claimed sends nothing, so it does not hold the release.
     pub fn release_registration(&self) -> Result<(), String> {
-        let rooms = self.shared.state().rooms.rooms();
-        if !rooms.is_empty() {
+        let mut sending: Vec<u64> = self.shared.state().tracked.iter().copied().collect();
+        if !sending.is_empty() {
+            sending.sort_unstable();
             return Err(format!(
-                "cannot release the cache while KV sends are in flight: rooms {rooms:?}"
+                "cannot release the cache while KV sends are in flight: rooms {sending:?}"
             ));
         }
         self.shared.transport.release_regions()
@@ -883,17 +963,25 @@ impl PrefillPeer {
         {
             let shared = shared.clone();
             let stop = stop.clone();
+            let unclaimed_ttl = config.bootstrap_timeout;
             thread::Builder::new()
                 .name("ts-pd-bootstrap".to_owned())
-                .spawn(move || loop {
-                    match messages.recv_timeout(SOCKET_POLL) {
-                        Ok(frames) => shared.handle(&frames),
-                        Err(mpsc::RecvTimeoutError::Timeout) => {
-                            if stop.load(Ordering::Relaxed) {
-                                return;
+                .spawn(move || {
+                    let mut swept = Instant::now();
+                    loop {
+                        match messages.recv_timeout(SOCKET_POLL) {
+                            Ok(frames) => shared.handle(&frames),
+                            Err(mpsc::RecvTimeoutError::Timeout) => {
+                                if stop.load(Ordering::Relaxed) {
+                                    return;
+                                }
                             }
+                            Err(mpsc::RecvTimeoutError::Disconnected) => return,
                         }
-                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                        if swept.elapsed() >= SOCKET_POLL {
+                            swept = Instant::now();
+                            shared.drop_unclaimed(unclaimed_ttl);
+                        }
                     }
                 })?;
         }
@@ -977,13 +1065,7 @@ impl PrefillPeer {
             return;
         };
         self.order.retain(|tracked| tracked != rid);
-        let mut state = self.shared.state();
-        state.rooms.remove(sender.room);
-        state.destinations.remove(&sender.room);
-        state.cached_tokens.remove(&sender.room);
-        state.bootstrap_logprobs.remove(&sender.room);
-        state.layerwise_rooms.remove(&sender.room);
-        state.prefill_metadata.remove(&sender.room);
+        self.shared.state().clear(sender.room);
     }
 }
 
@@ -1001,6 +1083,10 @@ impl TransferPeer for PrefillPeer {
             state.cached_tokens.remove(&room);
             state.bootstrap_logprobs.remove(&room);
             state.rooms.update(room, TransferPoll::Bootstrapping);
+            // Claimed: its pre-allocations, or its failure, are this
+            // request's now.
+            state.unclaimed.remove(&room);
+            state.tracked.insert(room);
         }
         if self
             .senders
@@ -1143,5 +1229,51 @@ mod tests {
         assert!(!step_ready(STEP_COUNT_MAX - 1, 0));
         assert!(step_ready(1, 0));
         assert!(step_ready(0, STEP_COUNT_MAX - 1));
+    }
+
+    #[test]
+    fn unclaimed_rooms_expire_and_their_decode_ranks_are_told() {
+        let mut state = State::default();
+        state.registrations.insert(
+            "s0".to_owned(),
+            Registration {
+                endpoint: "decode".to_owned(),
+                port: 7,
+                session_id: "s0".to_owned(),
+                decode_tp_size: 1,
+                decode_tp_rank: 0,
+                is_dummy: false,
+                expected_decode_ranks: vec![0],
+            },
+        );
+        let destination = || {
+            vec![Destination {
+                session_id: "s0".to_owned(),
+                is_dummy: false,
+            }]
+        };
+        // Pre-allocated by a Decode rank; its request never registers here.
+        state.destinations.insert(1, destination());
+        state.touch(1);
+        // Failed here before any request claimed it (an EPD timeout): its
+        // destinations were told then.
+        state.rooms.update(2, TransferPoll::Failed);
+        state.touch(2);
+        // A request's room never expires.
+        state.tracked.insert(3);
+        state.destinations.insert(3, destination());
+        state.touch(3);
+
+        assert_eq!(
+            state.take_unclaimed(Duration::from_secs(60)),
+            (Vec::new(), Vec::new())
+        );
+        let (expired, notices) = state.take_unclaimed(Duration::ZERO);
+        assert_eq!(expired, [1, 2]);
+        assert_eq!(notices, [(("decode".to_owned(), 7), 1)]);
+        assert!(state.unclaimed.is_empty());
+        assert!(!state.destinations.contains_key(&1));
+        assert_eq!(state.rooms.get(2), None);
+        assert!(state.destinations.contains_key(&3));
     }
 }

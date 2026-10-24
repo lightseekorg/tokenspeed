@@ -227,6 +227,13 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     });
     let mut params = request.sampling_params;
     sampling::resolve(&mut params, &rid);
+    // Checked as the client sent them: the context clamp below is the
+    // engine's, so `min_new_tokens` is bounded by the budget asked for, not
+    // the one the context leaves (the request then finishes at its length).
+    let invalid = request
+        .validation_error
+        .clone()
+        .or_else(|| refusal(&view, &params, limits));
 
     let prompt_len = request.input_ids.as_ref().map_or(0, Vec::len) as i64;
     let stop_token_ids: BTreeSet<i32> = if params.ignore_eos {
@@ -253,10 +260,6 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     );
     state.created_time = request.created_time;
 
-    let invalid = request
-        .validation_error
-        .clone()
-        .or_else(|| refusal(&view, &params, limits));
     if invalid.is_none() && request.return_logprob {
         state.set_logprobs(LogprobRequest {
             start: view.logprob_start_len,
@@ -580,6 +583,34 @@ mod tests {
         };
         // max_model_len - 1 - prompt - 1
         assert_eq!(admission.spec.max_new_tokens, 48);
+    }
+
+    #[test]
+    fn min_new_tokens_is_checked_against_the_budget_asked_for() {
+        // The context leaves 8 tokens of the 50 asked for: the request runs
+        // to its length rather than being refused over a budget the client
+        // never sent.
+        let params = SamplingParams {
+            max_new_tokens: Some(50),
+            min_new_tokens: 20,
+            ..Default::default()
+        };
+        let Some(Admitted::Run(admission)) = admit(request("r1", vec![0; 90], params), &limits())
+        else {
+            panic!("expected admission");
+        };
+        assert_eq!(admission.spec.max_new_tokens, 8);
+        assert_eq!(admission.sampling_params.max_new_tokens, Some(8));
+
+        let params = SamplingParams {
+            max_new_tokens: Some(10),
+            min_new_tokens: 20,
+            ..Default::default()
+        };
+        assert!(
+            refused_message(admit(request("r2", vec![1], params), &limits()).unwrap())
+                .contains("min_new_tokens must be in (0, max_new_tokens(10)]")
+        );
     }
 
     #[test]

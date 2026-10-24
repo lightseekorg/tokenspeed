@@ -249,7 +249,7 @@ Local I/O remains labeled by TP rank; exporters do not make storage admission
 or retirement decisions.
 
 The control plane MAX-reduces these durations and counts across cache owners
-through the fixed CPU header. C++ closes a shared read/write admission gate when
+from the round's reports. C++ closes a shared read/write admission gate when
 any high watermark is reached and reopens it only when all observations reach
 their low watermarks. Local wall-clock timestamps never cross this boundary.
 The gate is independent of pause/freeze, backend health and quarantine. It does
@@ -292,13 +292,15 @@ and a successful backend call does not override C++ pressure admission.
 Every attention-TP owner sends its newly completed records once over the
 replica's collective mesh. The control plane retains partial-owner records
 until the other owners finish.
-Each round first exchanges a named CPU header: the TP leader's monotonic clock,
-forward/storage permissions, completion count, an error flag and the three
-pressure observations. Buffer width follows these fields, independently of
-model attention heads and the number of owners. Permissions are intersected
-and pressure is MAX-reduced. Idle and pressure-only rounds exchange only
-headers; completion/error facts trigger a bounded payload exchange. The agreed
-tick is delivered every round, including idle and frozen rounds.
+Each round every owner's report rides the replica's relay exchange, one CPU
+all-gather that also carries the TP leader's frontend messages: the owner's
+monotonic clock, the three pressure observations, its completions, and an
+error when its poll was invalid. The TP leader's clock becomes the tick's and
+pressure is MAX-reduced; the forward/storage permissions come from the
+control state, which every owner holds alike. The report's size follows its
+completions, independently of model attention heads and the number of
+owners. The agreed tick is delivered every round, including idle and frozen
+rounds.
 Results are agreed per operation, so a slow earlier operation cannot block a
 later complete one. Per-key validity and retirement are AND-reduced;
 confirmed missing/invalid object facts are OR-reduced. A single missing shard
@@ -307,7 +309,7 @@ object-failure evidence. The window is bounded by operation and key credits;
 it is not truncated to a prefix of pending operations. An invalid local
 report joins the collective as an error before every owner raises the
 protocol error: local completion records are validated inside that same error
-boundary, before header exchange. Per-key masks have equal lengths and success
+boundary, before the exchange. Per-key masks have equal lengths and success
 cannot also report an object failure. Query/PUT cannot report read failures.
 Malformed store results follow the store's explicit failure-retirement
 contract.

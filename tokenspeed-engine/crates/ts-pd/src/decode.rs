@@ -111,14 +111,22 @@ struct Target {
 /// The first valid value each Prefill rank reported for a room.
 #[derive(Debug, Clone, Default)]
 struct Landed {
-    bootstrap_token: Option<i64>,
+    bootstrap_token: Option<i32>,
     spec_candidate_ids: Option<Vec<i32>>,
     bootstrap_logprob: Option<f64>,
 }
 
+/// What a route's registered targets are kept by: the bootstrap address,
+/// the room's Prefill DP group and the target ranks.
+type ConnectionKey = (String, u64, Vec<i64>);
+
 #[derive(Default)]
 struct State {
     rooms: RoomTable,
+    /// The rooms of the requests the scheduling loop tracks. Only these
+    /// keep state: a late report, connection or admission of a room the
+    /// loop forgot must not bring it back.
+    tracked: HashSet<u64>,
     expected: HashMap<u64, BTreeSet<i64>>,
     responses: HashMap<u64, BTreeSet<i64>>,
     pending: HashMap<u64, Landed>,
@@ -131,12 +139,15 @@ struct State {
     addr_rooms: HashMap<String, HashSet<u64>>,
     /// Bootstrap address -> its route; the addresses the heartbeat watches.
     routes: HashMap<String, Arc<PrefillRoute>>,
-    /// `{addr}_{dp group}_{ranks}` -> the registered targets.
-    connections: HashMap<String, Arc<Vec<Target>>>,
+    connections: HashMap<ConnectionKey, Arc<Vec<Target>>>,
 }
 
 impl State {
+    /// Fail a tracked room; an untracked one has nothing to fail.
     fn fail(&mut self, room: u64, reason: impl Into<String>) {
+        if !self.tracked.contains(&room) {
+            return;
+        }
         self.rooms.record_failure(room, reason);
         self.rooms.update(room, TransferPoll::Failed);
     }
@@ -144,7 +155,7 @@ impl State {
     /// Apply one Prefill rank's report.
     fn apply(&mut self, message: StatusMessage) {
         let room = message.room;
-        if self.rooms.get(room).is_none() {
+        if !self.tracked.contains(&room) {
             return;
         }
         match message.status {
@@ -169,12 +180,26 @@ impl State {
                 // TP ranks describe overlapping prefixes, not disjoint ranges.
                 let cached = self.cached_tokens.entry(room).or_insert(0);
                 *cached = (*cached).max(message.cached_tokens);
-                // The rank carrying the first token need not complete last.
+                // The rank carrying the first token need not complete last;
+                // -1 is a rank without one.
+                let token = match message.bootstrap_token {
+                    -1 => None,
+                    token => {
+                        match i32::try_from(token).ok().filter(|token| *token >= 0) {
+                            Some(token) => Some(token),
+                            None => {
+                                self.fail(
+                                room,
+                                format!("Received KV completion with an invalid first token {token}"),
+                            );
+                                return;
+                            }
+                        }
+                    }
+                };
                 let pending = self.pending.entry(room).or_default();
-                if message.bootstrap_token != -1 {
-                    pending
-                        .bootstrap_token
-                        .get_or_insert(message.bootstrap_token);
+                if let Some(token) = token {
+                    pending.bootstrap_token.get_or_insert(token);
                 }
                 if let Some(ids) = message.spec_candidate_ids {
                     pending.spec_candidate_ids.get_or_insert(ids);
@@ -193,6 +218,15 @@ impl State {
                     return;
                 }
                 let landed = self.pending.remove(&room).unwrap_or_default();
+                if landed.bootstrap_token.is_none() {
+                    // The first decode feeds on that token: without it the
+                    // request cannot run here.
+                    self.fail(
+                        room,
+                        "Every Prefill rank reported the KV landed without the request's first token",
+                    );
+                    return;
+                }
                 self.landed.insert(room, landed);
                 self.rooms.update(room, TransferPoll::Success);
             }
@@ -206,8 +240,59 @@ impl State {
         }
     }
 
+    /// A room is connected to `targets`, the ranks `route` names at `addr`:
+    /// it is bootstrapped. A room whose request ended while the lookups ran
+    /// stays forgotten. Returns whether the room was still tracked.
+    fn attach(
+        &mut self,
+        room: u64,
+        addr: &str,
+        route: &PrefillRoute,
+        targets: Arc<Vec<Target>>,
+    ) -> bool {
+        if !self.tracked.contains(&room) {
+            return false;
+        }
+        self.expected
+            .insert(room, route.expected_prefill_ranks.iter().copied().collect());
+        self.targets.insert(room, targets);
+        self.addr_rooms
+            .entry(addr.to_owned())
+            .or_default()
+            .insert(room);
+        self.rooms.update(room, TransferPoll::Bootstrapped);
+        true
+    }
+
+    /// The Prefill node at bootstrap address `addr` is lost: forget its
+    /// route and its connections, and fail its unfinished rooms. Returns how
+    /// many failed.
+    fn lose_node(&mut self, addr: &str) -> usize {
+        self.connections
+            .retain(|(connected, _, _), _| connected != addr);
+        self.routes.remove(addr);
+        let rooms = self.addr_rooms.remove(addr).unwrap_or_default();
+        let mut affected = 0;
+        for room in rooms {
+            if matches!(
+                self.rooms.get(room),
+                None | Some(TransferPoll::Success | TransferPoll::Failed)
+            ) || self.rooms.has_failure(room)
+            {
+                continue;
+            }
+            self.fail(
+                room,
+                format!("Losing connection with prefill instance (bootstrap_addr: {addr})"),
+            );
+            affected += 1;
+        }
+        affected
+    }
+
     fn clear(&mut self, room: u64, addr: &str) {
         self.rooms.remove(room);
+        self.tracked.remove(&room);
         self.expected.remove(&room);
         self.responses.remove(&room);
         self.pending.remove(&room);
@@ -263,12 +348,8 @@ impl Shared {
     /// is used, and mark the room bootstrapped.
     fn connect(&self, room: u64, addr: &str) -> Result<(), String> {
         let route = self.route(addr)?;
-        self.state()
-            .expected
-            .insert(room, route.expected_prefill_ranks.iter().copied().collect());
         let dp_group = room % route.prefill_dp_size.max(1) as u64;
-        let ranks: Vec<String> = route.target_tp_ranks.iter().map(i64::to_string).collect();
-        let key = format!("{addr}_{dp_group}_{}", ranks.join(","));
+        let key: ConnectionKey = (addr.to_owned(), dp_group, route.target_tp_ranks.clone());
         let known = self.state().connections.get(&key).cloned();
         let targets = match known {
             Some(targets) => targets,
@@ -328,41 +409,19 @@ impl Shared {
                 targets
             }
         };
-        let mut state = self.state();
-        state.targets.insert(room, targets);
-        state
-            .addr_rooms
-            .entry(addr.to_owned())
-            .or_default()
-            .insert(room);
-        state.rooms.update(room, TransferPoll::Bootstrapped);
-        tracing::debug!(room, "connected");
+        if self.state().attach(room, addr, &route, targets) {
+            tracing::debug!(room, "connected");
+        }
         Ok(())
     }
 
     /// Fail every unfinished room reading from a lost Prefill node.
     fn lose_node(&self, addr: &str) {
-        let mut state = self.state();
-        state.connections.retain(|key, _| !key.starts_with(addr));
-        state.routes.remove(addr);
-        let rooms = state.addr_rooms.remove(addr).unwrap_or_default();
-        let mut affected = 0;
-        for room in rooms {
-            if matches!(
-                state.rooms.get(room),
-                None | Some(TransferPoll::Success | TransferPoll::Failed)
-            ) || state.rooms.has_failure(room)
-            {
-                continue;
-            }
-            state.fail(
-                room,
-                format!("Losing connection with prefill instance (bootstrap_addr: {addr})"),
-            );
-            if let Some(metrics) = &self.metrics {
+        let affected = self.state().lose_node(addr);
+        if let Some(metrics) = &self.metrics {
+            for _ in 0..affected {
                 metrics.record_failure();
             }
-            affected += 1;
         }
         tracing::error!(
             addr,
@@ -412,12 +471,13 @@ pub struct DecodeOutbox {
 
 impl DecodeOutbox {
     /// A sleep releases the cache: deregister it from the transfer engine,
-    /// refused while a request's KV may still land.
+    /// refused while a tracked request's KV may still land.
     pub fn release_registration(&self) -> Result<(), String> {
-        let rooms = self.shared.state().rooms.rooms();
-        if !rooms.is_empty() {
+        let mut receiving: Vec<u64> = self.shared.state().tracked.iter().copied().collect();
+        if !receiving.is_empty() {
+            receiving.sort_unstable();
             return Err(format!(
-                "cannot release the cache while KV receives are in flight: rooms {rooms:?}"
+                "cannot release the cache while KV receives are in flight: rooms {receiving:?}"
             ));
         }
         self.shared.transport.release_regions()
@@ -438,6 +498,13 @@ impl DecodeOutbox {
     pub fn receive(&self, rid: &str, room: u64, request_pool_index: i32, manifest: &[u8]) {
         let targets = {
             let mut state = self.shared.state();
+            if !state.tracked.contains(&room) {
+                // The loop ended the request (its transfer failed) after it
+                // planned this admission: its pages go back, so no Prefill
+                // rank may write them.
+                tracing::debug!(rid, room, "not pre-allocating an ended request");
+                return;
+            }
             state.admissions.insert(room, request_pool_index);
             state.waiting_since.insert(room, Instant::now());
             state.rooms.update(room, TransferPoll::WaitingForInput);
@@ -614,10 +681,11 @@ impl TransferPeer for DecodePeer {
     fn register(&mut self, rid: &str, bootstrap: &BootstrapInfo) -> Result<(), PdError> {
         let room = bootstrap.room;
         let addr = join_host_port(&bootstrap.host, bootstrap.port);
-        self.shared
-            .state()
-            .rooms
-            .update(room, TransferPoll::Bootstrapping);
+        {
+            let mut state = self.shared.state();
+            state.tracked.insert(room);
+            state.rooms.update(room, TransferPoll::Bootstrapping);
+        }
         if self
             .receivers
             .insert(
@@ -733,14 +801,13 @@ impl TransferPeer for DecodePeer {
                     *state.admissions.get(&receiver.room).ok_or_else(|| {
                         PdError::Peer(format!("{rid}'s KV landed before its pages were admitted"))
                     })?;
-                let bootstrap_token = landed.bootstrap_token.unwrap_or(-1);
+                // A room lands only with its first token (`State::apply`).
+                let bootstrap_token = landed.bootstrap_token.ok_or_else(|| {
+                    PdError::Peer(format!("{rid}'s KV landed without its first token"))
+                })?;
                 events.push(PdEvent::RemotePrefillDone(RemotePrefill {
                     rid: rid.clone(),
-                    bootstrap_token: i32::try_from(bootstrap_token).map_err(|_| {
-                        PdError::Peer(format!(
-                            "{rid}'s bootstrap token {bootstrap_token} is out of range"
-                        ))
-                    })?,
+                    bootstrap_token,
                     cached_tokens,
                     bootstrap_logprob: landed.bootstrap_logprob,
                     spec_candidate_ids: landed.spec_candidate_ids,
@@ -763,4 +830,96 @@ impl TransferPeer for DecodePeer {
 
     /// The decode node has no encoder to wait on.
     fn abort_room(&mut self, _: &str, _: u64) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn success(room: u64, prefill_rank: i64, bootstrap_token: i64) -> StatusMessage {
+        StatusMessage {
+            room,
+            status: TransferPoll::Success,
+            prefill_rank,
+            bootstrap_token,
+            spec_candidate_ids: None,
+            cached_tokens: 0,
+            bootstrap_logprob: None,
+        }
+    }
+
+    fn route() -> PrefillRoute {
+        PrefillRoute {
+            target_tp_ranks: vec![0, 1],
+            dummy_tp_ranks: Vec::new(),
+            expected_prefill_ranks: vec![0, 1],
+            prefill_dp_size: 1,
+        }
+    }
+
+    /// Track `room` and connect it to Prefill ranks 0 and 1 at `addr`.
+    fn connected(state: &mut State, room: u64, addr: &str) {
+        state.tracked.insert(room);
+        state.rooms.update(room, TransferPoll::Bootstrapping);
+        assert!(state.attach(room, addr, &route(), Arc::new(Vec::new())));
+    }
+
+    #[test]
+    fn a_room_lands_with_the_first_token_any_rank_carried() {
+        let mut state = State::default();
+        connected(&mut state, 1, "prefill:80");
+        state.apply(success(1, 1, -1));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Bootstrapped));
+        state.apply(success(1, 0, 7));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Success));
+        assert_eq!(state.landed[&1].bootstrap_token, Some(7));
+    }
+
+    #[test]
+    fn a_landing_without_a_valid_first_token_fails_the_room() {
+        let mut state = State::default();
+        connected(&mut state, 1, "prefill:80");
+        state.apply(success(1, 0, -1));
+        state.apply(success(1, 1, -1));
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert!(state.rooms.failure(1).unwrap().contains("first token"));
+        connected(&mut state, 2, "prefill:80");
+        state.apply(success(2, 0, i64::from(i32::MAX) + 1));
+        assert_eq!(state.rooms.get(2), Some(TransferPoll::Failed));
+    }
+
+    #[test]
+    fn a_forgotten_room_is_not_brought_back() {
+        let mut state = State::default();
+        connected(&mut state, 1, "prefill:80");
+        state.clear(1, "prefill:80");
+        // A late report, failure or connection of the room changes nothing.
+        state.apply(success(1, 0, 7));
+        state.fail(1, "late");
+        assert!(!state.attach(1, "prefill:80", &route(), Arc::new(Vec::new())));
+        assert_eq!(state.rooms.get(1), None);
+        assert!(state.expected.is_empty());
+        assert!(state.targets.is_empty());
+        assert!(state.pending.is_empty() && state.landed.is_empty());
+    }
+
+    #[test]
+    fn losing_a_node_keeps_another_whose_address_extends_its_own() {
+        let mut state = State::default();
+        for (room, addr) in [(1, "host:80"), (2, "host:8000")] {
+            connected(&mut state, room, addr);
+            state
+                .connections
+                .insert((addr.to_owned(), 0, vec![0, 1]), Arc::new(Vec::new()));
+        }
+        assert_eq!(state.lose_node("host:80"), 1);
+        assert_eq!(state.rooms.get(1), Some(TransferPoll::Failed));
+        assert_eq!(state.rooms.get(2), Some(TransferPoll::Bootstrapped));
+        let kept: Vec<&str> = state
+            .connections
+            .keys()
+            .map(|(addr, _, _)| addr.as_str())
+            .collect();
+        assert_eq!(kept, ["host:8000"]);
+    }
 }

@@ -41,7 +41,8 @@ pub struct BootstrapInfo {
 pub struct RemotePrefill {
     /// The request.
     pub rid: String,
-    /// The prefill node's first token, -1 if it sent none.
+    /// The prefill node's first token: a landing without one is a failed
+    /// transfer, as the request's first decode feeds on it.
     pub bootstrap_token: i32,
     /// Prompt tokens the prefill node served from its cache.
     pub cached_tokens: i64,

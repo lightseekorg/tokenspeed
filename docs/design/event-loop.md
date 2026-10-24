@@ -30,8 +30,9 @@ admits the same requests in the same round; only it sends outputs. With
 attention DP the replicas' schedulers differ but their forwards run in step:
 each round every rank shares its batch's size, and a rank with none runs an
 idle forward when another has one. A stop request rides those collectives, so
-every rank stops after the same round. One rank is the same path with groups
-of one.
+every rank stops after the same round; a frontend that is gone (its input
+socket closed, which does not reconnect) stops the engine the same way. One
+rank is the same path with groups of one.
 
 The launcher (`entrypoints/engine.py`) starts the ranks through
 `start_rust_host`, whatever the deployment: the in-process `Engine`, the
@@ -391,7 +392,7 @@ every point where the scheduler's state advances, and why:
 * **Head of the round** — completed Host cache ops (`CacheOps::acknowledged`:
   `WriteBackDone`, `LoadBackDone`, `SnapshotDone`, `RestoreDone`, each
   replica-intersected), together with the L3 agreement's storage facts
-  (`L3::round`: the round's tick, the cancellations, the storage operations
+  (`L3::agree`: the round's tick, the cancellations, the storage operations
   every owner completed), through one `advance_head`. These must advance
   *before* `next_execution_plan`; otherwise, cache-gated admissions -- a
   request whose stored prefix landed in Host, a suspended request's restore,
@@ -489,13 +490,24 @@ and belongs in diagnostics and leak checks, never in the per-round sampler.
 **Pause and memory release** (`control`). A pause in `abort` mode aborts what
 runs, `wait` lets it finish; both stop admissions and answer once the
 scheduler drained. `keep` freezes everything and answers at once: a frozen
-round commits what is dispatched, plans nothing, and still joins the
-attention-DP agreement (an idle forward when a peer runs one, but not while
-memory is released: the weights are unmapped). A memory release drains like
+round commits what is dispatched and still joins the attention-DP agreement
+(an idle forward when a peer runs one, but not while memory is released: the
+weights are unmapped; idle forwards count toward the expert rebalance like
+real ones, so the ranks' rebalances stay in step). It plans like any round,
+but the scheduler, which learns the forward permission from the round's
+storage tick, plans only cache and storage work: write-backs and storage
+cancels still drain. With L3 every round carries a tick; without, the loop
+sends one when a freeze starts and when it ends. A memory release drains like
 `wait`, then frees its regions — one release/resume pair per tag, whose
 data-plane half (quiescing copies, the transfer engine's registration, the KV
 repair, NCCL suspend) runs on the forward thread — and freezes until they are
-resumed.
+resumed; a further release drains frozen. A release is refused under a
+`keep` pause (its drain would run the frozen requests, and the wake would end
+the pause), as a pause is under a release. A drain (`abort`, `wait`, a
+release) cancels the admitted requests the scheduler does not hold yet, which
+end toward their clients: those compiling their grammars, and those waiting
+for their images' embeddings, which end once their receives settle — the
+drain waits for those.
 A disaggregated engine refuses new requests while a release is draining or
 memory is released: their transfer registration would name memory the
 release unmaps. On release the prefill peer deregisters its cache regions and
@@ -572,32 +584,42 @@ QUERY and
 GET run before admission, only with a storage backend: a request waiting for
 its preparation is skipped before local prefix hashing, so an idle round does
 not rehash a long prompt while native I/O is outstanding. Every round with
-L3, at the head, the replica agrees on what its executors reported
-(`L3::round`). A fixed-size header per rank carries the clock, the forward
-and storage permissions, the completion count, an error flag and the queue
-pressure: rank 0's clock, the intersected permissions and the worst pressure
-become the round's tick, and idle rounds exchange only the header, while
-completions and errors add a bounded payload exchange. A storage operation
+L3, each member's executor report (its clock, queue pressure, completions,
+and an error, if its poll was invalid) rides the round's relay: one
+all-gather carries the first member's messages and every member's report, so
+the replica runs one exchange a round, not two. At the head the replica
+agrees on the reports (`L3::agree`): rank 0's clock and the worst pressure
+become the round's tick, with the forward and storage permissions the
+control state gives, which every member holds alike. A storage operation
 completes once every owner reported it: per key, success and native
 retirement on every owner, an object failure on any. A rank's invalid report
-enters the same header, and every rank fails after gathering it, so no rank
-strands a peer in the exchange. A frozen round plans too, with forwards and
-storage forbidden, so detaches and cancels still drain. An abort of a request
-still preparing its storage rides the next head: one that holds no pages yet
-finishes there (the forward path would never reap it), any other detaches
-from its storage work. Without L3 the round runs none of this. L3 requires
-PP=1; the D role receives its missing cache from its prefill peer.
+reaches every rank in the same exchange, and every rank fails after
+gathering it, so no rank strands a peer. A frozen round plans too, with
+forwards and storage forbidden, so detaches and cancels still drain. An
+abort of a request still preparing its storage rides the next head: one that
+holds no pages yet finishes there (the forward path would never reap it),
+any other detaches from its storage work. Without L3 the round runs none of
+this. L3 requires PP=1; the D role receives its missing cache from its
+prefill peer.
 
 **PD** (`pd`, `ts-pd`). Requests register with the transfer peer at
 admission, and every round the replica agrees on which transfers changed
 state; their scheduler events join the round's tail feedback, and a failed
-transfer aborts its request on every rank together.
+transfer aborts its request on every rank together. A peer keeps state only
+for the rooms of requests the loop tracks (a sleep waits for those alone),
+with one exception on the prefill side: a room the decode node pre-allocated
+for before its request registered here, or one this rank failed first (an
+EPD embedding timeout), waits unclaimed; one still unclaimed after the
+bootstrap timeout is dropped, and the decode ranks that pre-allocated for it
+are told it failed. A decode room whose KV lands without the request's first
+token fails: the first decode feeds on it.
 
 **EPD prefill** (`--disaggregation-mode prefill` with encode workers). A
 request whose images an encode worker embeds is staged at admission; each
 round the replica MIN-reduces which staged requests' embeddings landed on
 every rank, submits those, and fails those whose receive failed or timed out
-on any.
+on any. The receives settle while paused too: one that lands then is
+withheld, like any admission.
 
 **Grammars** (`grammar`, `--grammar-backend xgrammar`). A constrained
 request waits in the loop's grammar queue until its grammar compiled (off the
@@ -612,17 +634,18 @@ For orientation, one `EventLoop::round`:
 
 1. The frontend's owner receives (waiting briefly only when the whole engine
    is idle) and relays the round's messages to the replica, with its stop
-   request. Admit them in arrival order — a control operation and the
+   request; with L3 every member's storage executor report rides the same
+   exchange. Admit them in arrival order — a control operation and the
    requests before it keep their order — then apply the pause edges, admit
    the grammar queue and the EPD staged requests that are ready, and run the
    same-round gate.
-2. With L3, poll the storage executor and agree its reports across the
-   replica; while a cache op is open, poll the data plane's acknowledgments
-   and intersect them; then **advance the scheduler (head)** with both, so
-   this round's plan sees them.
-3. Frozen? Commit what is dispatched and join the attention-DP agreement;
-   with L3 the round also plans, with forwards and storage forbidden, and
-   dispatches the plan's cache and storage work.
+2. Agree the L3 reports into the round's storage tick (without L3, a tick
+   only when a freeze starts or ends); while a cache op is open, poll the
+   data plane's acknowledgments and intersect them; then **advance the
+   scheduler (head)** with both, so this round's plan sees them.
+3. Frozen? Commit what is dispatched, plan (the tick forbade forwards, so
+   the plan carries cache and storage work only) and dispatch that work,
+   and join the attention-DP agreement.
    Otherwise: plan (`next_execution_plan`), count its cache ops, finish the
    requests the plan aborted (`plan.aborts`: a capacity retraction whose
    victim could not be imaged aborted the newest resident inside the plan

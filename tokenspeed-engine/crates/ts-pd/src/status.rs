@@ -99,13 +99,6 @@ impl RoomTable {
         self.states.remove(&room);
         self.failures.remove(&room);
     }
-
-    /// The rooms known, in order.
-    pub fn rooms(&self) -> Vec<u64> {
-        let mut rooms: Vec<u64> = self.states.keys().copied().collect();
-        rooms.sort_unstable();
-        rooms
-    }
 }
 
 #[cfg(test)]

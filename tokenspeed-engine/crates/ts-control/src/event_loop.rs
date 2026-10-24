@@ -42,9 +42,11 @@
 //!
 //! Control operations (`control`) arrive with the requests and are relayed
 //! like them. A pause withholds new requests from the scheduler or, frozen,
-//! skips planning while the ranks stay in step; weight operations and cache
-//! flushes complete through a same-round gate, so every attention-DP rank
-//! runs the same one in the same round.
+//! forbids forwards while the ranks stay in step: the scheduler learns the
+//! permission from the round's storage tick, so a frozen round plans only
+//! cache and storage work. Weight operations and cache flushes complete
+//! through a same-round gate, so every attention-DP rank runs the same one
+//! in the same round.
 
 use std::{
     collections::{HashSet, VecDeque},
@@ -56,7 +58,7 @@ use ts_collective::{Group, Mesh, Reduce};
 use ts_metrics::{EngineMetrics, L3Metrics};
 use ts_scheduler::{
     CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
-    Scheduler, StorageRound,
+    Scheduler, StorageRound, StorageTickView,
 };
 use ts_wire::{
     control::{FlushCacheReqOutput, ProfileReqOutput},
@@ -66,6 +68,7 @@ use ts_wire::{
 use crate::{
     batch_log::{BatchLogConfig, BatchLogger, RoundStats},
     cache_ops::{CacheOpError, CacheOps},
+    codec::{Reader, Writer},
     control::{self, ControlConfig, Controls, Drain, Effect},
     eplb::{self, InternalOp, SlotMoves},
     grammar::{self as grammar_cache, GrammarKey, Grammars, InvalidGrammar, Lookup},
@@ -120,24 +123,20 @@ fn fnv1a<'a>(values: impl Iterator<Item = &'a i64>) -> i64 {
 
 /// A placement `[layers, physical]` as bytes: the row width, then the values.
 fn encode_rows(rows: &[Vec<i32>]) -> Vec<u8> {
-    let width = rows.first().map_or(0, Vec::len);
-    let mut out = (width as u64).to_le_bytes().to_vec();
-    for value in rows.iter().flatten() {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-    out
+    let mut out = Writer::new();
+    out.count(rows.first().map_or(0, Vec::len));
+    out.i32s(&rows.concat());
+    out.finish()
 }
 
 fn decode_rows(bytes: &[u8]) -> Option<Vec<Vec<i32>>> {
-    let width = usize::try_from(u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?)).ok()?;
-    let values: Vec<i32> = bytes[8..]
-        .chunks_exact(4)
-        .map(|chunk| i32::from_le_bytes(chunk.try_into().expect("four bytes")))
-        .collect();
+    let mut reader = Reader::new(bytes);
+    let width = reader.count()?;
+    let values = reader.i32s()?;
     if width == 0 || values.len() % width != 0 {
         return None;
     }
-    Some(values.chunks(width).map(<[i32]>::to_vec).collect())
+    reader.finish(values.chunks(width).map(<[i32]>::to_vec).collect())
 }
 
 /// How long an idle loop waits for a request before checking `stop` again.
@@ -323,6 +322,9 @@ pub trait Frontend {
     /// first when given one; otherwise returns at once.
     fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest>;
 
+    /// The frontend is gone: no message will arrive again.
+    fn closed(&self) -> bool;
+
     /// Send one round's outputs.
     fn send(&mut self, outputs: Vec<StreamedOutput>, load: Load);
 
@@ -336,6 +338,10 @@ impl<F: Frontend> Frontend for Option<F> {
     fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
         self.as_mut()
             .map_or_else(Vec::new, |frontend| frontend.receive(wait))
+    }
+
+    fn closed(&self) -> bool {
+        self.as_ref().is_some_and(Frontend::closed)
     }
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, load: Load) {
@@ -471,6 +477,20 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// No attention-DP rank had a batch last round, so an idle rank may wait
     /// for requests without holding the others' collectives back.
     dp_idle: bool,
+    /// Without L3, the forward permission the scheduler last received; it
+    /// starts allowed. With L3 every round's tick carries it.
+    forward_allowed: bool,
+}
+
+/// What a round starts from, the same on every replica member.
+struct Relayed {
+    /// The replica's first member is stopping.
+    stop: bool,
+    /// Its frontend messages.
+    messages: Vec<EngineRequest>,
+    /// With L3, every member's storage report, in member order; empty
+    /// without.
+    l3_reports: Vec<Vec<u8>>,
 }
 
 impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
@@ -510,6 +530,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             withheld: Vec::new(),
             staged: Vec::new(),
             dp_idle: true,
+            forward_allowed: true,
         }
     }
 
@@ -548,8 +569,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             Vec::new()
         };
-        let (mut stop, received) = self.relay(stop_requested, received)?;
-        self.admit(received, &mut outputs, &mut released)?;
+        // Nothing reaches a rank whose frontend is gone: it stops as on a
+        // stop request, so every rank stops after this round.
+        let stop_requested = stop_requested || self.frontend.closed();
+        let report = self.l3.as_ref().map(Tier::report);
+        let Relayed {
+            mut stop,
+            messages,
+            l3_reports,
+        } = self.relay(stop_requested, received, report)?;
+        self.admit(messages, &mut outputs, &mut released)?;
         self.apply_pause_transitions(&mut outputs, &mut released)?;
         self.drain_grammar_queue(&mut outputs, &mut released)?;
         self.drain_staged(&mut outputs, &mut released)?;
@@ -557,16 +586,9 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         // flushes and weight operations they run together.
         self.gate()?;
 
-        // The storage agreement and the cache-op acknowledgments advance at
-        // the head of the round, so this round's plan sees them. With L3 the
-        // replica agrees every round, if only on the clock and permissions.
-        let storage = match self.l3.as_mut() {
-            Some(l3) => {
-                let allowed = !self.controls.forward_blocked();
-                l3.round(allowed, allowed, &mut self.ranks.mesh, &self.ranks.replica)?
-            }
-            None => StorageRound::default(),
-        };
+        // The storage tick and the cache-op acknowledgments advance at the
+        // head of the round, so this round's plan sees them.
+        let storage = self.storage_round(&l3_reports)?;
         let ready = if self.cache_ops.open() > 0 {
             let polled = self.data_plane.poll_cache_events()?;
             self.cache_ops
@@ -594,21 +616,24 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             // the attention-DP ranks stay in step. With memory released not
             // even an idle forward may run: the weights are unmapped.
             self.commit_down_to(0, &mut events, &mut outputs, &mut released)?;
+            // Cache and storage work still progresses: the tick forbade
+            // forwards, so the plan carries nothing else.
+            let plan = self.scheduler.next_execution_plan();
             if let Some(l3) = &self.l3 {
-                // Storage still progresses: the agreed tick forbade forwards,
-                // so the plan carries cache and storage work only.
-                let plan = self.scheduler.next_execution_plan();
                 l3.submit(&plan)?;
-                self.cache_ops.dispatched(&plan.cache_ops());
-                if plan.needs_device() {
-                    self.data_plane.execute(plan, &Dispatch::default())?;
-                }
             }
+            self.cache_ops.dispatched(&plan.cache_ops());
+            if plan.needs_device() {
+                self.data_plane.execute(plan, &Dispatch::default())?;
+            }
+            let mut forwarded = false;
             if let Some(dp) = self.dp_round(None, &mut stop)? {
                 if dp.idle_forward && !self.controls.memory_released() {
                     self.data_plane.idle_forward(&dp)?;
+                    forwarded = true;
                 }
             }
+            self.note_forward(forwarded);
             std::thread::sleep(PAUSED_IDLE_SLEEP);
         } else {
             self.plan_and_dispatch(&mut stop, &mut events, &mut outputs, &mut released)?;
@@ -771,12 +796,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 forwarded = true;
             }
         }
-        if let Some(controller) = self.eplb.as_mut() {
-            // A forward (real or idle) is rank-identical; the steps it makes
-            // due complete through the gate.
-            let due = controller.note_round(forwarded);
-            self.controls.enqueue_internal(due);
-        }
+        self.note_forward(forwarded);
 
         // Commit from the head once the queue exceeds the depth; a round with
         // no new work drains fully so results never wait on future traffic.
@@ -786,6 +806,44 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             0
         };
         self.commit_down_to(depth, events, outputs, released)
+    }
+
+    /// Count this round's forward, real or idle, for the expert rebalance;
+    /// the steps it makes due complete through the gate. Every round on
+    /// every rank, frozen or not: the attention-DP ranks forward in step,
+    /// so their counts, and the steps that follow, stay rank-identical.
+    fn note_forward(&mut self, forwarded: bool) {
+        if let Some(controller) = self.eplb.as_mut() {
+            let due = controller.note_round(forwarded);
+            self.controls.enqueue_internal(due);
+        }
+    }
+
+    /// The round's storage input to the scheduler. With L3, the replica's
+    /// agreement on the members' reports, every round. Without, the forward
+    /// permission when a freeze starts or ends: the tick is the scheduler's
+    /// only input that carries it, and its clock, which times only storage
+    /// deadlines, stays 0.
+    fn storage_round(&mut self, l3_reports: &[Vec<u8>]) -> Result<StorageRound, LoopError> {
+        let allowed = !self.controls.forward_blocked();
+        if let Some(l3) = self.l3.as_mut() {
+            return Ok(l3.agree(l3_reports, allowed, allowed)?);
+        }
+        if allowed == self.forward_allowed {
+            return Ok(StorageRound::default());
+        }
+        self.forward_allowed = allowed;
+        Ok(StorageRound {
+            tick: Some(StorageTickView {
+                now_us: 0,
+                allow_forward: allowed,
+                allow_storage: allowed,
+                queued_operations: 0,
+                queued_bytes: 0,
+                oldest_operation_us: 0,
+            }),
+            ..StorageRound::default()
+        })
     }
 
     /// One-shot pause edges: an `abort` pause aborts every request,
@@ -802,11 +860,17 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 self.outputs.mark_abort(&rid, true);
             }
         }
-        if self.controls.take_cancel_grammar() {
-            // Requests still compiling their grammars produced nothing yet:
-            // cancelled, the grammar queue's next pass ends them toward their
-            // clients instead of withholding them past the drain.
-            for (submission, _, _) in &self.grammar_queue {
+        if self.controls.take_cancel_unscheduled() {
+            // Requests still compiling their grammars or receiving their
+            // images' embeddings produced nothing yet: cancelled, they end
+            // toward their clients (the grammar queue's next pass, or their
+            // receive settling) instead of being withheld past the drain.
+            let unscheduled = self
+                .grammar_queue
+                .iter()
+                .map(|(submission, _, _)| submission)
+                .chain(&self.staged);
+            for submission in unscheduled {
                 self.outputs.mark_abort(&submission.rid, true);
             }
         }
@@ -1072,15 +1136,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// EPD: admit the staged requests whose embeddings landed on every rank
-    /// of the replica, and fail those whose
-    /// receive failed or timed out on any. Withheld while paused, like any
-    /// admission.
+    /// of the replica, and fail those whose receive failed or timed out on
+    /// any. The receives settle while paused too, so a drain's cancelled
+    /// requests end and a frozen one's do not time out: a landed request is
+    /// withheld then, like any admission.
     fn drain_staged(
         &mut self,
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
-        if self.staged.is_empty() || self.controls.admit_blocked() {
+        if self.staged.is_empty() {
             return Ok(());
         }
         let codes = self.data_plane.epd_poll()?;
@@ -1129,6 +1194,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             }
         }
         self.staged = leftover;
+        if self.controls.admit_blocked() {
+            self.withheld.extend(admitted);
+            return Ok(());
+        }
         self.submit(admitted)
     }
 
@@ -1513,6 +1582,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !self.in_flight.is_empty() {
             return Ok(());
         }
+        // EPD: a request the drain cancelled (or its client aborted) ends
+        // toward its client only once its embedding receive settles.
+        let settling = self.staged.iter().any(|submission| {
+            self.outputs
+                .state(&submission.rid)
+                .is_some_and(|state| state.finished())
+        });
+        if settling {
+            return Ok(());
+        }
         if let Drain::Release(tags) = drain {
             // A gated operation still writes the weights, a transfer still
             // touches the cache, or the cache index still pins pages.
@@ -1584,27 +1663,59 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
     }
 
     /// The round's frontend messages, from the replica's first member, and
-    /// its stop request.
+    /// its stop request; with L3, every member's storage report, which this
+    /// rank's `l3_report` joins.
     fn relay(
         &mut self,
         stop_requested: bool,
         received: Vec<EngineRequest>,
-    ) -> Result<(bool, Vec<EngineRequest>), LoopError> {
+        l3_report: Option<Vec<u8>>,
+    ) -> Result<Relayed, LoopError> {
         let replica = &self.ranks.replica;
         if replica.size() == 1 {
-            return Ok((stop_requested, received));
+            return Ok(Relayed {
+                stop: stop_requested,
+                messages: received,
+                l3_reports: l3_report.into_iter().collect(),
+            });
         }
-        let payload = if self.owns_frontend() {
+        let owner = self.owns_frontend();
+        let payload = if owner {
             relay::encode(stop_requested, &received)
         } else {
             Vec::new()
         };
-        let relayed = self.ranks.mesh.broadcast(replica, 0, payload)?;
-        if self.owns_frontend() {
-            Ok((stop_requested, received))
+        let (relayed, l3_reports) = match l3_report {
+            None => (self.ranks.mesh.broadcast(replica, 0, payload)?, Vec::new()),
+            Some(report) => {
+                // Every member's storage report rides the relay: one
+                // exchange a round for both.
+                let gathered = self
+                    .ranks
+                    .mesh
+                    .all_gather(replica, &relay::join(&payload, &report))?;
+                let mut relayed = Vec::new();
+                let mut reports = Vec::with_capacity(gathered.len());
+                for (member, part) in gathered.iter().enumerate() {
+                    let (relay, report) = relay::split(part)?;
+                    if member == 0 {
+                        relayed = relay.to_vec();
+                    }
+                    reports.push(report.to_vec());
+                }
+                (relayed, reports)
+            }
+        };
+        let (stop, messages) = if owner {
+            (stop_requested, received)
         } else {
-            Ok(relay::decode(&relayed)?)
-        }
+            relay::decode(&relayed)?
+        };
+        Ok(Relayed {
+            stop,
+            messages,
+            l3_reports,
+        })
     }
 
     /// With attention DP, every rank's batch this round, and whether any

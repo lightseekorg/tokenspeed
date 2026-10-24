@@ -26,6 +26,7 @@
 
 pub mod batch_log;
 pub mod cache_ops;
+mod codec;
 pub mod control;
 pub mod eplb;
 pub mod event_loop;

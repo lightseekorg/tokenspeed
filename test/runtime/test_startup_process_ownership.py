@@ -239,6 +239,68 @@ def _repeated_failure_cleanup(signal_on_thread, writer):
         writer.close()
 
 
+# A metric reporter plugin whose sink records that it was closed.
+_RELAY_PROBE = """
+import pathlib
+
+from tokenspeed.runtime.metrics.registry import register_metric_reporter
+
+
+class _Sink:
+    def __init__(self, path):
+        self._path = pathlib.Path(path)
+
+    def emit(self, event):
+        pass
+
+    def close(self, timeout):
+        self._path.write_text("closed")
+
+
+def register():
+    register_metric_reporter(
+        "relay-probe",
+        validate=lambda config: config,
+        create_sink=lambda config: _Sink(config["path"]),
+        start_node=None,
+        override=False,
+    )
+"""
+
+
+def _install_relay_probe(directory):
+    """Install the probe plugin as a distribution on ``directory``."""
+    (directory / "relay_probe.py").write_text(_RELAY_PROBE)
+    dist = directory / "relay_probe-0.0.dist-info"
+    dist.mkdir()
+    (dist / "METADATA").write_text(
+        "Metadata-Version: 2.1\nName: relay-probe\nVersion: 0.0\n"
+    )
+    (dist / "entry_points.txt").write_text(
+        "[tokenspeed.plugins]\nrelay-probe = relay_probe:register\n"
+    )
+
+
+def _engine_shutdown_with_relay(directory, marker, writer):
+    # The relay's spawned process inherits this path, so it loads the probe.
+    sys.path.insert(0, directory)
+    from tokenspeed.runtime.engine.async_llm import AsyncLLM
+    from tokenspeed.runtime.entrypoints.engine import Engine
+    from tokenspeed.runtime.metrics.relay import MetricsRelay
+
+    relay = MetricsRelay({"relay-probe": {"path": marker}})
+    # Bypass model and network construction only: the relay and the shutdown
+    # are the real implementation.
+    tokenizer_manager = AsyncLLM.__new__(AsyncLLM)
+    tokenizer_manager.bootstrap_server = None
+    tokenizer_manager.metrics_relay = relay
+    engine = Engine.__new__(Engine)
+    engine.llm = None
+    engine.tokenizer_manager = tokenizer_manager
+    engine.shutdown()
+    writer.send(open(marker).read() if os.path.exists(marker) else None)
+
+
 def _stop_supervisor(proc):
     if proc.is_alive():
         # Test-only fallback must stop descendants if the regression hangs.
@@ -290,6 +352,26 @@ def test_repeated_failure_signals_cannot_interrupt_owner_cleanup(signal_on_threa
         assert result["finished_cleanup"]
         assert result["alive"] == [False, False]
         assert result["exitcodes"] == [-signal.SIGKILL, -signal.SIGKILL]
+        proc.join(_TIMEOUT_S)
+        assert proc.exitcode == 0
+    finally:
+        _stop_supervisor(proc)
+        reader.close()
+
+
+def test_engine_shutdown_lets_the_metrics_relay_flush(tmp_path):
+    # The relay closes its sinks on a stop; killed with the process tree, it
+    # would drop what they still buffer.
+    _install_relay_probe(tmp_path)
+    marker = tmp_path / "closed"
+    proc, reader = start_process_with_ready_pipe(
+        _engine_shutdown_with_relay,
+        (str(tmp_path), str(marker)),
+        contextlib.nullcontext(),
+    )
+    try:
+        assert reader.poll(_TIMEOUT_S), "Engine did not finish its shutdown"
+        assert reader.recv() == "closed"
         proc.join(_TIMEOUT_S)
         assert proc.exitcode == 0
     finally:

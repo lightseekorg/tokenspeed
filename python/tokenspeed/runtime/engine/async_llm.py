@@ -77,6 +77,7 @@ from tokenspeed.runtime.engine.scheduler_control_client import (
 )
 from tokenspeed.runtime.entrypoints import rl_control
 from tokenspeed.runtime.metrics.collector import RequestMetrics
+from tokenspeed.runtime.metrics.relay import MetricsRelay
 from tokenspeed.runtime.metrics.service import metrics_service
 from tokenspeed.runtime.utils import (
     dataclass_to_string_truncated,
@@ -135,6 +136,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # The prefill role's KV bootstrap server, which the launcher starts;
         # closed with the engine.
         self.bootstrap_server = None
+        # The node's metrics relay, which runs the output plugins for the
+        # engine hosts; the launcher starts it, and it closes with the engine.
+        self.metrics_relay: MetricsRelay | None = None
 
         # Read model args
         self.model_path = server_args.model

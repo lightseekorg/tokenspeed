@@ -39,6 +39,8 @@ use std::collections::BTreeSet;
 use ts_collective::{Group, Mesh, Reduce};
 use ts_scheduler::{CacheEvent, CacheEventKind, CacheOpView};
 
+use crate::codec::{Reader, Writer};
+
 /// The ranks disagree on the cache ops in flight, or cannot reach each other.
 #[derive(Debug, thiserror::Error)]
 pub enum CacheOpError {
@@ -87,31 +89,31 @@ fn key(event: &CacheEvent) -> Key {
 
 /// Acknowledgments as one rank shares them: kind, op id.
 fn encode(events: &[CacheEvent]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(events.len() * 5);
+    let mut out = Writer::new();
+    out.count(events.len());
     for event in events {
         let code = KINDS
             .iter()
             .position(|kind| *kind == event.kind)
             .expect("a bridge kind");
-        out.push(code as u8);
-        out.extend_from_slice(&event.op_id.to_le_bytes());
+        out.u8(code as u8);
+        out.u32(event.op_id);
     }
-    out
+    out.finish()
 }
 
 fn decode(bytes: &[u8]) -> Option<Vec<CacheEvent>> {
-    if bytes.len() % 5 != 0 {
-        return None;
-    }
-    bytes
-        .chunks_exact(5)
-        .map(|chunk| {
+    let mut reader = Reader::new(bytes);
+    let count = reader.count()?;
+    let events = (0..count)
+        .map(|_| {
             Some(CacheEvent {
-                kind: *KINDS.get(usize::from(chunk[0]))?,
-                op_id: u32::from_le_bytes(chunk[1..5].try_into().ok()?),
+                kind: *KINDS.get(usize::from(reader.u8()?))?,
+                op_id: reader.u32()?,
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    reader.finish(events)
 }
 
 /// The cache ops dispatched and not acknowledged yet.

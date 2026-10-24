@@ -565,3 +565,122 @@ fn a_room_no_decode_rank_reaches_times_out() {
         .unwrap();
     assert!(pair.prefill_outbox.send_unplanned("pending", 9).is_err());
 }
+
+#[test]
+fn rooms_no_request_claimed_neither_hold_a_sleep_nor_linger() {
+    let Some(library) = library() else {
+        eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
+        return;
+    };
+    let source = vec![1u8; BYTES];
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair(
+        library,
+        &source,
+        &destination,
+        false,
+        Duration::from_millis(500),
+    );
+    let (mut mesh, group) = single_rank();
+    // The Prefill rank failed a request before it registered there (an EPD
+    // embedding timeout).
+    pair.prefill.abort_room("epd-0", 77);
+    // A Decode rank pre-allocates for a request the Prefill rank never
+    // registers (it refused it at admission).
+    let rid = "refused";
+    pair.decode.register(rid, &pair.bootstrap).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.to_owned())
+    );
+    pair.decode_outbox.receive(rid, 4242, 3, b"manifest");
+    thread::sleep(Duration::from_millis(100));
+    // Neither room sends anything, so neither holds a sleep.
+    pair.prefill_outbox.release_registration().unwrap();
+    pair.prefill_outbox.restore_registration().unwrap();
+    // Unclaimed past the bootstrap timeout, the pre-allocated room is
+    // dropped and its Decode rank told.
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+}
+
+#[test]
+fn an_admission_after_its_request_ended_is_not_sent() {
+    let Some(library) = library() else {
+        eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
+        return;
+    };
+    let source = vec![1u8; BYTES];
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair(
+        library,
+        &source,
+        &destination,
+        false,
+        Duration::from_secs(60),
+    );
+    let (mut mesh, group) = single_rank();
+    // No bootstrap server listens there: the room's route lookup fails.
+    let unreachable = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let lost = BootstrapInfo {
+        port: unreachable,
+        room: 9,
+        ..pair.bootstrap.clone()
+    };
+    pair.decode.register("lost", &lost).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed("lost".to_owned())
+    );
+    // The admission the loop planned before the failure reaches the outbox
+    // only after it: the room stays forgotten, and a sleep proceeds.
+    pair.decode_outbox.receive("lost", 9, 3, b"manifest");
+    pair.decode_outbox.release_registration().unwrap();
+    assert!(pair.decode.poll(&mut mesh, &group).unwrap().is_empty());
+}
+
+#[test]
+fn a_landing_without_its_first_token_fails_the_request() {
+    let Some(library) = library() else {
+        eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
+        return;
+    };
+    let source = vec![1u8; BYTES];
+    let destination = vec![0u8; BYTES];
+    let mut pair = pair(
+        library,
+        &source,
+        &destination,
+        false,
+        Duration::from_secs(60),
+    );
+    let (mut mesh, group) = single_rank();
+    let rid = "tokenless";
+    pair.prefill.register(rid, &pair.bootstrap).unwrap();
+    pair.decode.register(rid, &pair.bootstrap).unwrap();
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.to_owned())
+    );
+    pair.decode_outbox.receive(rid, 4242, 3, b"manifest");
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Bootstrapped(rid.to_owned())
+    );
+    // An older or foreign Prefill peer reports the KV sent with no token.
+    pair.prefill_outbox.send(rid, 4242, -1, None);
+    assert_eq!(
+        next_event(&mut pair.prefill, &mut mesh, &group),
+        PdEvent::Succeeded(rid.to_owned())
+    );
+    assert_eq!(
+        next_event(&mut pair.decode, &mut mesh, &group),
+        PdEvent::Failed(rid.to_owned())
+    );
+}

@@ -29,7 +29,8 @@
 //! Pause modes: `abort` aborts what runs, `wait` lets it finish; both stop
 //! admissions and answer once the scheduler drained. `keep` freezes
 //! everything and answers at once. A memory release drains like `wait`,
-//! then frees its regions and freezes until they are resumed.
+//! then frees its regions and freezes until they are resumed; it is refused
+//! under a `keep` pause, as a pause is under a release.
 
 use std::collections::VecDeque;
 
@@ -243,10 +244,11 @@ pub struct Controls {
     /// An `abort` pause still has to abort what runs.
     abort_all: bool,
     /// An `abort` or `wait` pause, or a release, still has to cancel the
-    /// requests whose grammars compile: they are not in the scheduler, so
-    /// the drain would not wait for them, and once compiled they would be
-    /// withheld until a resume.
-    cancel_grammar: bool,
+    /// admitted requests not in the scheduler yet, whose grammars compile
+    /// or whose images' embeddings are on their way: the scheduler's drain
+    /// does not see them, and once ready they would be withheld until a
+    /// resume.
+    cancel_unscheduled: bool,
     /// Gated weight operations, in arrival order.
     weight_ops: VecDeque<ControlRequest>,
     /// Standalone cache flushes received this round.
@@ -281,7 +283,7 @@ impl Controls {
             released: Vec::new(),
             release_pending: false,
             abort_all: false,
-            cancel_grammar: false,
+            cancel_unscheduled: false,
             weight_ops: VecDeque::new(),
             flushes: 0,
             replies: Vec::new(),
@@ -365,10 +367,10 @@ impl Controls {
         std::mem::take(&mut self.abort_all)
     }
 
-    /// Whether to cancel the requests waiting for their grammars, once per
-    /// drain.
-    pub fn take_cancel_grammar(&mut self) -> bool {
-        std::mem::take(&mut self.cancel_grammar)
+    /// Whether to cancel the admitted requests not in the scheduler yet,
+    /// once per drain.
+    pub fn take_cancel_unscheduled(&mut self) -> bool {
+        std::mem::take(&mut self.cancel_unscheduled)
     }
 
     /// Take the replies produced so far.
@@ -422,11 +424,15 @@ impl Controls {
         self.drain.as_ref()
     }
 
-    /// Start a drain: stop admitting and arm `action` (`request_drain`).
+    /// Start a drain: stop admitting and arm `action` (`request_drain`). An
+    /// engine with memory released stays frozen: no forward may run before
+    /// its memory is back.
     fn request_drain(&mut self, abort_inflight: bool, action: Drain) {
-        self.state = PauseState::PausedNew;
+        if self.released.is_empty() {
+            self.state = PauseState::PausedNew;
+        }
         self.drain = Some(action);
-        self.cancel_grammar = true;
+        self.cancel_unscheduled = true;
         if abort_inflight {
             self.abort_all = true;
         }
@@ -647,7 +653,7 @@ impl Controls {
         }
         self.state = PauseState::Unpaused;
         self.abort_all = false;
-        self.cancel_grammar = false;
+        self.cancel_unscheduled = false;
         self.reply(resume_reply(true, ""));
     }
 
@@ -677,6 +683,15 @@ impl Controls {
         }
         if self.drain.is_some() {
             return fail(self, "a pause or release is already in progress".to_owned());
+        }
+        if self.state == PauseState::PausedAll && self.released.is_empty() {
+            // Its drain would let the frozen requests run, and the wake
+            // would silently end the keep pause.
+            return fail(
+                self,
+                "a keep pause froze the scheduler; resume_scheduler before releasing memory"
+                    .to_owned(),
+            );
         }
         if let Some(refusal) = refusal {
             return fail(self, format!("cannot release memory: {refusal}"));
@@ -742,6 +757,14 @@ mod tests {
         })
     }
 
+    fn release(tags: Option<Vec<&str>>) -> ControlRequest {
+        ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+            rid: None,
+            http_worker_ipc: None,
+            tags: tags.map(|tags| tags.into_iter().map(str::to_owned).collect()),
+        })
+    }
+
     fn successes(replies: &[ControlOutput]) -> Vec<(&'static str, bool)> {
         replies
             .iter()
@@ -794,8 +817,8 @@ mod tests {
         controls.handle(pause("abort"), None);
         assert!(controls.take_abort_all());
         assert!(!controls.take_abort_all());
-        assert!(controls.take_cancel_grammar());
-        assert!(!controls.take_cancel_grammar());
+        assert!(controls.take_cancel_unscheduled());
+        assert!(!controls.take_cancel_unscheduled());
         assert_eq!(controls.take_drain(), Some(Drain::Pause));
         controls.finish_pause_drain();
         assert_eq!(
@@ -852,6 +875,38 @@ mod tests {
     }
 
     #[test]
+    fn a_release_neither_ends_a_keep_pause_nor_thaws_a_released_engine() {
+        let mut controls = controls(true);
+        controls.handle(pause("keep"), None);
+        controls.take_replies();
+        // Its drain would run the frozen requests, and the wake would end
+        // the pause.
+        controls.handle(release(None), None);
+        assert_eq!(
+            successes(&controls.take_replies()),
+            [("ReleaseMemoryOccupationReqOutput", false)]
+        );
+        assert!(controls.forward_blocked() && controls.drain().is_none());
+        controls.handle(resume(), None);
+        controls.take_replies();
+
+        // A second release, while the first one's region is released, drains
+        // frozen: no forward may run before the memory is back.
+        controls.handle(release(Some(vec!["kv_cache"])), None);
+        let Some(Drain::Release(tags)) = controls.take_drain() else {
+            panic!("a release drains");
+        };
+        controls.finish_release(tags);
+        controls.take_replies();
+        controls.handle(release(Some(vec!["weights"])), None);
+        assert!(controls.forward_blocked());
+        assert_eq!(
+            controls.drain(),
+            Some(&Drain::Release(vec!["weights".to_owned()]))
+        );
+    }
+
+    #[test]
     fn a_keep_pause_freezes_at_once() {
         let mut controls = controls(false);
         controls.handle(pause("keep"), None);
@@ -869,13 +924,6 @@ mod tests {
 
     #[test]
     fn a_release_drains_frees_and_blocks_weight_loads_until_resumed() {
-        let release = |tags: Option<Vec<&str>>| {
-            ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-                rid: None,
-                http_worker_ipc: None,
-                tags: tags.map(|tags| tags.into_iter().map(str::to_owned).collect()),
-            })
-        };
         let mut off = controls(false);
         off.handle(release(None), None);
         assert_eq!(

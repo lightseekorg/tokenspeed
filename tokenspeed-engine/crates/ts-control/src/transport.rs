@@ -79,6 +79,9 @@ fn message(frames: Vec<Bytes>) -> ZmqMessage {
 pub struct EngineTransport {
     engine_index: u16,
     requests: mpsc::Receiver<EngineRequest>,
+    /// The input socket closed: the frontend is gone, and the socket does
+    /// not reconnect.
+    closed: bool,
     outputs: tokio::sync::mpsc::UnboundedSender<Vec<Bytes>>,
     runtime: Option<Runtime>,
 }
@@ -176,9 +179,21 @@ impl EngineTransport {
         Ok(Self {
             engine_index,
             requests,
+            closed: false,
             outputs,
             runtime: Some(runtime),
         })
+    }
+
+    /// The input task ended (its socket failed): note it once.
+    fn input_closed(&mut self) {
+        if !self.closed {
+            self.closed = true;
+            tracing::error!(
+                engine_index = self.engine_index,
+                "the frontend's input socket closed; the engine stops"
+            );
+        }
     }
 }
 
@@ -266,11 +281,30 @@ pub fn output_batch(
 
 impl Frontend for EngineTransport {
     fn receive(&mut self, wait: Option<Duration>) -> Vec<EngineRequest> {
+        // What arrived before the input closed is still delivered first.
         let first = match wait {
-            Some(timeout) => self.requests.recv_timeout(timeout).ok(),
-            None => self.requests.try_recv().ok(),
+            Some(timeout) => match self.requests.recv_timeout(timeout) {
+                Ok(request) => Some(request),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.input_closed();
+                    None
+                }
+            },
+            None => match self.requests.try_recv() {
+                Ok(request) => Some(request),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.input_closed();
+                    None
+                }
+            },
         };
         first.into_iter().chain(self.requests.try_iter()).collect()
+    }
+
+    fn closed(&self) -> bool {
+        self.closed
     }
 
     fn send(&mut self, outputs: Vec<StreamedOutput>, load: Load) {
@@ -299,5 +333,34 @@ impl Drop for EngineTransport {
             runtime.block_on(async { tokio::time::sleep(Duration::from_millis(100)).await });
             runtime.shutdown_timeout(Duration::from_secs(1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_input_is_noticed_after_its_last_messages() {
+        let (request_tx, requests) = mpsc::channel();
+        let (outputs, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let mut transport = EngineTransport {
+            engine_index: 0,
+            requests,
+            closed: false,
+            outputs,
+            runtime: None,
+        };
+        let abort = EngineRequest::Abort(vec!["r0".to_owned()]);
+        request_tx.send(abort.clone()).unwrap();
+        // The input task ended.
+        drop(request_tx);
+        assert_eq!(transport.receive(Some(Duration::from_secs(10))), [abort]);
+        assert!(!transport.closed());
+        // A wait returns at once: nothing can arrive any more.
+        let started = std::time::Instant::now();
+        assert!(transport.receive(Some(Duration::from_secs(10))).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(transport.closed());
     }
 }

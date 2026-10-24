@@ -148,6 +148,10 @@ class Engine(EngineBase):
             server_args = ServerArgs(**kwargs)
 
         self.server_args = server_args
+        # Set once the subprocesses run; `shutdown` may run before that, on a
+        # failed launch or at interpreter exit.
+        self.tokenizer_manager: AsyncLLM | None = None
+        self.llm: LLM | None = None
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -298,20 +302,25 @@ class Engine(EngineBase):
         # Stop the sync-facade event loop before subprocess teardown so any
         # in-flight blocking callers see a clean loop close instead of a
         # stale-reference error.
-        if getattr(self, "llm", None) is not None:
+        if self.llm is not None:
             self.llm.shutdown()
-        bootstrap_server = getattr(
-            getattr(self, "tokenizer_manager", None),
-            "bootstrap_server",
-            None,
-        )
-        close_bootstrap = getattr(bootstrap_server, "close", None)
+        tokenizer_manager = self.tokenizer_manager
         try:
-            if callable(close_bootstrap):
-                close_bootstrap()
+            if (
+                tokenizer_manager is not None
+                and tokenizer_manager.bootstrap_server is not None
+            ):
+                tokenizer_manager.bootstrap_server.close()
         except Exception:
             logger.exception("Failed to close the disaggregation bootstrap server")
         finally:
+            # Before the process tree goes down: the relay flushes its sinks
+            # on a stop, and would be killed with the tree.
+            if (
+                tokenizer_manager is not None
+                and tokenizer_manager.metrics_relay is not None
+            ):
+                tokenizer_manager.metrics_relay.close(timeout=2.0)
             kill_process_tree(os.getpid(), include_parent=False)
             metrics_service.close(timeout=2.0)
 
@@ -1035,12 +1044,14 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         _terminate_schedulers()
         for proc in scheduler_procs:
             proc.join(timeout=5)
+        # The ranks sent their last events: the relay flushes its sinks
+        # before the process tree, which it belongs to, goes down.
+        if metrics_relay is not None:
+            metrics_relay.close(timeout=2.0)
         if scheduler_procs:
             kill_process_tree(os.getpid(), include_parent=False)
         if kv_bootstrap_server is not None:
             kv_bootstrap_server.close()
-        if metrics_relay is not None:
-            metrics_relay.close(timeout=2.0)
         metrics_service.close(timeout=2.0)
 
 

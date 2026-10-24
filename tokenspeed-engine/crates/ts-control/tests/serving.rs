@@ -27,7 +27,7 @@
 //! connected by a real collective mesh.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     ffi::CString,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -47,11 +47,12 @@ use ts_control::{
     control::ControlConfig,
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, SlotMoves},
     event_loop::{
-        DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, LoopConfig, Ranks, Subsystems,
+        DataPlane, DataPlaneError, Dispatch, DpRound, EventLoop, Frontend, Load, LoopConfig,
+        LoopError, Ranks, Subsystems,
     },
     grammar::{GrammarConfig, GrammarKey, Grammars},
     ingress::{Admission, IngressLimits, LogprobServability},
-    output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role},
+    output::{FinishLog, ForwardResult, LogprobPlan, OutputProcessor, Role, StreamedOutput},
     pd::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer},
     transport::EngineTransport,
 };
@@ -70,7 +71,7 @@ use ts_wire::{
         ResumeSchedulerReqInput, UpdateWeightFromDiskReqInput, PROFILE_START,
     },
     multimodal::{Modality, MultimodalDataItem, MultimodalInputs},
-    ControlOutput, ControlRequest, EngineCoreReadyResponse, SamplingParams,
+    ControlOutput, ControlRequest, EngineCoreReadyResponse, EngineRequest, SamplingParams,
     TokenizedGenerateReqInput, Value,
 };
 
@@ -609,8 +610,9 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
-    /// A `lost-*` request's receive fails at its second poll; the others'
-    /// land after three polls, one more on each later rank.
+    /// A `lost-*` request's receive fails at its second poll, a `slow-*`
+    /// one's lands after a hundred; the others' land after three polls, one
+    /// more on each later rank.
     fn epd_poll(&mut self) -> Result<Vec<i64>, DataPlaneError> {
         let ep_rank = self.ep_rank;
         Ok(self
@@ -621,6 +623,12 @@ impl DataPlane for FakeDevice {
                 if rid.starts_with("lost") {
                     if *polls >= 2 {
                         0
+                    } else {
+                        1
+                    }
+                } else if rid.starts_with("slow") {
+                    if *polls >= 100 {
+                        2
                     } else {
                         1
                     }
@@ -980,7 +988,7 @@ struct Pd {
 }
 
 /// What an engine runs with beyond its layout, depth and cache tiers.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Setup {
     /// Predecessors Engram reads per token.
     ngram_context_len: usize,
@@ -1006,30 +1014,205 @@ struct Setup {
     l3_held_queries: bool,
 }
 
+impl Layout {
+    /// Ranks, attention-TP ranks per replica, and engines.
+    fn sizes(self) -> (usize, usize, usize) {
+        match self {
+            Layout::Single => (1, 1, 1),
+            Layout::Tp(size) | Layout::Pp(size) => (size, size, 1),
+            Layout::Dp(size) => (size, 1, size),
+        }
+    }
+}
+
+/// The loop's settings for `setup`.
+fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopConfig {
+    let pd = setup.pd.as_ref();
+    LoopConfig {
+        in_flight_depth,
+        limits: IngressLimits {
+            vocab_size: 100_000,
+            eos_token_ids: Vec::new(),
+            max_model_len: 4096,
+            max_req_input_len: 4000,
+            enable_output_logprobs: setup.logprobs,
+            requires_bootstrap: pd.is_some(),
+            multimodal: setup.epd_prefill,
+            grammar: setup.grammar,
+            logprobs: LogprobServability {
+                supports_prompt_logprobs: true,
+                logprob_order: "torch".to_owned(),
+                pipeline_parallel: pipeline,
+                disaggregated: pd.is_some(),
+                lm_head_tp_under_dp: false,
+                computes_prompt_logprobs: pd.is_none_or(|pd| pd.role != Role::Decode),
+            },
+        },
+        kv_total_pages: 512,
+        ngram_context_len: setup.ngram_context_len,
+        request_token_history: setup.request_token_history,
+        controls: ControlConfig {
+            memory_saver: true,
+            memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
+            l3_weight_version: None,
+        },
+        batch_log: BatchLogConfig {
+            enabled: true,
+            decode_log_interval: 40,
+            num_total_pages: 512,
+            spec_num_steps: 0,
+            dp_rank: 0,
+            disaggregated: pd.is_some(),
+            cache_state_group_ids: Vec::new(),
+            log_spec_accept_lengths: false,
+        },
+        kv_events: false,
+        epd_prefill: setup.epd_prefill,
+        // The fake device fills bitmasks from the committed matcher state,
+        // as the eager path does.
+        eager_grammar: setup.grammar,
+    }
+}
+
+/// What one rank's loop is built from besides its device, store and
+/// frontend.
+struct RankSpec {
+    rank: usize,
+    layout: Layout,
+    tiers: Tiers,
+    config: LoopConfig,
+    setup: Setup,
+    mesh_listener: Listener,
+    addresses: Vec<String>,
+}
+
+/// Connect `spec`'s rank to the others, build its loop over `device`,
+/// `store` and the frontend `frontend` makes, and run it until the ranks
+/// stop.
+fn run_rank<F: Frontend>(
+    spec: RankSpec,
+    device: FakeDevice,
+    store: Option<ScriptedStore>,
+    frontend: impl FnOnce() -> F,
+    stop: &AtomicBool,
+) -> Result<(), LoopError> {
+    let RankSpec {
+        rank,
+        layout,
+        tiers,
+        config,
+        setup,
+        mesh_listener,
+        addresses,
+    } = spec;
+    let (world, tp_size, num_engines) = layout.sizes();
+    let mesh = Mesh::connect(rank, mesh_listener, &addresses, Duration::from_secs(20)).unwrap();
+    let tp_first = rank / tp_size * tp_size;
+    let replica = Group::new(1, (tp_first..tp_first + tp_size).collect(), rank).unwrap();
+    let dp = (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
+    let frontend = frontend();
+    let Setup {
+        pd,
+        eplb,
+        grammar,
+        grammar_timeouts,
+        ..
+    } = setup;
+    let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
+    let outputs = OutputProcessor::new(
+        None,
+        1,
+        None,
+        role,
+        FinishLog {
+            enabled: true,
+            request_stats: true,
+        },
+    );
+    let transfer = pd.map(|pd| {
+        Box::new(FakePeer {
+            role: pd.role,
+            wire: pd.wire,
+            tracked: Vec::new(),
+        }) as Box<dyn TransferPeer + Send>
+    });
+    let pp =
+        matches!(layout, Layout::Pp(_)).then(|| Group::new(2, (0..world).collect(), rank).unwrap());
+    // Expert parallelism over every rank.
+    let ep = eplb
+        .filter(|_| world > 1)
+        .map(|_| Group::new(3, (0..world).collect(), rank).unwrap());
+    let ranks = Ranks {
+        mesh,
+        replica,
+        pp,
+        dp,
+        ep,
+    };
+    let mut event_loop = EventLoop::new(
+        new_scheduler(tiers, role),
+        device,
+        frontend,
+        outputs,
+        config,
+        ranks,
+        Subsystems {
+            transfer,
+            metrics: None,
+            kv_events: None,
+            eplb: eplb.map(|config| Controller::new(config(world, rank)).unwrap()),
+            grammars: grammar.then(|| {
+                let mut grammars = toy_grammars();
+                let key = GrammarKey {
+                    kind: "regex",
+                    source: TIMED_OUT_GRAMMAR.to_owned(),
+                };
+                for _ in 0..grammar_timeouts.map_or(0, |timeouts| timeouts(rank)) {
+                    grammars.record_timeout(&key, "timed out");
+                }
+                grammars
+            }),
+            l3_metrics: None,
+            l3: store.map(|store| l3_executor(store, rank)),
+        },
+    );
+    event_loop.run(stop)
+}
+
+/// A rank's device as the tests start it.
+fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
+    let (world, _, _) = layout.sizes();
+    FakeDevice {
+        placeholder_stage: matches!(layout, Layout::Pp(_)) && rank + 1 < world,
+        wire: setup.pd.as_ref().map(|pd| pd.wire.clone()),
+        ep_rank: rank,
+        // The trivial initial placement: slot p holds expert p % 4.
+        placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
+        ..Default::default()
+    }
+}
+
+/// Listeners for `world` ranks' mesh and the addresses they dial.
+fn mesh_listeners(world: usize) -> (Vec<Listener>, Vec<String>) {
+    let listeners: Vec<Listener> = (0..world)
+        .map(|_| Listener::bind("127.0.0.1").unwrap())
+        .collect();
+    let addresses = listeners
+        .iter()
+        .map(|listener| format!("127.0.0.1:{}", listener.port().unwrap()))
+        .collect();
+    (listeners, addresses)
+}
+
 async fn start_ranks_with(
     layout: Layout,
     in_flight_depth: usize,
     tiers: Tiers,
     setup: Setup,
 ) -> Engine {
-    let Setup {
-        ngram_context_len,
-        pd,
-        eplb,
-        epd_prefill,
-        grammar,
-        grammar_timeouts,
-        logprobs,
-        request_token_history,
-        l3_landed_keys,
-        l3_held_queries,
-    } = setup;
-    let (world, tp_size, num_engines) = match layout {
-        Layout::Single => (1, 1, 1),
-        Layout::Tp(size) | Layout::Pp(size) => (size, size, 1),
-        Layout::Dp(size) => (size, 1, size),
-    };
+    let (world, tp_size, num_engines) = layout.sizes();
     let pipeline = matches!(layout, Layout::Pp(_));
+    let config = loop_config(in_flight_depth, pipeline, &setup);
     let listener = ClientListener::bind(ClientConfig {
         handshake_address: ipc("handshake"),
         input_address: ipc("input"),
@@ -1044,32 +1227,19 @@ async fn start_ranks_with(
     .unwrap();
     let handshake = listener.handshake_address().to_owned();
     let stop = Arc::new(AtomicBool::new(false));
-    let mesh_listeners: Vec<Listener> = (0..world)
-        .map(|_| Listener::bind("127.0.0.1").unwrap())
-        .collect();
-    let addresses: Vec<String> = mesh_listeners
-        .iter()
-        .map(|listener| format!("127.0.0.1:{}", listener.port().unwrap()))
-        .collect();
+    let (mesh_listeners, addresses) = mesh_listeners(world);
     let ranks = mesh_listeners
         .into_iter()
         .enumerate()
         .map(|(rank, mesh_listener)| {
-            let device = FakeDevice {
-                placeholder_stage: pipeline && rank + 1 < world,
-                wire: pd.as_ref().map(|pd| pd.wire.clone()),
-                ep_rank: rank,
-                // The trivial initial placement: slot p holds expert p % 4.
-                placement: Arc::new(Mutex::new(vec![vec![0, 1, 2, 3, 0, 1]; 2])),
-                ..Default::default()
-            };
-            let storage_gate = if l3_held_queries {
+            let device = fake_device(layout, rank, &setup);
+            let storage_gate = if setup.l3_held_queries {
                 Gate::closed()
             } else {
                 Gate::opened()
             };
             let store = matches!(tiers, Tiers::L3).then(|| ScriptedStore {
-                landed: l3_landed_keys.map(|landed| landed(rank)),
+                landed: setup.l3_landed_keys.map(|landed| landed(rank)),
                 gate: storage_gate.clone(),
                 queries: Arc::new(Mutex::new(0)),
                 gets: Arc::new(Mutex::new(0)),
@@ -1093,138 +1263,38 @@ async fn start_ranks_with(
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
             };
-            let (addresses, handshake, stop) = (addresses.clone(), handshake.clone(), stop.clone());
-            let pd = pd.clone();
+            let spec = RankSpec {
+                rank,
+                layout,
+                tiers,
+                config: config.clone(),
+                setup: setup.clone(),
+                mesh_listener,
+                addresses: addresses.clone(),
+            };
+            let (handshake, stop) = (handshake.clone(), stop.clone());
             let thread = thread::spawn(move || {
-                let mesh = Mesh::connect(rank, mesh_listener, &addresses, Duration::from_secs(20))
-                    .unwrap();
-                let tp_first = rank / tp_size * tp_size;
-                let replica =
-                    Group::new(1, (tp_first..tp_first + tp_size).collect(), rank).unwrap();
-                let dp =
-                    (num_engines > 1).then(|| Group::new(0, (0..world).collect(), rank).unwrap());
                 // The TP group's first member owns the frontend; each
                 // attention-DP rank is its own engine.
-                let frontend = (rank == tp_first).then(|| {
-                    let engine_index = (rank / tp_size) as u16;
-                    let ready = EngineCoreReadyResponse {
-                        max_model_len: 4096,
-                        data_parallel_size: num_engines as i64,
-                        data_parallel_rank: i64::from(engine_index),
-                        ..Default::default()
-                    };
-                    EngineTransport::connect(
-                        &handshake,
-                        engine_index,
-                        ready,
-                        Duration::from_secs(20),
-                    )
-                    .unwrap()
-                });
-                let config = LoopConfig {
-                    in_flight_depth,
-                    limits: IngressLimits {
-                        vocab_size: 100_000,
-                        eos_token_ids: Vec::new(),
-                        max_model_len: 4096,
-                        max_req_input_len: 4000,
-                        enable_output_logprobs: logprobs,
-                        requires_bootstrap: pd.is_some(),
-                        multimodal: epd_prefill,
-                        grammar,
-                        logprobs: LogprobServability {
-                            supports_prompt_logprobs: true,
-                            logprob_order: "torch".to_owned(),
-                            pipeline_parallel: pipeline,
-                            disaggregated: pd.is_some(),
-                            lm_head_tp_under_dp: false,
-                            computes_prompt_logprobs: pd
-                                .as_ref()
-                                .is_none_or(|pd| pd.role != Role::Decode),
-                        },
-                    },
-                    kv_total_pages: 512,
-                    ngram_context_len,
-                    request_token_history,
-                    controls: ControlConfig {
-                        memory_saver: true,
-                        memory_regions: vec!["kv_cache".to_owned(), "weights".to_owned()],
-                        l3_weight_version: None,
-                    },
-                    batch_log: BatchLogConfig {
-                        enabled: true,
-                        decode_log_interval: 40,
-                        num_total_pages: 512,
-                        spec_num_steps: 0,
-                        dp_rank: 0,
-                        disaggregated: pd.is_some(),
-                        cache_state_group_ids: Vec::new(),
-                        log_spec_accept_lengths: false,
-                    },
-                    kv_events: false,
-                    epd_prefill,
-                    // The fake device fills bitmasks from the committed
-                    // matcher state, as the eager path does.
-                    eager_grammar: grammar,
+                let frontend = || {
+                    (rank % tp_size == 0).then(|| {
+                        let engine_index = (rank / tp_size) as u16;
+                        let ready = EngineCoreReadyResponse {
+                            max_model_len: 4096,
+                            data_parallel_size: num_engines as i64,
+                            data_parallel_rank: i64::from(engine_index),
+                            ..Default::default()
+                        };
+                        EngineTransport::connect(
+                            &handshake,
+                            engine_index,
+                            ready,
+                            Duration::from_secs(20),
+                        )
+                        .unwrap()
+                    })
                 };
-                let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
-                let outputs = OutputProcessor::new(
-                    None,
-                    1,
-                    None,
-                    role,
-                    FinishLog {
-                        enabled: true,
-                        request_stats: true,
-                    },
-                );
-                let transfer = pd.map(|pd| {
-                    Box::new(FakePeer {
-                        role: pd.role,
-                        wire: pd.wire,
-                        tracked: Vec::new(),
-                    }) as Box<dyn TransferPeer + Send>
-                });
-                let pp = pipeline.then(|| Group::new(2, (0..world).collect(), rank).unwrap());
-                // Expert parallelism over every rank.
-                let ep = eplb
-                    .filter(|_| world > 1)
-                    .map(|_| Group::new(3, (0..world).collect(), rank).unwrap());
-                let ranks = Ranks {
-                    mesh,
-                    replica,
-                    pp,
-                    dp,
-                    ep,
-                };
-                let mut event_loop = EventLoop::new(
-                    new_scheduler(tiers, role),
-                    device,
-                    frontend,
-                    outputs,
-                    config,
-                    ranks,
-                    Subsystems {
-                        transfer,
-                        metrics: None,
-                        kv_events: None,
-                        eplb: eplb.map(|config| Controller::new(config(world, rank)).unwrap()),
-                        grammars: grammar.then(|| {
-                            let mut grammars = toy_grammars();
-                            let key = GrammarKey {
-                                kind: "regex",
-                                source: TIMED_OUT_GRAMMAR.to_owned(),
-                            };
-                            for _ in 0..grammar_timeouts.map_or(0, |timeouts| timeouts(rank)) {
-                                grammars.record_timeout(&key, "timed out");
-                            }
-                            grammars
-                        }),
-                        l3_metrics: None,
-                        l3: store.map(|store| l3_executor(store, rank)),
-                    },
-                );
-                event_loop.run(&stop).unwrap();
+                run_rank(spec, device, store, frontend, &stop).unwrap();
             });
             Rank {
                 thread: Some(thread),
@@ -1237,6 +1307,138 @@ async fn start_ranks_with(
         stop,
         ranks,
     }
+}
+
+/// What a scripted frontend hands its engine: one batch of messages per
+/// round.
+type Script = Vec<Vec<EngineRequest>>;
+
+/// One engine's frontend in a scripted run: each round it hands the engine
+/// the next batch of its script, after the messages `react` made of the
+/// previous round's outputs. Once its script ran out it is gone, so the
+/// engine stops.
+struct ScriptedFrontend {
+    script: VecDeque<Vec<EngineRequest>>,
+    react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
+    reacted: Vec<EngineRequest>,
+    replies: Arc<Mutex<Vec<ControlOutput>>>,
+    /// The requests that finished, with their reasons.
+    finished: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl Frontend for ScriptedFrontend {
+    fn receive(&mut self, _wait: Option<Duration>) -> Vec<EngineRequest> {
+        let mut messages = std::mem::take(&mut self.reacted);
+        messages.extend(self.script.pop_front().unwrap_or_default());
+        messages
+    }
+
+    fn closed(&self) -> bool {
+        self.script.is_empty() && self.reacted.is_empty()
+    }
+
+    fn send(&mut self, outputs: Vec<StreamedOutput>, _load: Load) {
+        self.reacted.extend((self.react)(&outputs));
+        self.finished
+            .lock()
+            .unwrap()
+            .extend(outputs.iter().filter_map(|output| {
+                output
+                    .finish_reason
+                    .map(|reason| (output.rid.clone(), reason.to_owned()))
+            }));
+    }
+
+    fn reply(&mut self, output: ControlOutput) {
+        self.replies.lock().unwrap().push(output);
+    }
+}
+
+/// What a scripted run reads back from one rank.
+struct ScriptedRank {
+    outcome: Result<(), String>,
+    /// Its engine's control replies, on the engine's first rank.
+    replies: Vec<ControlOutput>,
+    finished: Vec<(String, String)>,
+    cache_ops: Vec<CacheOpKind>,
+    idle_forwards: usize,
+}
+
+/// Run `layout`'s ranks, one script per engine (its first rank's frontend
+/// plays it, reacting to outputs with `react`), until a script runs out and
+/// the ranks stop by themselves.
+fn run_scripted(
+    layout: Layout,
+    tiers: Tiers,
+    setup: Setup,
+    scripts: Vec<Script>,
+    react: fn(&[StreamedOutput]) -> Vec<EngineRequest>,
+) -> Vec<ScriptedRank> {
+    let (world, tp_size, num_engines) = layout.sizes();
+    assert_eq!(scripts.len(), num_engines);
+    let config = loop_config(0, matches!(layout, Layout::Pp(_)), &setup);
+    let stop = Arc::new(AtomicBool::new(false));
+    let (mesh_listeners, addresses) = mesh_listeners(world);
+    let mut scripts = scripts.into_iter();
+    let (done, outcomes) = std::sync::mpsc::channel();
+    let ranks: Vec<_> = mesh_listeners
+        .into_iter()
+        .enumerate()
+        .map(|(rank, mesh_listener)| {
+            let device = fake_device(layout, rank, &setup);
+            let (cache_ops, idle_forwards) =
+                (device.cache_ops.clone(), device.idle_forwards.clone());
+            let replies = Arc::new(Mutex::new(Vec::new()));
+            let finished = Arc::new(Mutex::new(Vec::new()));
+            let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
+                script: scripts.next().unwrap().into(),
+                react,
+                reacted: Vec::new(),
+                replies: replies.clone(),
+                finished: finished.clone(),
+            });
+            let spec = RankSpec {
+                rank,
+                layout,
+                tiers,
+                config: config.clone(),
+                setup: setup.clone(),
+                mesh_listener,
+                addresses: addresses.clone(),
+            };
+            let (stop, done) = (stop.clone(), done.clone());
+            let thread = thread::spawn(move || {
+                let outcome = run_rank(spec, device, None, || frontend, &stop)
+                    .map_err(|error| error.to_string());
+                done.send(rank).unwrap();
+                outcome
+            });
+            (thread, replies, finished, cache_ops, idle_forwards)
+        })
+        .collect();
+    for _ in 0..world {
+        if outcomes.recv_timeout(Duration::from_secs(60)).is_err() {
+            stop.store(true, Ordering::Relaxed);
+            panic!("the scripted ranks did not stop by themselves");
+        }
+    }
+    ranks
+        .into_iter()
+        .map(
+            |(thread, replies, finished, cache_ops, idle_forwards)| ScriptedRank {
+                outcome: thread.join().unwrap(),
+                replies: replies.lock().unwrap().clone(),
+                finished: finished.lock().unwrap().clone(),
+                cache_ops: cache_ops.lock().unwrap().clone(),
+                idle_forwards: *idle_forwards.lock().unwrap(),
+            },
+        )
+        .collect()
+}
+
+/// A scripted frontend that does not react to outputs.
+fn no_reaction(_: &[StreamedOutput]) -> Vec<EngineRequest> {
+    Vec::new()
 }
 
 fn request(rid: &str, prompt_len: usize, params: SamplingParams) -> TokenizedGenerateReqInput {
@@ -2508,4 +2710,169 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
     );
     let chunks = run(&engine.client, request("r2", 3, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
+    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags: None,
+    });
+    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags: None,
+    });
+    for (drain, undo) in [(pause("wait"), resume()), (release, wake)] {
+        let engine = start_ranks_with(
+            Layout::Single,
+            1,
+            Tiers::DeviceOnly,
+            Setup {
+                epd_prefill: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        // The drain arrives while the request waits for its image's
+        // embeddings: it is not in the scheduler, so the drain must end it
+        // rather than answer with it staged until the resume.
+        let stream = engine.client.generate(epd_request("slow-0")).await.unwrap();
+        let tag = drain.tag();
+        let drained = control(&engine, drain).await;
+        assert_eq!(drained.len(), 1);
+        assert!(drained[0].1, "{tag}");
+        let chunks = tokio::time::timeout(Duration::from_secs(1), collect(stream))
+            .await
+            .unwrap_or_else(|_| panic!("{tag} answered while the request still waits"));
+        let last = chunks.last().unwrap();
+        assert_eq!(last.finish_reason.as_deref(), Some("abort"), "{tag}");
+        let details = &last.finish_details.as_ref().unwrap().0;
+        assert!(
+            details
+                .iter()
+                .any(|(k, v)| k == "message" && *v == Value::from("Aborted by pause")),
+            "{tag}: {details:?}"
+        );
+        assert!(control(&engine, undo).await[0].1);
+        // The engine serves on.
+        assert_eq!(
+            tokens(&run(&engine.client, epd_request("img-1")).await),
+            [1000, 1001, 1002]
+        );
+    }
+}
+
+#[test]
+fn an_engine_stops_once_its_frontend_is_gone() {
+    // The frontend's last message is a request, then it is gone: every rank
+    // of the replica stops after that round, without a stop request.
+    let script = vec![vec![EngineRequest::Add(Box::new(request(
+        "r1",
+        5,
+        budget(3),
+    )))]];
+    for (rank, outcome) in run_scripted(
+        Layout::Tp(2),
+        Tiers::DeviceOnly,
+        Setup::default(),
+        vec![script],
+        no_reaction,
+    )
+    .into_iter()
+    .enumerate()
+    {
+        assert_eq!(outcome.outcome, Ok(()), "rank {rank}");
+    }
+}
+
+#[test]
+fn a_frozen_data_parallel_rank_keeps_its_rebalance_in_step() {
+    // Rank 1 is frozen while rank 0 forwards its request, then both get a
+    // rebalance trigger in the same round. The frozen rank's idle forwards
+    // count like the busy rank's real ones, so both rebalances sit in the
+    // same phase and the trigger runs the same collectives on both ranks.
+    let rounds = 80;
+    let mut first: Script = vec![Vec::new(); rounds];
+    let mut second: Script = vec![Vec::new(); rounds];
+    first[0].push(EngineRequest::Add(Box::new(request("r0", 20, budget(12)))));
+    second[0].push(EngineRequest::Control(Box::new(pause("keep"))));
+    for script in [&mut first, &mut second] {
+        script[40].push(EngineRequest::Control(Box::new(
+            ControlRequest::RebalanceExperts(ts_wire::control::RebalanceExpertsReqInput {
+                rid: None,
+                http_worker_ipc: None,
+            }),
+        )));
+    }
+    second[60].push(EngineRequest::Control(Box::new(resume())));
+    let ranks = run_scripted(
+        Layout::Dp(2),
+        Tiers::DeviceOnly,
+        Setup {
+            eplb: Some(eplb_config),
+            ..Setup::default()
+        },
+        vec![first, second],
+        no_reaction,
+    );
+    for (index, rank) in ranks.iter().enumerate() {
+        assert_eq!(rank.outcome, Ok(()), "rank {index}");
+    }
+    assert_eq!(ranks[0].finished, [("r0".to_owned(), "length".to_owned())]);
+    assert!(ranks[1].idle_forwards > 0);
+    let rebalanced = |rank: &ScriptedRank| -> Vec<bool> {
+        rank.replies
+            .iter()
+            .filter_map(|reply| match reply {
+                ControlOutput::RebalanceExperts(reply) => Some(reply.success),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(rebalanced(&ranks[0]).len(), 1);
+    assert_eq!(rebalanced(&ranks[0]), rebalanced(&ranks[1]));
+}
+
+#[test]
+fn a_flush_under_a_keep_pause_runs_once_the_cache_work_did() {
+    // A finished request's prefix pages are written back to Host in the
+    // round after it ends; the keep pause its finish triggers freezes the
+    // engine first. Frozen rounds still plan cache work (the scheduler only
+    // forbids forwards), so the write-back runs, and a flush under the
+    // pause finds no Host copy in flight.
+    fn freeze_on_finish(outputs: &[StreamedOutput]) -> Vec<EngineRequest> {
+        if outputs.iter().any(|output| output.finish_reason.is_some()) {
+            vec![EngineRequest::Control(Box::new(pause("keep")))]
+        } else {
+            Vec::new()
+        }
+    }
+    let mut script: Script = vec![Vec::new(); 40];
+    script[0].push(EngineRequest::Add(Box::new(request("r1", 65, budget(2)))));
+    script[30].push(EngineRequest::Control(Box::new(
+        ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        }),
+    )));
+    let ranks = run_scripted(
+        Layout::Single,
+        Tiers::HostL2,
+        Setup::default(),
+        vec![script],
+        freeze_on_finish,
+    );
+    let rank = &ranks[0];
+    assert_eq!(rank.outcome, Ok(()));
+    assert_eq!(rank.finished, [("r1".to_owned(), "length".to_owned())]);
+    assert_eq!(
+        outcome(rank.replies.clone()),
+        [
+            ("PauseSchedulerReqOutput", true),
+            ("FlushCacheReqOutput", true)
+        ]
+    );
+    assert!(rank.cache_ops.contains(&CacheOpKind::WriteBack));
 }

@@ -25,10 +25,13 @@
 //! The C++ scheduler owns readiness, deadlines and Host memory lifetime; it
 //! plans storage operations (query, get, put, cancel) that each cache owner
 //! runs on its Host-only executor (`ts-l3`), which the loop starts with the
-//! plan. The ranks of a replica mirror one scheduler, so they agree each
-//! round on the storage clock and the permissions to run forwards and start
-//! storage work, and on each operation's outcome once every owner reported
-//! it. A fault on one rank, even in its own poll, fails every rank in the
+//! plan. The ranks of a replica mirror one scheduler, so each round they
+//! share their executors' reports and agree on the storage clock and the
+//! worst pressure, and on each operation's outcome once every owner
+//! reported it. The reports ride the round's relay ([`crate::relay::join`]):
+//! one collective a round for both. The permissions to run forwards and
+//! start storage work come from the control state, which every member holds
+//! alike. A fault on one rank, even in its own poll, fails every rank in the
 //! same round instead of stranding peers in the next collective.
 
 use std::{
@@ -36,7 +39,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ts_collective::{Group, Mesh};
 use ts_l3::{Executor, Operation, StorageKey};
 pub use ts_l3::{StorageCompletion, StoragePoll, StoragePressure};
 use ts_metrics::L3SchedulerStats;
@@ -44,6 +46,8 @@ use ts_scheduler::{
     ExecutionPlan, Scheduler, StorageCancellationView, StorageDoneView, StorageOpKind,
     StorageRound, StorageStatsView, StorageTickView,
 };
+
+use crate::codec::{Reader, Writer};
 
 /// The scheduler's storage credits (`StorageConfig`) the agreement checks
 /// reports against.
@@ -64,17 +68,12 @@ pub enum L3Error {
     /// The reports break the protocol.
     #[error("L3: {0}")]
     Protocol(&'static str),
-    /// The ranks could not reach each other.
-    #[error(transparent)]
-    Collective(#[from] ts_collective::Error),
 }
 
 /// What one rank shares each round.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Report {
     now_us: i64,
-    allow_forward: bool,
-    allow_storage: bool,
     pressure: StoragePressure,
     error: Option<String>,
     completions: Vec<StorageCompletion>,
@@ -132,27 +131,33 @@ impl L3 {
         abort
     }
 
-    /// One round's agreement over `replica`: the clock, the permissions and
-    /// the worst pressure, the queued cancellations, and the operations every
-    /// owner has now completed (success and retirement ANDed, object failures
-    /// ORed across owners). Every member calls this every round.
-    pub fn round(
+    /// The report this rank shares this round: its executor's `poll`, or why
+    /// the poll is invalid. A bad record must not strand peers already
+    /// exchanging reports, so it becomes the report's error instead of a
+    /// local failure.
+    pub fn report(&self, poll: StoragePoll) -> Vec<u8> {
+        encode(&self.validated(poll))
+    }
+
+    /// One round's agreement on every replica member's [`L3::report`], in
+    /// member order: the first member's clock and the worst pressure, the
+    /// permissions (this rank's, which every member holds alike), the queued
+    /// cancellations, and the operations every owner has now completed
+    /// (success and retirement ANDed, object failures ORed across owners).
+    /// Every member calls this every round.
+    pub fn agree(
         &mut self,
-        poll: StoragePoll,
+        reports: &[Vec<u8>],
         allow_forward: bool,
         allow_storage: bool,
-        mesh: &mut Mesh,
-        replica: &Group,
     ) -> Result<StorageRound, L3Error> {
-        let local = self.validated(poll, allow_forward, allow_storage);
-        let reports = if replica.size() == 1 {
-            vec![local]
-        } else {
-            mesh.all_gather(replica, &encode(&local))?
-                .iter()
-                .map(|bytes| decode(bytes).ok_or(L3Error::Protocol("a malformed owner report")))
-                .collect::<Result<Vec<_>, _>>()?
-        };
+        let reports = reports
+            .iter()
+            .map(|bytes| decode(bytes).ok_or(L3Error::Protocol("a malformed owner report")))
+            .collect::<Result<Vec<_>, _>>()?;
+        if reports.is_empty() {
+            return Err(L3Error::Protocol("a round without reports"));
+        }
         let errors: Vec<String> = reports
             .iter()
             .filter_map(|report| report.error.clone())
@@ -198,8 +203,8 @@ impl L3 {
         };
         let tick = StorageTickView {
             now_us: reports[0].now_us,
-            allow_forward: reports.iter().all(|report| report.allow_forward),
-            allow_storage: reports.iter().all(|report| report.allow_storage),
+            allow_forward,
+            allow_storage,
             queued_operations: worst(|pressure| pressure.queued_operations),
             queued_bytes: worst(|pressure| pressure.queued_bytes),
             oldest_operation_us: worst(|pressure| pressure.oldest_operation_us),
@@ -252,10 +257,9 @@ impl L3 {
         due
     }
 
-    /// The report this rank shares: its poll, or why the poll is invalid.
-    /// A bad record must not strand peers already exchanging reports, so it
-    /// becomes the report's error instead of a local failure.
-    fn validated(&self, poll: StoragePoll, allow_forward: bool, allow_storage: bool) -> Report {
+    /// `poll` as this rank reports it: with its records, or with why they
+    /// are invalid in their place.
+    fn validated(&self, poll: StoragePoll) -> Report {
         let StoragePoll {
             now_us,
             completions,
@@ -289,16 +293,12 @@ impl L3 {
         match invalid {
             Some(error) => Report {
                 now_us,
-                allow_forward,
-                allow_storage,
                 pressure: StoragePressure::default(),
                 error: Some(error.chars().take(512).collect()),
                 completions: Vec::new(),
             },
             None => Report {
                 now_us,
-                allow_forward,
-                allow_storage,
                 pressure,
                 error: None,
                 completions,
@@ -373,17 +373,19 @@ impl Tier {
         self.executor.submit(&operations)
     }
 
-    /// One round's agreement on this rank's poll; see [`L3::round`].
-    pub fn round(
+    /// This round's report of this rank's executor; see [`L3::report`].
+    pub fn report(&self) -> Vec<u8> {
+        self.agreement.report(self.executor.poll())
+    }
+
+    /// The round's agreement on the members' reports; see [`L3::agree`].
+    pub fn agree(
         &mut self,
+        reports: &[Vec<u8>],
         allow_forward: bool,
         allow_storage: bool,
-        mesh: &mut Mesh,
-        replica: &Group,
     ) -> Result<StorageRound, L3Error> {
-        let poll = self.executor.poll();
-        self.agreement
-            .round(poll, allow_forward, allow_storage, mesh, replica)
+        self.agreement.agree(reports, allow_forward, allow_storage)
     }
 }
 
@@ -409,114 +411,50 @@ pub fn scheduler_stats(stats: StorageStatsView) -> L3SchedulerStats {
     }
 }
 
-fn put_i64(out: &mut Vec<u8>, value: i64) {
-    out.extend_from_slice(&value.to_le_bytes());
-}
-
-fn put_flags(out: &mut Vec<u8>, flags: &[bool]) {
-    out.extend_from_slice(&(flags.len() as u32).to_le_bytes());
-    out.extend(flags.iter().map(|&flag| u8::from(flag)));
-}
-
 /// A report as one rank shares it.
 fn encode(report: &Report) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_i64(&mut out, report.now_us);
-    out.push(u8::from(report.allow_forward));
-    out.push(u8::from(report.allow_storage));
-    put_i64(&mut out, report.pressure.queued_operations);
-    put_i64(&mut out, report.pressure.queued_bytes);
-    put_i64(&mut out, report.pressure.oldest_operation_us);
-    let error = report.error.as_deref().unwrap_or("");
-    out.push(u8::from(report.error.is_some()));
-    out.extend_from_slice(&(error.len() as u32).to_le_bytes());
-    out.extend_from_slice(error.as_bytes());
-    out.extend_from_slice(&(report.completions.len() as u32).to_le_bytes());
+    let mut out = Writer::new();
+    out.i64(report.now_us);
+    out.i64(report.pressure.queued_operations);
+    out.i64(report.pressure.queued_bytes);
+    out.i64(report.pressure.oldest_operation_us);
+    out.option(report.error.as_deref(), |out, error| {
+        out.bytes(error.as_bytes())
+    });
+    out.count(report.completions.len());
     for completion in &report.completions {
-        out.extend_from_slice(&completion.op_id.to_le_bytes());
-        out.push(u8::from(completion.retired));
-        put_flags(&mut out, &completion.success);
-        put_flags(&mut out, &completion.object_failures);
+        out.u64(completion.op_id);
+        out.flag(completion.retired);
+        out.flags(&completion.success);
+        out.flags(&completion.object_failures);
     }
-    out
-}
-
-/// A cursor over a shared report.
-struct Reader<'a>(&'a [u8]);
-
-impl Reader<'_> {
-    fn take(&mut self, len: usize) -> Option<&[u8]> {
-        if self.0.len() < len {
-            return None;
-        }
-        let (head, rest) = self.0.split_at(len);
-        self.0 = rest;
-        Some(head)
-    }
-
-    fn u8(&mut self) -> Option<u8> {
-        self.take(1).map(|bytes| bytes[0])
-    }
-
-    fn flag(&mut self) -> Option<bool> {
-        match self.u8()? {
-            0 => Some(false),
-            1 => Some(true),
-            _ => None,
-        }
-    }
-
-    fn u32(&mut self) -> Option<usize> {
-        let value = u32::from_le_bytes(self.take(4)?.try_into().ok()?);
-        usize::try_from(value).ok()
-    }
-
-    fn i64(&mut self) -> Option<i64> {
-        Some(i64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn u64(&mut self) -> Option<u64> {
-        Some(u64::from_le_bytes(self.take(8)?.try_into().ok()?))
-    }
-
-    fn flags(&mut self) -> Option<Vec<bool>> {
-        let len = self.u32()?;
-        (0..len).map(|_| self.flag()).collect()
-    }
+    out.finish()
 }
 
 fn decode(bytes: &[u8]) -> Option<Report> {
-    let mut reader = Reader(bytes);
+    let mut reader = Reader::new(bytes);
     let now_us = reader.i64()?;
-    let allow_forward = reader.flag()?;
-    let allow_storage = reader.flag()?;
     let pressure = StoragePressure {
         queued_operations: reader.i64()?,
         queued_bytes: reader.i64()?,
         oldest_operation_us: reader.i64()?,
     };
-    let has_error = reader.flag()?;
-    let error_len = reader.u32()?;
-    let error = String::from_utf8(reader.take(error_len)?.to_vec()).ok()?;
-    let count = reader.u32()?;
+    let error = reader.option(|reader| String::from_utf8(reader.bytes()?.to_vec()).ok())?;
+    let count = reader.count()?;
     let completions = (0..count)
         .map(|_| {
-            let op_id = reader.u64()?;
-            let retired = reader.flag()?;
             Some(StorageCompletion {
-                op_id,
-                retired,
+                op_id: reader.u64()?,
+                retired: reader.flag()?,
                 success: reader.flags()?,
                 object_failures: reader.flags()?,
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    reader.0.is_empty().then_some(Report {
+    reader.finish(Report {
         now_us,
-        allow_forward,
-        allow_storage,
         pressure,
-        error: has_error.then_some(error),
+        error,
         completions,
     })
 }
@@ -525,7 +463,7 @@ fn decode(bytes: &[u8]) -> Option<Report> {
 mod tests {
     use std::thread;
 
-    use ts_collective::Listener;
+    use ts_collective::{Group, Listener, Mesh};
 
     use super::*;
 
@@ -556,11 +494,10 @@ mod tests {
         }
     }
 
-    /// Run `rounds` on every rank of a replica of `polls.len()`; each rank's
+    /// Run `polls` on every rank of a replica of `polls.len()`, exchanging
+    /// the reports over a real mesh as the round's relay does; each rank's
     /// round outcomes.
-    fn replica(
-        polls: Vec<Vec<(StoragePoll, bool, bool)>>,
-    ) -> Vec<Vec<Result<StorageRound, String>>> {
+    fn replica(polls: Vec<Vec<StoragePoll>>) -> Vec<Vec<Result<StorageRound, String>>> {
         let listeners: Vec<_> = polls
             .iter()
             .map(|_| Listener::bind("127.0.0.1").unwrap())
@@ -582,9 +519,10 @@ mod tests {
                     let group = Group::new(0, (0..size).collect(), rank).unwrap();
                     let mut l3 = L3::new(LIMITS);
                     let mut outcomes = Vec::new();
-                    for (poll, allow_forward, allow_storage) in rounds {
+                    for poll in rounds {
+                        let reports = mesh.all_gather(&group, &l3.report(poll)).unwrap();
                         let outcome = l3
-                            .round(poll, allow_forward, allow_storage, &mut mesh, &group)
+                            .agree(&reports, true, true)
                             .map_err(|error| error.to_string());
                         let failed = outcome.is_err();
                         outcomes.push(outcome);
@@ -605,49 +543,29 @@ mod tests {
     #[test]
     fn owners_complete_out_of_order_and_converge_on_a_fault() {
         let rank0 = vec![
-            (
-                poll(
-                    10,
-                    vec![completion(1, &[true, true], true, &[false, false])],
-                ),
-                true,
-                true,
+            poll(
+                10,
+                vec![completion(1, &[true, true], true, &[false, false])],
             ),
-            (
-                poll(
-                    20,
-                    vec![completion(2, &[true, true], true, &[false, false])],
-                ),
-                true,
-                true,
+            poll(
+                20,
+                vec![completion(2, &[true, true], true, &[false, false])],
             ),
-            (poll(30, vec![]), true, true),
-            (
-                // An op id 0 completion: malformed.
-                poll(40, vec![completion(0, &[true], true, &[false])]),
-                false,
-                false,
-            ),
+            poll(30, vec![]),
+            // An op id 0 completion: malformed.
+            poll(40, vec![completion(0, &[true], true, &[false])]),
         ];
         let rank1 = vec![
-            (
-                poll(
-                    11,
-                    vec![completion(2, &[true, false], true, &[false, true])],
-                ),
-                true,
-                true,
+            poll(
+                11,
+                vec![completion(2, &[true, false], true, &[false, true])],
             ),
-            (poll(21, vec![]), true, true),
-            (
-                poll(
-                    31,
-                    vec![completion(1, &[false, false], false, &[false, false])],
-                ),
-                true,
-                true,
+            poll(21, vec![]),
+            poll(
+                31,
+                vec![completion(1, &[false, false], false, &[false, false])],
             ),
-            (poll(41, vec![]), false, false),
+            poll(41, vec![]),
         ];
         for outcomes in replica(vec![rank0, rank1]) {
             // Both operations incomplete: only the common tick, rank 0's clock.
@@ -675,27 +593,29 @@ mod tests {
     }
 
     #[test]
-    fn idle_rounds_agree_the_clock_and_the_permissions() {
+    fn idle_rounds_agree_on_the_first_members_clock() {
         let rounds = |rank: usize| {
             (0..3)
-                .map(|round| {
-                    (
-                        poll(100 * round + rank as i64, vec![]),
-                        rank == 0,
-                        rank == 1,
-                    )
-                })
+                .map(|round| poll(100 * round + rank as i64, vec![]))
                 .collect::<Vec<_>>()
         };
         for outcomes in replica((0..3).map(rounds).collect()) {
-            let mut previous = -1;
-            for outcome in outcomes {
-                let tick = outcome.unwrap().tick.unwrap();
-                assert!(tick.now_us > previous);
-                assert!(!tick.allow_forward && !tick.allow_storage);
-                previous = tick.now_us;
-            }
+            let clocks: Vec<i64> = outcomes
+                .into_iter()
+                .map(|outcome| outcome.unwrap().tick.unwrap().now_us)
+                .collect();
+            assert_eq!(clocks, [0, 100, 200]);
         }
+    }
+
+    #[test]
+    fn the_tick_carries_the_permissions_it_is_given() {
+        let mut l3 = L3::new(LIMITS);
+        let reports = [l3.report(poll(5, vec![]))];
+        let tick = l3.agree(&reports, false, true).unwrap().tick.unwrap();
+        assert!(!tick.allow_forward && tick.allow_storage);
+        let tick = l3.agree(&reports, true, false).unwrap().tick.unwrap();
+        assert!(tick.allow_forward && !tick.allow_storage);
     }
 
     #[test]
@@ -708,15 +628,11 @@ mod tests {
             },
             ..StoragePoll::default()
         };
-        let rank0 = vec![
-            (pressured(9, 0, 0), true, true),
-            (pressured(0, 0, 0), true, true),
-            (pressured(-1, 0, 0), true, true),
-        ];
+        let rank0 = vec![pressured(9, 0, 0), pressured(0, 0, 0), pressured(-1, 0, 0)];
         let rank1 = vec![
-            (pressured(0, 4096, 700_000), true, true),
-            (pressured(0, 0, 0), true, true),
-            (pressured(0, 0, 0), true, true),
+            pressured(0, 4096, 700_000),
+            pressured(0, 0, 0),
+            pressured(0, 0, 0),
         ];
         for outcomes in replica(vec![rank0, rank1]) {
             let tick = outcomes[0].as_ref().unwrap().tick.unwrap();
@@ -753,10 +669,7 @@ mod tests {
             completion(0, &[true], true, &[false]),
             completion(7, &[true; 5], true, &[false; 5]),
         ] {
-            let outcomes = replica(vec![
-                vec![(poll(1, vec![bad]), true, true)],
-                vec![(poll(1, vec![]), true, true)],
-            ]);
+            let outcomes = replica(vec![vec![poll(1, vec![bad])], vec![poll(1, vec![])]]);
             for outcome in outcomes {
                 let failure = outcome[0].as_ref().unwrap_err();
                 assert!(failure.contains("L3 replica polling failed"), "{failure}");
@@ -767,31 +680,23 @@ mod tests {
     #[test]
     fn a_rejection_is_not_a_confirmed_peer_miss() {
         let outcomes = replica(vec![
-            vec![(
-                poll(
+            vec![poll(
+                1,
+                vec![completion(
                     1,
-                    vec![completion(
-                        1,
-                        &[false, false, true],
-                        true,
-                        &[false, false, false],
-                    )],
-                ),
-                true,
-                true,
+                    &[false, false, true],
+                    true,
+                    &[false, false, false],
+                )],
             )],
-            vec![(
-                poll(
+            vec![poll(
+                1,
+                vec![completion(
                     1,
-                    vec![completion(
-                        1,
-                        &[true, false, true],
-                        true,
-                        &[false, true, false],
-                    )],
-                ),
-                true,
-                true,
+                    &[true, false, true],
+                    true,
+                    &[false, true, false],
+                )],
             )],
         ]);
         for outcome in outcomes {
@@ -807,18 +712,10 @@ mod tests {
         // Rank 1 reports operation 5 twice, differently, while rank 0 has
         // not finished it: the held report and the new one disagree.
         let outcomes = replica(vec![
-            vec![(poll(1, vec![]), true, true), (poll(2, vec![]), true, true)],
+            vec![poll(1, vec![]), poll(2, vec![])],
             vec![
-                (
-                    poll(1, vec![completion(5, &[true], true, &[false])]),
-                    true,
-                    true,
-                ),
-                (
-                    poll(2, vec![completion(5, &[false], true, &[false])]),
-                    true,
-                    true,
-                ),
+                poll(1, vec![completion(5, &[true], true, &[false])]),
+                poll(2, vec![completion(5, &[false], true, &[false])]),
             ],
         ]);
         for outcome in outcomes {
@@ -832,8 +729,6 @@ mod tests {
     fn reports_round_trip_their_encoding() {
         let report = Report {
             now_us: -3,
-            allow_forward: true,
-            allow_storage: false,
             pressure: StoragePressure {
                 queued_operations: 1,
                 queued_bytes: 2_i64.pow(33),
@@ -846,5 +741,9 @@ mod tests {
         let mut cut = encode(&report);
         cut.pop();
         assert_eq!(decode(&cut), None);
+        // A report that does not decode fails the round.
+        let mut l3 = L3::new(LIMITS);
+        let failure = l3.agree(&[cut], true, true).unwrap_err();
+        assert!(failure.to_string().contains("malformed"), "{failure}");
     }
 }
