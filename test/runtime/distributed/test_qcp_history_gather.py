@@ -23,7 +23,7 @@
 Four ranks own the pages of a sharded cache group cyclically. Each rank holds
 its owned rows of a deterministic reference plane; the gather must rebuild
 every request group's history in position order on every rank, with the
-per-rank split counted on the host from the page table. Also covered: a rank
+per-rank split counted on the host from the block table. Also covered: a rank
 that owns no row of a group still joins the collective, non-bf16 rows (packed
 index-K bytes, fp32 scales, fp8 latent) travel through a bf16-only gather
 backend byte-identically, the replicated (``placement=None``) path is a local
@@ -73,16 +73,19 @@ def _reference(virtual_slots: torch.Tensor) -> torch.Tensor:
     return (base + torch.arange(DIM, dtype=torch.float32)).to(torch.bfloat16)
 
 
-def _page_table() -> torch.Tensor:
-    """Three requests over distinct scheduler blocks (virtual kernel pages).
+def _block_table() -> torch.Tensor:
+    """Three requests over distinct scheduler blocks (the host block table).
 
     Request 2 uses blocks 9 and 10 only, so rank 0 (owner of blocks 1, 5, 9)
     and rank 1 (owner of 2, 6, 10) hold its rows while ranks 2 and 3 own
     nothing of it.
     """
-    blocks = torch.tensor(
-        [[1, 2, 3, 4], [5, 6, 7, 0], [9, 10, 0, 0]], dtype=torch.int64
-    )
+    return torch.tensor([[1, 2, 3, 4], [5, 6, 7, 0], [9, 10, 0, -1]], dtype=torch.int32)
+
+
+def _page_table() -> torch.Tensor:
+    """The block table expanded to virtual kernel pages, as the router does."""
+    blocks = _block_table().to(torch.int64)
     pages = blocks.unsqueeze(-1) * (GRANULARITY // PAGE) + torch.arange(
         GRANULARITY // PAGE
     )
@@ -182,7 +185,9 @@ def _run(rank: int, port: int) -> None:
 
     placement = _placement(rank)
     table = _page_table()
-    owned = owned_history_rows(table, SEQ_LENS, page_size=PAGE, placement=placement)
+    owned = owned_history_rows(
+        _block_table(), SEQ_LENS, block_granularity=GRANULARITY, placement=placement
+    )
     assert owned.shape == (WORLD, 3)
     assert owned.sum(dim=0).tolist() == SEQ_LENS.tolist()
     plane = _local_plane(rank)
@@ -365,7 +370,9 @@ def _run_index_k(
     placement = leaf.cache_placement(None)
     assert placement == _placement(rank)
     table = _page_table()
-    owned = owned_history_rows(table, SEQ_LENS, page_size=PAGE, placement=placement)
+    owned = owned_history_rows(
+        _block_table(), SEQ_LENS, block_granularity=GRANULARITY, placement=placement
+    )
     row_base = 0
     for requests in (slice(0, 2), slice(2, 3)):
         rows = int(SEQ_LENS[requests].sum())
@@ -442,7 +449,9 @@ def test_the_dsa_leaf_gathers_the_index_k_history_in_the_planes_format(
 
 def test_replicated_group_gathers_locally_without_a_collective():
     table = _page_table()
-    owned = owned_history_rows(table, SEQ_LENS, page_size=PAGE, placement=None)
+    owned = owned_history_rows(
+        _block_table(), SEQ_LENS, block_granularity=GRANULARITY, placement=None
+    )
     assert owned.tolist() == [SEQ_LENS.tolist()]
     rows = int(SEQ_LENS.sum())
     virtual_slots = build_prefill_kv_workspace_slots(
@@ -491,13 +500,28 @@ def test_host_owner_rule_agrees_with_the_kernel_translation(degree):
 
 
 def test_owned_history_rows_refuses_holes_below_the_length():
-    table = _page_table().clone()
+    table = _block_table().clone()
     table[0, 1] = 0  # a hole inside request 0's 15 rows
-    with pytest.raises(ValueError, match="holes"):
-        owned_history_rows(table, SEQ_LENS, page_size=PAGE, placement=_placement(0))
+    for placement in (_placement(0), None):
+        with pytest.raises(ValueError, match="holes"):
+            owned_history_rows(
+                table, SEQ_LENS, block_granularity=GRANULARITY, placement=placement
+            )
     with pytest.raises(ValueError, match="does not cover"):
         owned_history_rows(
-            _page_table(), torch.tensor([99, 1, 1]), page_size=PAGE, placement=None
+            _block_table(),
+            torch.tensor([99, 1, 1]),
+            block_granularity=GRANULARITY,
+            placement=None,
+        )
+    with pytest.raises(ValueError, match="does not match the placement"):
+        owned_history_rows(
+            _block_table(), SEQ_LENS, block_granularity=PAGE, placement=_placement(0)
+        )
+    # A replicated group has no placement to check the granularity against.
+    with pytest.raises(ValueError, match="must be positive"):
+        owned_history_rows(
+            _block_table(), SEQ_LENS, block_granularity=0, placement=None
         )
 
 

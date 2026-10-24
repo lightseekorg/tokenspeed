@@ -18,8 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The MLA prefix-chunk gather plan: host owner counts and the all-gather
-output rows every rank reads back."""
+"""The MLA prefix-chunk gather plan: the host's per-block segments, the
+per-row layout they expand to, and the all-gather output rows every rank
+reads back."""
 
 import os
 import sys
@@ -34,37 +35,46 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
-    owned_prefix_chunk_rows,
+    prefix_chunk_segments,
 )
+
+DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+    ),
+]
 
 
 def _random_layout(
     generator: torch.Generator,
     *,
     prefix_lens: list[int],
-    page_size: int,
-    subpages: int,
+    granularity: int,
     virtual_block_count: int,
 ) -> tuple[torch.Tensor, list[list[int]]]:
-    """A host kernel-page table dealing each request distinct random blocks,
-    and every request's virtual slot per prefix position."""
-    pages_needed = [-(-length // page_size) for length in prefix_lens]
-    blocks_needed = [-(-pages // subpages) for pages in pages_needed]
+    """A host block table dealing each request distinct random blocks (``-1``
+    ragged padding past them, as the bridge pads), and every request's
+    virtual slot per prefix position."""
+    blocks_needed = [-(-length // granularity) for length in prefix_lens]
     blocks = (
         torch.randperm(virtual_block_count - 1, generator=generator)[
             : sum(blocks_needed)
         ]
         + 1
     ).tolist()
-    columns = max(blocks_needed) * subpages + 3  # the mirror may be wider
-    table = torch.zeros((len(prefix_lens), columns), dtype=torch.int32)
+    columns = max(blocks_needed) + 3  # the table may be wider
+    table = torch.full((len(prefix_lens), columns), -1, dtype=torch.int32)
     slots = []
     for request, (length, count) in enumerate(zip(prefix_lens, blocks_needed)):
         mine, blocks = blocks[:count], blocks[count:]
-        pages = [block * subpages + sub for block in mine for sub in range(subpages)]
-        table[request, : len(pages)] = torch.tensor(pages, dtype=torch.int32)
+        table[request, :count] = torch.tensor(mine, dtype=torch.int32)
         slots.append(
-            [pages[p // page_size] * page_size + p % page_size for p in range(length)]
+            [
+                mine[p // granularity] * granularity + p % granularity
+                for p in range(length)
+            ]
         )
     return table, slots
 
@@ -78,73 +88,292 @@ def _chunk_slots(slots: list[list[int]], chunk_len: int) -> list[list[int]]:
     ]
 
 
+# The virtual block ids every layout draws from and every placement owns.
+VIRTUAL_BLOCK_COUNT = 4096
+
+
+def _placement(granularity: int, degree: int, rank: int) -> CachePlacement:
+    return CachePlacement(
+        block_granularity=granularity,
+        virtual_block_count=VIRTUAL_BLOCK_COUNT,
+        group=tuple(range(degree)),
+        rank=rank,
+    )
+
+
 CASES = [
-    # prefix_lens, page_size, subpages, chunk_len, degree
-    ([300], 64, 2, 128, 4),
-    ([1000, 37, 513], 64, 2, 100, 4),
-    ([5000, 4097], 32, 4, 2048, 16),
-    ([129, 0, 64], 64, 1, 64, 2),
-    ([7], 1, 4, 3, 2),
+    # prefix_lens, granularity, chunk_len, degree
+    ([300], 128, 128, 4),
+    ([1000, 37, 513], 128, 100, 4),
+    ([5000, 4097], 128, 2048, 16),
+    ([129, 0, 64], 64, 64, 2),
+    ([7], 4, 3, 2),
     # More loops than one window covers.
-    ([5000, 4097], 32, 4, 512, 4),
+    ([5000, 4097], 128, 512, 4),
+    # Loops shorter than a block (several loops cut one block), an odd
+    # degree, prefixes ending mid-block, five windows.
+    ([1000, 333, 0, 77], 128, 50, 3),
 ]
 
 
-@pytest.mark.parametrize("prefix_lens,page_size,subpages,chunk_len,degree", CASES)
-def test_owned_prefix_chunk_rows_matches_per_row_owners(
-    prefix_lens, page_size, subpages, chunk_len, degree
+@pytest.mark.parametrize("prefix_lens,granularity,chunk_len,degree", CASES)
+def test_prefix_chunk_segments_match_per_row_owners_and_slots(
+    prefix_lens, granularity, chunk_len, degree
 ):
-    generator = torch.Generator().manual_seed(7)
-    virtual_block_count = 4096
-    placement = CachePlacement(
-        block_granularity=page_size * subpages,
-        virtual_block_count=virtual_block_count,
-        group=tuple(range(degree)),
-        rank=0,
-    )
+    """Expanded row by row, the segments name every loop row's owner and
+    the owner's physical slot, in the loops' row order, and never span two
+    blocks."""
     table, slots = _random_layout(
-        generator,
+        torch.Generator().manual_seed(7),
         prefix_lens=prefix_lens,
-        page_size=page_size,
-        subpages=subpages,
-        virtual_block_count=virtual_block_count,
+        granularity=granularity,
+        virtual_block_count=VIRTUAL_BLOCK_COUNT,
     )
     chunks = _chunk_slots(slots, chunk_len)
-    counts = owned_prefix_chunk_rows(
+    segments = prefix_chunk_segments(
         table,
         torch.tensor(prefix_lens),
         chunk_len=chunk_len,
         num_chunks=len(chunks),
-        page_size=page_size,
-        placement=placement,
+        placement=_placement(granularity, degree, 0),
     )
-    rows = placement.block_granularity
-    expected = torch.zeros((len(chunks), degree), dtype=torch.int64)
-    for j, chunk in enumerate(chunks):
+    assert segments.loop_rows.tolist() == [len(chunk) for chunk in chunks]
+    assert (segments.rows > 0).all() and (segments.rows <= granularity).all()
+    owners, local_slots = [], []
+    for loop, row, rows, owner, local in zip(
+        segments.loop.tolist(),
+        segments.row.tolist(),
+        segments.rows.tolist(),
+        segments.owner.tolist(),
+        segments.local_slot.tolist(),
+    ):
+        # Segments tile the loops' rows in order.
+        assert row == len(owners)
+        owners.extend((loop, owner) for _ in range(rows))
+        local_slots.extend(range(local, local + rows))
+    expected_owners, expected_slots = [], []
+    for loop, chunk in enumerate(chunks):
         for slot in chunk:
-            expected[j, (slot // rows - 1) % degree] += 1
-    torch.testing.assert_close(counts, expected)
+            block = slot // granularity
+            expected_owners.append((loop, (block - 1) % degree))
+            expected_slots.append(
+                ((block - 1) // degree + 1) * granularity + slot % granularity
+            )
+    assert owners == expected_owners
+    assert local_slots == expected_slots
 
 
-def test_owned_prefix_chunk_rows_refuses_a_hole():
+def test_prefix_chunk_segments_refuse_a_hole_or_a_short_table():
     placement = CachePlacement(
         block_granularity=4, virtual_block_count=16, group=(0, 1), rank=0
     )
+    for table in ([[1, 0, 3]], [[1, -1, 3]]):
+        # A hole (0) or ragged padding (-1) below the prefix has no owner.
+        with pytest.raises(ValueError, match="holes"):
+            prefix_chunk_segments(
+                torch.tensor(table, dtype=torch.int32),
+                torch.tensor([6]),
+                chunk_len=6,
+                num_chunks=1,
+                placement=placement,
+            )
     with pytest.raises(ValueError, match="holes"):
-        owned_prefix_chunk_rows(
-            torch.tensor([[4, 0, 12]], dtype=torch.int32),
-            torch.tensor([3]),
-            chunk_len=3,
+        # A block past the virtual capacity has no owner either.
+        prefix_chunk_segments(
+            torch.tensor([[1, 16]], dtype=torch.int32),
+            torch.tensor([6]),
+            chunk_len=6,
             num_chunks=1,
-            page_size=1,
+            placement=placement,
+        )
+    with pytest.raises(ValueError, match="does not cover"):
+        prefix_chunk_segments(
+            torch.tensor([[1, 2]], dtype=torch.int32),
+            torch.tensor([9]),
+            chunk_len=9,
+            num_chunks=1,
             placement=placement,
         )
 
 
+def _per_row_windows(
+    chunks: list[list[int]], *, granularity: int, degree: int, rank: int
+):
+    """The plan of every window, row by row: each owner's rows go out in
+    order, rank-major, every owner padded to the largest count; rank
+    ``rank`` sends the physical slots of its rows, then the null slot 0."""
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        PREFIX_HISTORY_WINDOW_LOOPS,
+    )
+
+    windows = []
+    for first in range(0, len(chunks), PREFIX_HISTORY_WINDOW_LOOPS):
+        loops = chunks[first : first + PREFIX_HISTORY_WINDOW_LOOPS]
+        slots = [slot for loop in loops for slot in loop]
+        owners = [(slot // granularity - 1) % degree for slot in slots]
+        counts = tuple(owners.count(k) for k in range(degree))
+        send_rows = max(counts)
+        seen = [0] * degree
+        gathered_index, fetch = [], [0] * send_rows
+        for slot, owner in zip(slots, owners):
+            gathered_index.append(owner * send_rows + seen[owner])
+            if owner == rank:
+                fetch[seen[owner]] = (
+                    (slot // granularity - 1) // degree + 1
+                ) * granularity + slot % granularity
+            seen[owner] += 1
+        bounds = [0]
+        for loop in loops:
+            bounds.append(bounds[-1] + len(loop))
+        windows.append((counts, send_rows, fetch, gathered_index, tuple(bounds)))
+    return windows
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("prefix_lens,granularity,chunk_len,degree", CASES)
+def test_the_plan_matches_the_per_row_layout(
+    device, prefix_lens, granularity, chunk_len, degree
+):
+    """Every rank's per-block plan expands to exactly the per-row layout:
+    the same send slots, tail included, and the same all-gather row for
+    every loop row, window by window."""
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        plan_prefix_history_gather,
+    )
+
+    table, slots = _random_layout(
+        torch.Generator().manual_seed(11),
+        prefix_lens=prefix_lens,
+        granularity=granularity,
+        virtual_block_count=VIRTUAL_BLOCK_COUNT,
+    )
+    chunks = _chunk_slots(slots, chunk_len)
+    loops = [torch.tensor(chunk, dtype=torch.int32, device=device) for chunk in chunks]
+    for rank in sorted({0, degree // 2, degree - 1}):
+        placement = _placement(granularity, degree, rank)
+        windows = plan_prefix_history_gather(
+            loops,
+            block_table_cpu=table,
+            prefix_lens_cpu=torch.tensor(prefix_lens),
+            chunk_len=chunk_len,
+            placement=placement,
+        )
+        expected = _per_row_windows(
+            chunks, granularity=granularity, degree=degree, rank=rank
+        )
+        assert len(windows) == len(expected)
+        for window, (counts, send_rows, fetch, gathered_index, bounds) in zip(
+            windows, expected
+        ):
+            assert window.group == placement.group and window.rank == rank
+            assert window.owned_rows_per_rank == counts
+            assert window.send_rows == send_rows
+            assert window.loop_bounds == bounds
+            assert window.fetch_slots.dtype == torch.int32
+            assert window.fetch_slots.tolist() == fetch
+            assert window.gathered_index.dtype == torch.int32
+            assert window.gathered_index.tolist() == gathered_index
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("prefix_lens,page_size,subpages,chunk_len,degree", CASES)
+@pytest.mark.parametrize("ratio", [2, 4])
+def test_the_plan_matches_the_loops_cut_from_the_expanded_table(monkeypatch, ratio):
+    """The plan takes owners and send slots from the host block table and
+    only counts the loops; the loops are cut on the device from the kernel
+    page table the router expands from that same table. With kernel pages
+    smaller than a block, ragged ``-1`` padding and a ``0`` hole past a
+    prefix, every rank's plan equals the per-row layout derived from the
+    loops' own slots."""
+    from tokenspeed.runtime.layers.attention import chunk
+    from tokenspeed.runtime.layers.attention.backends.paged.group_tables import (
+        GroupTableSpec,
+        GroupTableStacks,
+    )
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        plan_prefix_history_gather,
+    )
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    granularity, degree = 8, 4
+    # An empty prefix, one ending on a block bound, two ending mid-block.
+    prefix_lens = [53, 0, 40, 17]
+    bs = len(prefix_lens)
+    # Five rows of every request a loop: loops cut blocks; eleven loops,
+    # three windows.
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 5 * bs)
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", 1)
+    table, _ = _random_layout(
+        torch.Generator().manual_seed(3),
+        prefix_lens=prefix_lens,
+        granularity=granularity,
+        virtual_block_count=VIRTUAL_BLOCK_COUNT,
+    )
+    # A retracted tail: a hole right past two prefixes' blocks.
+    for request in (0, 3):
+        table[request, -(-prefix_lens[request] // granularity)] = 0
+    stacks = GroupTableStacks(
+        [
+            GroupTableSpec(
+                group_id="full",
+                block_granularity=granularity,
+                kernel_page_size=granularity // ratio,
+                max_num_pages=table.shape[1] * ratio,
+            )
+        ],
+        max_bs=bs,
+        max_tokens_per_req=1,
+        max_extend_tokens=0,
+        device="cuda",
+    )
+    stacks.fill(bs, bs, {"full": table.cuda()})
+    prefix = torch.tensor(prefix_lens, dtype=torch.int32)
+    _, loops, _, _, _ = chunk.build_chunked_prefill_metadata_arrays(
+        prefix.cuda(), prefix, stacks.table("full", bs), granularity // ratio
+    )
+    chunks = [loop.tolist() for loop in loops]
+    assert len(chunks) == 11
+    for rank in range(degree):
+        windows = plan_prefix_history_gather(
+            loops,
+            block_table_cpu=table,
+            prefix_lens_cpu=prefix,
+            chunk_len=chunk.prefix_chunk_len(bs),
+            placement=_placement(granularity, degree, rank),
+        )
+        expected = _per_row_windows(
+            chunks, granularity=granularity, degree=degree, rank=rank
+        )
+        assert len(windows) == len(expected) == 3
+        for window, (counts, send_rows, fetch, gathered_index, bounds) in zip(
+            windows, expected
+        ):
+            assert window.owned_rows_per_rank == counts
+            assert window.send_rows == send_rows
+            assert window.loop_bounds == bounds
+            assert window.fetch_slots.tolist() == fetch
+            assert window.gathered_index.tolist() == gathered_index
+
+
+def test_the_plan_refuses_loops_the_block_table_does_not_cut():
+    from tokenspeed.runtime.layers.attention.dcp.cache import (
+        plan_prefix_history_gather,
+    )
+
+    placement = _placement(4, 2, 0)
+    with pytest.raises(ValueError, match="rows are not"):
+        plan_prefix_history_gather(
+            [torch.arange(4, 9, dtype=torch.int32)],
+            block_table_cpu=torch.tensor([[1, 2]], dtype=torch.int32),
+            prefix_lens_cpu=torch.tensor([6]),
+            chunk_len=6,
+            placement=placement,
+        )
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("prefix_lens,granularity,chunk_len,degree", CASES)
 def test_every_rank_reads_the_position_order_rows(
-    prefix_lens, page_size, subpages, chunk_len, degree
+    device, prefix_lens, granularity, chunk_len, degree
 ):
     """Emulate each window's all-gather over ``degree`` owners: every rank's
     send rows come from its own physical cache, and every rank's plan must
@@ -158,38 +387,28 @@ def test_every_rank_reads_the_position_order_rows(
     )
 
     generator = torch.Generator().manual_seed(11)
-    virtual_block_count = 4096
-    rows = page_size * subpages
+    rows = granularity
     table, slots = _random_layout(
         generator,
         prefix_lens=prefix_lens,
-        page_size=page_size,
-        subpages=subpages,
-        virtual_block_count=virtual_block_count,
+        granularity=granularity,
+        virtual_block_count=VIRTUAL_BLOCK_COUNT,
     )
     chunks = [
-        torch.tensor(chunk, dtype=torch.int32, device="cuda")
+        torch.tensor(chunk, dtype=torch.int32, device=device)
         for chunk in _chunk_slots(slots, chunk_len)
     ]
-    placements = [
-        CachePlacement(
-            block_granularity=rows,
-            virtual_block_count=virtual_block_count,
-            group=tuple(range(degree)),
-            rank=rank,
-        )
-        for rank in range(degree)
-    ]
+    placements = [_placement(rows, degree, rank) for rank in range(degree)]
     # Every virtual slot's payload is distinct; rank r stores the rows it
     # owns at its local slots and garbage everywhere else.
     width = 8
-    local_rows = ((virtual_block_count - 2) // degree + 2) * rows
+    local_rows = ((VIRTUAL_BLOCK_COUNT - 2) // degree + 2) * rows
     caches = [
-        torch.full((local_rows, width), -1, dtype=torch.int32, device="cuda")
+        torch.full((local_rows, width), -1, dtype=torch.int32, device=device)
         for _ in range(degree)
     ]
     every_slot = torch.cat(chunks).to(torch.int64)
-    payload = every_slot.unsqueeze(1) * width + torch.arange(width, device="cuda")
+    payload = every_slot.unsqueeze(1) * width + torch.arange(width, device=device)
     for placement, cache in zip(placements, caches):
         local, owned = resolve_cache_slots(every_slot, placement)
         cache[local[owned]] = payload[owned].to(torch.int32)
@@ -197,10 +416,9 @@ def test_every_rank_reads_the_position_order_rows(
     plans = [
         plan_prefix_history_gather(
             chunks,
-            page_table_cpu=table,
+            block_table_cpu=table,
             prefix_lens_cpu=torch.tensor(prefix_lens),
             chunk_len=chunk_len,
-            page_size=page_size,
             placement=placement,
         )
         for placement in placements
@@ -213,7 +431,7 @@ def test_every_rank_reads_the_position_order_rows(
         assert all(w.send_rows == send_rows for w in windows)
         assert all(w.loop_bounds == windows[0].loop_bounds for w in windows)
         gathered = torch.full(
-            (degree * send_rows, width), -2, dtype=torch.int32, device="cuda"
+            (degree * send_rows, width), -2, dtype=torch.int32, device=device
         )
         for rank, (window, cache) in enumerate(zip(windows, caches)):
             sent = cache.index_select(0, window.fetch_slots)
@@ -221,7 +439,7 @@ def test_every_rank_reads_the_position_order_rows(
         bounds = windows[0].loop_bounds
         for start, end in zip(bounds[:-1], bounds[1:]):
             expected = chunks[loop].to(torch.int64).unsqueeze(1) * width + torch.arange(
-                width, device="cuda"
+                width, device=device
             )
             for window in windows:
                 assert window.gathered_index.dtype == torch.int32
@@ -279,8 +497,8 @@ class _RecordingBackend:
         return SimpleNamespace(wait=lambda: None)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_read_prefix_history_prefetches_one_window_ahead():
+@pytest.mark.parametrize("device", DEVICES)
+def test_read_prefix_history_prefetches_one_window_ahead(device):
     """Every layer's loops read their rows back through windows that the
     previous window -- of this layer, else of the previous latent layer --
     already launched; the gathers run in the same order on every rank."""
@@ -291,19 +509,17 @@ def test_read_prefix_history_prefetches_one_window_ahead():
         resolve_cache_slots,
     )
 
-    degree, page_size, subpages, chunk_len = 2, 32, 4, 512
+    degree, rows, chunk_len = 2, 128, 512
     prefix_lens = [5000, 300]
     virtual_block_count = 512
-    rows = page_size * subpages
     table, slots = _random_layout(
         torch.Generator().manual_seed(5),
         prefix_lens=prefix_lens,
-        page_size=page_size,
-        subpages=subpages,
+        granularity=rows,
         virtual_block_count=virtual_block_count,
     )
     chunks = [
-        torch.tensor(chunk, dtype=torch.int32, device="cuda")
+        torch.tensor(chunk, dtype=torch.int32, device=device)
         for chunk in _chunk_slots(slots, chunk_len)
     ]
     every_slot = torch.cat(chunks).to(torch.int64)
@@ -316,7 +532,7 @@ def test_read_prefix_history_prefetches_one_window_ahead():
         return (
             layer_id * 1_000_000
             + slot.to(torch.int64).unsqueeze(1) * width
-            + torch.arange(width, device="cuda")
+            + torch.arange(width, device=device)
         ).to(torch.int32)
 
     runs = {}
@@ -332,16 +548,16 @@ def test_read_prefix_history_prefetches_one_window_ahead():
         planes = [None] * 6
         for layer_id in latent_layers:
             plane = torch.full(
-                (local_rows, 1, width), -1, dtype=torch.int32, device="cuda"
+                (local_rows, 1, width), -1, dtype=torch.int32, device=device
             )
             plane[local[owned], 0] = payload(layer_id, every_slot[owned])
             planes[layer_id] = plane
         pool = _StubLatentPool(planes)
         backend = _RecordingBackend(rank, peer_sends)
-        history = PrefixHistoryGather(placement, page_size=page_size, comm=backend)
+        history = PrefixHistoryGather(placement, comm=backend)
         history.prepare(
             chunks,
-            page_table_cpu=table,
+            block_table_cpu=table,
             prefix_lens_cpu=torch.tensor(prefix_lens),
             chunk_len=chunk_len,
         )
@@ -360,7 +576,8 @@ def test_read_prefix_history_prefetches_one_window_ahead():
                 )
             ]
             launched_after_layer.append(len(backend.sends))
-        torch.cuda.synchronize()
+        if device == "cuda":
+            torch.cuda.synchronize()
         runs[rank] = (outputs, launched_after_layer)
         peer_sends = backend.sends
 
@@ -386,18 +603,18 @@ def test_history_gather_plans_at_first_read():
     placement = CachePlacement(
         block_granularity=4, virtual_block_count=16, group=(0, 1), rank=0
     )
-    history = PrefixHistoryGather(placement, page_size=1, comm=None)
-    loops = [torch.tensor([4, 5, 6], dtype=torch.int32)]
-    with pytest.raises(RuntimeError, match="host page table"):
+    history = PrefixHistoryGather(placement, comm=None)
+    loops = [torch.tensor([4, 5, 6, 7, 0, 0], dtype=torch.int32)]
+    with pytest.raises(RuntimeError, match="host block table"):
         history.prepare(
-            loops, page_table_cpu=None, prefix_lens_cpu=torch.tensor([3]), chunk_len=3
+            loops, block_table_cpu=None, prefix_lens_cpu=torch.tensor([6]), chunk_len=6
         )
     history.prepare(
         loops,
-        # Page 0 below the prefix: an unplannable table, refused only on read.
-        page_table_cpu=torch.tensor([[4, 0, 12]], dtype=torch.int32),
-        prefix_lens_cpu=torch.tensor([3]),
-        chunk_len=3,
+        # Block 0 below the prefix: an unplannable table, refused only on read.
+        block_table_cpu=torch.tensor([[1, 0, 3]], dtype=torch.int32),
+        prefix_lens_cpu=torch.tensor([6]),
+        chunk_len=6,
     )
     with pytest.raises(ValueError, match="holes"):
         history.windows
@@ -406,6 +623,6 @@ def test_history_gather_plans_at_first_read():
     # no host table to plan from and reads nothing.
     no_loops = []
     history.prepare(
-        no_loops, page_table_cpu=None, prefix_lens_cpu=torch.tensor([0]), chunk_len=3
+        no_loops, block_table_cpu=None, prefix_lens_cpu=torch.tensor([0]), chunk_len=3
     )
     assert list(history.read(None, None, no_loops, dst_dtype=torch.int32)) == []

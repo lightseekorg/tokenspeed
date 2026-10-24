@@ -352,7 +352,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         extend_prefix_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
-        page_table_cpu: torch.Tensor | None,
+        block_table_cpu: torch.Tensor | None,
         **kwargs,
     ):
         reject_query_shard(query_shard, "CuteDSLMLABackend")
@@ -366,7 +366,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
             self._init_prefill_metadata(
                 seq_lens[:num_extends],
                 page_table=page_table[:num_extends],
-                page_table_cpu=page_table_cpu,
+                block_table_cpu=block_table_cpu,
                 extend_prefix_lens=extend_prefix_lens[:num_extends],
                 extend_prefix_lens_cpu=extend_prefix_lens_cpu[:num_extends],
                 extend_seq_lens=extend_seq_lens[:num_extends],
@@ -400,7 +400,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         extend_seq_lens: torch.Tensor,
         extend_seq_lens_cpu: torch.Tensor,
         *,
-        page_table_cpu: torch.Tensor | None,
+        block_table_cpu: torch.Tensor | None,
     ):
         # Worst-case bound to avoid GPU->CPU sync from seq_lens.max().item().
         # TODO: track a loose CPU upper bound (advance by chunked_prefill_size /
@@ -440,7 +440,7 @@ class CuteDSLMLABackend(PagedAttentionBackend):
         )
         self._prepare_prefix_history(
             chunk_kv_indices_list,
-            page_table_cpu=page_table_cpu,
+            block_table_cpu=block_table_cpu,
             prefix_lens_cpu=extend_prefix_lens_cpu,
         )
         self.chunked_prefill_metadata = TRTLLMMLAChunkedPrefillMetadata(

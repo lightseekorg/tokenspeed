@@ -470,7 +470,7 @@ def _init_prefill(backend, page_table, prefix, extend):
         extend_seq_lens_cpu=torch.tensor(extend, dtype=torch.int32),
         extend_with_prefix=any(p > 0 for p in prefix),
         query_shard=None,
-        page_table_cpu=None,
+        block_table_cpu=None,
     )
     return seq_lens
 
