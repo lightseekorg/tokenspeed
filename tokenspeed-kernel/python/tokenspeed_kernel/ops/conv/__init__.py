@@ -46,18 +46,29 @@ speculative rows are overwritten when their positions recur.
 The ring may be a channel-sliced view of a wider buffer
 (``ring[:, :, off:off + D]``): all kernels receive explicit strides, so only
 ``conv_cache.stride(-1) == 1`` is required.
+
+A target verify's decode kernel publishes nothing: the window to keep ends
+at the accepted frontier, known only after acceptance.
+:func:`inkling_ring_commit` then publishes it from the ring for every
+layer's streams at once, through the tables :func:`inkling_commit_tables`
+builds once.
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import torch
 
 # Aliased because importing the conv.triton and conv._triton submodules below
 # rebinds the names ``triton`` and ``_triton`` in this package.
+from tokenspeed_kernel._triton import tl as _tl
 from tokenspeed_kernel._triton import triton as _triton_lang
 from tokenspeed_kernel.ops.attention.gdn.triton import CausalConv1dPrefillMetadata
 from tokenspeed_kernel.ops.conv.triton import (
     PAD_SLOT_ID,
+    _inkling_ring_commit_kernel,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
     dflash2_grouped_conv,
@@ -69,9 +80,12 @@ from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 __all__ = [
     "PAD_SLOT_ID",
+    "InklingCommitTable",
     "causal_conv1d_fn",
     "causal_conv1d_update",
     "dflash2_grouped_conv",
+    "inkling_commit_tables",
+    "inkling_ring_commit",
     "inkling_ring_sconv",
     "seq_idx_from_cu_seqlens",
 ]
@@ -258,6 +272,183 @@ def inkling_ring_sconv(
         **({"launch_pdl": True} if enable_pdl else {}),
     )
     return y
+
+
+_COMMIT_DTYPES = {
+    torch.bfloat16: _tl.bfloat16,
+    torch.float16: _tl.float16,
+    torch.float32: _tl.float32,
+    torch.float8_e5m2: _tl.float8e5,
+    torch.float8_e4m3fn: _tl.float8e4nv,
+}
+
+
+@dataclass(frozen=True)
+class InklingCommitTable:
+    """The checkpoint fields one :func:`inkling_ring_commit` launch writes.
+
+    Each entry is one field of one layer's stream; every field is of
+    ``dtype``. Device tensors, one element per entry.
+
+    Attributes:
+        src_offsets: Int64 ring offset of the entry's first channel
+            (``layer * ring.stride(0) + channel``).
+        widths: Int32 channels the field holds.
+        addresses: Uint64 address of the field's page 0.
+        page_strides: Int64 field page stride, in elements.
+        row_strides: Int64 field row stride, in elements.
+        groups: Int32 row of the entry's group in ``live_pages``.
+        dtype: The fields' dtype.
+        state_rows: Rows per checkpoint (``W - 1``).
+        max_width: The widest entry.
+    """
+
+    src_offsets: torch.Tensor
+    widths: torch.Tensor
+    addresses: torch.Tensor
+    page_strides: torch.Tensor
+    row_strides: torch.Tensor
+    groups: torch.Tensor
+    dtype: torch.dtype
+    state_rows: int
+    max_width: int
+
+
+def inkling_commit_tables(
+    ring: torch.Tensor,
+    streams: Sequence[tuple[int, int, int, Sequence[torch.Tensor]]],
+) -> list[InklingCommitTable]:
+    """Describe the checkpoint fields :func:`inkling_ring_commit` writes.
+
+    Args:
+        ring: Conv rings of every layer ``[L, num_slots, R, C]``,
+            channel-contiguous.
+        streams: ``(layer, channel_offset, group, fields)`` per stream. The
+            stream's channels start at ``channel_offset`` of the layer's ring
+            and its fields (``[pages, W - 1, width]``, width-contiguous) split
+            them in order; ``group`` is the stream's row of ``live_pages``.
+
+    Returns:
+        One table per field dtype.
+    """
+    if ring.dim() != 4 or ring.stride(-1) != 1:
+        raise ValueError("the rings must be [L, num_slots, R, C], C-contiguous")
+    entries: dict[torch.dtype, list[tuple[int, ...]]] = {}
+    state_rows: int | None = None
+    for layer, channel_offset, group, fields in streams:
+        channel = channel_offset
+        for field in fields:
+            if field.dim() != 3 or field.stride(-1) != 1:
+                raise ValueError("a checkpoint field must be [pages, W - 1, width]")
+            if state_rows not in (None, field.shape[1]):
+                raise ValueError("every checkpoint field must hold W - 1 rows")
+            state_rows = field.shape[1]
+            entries.setdefault(field.dtype, []).append(
+                (
+                    layer * ring.stride(0) + channel,
+                    field.shape[-1],
+                    field.data_ptr(),
+                    field.stride(0),
+                    field.stride(1),
+                    group,
+                )
+            )
+            channel += field.shape[-1]
+        if channel > ring.shape[-1]:
+            raise ValueError(f"layer {layer}'s stream runs past the ring channels")
+
+    def device(values: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+        return torch.tensor(values, dtype=dtype, device=ring.device)
+
+    tables = []
+    for dtype, rows in entries.items():
+        offsets, widths, addresses, page_strides, row_strides, groups = zip(*rows)
+        tables.append(
+            InklingCommitTable(
+                src_offsets=device(offsets, torch.int64),
+                widths=device(widths, torch.int32),
+                addresses=device(addresses, torch.uint64),
+                page_strides=device(page_strides, torch.int64),
+                row_strides=device(row_strides, torch.int64),
+                groups=device(groups, torch.int32),
+                dtype=dtype,
+                state_rows=state_rows,
+                max_width=max(widths),
+            )
+        )
+    return tables
+
+
+def inkling_ring_commit(
+    ring: torch.Tensor,
+    tables: Sequence[InklingCommitTable],
+    live_pages: torch.Tensor,
+    cache_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    accepted_lengths: torch.Tensor,
+    *,
+    verify_width: int,
+) -> None:
+    """Publish each request's accepted conv window to its live block.
+
+    After a target verify the ring holds all ``verify_width`` speculative
+    rows of every request; the live block must hold the ``W - 1`` rows ending
+    at the committed frontier ``seq_lens - verify_width + clamp(accepted, 1,
+    verify_width)``, zeros before position 0. One launch per table covers
+    every layer's streams.
+
+    Args:
+        ring: The rings the tables were built over.
+        tables: :func:`inkling_commit_tables` of ``ring``.
+        live_pages: Int32 ``[G, >= B]`` live block per group and request,
+            request-contiguous; entries ``<= 0`` are holes and store nothing.
+        cache_indices: Contiguous int32 ``[B]`` ring slot per request;
+            ``PAD_SLOT_ID`` rows store nothing.
+        seq_lens: Contiguous integer ``[B]`` lengths through the verify chunk.
+        accepted_lengths: Contiguous integer ``[B]`` accepted tokens per
+            request.
+        verify_width: Tokens per request in the verify chunk.
+    """
+    num_reqs = accepted_lengths.shape[0]
+    if num_reqs == 0:
+        return
+    if live_pages.stride(-1) != 1:
+        raise ValueError("live_pages must be request-contiguous")
+    if not all(v.is_contiguous() for v in (cache_indices, seq_lens, accepted_lengths)):
+        raise ValueError(
+            "cache_indices, seq_lens and accepted_lengths must be contiguous"
+        )
+    enable_pdl = pdl_enabled()
+    for table in tables:
+        block_c = min(1024, _triton_lang.next_power_of_2(table.max_width))
+        grid = (
+            table.widths.shape[0],
+            num_reqs,
+            _triton_lang.cdiv(table.max_width, block_c),
+        )
+        _inkling_ring_commit_kernel[grid](
+            ring,
+            table.src_offsets,
+            table.widths,
+            table.addresses,
+            table.page_strides,
+            table.row_strides,
+            table.groups,
+            live_pages,
+            cache_indices,
+            seq_lens,
+            accepted_lengths,
+            ring.stride(1),
+            ring.stride(2),
+            live_pages.stride(0),
+            CKPT_DTYPE=_COMMIT_DTYPES[table.dtype],
+            STATE_ROWS=table.state_rows,
+            R=ring.shape[2],
+            VERIFY_WIDTH=verify_width,
+            BLOCK_C=block_c,
+            ENABLE_PDL=enable_pdl,
+            **({"launch_pdl": True} if enable_pdl else {}),
+        )
 
 
 def _state_layout(state: torch.Tensor, weight: torch.Tensor) -> str:

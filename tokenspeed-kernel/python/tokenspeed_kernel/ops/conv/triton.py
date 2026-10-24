@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
 )
 from tokenspeed_kernel.ops.conv._triton.grouped import dflash2_grouped_conv
 from tokenspeed_kernel.ops.conv._triton.sconv import (
+    _inkling_ring_commit_kernel,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
     select_prefill_config,
@@ -57,6 +58,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
     "PAD_SLOT_ID",
+    "_inkling_ring_commit_kernel",
     "_inkling_ring_sconv_decode_kernel",
     "_inkling_ring_sconv_prefill_kernel",
     "dflash2_grouped_conv",

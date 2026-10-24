@@ -29,9 +29,12 @@ from tokenspeed_kernel.numerics.torch.conv import (
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
     dflash2_grouped_conv,
+    inkling_commit_tables,
+    inkling_ring_commit,
     inkling_ring_sconv,
     seq_idx_from_cu_seqlens,
 )
+from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="sconv tests require a CUDA GPU."
@@ -831,6 +834,102 @@ def test_decode_publish_window_and_split(device: str) -> None:
     window1 = torch.cat([x[6:8], x1[1:2]])
     torch.testing.assert_close(ckpt_a[6], window1[:, :wa], atol=0, rtol=0)
     torch.testing.assert_close(ckpt_b[6], window1[:, wa:], atol=0, rtol=0)
+
+
+def ref_ring_commit(ring, streams, live_pages, cache_indices, seq_lens, accepted, k):
+    """Per-stream torch publication of each request's accepted window."""
+    bs = accepted.shape[0]
+    frontier = seq_lens.long() - k + accepted.long().clamp(1, k)
+    slots = cache_indices.long()
+    for layer, offset, group, fields in streams:
+        pages = live_pages[group, :bs].long()
+        dim = sum(field.shape[-1] for field in fields)
+        state = ring[layer][:, :, offset : offset + dim]
+        rows = fields[0].shape[1]
+        pos = frontier.view(bs, 1) - rows + torch.arange(rows, device=ring.device)
+        window = state[slots.clamp_min(0).view(bs, 1), pos.remainder(state.shape[1])]
+        window = torch.where((pos >= 0).unsqueeze(-1), window, torch.zeros_like(window))
+        parts = window.split([field.shape[-1] for field in fields], dim=-1)
+        for field, values in zip(fields, parts):
+            for b in range(bs):
+                if slots[b] >= 0 and pages[b] > 0:
+                    field[pages[b]] = values[b].to(field.dtype)
+
+
+def test_ring_commit_publishes_every_streams_accepted_window(device: str) -> None:
+    """One commit writes the accepted window of every layer's streams: fields
+    split a stream's channels, a second field dtype takes its own table, ring
+    rows wrap, positions before 0 are zeros, and padded rows and hole live
+    blocks write nothing."""
+    from tokenspeed_kernel.ops.conv.triton import _inkling_ring_commit_kernel
+
+    torch.manual_seed(9)
+    layers, k, pages = 3, 4, 10
+    ring = torch.randn(layers, 6, R, 24, device=device, dtype=DTYPE)
+    # Page-strided per-layer views, as the cache arena lays fields out.
+    k_planes = torch.full((pages, layers, W - 1, 5), 7.0, device=device, dtype=DTYPE)
+    v_planes = torch.full((pages, layers, W - 1, 3), 7.0, device=device, dtype=DTYPE)
+    hidden = torch.full((pages, layers, W - 1, 16), 7.0, device=device).to(
+        torch.float8_e5m2
+    )
+    expected = [t.clone() for t in (k_planes, v_planes, hidden)]
+
+    def streams(k_planes, v_planes, hidden):
+        return [
+            entry
+            for layer in range(layers)
+            for entry in (
+                (layer, 0, 0, (k_planes[:, layer], v_planes[:, layer])),
+                (layer, 8, 1, (hidden[:, layer],)),
+            )
+        ]
+
+    cache_indices = torch.tensor(
+        [1, PAD_SLOT_ID, 3, 4, 5], device=device, dtype=torch.int32
+    )
+    seq_lens = torch.tensor([130, 50, 6, 2, 263], device=device, dtype=torch.int32)
+    accepted = torch.tensor([2, 4, 0, 4, 9], device=device, dtype=torch.int32)
+    live_pages = torch.tensor(
+        [[7, 3, 0, 2, 9], [6, 8, 5, 0, 4]], device=device, dtype=torch.int32
+    )
+
+    tables = inkling_commit_tables(ring, streams(k_planes, v_planes, hidden))
+    assert [table.dtype for table in tables] == [DTYPE, torch.float8_e5m2]
+    inkling_ring_commit(
+        ring, tables, live_pages, cache_indices, seq_lens, accepted, verify_width=k
+    )
+    ref_ring_commit(
+        ring, streams(*expected), live_pages, cache_indices, seq_lens, accepted, k
+    )
+    assert torch.equal(k_planes, expected[0])
+    assert torch.equal(v_planes, expected[1])
+    assert torch.equal(hidden.view(torch.uint8), expected[2].view(torch.uint8))
+    # Every written page changed; the others kept the sentinel.
+    assert not torch.equal(k_planes[7], torch.full_like(k_planes[7], 7.0))
+    assert torch.equal(k_planes[3], torch.full_like(k_planes[3], 7.0))
+    # The kernel indexes request vectors by row, so a strided one is refused.
+    with pytest.raises(ValueError, match="contiguous"):
+        inkling_ring_commit(
+            ring,
+            tables,
+            live_pages,
+            cache_indices,
+            seq_lens,
+            accepted.repeat_interleave(2)[::2],
+            verify_width=k,
+        )
+
+    with assert_no_triton_compile(_inkling_ring_commit_kernel):
+        for bs in (1, 2, 16):
+            inkling_ring_commit(
+                ring,
+                tables,
+                torch.zeros(2, bs, device=device, dtype=torch.int32),
+                torch.zeros(bs, device=device, dtype=torch.int32),
+                torch.full((bs,), 40, device=device, dtype=torch.int32),
+                torch.ones(bs, device=device, dtype=torch.int32),
+                verify_width=k,
+            )
 
 
 def test_prefill_matches_decode_on_short_warm_chunks(device: str) -> None:
