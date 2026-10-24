@@ -20,6 +20,7 @@
 
 """Multi-token CTA scheduling, output coverage and workspace reuse."""
 
+from contextlib import nullcontext
 from unittest import mock
 
 import pytest
@@ -655,6 +656,151 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     assert all(
         cute_fused._WORKSPACES[key] is value for key, value in workspaces.items()
     )
+
+
+def test_startup_warms_full_tail_tiles_and_rounds(monkeypatch):
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    _reset_caches(monkeypatch)
+    monkeypatch.setattr(cute_fused, "_WARMED", set())
+    values = inputs(256, torch.bfloat16, True)
+    pdl_enabled(True)
+
+    def forward(rows):
+        return gated_residual_mix(
+            values[0][:rows],
+            values[1],
+            values[2],
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            projection_scale=0.25,
+            weights_independent=True,
+            override=None,
+            solution=None,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        with kernel_warmup(enabled=True):
+            forward(1)
+    stream.synchronize()
+    plans = dict(cute_fused._PLANS)
+    row_counts = (13, 16, 23, 32, 33, 64, 95, 96, 97, 128, 191, 192, 193, 224, 255, 256)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = [forward(rows) for rows in row_counts]
+    for factor in (0.75, -0.5):
+        values[0].mul_(factor)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = reference(values, 0.25)
+        for rows, actual in zip(row_counts, outputs):
+            check(actual, tuple(value[:rows] for value in expected), torch.bfloat16)
+    assert cute_fused._PLANS == plans
+
+
+@pytest.mark.parametrize("override_source", ["environment", "context"])
+@pytest.mark.parametrize(
+    ("override", "solution"),
+    [(None, None), ("triton_hyperconnection_mix", "triton")],
+    ids=["default", "conflicting"],
+)
+def test_startup_warms_global_fused_override(
+    monkeypatch, override_source, override, solution
+):
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.selection import kernel_override
+
+    _reset_caches(monkeypatch)
+    monkeypatch.setattr(cute_fused, "_WARMED", set())
+    values = inputs(1024, torch.bfloat16, True)
+    pdl_enabled(True)
+    env_key = "TOKENSPEED_KERNEL_OVERRIDE_RESIDUAL_HYPERCONNECTION_MIX"
+    forced = "cute_fused_hyperconnection_mix"
+    monkeypatch.delenv(env_key, raising=False)
+    if override_source == "environment":
+        monkeypatch.setenv(env_key, forced)
+        context = nullcontext()
+    else:
+        context = kernel_override("residual", "hyperconnection_mix", forced)
+
+    def forward(rows):
+        return gated_residual_mix(
+            values[0][:rows],
+            values[1],
+            values[2],
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            projection_scale=0.25,
+            weights_independent=True,
+            override=override,
+            solution=solution,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    row_counts = (520, 257, 385, 512, 768, 1024)
+    with context:
+        with torch.cuda.stream(stream), kernel_warmup(enabled=True):
+            forward(1)
+        stream.synchronize()
+        plans = dict(cute_fused._PLANS)
+        assert plans
+        with torch.cuda.stream(stream):
+            for rows in row_counts:
+                forward(rows)
+                assert cute_fused._PLANS == plans
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = [forward(rows) for rows in row_counts]
+        for factor in (0.75, -0.5):
+            values[0].mul_(factor)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = reference(values, 0.25)
+            for rows, actual in zip(row_counts, outputs):
+                check(actual, tuple(value[:rows] for value in expected), torch.bfloat16)
+        assert cute_fused._PLANS == plans
+
+
+@pytest.mark.parametrize("override_source", ["environment", "context"])
+def test_startup_skips_global_nonfused_override(monkeypatch, override_source):
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.selection import kernel_override
+
+    _reset_caches(monkeypatch)
+    monkeypatch.setattr(cute_fused, "_WARMED", set())
+    values = inputs(1, torch.bfloat16, True)
+    env_key = "TOKENSPEED_KERNEL_OVERRIDE_RESIDUAL_HYPERCONNECTION_MIX"
+    forced = "triton_hyperconnection_mix"
+    monkeypatch.delenv(env_key, raising=False)
+    if override_source == "environment":
+        monkeypatch.setenv(env_key, forced)
+        context = nullcontext()
+    else:
+        context = kernel_override("residual", "hyperconnection_mix", forced)
+
+    with context, kernel_warmup(enabled=True):
+        actual = gated_residual_mix(
+            *values,
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            projection_scale=0.25,
+            weights_independent=True,
+            override="cute_fused_hyperconnection_mix",
+            solution="cute_fused",
+        )
+    check(actual, reference(values, 0.25), torch.bfloat16)
+    assert not cute_fused._PLANS
+    assert not cute_fused._WARMED
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

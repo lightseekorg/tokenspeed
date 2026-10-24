@@ -3504,7 +3504,8 @@ class ServerArgs:
             "--disable-autotune",
             "--disable-flashinfer-autotune",
             action="store_true",
-            help="Skip profiling missing kernel tactics during startup. A matching "
+            help="Skip profiling missing kernel tactics during startup; kernel "
+            "compilation warmup still runs. A matching "
             "persistent FlashInfer cache is still loaded; uncovered shapes use "
             "the library's heuristic fallback.",
         )

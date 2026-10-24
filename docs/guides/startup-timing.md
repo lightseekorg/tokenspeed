@@ -29,7 +29,7 @@ The scheduler records these phases:
 | `communication.prepare` | Target/draft persistent communication preparation |
 | `kv.build` | Attention backend and KV pool construction, including rebinds |
 | `executor.init` | Executor construction |
-| `kernels.autotune` | Startup tactic selection |
+| `kernels.autotune` | Startup kernel compilation warmup and optional tactic selection |
 | `graph.probe_rebind` | Optional partial capture probe, release, and KV rebind |
 | `graph.capture` | Final serving graph capture |
 
