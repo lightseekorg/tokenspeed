@@ -34,7 +34,11 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
+from tokenspeed.runtime.engine.logprobs import (
+    resolve_logprob_start_len,
+    top_logprobs_launch_refusal,
+    top_logprobs_request_refusal,
+)
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     prompt_ends_in_reasoning,
     reasoning_block_markers,
@@ -43,10 +47,6 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
 from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-
-# Most alternatives a top-k logprob request may ask for per position (the
-# OpenAI chat API's bound; legacy completions ask for at most 5).
-MAX_TOP_LOGPROBS = 20
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -255,42 +255,15 @@ class InputProcessor:
     ) -> int:
         """Refuse a top-k logprob request this engine cannot serve; return k.
 
-        The top-k alternatives are computed where a forward runs eagerly: at
-        the prompt rows (``logprob_start_len``) and at the token a prefill
-        samples. A request whose every token is sampled in its prefill
-        (``max_new_tokens`` 0 or 1, as a teacher-forcing ``echo`` asks) is
-        served; a later token is sampled by a captured decode step, which
-        computes no alternatives, so a longer generation is refused rather
-        than answered with positions missing. The alternatives are torch's
-        log-softmax (the sampled token's logprob order), computed on the one
-        stage that holds logits, of a request this node completes.
+        The rules (``logprobs.top_logprobs_request_refusal`` and
+        ``top_logprobs_launch_refusal``) are the ones the direct msgpack
+        scheduler wire applies to the same field.
         """
-        server_args = self.engine.server_args
-        if not 0 < top_logprobs_num <= MAX_TOP_LOGPROBS:
-            raise ValueError(
-                f"top_logprobs_num must be between 1 and {MAX_TOP_LOGPROBS}, "
-                f"got {top_logprobs_num}."
-            )
-        if (sampling_params.max_new_tokens or 0) > 1:
-            raise ValueError(
-                "top_logprobs_num > 0 needs max_new_tokens <= 1: top-k logprobs "
-                "are computed for the prompt and the token a prefill samples, "
-                "not for decode steps."
-            )
-        if server_args.logprob_order != "torch":
-            raise ValueError(
-                "top_logprobs_num > 0 needs --logprob-order torch, not "
-                f"{server_args.logprob_order}."
-            )
-        if server_args.mapping is not None and server_args.mapping.has_pp:
-            raise ValueError(
-                "top_logprobs_num > 0 is not supported with pipeline parallelism."
-            )
-        if server_args.disaggregation_mode != "null":
-            raise ValueError(
-                "top_logprobs_num > 0 is not supported with disaggregated "
-                "prefill and decode."
-            )
+        reason = top_logprobs_request_refusal(
+            top_logprobs_num, sampling_params.max_new_tokens
+        ) or top_logprobs_launch_refusal(self.engine.server_args)
+        if reason is not None:
+            raise ValueError(reason)
         return top_logprobs_num
 
     async def tokenize_batch(

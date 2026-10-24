@@ -46,6 +46,64 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
     from tokenspeed.runtime.engine.io_struct import BatchStrOut
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+# Most alternatives a top-k logprob request may ask for per position (the
+# OpenAI chat API's bound; legacy completions ask for at most 5).
+MAX_TOP_LOGPROBS = 20
+
+
+def top_logprobs_request_refusal(
+    top_logprobs_num: int, max_new_tokens: int | None
+) -> str | None:
+    """Why a request's ``top_logprobs_num`` cannot be served, or None.
+
+    The top-k alternatives are computed where a forward runs eagerly: at the
+    prompt rows (``logprob_start_len``) and at the token a prefill samples. A
+    request whose every token is sampled in its prefill (``max_new_tokens`` 0
+    or 1, as a teacher-forcing ``echo`` asks) is served; a later token is
+    sampled by a captured decode step, which computes no alternatives, so a
+    longer generation is refused rather than answered with positions missing.
+    An unset ``max_new_tokens`` is refused too: the in-process ingress has
+    resolved it to the context's remainder before this check, and on the
+    msgpack wire None reaches it as is and means unbounded.
+    One rule for both ingresses, the in-process input processor and the direct
+    msgpack scheduler wire.
+    """
+    if not 0 < top_logprobs_num <= MAX_TOP_LOGPROBS:
+        return (
+            f"top_logprobs_num must be between 1 and {MAX_TOP_LOGPROBS}, "
+            f"got {top_logprobs_num}."
+        )
+    if max_new_tokens is None or max_new_tokens > 1:
+        return (
+            "top_logprobs_num > 0 needs max_new_tokens set to 0 or 1: top-k logprobs "
+            "are computed for the prompt and the token a prefill samples, "
+            "not for decode steps."
+        )
+    return None
+
+
+def top_logprobs_launch_refusal(server_args: ServerArgs) -> str | None:
+    """Why this launch computes no ranked alternatives at all, or None.
+
+    The alternatives are torch's log-softmax (the sampled token's logprob
+    order), computed on the one stage that holds logits, of a request this
+    node completes.
+    """
+    if server_args.logprob_order != "torch":
+        return (
+            "top_logprobs_num > 0 needs --logprob-order torch, not "
+            f"{server_args.logprob_order}."
+        )
+    if server_args.mapping is not None and server_args.mapping.has_pp:
+        return "top_logprobs_num > 0 is not supported with pipeline parallelism."
+    if server_args.disaggregation_mode != "null":
+        return (
+            "top_logprobs_num > 0 is not supported with disaggregated "
+            "prefill and decode."
+        )
+    return None
 
 
 def resolve_logprob_start_len(logprob_start_len: int | None, input_len: int) -> int:

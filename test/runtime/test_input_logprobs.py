@@ -240,8 +240,12 @@ def test_input_processor_takes_top_k_for_a_request_sampled_in_its_prefill():
 @pytest.mark.parametrize(
     ("server_args", "kwargs", "message"),
     [
-        ({}, {"sampling_params": {"max_new_tokens": 2}}, "max_new_tokens <= 1"),
-        ({}, {"sampling_params": {}}, "max_new_tokens <= 1"),
+        (
+            {},
+            {"sampling_params": {"max_new_tokens": 2}},
+            "max_new_tokens set to 0 or 1",
+        ),
+        ({}, {"sampling_params": {}}, "max_new_tokens set to 0 or 1"),
         ({}, {"top_logprobs_num": 21}, "between 1 and 20"),
         ({"logprob_order": "megatron"}, {}, "logprob-order torch"),
         ({"mapping": SimpleNamespace(has_pp=True)}, {}, "pipeline parallelism"),
