@@ -46,6 +46,7 @@ from tokenspeed.runtime.engine.logprobs import (
     top_logprobs_launch_refusal,
     top_logprobs_request_refusal,
 )
+from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions, is_mrope_model
 from tokenspeed.runtime.utils.env import envs
 
 logger = logging.getLogger(__name__)
@@ -359,6 +360,12 @@ class MsgpackRecvSocket:
     ones its ready response declares): a request of another kind is dropped
     with a warning instead of reaching a loop that has no handler for it, and
     a control call to a role that serves none is answered as not served.
+
+    ``mrope_hf_config`` is the model's HF config when this role runs the
+    language model: a multimodal request whose MRoPE position slots arrive
+    empty gets them filled from the engine's own position function, as the
+    in-process ingress does for its callers (``_fill_mrope_positions``). None
+    on a role that takes no generate requests.
     """
 
     def __init__(
@@ -371,6 +378,7 @@ class MsgpackRecvSocket:
         top_logprobs_unservable: str | None,
         control: ControlCalls,
         request_types: Sequence[str],
+        mrope_hf_config: object | None,
     ) -> None:
         self._socket = socket
         self._vocab_size = vocab_size
@@ -379,6 +387,7 @@ class MsgpackRecvSocket:
         self._top_logprobs_unservable = top_logprobs_unservable
         self._control = control
         self._request_types = frozenset(request_types)
+        self._mrope_hf_config = mrope_hf_config
         self._pending: collections.deque = collections.deque()
 
     def _validation_error(self, obj: TokenizedGenerateReqInput) -> str | None:
@@ -489,6 +498,8 @@ class MsgpackRecvSocket:
                 # The wire layer may have marked it already (e.g. n != 1).
                 if isinstance(obj, TokenizedGenerateReqInput):
                     reason = obj.validation_error or self._validation_error(obj)
+                    if reason is None:
+                        reason = self._fill_mrope_positions(obj)
                     if reason is not None:
                         logger.warning(
                             f"msgpack input: aborting invalid request {obj.rid!s}: "
@@ -497,6 +508,58 @@ class MsgpackRecvSocket:
                         obj.validation_error = reason
                 self._pending.append(obj)
         return self._pending.popleft()
+
+    def _fill_mrope_positions(self, obj: TokenizedGenerateReqInput) -> str | None:
+        """Fill a multimodal request's empty MRoPE position slots from the
+        engine's own position function, over the un-padded ids.
+
+        The frontend may send the three slots filled (its own port of the
+        function) or empty. Empty slots are computed here, exactly as the
+        in-process ingress computes them, so the model runner never falls back
+        to linear positions on an MRoPE architecture; filled slots are kept as
+        sent, and a non-MRoPE model leaves them empty. The un-padded ids are
+        required: the frontend has substituted pad values into ``input_ids``
+        for the embed splice, and padded ids locate no placeholders, so the
+        function would return linear positions without complaint. Returns the
+        reason the request cannot be positioned (no un-padded ids, a grid the
+        function rejects), which aborts the request the way a validation
+        failure does instead of escaping the drain loop.
+        """
+        multimodal_inputs = obj.multimodal_inputs
+        if (
+            self._mrope_hf_config is None
+            or multimodal_inputs is None
+            or multimodal_inputs.mrope_positions is not None
+            or multimodal_inputs.mrope_position_delta is not None
+            or not is_mrope_model(self._mrope_hf_config)
+        ):
+            return None
+        if obj.input_ids_unpadded is None:
+            return (
+                "mrope positions: a multimodal request on an MRoPE model needs "
+                "input_ids_unpadded (the ids with their placeholders); the padded "
+                "input_ids locate none"
+            )
+        try:
+            positions, delta = compute_mrope_positions(
+                self._mrope_hf_config,
+                list(obj.input_ids_unpadded),
+                multimodal_inputs.mm_items,
+            )
+        except Exception as exc:
+            # The function's precondition failures (a grid that does not
+            # match its placeholders) are the request's error, not the
+            # engine's: abort it with the text, keep draining.
+            return f"mrope positions: {exc!s}"
+        if positions is None:
+            return None
+        multimodal_inputs.mrope_positions = positions
+        multimodal_inputs.mrope_position_delta = delta
+        if delta is not None:
+            multimodal_inputs.mrope_position_delta_scalar = int(
+                delta.flatten()[0].item()
+            )
+        return None
 
     def close(self) -> None:
         self._socket.close()
@@ -631,6 +694,7 @@ def connect_msgpack_engine(
     supports_prompt_logprobs: bool,
     top_logprobs_unservable: str | None,
     request_types: Sequence[str],
+    mrope_hf_config: object | None,
 ) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
     """Run the startup handshake against SMG and return the wrapped
     data-plane sockets.
@@ -642,7 +706,9 @@ def connect_msgpack_engine(
       2. recv INIT -> learn SMG's input/output addresses.
       3. READY on the handshake DEALER.
       4. connect the input DEALER, register with the ready response, which
-         declares the request types this role serves (``request_types``) and
+         declares the request types this role serves (``request_types``),
+         whether this transport fills empty MRoPE position slots
+         (``computes_mrope_positions``, when ``mrope_hf_config`` is given) and
          the output structs this transport can emit for them
          (``emitted_layouts``) beside the caller's own entries.
       5. connect the output PUSH.
@@ -655,6 +721,7 @@ def connect_msgpack_engine(
             **ready_response.positional_layouts,
         },
         request_types=list(request_types),
+        computes_mrope_positions=mrope_hf_config is not None,
     )
 
     handshake = context.socket(zmq.DEALER)
@@ -707,6 +774,7 @@ def connect_msgpack_engine(
             top_logprobs_unservable=top_logprobs_unservable,
             control=control,
             request_types=request_types,
+            mrope_hf_config=mrope_hf_config,
         ),
         MsgpackSendSocket(output_socket, engine_index=engine_index, control=control),
     )
@@ -771,4 +839,5 @@ def connect_msgpack_engine_for_loop(
         supports_prompt_logprobs=loop.supports_prompt_logprobs,
         top_logprobs_unservable=top_logprobs_launch_refusal(server_args),
         request_types=SCHEDULER_REQUEST_TYPES,
+        mrope_hf_config=loop.model_config.hf_config,
     )

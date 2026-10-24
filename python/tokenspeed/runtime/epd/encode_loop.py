@@ -286,6 +286,8 @@ def connect_frontend(
             "language model."
         ),
         request_types=zmq_msgpack.ENCODE_REQUEST_TYPES,
+        # No generate requests here, so no MRoPE positions to fill.
+        mrope_hf_config=None,
     )
 
 

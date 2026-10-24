@@ -233,6 +233,13 @@ def _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items):
     return positions, delta
 
 
+def is_mrope_model(hf_config) -> bool:
+    """Whether ``hf_config`` names an architecture that runs on MRoPE
+    positions, the ones :func:`compute_mrope_positions` computes for."""
+    architectures = getattr(hf_config, "architectures", None) or []
+    return any(arch in _MROPE_ARCHITECTURES for arch in architectures)
+
+
 def compute_mrope_positions(hf_config, input_ids, mm_items):
     """Compute ``(mrope_positions, mrope_position_delta)`` for MRoPE models.
 
@@ -240,10 +247,10 @@ def compute_mrope_positions(hf_config, input_ids, mm_items):
     ``model_specific_data`` carries ``image_grid_thw`` / ``video_grid_thw``).
     Returns ``(None, None)`` for non-MRoPE models.
     """
-    architectures = getattr(hf_config, "architectures", None) or []
-    if not any(arch in _MROPE_ARCHITECTURES for arch in architectures):
+    if not is_mrope_model(hf_config):
         return None, None
 
+    architectures = getattr(hf_config, "architectures", None) or []
     if any(arch in _QWEN3_OMNI_ARCHITECTURES for arch in architectures):
         return _compute_qwen3_omni_mrope_positions(hf_config, input_ids, mm_items)
 
