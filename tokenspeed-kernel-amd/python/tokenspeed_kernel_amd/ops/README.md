@@ -1162,6 +1162,49 @@ When the grid leaves CUs idle, the launcher splits the KV stream and
 most one wave of CTAs and stream at least four pages each, since every split
 pays a fixed prologue and an FP32 partial store.
 
+### gfx1250 MHA prefill
+
+The kernel computes causal attention over packed sequences with equal or ragged
+lengths. It supports BF16, FP16, and FP8, head dimensions 64 and 128, grouped
+query heads, sliding windows, sinks, and natural-log LSE output.
+
+BF16/FP16 use finite tile and wave-count buckets. Compatible GQA groups pack
+query heads into matrix rows so they share K/V loads. Short sequences use one-
+or two-key-tile schedules with TDM query loads and fused K/V transfers. Short
+eight-wave tiles preserve wave ownership through the output store. Long
+sequences overlap K/V transfers with QK, softmax, and PV through a double
+buffer; selected layouts defer probability reductions to reduce loop work.
+
+Strongly imbalanced ragged batches compact live query tiles onto the grid.
+Partial query tiles remain masked and can use smaller matrices while reusing
+resident K/V. Request counts, uniform lengths, and tail lengths are runtime
+values; changing them within a tile/feature bucket does not recompile kernels.
+The launch policy and its thresholds live in `mha/prefill.py`.
+
+QK and PV accumulate in FP32. The denominator uses probabilities before rounding
+them to the input dtype for PV. Dot products must be finite in FP32. Online
+softmax subtracts the maximum before scaling, preserving large finite scores.
+The fixed-shift schedule changes probability rounding, so its results are
+numerically equivalent within tolerance, rather than bitwise identical.
+
+| Mode | Eligibility | Numerical contract |
+| --- | --- | --- |
+| Online softmax | General path, including FP8 and windows | Keep the maximum in unscaled score units; update it and rescale FP32 state for each key tile. |
+| Single-tile normalization | Short BF16/FP16, D128, 256 query rows, 128 keys, eight waves, no sinks/LSE | Subtract the tile maximum, accumulate the FP32 denominator, then round probabilities for PV. A finite maximum seed gives masked rows zero probability. |
+| Fixed first-tile shift | BF16/FP16, four waves, D64/D128, 64/128-key tiles, no window, at least three key tiles | Keep the first tile's shift. Require an absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. |
+| Online retry | Any valid row fails a fixed-shift guard | Recompute the workgroup with subtract-before-scale online softmax in the same launch and buffers, overwriting provisional output and LSE. |
+
+The shift bound limits cancellation; NaN-propagating reductions detect invalid
+output, and the denominator bound prevents reciprocal underflow. Masked rows do
+not participate in retry decisions. Guards evaluate current tensor values on
+every graph replay; high-range inputs can pay for both passes.
+
+LSE describes key logits and excludes sinks. When both are requested, the kernel
+writes key-only LSE before adding sinks to output normalization with stable
+rescaling. Tests cover this contract with independent FP64 attention, changing
+graph inputs, storage offsets, ragged boundaries, and bounded JIT
+specialization.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
