@@ -33,7 +33,13 @@ if TYPE_CHECKING:
 def is_epd_prefill_node(server_args: ServerArgs, is_multimodal_active: bool) -> bool:
     """Only the embedding stage receives encoder payloads and owns their pool."""
     return (
-        server_args.disaggregation_mode == "prefill"
+        (
+            server_args.disaggregation_mode == "prefill"
+            or (
+                server_args.disaggregation_mode == "null"
+                and server_args.enable_encoder_disaggregation
+            )
+        )
         and is_multimodal_active
         and server_args.mapping.is_first_pp_rank
     )

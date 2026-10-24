@@ -653,7 +653,10 @@ class EventLoop:
         # polling. Its execution face is inside the handle.
         self.kv_transfer = device.transfer
         epd_admission = None
-        if server_args.disaggregation_mode != "null":
+        if (
+            server_args.disaggregation_mode != "null"
+            or server_args.enable_encoder_disaggregation
+        ):
             # EPD: a multimodal prefill node is also the encode->prefill
             # embedding SINK (independent of kv_transfer, its P->D KV source)
             # -- it receives each image's embedding from encode workers over

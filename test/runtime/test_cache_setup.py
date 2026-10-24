@@ -1537,6 +1537,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_encoder_disaggregation=False,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -1655,17 +1656,19 @@ def test_the_admission_builds_the_pool_the_budget_left_out(
 
 
 @pytest.mark.parametrize(
-    "mode, active",
+    "mode, active, external",
     [
-        ("prefill", True),
-        ("prefill", False),
-        ("decode", True),
-        ("null", True),
-        ("encode", True),
+        ("prefill", True, False),
+        ("prefill", False, False),
+        ("decode", True, False),
+        ("null", True, False),
+        ("null", True, True),
+        ("null", False, True),
+        ("encode", True, False),
     ],
 )
 def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
-    monkeypatch, mode, active
+    monkeypatch, mode, active, external
 ) -> None:
     from tokenspeed.runtime.epd import prefill_admission, recv_pool
     from tokenspeed.runtime.epd.mooncake import prefill as mooncake_prefill
@@ -1680,6 +1683,7 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
     )
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_encoder_disaggregation=external,
         disaggregation_bootstrap_port=0,
         disaggregation_ib_device=None,
         mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1), is_first_pp_rank=True),
@@ -1702,7 +1706,9 @@ def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
     )
     left_out = recv_pool.recv_pool_bytes(server_args, active)
     assert sum(registered) == left_out
-    assert (left_out > 0) == (mode == "prefill" and active)
+    assert (left_out > 0) == (
+        (mode == "prefill" or (mode == "null" and external)) and active
+    )
 
 
 if __name__ == "__main__":

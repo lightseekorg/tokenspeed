@@ -892,7 +892,7 @@ def receive_encoded_embeddings(
 def build_prefill_embedding_manager(server_args, global_rank, is_multimodal_active):
     """Stand up the EPD encode->prefill embedding sink, if applicable.
 
-    Only a multimodal *prefill* node receives embeddings from encode workers. Built
+    A multimodal prefill node or explicitly enabled aggregated node receives embeddings. Built
     as one TP group (the embedding transport allows prefill_tp = any multiple of
     encode_tp) with no fixed base buffer (receive buffers are allocated per image
     at receive time). Construction spawns a daemon status thread, so build it
@@ -1155,10 +1155,16 @@ def make_epd_prefill_admission(
 ):
     """Build the EPD-prefill admission controller, or None for non-EPD nodes.
 
-    Returns None unless this is a multimodal *prefill* node (the only node that
-    receives encode->prefill embeddings)."""
+    Returns None unless this is a multimodal prefill node or an aggregated
+    node with encoder disaggregation explicitly enabled."""
     if (
-        server_args.disaggregation_mode != "prefill"
+        not (
+            server_args.disaggregation_mode == "prefill"
+            or (
+                server_args.disaggregation_mode == "null"
+                and server_args.enable_encoder_disaggregation
+            )
+        )
         or not model_config.is_multimodal_active
     ):
         return None
