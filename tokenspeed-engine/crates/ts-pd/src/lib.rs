@@ -32,6 +32,7 @@
 
 mod decode;
 mod http;
+pub mod layout;
 mod net;
 mod prefill;
 mod status;
