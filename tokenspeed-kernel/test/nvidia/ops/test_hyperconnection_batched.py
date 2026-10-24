@@ -26,7 +26,7 @@ import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -135,6 +135,10 @@ def test_batched_default_dispatch_respects_row_limit(
 @pytest.mark.parametrize(
     ("rows", "expected_kernel"),
     [
+        (16, "cute_fused_hyperconnection_mix"),
+        (32, "cute_fused_hyperconnection_mix"),
+        (64, "cute_fused_hyperconnection_mix"),
+        (65, "cute_fused_hyperconnection_mix"),
         (256, "cute_fused_hyperconnection_mix"),
         (257, "triton_hyperconnection_mix"),
         (1024, "triton_hyperconnection_mix"),
@@ -198,6 +202,10 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
         129,
         192,
         193,
+        207,
+        223,
+        224,
+        225,
         255,
         256,
         257,
@@ -237,7 +245,7 @@ def test_batched_fp64_and_changed_input_graph(rows):
                 assert torch.equal(actual, first)
 
 
-@pytest.mark.parametrize("rows", [17, 33, 97, 193, 385, 1024])
+@pytest.mark.parametrize("rows", [17, 32, 33, 64, 97, 193, 224, 225, 256, 385, 1024])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("has_inject", [False, True])
 def test_fp16_optional_inject_and_pdl(rows, enable_pdl, has_inject):
@@ -429,6 +437,68 @@ def test_stream_capacity_selects_worker_key_without_stream_key(monkeypatch):
     assert {workspace_key[2] for workspace_key in cute_fused._WORKSPACES} == {1, 2}
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("has_inject", [False, True])
+def test_mid_batch_replay_with_limited_cluster_capacity(
+    dtype, enable_pdl, has_inject, monkeypatch
+):
+    if current_platform().arch_version != ArchVersion(10, 7):
+        pytest.skip("requires the SM107 medium-tile preference")
+    _reset_caches(monkeypatch)
+    pdl_enabled(enable_pdl)
+    real_capacity = cute_fused._capacity
+
+    def limited_capacity(compiled, kernel, device, stream):
+        # Model a smaller GPU context without requiring a green context in CI.
+        return min(real_capacity(compiled, kernel, device, stream), 36)
+
+    monkeypatch.setattr(cute_fused, "_capacity", limited_capacity)
+    values = [
+        inputs(rows, dtype, has_inject) for rows in (193, 224, 225, 207, 223, 239)
+    ]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for value in values[:3]:
+            mix(value, 0.25, True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        mock.patch.object(
+            cute_fused.cute_ext,
+            "compile",
+            side_effect=AssertionError("warmed fallback must not compile new rows"),
+        ),
+        mock.patch.object(
+            cute_fused,
+            "_capacity",
+            side_effect=AssertionError("capture must reuse the stream capacity"),
+        ),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        outputs = [mix(value, 0.25, True) for value in values[3:]]
+    for factor in (0.75, -0.5):
+        for value in values:
+            value[0].mul_(factor)
+        for output in outputs:
+            for tensor in output:
+                if tensor is not None:
+                    tensor.fill_(float("nan"))
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        atol, rtol = (0.002, 0.008) if dtype == torch.bfloat16 else (0.0005, 0.002)
+        for actual, value in zip(outputs, values[3:]):
+            for tensor, expected in zip(actual, reference(value, 0.25)):
+                if expected is None:
+                    assert tensor is None
+                else:
+                    torch.testing.assert_close(
+                        tensor.cpu().double(), expected, atol=atol, rtol=rtol
+                    )
+
+
 def test_compiled_capacity_guards_cooperative_grid(monkeypatch):
     _reset_caches(monkeypatch)
     values = inputs(33, torch.bfloat16, True)
@@ -490,7 +560,7 @@ def test_exact_override_rejects_unvalidated_row_count():
         (33, 47, 63),
         (97, 111, 127),
         (193, 207, 223),
-        (224, 256),
+        (225, 239, 255),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -590,7 +660,7 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     assert set(cute_fused._WORKSPACES) == workspace_keys
 
 
-@pytest.mark.parametrize("rows", [3, 193, 385, 513, 1023])
+@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 193, 385, 513, 1023])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_tail_preserves_output_guards(rows, dtype):
     values = inputs(rows, dtype, True)

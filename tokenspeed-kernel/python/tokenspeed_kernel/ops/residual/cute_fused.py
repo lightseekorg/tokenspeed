@@ -169,6 +169,10 @@ def _capacity(compiled, kernel, device: torch.device, stream: CUstream):
 def _tactic(rows: int, projection_rows: int):
     # S, M_proj, B_mma, L_proj, L_batch, stages, F_mma. The single
     # parameterized kernel also supports S=1 and cluster-local projection loops.
+    if current_platform().arch_version == ArchVersion(10, 7) and 16 < rows <= 64:
+        # Wider token tiles let each split-K rank process fewer Down tiles.
+        # Above 32 rows, S8 keeps the token groups in one resident round.
+        return 16 if rows <= 32 else 8, 64, 32, 1, 1, 5, 32
     if rows <= 16:
         return 16, 64, 8 if rows <= 8 else 16, 1, 1, 5, 32
     if rows <= 32:
@@ -277,24 +281,6 @@ if _AVAILABLE:
             stream_id = int(torch.cuda.current_stream(normalized.device).cuda_stream)
             stream = CUstream(stream_id)
             enable_pdl = pdl_enabled()
-            tactic = _tactic(rows, projection_rows)
-            split_k, m, n, lp, lb, stages, f = tactic
-            single_tile = rows <= n and lb == 1
-            full_tiles = rows % n == 0
-            # A stream changes available occupancy (for example in a green
-            # context), but it does not change generated code. The final plan
-            # key adds the worker count derived from that occupancy below.
-            static_key = (
-                normalized.device.index,
-                normalized.dtype,
-                tactic,
-                single_tile,
-                full_tiles,
-                projection_rows,
-                enable_pdl,
-                projection_scale,
-                weights_independent,
-            )
 
             def operands_for(kernel):
                 workers = (
@@ -390,24 +376,59 @@ if _AVAILABLE:
                             _PLANS[plan_key] = plan
                 return plan_key, plan
 
-            probe_key, probe = plan_for(1, 1)
-            probe_capacity = capacity_for(probe_key, probe)
-            workers = 1 if single_tile else probe_capacity // probe[0].clusters
-            plan = probe
-            if workers > 1:
-                worker_key, plan = plan_for(workers, 1)
-                capacity_for(worker_key, plan)
-            kernel, compiled = plan
-            rounds = (
-                (rows + n * lb * kernel.workers - 1) // (n * lb * kernel.workers)
-                if kernel.clusters > 1
-                else 1
-            )
-            if rounds > 1:
-                # Bucket by scheduling rounds, not exact rows. Static loop bounds
-                # preserve register reuse across the pipeline's warp roles.
-                round_key, plan = plan_for(kernel.workers, rounds)
-                capacity_for(round_key, plan)
+            fallback = _tactic(rows, projection_rows)
+            tactics = (fallback,)
+            if (
+                current_platform().arch_version == ArchVersion(10, 7)
+                and 192 < rows <= 256
+            ):
+                # Reuse the medium tile while its measured cluster capacity
+                # avoids a second round; smaller contexts keep the wider tile.
+                medium = _tactic(192, projection_rows)
+                if medium != fallback:
+                    tactics = (medium, fallback)
+            for tactic in tactics:
+                split_k, m, n, lp, lb, stages, f = tactic
+                single_tile = rows <= n and lb == 1
+                full_tiles = rows % n == 0
+                # A stream changes available occupancy (for example in a green
+                # context), but it does not change generated code. The final plan
+                # key adds the worker count derived from that occupancy below.
+                static_key = (
+                    normalized.device.index,
+                    normalized.dtype,
+                    tactic,
+                    single_tile,
+                    full_tiles,
+                    projection_rows,
+                    enable_pdl,
+                    projection_scale,
+                    weights_independent,
+                )
+
+                probe_key, probe = plan_for(1, 1)
+                probe_capacity = capacity_for(probe_key, probe)
+                workers = 1 if single_tile else probe_capacity // probe[0].clusters
+                if tactic != fallback and rows > workers * n * lb:
+                    # The narrower projection tile only wins while all token
+                    # groups fit in one resident round on this stream.
+                    continue
+                plan = probe
+                if workers > 1:
+                    worker_key, plan = plan_for(workers, 1)
+                    capacity_for(worker_key, plan)
                 kernel, compiled = plan
-            compiled(*operands_for(kernel), stream)
+                rounds = (
+                    (rows + n * lb * kernel.workers - 1) // (n * lb * kernel.workers)
+                    if kernel.clusters > 1
+                    else 1
+                )
+                if rounds > 1:
+                    # Bucket by scheduling rounds, not exact rows. Static loop bounds
+                    # preserve register reuse across the pipeline's warp roles.
+                    round_key, plan = plan_for(kernel.workers, rounds)
+                    capacity_for(round_key, plan)
+                    kernel, compiled = plan
+                compiled(*operands_for(kernel), stream)
+                break
         return out, inject
