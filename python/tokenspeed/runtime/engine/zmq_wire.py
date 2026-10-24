@@ -8,8 +8,8 @@
 # duplicate wire-struct layer to keep in sync. This module keeps only the
 # transport-level pieces of the contract:
 #
-#   * the single-byte request-type frame (ADD/ABORT/CONTROL) that lets the
-#     receiver dispatch without decoding the payload;
+#   * the single-byte request-type frame (ADD/ABORT/CONTROL/ENCODE) that lets
+#     the receiver dispatch without decoding the payload;
 #   * the control call ``[call_id, method, args]`` behind the CONTROL byte and
 #     the tagged ``ControlReplySlim`` that answers it on the output socket;
 #   * the map-encoded startup-handshake structs (HELLO/INIT/READY plus the
@@ -25,6 +25,7 @@ from tokenspeed.runtime.engine.io_struct import (
     MsgpackDecoder,
     TokenizedGenerateReqInput,
 )
+from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 
 # Single-byte request-type frame: sent as a raw ZMQ frame ahead of the msgpack
 # payload so the receiver can dispatch without decoding first.
@@ -37,6 +38,20 @@ REQ_TYPE_ABORT = b"\x01"
 # the ones the frontend already speaks to its SGLang plugin, so one encoder and
 # one reply reader drive either scheduler.
 REQ_TYPE_CONTROL = b"\x02"
+# An encode request for the EPD encode role: the payload is the tagged
+# positional ``EncodeRequest`` (``runtime/epd/encode_worker.py``) with its
+# items' tensors as ext-encoded buffers or aux frames, exactly as an ADD's
+# multimodal payload rides. No reply: the embedding reaches the prefill peer
+# over the transfer engine.
+REQ_TYPE_ENCODE = b"\x03"
+
+# The request types by name, as an engine role lists the ones it serves in its
+# ready response (``WireEngineCoreReadyResponse.request_types``) and as the
+# transport tells a decoded request apart (``request_kind``).
+REQUEST_KIND_ADD = "add"
+REQUEST_KIND_ABORT = "abort"
+REQUEST_KIND_CONTROL = "control"
+REQUEST_KIND_ENCODE = "encode"
 
 # The rid of the scheduler request a control call becomes: the frontend's call
 # id behind a prefix no generate request uses, so the request's output is
@@ -108,10 +123,16 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     kv_cache_max_concurrency: float | None = None
     kv_events_config: dict | None = None
     # The field order of the positional (``array_like``) structs this engine
-    # emits on the output socket, by tag: the frontend reads here whether the
-    # wire answers control calls or carries an appended output column, with
-    # no version string to compare. Empty from an engine that predates it.
+    # can emit on the output socket, by tag: the frontend checks its decoders
+    # here (the control reply's tuple, an appended output column) with no
+    # version string to compare. Empty from an engine that predates it.
     positional_layouts: dict[str, list[str]] = {}
+    # The request types this engine role serves (``REQUEST_KIND_*``), the
+    # signal for what a connection takes, control calls included: the
+    # scheduler loop lists add, abort and control, the EPD encode loop lists
+    # encode. Empty from an engine that predates it, which serves add and
+    # abort (and control when ``positional_layouts`` names the reply).
+    request_types: list[str] = []
 
 
 # ----------------------------------------------------------------------------
@@ -167,6 +188,19 @@ def control_call_id(rid: object) -> int | None:
         return None
 
 
+def request_kind(request: object) -> str:
+    """The request type (``REQUEST_KIND_*``) a decoded request belongs to."""
+    if isinstance(request, TokenizedGenerateReqInput):
+        return REQUEST_KIND_ADD
+    if isinstance(request, AbortReq):
+        return REQUEST_KIND_ABORT
+    if isinstance(request, ControlCall):
+        return REQUEST_KIND_CONTROL
+    if isinstance(request, EncodeRequest):
+        return REQUEST_KIND_ENCODE
+    raise TypeError(f"not a request of the msgpack wire: {type(request).__name__}")
+
+
 def wire_tag(struct_type: type[msgspec.Struct]) -> str:
     """The tag string a tagged positional struct carries at element 0."""
     return struct_type.__struct_config__.tag
@@ -183,6 +217,7 @@ _DEC_CONTROL = msgspec.msgpack.Decoder(tuple[int, str, list])
 _DEC_INIT = msgspec.msgpack.Decoder(WireHandshakeInitMessage)
 # Native tagged request decode, tensor/aux-frame aware for multimodal payloads.
 _DEC_ADD = MsgpackDecoder(TokenizedGenerateReqInput)
+_DEC_ENCODE = MsgpackDecoder(EncodeRequest)
 
 
 # SMG decodes the ready response's dtype into a fixed enum of these strings, so
@@ -272,9 +307,10 @@ def decode_request_frames(frames: list[bytes]) -> list:
     """Decode a ``[type_byte, payload, *aux]`` request into io_structs.
 
     Returns a list because a single ABORT frame may carry several request ids;
-    an ADD always yields exactly one ``TokenizedGenerateReqInput`` and a
-    CONTROL exactly one ``ControlCall``. ADD aux frames hold out-of-band tensor
-    buffers (frame indices are relative to the payload, which is buffer 0).
+    an ADD always yields exactly one ``TokenizedGenerateReqInput``, a CONTROL
+    exactly one ``ControlCall`` and an ENCODE exactly one ``EncodeRequest``.
+    ADD and ENCODE aux frames hold out-of-band tensor buffers (frame indices
+    are relative to the payload, which is buffer 0).
     """
     if len(frames) < 2:
         raise ValueError(
@@ -289,4 +325,6 @@ def decode_request_frames(frames: list[bytes]) -> list:
         return [AbortReq(rid=rid) for rid in decode_abort(frames[1])]
     if type_byte == REQ_TYPE_CONTROL:
         return [decode_control(frames[1])]
+    if type_byte == REQ_TYPE_ENCODE:
+        return [_DEC_ENCODE.decode(frames[1:])]
     raise ValueError(f"unknown msgpack request type byte: {type_byte!r}")

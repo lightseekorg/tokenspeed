@@ -24,7 +24,7 @@ import logging
 import math
 import struct
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import msgspec
 import zmq
@@ -71,13 +71,37 @@ FLUSH_RETRY_INTERVAL_S = 0.05
 FLUSH_RETIRE_GRACE_S = 2.0
 
 # The positional structs the send adapter emits, by tag, declared in the
-# engine's ready response (``positional_layouts``) so the frontend learns from
-# the handshake that this wire answers control calls and which columns its
-# output batches carry.
+# engine's ready response (``positional_layouts``) so the frontend checks its
+# decoders against them: the control reply on every role (a stray call is
+# answered as not served even where none is served), the output batch where
+# generate requests are served (``emitted_layouts``).
 OUTPUT_LAYOUTS: dict[str, list[str]] = {
     zmq_wire.wire_tag(struct): zmq_wire.positional_layout(struct)
     for struct in (BatchTokenIDOutSlim, zmq_wire.ControlReplySlim)
 }
+
+
+def emitted_layouts(request_types: Sequence[str]) -> dict[str, list[str]]:
+    """The entries of ``OUTPUT_LAYOUTS`` a role serving ``request_types`` can
+    emit on its output socket."""
+    emitted = {zmq_wire.wire_tag(zmq_wire.ControlReplySlim)}
+    if zmq_wire.REQUEST_KIND_ADD in request_types:
+        emitted.add(zmq_wire.wire_tag(BatchTokenIDOutSlim))
+    return {tag: layout for tag, layout in OUTPUT_LAYOUTS.items() if tag in emitted}
+
+
+# The request types each engine role serves, declared in its ready response
+# (``request_types``, the frontend's signal for what a connection takes,
+# control calls included) and enforced by its receive adapter: the scheduler
+# loop takes generate, abort and control requests; the EPD encode loop takes
+# encode requests only (it answers a control call as not served, so the
+# caller does not wait out its timeout, and drops the rest).
+SCHEDULER_REQUEST_TYPES: tuple[str, ...] = (
+    zmq_wire.REQUEST_KIND_ADD,
+    zmq_wire.REQUEST_KIND_ABORT,
+    zmq_wire.REQUEST_KIND_CONTROL,
+)
+ENCODE_REQUEST_TYPES: tuple[str, ...] = (zmq_wire.REQUEST_KIND_ENCODE,)
 
 
 class ControlCallError(ValueError):
@@ -330,6 +354,11 @@ class MsgpackRecvSocket:
     ``control`` (shared with the send adapter, which answers the request's
     output under the call id); a call this side cannot place is answered as
     refused rather than dropped.
+
+    ``request_types`` names the request kinds this engine role serves (the
+    ones its ready response declares): a request of another kind is dropped
+    with a warning instead of reaching a loop that has no handler for it, and
+    a control call to a role that serves none is answered as not served.
     """
 
     def __init__(
@@ -341,6 +370,7 @@ class MsgpackRecvSocket:
         supports_prompt_logprobs: bool,
         top_logprobs_unservable: str | None,
         control: ControlCalls,
+        request_types: Sequence[str],
     ) -> None:
         self._socket = socket
         self._vocab_size = vocab_size
@@ -348,6 +378,7 @@ class MsgpackRecvSocket:
         self._supports_prompt_logprobs = supports_prompt_logprobs
         self._top_logprobs_unservable = top_logprobs_unservable
         self._control = control
+        self._request_types = frozenset(request_types)
         self._pending: collections.deque = collections.deque()
 
     def _validation_error(self, obj: TokenizedGenerateReqInput) -> str | None:
@@ -430,6 +461,20 @@ class MsgpackRecvSocket:
                 )
                 continue
             for obj in decoded:
+                kind = zmq_wire.request_kind(obj)
+                if kind not in self._request_types:
+                    if isinstance(obj, zmq_wire.ControlCall):
+                        self._control.refuse(
+                            obj.call_id,
+                            f"{obj.method}: control calls are not served on this "
+                            "engine role",
+                        )
+                    else:
+                        logger.warning(
+                            f"msgpack input: dropping a request of kind {kind!s}, "
+                            "which this engine role does not serve",
+                        )
+                    continue
                 if isinstance(obj, zmq_wire.ControlCall):
                     try:
                         self._pending.extend(self._control.requests_for(obj))
@@ -585,6 +630,7 @@ def connect_msgpack_engine(
     enable_output_logprobs: bool,
     supports_prompt_logprobs: bool,
     top_logprobs_unservable: str | None,
+    request_types: Sequence[str],
 ) -> tuple[MsgpackRecvSocket, MsgpackSendSocket]:
     """Run the startup handshake against SMG and return the wrapped
     data-plane sockets.
@@ -596,14 +642,19 @@ def connect_msgpack_engine(
       2. recv INIT -> learn SMG's input/output addresses.
       3. READY on the handshake DEALER.
       4. connect the input DEALER, register with the ready response, which
-         declares the output structs this transport emits (``OUTPUT_LAYOUTS``)
-         beside the caller's own entries.
+         declares the request types this role serves (``request_types``) and
+         the output structs this transport can emit for them
+         (``emitted_layouts``) beside the caller's own entries.
       5. connect the output PUSH.
     """
     identity = _engine_identity(engine_index)
     ready_response = msgspec.structs.replace(
         ready_response,
-        positional_layouts={**OUTPUT_LAYOUTS, **ready_response.positional_layouts},
+        positional_layouts={
+            **emitted_layouts(request_types),
+            **ready_response.positional_layouts,
+        },
+        request_types=list(request_types),
     )
 
     handshake = context.socket(zmq.DEALER)
@@ -655,6 +706,7 @@ def connect_msgpack_engine(
             supports_prompt_logprobs=supports_prompt_logprobs,
             top_logprobs_unservable=top_logprobs_unservable,
             control=control,
+            request_types=request_types,
         ),
         MsgpackSendSocket(output_socket, engine_index=engine_index, control=control),
     )
@@ -718,4 +770,5 @@ def connect_msgpack_engine_for_loop(
         enable_output_logprobs=server_args.enable_output_logprobs,
         supports_prompt_logprobs=loop.supports_prompt_logprobs,
         top_logprobs_unservable=top_logprobs_launch_refusal(server_args),
+        request_types=SCHEDULER_REQUEST_TYPES,
     )

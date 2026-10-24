@@ -28,13 +28,17 @@ frontend (ROUTER handshake/input + PULL output), with no model or GPU.
 
 from __future__ import annotations
 
+import gc
+import logging
 import struct
 import tempfile
 import threading
+import weakref
 from pathlib import Path
 
 import msgspec
 import pytest
+import torch
 import zmq
 
 from tokenspeed.runtime.engine import load_snapshot as load_snapshot_module
@@ -52,6 +56,8 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedGenerateReqInput,
 )
 from tokenspeed.runtime.engine.request_types import FINISH_ABORT, FINISH_LENGTH
+from tokenspeed.runtime.epd.encode_worker import EncodeRequest
+from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 _ENCODER = MsgpackEncoder()
@@ -478,6 +484,7 @@ def test_recv_socket_aborts_request_with_invalid_sampling_params():
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
 
     io_bad = recv.recv_pyobj()
@@ -513,6 +520,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     io = recv_off.recv_pyobj()
     assert io.rid == "r1"
@@ -525,6 +533,7 @@ def test_recv_socket_aborts_logprob_request_when_gate_is_off():
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     io = recv_on.recv_pyobj()
     assert io.validation_error is None
@@ -555,6 +564,7 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     io = recv.recv_pyobj()
     assert io.validation_error and needle in io.validation_error
@@ -567,6 +577,7 @@ def test_recv_socket_mirrors_the_sglang_logprob_gate(overrides, needle):
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     assert recv.recv_pyobj().validation_error is None
 
@@ -600,6 +611,7 @@ def test_recv_socket_takes_top_logprobs_under_the_engines_rules():
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     for rid in ("echo", "score"):
         io = recv.recv_pyobj()
@@ -642,6 +654,7 @@ def test_recv_socket_refuses_top_logprobs_the_launch_cannot_compute():
         supports_prompt_logprobs=True,
         top_logprobs_unservable=reason,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     assert recv.recv_pyobj().validation_error == reason
     assert "max_new_tokens set to 0 or 1" in recv.recv_pyobj().validation_error
@@ -680,6 +693,7 @@ def test_recv_socket_names_the_engine_capability_before_the_wire_limit():
         supports_prompt_logprobs=False,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     io = recv.recv_pyobj()
     assert io.validation_error and "not supported by this engine" in io.validation_error
@@ -699,6 +713,7 @@ def test_recv_socket_drops_malformed_message_and_keeps_draining():
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     io = recv.recv_pyobj()
     assert io.rid == "good"
@@ -715,6 +730,7 @@ def test_recv_socket_verify_does_not_apply_to_abort():
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=zmq_msgpack.ControlCalls(),
+        request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
     )
     a1 = recv.recv_pyobj()
     a2 = recv.recv_pyobj()
@@ -891,7 +907,10 @@ def _control_frames(call_id: int, method: str, args: list) -> list[bytes]:
 
 
 def _control_pair(
-    messages: list[list[bytes]], clock: _Clock | None = None, engine_index: int = 0
+    messages: list[list[bytes]],
+    clock: _Clock | None = None,
+    engine_index: int = 0,
+    request_types: tuple[str, ...] = zmq_msgpack.SCHEDULER_REQUEST_TYPES,
 ):
     """A receive/send adapter pair over fake sockets sharing one call table,
     as ``connect_msgpack_engine`` builds them."""
@@ -903,6 +922,7 @@ def _control_pair(
         supports_prompt_logprobs=True,
         top_logprobs_unservable=None,
         control=control,
+        request_types=request_types,
     )
     out = _FakeOutputSocket()
     send = zmq_msgpack.MsgpackSendSocket(
@@ -1170,6 +1190,184 @@ def test_control_outputs_of_no_call_are_not_answered():
 
 
 # --------------------------------------------------------------------------
+# Encode requests (the EPD encode role) and the per-role request-type filter
+# --------------------------------------------------------------------------
+
+
+def _encode_request(request_id: str, feature: torch.Tensor) -> EncodeRequest:
+    return EncodeRequest(
+        request_id=request_id,
+        bootstrap_host="h",
+        bootstrap_port=1,
+        bootstrap_room=7,
+        items=[
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                hash=5,
+                pad_value=9,
+                offsets=[(3, 8)],
+                feature=feature,
+                model_specific_data={"image_grid_thw": torch.tensor([[1, 2, 2]])},
+            )
+        ],
+    )
+
+
+def _encode_frames(req: EncodeRequest) -> list[bytes]:
+    return [zmq_wire.REQ_TYPE_ENCODE, *MsgpackEncoder().encode(req)]
+
+
+@pytest.mark.parametrize(
+    ("feature", "frame_count"),
+    [
+        # 16 bytes: the tensor rides inline in the payload.
+        (torch.arange(4, dtype=torch.float32).reshape(2, 2), 1),
+        # 512 bytes: above the zero-copy threshold, an out-of-band aux frame.
+        (torch.arange(128, dtype=torch.float32).reshape(8, 16), 2),
+    ],
+)
+def test_encode_frames_decode_to_the_encode_request(feature, frame_count):
+    frames = _encode_frames(_encode_request("e1", feature))
+    assert len(frames) == 1 + frame_count
+
+    [req] = zmq_wire.decode_request_frames(frames)
+    assert isinstance(req, EncodeRequest)
+    assert (
+        req.request_id,
+        req.bootstrap_host,
+        req.bootstrap_port,
+        req.bootstrap_room,
+    ) == (
+        "e1",
+        "h",
+        1,
+        7,
+    )
+    [item] = req.items
+    assert item.modality is Modality.IMAGE
+    assert (item.hash, item.pad_value) == (5, 9)
+    assert [tuple(span) for span in item.offsets] == [(3, 8)]
+    assert torch.equal(item.feature, feature)
+    assert torch.equal(
+        item.model_specific_data["image_grid_thw"], torch.tensor([[1, 2, 2]])
+    )
+
+
+def test_encode_payload_is_the_tagged_positional_request():
+    """The payload's shape, as a frontend writes it: the tagged array of
+    ``EncodeRequest``'s fields, its items the tagged arrays of
+    ``MultimodalDataItem``'s, tensors as the encoder's ext buffers."""
+    frames = _encode_frames(
+        _encode_request("e1", torch.arange(4, dtype=torch.float32).reshape(2, 2))
+    )
+    raw = msgspec.msgpack.decode(frames[1])
+    assert raw[:7] == ["EncodeRequest", None, None, "e1", "h", 1, 7]
+    assert zmq_wire.positional_layout(EncodeRequest) == [
+        "rid",
+        "http_worker_ipc",
+        "request_id",
+        "bootstrap_host",
+        "bootstrap_port",
+        "bootstrap_room",
+        "items",
+    ]
+    [item] = raw[7]
+    assert item[:4] == [Modality.IMAGE.value, 5, 9, [[3, 8]]]
+    assert zmq_wire.positional_layout(MultimodalDataItem) == [
+        "modality",
+        "hash",
+        "pad_value",
+        "offsets",
+        "feature",
+        "feature_shm",
+        "model_specific_data",
+        "encoded",
+        "encoded_deepstack",
+        "encode_handshake",
+    ]
+
+
+def test_emitted_layouts_follow_the_served_request_types():
+    scheduler = zmq_msgpack.emitted_layouts(zmq_msgpack.SCHEDULER_REQUEST_TYPES)
+    assert set(scheduler) == {"BatchTokenIDOutSlim", "ControlReplySlim"}
+    assert scheduler == zmq_msgpack.OUTPUT_LAYOUTS
+    encode = zmq_msgpack.emitted_layouts(zmq_msgpack.ENCODE_REQUEST_TYPES)
+    assert encode == {
+        "ControlReplySlim": zmq_msgpack.OUTPUT_LAYOUTS["ControlReplySlim"]
+    }
+
+
+def test_request_kind_names_every_wire_request():
+    assert zmq_wire.request_kind(_make_request(rid="r1")) == "add"
+    assert zmq_wire.request_kind(AbortReq(rid="r1")) == "abort"
+    assert (
+        zmq_wire.request_kind(
+            zmq_wire.ControlCall(call_id=1, method="flush_cache", args=[])
+        )
+        == "control"
+    )
+    assert (
+        zmq_wire.request_kind(
+            _encode_request("e1", torch.arange(4, dtype=torch.float32).reshape(2, 2))
+        )
+        == "encode"
+    )
+    with pytest.raises(TypeError):
+        zmq_wire.request_kind(FlushCacheReqInput())
+    assert zmq_wire.WireEngineCoreReadyResponse().request_types == []
+    assert zmq_msgpack.SCHEDULER_REQUEST_TYPES == ("add", "abort", "control")
+    assert zmq_msgpack.ENCODE_REQUEST_TYPES == ("encode",)
+
+
+def test_encode_role_serves_encode_requests_only(caplog):
+    # A generate request has no handler on the encode loop: dropped, loudly. A
+    # control call is answered as not served, so the caller does not wait out
+    # its timeout. The encode request is the one that flows.
+    feature = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+    recv, send, out = _control_pair(
+        [
+            _add_frames("r1", SamplingParams()),
+            _control_frames(7, "flush_cache", [1.0]),
+            _encode_frames(_encode_request("e1", feature)),
+        ],
+        engine_index=2,
+        request_types=zmq_msgpack.ENCODE_REQUEST_TYPES,
+    )
+    with caplog.at_level(logging.WARNING):
+        req = recv.recv_pyobj()
+    assert isinstance(req, EncodeRequest) and req.request_id == "e1"
+    assert torch.equal(req.items[0].feature, feature)
+    assert "dropping a request of kind add" in caplog.text
+    [reply] = _control_replies(out)
+    assert (reply.call_id, reply.success, reply.engine_index) == (7, False, 2)
+    assert reply.message == (
+        "flush_cache: control calls are not served on this engine role"
+    )
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+
+
+def test_scheduler_role_drops_an_encode_request(caplog):
+    recv, send, out = _control_pair(
+        [
+            _encode_frames(
+                _encode_request(
+                    "e1", torch.arange(4, dtype=torch.float32).reshape(2, 2)
+                )
+            ),
+            _add_frames("r1", SamplingParams()),
+        ]
+    )
+    with caplog.at_level(logging.WARNING):
+        io = recv.recv_pyobj()
+    assert isinstance(io, TokenizedGenerateReqInput) and io.rid == "r1"
+    assert "dropping a request of kind encode" in caplog.text
+    assert out.sent == []
+    with pytest.raises(zmq.Again):
+        recv.recv_pyobj(zmq.NOBLOCK)
+
+
+# --------------------------------------------------------------------------
 # Transport loopback (engine CONNECTs; frontend BINDs)
 # --------------------------------------------------------------------------
 
@@ -1178,10 +1376,16 @@ class _FakeSmgFrontend:
     """Hand-rolled frontend side: binds handshake/input ROUTERs + output PULL
     and drives HELLO -> INIT -> READY -> input registration."""
 
-    def __init__(self, ctx: zmq.Context, base: Path) -> None:
+    def __init__(self, ctx: zmq.Context, base: Path, *, tcp_handshake: bool) -> None:
         self.handshake = ctx.socket(zmq.ROUTER)
-        self.handshake_addr = f"ipc://{base / 'handshake.sock'}"
-        self.handshake.bind(self.handshake_addr)
+        if tcp_handshake:
+            # The encode loop dials ``--data-parallel-address:--data-parallel-rpc-port``.
+            self.handshake_port = self.handshake.bind_to_random_port("tcp://127.0.0.1")
+            self.handshake_addr = f"tcp://127.0.0.1:{self.handshake_port:d}"
+        else:
+            self.handshake_port = None
+            self.handshake_addr = f"ipc://{base / 'handshake.sock'}"
+            self.handshake.bind(self.handshake_addr)
 
         self.input = ctx.socket(zmq.ROUTER)
         self.input_addr = f"ipc://{base / 'input.sock'}"
@@ -1234,6 +1438,10 @@ class _FakeSmgFrontend:
             ]
         )
 
+    def send_encode(self, req: EncodeRequest) -> None:
+        frames = self._encoder.encode(req)
+        self.input.send_multipart([self.engine_id, zmq_wire.REQ_TYPE_ENCODE, *frames])
+
     def recv_output(self) -> BatchTokenIDOutSlim:
         assert self.output.poll(10_000, zmq.POLLIN), "no output from engine"
         frames = self.output.recv_multipart()
@@ -1253,7 +1461,7 @@ def test_connect_and_data_plane_roundtrip():
     ctx = zmq.Context()
     tmp = tempfile.TemporaryDirectory()
     base = Path(tmp.name)
-    frontend = _FakeSmgFrontend(ctx, base)
+    frontend = _FakeSmgFrontend(ctx, base, tcp_handshake=False)
 
     engine_holder: dict = {}
     error_holder: dict = {}
@@ -1271,6 +1479,7 @@ def test_connect_and_data_plane_roundtrip():
                 enable_output_logprobs=False,
                 supports_prompt_logprobs=True,
                 top_logprobs_unservable=None,
+                request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
             )
             engine_holder["recv"] = recv
             engine_holder["send"] = send
@@ -1299,6 +1508,8 @@ def test_connect_and_data_plane_roundtrip():
             "engine_index",
         ]
         assert layouts["BatchTokenIDOutSlim"][:2] == ["rids", "output_ids"]
+        # ... and the request types this role serves.
+        assert frontend.ready_response["request_types"] == ["add", "abort", "control"]
 
         # ADD -> the engine decodes a TokenizedGenerateReqInput.
         sp = SamplingParams(temperature=0.5, max_new_tokens=8)
@@ -1361,7 +1572,7 @@ def test_two_dp_ranks_connect_with_distinct_identities():
     their producing rank in the batch (the PULL side has no identity)."""
     ctx = zmq.Context()
     tmp = tempfile.TemporaryDirectory()
-    frontend = _FakeSmgFrontend(ctx, Path(tmp.name))
+    frontend = _FakeSmgFrontend(ctx, Path(tmp.name), tcp_handshake=False)
 
     engines: dict[int, tuple] = {}
     errors: dict[int, Exception] = {}
@@ -1383,6 +1594,7 @@ def test_two_dp_ranks_connect_with_distinct_identities():
                 enable_output_logprobs=False,
                 supports_prompt_logprobs=True,
                 top_logprobs_unservable=None,
+                request_types=zmq_msgpack.SCHEDULER_REQUEST_TYPES,
             )
         except Exception as exc:
             errors[index] = exc
@@ -1439,6 +1651,97 @@ def test_two_dp_ranks_connect_with_distinct_identities():
         for recv, send in engines.values():
             recv.close()
             send.close()
+        frontend.close()
+        ctx.term()
+        tmp.cleanup()
+
+
+def test_encode_loop_dials_the_frontend_and_takes_encode_requests():
+    """The EPD encode role under ``--zmq-msgpack``: the loop's ``connect_frontend``
+    runs the scheduler's handshake with the encode role's ready response, and
+    the resulting receiver takes encode requests (tensor frames included),
+    drops a generate request and answers a control call as not served, with
+    the send adapter held by nothing but the receiver, as the loop holds it."""
+    from tokenspeed.runtime.epd import encode_loop
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    ctx = zmq.Context()
+    tmp = tempfile.TemporaryDirectory()
+    base = Path(tmp.name)
+    frontend = _FakeSmgFrontend(ctx, base, tcp_handshake=True)
+    server_args = ServerArgs(
+        model="x",
+        zmq_msgpack=True,
+        zmq_engine_index=3,
+        data_parallel_rpc_port=frontend.handshake_port,
+    )
+
+    engine_holder: dict = {}
+    error_holder: dict = {}
+
+    def _engine():
+        try:
+            recv, send = encode_loop.connect_frontend(
+                server_args,
+                ctx,
+                context_len=4096,
+                dtype=torch.bfloat16,
+                vocab_size=32000,
+                multimodal_encoder_dtype="bfloat16",
+                attn_tp_size=1,
+            )
+            engine_holder["recv"] = recv
+            engine_holder["send"] = weakref.ref(send)
+        except Exception as exc:  # surface into the test thread
+            error_holder["err"] = exc
+
+    engine_thread = threading.Thread(target=_engine)
+    engine_thread.start()
+    frontend.run_handshake()
+    engine_thread.join(timeout=15)
+    assert not error_holder, error_holder.get("err")
+    assert "recv" in engine_holder, "encode role handshake did not complete"
+
+    recv = engine_holder["recv"]
+    # The loop keeps the receiver only; the sender lives on through the
+    # receiver's call table, which is what answers the control call below.
+    gc.collect()
+    send = engine_holder["send"]()
+    assert send is not None
+    try:
+        assert frontend.engine_id == struct.pack("<H", 3)
+        ready = frontend.ready_response
+        assert ready["request_types"] == ["encode"]
+        # No generate requests served here, so no output batches are
+        # declared; the control reply is, since a stray call is answered.
+        assert ready["positional_layouts"] == {
+            "ControlReplySlim": ["call_id", "success", "message", "engine_index"]
+        }
+        assert ready["num_gpu_blocks"] == 0
+        assert (ready["max_model_len"], ready["dtype"]) == (4096, "bfloat16")
+        assert ready["multimodal_encoder_dtype"] == "bfloat16"
+        assert ready["vllm_version"].startswith("tokenspeed-")
+        assert ready["max_num_seqs"] == server_args.max_num_seqs
+        assert ready["max_num_batched_tokens"] == server_args.chunked_prefill_size
+        assert ready["instance_id"] == "x"
+
+        frontend.send_control(7, "flush_cache", [1.0])
+        frontend.send_add(_make_request(rid="req-1", input_ids=[5, 6, 7]))
+        feature = torch.arange(128, dtype=torch.float32).reshape(8, 16)
+        frontend.send_encode(_encode_request("e1", feature))
+
+        req = recv.recv_pyobj()
+        assert isinstance(req, EncodeRequest)
+        assert (req.request_id, req.bootstrap_room) == ("e1", 7)
+        assert torch.equal(req.items[0].feature, feature)
+        reply = frontend.recv_control_reply()
+        assert (reply.call_id, reply.success, reply.engine_index) == (7, False, 3)
+        assert "not served" in reply.message
+        with pytest.raises(zmq.Again):
+            recv.recv_pyobj(zmq.NOBLOCK)
+    finally:
+        recv.close()
+        send.close()
         frontend.close()
         ctx.term()
         tmp.cleanup()
