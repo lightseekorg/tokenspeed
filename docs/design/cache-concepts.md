@@ -1080,7 +1080,11 @@ the next request-reclaimable candidate using one policy: LRU access epoch,
 then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Finally, walk the selected blocks in
 reverse and restore every block that is not strictly required, yielding a
-minimal eviction set in `victims`.
+minimal eviction set in `victims`. The shadow occupancy is a class of its own
+(`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
+empty parents, the occupants left in each parent a victim leaves — with the
+pool's own fit formula, so a planner on any pool the coordinator registered
+its groups in tries victims the same way.
 
 Each cache group uses a non-owning cursor over its tier's eviction index.
 It advances continuously, skips fully pinned epochs, and returns complete

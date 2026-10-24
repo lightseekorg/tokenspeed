@@ -21,6 +21,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 
 #include "cache/coordinator/group_geometry.h"
+#include "cache/coordinator/shadow_occupancy.h"
 
 #include <algorithm>
 #include <array>
@@ -28,7 +29,6 @@
 #include <optional>
 #include <span>
 #include <tuple>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -91,7 +91,7 @@ public:
           shapes_{shapes},
           claimed_{claimed},
           victims_{victims},
-          local_free_slots_by_bucket_(groups.size()),
+          shadow_{pool, groups},
           shape_need_(groups.size()),
           blocks_needed_(groups.size()) {}
 
@@ -101,17 +101,17 @@ public:
 
         // Existing local holes plus empty parents are the zero-eviction
         // capacity. Do not discard cache merely to make placement denser.
-        if (fits()) {
+        if (shadow_.Fits(shape_need_, blocks_needed_)) {
             return true;
         }
 
         collectCandidates();
-        while (!fits()) {
+        while (!shadow_.Fits(shape_need_, blocks_needed_)) {
             const std::optional<VictimCandidate> candidate = nextVictimCandidate();
             if (!candidate) {
                 return false;
             }
-            removeOccupant(candidate->group_id, candidate->location);
+            shadow_.Remove(candidate->group_id, candidate->location);
             victims_.emplace_back(candidate->group_id, candidate->location);
         }
 
@@ -121,9 +121,9 @@ public:
         required_victims.reserve(victims_.size());
         for (std::size_t i = victims_.size(); i > 0; --i) {
             const auto& [group_id, location] = victims_[i - 1];
-            restoreOccupant(group_id, location);
-            if (!fits()) {
-                removeOccupant(group_id, location);
+            shadow_.Restore(group_id, location);
+            if (!shadow_.Fits(shape_need_, blocks_needed_)) {
+                shadow_.Remove(group_id, location);
                 required_victims.emplace_back(group_id, location);
             }
         }
@@ -211,13 +211,7 @@ private:
                 }
                 shape_need_[i] = shapes_[i].blocks_by_bucket;
             }
-            const std::span<const std::int64_t> holes = pool_.FreeSlotsByBucket(static_cast<std::uint32_t>(i));
-            local_free_slots_by_bucket_[i].assign(holes.begin(), holes.end());
-            if (local_free_slots_by_bucket_[i].empty()) {
-                local_free_slots_by_bucket_[i].assign(buckets, 0);  // never allocated: no bound parent
-            }
         }
-        empty_parent_count_ = pool_.NumEmptyLcmBlocks();
     }
 
     // Blocks a tail costs this group beyond the growth demand. A table never
@@ -546,70 +540,6 @@ private:
         return candidate;
     }
 
-    // Shadow holes follow the pool's own bookkeeping: a parent whose last
-    // occupant leaves takes its holes with it into the empty FIFO, and every
-    // bucket owned packing / shard_count of them.
-    void removeOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        _assert(pool_.BoundGroup(location.lcm_block_id) == group_id,
-                "released admission location belongs to another group");
-        auto it =
-            remaining_occupied_.try_emplace(location.lcm_block_id, pool_.OccupiedCount(location.lcm_block_id)).first;
-        std::int32_t& occupied = it->second;
-        _assert(occupied > 0, "admission released the same location twice");
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        std::vector<std::int64_t>& holes = local_free_slots_by_bucket_[group_id];
-        const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
-        if (occupied == 1) {
-            const std::int64_t per_bucket = allocator.CacheBlocksPerLcmBlock() / allocator.ShardCount();
-            for (std::int64_t& bucket_holes : holes) {
-                bucket_holes -= per_bucket;
-            }
-            ++holes[bucket];
-            occupied = 0;
-            ++empty_parent_count_;
-        } else {
-            --occupied;
-            ++holes[bucket];
-        }
-    }
-
-    void restoreOccupant(std::uint32_t group_id, CacheBlockLocation location) {
-        auto it = remaining_occupied_.find(location.lcm_block_id);
-        _assert(it != remaining_occupied_.end(), "restored admission victim has no shadow occupancy");
-        std::int32_t& occupied = it->second;
-        const GroupAllocator& allocator = groups_[group_id].Allocator();
-        const std::int32_t slots = allocator.CacheBlocksPerLcmBlock();
-        std::vector<std::int64_t>& holes = local_free_slots_by_bucket_[group_id];
-        const auto bucket = static_cast<std::size_t>(allocator.BucketOf(location));
-        if (occupied == 0) {
-            _assert(empty_parent_count_ > 0, "restoring an admission victim underflowed empty parents");
-            --empty_parent_count_;
-            occupied = 1;
-            const std::int64_t per_bucket = slots / allocator.ShardCount();
-            for (std::int64_t& bucket_holes : holes) {
-                bucket_holes += per_bucket;
-            }
-            --holes[bucket];
-        } else {
-            _assert(occupied < slots, "restoring an admission victim overflowed its parent");
-            ++occupied;
-            --holes[bucket];
-        }
-    }
-
-    // One fit formula for both transactions: the bucket-constrained demand
-    // shares the parents it opens, the dense demand takes any hole, and an
-    // admission with no bucket demand reduces to holes plus parents times
-    // packing.
-    bool fits() const {
-        std::int64_t parents_needed = 0;
-        for (std::size_t i = 0; i < groups_.size(); ++i) {
-            parents_needed += ParentsNeededForBuckets(shape_need_[i], local_free_slots_by_bucket_[i], blocks_needed_[i],
-                                                      groups_[i].Allocator().CacheBlocksPerLcmBlock());
-        }
-        return parents_needed <= empty_parent_count_;
-    }
-
     // The coordinator planned for, read through its public views
     // (ForEachBoundaryKey); groups_, geometry_ and the pools are its own.
     const CacheCoordinator& coordinator_;
@@ -629,17 +559,16 @@ private:
     // from eviction like the probe's prefix hits.
     std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed_;
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>>& victims_;
-    std::unordered_map<std::int32_t, std::int32_t> remaining_occupied_;
-    // Per group: holes per bucket in bound parents, the bucket-constrained
-    // blocks (a restore's rebuilt slots; an admission's Host-hit destinations
-    // and tail copies), and the dense blocks wanted in any bucket.
-    std::vector<std::vector<std::int64_t>> local_free_slots_by_bucket_;
+    // The pool as the tentative victims would leave it.
+    ShadowOccupancy shadow_;
+    // Per group: the bucket-constrained blocks (a restore's rebuilt slots; an
+    // admission's Host-hit destinations and tail copies), and the dense
+    // blocks wanted in any bucket.
     std::vector<std::vector<std::int64_t>> shape_need_;
     std::vector<std::int64_t> blocks_needed_;
     // Whether an owner's copy-in reads a canonical block in another bucket
     // than its own (collectOwnerCopyBuckets, protectDedupedTail).
     bool owner_copy_changes_bucket_{false};
-    std::int64_t empty_parent_count_{0};
     std::vector<VictimCandidate> request_reclaim_candidates_;
     std::size_t next_request_candidate_index_{0};
     std::vector<CacheGroupVictimCandidates> cache_group_candidates_;
