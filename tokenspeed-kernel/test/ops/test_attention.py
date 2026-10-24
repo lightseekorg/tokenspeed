@@ -517,6 +517,79 @@ def test_mha_decode_with_kvcache(
         torch.testing.assert_close(out.float().cpu(), expected_out, rtol=tol, atol=tol)
 
 
+@pytest.mark.parametrize("batch_size", [1, 64], ids=["one-request", "wide-grid"])
+def test_mha_decode_with_kvcache_triton_windowed_block(
+    device: str, batch_size: int, require
+) -> None:
+    """A block draft's decode: a 9-query causal block over a 2048-key window.
+
+    One request leaves the grid a few programs wide, so the launch splits the
+    window across many programs; a wide batch fills the device and does not
+    split. Both must match the reference.
+    """
+    require("attention", "mha_decode_with_kvcache", "triton", torch.bfloat16, "q")
+    seqlen_q, window_left, page_size, head_dim = 9, 2047, 128, 64
+    num_q_heads, num_kv_heads = 12, 2
+    cache_len = 3001
+    pages_per_seq = (cache_len + page_size - 1) // page_size
+    k_cache = torch.randn(
+        batch_size * pages_per_seq,
+        page_size,
+        num_kv_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    # Pages in reverse order, so a wrong page lookup cannot pass.
+    page_table = (
+        torch.arange(batch_size * pages_per_seq, device=device, dtype=torch.int32)
+        .flip(0)
+        .view(batch_size, pages_per_seq)
+    )
+    cache_seqlens = torch.full(
+        (batch_size,), cache_len, device=device, dtype=torch.int32
+    )
+    q = torch.randn(
+        batch_size * seqlen_q,
+        num_q_heads,
+        head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+
+    out = mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=65536,
+        max_seqlen_q=seqlen_q,
+        window_left=window_left,
+        solution="triton",
+    )
+
+    group = num_q_heads // num_kv_heads
+    for b in range(batch_size):
+        keys = k_cache[page_table[b].long()].reshape(-1, num_kv_heads, head_dim)
+        values = v_cache[page_table[b].long()].reshape(-1, num_kv_heads, head_dim)
+        for i in range(seqlen_q):
+            # Query i sees the keys before its own position, inclusive.
+            end = cache_len - (seqlen_q - 1 - i)
+            start = max(0, end - (window_left + 1))
+            k_i = keys[start:end].float().repeat_interleave(group, dim=1)
+            v_i = values[start:end].float().repeat_interleave(group, dim=1)
+            row = q[b * seqlen_q + i].float()
+            probs = torch.softmax(
+                torch.einsum("hd,nhd->hn", row, k_i) / math.sqrt(head_dim), dim=-1
+            )
+            expected = torch.einsum("hn,nhd->hd", probs, v_i)
+            torch.testing.assert_close(
+                out[b * seqlen_q + i].float(), expected, rtol=1e-2, atol=1e-2
+            )
+
+
 @pytest.mark.parametrize(
     "cache_seqlen,adversarial_inputs",
     [

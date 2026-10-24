@@ -10,6 +10,7 @@ recurrent KDA state still gets committed after a DSpark verify.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -332,3 +333,103 @@ def test_the_block_projection_stands_down_without_a_sharded_head() -> None:
 
     drafter.lm_head = _ShardedHead(torch.randn(0, HIDDEN))
     assert drafter._block_base_logits(torch.randn(2, 4, HIDDEN)) is None
+
+
+# --------------------------------------------------------------------------
+# Vocab-parallel argmax without the fused kernel
+# --------------------------------------------------------------------------
+
+
+class _RankShard:
+    """One rank's slice of an unpadded vocab-parallel head."""
+
+    def __init__(self, full_weight: torch.Tensor, rank: int, tp_size: int) -> None:
+        shard = full_weight.shape[0] // tp_size
+        self.weight = full_weight[rank * shard : (rank + 1) * shard].contiguous()
+        self.num_embeddings = full_weight.shape[0]
+        self.org_vocab_size = full_weight.shape[0]
+        self.shard_indices = SimpleNamespace(
+            num_org_elements=shard,
+            num_org_elements_padded=shard,
+            num_added_elements=0,
+            org_vocab_start_index=rank * shard,
+            added_vocab_start_index=full_weight.shape[0],
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_the_walk_step_reduces_packed_keys_without_the_fused_kernel(
+    monkeypatch,
+) -> None:
+    """Without the fused distributed argmax (any non-NVIDIA platform), each
+    walk step must still return the full-vocabulary argmax of base logits
+    plus Markov bias, on every rank, from one packed-key all-reduce."""
+    from tokenspeed_kernel.ops.sampling.triton.vocab_parallel_argmax import (
+        vocab_parallel_argmax_keys,
+    )
+
+    from tokenspeed.runtime.execution.drafter import dflash as dflash_module
+    from tokenspeed.runtime.layers import logits_processor as lp_module
+    from tokenspeed.runtime.layers.logits_processor import LogitsProcessor
+
+    device = "cuda"
+    tp_size, vocab, hidden, rows = 2, 2048, 64, 3
+    torch.manual_seed(5)
+    full_weight = torch.randn(vocab, hidden, device=device, dtype=torch.bfloat16)
+    draft_hidden = torch.randn(rows, hidden, device=device, dtype=torch.bfloat16)
+    w2 = torch.randn(vocab, RANK, device=device, dtype=torch.bfloat16)
+    latent = torch.randn(rows, RANK, device=device, dtype=torch.bfloat16)
+
+    def bias_fn(vocab_start: int, count: int) -> torch.Tensor:
+        return latent @ w2[vocab_start : vocab_start + count].T
+
+    shard_width = vocab // tp_size
+
+    def rank_logits(rank: int) -> torch.Tensor:
+        weight = _RankShard(full_weight, rank, tp_size).weight
+        return draft_hidden @ weight.T + bias_fn(rank * shard_width, shard_width)
+
+    def rank_keys(rank: int) -> torch.Tensor:
+        keys = torch.empty(rows, dtype=torch.int64, device=device)
+        return vocab_parallel_argmax_keys(
+            rank_logits(rank), vocab_offset=rank * shard_width, out=keys
+        )
+
+    # The argmax of the gathered row, first index on ties.
+    expected = torch.argmax(
+        torch.cat([rank_logits(r) for r in range(tp_size)], dim=-1).float(), dim=-1
+    )
+    for rank in range(tp_size):
+        other = rank_keys(1 - rank)
+        reduced = []
+
+        def fake_all_reduce(tensor, group, op):
+            # The process group is what this test lacks: reduce with the
+            # other rank's keys, computed by the same packing op.
+            reduced.append(1)
+            return torch.maximum(tensor, other)
+
+        monkeypatch.setattr(lp_module, "all_reduce", fake_all_reduce)
+        processor = LogitsProcessor(
+            config=SimpleNamespace(model_type="test", vocab_size=vocab),
+            tp_rank=rank,
+            tp_size=tp_size,
+            tp_group=(0, 1),
+            dp_lm_head_tp=False,
+        )
+        # No fused kernel on this platform.
+        monkeypatch.setattr(
+            processor, "acquire_dist_argmax_state", lambda *a, **k: None
+        )
+        drafter = DSpark.__new__(DSpark)
+        drafter.spec_num_tokens = 8
+        drafter.input_buffers = SimpleNamespace(max_bs=4)
+        drafter.lm_head = _RankShard(full_weight, rank, tp_size)
+        drafter.logits_processor = processor
+        drafter._dist_argmax_state = dflash_module._UNSET
+        out = torch.empty(rows, dtype=torch.int32, device=device)
+
+        drafter._greedy_argmax_vocab_parallel(draft_hidden, out=out, bias_fn=bias_fn)
+
+        assert reduced == [1], "one collective per walk step"
+        assert torch.equal(out.long(), expected), f"rank {rank}"

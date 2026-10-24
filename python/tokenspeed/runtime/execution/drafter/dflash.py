@@ -46,6 +46,7 @@ from tokenspeed.runtime.execution.forward_batch_info import (
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import (
     LogitsMetadata,
+    VocabParallelArgmax,
     _dist_argmax_vetoed,
 )
 from tokenspeed.runtime.utils import get_colorful_logger
@@ -313,17 +314,27 @@ class DFlash(BaseDrafter):
             or not 2 <= tp_size <= 32
             or int(head.num_embeddings) != int(head.org_vocab_size)
             or shard * tp_size != int(head.org_vocab_size)
-            or not _supports_dist_argmax_shape(shard, dtype, tp_size)
         ):
             return None
-        return self.logits_processor.acquire_dist_argmax_state(
-            head,
-            max_M=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
-            # Back-to-back walk rounds carry no cross-rank sync between them,
-            # which skip_ping_pong would require.
-            skip_ping_pong=False,
-            dtype=dtype,
-        )
+        state = None
+        if _supports_dist_argmax_shape(shard, dtype, tp_size):
+            state = self.logits_processor.acquire_dist_argmax_state(
+                head,
+                max_M=self.input_buffers.max_bs * max(self.spec_num_tokens - 1, 1),
+                # Back-to-back walk rounds carry no cross-rank sync between
+                # them, which skip_ping_pong would require.
+                skip_ping_pong=False,
+                dtype=dtype,
+            )
+        if state is None:
+            # No fused kernel here (it is NVIDIA-only): the packed-key
+            # all-reduce the target sampler falls back to. One collective per
+            # call instead of the gather path's two.
+            state = VocabParallelArgmax(
+                self.logits_processor.tp_group,
+                int(self.logits_processor.tp_rank) * shard,
+            )
+        return state
 
     def _ensure_dist_argmax_state(self, dtype: torch.dtype, device: torch.device):
         """Probe once, before capture, and reuse the verdict for the process."""
@@ -441,6 +452,12 @@ class DFlash(BaseDrafter):
                 base_logits = base_logits + bias_fn(org_vocab_start, num_org).to(
                     base_logits.dtype
                 )
+            if isinstance(dist_state, VocabParallelArgmax):
+                idx = dist_state(base_logits)
+                if out is not None:
+                    out.copy_(idx.view_as(out))
+                    return out
+                return idx.to(torch.int32)
             if dist_state is not None:
                 # Without padding the rank-major index IS the global id.
                 _, idx = _dist_argmax(dist_state, base_logits)

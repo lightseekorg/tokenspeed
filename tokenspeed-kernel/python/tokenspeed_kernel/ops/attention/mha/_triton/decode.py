@@ -25,6 +25,11 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform
 
 _MIN_BLOCK_KV = 32
+# Upper bound on KV splits. Stage 2 takes it as its compile-time loop bound,
+# so it is one fixed value; each launch picks its split count at or below it.
+_MAX_KV_SPLITS = 16
+# Fewest keys a split is worth: below this a split's fixed cost dominates.
+_MIN_KEYS_PER_SPLIT = 256
 
 
 @triton.jit
@@ -204,13 +209,12 @@ def _decode_att_m_fwd(
     # MI3xx uses a smaller block size to stay within the SGPR limit.
     if platform.is_amd:
         BLOCK = 8
-    MAX_KV_SPLITS = max_kv_splits
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
 
     total_q, head_num = q.shape[0], q.shape[1]
 
-    grid = (total_q, head_num, MAX_KV_SPLITS)
+    grid = (total_q, head_num, att_out.shape[2])
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     if kv_group_num == 1:
@@ -483,11 +487,10 @@ def _decode_grouped_att_m_fwd(
     kv_group_num = q.shape[1] // k_buffer.shape[1]
 
     BLOCK_H = 16
-    MAX_KV_SPLITS = max_kv_splits
     grid = (
         total_q,
         triton.cdiv(head_num, min(BLOCK_H, kv_group_num)),
-        MAX_KV_SPLITS,
+        att_out.shape[2],
     )
 
     extra_kargs = {}
@@ -787,7 +790,7 @@ def decode_attention_fwd(
     logit_cap=0.0,
     sinks=None,
 ):
-    assert max_kv_splits == attn_logits.shape[2]
+    assert attn_logits.shape[2] <= max_kv_splits
     assert q.shape[0] == cache_seqlens.shape[0] * max_seqlen_q
     assert q.shape[0] <= attn_logits.shape[0]
 
@@ -837,6 +840,38 @@ def decode_attention_fwd(
         )
 
 
+def _decode_split_count(
+    total_q: int,
+    num_heads: int,
+    num_kv_heads: int,
+    max_seqlen_k: int,
+    window_left: int,
+) -> int:
+    """KV splits per query row for one decode launch.
+
+    Without splits, one program walks a row's whole key range serially, so a
+    small grid (one request's draft block, a few heads per rank) leaves most
+    compute units idle. Split until the grid has about eight programs per
+    compute unit, but keep at least ``_MIN_KEYS_PER_SPLIT`` keys per split,
+    and round down to a power of two. Every input is fixed for a captured
+    graph: ``max_seqlen_k`` is the context capacity, not the batch's longest
+    sequence.
+    """
+    kv_group_num = num_heads // num_kv_heads
+    head_programs = (
+        num_heads
+        if kv_group_num == 1
+        else triton.cdiv(num_heads, min(16, kv_group_num))
+    )
+    keys = min(max_seqlen_k, window_left + 1) if window_left >= 0 else max_seqlen_k
+    by_length = triton.cdiv(max(keys, 1), _MIN_KEYS_PER_SPLIT)
+    by_occupancy = triton.cdiv(
+        8 * current_platform().sm_count, max(total_q * head_programs, 1)
+    )
+    splits = max(1, min(_MAX_KV_SPLITS, by_length, by_occupancy))
+    return 1 << (splits.bit_length() - 1)
+
+
 def _triton_mha_decode_with_kvcache_impl(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -858,11 +893,13 @@ def _triton_mha_decode_with_kvcache_impl(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(q.shape[-1])
     out = torch.empty_like(q)
-    max_kv_splits = 4
+    kv_splits = _decode_split_count(
+        q.shape[0], q.shape[1], k_cache.shape[2], max_seqlen_k, window_left
+    )
     attn_logits = torch.empty(
         q.shape[0],
         q.shape[1],
-        max_kv_splits,
+        kv_splits,
         q.shape[2],
         dtype=torch.float32,
         device=q.device,
@@ -870,12 +907,12 @@ def _triton_mha_decode_with_kvcache_impl(
     attn_lse = torch.empty(
         q.shape[0],
         q.shape[1],
-        max_kv_splits,
+        kv_splits,
         dtype=torch.float32,
         device=q.device,
     )
-    num_kv_splits = torch.ones(
-        (cache_seqlens.shape[0],), dtype=torch.int32, device=q.device
+    num_kv_splits = torch.full(
+        (cache_seqlens.shape[0],), kv_splits, dtype=torch.int32, device=q.device
     )
     decode_attention_fwd(
         q,
@@ -887,7 +924,7 @@ def _triton_mha_decode_with_kvcache_impl(
         attn_logits,
         attn_lse,
         num_kv_splits,
-        max_kv_splits,
+        _MAX_KV_SPLITS,
         max_seqlen_q,
         page_table.stride(0),
         k_cache.shape[1],
