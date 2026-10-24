@@ -31,6 +31,7 @@ RUNNER_GROUP_VENDORS = {
 SHARED_DIRECTORIES = (
     "python",
     "test",
+    "tokenspeed-engine",
     "tokenspeed-kernel",
     "tokenspeed-scheduler",
 )

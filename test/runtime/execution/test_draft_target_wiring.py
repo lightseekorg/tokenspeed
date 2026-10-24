@@ -861,7 +861,8 @@ def test_device_weight_update_notifies_drafter_before_returning():
         drafter=SimpleNamespace(
             on_target_weights_updated=lambda: refreshed.append("refreshed")
         ),
-        forward_thread=SimpleNamespace(run=lambda callback: callback()),
+        device="cpu",
+        complete_pending_drafting=lambda: None,
     )
     handle = DeviceHandle(executor)
     request = UpdateWeightsFromDistributedReqInput(

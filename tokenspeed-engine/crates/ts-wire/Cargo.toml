@@ -1,0 +1,15 @@
+[package]
+name = "ts-wire"
+description = "TokenSpeed engine IPC schema and msgpack codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

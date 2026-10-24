@@ -18,23 +18,31 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Host-only L3 construction preserves namespace and ownership behavior."""
+"""The L3 settings the data plane resolves for the engine host: namespace
+identity, the Host pool and the store, and the executor they start
+(``tokenspeed_engine.L3Executor``)."""
 
 from __future__ import annotations
 
 import json
 import sys
-import time
 from dataclasses import replace
 from pathlib import Path
+from test.l3_test_utils import StorageOp, run_storage
 
 import pytest
+import torch
+from tokenspeed_engine import L3Executor
+from tokenspeed_scheduler import StorageKind
 from transformers import Qwen3Config
 
-from tokenspeed.runtime.cache.host_storage import HostCacheResources
-from tokenspeed.runtime.cache.l3.executor import StorageJob
-from tokenspeed.runtime.cache.l3.factory import create_l3_executor
-from tokenspeed.runtime.cache.transfer.layout import CacheField, CacheGroupLayout
+from tokenspeed.runtime.cache.host_storage import HostCacheResources, HostCacheStorage
+from tokenspeed.runtime.cache.l3.factory import l3_settings
+from tokenspeed.runtime.cache.transfer.layout import (
+    CacheField,
+    CacheGroupLayout,
+    CacheTransferLayout,
+)
 from tokenspeed.runtime.cache.transfer.ownership import BlockOwnerTranslation
 from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -62,19 +70,6 @@ register_cuda_ci(
 )
 
 
-class Host:
-    """CPU byte storage substitutes only for a GPU-pinned allocation."""
-
-    def __init__(self):
-        self.host_buffer = bytearray(64)
-        self.host_cache_block_bytes = (4,)
-        self.num_host_lcm_blocks = 16
-
-    def host_block_range(self, group: int, block: int) -> tuple[int, int]:
-        assert group == 0 and 1 <= block <= 16
-        return (block - 1) * 4, 4
-
-
 def checkpoint(path: Path, *, payload: bytes) -> None:
     path.mkdir()
     Qwen3Config(
@@ -93,6 +88,8 @@ def checkpoint(path: Path, *, payload: bytes) -> None:
 
 @pytest.fixture
 def construction(tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip("the pinned Host pool needs a CUDA device")
     path = tmp_path / "target"
     checkpoint(path, payload=b"target-checkpoint")
     args = ServerArgs(
@@ -112,16 +109,26 @@ def construction(tmp_path):
         model_override_args='{"rope_scaling": null}',
         dtype="bfloat16",
     )
-    host = Host()
+    groups = (CacheGroupLayout("full", 1, (CacheField("layer.0.k", 0, 0, 4, 4),)),)
+    # Sixteen 4-byte LCM blocks; the device buffer only shapes the layout.
+    storage = HostCacheStorage(
+        CacheTransferLayout(
+            num_lcm_blocks=16,
+            groups=groups,
+            buffers=(torch.zeros(68, dtype=torch.uint8),),
+            consumers=(("layer.0.k",),),
+        ),
+        num_host_lcm_blocks=16,
+    )
     host_cache = HostCacheResources(
-        storage=host,
+        storage=storage,
         ownership=BlockOwnerTranslation(
             shard_counts=(1,),
             device_virtual_counts=(17,),
             host_virtual_counts=(17,),
             rank=0,
         ),
-        groups=(CacheGroupLayout("full", 1, (CacheField("layer.0.k", 0, 0, 4, 4),)),),
+        groups=groups,
         memory_plan=CacheMemoryPlan(
             prefix_granularity=2,
             lcm_block_bytes=4,
@@ -137,46 +144,48 @@ def construction(tmp_path):
         attention_backend_name="triton",
         draft_attention_backend_name="",
     )
-    return args, model, host, {"host_cache": host_cache, "world_cpu_group": None}
+    return args, model, storage, {"host_cache": host_cache, "world_cpu_group": None}
 
 
-def complete(executor):
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        rows = executor.poll().completions
-        if rows:
-            assert len(rows) == 1
-            return rows[0]
-        time.sleep(0.001)
-    raise AssertionError("L3 worker did not finish")
+def test_settings_place_the_shared_host_pool(construction):
+    args, model, storage, factory_kwargs = construction
+    settings = l3_settings(args, model, None, **factory_kwargs)
+    assert settings.host_buffer == storage.host_buffer.data_ptr()
+    assert settings.host_buffer_bytes == 64
+    assert settings.groups == ((1, 4, 1),)
+    assert (settings.lcm_block_bytes, settings.num_lcm_blocks) == (4, 16)
+    assert (settings.owner_rank, settings.tp_rank) == (0, 0)
+    assert (settings.backend, settings.mooncake) == ("memory", None)
+    assert settings.runtime.scheduler.max_host_blocks <= storage.num_host_lcm_blocks
 
 
-def test_factory_roundtrips_through_the_shared_host_resource(construction):
-    args, model, host, factory_kwargs = construction
-    executor = create_l3_executor(args, model, None, **factory_kwargs)
+def test_settings_start_an_executor_over_the_shared_host_pool(construction):
+    args, model, storage, factory_kwargs = construction
+    executor = L3Executor(l3_settings(args, model, None, **factory_kwargs))
+    # The pinned pool starts uninitialized.
+    host = storage.host_buffer
+    host.zero_()
+    key = [(0, "prefix", 0)]
     try:
-        assert executor.config.scheduler.max_host_blocks <= host.num_host_lcm_blocks
-        host.host_buffer[:4] = b"KV01"
-        key = executor._object_key("prefix", 0, 0)
-        executor.submit(StorageJob(1, "put", (key,), (0,), (4,)))
-        put = complete(executor)
-        assert put.success == (True,) and put.retired
-        host.host_buffer[:4] = b"xxxx"
-        executor.submit(StorageJob(2, "get", (key,), (0,), (4,)))
-        get = complete(executor)
-        assert get.success == (True,) and get.retired
-        assert host.host_buffer[:8] == b"KV01" + bytes(4)
+        host[:4] = torch.frombuffer(bytearray(b"KV01"), dtype=torch.uint8)
+        put = run_storage(executor, StorageOp(1, StorageKind.Put, key, [1]))
+        assert put[1:] == ([True], True, [False])
+        host[:4] = torch.frombuffer(bytearray(b"xxxx"), dtype=torch.uint8)
+        get = run_storage(executor, StorageOp(2, StorageKind.Get, key, [1]))
+        assert get[1:] == ([True], True, [False])
+        assert bytes(host[:8].tolist()) == b"KV01" + bytes(4)
+        assert executor.delete_namespace()
     finally:
-        executor.close(timeout_s=5)
+        executor.close(5.0)
 
 
-def test_factory_freezes_namespace_inputs_before_weight_version_switch(construction):
+def test_settings_freeze_namespace_inputs_before_weight_version_switch(construction):
     args, model, _, factory_kwargs = construction
-    executor = create_l3_executor(args, model, None, **factory_kwargs)
+    executor = L3Executor(l3_settings(args, model, None, **factory_kwargs))
     try:
-        original = executor.key_prefix
+        original = executor.key_prefix()
         executor.set_weight_version("v2")
-        expected = executor.key_prefix
+        expected = executor.key_prefix()
         assert expected != original
         executor.set_weight_version("v1")
         model.model_override_args["new_override"] = {"nested": [1, 2]}
@@ -185,34 +194,31 @@ def test_factory_freezes_namespace_inputs_before_weight_version_switch(construct
             factory_kwargs["host_cache"], attention_backend_name="changed-backend"
         )
         executor.set_weight_version("v2")
-        assert executor.key_prefix == expected
-        changed = create_l3_executor(args, model, None, **factory_kwargs)
+        assert executor.key_prefix() == expected
+        changed = L3Executor(l3_settings(args, model, None, **factory_kwargs))
         try:
             changed.set_weight_version("v2")
-            assert changed.key_prefix != expected
+            assert changed.key_prefix() != expected
         finally:
-            changed.close(timeout_s=5)
+            changed.close(5.0)
     finally:
-        executor.close(timeout_s=5)
+        executor.close(5.0)
 
 
-def test_factory_includes_the_draft_checkpoint_identity(construction, tmp_path):
+def test_settings_include_the_draft_checkpoint_identity(construction, tmp_path):
     args, model, _, factory_kwargs = construction
     path = tmp_path / "draft"
     checkpoint(path, payload=b"draft-checkpoint")
     draft = ModelConfig(
         str(path), server_args=args, model_override_args="{}", dtype="bfloat16"
     )
-    target_only = create_l3_executor(args, model, None, **factory_kwargs)
-    with_draft = create_l3_executor(args, model, draft, **factory_kwargs)
-    try:
-        assert target_only.key_prefix != with_draft.key_prefix
-    finally:
-        target_only.close(timeout_s=5)
-        with_draft.close(timeout_s=5)
+    target_only = l3_settings(args, model, None, **factory_kwargs)
+    with_draft = l3_settings(args, model, draft, **factory_kwargs)
+    assert not target_only.has_draft and with_draft.has_draft
+    assert target_only.deployment_id != with_draft.deployment_id
 
 
-def test_factory_refuses_head_partitioned_payload_on_cyclic_owners(construction):
+def test_settings_refuse_head_partitioned_payload_on_cyclic_owners(construction):
     args, model, _, factory_kwargs = construction
     ownership = BlockOwnerTranslation(
         shard_counts=(2,),
@@ -224,35 +230,57 @@ def test_factory_refuses_head_partitioned_payload_on_cyclic_owners(construction)
         factory_kwargs["host_cache"], ownership=ownership
     )
     with pytest.raises(ValueError, match="layer.0.k is head-partitioned"):
-        create_l3_executor(args, model, None, **factory_kwargs)
+        l3_settings(args, model, None, **factory_kwargs)
 
 
-def test_factory_validates_limits_against_actual_host_capacity(construction):
-    args, model, host, factory_kwargs = construction
+def test_settings_validate_limits_against_actual_host_capacity(construction):
+    args, model, storage, factory_kwargs = construction
     args.kvstore_storage_backend_extra_config = json.dumps(
-        {"async": {"max_host_blocks": host.num_host_lcm_blocks + 1}}
+        {"async": {"max_host_blocks": storage.num_host_lcm_blocks + 1}}
     )
     with pytest.raises(ValueError, match="exceeds usable Host parents"):
-        create_l3_executor(args, model, None, **factory_kwargs)
+        l3_settings(args, model, None, **factory_kwargs)
 
 
 def test_unconfigured_storage_needs_neither_host_memory_nor_checkpoint_io(construction):
     args, model, _, _ = construction
     args.kvstore_storage_backend = None
     Path(model.model_path, "model.safetensors").unlink()
-    assert (
-        create_l3_executor(args, model, None, host_cache=None, world_cpu_group=None)
-        is None
-    )
+    assert l3_settings(args, model, None, host_cache=None, world_cpu_group=None) is None
 
 
 def test_configured_storage_requires_host_memory(construction):
     args, model, _, _ = construction
     with pytest.raises(ValueError, match="requires a Host L2 allocation"):
-        create_l3_executor(args, model, None, host_cache=None, world_cpu_group=None)
+        l3_settings(args, model, None, host_cache=None, world_cpu_group=None)
 
 
-def test_factory_resolves_draft_eagle_layers_and_explicit_override(
+def test_an_unknown_store_is_refused(construction):
+    args, model, _, factory_kwargs = construction
+    args.kvstore_storage_backend = "nfs"
+    with pytest.raises(ValueError, match="unsupported KVStore storage backend"):
+        l3_settings(args, model, None, **factory_kwargs)
+
+
+def test_mooncake_settings_take_this_ranks_segment_share(construction, monkeypatch):
+    args, model, _, factory_kwargs = construction
+    monkeypatch.setenv("TOKENSPEED_MOONCAKE_STORE_LIBRARY", "/opt/libmooncake_store.so")
+    args.kvstore_storage_backend = "mooncake"
+    args.kvstore_storage_backend_extra_config = json.dumps(
+        {
+            "master_server_address": "127.0.0.1:50051",
+            "global_segment_size": "2gb",
+            "tenant_id": "tenant-a",
+        }
+    )
+    mooncake = l3_settings(args, model, None, **factory_kwargs).mooncake
+    assert mooncake.library == "/opt/libmooncake_store.so"
+    assert mooncake.master_server_address == "127.0.0.1:50051"
+    assert mooncake.global_segment_size == 2 * 1024**3
+    assert mooncake.tenant_id == "tenant-a"
+
+
+def test_settings_resolve_draft_eagle_layers_and_explicit_override(
     construction, tmp_path
 ):
     args, model, _, factory_kwargs = construction
@@ -267,15 +295,10 @@ def test_factory_resolves_draft_eagle_layers_and_explicit_override(
     )
     args.speculative_algorithm = "EAGLE3"
     args.eagle3_layers_to_capture = None
-    automatic = create_l3_executor(args, model, draft, **factory_kwargs)
+    automatic = l3_settings(args, model, draft, **factory_kwargs)
     args.eagle3_layers_to_capture = [0]
-    explicit = create_l3_executor(args, model, draft, **factory_kwargs)
+    explicit = l3_settings(args, model, draft, **factory_kwargs)
     args.eagle3_layers_to_capture = [1]
-    changed = create_l3_executor(args, model, draft, **factory_kwargs)
-    try:
-        assert automatic.key_prefix == explicit.key_prefix
-        assert changed.key_prefix != automatic.key_prefix
-    finally:
-        automatic.close(timeout_s=5)
-        explicit.close(timeout_s=5)
-        changed.close(timeout_s=5)
+    changed = l3_settings(args, model, draft, **factory_kwargs)
+    assert automatic.deployment_id == explicit.deployment_id
+    assert changed.deployment_id != automatic.deployment_id

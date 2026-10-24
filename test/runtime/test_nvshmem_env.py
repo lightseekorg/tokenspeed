@@ -41,8 +41,8 @@ def test_nvshmem_ib_traffic_class_reaches_process_environ():
 
 
 def test_nvshmem_ib_traffic_class_reassert_is_idempotent():
-    # run_event_loop re-asserts the value in each inference process; doing so
-    # must not corrupt or drop the setting.
+    # Each engine rank re-asserts the value at bootstrap; doing so must not
+    # corrupt or drop the setting.
     with envs.NVSHMEM_IB_TRAFFIC_CLASS.override(100):
         envs.NVSHMEM_IB_TRAFFIC_CLASS.set(envs.NVSHMEM_IB_TRAFFIC_CLASS.get())
         assert envs.NVSHMEM_IB_TRAFFIC_CLASS.get() == 100

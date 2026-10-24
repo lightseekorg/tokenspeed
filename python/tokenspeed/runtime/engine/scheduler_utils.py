@@ -18,10 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Helper functions for constructing scheduler specs and events."""
+"""What the data plane and the rank setup read off the C++ scheduler: its
+config, its cache geometry and groups, the cache ops a plan carries and
+their acknowledgments, and the block tables a forward reads."""
 
-import os
-import weakref
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -31,9 +31,6 @@ import torch
 from tokenspeed_scheduler import (
     Cache,
     CacheGroupConfig,
-    ExecutionEvent,
-    ForwardEvent,
-    RequestSpec,
     SchedulerConfig,
     StorageConfig,
 )
@@ -44,11 +41,6 @@ from tokenspeed.runtime.cache.transfer.ops import (
     RestoreOp,
     SnapshotOp,
 )
-from tokenspeed.runtime.execution.types import (
-    InputLogprobPlan,
-    NGramInputs,
-    RequestHistorySeeds,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
@@ -58,17 +50,14 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 )
 
 # The Host cache's ACKs, as the scheduler binds them: an L2 write-back or
-# load-back ticket, a
-# retraction image's snapshot store, a restore. The hooks carry them across
-# ranks as ``(kind, op_id)`` payloads and rebuild the binding event from the
-# payload.
+# load-back ticket, a retraction image's snapshot store, a restore. The data
+# plane reports them to the Rust control plane as ``(kind, op_id)`` payloads.
 _CACHE_EVENT_TYPES = {
     "WriteBackDoneEvent": Cache.WriteBackDoneEvent,
     "LoadBackDoneEvent": Cache.LoadBackDoneEvent,
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
-_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def engram_context_len(text_config) -> int:
@@ -78,205 +67,6 @@ def engram_context_len(text_config) -> int:
     if getattr(text_config, "ngram_context_len", None) != 3:
         raise ValueError("Engram requires hf_text_config.ngram_context_len = 3")
     return text_config.ngram_context_len
-
-
-def ngram_inputs_for_forward(
-    forward_op, rid_to_state: Mapping, context_len: int
-) -> NGramInputs | None:
-    """Snapshot one bounded seed window per request, including empty prefills.
-
-    Each row is [current, prev1..3] at the extend prefix or the newest committed
-    decode token. Prompt/output lists contain physical IDs, unlike the unpadded
-    detokenizer prompt. The executor uses these immutable windows to seed/reset
-    its accepted input tail; ongoing decode and proposed predecessors stay on
-    the device, even when an entire verify result awaits its host commit.
-    """
-    if context_len == 0:
-        return None
-    tokens, positions = [], []
-    num_extends = forward_op.num_extends()
-    for i, rid in enumerate(forward_op.request_ids):
-        state = rid_to_state[rid]
-        prompt, output = state.prompt_input_ids, state.output_ids
-        prompt_len = len(prompt)
-        total = prompt_len + len(output)
-        length = forward_op.input_lengths[i]
-        if i < num_extends:
-            start = forward_op.extend_prefix_lens[i]
-            if start < 0 or start + length > total:
-                raise ValueError(f"N-gram prefill exceeds physical tokens for {rid}")
-        else:
-            start = total - 1
-            if start < 0:
-                raise ValueError(f"N-gram decode requires physical tokens for {rid}")
-        tokens.append(
-            tuple(
-                (
-                    -1
-                    if p < 0 or p >= total
-                    else prompt[p] if p < prompt_len else output[p - prompt_len]
-                )
-                for p in range(start, start - context_len - 1, -1)
-            )
-        )
-        positions.append(start)
-    return NGramInputs(tokens=tuple(tokens), positions=tuple(positions))
-
-
-def input_logprob_plan_for_forward(
-    forward_op, rid_to_state: Mapping
-) -> InputLogprobPlan | None:
-    """Name the prompt rows of this forward whose next-token logprob is wanted.
-
-    An extend row ``i`` feeds prompt positions ``[extend_prefix_lens[i],
-    extend_prefix_lens[i] + input_lengths[i])`` (bounded replay re-feeds the
-    leading rows; they never reach ``logprob_start_len`` because the admission
-    probe is capped there). The request wants position ``p`` when
-    ``logprob_start_len <= p < input_length - 1``: the last prompt position
-    predicts the first generated token, which is the output logprob's job.
-    Positions past the prompt and requests that already finalized their
-    prompt logprobs contribute nothing.
-    The plan is one triple per extend slot; the targets (each row's next
-    prompt token) are read on the device from the scheduler's shifted input
-    ids, which cover the chunk boundary, so nothing per row crosses here.
-
-    The plan's ``top_k`` is the largest ``top_logprobs_num`` among the
-    planned slots: every gathered row returns that many alternatives, and the
-    commit path keeps each request's own count.
-
-    Returns:
-        The plan, or None when no row of the batch needs a prompt logprob.
-    """
-    num_extends = forward_op.num_extends()
-    if num_extends <= 0:
-        return None
-    row_starts: list[int] = []
-    counts: list[int] = []
-    position_starts: list[int] = []
-    top_k = 0
-    row_offset = 0
-    for i in range(num_extends):
-        state = rid_to_state[forward_op.request_ids[i]]
-        chunk_start = forward_op.extend_prefix_lens[i]
-        chunk_len = forward_op.input_lengths[i]
-        lo = max(chunk_start, state.logprob_start_len)
-        hi = min(chunk_start + chunk_len, state.input_length - 1)
-        if (
-            not state.wants_input_logprobs
-            or state.input_token_logprobs_val is not None
-            or lo >= hi
-        ):
-            row_starts.append(0)
-            counts.append(0)
-            position_starts.append(0)
-        else:
-            row_starts.append(row_offset + lo - chunk_start)
-            counts.append(hi - lo)
-            position_starts.append(lo)
-            top_k = max(top_k, state.top_logprobs_num)
-        row_offset += chunk_len
-    if not any(counts):
-        return None
-    return InputLogprobPlan(
-        row_starts=tuple(row_starts),
-        counts=tuple(counts),
-        position_starts=tuple(position_starts),
-        top_k=top_k,
-    )
-
-
-def sampled_top_k_for_forward(forward_op, rid_to_state: Mapping) -> int:
-    """How many alternatives this forward's prefill samples are reported with.
-
-    The largest ``top_logprobs_num`` among the extend slots of requests that
-    return logprobs; 0 when none asks, which leaves the forward as it was.
-    The ingress takes a top-k request only when each of its tokens is sampled
-    in a prefill (``max_new_tokens <= 1``), so decode rows never need one.
-    """
-    num_extends = forward_op.num_extends()
-    if num_extends == 0:
-        return 0
-    # One read: each read of the binding's ``request_ids`` builds a new list.
-    request_ids = forward_op.request_ids
-    top_k = 0
-    for i in range(num_extends):
-        state = rid_to_state.get(request_ids[i])
-        if state is not None and state.return_logprob:
-            top_k = max(top_k, state.top_logprobs_num)
-    return top_k
-
-
-class RequestHistoryRows:
-    """Which request's committed tokens each executor history row holds.
-
-    Every forward appends its inputs to its slot's row at the committed
-    frontier, so a row holds request ``rid``'s tokens from position 0 once
-    rid has started there at position 0 or been seeded there, until another
-    request runs in the slot. That ownership decides when a forward must
-    seed its committed prefix: a prefix-cache hit, a slot handoff, a
-    retracted request's restore into another slot (its history row is
-    token-derived and not part of its image), or a PD decode landing, whose
-    first local forward is a decode over a remotely prefilled prompt. Later
-    chunks of one prefill and ordinary decode steps never reseed.
-
-    Ownership is recorded per admission — the request's state object, held
-    weakly — not per request id: clients may reuse a finished request's id,
-    and a later request landing in the same slot must not inherit the row.
-    A restored request keeps its state object but lands in a new slot, so
-    the row ownership check reseeds it there.
-
-    Call :meth:`seeds_for_forward` exactly once per forward the executor
-    runs, in dispatch order (the executor runs forwards in that order).
-    """
-
-    def __init__(self) -> None:
-        self._owners: dict[int, weakref.ref] = {}
-
-    def seeds_for_forward(
-        self, forward_op, rid_to_state: Mapping
-    ) -> RequestHistorySeeds | None:
-        """Record the batch's slot ownership; snapshot the prefixes it needs.
-
-        Prompt/output lists hold physical IDs. A decode's input is the
-        request's newest token, so its row must already hold every token
-        before it. Returns None when no row in the batch needs a seed.
-        """
-        slots: list[int] = []
-        prefix_lengths: list[int] = []
-        tokens: list[tuple[int, ...]] = []
-        num_extends = forward_op.num_extends()
-        for i, rid in enumerate(forward_op.request_ids):
-            slot = int(forward_op.request_pool_indices[i])
-            state = rid_to_state[rid]
-            owner = self._owners.get(slot)
-            held = owner is not None and owner() is state
-            self._owners[slot] = weakref.ref(state)
-            prompt, output = state.prompt_input_ids, state.output_ids
-            total = len(prompt) + len(output)
-            boundary = (
-                int(forward_op.extend_prefix_lens[i]) if i < num_extends else total - 1
-            )
-            if boundary <= 0 or held:
-                continue
-            if boundary > total:
-                raise ValueError(
-                    f"Request history prefix {boundary} exceeds the physical "
-                    f"tokens of {rid}"
-                )
-            if boundary <= len(prompt):
-                prefix = tuple(prompt[:boundary])
-            else:
-                prefix = tuple(prompt) + tuple(output[: boundary - len(prompt)])
-            slots.append(slot)
-            prefix_lengths.append(boundary)
-            tokens.append(prefix)
-        if not slots:
-            return None
-        return RequestHistorySeeds(
-            slots=tuple(slots),
-            prefix_lengths=tuple(prefix_lengths),
-            tokens=tuple(tokens),
-        )
 
 
 @dataclass(frozen=True)
@@ -305,36 +95,6 @@ def scheduler_cache_geometry_from_pool(pool: Any) -> SchedulerCacheGeometry:
         num_usable_pages=num_lcm_blocks,
         token_capacity=contract.token_capacity,
     )
-
-
-# "No bound" for RequestSpec.max_cached_prefix_tokens (the C++ default).
-UNBOUNDED_CACHED_PREFIX_TOKENS = 2**31 - 1
-
-
-def make_spec(
-    rid: str,
-    tokens: list[int],
-    *,
-    max_cached_prefix_tokens: int,
-    max_new_tokens: int = 0,
-) -> RequestSpec:
-    """Build the C++ scheduler's admission record for one request.
-
-    Args:
-        rid: Request id.
-        tokens: Prompt token ids.
-        max_cached_prefix_tokens: Longest prompt prefix the admission probe may
-            claim from the prefix cache. ``UNBOUNDED_CACHED_PREFIX_TOKENS``
-            keeps the ordinary rule; a request returning prompt logprobs from
-            position ``s`` passes ``s`` so those positions are recomputed.
-        max_new_tokens: Declared generation budget (0 = undeclared).
-    """
-    spec = RequestSpec()
-    spec.request_id = rid
-    spec.tokens = tokens
-    spec.max_new_tokens = max_new_tokens
-    spec.max_cached_prefix_tokens = max_cached_prefix_tokens
-    return spec
 
 
 def make_config(
@@ -543,111 +303,9 @@ def resolve_dspark_prefix_replay_tokens(
     return replay_tokens
 
 
-def make_extend_result_event(
-    request_id: str,
-    tokens: Sequence[int] = (),
-    spec_candidate_ids: Sequence[int] | None = None,
-) -> "ForwardEvent.ExtendResult":
-    fe = ForwardEvent.ExtendResult()
-    fe.request_id = request_id
-    fe.tokens = list(tokens)
-    if spec_candidate_ids:
-        # P-side final chunk: the drafter candidates ride to the scheduler so
-        # its remote-decode operation is self-contained.
-        fe.spec_candidate_ids = list(spec_candidate_ids)
-    return fe
-
-
-def make_finish_event(request_id: str) -> "ForwardEvent.Finish":
-    fe = ForwardEvent.Finish()
-    fe.request_id = request_id
-    return fe
-
-
-def make_abort_event(request_id: str) -> "ForwardEvent.Abort":
-    """Finish without caching: AbortEvent skips the single-table-tree insert and
-    never enters Draining, so no host-KV writeback (target or draft) is
-    issued. Used for numerically-corrupted requests whose KV must not be
-    reused.
-    """
-    fe = ForwardEvent.Abort()
-    fe.request_id = request_id
-    return fe
-
-
-def make_update_reserve_tokens_event(request_id: str, new_reserve_num_tokens: int):
-    fe = ForwardEvent.UpdateReserveNumTokens()
-    fe.request_id = request_id
-    fe.reserve_num_tokens_in_next_schedule_event = new_reserve_num_tokens
-    return fe
-
-
-def scheduler_pd_lifecycle(scheduler):
-    """Return a query for the PD request lifecycle counts.
-
-    ``(bootstrapping, prefilling, remote_prefilling, decoding, pd_pinned)``
-    -- five state counts over the request table, bound to the scheduler once
-    so the batch logger reads them only when it emits a line.
-
-    Args:
-        scheduler: The engine's C++ scheduler.
-    """
-
-    def lifecycle() -> tuple[int, int, int, int, int]:
-        return (
-            scheduler.bootstrapping_size(),
-            scheduler.prefilling_size(),
-            scheduler.remote_prefilling_size(),
-            scheduler.decoding_size(),
-            scheduler.pd_transfer_size(),
-        )
-
-    return lifecycle
-
-
-def scheduler_cache_group_pages(scheduler):
-    """Return a ``group_id -> (total, available)`` page-count query.
-
-    Two counter reads, bound to the scheduler once, so the batch logger holds
-    a query rather than a reference to the loop that owns the scheduler.
-
-    Args:
-        scheduler: The engine's C++ scheduler.
-
-    Returns:
-        A callable taking a cache-group id and returning its total and
-        available page counts.
-    """
-
-    def pages(group_id: str) -> tuple[int, int]:
-        return (
-            scheduler.cache_group_total_pages(group_id),
-            scheduler.cache_group_available_pages(group_id),
-        )
-
-    return pages
-
-
-def advance_scheduler(scheduler, events: list) -> None:
-    """Feed completion events (forward results or cache-op results) back into
-    the C++ scheduler. The ONLY caller of ``scheduler.advance``.
-
-    Design principle: this is only invoked explicitly and directly from the
-    ``EventLoop.event_loop`` body — never from helpers. Helpers RETURN their
-    events; the loop applies them, so every scheduler state change is visible
-    by reading the loop alone.
-    """
-    ec = ExecutionEvent()
-    for event in events:
-        ec.add_event(event)
-    # nanobind calls emit no Python-tracer or Kineto events, so without this
-    # annotation the C++ time is an unlabeled gap in the profiler timeline.
-    with torch.profiler.record_function("scheduler.advance"):
-        scheduler.advance(ec)
-
-
 def cache_event_to_payload(event) -> dict:
-    """A cache ACK as the rank-synchronizing payload the hooks gather.
+    """A cache ACK as the payload the host's data plane reports
+    (``HostDataPlane.poll_cache_events``).
 
     ``(kind, op_id)`` identifies a completed Host copy.
     """
@@ -659,17 +317,6 @@ def cache_event_to_payload(event) -> dict:
         "op_id": int(event.op_id),
     }
     return payload
-
-
-def cache_event_from_payload(payload: dict):
-    kind = payload["kind"]
-    if kind not in _CACHE_EVENT_TYPES:
-        raise ValueError(f"Unsupported cache event type: {kind}")
-    if kind == "LoadBackDoneEvent":
-        return _CACHE_EVENT_TYPES[kind](int(payload["op_id"]))
-    event = _CACHE_EVENT_TYPES[kind]()
-    event.op_id = int(payload["op_id"])
-    return event
 
 
 def _check_batch_rows(op, columns: Sequence[Sequence]) -> int:
@@ -808,7 +455,8 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
 
     L2 wire batches pass through; snapshot/restore batches become per-request
     operations. Host-only QUERY/GET/PUT/Cancel descriptors go to the storage
-    tuple. Unknown kinds fail the whole conversion without partial submission.
+    tuple: the engine host's L3 executor runs them. Unknown kinds fail the
+    whole conversion without partial submission.
     """
     device: list = []
     storage: list = []
@@ -832,37 +480,6 @@ def cache_ops_from_plan(execution_plan) -> CacheOperations:
         else:
             raise TypeError(f"unsupported cache op kind: {type(op).__name__}")
     return CacheOperations(tuple(device), tuple(storage))
-
-
-def cache_event_key(payload: dict) -> tuple[str, int]:
-    return payload["kind"], int(payload["op_id"])
-
-
-def pop_common_cache_event_payloads(
-    pending_payloads_by_rank: Sequence[Sequence[dict]],
-) -> list[dict]:
-    if not pending_payloads_by_rank:
-        return []
-
-    rank_maps = []
-    common_keys = None
-    for payloads in pending_payloads_by_rank:
-        rank_map = {cache_event_key(payload): payload for payload in payloads}
-        rank_maps.append(rank_map)
-        rank_keys = set(rank_map)
-        common_keys = rank_keys if common_keys is None else common_keys & rank_keys
-        if not common_keys:
-            return []
-
-    ready_payloads = []
-    for key in sorted(common_keys, key=lambda item: (item[1], item[0])):
-        ready_payloads.append(dict(rank_maps[0][key]))
-    return ready_payloads
-
-
-def cache_sync_debug_enabled() -> bool:
-    value = os.getenv("TS_DEBUG_CACHE_SYNC", "")
-    return value.strip().lower() in _TRUTHY_ENV_VALUES
 
 
 class PackedBlockTables(NamedTuple):

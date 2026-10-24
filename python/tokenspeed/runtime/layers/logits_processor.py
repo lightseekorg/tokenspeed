@@ -981,8 +981,8 @@ class LogitsProcessor(nn.Module):
                 have no activations to read.
             RuntimeError: The head is vocab-sharded over attention-DP ranks
                 (``dp_lm_head_tp``); admission refuses such requests
-                (``RequestHandler.supports_input_logprobs``), so reaching here
-                is a routing error.
+                (``LogprobServability``), so reaching here is a routing
+                error.
         """
         plan = logits_metadata.input_logprob_rows
         if self.dp_lm_head_tp:

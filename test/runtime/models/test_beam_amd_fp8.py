@@ -62,7 +62,7 @@ register_cuda_ci(est_time=40, suite="runtime-1gpu")
 
 @pytest.mark.parametrize("mixed", [False, True])
 def test_beam_scheduler_preserves_nonmixed_capacity_and_explicit_opt_in(mixed):
-    from tokenspeed.runtime.engine.event_loop import scheduler_config_from_args
+    from tokenspeed.runtime.engine.rank_setup import scheduler_config_from_args
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
     args = ServerArgs(

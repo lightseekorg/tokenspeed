@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The capturable grammar's host node, with real xgrammar matchers.
+"""The capturable grammar's host node, with real xgrammar matchers behind
+the engine host's grammar entries (``grammar_test_utils``).
 
 The node is C++ that runs on the CUDA callback thread: it must finish
 without the GIL, advance each forward's matchers exactly once (from the
@@ -47,15 +48,13 @@ register_cuda_ci(
     disabled_on_runners_reason="the host node builds against the CUDA runtime",
 )
 
+from test.runtime.grammar_test_utils import handle_known, host_grammar  # noqa: E402
+
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
 from tokenspeed.runtime.grammar.capturable_grammar import (  # noqa: E402
     CapturableGrammarExecutor,
-)
-from tokenspeed.runtime.grammar.xgrammar_backend import (  # noqa: E402
-    XGrammarGrammar,
-    keep_gil_in_matcher_calls,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -72,16 +71,12 @@ for _id, _text in ((EOS, "<eos>"), (A, "a"), (B, "b"), (C, "c"), (BRACE, "}")):
 
 @pytest.fixture(scope="module")
 def compile_grammar():
-    keep_gil_in_matcher_calls()
     compiler = xgr.GrammarCompiler(xgr.TokenizerInfo(VOCAB, stop_token_ids=[EOS]))
     return compiler.compile_grammar
 
 
 def _grammar(compiled, accepted=()):
-    grammar = XGrammarGrammar(xgr.GrammarMatcher(compiled), len(VOCAB), compiled, None)
-    for token in accepted:
-        grammar.accept_token(token)
-    return grammar
+    return host_grammar(compiled, accepted)
 
 
 def _next_mask(grammar):
@@ -304,6 +299,32 @@ def test_a_queued_host_node_outlives_its_executor(compile_grammar):
     torch.cuda.synchronize()
     host_bitmask = capturable_grammar._LIVE_HOSTS[-1][1]
     assert torch.equal(host_bitmask[0], _next_mask(_grammar(compiled)))
+
+
+def test_a_queued_batch_keeps_the_matcher_past_its_release(compile_grammar):
+    compiled = compile_grammar('root ::= "a" ("b" | "c")* "}"')
+    executor = _executor(max_bs=1)
+    layout = ForwardOutputLayout(0, 0, 1, 1)
+    grammar = _grammar(compiled)
+    first = executor.add_batch(grammars=[grammar], bs=1, output_layout=layout)
+    # The request ends while its forward is queued: that forward's node
+    # still fills from the matcher, and the next one still advances it.
+    grammar.release()
+    _launch(executor)
+    torch.cuda.synchronize()
+    assert torch.equal(executor.host_bitmask[0], _next_mask(_grammar(compiled)))
+    executor.output_tokens[0] = A
+    executor.accept_lengths[0] = 1
+    executor.add_batch(grammars=[None], bs=1, output_layout=layout)
+    _launch(executor)
+    torch.cuda.synchronize()
+    assert first.wait(0) and first.terminated_at() == [-1]
+    assert torch.equal(_next_mask(grammar), _next_mask(_grammar(compiled, [A])))
+    del first
+    assert handle_known(grammar.handle)
+    # The next add drops the batch the node is done with, and the last hold.
+    executor.add_batch(grammars=[None], bs=1, output_layout=layout)
+    assert not handle_known(grammar.handle)
 
 
 @pytest.mark.parametrize("on_host", [False, True])
