@@ -124,8 +124,8 @@ class DeepseekV41Config(SoftmaxAttnConfig):
                 raise ValueError(
                     "V4.1 model QCP currently requires the PD prefill role"
                 )
-            if attn.head_tp_size != 1 or attn.kvp_size != 1:
-                raise ValueError("V4.1 model QCP requires head TP=1 and KVP=1")
+            if attn.head_tp_size != 1:
+                raise ValueError("V4.1 model QCP requires head TP=1")
             if (
                 not server_args.disable_prefill_graph
                 or server_args.enable_mixed_batch

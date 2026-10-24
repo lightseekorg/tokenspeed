@@ -273,6 +273,7 @@ def _extend(
         (counts + prefix).to(device),
         ForwardMode.EXTEND,
         block_tables=tables,
+        block_tables_cpu={gid: table.cpu() for gid, table in tables.items()},
         extend_seq_lens=counts.to(device),
         extend_seq_lens_cpu=counts,
         extend_prefix_lens=prefix.to(device),
@@ -3394,7 +3395,8 @@ def test_model_qcp_metadata_keeps_full_cache_coordinates(rank):
         )
 
 
-def test_model_qcp_prefill_config():
+@pytest.mark.parametrize("kvp_size", [1, 4])
+def test_model_qcp_prefill_config(kvp_size):
     recipe = _recipe("cpu")
     hf = recipe.model_config.hf_config
     hf.index_topk, hf.candidate_topk_blocks, hf.candidate_block_size = 4, 2, 8
@@ -3403,6 +3405,7 @@ def test_model_qcp_prefill_config():
         device="cuda",
         attn_tp_size=4,
         query_context_parallel_size=4,
+        kv_parallel_size=kvp_size,
         ep_size=4,
         disaggregation_mode="prefill",
         disaggregation_layerwise_interval=0,
@@ -3423,6 +3426,7 @@ def test_model_qcp_prefill_config():
     )
     config = DeepseekV41Config.generate(args, model, False)
     assert config.qcp_size == 4
+    assert config.kvp_size == kvp_size
     assert config.component(DeepseekV41Config).attn_tp_size == 1
     args.deepseek_v41_indexer_query_parallel_size = 4
     with pytest.raises(ValueError, match="cannot combine with aggregate QCP"):
@@ -3442,7 +3446,8 @@ def test_model_qcp_prefill_config():
 
 
 @pytest.mark.parametrize("dspark", [False, True])
-def test_pd_replicated_prefill_to_sharded_decode_contract(dspark):
+@pytest.mark.parametrize("prefill_kvp", [1, 4])
+def test_pd_prefill_to_sharded_decode_contract(dspark, prefill_kvp):
     from tokenspeed.runtime.pd.cache_protocol import build_arena_cache_transfer_contract
     from tokenspeed.runtime.pd.transfer_plan import (
         CacheTransferPlanner,
@@ -3454,6 +3459,9 @@ def test_pd_replicated_prefill_to_sharded_decode_contract(dspark):
     source_recipe.attn_config = replace(
         source_recipe.attn_config,
         pd_disaggregation_enabled=True,
+        kvp_size=prefill_kvp,
+        kvp_rank=0,
+        kvp_group=tuple(range(prefill_kvp)),
     )
     destination_recipe.attn_config = replace(
         destination_recipe.attn_config,
@@ -3481,25 +3489,33 @@ def test_pd_replicated_prefill_to_sharded_decode_contract(dspark):
         seen = []
         for rank in range(4):
             route = planner.plan_for_decode_rank(rank)
-            assert len(route.target_prefill_ranks) == 1
+            assert len(route.target_prefill_ranks) == prefill_kvp
             count = destination.shard_count(group)
-            src, dst = local_transfer_pages(
-                source_ids,
-                destination_ids,
-                group_id=group,
-                source_layout=source,
-                destination_layout=destination,
-                source_owner_rank=0,
-                destination_owner_rank=rank,
-            )
-            restored_ids = ((dst - 1) * count + (rank if count > 1 else 0) + 1).tolist()
-            expected = [
-                (s, d)
-                for s, d in zip(source_ids, destination_ids)
-                if count == 1 or (d - 1) % count == rank
-            ]
-            assert list(zip(src.tolist(), restored_ids)) == expected
-            seen.extend(src.tolist())
+            source_count = source.shard_count(group)
+            for source_rank in range(source_count):
+                src, dst = local_transfer_pages(
+                    source_ids,
+                    destination_ids,
+                    group_id=group,
+                    source_layout=source,
+                    destination_layout=destination,
+                    source_owner_rank=source_rank,
+                    destination_owner_rank=rank,
+                )
+                restored_src = (
+                    (src - 1) * source_count + source_rank + 1
+                ).tolist()
+                restored_dst = (
+                    (dst - 1) * count + (rank if count > 1 else 0) + 1
+                ).tolist()
+                expected = [
+                    (s, d)
+                    for s, d in zip(source_ids, destination_ids)
+                    if (count == 1 or (d - 1) % count == rank)
+                    and (s - 1) % source_count == source_rank
+                ]
+                assert list(zip(restored_src, restored_dst)) == expected
+                seen.extend(restored_src)
         assert sorted(seen) == sorted(
             list(source_ids) * (1 if group in (R1, R2) else 4)
         )

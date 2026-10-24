@@ -36,6 +36,7 @@ import sys
 import weakref
 from contextlib import contextmanager
 from copy import copy
+from dataclasses import replace
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
 from test.runtime.test_deepseek_v41_engram import _mapping, _Tokenizer
@@ -3773,6 +3774,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
+    kvp_size = 4
     rank = int(os.environ["RANK"])
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     torch.cuda.set_device(device)
@@ -3781,6 +3783,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
         world_size=4,
         attn_tp_size=4,
         attn_qcp_size=4,
+        attn_kvp_size=kvp_size,
         dense_tp_size=4,
         moe_tp_size=1,
         moe_ep_size=4,
@@ -3826,8 +3829,35 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 module.quant_method.process_weights_after_loading(module)
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
-        backend = _backend(str(device), 2)
+        from test.runtime.test_deepseek_v41_cache import _pool, _recipe
+        from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
+            DeepseekV41AttentionBackend,
+        )
+        from tokenspeed.runtime.layers.attention.configs.deepseek_v41 import (
+            DeepseekV41Config,
+        )
+
+        replicated = _backend(str(device), 2)
+        recipe = _recipe(str(device))
+        recipe.attn_config = replace(
+            recipe.attn_config,
+            kvp_size=kvp_size,
+            kvp_rank=rank,
+            kvp_group=tuple(range(kvp_size)),
+        )
+        sharded_config = recipe.attn_config
+        partitioned = DeepseekV41AttentionBackend(
+            sharded_config, sharded_config.component(DeepseekV41Config)
+        )
+        partitioned.set_cache_pool(_pool(recipe, str(device)))
         tables = _tables(str(device))
+        kvp_tables = {gid: table.clone() for gid, table in tables.items()}
+        # Virtual KVP pages must map to the same disjoint physical LCM
+        # parents as the replicated fixture, rather than aliasing SWA pages.
+        for gid in (R1, R2):
+            table = kvp_tables[gid]
+            offset = (table[0, 0] - 1) * (kvp_size - 1)
+            table.add_(torch.where(table > 0, offset, 0))
         for length in (2, 7, 257):
             ids = torch.arange(length, device=device) % 7
             previous = torch.stack(
@@ -3844,7 +3874,11 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             mask = torch.ones(length, dtype=torch.bool, device=device)
             hashes = adapter.model.engram_hash(ids, previous, mask)
             outputs = []
-            for sharded in (False, True):
+            for sharded, backend in (
+                (False, replicated),
+                (True, replicated),
+                (True, partitioned),
+            ):
                 backend.cache_pool.arena.buffer.zero_()
                 plan = (
                     QueryShardPlan.from_forward(
@@ -3858,7 +3892,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                 )
                 meta = _extend(
                     backend,
-                    tables,
+                    kvp_tables if backend is partitioned else tables,
                     [length],
                     [0],
                     [0],
@@ -3878,15 +3912,19 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                     engram_token_mask=mask[rows],
                     image_mask=None,
                 )
-                assert torch.isfinite(result).all()
+                assert torch.isfinite(result).all(), (
+                    length, sharded, backend.kvp_size
+                )
                 outputs.append(result[-1:].clone())
             # Different GEMM row shapes and EP reduction order may round BF16
             # differently; this checks the sampled hidden output, not task accuracy.
             torch.testing.assert_close(outputs[1], outputs[0], rtol=0.03, atol=0.03)
-            gathered = [torch.empty_like(outputs[1]) for _ in range(4)]
-            torch.distributed.all_gather(gathered, outputs[1])
+            # Packed history transport must not change the QCP computation.
+            torch.testing.assert_close(outputs[2], outputs[1], rtol=0, atol=0)
+            gathered = [torch.empty_like(outputs[2]) for _ in range(4)]
+            torch.distributed.all_gather(gathered, outputs[2])
             for other in gathered:
-                torch.testing.assert_close(outputs[1], other, rtol=0, atol=0)
+                torch.testing.assert_close(outputs[2], other, rtol=0, atol=0)
 
             # Verify capture transport independently of GEMM/EP rounding:
             # deterministic taps must be restored byte-for-byte across uneven

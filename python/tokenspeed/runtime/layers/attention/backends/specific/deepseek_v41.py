@@ -645,9 +645,8 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 not forward_mode.is_extend()
                 or forward_mode.is_mixed()
                 or num_extends != bs
-                or self.kvp_size != 1
             ):
-                raise ValueError("V4.1 model QCP requires pure prefill with KVP=1")
+                raise ValueError("V4.1 model QCP requires pure prefill")
             if (
                 len(self.spec.indexer_query_group) > 1
                 or len(self.spec.attention_query_group) > 1
@@ -2042,10 +2041,6 @@ class DeepseekV41AttentionBackend(AttentionBackend):
                 raise ValueError("V4.1 sharded SWA requires pure prefill")
             if not 0 <= layer_id < len(self.spec.kv_owners):
                 raise ValueError("V4.1 layer_id is outside the backbone")
-            if self.kvp_size > 1:
-                raise NotImplementedError(
-                    "Model QCP with KVP needs collective validation"
-                )
             if len(self.spec.attention_query_group) > 1:
                 raise ValueError(
                     "Model QCP cannot combine with aggregate attention QCP"
