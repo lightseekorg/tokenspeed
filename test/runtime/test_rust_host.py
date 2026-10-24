@@ -333,7 +333,6 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
     server_args.mapping.rank = 0
     return HostDataPlane(
         handle,
-        None,
         Profiler(
             server_args=server_args,
             device=handle,
@@ -345,7 +344,7 @@ def _data_plane(handle: DeviceHandle) -> HostDataPlane:
         report_compiles=False,
         max_encoder_tokens=None,
         attn_tp_cpu_group=None,
-        epd_admission=None,
+        epd_publisher=None,
     )
 
 
@@ -357,7 +356,7 @@ def executor():
 def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1", temperature=0.0, max_new_tokens=8, stop_token_ids={9})
-    plane.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None, None)])
+    plane.admit([("r1", msgspec.msgpack.encode(params), [2, 9], 11, None)])
     scheduler = _scheduler()
     spec = RequestSpec()
     spec.request_id = "r1"
@@ -387,7 +386,7 @@ def test_the_data_plane_runs_a_plan_with_the_admitted_requests(executor):
 
 def test_the_data_plane_hands_the_logprob_plan_to_the_forward(executor):
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
+    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
         _plan_with_one_request("r1"), None, None, None, (([0], [2], [0], 2), 1), None
@@ -417,7 +416,7 @@ def _plan_with_one_request(rid: str):
 
 def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
+    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     pending = plane.execute(
         _plan_with_one_request("r1"),
@@ -441,7 +440,7 @@ def test_a_data_parallel_forward_carries_every_ranks_batch(executor):
 
 def test_an_idle_data_parallel_rank_runs_an_idle_forward(executor):
     plane = _data_plane(DeviceHandle(executor))
-    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)])
+    plane.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
 
     # This rank's plan has a batch, but the control plane decided it idles.
     assert (
@@ -512,7 +511,7 @@ def test_the_data_plane_leaves_a_plans_storage_operations_to_the_host(executor):
 def test_a_released_request_is_forgotten(executor):
     plane = _data_plane(DeviceHandle(executor))
     params = _resolved("r1")
-    plane.admit([("r1", msgspec.msgpack.encode(params), [], 10, None, None)])
+    plane.admit([("r1", msgspec.msgpack.encode(params), [], 10, None)])
     plane.release(["r1"])
     with pytest.raises(KeyError):
         plane.release(["r1"])
@@ -522,9 +521,7 @@ def test_a_forward_lands_once_and_counts_toward_a_profile_at_its_note(executor):
     """The commit waits on the copy event exactly once; the profiler counts
     the forward only when the forward thread runs its committed note."""
     profiled = _data_plane(DeviceHandle(executor))
-    profiled.admit(
-        [("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None, None)]
-    )
+    profiled.admit([("r1", msgspec.msgpack.encode(_resolved("r1")), [], 11, None)])
     launched = profiled.execute(
         _plan_with_one_request("r1"), None, None, None, (None, 0), None
     )

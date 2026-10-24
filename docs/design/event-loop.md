@@ -244,19 +244,21 @@ Consequences:
   through tensor indexing can stage a CPU tensor and introduce a hidden
   synchronous H2D copy, blocking further forward launches.
 
-EPD prefill admission is the data plane's own (the `epd_stage`, `epd_poll`
-and `epd_settle` operations), so its device half — receive-buffer
-allocation, the publish clone/scatter, and the NCCL shard reassembly — runs
-on the forward thread, which also puts the reassembly broadcasts on the same
-issuing thread as the model's collectives and keeps the cross-rank launch
-order.
-
-With pipeline parallelism, only PP0 receives encoder payloads and reserves
-the receive pool. PP0's attention TP group first agrees on completion;
-`PipelineEpdPrefillAdmission` then broadcasts admitted/failed request IDs
-along the pipeline CPU groups. Every stage submits the same requests in
-the same round, while later stages hold no encoder receiver or
-payload. Decode does not build this admission controller.
+An EPD prefill node's first stage receives each multimodal item's embedding
+through the host's embedding receiver (`ts-pd`'s `epd::receiver`): it looks
+up and registers with the encode ranks, leases each item a slot of the
+receive pools and tells the encode rank where to write, and every round
+reports each staged request's state, which the replica MIN-reduces, so a
+request is admitted, or failed, on every rank in the same round. Later
+pipeline stages hold no receiver and agree with whatever the first decides;
+decode builds none. The data plane keeps the device half. It allocates the
+pools (one device buffer, after the cache is sized; the host registers it
+once). `epd_publish` copies the landed rows out of their slots onto the
+items before any forward of the request and, with row sharding, rebuilds
+each image's other rows with NCCL broadcasts — on the forward thread, the
+same issuing thread as the model's collectives, which keeps the cross-rank
+launch order. `epd_released`, a completion query, reports the slots whose
+copies finished, so the receiver leases them again.
 
 The encoder's TP ranks attach every pixel-SHM segment in a received batch
 before any rank submits it to the encode worker. A CPU-group rendezvous

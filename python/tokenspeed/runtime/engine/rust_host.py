@@ -94,9 +94,9 @@ from tokenspeed.runtime.engine.scheduler_utils import (
     resolve_dspark_prefix_replay_tokens,
     should_use_overlap_schedule,
 )
-from tokenspeed.runtime.epd.prefill_admission import (
+from tokenspeed.runtime.epd.prefill_receive import (
     assert_embeddings_received,
-    make_epd_prefill_admission,
+    build_epd_receive,
 )
 from tokenspeed.runtime.execution.device import (
     arm_data_plane_sync_debug,
@@ -415,7 +415,8 @@ class HostConfig:
         engine_role: ``--disaggregation-mode``, an L3 metrics label.
         eplb: With ``--enable-eplb``, the rebalance's settings; else None.
         epd_prefill: An EPD prefill node: requests whose images an encode
-            worker embeds wait for the embeddings before they are scheduled.
+            node embeds wait for the embeddings before they are scheduled;
+            its first stage receives them (``HostBootstrap.epd_receive``).
         grammar: Grammar-constrained decoding's settings; None with
             ``--grammar-backend none``.
         eager_grammar: The forward fills grammar bitmasks from the
@@ -542,7 +543,7 @@ class HostDataPlane:
         report_compiles: bool,
         max_encoder_tokens: int | None,
         attn_tp_cpu_group,
-        epd_admission,
+        epd_publisher,
     ) -> None:
         self._device = handle
         # The control plane exports the serving-time compilations.
@@ -558,9 +559,10 @@ class HostDataPlane:
         self._max_encoder_tokens = max_encoder_tokens
         # The ranks a request's shared-memory features are exchanged over.
         self._attn_tp_cpu_group = attn_tp_cpu_group
-        # EPD prefill node: the embedding receives (``EpdPrefillAdmission``);
-        # None elsewhere.
-        self._epd = epd_admission
+        # EPD, a multimodal prefill node's first stage: publishes the
+        # embeddings the host's receiver landed (``EmbeddingPublisher``); None
+        # elsewhere.
+        self._epd = epd_publisher
         # The host's matcher entries (``set_grammar_entries``), with grammar
         # on.
         self._grammar_entries: HostGrammarEntries | None = None
@@ -895,25 +897,27 @@ class HostDataPlane:
                 self._grammar_entries, handle, frozenset(stop_token_ids)
             )
 
-    def epd_stage(self, rids: list[str]) -> None:
-        """EPD: start receiving these admitted requests' image embeddings
-        from their encode workers. Like every EPD step, a data-plane task:
-        behind a drafter's pending round."""
+    def epd_publish(
+        self,
+        landed: list[tuple[str, list[tuple[int, int | None, int, int, int, bool]]]],
+    ) -> None:
+        """EPD: put the embeddings the host's receiver landed onto their
+        requests' items ``(rid, landed items)``, before any forward of
+        theirs; with row sharding the replica's ranks rebuild each image's
+        other rows. Like every data-plane task, behind a drafter's pending
+        round."""
         self._device.settle()
-        for rid in rids:
-            self._epd.stage(rid, self._requests[rid].multimodal_inputs.mm_items)
+        self._epd.publish(
+            [
+                (self._requests[rid].multimodal_inputs.mm_items, items)
+                for rid, items in landed
+            ]
+        )
 
-    def epd_poll(self) -> list[int]:
-        """EPD: every staged receive's state on this rank, in staging order
-        (0 failed or timed out, 1 receiving, 2 done)."""
-        self._device.settle()
-        return self._epd.poll_codes()
-
-    def epd_settle(self, codes: list[int]) -> None:
-        """EPD: act on the replica-agreed states: reassemble the done
-        receives' embeddings, release the failed ones."""
-        self._device.settle()
-        self._epd.settle(codes)
+    def epd_released(self) -> list[int]:
+        """EPD: the receive slots whose rows ``epd_publish`` finished copying
+        out; a completion query, on the control thread."""
+        return self._epd.released()
 
     def snapshot_expert_load(self) -> tuple[list[list[int]], list[list[int]]]:
         """This rank's route counters since the previous snapshot and the
@@ -1130,24 +1134,19 @@ class HostBootstrap:
                 TorchMemorySaverAdapter.create(enable=server_args.enable_memory_saver),
                 nccl_suspendable=nccl_suspend_supported(),
             )
-            # EPD: a multimodal prefill node also receives image embeddings from
-            # encode workers; None for every other node.
-            epd_admission = (
-                make_epd_prefill_admission(
-                    server_args,
-                    global_rank,
-                    model_config=model_config,
-                    encoder_model_facts=device.encoder_model_facts,
-                    mapping=mapping,
-                    attn_tp_rank=attn_tp_rank,
-                    attn_tp_size=server_args.attn_tp_size or mapping.attn.tp_size,
-                    attn_tp_cpu_group=pg_manager.get_process_group(
-                        "gloo", mapping.attn.tp_group
-                    ),
-                    pg_manager=pg_manager,
-                )
-                if server_args.disaggregation_mode != "null"
-                else None
+            # EPD: a multimodal prefill node's first stage receives image
+            # embeddings from encode nodes; None for every other rank.
+            epd_receive = build_epd_receive(
+                server_args,
+                model_config=model_config,
+                encoder_model_facts=device.encoder_model_facts,
+                mapping=mapping,
+                attn_tp_rank=attn_tp_rank,
+                attn_tp_size=server_args.attn_tp_size or mapping.attn.tp_size,
+                attn_tp_cpu_group=pg_manager.get_process_group(
+                    "gloo", mapping.attn.tp_group
+                ),
+                pg_manager=pg_manager,
             )
             self.config = HostConfig(
                 handshake_address=server_args.zmq_handshake_endpoint(),
@@ -1226,7 +1225,10 @@ class HostBootstrap:
                     and kv_events_config.publisher in (None, "zmq")
                     else None
                 ),
-                epd_prefill=epd_admission is not None,
+                epd_prefill=(
+                    server_args.disaggregation_mode == "prefill"
+                    and model_config.is_multimodal_active
+                ),
                 grammar=(
                     GrammarSettings(
                         tokenizer_info=grammar_tokenizer_info(
@@ -1267,6 +1269,9 @@ class HostBootstrap:
             #: The PD peer the host starts its own from, None outside
             #: disaggregation.
             self.transfer_peer = device.transfer
+            #: EPD: the settings the host starts its embedding receiver from,
+            #: on a multimodal prefill node's first stage; else None.
+            self.epd_receive = epd_receive.settings if epd_receive is not None else None
             self.data_plane = HostDataPlane(
                 device.handle,
                 Profiler(
@@ -1296,7 +1301,9 @@ class HostBootstrap:
                 attn_tp_cpu_group=pg_manager.get_process_group(
                     "gloo", mapping.attn.tp_group
                 ),
-                epd_admission=epd_admission,
+                epd_publisher=(
+                    epd_receive.publisher if epd_receive is not None else None
+                ),
             )
             self._device = device.handle
 

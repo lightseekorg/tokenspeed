@@ -18,9 +18,9 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! The PD transfer peer as the scheduling loop sees it: requests register at
-//! admission, and every round the replica agrees on which transfers changed
-//! state.
+//! The PD transfer peer, and the EPD embedding receiver, as the scheduling
+//! loop sees them: requests register at admission, and every round the
+//! replica agrees on which transfers changed state.
 
 use ts_collective::{Group, Mesh};
 
@@ -99,4 +99,72 @@ pub trait TransferPeer {
     /// request failed before it could register (its embeddings never
     /// arrived), so its receiver fails instead of waiting. Best effort.
     fn abort_room(&mut self, rid: &str, room: u64);
+}
+
+/// EPD: one multimodal item of a request whose embedding an encode node
+/// computes, as the request names it (`item.encode_handshake`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingItem {
+    /// The item's position among the request's multimodal items.
+    pub index: usize,
+    /// The encode node's bootstrap server.
+    pub host: String,
+    /// Its port.
+    pub port: u16,
+    /// The room the encode node ships the item's embedding under.
+    pub room: u64,
+    /// The embedding's rows: the item's tokens.
+    pub rows: i64,
+}
+
+/// EPD: where one received item's rows landed, for the data plane to
+/// publish onto the item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedItem {
+    /// The item's position among the request's multimodal items.
+    pub index: usize,
+    /// The receive slot holding the rows; `None` when this rank received
+    /// none (an empty shard).
+    pub slot: Option<usize>,
+    /// The first row this rank received within the image.
+    pub row_start: i64,
+    /// The rows it received, packed at the slot's start.
+    pub row_count: i64,
+    /// The image's rows.
+    pub rows: i64,
+    /// The rows are this rank's shard: the ranks rebuild the rest.
+    pub sharded: bool,
+}
+
+/// EPD: a request whose items' embeddings all landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedRequest {
+    /// The request.
+    pub rid: String,
+    /// Its items, in the request's order.
+    pub items: Vec<LandedItem>,
+}
+
+/// EPD, a prefill node's first stage: receiving the encode nodes'
+/// embeddings of the requests waiting for them, as the scheduling loop
+/// drives it. Every member of the replica stages the same requests in the
+/// same order and settles the same codes.
+pub trait EmbeddingReceiver {
+    /// Start receiving `rid`'s items' embeddings.
+    fn stage(&mut self, rid: &str, items: &[EmbeddingItem]);
+
+    /// Every staged request's state on this rank, in staging order: 0
+    /// failed or timed out, 1 receiving, 2 landed.
+    fn poll(&mut self) -> Vec<i64>;
+
+    /// Act on the replica-agreed `codes` (`poll` order): forget the settled
+    /// requests, and return the landed ones' items for the data plane to
+    /// publish. Their slots stay leased until [`EmbeddingReceiver::release`].
+    fn settle(&mut self, codes: &[i64]) -> Vec<LandedRequest>;
+
+    /// The data plane copied these slots' rows out: they take new receives.
+    fn release(&mut self, slots: &[usize]);
+
+    /// Whether a landed slot still waits for its rows to be copied out.
+    fn awaiting_release(&self) -> bool;
 }

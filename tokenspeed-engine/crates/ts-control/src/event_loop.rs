@@ -56,7 +56,7 @@ use std::{
 
 use ts_collective::{Group, Mesh, Reduce};
 use ts_metrics::{EngineMetrics, L3Metrics};
-use ts_pd::{PdError, PdEvent, TransferPeer};
+use ts_pd::{EmbeddingItem, EmbeddingReceiver, LandedRequest, PdError, PdEvent, TransferPeer};
 use ts_scheduler::{
     CacheEvent, CacheOpKind, ExecutionPlan, ForwardBatchView, ForwardEvent, ForwardEventKind,
     Scheduler, StorageRound, StorageTickView,
@@ -147,8 +147,8 @@ struct Submission {
     rid: String,
     spec: ts_scheduler::RequestSpec,
     bootstrap: Option<ts_pd::BootstrapInfo>,
-    /// EPD: it waits for its images' embeddings.
-    epd: bool,
+    /// EPD: the items whose embeddings it waits for.
+    embeddings: Vec<EmbeddingItem>,
 }
 
 /// How long a frozen round sleeps, so a `keep` pause does not spin a core.
@@ -228,17 +228,13 @@ pub trait DataPlane {
         grammars: &[(String, u64, Vec<i32>)],
     ) -> Result<(), DataPlaneError>;
 
-    /// EPD: start receiving the encode workers' embeddings of these admitted
-    /// requests' images.
-    fn epd_stage(&mut self, rids: &[String]) -> Result<(), DataPlaneError>;
+    /// EPD: put the landed embeddings onto the requests' items, before any
+    /// forward of theirs; with row sharding, the replica's ranks rebuild
+    /// each image's other rows in the same order.
+    fn epd_publish(&mut self, landed: &[LandedRequest]) -> Result<(), DataPlaneError>;
 
-    /// EPD: this rank's state of every staged receive, in staging order: 0
-    /// failed or timed out, 1 receiving, 2 done.
-    fn epd_poll(&mut self) -> Result<Vec<i64>, DataPlaneError>;
-
-    /// EPD: act on the replica-agreed codes (`epd_poll` order): reassemble
-    /// the done receives, release the failed ones.
-    fn epd_settle(&mut self, codes: &[i64]) -> Result<(), DataPlaneError>;
+    /// EPD: the receive slots whose rows `epd_publish` finished copying out.
+    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError>;
 
     /// EPLB: move one chunk of layers' experts into `rows`, this rank's part
     /// being `moves` (one per layer), and switch their routing tables.
@@ -413,8 +409,10 @@ pub struct LoopConfig {
     /// The scheduler records KV cache events: every rank drains them each
     /// round, and the rank with a publisher sends them.
     pub kv_events: bool,
-    /// An EPD prefill node: a request whose images an encode worker embeds
-    /// waits for the embeddings before it is scheduled.
+    /// An EPD prefill node: a request whose images an encode node embeds
+    /// waits for the embeddings before it is scheduled. Its first stage
+    /// receives them ([`Subsystems::embeddings`]); a later stage follows the
+    /// first's decisions.
     pub epd_prefill: bool,
     /// The data plane fills grammar bitmasks before a forward from the
     /// matchers' state, which only a commit advances: a grammar batch
@@ -428,6 +426,9 @@ pub struct LoopConfig {
 pub struct Subsystems {
     /// The PD transfer peer of a disaggregated engine.
     pub transfer: Option<Box<dyn TransferPeer + Send>>,
+    /// EPD: the embedding receiver of a multimodal prefill node's first
+    /// stage.
+    pub embeddings: Option<Box<dyn EmbeddingReceiver + Send>>,
     /// The engine metrics, on the rank that reports them.
     pub metrics: Option<EngineMetrics>,
     /// The KV cache event publisher, on the rank that publishes them.
@@ -453,6 +454,7 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     config: LoopConfig,
     ranks: Ranks,
     transfer: Option<Box<dyn TransferPeer + Send>>,
+    embeddings: Option<Box<dyn EmbeddingReceiver + Send>>,
     metrics: Option<EngineMetrics>,
     kv_events: Option<KvEventPublisher>,
     eplb: Option<eplb::Controller>,
@@ -472,7 +474,7 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Admissions withheld from the scheduler while paused, in arrival order.
     withheld: Vec<Submission>,
     /// EPD: admissions waiting for their images' embeddings, in staging
-    /// order (rank-identical, the order the data plane reports them in).
+    /// order (rank-identical, the order the receiver reports them in).
     staged: Vec<Submission>,
     /// No attention-DP rank had a batch last round, so an idle rank may wait
     /// for requests without holding the others' collectives back.
@@ -520,6 +522,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             config,
             ranks,
             transfer: subsystems.transfer,
+            embeddings: subsystems.embeddings,
             metrics: subsystems.metrics,
             kv_events: subsystems.kv_events,
             eplb: subsystems.eplb,
@@ -1119,13 +1122,16 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         };
         let (staged, submissions): (Vec<_>, Vec<_>) = submissions
             .into_iter()
-            .partition(|submission| self.config.epd_prefill && submission.epd);
+            .partition(|submission| self.config.epd_prefill && !submission.embeddings.is_empty());
         if !staged.is_empty() {
             // Its transfer registers only once it reaches the scheduler: a
             // transfer event for a request the scheduler does not know is a
             // failure.
-            let rids: Vec<String> = staged.iter().map(|s| s.rid.clone()).collect();
-            self.data_plane.epd_stage(&rids)?;
+            if let Some(receiver) = self.embeddings.as_mut() {
+                for submission in &staged {
+                    receiver.stage(&submission.rid, &submission.embeddings);
+                }
+            }
             self.staged.extend(staged);
         }
         if self.controls.admit_blocked() {
@@ -1145,10 +1151,25 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         outputs: &mut Vec<StreamedOutput>,
         released: &mut Vec<String>,
     ) -> Result<(), LoopError> {
+        if self
+            .embeddings
+            .as_ref()
+            .is_some_and(|receiver| receiver.awaiting_release())
+        {
+            let slots = self.data_plane.epd_released()?;
+            if let Some(receiver) = self.embeddings.as_mut() {
+                receiver.release(&slots);
+            }
+        }
         if self.staged.is_empty() {
             return Ok(());
         }
-        let codes = self.data_plane.epd_poll()?;
+        // A later pipeline stage receives nothing: it agrees with whatever
+        // the first decides (landed, the MIN's neutral value).
+        let codes = match self.embeddings.as_mut() {
+            Some(receiver) => receiver.poll(),
+            None => vec![2; self.staged.len()],
+        };
         if codes.len() != self.staged.len() {
             return Err(LoopError::DataPlane(DataPlaneError(format!(
                 "{} EPD receive states for {} staged requests",
@@ -1157,7 +1178,12 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             ))));
         }
         let codes = self.replica_min(codes)?;
-        self.data_plane.epd_settle(&codes)?;
+        if let Some(receiver) = self.embeddings.as_mut() {
+            let landed = receiver.settle(&codes);
+            if !landed.is_empty() {
+                self.data_plane.epd_publish(&landed)?;
+            }
+        }
         let mut admitted = Vec::new();
         let mut leftover = Vec::new();
         for (submission, code) in std::mem::take(&mut self.staged).into_iter().zip(codes) {
@@ -2017,7 +2043,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 rid: admission.rid,
                 spec: admission.spec,
                 bootstrap: admission.bootstrap,
-                epd: admission.epd,
+                embeddings: admission.embeddings,
             };
             if let Some(key) = admission.grammar {
                 // A cache hit admits at once, unless the replica must first

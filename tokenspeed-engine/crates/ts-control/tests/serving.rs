@@ -59,7 +59,10 @@ use ts_l3::{
     monotonic_clock, Executor, ExecutorConfig, GroupLayout, HostBuffer, HostLayout, IoResult,
     Namespace, Range, Store, StoreError,
 };
-use ts_pd::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer};
+use ts_pd::{
+    BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
+    RemotePrefill, TransferPeer,
+};
 use ts_scheduler::{
     CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
 };
@@ -260,10 +263,12 @@ struct FakeDevice {
     placement: Arc<Mutex<Vec<Vec<i32>>>>,
     /// EPLB: every chunk applied, with its layers' rows.
     applied: Applied,
-    /// EPD: the staged requests in staging order, with the polls each saw.
-    epd_staged: Vec<(String, usize)>,
-    /// EPD: requests admitted after their embeddings landed, in order.
+    /// EPD: requests whose landed embeddings were published, in order.
     epd_admitted: Arc<Mutex<Vec<String>>>,
+    /// EPD: receive slots published and not yet reported copied out.
+    epd_copying: Vec<usize>,
+    /// EPD: slots reported copied out.
+    epd_released: Arc<Mutex<Vec<usize>>>,
     /// Grammar: each constrained request's matcher handle.
     grammars: HashMap<String, u64>,
 }
@@ -404,6 +409,88 @@ impl TransferPeer for FakePeer {
     }
 
     fn abort_room(&mut self, _: &str, _: u64) {}
+}
+
+/// EPD: a `lost-*` request's receive fails at its second poll, a `slow-*`
+/// one's lands after a hundred; the others' land after three polls, one more
+/// on each later rank. Each landed item takes one slot of eight.
+struct FakeReceiver {
+    rank: usize,
+    staged: Vec<(String, Vec<EmbeddingItem>, usize)>,
+    free: Vec<usize>,
+    awaiting: Vec<usize>,
+}
+
+impl EmbeddingReceiver for FakeReceiver {
+    fn stage(&mut self, rid: &str, items: &[EmbeddingItem]) {
+        assert!(!items.is_empty());
+        self.staged.push((rid.to_owned(), items.to_vec(), 0));
+    }
+
+    fn poll(&mut self) -> Vec<i64> {
+        let rank = self.rank;
+        self.staged
+            .iter_mut()
+            .map(|(rid, _, polls)| {
+                *polls += 1;
+                let landed_at = if rid.starts_with("lost") {
+                    return i64::from(*polls < 2);
+                } else if rid.starts_with("slow") {
+                    100
+                } else {
+                    3 + rank
+                };
+                if *polls >= landed_at {
+                    2
+                } else {
+                    1
+                }
+            })
+            .collect()
+    }
+
+    fn settle(&mut self, codes: &[i64]) -> Vec<LandedRequest> {
+        assert_eq!(codes.len(), self.staged.len());
+        let mut landed = Vec::new();
+        let mut kept = Vec::new();
+        for ((rid, items, polls), &code) in self.staged.drain(..).zip(codes) {
+            match code {
+                2 => landed.push(LandedRequest {
+                    rid,
+                    items: items
+                        .into_iter()
+                        .map(|item| {
+                            let slot = self.free.pop().expect("a free slot");
+                            self.awaiting.push(slot);
+                            LandedItem {
+                                index: item.index,
+                                slot: Some(slot),
+                                row_start: 0,
+                                row_count: item.rows,
+                                rows: item.rows,
+                                sharded: false,
+                            }
+                        })
+                        .collect(),
+                }),
+                1 => kept.push((rid, items, polls)),
+                _ => {}
+            }
+        }
+        self.staged = kept;
+        landed
+    }
+
+    fn release(&mut self, slots: &[usize]) {
+        for slot in slots {
+            let position = self.awaiting.iter().position(|s| s == slot).unwrap();
+            self.free.push(self.awaiting.remove(position));
+        }
+    }
+
+    fn awaiting_release(&self) -> bool {
+        !self.awaiting.is_empty()
+    }
 }
 
 impl DataPlane for FakeDevice {
@@ -604,55 +691,20 @@ impl DataPlane for FakeDevice {
         Ok(())
     }
 
-    fn epd_stage(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
-        self.epd_staged
-            .extend(rids.iter().map(|rid| (rid.clone(), 0)));
-        Ok(())
-    }
-
-    /// A `lost-*` request's receive fails at its second poll, a `slow-*`
-    /// one's lands after a hundred; the others' land after three polls, one
-    /// more on each later rank.
-    fn epd_poll(&mut self) -> Result<Vec<i64>, DataPlaneError> {
-        let ep_rank = self.ep_rank;
-        Ok(self
-            .epd_staged
-            .iter_mut()
-            .map(|(rid, polls)| {
-                *polls += 1;
-                if rid.starts_with("lost") {
-                    if *polls >= 2 {
-                        0
-                    } else {
-                        1
-                    }
-                } else if rid.starts_with("slow") {
-                    if *polls >= 100 {
-                        2
-                    } else {
-                        1
-                    }
-                } else if *polls >= 3 + ep_rank {
-                    2
-                } else {
-                    1
-                }
-            })
-            .collect())
-    }
-
-    fn epd_settle(&mut self, codes: &[i64]) -> Result<(), DataPlaneError> {
-        assert_eq!(codes.len(), self.epd_staged.len());
-        let mut kept = Vec::new();
-        for ((rid, polls), &code) in self.epd_staged.drain(..).zip(codes) {
-            match code {
-                2 => self.epd_admitted.lock().unwrap().push(rid),
-                1 => kept.push((rid, polls)),
-                _ => {}
-            }
+    fn epd_publish(&mut self, landed: &[LandedRequest]) -> Result<(), DataPlaneError> {
+        for request in landed {
+            self.epd_admitted.lock().unwrap().push(request.rid.clone());
+            self.epd_copying
+                .extend(request.items.iter().filter_map(|item| item.slot));
         }
-        self.epd_staged = kept;
         Ok(())
+    }
+
+    /// The published rows are copied out by the next query.
+    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
+        let slots = std::mem::take(&mut self.epd_copying);
+        self.epd_released.lock().unwrap().extend(&slots);
+        Ok(slots)
     }
 
     #[allow(clippy::type_complexity)]
@@ -855,6 +907,7 @@ struct Rank {
     device_ops: Arc<Mutex<Vec<String>>>,
     applied: Applied,
     epd_admitted: Arc<Mutex<Vec<String>>>,
+    epd_released: Arc<Mutex<Vec<usize>>>,
 }
 
 /// How the ranks split into schedulers.
@@ -1116,6 +1169,7 @@ fn run_rank<F: Frontend>(
         eplb,
         grammar,
         grammar_timeouts,
+        epd_prefill,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1158,6 +1212,14 @@ fn run_rank<F: Frontend>(
         ranks,
         Subsystems {
             transfer,
+            embeddings: epd_prefill.then(|| {
+                Box::new(FakeReceiver {
+                    rank,
+                    staged: Vec::new(),
+                    free: (0..8).collect(),
+                    awaiting: Vec::new(),
+                }) as Box<dyn EmbeddingReceiver + Send>
+            }),
             metrics: None,
             kv_events: None,
             eplb: eplb.map(|config| Controller::new(config(world, rank)).unwrap()),
@@ -1262,6 +1324,7 @@ async fn start_ranks_with(
                 device_ops: device.device_ops.clone(),
                 applied: device.applied.clone(),
                 epd_admitted: device.epd_admitted.clone(),
+                epd_released: device.epd_released.clone(),
             };
             let spec = RankSpec {
                 rank,
@@ -1895,13 +1958,17 @@ fn epd_request(rid: &str) -> TokenizedGenerateReqInput {
                 modality: Modality::Image,
                 hash: None,
                 pad_value: None,
-                offsets: None,
+                offsets: Some(vec![(0, 2)]),
                 feature: None,
                 feature_shm: None,
                 model_specific_data: Dict::default(),
                 encoded: None,
                 encoded_deepstack: None,
-                encode_handshake: Some(Dict::default()),
+                encode_handshake: Some(Dict(vec![
+                    (Value::from("bootstrap_room"), Value::from(7)),
+                    (Value::from("bootstrap_host"), Value::from("127.0.0.1")),
+                    (Value::from("bootstrap_port"), Value::from(8998)),
+                ])),
             }],
             im_token_id: None,
             video_token_id: None,
@@ -2046,6 +2113,8 @@ async fn epd_requests_wait_for_their_embeddings_on_every_rank() {
     engine.settle().await;
     for rank in 0..2 {
         assert_eq!(*engine.ranks[rank].epd_admitted.lock().unwrap(), ["img-0"]);
+        // Its slot went back once the data plane copied its rows out.
+        assert_eq!(*engine.ranks[rank].epd_released.lock().unwrap(), [7]);
         let released: Vec<String> = engine
             .released_on(rank)
             .into_iter()

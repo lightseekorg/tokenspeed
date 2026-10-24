@@ -58,7 +58,7 @@ hold each piece:
   register/abort, event polling), or None outside PD. Built here too: its
   execution face lives inside the handle, and everything its construction
   needs is ``server_args`` or an object this builder already owns.
-- ``encoder_model_facts`` — a startup-only callable for EPD admission,
+- ``encoder_model_facts`` — a startup-only callable for the EPD receive,
   resolved past its gate because a text-only model has no vision tower.
 - ``host_cache`` — startup-only Host storage and immutable payload facts,
   consumed by Host-only storage construction outside the device builder.
@@ -189,7 +189,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class EncoderModelFacts:
-    """The narrow model facts EPD admission needs, without the model.
+    """The narrow model facts the EPD receive needs, without the model.
 
     Attributes:
         device: The engine's device.
@@ -327,12 +327,12 @@ class DeviceBuild:
         host_cache: Startup-only Host resources and immutable payload facts,
             or None without an L2 Host allocation. Contains no Device buffers.
         handle: The running handle; the loop's only reach into the device.
-        encoder_model_facts: Zero-argument callable extracting the facts EPD
-            admission needs (``EncoderModelFacts``). A callable, not a value:
-            reading the vision tower's dtype raises on a text-only model, so
-            it must only run after the EPD admission gate has decided the
-            node is a multimodal prefill node. Startup-only, like the rest of
-            this object.
+        encoder_model_facts: Zero-argument callable extracting the facts the
+            EPD receive needs (``EncoderModelFacts``). A callable, not a
+            value: reading the vision tower's dtype raises on a text-only
+            model, so it must only run after the EPD receive's gate has
+            decided the node is a multimodal prefill node. Startup-only, like
+            the rest of this object.
     """
 
     specs: DeviceSpecs
@@ -981,7 +981,7 @@ def arm_data_plane_sync_debug(device: str) -> None:
     """Arm torch's sync-debug mode for the serving phase when asked to.
 
     Startup synchronizes on purpose -- weight loading, tuning, graph capture,
-    the PD transfer and L2 executor builders, the EPD admission's NCCL
+    the PD transfer and L2 executor builders, the EPD receive's NCCL
     warm-up in the rank's bootstrap -- so the rank arms the mode as its
     very last step before serving. It is process-wide:
     the control plane's ``copy_event.synchronize()`` and non-blocking D2H
@@ -1208,8 +1208,8 @@ def build_device_side(
     The chain is linear and the order is load-bearing: the multimodal runtime
     and persistent communication buffers must be prepared after weights are
     loaded and before ``create_attn_components`` profiles memory for the KV
-    budget (the EPD receive pool, which the admission allocates later, is left
-    out of that budget instead).
+    budget (the EPD receive pool, which the rank's bootstrap allocates later,
+    is left out of that budget instead).
 
     Args:
         server_args: Parsed server arguments.

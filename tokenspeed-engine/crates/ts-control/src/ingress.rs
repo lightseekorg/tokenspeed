@@ -27,7 +27,7 @@
 
 use std::collections::BTreeSet;
 
-use ts_pd::BootstrapInfo;
+use ts_pd::{BootstrapInfo, EmbeddingItem};
 use ts_scheduler::RequestSpec;
 use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
@@ -177,10 +177,9 @@ pub struct Admission {
     /// Its multimodal inputs, for the data plane, which owns the feature
     /// records: the wire frames of a generate request carrying only them.
     pub multimodal: Option<Vec<bytes::Bytes>>,
-    /// EPD: an encode worker computes some of its images' embeddings (an
-    /// item names its encode handshake), which must land before it is
-    /// scheduled.
-    pub epd: bool,
+    /// EPD: the items whose embeddings an encode node computes (an item
+    /// names its encode handshake), which must land before it is scheduled.
+    pub embeddings: Vec<EmbeddingItem>,
     /// The grammar its output follows, compiled before it is scheduled.
     pub grammar: Option<crate::grammar::GrammarKey>,
 }
@@ -211,12 +210,10 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     };
     let view = request_view(&request, limits);
     let bootstrap = bootstrap_info(&request);
-    let epd = request.multimodal_inputs.as_ref().is_some_and(|inputs| {
-        inputs
-            .mm_items
-            .iter()
-            .any(|item| item.encode_handshake.is_some())
-    });
+    let embeddings = request
+        .multimodal_inputs
+        .as_ref()
+        .map_or(Ok(Vec::new()), embedding_items);
     let multimodal = request.multimodal_inputs.take().map(|inputs| {
         // Only the data plane reads them; it decodes them as the wire does.
         let carrier = TokenizedGenerateReqInput {
@@ -233,6 +230,7 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     let invalid = request
         .validation_error
         .clone()
+        .or_else(|| embeddings.as_ref().err().cloned())
         .or_else(|| refusal(&view, &params, limits));
 
     let prompt_len = request.input_ids.as_ref().map_or(0, Vec::len) as i64;
@@ -322,9 +320,51 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         sampling_params: params,
         bootstrap,
         multimodal,
-        epd,
+        embeddings: embeddings.unwrap_or_default(),
         grammar,
     })))
+}
+
+/// EPD: the items naming an encode node's handshake (`bootstrap_room`,
+/// `bootstrap_host`, `bootstrap_port`), with their embeddings' rows: one per
+/// token of the item's ranges (`_item_token_count`).
+fn embedding_items(inputs: &ts_wire::MultimodalInputs) -> Result<Vec<EmbeddingItem>, String> {
+    let mut items = Vec::new();
+    for (index, item) in inputs.mm_items.iter().enumerate() {
+        let Some(handshake) = &item.encode_handshake else {
+            continue;
+        };
+        let field = |key: &str| handshake.get(&ts_wire::Value::from(key));
+        let integer = |key: &str| match field(key) {
+            Some(ts_wire::Value::Int(value)) => Some(*value),
+            _ => None,
+        };
+        let malformed = || format!("item {index}'s encode handshake is malformed");
+        let host = match field("bootstrap_host") {
+            Some(ts_wire::Value::Str(host)) => host.clone(),
+            _ => return Err(malformed()),
+        };
+        let port = integer("bootstrap_port")
+            .and_then(|port| port.narrow::<u16>("a port").ok())
+            .ok_or_else(malformed)?;
+        let room = integer("bootstrap_room")
+            .and_then(|room| room.narrow::<u64>("a room").ok())
+            .ok_or_else(malformed)?;
+        let rows = item
+            .offsets
+            .iter()
+            .flatten()
+            .map(|&(start, end)| end - start + 1)
+            .sum();
+        items.push(EmbeddingItem {
+            index,
+            host,
+            port,
+            room,
+            rows,
+        });
+    }
+    Ok(items)
 }
 
 /// The request's PD bootstrap fields, if it names all three.
@@ -499,7 +539,7 @@ fn too_many_stop_token_ids(state: &RequestState, params: &SamplingParams) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use ts_wire::Value;
+    use ts_wire::{Modality, MultimodalDataItem, MultimodalInputs, Value};
 
     use super::*;
     use crate::request::FinishReason;
@@ -842,5 +882,95 @@ mod tests {
         let mut no_id = request("x", vec![1], SamplingParams::default());
         no_id.rid = None;
         assert!(admit(no_id, &limits()).is_none());
+    }
+
+    fn image(
+        offsets: Vec<(i64, i64)>,
+        handshake: Option<Vec<(&str, Value)>>,
+    ) -> MultimodalDataItem {
+        MultimodalDataItem {
+            modality: Modality::Image,
+            hash: None,
+            pad_value: None,
+            offsets: Some(offsets),
+            feature: None,
+            feature_shm: None,
+            model_specific_data: ts_wire::Dict::default(),
+            encoded: None,
+            encoded_deepstack: None,
+            encode_handshake: handshake.map(|fields| {
+                ts_wire::Dict(
+                    fields
+                        .into_iter()
+                        .map(|(key, value)| (Value::from(key), value))
+                        .collect(),
+                )
+            }),
+        }
+    }
+
+    fn with_images(items: Vec<MultimodalDataItem>) -> TokenizedGenerateReqInput {
+        TokenizedGenerateReqInput {
+            multimodal_inputs: Some(MultimodalInputs {
+                mm_items: items,
+                im_token_id: None,
+                video_token_id: None,
+                mrope_positions: None,
+                mrope_position_delta: None,
+                mrope_position_delta_scalar: None,
+                mrope_position_delta_repeated_cache: None,
+            }),
+            ..request("r1", vec![0; 16], SamplingParams::default())
+        }
+    }
+
+    #[test]
+    fn epd_items_name_their_encode_node_and_rows() {
+        let limits = IngressLimits {
+            multimodal: true,
+            ..limits()
+        };
+        // A room past i64 (rooms are random 64-bit), two ranges of one
+        // image, and an item the prefill node encodes itself.
+        let room = (1u64 << 63) + 5;
+        let request = with_images(vec![
+            image(vec![(0, 1)], None),
+            image(
+                vec![(2, 4), (8, 9)],
+                Some(vec![
+                    ("bootstrap_host", Value::from("10.0.0.3")),
+                    ("bootstrap_port", Value::from(8998)),
+                    (
+                        "bootstrap_room",
+                        Value::Int(ts_wire::msgpack::Integer::Unsigned(room)),
+                    ),
+                ]),
+            ),
+        ]);
+        let Some(Admitted::Run(admission)) = admit(request, &limits) else {
+            panic!("expected admission");
+        };
+        assert_eq!(
+            admission.embeddings,
+            [EmbeddingItem {
+                index: 1,
+                host: "10.0.0.3".to_owned(),
+                port: 8998,
+                room,
+                rows: 5,
+            }]
+        );
+        // A handshake without its port cannot be received: refused.
+        let request = with_images(vec![image(
+            vec![(0, 1)],
+            Some(vec![
+                ("bootstrap_host", Value::from("10.0.0.3")),
+                ("bootstrap_room", Value::from(7)),
+            ]),
+        )]);
+        assert_eq!(
+            refused_message(admit(request, &limits).expect("answered")),
+            "Invalid request: item 0's encode handshake is malformed"
+        );
     }
 }

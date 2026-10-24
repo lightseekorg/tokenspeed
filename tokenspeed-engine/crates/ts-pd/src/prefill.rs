@@ -1348,6 +1348,15 @@ impl PrefillPeer {
         self.shared.transport.sockets.port()
     }
 
+    /// EPD, the first stage of a multimodal Prefill node: a receiver of the
+    /// encode nodes' embeddings, over this peer's transfer engine.
+    pub fn embedding_receiver(
+        &self,
+        config: crate::epd::receiver::ReceiverConfig,
+    ) -> Result<crate::epd::receiver::Receiver, StartError> {
+        crate::epd::receiver::Receiver::start(config, self.shared.transport.clone())
+    }
+
     /// The transfer engine's session id.
     pub fn session_id(&self) -> String {
         self.shared.transport.session_id()

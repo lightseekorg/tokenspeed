@@ -33,12 +33,13 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyBytes};
 use ts_control::output::Role;
 use ts_pd::{
+    epd::receiver::{PoolRegion, ReceiverConfig},
     layout::{
         contract::Contract,
         manifest::{BlockTable, BlockTables},
     },
-    BatchRows, DecodeConfig, DecodeOutbox, DecodePeer, Layerwise, PeerConfig, PrefillConfig,
-    PrefillLayout, PrefillOutbox, PrefillPeer, TransferPeer,
+    BatchRows, DecodeConfig, DecodeOutbox, DecodePeer, EmbeddingReceiver, Layerwise, PeerConfig,
+    PrefillConfig, PrefillLayout, PrefillOutbox, PrefillPeer, TransferPeer,
 };
 use ts_scheduler::{ExecutionPlan, TransferBatchView};
 
@@ -194,22 +195,68 @@ fn contract(settings: &Bound<'_, PyAny>, name: &str) -> PyResult<Contract> {
     Contract::from_wire(wire.as_bytes()).map_err(|error| PyRuntimeError::new_err(error.0))
 }
 
-/// What a peer runs: its control face, for the scheduling loop, and its
-/// forward-thread face.
-pub type Started = (Role, Option<(Box<dyn TransferPeer + Send>, Streams)>);
+/// A rank's disaggregation peers.
+pub struct Peers {
+    /// The rank's role.
+    pub role: Role,
+    /// The PD transfer peer's control face, for the scheduling loop.
+    pub transfer: Option<Box<dyn TransferPeer + Send>>,
+    /// Its forward-thread face.
+    pub streams: Option<Streams>,
+    /// EPD: the embedding receiver of a multimodal Prefill rank's first
+    /// stage.
+    pub embeddings: Option<Box<dyn EmbeddingReceiver + Send>>,
+}
 
-/// The rank's role and PD peer, started from the settings of the peer
-/// object the bootstrap built (`HostBootstrap.transfer_peer`), its outcomes
-/// counted in `metrics`; `outbox` reaches it from then on. `Role::Plain`
-/// and no peer outside disaggregation.
+/// EPD: a receiver's settings (`EpdReceiveSettings`).
+fn receiver_config(epd: &Bound<'_, PyAny>) -> PyResult<ReceiverConfig> {
+    let slots: usize = epd.getattr("slots")?.extract()?;
+    let region = |base: &str, slot_bytes: &str| -> PyResult<Option<PoolRegion>> {
+        let slot_bytes: u64 = epd.getattr(slot_bytes)?.extract()?;
+        Ok((slots > 0 && slot_bytes > 0).then_some(PoolRegion {
+            base: epd.getattr(base)?.extract()?,
+            slot_bytes,
+            slots,
+        }))
+    };
+    Ok(ReceiverConfig {
+        tp_size: epd.getattr("tp_size")?.extract()?,
+        tp_rank: epd.getattr("tp_rank")?.extract()?,
+        hidden: epd.getattr("hidden")?.extract()?,
+        num_deepstack: epd.getattr("num_deepstack")?.extract()?,
+        dtype: epd.getattr("dtype")?.extract()?,
+        element_size: epd.getattr("element_size")?.extract()?,
+        shard: epd.getattr("shard")?.extract()?,
+        pool: region("pool_base", "slot_bytes")?,
+        deepstack_pool: region("deepstack_base", "deepstack_slot_bytes")?,
+        timeout: seconds(epd.getattr("timeout_s")?.extract()?),
+    })
+}
+
+/// The rank's role and peers, started from the settings of the peer object
+/// the bootstrap built (`HostBootstrap.transfer_peer`) and, on an EPD
+/// Prefill rank's first stage, of its embedding receive (`epd`); the PD
+/// peer's outcomes are counted in `metrics`, and `outbox` reaches it from
+/// then on. `Role::Plain` and no peer outside disaggregation.
 pub fn start(
     py: Python<'_>,
     peer: Bound<'_, PyAny>,
+    epd: Bound<'_, PyAny>,
     outbox: &Outbox,
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
-) -> PyResult<Started> {
+) -> PyResult<Peers> {
+    let refuse_epd =
+        || PyRuntimeError::new_err("EPD embeddings are received only on a PD Prefill node");
     if peer.is_none() {
-        return Ok((Role::Plain, None));
+        if !epd.is_none() {
+            return Err(refuse_epd());
+        }
+        return Ok(Peers {
+            role: Role::Plain,
+            transfer: None,
+            streams: None,
+            embeddings: None,
+        });
     }
     let settings = peer.getattr("settings")?;
     let role_settings = peer.getattr("role_settings")?;
@@ -266,9 +313,23 @@ pub fn start(
                 session = peer.session_id(),
                 "PD prefill peer up"
             );
+            let embeddings = if epd.is_none() {
+                None
+            } else {
+                let config = receiver_config(&epd)?;
+                let receiver = py
+                    .detach(|| peer.embedding_receiver(config))
+                    .map_err(failed)?;
+                Some(Box::new(receiver) as Box<dyn EmbeddingReceiver + Send>)
+            };
             let streams = Streams::Prefill(prefill_outbox);
             let _ = outbox.streams.set(streams.clone());
-            Ok((Role::Prefill, Some((Box::new(peer), streams))))
+            Ok(Peers {
+                role: Role::Prefill,
+                transfer: Some(Box::new(peer)),
+                streams: Some(streams),
+                embeddings,
+            })
         }
         "decode" => {
             let config = DecodeConfig {
@@ -289,6 +350,9 @@ pub fn start(
                     .getattr("heartbeat_max_failures")?
                     .extract()?,
             };
+            if !epd.is_none() {
+                return Err(refuse_epd());
+            }
             let (peer, decode_outbox) = py.detach(|| DecodePeer::start(config)).map_err(failed)?;
             tracing::info!(
                 port = peer.port(),
@@ -297,7 +361,12 @@ pub fn start(
             );
             let streams = Streams::Decode(decode_outbox);
             let _ = outbox.streams.set(streams.clone());
-            Ok((Role::Decode, Some((Box::new(peer), streams))))
+            Ok(Peers {
+                role: Role::Decode,
+                transfer: Some(Box::new(peer)),
+                streams: Some(streams),
+                embeddings: None,
+            })
         }
         other => Err(PyRuntimeError::new_err(format!(
             "no PD peer for mode {other}"

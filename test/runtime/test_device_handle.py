@@ -849,7 +849,7 @@ def test_the_remote_decode_keeps_the_forward_order():
 
 
 # ----------------------------------------------------------------------
-# EPD admission: encoder facts resolve past the gate, never before.
+# EPD receive: the encoder facts a multimodal prefill node reads.
 # ----------------------------------------------------------------------
 
 
@@ -907,34 +907,6 @@ def test_encoder_facts_fall_back_to_vision_parameter_dtype():
     assert facts == EncoderModelFacts(
         device="cpu", hidden=64, num_deepstack=3, dtype=torch.float32
     )
-
-
-def test_text_only_pd_nodes_never_read_the_encoder_facts():
-    """The facts callable must not fire unless the node is an EPD prefill.
-
-    Reading the vision tower's dtype raises on a text-only model, and every
-    text-only PD node passes through this factory — so the facts are handed
-    over as a bound method and resolved only past the manager gate. Passing
-    the VALUE here once crashed every text-only PD deployment at startup.
-    """
-    from tokenspeed.runtime.epd.prefill_admission import make_epd_prefill_admission
-
-    def facts():  # pragma: no cover — reaching this is the failure
-        raise AssertionError("encoder facts read on a non-EPD node")
-
-    admission = make_epd_prefill_admission(
-        SimpleNamespace(disaggregation_mode="decode"),
-        0,
-        model_config=SimpleNamespace(is_multimodal_active=False),
-        encoder_model_facts=facts,
-        mapping=None,
-        attn_tp_rank=0,
-        attn_tp_size=1,
-        attn_tp_cpu_group=None,
-        pg_manager=None,
-    )
-
-    assert admission is None
 
 
 # ----------------------------------------------------------------------
@@ -1072,50 +1044,6 @@ def test_metadata_only_ops_are_recognized_by_schema():
     assert not _only_aliases_inputs(torch.ops.aten.add.Tensor)
     assert not _only_aliases_inputs(torch.ops.aten.clone.default)
     assert not _only_aliases_inputs(torch.ops.aten.copy_.default)
-
-
-def test_epd_receive_registers_its_own_buffer_without_the_pool(monkeypatch):
-    """With no receive pool, the job allocates the item's receive buffer and
-    registers it with the transfer engine itself."""
-    from tokenspeed.runtime.epd import prefill_admission
-
-    monkeypatch.setattr(prefill_admission, "_get_pool", lambda engine, device: None)
-    registered: list = []
-
-    item = SimpleNamespace(
-        encode_handshake={
-            "bootstrap_host": "h",
-            "bootstrap_port": 1,
-            "bootstrap_room": 2,
-        },
-        encoded=None,
-        offsets=[(0, 3)],  # 4 encoded tokens
-    )
-
-    class _Receiver:
-        def __init__(self, manager, addr, room) -> None:
-            pass
-
-        def poll(self):  # pragma: no cover — not driven here
-            return "Bootstrapped"
-
-    job = prefill_admission.EmbeddingReceiveJob(
-        [item],
-        SimpleNamespace(
-            engine=SimpleNamespace(
-                register=lambda ptr, nbytes: registered.append((ptr, nbytes))
-            )
-        ),
-        hidden=8,
-        num_deepstack=0,
-        dtype=torch.float32,
-        device="cpu",
-        receiver_factory=_Receiver,
-    )
-
-    recv_main = job._items[0].recv_main
-    assert recv_main.shape == (4, 8)
-    assert registered == [(recv_main.data_ptr(), 4 * 8 * 4)]
 
 
 def test_expert_load_reset_and_dump_ride_the_execution_stream(tmp_path):

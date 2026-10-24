@@ -24,9 +24,10 @@ The mechanical plumbing (the Mooncake engine + ZMQ control socket + room-keyed
 status FSM) is the role-neutral shared base in :mod:`tokenspeed.runtime.pd.base`;
 the bootstrap rendezvous server is the engine's (``tokenspeed_engine``). This
 module just layers the embedding role's buffer args onto it. The
-embedding-specific *semantics* -- the wire frames and the senders/receivers --
-live in the sibling ``encode`` / ``sender`` / ``prefill`` / ``receiver``
-modules; nothing here carries any KV/MLA/metrics state.
+embedding-specific *semantics* -- the wire frames and the senders -- live in
+the sibling ``encode`` / ``sender`` modules (the prefill side's receiver is
+the host's, ``ts-pd``'s ``epd::receiver``); nothing here carries any
+KV/MLA/metrics state.
 """
 
 from __future__ import annotations

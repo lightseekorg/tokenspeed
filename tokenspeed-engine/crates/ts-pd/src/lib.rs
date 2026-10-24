@@ -38,6 +38,7 @@ mod batch;
 pub mod bootstrap;
 mod control;
 mod decode;
+pub mod epd;
 mod http;
 pub mod layout;
 mod net;
@@ -53,7 +54,10 @@ use std::{
 
 pub use batch::BatchRows;
 pub use bootstrap::{BootstrapServer, Registry};
-pub use control::{BootstrapInfo, PdError, PdEvent, RemotePrefill, TransferPeer};
+pub use control::{
+    BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
+    RemotePrefill, TransferPeer,
+};
 pub use decode::{DecodeConfig, DecodeOutbox, DecodePeer};
 pub use layout::{
     registration::{PrefillLayout, PrefillRoute},

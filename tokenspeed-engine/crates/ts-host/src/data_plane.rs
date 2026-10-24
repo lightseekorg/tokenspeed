@@ -53,6 +53,7 @@ use ts_control::{
     ingress::Admission,
     output::{ForwardResult, HistorySeeds, LogprobPlan, NgramWindows, TopLogprobs},
 };
+use ts_pd::LandedRequest;
 use ts_scheduler::{CacheEvent, CacheEventKind, ExecutionPlan};
 use ts_wire::{control::ProfileReq, ControlRequest, Wire};
 
@@ -71,6 +72,11 @@ struct Execution {
     logprobs: Option<LogprobPlan>,
     history: Option<HistorySeeds>,
 }
+
+/// EPD: one landed item as the data plane's `epd_publish` takes it: the
+/// item's index, its slot or None, the first row received, how many, the
+/// image's rows, and whether they are this rank's shard.
+type PyLandedItem = (usize, Option<usize>, i64, i64, i64, bool);
 
 /// An operation for the forward thread.
 enum Op {
@@ -112,14 +118,8 @@ enum Op {
     SnapshotExpertLoad {
         reply: mpsc::SyncSender<Result<ExpertLoad, String>>,
     },
-    EpdStage(Vec<String>),
-    EpdPoll {
-        reply: mpsc::SyncSender<Result<Vec<i64>, String>>,
-    },
-    EpdSettle {
-        codes: Vec<i64>,
-        reply: mpsc::SyncSender<Result<(), String>>,
-    },
+    /// EPD: landed embeddings to publish onto their items.
+    EpdPublish(Vec<LandedRequest>),
     ApplyExpertPlacement {
         layer_ids: Vec<usize>,
         rows: Vec<Vec<i32>>,
@@ -458,17 +458,17 @@ impl DataPlane for PythonDataPlane {
         self.queue(Op::AttachGrammars(grammars.to_vec()))
     }
 
-    fn epd_stage(&mut self, rids: &[String]) -> Result<(), DataPlaneError> {
-        self.queue(Op::EpdStage(rids.to_vec()))
+    fn epd_publish(&mut self, landed: &[LandedRequest]) -> Result<(), DataPlaneError> {
+        self.queue(Op::EpdPublish(landed.to_vec()))
     }
 
-    fn epd_poll(&mut self) -> Result<Vec<i64>, DataPlaneError> {
-        self.ask(|reply| Op::EpdPoll { reply })
-    }
-
-    fn epd_settle(&mut self, codes: &[i64]) -> Result<(), DataPlaneError> {
-        let codes = codes.to_vec();
-        self.ask(|reply| Op::EpdSettle { codes, reply })
+    /// A completion query: the copies' events, read on this thread.
+    fn epd_released(&mut self) -> Result<Vec<usize>, DataPlaneError> {
+        self.query(|plane| {
+            plane
+                .call_method0("epd_released")
+                .and_then(|slots| slots.extract())
+        })
     }
 
     fn snapshot_expert_load(&mut self) -> Result<ExpertLoad, DataPlaneError> {
@@ -571,7 +571,6 @@ fn forward_loop(
                 | Op::IdleForward { reply, .. }
                 | Op::ReleaseMemory { reply, .. }
                 | Op::ResumeMemory { reply, .. }
-                | Op::EpdSettle { reply, .. }
                 | Op::ApplyExpertPlacement { reply, .. } => {
                     let _ = reply.send(Err(failure));
                 }
@@ -581,15 +580,12 @@ fn forward_loop(
                 Op::SnapshotExpertLoad { reply } => {
                     let _ = reply.send(Err(failure));
                 }
-                Op::EpdPoll { reply } => {
-                    let _ = reply.send(Err(failure));
-                }
                 Op::Admit(_)
                 | Op::Execute(_)
                 | Op::Committed(_)
                 | Op::Release(_)
                 | Op::Land { .. }
-                | Op::EpdStage(_)
+                | Op::EpdPublish(_)
                 | Op::AttachGrammars(_) => {}
             }
             continue;
@@ -760,22 +756,30 @@ fn run(
                 .call_method1("attach_grammars", (grammars,))
                 .map_err(python)?;
         }
-        Op::EpdStage(rids) => {
-            plane.call_method1("epd_stage", (rids,)).map_err(python)?;
-        }
-        Op::EpdPoll { reply } => {
-            let done = plane
-                .call_method0("epd_poll")
-                .and_then(|codes| codes.extract())
-                .map_err(python);
-            answer(reply, done)?;
-        }
-        Op::EpdSettle { codes, reply } => {
-            let done = plane
-                .call_method1("epd_settle", (codes,))
-                .map(drop)
-                .map_err(python);
-            answer(reply, done)?;
+        Op::EpdPublish(landed) => {
+            let landed: Vec<(String, Vec<PyLandedItem>)> = landed
+                .into_iter()
+                .map(|request| {
+                    let items = request
+                        .items
+                        .into_iter()
+                        .map(|item| {
+                            (
+                                item.index,
+                                item.slot,
+                                item.row_start,
+                                item.row_count,
+                                item.rows,
+                                item.sharded,
+                            )
+                        })
+                        .collect();
+                    (request.rid, items)
+                })
+                .collect();
+            plane
+                .call_method1("epd_publish", (landed,))
+                .map_err(python)?;
         }
         Op::SnapshotExpertLoad { reply } => {
             let done = plane

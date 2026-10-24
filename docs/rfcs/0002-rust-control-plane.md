@@ -241,7 +241,7 @@ their release, ordered behind the forward that captured them, as today.
 | L2 / snapshot cache ops | op adaptation, ACK polling, replica intersection | the `HostCacheExecutor` and its streams |
 | L3 | the per-round storage agreement (clock, permissions, completions, pressure), cancellations, namespace / weight-version gates | the Host-only L3 executor and its storage backend clients (including the Mooncake store) |
 | PD | bootstrap server, request registration, the Mooncake transfer engine: memory registration, transfer submission, status polling | KV packing into staging buffers (GPU copies), landing |
-| EPD | admission controller, completion agreement | receive pools, reassembly, encoder |
+| EPD | the prefill receiver: encode-rank handshakes, receive slots, completion agreement | receive-pool memory, publish and reassembly, encoder |
 | Pause / memory saver | state machine, drain gates | release/wake regions |
 | RL weight ops | the two FIFOs and the same-round gate | the weight load and NCCL group work |
 | EPLB | controller, agreements, placement solver | load snapshot, apply placement |
@@ -465,8 +465,10 @@ bootstrap server is `ts-pd`'s too, which the launcher hosts through
 `tokenspeed_engine`. Layerwise streaming reads the producer's step counter
 directly. The memory saver's release deregisters
 the prefill peer's cache regions and registers them again on resume, and
-gives the decode peer a fresh transfer session. EPD prefill admission keeps
-its device half in Python and agrees on landed embeddings each round. L3
+gives the decode peer a fresh transfer session. The EPD prefill receiver is
+`ts-pd`'s too (the encode-rank handshakes, the receive slots, the agreement
+on landed embeddings); the data plane keeps the pools' memory, the publish
+copies and the shard reassembly. L3
 storage, context parallelism (which needs no control-plane logic of its
 own), pause, RL weight operations, EPLB (controller, solver and move plan),
 grammar-constrained decoding (`ts-grammar`, xgrammar's C++ library),
