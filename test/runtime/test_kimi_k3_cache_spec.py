@@ -134,6 +134,27 @@ def test_bf16_mla_cache_reuses_the_same_packing_rule() -> None:
     assert latent.page_stride_bytes == latent_page_bytes
 
 
+def test_bf16_recurrent_state_keeps_layout_and_latent_stride() -> None:
+    """The existing dtype option changes storage bytes without changing axes."""
+    recipe, _, fp32_layout = kimi_tp8_layout()
+    recipe.server_args.mamba_ssm_dtype = "bfloat16"
+    bf16_plan = recipe.setup().spec.memory_plan
+    fp32_plan = fp32_layout.bind(7)
+    assert bf16_plan.lcm_block_bytes == fp32_plan.lcm_block_bytes // 2
+    old_fields = {field.field_id: field for field in fp32_plan.fields}
+    for field in bf16_plan.fields:
+        old = old_fields[field.field_id]
+        assert field.shape == old.shape
+        if field.field_id.endswith(".recurrent_state"):
+            assert field.dtype == "bfloat16"
+            assert old.dtype == "float32"
+        elif field.field_id.endswith(".conv_state"):
+            assert field.dtype == old.dtype == "bfloat16"
+            assert field.shape[-1] == 3
+        else:
+            assert field.page_stride_bytes == old.page_stride_bytes
+
+
 @pytest.mark.parametrize("kvp_size", [1, 4])
 def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     monkeypatch,
@@ -176,8 +197,10 @@ def test_speculative_verify_workspace_is_reserved_outside_the_arena(
     assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
 
 
+@pytest.mark.parametrize("raw_gate", [False, True])
 def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     monkeypatch,
+    raw_gate,
 ) -> None:
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
@@ -185,7 +208,7 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
     )
     monkeypatch.setattr(
         "tokenspeed_kernel.ops.attention.kda.kda_batched_replay_uses_raw_gate",
-        lambda dtype, **kwargs: False,
+        lambda dtype, **kwargs: raw_gate,
     )
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=5,
@@ -200,10 +223,17 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         for field in fields
         if field.field_id.endswith(".conv_state")
     )
+    # Raw-gate replay aliases the committed conv pool and stores BF16 gates;
+    # other replay paths reserve transient conv rows and FP32 gates.
+    if raw_gate:
+        conv_row_bytes = 0
+    gate_bytes = 2 if raw_gate else 4
     # 69 KDA layers x (4 requests x 8 draft tokens) rows, each one bf16
-    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus an fp32 gate row
+    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus a gate row
     # (12 x 128), per rank at TP8.
-    expected_payload_bytes = 69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * 4)
+    expected_payload_bytes = (
+        69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * gate_bytes)
+    )
     expected_workspace_bytes = conv_row_bytes + expected_payload_bytes
 
     setup = recipe.setup()
@@ -214,6 +244,26 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         recipe.cache_budget_bytes - expected_workspace_bytes
     ) // layout.lcm_block_bytes - 1
     assert setup.spec.memory_plan.num_lcm_blocks == expected_parents
+
+
+def test_bf16_replay_reserves_one_shared_state_input(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_replay_commit_supported",
+        lambda dtype, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        "tokenspeed_kernel.ops.attention.kda.kda_batched_replay_uses_raw_gate",
+        lambda dtype, **kwargs: False,
+    )
+    recipe, _, _ = kimi_tp8_layout(
+        max_bs=4,
+        speculative_algorithm="DSPARK",
+        speculative_num_draft_tokens=8,
+    )
+    fp32_bytes = recipe.workspace_bytes()
+    recipe.server_args.mamba_ssm_dtype = "bfloat16"
+    # One four-request state buffer, rather than a copy for each of 69 layers.
+    assert recipe.workspace_bytes() - fp32_bytes == 4 * 12 * 128 * 128 * 2
 
 
 def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
@@ -309,6 +359,20 @@ def test_k3_binding_utilization_with_real_bf16_draft_geometry():
     widened = merged.capacity_report()
     assert abs(widened["full_attention"]["binding_utilization"] - 1.0) < 1e-3
     assert abs(widened["linear_attention_0"]["binding_utilization"] - 0.6224) < 1e-3
+
+
+def test_kda_state_dtype_cli_defaults_to_fp32() -> None:
+    import argparse
+
+    from tokenspeed.runtime.utils.server_args import ServerArgs
+
+    parser = argparse.ArgumentParser()
+    ServerArgs.add_cli_args(parser)
+    assert parser.parse_args([]).mamba_ssm_dtype == "float32"
+    assert (
+        parser.parse_args(["--mamba-ssm-dtype", "bfloat16"]).mamba_ssm_dtype
+        == "bfloat16"
+    )
 
 
 @pytest.mark.parametrize("limit", [1, 16384])

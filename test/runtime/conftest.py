@@ -105,6 +105,7 @@ def kimi_recipe(
     return KimiK3Recipe(
         server_args=SimpleNamespace(
             kv_offload_config=None,
+            mamba_ssm_dtype="float32",
             max_total_tokens=None,
             chunked_prefill_size=max_scheduled_tokens,
             disaggregation_mode="null",

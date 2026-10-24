@@ -906,6 +906,181 @@ class TestKimiK3RegistrationTests:
                 assert mixed_qkv.dtype == torch.bfloat16
                 assert mixed_qkv.shape == (rows, 3 * 64)
 
+    @staticmethod
+    def _kda_output_layer(*, fp8):
+        from tokenspeed.runtime.models import kimi_k3
+
+        config = KimiLinearConfig(
+            hidden_size=256 if fp8 else 128,
+            num_hidden_layers=1,
+            num_attention_heads=1,
+            num_key_value_heads=1,
+            linear_attn_config={
+                "kda_layers": [1],
+                "full_attn_layers": [],
+                "num_heads": 2 if fp8 else 1,
+                "head_dim": 128,
+                "short_conv_kernel_size": 4,
+                "gate_lower_bound": -5.0,
+                "use_full_rank_gate": True,
+            },
+        )
+        mapping = SimpleNamespace(
+            linear_attn=SimpleNamespace(tp_rank=0, tp_size=1, tp_group=(0,)),
+        )
+        layer = kimi_k3.KimiLinearKDA(
+            config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
+        )
+        if fp8:
+            layer.o_proj.quant_method = kimi_k3.Fp8LinearMethod(
+                kimi_k3.Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    weight_block_size=[128, 128],
+                )
+            )
+            layer.o_proj.weight = torch.nn.Parameter(
+                torch.empty(256, 256, dtype=torch.float8_e4m3fn), requires_grad=False
+            )
+            layer.o_proj.register_parameter(
+                "weight_scale_inv",
+                torch.nn.Parameter(torch.ones(2, 2), requires_grad=False),
+            )
+        return layer
+
+    def test_kda_output_plan_is_prepared_after_quantization_and_refreshed_on_reload(
+        self,
+    ):
+        from tokenspeed.runtime.models import kimi_k3
+
+        layer = self._kda_output_layer(fp8=True)
+        language_model = kimi_k3.KimiLinearForCausalLM.__new__(
+            kimi_k3.KimiLinearForCausalLM
+        )
+        torch.nn.Module.__init__(language_model)
+        language_model.model = torch.nn.ModuleDict(
+            {"layers": torch.nn.ModuleList([torch.nn.ModuleDict({"self_attn": layer})])}
+        )
+        model = kimi_k3.KimiK3ForConditionalGeneration.__new__(
+            kimi_k3.KimiK3ForConditionalGeneration
+        )
+        torch.nn.Module.__init__(model)
+        model.language_model = language_model
+        assert layer._output_plan is None
+        with (
+            mock.patch.dict(os.environ, {"TOKENSPEED_MAMBA_SSM_DTYPE": "bfloat16"}),
+            mock.patch.dict(kimi_k3.global_server_args_dict, dense_gemm_backend="auto"),
+            mock.patch.object(
+                kimi_k3, "has_flashinfer_fp8_blockscale", return_value=True
+            ),
+        ):
+            model.post_load_weights()
+            assert layer._output_plan is None
+            model.post_quant_warmup()
+            first_plan = layer._output_plan
+            assert kimi_k3.fp8_linear_gated_rmsnorm_supported(first_plan)
+            scales = first_plan
+            scales_ptr = scales.data_ptr()
+            updated_scales = torch.tensor([[2.0, 3.0], [5.0, 7.0]])
+            layer.o_proj.weight_scale_inv.copy_(updated_scales)
+            model.post_load_weights()
+            assert layer._output_plan is first_plan
+            assert first_plan.data_ptr() == scales_ptr
+            torch.testing.assert_close(scales, updated_scales.t(), atol=0, rtol=0)
+            model.post_quant_warmup()
+            assert layer._output_plan is first_plan
+            assert first_plan.data_ptr() == scales_ptr
+
+            layer.o_proj.quant_method.quant_config.scale_fmt = "ue8m0"
+            with pytest.raises(ValueError, match="changed format"):
+                model.post_quant_warmup()
+            assert layer._output_plan is first_plan
+            unsupported = self._kda_output_layer(fp8=True)
+            unsupported.o_proj.quant_method.quant_config.scale_fmt = "ue8m0"
+            unsupported.prepare_output_plan()
+            assert unsupported._output_plan is None
+            for weight_shape, scale_shape, scale_dtype in (
+                ((128, 128), (1,), torch.float32),
+                ((129, 128), (2, 1), torch.float32),
+                ((128, 129), (1, 2), torch.float32),
+                ((128, 128), (1, 1), torch.bfloat16),
+            ):
+                unsupported = self._kda_output_layer(fp8=True)
+                unsupported.o_proj.weight.data = torch.empty(
+                    weight_shape, dtype=torch.float8_e4m3fn
+                )
+                unsupported.o_proj.weight_scale_inv.data = torch.ones(
+                    scale_shape, dtype=scale_dtype
+                )
+                unsupported.prepare_output_plan()
+                assert unsupported._output_plan is None
+            unquantized = self._kda_output_layer(fp8=False)
+            unquantized.prepare_output_plan()
+            assert unquantized._output_plan is None
+
+    def test_kda_output_fusion_preserves_projection_destinations_and_communication(
+        self,
+    ):
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+        from tokenspeed.runtime.models import kimi_k3
+
+        layer = self._kda_output_layer(fp8=False)
+        rows = 2
+        hidden = torch.empty(rows, 128, dtype=torch.bfloat16)
+        output = torch.empty_like(hidden)
+        projection_outputs = (
+            torch.empty(rows, 384, dtype=torch.bfloat16),
+            torch.empty_like(hidden),
+            torch.empty_like(hidden),
+            torch.empty(rows, 1, dtype=torch.bfloat16),
+        )
+        plan = kimi_k3.prepare_flashinfer_fp8_blockscale_weight_scales(torch.ones(1, 1))
+        for prepared, destination, parallel in (
+            (False, False, False),
+            (True, False, False),
+            (True, True, False),
+            (True, False, True),
+        ):
+            layer._output_plan = plan if prepared else None
+            layer.output_parallel = SimpleNamespace() if parallel else None
+            backend = mock.Mock(return_value=hidden)
+            ctx = SimpleNamespace(
+                forward_mode=ForwardMode.DECODE,
+                bs=rows,
+                attn_backend=SimpleNamespace(forward=backend),
+                token_to_kv_pool=None,
+            )
+            with (
+                mock.patch.dict(os.environ, {"TOKENSPEED_MAMBA_SSM_DTYPE": "bfloat16"}),
+                mock.patch.object(
+                    layer, "_project_qkvfab", return_value=projection_outputs
+                ),
+                mock.patch.object(
+                    kimi_k3, "fp8_linear_gated_rmsnorm", return_value=output
+                ) as fused,
+                mock.patch.object(kimi_k3, "mm", return_value=output) as direct,
+                mock.patch.object(
+                    kimi_k3, "rmsnorm_gated_sigmoid", return_value=hidden
+                ),
+                mock.patch.object(
+                    layer.o_proj, "forward", return_value=(output, None)
+                ) as projection,
+            ):
+                result = layer(
+                    positions=torch.empty(rows, dtype=torch.int64),
+                    hidden_states=hidden,
+                    ctx=ctx,
+                    comm_manager=None,
+                    projection_out=output if destination else None,
+                )
+            assert result is output
+            assert fused.called == (prepared and not destination and not parallel)
+            assert direct.called == destination
+            assert projection.called == (parallel or not prepared)
+            if destination:
+                assert direct.call_args.kwargs["out"] is output
+            if parallel:
+                assert projection.call_args.kwargs["ctx"] is ctx
+
     @_NVIDIA_ONLY
     def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
         import tokenspeed.runtime.models.kimi_k3 as kimi_k3

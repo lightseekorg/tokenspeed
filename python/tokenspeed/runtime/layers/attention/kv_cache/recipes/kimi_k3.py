@@ -28,6 +28,7 @@ byte width so no parent is wasted.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping
 from dataclasses import replace
 from functools import cached_property
@@ -261,7 +262,7 @@ class KimiK3Recipe(CacheRecipe):
                 f"layer.{layer_id}.recurrent_state",
                 plane_id,
                 recurrent_shape,
-                cache_dtype_name(torch.float32),
+                cache_dtype_name(getattr(torch, self.server_args.mamba_ssm_dtype)),
                 exact_page_stride=False,
             ),
         )
@@ -336,12 +337,20 @@ class KimiK3Recipe(CacheRecipe):
             # Verify staging exists for the target's verify step; the prefill
             # role only ever writes committed prompt state.
             return 0
-        return kda_verify_workspace_bytes(
+        workspace_bytes = kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
             draft_token_num=int(self.server_args.speculative_num_draft_tokens),
             replay_kda=self.replay_kda,
         )
+        if self.replay_kda and self.server_args.mamba_ssm_dtype == "bfloat16":
+            # One compact BF16 verify input, shared across all KDA layers.
+            workspace_bytes += (
+                self.attn_config.max_bs
+                * math.prod(self._kda_shapes[1])
+                * torch.bfloat16.itemsize
+            )
+        return workspace_bytes
 
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 

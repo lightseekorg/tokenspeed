@@ -99,9 +99,9 @@ def flash_kda_chunk_prefill(
         beta: Raw beta logits ``[B, T, HV]``; sigmoid is applied in-kernel.
         A_log: Per-head FP32 decay parameter ``[HV]``.
         dt_bias: FP32 gate bias with ``HV * K`` elements.
-        initial_state: Optional FP32 recurrent state per packed sequence in
-            the FLA-native ``[N, HV, K, V]`` convention; ``None`` starts from
-            zero.
+        initial_state: Optional BF16 or FP32 recurrent state per packed
+            sequence in the FLA-native ``[N, HV, K, V]`` convention;
+            promoted to FP32 for the scan. ``None`` starts from zero.
         cu_seqlens: Cumulative sequence boundaries ``[N + 1]`` (``B`` must
             be 1); ``None`` treats each batch row as one sequence.
         cu_seqlens_cpu: Host copy of ``cu_seqlens`` (unified prefill-op
@@ -113,7 +113,7 @@ def flash_kda_chunk_prefill(
 
     Returns:
         ``(o [B, T, HV, V], final_state [N, HV, K, V])`` matching the FLA
-        wrapper's convention.
+        wrapper's convention, with FP32 final state.
     """
     if not beta_is_logit:
         raise ValueError("flash_kda_chunk_prefill requires raw beta logits")
@@ -130,8 +130,9 @@ def flash_kda_chunk_prefill(
         num_sequences = q.shape[0]
         boundaries = None
     # FLA-native [N, HV, K, V] -> FlashKDA [N, HV, V, K].
+    # FlashKDA requires initial and final states to have the same dtype.
     state_in = (
-        initial_state.transpose(-1, -2).contiguous()
+        initial_state.transpose(-1, -2).float().contiguous()
         if initial_state is not None
         else None
     )
