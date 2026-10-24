@@ -761,6 +761,8 @@ def _mhc_post_hc4_triton_kernel(
     acc2 = tl.load(post + post_base + 2).to(tl.float32) * hidden_values
     acc3 = tl.load(post + post_base + 3).to(tl.float32) * hidden_values
 
+    # Match the fused CUDA post-mapping before the BF16 materialization.
+    # Explicit FMA prevents compiler-dependent contraction of separate products.
     comb_base = token_id * 16
     for in_hc in tl.static_range(0, 4):
         residual_values = tl.load(
@@ -769,10 +771,16 @@ def _mhc_post_hc4_triton_kernel(
             other=0.0,
         ).to(tl.float32)
         comb_row = comb_base + in_hc * 4
-        acc0 += tl.load(comb + comb_row).to(tl.float32) * residual_values
-        acc1 += tl.load(comb + comb_row + 1).to(tl.float32) * residual_values
-        acc2 += tl.load(comb + comb_row + 2).to(tl.float32) * residual_values
-        acc3 += tl.load(comb + comb_row + 3).to(tl.float32) * residual_values
+        acc0 = tl.fma(tl.load(comb + comb_row).to(tl.float32), residual_values, acc0)
+        acc1 = tl.fma(
+            tl.load(comb + comb_row + 1).to(tl.float32), residual_values, acc1
+        )
+        acc2 = tl.fma(
+            tl.load(comb + comb_row + 2).to(tl.float32), residual_values, acc2
+        )
+        acc3 = tl.fma(
+            tl.load(comb + comb_row + 3).to(tl.float32), residual_values, acc3
+        )
 
     tl.store(out + token_residual_offset + hidden_offsets, acc0, mask=hidden_mask)
     tl.store(
@@ -1160,7 +1168,12 @@ def triton_mhc_post(
     post: torch.Tensor,
     comb: torch.Tensor,
 ) -> torch.Tensor:
-    """Run the portable Triton mHC post-mapping."""
+    """Run the portable Triton mHC post-mapping.
+
+    For hc=4, round the FP32 post product, then accumulate residual streams
+    in input order with FP32 fused multiply-adds before casting the output.
+    This preserves the materialized residual of the fused CUDA path.
+    """
     if not hidden_states.is_cuda:
         raise RuntimeError("fast mHC requires CUDA tensors")
     if residual.numel() == 0:
@@ -1843,6 +1856,49 @@ def triton_mhc_mixes(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_it
         _mhc_prenorm_gemm_triton,
         mhc_pre_mix_hc4,
     )
+
+
+@triton.jit(do_not_specialize=["X0", "X1"], do_not_specialize_on_alignment=["X0", "X1"])
+def _mhc_init_kernel(
+    X, Y, PRE, X0, X1, H: tl.constexpr, HC: tl.constexpr, B: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    d = tile * B + tl.arange(0, B)
+    # Strided views can span more than int32 elements within one row.
+    value = tl.load(X + row * X0 + d.to(tl.int64) * X1, d < H, 0)
+    for stream in tl.static_range(HC):
+        tl.store(Y + (row * HC + stream) * H + d, value, d < H)
+        if tile == 0:
+            tl.store(PRE + row * HC + stream, 1.0 if stream == 0 else 0.0)
+
+
+@register_kernel(
+    "residual",
+    "mhc_init",
+    name="triton_mhc_init",
+    solution="triton",
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=format_signatures(("hidden",), "dense", _DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_mhc_init(hidden, hc_mult):
+    rows, width = hidden.shape
+    residual = hidden.new_empty((rows, hc_mult, width))
+    pre = torch.empty((rows, hc_mult), dtype=torch.float32, device=hidden.device)
+    if rows:
+        _mhc_init_kernel[(rows, triton.cdiv(width, 1024))](
+            hidden,
+            residual,
+            pre,
+            hidden.stride(0),
+            hidden.stride(1),
+            H=width,
+            HC=hc_mult,
+            B=1024,
+            num_warps=4,
+        )
+    return residual, pre
 
 
 def mhc_apply_pre(residual: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:

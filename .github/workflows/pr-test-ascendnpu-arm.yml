@@ -25,7 +25,7 @@ name: Ascend NPU Tests
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
 
 permissions:
@@ -33,7 +33,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}${{ github.event.action == 'labeled' && github.event.label.name != 'high priority' && format('-ignored-label-{0}', github.run_id) || '' }}
+  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -42,8 +42,7 @@ jobs:
     if: |
       (github.repository == 'lightseekorg/tokenspeed' ||
        github.repository == vars.TOKENSPEED_NPU_CI_REPOSITORY) &&
-      github.event.deleted != true &&
-      (github.event.action != 'labeled' || github.event.label.name == 'high priority')
+      github.event.deleted != true
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:

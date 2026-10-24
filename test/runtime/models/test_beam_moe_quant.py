@@ -678,6 +678,81 @@ def test_the_offered_token_fp8_is_consumed_once(server, monkeypatch):
     assert attn._token_fp8 is None
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FP8 kernels need CUDA")
+@pytest.mark.parametrize("sandwich", [False, True])
+@pytest.mark.parametrize("consumer_kind", ["dense", "attention"])
+def test_norm_fp8_offer_matches_separate_quantization(server, sandwich, consumer_kind):
+    """Real norm and GEMM kernels agree with separately quantizing the BF16 rows."""
+    from tokenspeed.runtime.models.beam_sandwich_fusion import BeamSandwichNorm
+
+    server("flashinfer_trtllm")
+    tensors, _ = fp8_checkpoint()
+    model = _model(ct())
+    model.load_weights(list(tensors.items()))
+    model.cuda()
+    layer = model.model.layers[0]
+    consumer = layer.mlp if consumer_kind == "dense" else layer.self_attn
+    _post_load(consumer)
+    norm = (
+        layer.post_attention_layernorm
+        if consumer_kind == "dense"
+        else layer.input_layernorm
+    )
+    project = consumer if consumer_kind == "dense" else consumer.project_qkv_gate
+
+    def equal_outputs(left, right):
+        if isinstance(left, tuple):
+            return all(torch.equal(a, b) for a, b in zip(left, right, strict=True))
+        return torch.equal(left, right)
+
+    if sandwich:
+        norm.__class__ = BeamSandwichNorm
+        object.__setattr__(norm, "_sandwich_producer", layer.attn_output_layernorm)
+        object.__setattr__(norm, "_sandwich_mapping", model.mapping)
+    for tokens in (1, 8, 64):
+        x = torch.randn(tokens, 128, device="cuda", dtype=torch.bfloat16)
+        rows, _ = norm(x, x, x_scale=0.5, residual_scale=0.75)
+        offered_rows, codes, scales = consumer._token_fp8
+        assert offered_rows is rows
+        expected_codes, expected_scales = beam.quantize_fp8(
+            rows, granularity="token", enable_pdl=False
+        )
+        assert torch.equal(codes.view(torch.uint8), expected_codes.view(torch.uint8))
+        assert torch.equal(scales, expected_scales)
+        offered_output = project(rows)
+        assert consumer._token_fp8 is None
+        separate_output = project(rows)
+        assert equal_outputs(offered_output, separate_output)
+        # An offer belongs to exactly one tensor and cannot survive a different input.
+        consumer.offer_token_fp8(rows, codes, scales)
+        assert equal_outputs(project(rows.clone()), separate_output)
+        assert consumer._token_fp8 is None
+    assert not consumer.takes_token_fp8(
+        torch.zeros(65, 128, device="cuda", dtype=torch.bfloat16)
+    )
+    bf16 = _model().cuda().model.layers[0].mlp
+    _post_load(bf16)
+    assert not bf16.takes_token_fp8(
+        torch.zeros(1, 128, device="cuda", dtype=torch.bfloat16)
+    )
+
+
+def test_dense_fp8_offer_is_owned_by_one_call(server):
+    """Row identity and single consumption hold even before kernels are launched."""
+    server("flashinfer_trtllm")
+    mlp = _model(ct()).model.layers[0].mlp
+    rows = torch.zeros(1, 128, dtype=torch.bfloat16)
+    codes = torch.zeros(1, 128).to(FP8)
+    scales = torch.ones(1, 1)
+    mlp.offer_token_fp8(rows, codes, scales)
+    offered = mlp._input_fp8(rows)
+    assert offered[0] is codes and offered[1] is scales
+    assert mlp._input_fp8(rows) is None
+    mlp.offer_token_fp8(rows, codes, scales)
+    assert mlp._input_fp8(rows.clone()) is None
+    assert mlp._input_fp8(rows) is None
+
+
 Q = "model.layers.0.self_attn.q_proj"
 ROUTER = "model.layers.1.mlp.gate"
 

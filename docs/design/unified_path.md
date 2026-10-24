@@ -687,6 +687,16 @@ idle ranks join its draft collectives with empty rows. A round with no
 decodes performs no draft forward. Decode graph warmup and capture use the
 same uniform padded decode counts as their target batches.
 
+V4.1 completes deferred HC posts and reductions before stage handoffs or
+Engram updates. The fixed graph input state contains only completed residuals.
+Prefill warmup runs on the eventual capture stream because MegaMHC initializes
+per-stream barriers. Allocation observers wrap capture alone, leaving eager
+warmup allocations in utilization headroom. Fused HC all-reduce admission
+respects both deterministic and batch-invariant collective settings. Empty
+consumer rows carry no deferred post. Cache-only narrowing completes the incoming
+post before the global KV producer and skips new HC mixes; idle ranks still
+participate in expert-owned dispatch/combine, which never defers another reduction.
+
 ### Prefill requests without generated outputs
 
 The original execution batch and cache metadata always contain every request.
@@ -1240,10 +1250,26 @@ recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
 verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
-The runner calls `commit_speculative_state_after_verify` once on the target
-after drafted decode/mixed execution or graph replay, with live acceptance
-and `num_extends`. Since forward mode is derived from the extend count,
-zero means decode at this entry. Hybrid commits GDN/KDA only then; the
+The runner calls `commit_state_after_acceptance` once on the target
+after decode/mixed execution or graph replay, with live acceptance and
+`num_extends`. KDA uses the same replay lifecycle for standard target decode:
+its verify width and accepted count are one when there are no draft tokens.
+Its cache recipe reserves the record workspace for this case before sizing
+the arena. Replay capability determines this reservation even without a drafter;
+prefill-only engines do not reserve decode records. NVIDIA target verification and
+commit use saved corrections for both BF16 and FP16 activations; the same
+batched recovery also handles a layer subset. AMD uses its registered
+batched recovery over saved records. Fused convolution verification retains
+original QKV in its records workspace. The registered backend owns the gate
+projection when the model does not supply a gate. Split convolution producers
+retain original QKV in the same launch that computes convolved rows. Both
+arrangements write the existing replay workspace; commit reads that workspace
+after acceptance. A missing batched binding is an error,
+not a reason to recompute each layer through a second commit path. Since forward
+mode is derived from the extend count, zero means decode at this entry. Hybrid
+delegates to the recurrent child.
+A mixed batch gives prefill and decode rows their existing metadata and
+forwards; only the decode suffix enters the acceptance commit. The
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
 decode/mixed, excluding leading extends from QSA acceptance. Mixed rounds
 retain PLE's direct state writes. Each consumer commits once; stateless

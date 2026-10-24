@@ -29,7 +29,7 @@ path. The TP-agreed path has one owner, the backend's packed verify output
 * `TreeSpec.compact_rows` moves the target hidden rows to the front of the
   window and the positions back from `vc + depth` to `vc + i`;
 * stateful backends receive it through
-  `commit_speculative_state_after_verify(accepted_path=...)` (`None` for a chain).
+  `commit_state_after_acceptance(accepted_path=...)` (`None` for a chain).
 
 Everything downstream sees a chain.
 

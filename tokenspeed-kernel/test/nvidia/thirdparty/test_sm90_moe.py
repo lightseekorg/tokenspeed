@@ -230,6 +230,21 @@ def test_direct_lookup_overflow_matches_original(implementations, expert_weights
         torch.testing.assert_close(actual, reference, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("tokens", (32, 512))
+def test_prefix_scan_with_more_experts_than_threads_matches_original(
+    implementations, tokens
+):
+    # 512 experts take two scan chunks of the 384-thread SwapAB block.
+    experts = 512
+    weights = _make_expert_weights(experts, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+    arguments = _arguments(weights, tokens, experts, HIDDEN_SIZE, TOP_K, False)
+    reference = implementations["default"](**arguments)[0].clone()
+    hint = max(1, (tokens * TOP_K + experts - 1) // experts)
+    for mode in ("expected_m", "optimized", "fc1_4"):
+        actual = implementations[mode](**arguments, expected_m=hint)[0]
+        torch.testing.assert_close(actual, reference, atol=0, rtol=0)
+
+
 def _activation_quantization_launches(call):
     """Kernel names and grids of the grouped activation quantization in one call."""
     with torch.profiler.profile(

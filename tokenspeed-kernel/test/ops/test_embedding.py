@@ -29,6 +29,7 @@ from tokenspeed_kernel.ops.embedding import (
     apply_k_rope,
     apply_rope,
     apply_rope_mla,
+    mxfp8_embedding,
 )
 from tokenspeed_kernel.platform import current_platform
 from utils import assert_no_triton_compile
@@ -701,3 +702,94 @@ def test_triton_rope_reads_int32_positions_past_two_to_the_25():
         outs.append((q, k))
     for a, b in zip(*outs):
         assert torch.equal(a.view(torch.int16), b.view(torch.int16))
+
+
+def _mxfp8_table(device) -> tuple[torch.Tensor, torch.Tensor]:
+    generator = torch.Generator(device=device).manual_seed(83)
+    weight = torch.randn((64, 256), device=device, generator=generator).to(
+        torch.float8_e4m3fn
+    )
+    scales = torch.randint(
+        118, 132, (64, 8), device=device, dtype=torch.uint8, generator=generator
+    )
+    return weight, scales
+
+
+def _mxfp8_indices(device, rows: int, layout: str, dtype: torch.dtype) -> torch.Tensor:
+    if layout == "layer":
+        ids = torch.arange(rows * 2 * 24, device=device, dtype=dtype).reshape(
+            rows, 2, 24
+        )[:, 1, :]
+    elif layout == "transpose":
+        ids = torch.arange(rows * 24, device=device, dtype=dtype).reshape(24, rows).t()
+    elif layout == "columns":
+        ids = torch.arange(rows * 48, device=device, dtype=dtype).reshape(rows, 48)[
+            :, ::2
+        ]
+    elif layout == "broadcast":
+        return (torch.arange(24, device=device, dtype=dtype) * 4).expand(rows, -1)
+    else:
+        ids = torch.arange(rows * 24, device=device, dtype=dtype).reshape(rows, 2, 12)
+    # Update in place to retain the sliced/strided layout.
+    ids.copy_(ids % 90)
+    return ids
+
+
+def _mxfp8_reference(weight, scales, ids):
+    local = (ids >= 17) & (ids < 70)
+    offset = (ids.long() - 17).clamp(0, 63)
+    codes = weight.view(torch.uint8)[offset].view(torch.float8_e4m3fn).float()
+    factors = (
+        scales[offset].view(torch.float8_e8m0fnu).float().repeat_interleave(32, dim=-1)
+    )
+    return (codes * factors).to(torch.bfloat16).masked_fill(~local[..., None], 0)
+
+
+@pytest.mark.parametrize("rows", [0, 6, 12, 24, 48, 96, 192, 1031])
+@pytest.mark.parametrize(
+    "layout", ["layer", "transpose", "columns", "broadcast", "contiguous"]
+)
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+def test_embedding_reads_strided_ids(device, rows, layout, dtype):
+    weight, scales = _mxfp8_table(device)
+    ids = _mxfp8_indices(device, rows, layout, dtype)
+    actual = mxfp8_embedding(weight, scales, ids, 17, 70)
+    expected = _mxfp8_reference(weight, scales, ids)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.is_contiguous()
+
+
+def test_embedding_rejects_noncontiguous_three_dimensional_ids(device):
+    weight, scales = _mxfp8_table(device)
+    ids = torch.zeros((2, 3, 4), device=device, dtype=torch.int64).transpose(0, 1)
+    with pytest.raises(ValueError, match="contiguous or two-dimensional IDs"):
+        mxfp8_embedding(weight, scales, ids, 17, 70)
+
+
+def test_embedding_replays_updated_layer_slice(device):
+    weight, scales = _mxfp8_table(device)
+    ids = _mxfp8_indices(device, 6, "layer", torch.int64)
+    mxfp8_embedding(weight, scales, ids, 17, 70)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = mxfp8_embedding(weight, scales, ids, 17, 70)
+    for shift in (1, 3, 11):
+        ids.copy_((ids + shift) % 90)
+        graph.replay()
+        torch.testing.assert_close(
+            captured, _mxfp8_reference(weight, scales, ids), rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("rows", [2048, 2049, 65536])
+def test_embedding_strided_large_row_dispatch(device, rows):
+    weight, scales = _mxfp8_table(device)
+    ids = torch.arange(rows * 2, device=device, dtype=torch.int64).reshape(rows, 2)[
+        :, 1:2
+    ]
+    ids.copy_(ids % 90)
+    actual = mxfp8_embedding(weight, scales, ids, 17, 70)
+    torch.testing.assert_close(
+        actual, _mxfp8_reference(weight, scales, ids), rtol=0, atol=0
+    )

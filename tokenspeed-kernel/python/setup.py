@@ -536,6 +536,7 @@ KERNEL_GROUPS = [
         ],
         [],
     ),
+    ("trtllm_mhc", [CUDA_CSRC_DIR / "trtllm_mnnvl_mhc.cu"], []),
     (
         "trtllm_comm",
         [
@@ -1123,6 +1124,7 @@ setup(
             "csrc/*.jinja",
             "csrc/include/*",
         ],
+        "tokenspeed_kernel.thirdparty.vllm_recoverssm": ["LICENSE"],
         # Petit Gluon compiles its small HIP VMM binding lazily on first use.
         "tokenspeed_kernel.thirdparty.gluon_petit": [
             "LICENSE.txt",
