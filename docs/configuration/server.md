@@ -1187,7 +1187,14 @@ Mooncake Store (L3)
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
+headroom per rank. Available means the smaller of the host's free memory and
+what the process's memory cgroup still allows (its limit, `memory.max` or
+`memory.high` on cgroup v2, less its usage with page cache counted as free;
+the tightest limit over its cgroup and the ones above it, found through
+`/proc/self/mountinfo`), so a container or a Slurm step is sized against its
+own limit; the
+sizing warning and the refusal name which one was used. Each buffer counts at
+the size it pins: PyTorch's pinned
 allocator rounds every allocation up to a power of two, so a 140 GB L2
 takes 274.88 GB. A ratio size larger than that share is capped to the
 largest L2 every rank's share holds beside its snapshot pool -- the whole

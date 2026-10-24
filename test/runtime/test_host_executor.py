@@ -93,7 +93,7 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.HostTransferLane = Mock
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
-    lanes.host_memory_share = Mock(return_value=10**12)
+    lanes.host_memory_share = Mock(return_value=(10**12, "host (psutil)"))
     lanes.largest_pinned_fit = Mock(side_effect=lambda room_bytes: max(room_bytes, 0))
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
@@ -920,6 +920,7 @@ class TestGroupAwareWireTest:
                 "virtual_memory",
                 return_value=SimpleNamespace(available=10**12),
             ),
+            patch.object(lanes_module, "cgroup_memory_headroom", return_value=None),
             patch.object(
                 executor_module, "LayerwiseLoadTracker", side_effect=make_tracker
             ),
@@ -1003,6 +1004,7 @@ class TestGroupAwareWireTest:
                 "virtual_memory",
                 return_value=SimpleNamespace(available=10**12),
             ),
+            patch.object(lanes_module, "cgroup_memory_headroom", return_value=None),
             patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
             patch.object(
                 executor_module,
@@ -1356,6 +1358,7 @@ class TestHostMemoryShareTest:
             ),
             patch.object(executor_module, "HostCacheStorage", return_value=storage),
             patch.object(lanes_module.psutil, "virtual_memory", return_value=available),
+            patch.object(lanes_module, "cgroup_memory_headroom", return_value=None),
             patch.object(executor_module, "LayerwiseLoadTracker", return_value=tracker),
             patch.object(
                 executor_module,
@@ -1502,6 +1505,137 @@ class TestHostMemoryShareTest:
         for room in (1, 3, 2**37 - 1, 228_260 * self.BLOCK_BYTES):
             assert (pinned(fit(room))) <= (room)
             assert (pinned(fit(room) + 1)) > (room)
+
+
+class TestCgroupMemoryHeadroom:
+    """Inside a container or a Slurm step psutil reports the whole host, so
+    the share is bounded by what this process's memory cgroups still allow."""
+
+    GB = 10**9
+
+    @pytest.fixture(autouse=True)
+    def _fake_procfs(self, tmp_path, monkeypatch):
+        try:
+            self.lanes = _lanes_module()
+        except (ImportError, ModuleNotFoundError) as exc:
+            pytest.skip(f"needs runtime dependencies: {exc}")
+        self.root = tmp_path
+        self.proc_cgroup = tmp_path / "cgroup"
+        self.mountinfo = tmp_path / "mountinfo"
+        self.mounts = []
+        monkeypatch.setattr(self.lanes, "_PROC_SELF_CGROUP", self.proc_cgroup)
+        monkeypatch.setattr(self.lanes, "_PROC_SELF_MOUNTINFO", self.mountinfo)
+
+    def _mount(self, fs_type, super_options, *, root="/", name=None):
+        """Mount a fake cgroup hierarchy; returns the mount directory."""
+        mount = self.root / (name or fs_type)
+        mount.mkdir(exist_ok=True)
+        self.mounts.append(
+            f"{30 + len(self.mounts)} 1 0:{len(self.mounts)} {root} {mount} rw "
+            f"shared:1 - {fs_type} {fs_type} {super_options}"
+        )
+        self.mountinfo.write_text("\n".join(self.mounts) + "\n")
+        return mount
+
+    def _cgroup(self, directory, *, stat="", **files):
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, value in files.items():
+            (directory / name.replace("__", ".")).write_text(f"{value}\n")
+        (directory / "memory.stat").write_text(stat)
+        return directory
+
+    def test_no_procfs_means_no_cgroup_limit(self):
+        assert self.lanes.cgroup_memory_headroom() is None
+
+    def test_v2_counts_page_cache_as_free(self):
+        # Right after an earlier run: 281 GB charged, 275 GB of it file cache.
+        mount = self._mount("cgroup2", "rw,nsdelegate")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(
+            mount,
+            memory__max=287 * self.GB,
+            memory__current=281 * self.GB,
+            stat=f"anon 6\nactive_file {100 * self.GB}\ninactive_file {175 * self.GB}\n",
+        )
+        headroom, source = self.lanes.cgroup_memory_headroom()
+        assert headroom == 281 * self.GB
+        assert "cgroup v2" in source
+
+    def test_v2_without_a_limit_is_not_a_bound(self):
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(mount, memory__max="max", memory__high="max", memory__current=1)
+        assert self.lanes.cgroup_memory_headroom() is None
+
+    def test_v2_high_is_a_limit_too(self):
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(
+            mount,
+            memory__max=200 * self.GB,
+            memory__high=100 * self.GB,
+            memory__current=10 * self.GB,
+        )
+        assert self.lanes.cgroup_memory_headroom()[0] == 90 * self.GB
+
+    def test_tightest_ancestor_binds(self):
+        # A Slurm job limit above a looser step limit, seen from the host root.
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/job_1/step_0\n")
+        job = self._cgroup(
+            mount / "job_1", memory__max=100 * self.GB, memory__current=10 * self.GB
+        )
+        self._cgroup(
+            job / "step_0", memory__max=200 * self.GB, memory__current=10 * self.GB
+        )
+        headroom, source = self.lanes.cgroup_memory_headroom()
+        assert headroom == 90 * self.GB
+        assert source.endswith("job_1"), source
+
+    def test_container_mount_and_cgroup_namespace(self):
+        # The container's own cgroup is mounted; /proc/self/cgroup names it by
+        # its host path, or as "/" under a cgroup namespace.
+        mount = self._mount("cgroup2", "rw", root="/kubepods/pod1/abc")
+        self._cgroup(mount, memory__max=50 * self.GB, memory__current=10 * self.GB)
+        for path in ("/kubepods/pod1/abc", "/"):
+            self.proc_cgroup.write_text(f"0::{path}\n")
+            assert self.lanes.cgroup_memory_headroom()[0] == 40 * self.GB
+
+    def test_v1_limit_and_unlimited_sentinel(self):
+        self._mount("cgroup", "rw,cpu,cpuacct", name="cpu")
+        memory = self._mount("cgroup", "rw,memory", name="memory")
+        self.proc_cgroup.write_text("9:memory:/\n2:cpu,cpuacct:/\n")
+        self._cgroup(
+            memory,
+            memory__limit_in_bytes=287 * self.GB,
+            memory__usage_in_bytes=12 * self.GB,
+            stat=f"active_file 1\ntotal_active_file {self.GB}\n"
+            f"total_inactive_file {self.GB}\n",
+        )
+        headroom, source = self.lanes.cgroup_memory_headroom()
+        assert headroom == 277 * self.GB
+        assert "cgroup v1" in source
+
+        (memory / "memory.limit_in_bytes").write_text("9223372036854771712\n")
+        assert self.lanes.cgroup_memory_headroom() is None
+
+    def test_share_takes_the_smaller_of_host_and_cgroup(self):
+        # A 2 GB cgroup headroom is below what any test host has free.
+        mount = self._mount("cgroup2", "rw")
+        self.proc_cgroup.write_text("0::/\n")
+        self._cgroup(mount, memory__max=3 * self.GB, memory__current=self.GB)
+        share, source = self.lanes.host_memory_share(
+            nprocs_per_node=2, headroom_bytes=0
+        )
+        assert share == self.GB
+        assert source == f"cgroup v2 {mount}"
+
+        (mount / "memory.max").write_text("max\n")
+        share, source = self.lanes.host_memory_share(
+            nprocs_per_node=1, headroom_bytes=0
+        )
+        assert source == "host (psutil)"
+        assert share > 0
 
 
 class TestL3FlatKvExecutorTest:

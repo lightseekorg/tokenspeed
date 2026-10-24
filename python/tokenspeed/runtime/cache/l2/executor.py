@@ -257,7 +257,7 @@ class HostCacheExecutor:
         self.max_retracted_requests = self.snapshot_sizing.max_retracted_requests
         snapshot_bytes = snapshot_lcm_blocks * host_lcm_block_bytes
         arena_bytes = (self.max_retracted_requests + 1) * self.blob_bytes
-        share_bytes = host_memory_share(
+        share_bytes, share_source = host_memory_share(
             nprocs_per_node=nprocs_per_node, headroom_bytes=_HOST_MEM_HEADROOM_BYTES
         )
         # Each buffer takes the power of two its pinned allocation rounds to.
@@ -283,7 +283,7 @@ class HostCacheExecutor:
                 f"{nprocs_per_node} ranks of a node pin Host memory together, "
                 "and each pinned buffer takes a power of two; this rank's share "
                 f"is {share_bytes / 1e9:.2f} GB (the node's available Host "
-                "memory over its ranks, less "
+                f"memory, from {share_source}, over its ranks, less "
                 f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
             )
             host_lcm_blocks = fitting_l2_blocks
@@ -292,6 +292,7 @@ class HostCacheExecutor:
         check_host_memory(
             pinned_host_bytes(l2_bytes) + pool_pinned_bytes,
             share_bytes=share_bytes,
+            share_source=share_source,
             purpose="the compact Host cache",
         )
 
