@@ -118,8 +118,9 @@ independent weight streams in flight per CU, which suits cold weights.
 
 - `x` is a contiguous `[1, K]` row, `w` a contiguous `[N, K]` matrix and `out`
   a contiguous `[1, N]` destination, all BF16. `K` is a compile-time constant.
-- `BLOCK_K` and the wave count depend on `K` alone: one wave of 16-byte loads
-  for `K <= 1536`, wider programs above.
+- `BLOCK_K` and the wave count follow `K` (one wave of 16-byte loads for
+  `K <= 1536`, wider programs above), except for the `(N, K)` shapes in
+  `_CONFIGS`, whose geometry measured faster in cold-cache sweeps.
 - `gemm.mv` takes it for any single row with `N, K >= 128`. `gemm.mm` hands a
   single row to this GEMV only for the `(N, K)` shapes in
   `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or

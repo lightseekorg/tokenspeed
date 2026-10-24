@@ -28,8 +28,26 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 _SUBGROUP_SIZE = 64
 
 
+# (N, K) -> (BLOCK_K, wave count) where another geometry beat the K rule below
+# by at least 1.5% in each of three cold-weight graph-replay sweeps on MI355X
+# (median of six runs alternating with the K rule).
+_CONFIGS: dict[tuple[int, int], tuple[int, int]] = {
+    (160, 4096): (2048, 4),  # GLM 5.3 Flash attention TP4
+    (288, 4096): (2048, 4),  # GLM 5.3 Flash MoE router gate
+    (512, 8192): (1024, 8),  # Muse Spark pre-expert projection TP8
+    (896, 21504): (1024, 2),
+    (2112, 14336): (1024, 2),
+    (2560, 3072): (512, 1),  # Qwen3.8-Flash-Next attention o_proj TP2
+    (4608, 7168): (512, 1),
+    (7168, 1536): (128, 1),  # Kimi K3 o_proj TP8
+    (7168, 2304): (512, 1),
+}
+
+
 def _rowcta_config(n: int, k: int) -> tuple[int, int]:
     """Choose the cold-weight reduction geometry for a one-row projection."""
+    if (n, k) in _CONFIGS:
+        return _CONFIGS[(n, k)]
     if k == 8192:
         return (256, 2) if n <= 1024 else (1024, 2)
     if k == 2048:
