@@ -180,6 +180,285 @@ def test_mha_prefill_lse(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
+def _reference_gqa_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    q_pos: torch.Tensor,
+    k_pos: torch.Tensor,
+    window_left: int,
+    sinks: torch.Tensor | None,
+) -> torch.Tensor:
+    """Causal GQA in fp32; a sink adds one logit per head to the softmax
+    denominator and contributes no value."""
+    group = q.shape[1] // k.shape[1]
+    k = k.float().repeat_interleave(group, dim=1)
+    v = v.float().repeat_interleave(group, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k) / math.sqrt(q.shape[-1])
+    mask = q_pos[:, None] >= k_pos[None, :]
+    if window_left >= 0:
+        mask &= q_pos[:, None] - k_pos[None, :] <= window_left
+    scores = scores.masked_fill(~mask[None], float("-inf"))
+    if sinks is not None:
+        sink = sinks.float()[:, None, None].expand(-1, scores.shape[1], 1)
+        scores = torch.cat([scores, sink], dim=-1)
+    probs = torch.softmax(scores, dim=-1)
+    if sinks is not None:
+        probs = probs[..., :-1]
+    return torch.einsum("hqk,khd->qhd", probs, v)
+
+
+def _paged_kv(
+    kv_lens: list[int], page_size: int, rows: tuple[int, ...], device: str
+) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor]]:
+    """Scatter each sequence's rows over shuffled pages; returns the cache,
+    the page table and the per-sequence dense rows."""
+    pages_per_seq = [(n + page_size - 1) // page_size for n in kv_lens]
+    num_pages = sum(pages_per_seq)
+    order = torch.randperm(num_pages, device=device, dtype=torch.int32)
+    cache = torch.zeros(
+        (num_pages, page_size, *rows), device=device, dtype=torch.bfloat16
+    )
+    page_table = torch.zeros(
+        (len(kv_lens), max(pages_per_seq)), device=device, dtype=torch.int32
+    )
+    dense, first = [], 0
+    for seq, (kv_len, pages) in enumerate(zip(kv_lens, pages_per_seq)):
+        table = order[first : first + pages]
+        first += pages
+        page_table[seq, :pages] = table
+        rows_i = torch.randn((kv_len, *rows), device=device, dtype=torch.bfloat16)
+        padded = torch.zeros(
+            (pages * page_size, *rows), device=device, dtype=torch.bfloat16
+        )
+        padded[:kv_len] = rows_i
+        cache[table.long()] = padded.view(pages, page_size, *rows)
+        dense.append(rows_i)
+    return cache, page_table, dense
+
+
+# MiMo-V2 pairs 192-wide query/key heads with 128-wide value heads.
+_DISTINCT_V_GEOMETRY = dict(
+    num_q_heads=16, num_kv_heads=2, head_dim=192, v_head_dim=128
+)
+
+
+@pytest.mark.parametrize("solution", ["triton", "fa3"])
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
+@pytest.mark.parametrize("window_left", [-1, 127], ids=["full", "sliding"])
+def test_mha_prefill_distinct_v_head_dim(
+    device: str, solution: str, has_sink: bool, window_left: int, require
+) -> None:
+    require("attention", "mha_prefill", solution, torch.bfloat16, "q")
+    g = _DISTINCT_V_GEOMETRY
+    seqlens = [300, 77, 512]
+    cu_seqlens_cpu = [0]
+    for seqlen in seqlens:
+        cu_seqlens_cpu.append(cu_seqlens_cpu[-1] + seqlen)
+    total = cu_seqlens_cpu[-1]
+    q = torch.randn(total, g["num_q_heads"], g["head_dim"], device=device).bfloat16()
+    k = torch.randn(total, g["num_kv_heads"], g["head_dim"], device=device).bfloat16()
+    v = torch.randn(total, g["num_kv_heads"], g["v_head_dim"], device=device).bfloat16()
+    sinks = (
+        torch.randn(g["num_q_heads"], device=device).bfloat16() if has_sink else None
+    )
+
+    out = mha_prefill(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=torch.tensor(cu_seqlens_cpu, device=device, dtype=torch.int32),
+        cu_seqlens_cpu=cu_seqlens_cpu,
+        max_seqlen=max(seqlens),
+        window_left=window_left,
+        sinks=sinks,
+        solution=solution,
+    )
+
+    assert out.shape == (total, g["num_q_heads"], g["v_head_dim"])
+    expected = torch.cat(
+        [
+            _reference_gqa_attention(
+                q[start:end],
+                k[start:end],
+                v[start:end],
+                torch.arange(end - start, device=device),
+                torch.arange(end - start, device=device),
+                window_left,
+                sinks,
+            )
+            for start, end in zip(cu_seqlens_cpu[:-1], cu_seqlens_cpu[1:])
+        ]
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("solution", ["triton", "fa3"])
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
+@pytest.mark.parametrize("window_left", [-1, 127], ids=["full", "sliding"])
+def test_mha_extend_with_kvcache_distinct_v_head_dim(
+    device: str, solution: str, has_sink: bool, window_left: int, require
+) -> None:
+    require("attention", "mha_extend_with_kvcache", solution, torch.bfloat16, "q")
+    g = _DISTINCT_V_GEOMETRY
+    page_size = 64
+    prefix_lens, query_lens = [0, 191, 300], [130, 9, 67]
+    kv_lens = [p + n for p, n in zip(prefix_lens, query_lens)]
+    k_cache, page_table, k_rows = _paged_kv(
+        kv_lens, page_size, (g["num_kv_heads"], g["head_dim"]), device
+    )
+    v_cache, _, v_rows = _paged_kv(
+        kv_lens, page_size, (g["num_kv_heads"], g["v_head_dim"]), device
+    )
+    # Both caches must share one page table: rewrite V at K's pages.
+    v_cache.zero_()
+    for seq, rows in enumerate(v_rows):
+        pages = (kv_lens[seq] + page_size - 1) // page_size
+        padded = torch.zeros(
+            (pages * page_size, *rows.shape[1:]), device=device, dtype=rows.dtype
+        )
+        padded[: kv_lens[seq]] = rows
+        v_cache[page_table[seq, :pages].long()] = padded.view(
+            pages, page_size, *rows.shape[1:]
+        )
+    q = torch.randn(
+        sum(query_lens), g["num_q_heads"], g["head_dim"], device=device
+    ).bfloat16()
+    sinks = (
+        torch.randn(g["num_q_heads"], device=device).bfloat16() if has_sink else None
+    )
+    cu_q = torch.tensor([0, *torch.tensor(query_lens).cumsum(0).tolist()])
+    cu_kv = torch.tensor([0, *torch.tensor(kv_lens).cumsum(0).tolist()])
+
+    out = mha_extend_with_kvcache(
+        q=q,
+        cu_seqlens_q=cu_q.to(device=device, dtype=torch.int32),
+        cu_seqlens_kv=cu_kv.to(device=device, dtype=torch.int32),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=torch.tensor(kv_lens, device=device, dtype=torch.int32),
+        max_seqlen_q=max(query_lens),
+        max_seqlen_k=max(kv_lens),
+        is_causal=True,
+        window_left=window_left,
+        sinks=sinks,
+        solution=solution,
+    )
+
+    assert out.shape == (sum(query_lens), g["num_q_heads"], g["v_head_dim"])
+    expected = torch.cat(
+        [
+            _reference_gqa_attention(
+                q[cu_q[seq] : cu_q[seq + 1]],
+                k_rows[seq],
+                v_rows[seq],
+                prefix_lens[seq] + torch.arange(query_lens[seq], device=device),
+                torch.arange(kv_lens[seq], device=device),
+                window_left,
+                sinks,
+            )
+            for seq in range(len(kv_lens))
+        ]
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("solution", ["triton", "fa3"])
+@pytest.mark.parametrize("has_sink", [False, True], ids=["no-sink", "sink"])
+@pytest.mark.parametrize("window_left", [-1, 127], ids=["full", "sliding"])
+@pytest.mark.parametrize("seqlen_q", [1, 4], ids=["q1", "q4"])
+def test_mha_decode_with_kvcache_distinct_v_head_dim(
+    device: str,
+    solution: str,
+    has_sink: bool,
+    window_left: int,
+    seqlen_q: int,
+    require,
+) -> None:
+    require("attention", "mha_decode_with_kvcache", solution, torch.bfloat16, "q")
+    g = _DISTINCT_V_GEOMETRY
+    page_size = 64
+    kv_lens = [seqlen_q + n for n in (63, 300, 17, 191)]
+    k_cache, page_table, k_rows = _paged_kv(
+        kv_lens, page_size, (g["num_kv_heads"], g["head_dim"]), device
+    )
+    v_cache = torch.zeros(
+        (*k_cache.shape[:3], g["v_head_dim"]), device=device, dtype=torch.bfloat16
+    )
+    v_rows = []
+    for seq, kv_len in enumerate(kv_lens):
+        pages = (kv_len + page_size - 1) // page_size
+        rows = torch.randn(
+            kv_len, g["num_kv_heads"], g["v_head_dim"], device=device
+        ).bfloat16()
+        padded = torch.zeros(
+            (pages * page_size, *rows.shape[1:]), device=device, dtype=rows.dtype
+        )
+        padded[:kv_len] = rows
+        v_cache[page_table[seq, :pages].long()] = padded.view(
+            pages, page_size, *rows.shape[1:]
+        )
+        v_rows.append(rows)
+    q = torch.randn(
+        len(kv_lens) * seqlen_q, g["num_q_heads"], g["head_dim"], device=device
+    ).bfloat16()
+    sinks = (
+        torch.randn(g["num_q_heads"], device=device).bfloat16() if has_sink else None
+    )
+
+    out = mha_decode_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=torch.tensor(kv_lens, device=device, dtype=torch.int32),
+        max_seqlen_k=max(kv_lens),
+        max_seqlen_q=seqlen_q,
+        window_left=window_left,
+        sinks=sinks,
+        solution=solution,
+    )
+
+    assert out.shape == (q.shape[0], g["num_q_heads"], g["v_head_dim"])
+    expected = torch.cat(
+        [
+            _reference_gqa_attention(
+                q[seq * seqlen_q : (seq + 1) * seqlen_q],
+                k_rows[seq],
+                v_rows[seq],
+                kv_len - seqlen_q + torch.arange(seqlen_q, device=device),
+                torch.arange(kv_len, device=device),
+                window_left,
+                sinks,
+            )
+            for seq, kv_len in enumerate(kv_lens)
+        ]
+    )
+    torch.testing.assert_close(out.float(), expected, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.parametrize("op", ["prefill", "extend", "decode"])
+def test_mha_distinct_v_head_dim_skips_equal_width_only_kernels(op: str) -> None:
+    """A kernel that has not opted in never serves a narrower value head."""
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import spec_matches_traits
+
+    mode = {
+        "prefill": "mha_prefill",
+        "extend": "mha_extend_with_kvcache",
+        "decode": "mha_decode_with_kvcache",
+    }[op]
+    specs = KernelRegistry.get().get_for_operator("attention", mode)
+    serving = {
+        spec.solution
+        for spec in specs
+        if spec_matches_traits(spec, {"distinct_v_head_dim": True})
+    }
+    assert serving <= {"triton", "fa3"}
+    assert all("distinct_v_head_dim" in spec.traits for spec in specs)
+
+
 @pytest.mark.parametrize(
     "is_causal,use_custom_mask",
     [(True, False), (False, False), (True, True)],

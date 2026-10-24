@@ -176,6 +176,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         signatures=_TRTLLM_GEN_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False}),
             "head_dim": frozenset({64, 128, 256}),
             "is_causal": frozenset({False, True}),
             "logit_cap": frozenset({False}),
@@ -256,6 +257,7 @@ if platform.is_nvidia and platform.is_hopper_plus:
         signatures=_TRTLLM_GEN_SIGNATURES,
         priority=Priority.SPECIALIZED,
         traits={
+            "distinct_v_head_dim": frozenset({False}),
             "logit_cap": frozenset({False}),
             "return_lse": frozenset({False}),
             "sinks": frozenset({False, True}),

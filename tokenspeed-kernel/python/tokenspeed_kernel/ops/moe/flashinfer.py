@@ -2081,6 +2081,9 @@ if platform.is_nvidia:
                 w, "activation_situ_linear_beta", "situ_linear_beta"
             )
             limit = None
+        elif plan["activation"] == "silu":
+            # Plain SwiGLU, silu(gate) * up: no alpha, linear offset or clamp.
+            alpha = beta = limit = None
         elif (swiglu_arg := getattr(w, "swiglu_arg", None)) is None:
             alpha = 1.702
             limit = 7.0

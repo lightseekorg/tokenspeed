@@ -204,6 +204,7 @@ def _gqa_prologue_kernel(
     v_cache_stride_h,
     num_q_heads: tl.constexpr,
     head_dim: tl.constexpr,
+    v_head_dim: tl.constexpr,
     half_rotary: tl.constexpr,
     weight_offset: tl.constexpr,
     eps: tl.constexpr,
@@ -332,9 +333,11 @@ def _gqa_prologue_kernel(
             KV_SCALED,
         )
         offs = tl.arange(0, BLOCK)
-        mask = write_mask[:, None] & (offs < head_dim)[None, :]
+        mask = write_mask[:, None] & (offs < v_head_dim)[None, :]
         value = tl.load(
-            v_ptr + (tokens * v_stride_t + kv_head * head_dim)[:, None] + offs[None, :],
+            v_ptr
+            + (tokens * v_stride_t + kv_head * v_head_dim)[:, None]
+            + offs[None, :],
             mask=mask,
         )
         dst = (
@@ -385,6 +388,7 @@ def triton_gqa_prologue(
     prepared = current_platform().is_cdna4 and norm is None and rotary is None
     num_tokens = q.shape[0]
     num_kv_heads, head_dim = cache.k_cache.shape[1:]
+    v_head_dim = cache.v_cache.shape[-1]
     num_q_heads = q.shape[1:].numel() // head_dim
     q_out = (
         q.flatten(1)
@@ -450,6 +454,7 @@ def triton_gqa_prologue(
             cache.v_cache.stride(1),
             num_q_heads,
             head_dim,
+            v_head_dim,
             half_rotary,
             0.0 if norm is None else norm.weight_offset,
             0.0 if norm is None else norm.eps,
@@ -463,7 +468,7 @@ def triton_gqa_prologue(
             RETURN_K=return_kv and not prepared,
             KV_SCALED=scales is not None,
             BLOCK_T=block_t,
-            BLOCK=triton.next_power_of_2(head_dim),
+            BLOCK=triton.next_power_of_2(max(head_dim, v_head_dim)),
             HALF_BLOCK=max(triton.next_power_of_2(half_rotary), 1),
             ENABLE_PDL=enable_pdl,
             num_warps=4,

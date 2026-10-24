@@ -129,7 +129,8 @@ class MHATokenToKVPool(CachePool):
         heads_l = self._layer_heads_per_rank(layer_id)
         if heads_l == self.head_num:
             return buf
-        return buf.reshape(-1, heads_l, self.head_dim)
+        # Each plane keeps its own head width: values may be narrower than keys.
+        return buf.reshape(-1, heads_l, buf.shape[-1])
 
     def _layer_heads_per_rank(self, layer_id: int) -> int:
         counts = self._layer_kv_head_counts

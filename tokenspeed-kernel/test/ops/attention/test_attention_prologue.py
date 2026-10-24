@@ -631,6 +631,49 @@ def test_per_tensor_kv_scales_need_an_fp8_cache_and_positive_values():
             FP8TensorScales(k=bad, v=1.0)
 
 
+@pytest.mark.parametrize("solution", [None, "triton"])
+def test_gqa_writes_value_heads_narrower_than_keys(solution):
+    """MiMo-V2 geometry: 192-wide query/key heads with a 64-wide NeoX RoPE and
+    128-wide value heads. Keys rotate, values are stored as given."""
+    tokens, rows, hq, hkv, dim, v_dim, total = 12, 9, 4, 2, 192, 128, 64
+    g = torch.Generator(device="cuda").manual_seed(13)
+    q = torch.randn(tokens, hq * dim, dtype=BF16, device="cuda", generator=g)
+    k = torch.randn(tokens, hkv * dim, dtype=BF16, device="cuda", generator=g)
+    v = torch.randn(tokens, hkv * v_dim, dtype=BF16, device="cuda", generator=g)
+    rotary = Rotary(
+        cos_sin_cache(64),
+        torch.randint(0, 4096, (tokens,), device="cuda", generator=g),
+        RopeStyle.NEOX,
+        None,
+    )
+    loc = slots(rows, total, seed=14)
+    k_cache, _ = gqa_cache(total, hkv, dim, BF16)
+    _, v_cache = gqa_cache(total, hkv, v_dim, BF16)
+    before_v = v_cache.clone()
+    out = gqa_prologue(
+        q,
+        k,
+        v,
+        norm=None,
+        rotary=rotary,
+        cache=HeadKVCache(k_cache=k_cache, v_cache=v_cache, scales=None, slots=loc),
+        return_kv=True,
+        solution=solution,
+        override=None,
+    )
+    q_ref, _ = reference_heads(q, None, None, rotary, dim)
+    k_ref, _ = reference_heads(k, None, None, rotary, dim)
+    torch.testing.assert_close(out.q.double(), q_ref, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        k_cache[loc].flatten(1).double(), k_ref[:rows], atol=2e-2, rtol=2e-2
+    )
+    untouched = torch.ones(total, dtype=torch.bool, device="cuda")
+    untouched[loc] = False
+    assert bytes_equal(v_cache[untouched], before_v[untouched])
+    assert bytes_equal(v_cache[loc], v[:rows].view(rows, hkv, v_dim))
+    assert out.v.shape == (tokens, hkv * v_dim)
+
+
 def test_int32_indices_give_the_int64_bytes():
     """Slots and positions arrive as int32 or int64; every solution reads both alike."""
     tokens, hq, hkv, dim, total = 6, 4, 2, 64, 16

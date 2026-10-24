@@ -131,6 +131,9 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.kv_cache_dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
             and not self.is_mxfp8
         )
+        self.v_head_dim = spec.value_head_dim
+        if self.is_mxfp8 and self.v_head_dim != self.head_dim:
+            raise ValueError("mxfp8 KV cache requires values as wide as keys")
         self.plan = partial(
             mha_plan,
             dtype=(
@@ -139,6 +142,7 @@ class MHAAttnBackend(PagedAttentionBackend):
                 else (self.kv_cache_dtype if self.is_fp8 else self.qkv_dtype)
             ),
             head_dim=self.head_dim,
+            v_head_dim=self.v_head_dim,
             return_lse=False,
             solution=self.kernel_solution,
         )
@@ -325,7 +329,6 @@ class MHAAttnBackend(PagedAttentionBackend):
         bs: int,
         **kwargs,
     ) -> torch.Tensor:
-        assert layer.qk_head_dim == layer.v_head_dim
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
         metadata = self.forward_decode_metadata
@@ -368,7 +371,6 @@ class MHAAttnBackend(PagedAttentionBackend):
         bs: int,
         **kwargs,
     ) -> torch.Tensor:
-        assert layer.qk_head_dim == layer.v_head_dim
         assert k is not None and v is not None
 
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)

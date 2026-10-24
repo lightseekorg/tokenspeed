@@ -375,7 +375,9 @@ class TestAttentionBackendChoices:
             num_attention_layers=2,
             num_attention_heads=16,
             num_key_value_heads=8,
+            layer_num_key_value_heads=None,
             head_dim=128,
+            v_head_dim=128,
             dtype="bfloat16",
         )
 

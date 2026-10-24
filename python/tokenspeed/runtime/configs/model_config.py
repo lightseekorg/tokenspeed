@@ -307,6 +307,55 @@ def configure_dots3_note_attention(model_config, server_args: ServerArgs) -> Non
     configure(model_config, server_args)
 
 
+def configure_mimo_v2_attention(model_config, server_args: ServerArgs) -> None:
+    """MiMo-V2: GQA with value heads narrower than query/key heads.
+
+    ``hybrid_layer_pattern`` marks each sliding layer with 1. Full and sliding
+    layers share the head widths and query heads but may differ in KV heads
+    (MiMo-V2.6-Flash: 4 and 8), so the per-layer counts are recorded for the
+    cache recipe.
+    """
+    del server_args  # the geometry follows the checkpoint alone
+    hf = model_config.hf_text_config
+    if (
+        hf.swa_head_dim != hf.head_dim
+        or hf.swa_v_head_dim != hf.v_head_dim
+        or hf.swa_num_attention_heads != hf.num_attention_heads
+    ):
+        raise ValueError(
+            "MiMo-V2 full and sliding layers must share head widths and query heads"
+        )
+    pattern = tuple(hf.hybrid_layer_pattern)
+    if len(pattern) != hf.num_hidden_layers or not set(pattern) <= {0, 1}:
+        raise ValueError(f"Unsupported MiMo-V2 hybrid_layer_pattern {pattern}")
+    model_config.attention_arch = AttentionArch.MHA
+    model_config.head_dim = hf.head_dim
+    model_config.v_head_dim = hf.v_head_dim
+    model_config.layer_num_key_value_heads = tuple(
+        hf.swa_num_key_value_heads if is_sliding else hf.num_key_value_heads
+        for is_sliding in pattern
+    )
+    # The reference implementation derives layer_types from the same pattern.
+    hf.layer_types = [
+        "sliding_attention" if is_sliding else "full_attention"
+        for is_sliding in pattern
+    ]
+    # Cache groups: sliding layers split round-robin into sub-groups no larger
+    # than the full group (as Inkling does), so every slab of the hybrid slab
+    # layout is bound by one layer of each group and an owned block leaves no
+    # dead slab rows (MiMo-V2.6-Flash: 39 sliding + 9 full -> 5 sub-groups).
+    full_count = pattern.count(0)
+    subgroups = -(-pattern.count(1) // full_count) if full_count else 1
+    labels, sliding_rank = [], 0
+    for is_sliding in pattern:
+        if is_sliding:
+            labels.append(f"sliding_attention_{sliding_rank % subgroups}")
+            sliding_rank += 1
+        else:
+            labels.append("full_attention")
+    hf.cache_layer_types = labels
+
+
 def configure_minimax_m3_attention(model_config, server_args: ServerArgs) -> None:
     del server_args  # the geometry follows the checkpoint alone
     model_config.attention_arch = AttentionArch.MSA
@@ -513,6 +562,11 @@ def _beam_checkpoint_format(model_config) -> str | None:
 
 
 _ATTENTION_FAMILY_SPECS = (
+    _AttentionFamilySpec(
+        name="MiMo-V2",
+        architectures=frozenset({"MiMoV2ForCausalLM"}),
+        configure=configure_mimo_v2_attention,
+    ),
     _AttentionFamilySpec(
         name="dots3-note",
         architectures=frozenset({"Dots3NoteForCausalLM", "Dots3NoteForCausalLMNextN"}),
@@ -965,6 +1019,12 @@ class ModelConfig:
             "head_dim",
             self.hf_text_config.hidden_size // self.hf_text_config.num_attention_heads,
         )
+        # Value head width. The MLA/DSA hooks and MHA models whose value heads
+        # are narrower than their query/key heads (MiMo-V2) set it below.
+        self.v_head_dim = self.head_dim
+        # Per-layer KV head counts when layers differ (MiMo-V2's full and
+        # sliding layers); None when every layer has num_key_value_heads.
+        self.layer_num_key_value_heads: tuple[int, ...] | None = None
 
         # Storage of the DSA index-key plane, one of INDEX_K_FORMATS
         # (layers/attention/configs/dsa.py). A DSA model's configure-attention
