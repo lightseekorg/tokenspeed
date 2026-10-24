@@ -226,6 +226,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         self.rank = tp_rank
         self.group = tp_group
         self.gather_column_view = replicated and replicate_for_owned_rows
+        # Every rank holds the whole weight, so a rank can project any columns.
+        self.replicated = replicated
         self.workspace = None
         self.multicast = None
         if tp_size > 1 and (not replicated or self.gather_column_view):
@@ -1435,10 +1437,13 @@ class MuseSparkMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         owned_global_rows: int | None,
+        project: bool,
     ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
 
         The returned projection may defer its gather to the residual boundary.
+        Without ``project`` the combined expert rows are returned unprojected
+        for a boundary that applies ``post_expert_proj`` itself.
         """
         # The graph phase warms the fork serially, so capture never first-touches it.
         with self.stream_fork.scope(
@@ -1566,6 +1571,9 @@ class MuseSparkMoE(nn.Module):
                 route_weights=topk_weights,
                 owned_rows=owned_global_rows is not None,
             )
+        if not project:
+            assert owned_global_rows is None
+            return combined, None
         if owned_global_rows is not None:
             output = iris.acquire_owned_post_expert_output(
                 owned_global_rows, self.post_expert_proj.output_size
@@ -1800,13 +1808,60 @@ class MuseSparkDecoderLayer(nn.Module):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
+        post_norm = self.post_feedforward_layernorm
+        alpha, beta = self.post_feedforward_residual_gate._gate_coefficients()
+        next_weight, next_eps, next_weight_offset = (
+            (None, 0.0, 0.0)
+            if next_input_layernorm is None
+            else (
+                next_input_layernorm.weight,
+                next_input_layernorm.eps,
+                next_input_layernorm.weight_offset,
+            )
+        )
+        projection = self.mlp.post_expert_proj
+        # One decode row projects only this rank's post-expert columns; the
+        # boundary gathers them, which beats streaming the replicated weight.
+        project_in_boundary = (
+            owned_global_rows is None
+            and self.iris_state is not None
+            and projection.replicated
+            and not projection.gather_column_view
+            and not _gemm_dispatch_required()
+            and resolve_kernel_override("residual", "post_norm_residual_pre_norm", None)
+            is None
+            and self.iris_state.can_gemv_all_gather_boundary(
+                mlp_input.shape[0],
+                projection.weight,
+                hidden_states,
+                post_norm.weight,
+                alpha,
+                beta,
+                next_weight,
+            )
+        )
         mlp_output, sentinel = self.mlp(
             mlp_input,
             router_input,
             num_global_tokens,
             max_num_tokens_per_gpu,
             owned_global_rows,
+            project=not project_in_boundary,
         )
+        if project_in_boundary:
+            return self.iris_state.gemv_all_gather_boundary(
+                mlp_output,
+                projection.weight,
+                hidden_states,
+                post_norm.weight,
+                alpha,
+                beta,
+                next_weight,
+                post_norm.eps,
+                post_norm.weight_offset,
+                next_eps,
+                next_weight_offset,
+            )
         boundary = (
             post_norm_residual_pre_norm_bf16
             if current_platform().is_cdna4
@@ -1815,17 +1870,14 @@ class MuseSparkDecoderLayer(nn.Module):
         boundary_outputs = boundary(
             hidden_states,
             mlp_output,
-            self.post_feedforward_layernorm.weight,
-            self.post_feedforward_layernorm.eps,
-            self.post_feedforward_layernorm.weight_offset,
-            *self.post_feedforward_residual_gate._gate_coefficients(),
-            next_input_layernorm.weight if next_input_layernorm is not None else None,
-            next_input_layernorm.eps if next_input_layernorm is not None else 0.0,
-            (
-                next_input_layernorm.weight_offset
-                if next_input_layernorm is not None
-                else 0.0
-            ),
+            post_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            alpha,
+            beta,
+            next_weight,
+            next_eps,
+            next_weight_offset,
             pdl_enabled(),
             None if owned_global_rows is not None else sentinel,
             1,
