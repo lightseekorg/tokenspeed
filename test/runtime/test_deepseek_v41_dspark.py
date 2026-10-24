@@ -486,6 +486,24 @@ def test_window_attention_kernel_matches_reference():
     kv = backend._workspace(
         swa, positions, rotary.cos_sin_cache, None, config.rms_norm_eps
     )
+    current = dsv41.dspark_rows(
+        swa,
+        None,
+        None,
+        positions,
+        rotary.cos_sin_cache,
+        None,
+        None,
+        torch.empty_like(swa),
+    )
+    separate = torch.cat(
+        (
+            field[backend.selection.page, backend.selection.row],
+            current.reshape(batch, block, dim),
+        ),
+        dim=1,
+    )
+    torch.testing.assert_close(kv, separate, rtol=0, atol=0)
     expected = backend._reference_forward(q, kv, sink, dim**-0.5)
     # Both branches feed the kernel the very same quantized block rows.
     torch.testing.assert_close(
