@@ -511,7 +511,12 @@ class EventLoop:
         )
         # Every role reserves the first decode/verify window behind the prompt:
         # a decoding role to verify into it, the prefill role to draft into it.
-        input_reserve = max(decode_input_tokens, 1)
+        # The admission's generation budget (RequestHandler, max_req_len -
+        # prompt - 1 with max_req_len = max_model_len - 1) reserves two tokens
+        # of its own, so the published bound takes the larger reserve: the
+        # frontend's gate, its message and the handler's refusal then name
+        # one number.
+        input_reserve = max(decode_input_tokens, 2)
         self.max_req_input_len = self.max_model_len - input_reserve
         if self.max_req_input_len < 1:
             raise RuntimeError(
@@ -600,6 +605,7 @@ class EventLoop:
             server_args=self.server_args,
             hf_eos_token_id=self.model_config.hf_eos_token_id,
             max_req_len=self.max_model_len - 1,
+            max_req_input_len=self.max_req_input_len,
             vocab_size=self.model_config.vocab_size,
             recv_func=self.recv_from_tokenizer,
             send_func=self.send_to_tokenizer,

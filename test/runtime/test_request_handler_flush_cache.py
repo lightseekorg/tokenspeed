@@ -47,6 +47,7 @@ def _real_handler(server_args, *, can_clear_cache_fn, clear_cache_fn=None, devic
             server_args,
             hf_eos_token_id=0,
             max_req_len=2048,
+            max_req_input_len=2047,
             vocab_size=32000,
             recv_func=mock.Mock(),
             send_func=mock.Mock(),

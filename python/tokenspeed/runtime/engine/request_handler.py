@@ -218,6 +218,7 @@ class RequestHandler:
         clear_cache_fn=None,
         architectures: list[str] | None = None,
         *,
+        max_req_input_len: int,
         tokenizer_kwargs: Mapping[str, object],
         l3,
         pause_controller=None,
@@ -319,6 +320,9 @@ class RequestHandler:
 
         self.hf_eos_token_id = hf_eos_token_id
         self.max_req_len = max_req_len
+        # The loop's input bound: the window less the decode reserve, the one
+        # the in-process frontend enforces before tokenizing a request.
+        self.max_req_input_len = max_req_input_len
         # LM-head TP under attention DP exchanges the logits rows with the
         # group once per forward (LogitsProcessor._lm_head_tp_row_counts); the
         # prompt-logprob chunk loop would run that exchange a per-rank number
@@ -891,14 +895,43 @@ class RequestHandler:
         """Clamp ``max_new_tokens`` to the context and declare it to the
         scheduler, which sizes the request's admission reserve from it. No
         layout caps it: a retracted request resumes by restore, never by a
-        recovery prefill, so a decode-only attention layout admits any budget."""
+        recovery prefill, so a decode-only attention layout admits any budget.
+
+        A prompt the scheduler cannot take is refused here with the request's
+        own client error: an empty one, or one past the engine's input bound
+        (the window less the decode reserve, as the in-process frontend
+        bounds it; less the budget's own term, which leaves no budget at the
+        window's edge). Declared as is, such a record is rejected by the
+        scheduler's admission (``SubmitRequests``), and that rejection ends
+        the scheduler process, not the request. Within the bound the admitted
+        record always fits: prompt + max(budget, decode reserve) <= window <=
+        the cache's single-request capacity. The direct scheduler wire bounds
+        nothing before this point. The refusal is this engine's: under PD the
+        roles must share the window and the reserve, as the dual dispatch of a
+        request to both already assumes, or a prompt in the gap is admitted
+        on one role and refused on the other."""
+        prompt_tokens = len(req_state.prompt_input_ids)
+        max_input_len = min(self.max_req_input_len, self.max_req_len - 1)
+        if prompt_tokens == 0:
+            req_state.finished_reason = FINISH_ABORT(
+                "Invalid request: the input is empty",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+            return
+        if prompt_tokens > max_input_len:
+            req_state.finished_reason = FINISH_ABORT(
+                f"Invalid request: the input ({prompt_tokens} tokens) exceeds "
+                f"the engine's maximum input length ({max_input_len} tokens)",
+                status_code=HTTPStatus.BAD_REQUEST,
+            )
+            return
         req_state.sampling_params.max_new_tokens = min(
             (
                 req_state.sampling_params.max_new_tokens
                 if req_state.sampling_params.max_new_tokens is not None
                 else 1 << 30
             ),
-            self.max_req_len - len(req_state.prompt_input_ids) - 1,
+            self.max_req_len - prompt_tokens - 1,
         )
         req_spec.max_new_tokens = req_state.sampling_params.max_new_tokens
 
