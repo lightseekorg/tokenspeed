@@ -112,6 +112,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
     add_executable(tokenspeed_scheduler_tests
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_prefix_index.cpp
+        tests/cpp/test_host_retention.cpp
         tests/cpp/test_tail_table.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp

@@ -101,10 +101,14 @@ to the global empty-parent FIFO rather than any group.
 The pool knows which child slots are occupied, never who holds them. Whether a
 child is pinned by a request table, published by a prefix-cache entry, or held
 by an in-flight transfer is a `CacheBlockRef` ownership fact that lives with
-the holders; the pool does not track it, and `CacheBlockRef` does not report
-it. Anything that needs "held only by the cache" asks `PrefixCacheIndex`
-(`ParentIsFullyEvictable`), which is a scan and is therefore reserved for
-eviction policy and leak checks, not for per-step accounting.
+the holders. The pool forwards occupancy and reference-count transitions
+(1 to 2 and 2 to 1) to an optional non-owning per-group observer; it stores
+no ownership counts or cache policy. The Host prefix index subscribes to
+maintain eviction eligibility. Its stable pool-scoped state detaches before
+destruction, including when external refs outlive the index. Rejecting a second
+subscription preserves the active observer. Notifications
+never acquire refs. `ParentIsFullyEvictable` remains a live bounded-parent
+check for eviction policy and leak checks, not per-step accounting.
 
 Admission first checks the indexed free-slot and empty-parent counts. If the
 request fits, it does not enumerate eviction candidates. Under memory pressure,
@@ -868,6 +872,24 @@ Its responsibilities:
   The way back is one `SnapshotRestoreOperation` whose rows name their Host
   tier; its L2-tier destinations are republished at the ACK
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
+* **Host victim ordering.** Free capacity is consumed first in request order.
+  Under pressure, each group/bucket maintains a non-owning ordered index of
+  published children ranked by `(was_acquired, epoch, group, parent, slot)`.
+  Same-group holes are preferred. A shared ordered parent index ranks each
+  parent by its maximum published child value for cross-group reclamation.
+  Publication, acquisition (including at the same epoch), republication under
+  older epochs, and eviction update both indexes. Updating a parent examines
+  only its fixed packing, never the whole pool. Device admission keeps its
+  separate epoch-first policy.
+  Only unpinned publications enter the child ordering, and only parents
+  whose occupied children are all published and unpinned enter the parent
+  ordering. Reference-count transitions update eligibility immediately; pool
+  occupancy changes also invalidate parents with new unpublished transfer
+  destinations. Publication and completion or cancellation restore eligibility
+  through the same notifications. Request refs, transfer refs, and image pins
+  keep their existing lifetimes. Each transition costs logarithmic index work
+  plus bounded parent maintenance; selection never traverses pinned prefixes.
+  No store collects or sorts the whole Host index.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at

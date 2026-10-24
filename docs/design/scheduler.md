@@ -1157,6 +1157,12 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   only such ops may be fenced ahead of the plan's page reuse by the runtime. A
   new store site chooses its guard explicitly (`StartPendingStores` has no
   default).
+- Host allocation uses maintained child and cross-group parent retention
+  indexes ([cache concepts](cache-concepts.md)); reference-count and occupancy
+  notifications keep ineligible entries out of both. A retention-index entry
+  owns no block and cannot extend or
+  shorten a request or transfer lifetime; unpublished in-flight destinations
+  exclude their parent from cross-group eviction.
 - Every tier transfer pairs blocks of equal residue (bucket): L2 store, L2
   prefix load, both image legs and the restore; the transfer manager asserts
   it when it builds a batch, so under page-cyclic sharding the rank that owns
