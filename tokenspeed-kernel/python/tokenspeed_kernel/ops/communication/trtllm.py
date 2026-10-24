@@ -986,7 +986,9 @@ if current_platform().is_nvidia:
         max_token_num: int = 2048,
         trigger_completion_at_end: bool = True,
         launch_with_pdl: bool | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        norm_out_bf16: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor] | None:
         """All-reduce a sublayer partial and run the pre/post norm boundary on
         the sum in one MNNVL launch.
 
@@ -1019,6 +1021,14 @@ if current_platform().is_nvidia:
                 store (otherwise after the inputs are loaded).
             launch_with_pdl: Programmatic dependent launch; None follows
                 ``pdl_enabled()``.
+            token_fp8_out: Optional ``(codes, scales)`` buffers, contiguous FP8
+                E4M3 ``[T, H]`` and FP32 ``[T, 1]``: the launch also writes
+                ``norm_out`` quantized per token, the codes and scales
+                ``ops/quantization/triton.py``'s ``fp8_quantize_per_token``
+                gives for that BF16 ``norm_out`` (as ``rmsnorm``'s
+                ``token_fp8_out``).
+            norm_out_bf16: With ``token_fp8_out``, False skips the BF16
+                ``norm_out`` store (``norm_out`` is returned as None).
 
         Returns:
             ``(norm_out, residual_out)``, or None when no fused kernel serves
@@ -1051,6 +1061,26 @@ if current_platform().is_nvidia:
                     f"{tuple(tensor.shape)} on {tensor.device}"
                 )
         x_scale, residual_scale = _sandwich_scale_pair(x_scale, residual_scale)
+        if token_fp8_out is not None:
+            codes, scales = token_fp8_out
+            if (
+                codes.dtype != torch.float8_e4m3fn
+                or tuple(codes.shape) != (tokens, hidden)
+                or not codes.is_contiguous()
+                or codes.device != input_tensor.device
+                or scales.dtype != torch.float32
+                or scales.numel() != tokens
+                or not scales.is_contiguous()
+                or scales.device != input_tensor.device
+            ):
+                raise ValueError(
+                    "token_fp8_out takes contiguous FP8 E4M3 codes shaped "
+                    f"{(tokens, hidden)} and FP32 [{tokens}, 1] scales on "
+                    f"{input_tensor.device}, got {codes.dtype} "
+                    f"{tuple(codes.shape)} and {scales.dtype} {tuple(scales.shape)}"
+                )
+        elif not norm_out_bf16:
+            raise ValueError("norm_out_bf16=False needs token_fp8_out")
         world_size = group.size()
         if world_size <= 1 or not 1 <= tokens <= max_token_num:
             return None
@@ -1077,8 +1107,9 @@ if current_platform().is_nvidia:
         ):
             return None
         _mark_captured(manager, mnnvl)
-        norm_out = torch.empty_like(input_tensor)
+        norm_out = torch.empty_like(input_tensor) if norm_out_bf16 else None
         residual_out = torch.empty_like(residual)
+        fp8_kwargs = {} if token_fp8_out is None else {"token_fp8_out": token_fp8_out}
         trtllm_mnnvl_sandwich_norm_allreduce(
             mnnvl,
             input_tensor,
@@ -1094,6 +1125,7 @@ if current_platform().is_nvidia:
             residual_scale=residual_scale,
             trigger_completion_at_end=trigger_completion_at_end,
             launch_with_pdl=launch_with_pdl,
+            **fp8_kwargs,
         )
         return norm_out, residual_out
 

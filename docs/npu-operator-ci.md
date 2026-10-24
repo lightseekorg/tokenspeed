@@ -9,10 +9,10 @@ The `select` job can run in an allowed repository. The hardware job additionally
 When that variable is absent or disabled, the hardware job is skipped without entering a runner queue. A positive selection result does not mean the operators have run.
 The NPU allowlist uses its own `TOKENSPEED_NPU_CI_REPOSITORY` variable; it does not require the shared repository variable used by GPU workflows, so enabling NPU CI does not also enable other vendors' scheduling.
 
-Supported PR events are `opened`, `synchronize`, `reopened`, `ready_for_review`, and `labeled`. Only the `high priority` label triggers a run on a labeling event. Draft PRs do not start the NPU job.
-The label does not change the order: accuracy always precedes performance.
+Supported PR events are `opened`, `synchronize`, `reopened`, and `ready_for_review`. Draft PRs do not start the NPU job.
+Accuracy always precedes performance.
 The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
-Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
+Test code never runs through `pull_request_target`.
 
 The GitHub-hosted `select` job checks out the event commit, runs the CPU-only API regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`. Selection uses the same GitHub API change-list checks as the independent NPU workflow:
 

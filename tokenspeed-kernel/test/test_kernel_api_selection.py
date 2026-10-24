@@ -306,6 +306,7 @@ def test_residual_family_exports_and_modes():
         "mhc_apply_pre",
         "mhc_apply_pre_quantize_fp8",
         "mhc_fused_hc",
+        "mhc_init",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -326,6 +327,7 @@ def test_residual_family_exports_and_modes():
         "hyperconnection_mix",
         "mhc_apply_pre",
         *({"mhc_apply_pre_fp8_group32"} if Platform.get().is_amd else set()),
+        "mhc_init",
         "mhc_mixes",
         "mhc_post",
         "mhc_pre",
@@ -556,6 +558,18 @@ def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
         B_scales=b_scales,
         out_dtype=torch.bfloat16,
         block_size=[1, 32],
+        quant="mxfp8",
+    )
+
+
+def _mm_fp32_blockscale(m: int, n: int, k: int, out_dtype: torch.dtype) -> torch.Tensor:
+    return kernel_mm(
+        torch.empty((m, k), dtype=_fp8_dtype()),
+        torch.empty((n, k), dtype=_fp8_dtype()),
+        A_scales=torch.empty((m, (k + 127) // 128), dtype=torch.float32),
+        B_scales=torch.empty(((n + 127) // 128, (k + 127) // 128), dtype=torch.float32),
+        out_dtype=out_dtype,
+        block_size=[128, 128],
         quant="mxfp8",
     )
 
@@ -6505,9 +6519,26 @@ _CASES = [
         "cdna4",
         "gemm",
         "mm",
-        "triton_mm_fp8_blockscale",
+        "gluon_mm_fp8_blockscale_gfx950",
         lambda: _mm_mxfp8(4),
     ),
+    *[
+        _case(
+            _is_cdna4,
+            "cdna4",
+            "gemm",
+            "mm",
+            expected,
+            partial(_mm_fp32_blockscale, m, n, k, dtype),
+            id_suffix=f"fp32-blockscale-m{m}-n{n}-k{k}-{dtype}",
+        )
+        for m, n, k, dtype, expected in (
+            (17, 130, 3072, torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+            (896, 6144, 4096, torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+            (8192, 4096, 512, torch.bfloat16, "gluon_mm_fp8_blockscale_gfx950"),
+            (4, 128, 512, torch.float16, "triton_mm_fp8_blockscale"),
+        )
+    ],
     # DeepSeek V4.1 MXFP8 projections on gfx950: the weight-streaming decode
     # kernel through 256 rows (ahead of the skinny kernel's 64-row range),
     # the large-tile kernel beyond, and from 64 rows on for 2**26-element
