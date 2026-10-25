@@ -45,7 +45,7 @@ def load_manifest(path: Path) -> dict:
     if any(not isinstance(p, str) or not p for p in patterns):
         raise ValueError("watch_paths must contain nonempty strings")
     phases = ("accuracy", "performance")
-    if manifest.get("expected_plans") != "ci/npu_ops_test/expected-plans.json":
+    if manifest.get("expected_plans") != "test/ci/npu/expected-plans.json":
         raise ValueError("Invalid expected_plans path")
     execution = manifest.get("execution")
     if not isinstance(execution, dict) or execution.get("phases") != list(phases):
@@ -69,7 +69,7 @@ def load_manifest(path: Path) -> dict:
         names.add(name)
         if "entry" in operator or "scripts" in operator:
             raise ValueError(f"{name}: legacy entry/scripts are not supported")
-        if operator.get("script") != f"ci/npu_ops_test/tests/{name}-test.py":
+        if operator.get("script") != f"test/ci/npu/tests/{name}-test.py":
             raise ValueError(f"{name}: invalid script path")
         for field in ("accuracy_cases", "performance_configs"):
             value = operator.get(field)

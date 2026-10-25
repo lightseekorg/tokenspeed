@@ -61,14 +61,14 @@ def parse_args(argv=None):
 def load_inputs(repo_root):
     root = Path(repo_root).resolve(strict=True)
     scanner = runpy.run_path(
-        str(root / "ci/npu_ops_test/changes.py"),
+        str(root / "test/ci_system/npu/changes.py"),
         run_name="npu_phase_scanner",
     )
     reporting = runpy.run_path(
-        str(root / "ci/npu_ops_test/reporting.py"),
+        str(root / "test/ci_system/npu/reporting.py"),
         run_name="npu_phase_reporting",
     )
-    manifest_path = root / "ci/npu_ops_test/manifest.json"
+    manifest_path = root / "test/ci/npu/manifest.json"
     manifest = scanner["load_manifest"](manifest_path)
     manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     plan = reporting["read_expected_plan"](

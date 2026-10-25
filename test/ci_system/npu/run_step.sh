@@ -59,5 +59,5 @@ mkdir -p "$TMPDIR" "$XDG_CACHE_HOME" "$TRITON_CACHE_DIR" "$PYTHONPYCACHEPREFIX"
 echo "Starting phase executor: $phase"
 # Keep the lock in the executor process; it cleans up the child process group.
 exec /srv/tokenspeed-npu/cann9-torch29-py312-root/venv/bin/python -B -u \
-  ci/npu_ops_test/run_phase.py --repo-root "$PWD" --phase "$phase" \
+  test/ci_system/npu/run_phase.py --repo-root "$PWD" --phase "$phase" \
   --output-dir "$work/$phase" --timeout-seconds 600
