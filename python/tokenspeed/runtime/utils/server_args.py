@@ -1777,14 +1777,14 @@ class ServerArgs:
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
         if self.numerics != "auto":
             self._resolve_rl_bitwise()
-        # Individual switches that veto a fusion resolve_communication may
-        # have auto-enabled, whatever the envelope. CommManager.should_fuse
-        # re-derives the veto from the switches, so the fused kernels stay off
-        # even where this flag is read before the fold.
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
             self.enable_allreduce_fusion = False
             self.comm_fusion_max_num_tokens = -1
+        # Individual switches that veto a fusion resolve_communication may
+        # have auto-enabled, whatever the envelope. CommManager.should_fuse
+        # re-derives the veto from the switches, so the fused kernels stay off
+        # even where this flag is read before the fold.
         if self.layer_boundary_norm == "unfused":
             # The fused all-reduce+norm kernels add the residual inside the
             # fusion; the unfused boundary norm needs the bf16 sum first.
