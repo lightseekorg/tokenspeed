@@ -39,10 +39,11 @@ namespace tokenspeed {
 
 // Which call drained a Host L2 store (not which code queued its candidates):
 // boundary publication or finish through StartPendingStores, a retraction
-// image through StartRetractionStores. Accounting only -- it selects the
-// counters a store lands in, never reaches the runtime (which branches on
-// StoreSourceGuard), and no scheduling decision reads it.
-enum class HostStoreCause : std::uint8_t { kPublication, kFinish, kRetraction };
+// image through StartRetractionStores, what an admission evicted under the
+// write-back policy through StartEvictionStores. Accounting only -- it
+// selects the counters a store lands in, never reaches the runtime (which
+// branches on StoreSourceGuard), and no scheduling decision reads it.
+enum class HostStoreCause : std::uint8_t { kPublication, kFinish, kRetraction, kEviction };
 
 // Owns the mechanics and asynchronous lifetime of transfers between Device and
 // Host cache tiers. Scheduling policy and request state transitions stay in
@@ -59,15 +60,29 @@ public:
     // queue -- StartRetractionStores builds it from the victim's tables.
     // `cause` (kPublication or kFinish) only picks the counters.
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause);
+    // Drains the segments this plan's admissions recorded under the
+    // write-back policy (CacheCoordinator::TakeEvictedSegments) into one
+    // stream-ordered write-back op: their Device pages may be granted away
+    // in this same plan, so the runtime orders the copies ahead of the plan's
+    // page reuse. Segments go newest Device access first, so the oldest are
+    // the ones dropped when the Host cannot place every one
+    // (AcquireHostSegments); a dropped segment publishes nothing. A member
+    // the Host already holds is not copied, nor is one an unacknowledged
+    // store already carries (the segment waits for that store too) or one
+    // whose key another member of its segment copies. Each segment publishes
+    // once every op it waits for is acknowledged, less the members that
+    // became dead meanwhile; one that waits for none settles here. nullopt
+    // when nothing is copied.
+    std::optional<WriteBackOperation> StartEvictionStores();
     LoadBackOperation StartPrefixLoad(std::vector<BlockTransfer> block_transfers);
 
     // A retraction image and the two store ops that fill it. The L2 leg is a
     // stream-ordered write-back of the published pages not yet on Host (keys
-    // already Host-cached or carried by an in-flight store are pinned, not
-    // copied again); the tail leg is the snapshot store of every other data
-    // slot plus the slot-state blob. pending_store_ops lists every op the
-    // image waits for -- both legs' own ops and any earlier in-flight store
-    // carrying one of its keys.
+    // already Host-cached or carried by an in-flight store that publishes them
+    // at its ACK are pinned, not copied again); the tail leg is the snapshot
+    // store of every other data slot plus the slot-state blob.
+    // pending_store_ops lists every op the image waits for -- both legs' own
+    // ops and any earlier in-flight store carrying one of its keys.
     struct RetractionStores {
         RetractionImage image;
         std::optional<WriteBackOperation> host_store;
@@ -99,10 +114,13 @@ public:
                                                   std::vector<BlockTransfer> load_pairs,
                                                   std::vector<BlockTransfer> snapshot_pairs);
 
-    // Publishes every ticket's Host entry and drops the op's pins. Returns
-    // the entries as published -- the block canonical for each key after the
-    // index possibly redirected the publication to an existing entry -- so a
-    // retraction image pinned on a ticket's block can follow the redirect.
+    // Publishes every ticket's Host entry (an eviction write-back's tickets
+    // excepted: their segments publish them) and drops the op's pins, then
+    // settles every in-flight segment for which this was the last op it
+    // waited on. Returns the entries as published -- the block canonical for
+    // each key after the index possibly redirected the publication to an
+    // existing entry -- so a retraction image pinned on a ticket's block can
+    // follow the redirect.
     std::vector<HostPublication> CompleteWriteBack(std::uint32_t op_id);
     // A prefix load landed: drops the op's pins. Its destinations were
     // published at admission (every source is a Host-warm entry).
@@ -139,7 +157,11 @@ public:
     // drain takes lands in exactly one outcome -- host_cached, in_flight,
     // evicted_before_drain, no_placement, or stored (counted in blocks) -- and
     // so does each published slot of one retraction attempt: host_cached,
-    // in_flight, stored, snapshot_fallback or image_refused.
+    // in_flight, stored, snapshot_fallback or image_refused, and each member
+    // of a StartEvictionStores drain: host_cached, in_flight, no_placement
+    // (its segment was dropped) or stored (in blocks; recopied counts the
+    // ones copied again). Of an eviction's placed members, cancelled counts
+    // those its segment's settlement did not publish.
     struct WriteBackStats {
         std::uint64_t ops{0};
         std::vector<std::uint64_t> blocks;      // stored, by cache group index
@@ -149,6 +171,13 @@ public:
         std::uint64_t no_placement{0};          // no Host block in its group and bucket
         std::uint64_t snapshot_fallback{0};     // retraction: the slot rides the snapshot pool instead
         std::uint64_t image_refused{0};         // retraction: the Host block died with a refused image
+        // Eviction: of the stored blocks, those an earlier eviction had
+        // written back already (the Host dropped that copy since).
+        std::uint64_t recopied{0};
+        // Eviction: placed members not published when their segment settled (a
+        // tail whose hint the cap dropped, a boundary with no checkpoint
+        // boundary at or under it any more).
+        std::uint64_t cancelled{0};
     };
     // Host L2 -> Device copies: of prefix-hit loads (one op per first
     // admission the Host wins), and of restores (one op per restore that has
@@ -164,11 +193,12 @@ public:
     const LoadBackStats& RestoreLoadStats() const { return restore_load_stats_; }
 
 private:
-    // A store ticket always pins its Host destination; the ACK's one job is
-    // publishing that entry (CacheHostBlock). Whether it also pins the Device
-    // source is the op's StoreSourceGuard: kPinnedUntilAck keeps the source
-    // cached and unevictable until the ACK, kStreamOrdered leaves it empty
-    // and relies on the runtime ordering the copy ahead of any reuse.
+    // A store ticket always pins its Host destination; the ACK publishes that
+    // entry (CacheHostBlock), except on an eviction write-back, whose segments
+    // publish it. Whether it also pins the Device source is the op's
+    // StoreSourceGuard: kPinnedUntilAck keeps the source cached and unevictable
+    // until the ACK, kStreamOrdered leaves it empty and relies on the runtime
+    // ordering the copy ahead of any reuse.
     struct StoreTicket {
         CacheKey key;
         CacheBlockRef device_block_ref;
@@ -178,6 +208,18 @@ private:
     struct InFlightWriteBack {
         StoreSourceGuard guard;
         std::vector<StoreTicket> tickets;
+        // Whether the ACK publishes the tickets. An eviction write-back's
+        // publish through the segments that wait for this op instead, which
+        // may wait for later ops or be cancelled.
+        bool publishes_at_ack{false};
+    };
+    // An eviction write-back's segment between its drain and its last ACK:
+    // every member carries the Host block it publishes, and pending_store_ops
+    // lists the ops still out among those carrying its members (its own
+    // drain's, and earlier ones it borrowed a member from).
+    struct InFlightSegment {
+        CacheCoordinator::EvictedSegment segment;
+        std::vector<std::uint32_t> pending_store_ops;
     };
 
     // A tail store pins its snapshot-pool destinations and the blob slot it
@@ -198,25 +240,30 @@ private:
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);
     std::vector<CacheTransfer> resolveTransfers(std::span<const BlockTransfer> block_transfers) const;
-    // The Host block an unacknowledged store already carries for each key,
-    // with that store's op id. Built once per retraction from write_backs_
-    // (rather than mirrored in a second container) and looked up per slot.
+    // The Host block an unacknowledged store already carries for each key, with
+    // that store's op id and publishes_at_ack (InFlightWriteBack). Built once
+    // per drain from write_backs_ (rather than mirrored in a second container)
+    // and looked up per block; a key a store publishing at its ACK carries
+    // names that store.
     struct InFlightHostBlock {
         CacheBlockRef block;
         std::uint32_t op_id{0};
+        bool publishes_at_ack{false};
     };
     using InFlightHostBlocks = std::unordered_map<CacheKey, InFlightHostBlock, CacheKeyHash>;
     InFlightHostBlocks inFlightHostBlocks() const;
 
     CacheCoordinator& coordinator_;
     std::unordered_map<std::uint32_t, InFlightWriteBack> write_backs_;
+    // In drain order. Each waits for at least one op of write_backs_.
+    std::vector<InFlightSegment> in_flight_segments_;
     // Each transfer pins both tiers until the runtime acknowledges the copy.
     std::unordered_map<std::uint32_t, std::vector<BlockTransfer>> load_backs_;
     std::unordered_map<std::uint32_t, InFlightSnapshotStore> snapshot_stores_;
     std::unordered_map<std::uint32_t, InFlightSnapshotRestore> snapshot_restores_;
     std::uint32_t next_op_id_{0};
     // Indexed by HostStoreCause; every per-group vector is sized at construction.
-    std::array<WriteBackStats, 3> write_back_stats_;
+    std::array<WriteBackStats, 4> write_back_stats_;
     LoadBackStats prefix_load_stats_;
     LoadBackStats restore_load_stats_;
 };

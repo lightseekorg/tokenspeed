@@ -429,7 +429,8 @@ public:
 
 private:
     // Current prefix hits are protected before candidates reach this policy.
-    // A request-only block with no CacheEntry is reclaimed first. Cached
+    // A request-only block with no CacheEntry is reclaimed first, level with
+    // a superseded input (CacheCoordinator::MarkSupersededStateInput). Cached
     // entries then compare request access epoch, followed within one epoch by
     // the tier order below. Position keeps the deeper unproven non-closed
     // boundary, while a closed prefix is reclaimed from its suffix.
@@ -681,8 +682,9 @@ private:
         return VictimCandidate{
             .group_id = group_id,
             .location = location,
-            // Access epochs start at one. Zero puts an uncached block ahead of
-            // every reusable cache entry.
+            // Access epochs start at one. Zero puts an uncached block, and a
+            // superseded input re-registered there, ahead of every reusable
+            // cache entry.
             .last_access_epoch = last_access_epoch,
             .eviction_tier = eviction_tier,
             .position_rank = position_rank,
@@ -1091,6 +1093,10 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             _assert(!input, "a State group matches one checkpoint");
             input = std::move(acquired_prefix.state_at_prompt_end[i]);
         }
+        if (const std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool_, input);
+            key && tails_.Contains(key->content_hash)) {
+            result.resumed_tail_hash = key->content_hash;
+        }
         groups_[i].Allocator().ShapeStateTable(*demands[i].table, std::move(input));
     }
     // Gives the table a private block in `slot`: a copy of the block there
@@ -1108,19 +1114,26 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             result.new_page_ids[i].push_back(destination);
         }
     };
-    std::vector<std::tuple<std::uint32_t, CacheBlockLocation, DeviceEvictionCounts DeviceEvictionStats::*>>
+    std::vector<
+        std::tuple<std::uint32_t, CacheBlockLocation, DeviceEvictionCounts DeviceEvictionStats::*, EvictedSegment*>>
         prospective_victims;
+    // Under the write-back policy each set of cache victims is recorded as
+    // one segment for this plan's drain; the request's own released slots are
+    // dropped. The segments this admission starts follow every earlier one.
+    const std::size_t first_new_segment_index = evicted_segments_.size();
     // A reclaimable table block may still be pinned by both the request and
     // cache here. Evict what is already free, then slide the request tables and
     // retry the blocks whose request reference has just been released.
     for (const VictimSet& set : plan.victims) {
+        EvictedSegment* segment =
+            write_back_evictions_ && !set.is_request_reclaim ? &evicted_segments_.emplace_back() : nullptr;
         for (const auto& [group_id, location, in_stranded_suffix] : set.members) {
             DeviceEvictionCounts DeviceEvictionStats::*reason =
                 set.is_request_reclaim ? &DeviceEvictionStats::request_reclaim
                 : in_stranded_suffix   ? &DeviceEvictionStats::stranded_suffix
                                        : &DeviceEvictionStats::admission;
-            if (!evictCachedBlock(group_id, location, reason)) {
-                prospective_victims.emplace_back(group_id, location, reason);
+            if (!evictCachedBlock(group_id, location, reason, segment)) {
+                prospective_victims.emplace_back(group_id, location, reason, segment);
             }
         }
     }
@@ -1168,9 +1181,18 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
         recordPublishedTail(completed);
     }
-    for (const auto& [group_id, location, reason] : prospective_victims) {
-        if (!evictCachedBlock(group_id, location, reason)) {
+    for (const auto& [group_id, location, reason, segment] : prospective_victims) {
+        if (!evictCachedBlock(group_id, location, reason, segment)) {
             FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");
+        }
+    }
+    // A set whose every block was dropped records nothing; the rest are
+    // dated by their newest member.
+    std::erase_if(evicted_segments_, [](const EvictedSegment& segment) { return segment.members.empty(); });
+    for (std::size_t s = first_new_segment_index; s < evicted_segments_.size(); ++s) {
+        for (const EvictedBlock& member : evicted_segments_[s].members) {
+            evicted_segments_[s].newest_access_epoch =
+                std::max(evicted_segments_[s].newest_access_epoch, member.metadata.last_access_epoch);
         }
     }
 
@@ -1366,7 +1388,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     // same-hash State checkpoint an earlier victim's cascade already took).
     for (const VictimSet& set : candidate->victims) {
         for (const VictimSet::Member& member : set.members) {
-            if (!evictCachedBlock(member.group_id, member.location, &DeviceEvictionStats::restore)) {
+            if (!evictCachedBlock(member.group_id, member.location, &DeviceEvictionStats::restore,
+                                  /*write_back_segment=*/nullptr)) {
                 FatalCheck(!pool_.IsOccupied(member.location), "restore victim changed before acquisition");
             }
         }

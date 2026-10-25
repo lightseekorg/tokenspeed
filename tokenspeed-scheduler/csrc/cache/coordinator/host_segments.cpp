@@ -276,7 +276,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostSegments(std:
                 std::vector<std::pair<const BoundaryTree::Node*, std::vector<NodeEntry>>> climbed;
                 climbed.emplace_back(&candidate_node, std::move(candidate_entries));
                 if (num_state_groups_ > 0) {
-                    while (top->parent != nullptr && top->parent->on_host &&
+                    while (top->parent != nullptr && top->parent->on_host && top->parent->pending_host_stores == 0 &&
                            num_remaining_checkpoint_boundaries(*top->parent) ==
                                num_remaining_checkpoint_boundaries(candidate_node)) {
                         std::vector<NodeEntry> entries = untaken_entries_of(*top->parent);
@@ -286,6 +286,13 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostSegments(std:
                         top = top->parent;
                         climbed.emplace_back(top, std::move(entries));
                     }
+                }
+                // A page an eviction write-back is bringing here is judged when
+                // it lands by the checkpoint boundaries under it: taking these
+                // would leave it to arrive dead, above the victim or in it (a
+                // KV page on its way under its Host checkpoints).
+                if (top->parent != nullptr && top->parent->pending_host_stores > 0) {
+                    continue;
                 }
                 victim.nearest_untaken_page = top->parent;
                 // Post-order over the Host children: a node after the nodes
@@ -319,6 +326,10 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostSegments(std:
                             TakenNode{.node = frame.node, .entries = std::move(entries), .takes_page = takes_page});
                     }
                     stack.pop_back();
+                }
+                if (std::ranges::any_of(walked,
+                                        [](const BoundaryTree::Node* node) { return node->pending_host_stores > 0; })) {
+                    continue;
                 }
             }
             // One member in use passes the whole victim over.

@@ -81,8 +81,42 @@ void SchedulerConfig::Validate() const {
     if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
         throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
     }
+    // Write-back is the P role's alone for now: a single replica on every
+    // group (an eviction's ACK is this rank's), and no L3 staging through
+    // the Host. Attention TP and PP are the runtime's to refuse; the
+    // scheduler does not see them.
+    //
+    // No sliding-window group yet. Such a group takes Device copies (a hit's
+    // private copy of a tail block) as a full-attention group does, and the
+    // runtime orders one plan's copies so that a block is read before it is
+    // overwritten within each group only: a page one group's copy reads that a
+    // later admission of the plan evicts and grants as another group's copy
+    // destination could be overwritten first.
     if (host_write_policy == HostWritePolicy::kWriteBack) {
-        throw std::invalid_argument("Scheduler: host_write_policy WriteBack is not available yet");
+        if (!HasHostCache()) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
+        }
+        if (role != Role::kP) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack is available on the P role only");
+        }
+        if (enable_l3_storage) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");
+        }
+        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.shard_count > 1; })) {
+            throw std::invalid_argument(
+                "Scheduler: host_write_policy WriteBack requires shard_count 1 on every cache group (no KV "
+                "parallelism)");
+        }
+        for (const CacheGroupConfig& group : cache_groups) {
+            if (group.attn_kind == AttnKind::kSlidingWindow) {
+                throw std::invalid_argument("Cache group '" + group.group_id +
+                                            "': host_write_policy WriteBack does not support a sliding-window group");
+            }
+        }
+        // BoundaryTree::Node::written_back_group_bits keeps one bit per group.
+        if (cache_groups.size() > 64) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack supports at most 64 cache groups");
+        }
     }
     // The snapshot pool is stated explicitly on every role: the null page
     // alone (and no slots) says "never retract", anything more needs slots.

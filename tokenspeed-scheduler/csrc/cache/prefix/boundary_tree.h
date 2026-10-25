@@ -31,13 +31,14 @@
 namespace tokenspeed {
 
 // The tree of published prefix boundaries, shared by both tiers: one node per
-// content hash some tier indexes, linked to the chain hash of the page before
-// it (a tail to its prior; page 0 has none). It answers what the flat per-group
-// indexes cannot: which pages a checkpoint boundary (a boundary with a State
-// checkpoint) depends on, how many checkpoint boundaries depend on a page, and
-// which Host pages end a chain. Walks follow parent pointers and the
-// insertion-ordered child and leaf lists, never the map, so mirrored ranks
-// agree. The coordinator keeps it in step with its indexes; no match reads it.
+// content hash some tier indexes or an eviction write-back is bringing to the
+// Host, linked to the chain hash of the page before it (a tail to its prior;
+// page 0 has none). It answers what the flat per-group indexes cannot: which
+// pages a checkpoint boundary (a boundary with a State checkpoint) depends on,
+// how many checkpoint boundaries depend on a page, and which Host pages end a
+// chain. Walks follow parent pointers and the insertion-ordered child and leaf
+// lists, never the map, so mirrored ranks agree. The coordinator keeps it in
+// step with its indexes; no match reads it.
 class BoundaryTree {
 public:
     // Indexes into an array by CacheTier, such as a Node's per-tier fields.
@@ -67,21 +68,31 @@ public:
         std::int32_t boundary_tokens{0};
         std::int32_t tail_tokens{0};
         // By CacheTier: whether this boundary has a checkpoint on that tier
-        // (some State group holds its checkpoint there), and how many
-        // boundaries in the subtree, this node included, have a checkpoint on
-        // that tier (a boundary counts once, however many State groups hold one
-        // there).
+        // (some State group holds its checkpoint there; on the Host also one on
+        // its way there), and how many boundaries in the subtree, this node
+        // included, have a checkpoint on that tier (a boundary counts once,
+        // however many State groups hold one there).
         std::array<bool, 2> has_checkpoint{};
         std::array<std::int32_t, 2> checkpoint_boundaries_in_subtree{};
         // Whether some group holds this hash on the Device tier.
         bool on_device{false};
-        // Whether some group holds this hash on the Host tier, and how many
-        // children do. A Host leaf -- on the Host, no child on the Host -- is
-        // in the Host leaf list, in the order it became one.
+        // Whether some group holds this hash on the Host tier or a store is
+        // bringing one there, and how many children are on the Host in that
+        // sense (children_on_host). A Host leaf -- on the Host, no child on the
+        // Host -- is in the Host leaf list, in the order it became one.
         bool on_host{false};
         std::int32_t children_on_host{0};
         Node* prev_host_leaf{nullptr};
         Node* next_host_leaf{nullptr};
+        // The blocks of this hash an eviction write-back has recorded and not
+        // settled yet, and how many of them are State checkpoints: while any
+        // is out the node, its tail hint and its Host presence stay.
+        std::int32_t pending_host_stores{0};
+        std::int32_t pending_host_checkpoint_stores{0};
+        // Accounting only, bit i for cache group i: an eviction write-back
+        // published this hash's blocks of that group on the Host before, so
+        // copying one again is a recopy.
+        std::uint64_t written_back_group_bits{0};
     };
 
     BoundaryTree() = default;
@@ -185,12 +196,12 @@ public:
     // The oldest Host leaf; next_host_leaf walks the rest.
     const Node* FirstHostLeaf() const { return first_host_leaf_; }
 
-    // Drops a childless node that holds nothing: no checkpoint on either tier
-    // and nothing on either tier.
+    // Drops a childless node that holds nothing: no checkpoint on either tier,
+    // nothing on either tier and no store on its way to the Host.
     void Remove(Node& node) {
-        _assert(
-            node.first_child == nullptr && !node.on_device && !node.on_host && !node.HasCheckpointBoundaryInSubtree(),
-            "only a childless node that holds nothing leaves the tree");
+        _assert(node.first_child == nullptr && !node.on_device && !node.on_host &&
+                    !node.HasCheckpointBoundaryInSubtree() && node.pending_host_stores == 0,
+                "only a childless node that holds nothing leaves the tree");
         if (node.parent != nullptr) {
             Node& parent = *node.parent;
             (node.prev_sibling != nullptr ? node.prev_sibling->next_sibling : parent.first_child) = node.next_sibling;

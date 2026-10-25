@@ -95,7 +95,7 @@ public:
         for (const auto& key : keys) {
             auto block = coordinator.AcquireHostBlock(key.group_id, 0);
             ASSERT_TRUE(block);
-            coordinator.CacheHostBlock(block, key);
+            coordinator.CacheHostBlock(block, key, std::nullopt);
         }
     }
 

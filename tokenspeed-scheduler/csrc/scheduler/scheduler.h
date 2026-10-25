@@ -70,6 +70,7 @@ struct HostCacheStats {
     TierTransferManager::WriteBackStats publication_stores;
     TierTransferManager::WriteBackStats finish_stores;
     TierTransferManager::WriteBackStats retraction_stores;
+    TierTransferManager::WriteBackStats eviction_stores;
     TierTransferManager::LoadBackStats prefix_loads;
     TierTransferManager::LoadBackStats restore_loads;
     CacheCoordinator::HostEvictionStats host_evictions;

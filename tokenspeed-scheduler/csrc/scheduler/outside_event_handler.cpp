@@ -126,6 +126,15 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         if (completed.completed_pages->tail) {
             store_hashes.push_back(completed.completed_pages->tail->hash);
         }
+        // Under write-back the checkpoint where the previous turn ended is
+        // marked once this end state supersedes it: it stays matchable, but
+        // is the first eviction candidate, and is dropped rather than
+        // written back when an admission needs its room. Only now: a request
+        // that fails before its finish (a PD transfer that fails) publishes
+        // nothing and marks nothing.
+        if (config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack && progress.resumed_tail_hash) {
+            coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
+        }
     }
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;

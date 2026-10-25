@@ -33,6 +33,7 @@
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_index.h"
+#include "cache/tier/transfer_manager.h"
 #include "cache_test_access.h"
 
 namespace tokenspeed {
@@ -308,7 +309,8 @@ void MeasureHostBlockAcquisition(std::int32_t pool_size, std::int32_t iterations
         ++next_key;
         coordinator.CacheHostBlock(
             batch.blocks.front(),
-            CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(next_key), .page_offset = 0});
+            CacheKey{.group_id = 0, .content_hash = "host-cache-" + std::to_string(next_key), .page_offset = 0},
+            std::nullopt);
         return static_cast<std::uint64_t>(batch.stats.allocated);
     });
 }
@@ -327,7 +329,8 @@ void MeasureSparseHostBlockAcquisition(std::int32_t pool_size, std::int32_t iter
                                                    /*write_back_evictions=*/false);
     std::vector<CacheBlockRef> pins = host_pool.AcquireBlocks(0, pool_size - 1);
     CacheBlockRef cached = host_pool.AcquireBlock(1);
-    coordinator.CacheHostBlock(cached, CacheKey{.group_id = 1, .content_hash = "initial", .page_offset = 0});
+    coordinator.CacheHostBlock(cached, CacheKey{.group_id = 1, .content_hash = "initial", .page_offset = 0},
+                               std::nullopt);
     cached.reset();
     std::uint64_t next_key = 0;
     Measure("acquire_host_blocks_sparse_evictable", pool_size, 1, iterations, [&] {
@@ -336,7 +339,8 @@ void MeasureSparseHostBlockAcquisition(std::int32_t pool_size, std::int32_t iter
             std::abort();
         }
         coordinator.CacheHostBlock(
-            replacement, CacheKey{.group_id = 1, .content_hash = std::to_string(++next_key), .page_offset = 0});
+            replacement, CacheKey{.group_id = 1, .content_hash = std::to_string(++next_key), .page_offset = 0},
+            std::nullopt);
         return static_cast<std::uint64_t>(replacement->Location().lcm_block_id);
     });
 }
@@ -356,8 +360,8 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
     for (std::int32_t i = 0; i < pool_size; ++i) {
         const auto group_id = static_cast<std::uint32_t>(i % 2);
         CacheBlockRef block = host_pool.AcquireBlock(group_id);
-        coordinator.CacheHostBlock(block,
-                                   CacheKey{.group_id = group_id, .content_hash = std::to_string(i), .page_offset = 0});
+        coordinator.CacheHostBlock(
+            block, CacheKey{.group_id = group_id, .content_hash = std::to_string(i), .page_offset = 0}, std::nullopt);
     }
     const std::array<std::uint32_t, 2> group_ids{0, 1};
     const std::array<std::int32_t, 2> buckets{0, 0};
@@ -370,7 +374,8 @@ void MeasureMultiGroupHostBlockAcquisition(std::int32_t pool_size, std::int32_t 
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             coordinator.CacheHostBlock(
                 batch.blocks[i],
-                CacheKey{.group_id = group_ids[i], .content_hash = std::to_string(++next_key), .page_offset = 0});
+                CacheKey{.group_id = group_ids[i], .content_hash = std::to_string(++next_key), .page_offset = 0},
+                std::nullopt);
         }
         return static_cast<std::uint64_t>(batch.stats.allocated);
     });
@@ -427,7 +432,7 @@ void MeasureSessionWithoutDeviceCheckpointAdmission(std::int32_t pages, std::int
     }
     for (const CacheKey& key : host_keys) {
         CacheBlockRef block = host_pool.AcquireBlock(key.group_id);
-        coordinator.CacheHostBlock(block, key);
+        coordinator.CacheHostBlock(block, key, std::nullopt);
     }
     const std::optional<CacheBlockLocation> checkpoint = CacheCoordinatorTestAccess::DeviceLocationOf(
         coordinator, 1, CacheKey{.group_id = 1, .content_hash = hashes.back()});
@@ -453,6 +458,10 @@ void MeasureSessionWithoutDeviceCheckpointAdmission(std::int32_t pages, std::int
         timings.push_back(std::chrono::duration<double, std::nano>(end - begin).count());
         coordinator.Free(tables);
         held.clear();
+        // The plan's drain: every page is on the Host already.
+        for (CacheCoordinator::EvictedSegment& segment : coordinator.TakeEvictedSegments()) {
+            coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/true);
+        }
         if (coordinator.GroupPrefixIndex(0).Contains(pool, CacheKey{.group_id = 0, .content_hash = hashes.front()})) {
             std::abort();
         }
@@ -541,6 +550,10 @@ void MeasureSegmentAdmission(bool write_back_evictions, std::int32_t segments, s
         timings.push_back(std::chrono::duration<double, std::nano>(end - begin).count());
         coordinator.Free(tables);
         held.clear();
+        // The plan's drain, with no Host room: every segment is dropped.
+        for (CacheCoordinator::EvictedSegment& segment : coordinator.TakeEvictedSegments()) {
+            coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+        }
         std::int32_t gone = 0;
         for (const std::vector<std::string>& hashes : sessions) {
             if (evicted(hashes)) {
@@ -557,6 +570,115 @@ void MeasureSegmentAdmission(bool write_back_evictions, std::int32_t segments, s
     std::cout << (write_back_evictions ? "admit_by_segments_k3_shape" : "admit_by_blocks_k3_shape") << ',' << kParents
               << ',' << segments << ',' << iterations << ',' << timings[timings.size() / 2] << ',' << evicted_sessions
               << '\n';
+}
+
+// One write-back plan in the K3 geometry, from the admissions to the
+// collection: 532 Device parents and 487 Host parents, a Full group of 89
+// blocks per parent and three State groups, sessions of 150 pages chained by
+// SHA-256 page hashes, each ending in its checkpoint. With every free slot
+// held, `admissions` first chunks are admitted in one plan, each needing six
+// fresh State parents (both slots of each State group) and one Full page, so
+// each evicts about two sessions; the plan's one drain places all of them on
+// a full Host -- evicting the least recently used Host sessions -- and
+// issues one copy, the ACK publishes them, and the collection takes what the
+// Host evictions left dead. All of it is timed, and the rows the copy
+// carries are reported per plan; then new sessions take the evicted ones'
+// place on the Device. The Host fills during warm-up rounds that are not
+// timed.
+void MeasureWriteBackPlan(std::int32_t admissions, std::int32_t iterations) {
+    constexpr std::int32_t kParents = 532;
+    constexpr std::int32_t kHostParents = 487;
+    constexpr std::int32_t kFullPacking = 89;
+    constexpr std::int32_t kPages = 150;
+    constexpr std::int32_t kP = 4;
+    BlockPool pool(kParents, {kFullPacking, 1, 1, 1});
+    BlockPool host_pool(kHostParents, {kFullPacking, 1, 1, 1});
+    const std::array specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = kFullPacking, .block_granularity = kP},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1},
+    };
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    TierTransferManager transfers{coordinator};
+    std::int32_t next_session = 0;
+    std::vector<std::vector<std::string>> sessions;
+    const auto publish_new = [&] {
+        std::vector<std::string> hashes;
+        for (std::int32_t page = 0; page < kPages; ++page) {
+            const std::array<std::int32_t, 2> tokens{next_session, page};
+            hashes.push_back(HashPrefixPage(tokens, hashes.empty() ? std::string{} : hashes.back()));
+        }
+        ++next_session;
+        std::vector<BlockTable> tables(4);
+        if (!AdmitForTest(coordinator, tables, kPages * kP)) {
+            std::abort();
+        }
+        CacheCompletedBlocksForTest(coordinator, tables, hashes,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, kPages * kP, CacheBoundaryKind::kEndpoint,
+                                    /*stream_completed_to_host=*/false, /*publish_state=*/true);
+        coordinator.Free(tables);
+        sessions.push_back(std::move(hashes));
+    };
+    // A fresh session takes six State parents and two Full ones while it is
+    // admitted.
+    while (pool.NumEmptyLcmBlocks() >= 8) {
+        publish_new();
+    }
+    const std::int32_t warm_up = kHostParents / (5 * admissions) + 1;
+    std::vector<double> timings;
+    timings.reserve(static_cast<std::size_t>(iterations));
+    std::uint64_t written_back = 0;
+    std::uint64_t copied_rows = 0;
+    for (std::int32_t iteration = 0; iteration < warm_up + iterations; ++iteration) {
+        std::vector<CacheBlockRef> held = pool.AcquireBlocks(/*group_id=*/0, pool.NumFreeSlots(0));
+        for (CacheBlockRef& block : pool.AcquireBlocks(/*group_id=*/1, pool.NumEmptyLcmBlocks())) {
+            held.push_back(std::move(block));
+        }
+        std::vector<std::vector<BlockTable>> tables(static_cast<std::size_t>(admissions), std::vector<BlockTable>(4));
+        const auto begin = std::chrono::steady_clock::now();
+        for (std::vector<BlockTable>& request_tables : tables) {
+            if (!AdmitForTest(coordinator, request_tables, coordinator.ProbePrefix({}),
+                              GroupDemand{.extent = DenseGrowth{kP}}, RequestProgress{},
+                              StateStep{.kind = StateStep::Kind::kRotate})) {
+                std::abort();
+            }
+        }
+        const std::optional<WriteBackOperation> op = transfers.StartEvictionStores();
+        if (!op) {
+            std::abort();
+        }
+        written_back += transfers.CompleteWriteBack(op->op_id).size();
+        coordinator.CollectDeadEntries();
+        const auto end = std::chrono::steady_clock::now();
+        if (iteration >= warm_up) {
+            timings.push_back(std::chrono::duration<double, std::nano>(end - begin).count());
+            copied_rows += op->transfers.size();
+        }
+        for (std::vector<BlockTable>& request_tables : tables) {
+            coordinator.Free(request_tables);
+        }
+        held.clear();
+        const std::size_t before = sessions.size();
+        std::erase_if(sessions, [&](const std::vector<std::string>& hashes) {
+            return !coordinator.GroupPrefixIndex(1).Contains(pool,
+                                                             CacheKey{.group_id = 1, .content_hash = hashes.back()});
+        });
+        if (sessions.size() == before) {
+            std::abort();
+        }
+        for (std::size_t session = sessions.size(); session < before; ++session) {
+            publish_new();
+        }
+    }
+    std::ranges::sort(timings);
+    std::cout << "write_back_plan_k3_first_chunks," << kParents << ',' << admissions << ',' << iterations << ','
+              << timings[timings.size() / 2] << ',' << written_back << ",p99=" << timings[timings.size() * 99 / 100]
+              << ",rows_per_plan=" << copied_rows / static_cast<std::uint64_t>(iterations) << '\n';
 }
 
 }  // namespace
@@ -589,6 +711,9 @@ int main() {
     for (const std::int32_t segments : {1, 2, 3}) {
         tokenspeed::MeasureSegmentAdmission(/*write_back_evictions=*/true, segments, /*iterations=*/200);
         tokenspeed::MeasureSegmentAdmission(/*write_back_evictions=*/false, segments, /*iterations=*/200);
+    }
+    for (const std::int32_t admissions : {1, 2, 3, 4}) {
+        tokenspeed::MeasureWriteBackPlan(admissions, /*iterations=*/200);
     }
     return 0;
 }

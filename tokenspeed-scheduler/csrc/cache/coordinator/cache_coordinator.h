@@ -73,10 +73,10 @@ public:
 
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier;
-    // write_back_evictions whether an admission evicts Device cache by
-    // segments, so what leaves can be written back, and dead prefix entries are
-    // collected on both tiers (the Host write-back policy; it needs a Host pool
-    // and excludes streaming). The
+    // write_back_evictions whether an admission evicts Device cache by segments
+    // and records them for the plan's write-back drain (TakeEvictedSegments),
+    // and dead prefix entries are collected on both tiers (the Host write-back
+    // policy; it needs a Host pool and excludes streaming). The
     // snapshot pool holds retracted requests' private KV images (Snapshot /
     // Restore); nullptr means the engine never retracts. enable_l3_storage,
     // host_pool, snapshot_pool, stream_device_cache_to_host and
@@ -246,6 +246,11 @@ public:
         // new_page_ids), null elsewhere. The caller holds it until the
         // request's next publication point publishes it.
         std::vector<CacheBlockRef> state_checkpoint_blocks;
+        // The tail whose checkpoints the Device supplied as the State groups'
+        // slot 0: a first admission resuming inside a page, where an earlier
+        // turn ended. The end state the request publishes supersedes it
+        // (MarkSupersededStateInput).
+        std::optional<ContentHash> resumed_tail_hash;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -388,24 +393,94 @@ public:
     // include_host selects both tiers (Host is a no-op without a host pool).
     bool CacheIsClearable(bool include_host) const;
     // Evicts, on both tiers, the prefix entries no probe can resume from any
-    // more (write_back_evictions only; nothing is queued otherwise). A node is
-    // dead when no checkpoint boundary is left in its subtree on either tier
-    // (with State groups), when it is a tail no probe enumerates (its hint is
-    // gone), or when it is a gap a prefix-closed group cannot cross: no
-    // prefix-closed group holds it on either tier, whatever State entries or
-    // children it keeps. Evicting and syncing tree nodes queue the candidates:
-    // the node syncTreeNode stops at once no checkpoint boundary is left under
-    // it, a gap, a tail the cap left behind. Each is checked again when
-    // collected -- a live request may have published a checkpoint boundary
-    // under it since -- then the collection climbs while the parent is dead and
-    // none of its entries is in use, and takes every entry of that subtree not
-    // in use, deepest boundary first. A root with an entry in use waits for the
-    // next call. The scheduler calls it once per plan, after the build.
+    // more (write_back_evictions only; nothing is queued otherwise). A node no
+    // eviction write-back is bringing to the Host is dead when no checkpoint
+    // boundary is left in its subtree on either tier (with State groups), when
+    // it is a tail no probe enumerates (its hint is gone), or when it is a gap
+    // a prefix-closed group cannot cross: no prefix-closed group holds it on
+    // either tier, whatever State entries or children it keeps. Evicting,
+    // syncing tree nodes and settling a write-back queue the candidates: the
+    // node syncTreeNode stops at once no checkpoint boundary is left under it,
+    // a gap, a tail the cap left behind, a boundary a settlement did not
+    // publish. Each is checked again when collected -- a live request may have
+    // published a checkpoint boundary under it since -- then the collection
+    // climbs while the parent is dead and none of its entries is in use, and
+    // takes every entry of that subtree not in use, deepest boundary first. A
+    // root with an entry in use waits for the next call. The scheduler calls it
+    // once per plan, after the build and its write-back drain.
     void CollectDeadEntries();
 
     struct StoreCandidate {
         CacheKey key;
     };
+    // A Device entry an admission evicted under the write-back policy,
+    // captured before the index let the block go: its page may be granted
+    // again in this same plan, so the copy rides the plan's stream-ordered
+    // lane ahead of that reuse, and nothing here pins the Device block.
+    struct EvictedBlock {
+        CacheKey key;
+        // The page id and the bucket follow from the location alone.
+        CacheBlockLocation device_location;
+        // Read before the eviction; the Host entry inherits it.
+        PrefixCacheIndex::CachedBlockMetadata metadata;
+        // The key's Host entry, held from the eviction on when the Host had
+        // one; otherwise the drain sets the Host block that carries it.
+        CacheBlockRef host_block;
+        // Accounting only: an earlier write-back published this hash's block of
+        // this group on the Host, so copying it again is a recopy.
+        bool written_back_before{false};
+    };
+    // One Host store transaction: what one victim set of an admission
+    // evicted, or several that depend on each other once
+    // TakeEvictedSegments merged them. Its members publish together, only
+    // once every copy they need has landed.
+    struct EvictedSegment {
+        // In eviction order: the deepest boundary first, each boundary's
+        // blocks together.
+        std::vector<EvictedBlock> members;
+        // The newest Device access epoch among the members.
+        std::uint64_t newest_access_epoch{0};
+    };
+    // The segments this plan's admissions recorded, in the order they were
+    // recorded, with every segment that hangs under the KV pages of a later
+    // one merged into it (members concatenated in recording order). Two
+    // admissions of one build may each take a segment where the second
+    // climbs through pages the first one's segment hangs under; placed
+    // apart, the first could reach the Host without the prefix it needs.
+    // Segments recording the same key (evicted, published again and evicted
+    // again in one build) are merged too: the drain copies the key once. The
+    // write-back drain is its one consumer, once per plan.
+    std::vector<EvictedSegment> TakeEvictedSegments();
+    // Ends a segment's Host store transaction, member by member in eviction
+    // order: with placed_on_host, each member reaches the Host index as its
+    // Device entry was (epoch -- the newer of that and an existing Host entry's
+    // -- logical block index and boundary kind), unless it is cancelled: a tail
+    // whose hint the per-prior cap dropped meanwhile, or a boundary with no
+    // checkpoint boundary at or under it any more on either tier. A cancelled
+    // member already on the Host leaves it once nothing else holds it. Without
+    // placed_on_host (no Host placement), nothing is published. Either way
+    // every member's hold on its tree node ends and a node left dead is queued
+    // for collection. Returns the entries published, the block canonical for
+    // each key.
+    std::vector<HostPublication> SettleEvictedSegment(EvictedSegment&& segment, bool placed_on_host);
+    // Marks as superseded the Device entries of the tail a request resumed from
+    // (AdmissionResult::resumed_tail_hash) -- every State group's checkpoint
+    // there and the tail's blocks -- once the end state its finish published
+    // supersedes them. They stay cached and matchable, so the same prompt sent
+    // again still resumes there, but they are re-registered at
+    // kSupersededAccessEpoch: the Device's eviction order reaches them before
+    // any other cache entry, and an eviction for the cache drops them as the
+    // request's reclaim instead of writing them back (evictCachedBlockAlone).
+    // A request that acquires them, or a publication of the same key, gives
+    // them its own epoch, and so unmarks them. Under the write-back policy
+    // the P role marks the input of a turn this way; only a tail's -- a turn
+    // ends inside a page -- since a page boundary is where a junction cut or
+    // an in-forward checkpoint publishes for other prompts. A tail the cap
+    // dropped meanwhile left with its hint. access_epoch is the finishing
+    // request's: an entry dated later was acquired or published since by
+    // another request, still the input of that one until it finishes, so
+    // nothing is marked.
+    void MarkSupersededStateInput(const ContentHash& resumed_tail_hash, std::uint64_t access_epoch);
     // Host entries evicted for one reason, each also counted as
     // device_resident when the Device index still held its key.
     struct HostEvictionCounts {
@@ -427,8 +502,8 @@ public:
         // A segment plan took it as a checkpoint boundary a deeper Device one
         // supersedes.
         HostEvictionCounts superseded;
-        // A segment plan took it as a dead entry, or CollectDeadEntries
-        // evicted it.
+        // A segment plan took it as a dead entry, CollectDeadEntries evicted
+        // it, or a settled write-back cancelled it (a held member).
         HostEvictionCounts dead_entry;
         // The per-prior tail cap dropped its tail, entry by entry after the
         // tail's Device blocks (device_resident when the Device kept a pinned
@@ -490,15 +565,17 @@ public:
     // Host pages under them, or only its checkpoints while deeper Host
     // checkpoint boundaries still read its page; a Host page no Host checkpoint
     // boundary depends on (without State groups: a page no Host page continues,
-    // a Host leaf) goes with the Host pages under it. One member in use passes the whole
-    // victim over. Victims go by class: dead entries (a checkpoint boundary
-    // missing a State group's checkpoint, a tail no probe enumerates, a page no
-    // Host checkpoint boundary depends on) first; then duplicates of a boundary
-    // the Device resumes and checkpoint boundaries a deeper Device checkpoint
-    // boundary on their chain supersedes, the newest Device copy first; then
-    // Host-only cache, least recently used first. Once a victim took every Host
-    // page under the page above it, that page is a candidate too. The restore
-    // pass then returns, newest first, each victim the placed segments can do
+    // a Host leaf) goes with the Host pages under it. One member in use passes
+    // the whole victim over, as does a parent page an eviction write-back is
+    // bringing to the Host (it would arrive with nothing under it). Victims go
+    // by class: dead entries (a checkpoint boundary missing a State group's
+    // checkpoint, a tail no probe enumerates, a page no Host checkpoint
+    // boundary depends on) first; then duplicates of a boundary the Device
+    // resumes and checkpoint boundaries a deeper Device checkpoint boundary on
+    // their chain supersedes, the newest Device copy first; then Host-only
+    // cache, least recently used first. Once a victim took every Host page
+    // under the page above it, that page is a candidate too. The restore pass
+    // then returns, newest first, each victim the placed segments can do
     // without and whose parent page stays. A dropped segment's rows hold empty
     // references.
     HostAllocationBatch AcquireHostSegments(std::span<const std::uint32_t> group_ids,
@@ -512,7 +589,13 @@ public:
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
-    void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    // Publishes a Host block under key; a key that already has a Host entry
+    // re-points block_ref to it. inherited_metadata carries the Device entry's
+    // metadata an eviction write-back publishes under (the newer of its
+    // epoch and an existing entry's); nullopt publishes as a fresh access
+    // with no logical block index, at a chunk boundary.
+    void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key,
+                        std::optional<PrefixCacheIndex::CachedBlockMetadata> inherited_metadata);
     void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
     CacheBlockRef AcquireHostCachedBlock(const CacheKey& key);
     struct StorageReservation {
@@ -534,6 +617,11 @@ public:
     // before any drain took them.
     const HostEvictionStats& HostEvictions() const { return host_evictions_; }
     std::uint64_t StoreCandidatesDroppedByFlush() const { return store_candidates_dropped_by_flush_; }
+    // The Device entries an admission evicted under the write-back policy
+    // without recording them: no probe could resume from them on the Host (a
+    // tail whose hint is gone, a boundary with no checkpoint boundary at or
+    // under it).
+    std::uint64_t DeadEntriesNotWrittenBack() const { return dead_entries_not_written_back_; }
 
     // Device entries evicted for one reason, each also counted as
     // host_resident when the Host index still held its key (never without a
@@ -551,7 +639,9 @@ public:
         // An admission's planned victims.
         DeviceEvictionCounts admission;
         // The slots the admitted request itself releases at this step (its
-        // State input, its expired window blocks) and what they take along.
+        // State input, its expired window blocks) and what they take along;
+        // when evicting by segments, also a superseded input an admission
+        // evicts (MarkSupersededStateInput).
         DeviceEvictionCounts request_reclaim;
         // The blocks a segment takes from under its chosen victim so no Device
         // page outlives its parent; only when evicting by segments.
@@ -781,24 +871,33 @@ private:
     void recordPublishedTail(const CompletedPages& completed);
     void recordTail(const ContentHash& prior, const TailPublication& tail);
     // Evicts every group's Device entries under a tail hash: a tail's blocks
-    // are usable only together, so they leave together. `reason` (the
-    // DeviceEvictionStats field of what started the eviction) only picks the
-    // counter each eviction lands in; eviction order and cascades never
-    // depend on it.
+    // are usable only together, so they leave together. `reason` and
+    // write_back_segment as for evictCachedBlockAlone.
     void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens,
-                          DeviceEvictionCounts DeviceEvictionStats::*reason);
+                          DeviceEvictionCounts DeviceEvictionStats::*reason, EvictedSegment* write_back_segment);
     // Device eviction of a planned or flushed victim, with its cascade (its
     // tail's companions or, for a page's KV block or one State group's
-    // checkpoint, every State group's checkpoint under its hash), all counted
-    // under `reason`. A companion still pinned elsewhere stays.
+    // checkpoint, every State group's checkpoint under its hash); `reason` and
+    // write_back_segment as for evictCachedBlockAlone. A companion still
+    // pinned elsewhere stays.
     bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
-                          DeviceEvictionCounts DeviceEvictionStats::*reason);
+                          DeviceEvictionCounts DeviceEvictionStats::*reason, EvictedSegment* write_back_segment);
     // Device eviction of one entry without its cascade, the one place a
-    // Device entry leaves the index: it reports and counts the eviction and
-    // syncs the entry's tree node. Returns the key that left, nullopt when the
-    // entry is pinned or gone.
+    // Device entry leaves the index: it reports the eviction, counts it under
+    // `reason` (the DeviceEvictionStats field of what started the eviction;
+    // eviction order and cascades never depend on it) and syncs the entry's
+    // tree node. It returns the key that left the index, nullopt when the
+    // entry is pinned or gone. With write_back_segment (an admission's cache
+    // victim under the write-back policy) an entry that left is recorded
+    // there -- its metadata read before it left, its Host entry held when the
+    // Host has one -- and holds its tree node, tail hint included, until the
+    // segment settles; one no probe could resume from on the Host is dropped
+    // instead (DeadEntriesNotWrittenBack), and a superseded input
+    // (MarkSupersededStateInput) is dropped and counted as request_reclaim,
+    // whatever `reason` says. nullptr drops it.
     std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
-                                                  DeviceEvictionCounts DeviceEvictionStats::*reason);
+                                                  DeviceEvictionCounts DeviceEvictionStats::*reason,
+                                                  EvictedSegment* write_back_segment);
     // Evicts an unpinned Host entry and, for a State checkpoint, the other
     // State groups' unpinned entries at its hash. Each entry that left counts
     // under host_evictions_.*reason, as device_resident too when the Device
@@ -820,14 +919,16 @@ private:
     // under the page before it.
     void linkPublication(const CompletedPages& completed);
     // Brings the tree node of `hash` back in step with the indexes after an
-    // entry under it left either tier: its checkpoint flags and Host presence
-    // follow the entries that remain, and a node no tier holds and no child
-    // hangs under leaves the tree with its tail hint, as does each parent left
-    // the same way. Under write_back_evictions it queues for CollectDeadEntries
-    // the node it stops at when taking a checkpoint boundary or a node away
-    // left no checkpoint boundary under it (the deepest such node left; the
-    // collection climbs from it), and a node no prefix-closed group holds on
-    // either tier (a gap).
+    // entry under it left either tier or a store on its way to the Host was
+    // recorded or settled: its checkpoint flags and Host presence follow the
+    // entries that remain and the stores still out, and a node no tier holds,
+    // no store is bringing and no child hangs under leaves the tree with its
+    // tail hint, as does each parent left the same way. Under
+    // write_back_evictions it queues for CollectDeadEntries the node it stops
+    // at when taking a checkpoint boundary or a node away left no checkpoint
+    // boundary under it (the deepest such node left; the collection climbs from
+    // it), and a node no prefix-closed group holds on either tier and no store
+    // is bringing (a gap).
     void syncTreeNode(const ContentHash& hash);
     // Whether an imaged slot belongs to the page the computed frontier ends
     // inside: the restored request writes and later republishes those blocks,
@@ -853,8 +954,9 @@ private:
     bool stream_device_cache_to_host_{false};
     // An admission evicts Device cache by segments: a checkpoint boundary with
     // the pages only it depends on and everything under them, so the Device's
-    // coverage stays closed from the root; and the dead prefix entries either
-    // tier is left with are collected.
+    // coverage stays closed from the root; records what its cache victims leave
+    // behind for this plan's write-back drain; and the dead prefix entries
+    // either tier is left with are collected.
     bool write_back_evictions_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
@@ -866,6 +968,11 @@ private:
     // State or sliding group resumes past a page that holds nothing.
     bool has_prefix_closed_groups_{false};
     std::uint64_t next_access_epoch_{0};
+    // Issued access epochs start at 1. A superseded input is re-registered
+    // at this one (MarkSupersededStateInput), below every other cache entry
+    // and level with the blocks no entry holds, until an acquisition or a
+    // publication touches it again.
+    static constexpr std::uint64_t kSupersededAccessEpoch{0};
     struct HostParentCandidate {
         std::uint64_t newest_access_epoch{0};
         std::int32_t evictable_children{0};
@@ -883,10 +990,16 @@ private:
     // CollectDeadEntries (write_back_evictions only). A node may be gone or
     // alive again by the time it is collected.
     std::deque<ContentHash> dead_candidates_;
+    // The segments this plan's admissions recorded (write_back_evictions
+    // only), empty outside a build: the plan's drain takes them. A deque, so
+    // an admission keeps pointing at the segments it records into while it
+    // adds more.
+    std::deque<EvictedSegment> evicted_segments_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
     // Accounting only.
     HostEvictionStats host_evictions_;
+    std::uint64_t dead_entries_not_written_back_{0};
     std::uint64_t store_candidates_dropped_by_flush_{0};
     DeviceEvictionStats device_evictions_;
 };

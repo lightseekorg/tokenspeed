@@ -67,8 +67,9 @@ enum class StoreSourceGuard : std::uint8_t {
     kPinnedUntilAck,
     // The Device block is released -- and may be re-granted -- the moment the
     // store issues; the runtime must order the copy on the forward thread's
-    // stream ahead of the plan's page reuse. A retraction's snapshot: the
-    // victim's pages are granted away in the same round.
+    // stream ahead of the plan's page reuse. A retraction's snapshot (the
+    // victim's pages are granted away in the same round) and an eviction
+    // write-back (the evicted pages fund the admissions of the same plan).
     kStreamOrdered,
 };
 

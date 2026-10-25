@@ -48,7 +48,8 @@ struct CacheCoordinatorTestAccess {
     // The planner's Device eviction of one entry, with its tail cascade,
     // counted as an admission's.
     static bool EvictCachedBlock(CacheCoordinator& coordinator, std::uint32_t group_id, CacheBlockLocation location) {
-        return coordinator.evictCachedBlock(group_id, location, &CacheCoordinator::DeviceEvictionStats::admission);
+        return coordinator.evictCachedBlock(group_id, location, &CacheCoordinator::DeviceEvictionStats::admission,
+                                            /*write_back_segment=*/nullptr);
     }
 
     // A Device-cached block, located rather than referenced: a held reference

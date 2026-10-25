@@ -162,8 +162,8 @@ TEST(CacheOperationTest, EveryTierTransferPairsBlocksOfEqualResidue) {
     std::vector<CacheBlockRef> other_bucket = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1});
     ASSERT_EQ(device.size() + same_bucket.size() + other_bucket.size(), 3u);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
-    coordinator.CacheHostBlock(same_bucket.front(), key);
-    coordinator.CacheHostBlock(other_bucket.front(), CacheKey{.group_id = 0, .content_hash = "h1"});
+    coordinator.CacheHostBlock(same_bucket.front(), key, std::nullopt);
+    coordinator.CacheHostBlock(other_bucket.front(), CacheKey{.group_id = 0, .content_hash = "h1"}, std::nullopt);
 
     std::vector<BlockTransfer> ok;
     ok.push_back(
@@ -573,7 +573,7 @@ TEST(CacheOperationTest, PendingStoreDrainCountsEachCandidateOnce) {
                                                  /*newly_cached=*/nullptr);
     }
     CacheBlockRef host_copy = host_pool.AcquireBlock(0);
-    coordinator.CacheHostBlock(host_copy, on_host);
+    coordinator.CacheHostBlock(host_copy, on_host, std::nullopt);
     host_copy.reset();
 
     coordinator.QueueCachedBlocksForStore(std::array{travelling.content_hash});
@@ -736,7 +736,7 @@ TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAnd
     const CacheKey key{.group_id = 0, .content_hash = hashes[0]};
     CacheBlockRef source = coordinator.AcquireHostBlock(0, /*bucket=*/0);
     ASSERT_TRUE(source);
-    coordinator.CacheHostBlock(source, key);
+    coordinator.CacheHostBlock(source, key, std::nullopt);
     CacheBlockRef destination = pool.AcquireBlock(0);
     const auto location = destination->Location();
     coordinator.CacheDeviceBlock(destination, key, /*logical_block_index=*/-1, CacheBoundaryKind::kEndpoint);
@@ -815,7 +815,7 @@ TEST(CacheOperationTest, HostHitsLoadWithoutKeys) {
     CacheBlockRef host_block = host_pool.AcquireBlock(/*group_id=*/0);
     ASSERT_TRUE(host_block);
     const CacheKey key{.group_id = 0, .content_hash = "h0"};
-    coordinator.CacheHostBlock(host_block, key);
+    coordinator.CacheHostBlock(host_block, key, std::nullopt);
     host_block.reset();
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 1>{"h0"});
@@ -889,7 +889,7 @@ TEST(CacheOperationTest, AdmissionLoadPairsKeepHostPinnedAfterTableFree) {
     for (const CacheKey& key : {key_h0, key_h1}) {
         CacheBlockRef host_block = coordinator.AcquireHostBlock(/*group_id=*/0, /*bucket=*/0);
         ASSERT_TRUE(host_block);
-        coordinator.CacheHostBlock(host_block, key);
+        coordinator.CacheHostBlock(host_block, key, std::nullopt);
     }
 
     auto probe = coordinator.ProbePrefix(std::array<std::string, 2>{"h0", "h1"});
@@ -1070,7 +1070,7 @@ TEST_F(AsyncStorageTailTest, KnownTailBelowTheRequestBoundCanBeRestored) {
     const auto known = prompt(7, true);
     auto state = coordinator.AcquireHostBlock(2, 0);
     ASSERT_TRUE(state);
-    coordinator.CacheHostBlock(state, {.group_id = 2, .content_hash = known.tail->hash});
+    coordinator.CacheHostBlock(state, {.group_id = 2, .content_hash = known.tail->hash}, std::nullopt);
     coordinator.CacheHostTail(hashes[0], *known.tail);
     state.reset();
     const auto longer = prompt(11, true);
@@ -1093,7 +1093,7 @@ TEST_F(AsyncStorageTailTest, KnownTailBelowTheRequestBoundCanBeRestored) {
 TEST_F(AsyncStorageTailTest, DifferentTokensUnderTheSamePriorDoNotQueryTheKnownTail) {
     const auto known = prompt(7, true);
     auto state = coordinator.AcquireHostBlock(2, 0);
-    coordinator.CacheHostBlock(state, {.group_id = 2, .content_hash = known.tail->hash});
+    coordinator.CacheHostBlock(state, {.group_id = 2, .content_hash = known.tail->hash}, std::nullopt);
     coordinator.CacheHostTail(hashes[0], *known.tail);
     tokens[6] = 100;
     const auto query = coordinator.MissingStorageKeys(prompt(7, true), 64);
@@ -1161,7 +1161,7 @@ TEST_F(AsyncStorageTransactionTest, CancellationBeforeDispatchReleasesReservatio
 
 TEST_F(AsyncStorageTransactionTest, HostPublicationDoesNotProveRemoteExistence) {
     auto ref = host.AcquireBlock(0);
-    coordinator.CacheHostBlock(ref, key("h0"));
+    coordinator.CacheHostBlock(ref, key("h0"), std::nullopt);
     EXPECT_TRUE(coordinator.ContainsHostCachedBlock(key("h0")));
     EXPECT_EQ(storage.NumOperations(), 0u);
     EXPECT_TRUE(storage.TakeCommands().empty());
@@ -1169,7 +1169,7 @@ TEST_F(AsyncStorageTransactionTest, HostPublicationDoesNotProveRemoteExistence) 
 
 TEST_F(AsyncStorageTransactionTest, PutPinsOnlyAtDispatchAndFailureKeepsL2) {
     auto ref = host.AcquireBlock(0);
-    coordinator.CacheHostBlock(ref, key("h0"));
+    coordinator.CacheHostBlock(ref, key("h0"), std::nullopt);
     ref.reset();
     storage.QueueBackups(std::array{key("h0")});
     EXPECT_EQ(storage.NumHeldBlocks(), 0u);
@@ -1190,7 +1190,7 @@ TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveHostCreditsForAnUnrelatedRea
     for (int i = 0; i < 4; ++i) {
         auto ref = host.AcquireBlock(0);
         auto cache_key = key("backup" + std::to_string(i));
-        coordinator.CacheHostBlock(ref, cache_key);
+        coordinator.CacheHostBlock(ref, cache_key, std::nullopt);
         backup_keys.push_back(cache_key);
     }
     transfers.QueueBackups(backup_keys);
@@ -1224,7 +1224,7 @@ TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveHostCreditsForAnUnrelatedRea
 TEST_F(AsyncStorageTransactionTest, TemporaryWriteCreditExhaustionRetainsResidentCandidates) {
     for (const auto& hash : hashes) {
         auto ref = host.AcquireBlock(0);
-        coordinator.CacheHostBlock(ref, key(hash));
+        coordinator.CacheHostBlock(ref, key(hash), std::nullopt);
     }
     storage.QueueBackups(coordinator.ExpandPrefixKeys(hashes));
     storage.StartBackups();
@@ -1292,7 +1292,7 @@ TEST_F(AsyncStorageTransactionTest, SlowBackupsLeaveOperationCreditsForQueries) 
     for (int i = 0; i < 4; ++i) {
         auto ref = host.AcquireBlock(0);
         const auto cache_key = key("backup" + std::to_string(i));
-        coordinator.CacheHostBlock(ref, cache_key);
+        coordinator.CacheHostBlock(ref, cache_key, std::nullopt);
         ref.reset();
         transfers.QueueBackups(std::array{cache_key});
         transfers.StartBackups();
@@ -1307,7 +1307,7 @@ TEST_F(AsyncStorageTransactionTest, AOneCreditBudgetStillAllowsReads) {
     StorageTransferManager transfers{
         coordinator, StorageConfig{1, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
     auto ref = host.AcquireBlock(0);
-    coordinator.CacheHostBlock(ref, key("backup"));
+    coordinator.CacheHostBlock(ref, key("backup"), std::nullopt);
     ref.reset();
     transfers.QueueBackups(std::array{key("backup")});
     transfers.StartBackups();
@@ -1338,7 +1338,7 @@ TEST_F(AsyncStorageTransactionTest, EitherZeroWriteBudgetRejectsCandidatesImmedi
 
 TEST_F(AsyncStorageTransactionTest, PressureGateDropsBackupsAndRequiresAllLowWatermarks) {
     auto ref = host.AcquireBlock(0);
-    coordinator.CacheHostBlock(ref, key("backup"));
+    coordinator.CacheHostBlock(ref, key("backup"), std::nullopt);
     ref.reset();
     storage.QueueBackups(std::array{key("backup")});
     storage.UpdatePressure({8, 0, 0});
@@ -1487,7 +1487,7 @@ TEST(CacheOperationTest, ShardedL3ReservationRespectsBucketPressureAndExistingHo
     const std::array<std::string, 4> hashes{"h0", "h1", "h2", "h3"};
     auto pinned = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{2});
     auto warm = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
-    coordinator.CacheHostBlock(warm.front(), CacheKey{.group_id = 0, .content_hash = "h0"});
+    coordinator.CacheHostBlock(warm.front(), CacheKey{.group_id = 0, .content_hash = "h0"}, std::nullopt);
     warm.clear();
     const auto prompt = StoragePrompt(hashes, 2);
     const auto query = coordinator.MissingStorageKeys(prompt, 16);
@@ -1519,8 +1519,8 @@ TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {
     const CacheKey unrelated{.group_id = 0, .content_hash = "other"};
     auto first = host.AcquireBlock(0);
     auto second = host.AcquireBlock(0);
-    coordinator.CacheHostBlock(first, later);
-    coordinator.CacheHostBlock(second, unrelated);
+    coordinator.CacheHostBlock(first, later, std::nullopt);
+    coordinator.CacheHostBlock(second, unrelated, std::nullopt);
     first.reset();
     second.reset();
     const std::array hashes{std::string{"h0"}, std::string{"h1"}};
@@ -1537,7 +1537,7 @@ TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {
 
 TEST_F(AsyncStorageTransactionTest, AnIndependentPutStillProtectsAWarmGetDependency) {
     auto warm = coordinator.AcquireHostBlock(0, 0);
-    coordinator.CacheHostBlock(warm, key("h0"));
+    coordinator.CacheHostBlock(warm, key("h0"), std::nullopt);
     const auto location = warm->Location();
     warm.reset();
     storage.QueueBackups(std::array{key("h0")});

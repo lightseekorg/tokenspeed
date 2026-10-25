@@ -232,7 +232,7 @@ def scheduler_config_from_args(
         num_snapshot_pages=specs.num_snapshot_pages,
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
-        # The only Host write policy the scheduler implements so far.
+        # Write-through until the server exposes the policy.
         host_write_policy="write_through",
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,

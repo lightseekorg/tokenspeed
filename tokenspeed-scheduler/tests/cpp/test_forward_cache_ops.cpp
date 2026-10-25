@@ -806,24 +806,77 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
     }
 }
 
-TEST(SchedulerConfigValidateTest, WriteBackIsRefusedUntilItIsImplemented) {
-    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
-        SCOPED_TRACE(static_cast<int>(role));
+// Write-back is the P role's alone for now (attention TP and PP are the
+// runtime's to refuse): it needs a Host tier, and refuses the other roles, L3,
+// a sharded group, a sliding-window group and more groups than the 64 bits
+// that mark a hash's written-back groups.
+TEST(SchedulerConfigValidateTest, WriteBackOnlyOnThePrefillRole) {
+    const auto prefill = [] {
         SchedulerConfig config = MakeValidConfig();
-        config.role = role;
-        if (role != Role::kFused) {
-            config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
-        }
+        config.role = Role::kP;
+        config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
         SetTestSnapshotPool(config);
         config.host_allocator.total_pages = 2;
         config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
-        try {
-            config.Validate();
-            FAIL() << "write_back must be refused";
-        } catch (const std::invalid_argument& error) {
-            EXPECT_NE(std::string{error.what()}.find("host_write_policy WriteBack"), std::string::npos) << error.what();
-        }
+        return config;
+    };
+    EXPECT_NO_THROW(prefill().Validate());
+    SchedulerConfig no_host = prefill();
+    no_host.host_allocator.total_pages = 1;
+    ExpectRejectedNamingGroup(no_host, "requires a Host L2 cache");
+    SchedulerConfig disabled_host = prefill();
+    disabled_host.disable_l2_cache = true;
+    ExpectRejectedNamingGroup(disabled_host, "requires a Host L2 cache");
+    for (const Role role : {Role::kFused, Role::kD}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        SchedulerConfig other_role = prefill();
+        other_role.role = role;
+        SetTestSnapshotPool(other_role);
+        ExpectRejectedNamingGroup(other_role, "on the P role only");
     }
+    SchedulerConfig l3 = prefill();
+    l3.enable_l3_storage = true;
+    l3.storage_config = StorageConfig{4, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};
+    ExpectRejectedNamingGroup(l3, "excludes L3 storage");
+    SchedulerConfig sharded = prefill();
+    sharded.cache_groups[0].cache_blocks_per_lcm_block = 2;
+    sharded.cache_groups[0].shard_count = 2;
+    ExpectRejectedNamingGroup(sharded, "requires shard_count 1");
+
+    // A sliding-window group beside the full one, replayable or not: named.
+    for (const bool replayable : {false, true}) {
+        SCOPED_TRACE(replayable);
+        SchedulerConfig sliding = prefill();
+        CacheGroupConfig swa = sliding.cache_groups[0];
+        swa.group_id = "swa";
+        swa.attn_kind = AttnKind::kSlidingWindow;
+        swa.sliding_window_tokens = 128;
+        swa.replayable = replayable;
+        sliding.cache_groups.push_back(swa);
+        sliding.max_scheduled_tokens = 256;
+        sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        EXPECT_NO_THROW(sliding.Validate()) << "write-through takes it";
+        sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        ExpectRejectedNamingGroup(sliding, "does not support a sliding-window group");
+        ExpectRejectedNamingGroup(sliding, "swa");
+    }
+
+    // 64 groups construct a write-back scheduler; a 65th is refused before
+    // any pool or the cache coordinator is built.
+    SchedulerConfig wide = prefill();
+    for (std::int32_t i = 1; i < 64; ++i) {
+        CacheGroupConfig group = wide.cache_groups[0];
+        group.group_id = "full" + std::to_string(i);
+        wide.cache_groups.push_back(group);
+    }
+    EXPECT_NO_THROW(Scheduler{wide});
+    CacheGroupConfig last = wide.cache_groups[0];
+    last.group_id = "full64";
+    wide.cache_groups.push_back(last);
+    ExpectRejectedNamingGroup(wide, "at most 64 cache groups");
+    EXPECT_THROW(Scheduler{wide}, std::invalid_argument);
+    wide.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    EXPECT_NO_THROW(wide.Validate()) << "write-through keeps no bit per group";
 }
 
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {

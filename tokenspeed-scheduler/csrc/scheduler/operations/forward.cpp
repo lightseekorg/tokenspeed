@@ -528,6 +528,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         .prefix_hashes = std::move(match.prefix_hashes),
         .access_epoch = admission->access_epoch,
         .junction_tokens = admission->junction_tokens,
+        .resumed_tail_hash = std::move(admission->resumed_tail_hash),
     };
     if (writes_checkpoint) {
         cache_progress.state_checkpoint_tokens = state_checkpoint;
@@ -994,9 +995,10 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
     // policy cannot see that write, so no retraction until it lands. A
     // pinned store mid-flight holds pages the ACK is about to release; the
     // blocked admission retries against them next round before anyone is
-    // sacrificed. (Stream-ordered stores -- both legs of an image -- hold
-    // nothing and gate nothing; an in-flight restore gates nothing because
-    // its request is Restoring, invisible to chooseVictim.)
+    // sacrificed. (Stream-ordered stores -- both legs of an image, and
+    // eviction write-backs -- hold nothing and gate nothing; an in-flight
+    // restore gates nothing because its request is Restoring, invisible to
+    // chooseVictim.)
     if (tier_transfers_.HasLoadBacksInFlight() || tier_transfers_.HasPinnedStoresInFlight()) {
         return;
     }

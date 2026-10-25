@@ -595,12 +595,15 @@ the D2H copies' completion ahead of everything else the plan does to those
 pages — that stream carries the zeroing, fences the forwards, and gates a
 granted remote prefill's RDMA trigger (see `DeviceHandle.execute` and
 `event-loop.md`) — so the copies read the old bytes whatever the scheduler
-does with the pages. These are the only stores that pay for their ordering on
-the forward's critical path, and they have to: the pages are gone in the same
-round.
+does with the pages. The Host write-back policy's eviction stores (§3.1) are
+the third stream-ordered kind, for the same reason: the pages an admission
+evicts fund the admissions of the same plan. These are the only stores that
+pay for their ordering on the forward's critical path, and they have to: the
+pages are gone in the same round.
 
 **Every other store pins its Device sources until the ack.** Boundary
-publications of a live request and the finish-time flush are issued with
+publications of a live request and the finish-time flush (write-through only)
+are issued with
 `StoreSourceGuard::kPinnedUntilAck`: the ticket holds a `CacheBlockRef` on
 each source, so the block stays cached and unevictable — the admission planner
 cannot take it, `ClearDeviceCache` refuses, `NumNewlyReleasableLcmBlocks` does
@@ -610,12 +613,18 @@ on its own stream and no forward waits. A cached block is never written again
 by its owner (prefix reuse already depends on that), so the pin alone makes
 the copy race-free. Both guards share one ticket (`StartPendingStores(guard,
 cause)` drains the publication queue; `StartRetractionStores` builds the
-image's L2 leg from the victim's tables), and the op carries `source_pinned`
-to the runtime, which branches on the guard and never on the reason. The
-`HostStoreCause` (publication, finish or retraction) names the drain point; it
-only selects the Host L2 counters a store's outcomes land in, which no
-scheduling decision reads. They count deterministic events only (no clock), so
-the mirrored schedulers on every rank hold the same values.
+image's L2 leg from the victim's tables; `StartEvictionStores` drains what the
+plan's admissions evicted), and the op carries `source_pinned` to the runtime,
+which branches on the guard and never on the cause. Whatever its guard or
+cause, the op is a `WriteBackOperation`, batched in the plan's
+`WriteBackBatch` (`WriteBackOp` in Python) and acknowledged by
+`CompleteWriteBack`: "write back" in these names means any copy from the
+Device to Host L2, under either Host write policy, not only under
+`write_back` (§3.1). The `HostStoreCause`
+(publication, finish, retraction or eviction) names the drain point; it only
+selects the Host L2 counters a store's outcomes land in, which no scheduling
+decision reads. They count deterministic events only (no clock), so the
+mirrored schedulers on every rank hold the same values.
 
 **Per-victim quiescence, not global.** A request whose own forward is still
 out must not be retracted — its result would land on pages it no longer owns,
@@ -627,9 +636,9 @@ its admission owns, and the victim policy cannot see that write. And an
 in-flight *pinned* store: it holds Device capacity the ack returns by itself,
 so retracting anyone for that capacity would be the thrash of §4 — the
 blocked admission retries against the released pins next round instead.
-Stream-ordered stores — both legs of an image — hold nothing and gate
-nothing, and an in-flight restore gates nothing: its request is `Restoring`,
-invisible to `chooseVictim`.
+Stream-ordered stores — both legs of an image, and eviction write-backs —
+hold nothing and gate nothing, and an in-flight restore gates nothing: its
+request is `Restoring`, invisible to `chooseVictim`.
 
 The forward-out check is a count in `fsm::ForwardResources`, incremented when
 a forward is scheduled and cleared when its result lands. It lives in the
@@ -761,6 +770,31 @@ The transfer ACK (`pd::SucceededEvent`) publishes the prompt like a finish —
 its full pages, its partial page as a tail and each State group's prompt-end
 state (§1.2) — and releases request ownership; cached entries remain subject
 to normal eviction.
+
+**Host L2: write-back.** With `host_write_policy` `kWriteBack` (this role
+only, unsharded groups, no sliding-window group, no L3) nothing streams to
+the Host at publication. Instead what an admission evicts for the cache leaves
+by whole segments and is written back in the same plan, by the drain right
+after the build (one stream-ordered op, §2); how a segment is recorded,
+placed, published or dropped is in [Cache
+concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator). At
+overlap depth 0 the op's ACK lands before the next plan is built: the forward
+the copy is fenced ahead of commits first, and the round's head advances
+completed cache ops (`CacheOps::acknowledged`, `event-loop.md`) before it
+builds. The request's own released slots are dropped, never written back, and
+so is the checkpoint the prompt resumed from on the Device when it is a tail
+(where the previous turn ended), once superseded: the finish that publishes
+the prompt-end state, after the transfer completes, marks it
+(`MarkSupersededStateInput`). It stays cached and matchable -- the same prompt
+sent again resumes there -- and is the first eviction candidate: an admission
+that needs its room drops it, as request reclaim, and one whose later victims
+make the room alone keeps it; a request that resumes there again unmarks it
+until its own finish (an earlier request finishing meanwhile leaves it
+unmarked), and a transfer that fails marks nothing. One at a page boundary --
+a junction, which other prompts resume at -- is never marked. So the two tiers
+together hold distinct content up to about the sum of their capacities, less
+pinned and in-flight blocks, where write-through keeps on the Host a copy of
+what the Device holds.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a
@@ -1163,11 +1197,20 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   A sliding-window group's growth can outrun its reserve (1); the
   empty-round retraction keeps such a pool live (2).
 - A store either pins its Device sources until the ack or is stream-ordered;
-  never neither (2). Only the two legs of a retraction image are
-  stream-ordered — their sources are granted away in the same round — and
-  only such ops may be fenced ahead of the plan's page reuse by the runtime. A
-  new store site chooses its guard explicitly (`StartPendingStores` has no
-  default).
+  never neither (2). Only the two legs of a retraction image and the Host
+  write-back policy's eviction stores are stream-ordered — their sources are
+  granted away in the same round — and only such ops may be fenced ahead of
+  the plan's page reuse by the runtime. A new store site chooses its guard
+  explicitly (`StartPendingStores` has no default). Under write-back no
+  store pins its sources.
+- What an admission evicts under write-back is drained in the plan that
+  evicted it (`StartEvictionStores`, right after the build); no record
+  outlives its plan (by construction: only the build records, and that drain
+  takes every record; `ClearDeviceCache`, which runs between plans, asserts
+  none is left), and the segments of one plan that depend on each other — a
+  later admission's segment taking pages an earlier one's checkpoint still
+  needs — are merged before the Host places them, so they arrive together or
+  not at all (3.1).
 - Every tier transfer pairs blocks of equal residue (bucket): L2 store, L2
   prefix load, both image legs and the restore; the transfer manager asserts
   it when it builds a batch, so under page-cyclic sharding the rank that owns

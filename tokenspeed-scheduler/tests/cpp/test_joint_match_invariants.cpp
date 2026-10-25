@@ -46,6 +46,7 @@
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
 #include "cache/prefix/prefix_hasher.h"
+#include "cache/tier/transfer_manager.h"
 #include "cache_test_access.h"
 #include "unit_test_helper.h"
 
@@ -466,6 +467,7 @@ TEST(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderSeg
         CacheCoordinator coordinator = MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/false, &host,
                                                        /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
                                                        /*write_back_evictions=*/true);
+        TierTransferManager transfers{coordinator};
         struct Session {
             std::vector<std::int32_t> tokens;
             std::vector<std::string> hashes;
@@ -571,8 +573,14 @@ TEST(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderSeg
                 ++floods;
             }
 
-            // As the scheduler does once per plan; nothing is in use now, so
-            // every page left without a checkpoint boundary under it goes.
+            // As the scheduler does once per plan: the write-back drain -- the
+            // Host's one parent never holds a checkpoint boundary's three
+            // checkpoints, so every segment is dropped -- and then the
+            // collection; nothing is in use now, so every page left without a
+            // checkpoint boundary under it goes.
+            if (std::optional<WriteBackOperation> store = transfers.StartEvictionStores()) {
+                transfers.CompleteWriteBack(store->op_id);
+            }
             if (collect) {
                 coordinator.CollectDeadEntries();
             }

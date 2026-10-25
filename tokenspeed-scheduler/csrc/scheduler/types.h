@@ -63,10 +63,12 @@ struct SchedulerConfig {
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
 
     // What feeds Host L2 from ordinary Device prefix entries; required with a
-    // Host tier (Validate).
+    // Host tier (Validate says where kWriteBack may run).
     //   kWriteThrough  published entries stream to Host at chunk ends, the
     //                  prompt end and finish.
-    //   kWriteBack     not available yet: Validate refuses it.
+    //   kWriteBack     nothing streams at publication: what an admission
+    //                  evicts is written back to Host in the same plan, by
+    //                  whole segments.
     enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
     HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
 

@@ -393,8 +393,10 @@ no caller-side fence to remember.)
 Each op says how the scheduler guards its Device sources
 (`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
 and unevictable until the ACK, so its copy overlaps whatever the round does
-next and nobody waits on it. An unpinned op's sources may be re-granted in the
-same plan, so it is launched first and the fence stream the caller names --
+next and nobody waits on it. An unpinned op's sources (a retraction image's
+pages, or what an admission evicted under the write-back policy) may be
+re-granted in the same plan, so it is launched first and the fence stream the
+caller names --
 the default stream, where the plan's page zeroing runs -- waits on its
 completion event before the zeroing is enqueued — the zeroing, load-backs,
 forwards and RDMA triggers behind it inherit the fence (the forward by
@@ -651,15 +653,16 @@ Perception rules per directory:
   leaves). A publication links its new pages and tail — and any node of its
   pages that an entry started without a parent (below) — before any group
   registers under them, so a checkpoint counts in every ancestor as it is
-  published; a node lives while either tier holds its hash or a child hangs
-  under it, and goes with its tail hint once neither holds. An entry
-  registered with no node yet (an L3 GET, a store whose Device entry left
-  before its ACK, a restore's republication) starts one without a parent. It
-  is kept in step with the indexes: no match reads it, evicting by segments
-  selects along it (`AdmissionPlanner`, and the Host's segment plan,
-  `AcquireHostSegments`), the collection of dead prefix entries finds them
-  through it, and its walks follow parent pointers and insertion-ordered
-  lists, never the map, so mirrored ranks agree.
+  published; a node lives while either tier holds its hash, an eviction
+  write-back is bringing it to the Host, or a child hangs under it, and goes
+  with its tail hint once none of these holds. An entry registered with no
+  node yet (an L3 GET, a store whose Device entry left before its ACK, a
+  restore's republication) starts one without a parent. It is kept in step
+  with the indexes: no match reads it, evicting by segments selects along it
+  (`AdmissionPlanner`, and the Host's segment plan, `AcquireHostSegments`),
+  the collection of dead prefix entries finds them through it, and its walks
+  follow parent pointers and insertion-ordered lists, never the map, so
+  mirrored ranks agree.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
@@ -866,7 +869,10 @@ Its responsibilities:
   candidate `T`s without knowing them. A tail's blocks are usable only
   together: evicting one Device block of a tail hash evicts every group's
   entries under it (`evictCachedBlock`), and the table forgets a hash once no
-  tier holds an entry for it. A published partial page is never written
+  tier holds an entry for it and no eviction write-back is bringing one to
+  the Host: a hint stays while such a store is out, and when the cap drops
+  it meanwhile, the store's settlement cancels the tail instead of
+  publishing it (the ACK never records a tail). A published partial page is never written
   again: a restore copies a victim's partial page into a fresh block (an
   unkeyed L2 row, not republished) instead of claiming the published one.
   Host-warm first-chunk extensions call `CacheFullBlocks` at admit (the
@@ -899,14 +905,18 @@ Its responsibilities:
 * **Two tiers (Device/Host).** What feeds the Host tier from ordinary
   Device prefix entries is an explicit cache policy,
   `SchedulerConfig::host_write_policy`: `Validate` requires it with a Host
-  tier and has no default to fall back on. Under `kWriteThrough`, the only
-  policy implemented so far (`Validate` refuses `kWriteBack`), Device prefix
-  publication streams to the Host tier (`stream_device_cache_to_host_`) on
-  the fused and P roles; the D role's Host tier holds retraction images
-  only. A `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries. Host L2 uses free capacity first, then global
-  LRU across cache groups: a compatible child in the requested group competes
-  with fully evictable LCM parents across groups. When only one group needs
+  tier and has no default to fall back on. Under `kWriteThrough`, Device
+  prefix publication streams to the Host tier
+  (`stream_device_cache_to_host_`) on the fused and P roles; the D role's
+  Host tier holds retraction images only. Under `kWriteBack` (the P role
+  only, every group unsharded, no sliding-window group, at most 64 groups,
+  no L3: `Validate`) nothing streams at publication; what an admission
+  evicts is written back instead (below).
+  Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
+  alongside Host-side acquire/contains/pin queries. Host L2 uses free
+  capacity first, then global LRU across cache groups: a compatible child in
+  the requested group competes with fully evictable LCM parents across
+  groups. When only one group needs
   replacement, its own parents are omitted: the initial allocation pass
   exhausted the requested buckets' holes, so each such parent has a compatible
   child no newer than its newest child and cannot beat single-child eviction.
@@ -957,19 +967,41 @@ Its responsibilities:
   The way back is one `SnapshotRestoreOperation` whose rows name their Host
   tier; its L2-tier destinations are republished at the ACK
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
-  Those stores, retraction images and L3 prefetches take Host blocks one
-  by one (`AcquireHostBlocks`). What the write-back policy writes back takes
-  them per segment (`AcquireHostSegments`; nothing calls it yet), and a
-  segment arrives whole: every segment's blocks are fitted jointly before
-  anything is evicted, a segment is placed whole or not at all, and nothing
-  is evicted for a dropped one. Host victims are whole as well — a Host
-  checkpoint boundary with the Host pages only it depends on, or a Host page no
-  checkpoint boundary depends on — and one block in use passes the whole victim
-  over. They go by class: dead entries, then duplicates of a boundary the
-  Device resumes and checkpoint boundaries a deeper Device checkpoint boundary
-  supersedes (the newest Device copy first), then Host-only cache (least
-  recently used first). `AcquireHostSegments` documents the victim shapes, the
-  ranking and the restore pass.
+  Under write-back (`write_back_evictions`), each victim set an admission
+  evicts for the cache is recorded as one *segment* as it leaves the index
+  (`evictCachedBlockAlone`); the request's own released slots are dropped,
+  and so is a block no probe could resume from on the Host
+  (`DeadEntriesNotWrittenBack`). A record holds its tree node, tail hint and
+  Host presence until its segment settles, and a block the Host holds already
+  rides as that entry, never copied again. The invariants: the Device's
+  coverage stays closed from the root and a segment is never split; the plan
+  that evicts drains its segments right after the build
+  (`TierTransferManager::StartEvictionStores`), as one stream-ordered copy
+  the runtime orders ahead of the plan's reuse of those pages, and no record
+  outlives its plan; segments that depend on each other are placed together;
+  and a segment publishes whole, at the last ACK it waits for, with its
+  Device metadata, or not at all (`SettleEvictedSegment`, which also drops
+  what a cap or the loss of every checkpoint boundary under it made dead
+  meanwhile).
+  A P request's finish marks the Device tail checkpoint it resumed from
+  superseded (`MarkSupersededStateInput`), since the prompt-end state it
+  publishes supersedes it: still matchable, so the same prompt sent again
+  resumes there, but re-registered at access epoch 0, so it is the Device's
+  first eviction candidate (an admission whose later victims make the room
+  alone keeps it), and dropped, as request reclaim, when an admission evicts
+  it. A request that acquires it again gives it its own epoch, which unmarks
+  it until that request's finish (an earlier request finishing meanwhile
+  leaves it unmarked); a page boundary's (a junction's) is never marked.
+  Write-through's publication and finish stores, retraction images and L3
+  prefetches take Host blocks one by one (`AcquireHostBlocks`). What the
+  write-back policy writes back takes them per segment
+  (`AcquireHostSegments`), and a segment arrives whole: every segment's blocks
+  are fitted jointly before anything is evicted, a segment is placed whole or
+  not at all, and nothing is evicted for a dropped one. Host victims are whole
+  as well, never in use, and never take or sit right under a page an eviction
+  write-back is still bringing, which would otherwise arrive with nothing
+  under it; dead entries go first, Host-only cache last. `AcquireHostSegments`
+  documents the victim shapes, the ranking and the restore pass.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at
@@ -1063,13 +1095,17 @@ Its responsibilities:
   hint the per-prior cap dropped, and everything at and under a *gap* — a
   page no prefix-closed group holds on either tier, whatever State entries
   or successors it keeps: a prefix-closed group cannot cross it, so not
-  even the page's own checkpoints resume. Eviction queues candidates as it goes,
-  and `CollectDeadEntries`, once per plan after the build, judges each again by
-  the state it finds (a live request may have published a checkpoint under it
-  since), then evicts the dead subtree on both tiers, deepest boundary first
-  (`DeviceEvictionStats::dead_entry_collection`); nothing a live request's table
-  holds is taken, and what is in use waits for a later plan. `ClearDeviceCache`
-  empties the queue, so a Device-only clear never collects Host L2.
+  even the page's own checkpoints resume. Nothing is dead while an eviction
+  write-back is bringing it to the Host. Eviction queues candidates as it goes
+  (and a write-back's settlement every boundary it did not publish), and
+  `CollectDeadEntries`, once per plan after the build and the write-back drain,
+  judges each again by the state it finds (a live request may have published a
+  checkpoint under it since), then evicts the dead subtree on both tiers,
+  deepest boundary first (`DeviceEvictionStats::dead_entry_collection`); nothing
+  a live request's table holds is taken, and what is in use, or has a store
+  still on its way into it, waits for a later plan. `ClearDeviceCache` writes
+  nothing back and empties the queue: a Device-only clear loses what only the
+  Device holds and never collects Host L2.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially, or not
@@ -1110,7 +1146,10 @@ boundary → suffix of a closed prefix). Each candidate expands into a
 selected sets in reverse and restore every set that is not strictly
 required, yielding a minimal eviction plan in `victims`; `Admit` evicts set
 by set, oldest first, and counts the request's own released slots apart
-(`DeviceEvictionStats::request_reclaim`). The shadow occupancy is a class of its own
+(`DeviceEvictionStats::request_reclaim`); under write-back it records every
+other set as one segment for the plan's write-back drain, except a
+superseded input, which ranks at epoch 0 with the uncached blocks and, in
+whichever set it leaves, is dropped and counted as request reclaim. The shadow occupancy is a class of its own
 (`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
 empty parents, the occupants left in each parent a victim leaves — with the
 pool's own fit formula, so a planner on any pool the coordinator registered
