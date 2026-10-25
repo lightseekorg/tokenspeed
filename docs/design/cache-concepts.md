@@ -896,6 +896,13 @@ Its responsibilities:
   the same hash, on the Device and on the Host tier alike, since a resume
   needs all of them; it takes no KV along, which still serves the
   boundaries past it.
+  A finish that publishes the end state of a request which resumed at a
+  Device tail checkpoint marks that input superseded
+  (`MarkSupersededStateInput`): its Device entries are registered again at
+  access epoch 0, still matchable but first in the eviction order, and an
+  admission that evicts them counts them as request reclaim
+  ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)
+  gives why and when a later request unmarks it).
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -983,15 +990,7 @@ Its responsibilities:
   Device metadata, or not at all (`SettleEvictedSegment`, which also drops
   what a cap or the loss of every checkpoint boundary under it made dead
   meanwhile).
-  A P request's finish marks the Device tail checkpoint it resumed from
-  superseded (`MarkSupersededStateInput`), since the prompt-end state it
-  publishes supersedes it: still matchable, so the same prompt sent again
-  resumes there, but re-registered at access epoch 0, so it is the Device's
-  first eviction candidate (an admission whose later victims make the room
-  alone keeps it), and dropped, as request reclaim, when an admission evicts
-  it. A request that acquires it again gives it its own epoch, which unmarks
-  it until that request's finish (an earlier request finishing meanwhile
-  leaves it unmarked); a page boundary's (a junction's) is never marked.
+  A superseded input (above) an admission evicts is dropped, never recorded.
   Write-through's publication and finish stores, retraction images and L3
   prefetches take Host blocks one by one (`AcquireHostBlocks`). What the
   write-back policy writes back takes them per segment
@@ -1146,10 +1145,10 @@ boundary → suffix of a closed prefix). Each candidate expands into a
 selected sets in reverse and restore every set that is not strictly
 required, yielding a minimal eviction plan in `victims`; `Admit` evicts set
 by set, oldest first, and counts the request's own released slots apart
-(`DeviceEvictionStats::request_reclaim`); under write-back it records every
-other set as one segment for the plan's write-back drain, except a
-superseded input, which ranks at epoch 0 with the uncached blocks and, in
-whichever set it leaves, is dropped and counted as request reclaim. The shadow occupancy is a class of its own
+(`DeviceEvictionStats::request_reclaim`), and so a superseded input, which
+ranks at epoch 0 with the uncached blocks, in whichever set it leaves; under
+the write-back policy it records every other set as one segment for the
+plan's write-back drain. The shadow occupancy is a class of its own
 (`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
 empty parents, the occupants left in each parent a victim leaves — with the
 pool's own fit formula, so a planner on any pool the coordinator registered

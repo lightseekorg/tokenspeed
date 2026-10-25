@@ -1386,6 +1386,7 @@ class StateCheckpointPrefillHostSuite : public StateCheckpointInForwardPrefillRo
 protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointInForwardPrefillRoleSuite::MakeConfig();
+        cfg.role = role_;
         cfg.state_checkpoint_in_forward = in_forward_;
         cfg.device_allocator.total_pages = device_pages_;
         cfg.host_allocator.total_pages = host_pages_;
@@ -1396,6 +1397,7 @@ protected:
             const bool is_state = group.attn_kind == AttnKind::kState;
             group.cache_blocks_per_lcm_block = is_state ? 1 : 4;
             group.total_pages = (cfg.device_allocator.total_pages - 1) * group.cache_blocks_per_lcm_block + 1;
+            group.shard_count = is_state ? 1 : kv_shard_count_;
         }
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -1420,6 +1422,10 @@ protected:
     std::int32_t host_pages_{13};
     bool in_forward_{false};
     bool kv_events_{false};
+    // KV parallelism: the full group's pages dealt page-cyclically over this
+    // many shards (write-through only).
+    std::int32_t kv_shard_count_{1};
+    Role role_{Role::kP};
     SchedulerConfig::HostWritePolicy write_policy_{SchedulerConfig::HostWritePolicy::kWriteBack};
 };
 
@@ -1644,11 +1650,12 @@ TEST_F(StateCheckpointPrefillHostSuite, AnIdenticalResendResumesAtTheSupersededI
 
 // o, then s1 and its next turn h, leave three of the Device's 16 parents
 // empty; h's finish marks s1's checkpoint at 22 superseded. f1's first chunk
-// needs three more: under write-back the checkpoint goes first, ahead of o,
-// the least recently used session, and is enough. It leaves with its tail's
-// KV block as h's reclaim, written back nowhere; o and h still resume on the
-// Device, and the same prompt as h no longer resumes at 22. Under
-// write-through nothing is marked: o's checkpoints make the room.
+// needs three more: the checkpoint goes first, ahead of o, the least recently
+// used session, and is enough. It leaves with its tail's KV block as h's
+// reclaim, under either write policy; o and h still resume on the Device.
+// Under write-back it is written back nowhere, so the same prompt as h no
+// longer resumes at 22; under write-through its finish stored it on the Host,
+// so that prompt loads it back from there.
 TEST_F(StateCheckpointPrefillHostSuite, TheSupersededInputIsTheFirstVictim) {
     device_pages_ = 17;
     for (const auto policy :
@@ -1674,29 +1681,163 @@ TEST_F(StateCheckpointPrefillHostSuite, TheSupersededInputIsTheFirstVictim) {
         ASSERT_NE(FindForwardBatch(plan), nullptr);
         const HostCacheStats stats = scheduler_->GetHostCacheStats();
         // The checkpoint's tail: its KV block and three checkpoints.
-        EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, write_back ? 4u : 0u);
+        EXPECT_EQ(stats.device_evictions.request_reclaim.blocks, 4u);
+        EXPECT_EQ(stats.device_evictions.admission.blocks, 0u);
         if (write_back) {
             EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(plan).empty());
-            EXPECT_EQ(stats.device_evictions.admission.blocks, 0u);
         }
         AckWriteBacks(plan);
         SendAbortEvent("f1");
         AckWriteBacks(PlanOnce());
 
-        if (write_back) {
-            o.push_back(77);
-            const Resume o_next = Probe("o-next", o);
-            EXPECT_EQ(o_next.prefix_tokens, 22);
-            EXPECT_EQ(o_next.load_rows, 0);
-            std::vector<std::int32_t> next = tokens;
-            next.push_back(77);
-            const Resume h_next = Probe("h-next", next);
-            EXPECT_EQ(h_next.prefix_tokens, 27);
-            EXPECT_EQ(h_next.load_rows, 0);
-        }
+        o.push_back(77);
+        const Resume o_next = Probe("o-next", o);
+        EXPECT_EQ(o_next.prefix_tokens, 22);
+        EXPECT_EQ(o_next.load_rows, 0);
+        std::vector<std::int32_t> next = tokens;
+        next.push_back(77);
+        const Resume h_next = Probe("h-next", next);
+        EXPECT_EQ(h_next.prefix_tokens, 27);
+        EXPECT_EQ(h_next.load_rows, 0);
         const Resume resent = Probe("resent", tokens);
         EXPECT_EQ(resent.prefix_tokens, write_back ? 0 : 22);
-        EXPECT_EQ(resent.load_rows, 0);
+        EXPECT_EQ(resent.load_rows, write_back ? 0 : 4) << "the tail block and one checkpoint per State group";
+    }
+}
+
+// The tie the mark breaks: h acquires s1's checkpoint at 22 and publishes its
+// end state at 27 under one access epoch, so with s1 and h alone on the
+// Device the two tails' checkpoints rank level and block location decides,
+// here for the one at 27. f1's first chunk needs the room of one tail's
+// checkpoints. Under write-through -- with a Host tier or without one, the
+// full group sharded (KV parallelism) or not -- h's finish marked the
+// checkpoint at 22: it leaves, as h's reclaim, and h's next turn resumes at
+// 27 on the Device. (Unmarked, the end state at 27 leaves: that turn loads
+// it back from the Host, or without one resumes at 22.) The finish's own
+// store lands first: it pins the end state until then.
+TEST_F(StateCheckpointPrefillHostSuite, TheEndStateOutlivesTheInputItSupersedesUnderWriteThrough) {
+    device_pages_ = 15;
+    write_policy_ = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    for (const auto& [host_cache, shards] :
+         {std::pair{true, 1}, std::pair{false, 1}, std::pair{true, 2}, std::pair{false, 2}}) {
+        SCOPED_TRACE(testing::Message() << "host " << host_cache << ", KV shards " << shards);
+        kv_shard_count_ = shards;
+        Reset(host_cache, /*decode_width=*/1);
+        std::vector<std::int32_t> tokens = MakeTokens(22);
+        CompleteSession("s1", tokens);
+        for (std::int32_t i = 0; i < 5; ++i) {
+            tokens.push_back(600 + i);
+        }
+        CompleteSession("h", tokens);
+        AckWriteBacks(PlanOnce());
+
+        Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
+        SendBootstrapped("f1");
+        const ExecutionPlan plan = PlanOnce();
+        ASSERT_NE(FindForwardBatch(plan), nullptr);
+        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        // The input's tail: its KV block and three checkpoints.
+        EXPECT_EQ(evictions.request_reclaim.blocks, 4u);
+        EXPECT_EQ(evictions.admission.blocks, 0u);
+        AckWriteBacks(plan);
+        SendAbortEvent("f1");
+        AckWriteBacks(PlanOnce());
+
+        tokens.push_back(77);
+        const Resume next = Probe("h-next", tokens);
+        EXPECT_EQ(next.prefix_tokens, 27);
+        EXPECT_EQ(next.load_rows, 0);
+    }
+}
+
+// On the fused role a turn publishes two tails: its prompt end at its first
+// decode and its end state at its finish. s1 ends at 23 (its 22 tokens and a
+// decode); h, its next turn, resumes at s1's end state and publishes its
+// prompt end at 28 and its end state at 29, both at the epoch its admission
+// dated that input with. Under write-through, with a Host tier or without
+// one, h's finish marks the input. f1's first chunk needs the room of two
+// tails' checkpoints: the input at 23 leaves first, as h's reclaim, then s1's
+// prompt end at 22, the least recently used; h's next turn resumes at 29 and
+// a prompt that leaves h's turn at its prompt end resumes at 28, both on the
+// Device. (Unmarked, the input ranks level with h's two tails: after s1's
+// prompt end, both of h's leave here, and the next turn loads its end state
+// back from the Host, or without one resumes at 23.) h's own two tails still
+// rank level with each other: which one the next turn resumes at depends on
+// whether the client sends the reply back as it was generated.
+TEST_F(StateCheckpointPrefillHostSuite, TheFusedRoleMarksTheInputAheadOfBothTailsOfTheTurn) {
+    device_pages_ = 20;
+    write_policy_ = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    role_ = Role::kFused;
+    for (const bool host_cache : {true, false}) {
+        SCOPED_TRACE(host_cache);
+        Reset(host_cache, /*decode_width=*/1);
+        const std::vector<std::int32_t> s1 = MakeTokens(22);
+        std::vector<std::int32_t> h = s1;
+        h.push_back(900);
+        for (std::int32_t i = 0; i < 5; ++i) {
+            h.push_back(600 + i);
+        }
+        // The prefill samples 900, the first decode 901; the finish leaves
+        // the request quiescent, so it publishes the state after 900.
+        for (const auto& [id, tokens] : {std::pair{"s1", s1}, std::pair{"h", h}}) {
+            Submit(RequestWithTokens(id, tokens));
+            const std::vector<Chunk> chunks = RunPrefill(id, static_cast<std::int32_t>(tokens.size()));
+            ASSERT_FALSE(chunks.empty()) << id;
+            EXPECT_EQ(chunks[0].prefix_tokens, std::string{id} == "h" ? 23 : 0) << id;
+            AckWriteBacks(PlanOnce());
+            SendForwardDone(id, {901});
+            SendFinish(id);
+            AckWriteBacks(PlanOnce());
+        }
+
+        Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
+        const ExecutionPlan plan = PlanOnce();
+        ASSERT_NE(FindForwardBatch(plan), nullptr);
+        // Each tail leaves with its KV block and three checkpoints: the input
+        // at 23 as h's reclaim, s1's prompt end at 22 as an admission victim.
+        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        EXPECT_EQ(evictions.request_reclaim.blocks, 4u);
+        EXPECT_EQ(evictions.admission.blocks, 4u);
+        AckWriteBacks(plan);
+        SendAbortEvent("f1");
+        AckWriteBacks(PlanOnce());
+
+        std::vector<std::int32_t> next = h;
+        next.push_back(900);
+        next.push_back(77);
+        const Resume resumed = Probe("h-next", next);
+        EXPECT_EQ(resumed.prefix_tokens, 29);
+        EXPECT_EQ(resumed.load_rows, 0);
+        std::vector<std::int32_t> branch = h;
+        branch.push_back(555);
+        const Resume branched = Probe("branch", branch);
+        EXPECT_EQ(branched.prefix_tokens, 28);
+        EXPECT_EQ(branched.load_rows, 0);
+    }
+}
+
+// Only an admission's eviction counts a superseded input as the reclaim of
+// the request that superseded it: a clear counts it as flushed, as every
+// other entry -- s1's five pages and the tail block at 22, h's page at 20
+// and the tail block at 27, and the two tails' checkpoints.
+TEST_F(StateCheckpointPrefillHostSuite, AClearFlushesTheSupersededInputLikeAnyEntry) {
+    device_pages_ = 16;
+    for (const auto policy :
+         {SchedulerConfig::HostWritePolicy::kWriteBack, SchedulerConfig::HostWritePolicy::kWriteThrough}) {
+        SCOPED_TRACE(static_cast<int>(policy));
+        write_policy_ = policy;
+        Reset(/*host_cache=*/true, /*decode_width=*/1);
+        std::vector<std::int32_t> tokens = MakeTokens(22);
+        CompleteSession("s1", tokens);
+        for (std::int32_t i = 0; i < 5; ++i) {
+            tokens.push_back(600 + i);
+        }
+        CompleteSession("h", tokens);
+        AckWriteBacks(PlanOnce());
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        EXPECT_EQ(evictions.flush.blocks, 14u) << "eight KV blocks and two tails' three checkpoints";
+        EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
     }
 }
 
@@ -1953,63 +2094,229 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
 // and checkpoints at 27 are written back; the checkpoint at 22 stays on the
 // Device for g tried again. Had g finished, its finish would have marked the
 // checkpoint, and f1 would have dropped it instead, so the same prompt as g
-// sent again would start over.
+// sent again would start over. Under write-through, with a Host tier or
+// without one, the same holds: f1 evicts h's tail and its checkpoints at 27
+// while g's input is unmarked, and the checkpoint at 22 as well, as g's
+// reclaim, once g finished -- the same prompt as g then loads it back from
+// the Host, or without one starts over.
 TEST_F(StateCheckpointPrefillHostSuite, AnEarlierFinishLeavesALaterHittersInputUnmarked) {
     device_pages_ = 15;
-    for (const bool g_finishes : {false, true}) {
-        SCOPED_TRACE(g_finishes);
-        Reset(/*host_cache=*/true, /*decode_width=*/1);
+    for (const auto& [policy, host_cache] : {std::pair{SchedulerConfig::HostWritePolicy::kWriteBack, true},
+                                             std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, true},
+                                             std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, false}}) {
+        for (const bool g_finishes : {false, true}) {
+            SCOPED_TRACE(testing::Message() << "policy " << static_cast<int>(policy) << ", host " << host_cache
+                                            << ", g finishes " << g_finishes);
+            write_policy_ = policy;
+            const bool write_back = policy == SchedulerConfig::HostWritePolicy::kWriteBack;
+            Reset(host_cache, /*decode_width=*/1);
+            const std::vector<std::int32_t> s1 = MakeTokens(22);
+            CompleteSession("s1", s1);
+            std::vector<std::int32_t> h = s1;
+            std::vector<std::int32_t> g = s1;
+            for (std::int32_t i = 0; i < 5; ++i) {
+                h.push_back(600 + i);
+                g.push_back(700 + i);
+            }
+            for (const auto& [id, tokens] : {std::pair{"h", h}, std::pair{"g", g}}) {
+                Submit(RequestWithTokens(id, tokens));
+                SendBootstrapped(id);
+                const std::vector<Chunk> chunks = RunPrefill(id, 27);
+                ASSERT_EQ(chunks.size(), 1u) << id;
+                EXPECT_EQ(chunks[0].prefix_tokens, 22) << id;
+                const ExecutionPlan handoff = PlanOnce();
+                ASSERT_TRUE(handoff.remote_decode.has_value()) << id;
+                AckWriteBacks(handoff);
+            }
+            SendPdSucceeded("h");
+            if (g_finishes) {
+                SendPdSucceeded("g");
+            } else {
+                ExecutionEvent failed;
+                failed.With(pd::FailedEvent{"g"});
+                scheduler_->Advance(std::move(failed));
+            }
+            // Under write-through the finishes' stores land first: each pins
+            // its end state until then.
+            AckWriteBacks(PlanOnce());
+
+            Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
+            SendBootstrapped("f1");
+            const ExecutionPlan plan = PlanOnce();
+            ASSERT_NE(FindForwardBatch(plan), nullptr);
+            const std::vector<CacheOperation> stores = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
+            ASSERT_EQ(stores.size(), write_back ? 1u : 0u);
+            const std::uint64_t reclaimed = scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks;
+            EXPECT_EQ(reclaimed, g_finishes ? 4u : 0u) << "the tail's KV block and three checkpoints";
+            if (write_back && !g_finishes) {
+                std::map<std::uint32_t, std::int32_t> rows_by_group;
+                for (const std::uint32_t group : std::get<WriteBackBatch>(stores.front()).group_ids[0]) {
+                    ++rows_by_group[group];
+                }
+                EXPECT_EQ(rows_by_group, (std::map<std::uint32_t, std::int32_t>{{0, 2}, {1, 1}, {2, 1}, {3, 1}}));
+            }
+            AckWriteBacks(plan);
+            SendAbortEvent("f1");
+            AckWriteBacks(PlanOnce());
+            const Resume again = Probe("g-again", g);
+            const bool from_host = g_finishes && !write_back && host_cache;
+            EXPECT_EQ(again.prefix_tokens, g_finishes && !from_host ? 0 : 22);
+            EXPECT_EQ(again.load_rows, from_host ? 4 : 0) << "the tail block and one checkpoint per State group";
+        }
+    }
+}
+
+// As in AnEarlierFinishLeavesALaterHittersInputUnmarked, h and then g resume
+// at s1's checkpoint at 22, g's transfer fails, and h's finish leaves the
+// checkpoint unmarked for g tried again -- also when x, s1's prompt sent again
+// before h came, publishes that checkpoint again after g's hit and before
+// h's finish: x's finish dates it back to x's epoch, below h's, but g's hit
+// still counts. Unmarked, it ranks after o's tail, the least recently used:
+// f1's prefill evicts o's checkpoints with o's tail block (under write-back
+// o's whole segment, written back), nothing as a reclaim, and g tried again
+// resumes at 22 on the Device. o's next turn loads its checkpoints back from
+// the Host (its whole session under write-back), or without one starts over.
+// (Marked, the checkpoint at 22 would leave first, as h's reclaim.)
+TEST_F(StateCheckpointPrefillHostSuite, AnOlderPublicationLeavesALaterHittersInputUnmarked) {
+    device_pages_ = 24;
+    host_pages_ = 40;
+    for (const auto& [policy, host_cache] : {std::pair{SchedulerConfig::HostWritePolicy::kWriteBack, true},
+                                             std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, true},
+                                             std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, false}}) {
+        SCOPED_TRACE(testing::Message() << "policy " << static_cast<int>(policy) << ", host " << host_cache);
+        write_policy_ = policy;
+        const bool write_back = policy == SchedulerConfig::HostWritePolicy::kWriteBack;
+        Reset(host_cache, /*decode_width=*/1);
+        config_.max_batch_size = 3;  // x, h and g in flight together
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        std::vector<std::int32_t> o = MakeTokens(22, 3000);
+        CompleteSession("o", o);
         const std::vector<std::int32_t> s1 = MakeTokens(22);
         CompleteSession("s1", s1);
+        AckWriteBacks(PlanOnce());
         std::vector<std::int32_t> h = s1;
         std::vector<std::int32_t> g = s1;
         for (std::int32_t i = 0; i < 5; ++i) {
             h.push_back(600 + i);
             g.push_back(700 + i);
         }
-        for (const auto& [id, tokens] : {std::pair{"h", h}, std::pair{"g", g}}) {
+        for (const auto& [id, tokens] : {std::pair{"x", s1}, std::pair{"h", h}, std::pair{"g", g}}) {
             Submit(RequestWithTokens(id, tokens));
             SendBootstrapped(id);
-            const std::vector<Chunk> chunks = RunPrefill(id, 27);
-            ASSERT_EQ(chunks.size(), 1u) << id;
-            EXPECT_EQ(chunks[0].prefix_tokens, 22) << id;
+            const std::vector<Chunk> chunks = RunPrefill(id, static_cast<std::int32_t>(tokens.size()));
+            ASSERT_FALSE(chunks.empty()) << id;
+            EXPECT_EQ(chunks[0].prefix_tokens, std::string{id} == "x" ? 0 : 22) << id;
             const ExecutionPlan handoff = PlanOnce();
             ASSERT_TRUE(handoff.remote_decode.has_value()) << id;
             AckWriteBacks(handoff);
         }
+        SendPdSucceeded("x");
+        AckWriteBacks(PlanOnce());
         SendPdSucceeded("h");
-        if (g_finishes) {
-            SendPdSucceeded("g");
-        } else {
-            ExecutionEvent failed;
-            failed.With(pd::FailedEvent{"g"});
-            scheduler_->Advance(std::move(failed));
-        }
+        ExecutionEvent failed;
+        failed.With(pd::FailedEvent{"g"});
+        scheduler_->Advance(std::move(failed));
+        AckWriteBacks(PlanOnce());
 
         Submit(RequestWithTokens("f1", MakeTokens(22, 1000)));
         SendBootstrapped("f1");
-        const ExecutionPlan plan = PlanOnce();
-        ASSERT_NE(FindForwardBatch(plan), nullptr);
-        const std::vector<CacheOperation> stores = ExtractCacheOpsOfKind<WriteBackBatch>(plan);
-        ASSERT_EQ(stores.size(), 1u);
-        std::map<std::uint32_t, std::int32_t> rows_by_group;
-        for (const std::uint32_t group : std::get<WriteBackBatch>(stores.front()).group_ids[0]) {
-            ++rows_by_group[group];
-        }
-        const std::uint64_t reclaimed = scheduler_->GetHostCacheStats().device_evictions.request_reclaim.blocks;
-        if (g_finishes) {
-            EXPECT_EQ(reclaimed, 4u) << "the tail's KV block and three checkpoints";
-        } else {
-            EXPECT_EQ(rows_by_group, (std::map<std::uint32_t, std::int32_t>{{0, 2}, {1, 1}, {2, 1}, {3, 1}}));
-            EXPECT_EQ(reclaimed, 0u);
-        }
-        AckWriteBacks(plan);
+        ASSERT_EQ(RunPrefill("f1", 22).size(), 3u);
+        // o's tail: its KV block and three checkpoints, and under write-back
+        // the rest of o's segment, its five pages.
+        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        EXPECT_EQ(evictions.admission.blocks, write_back ? 9u : 4u);
+        EXPECT_EQ(evictions.request_reclaim.blocks, 0u);
+        AckWriteBacks(PlanOnce());
         SendAbortEvent("f1");
         AckWriteBacks(PlanOnce());
         const Resume again = Probe("g-again", g);
-        EXPECT_EQ(again.prefix_tokens, g_finishes ? 0 : 22);
+        EXPECT_EQ(again.prefix_tokens, 22);
         EXPECT_EQ(again.load_rows, 0);
+        o.push_back(77);
+        const Resume o_next = Probe("o-next", o);
+        EXPECT_EQ(o_next.prefix_tokens, host_cache ? 22 : 0);
+        EXPECT_EQ(o_next.load_rows, write_back ? 9 : host_cache ? 4 : 0);
     }
+}
+
+// On the fused role h resumes at s1's end state at 23 and prefills [23, 39)
+// in two chunks. The forced retraction of plan 7 suspends it after the first,
+// with that input still in its slot 0, and f0, admitted in the same plan,
+// evicts the input from the Device. h's restore loads it back from the Host
+// and republishes it dated with h's own access epoch, as its admission dated
+// it, so h's finish still marks it superseded: f1's first chunk drops it, as
+// h's reclaim, and h's next turn resumes at its end state at 40 on the
+// Device. (Dated as a later request's hit, the input would stay unmarked and
+// outrank h's tails: f1 would evict two older tails instead, h's end state
+// among them, and that turn would load its checkpoints back from the Host.)
+TEST_F(StateCheckpointPrefillHostSuite, ARestoredInputIsStillMarkedByItsOwnFinish) {
+    device_pages_ = 18;
+    write_policy_ = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    role_ = Role::kFused;
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    config_.debug_force_retraction_interval = -7;  // the oldest Prefilling request, every seventh plan
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    const std::vector<std::int32_t> s1 = MakeTokens(22);
+    Submit(RequestWithTokens("s1", s1));
+    ASSERT_EQ(RunPrefill("s1", 22).size(), 3u);  // plans 1-3
+    AckWriteBacks(PlanOnce());                   // plan 4: the first decode
+    SendForwardDone("s1", {901});
+    SendFinish("s1");
+    AckWriteBacks(PlanOnce());  // plan 5
+    std::vector<std::int32_t> h = s1;
+    h.push_back(900);
+    for (std::int32_t i = 0; i < 16; ++i) {
+        h.push_back(600 + i);
+    }
+    Submit(RequestWithTokens("h", h));
+    const ExecutionPlan first = PlanOnce();  // plan 6
+    const ForwardBatch* chunk = FindForwardBatch(first);
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(chunk->extend_prefix_lens, std::vector<std::int32_t>{23});
+    AckWriteBacks(first);
+    SendForwardDone("h");
+
+    Submit(RequestWithTokens("f0", MakeTokens(30, 1000)));
+    const ExecutionPlan retraction = PlanOnce();  // plan 7
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    ASSERT_NE(FindForwardBatch(retraction), nullptr) << "f0's first chunk";
+    AckImageStores(retraction);
+    AckWriteBacks(retraction);
+    SendForwardDone("f0");
+    SendAbortEvent("f0");
+    const ExecutionPlan readmit = PlanOnce();
+    ASSERT_NE(FindRestore(readmit), nullptr);
+    AckRestores(readmit);
+    AckWriteBacks(readmit);
+    const ExecutionPlan second = PlanOnce();
+    chunk = FindForwardBatch(second);
+    ASSERT_NE(chunk, nullptr);
+    EXPECT_EQ(chunk->extend_prefix_lens, std::vector<std::int32_t>{31});
+    AckWriteBacks(second);
+    SendForwardDone("h", {900});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("h", {901});
+    SendFinish("h");
+    AckWriteBacks(PlanOnce());
+
+    const HostCacheStats before = scheduler_->GetHostCacheStats();
+    Submit(RequestWithTokens("f1", MakeTokens(4, 2000)));
+    const ExecutionPlan plan = PlanOnce();
+    ASSERT_NE(FindForwardBatch(plan), nullptr);
+    // In f1's plan alone: the input's three checkpoints, as h's reclaim.
+    const HostCacheStats after = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(after.device_evictions.admission.blocks - before.device_evictions.admission.blocks, 0u);
+    EXPECT_EQ(after.device_evictions.request_reclaim.blocks - before.device_evictions.request_reclaim.blocks, 3u);
+    AckWriteBacks(plan);
+    SendAbortEvent("f1");
+    AckWriteBacks(PlanOnce());
+
+    std::vector<std::int32_t> next = h;
+    next.push_back(900);
+    next.push_back(77);
+    const Resume resumed = Probe("h-next", next);
+    EXPECT_EQ(resumed.prefix_tokens, 40);
+    EXPECT_EQ(resumed.load_rows, 0);
 }
 
 // A junction checkpoint is no superseded input: other prompts resume there.

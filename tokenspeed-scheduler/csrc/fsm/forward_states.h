@@ -52,9 +52,8 @@ struct CacheProgress {
     // so the next prompt resumes at the junction. Zero once passed or absent.
     std::int32_t junction_tokens{0};
     // The tail checkpoint the request resumed from on the Device
-    // (CacheCoordinator::AdmissionResult::resumed_tail_hash). Under the Host
-    // write-back policy the finish that publishes the end state marks
-    // it superseded.
+    // (CacheCoordinator::AdmissionResult::resumed_tail_hash). The finish that
+    // publishes the end state marks it superseded.
     std::optional<std::string> resumed_tail_hash;
     // The in-forward State checkpoint a scheduled forward writes
     // (SchedulerConfig::state_checkpoint_in_forward): the page boundary it

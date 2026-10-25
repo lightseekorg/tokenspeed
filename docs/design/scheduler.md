@@ -311,6 +311,33 @@ chunk's state output is its own natural checkpoint.
 the request; the backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
 
+**A superseded input leaves first.** A prompt that resumes at a tail
+checkpoint on the Device -- where its previous turn ended
+(`AdmissionResult::resumed_tail_hash`) -- dates it with its access epoch at
+admission, and its finish dates the end state it publishes with the same epoch.
+The two would rank level in the Device's eviction order, so block location would
+decide, and as often as not the end state the next turn resumes at would leave
+first. The finish that publishes the end state (on the P role, once the transfer
+completes) therefore marks that input superseded (`MarkSupersededStateInput`) on
+every role, under either Host write policy and without a Host tier: its
+checkpoints and its tail's KV blocks are registered again at access epoch 0,
+level with the blocks no cache entry holds. It stays cached and matchable -- the
+same prompt sent again resumes there -- and is the first eviction candidate: an
+admission that needs its room evicts it, counted as request reclaim, and one
+whose later victims make the room alone keeps it. A request that resumes there
+again unmarks it until its own finish (an earlier request finishing
+meanwhile leaves it unmarked, even once an older request's publication of
+the same tail has dated it back; a request's own restore, which dates what
+it loads back with the request's epoch, is no later hit), and a request that
+fails before its finish (a transfer that fails) marks nothing, nor does a
+finish whose end state is the input itself (a D request that claimed its
+prompt-end checkpoint and leaves before any decode). One at a page
+boundary -- a junction or an in-forward checkpoint, which other prompts
+resume at -- is never marked. On the fused role a turn also publishes its
+prompt end, at its first decode and at the same epoch: that one and the end
+state still rank level, since which of them the next turn resumes at depends
+on whether the client sends the reply back as it was generated.
+
 **Capacity.** A State group holds at most two blocks per live request on
 every role — the pair, never a page per token — so `ReservePrefillDemands`
 reserves nothing for it and the capacity model (§1.4) charges `2` per request.
@@ -783,19 +810,10 @@ overlap depth 0 the op's ACK lands before the next plan is built: the forward
 the copy is fenced ahead of commits first, and the round's head advances
 completed cache ops (`CacheOps::acknowledged`, `event-loop.md`) before it
 builds. The request's own released slots are dropped, never written back, and
-so is the checkpoint the prompt resumed from on the Device when it is a tail
-(where the previous turn ended), once superseded: the finish that publishes
-the prompt-end state, after the transfer completes, marks it
-(`MarkSupersededStateInput`). It stays cached and matchable -- the same prompt
-sent again resumes there -- and is the first eviction candidate: an admission
-that needs its room drops it, as request reclaim, and one whose later victims
-make the room alone keeps it; a request that resumes there again unmarks it
-until its own finish (an earlier request finishing meanwhile leaves it
-unmarked), and a transfer that fails marks nothing. One at a page boundary --
-a junction, which other prompts resume at -- is never marked. So the two tiers
-together hold distinct content up to about the sum of their capacities, less
-pinned and in-flight blocks, where write-through keeps on the Host a copy of
-what the Device holds.
+so is a superseded input (§1.2) an admission evicts. So the two tiers together
+hold distinct content up to about the sum of their capacities, less pinned and
+in-flight blocks, where write-through keeps on the Host a copy of what the
+Device holds.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a

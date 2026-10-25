@@ -68,6 +68,11 @@ public:
         std::int32_t logical_block_index{-1};
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         bool was_acquired{false};
+        // The largest epoch any acquisition or publication touched the entry
+        // with. last_access_epoch can move back below it (a publication under
+        // an older epoch, CacheCoordinator::MarkSupersededStateInput); this
+        // one never does.
+        std::uint64_t max_access_epoch{0};
     };
 
     // Non-owning traversal state, bound on first use to one index/pool. The
@@ -127,6 +132,7 @@ public:
             .last_access_epoch = access_epoch,
             .logical_block_index = logical_block_index,
             .boundary_kind = boundary_kind,
+            .max_access_epoch = access_epoch,
         });
         CacheEntryIterator entry_it = std::prev(cache_index.entries.end());
         cache_index.by_key.emplace(entry_it->key, entry_it);
@@ -384,6 +390,8 @@ private:
         CacheBoundaryKind boundary_kind{CacheBoundaryKind::kChunk};
         // Set only after a successful request admission acquires this entry.
         bool was_acquired{false};
+        // See CachedBlockMetadata::max_access_epoch.
+        std::uint64_t max_access_epoch{0};
     };
 
     struct CacheEntries {
@@ -404,6 +412,7 @@ private:
             .logical_block_index = cache_entry.logical_block_index,
             .boundary_kind = cache_entry.boundary_kind,
             .was_acquired = cache_entry.was_acquired,
+            .max_access_epoch = cache_entry.max_access_epoch,
         };
     }
     static EvictionOrder evictionOrder(const CacheEntry& cache_entry) {
@@ -420,6 +429,7 @@ private:
     // requests can republish under an older epoch, so moving entries to the
     // back of an LRU list would not preserve this order.
     void touchEntry(CacheEntries& cache_index, CacheEntryIterator entry_it, std::uint64_t access_epoch) {
+        entry_it->max_access_epoch = std::max(entry_it->max_access_epoch, access_epoch);
         if (entry_it->last_access_epoch == access_epoch) {
             return;
         }

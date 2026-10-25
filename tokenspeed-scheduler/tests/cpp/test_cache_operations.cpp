@@ -739,7 +739,8 @@ TEST(CacheOperationTest, HostRestoredStateCheckpointRemainsCachedAfterLoadAckAnd
     coordinator.CacheHostBlock(source, key, std::nullopt);
     CacheBlockRef destination = pool.AcquireBlock(0);
     const auto location = destination->Location();
-    coordinator.CacheDeviceBlock(destination, key, /*logical_block_index=*/-1, CacheBoundaryKind::kEndpoint);
+    coordinator.CacheDeviceBlock(destination, key, /*logical_block_index=*/-1, CacheBoundaryKind::kEndpoint,
+                                 /*access_epoch=*/1);
     std::vector<BlockTable> tables{BlockTable::FromBlocks({std::move(destination)}, 0)};
     std::vector<BlockTransfer> pairs;
     pairs.push_back(BlockTransfer{.source = std::move(source), .destination = tables[0].Blocks()[0]});

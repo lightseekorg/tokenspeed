@@ -108,11 +108,13 @@ public:
     // slot (shared) and the request-pool row the blob is imported into
     // (owned here until the ACK, then handed back by CompleteSnapshotRestore)
     // stay pinned until the ACK, so an abort while Restoring cannot re-grant a
-    // page, slot or row the copy is still writing.
+    // page, slot or row the copy is still writing. access_epoch is the
+    // request's, which the ACK's republication dates the L2 rows with.
     SnapshotRestoreOperation StartSnapshotRestore(const std::string& request_id, ReqPoolIndex request_pool_index,
                                                   std::shared_ptr<SnapshotSlotIndex> blob_slot,
                                                   std::vector<BlockTransfer> load_pairs,
-                                                  std::vector<BlockTransfer> snapshot_pairs);
+                                                  std::vector<BlockTransfer> snapshot_pairs,
+                                                  std::uint64_t access_epoch);
 
     // Publishes every ticket's Host entry (an eviction write-back's tickets
     // excepted: their segments publish them) and drops the op's pins, then
@@ -236,6 +238,7 @@ private:
         std::vector<BlockTransfer> transfers;
         std::shared_ptr<SnapshotSlotIndex> blob_slot;
         ReqPoolIndex request_pool_index;
+        std::uint64_t access_epoch{0};
     };
     std::uint32_t nextOpId() { return next_op_id_++; }
     LoadBackOperation startLoadBack(std::vector<BlockTransfer> block_transfers);

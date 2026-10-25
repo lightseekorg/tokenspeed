@@ -518,11 +518,9 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
     return stores;
 }
 
-SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(const std::string& request_id,
-                                                                   ReqPoolIndex request_pool_index,
-                                                                   std::shared_ptr<SnapshotSlotIndex> blob_slot,
-                                                                   std::vector<BlockTransfer> load_pairs,
-                                                                   std::vector<BlockTransfer> snapshot_pairs) {
+SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(
+    const std::string& request_id, ReqPoolIndex request_pool_index, std::shared_ptr<SnapshotSlotIndex> blob_slot,
+    std::vector<BlockTransfer> load_pairs, std::vector<BlockTransfer> snapshot_pairs, std::uint64_t access_epoch) {
     _assert(request_pool_index.valid(), "a restore imports the slot-state blob into a request-pool row");
     _assert(blob_slot != nullptr && blob_slot->valid(), "a restore imports from the image's blob slot");
     for (const BlockTransfer& pair : load_pairs) {
@@ -556,7 +554,8 @@ SnapshotRestoreOperation TierTransferManager::StartSnapshotRestore(const std::st
             .emplace(op.op_id, InFlightSnapshotRestore{.request_id = request_id,
                                                        .transfers = std::move(transfers),
                                                        .blob_slot = std::move(blob_slot),
-                                                       .request_pool_index = std::move(request_pool_index)})
+                                                       .request_pool_index = std::move(request_pool_index),
+                                                       .access_epoch = access_epoch})
             .second;
     _assert(inserted, "duplicate snapshot restore op id");
     return op;
@@ -588,7 +587,7 @@ ReqPoolIndex TierTransferManager::CompleteSnapshotRestore(std::uint32_t op_id, b
         for (BlockTransfer& transfer : it->second.transfers) {
             if (transfer.destination && !transfer.key.content_hash.empty()) {
                 coordinator_.CacheDeviceBlock(transfer.destination, transfer.key, transfer.logical_block_index,
-                                              transfer.boundary_kind);
+                                              transfer.boundary_kind, it->second.access_epoch);
             }
         }
     }

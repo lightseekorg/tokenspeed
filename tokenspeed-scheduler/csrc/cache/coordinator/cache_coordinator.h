@@ -466,20 +466,14 @@ public:
     // Marks as superseded the Device entries of the tail a request resumed from
     // (AdmissionResult::resumed_tail_hash) -- every State group's checkpoint
     // there and the tail's blocks -- once the end state its finish published
-    // supersedes them. They stay cached and matchable, so the same prompt sent
-    // again still resumes there, but they are re-registered at
-    // kSupersededAccessEpoch: the Device's eviction order reaches them before
-    // any other cache entry, and an eviction for the cache drops them as the
-    // request's reclaim instead of writing them back (evictCachedBlockAlone).
-    // A request that acquires them, or a publication of the same key, gives
-    // them its own epoch, and so unmarks them. Under the write-back policy
-    // the P role marks the input of a turn this way; only a tail's -- a turn
-    // ends inside a page -- since a page boundary is where a junction cut or
-    // an in-forward checkpoint publishes for other prompts. A tail the cap
-    // dropped meanwhile left with its hint. access_epoch is the finishing
-    // request's: an entry dated later was acquired or published since by
-    // another request, still the input of that one until it finishes, so
-    // nothing is marked.
+    // supersedes them (docs/design/scheduler.md §1.2 gives why): they stay
+    // cached and matchable, re-registered at kSupersededAccessEpoch, first in
+    // the Device's eviction order (evictCachedBlockAlone counts them as request
+    // reclaim). A request that acquires them, or a publication of the same
+    // key, gives them its own epoch. Nothing is marked when the tail table no
+    // longer lists the tail (the cap dropped it meanwhile), or when any of its
+    // entries was touched after access_epoch, the finishing request's: another
+    // request acquired or published it since.
     void MarkSupersededStateInput(const ContentHash& resumed_tail_hash, std::uint64_t access_epoch);
     // Host entries evicted for one reason, each also counted as
     // device_resident when the Device index still held its key.
@@ -640,8 +634,8 @@ public:
         DeviceEvictionCounts admission;
         // The slots the admitted request itself releases at this step (its
         // State input, its expired window blocks) and what they take along;
-        // when evicting by segments, also a superseded input an admission
-        // evicts (MarkSupersededStateInput).
+        // also a superseded input an admission evicts
+        // (MarkSupersededStateInput).
         DeviceEvictionCounts request_reclaim;
         // The blocks a segment takes from under its chosen victim so no Device
         // page outlives its parent; only when evicting by segments.
@@ -663,9 +657,13 @@ public:
     // Publishes a Device block a restore filled from Host L2
     // (CompleteSnapshotRestore): the entry comes back with the logical block
     // index and boundary kind it was published under before the retraction,
-    // so eviction ranks it as it did the original.
+    // so eviction ranks it as it did the original, and dated with the
+    // restored request's access epoch, as its admission and its restore's
+    // Device hits dated the rest of its prefix -- not as a later request's
+    // hit, so the request's finish still marks its input superseded
+    // (MarkSupersededStateInput).
     void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
-                          CacheBoundaryKind boundary_kind);
+                          CacheBoundaryKind boundary_kind, std::uint64_t access_epoch);
 
     bool EnablesL3Storage() const { return enable_l3_storage_; }
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const;
@@ -887,14 +885,14 @@ private:
     // `reason` (the DeviceEvictionStats field of what started the eviction;
     // eviction order and cascades never depend on it) and syncs the entry's
     // tree node. It returns the key that left the index, nullopt when the
-    // entry is pinned or gone. With write_back_segment (an admission's cache
-    // victim under the write-back policy) an entry that left is recorded
-    // there -- its metadata read before it left, its Host entry held when the
-    // Host has one -- and holds its tree node, tail hint included, until the
-    // segment settles; one no probe could resume from on the Host is dropped
-    // instead (DeadEntriesNotWrittenBack), and a superseded input
-    // (MarkSupersededStateInput) is dropped and counted as request_reclaim,
-    // whatever `reason` says. nullptr drops it.
+    // entry is pinned or gone. A superseded input (MarkSupersededStateInput) an
+    // admission evicts (`reason` admission) counts as request_reclaim and is
+    // never recorded. With write_back_segment (an admission's cache victim
+    // under the write-back policy) any other entry that left is recorded there
+    // -- its metadata read before it left, its Host entry held when the Host
+    // has one -- and holds its tree node, tail hint included, until the segment
+    // settles; one no probe could resume from on the Host is dropped instead
+    // (DeadEntriesNotWrittenBack). nullptr drops it.
     std::optional<CacheKey> evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
                                                   DeviceEvictionCounts DeviceEvictionStats::*reason,
                                                   EvictedSegment* write_back_segment);

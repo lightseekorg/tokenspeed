@@ -1456,10 +1456,13 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
                                                                 EvictedSegment* write_back_segment) {
     // Read while the entry is still there: the Host entry inherits it.
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
-        write_back_segment != nullptr ? groups_[group_id].Index().MetadataFor(pool_, location) : std::nullopt;
-    // A superseded input leaves as the reclaim of the request that
-    // superseded it, never written back.
-    if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch) {
+        groups_[group_id].Index().MetadataFor(pool_, location);
+    // A superseded input an admission evicts leaves as the reclaim of the
+    // request that superseded it, under either write policy, and is never
+    // written back. It is never a stranded suffix: a tail at epoch 0 is a
+    // candidate of its own before any page above it.
+    if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
+        reason == &DeviceEvictionStats::admission) {
         reason = &DeviceEvictionStats::request_reclaim;
         write_back_segment = nullptr;
     }
@@ -1896,13 +1899,15 @@ void CacheCoordinator::MarkSupersededStateInput(const ContentHash& resumed_tail_
         return;
     }
     // A later request's hit still needs them: the whole tail stays unmarked,
-    // so its checkpoints and blocks keep leaving together.
+    // so its checkpoints and blocks keep leaving together. The newest touch
+    // decides, not the eviction epoch: an older request's publication of the
+    // same tail since then dated them back, but the later hit stands.
     bool touched_since = false;
     ForEachBoundaryKey(
         CacheKey{.content_hash = resumed_tail_hash}, *tail_tokens, [&](std::size_t i, const CacheKey& key) {
             if (CacheBlockRef block = groups_[i].Index().Find(pool_, key)) {
                 touched_since |=
-                    groups_[i].Index().MetadataFor(pool_, block->Location())->last_access_epoch > access_epoch;
+                    groups_[i].Index().MetadataFor(pool_, block->Location())->max_access_epoch > access_epoch;
             }
         });
     if (touched_since) {
@@ -2355,12 +2360,12 @@ void CacheCoordinator::CacheHostTail(const ContentHash& prior, const TailPublica
 }
 
 void CacheCoordinator::CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
-                                        CacheBoundaryKind boundary_kind) {
+                                        CacheBoundaryKind boundary_kind, std::uint64_t access_epoch) {
     _assert(static_cast<bool>(block_ref), "CacheDeviceBlock requires a destination block");
     _assert(key.group_id < groups_.size(), "CacheDeviceBlock group id out of range");
     std::vector<std::pair<CacheKey, CacheBlockRef>> newly_cached;
-    groups_[key.group_id].Index().Register(pool_, block_ref, key, ++next_access_epoch_, logical_block_index,
-                                           boundary_kind, &newly_cached);
+    groups_[key.group_id].Index().Register(pool_, block_ref, key, access_epoch, logical_block_index, boundary_kind,
+                                           &newly_cached);
     // The node the restored entry was published under is gone when no tier
     // held the hash meanwhile; then it starts one without a parent, until a
     // publication through its hash gives it its boundary (and, past page 0,

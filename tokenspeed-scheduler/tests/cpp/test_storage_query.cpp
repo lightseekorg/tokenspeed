@@ -186,7 +186,8 @@ TEST(StorageQueryTest, ADeviceKvPrefixQueriesOnlyTheMissingCheckpoint) {
     for (std::size_t page = 0; page < 3; ++page) {
         CacheBlockRef block = cache.device.AcquireBlock(0);
         cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
-                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk);
+                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk,
+                                           /*access_epoch=*/1);
     }
     const auto prefix = prompt.Prefix(13, false);
     const auto query = cache.coordinator.MissingStorageKeys(prefix, 3);
@@ -210,7 +211,8 @@ TEST(StorageQueryTest, ADeviceKvPrefixReservesOnlyItsHostSuffix) {
     for (std::size_t page = 0; page < 3; ++page) {
         CacheBlockRef block = cache.device.AcquireBlock(0);
         cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
-                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk);
+                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk,
+                                           /*access_epoch=*/1);
     }
     const auto prefix = prompt.Prefix(21, false);
     const std::vector<CacheKey> hits{{.group_id = 0, .content_hash = prompt.hashes[3]},
@@ -233,7 +235,8 @@ TEST(StorageQueryTest, AReservationResumesBelowTheDeviceKvCoverage) {
     for (std::size_t page = 0; page < 4; ++page) {
         CacheBlockRef block = cache.device.AcquireBlock(0);
         cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
-                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk);
+                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk,
+                                           /*access_epoch=*/1);
     }
     const auto prefix = prompt.Prefix(17, false);
     const std::vector<CacheKey> hits{{.group_id = 1, .content_hash = prompt.hashes[1]},

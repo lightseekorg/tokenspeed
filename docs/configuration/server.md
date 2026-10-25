@@ -1231,17 +1231,7 @@ Under `write_back`:
   clears both tiers under either policy.
 - Not everything the GPU evicts reaches the Host: what a request releases
   itself, what nothing can resume from any more, and pages evicted together
-  that the Host cannot fit as a whole are dropped. On a hybrid
-  (recurrent-state) model, the first includes the state checkpoint a request
-  resumed from, once a later chunk or its own end state replaces it (see
-  the next item), and the second the pages no state checkpoint on either
-  tier depends on.
-- On a hybrid model, when a prompt resumes on the GPU from the state
-  checkpoint where the conversation's previous turn ended, that checkpoint
-  stays cached after the request's own end state replaces it (once the
-  transfer to the decode peer completes), so the same prompt sent again,
-  which cannot resume at its own end state, can still resume there. It is
-  then the GPU's first eviction candidate, ahead of the newer end state.
+  that the Host cannot fit as a whole are dropped.
 - [KV cache events](#kv-cache-events) keep describing the GPU cache.
 
 Elsewhere on this page, "write-back" means any copy from the GPU to Host L2,

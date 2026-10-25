@@ -1263,9 +1263,9 @@ bool Scheduler::scheduleRestore(AdmissionFeedback& feedback, PlanBuild& build, R
     // The restore op owns the request-pool row it imports the blob into until
     // its ACK hands it to the resumed state (an abort meanwhile must not
     // re-grant a row still being written), and shares the blob slot.
-    SnapshotRestoreOperation op =
-        tier_transfers_.StartSnapshotRestore(request->Id(), req_pool_allocator_.Allocate(), retracted->blob_slot,
-                                             std::move(result->load_pairs), std::move(result->snapshot_pairs));
+    SnapshotRestoreOperation op = tier_transfers_.StartSnapshotRestore(
+        request->Id(), req_pool_allocator_.Allocate(), retracted->blob_slot, std::move(result->load_pairs),
+        std::move(result->snapshot_pairs), retracted->cache_progress.access_epoch);
     const std::uint32_t restore_op = op.op_id;
     build.snapshot_restores.push_back(std::move(op));
     request->Apply(fsm::ScheduleRestoreEvent{&coordinator_, std::move(tables), restore_op});

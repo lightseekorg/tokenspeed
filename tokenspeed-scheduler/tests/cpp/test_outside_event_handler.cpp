@@ -1082,6 +1082,76 @@ TEST_F(PdDecodeCapacityTestSuite, SingleRequestCapacityChargesTheLandingShapeOnl
     EXPECT_EQ(scheduler_->MaxSingleRequestTokens(), 24);
 }
 
+// The D role's State input is a Device tail checkpoint when its prompt
+// claims the prompt-end state an earlier request left there: r1 repeats the
+// nine tokens r0 computed and claims r0's state at 9. Once r1 decodes, its
+// finish publishes its state at 10, which supersedes that one: big's landing
+// evicts it first, as r1's reclaim, with its tail's KV block, and old's
+// checkpoint, the least recently used, with its own; the prompt ending at 10
+// still claims its state, the one ending at 9 no longer does. Had r1 left
+// before any decode, its end state would be the state at 9 itself,
+// superseding nothing: big's landing evicts only old's, and the prompt ending
+// at 9 still claims its state.
+TEST_F(PdSparseDecodeAdmissionTestSuite, AClaimedPromptEndStateIsSupersededOnlyByADecode) {
+    config_.device_allocator.total_pages = 10;  // null parent + nine usable parents
+    config_.cache_groups[0].total_pages = 19;
+    config_.cache_groups[1].total_pages = 10;
+    SetTestSnapshotPool(config_);
+    for (const bool r1_decodes : {false, true}) {
+        SCOPED_TRACE(r1_decodes);
+        scheduler_ = std::make_unique<Scheduler>(config_);
+        RequestSpec r1 = MakeRequestSpec("r1", /*num_pages=*/4, /*start=*/1);
+        r1.tokens.push_back(42);
+        // Each lands with the bootstrap token 42; old and r0 decode it and
+        // leave at nine tokens.
+        for (const auto& [id, start] : {std::pair{"old", 100}, std::pair{"r0", 1}, std::pair{"r1", 1}}) {
+            const std::string request_id = id;
+            Submit({request_id == "r1" ? r1 : MakeRequestSpec(request_id, /*num_pages=*/4, start)});
+            SendBootstrapped(request_id);
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* landing = FindRemoteAdmission(plan);
+            ASSERT_NE(landing, nullptr) << request_id;
+            EXPECT_EQ(landing->state_prefix_cached, std::vector<bool>{request_id == "r1"}) << request_id;
+            SendRemotePrefillDone(request_id, /*bootstrap_token=*/42);
+            if (request_id != "r1" || r1_decodes) {
+                ASSERT_NE(FindForwardBatch(PlanOnce().Operations()), nullptr) << request_id;
+                SendForwardDone(request_id, {43});
+            }
+            ExecutionEvent succeeded;
+            succeeded.With(pd::SucceededEvent{request_id});
+            scheduler_->Advance(succeeded);
+            AckWriteBacks(PlanOnce());
+        }
+
+        Submit({MakeRequestSpec("big", /*num_pages=*/2, /*start=*/500)});
+        SendBootstrapped("big");
+        ASSERT_NE(FindRemoteAdmission(PlanOnce()), nullptr);
+        // Each state at 9 leaves with its tail's KV block: old's as an
+        // admission victim, r0's, once r1 decoded, as r1's reclaim.
+        const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+        EXPECT_EQ(evictions.admission.blocks, 2u);
+        EXPECT_EQ(evictions.request_reclaim.blocks, r1_decodes ? 2u : 0u);
+        SendAbortEvent("big");
+        PlanOnce();
+
+        for (const bool ends_at_10 : {false, true}) {
+            RequestSpec again = r1;
+            again.request_id = ends_at_10 ? "again-10" : "again-9";
+            if (ends_at_10) {
+                again.tokens.push_back(42);
+            }
+            Submit({again});
+            SendBootstrapped(again.request_id);
+            const ExecutionPlan plan = PlanOnce();
+            const ForwardBatch* landing = FindRemoteAdmission(plan);
+            ASSERT_NE(landing, nullptr) << again.request_id;
+            EXPECT_EQ(landing->state_prefix_cached, std::vector<bool>{ends_at_10 == r1_decodes}) << again.request_id;
+            SendAbortEvent(again.request_id);
+            PlanOnce();
+        }
+    }
+}
+
 TEST_F(PdSparseDecodeAdmissionTestSuite, LandsThePromptEndStateInSlotOneAndDecodesInPlace) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");

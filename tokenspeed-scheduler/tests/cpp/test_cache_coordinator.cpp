@@ -4898,7 +4898,8 @@ TEST(RetractionImageTest, PublishedSlotsRideHostCacheAndRestoreAsKeyedLoads) {
     EXPECT_EQ(restore->load_pairs[1].logical_block_index, 1);
     EXPECT_EQ(restore->load_pairs[1].boundary_kind, CacheBoundaryKind::kChunk);
     coordinator.CacheDeviceBlock(restore->load_pairs[1].destination, restore->load_pairs[1].key,
-                                 restore->load_pairs[1].logical_block_index, restore->load_pairs[1].boundary_kind);
+                                 restore->load_pairs[1].logical_block_index, restore->load_pairs[1].boundary_kind,
+                                 /*access_epoch=*/1);
     const auto republished = coordinator.GroupPrefixIndex(0).MetadataFor(pool, restored[0].Blocks()[1]->Location());
     ASSERT_TRUE(republished);
     EXPECT_EQ(republished->logical_block_index, 1);
@@ -6948,11 +6949,11 @@ TEST_F(BoundaryTreeCoordinatorTest, AHostEntryWithoutAPublicationStartsANodeOfIt
 TEST_F(BoundaryTreeCoordinatorTest, ARepublishedDeviceEntryWithoutANodeStartsOneOfItsOwn) {
     {
         CacheBlockRef page = pool_.AcquireBlock(0);
-        coordinator_.CacheDeviceBlock(page, Key("restored", 0), /*logical_block_index=*/0,
-                                      CacheBoundaryKind::kEndpoint);
+        coordinator_.CacheDeviceBlock(page, Key("restored", 0), /*logical_block_index=*/0, CacheBoundaryKind::kEndpoint,
+                                      /*access_epoch=*/1);
         CacheBlockRef checkpoint = pool_.AcquireBlock(1);
         coordinator_.CacheDeviceBlock(checkpoint, Key("restored", 1), /*logical_block_index=*/-1,
-                                      CacheBoundaryKind::kEndpoint);
+                                      CacheBoundaryKind::kEndpoint, /*access_epoch=*/1);
     }
     const Node* node = Tree().Find("restored");
     ASSERT_NE(node, nullptr);
