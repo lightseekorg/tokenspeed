@@ -32,16 +32,6 @@ from tokenspeed_kernel.thirdparty.deep_select import deep_select_alignment
 
 @triton.jit(
     do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP", "STRIDE"],
-    do_not_specialize_on_alignment=[
-        "X0",
-        "L0",
-        "T0",
-        "T1",
-        "TC",
-        "NP",
-        "CAP",
-        "STRIDE",
-    ],
 )
 def _clean_logits_block_max(
     X,
@@ -151,7 +141,6 @@ def clean_logits_and_block_max(
 
 @triton.jit(
     do_not_specialize=["C0", "T0", "N", "NP"],
-    do_not_specialize_on_alignment=["C0", "T0", "N", "NP"],
 )
 def _gather_index_pages(C, T, V, F, C0, T0, N, NP, P: tl.constexpr, B: tl.constexpr):
     row = tl.program_id(0).to(tl.int64) * B + tl.arange(0, B)
@@ -207,17 +196,6 @@ def gather_index_pages(
 
 @triton.jit(
     do_not_specialize=["C0", "C1", "L0", "T0", "T1", "PAGES", "NC", "CAP", "WIDTH"],
-    do_not_specialize_on_alignment=[
-        "C0",
-        "C1",
-        "L0",
-        "T0",
-        "T1",
-        "PAGES",
-        "NC",
-        "CAP",
-        "WIDTH",
-    ],
 )
 def _normalize_candidate_blocks(
     C,
@@ -273,7 +251,6 @@ def _normalize_candidate_blocks(
 
 @triton.jit(
     do_not_specialize=["S0", "WIDTH"],
-    do_not_specialize_on_alignment=["S0", "WIDTH"],
 )
 def _mask_candidate_logits(
     SCORES,

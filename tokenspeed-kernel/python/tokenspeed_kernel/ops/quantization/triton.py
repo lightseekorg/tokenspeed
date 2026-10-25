@@ -1783,7 +1783,6 @@ def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
 
 @triton.jit(
     do_not_specialize=["M", "X0"],
-    do_not_specialize_on_alignment=["M", "X0"],
 )
 def _fp8_group32_ue8m0_quantize_swizzled(
     X,

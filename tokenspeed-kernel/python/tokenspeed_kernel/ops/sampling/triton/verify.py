@@ -41,15 +41,6 @@ from tokenspeed_kernel.platform import pdl_enabled
         "candidates_col_stride",
         "target_sampled_stride",
     ],
-    do_not_specialize_on_alignment=[
-        "predicts_stride",
-        "accept_index_row_stride",
-        "accept_index_col_stride",
-        "accept_token_num_stride",
-        "candidates_row_stride",
-        "candidates_col_stride",
-        "target_sampled_stride",
-    ],
 )
 def _verify_chain_target_sampled_kernel(
     predicts_ptr,

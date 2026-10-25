@@ -28,7 +28,6 @@ from tokenspeed_kernel._triton import tl, triton
 
 @triton.jit(
     do_not_specialize=["block_table_stride", "block_table_cols"],
-    do_not_specialize_on_alignment=["block_table_stride", "block_table_cols"],
 )
 def _kpool_expand_slots_kernel(
     out,

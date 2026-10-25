@@ -248,7 +248,9 @@ whether it is 1 or divisible by 16, and a pointer on 16-byte alignment.
 Startup warms only the classes graph capture happens to see. On the serving
 path, a per-batch count (tokens, rows, requests) belongs in
 `do_not_specialize`, and a pointer into a buffer sliced at a per-batch
-offset belongs in `do_not_specialize_on_alignment`. A stride that changes
+offset belongs in `do_not_specialize_on_alignment`. `do_not_specialize`
+already drops the alignment key too, so its arguments need no second listing
+in `do_not_specialize_on_alignment`. A stride that changes
 between call sites but stays a multiple of 16, such as a projection's row
 width, stays a plain runtime argument: one class covers it, and the hint
 keeps row loads vectorized. Use a fixed block with a loop for a

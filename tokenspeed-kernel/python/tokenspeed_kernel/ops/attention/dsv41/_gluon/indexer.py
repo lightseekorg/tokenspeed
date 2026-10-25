@@ -48,7 +48,6 @@ def _score_query_tile(queries: int, width: int) -> int:
 
 @triton.jit(
     do_not_specialize=["Q0", "Q1", "Q2", "W0", "W1"],
-    do_not_specialize_on_alignment=["Q0", "Q1", "Q2", "W0", "W1"],
 )
 def _pack_index_queries_padded(
     Q,

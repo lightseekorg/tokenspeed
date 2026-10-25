@@ -2033,22 +2033,6 @@ def triton_dsv41_dspark_rows(
         "PAGES",
         "PAGE_ROWS",
     ],
-    do_not_specialize_on_alignment=[
-        "X0",
-        "POS0",
-        "CS0",
-        "W0",
-        "W1",
-        "P0",
-        "P1",
-        "R0",
-        "R1",
-        "O0",
-        "HISTORY",
-        "BLOCK",
-        "PAGES",
-        "PAGE_ROWS",
-    ],
 )
 def _dspark_workspace_kernel(
     X,
@@ -2413,7 +2397,7 @@ def triton_dsv41_dspark_block(
     return ids, positions, pre_mix, request_indices, page, row, indices
 
 
-@triton.jit(do_not_specialize=["X0", "X1"], do_not_specialize_on_alignment=["X0", "X1"])
+@triton.jit(do_not_specialize=["X0", "X1"])
 def _pack_index_queries(X, V, S, X0, X1):
     row = tl.program_id(0).to(tl.int64)
     d = tl.arange(0, 128)
@@ -2512,7 +2496,6 @@ def pack_index_queries(values):
 
 @triton.jit(
     do_not_specialize=["T0", "T1", "L0", "TC", "NP", "CAP"],
-    do_not_specialize_on_alignment=["T0", "T1", "L0", "TC", "NP", "CAP"],
 )
 def _safe_metadata(
     T, L, OT, OL, T0, T1, L0, TC, NP, CAP, P: tl.constexpr, B: tl.constexpr
@@ -2553,7 +2536,6 @@ def safe_metadata(table, lengths, pages, capacity, page_size):
 
 @triton.jit(
     do_not_specialize=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
-    do_not_specialize_on_alignment=["X0", "L0", "T0", "T1", "TC", "NP", "CAP"],
 )
 def _clean_logits(
     X,
@@ -2597,7 +2579,6 @@ def clean_logits(values, lengths, table, pages, capacity, page_size):
 
 @triton.jit(
     do_not_specialize=["L0", "N", "CAP"],
-    do_not_specialize_on_alignment=["L0", "N", "CAP"],
 )
 def _dense_ranges(L, START, END, L0, N, CAP, B: tl.constexpr):
     row = tl.program_id(0) * B + tl.arange(0, B)
@@ -2681,7 +2662,6 @@ def candidate_scores(logits, candidates):
 
 @triton.jit(
     do_not_specialize=["X0", "X1", "L0", "S0", "W", "SW"],
-    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "SW"],
 )
 def _prepare_dense(
     X,
@@ -2707,7 +2687,6 @@ def _prepare_dense(
 
 @triton.jit(
     do_not_specialize=["X0", "X1", "L0", "S0", "W", "SW"],
-    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "SW"],
 )
 def _reduce_blocks(
     X,
@@ -2749,7 +2728,6 @@ def _reduce_blocks(
 
 @triton.jit(
     do_not_specialize=["C0", "C1", "L0", "N", "W", "X0", "X1", "SW"],
-    do_not_specialize_on_alignment=["C0", "C1", "L0", "N", "W", "X0", "X1", "SW"],
 )
 def _normalize_candidates(
     C,
@@ -2800,7 +2778,6 @@ def _normalize_candidates(
 
 @triton.jit(
     do_not_specialize=["X0", "X1", "L0", "S0", "W", "NC", "SW"],
-    do_not_specialize_on_alignment=["X0", "X1", "L0", "S0", "W", "NC", "SW"],
 )
 def _gather_candidates(
     X,
@@ -2829,7 +2806,6 @@ def _gather_candidates(
 
 @triton.jit(
     do_not_specialize=["I0", "S0", "NC", "W"],
-    do_not_specialize_on_alignment=["I0", "S0", "NC", "W"],
 )
 def _finish_selection(
     I,
@@ -2867,7 +2843,6 @@ def _finish_selection(
 
 @triton.jit(
     do_not_specialize=["COUNT", "WIDTH", "L0"],
-    do_not_specialize_on_alignment=["COUNT", "WIDTH", "L0"],
 )
 def _clamp_selection_ends(L, E, COUNT, WIDTH, L0, TILE: tl.constexpr):
     row = tl.program_id(0) * TILE + tl.arange(0, TILE)
@@ -3548,17 +3523,6 @@ def block_maxima_with_lengths(
         "blocks",
         "workers",
     ],
-    do_not_specialize_on_alignment=[
-        "width",
-        "score_stride",
-        "length_stride",
-        "table_stride",
-        "page_stride",
-        "table_width",
-        "num_pages",
-        "blocks",
-        "workers",
-    ],
 )
 def _clean_block_maxima_kernel(
     Scores,
@@ -3660,7 +3624,7 @@ def clean_block_maxima(
     return cleaned, maxima, ends
 
 
-@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["N"])
+@triton.jit(do_not_specialize=["N"])
 def _pack_index_inputs(
     X,
     W,
@@ -3801,12 +3765,6 @@ def _copy_attention_heads(dst, src, sink, sink_out):
         "Lengths",
         "Blocks",
         "BlockLengths",
-        "TS0",
-        "TS1",
-        "LS",
-        "TC",
-        "PAGES",
-        "C",
     ],
 )
 def _index_select_all(
@@ -3984,7 +3942,6 @@ def _block_select_keys(row, start, n, latest, BLOCK: tl.constexpr):
 
 @triton.jit(
     do_not_specialize=["visible_capacity"],
-    do_not_specialize_on_alignment=["visible_capacity"],
 )
 def _index_block_select_kernel(
     logits,
@@ -4084,7 +4041,6 @@ def _visible_blocks(visible, query, n_blocks, visible_capacity):
 
 @triton.jit(
     do_not_specialize=["visible_capacity"],
-    do_not_specialize_on_alignment=["visible_capacity"],
 )
 def _block_keys_pass(
     logits,
@@ -4129,7 +4085,6 @@ def _load_block_keys(keys, query, start, n, n_blocks, BLOCK: tl.constexpr):
 
 @triton.jit(
     do_not_specialize=["visible_capacity"],
-    do_not_specialize_on_alignment=["visible_capacity"],
 )
 def _block_hist_pass(
     keys,
@@ -4164,7 +4119,6 @@ def _block_hist_pass(
 
 @triton.jit(
     do_not_specialize=["visible_capacity"],
-    do_not_specialize_on_alignment=["visible_capacity"],
 )
 def _block_count_pass(
     keys,
@@ -4193,7 +4147,6 @@ def _block_count_pass(
 
 @triton.jit(
     do_not_specialize=["visible_capacity"],
-    do_not_specialize_on_alignment=["visible_capacity"],
 )
 def _block_emit_pass(
     keys,
