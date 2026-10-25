@@ -6,20 +6,29 @@ engine rank is a `ts-host` process that runs the scheduling loop in Rust and
 embeds CPython for the data plane. The design rules of the loop are in
 [`docs/design/event-loop.md`](../docs/design/event-loop.md).
 
-| Crate | Role |
-| --- | --- |
-| `ts-wire` | The engine IPC schema and its msgpack codec, byte-compatible with the Python structs in `python/tokenspeed/runtime/engine/io_struct.py` and `zmq_wire.py`. |
-| `ts-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts and control operations. |
-| `ts-py` | `tokenspeed_engine._native`: `ts-client` for the Python frontend (`AsyncLLM`, under the `Engine` API and the gRPC servicer), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
-| `ts-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
-| `ts-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. |
-| `ts-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, the engine side of the msgpack wire, and the per-round agreements among ranks. |
-| `ts-grammar` | Grammar-constrained decoding on xgrammar's C++ library: compilation and the matchers, which the data plane drives through C entry points. |
-| `ts-metrics` | The engine's metrics: Prometheus' multiprocess files, written directly, and the events the node's plugin relay runs output plugins on. |
-| `ts-mooncake` | The Mooncake transfer engine and store client through their C APIs, loaded at runtime from the `tokenspeed-mooncake` wheel. |
-| `ts-l3` | The L3 storage tier's Host-only executor ([asynchronous L3](../docs/design/async-l3-cache.md)): object naming, the Host pool's layout and ownership, bounded queues and workers, backend health, and the stores (the Mooncake store client, and an in-memory one for tests). |
-| `ts-pd` | The PD transfer peer: the P/D handshake, room states, transfer workers and the per-round agreement on transfer progress. |
-| `ts-host` | The rank binary: it embeds the interpreter, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
+| Source crate | Published package | Role |
+| --- | --- | --- |
+| `ts-wire` | `tokenspeed-wire` | The engine IPC schema and its msgpack codec, byte-compatible with the Python structs in `python/tokenspeed/runtime/engine/io_struct.py` and `zmq_wire.py`. |
+| `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts and control operations. |
+| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for the Python frontend (`AsyncLLM`, under the `Engine` API and the gRPC servicer), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
+| `ts-collective` | `tokenspeed-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
+| `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. |
+| `ts-control` | `tokenspeed-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, the engine side of the msgpack wire, and the per-round agreements among ranks. |
+| `ts-grammar` | `tokenspeed-grammar` | Grammar-constrained decoding on xgrammar's C++ library: compilation and the matchers, which the data plane drives through C entry points. |
+| `ts-metrics` | `tokenspeed-metrics` | The engine's metrics: Prometheus' multiprocess files, written directly, and the events the node's plugin relay runs output plugins on. |
+| `ts-mooncake` | `tokenspeed-mooncake` | The Mooncake transfer engine and store client through their C APIs, loaded at runtime from the `tokenspeed-mooncake` wheel. |
+| `ts-l3` | `tokenspeed-l3` | The L3 storage tier's Host-only executor ([asynchronous L3](../docs/design/async-l3-cache.md)): object naming, the Host pool's layout and ownership, bounded queues and workers, backend health, and the stores (the Mooncake store client, and an in-memory one for tests). |
+| `ts-pd` | `tokenspeed-pd` | The PD transfer peer: the P/D handshake, room states, transfer workers and the per-round agreement on transfer progress. |
+| `ts-host` | `tokenspeed-host` | The rank binary: it embeds the interpreter, has `engine/rust_host.py` build the data plane and the scheduler, and runs the loop on its main thread and the data plane on its forward thread. |
+
+The crates.io packages use the `tokenspeed-` prefix. Their Rust library names
+remain `ts_wire`, `ts_client`, and so on; the Python module remains `_native`,
+and the host executable remains `ts-host`. For example:
+
+```toml
+[dependencies]
+ts-client = { package = "tokenspeed-client", version = "0.1.0" }
+```
 
 ## Wire conformance
 
@@ -39,15 +48,22 @@ re-encodes to the same bytes, so only the value checks catch it.
 
 ## Building
 
+The native crates target Linux and need a C++ compiler, CMake, OpenSSL
+development headers, and Python development headers. Set `PYO3_PYTHON` to
+an interpreter with `nanobind>=2.13.0` and `tokenspeed-spdlog==1.15.1`
+installed. The scheduler source is bundled in its crate; the grammar build
+downloads the pinned, SHA256-checked xgrammar source release and therefore
+needs network access (or `FETCHCONTENT_SOURCE_DIR_XGRAMMAR` for a local copy).
+
 `ts-host` and `ts-py` link the CPython the engine runs under; build with it
 as `PYO3_PYTHON`, which needs `nanobind` and `tokenspeed-spdlog`, as the
 scheduler wheel build does:
 
 ```bash
-PYO3_PYTHON=$(which python) cargo build --release -p ts-host -p ts-py
+PYO3_PYTHON=$(which python) cargo build --release -p tokenspeed-host -p tokenspeed-py
 ```
 
-The `tokenspeed-engine` wheel (`pyproject.toml`, built with maturin) carries
+The `tokenspeed-engine` wheel (`pyproject.toml`, built with setuptools) carries
 `tokenspeed_engine._native` and the `ts-host` binary. To run a development
 build instead, put `_native` on the Python path and point
 `TOKENSPEED_HOST_BINARY` at the binary. `TS_HOST_LOG` sets the Rust log

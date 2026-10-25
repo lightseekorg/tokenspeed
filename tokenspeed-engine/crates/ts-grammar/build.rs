@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 
 fn main() {
+    cxx_build::CFG.include_prefix = "ts-grammar";
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let mut config = cmake::Config::new(&manifest);
     if let Ok(source) = std::env::var("FETCHCONTENT_SOURCE_DIR_XGRAMMAR") {

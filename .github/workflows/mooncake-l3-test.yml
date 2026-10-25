@@ -98,14 +98,14 @@ jobs:
         working-directory: tokenspeed-engine
         env:
           MOONCAKE_REQUIRE_MASTER: "1"
-        run: cargo test --locked -p ts-l3 --test mooncake -- --test-threads=1
+        run: cargo test --locked -p tokenspeed-l3 --test mooncake -- --test-threads=1
 
       # tokenspeed_engine.L3Executor without ts-host, which needs no C++
       # scheduler build.
       - name: Build the L3 executor's Python module
         working-directory: tokenspeed-engine
         run: |
-          PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release --locked -p ts-py
+          PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release --locked -p tokenspeed-py
           cp target/release/lib_native.so \
             "python/tokenspeed_engine/_native$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 
@@ -144,7 +144,7 @@ jobs:
         working-directory: tokenspeed-engine
         run: |
           PYO3_PYTHON=$(which python) PYO3_BUILD_EXTENSION_MODULE=1 \
-            cargo build --release --locked -p ts-py
+            cargo build --release --locked -p tokenspeed-py
           cp target/release/lib_native.so \
             "python/tokenspeed_engine/_native$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 

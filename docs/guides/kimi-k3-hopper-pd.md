@@ -310,7 +310,7 @@ python -m pytest -q \
 ```
 
 The transfer planning between the two roles (routes, block manifests,
-copies) is the engine's: run `cargo test -p ts-pd` in `tokenspeed-engine/`.
+copies) is the engine's: run `cargo test -p tokenspeed-pd` in `tokenspeed-engine/`.
 
 Also run the existing K3 DSpark/capture tests. Keep runtime and kernel test
 roots in separate pytest invocations to avoid their conflicting `conftest` module names.

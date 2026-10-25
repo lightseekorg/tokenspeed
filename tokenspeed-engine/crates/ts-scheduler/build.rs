@@ -43,11 +43,12 @@ fn python_output(python: &str, code: &str) -> String {
 }
 
 fn main() {
+    cxx_build::CFG.include_prefix = "ts-scheduler";
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let scheduler_dir = manifest
-        .join("../../../tokenspeed-scheduler")
+        .join("scheduler")
         .canonicalize()
-        .expect("tokenspeed-scheduler/ next to tokenspeed-engine/");
+        .expect("bundled scheduler source");
     let python = pyo3_build_config::get()
         .executable()
         .expect("PyO3 found no Python interpreter; set PYO3_PYTHON")

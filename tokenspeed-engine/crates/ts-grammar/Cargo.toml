@@ -1,12 +1,16 @@
 [package]
-name = "ts-grammar"
+name = "tokenspeed-grammar"
 description = "Constrained decoding for the TokenSpeed control plane: xgrammar's C++ core behind a cxx facade"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+readme.workspace = true
 links = "ts_grammar"
+
+[lib]
+name = "ts_grammar"
 
 [dependencies]
 cxx = "1.0"

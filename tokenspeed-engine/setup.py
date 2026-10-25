@@ -64,12 +64,12 @@ class BuildPyWithRust(build_py):
     def run(self) -> None:
         super().run()
         package = Path(self.build_lib) / "tokenspeed_engine"
-        release = _cargo_build("ts-py", extension_module=True)
+        release = _cargo_build("tokenspeed-py", extension_module=True)
         shutil.copy2(
             release / "lib_native.so",
             package / f"_native{sysconfig.get_config_var('EXT_SUFFIX')}",
         )
-        release = _cargo_build("ts-host", extension_module=False)
+        release = _cargo_build("tokenspeed-host", extension_module=False)
         (package / "bin").mkdir(exist_ok=True)
         shutil.copy2(release / "ts-host", package / "bin" / "ts-host")
 

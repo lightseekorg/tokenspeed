@@ -1244,6 +1244,160 @@ dependencies = [
 ]
 
 [[package]]
+name = "tokenspeed-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
+ "tokenspeed-wire",
+ "tokio",
+ "tracing",
+ "zeromq",
+]
+
+[[package]]
+name = "tokenspeed-collective"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "tokenspeed-control"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32fast",
+ "pyo3",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokenspeed-client",
+ "tokenspeed-collective",
+ "tokenspeed-grammar",
+ "tokenspeed-l3",
+ "tokenspeed-metrics",
+ "tokenspeed-pd",
+ "tokenspeed-scheduler",
+ "tokenspeed-wire",
+ "tokio",
+ "tracing",
+ "zeromq",
+]
+
+[[package]]
+name = "tokenspeed-grammar"
+version = "0.1.0"
+dependencies = [
+ "cmake",
+ "cxx",
+ "cxx-build",
+]
+
+[[package]]
+name = "tokenspeed-host"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "pyo3",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokenspeed-collective",
+ "tokenspeed-control",
+ "tokenspeed-grammar",
+ "tokenspeed-l3",
+ "tokenspeed-metrics",
+ "tokenspeed-mooncake",
+ "tokenspeed-pd",
+ "tokenspeed-scheduler",
+ "tokenspeed-wire",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zeromq",
+]
+
+[[package]]
+name = "tokenspeed-l3"
+version = "0.1.0"
+dependencies = [
+ "pyo3",
+ "sha2",
+ "thiserror 2.0.21",
+ "tokenspeed-metrics",
+ "tokenspeed-mooncake",
+ "tracing",
+]
+
+[[package]]
+name = "tokenspeed-metrics"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "tokenspeed-wire",
+ "tokio",
+ "tracing",
+ "zeromq",
+]
+
+[[package]]
+name = "tokenspeed-mooncake"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "tokenspeed-pd"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokenspeed-collective",
+ "tokenspeed-metrics",
+ "tokenspeed-mooncake",
+ "tokio",
+ "tracing",
+ "ureq",
+ "zeromq",
+]
+
+[[package]]
+name = "tokenspeed-py"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "pyo3",
+ "pyo3-async-runtimes",
+ "tokenspeed-client",
+ "tokenspeed-l3",
+ "tokenspeed-pd",
+ "tokenspeed-wire",
+ "tokio",
+]
+
+[[package]]
+name = "tokenspeed-scheduler"
+version = "0.1.0"
+dependencies = [
+ "cmake",
+ "cxx",
+ "cxx-build",
+ "pyo3",
+ "pyo3-build-config",
+]
+
+[[package]]
+name = "tokenspeed-wire"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tokio"
 version = "1.54.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1344,160 +1498,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "ts-client"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "ts-wire",
- "zeromq",
-]
-
-[[package]]
-name = "ts-collective"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.21",
- "tracing",
-]
-
-[[package]]
-name = "ts-control"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "crc32fast",
- "pyo3",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "ts-client",
- "ts-collective",
- "ts-grammar",
- "ts-l3",
- "ts-metrics",
- "ts-pd",
- "ts-scheduler",
- "ts-wire",
- "zeromq",
-]
-
-[[package]]
-name = "ts-grammar"
-version = "0.1.0"
-dependencies = [
- "cmake",
- "cxx",
- "cxx-build",
-]
-
-[[package]]
-name = "ts-host"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "pyo3",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "ts-collective",
- "ts-control",
- "ts-grammar",
- "ts-l3",
- "ts-metrics",
- "ts-mooncake",
- "ts-pd",
- "ts-scheduler",
- "ts-wire",
- "zeromq",
-]
-
-[[package]]
-name = "ts-l3"
-version = "0.1.0"
-dependencies = [
- "pyo3",
- "sha2",
- "thiserror 2.0.21",
- "tracing",
- "ts-metrics",
- "ts-mooncake",
-]
-
-[[package]]
-name = "ts-metrics"
-version = "0.1.0"
-dependencies = [
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "ts-wire",
- "zeromq",
-]
-
-[[package]]
-name = "ts-mooncake"
-version = "0.1.0"
-dependencies = [
- "libloading",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "ts-pd"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "serde_json",
- "thiserror 2.0.21",
- "tokio",
- "tracing",
- "ts-collective",
- "ts-metrics",
- "ts-mooncake",
- "ureq",
- "zeromq",
-]
-
-[[package]]
-name = "ts-py"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "pyo3",
- "pyo3-async-runtimes",
- "tokio",
- "ts-client",
- "ts-l3",
- "ts-pd",
- "ts-wire",
-]
-
-[[package]]
-name = "ts-scheduler"
-version = "0.1.0"
-dependencies = [
- "cmake",
- "cxx",
- "cxx-build",
- "pyo3",
- "pyo3-build-config",
-]
-
-[[package]]
-name = "ts-wire"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "thiserror 2.0.21",
 ]
 
 [[package]]
