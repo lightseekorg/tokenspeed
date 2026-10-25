@@ -1781,6 +1781,10 @@ class ServerArgs:
         # have auto-enabled, whatever the envelope. CommManager.should_fuse
         # re-derives the veto from the switches, so the fused kernels stay off
         # even where this flag is read before the fold.
+        if self.batch_invariant_collectives:
+            # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
+            self.enable_allreduce_fusion = False
+            self.comm_fusion_max_num_tokens = -1
         if self.layer_boundary_norm == "unfused":
             # The fused all-reduce+norm kernels add the residual inside the
             # fusion; the unfused boundary norm needs the bf16 sum first.
@@ -3825,13 +3829,14 @@ class ServerArgs:
             "--batch-invariant-collectives",
             action="store_true",
             help="One association order per reduction, independent of the "
-            "batch: every reduction runs as NCCL data movement plus a "
-            "fixed-rank-order fp32 fold, which for an all-reduce costs "
+            "batch: every reduction is a fixed-rank-order fp32 fold, on the "
+            "trtllm workspace kernels where one is armed, otherwise as data "
+            "movement plus the fold, which for an all-reduce costs "
             "world_size times the traffic. NCCL sums are run-stable but chunk "
             "by message size, and the NVLS in-switch reduction's order moves "
             "with a row's offset in the buffer, so neither is "
-            "batch-invariant. Gathers keep the multicast kernels. Folded in "
-            "by --numerics rl-bitwise.",
+            "batch-invariant. Gathers keep the multicast kernels. Turns off "
+            "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",
