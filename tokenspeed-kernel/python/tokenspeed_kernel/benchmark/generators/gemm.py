@@ -50,6 +50,7 @@ from tokenspeed_kernel.selection import (
 from tokenspeed_kernel.signature import (
     FormatSignature,
     ScaleFormat,
+    dense_format_signature,
     dense_tensor_format,
     format_signature,
     tensor_format,
@@ -66,6 +67,7 @@ __all__ = [
     "prepare_linear_attnres_partials",
     "prepare_mm",
     "prepare_mxfp8_mm",
+    "prepare_prepared_fp32_router_gemv",
 ]
 
 
@@ -819,6 +821,93 @@ def prepare_mv(
             "dtype": "bfloat16",
             "x_layout": "MK",
             "weight_layout": "NK",
+            "out_layout": "MN",
+        },
+    )
+
+
+def prepare_prepared_fp32_router_gemv(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare an FP32 router GEMV computing ``(x @ weight) * multiplier``.
+
+    The router weight is stored ``[K, N]`` and converted once to the selected
+    kernel's persistent layout, as model loading does; each invocation runs
+    the planned kernel over ``x[M, K]``.
+    """
+
+    if request.registration is not None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.prepared_fp32_router_gemv selects through its plan; "
+            "use solution instead of registration",
+        )
+    _reject_unknown_parameters(request, {"M", "N", "K", "multiplier", "dtype"})
+    M = _positive_int(request.parameters.get("M"), "M")
+    N = _positive_int(request.parameters.get("N"), "N")
+    K = _positive_int(request.parameters.get("K"), "K")
+    multiplier = request.parameters.get("multiplier")
+    if not isinstance(multiplier, float) or not math.isfinite(multiplier):
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.prepared_fp32_router_gemv multiplier must be a finite float",
+        )
+    if request.parameters.get("dtype") != "float32":
+        raise BenchmarkCaseError(
+            BenchmarkStatus.INVALID_CASE,
+            "gemm.prepared_fp32_router_gemv dtype must be float32",
+        )
+
+    from tokenspeed_kernel.ops import gemm as gemm_ops
+
+    load_builtin_kernels()
+    try:
+        # The plan's own selection, repeated to name the timed registration.
+        selected = select_kernel(
+            request.family,
+            request.mode,
+            dense_format_signature(("x", "weight"), (torch.float32, torch.float32)),
+            features=frozenset(),
+            platform=platform,
+            solution=request.solution,
+        )
+        plan = gemm_ops.fp32_router_gemv_plan(
+            hidden_size=K,
+            output_size=N,
+            dtype=torch.float32,
+            solution=request.solution,
+            batch_invariant=False,
+        )
+    except NoKernelFoundError as exc:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(exc)) from exc
+    spec = KernelRegistry.get().get_by_name(selected.name)
+    if spec is None:
+        raise BenchmarkCaseError(
+            BenchmarkStatus.REGISTRATION_MISSING,
+            f"Selected registration {selected.name!r} is not available",
+        )
+
+    x, weight = _random_tensors(request.seed, torch.float32, (M, K), (K, N))
+    prepared_weight = gemm_ops.fp32_router_gemv_process_weight(plan, weight)
+    counters = gemm_ops.fp32_router_gemv_counters(N, x.device)
+
+    def invoke() -> torch.Tensor:
+        return gemm_ops.fp32_router_gemv_execute(
+            plan, x, prepared_weight, multiplier, counters, False
+        )
+
+    return _prepared_timing(
+        spec,
+        invoke,
+        {
+            "M": M,
+            "N": N,
+            "K": K,
+            "multiplier": multiplier,
+            "dtype": "float32",
+            "x_layout": "MK",
+            "weight_layout": "KN",
             "out_layout": "MN",
         },
     )

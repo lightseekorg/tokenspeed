@@ -31,7 +31,12 @@
     "gfx950/qwen38_flash/gemm.json",
     "gfx950/qwen38_flash/qsa.json",
     "gfx950/qwen38_flash/gdn.json",
-    "gfx950/beam/moe.json"
+    "gfx950/beam/moe.json",
+    "gfx950/muse_spark/gemm.json",
+    "gfx950/muse_spark/attention.json",
+    "gfx950/muse_spark/layernorm.json",
+    "gfx950/muse_spark/moe.json",
+    "gfx950/muse_spark/residual.json"
   ],
   "cases": []
 }

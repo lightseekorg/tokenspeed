@@ -44,12 +44,15 @@ __all__ = [
     "prepare_mhc_apply_pre",
     "prepare_mhc_mixes",
     "prepare_mhc_post",
+    "prepare_post_norm_residual_pre_norm",
 ]
 
 
 _IMPLEMENTED_MODEL_PROFILES = frozenset({"kimi_k3_tp8"})
 _IMPLEMENTED_MHC_MODEL_PROFILES = frozenset({"dsv41_flash_tp4"})
 _IMPLEMENTED_HC_MIX_MODEL_PROFILES = frozenset({"qwen38_flash_tp2"})
+_IMPLEMENTED_GATED_BOUNDARY_MODEL_PROFILES = frozenset({"muse_spark_tp8"})
+_GATED_BOUNDARY_OUTPUTS = frozenset({"fp32_and_bf16", "bf16"})
 
 
 def _invalid(message: str) -> BenchmarkCaseError:
@@ -553,6 +556,138 @@ def prepare_hyperconnection_mix(
             "lowrank": lowrank,
             "inject": inject,
             "dtype": "bfloat16",
+        },
+        validation=None,
+    )
+
+
+def prepare_post_norm_residual_pre_norm(
+    request: BenchmarkRequest,
+    platform: PlatformInfo,
+) -> PreparedBenchmark:
+    """Prepare one fused decoder-layer boundary of a gated FP32 residual stream.
+
+    The call normalizes the BF16 branch (``post_weighted`` selects an
+    input-scale weight, else a weightless norm), adds it to the FP32 stream
+    through the norm-preserving residual gate and, with ``pre_weighted``,
+    applies the next sublayer's affine RMSNorm. ``outputs="bf16"`` runs the
+    entry that returns only the BF16 next input, as Muse Spark's FFN boundary
+    does on CDNA4; ``"fp32_and_bf16"`` also returns the FP32 rows its router
+    reads after attention.
+    """
+
+    _ = platform
+    if request.registration is not None or request.solution is not None:
+        raise _invalid("post_norm_residual_pre_norm cases use normal kernel selection")
+    parameters = request.parameters
+    if parameters.get("validation") is not None:
+        raise _invalid(
+            "post_norm_residual_pre_norm correctness validation is not implemented"
+        )
+    model_profile = parameters["model_profile"]
+    if model_profile not in _IMPLEMENTED_GATED_BOUNDARY_MODEL_PROFILES:
+        raise _invalid(
+            "Implemented post_norm_residual_pre_norm model_profile values: "
+            f"{', '.join(sorted(_IMPLEMENTED_GATED_BOUNDARY_MODEL_PROFILES))}"
+        )
+    if parameters["dtype"] != "bfloat16":
+        raise _invalid("post_norm_residual_pre_norm branch dtype must be bfloat16")
+    tokens = _positive(parameters, "tokens")
+    hidden_size = _positive(parameters, "hidden_size")
+    post_weighted = _flag(parameters, "post_weighted")
+    pre_weighted = _flag(parameters, "pre_weighted")
+    outputs = parameters["outputs"]
+    if outputs not in _GATED_BOUNDARY_OUTPUTS:
+        raise _invalid(
+            "post_norm_residual_pre_norm outputs must be one of: "
+            f"{', '.join(sorted(_GATED_BOUNDARY_OUTPUTS))}"
+        )
+    scalars = {}
+    for name in ("post_eps", "pre_eps", "gate_eps", "gate_temperature"):
+        value = parameters[name]
+        if not isinstance(value, float) or not math.isfinite(value) or value <= 0.0:
+            raise _invalid(f"post_norm_residual_pre_norm {name} must be positive")
+        scalars[name] = value
+    weight_offset = parameters["weight_offset"]
+    if not isinstance(weight_offset, float):
+        raise _invalid("post_norm_residual_pre_norm weight_offset must be a float")
+
+    branch, post_weight, pre_weight, gate = _random_tensors(
+        request.seed,
+        (tokens, hidden_size),
+        (hidden_size,),
+        (hidden_size,),
+        (hidden_size,),
+    )
+    stream = branch.float().mul_(4.0)
+    post_weight = post_weight.mul_(0.1) if post_weighted else None
+    pre_weight = pre_weight.mul_(0.1) if pre_weighted else None
+
+    from tokenspeed_kernel.ops import residual as residual_ops
+
+    # Mirror the operation's selection traits for these operands.
+    from tokenspeed_kernel.ops.residual._cute_dsl.gated_boundary import (
+        cluster_boundary_supported,
+    )
+
+    load_builtin_kernels()
+    alpha, beta = residual_ops.residual_gate_coefficients(
+        gate, scalars["gate_temperature"], scalars["gate_eps"]
+    )
+    try:
+        kernel = select_kernel(
+            "residual",
+            "post_norm_residual_pre_norm",
+            format_signature(
+                stream=dense_tensor_format(stream.dtype),
+                branch=dense_tensor_format(branch.dtype),
+            ),
+            platform=platform,
+            traits={
+                "cluster_supported": cluster_boundary_supported(
+                    stream, branch, post_weight, alpha, beta, pre_weight, None, 1
+                )
+            },
+        )
+    except NoKernelFoundError as error:
+        raise BenchmarkCaseError(BenchmarkStatus.NOT_APPLICABLE, str(error)) from error
+    entry = (
+        residual_ops.post_norm_residual_pre_norm_bf16
+        if outputs == "bf16"
+        else residual_ops.post_norm_residual_pre_norm
+    )
+
+    def invoke() -> object:
+        return entry(
+            stream,
+            branch,
+            post_weight,
+            scalars["post_eps"],
+            weight_offset,
+            alpha,
+            beta,
+            pre_weight,
+            scalars["pre_eps"],
+            weight_offset,
+            False,
+            None,
+            1,
+        )
+
+    return PreparedBenchmark(
+        registration=_registered_spec(kernel.name),
+        invocation=PreparedInvocation(invoke=invoke),
+        parameters={
+            "model_profile": model_profile,
+            "tokens": tokens,
+            "hidden_size": hidden_size,
+            "post_weighted": post_weighted,
+            "pre_weighted": pre_weighted,
+            "outputs": outputs,
+            **scalars,
+            "weight_offset": weight_offset,
+            "dtype": "bfloat16",
+            "stream_dtype": "float32",
         },
         validation=None,
     )

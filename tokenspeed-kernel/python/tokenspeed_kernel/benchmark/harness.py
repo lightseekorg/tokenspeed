@@ -198,6 +198,7 @@ def _load_builtin_generators() -> None:
         prepare_linear_attnres_partials,
         prepare_mm,
         prepare_mv,
+        prepare_prepared_fp32_router_gemv,
     )
     from tokenspeed_kernel.benchmark.generators.kda import (
         prepare_kda_fused_paged_decode,
@@ -205,6 +206,15 @@ def _load_builtin_generators() -> None:
         prepare_kda_paged_decode,
         prepare_kda_paged_prefill,
         prepare_kda_replay_commit,
+    )
+    from tokenspeed_kernel.benchmark.generators.layernorm import (
+        prepare_weightless_rmsnorm_gated_sigmoid,
+    )
+    from tokenspeed_kernel.benchmark.generators.mha import (
+        prepare_gqa_prologue,
+        prepare_mha_decode,
+        prepare_mha_extend,
+        prepare_mha_prefill,
     )
     from tokenspeed_kernel.benchmark.generators.mla import (
         prepare_mla_decode,
@@ -217,6 +227,7 @@ def _load_builtin_generators() -> None:
         prepare_latent_expert_shared,
         prepare_latent_input,
         prepare_moe_apply,
+        prepare_routed_input_scale_rmsnorm_sum,
         prepare_sigmoid_bias_topk,
         prepare_softmax_topk,
         prepare_topk,
@@ -233,6 +244,7 @@ def _load_builtin_generators() -> None:
         prepare_mhc_apply_pre,
         prepare_mhc_mixes,
         prepare_mhc_post,
+        prepare_post_norm_residual_pre_norm,
     )
 
     _BENCHMARK_GENERATORS.setdefault(
@@ -277,6 +289,20 @@ def _load_builtin_generators() -> None:
     )
     _BENCHMARK_GENERATORS.setdefault(("attention", "dsa_decode"), prepare_dsa_decode)
     _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "mha_decode_with_kvcache"), prepare_mha_decode
+    )
+    _BENCHMARK_GENERATORS.setdefault(("attention", "mha_prefill"), prepare_mha_prefill)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "mha_extend_with_kvcache"), prepare_mha_extend
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("attention", "gqa_prologue"), prepare_gqa_prologue
+    )
+    _BENCHMARK_GENERATORS.setdefault(
+        ("layernorm", "weightless_rmsnorm_gated_sigmoid"),
+        prepare_weightless_rmsnorm_gated_sigmoid,
+    )
+    _BENCHMARK_GENERATORS.setdefault(
         ("attention", "dsv41_selected_attention"), prepare_dsv41_selected_attention
     )
     _BENCHMARK_GENERATORS.setdefault(
@@ -307,11 +333,18 @@ def _load_builtin_generators() -> None:
     _BENCHMARK_GENERATORS.setdefault(("residual", "mhc_mixes"), prepare_mhc_mixes)
     _BENCHMARK_GENERATORS.setdefault(("residual", "mhc_post"), prepare_mhc_post)
     _BENCHMARK_GENERATORS.setdefault(
+        ("residual", "post_norm_residual_pre_norm"),
+        prepare_post_norm_residual_pre_norm,
+    )
+    _BENCHMARK_GENERATORS.setdefault(
         ("residual", "mhc_apply_pre"), prepare_mhc_apply_pre
     )
     _BENCHMARK_GENERATORS.setdefault(("gemm", "bmm"), prepare_dense_bmm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mm"), prepare_mm)
     _BENCHMARK_GENERATORS.setdefault(("gemm", "mv"), prepare_mv)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("gemm", "prepared_fp32_router_gemv"), prepare_prepared_fp32_router_gemv
+    )
     _BENCHMARK_GENERATORS.setdefault(
         ("gemm", "grouped_bf16_projection"), prepare_grouped_bf16_projection
     )
@@ -327,6 +360,10 @@ def _load_builtin_generators() -> None:
         ("quantization", "fp8_with_scale"), prepare_fp8_with_scale
     )
     _BENCHMARK_GENERATORS.setdefault(("moe", "apply"), prepare_moe_apply)
+    _BENCHMARK_GENERATORS.setdefault(
+        ("moe", "routed_input_scale_rmsnorm_sum"),
+        prepare_routed_input_scale_rmsnorm_sum,
+    )
     _BENCHMARK_GENERATORS.setdefault(("moe", "latent_input"), prepare_latent_input)
     _BENCHMARK_GENERATORS.setdefault(
         ("moe", "latent_expert_shared"), prepare_latent_expert_shared

@@ -1170,3 +1170,117 @@ def test_moe_apply_generator_plans_dynamic_mxfp4_activations(
     assert captured["weight_dtype"] == "mxfp4"
     assert captured["internal_activation_dtype"] == "mxfp4"
     assert captured["ispp"] == 320
+
+
+def _muse_apply_request(**overrides: object) -> BenchmarkRequest:
+    parameters = {
+        "model_profile": "muse_spark_tp8",
+        "tokens": 4,
+        "hidden_size": 4096,
+        "intermediate_size": 4096,
+        "num_experts": 256,
+        "num_local_experts": 256,
+        "topk": 8,
+        "tp_size": 8,
+        "ep_size": 1,
+        "ep_rank": 0,
+        "input_dtype": "bfloat16",
+        "router_logits_dtype": "float32",
+        "weight_dtype": "mxfp4",
+        "activation": "silu",
+        "routing_mode": "precomputed_topk",
+        "route_scope": "global",
+        "route_distribution": "router",
+        "routed_scaling_factor": 1.0,
+        "normalize_topk_weights": True,
+        "internal_activation_dtype": "mxfp4",
+        "token_count_scope": "global",
+        "do_finalize": False,
+        "prequantized_input": True,
+        **overrides,
+    }
+    return BenchmarkRequest(
+        family="moe",
+        mode="apply",
+        parameters=parameters,
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"do_finalize": 0}, "boolean"),
+        ({"prequantized_input": "yes"}, "boolean"),
+        (
+            {"weight_dtype": "unquant", "internal_activation_dtype": "input"},
+            "prequantized input requires MXFP4",
+        ),
+    ],
+)
+def test_moe_apply_rejects_invalid_route_output_and_input_contracts(
+    overrides, match
+) -> None:
+    with pytest.raises(BenchmarkCaseError, match=match):
+        prepare_moe_apply(_muse_apply_request(**overrides), None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_moe_apply_defers_finalize_over_prequantized_input() -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    platform = current_platform()
+    if not platform.is_cdna4:
+        pytest.skip("prequantized MXFP4 expert input requires an AMD CDNA4 GPU")
+
+    deferred = prepare_moe_apply(_muse_apply_request(), platform)
+    routes, bias, route_map = deferred.invocation.invoke()
+    finalized = prepare_moe_apply(
+        _muse_apply_request(do_finalize=True, prequantized_input=False), platform
+    ).invocation.invoke()
+
+    # Deferred apply leaves one unweighted row per route for the caller to reduce.
+    assert routes.shape == (4 * 8, 4096) and bias is None
+    assert route_map.numel() == 4 * 8
+    assert finalized.shape == (4, 4096)
+    assert deferred.parameters["do_finalize"] is False
+    assert deferred.parameters["prequantized_input"] is True
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_routed_rmsnorm_sum_reduces_topk_routes_per_token() -> None:
+    from tokenspeed_kernel.benchmark.generators.moe import (
+        prepare_routed_input_scale_rmsnorm_sum,
+    )
+    from tokenspeed_kernel.platform import current_platform
+
+    prepared = prepare_routed_input_scale_rmsnorm_sum(
+        BenchmarkRequest(
+            family="moe",
+            mode="routed_input_scale_rmsnorm_sum",
+            parameters={
+                "model_profile": "muse_spark_tp8",
+                "tokens": 3,
+                "topk": 8,
+                "hidden_size": 256,
+                "input_dtype": "bfloat16",
+                "eps": 1e-8,
+                "weight_offset": 1.0,
+            },
+            solution=None,
+            registration=None,
+            cold_cache=True,
+            seed=42,
+        ),
+        current_platform(),
+    )
+    out = prepared.invocation.invoke()
+
+    assert prepared.registration.mode == "routed_input_scale_rmsnorm_sum"
+    assert out.shape == (3, 256) and out.dtype == torch.bfloat16
+    # Unit-RMS routes summed with weights that sum to one stay within unit RMS
+    # (up to the ~1.1 norm gain).
+    assert torch.all(out.float().square().mean(-1).sqrt() < 1.5)
