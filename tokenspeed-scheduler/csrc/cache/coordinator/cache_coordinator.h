@@ -400,6 +400,10 @@ public:
         // parent, whoever asked (a publication, finish or retraction store, an
         // L3 prefetch).
         HostEvictionCounts lru;
+        // The per-prior tail cap dropped its tail, entry by entry after the
+        // tail's Device blocks (device_resident when the Device kept a pinned
+        // companion).
+        HostEvictionCounts tail_cap;
         // ClearCache, after the Device clear, so never device_resident.
         HostEvictionCounts flush;
     };
@@ -687,7 +691,7 @@ private:
     void cacheDeviceCompletedBlocksForGroup(std::size_t group_index, BlockTable& table, const CompletedPages& completed,
                                             std::uint64_t access_epoch);
     // Records a published tail in the tail table and evicts the tail the
-    // per-prior cap dropped.
+    // per-prior cap dropped, on both tiers.
     void recordPublishedTail(const CompletedPages& completed);
     void recordTail(const ContentHash& prior, const TailPublication& tail);
     // Evicts every group's Device entries under a tail hash: a tail's blocks

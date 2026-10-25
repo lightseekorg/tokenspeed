@@ -1511,9 +1511,24 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
 }
 
 void CacheCoordinator::recordTail(const ContentHash& prior, const TailPublication& tail) {
-    if (const std::optional<TailTable::Tail> dropped = tails_.Add(prior, tail.tail_tokens, tail.hash)) {
-        evictTailEntries(dropped->hash, dropped->tail_tokens, &DeviceEvictionStats::tail_cap);
+    const std::optional<TailTable::Tail> dropped = tails_.Add(prior, tail.tail_tokens, tail.hash);
+    if (!dropped) {
+        return;
     }
+    evictTailEntries(dropped->hash, dropped->tail_tokens, &DeviceEvictionStats::tail_cap);
+    if (host_pool_ == nullptr) {
+        return;
+    }
+    // No probe enumerates a dropped tail, so its Host entries could never be
+    // matched again either. One still in use (by a retracted request's image,
+    // or as a copy's source) stays, and a store still in flight publishes its
+    // entry at the ACK; both age out through ordinary Host eviction.
+    ForEachBoundaryKey(CacheKey{.content_hash = dropped->hash}, dropped->tail_tokens,
+                       [&](std::size_t i, const CacheKey& key) {
+                           if (const std::optional<CacheBlockLocation> location = locationOf(*host_pool_, i, key)) {
+                               evictHostCachedBlock(groups_[i].Id(), *location, &HostEvictionStats::tail_cap);
+                           }
+                       });
 }
 
 CacheKey CacheCoordinator::historyBlockKey(std::size_t group_index, const CompletedPages& completed,

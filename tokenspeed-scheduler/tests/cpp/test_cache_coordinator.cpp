@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -5623,8 +5624,12 @@ protected:
     // Group 0: full attention with 2-token blocks (two blocks per page);
     // group 1: full attention with 4-token blocks; group 2: a sliding window
     // of 3 tokens over 2-token blocks (lookback of one block).
-    TailPublicationTest()
+    TailPublicationTest() : TailPublicationTest(/*with_host=*/false) {}
+    // with_host gives the coordinator a Host tier of the same shape, which
+    // only the test itself feeds.
+    explicit TailPublicationTest(bool with_host)
         : pool_(/*num_lcm_blocks=*/64, {1, 1, 1}),
+          host_pool_(/*num_lcm_blocks=*/64, {1, 1, 1}),
           coordinator_{MakeCoordinator(
               std::vector<CacheGroupSpec>{
                   CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -5634,7 +5639,7 @@ protected:
                                  .cache_blocks_per_lcm_block = 1,
                                  .block_granularity = 2},
               },
-              kP, pool_, /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+              kP, pool_, /*enable_l3_storage=*/false, with_host ? &host_pool_ : nullptr, /*snapshot_pool=*/nullptr,
               /*stream_device_cache_to_host=*/false)} {}
 
     // Admits a request over `tokens` and publishes everything below
@@ -5664,12 +5669,35 @@ protected:
         return tail;
     }
 
+    // Nine requests sharing page 0 end at nine different offsets of page 1:
+    // nine tails under one prior, so the ninth drops the first. before_ninth
+    // sees the first eight tails just before the ninth is published, to pin
+    // or store what the test needs then.
+    std::vector<TailPublication> PublishNineTails(
+        const std::function<void(const std::vector<TailPublication>&)>& before_ninth) {
+        std::vector<TailPublication> tails;
+        for (std::int32_t extra = 1; extra <= TailTable::kMaxTailsPerPrior + 1; ++extra) {
+            std::vector<std::int32_t> tokens = MakeTokens(kP);
+            for (std::int32_t i = 0; i < 3; ++i) {
+                tokens.push_back(1000 * extra + i);
+            }
+            if (extra == TailTable::kMaxTailsPerPrior + 1) {
+                before_ninth(tails);
+            }
+            std::vector<BlockTable> tables(3);
+            tails.push_back(PublishFinal(tables, tokens, /*num_computed_tokens=*/kP + 3));
+            coordinator_.Free(tables);
+        }
+        return tails;
+    }
+
     bool Cached(std::uint32_t group, const std::string& hash, std::int32_t offset) const {
         return coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(group))
             .Contains(pool_, Key(hash, group, offset));
     }
 
     BlockPool pool_;
+    BlockPool host_pool_;
     CacheCoordinator coordinator_;
     std::vector<std::string> hashes_;
 };
@@ -5894,23 +5922,13 @@ TEST_F(TailPublicationTest, CapDropsTheLeastRecentlyUsedTailUnderOnePriorWithIts
 }
 
 TEST_F(TailPublicationTest, CapCountsOnlyTheBlocksItEvictsAndLeavesAPinnedCompanionIndexed) {
-    // Nine tails under one prior: the ninth drops the first, whose first
-    // block in group 0 is still referenced, as a request table would hold it.
-    std::vector<TailPublication> tails;
+    // The ninth tail drops the first, whose first block in group 0 is still
+    // referenced, as a request table would hold it.
     CacheBlockRef pinned;
-    for (std::int32_t extra = 1; extra <= TailTable::kMaxTailsPerPrior + 1; ++extra) {
-        std::vector<std::int32_t> tokens = MakeTokens(kP);
-        for (std::int32_t i = 0; i < 3; ++i) {
-            tokens.push_back(1000 * extra + i);
-        }
-        if (extra == TailTable::kMaxTailsPerPrior + 1) {
-            pinned = coordinator_.GroupPrefixIndex(0).Find(pool_, Key(tails.front().hash, 0, 0));
-            ASSERT_TRUE(static_cast<bool>(pinned));
-        }
-        std::vector<BlockTable> tables(3);
-        tails.push_back(PublishFinal(tables, tokens, /*num_computed_tokens=*/kP + 3));
-        coordinator_.Free(tables);
-    }
+    const std::vector<TailPublication> tails = PublishNineTails([&](const std::vector<TailPublication>& published) {
+        pinned = coordinator_.GroupPrefixIndex(0).Find(pool_, Key(published.front().hash, 0, 0));
+    });
+    ASSERT_TRUE(static_cast<bool>(pinned));
     EXPECT_EQ(coordinator_.TailCapEvictions(), 1);
     EXPECT_TRUE(Cached(0, tails.front().hash, 0)) << "the pinned companion stays indexed";
     EXPECT_FALSE(Cached(0, tails.front().hash, 1));
@@ -5921,6 +5939,73 @@ TEST_F(TailPublicationTest, CapCountsOnlyTheBlocksItEvictsAndLeavesAPinnedCompan
     // its pinned first one.
     EXPECT_EQ(coordinator_.DeviceEvictions().tail_cap.blocks, 4u);
     EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 0u) << "the pool never ran short";
+}
+
+// The tail cap with a Host tier: a dropped tail can never be matched again,
+// so its Host entries leave with its Device blocks.
+class TailCapHostTest : public TailPublicationTest {
+protected:
+    TailCapHostTest() : TailPublicationTest(/*with_host=*/true) {}
+
+    // Copies every Device entry of a published tail to the Host, as a
+    // write-through store's ACK publishes it. Returns how many it copied.
+    std::int32_t StoreOnHost(const TailPublication& tail) {
+        std::int32_t stored = 0;
+        coordinator_.ForEachBoundaryKey(
+            CacheKey{.content_hash = tail.hash}, tail.tail_tokens, [&](std::size_t i, const CacheKey& key) {
+                if (!coordinator_.GroupPrefixIndex(static_cast<std::int32_t>(i)).Contains(pool_, key)) {
+                    return;
+                }
+                CacheBlockRef block = host_pool_.AcquireBlock(key.group_id);
+                coordinator_.CacheHostBlock(block, key);
+                ++stored;
+            });
+        return stored;
+    }
+};
+
+TEST_F(TailCapHostTest, CapDropsTheTailsHostEntriesToo) {
+    // The two oldest tails are on the Host before the ninth arrives.
+    const std::vector<TailPublication> tails = PublishNineTails([&](const std::vector<TailPublication>& published) {
+        EXPECT_EQ(StoreOnHost(published[0]), 5) << "two, one and two blocks in groups 0, 1 and 2";
+        EXPECT_EQ(StoreOnHost(published[1]), 5);
+    });
+    EXPECT_EQ(coordinator_.TailCapEvictions(), 1);
+    EXPECT_EQ(coordinator_.NumTailEntries(), static_cast<std::size_t>(TailTable::kMaxTailsPerPrior));
+    EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 5) << "only the second tail's five Host entries are left";
+    coordinator_.ForEachBoundaryKey(
+        CacheKey{.content_hash = tails[0].hash}, tails[0].tail_tokens, [&](std::size_t, const CacheKey& key) {
+            EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(key)) << "group " << key.group_id;
+            EXPECT_FALSE(Cached(key.group_id, tails[0].hash, key.page_offset)) << "group " << key.group_id;
+        });
+    coordinator_.ForEachBoundaryKey(
+        CacheKey{.content_hash = tails[1].hash}, tails[1].tail_tokens, [&](std::size_t, const CacheKey& key) {
+            EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(key)) << "group " << key.group_id;
+        });
+    // Each entry leaves after the Device's, so none is Device-resident.
+    EXPECT_EQ(coordinator_.HostEvictions().tail_cap.blocks, 5u);
+    EXPECT_EQ(coordinator_.HostEvictions().tail_cap.device_resident, 0u);
+    EXPECT_EQ(coordinator_.DeviceEvictions().tail_cap.blocks, 5u) << "the Device side is unchanged";
+}
+
+TEST_F(TailCapHostTest, CapLeavesAPinnedHostEntryOfTheTail) {
+    // The two oldest tails are on the Host before the ninth arrives, and a
+    // load-back reads the first one's group 0 block.
+    CacheBlockRef held;
+    const std::vector<TailPublication> tails = PublishNineTails([&](const std::vector<TailPublication>& published) {
+        EXPECT_EQ(StoreOnHost(published[0]), 5);
+        EXPECT_EQ(StoreOnHost(published[1]), 5);
+        held = coordinator_.AcquireHostCachedBlock(Key(published[0].hash, 0));
+    });
+    ASSERT_TRUE(static_cast<bool>(held));
+    EXPECT_EQ(coordinator_.TailCapEvictions(), 1);
+    EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(tails[0].hash, 0))) << "the load-back's source stays";
+    EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(tails[0].hash, 0, /*page_offset=*/1)));
+    EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(tails[0].hash, 1)));
+    EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 6);
+    EXPECT_EQ(coordinator_.HostEvictions().tail_cap.blocks, 4u) << "only the unpinned ones count: 1, 1 and 2";
+    held.reset();
+    EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(tails[0].hash, 0))) << "an ordinary entry again";
 }
 
 // ---------------------------------------------------------------------------

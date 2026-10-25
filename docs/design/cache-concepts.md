@@ -842,7 +842,8 @@ Its responsibilities:
   of the offsets published under each last-full-page hash, capped at eight
   per prior in least-recently-used order — a hit or a republication keeps a
   tail young, so a hot shared tail outlives any number of one-off prompts
-  ending in the same page (the dropped tail's blocks are evicted;
+  ending in the same page (the dropped tail's blocks are evicted from the
+  Device and the Host tier alike, except those still pinned;
   `Scheduler::TailCapEvictions` counts them) — so a probe can enumerate the
   candidate `T`s without knowing them. A tail's blocks are usable only
   together: evicting one Device block of a tail hash evicts every group's
