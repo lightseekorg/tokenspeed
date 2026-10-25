@@ -27,7 +27,6 @@ Exercises the production collectives, candidate selection and attention merge.
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 
 
-
 def check_attention_merge(group) -> None:
     import torch
     import torch.distributed as dist
@@ -61,13 +60,9 @@ def check_attention_merge(group) -> None:
             gathered = backend.nccl.all_gather(
                 lse.unsqueeze(0).contiguous(), group, dim=0
             )
-            weighted, global_lse = dcp_weight_for_reduce_scatter(
-                output, gathered, rank
-            )
+            weighted, global_lse = dcp_weight_for_reduce_scatter(output, gathered, rank)
             reduced = reduce_scatter(weighted, group).movedim(0, 1)
-            return dcp_apply_sink(
-                reduced, global_lse, sink, dtype=output.dtype
-            )
+            return dcp_apply_sink(reduced, global_lse, sink, dtype=output.dtype)
 
         expected = reference()
         torch.testing.assert_close(merge(), expected, rtol=0, atol=0, equal_nan=True)
