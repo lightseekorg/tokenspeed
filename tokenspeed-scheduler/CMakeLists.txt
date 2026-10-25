@@ -113,6 +113,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_prefix_hasher.cpp
         tests/cpp/test_prefix_index.cpp
         tests/cpp/test_tail_table.cpp
+        tests/cpp/test_boundary_tree.cpp
         tests/cpp/test_block_pool.cpp
         tests/cpp/test_cache_block_ref.cpp
         tests/cpp/test_full_attn_group.cpp

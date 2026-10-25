@@ -867,6 +867,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             prospective_victims.push_back(victim);
         }
     }
+    if (effective.completed_pages) {
+        linkPublication(*effective.completed_pages);
+    }
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         BlockTable& table = *demands[i].table;
         if (effective.completed_pages) {
@@ -902,7 +905,11 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         }
     }
     if (effective.completed_pages) {
-        recordPublishedTail(*effective.completed_pages);
+        const CompletedPages& completed = *effective.completed_pages;
+        // A model without a prefix-closed group may register nothing under
+        // the deepest boundary linked (a chunk end of State groups alone).
+        syncTreeNode(completed.tail ? completed.tail->hash : completed.prefix_hashes.back());
+        recordPublishedTail(completed);
     }
     for (const auto& [group_id, location] : prospective_victims) {
         if (!evictCachedBlock(group_id, location, &DeviceEvictionStats::admission)) {

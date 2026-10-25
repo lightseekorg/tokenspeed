@@ -886,6 +886,40 @@ TEST_F(StateCheckpointSuite, ADeviceKvHitLoadsOnlyTheHostCheckpoint) {
     EXPECT_EQ(after.prefix_hits.host_gain_tokens - before.prefix_hits.host_gain_tokens, 8u);
 }
 
+// A Host hit publishes its extension pages on the Device; the next prompt
+// resumes on them and loads only the Host pages and checkpoints beyond them
+// (BoundaryTreeCoordinatorTest.AHostExtensionKeepsItsPagesLinkedToTheirParents
+// checks the tree nodes they leave).
+TEST_F(StateCheckpointSuite, AHostHitResumesOnAnEarlierHostHitsPages) {
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    // r1's prompt end publishes pages 0 and 1 with the checkpoint at 8; r2
+    // resumes there and its prompt end publishes pages 2 and 3 with the
+    // checkpoint at 16. All of it streams to the Host.
+    for (const std::int32_t prompt_tokens : {8, 16}) {
+        const std::string id = "r" + std::to_string(prompt_tokens);
+        Submit(RequestWithTokens(id, MakeTokens(prompt_tokens)));
+        AckWriteBacks(PlanOnce());
+        SendForwardDone(id, {101});
+        AckWriteBacks(PlanOnce());  // prompt end
+        SendForwardDone(id, {102});
+        SendFinish(id);
+        AckWriteBacks(PlanOnce());
+    }
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+
+    // A Host hit at 8 brings pages 0 and 1 back to the Device; the next
+    // prompt resumes at 16 on them plus the Host's pages 2 and 3, which its
+    // admission publishes on the Device.
+    std::vector<std::int32_t> prompt = MakeTokens(8);
+    prompt.push_back(77);
+    ASSERT_EQ(Probe("warm", prompt).prefix_tokens, 8);
+    prompt = MakeTokens(16);
+    prompt.push_back(77);
+    const Resume hit = Probe("hit", prompt);
+    EXPECT_EQ(hit.prefix_tokens, 16);
+    EXPECT_EQ(hit.load_rows, 2 + 3) << "pages 2 and 3 and one state per group";
+}
+
 class StateOnlySuite : public StateCheckpointSuite {
 protected:
     SchedulerConfig MakeConfig() override {

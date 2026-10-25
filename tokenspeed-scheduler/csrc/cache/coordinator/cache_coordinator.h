@@ -36,14 +36,13 @@
 #include "cache/coordinator/group_geometry.h"
 #include "cache/cache_group.h"
 #include "cache/core/cache_types.h"
+#include "cache/prefix/boundary_tree.h"
 #include "cache/prefix/tail_table.h"
 #include "utils.h"
 
 namespace tokenspeed {
 
 struct CacheCoordinatorTestAccess;
-
-enum class CacheTier { kDevice, kHost };
 
 // The first block (page offset) of a tail a group needs: 0 for a group that
 // keeps every row; for a sliding group the block holding the first row of the
@@ -722,8 +721,21 @@ private:
     // reference to it.
     std::optional<CacheBlockLocation> locationOf(const BlockPool& pool, std::size_t group_index,
                                                  const CacheKey& key) const;
-    // Drops a tail hash from the tail table once no tier holds an entry for it.
-    void pruneTailIfUnreferenced(const ContentHash& hash);
+    // Adds the tree nodes of a publication before any group registers under
+    // them, so a checkpoint counts in every ancestor as it is published: one
+    // per newly hashed page under the page before it, and the tail under the
+    // last page. A page below them whose node is gone (a model without a
+    // prefix-closed group keeps no entry for some pages) gets one again, so the
+    // tree stays whole; a node that exists keeps its links, but one started
+    // without a known parent gets its boundary and, past page 0, is linked
+    // under the page before it.
+    void linkPublication(const CompletedPages& completed);
+    // Brings the tree node of `hash` back in step with the indexes after an
+    // entry under it left either tier: its checkpoint flags and Host presence
+    // follow the entries that remain, and a node no tier holds and no child
+    // hangs under leaves the tree with its tail hint, as does each parent left
+    // the same way.
+    void syncTreeNode(const ContentHash& hash);
     // Whether an imaged slot belongs to the page the computed frontier ends
     // inside: the restored request writes and later republishes those blocks,
     // so they are copied, never claimed. Every slot below is immutable.
@@ -760,6 +772,9 @@ private:
     std::vector<HostParentCandidate> host_parent_candidates_;
     std::vector<std::int32_t> host_touched_parents_;
     TailTable tails_;
+    // How the boundaries either tier indexes chain, in step with the indexes
+    // (bookkeeping: no match or eviction reads it).
+    BoundaryTree boundary_tree_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
     // Accounting only.

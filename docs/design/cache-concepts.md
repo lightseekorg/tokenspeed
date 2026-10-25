@@ -642,6 +642,23 @@ Perception rules per directory:
   (`Scheduler.tail_cap_evictions`). The probe enumerates it to find the
   candidate boundaries inside a page; eviction of a tail's block removes its
   entry.
+* **`BoundaryTree`** (`boundary_tree.h`) — the coordinator's tree of the
+  boundaries it indexes, shared by both tiers: one node per content
+  hash either tier holds, linked to the chain hash of the page before it (a
+  tail to its prior), counting per tier the *checkpoint boundaries* —
+  boundaries where some State group holds a checkpoint on that tier — in its
+  subtree, and listing the Host pages no Host page continues (the Host
+  leaves). A publication links its new pages and tail — and any node of its
+  pages that an entry started without a parent (below) — before any group
+  registers under them, so a checkpoint counts in every ancestor as it is
+  published; a node lives while either tier holds its hash or a child hangs
+  under it (a page whose entries all left but whose successors remain is a
+  *gap*), and goes with its tail hint once neither holds. An entry registered
+  with no node yet (an L3 GET, a store whose Device entry left before its ACK,
+  a restore's republication) starts one without a parent. It is bookkeeping
+  kept in step with the indexes: no match reads it, and its walks follow
+  parent pointers and insertion-ordered lists, never the map, so mirrored
+  ranks agree.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 

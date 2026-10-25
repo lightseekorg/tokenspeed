@@ -6119,6 +6119,563 @@ TEST_F(StateCheckpointCascadeTest, PlannedCheckpointVictimsLeaveTogether) {
     coordinator_.Free(tables);
 }
 
+// ---------------------------------------------------------------------------
+// The boundary tree through the coordinator: a publication links its nodes
+// before any group registers under them, and a node lives exactly while some
+// tier holds its hash or a child hangs under it. K3 shape: P = 4, one Full
+// group (one block per page, four per parent) and three State groups (one per
+// parent), on the Device and the Host tier alike; the Host is fed only by the
+// test.
+// ---------------------------------------------------------------------------
+class BoundaryTreeCoordinatorTest : public ::testing::Test {
+protected:
+    static constexpr std::int32_t kP = 4;
+    static constexpr std::size_t kDevice = static_cast<std::size_t>(CacheTier::kDevice);
+    using Node = BoundaryTree::Node;
+    using CheckpointBoundaryCounts = std::array<std::int32_t, 2>;  // checkpoint_boundaries_in_subtree by CacheTier
+
+    BoundaryTreeCoordinatorTest()
+        : pool_(/*num_lcm_blocks=*/32, {4, 1, 1, 1}),
+          host_pool_(/*num_lcm_blocks=*/32, {4, 1, 1, 1}),
+          coordinator_{MakeCoordinator(
+              std::vector<CacheGroupSpec>{
+                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
+              kP, pool_, /*enable_l3_storage=*/false, &host_pool_, /*snapshot_pool=*/nullptr,
+              /*stream_device_cache_to_host=*/false)} {}
+
+    const BoundaryTree& Tree() const { return CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator_); }
+
+    const Node& NodeOf(const std::string& hash) const {
+        const Node* node = Tree().Find(hash);
+        _assert(node != nullptr, "the hash has a tree node");
+        return *node;
+    }
+
+    // Admits a request over `tokens` and publishes all of them as a final
+    // frontier: the full pages (hashes_), the tail at an unaligned end, and
+    // every State group's checkpoint at the end. Returns the tail.
+    std::optional<TailPublication> PublishFinal(std::vector<BlockTable>& tables,
+                                                const std::vector<std::int32_t>& tokens) {
+        const auto num_tokens = static_cast<std::int32_t>(tokens.size());
+        EXPECT_TRUE(AdmitForTest(coordinator_, tables, num_tokens));
+        std::vector<std::vector<std::int32_t>> pages;
+        for (std::int32_t page = 0; page < num_tokens / kP; ++page) {
+            pages.emplace_back(tokens.begin() + page * kP, tokens.begin() + (page + 1) * kP);
+        }
+        hashes_ = ContentHashes(pages);
+        std::optional<TailPublication> tail;
+        if (num_tokens % kP != 0) {
+            tail = TailPublication{
+                .tail_tokens = num_tokens % kP,
+                .hash = HashPrefixPage(token_span(tokens).subspan(pages.size() * kP),
+                                       hashes_.empty() ? std::string{} : hashes_.back()),
+            };
+        }
+        const RequestProgress progress{
+            .completed_pages = CompletedPages{.prefix_hashes = hashes_,
+                                              .first_new_prefix_page = 0,
+                                              .tail = tail,
+                                              .publish_state = true,
+                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
+            .num_computed_tokens = num_tokens,
+        };
+        coordinator_.CacheCompletedBlocks(tables, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+        return tail;
+    }
+
+    // Registers a Host copy of a Device entry, as a write-through store's ACK
+    // does.
+    void StoreOnHost(const CacheKey& key) {
+        CacheBlockRef block = host_pool_.AcquireBlock(key.group_id);
+        coordinator_.CacheHostBlock(block, key);
+    }
+
+    // A planned Device eviction of the entry under `key`, with its cascade.
+    void EvictOnDevice(const CacheKey& key) {
+        const std::optional<CacheBlockLocation> location =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, key.group_id, key);
+        ASSERT_TRUE(location.has_value());
+        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator_, key.group_id, *location));
+    }
+
+    BlockPool pool_;
+    BlockPool host_pool_;
+    CacheCoordinator coordinator_;
+    std::vector<std::string> hashes_;
+};
+
+TEST_F(BoundaryTreeCoordinatorTest, TreeNodesFollowPublication) {
+    std::vector<BlockTable> tables(4);
+    // 22 tokens: five pages and a tail of 2, the checkpoint under the tail.
+    const std::optional<TailPublication> tail = PublishFinal(tables, MakeTokens(22));
+    coordinator_.Free(tables);
+    ASSERT_TRUE(tail.has_value());
+    ASSERT_EQ(hashes_.size(), 5u);
+
+    EXPECT_EQ(Tree().Size(), 6u);
+    EXPECT_EQ(NodeOf(hashes_[0]).parent, nullptr);
+    for (std::size_t page = 0; page < hashes_.size(); ++page) {
+        const Node& node = NodeOf(hashes_[page]);
+        if (page > 0) {
+            EXPECT_EQ(node.parent, &NodeOf(hashes_[page - 1])) << "page " << page;
+        }
+        EXPECT_EQ(node.boundary_tokens, static_cast<std::int32_t>(page + 1) * kP);
+        EXPECT_EQ(node.tail_tokens, 0);
+        // The checkpoint at 22 is the only checkpoint boundary; every page
+        // below counts it.
+        EXPECT_FALSE(node.has_checkpoint[kDevice]) << "page " << page;
+        EXPECT_EQ(node.checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0})) << "page " << page;
+    }
+    const Node& tail_node = NodeOf(tail->hash);
+    EXPECT_EQ(tail_node.parent, &NodeOf(hashes_[4]));
+    EXPECT_EQ(tail_node.boundary_tokens, 22);
+    EXPECT_EQ(tail_node.tail_tokens, 2);
+    EXPECT_TRUE(tail_node.has_checkpoint[kDevice]);
+    EXPECT_EQ(tail_node.checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}));
+    EXPECT_EQ(Tree().FirstHostLeaf(), nullptr) << "nothing on the Host";
+}
+
+// The in-forward checkpoint at 8 sits on a page the same publication
+// hashes. Its nodes are linked before the State groups register, so it
+// counts in its ancestors as it is published -- by a finish
+// (CacheCompletedBlocks) and by the next chunk's admission alike.
+TEST_F(BoundaryTreeCoordinatorTest, ANewCheckpointCountsInItsAncestorsWhenItIsPublished) {
+    for (const bool by_admission : {false, true}) {
+        SCOPED_TRACE(by_admission);
+        const std::vector<std::int32_t> tokens = MakeTokens(12, by_admission ? 100 : 1);
+        // The chunk [0, 12) writes the state at 8 into a block of its own.
+        std::vector<BlockTable> tables(4);
+        std::optional<CacheCoordinator::AdmissionResult> chunk =
+            AdmitForTest(coordinator_, tables, coordinator_.ProbePrefix({}), GroupDemand{.extent = DenseGrowth{12}},
+                         RequestProgress{}, StateStep{.kind = StateStep::Kind::kRotate, .checkpoint = true});
+        ASSERT_TRUE(chunk.has_value());
+        std::vector<CacheBlockRef> checkpoints = std::move(chunk->state_checkpoint_blocks);
+        const std::vector<std::string> hashes = ContentHashes({{tokens.begin(), tokens.begin() + 4},
+                                                               {tokens.begin() + 4, tokens.begin() + 8},
+                                                               {tokens.begin() + 8, tokens.end()}});
+        const RequestProgress progress{
+            .completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                              .first_new_prefix_page = 0,
+                                              .state_checkpoint_pages = 2,
+                                              .state_checkpoint_blocks = checkpoints},
+            .num_computed_tokens = 12,
+        };
+        if (by_admission) {
+            ASSERT_TRUE(AdmitForTest(coordinator_, tables, coordinator_.ProbePrefix({}),
+                                     GroupDemand{.extent = DenseGrowth{4}}, progress));
+        } else {
+            coordinator_.CacheCompletedBlocks(tables, progress,
+                                              CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+        }
+        EXPECT_TRUE(NodeOf(hashes[1]).has_checkpoint[kDevice]);
+        EXPECT_EQ(NodeOf(hashes[1]).parent, &NodeOf(hashes[0]));
+        EXPECT_EQ(NodeOf(hashes[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}));
+        EXPECT_EQ(NodeOf(hashes[1]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}));
+        EXPECT_EQ(NodeOf(hashes[2]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 0}))
+            << "the page after the checkpoint";
+        coordinator_.Free(tables);
+    }
+}
+
+TEST_F(BoundaryTreeCoordinatorTest, ANodeLivesWhileEitherTierHoldsItsHash) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(12));  // three pages, the checkpoint under the last
+    coordinator_.Free(tables);
+    // The last page and its checkpoint are on the Host too.
+    for (std::uint32_t group = 0; group < 4; ++group) {
+        StoreOnHost(Key(hashes_[2], group));
+    }
+    const Node* last = &NodeOf(hashes_[2]);
+    EXPECT_TRUE(last->on_host);
+    EXPECT_EQ(NodeOf(hashes_[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 1}));
+    EXPECT_EQ(Tree().FirstHostLeaf(), last);
+
+    // The Device evicts the page and, with it, the checkpoint: the Host keeps
+    // the node, linked as it was.
+    EvictOnDevice(Key(hashes_[2], 0));
+    ASSERT_EQ(Tree().Find(hashes_[2]), last);
+    EXPECT_EQ(last->parent, &NodeOf(hashes_[1]));
+    EXPECT_EQ(last->has_checkpoint, (std::array<bool, 2>{false, true}));
+    EXPECT_EQ(NodeOf(hashes_[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 1}));
+
+    // The Host evicts the checkpoint (its cascade takes every State group's)
+    // and then the page: the node leaves, the pages below stay.
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key(hashes_[2], 2)));
+    EXPECT_EQ(last->has_checkpoint, (std::array<bool, 2>{false, false}));
+    EXPECT_EQ(NodeOf(hashes_[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 0}));
+    EXPECT_TRUE(last->on_host);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key(hashes_[2], 0)));
+    EXPECT_EQ(Tree().Find(hashes_[2]), nullptr);
+    EXPECT_EQ(Tree().Size(), 2u);
+    EXPECT_EQ(NodeOf(hashes_[1]).first_child, nullptr);
+    EXPECT_EQ(Tree().FirstHostLeaf(), nullptr);
+}
+
+TEST_F(BoundaryTreeCoordinatorTest, AGapNodeKeepsItsChildrenLinked) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(12));
+    coordinator_.Free(tables);
+
+    // The middle page leaves the Device; the last page still hangs under it.
+    EvictOnDevice(Key(hashes_[1], 0));
+    const Node* gap = Tree().Find(hashes_[1]);
+    ASSERT_NE(gap, nullptr);
+    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(hashes_[1], 0), /*tail_tokens=*/0),
+              CacheCoordinator::BoundaryResidency::kNone);
+    EXPECT_EQ(gap->first_child, &NodeOf(hashes_[2]));
+    EXPECT_EQ(NodeOf(hashes_[2]).parent, gap);
+    EXPECT_EQ(gap->checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}))
+        << "it still counts the checkpoint below it";
+
+    // Once the page below leaves too, nothing hangs under the gap and it goes
+    // with it.
+    EvictOnDevice(Key(hashes_[2], 0));
+    EXPECT_EQ(Tree().Find(hashes_[2]), nullptr);
+    EXPECT_EQ(Tree().Find(hashes_[1]), nullptr);
+    EXPECT_EQ(Tree().Size(), 1u);
+    EXPECT_EQ(NodeOf(hashes_[0]).first_child, nullptr);
+    EXPECT_EQ(NodeOf(hashes_[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 0}));
+}
+
+TEST_F(BoundaryTreeCoordinatorTest, ClearCacheEmptiesTheBoundaryTree) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(12));
+    coordinator_.Free(tables);
+    StoreOnHost(Key(hashes_[0], 0));
+    for (std::uint32_t group = 0; group < 4; ++group) {
+        StoreOnHost(Key(hashes_[2], group));
+    }
+    ASSERT_EQ(Tree().Size(), 3u);
+
+    ASSERT_TRUE(coordinator_.ClearCache());
+    EXPECT_EQ(Tree().Size(), 0u);
+    EXPECT_EQ(Tree().FirstHostLeaf(), nullptr);
+
+    // The next publication starts the tree afresh.
+    std::vector<BlockTable> next(4);
+    PublishFinal(next, MakeTokens(8));
+    coordinator_.Free(next);
+    EXPECT_EQ(Tree().Size(), 2u);
+    EXPECT_EQ(NodeOf(hashes_[1]).parent, &NodeOf(hashes_[0]));
+    EXPECT_EQ(NodeOf(hashes_[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}));
+}
+
+TEST_F(BoundaryTreeCoordinatorTest, ClearDeviceCacheKeepsTheNodesHostEntriesNeed) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(16));  // four pages, the checkpoint under the last
+    coordinator_.Free(tables);
+    // The Host holds the first page and the last with its checkpoint.
+    StoreOnHost(Key(hashes_[0], 0));
+    for (std::uint32_t group = 0; group < 4; ++group) {
+        StoreOnHost(Key(hashes_[3], group));
+    }
+
+    ASSERT_TRUE(coordinator_.ClearDeviceCache());
+    EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 5) << "Host L2 is untouched";
+    // The two pages between hold nothing any more but link the last one.
+    EXPECT_EQ(Tree().Size(), 4u);
+    for (std::size_t page = 1; page < 4; ++page) {
+        EXPECT_EQ(NodeOf(hashes_[page]).parent, &NodeOf(hashes_[page - 1])) << "page " << page;
+    }
+    for (const std::string& hash : hashes_) {
+        EXPECT_EQ(NodeOf(hash).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 1}));
+    }
+    EXPECT_FALSE(NodeOf(hashes_[1]).on_host);
+    // The first page is a Host leaf too: no child of it is on the Host.
+    EXPECT_EQ(Tree().FirstHostLeaf(), &NodeOf(hashes_[0]));
+    EXPECT_EQ(NodeOf(hashes_[0]).next_host_leaf, &NodeOf(hashes_[3]));
+}
+
+// The tail hint goes exactly when the last entry under the tail hash leaves
+// either tier, as before the boundary tree (TailPublicationTest's
+// EvictingOneTailBlockTakesItsCompanionsAndPrunesTheTable), and the tail's
+// node goes with it.
+TEST_F(BoundaryTreeCoordinatorTest, TailHintPruningIsUnchangedWithoutPendingStores) {
+    std::vector<BlockTable> first(4);
+    const TailPublication device_only = *PublishFinal(first, MakeTokens(22));
+    coordinator_.Free(first);
+    std::vector<BlockTable> second(4);
+    const TailPublication host_too = *PublishFinal(second, MakeTokens(22, 100));
+    coordinator_.Free(second);
+    StoreOnHost(Key(host_too.hash, 0));
+    ASSERT_EQ(coordinator_.NumTailEntries(), 2u);
+
+    // One block of a Device-only tail takes the rest; the hint and the node
+    // leave with the last of them.
+    EvictOnDevice(Key(device_only.hash, 1));
+    EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(device_only.hash, 0), device_only.tail_tokens),
+              CacheCoordinator::BoundaryResidency::kNone);
+    EXPECT_EQ(coordinator_.NumTailEntries(), 1u);
+    EXPECT_EQ(Tree().Find(device_only.hash), nullptr);
+
+    // The Host still holds the other tail's KV block: hint and node stay
+    // until it leaves too.
+    EvictOnDevice(Key(host_too.hash, 0));
+    EXPECT_EQ(coordinator_.NumTailEntries(), 1u);
+    ASSERT_NE(Tree().Find(host_too.hash), nullptr);
+    EXPECT_TRUE(NodeOf(host_too.hash).on_host);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key(host_too.hash, 0)));
+    EXPECT_EQ(coordinator_.NumTailEntries(), 0u);
+    EXPECT_EQ(Tree().Find(host_too.hash), nullptr);
+    EXPECT_EQ(Tree().Size(), 10u) << "both sessions' five pages stay on the Device";
+}
+
+// A Host entry no publication linked -- an L3 GET, or a store whose Device
+// entry left before its ACK -- starts a node without a parent.
+TEST_F(BoundaryTreeCoordinatorTest, AHostEntryWithoutAPublicationStartsANodeOfItsOwn) {
+    StoreOnHost(Key("orphan", 0));
+    StoreOnHost(Key("orphan", 1));
+    const Node& node = NodeOf("orphan");
+    EXPECT_EQ(node.parent, nullptr);
+    EXPECT_EQ(node.boundary_tokens, 0);
+    EXPECT_TRUE(node.on_host);
+    EXPECT_EQ(node.has_checkpoint, (std::array<bool, 2>{false, true}));
+    EXPECT_EQ(Tree().FirstHostLeaf(), &node);
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key("orphan", 0)));
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key("orphan", 1)));
+    EXPECT_EQ(Tree().Size(), 0u);
+}
+
+// A restore's republished Device entry whose node left while no tier held the
+// hash starts a node without a parent, and its eviction takes the node along.
+TEST_F(BoundaryTreeCoordinatorTest, ARepublishedDeviceEntryWithoutANodeStartsOneOfItsOwn) {
+    {
+        CacheBlockRef page = pool_.AcquireBlock(0);
+        coordinator_.CacheDeviceBlock(page, Key("restored", 0), /*logical_block_index=*/0,
+                                      CacheBoundaryKind::kEndpoint);
+        CacheBlockRef checkpoint = pool_.AcquireBlock(1);
+        coordinator_.CacheDeviceBlock(checkpoint, Key("restored", 1), /*logical_block_index=*/-1,
+                                      CacheBoundaryKind::kEndpoint);
+    }
+    const Node* node = Tree().Find("restored");
+    ASSERT_NE(node, nullptr);
+    EXPECT_EQ(node->parent, nullptr);
+    EXPECT_EQ(node->boundary_tokens, 0);
+    EXPECT_FALSE(node->on_host);
+    EXPECT_EQ(node->has_checkpoint, (std::array<bool, 2>{true, false}));
+    EXPECT_EQ(node->checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}));
+    // The page leaves the Device and takes the checkpoint along.
+    EvictOnDevice(Key("restored", 0));
+    EXPECT_EQ(Tree().Size(), 0u);
+}
+
+// A request holds a page whose node an entry started without a parent -- a
+// Host page (an L3 GET's, or a write-through ACK's after its Device entry
+// left) its admission loaded and published on the Device, as a Host
+// extension is -- and publishes the pages after it. The search for their
+// parent goes on past that node, so the publication links it under the page
+// before it too, which then counts the Host page and the Device checkpoint
+// boundary at 12.
+TEST_F(BoundaryTreeCoordinatorTest, APublicationLinksTheNodeOfAPageItHolds) {
+    const std::vector<std::int32_t> tokens = MakeTokens(12);
+    const std::vector<std::string> hashes = ContentHashes({{tokens.begin(), tokens.begin() + 4},
+                                                           {tokens.begin() + 4, tokens.begin() + 8},
+                                                           {tokens.begin() + 8, tokens.end()}});
+    StoreOnHost(Key(hashes[1], 0));
+    std::vector<BlockTable> tables(4);
+    ASSERT_TRUE(AdmitForTest(coordinator_, tables, 12));
+    const std::uint64_t epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_);
+    for (std::int32_t page = 0; page < 2; ++page) {
+        coordinator_.CacheFullBlocks(tables, std::span{hashes}.subspan(page, 1), epoch, /*first_slot=*/page,
+                                     CacheBoundaryKind::kChunk);
+    }
+    ASSERT_EQ(NodeOf(hashes[1]).parent, nullptr);
+    const RequestProgress progress{
+        .completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                          .first_new_prefix_page = 2,
+                                          .publish_state = true,
+                                          .boundary_kind = CacheBoundaryKind::kEndpoint},
+        .num_computed_tokens = 12,
+    };
+    coordinator_.CacheCompletedBlocks(tables, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_));
+    coordinator_.Free(tables);
+
+    EXPECT_EQ(NodeOf(hashes[0]).parent, nullptr);
+    EXPECT_EQ(NodeOf(hashes[1]).parent, &NodeOf(hashes[0]));
+    EXPECT_EQ(NodeOf(hashes[1]).boundary_tokens, 2 * kP);
+    EXPECT_EQ(NodeOf(hashes[2]).parent, &NodeOf(hashes[1]));
+    EXPECT_EQ(NodeOf(hashes[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 0}));
+    EXPECT_EQ(NodeOf(hashes[0]).children_on_host, 1);
+    EXPECT_EQ(Tree().FirstHostLeaf(), &NodeOf(hashes[1]));
+}
+
+// The Host's checkpoint at 8 (an L3 GET's, or a write-through ACK's after its
+// Device entry left) starts a node without a parent. The publication of the
+// pages through it links that node under the page before it, which then counts
+// the Host checkpoint boundary and the Device checkpoint boundary at 12 under
+// it, as it would had the publication come first.
+TEST_F(BoundaryTreeCoordinatorTest, APublicationLinksTheNodeAHostEntryStarted) {
+    const std::vector<std::int32_t> tokens = MakeTokens(12);
+    const std::vector<std::string> hashes = ContentHashes({{tokens.begin(), tokens.begin() + 4},
+                                                           {tokens.begin() + 4, tokens.begin() + 8},
+                                                           {tokens.begin() + 8, tokens.end()}});
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        StoreOnHost(Key(hashes[1], group));
+    }
+    ASSERT_EQ(NodeOf(hashes[1]).parent, nullptr);
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, tokens);
+    coordinator_.Free(tables);
+    ASSERT_EQ(hashes_, hashes);
+
+    EXPECT_EQ(NodeOf(hashes[1]).parent, &NodeOf(hashes[0]));
+    EXPECT_EQ(NodeOf(hashes[1]).boundary_tokens, 2 * kP);
+    EXPECT_EQ(NodeOf(hashes[2]).parent, &NodeOf(hashes[1]));
+    EXPECT_EQ(NodeOf(hashes[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{1, 1}));
+    EXPECT_EQ(NodeOf(hashes[0]).children_on_host, 1);
+    EXPECT_EQ(Tree().FirstHostLeaf(), &NodeOf(hashes[1]));
+
+    // Both checkpoint boundaries leave; the pages stay on the Device.
+    EvictOnDevice(Key(hashes[2], 1));
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator_, Key(hashes[1], 1)));
+    EXPECT_EQ(NodeOf(hashes[0]).checkpoint_boundaries_in_subtree, (CheckpointBoundaryCounts{0, 0}));
+    EXPECT_EQ(NodeOf(hashes[0]).children_on_host, 0);
+    EXPECT_EQ(Tree().Size(), 3u);
+}
+
+// A Host hit at 16 on the Device's pages 0 and 1: its admission publishes
+// the Host's pages 2 and 3 on the Device one by one, with no publication to
+// link them. They still hang under the pages before them, since some tier
+// held each of them from its first publication on. The hit's checkpoints
+// stay private, so the Host alone holds those at 16.
+TEST_F(BoundaryTreeCoordinatorTest, AHostExtensionKeepsItsPagesLinkedToTheirParents) {
+    std::vector<std::int32_t> tokens = MakeTokens(16);
+    std::vector<BlockTable> published(4);
+    PublishFinal(published, tokens);
+    coordinator_.Free(published);
+    const std::vector<std::string> hashes = hashes_;
+    for (const std::string& hash : hashes) {
+        StoreOnHost(Key(hash, 0));
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        StoreOnHost(Key(hashes[3], group));
+    }
+    // The Device keeps pages 0 and 1: page 3 takes its checkpoints along.
+    EvictOnDevice(Key(hashes[3], 0));
+    EvictOnDevice(Key(hashes[2], 0));
+
+    tokens.push_back(77);
+    CacheCoordinator::PrefixProbe probe =
+        coordinator_.ProbePromptPrefix({.prefix_hashes = hashes, .tokens = tokens, .max_tokens = 4 * kP});
+    ASSERT_EQ(probe.device.full_page_tokens, 2 * kP);
+    ASSERT_EQ(probe.host.num_common_tokens, 4 * kP);
+    std::vector<BlockTable> tables(4);
+    const std::optional<CacheCoordinator::AdmissionResult> admitted =
+        AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(admitted.has_value());
+    for (std::int32_t page = 2; page < 4; ++page) {
+        coordinator_.CacheFullBlocks(tables, std::span<const std::string>(hashes).subspan(page, 1),
+                                     admitted->access_epoch, page, CacheBoundaryKind::kChunk);
+    }
+
+    EXPECT_EQ(NodeOf(hashes[0]).parent, nullptr);
+    for (std::size_t page = 1; page < hashes.size(); ++page) {
+        EXPECT_EQ(NodeOf(hashes[page]).parent, &NodeOf(hashes[page - 1])) << "page " << page;
+        EXPECT_EQ(NodeOf(hashes[page]).boundary_tokens, static_cast<std::int32_t>(page + 1) * kP);
+    }
+    EXPECT_EQ(NodeOf(hashes[3]).has_checkpoint, (std::array<bool, 2>{false, true}));
+    coordinator_.Free(tables);
+}
+
+// The same without a prefix-closed group: no group holds the first page, so
+// only the link keeps its node, and it leaves with the last checkpoint boundary
+// under it instead of staying behind for good.
+TEST(BoundaryTreeStateOnlyTest, APageAboveALinkedNodeLeavesWithTheLastCheckpointUnderIt) {
+    constexpr std::int32_t kP = 4;
+    const std::vector<CacheGroupSpec> specs(
+        3, CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1});
+    BlockPool pool(/*num_lcm_blocks=*/8, {1, 1, 1});
+    BlockPool host_pool(/*num_lcm_blocks=*/4, {1, 1, 1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false);
+    const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}});
+    for (std::uint32_t group = 0; group < 3; ++group) {
+        CacheBlockRef block = host_pool.AcquireBlock(group);
+        coordinator.CacheHostBlock(block, Key(hashes[1], group));
+    }
+    std::vector<BlockTable> tables(3);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 3 * kP));
+    CacheCompletedBlocksForTest(coordinator, tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/3 * kP,
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/true);
+    coordinator.Free(tables);
+    ASSERT_EQ(tree.Size(), 3u);
+    EXPECT_EQ(tree.Find(hashes[1])->parent, tree.Find(hashes[0]));
+    EXPECT_EQ(tree.Find(hashes[0])->checkpoint_boundaries_in_subtree, (std::array<std::int32_t, 2>{1, 1}));
+
+    // The Device's checkpoint at 12 and then the Host's at 8 leave, each
+    // taking the other groups' at its hash along.
+    const std::optional<CacheBlockLocation> device_checkpoint =
+        CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(hashes[2], 0));
+    ASSERT_TRUE(device_checkpoint && CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, 0, *device_checkpoint));
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictHostCachedBlock(coordinator, Key(hashes[1], 0)));
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(tree.Size(), 0u);
+}
+
+// Without a prefix-closed group a publication may register nothing at all (a
+// chunk end of State groups alone): the nodes it linked do not stay, whether
+// a finish (CacheCompletedBlocks) or the next chunk's admission publishes it.
+// The next publication that registers a checkpoint links the whole chain
+// again.
+TEST(BoundaryTreeStateOnlyTest, APublicationThatRegistersNothingLeavesNoNode) {
+    constexpr std::int32_t kP = 4;
+    for (const bool by_admission : {false, true}) {
+        SCOPED_TRACE(by_admission);
+        BlockPool pool(/*num_lcm_blocks=*/8, {1});
+        CacheCoordinator coordinator = MakeCoordinator(
+            std::vector<CacheGroupSpec>{{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1}}, kP, pool,
+            /*enable_l3_storage=*/false, /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr,
+            /*stream_device_cache_to_host=*/false);
+        const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
+        std::vector<BlockTable> tables(1);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, 8));
+        const std::vector<std::string> hashes = ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}});
+        const RequestProgress chunk_end{
+            .completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                              .first_new_prefix_page = 0,
+                                              .publish_state = false,
+                                              .boundary_kind = CacheBoundaryKind::kChunk},
+            .num_computed_tokens = 8,
+        };
+        if (by_admission) {
+            ASSERT_TRUE(AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}}, chunk_end));
+        } else {
+            coordinator.CacheCompletedBlocks(tables, chunk_end,
+                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        }
+        EXPECT_EQ(tree.Size(), 0u);
+
+        // The prompt end at 8 publishes the checkpoint over pages published
+        // before.
+        const RequestProgress prompt_end{
+            .completed_pages = CompletedPages{.prefix_hashes = hashes,
+                                              .first_new_prefix_page = 2,
+                                              .publish_state = true,
+                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
+            .num_computed_tokens = 8,
+        };
+        if (by_admission) {
+            ASSERT_TRUE(AdmitForTest(coordinator, tables, GroupDemand{.extent = DenseGrowth{4}}, prompt_end));
+        } else {
+            coordinator.CacheCompletedBlocks(tables, prompt_end,
+                                             CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+        }
+        coordinator.Free(tables);
+        ASSERT_EQ(tree.Size(), 2u);
+        EXPECT_EQ(tree.Find(hashes[1])->parent, tree.Find(hashes[0]));
+        EXPECT_TRUE(tree.Find(hashes[1])->has_checkpoint[static_cast<std::size_t>(CacheTier::kDevice)]);
+        EXPECT_EQ(tree.Find(hashes[0])->checkpoint_boundaries_in_subtree, (std::array<std::int32_t, 2>{1, 0}));
+        EXPECT_EQ(tree.Find(hashes[1])->checkpoint_boundaries_in_subtree, (std::array<std::int32_t, 2>{1, 0}));
+    }
+}
+
 }  // namespace
 TEST(StoragePrefixReservationTest, DistributesRestoredPagesAcrossCyclicOwners) {
     BlockPool pool(4, {2});

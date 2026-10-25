@@ -57,6 +57,21 @@ struct CacheCoordinatorTestAccess {
                                                               std::size_t group_index, const CacheKey& key) {
         return coordinator.locationOf(coordinator.pool_, group_index, key);
     }
+
+    // A Host LRU eviction of the entry under `key` (counted under lru), with
+    // its State cascade; false when it is pinned or absent.
+    static bool EvictHostCachedBlock(CacheCoordinator& coordinator, const CacheKey& key) {
+        const std::optional<CacheBlockLocation> location =
+            coordinator.locationOf(*coordinator.host_pool_, key.group_id, key);
+        if (!location) {
+            return false;
+        }
+        return coordinator.evictHostCachedBlock(key.group_id, *location, &CacheCoordinator::HostEvictionStats::lru);
+    }
+
+    static const BoundaryTree& BoundaryTreeOf(const CacheCoordinator& coordinator) {
+        return coordinator.boundary_tree_;
+    }
 };
 
 inline auto MatchPrefixForTest(CacheCoordinator& coordinator, std::span<const std::string> content_hashes) {
