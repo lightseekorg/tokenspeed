@@ -75,6 +75,10 @@ struct HostCacheStats {
     TierTransferManager::LoadBackStats restore_loads;
     CacheCoordinator::HostEvictionStats host_evictions;
     std::uint64_t store_candidates_dropped_by_flush{0};
+    // What admissions evicted under write-back and dropped at once, no probe
+    // being able to resume from it on the Host (dead entries, never written
+    // back).
+    std::uint64_t dead_entries_not_written_back{0};
     CacheCoordinator::DeviceEvictionStats device_evictions;
 };
 

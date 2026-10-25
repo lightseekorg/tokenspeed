@@ -269,6 +269,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("device_resident", &tokenspeed::CacheCoordinator::HostEvictionCounts::device_resident);
     nb::class_<tokenspeed::CacheCoordinator::HostEvictionStats>(m, "HostEvictionStats")
         .def_ro("lru", &tokenspeed::CacheCoordinator::HostEvictionStats::lru)
+        .def_ro("duplicate", &tokenspeed::CacheCoordinator::HostEvictionStats::duplicate)
+        .def_ro("superseded", &tokenspeed::CacheCoordinator::HostEvictionStats::superseded)
+        .def_ro("dead_entry", &tokenspeed::CacheCoordinator::HostEvictionStats::dead_entry)
+        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::HostEvictionStats::tail_cap)
         .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush);
     nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
         .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
@@ -289,7 +293,9 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("evicted_before_drain", &tokenspeed::TierTransferManager::WriteBackStats::evicted_before_drain)
         .def_ro("no_placement", &tokenspeed::TierTransferManager::WriteBackStats::no_placement)
         .def_ro("snapshot_fallback", &tokenspeed::TierTransferManager::WriteBackStats::snapshot_fallback)
-        .def_ro("image_refused", &tokenspeed::TierTransferManager::WriteBackStats::image_refused);
+        .def_ro("image_refused", &tokenspeed::TierTransferManager::WriteBackStats::image_refused)
+        .def_ro("recopied", &tokenspeed::TierTransferManager::WriteBackStats::recopied)
+        .def_ro("cancelled", &tokenspeed::TierTransferManager::WriteBackStats::cancelled);
     nb::class_<tokenspeed::TierTransferManager::LoadBackStats>(m, "LoadBackStats")
         .def_ro("ops", &tokenspeed::TierTransferManager::LoadBackStats::ops)
         .def_ro("blocks", &tokenspeed::TierTransferManager::LoadBackStats::blocks);
@@ -304,10 +310,12 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("publication_stores", &tokenspeed::HostCacheStats::publication_stores)
         .def_ro("finish_stores", &tokenspeed::HostCacheStats::finish_stores)
         .def_ro("retraction_stores", &tokenspeed::HostCacheStats::retraction_stores)
+        .def_ro("eviction_stores", &tokenspeed::HostCacheStats::eviction_stores)
         .def_ro("prefix_loads", &tokenspeed::HostCacheStats::prefix_loads)
         .def_ro("restore_loads", &tokenspeed::HostCacheStats::restore_loads)
         .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
         .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
+        .def_ro("dead_entries_not_written_back", &tokenspeed::HostCacheStats::dead_entries_not_written_back)
         .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions);
 
     // ─── ExecutionEvent ─────────────────────────────────────────────

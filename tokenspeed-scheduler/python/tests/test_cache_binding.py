@@ -331,6 +331,21 @@ def test_host_cache_stats_count_publication_and_finish_stores():
     )
     assert fresh.host_evictions.lru.blocks == fresh.host_evictions.flush.blocks == 0
     assert fresh.device_evictions.admission.blocks == 0
+    assert len(fresh.eviction_stores.blocks) == num_groups
+    assert (
+        fresh.eviction_stores.ops
+        == fresh.eviction_stores.recopied
+        == fresh.eviction_stores.cancelled
+        == fresh.dead_entries_not_written_back
+        == 0
+    )
+    assert (
+        fresh.host_evictions.duplicate.blocks
+        == fresh.host_evictions.superseded.blocks
+        == fresh.host_evictions.dead_entry.blocks
+        == fresh.host_evictions.tail_cap.blocks
+        == 0
+    )
     assert fresh.publication_stores.ops == fresh.finish_stores.ops == 0
     assert list(fresh.publication_stores.blocks) == [0] * num_groups
     assert list(fresh.finish_stores.blocks) == [0] * num_groups
@@ -396,3 +411,93 @@ def test_host_cache_stats_count_publication_and_finish_stores():
     assert scheduler.host_pool_cached_blocks() == 5 + 6
     assert scheduler.host_pool_total_blocks() == 32
     assert scheduler.host_pool_free_blocks() == 32 - 3 - 6
+
+
+def test_host_cache_stats_count_eviction_write_backs():
+    """The prefill role under Host write-back: one Full group of 16-token
+    pages on four Device and two Host pages. a's 40-token prompt leaves two
+    pages and a tail; b's evicts a's tail and second page and writes both
+    back, filling the Host. c's 20-token prompt evicts a's first page and b's
+    tail, two segments. The Host plan lists its leaves -- a's tail, and b's on
+    its way -- and takes a's tail (Host-only, never loaded), after which a's
+    second page is a Host leaf; it stays, its parent being on its way to the
+    Host. One free page places b's tail, the newer segment; a's first page is
+    dropped whole. With it gone from both tiers, the collection takes a's second
+    page from the Host: nothing reaches it any more."""
+    page = 16
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = page
+    cfg.max_scheduled_tokens = 256
+    cfg.max_batch_size = 4
+    cfg.num_device_pages = 4 + 1
+    cfg.num_host_pages = 2 + 1
+    cfg.num_snapshot_pages = 1
+    cfg.disable_l2_cache = False
+    cfg.role = ts.SchedulerConfig.Role.P
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full_attention",
+            block_granularity=page,
+            total_pages=4 + 1,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+    stores = []
+    for rid, tokens in (
+        ("a", list(range(40))),
+        ("b", list(range(100, 140))),
+        ("c", list(range(200, 220))),
+    ):
+        scheduler.submit_requests([_spec(rid, tokens)])
+        events = ExecutionEvent()
+        events.add_event(ts.PD.BootstrappedEvent(rid))
+        scheduler.advance(events)
+        # The prefill, then the hand-off to the decode peer, which succeeds.
+        plan = scheduler.next_execution_plan()
+        acks = ExecutionEvent()
+        for op in plan.cache:
+            stores.append([list(rows) for rows in op.src_pages])
+            for op_id in op.op_ids:
+                done = Cache.WriteBackDoneEvent()
+                done.op_id = op_id
+                acks.add_event(done)
+        scheduler.advance(acks)
+        _advance(scheduler, rid, [1000])
+        assert list(scheduler.next_execution_plan().remote_decode.request_ids) == [rid]
+        events = ExecutionEvent()
+        events.add_event(ts.PD.SucceededEvent(rid))
+        scheduler.advance(events)
+    assert [[len(rows) for rows in store] for store in stores] == [[2], [1]]
+
+    stats = scheduler.host_cache_stats()
+    eviction_stores = stats.eviction_stores
+    assert (eviction_stores.ops, list(eviction_stores.blocks)) == (2, [3])
+    assert eviction_stores.no_placement == 1
+    assert (eviction_stores.host_cached, eviction_stores.in_flight) == (0, 0)
+    assert (eviction_stores.recopied, eviction_stores.cancelled) == (0, 0)
+    assert stats.dead_entries_not_written_back == 0
+    # a's tail, Host-only, which the Host plan took (lru), and a's second
+    # page, which the collection took (dead_entry).
+    host = stats.host_evictions
+    assert (
+        host.lru.blocks,
+        host.lru.device_resident,
+        host.duplicate.blocks,
+        host.superseded.blocks,
+        host.dead_entry.blocks,
+        host.dead_entry.device_resident,
+        host.tail_cap.blocks,
+    ) == (1, 0, 0, 0, 1, 0, 0)
+    # Every block an admission evicted for the cache was stored or dropped:
+    # a's tail and second page, then a's first page and b's tail.
+    device = stats.device_evictions
+    assert (
+        device.admission.blocks
+        == sum(eviction_stores.blocks) + eviction_stores.no_placement
+    )
+    assert (device.admission.blocks, device.stranded_suffix.blocks) == (4, 0)
+    # b's tail is the Host's one entry.
+    assert scheduler.host_pool_cached_blocks() == 1
