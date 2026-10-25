@@ -1288,19 +1288,24 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         }
         const std::uint32_t group_id = group_ids[i];
         const std::int32_t bucket = buckets[i];
-        // An earlier replacement may have opened more slots for this group.
+        // An earlier replacement may have opened more slots for this group,
+        // also through the State cascade of another group's victim
+        // (evictHostCachedBlock): that room is used before any victim goes.
         batch.blocks[i] = acquire_in_bucket(group_id, bucket);
         if (!batch.blocks[i]) {
             BucketCandidates& candidates = children[group_id][bucket];
             while (candidates.next < candidates.entries.size() &&
                    !groups_[group_id].Index().MetadataFor(*host_pool_, candidates.entries[candidates.next].location)) {
-                // Another group's replacement may have rebound this parent.
+                // Another group's replacement may have rebound this parent,
+                // or an earlier victim's State cascade taken the entry.
                 ++candidates.next;
             }
             while (!victim_parents.empty()) {
                 const auto& [parent_value, parent_id] = victim_parents.front();
                 // Candidate metadata is a snapshot: check current placement
-                // as well as destinations pinned earlier in this batch.
+                // as well as destinations pinned earlier in this batch. A
+                // State cascade may have emptied a parent (skipped here) or
+                // taken some of its children (the rest still go whole).
                 if (!parents[parent_id].allocated && host_pool_->OccupiedCount(parent_id) > 0 &&
                     host_pool_->BoundGroup(parent_id) == std::get<1>(parent_value)) {
                     break;
@@ -1318,7 +1323,8 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             if (has_child && (!has_parent || candidates.entries[candidates.next].metadata.last_access_epoch <=
                                                  std::get<0>(victim_parents.front().first))) {
                 // The retry above found no compatible hole. Releasing one
-                // Host child creates the only placement for its refill.
+                // Host child creates the only placement for its refill; its
+                // State cascade takes only other groups' entries.
                 const CacheBlockLocation location = candidates.entries[candidates.next++].location;
                 _assert(evictHostCachedBlock(group_id, location, &HostEvictionStats::lru),
                         "selected Host child is not evictable");
@@ -1416,7 +1422,7 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
             if (!GroupIsState(i)) {
                 return;
             }
-            if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
+            if (const std::optional<CacheBlockLocation> location = locationOf(pool_, i, key)) {
                 evictCachedBlockAlone(groups_[i].Id(), *location, reason);
             }
         });
@@ -1427,25 +1433,46 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
 
 bool CacheCoordinator::evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                                             HostEvictionCounts HostEvictionStats::*reason) {
-    std::optional<CacheKey> removed = groups_[group_id].Index().Evict(*host_pool_, location);
+    const auto evict_entry = [&](std::uint32_t entry_group, CacheBlockLocation entry_location) {
+        std::optional<CacheKey> removed = groups_[entry_group].Index().Evict(*host_pool_, entry_location);
+        if (!removed) {
+            return removed;
+        }
+        HostEvictionCounts& evicted = host_evictions_.*reason;
+        ++evicted.blocks;
+        // Contains takes no reference, so it pins nothing on the Device tier.
+        if (groups_[entry_group].Index().Contains(pool_, *removed)) {
+            ++evicted.device_resident;
+        }
+        return removed;
+    };
+    const std::optional<CacheKey> removed = evict_entry(group_id, location);
     if (!removed) {
         return false;
     }
-    HostEvictionCounts& evicted = host_evictions_.*reason;
-    ++evicted.blocks;
-    // Contains takes no reference, so it pins nothing on the Device tier.
-    if (groups_[group_id].Index().Contains(pool_, *removed)) {
-        ++evicted.device_resident;
+    if (GroupIsState(group_id)) {
+        // A checkpoint resumes only with every State group's block at its
+        // hash: the others leave with it unless pinned. A Host checkpoint
+        // can resume on the Device's KV of its page, so no Host KV block
+        // takes a checkpoint along.
+        ForEachBoundaryKey(*removed, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& key) {
+            if (!GroupIsState(i)) {
+                return;
+            }
+            if (const std::optional<CacheBlockLocation> sibling = locationOf(*host_pool_, i, key)) {
+                evict_entry(groups_[i].Id(), *sibling);
+            }
+        });
     }
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
 }
 
-std::optional<CacheBlockLocation> CacheCoordinator::deviceLocationOf(std::size_t group_index,
-                                                                     const CacheKey& key) const {
+std::optional<CacheBlockLocation> CacheCoordinator::locationOf(const BlockPool& pool, std::size_t group_index,
+                                                               const CacheKey& key) const {
     // The reference from Find must not outlive this lookup: an eviction that
     // follows requires the index to be the block's only owner.
-    const CacheBlockRef block = groups_[group_index].Index().Find(pool_, key);
+    const CacheBlockRef block = groups_[group_index].Index().Find(pool, key);
     return block ? std::optional<CacheBlockLocation>{block->Location()} : std::nullopt;
 }
 
@@ -1454,7 +1481,7 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
     ForEachBoundaryKey(CacheKey{.content_hash = hash}, tail_tokens, [&](std::size_t i, const CacheKey& key) {
         // A companion still pinned by a request table stays indexed; it
         // ages out through the ordinary eviction order.
-        if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
+        if (const std::optional<CacheBlockLocation> location = locationOf(pool_, i, key)) {
             evictCachedBlockAlone(groups_[i].Id(), *location, reason);
         }
     });

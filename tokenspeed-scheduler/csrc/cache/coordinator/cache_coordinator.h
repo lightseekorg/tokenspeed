@@ -392,7 +392,9 @@ public:
         std::uint64_t blocks{0};
         std::uint64_t device_resident{0};
     };
-    // Host evictions over every cache group, by why the entry left.
+    // Host evictions over every cache group, by why the entry left. The other
+    // State groups' checkpoints a State entry takes along at its hash count
+    // under the same reason.
     struct HostEvictionStats {
         // AcquireHostBlocks' global LRU took it, as one child or with a whole
         // parent, whoever asked (a publication, finish or retraction store, an
@@ -426,7 +428,10 @@ public:
     // the same rows on every rank. Free capacity first, then global LRU over
     // compatible children and fully evictable parents of any group. A parent
     // is ranked by its newest child; equal epochs prefer one child. A
-    // shortfall leaves an empty reference.
+    // shortfall leaves an empty reference. Evicting a State checkpoint takes
+    // the other State groups' at its hash along; every block retries free
+    // capacity before it picks a victim, so it places in the room such a
+    // cascade freed before another victim goes.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket);
@@ -702,12 +707,17 @@ private:
     // calls it for the companions of the block that left.
     bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
                                DeviceEvictionCounts DeviceEvictionStats::*reason);
-    // Evicts an unpinned Host entry and counts it under
-    // host_evictions_.*reason, as device_resident too when the Device index
-    // still holds its key.
+    // Evicts an unpinned Host entry and, for a State checkpoint, the other
+    // State groups' unpinned entries at its hash. Each entry that left counts
+    // under host_evictions_.*reason, as device_resident too when the Device
+    // index still holds its key. False when the entry itself is pinned or
+    // gone; then nothing is evicted.
     bool evictHostCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
                               HostEvictionCounts HostEvictionStats::*reason);
-    std::optional<CacheBlockLocation> deviceLocationOf(std::size_t group_index, const CacheKey& key) const;
+    // Where `pool`'s tier of group_index's index holds key, without keeping a
+    // reference to it.
+    std::optional<CacheBlockLocation> locationOf(const BlockPool& pool, std::size_t group_index,
+                                                 const CacheKey& key) const;
     // Drops a tail hash from the tail table once no tier holds an entry for it.
     void pruneTailIfUnreferenced(const ContentHash& hash);
     // Whether an imaged slot belongs to the page the computed frontier ends

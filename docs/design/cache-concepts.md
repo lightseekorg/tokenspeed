@@ -865,9 +865,12 @@ Its responsibilities:
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
   On Device, evicting a History block under a chain hash also evicts the
   State checkpoints under that hash, so Device state does not outlive the
-  KV it continues. Evicting one State group's checkpoint there evicts every
-  other State group's checkpoint at the same hash, since a resume needs all
-  of them; it takes no KV along, which still serves the boundaries past it.
+  KV it continues; a Host checkpoint can resume on the Device's KV of its
+  page, so evicting a Host KV block takes no checkpoint along. Evicting one
+  State group's checkpoint evicts every other State group's checkpoint at
+  the same hash, on the Device and on the Host tier alike, since a resume
+  needs all of them; it takes no KV along, which still serves the
+  boundaries past it.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -899,7 +902,10 @@ Its responsibilities:
   bound to another group. Parent aggregation reuses coordinator-owned scratch
   storage and resets and examines only touched parents, rather than the whole
   Host arena on every allocation batch. Child reuse preserves the requested
-  placement bucket. Host eviction removes each selected entry independently.
+  placement bucket. Host eviction removes each selected entry independently,
+  except that a State checkpoint takes the other State groups' checkpoints
+  at its hash along; each block retries free capacity before it picks a
+  victim, so it places in the room such a cascade freed.
   No group has an eviction preference or a fixed share of the pool; capacity follows the access
   pattern, without guaranteeing that KV and every required state checkpoint
   remain resident together. During prefill, each chunk end queues the

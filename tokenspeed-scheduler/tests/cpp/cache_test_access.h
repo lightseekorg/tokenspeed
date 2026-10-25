@@ -55,7 +55,7 @@ struct CacheCoordinatorTestAccess {
     // would pin it against eviction.
     static std::optional<CacheBlockLocation> DeviceLocationOf(const CacheCoordinator& coordinator,
                                                               std::size_t group_index, const CacheKey& key) {
-        return coordinator.deviceLocationOf(group_index, key);
+        return coordinator.locationOf(coordinator.pool_, group_index, key);
     }
 };
 

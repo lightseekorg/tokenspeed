@@ -3241,6 +3241,278 @@ TEST(CacheCoordinatorHostReplacement, BatchCrossGroupRebindingChoosesLowestCache
     EXPECT_EQ(host_pool.BoundGroup(newer_parent), 1u);
 }
 
+// The K3 shape on both tiers: P = 4, one Full group (four blocks per parent)
+// and three State groups (one per parent).
+const std::vector<CacheGroupSpec> kK3HostSpecs{
+    {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 4},
+    {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+};
+
+TEST(CacheCoordinatorHostReplacement, AHostStateEvictionTakesTheOtherStateGroupsAtItsHash) {
+    BlockPool device_pool(8, {4, 1, 1, 1});
+    BlockPool host_pool(4, {4, 1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    // A page's three checkpoints and then its KV fill the Host, so group 1's
+    // checkpoint is the least recently used entry; the Device still holds
+    // group 2's checkpoint.
+    for (std::uint32_t group : {1u, 2u, 3u, 0u}) {
+        HostPut(coordinator, host_pool, "h", group);
+    }
+    HostPut(coordinator, device_pool, "h", 2);
+
+    const std::array<std::uint32_t, 1> groups{1};
+    const std::array<std::int32_t, 1> buckets{0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    ASSERT_TRUE(batch.blocks[0]);
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("h", group))) << "group " << group;
+    }
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("h", 0))) << "a checkpoint takes no KV along";
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(2).Contains(device_pool, Key("h", 2))) << "the Device tier is untouched";
+    EXPECT_EQ(coordinator.NumFreeHostLcmBlocks(), 2) << "the siblings' parents are empty";
+    // Every entry that left counts under the reason of the eviction that took
+    // it.
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.device_resident, 1u) << "the Device still holds group 2's";
+}
+
+// Two checkpoints fill the Host and a batch stores one block per State group:
+// the older checkpoint's eviction frees room for all three, so the newer one
+// stays whole.
+TEST(CacheCoordinatorHostReplacement, StateCascadeDoesNotOverEvict) {
+    BlockPool device_pool(8, {4, 1, 1, 1});
+    BlockPool host_pool(6, {4, 1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    for (const char* hash : {"older", "newer"}) {
+        for (std::uint32_t group = 1; group <= 3; ++group) {
+            HostPut(coordinator, host_pool, hash, group);
+        }
+    }
+
+    const std::array<std::uint32_t, 3> groups{1, 2, 3};
+    const std::array<std::int32_t, 3> buckets{0, 0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.stats.allocated, 3u);
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("older", group))) << "group " << group;
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("newer", group))) << "group " << group;
+    }
+    // Groups 2 and 3 take the room group 1's victim freed: only the older
+    // checkpoint's three entries leave.
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator.NumFreeHostLcmBlocks(), 0);
+}
+
+// Two blocks of one State group: the first victim's cascade frees the room
+// the second needs.
+TEST(CacheCoordinatorHostReplacement, AStateCascadeFundsTheSameGroupsNextBlock) {
+    BlockPool device_pool(8, {4, 1, 1, 1});
+    BlockPool host_pool(6, {4, 1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    for (const char* hash : {"older", "newer"}) {
+        for (std::uint32_t group = 1; group <= 3; ++group) {
+            HostPut(coordinator, host_pool, hash, group);
+        }
+    }
+
+    const std::array<std::uint32_t, 2> groups{1, 1};
+    const std::array<std::int32_t, 2> buckets{0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_EQ(batch.stats.allocated, 2u);
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("older", group))) << "group " << group;
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("newer", group))) << "group " << group;
+    }
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator.NumFreeHostLcmBlocks(), 1);
+}
+
+// A whole-parent eviction for one group takes a checkpoint whose sibling
+// frees a parent of its own: a later group of the batch places there instead
+// of taking the next least recently used parent, group 0's.
+TEST(CacheCoordinatorHostReplacement, AParentEvictionsStateCascadeFundsALaterGroup) {
+    BlockPool device_pool(4, {2, 2, 1, 1});
+    BlockPool host_pool(3, {2, 2, 1, 1});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    const std::int32_t h_parent = HostPut(coordinator, host_pool, "h", 2);
+    HostPut(coordinator, host_pool, "x0", 0);
+    HostPut(coordinator, host_pool, "x1", 0);
+    HostPut(coordinator, host_pool, "h", 3);
+
+    // Group 0's first block takes group 2's older parent whole rather than
+    // its own child; group 1 holds no entry.
+    const std::array<std::uint32_t, 4> groups{0, 0, 1, 1};
+    const std::array<std::int32_t, 4> buckets{0, 0, 0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.stats.allocated, 4u);
+    EXPECT_EQ(batch.stats.unallocated, 0u);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("x0", 0)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("x1", 0)));
+    EXPECT_EQ(batch.blocks[0]->Location().lcm_block_id, h_parent) << "group 2's parent went whole to group 0";
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 2u) << "h in group 2 and, by the cascade, in group 3";
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 2);
+}
+
+// A full K3 Host whose checkpoints are older than its KV, and a batch of one
+// KV block and then one checkpoint block: the KV block's least recently used
+// victim is a checkpoint's whole parent, whose cascade frees the room the
+// checkpoint block takes, so no KV entry is evicted.
+TEST(CacheCoordinatorHostReplacement, AKvBlocksCheckpointVictimFundsTheStateBlock) {
+    BlockPool device_pool(8, {4, 1, 1, 1});
+    BlockPool host_pool(4, {4, 1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    const std::int32_t checkpoint_parent = HostPut(coordinator, host_pool, "h", 1);
+    for (std::uint32_t group = 2; group <= 3; ++group) {
+        HostPut(coordinator, host_pool, "h", group);
+    }
+    for (const char* hash : {"k0", "k1", "k2", "k3"}) {
+        HostPut(coordinator, host_pool, hash, 0);
+    }
+    ASSERT_EQ(coordinator.NumFreeHostLcmBlocks(), 0);
+
+    const std::array<std::uint32_t, 2> groups{0, 1};
+    const std::array<std::int32_t, 2> buckets{0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.stats.allocated, 2u);
+    for (const char* hash : {"k0", "k1", "k2", "k3"}) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+    }
+    EXPECT_EQ(batch.blocks[0]->Location().lcm_block_id, checkpoint_parent)
+        << "group 1's checkpoint parent went whole to the KV block";
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u) << "the checkpoint and its two siblings";
+    EXPECT_EQ(coordinator.NumFreeHostLcmBlocks(), 1);
+}
+
+// Every KV entry pinned and the checkpoint block first: its own victim's
+// cascade frees two parents, and the KV block, which would otherwise take a
+// sibling's parent whole, places in one without a victim.
+TEST(CacheCoordinatorHostReplacement, AStateCascadeFundsAKvBlockWithoutAVictim) {
+    BlockPool device_pool(8, {4, 1, 1, 1});
+    BlockPool host_pool(4, {4, 1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    std::vector<CacheBlockRef> pinned;
+    for (const char* hash : {"k0", "k1", "k2", "k3"}) {
+        HostPut(coordinator, host_pool, hash, 0);
+        pinned.push_back(coordinator.GroupPrefixIndex(0).Find(host_pool, Key(hash, 0)));
+        ASSERT_TRUE(pinned.back()) << hash;
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        HostPut(coordinator, host_pool, "h", group);
+    }
+
+    const std::array<std::uint32_t, 2> groups{1, 0};
+    const std::array<std::int32_t, 2> buckets{0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.stats.allocated, 2u);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u) << "one checkpoint and its two siblings; the KV block none";
+    EXPECT_EQ(coordinator.NumFreeHostLcmBlocks(), 1);
+}
+
+// A checkpoint the cascade would take but something still pins stays: the
+// first block takes the oldest checkpoint parent whole, whose cascade frees
+// the room the second block takes instead of the older KV parent, and leaves
+// the pinned sibling indexed.
+TEST(CacheCoordinatorHostReplacement, AStateCascadeLeavesAPinnedSibling) {
+    BlockPool device_pool(8, {4, 1, 1, 1});
+    BlockPool host_pool(4, {4, 1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(kK3HostSpecs, 4, device_pool, /*enable_l3_storage=*/false,
+                                                   &host_pool, /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    HostPut(coordinator, host_pool, "h", 1);
+    HostPut(coordinator, host_pool, "h", 2);
+    HostPut(coordinator, host_pool, "k", 0);
+    HostPut(coordinator, host_pool, "h", 3);
+    CacheBlockRef pinned = coordinator.GroupPrefixIndex(1).Find(host_pool, Key("h", 1));
+    ASSERT_TRUE(pinned);
+
+    const std::array<std::uint32_t, 2> groups{1, 2};
+    const std::array<std::int32_t, 2> buckets{0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.stats.allocated, 2u);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("h", 1))) << "a pinned sibling stays";
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("h", 2)));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("h", 3)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("k", 0)));
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 2u) << "h in group 2 and, by the cascade, in group 3";
+    EXPECT_EQ(coordinator.NumFreeHostLcmBlocks(), 0);
+}
+
+// A cascade that takes some of a candidate parent's entries leaves it a
+// valid candidate: a later block evicts the rest and places there.
+TEST(CacheCoordinatorHostReplacement, AParentACascadePartlyEvictedStillGoesWhole) {
+    BlockPool device_pool(4, {2, 1, 2});
+    BlockPool host_pool(2, {2, 1, 2});
+    const std::array specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 2, .block_granularity = 0},
+    };
+    CacheCoordinator coordinator = MakeCoordinator(specs, 2, device_pool, /*enable_l3_storage=*/false, &host_pool,
+                                                   /*snapshot_pool=*/nullptr,
+                                                   /*stream_device_cache_to_host=*/true);
+    HostPut(coordinator, host_pool, "a", 1);
+    const std::int32_t shared_parent = HostPut(coordinator, host_pool, "a", 2);
+    ASSERT_EQ(HostPut(coordinator, host_pool, "b", 2), shared_parent);
+
+    // Group 1's own checkpoint ties with its parent and goes alone, taking
+    // group 2's "a" from the shared parent; the Full block then takes what is
+    // left of that parent.
+    const std::array<std::uint32_t, 2> groups{1, 0};
+    const std::array<std::int32_t, 2> buckets{0, 0};
+    CacheCoordinator::HostAllocationBatch batch = coordinator.AcquireHostBlocks(groups, buckets);
+
+    EXPECT_TRUE(std::ranges::all_of(batch.blocks, [](const CacheBlockRef& ref) { return static_cast<bool>(ref); }));
+    EXPECT_EQ(batch.blocks[1]->Location().lcm_block_id, shared_parent);
+    EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 3u) << "a in groups 1 and 2, then b";
+
+    // The same Host again, with group 1's block alone, shows the parent the
+    // Full block took was partly evicted: group 1's checkpoint takes group 2's
+    // "a" from it and leaves "b".
+    batch.blocks.clear();
+    HostPut(coordinator, host_pool, "a", 1);
+    const std::int32_t refilled_parent = HostPut(coordinator, host_pool, "a", 2);
+    ASSERT_EQ(HostPut(coordinator, host_pool, "b", 2), refilled_parent);
+    const std::array<std::uint32_t, 1> checkpoint_group{1};
+    const std::array<std::int32_t, 1> checkpoint_bucket{0};
+    batch = coordinator.AcquireHostBlocks(checkpoint_group, checkpoint_bucket);
+    ASSERT_TRUE(batch.blocks[0]);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key("a", 2))) << "the cascade took it";
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("b", 2)));
+}
+
 TEST(CacheCoordinatorHostReplacement, BatchDoesNotRebindPinnedParent) {
     BlockPool device_pool(2, {2, 1});
     BlockPool host_pool(1, {2, 1});
