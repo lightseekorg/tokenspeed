@@ -34,7 +34,10 @@ from tokenspeed.runtime.engine.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from tokenspeed.runtime.engine.logprobs import resolve_logprob_start_len
+from tokenspeed.runtime.engine.logprobs import (
+    LogprobServability,
+    resolve_logprob_start_len,
+)
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     prompt_ends_in_reasoning,
     reasoning_block_markers,
@@ -43,10 +46,6 @@ from tokenspeed.runtime.grammar.reasoning_structural_tag import (
 from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
 from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams
-
-# Most alternatives a top-k logprob request may ask for per position (the
-# OpenAI chat API's bound; legacy completions ask for at most 5).
-MAX_TOP_LOGPROBS = 20
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -219,78 +218,34 @@ class InputProcessor:
                     f"data_parallel_rank must be in [0, {dp_size}), got {rank}"
                 )
 
+    def _logprob_servability(self) -> LogprobServability:
+        return LogprobServability.of(
+            self.engine.server_args,
+            supports_prompt_logprobs=self.engine.supports_prompt_logprobs,
+            vocab_size=self.engine.model_config.vocab_size,
+        )
+
     def _verify_prompt_logprobs_servable(
         self, input_ids: list[int], multimodal_inputs
     ) -> None:
-        """Refuse a request whose prompt logprobs this engine cannot compute.
-
-        Everything the data plane would otherwise trip over is a 400 here:
-        the engine's capability (a model that narrows its prefill rows has no
-        activations for the prompt positions -- ``AsyncLLM.supports_prompt_logprobs``,
-        reported by the scheduler at startup), a multimodal prompt (its media
-        positions carry content-hash ids, not tokens, so they have no logprob)
-        and a client-supplied token id outside the vocabulary (its logprob
-        column does not exist).
-        """
-        if not self.engine.supports_prompt_logprobs:
-            raise ValueError(
-                "logprob_start_len >= 0 (prompt logprobs) is not supported by this "
-                "engine: the model narrows its prefill rows, so it cannot score "
-                "every prompt position. Use logprob_start_len=-1."
-            )
-        if multimodal_inputs is not None:
-            raise ValueError(
-                "logprob_start_len >= 0 (prompt logprobs) is not supported for "
-                "multimodal prompts; use logprob_start_len=-1."
-            )
-        vocab_size = self.engine.model_config.vocab_size
-        if min(input_ids) < 0 or max(input_ids) >= vocab_size:
-            raise ValueError(
-                "prompt logprobs need every prompt token id inside the vocabulary "
-                f"[0, {vocab_size}); input_ids contains one outside it."
-            )
+        """Refuse, as a 400, a request whose prompt logprobs this engine
+        cannot compute (``LogprobServability.prompt_logprobs_refusal``)."""
+        reason = self._logprob_servability().prompt_logprobs_refusal(
+            input_ids, multimodal_inputs is not None
+        )
+        if reason is not None:
+            raise ValueError(reason)
 
     def _verify_top_logprobs_servable(
         self, top_logprobs_num: int, sampling_params: SamplingParams
     ) -> int:
-        """Refuse a top-k logprob request this engine cannot serve; return k.
-
-        The top-k alternatives are computed where a forward runs eagerly: at
-        the prompt rows (``logprob_start_len``) and at the token a prefill
-        samples. A request whose every token is sampled in its prefill
-        (``max_new_tokens`` 0 or 1, as a teacher-forcing ``echo`` asks) is
-        served; a later token is sampled by a captured decode step, which
-        computes no alternatives, so a longer generation is refused rather
-        than answered with positions missing. The alternatives are torch's
-        log-softmax (the sampled token's logprob order), computed on the one
-        stage that holds logits, of a request this node completes.
-        """
-        server_args = self.engine.server_args
-        if not 0 < top_logprobs_num <= MAX_TOP_LOGPROBS:
-            raise ValueError(
-                f"top_logprobs_num must be between 1 and {MAX_TOP_LOGPROBS}, "
-                f"got {top_logprobs_num}."
-            )
-        if (sampling_params.max_new_tokens or 0) > 1:
-            raise ValueError(
-                "top_logprobs_num > 0 needs max_new_tokens <= 1: top-k logprobs "
-                "are computed for the prompt and the token a prefill samples, "
-                "not for decode steps."
-            )
-        if server_args.logprob_order != "torch":
-            raise ValueError(
-                "top_logprobs_num > 0 needs --logprob-order torch, not "
-                f"{server_args.logprob_order}."
-            )
-        if server_args.mapping is not None and server_args.mapping.has_pp:
-            raise ValueError(
-                "top_logprobs_num > 0 is not supported with pipeline parallelism."
-            )
-        if server_args.disaggregation_mode != "null":
-            raise ValueError(
-                "top_logprobs_num > 0 is not supported with disaggregated "
-                "prefill and decode."
-            )
+        """Refuse a top-k logprob request this engine cannot serve
+        (``LogprobServability.top_logprobs_refusal``); return k."""
+        reason = self._logprob_servability().top_logprobs_refusal(
+            top_logprobs_num, sampling_params.max_new_tokens
+        )
+        if reason is not None:
+            raise ValueError(reason)
         return top_logprobs_num
 
     async def tokenize_batch(

@@ -35,11 +35,12 @@ import pytest
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
-from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+from test.runtime.scheduler_driver import (  # noqa: E402
     advance_scheduler,
-    make_config,
     make_extend_result_event,
 )
+
+from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
 
 PAGE = 16
 PROMPT = list(range(40))  # 2 hash-complete pages and an 8-token tail

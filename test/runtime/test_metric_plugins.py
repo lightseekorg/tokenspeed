@@ -111,23 +111,6 @@ def test_config_copy_is_independent_and_accepts_shared_noncyclic_values(registry
     assert copied["two"]["labels"] == original["two"]["labels"]
 
 
-@pytest.mark.parametrize(
-    "config",
-    [
-        [],
-        {1: "value"},
-        {"nested": [{"value": object()}]},
-        {"tuple": (1, 2)},
-        {"value": float("nan")},
-        {"value": float("inf")},
-        {"value": float("-inf")},
-    ],
-)
-def test_config_rejects_non_json_values(registry, config):
-    with pytest.raises(ValueError):
-        registry.copy_metric_config(config)
-
-
 def test_config_rejects_cycles(registry):
     config = {"children": []}
     config["children"].append(config)

@@ -328,6 +328,34 @@ def pad_gated_residual_projection_weight(
         )
 
 
+def prepare_gated_residual_up_weight(
+    weight: _torch.Tensor,
+    hc_count: int,
+    hidden_size: int,
+    lowrank: int,
+) -> _torch.Tensor | None:
+    """Prepare an optional derived Up weight once during model loading.
+
+    Args:
+        weight: Canonical ``[hc_count * hidden_size, lowrank]`` Up weight.
+        hc_count: Number of residual branches.
+        hidden_size: Width of one branch.
+        lowrank: Mix gate bottleneck rank.
+
+    Returns:
+        A packed tensor for supported prefill kernels, or None. Its owner must
+        refresh it whenever ``weight`` changes, preserving storage during graph
+        replay. Other kernels continue to consume the canonical weight.
+    """
+    from tokenspeed_kernel.ops.residual.cute_dsl import prepare_up_mix_weight
+
+    if weight.shape != (hc_count * hidden_size, lowrank):
+        raise ValueError(
+            "up weight shape must match hc_count * hidden_size and lowrank"
+        )
+    return prepare_up_mix_weight(weight, hc_count, hidden_size, lowrank)
+
+
 def select_gated_residual_mix_kernel(
     flat: _torch.Tensor,
     projection_weight: _torch.Tensor,
@@ -339,6 +367,7 @@ def select_gated_residual_mix_kernel(
     weights_independent: bool,
     override: str | None,
     solution: str | None,
+    packed_up_weight: _torch.Tensor | None = None,
 ):
     """Select the ``gated_residual_mix`` kernel for validated 2-D inputs.
 
@@ -346,6 +375,7 @@ def select_gated_residual_mix_kernel(
         flat: Normalized residual streams shaped ``[rows, hc_count * hidden_size]``.
         projection_weight: Fused down/inject weight (see ``gated_residual_mix``).
         up_weight: Mix-up weight shaped ``[hc_count * hidden_size, lowrank]``.
+        packed_up_weight: Optional load-time layout of up_weight for prefill.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
@@ -361,6 +391,11 @@ def select_gated_residual_mix_kernel(
     rows = int(flat.shape[0])
 
     traits = {
+        "prefill_up_mix": (
+            rows >= 4096
+            and packed_up_weight is not None
+            and packed_up_weight.data_ptr() % 16 == 0
+        ),
         "weights_independent": weights_independent,
         "fused_grid_supported": supports_fused_hc(flat.device),
         "fused_tma_aligned": all(
@@ -407,6 +442,7 @@ def gated_residual_mix(
     projection_scale: float = 1.0,
     override: str | None = None,
     solution: str | None = None,
+    packed_up_weight: _torch.Tensor | None = None,
 ) -> tuple[_torch.Tensor, _torch.Tensor | None]:
     """Mix normalized hyperconnection branches and optionally form inject logits.
 
@@ -424,6 +460,9 @@ def gated_residual_mix(
             by :func:`pad_gated_residual_projection_weight` during loading.
         up_weight: Mix-up weight shaped
             ``[hc_count * hidden_size, lowrank]``.
+        packed_up_weight: Optional output of prepare_gated_residual_up_weight
+            for the current up_weight contents. Kernels without packed-weight
+            support use up_weight; this does not force an implementation.
         hc_count: Number of residual branches.
         hidden_size: Width of one branch.
         lowrank: Rank of the mix gate bottleneck.
@@ -475,6 +514,15 @@ def gated_residual_mix(
         )
     _same_tensor_contract(flat, projection_weight, "projection_weight")
     _same_tensor_contract(flat, up_weight, "up_weight")
+    if packed_up_weight is not None:
+        _same_tensor_contract(flat, packed_up_weight, "packed_up_weight")
+        if (
+            packed_up_weight.shape != up_weight.shape
+            or not packed_up_weight.is_contiguous()
+        ):
+            raise ValueError(
+                "packed_up_weight must have the up weight shape and contiguous storage"
+            )
     if not flat.is_cuda:
         raise ValueError("gated_residual_mix requires GPU tensors")
 
@@ -488,6 +536,24 @@ def gated_residual_mix(
         )
         return mixed, inject
 
+    from tokenspeed_kernel.ops.tuning import is_warming_up
+
+    if is_warming_up():
+        from tokenspeed_kernel.ops.residual.cute_fused import warmup
+
+        warmup(
+            flat,
+            projection_weight,
+            up_weight,
+            hc_count,
+            hidden_size,
+            lowrank,
+            projection_rows=projection_rows,
+            projection_scale=projection_scale,
+            weights_independent=weights_independent,
+            override=override,
+            solution=solution,
+        )
     kernel, traits = select_gated_residual_mix_kernel(
         flat,
         projection_weight,
@@ -496,6 +562,7 @@ def gated_residual_mix(
         hidden_size,
         lowrank,
         weights_independent=weights_independent,
+        packed_up_weight=packed_up_weight,
         override=override,
         solution=solution,
     )
@@ -519,6 +586,7 @@ def gated_residual_mix(
             projection_rows,
             projection_scale,
             weights_independent,
+            packed_up_weight=packed_up_weight,
         )
     mixed = mixed.reshape(*leading_shape, hidden_size)
     if inject is not None:
@@ -608,6 +676,34 @@ def gated_residual_combine(
 # ===-----------------------------------------------------------------------===#
 
 
+def mhc_init(
+    hidden: _torch.Tensor, hc_mult: int
+) -> tuple[_torch.Tensor, _torch.Tensor]:
+    """Initialize independent mHC streams and their first-stream input mix.
+
+    Args:
+        hidden: Floating point token embeddings ``[rows, hidden_size]``.
+            Strided embeddings are supported.
+        hc_mult: Positive number of residual streams to replicate.
+
+    Returns:
+        Contiguous embeddings ``[rows, hc_mult, hidden_size]`` and FP32
+        one-hot input coefficients ``[rows, hc_mult]`` selecting stream zero.
+        Both outputs are owned by this invocation, with no retained scratch.
+    """
+    if hidden.ndim != 2 or hidden.shape[1] == 0 or hc_mult < 1:
+        raise ValueError("mhc_init requires [rows, hidden_size > 0] and hc_mult > 0")
+    kernel = select_kernel(
+        "residual",
+        "mhc_init",
+        format_signature(hidden=dense_tensor_format(hidden.dtype)),
+        traits={},
+        override=None,
+        solution=None,
+    )
+    return kernel(hidden, hc_mult)
+
+
 def mhc_mixes(
     residual: _torch.Tensor,
     weight: _torch.Tensor,
@@ -665,6 +761,84 @@ def mhc_mixes(
         solution=None,
     )
     return kernel(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_iters)
+
+
+def try_mhc_shifted_post_pre_norm(
+    x: _torch.Tensor,
+    residual: _torch.Tensor,
+    pre: _torch.Tensor,
+    post: _torch.Tensor,
+    comb: _torch.Tensor,
+    weight: _torch.Tensor,
+    scale: _torch.Tensor,
+    base: _torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    norm_weight: _torch.Tensor,
+    norm_eps: float,
+) -> (
+    tuple[_torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor, _torch.Tensor]
+    | None
+):
+    """Fuse HC post, shifted input/RMSNorm, and the next HC coefficients.
+
+    Args:
+        x: BF16 sublayer output [T,H], already reduced across ranks.
+        residual: BF16 residual before that sublayer [T,4,H].
+        pre: FP32 previous pre-mix [T,4], used to collapse the new residual.
+        post: FP32 sublayer output mix [T,4].
+        comb: FP32 residual mix [T,4,4], with input then output HC axes.
+        weight: FP32 next mixing projection [24,4*H].
+        scale: FP32 next pre/post/combine scales [3].
+        base: FP32 next mixing biases [24].
+        rms_eps: Epsilon for next coefficient RMS normalization.
+        hc_eps: Epsilon for pre-mix and Sinkhorn normalization.
+        sinkhorn_iters: Positive number of Sinkhorn iterations.
+        norm_weight: BF16 input RMSNorm weight [H].
+        norm_eps: Input RMSNorm epsilon.
+
+    Returns:
+        New BF16 residual [T,4,H], BF16 normalized input [T,H], and FP32 next
+        pre/post/comb [T,4], [T,4], [T,4,4]; or None for unsupported inputs.
+        The input uses ``pre``, not the newly generated pre-mix. All tensors
+        must be contiguous and colocated on an SM100-family GPU, with H a
+        positive multiple of 1024 and 0<T<=2**20. Inputs are never mutated.
+        Not safe under CUDA graph replay: split barriers can read the previous
+        replay's partials.
+    """
+    from tokenspeed_kernel.ops.residual.deep_gemm import mega_mhc_eligible
+
+    if not mega_mhc_eligible(
+        x, residual, pre, post, comb, weight, scale, base, sinkhorn_iters, norm_weight
+    ):
+        return None
+    try:
+        kernel = select_kernel(
+            "residual",
+            "mhc_shifted_post_pre_norm",
+            format_signature(residual=dense_tensor_format(residual.dtype)),
+            traits=None,
+            override=None,
+            solution=None,
+        )
+    except NoKernelFoundError:
+        return None
+    return kernel(
+        x,
+        residual,
+        pre,
+        post,
+        comb,
+        weight,
+        scale,
+        base,
+        rms_eps,
+        hc_eps,
+        sinkhorn_iters,
+        norm_weight,
+        norm_eps,
+    )
 
 
 def mhc_apply_pre(
@@ -991,6 +1165,7 @@ __all__ = [
     "mhc_apply_pre",
     "mhc_apply_pre_quantize_fp8",
     "mhc_fused_hc",
+    "mhc_init",
     "mhc_mixes",
     "mhc_post",
     "mhc_pre",
@@ -998,6 +1173,7 @@ __all__ = [
     "post_norm_residual_pre_norm",
     "post_norm_residual_pre_norm_bf16",
     "residual_gate_coefficients",
+    "try_mhc_shifted_post_pre_norm",
 ]
 
 

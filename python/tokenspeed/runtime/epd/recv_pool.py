@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""The EPD receive pool's size, shared by the device builder and the prefill admission."""
+"""The EPD receive pool's size, shared by the device builder and the prefill receive."""
 
 from __future__ import annotations
 
@@ -28,6 +28,9 @@ from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.utils.server_args import ServerArgs
+
+# Slot starts stay aligned for any element type.
+_SLOT_ALIGN = 256
 
 
 def is_epd_prefill_node(server_args: ServerArgs, is_multimodal_active: bool) -> bool:
@@ -48,10 +51,18 @@ def recv_pool_geometry() -> tuple[int, int]:
     return n_slots, slot_mb
 
 
+def split_slot(slot_bytes: int, num_deepstack: int) -> tuple[int, int]:
+    """One slot's bytes split between an item's rows and its deepstack rows,
+    which are ``num_deepstack`` times as wide: ``(rows, deepstack rows)``.
+    Together they fit the slot, so the pool stays within its budget."""
+    main = slot_bytes // (1 + num_deepstack) // _SLOT_ALIGN * _SLOT_ALIGN
+    return main, main * num_deepstack
+
+
 def recv_pool_bytes(server_args: ServerArgs, is_multimodal_active: bool) -> int:
     """Device bytes the receive pool takes on this node, 0 where none is built.
 
-    The prefill admission allocates the pool after the KV cache is sized, so the
+    The prefill receive allocates the pool after the KV cache is sized, so the
     cache budget leaves these bytes out.
     """
     if not is_epd_prefill_node(server_args, is_multimodal_active):

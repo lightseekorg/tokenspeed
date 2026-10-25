@@ -103,7 +103,7 @@ class _StubAsyncLLM(AsyncLLM):
         self.input_processor = _StubInputProcessor()
         self.sent: list[TokenizedGenerateReqInput] = []
 
-    def _send_one_request(self, obj, tokenized_obj, created_time=None) -> None:
+    async def _send_one_request(self, obj, tokenized_obj, created_time=None) -> None:
         self.sent.append(tokenized_obj)
 
     async def _wait_one_response(self, obj):

@@ -12,6 +12,7 @@
   },
   "min_regression_absolute_us": 1.0,
   "case_files": [
+    "gfx950/glm53_flash/gemm.json",
     "gfx950/glm53_flash/kda.json",
     "gfx950/glm53_flash/dsa.json",
     "gfx950/glm53_flash/moe.json",

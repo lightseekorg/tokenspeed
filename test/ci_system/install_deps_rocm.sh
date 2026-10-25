@@ -78,6 +78,8 @@ pip_install_with_retry pip3 install --force-reinstall --no-deps \
     tokenspeed-scheduler/ \
     --config-settings="build-dir=${SCHEDULER_BUILD_DIR}"
 rm -rf "${SCHEDULER_BUILD_DIR}"
+echo "=== Step 5b: Install TokenSpeed Engine ==="
+WORKSPACE="${WORKSPACE}" bash "${WORKSPACE}/test/ci_system/install_tokenspeed_engine.sh"
 
 echo "=== Step 6: Install TokenSpeed ==="
 # tokenspeed-smg / -grpc-servicer / -grpc-proto are pinned in

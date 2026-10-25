@@ -15,7 +15,7 @@ from tokenspeed_kernel.ops.quantization.triton import (
     fp8_token_multiplier,
     fp8_token_scale,
 )
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -496,9 +496,10 @@ def _gated_residual_combine_norm_kernel(
     BLOCK: tl.constexpr,
     PRELOAD_RESIDUAL: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    GROUPS_FIRST: tl.constexpr,
 ):
-    row = tl.program_id(0)
-    group = tl.program_id(1)
+    row = tl.program_id(1 if GROUPS_FIRST else 0)
+    group = tl.program_id(0 if GROUPS_FIRST else 1)
     offsets = tl.arange(0, BLOCK)
     mask = offsets < GROUP_SIZE
     positions = row * WIDTH + group * GROUP_SIZE + offsets
@@ -585,11 +586,22 @@ def gated_residual_combine_norm(
     if block > 65536:
         raise ValueError("group_size is too large for the Triton reduction")
     rows = residual.numel() // width
+    groups_first = (
+        4096 <= rows <= 65535
+        and groups == 4
+        and group_size == 2560
+        and residual.dtype in (torch.bfloat16, torch.float16)
+        and current_platform().is_nvidia
+        and current_platform().arch_version == ArchVersion(10, 7)
+    )
+    # Reuse each row's block output without exceeding CUDA's grid-y limit.
+    grid = (groups, rows) if groups_first else (rows, groups)
+    # Both grid orders are fixed JIT configurations; warm each before serving.
     enable_pdl = pdl_enabled()
     launch_kwargs = (
         {"launch_pdl": True} if enable_pdl and current_platform().is_nvidia else {}
     )
-    _gated_residual_combine_norm_kernel[(rows, groups)](
+    _gated_residual_combine_norm_kernel[grid](
         residual,
         block_output,
         inject_logits,
@@ -603,6 +615,7 @@ def gated_residual_combine_norm(
         BLOCK=block,
         PRELOAD_RESIDUAL=preload_residual,
         ENABLE_PDL=enable_pdl,
+        GROUPS_FIRST=groups_first,
         **launch_kwargs,
     )
     return combined, normalized

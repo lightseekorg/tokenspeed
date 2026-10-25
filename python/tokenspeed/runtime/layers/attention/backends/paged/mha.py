@@ -293,6 +293,23 @@ class MHAAttnBackend(PagedAttentionBackend):
             self.page_table_buf[:bs].copy_(page_table[:bs])
         self.forward_decode_metadata = self._decode_views(bs)
 
+    def decode_buffer_targets(
+        self, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        if self.block_decode_active:
+            return None
+        return self.seq_lens_buf[:bs], self.page_table_buf[:bs]
+
+    @property
+    def decode_seq_lens_floor(self) -> int:
+        return self.verify_floor
+
+    def publish_decode_metadata(
+        self, bs: int, seq_lens: torch.Tensor, *, num_extends: int
+    ) -> None:
+        del seq_lens, num_extends
+        self.forward_decode_metadata = self._decode_views(bs)
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------

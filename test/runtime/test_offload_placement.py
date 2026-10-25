@@ -33,7 +33,12 @@ from tokenspeed_kernel.platform import current_platform
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="sparse KV offload CuTe kernels require NVIDIA SM90+",
+)
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not current_platform().is_hopper_plus,
     reason="sparse KV offload CuTe kernels require NVIDIA SM90+",
@@ -49,10 +54,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroup
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
     plan_cache_storage,
 )
-from tokenspeed.runtime.pd.cache_protocol import (
-    CacheTransferContract,
-    build_arena_cache_transfer_contract,
-)
+from tokenspeed.runtime.pd.cache_protocol import build_arena_cache_transfer_contract
 
 
 @pytest.mark.parametrize("prefix_granularity", [8, 16])
@@ -94,14 +96,12 @@ def test_segmented_host_device_contract_and_budget(prefix_granularity):
     )
     assert arena.field(names[0]).is_cuda
     assert arena.field(names[1]).is_pinned()
-    contract, base = build_arena_cache_transfer_contract(arena)
-    restored = CacheTransferContract.from_wire_bytes(contract.to_wire_bytes())
-    assert restored == contract
+    contract, _ = build_arena_cache_transfer_contract(arena)
     for name in names:
-        assert restored.field_address(base, name) == arena.field(name).data_ptr()
+        assert contract.field_addresses[name] == arena.field(name).data_ptr()
     # A PD writer uses the advertised landing address, not the hot device view.
     source = torch.arange(32, dtype=torch.bfloat16)
-    destination = restored.field_address(base, names[1]) + 8 * 32 * 2
+    destination = contract.field_addresses[names[1]] + 8 * 32 * 2
     ctypes.memmove(destination, source.data_ptr(), source.numel() * 2)
     assert torch.equal(arena.field(names[1])[8, 0], source)
     # Sixteen LCM blocks plus the group's dummy page share the flat row view.

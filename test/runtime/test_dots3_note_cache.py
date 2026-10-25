@@ -178,15 +178,17 @@ def test_history_and_draft_fields_share_the_planned_arena(
 
     if pd:
         from tokenspeed.runtime.pd.cache_protocol import (
-            CacheTransferContract,
             build_arena_cache_transfer_contract,
         )
 
         contract, base_addr = build_arena_cache_transfer_contract(arena)
-        received = CacheTransferContract.from_wire_bytes(contract.to_wire_bytes())
-        for field in received.plan.fields:
+        for field in contract.plan.fields:
+            # Each field lands where its page 0 sits in the one arena.
+            assert contract.field_addresses[field.field_id] == base_addr + (
+                contract.plan.field_page_byte_offset(field.field_id, 0)
+            )
             for page_id in (0, 1, 2):
-                offset = received.plan.field_page_byte_offset(field.field_id, page_id)
+                offset = contract.plan.field_page_byte_offset(field.field_id, page_id)
                 assert (
                     base_addr + offset
                     == arena.field(field.field_id)[page_id].data_ptr()

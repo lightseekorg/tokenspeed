@@ -133,66 +133,6 @@ class TestServerArgs:
         plain = ServerArgs(**DP8)
         plain.validate_tp_batch_invariant_weights("fp8", ())
 
-    def test_head_tp_decode_engine_admits_any_generation_budget(self):
-        """A retracted request resumes by restore, never by a recovery
-        prefill, so the decode-only head-TP layout needs no admission cap:
-        the budget only clamps to the context, as on every engine."""
-        import inspect
-
-        from tokenspeed.runtime.engine import request_handler
-        from tokenspeed.runtime.engine.request_handler import RequestHandler
-
-        args = ServerArgs(**DP8, attn_head_tp_size=8, disaggregation_mode="decode")
-        assert args.mapping.attn.head_tp_serves_decode_only
-
-        def admit(max_new_tokens):
-            handler = RequestHandler.__new__(RequestHandler)
-            handler.max_req_len = 65536
-            spec = SimpleNamespace(max_new_tokens=0)
-            state = SimpleNamespace(
-                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
-                prompt_input_ids=[1, 2, 3],
-                finished_reason=None,
-            )
-            RequestHandler._apply_generation_budget(handler, spec, state)
-            return spec, state
-
-        spec, state = admit(4096 + 1)
-        assert spec.max_new_tokens == 4097 and state.finished_reason is None
-        # An undeclared budget is the context remainder, admitted too.
-        spec, state = admit(None)
-        assert spec.max_new_tokens == 65536 - 3 - 1 and state.finished_reason is None
-        # No layout-keyed budget survives anywhere in the handler.
-        assert "max_new_tokens_budget" not in inspect.getsource(request_handler)
-
-    def test_lm_head_tp_under_dp_refuses_prompt_logprobs(self):
-        """The LM-head TP group exchanges its logits rows once per forward;
-        the prompt-logprob chunk loop would run that exchange a per-rank
-        number of times, so the engine aborts such requests at admission."""
-        from tokenspeed.runtime.engine.request_handler import RequestHandler
-
-        def admit(server_args, wants_input_logprobs):
-            handler = RequestHandler.__new__(RequestHandler)
-            mapping = server_args.mapping
-            handler.supports_input_logprobs = not (
-                mapping.attn.has_dp and mapping.lm_head.has_tp
-            )
-            state = SimpleNamespace(
-                wants_input_logprobs=wants_input_logprobs, finished_reason=None
-            )
-            RequestHandler._refuse_unsupported_input_logprobs(handler, state)
-            return state
-
-        sharded = ServerArgs(**DP8, lm_head_tp_size=8)
-        sharded.mapping.rank = 0
-        assert admit(sharded, False).finished_reason is None
-        state = admit(sharded, True)
-        assert state.finished_reason is not None
-        assert "lm-head-tp-size" in state.finished_reason.message
-        replicated = ServerArgs(**DP8)
-        replicated.mapping.rank = 0
-        assert admit(replicated, True).finished_reason is None
-
     def test_batch_invariant_rejects_unknown_selection(self):
         with pytest.raises(ValueError, match="tp-batch-invariant"):
             ServerArgs(

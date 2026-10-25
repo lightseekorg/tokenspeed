@@ -37,18 +37,13 @@ from tokenspeed.runtime.engine.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
-    GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     IsSchedulerPausedReqInput,
-    IsSchedulerPausedReqOutput,
     IsSleepingReqInput,
-    IsSleepingReqOutput,
     PauseMode,
     PauseSchedulerReqInput,
-    PauseSchedulerReqOutput,
     ProfileReq,
-    ProfileReqOutput,
     ProfileReqType,
     RebalanceExpertsReqInput,
     RebalanceExpertsReqOutput,
@@ -57,7 +52,6 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     ResumeSchedulerReqInput,
-    ResumeSchedulerReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
     UpdateWeightsFromDistributedReqInput,
@@ -65,12 +59,8 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromMooncakeReqInput,
     UpdateWeightsFromMooncakeReqOutput,
     UpdateWeightsFromTensorReqInput,
-    UpdateWeightsFromTensorReqOutput,
 )
-from tokenspeed.runtime.engine.scheduler_communicator import _Communicator
-from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.env import envs
-from tokenspeed.runtime.utils.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.engine.async_llm import AsyncLLM
@@ -121,140 +111,12 @@ def combined_weight_update_output(
 
 
 class SchedulerControlClient:
-    """Scheduler control-plane client methods for AsyncLLM."""
-
-    def init_communicators(self: AsyncLLM, server_args: ServerArgs):
-        # Communicators
-        self.init_weights_update_group_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.destroy_weights_update_group_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.update_weights_from_distributed_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.update_weights_from_mooncake_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.rebalance_experts_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.update_weights_from_tensor_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.get_weights_by_name_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.release_memory_occupation_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.resume_memory_occupation_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.flush_cache_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.pause_scheduler_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.resume_scheduler_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.is_scheduler_paused_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.is_sleeping_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.profile_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.get_internal_state_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-        self.set_internal_state_communicator = _Communicator(
-            self.engine_core_client.send_to_scheduler, server_args.mapping.attn.dp_size
-        )
-
-        self._result_dispatcher += self._get_communicator_dispatcher()
-
-    def _get_communicator_dispatcher(self: AsyncLLM):
-        return TypeBasedDispatcher(
-            [
-                (
-                    InitWeightsUpdateGroupReqOutput,
-                    self.init_weights_update_group_communicator.handle_recv,
-                ),
-                (
-                    DestroyWeightsUpdateGroupReqOutput,
-                    self.destroy_weights_update_group_communicator.handle_recv,
-                ),
-                (
-                    UpdateWeightsFromDistributedReqOutput,
-                    self.update_weights_from_distributed_communicator.handle_recv,
-                ),
-                (
-                    UpdateWeightsFromMooncakeReqOutput,
-                    self.update_weights_from_mooncake_communicator.handle_recv,
-                ),
-                (
-                    RebalanceExpertsReqOutput,
-                    self.rebalance_experts_communicator.handle_recv,
-                ),
-                (
-                    UpdateWeightsFromTensorReqOutput,
-                    self.update_weights_from_tensor_communicator.handle_recv,
-                ),
-                (
-                    GetWeightsByNameReqOutput,
-                    self.get_weights_by_name_communicator.handle_recv,
-                ),
-                (
-                    ReleaseMemoryOccupationReqOutput,
-                    self.release_memory_occupation_communicator.handle_recv,
-                ),
-                (
-                    ResumeMemoryOccupationReqOutput,
-                    self.resume_memory_occupation_communicator.handle_recv,
-                ),
-                (
-                    FlushCacheReqOutput,
-                    self.flush_cache_communicator.handle_recv,
-                ),
-                (
-                    PauseSchedulerReqOutput,
-                    self.pause_scheduler_communicator.handle_recv,
-                ),
-                (
-                    ResumeSchedulerReqOutput,
-                    self.resume_scheduler_communicator.handle_recv,
-                ),
-                (
-                    IsSchedulerPausedReqOutput,
-                    self.is_scheduler_paused_communicator.handle_recv,
-                ),
-                (
-                    IsSleepingReqOutput,
-                    self.is_sleeping_communicator.handle_recv,
-                ),
-                (
-                    ProfileReqOutput,
-                    self.profile_communicator.handle_recv,
-                ),
-                (
-                    GetInternalStateReqOutput,
-                    self.get_internal_state_communicator.handle_recv,
-                ),
-                (
-                    SetInternalStateReqOutput,
-                    self.set_internal_state_communicator.handle_recv,
-                ),
-            ]
-        )
+    """Control operations for AsyncLLM: each runs on every engine (one per
+    attention-DP rank) through ``AsyncLLM._control``, which returns every
+    engine's reply."""
 
     async def flush_cache(self: AsyncLLM) -> FlushCacheReqOutput:
-        results = await self.flush_cache_communicator(FlushCacheReqInput())
+        results = await self._control(FlushCacheReqInput())
         return combined_flush_cache_output(results)
 
     async def pause_scheduler(self: AsyncLLM, *, mode: PauseMode = "abort") -> bool:
@@ -271,25 +133,19 @@ class SchedulerControlClient:
         # Pause may be the very first call (e.g. weight swap before serving),
         # so ensure the output-dispatch loop is running to receive the reply.
         self.auto_create_handle_loop()
-        result = (
-            await self.pause_scheduler_communicator(PauseSchedulerReqInput(mode=mode))
-        )[0]
+        result = (await self._control(PauseSchedulerReqInput(mode=mode)))[0]
         return result.success
 
     async def resume_scheduler(self: AsyncLLM) -> bool:
         """Resume generation after :meth:`pause_scheduler`."""
         self.auto_create_handle_loop()
-        result = (await self.resume_scheduler_communicator(ResumeSchedulerReqInput()))[
-            0
-        ]
+        result = (await self._control(ResumeSchedulerReqInput()))[0]
         return result.success
 
     async def is_scheduler_paused(self: AsyncLLM) -> bool:
         """Return whether the scheduler is currently paused."""
         self.auto_create_handle_loop()
-        result = (
-            await self.is_scheduler_paused_communicator(IsSchedulerPausedReqInput())
-        )[0]
+        result = (await self._control(IsSchedulerPausedReqInput()))[0]
         return result.is_paused
 
     async def start_profile(
@@ -325,7 +181,7 @@ class SchedulerControlClient:
         return await self._execute_profile(req)
 
     async def _execute_profile(self: AsyncLLM, req: ProfileReq):
-        result = (await self.profile_communicator(req))[0]
+        result = (await self._control(req))[0]
         if not result.success:
             raise RuntimeError(result.message)
         return result
@@ -343,7 +199,7 @@ class SchedulerControlClient:
         obj: InitWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        results = await self.init_weights_update_group_communicator(obj)
+        results = await self._control(obj)
         return combined_weight_update_output(results)
 
     async def destroy_weights_update_group(
@@ -351,7 +207,7 @@ class SchedulerControlClient:
         obj: DestroyWeightsUpdateGroupReqInput,
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
-        results = await self.destroy_weights_update_group_communicator(obj)
+        results = await self._control(obj)
         return combined_weight_update_output(results)
 
     async def update_weights_from_distributed(
@@ -360,7 +216,7 @@ class SchedulerControlClient:
     ) -> tuple[bool, str]:
         self.auto_create_handle_loop()
         async with self.model_update_lock.writer_lock:
-            results = await self.update_weights_from_distributed_communicator(obj)
+            results = await self._control(obj)
         return combined_weight_update_output(results)
 
     async def update_weights_from_mooncake(
@@ -370,7 +226,7 @@ class SchedulerControlClient:
         """Load one committed Mooncake weight-store version on every worker."""
         self.auto_create_handle_loop()
         async with self.model_update_lock.writer_lock:
-            results = await self.update_weights_from_mooncake_communicator(obj)
+            results = await self._control(obj)
         return combined_weight_update_output(results)
 
     async def rebalance_experts(
@@ -384,7 +240,7 @@ class SchedulerControlClient:
         taken; the weight moves follow in later rounds. The replies are ANDed.
         """
         self.auto_create_handle_loop()
-        results = await self.rebalance_experts_communicator(obj)
+        results = await self._control(obj)
         return combined_weight_update_output(results)
 
     async def update_weights_from_tensor(
@@ -398,68 +254,59 @@ class SchedulerControlClient:
         # This means that weight sync
         # cannot run while requests are in progress.
         async with self.model_update_lock.writer_lock:
-            result = (await self.update_weights_from_tensor_communicator(obj))[0]
+            result = (await self._control(obj))[0]
             return result.success, result.message
 
     async def get_weights_by_name(
         self: AsyncLLM,
         obj: GetWeightsByNameReqInput,
     ):
-        self.auto_create_handle_loop()
-        results = await self.get_weights_by_name_communicator(obj)
-        all_parameters = [r.parameter for r in results]
-        if not self.server_args.mapping.attn.has_dp:
-            return all_parameters[0]
-        else:
-            return all_parameters
+        raise NotImplementedError(
+            "get_weights_by_name is not served: no engine handles it"
+        )
 
     async def release_memory_occupation(
         self: AsyncLLM,
         obj: ReleaseMemoryOccupationReqInput,
     ) -> ReleaseMemoryOccupationReqOutput:
         self.auto_create_handle_loop()
-        return (await self.release_memory_occupation_communicator(obj))[0]
+        return (await self._control(obj))[0]
 
     async def resume_memory_occupation(
         self: AsyncLLM,
         obj: ResumeMemoryOccupationReqInput,
     ) -> ResumeMemoryOccupationReqOutput:
         self.auto_create_handle_loop()
-        return (await self.resume_memory_occupation_communicator(obj))[0]
+        return (await self._control(obj))[0]
 
     async def is_sleeping(self: AsyncLLM) -> bool:
         self.auto_create_handle_loop()
-        result = (await self.is_sleeping_communicator(IsSleepingReqInput()))[0]
+        result = (await self._control(IsSleepingReqInput()))[0]
         return result.is_sleeping
 
     async def get_internal_state(self: AsyncLLM) -> list[dict[Any, Any]]:
         req = GetInternalStateReq()
-        responses: list[GetInternalStateReqOutput] = (
-            await self.get_internal_state_communicator(req)
-        )
+        responses: list[GetInternalStateReqOutput] = await self._control(req)
         # Many DP ranks
         return [res.internal_state for res in responses]
 
     async def set_internal_state(
         self: AsyncLLM, obj: SetInternalStateReq
     ) -> list[bool]:
-        responses: list[SetInternalStateReqOutput] = (
-            await self.set_internal_state_communicator(obj)
-        )
+        responses: list[SetInternalStateReqOutput] = await self._control(obj)
         return [res.updated for res in responses]
 
     async def get_load(self: AsyncLLM) -> list[GetLoadReqOutput]:
+        """Each engine's latest load, as it reported it with its outputs."""
         self.auto_create_handle_loop()
-        return self.load_snapshot_store.project_loads()
-
-    async def load_snapshot_loop(self: AsyncLLM) -> None:
-        """Cache scheduler-published snapshots and relay accepted updates to DP."""
-        while True:
-            snapshot = await self.engine_core_client.recv_load_snapshot.recv_pyobj()
-            if not self.load_snapshot_store.accept(snapshot):
-                continue
-            if (
-                self.server_args.mapping.attn.has_dp
-                and self.server_args.load_balance_method != "round_robin"
-            ):
-                await self.engine_core_client.send_to_scheduler.send_pyobj(snapshot)
+        return [
+            GetLoadReqOutput(
+                dp_rank=dp_rank,
+                num_reqs=num_running + num_waiting,
+                num_waiting_reqs=num_waiting,
+                num_pages=kv_active_pages,
+            )
+            for dp_rank, (num_running, num_waiting, kv_active_pages, _) in enumerate(
+                self.frontend.loads()
+            )
+        ]

@@ -253,8 +253,16 @@ A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
 retraction image -- published under the hash of that token count, page
-boundary or not. No forward computes an interior checkpoint, no scan is split
-into body and tail, and no state group declares a token span: a hit resumes
+boundary or not. The one interior checkpoint is opt-in
+(`--enable-state-checkpoint-in-forward`): the forward that spans a long
+prompt's last page boundary before its replay tail also stores the state at
+that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
+`InForwardStateCheckpoints`) -- the GDN scan emits it from inside the kernel,
+the conv and PLE windows are the inputs before it -- which is then published
+like a natural checkpoint
+([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
+No scan is split into body and tail, and no state group declares a token
+span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
 tail of the same instant in the history groups
 ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)
@@ -270,7 +278,10 @@ masked state writer (`store_state_rows`) drops its result, and the padded
 output rows are zeroed by a device-side bound the capture cannot freeze. The
 live tokens keep the packing of the unpadded forward, so a capture of any
 request count matches eager bit for bit; nothing about padding reaches the
-cache or the scheduler.
+cache or the scheduler. A forward that writes an in-forward State checkpoint
+keeps its live metadata instead (`prepare_prefill_metadata` returns False):
+the capacity layout carries no checkpoint, so the layer runs at its eager
+break of the ordinary prefill graph.
 
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays
@@ -278,17 +289,34 @@ null, so the first decode reads the landed state). When the decode role's
 own prefix cache holds the state for the prompt end -- a state hit counts
 only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
-and both sides omit the group from the manifest (`pd/cache_protocol.py`).
+and both sides omit the group from the manifest (`ts-pd`'s `layout::manifest`).
 
-Speculative KDA verification stores no per-position recurrent states: it
-captures each window's raw projections in a compact payload and commits by
-replaying the accepted prefix from the committed block. The Kimi-K3 and
-GLM-5.3-Flash recipes share this workspace calculation and reserve it before
-sizing the arena -- the transient conv rows plus the per-layer capture
-payloads. GLM also reserves its target/draft-shared KPool tails once, so state
-memory does not disappear from the GPU budget. (Platforms without the replay
-kernels fall back to the dense `max_bs * (draft_tokens + 1)` per-position
-state workspace, reserved the same way.)
+KDA targets with a batched commit kernel use the same deferred-state lifecycle
+for ordinary decode (`T=1`) and speculative verification. Verify leaves the
+committed recurrent and convolution state unchanged; acceptance selects the
+prefix to commit into the live block.
+
+On NVIDIA and AMD, verify saves FP32 corrections plus unnormalized keys and raw gates
+in the activation dtype (BF16 or FP16). Recovery recomputes key normalization
+and gate decay, then applies the saved corrections to the input checkpoint.
+It does not recompute the state-dependent correction or the gate projection.
+Original QKV rows are retained only for convolution-history commit. The
+persistent convolution pool keeps its cache dtype, independently of activation
+dtype. Records and position/generation stamps cover the current verify round;
+they are transient workspace, not prefix-cache entries.
+
+Both vendors consume the same post-convolution activation values in verify
+and save those unnormalized keys for recovery. NVIDIA uses Triton recovery;
+AMD uses Gluon recovery. Neither recomputes the state-dependent correction.
+Convolution history is committed separately so in-place pages are safe.
+Platforms without a matching batched commit and no-store verify keep the dense
+`max_bs * (draft_tokens + 1)` per-position state workspace.
+
+The Kimi-K3 and GLM-5.3-Flash recipes share the backend's payload specification
+and reserve transient convolution rows, payloads, descriptors and record
+metadata before sizing the arena. Prefill-only engines reserve no decode
+records. GLM also reserves its target/draft-shared KPool tails once, so state
+memory does not disappear from the GPU budget.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 
@@ -450,8 +478,9 @@ the same plan). The restore is one op: on the load stream behind the
 zeroing, the L2-tier rows, the pool-tier rows, the slot-state import, one
 event — no layerwise tracker, because the request is `Restoring` and
 unschedulable until the ACK. Three ACK kinds ride the one cache poll
-(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and `CacheOpHooks`
-replica-intersects them alike; a readmission needs both store ACKs.
+(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and the control plane
+(`ts-control`'s `cache_ops`) replica-intersects them alike; a readmission
+needs both store ACKs.
 
 **Slot-state image.** Device state keyed by `req_pool_index` that lives in no
 cache group must travel with the pages or the continuation is not exact: the
@@ -506,7 +535,8 @@ owners is an error, and a replicated group translates to the identity. Each
 Host tier holds one translation (same Device bound, its own Host bound,
 `1 + host_lcm_blocks × packing × shard_count`). An op whose every row belongs
 to other ranks is still acknowledged by this rank from an empty copy; the
-hooks' replica intersection completes the op only once every owner has. The
+control plane's replica intersection completes the op only once every owner
+has. The
 scheduler side (residue-class allocation for every tier transfer, the Host
 pools registered with each group's `shard_count`) is what makes the
 translation exact, so both Host tiers serve a KV-page-sharded engine. L3
@@ -799,8 +829,9 @@ Its responsibilities:
   (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,
   retraction); a chunk end or decode step publishes no state (see
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
-  Evicting a History block under a chain hash evicts the state checkpoints
-  under that hash as well, so a state never outlives the KV it continues.
+  On Device, evicting a History block under a chain hash also evicts the
+  State checkpoints under that hash, so Device state does not outlive the
+  KV it continues.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -810,7 +841,27 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries. During prefill, each chunk end queues the
+  acquire/contains/pin queries. Host L2 uses free capacity first, then global
+  LRU across cache groups: a compatible child in the requested group competes
+  with fully evictable LCM parents across groups. When only one group needs
+  replacement, its own parents are omitted: the initial allocation pass
+  exhausted the requested buckets' holes, so each such parent has a compatible
+  child no newer than its newest child and cannot beat single-child eviction.
+  Cross-group reuse must free a whole parent, ranked by its most recently
+  accessed child, so a cold sibling cannot cause newer data to be discarded.
+  Equal epochs prefer
+  evicting one child; group and physical location break remaining ties. A
+  prefix hit refreshes its access epoch, and earlier reuse grants no
+  additional protection. Pinned entries, partially pinned foreign parents,
+  and blocks allocated earlier in the same batch remain protected. Parent
+  candidates are snapshots; selection skips parents that are now empty or
+  bound to another group. Parent aggregation reuses coordinator-owned scratch
+  storage and resets and examines only touched parents, rather than the whole
+  Host arena on every allocation batch. Child reuse preserves the requested
+  placement bucket. Host eviction removes each selected entry independently.
+  No group has an eviction preference or a fixed share of the pool; capacity follows the access
+  pattern, without guaranteeing that KV and every required state checkpoint
+  remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
   admission, or a junction cut) queues its tail and state checkpoint too;
   the candidates are merged into a batched writeback. Ordinary decode
@@ -884,9 +935,10 @@ Its responsibilities:
   positional-encoding or kernel changes that alter KV without changing the
   checkpoint, layout or recorded producer choices. A git SHA would split
   caches on unrelated changes; a package version may stay unchanged across
-  KV-affecting edits. Static facts are captured once. `storage_key_prefix`
-  combines their digest with explicit target/draft weight versions, without
-  re-reading mutable launch options or checkpoint files on version updates.
+  KV-affecting edits. Static facts are captured once. The namespace
+  (`ts-l3`'s `key_prefix`) combines their digest with explicit target/draft
+  weight versions, without re-reading mutable launch options or checkpoint
+  files on version updates.
   Use resolved `mapping.attn.tp_size`, not `--attn-tp-size` alone: different TP
   widths can have identical per-rank packed geometry while assigning different
   heads to a rank.
@@ -1337,13 +1389,13 @@ contributed.
 
 PD transfer supports independently sharded prefill and decode roles. Manifests carry scheduler (virtual) IDs on both sides and are bounded
 by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
-the physical page count. The route planner (`pd/transfer_plan.py`) reads
+the physical page count. The route planner (`ts-pd`'s `layout::route`) reads
 `shard_count` from the wire `group_specs`: for a sharded group it fans a
 decode rank's replica out to the whole KVP subgroup (consecutive attention-TP
 ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
 the sender keeps the manifest blocks with `(v - 1) % owner_count ==
-owner_rank`, translates them to local pages through the same
-`owned_local_pages` placement zeroing uses, and matches them to destination blocks at the same manifest positions.
+owner_rank`, translates them to local pages with the placement zeroing uses
+(`owned_local_pages`), and matches them to destination blocks at the same manifest positions.
 Only pairs owned by the destination rank are copied, after translating both
 virtual IDs to local pages. Every rank of the subgroup therefore
 serves every decode rank and none is a control-only dummy; the decode receiver

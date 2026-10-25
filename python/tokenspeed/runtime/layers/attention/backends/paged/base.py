@@ -386,14 +386,22 @@ class PagedAttentionBackend(CachePoolBinding, ABC):
         """The ``(seq_lens, page_table)`` buffer views a decode refresh copies into.
 
         A leaf whose :meth:`refresh_decode_metadata` is exactly those two
-        copies followed by :meth:`publish_decode_metadata` returns them, so
-        the router can fill every such leaf with one batched copy; a leaf
-        with any other refresh returns None and refreshes itself.
+        copies (seq_lens clamped to :attr:`decode_seq_lens_floor`) followed
+        by :meth:`publish_decode_metadata` returns them, so the router can
+        fill every such leaf with one batched copy; a leaf with any other
+        refresh returns None and refreshes itself.
 
         Args:
             bs: Requests to prepare (the padded graph batch under replay).
         """
         return None
+
+    @property
+    def decode_seq_lens_floor(self) -> int:
+        """The minimum the router clamps ``seq_lens`` to before copying them
+        into :meth:`decode_buffer_targets`. Decode ``seq_lens`` are at least
+        1 (padding rows replay at 1), so 1 copies them unchanged."""
+        return 1
 
     def publish_decode_metadata(
         self, bs: int, seq_lens: torch.Tensor, *, num_extends: int

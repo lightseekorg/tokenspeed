@@ -39,6 +39,7 @@ from tokenspeed_kernel.signature import (
 
 __all__ = [
     "bf16_moe_routes",
+    "gather_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
     "dispatch_topk_ids",
@@ -994,6 +995,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (  # noqa: E402
     prepare_nvfp4_routing,
 )
 from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
+    gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
 )
@@ -1817,6 +1819,12 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    deferred_output_is_token_order = True in apply_spec.traits.get(
+        "deferred_output_is_token_order", frozenset({False})
+    )
+    supports_deferred_out = True in apply_spec.traits.get(
+        "supports_deferred_out", frozenset({False})
+    )
     topk_weights_dtypes = apply_spec.traits.get(
         "topk_weights_dtype", frozenset({torch.float32})
     )
@@ -1858,6 +1866,8 @@ def moe_plan(
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "deferred_output_is_token_order": deferred_output_is_token_order,
+        "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
@@ -1943,6 +1953,7 @@ def moe_apply(
     shared_out: torch.Tensor | None = None,
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     routing_prepared: object | None = None,
+    deferred_out: torch.Tensor | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -1989,9 +2000,13 @@ def moe_apply(
         routing_prepared: Routing metadata the top-k kernel filled ahead of
             this call, so the kernel skips its routing launch. Only forwarded
             when given; kernels that cannot consume it reject it.
+        deferred_out: Optional caller-owned route destination for
+            ``do_finalize=False``; requires ``supports_deferred_out``.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
+    if deferred_out is not None and (do_finalize or not plan["supports_deferred_out"]):
+        raise ValueError("selected MoE plan cannot write the supplied deferred output")
     data = x[0] if isinstance(x, tuple) else x
     kernel = plan["apply_kernel"]
     if "batch_invariant" in plan["features"] and data.dtype != plan["input_dtype"]:
@@ -2023,6 +2038,7 @@ def moe_apply(
     quantized_kwargs = {"x_quantized": x_quantized} if x_quantized is not None else {}
     if routing_prepared is not None:
         quantized_kwargs["routing_prepared"] = routing_prepared
+    output_kwargs = {"deferred_out": deferred_out} if deferred_out is not None else {}
     return kernel(
         plan=plan,
         x=x,
@@ -2037,6 +2053,7 @@ def moe_apply(
         **a2a_kwargs,
         **shared_kwargs,
         **quantized_kwargs,
+        **output_kwargs,
     )
 
 

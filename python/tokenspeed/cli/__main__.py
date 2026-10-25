@@ -72,8 +72,7 @@ def main() -> None:
         "— e.g. `smg serve --backend tokenspeed --connection-mode zmq` — "
         "binds the msgpack ZMQ sockets and this engine dials in at "
         "--data-parallel-address/--data-parallel-rpc-port (default "
-        "tcp://127.0.0.1:30500). Implies --zmq-msgpack and "
-        "--skip-tokenizer-init.",
+        "tcp://127.0.0.1:30500). Implies --skip-tokenizer-init.",
     )
     serve_parser.set_defaults(func=_serve)
 

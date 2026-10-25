@@ -26,7 +26,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_amd, reason="Iris requires AMD ROCm"
@@ -48,6 +48,7 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_cache_policy,
         iris_lamport_allreduce,
     )
 
@@ -65,6 +66,9 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
             "TOTAL_ELEMENTS": 6 * 10752,
             "MAX_ELEMENTS": 6 * 10752,
             "NUM_STAGES": 3,
+            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
         },
         attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
     )
@@ -77,16 +81,7 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     (tmp_path / f"lamport-rank{rank}.amdgcn").write_text(assembly)
     (tmp_path / f"lamport-rank{rank}.llir").write_text(kernel.asm["llir"])
     lines = assembly.splitlines()
-    labels = {
-        match[1]: index
-        for index, line in enumerate(lines)
-        if (match := re.match(r"^(\.LBB\w+):", line))
-    }
-    cycles = []
-    for index, line in enumerate(lines):
-        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
-        if match and labels[match[1]] < index:
-            cycles.append(lines[labels[match[1]] : index + 1])
+    cycles = _polling_cycles(assembly)
     assert cycles, "polling loop was removed"
     assert any(
         sum("buffer_load_dwordx4" in line and "sc0 sc1" in line for line in cycle) == 7
@@ -97,6 +92,87 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
         == 14
     ), "publication and reset must use 16-byte system-cache stores"
     assert kernel.metadata.num_warps == 1
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+def _polling_cycles(assembly):
+    lines = assembly.splitlines()
+    labels = {
+        match[1]: index
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(\.LBB\w+):", line))
+    }
+    cycles = []
+    for index, line in enumerate(lines):
+        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
+        if match and labels[match[1]] < index:
+            cycles.append(lines[labels[match[1]] : index + 1])
+    return cycles
+
+
+def test_lamport_two_shot_polling_codegen(tmp_path):
+    """Both two-shot exchanges must reread all seven peer mailboxes per retry."""
+    from tokenspeed_kernel._triton import gluon, triton
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        iris_cache_policy,
+        iris_lamport_twoshot_bf16_allreduce,
+    )
+
+    fn = iris_lamport_twoshot_bf16_allreduce
+    signature = {
+        "input_ptr": "*bf16",
+        "region_sym_ptr": "*bf16",
+        "output_ptr": "*bf16",
+        "epochs": "*i32",
+        "regions": ("i64",) * 8,
+        "total_elements": "i32",
+    }
+    attrs = {}
+    for index, name in enumerate(fn.arg_names):
+        if name == "regions":
+            attrs.update(
+                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
+            )
+        elif name in signature:
+            attrs[(index,)] = [["tt.divisibility", 16]]
+    source = gluon._runtime.GluonASTSource(
+        fn,
+        signature,
+        constexprs={
+            "RANK": 3,
+            "WORLD_SIZE": 8,
+            "MAX_SHARD_ELEMENTS": 131072,
+            "NUM_STAGES": 3,
+            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        attrs=attrs,
+    )
+    kernel = triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": 1},
+    )
+    assembly = kernel.asm["amdgcn"]
+    (tmp_path / "two-shot.amdgcn").write_text(assembly)
+    # Group system-scope peer loads by the loop that LLVM reports for them.
+    loads = {}
+    header = None
+    for line in assembly.splitlines():
+        if match := re.match(r"^\.L(BB\w+):", line):
+            loop = re.search(r"Header=(BB\w+)|(=>This Inner Loop Header)", line)
+            header = (loop[1] or match[1]) if loop else None
+        elif header and "buffer_load_dword " in line and "sc0 sc1" in line:
+            loads[header] = loads.get(header, 0) + 1
+    assert sorted(loads.values()) == [
+        7,
+        7,
+    ], "each exchange must poll all seven peers per retry"
+    # Readiness watches only the odd half of each BF16 pair, so every mailbox
+    # push and reset must store the whole pair in one dword.
+    stores = re.findall(r"^\s*(buffer_store_\w+)[^\n]*\bsc0 sc1\b", assembly, re.M)
+    assert stores and set(stores) == {"buffer_store_dword"}, sorted(set(stores))
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 

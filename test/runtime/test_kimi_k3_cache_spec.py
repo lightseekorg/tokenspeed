@@ -184,8 +184,8 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         lambda dtype, **kwargs: True,
     )
     monkeypatch.setattr(
-        "tokenspeed_kernel.ops.attention.kda.kda_batched_replay_uses_raw_gate",
-        lambda dtype, **kwargs: False,
+        "tokenspeed_kernel.ops.attention.kda.kda_fused_paged_verify_uses_split_producers",
+        lambda dtype, **kwargs: True,
     )
     recipe, groups, layout = kimi_tp8_layout(
         draft_layers=5,
@@ -200,11 +200,19 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
         for field in fields
         if field.field_id.endswith(".conv_state")
     )
-    # 69 KDA layers x (4 requests x 8 draft tokens) rows, each one bf16
-    # qkv/f_a/beta row (4608 + 128 + 12 channels) plus an fp32 gate row
-    # (12 x 128), per rank at TP8.
-    expected_payload_bytes = 69 * 4 * 8 * ((4608 + 128 + 12) * 2 + 12 * 128 * 4)
-    expected_workspace_bytes = conv_row_bytes + expected_payload_bytes
+    # 69 layers x (4 requests x 8 positions): BF16 raw QKV and K/raw gate,
+    # FP32 correction, plus fixed descriptors and request/generation stamps.
+    expected_payload_bytes = 69 * 4 * 8 * (4608 * 2 + 1536 * 4 + 3072 * 2)
+    descriptor_bytes = 69 * (10 * 8 + 4) + 3 * 4 * 8
+    page_and_step_bytes = (2 * 3 + 1) * 4 * 4
+    record_metadata_bytes = 4 * 3 * 8 + 69 * 4 * 8 * 2 * 8
+    expected_workspace_bytes = (
+        conv_row_bytes
+        + expected_payload_bytes
+        + descriptor_bytes
+        + page_and_step_bytes
+        + record_metadata_bytes
+    )
 
     setup = recipe.setup()
 
@@ -217,6 +225,7 @@ def test_replay_verify_workspace_reserves_conv_rows_and_payloads(
 
 
 def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
+    """A prefill-only engine has no decode records, with or without a drafter."""
     recipe, _, _ = kimi_tp8_layout(
         draft_layers=5,
         max_bs=4,
@@ -224,21 +233,21 @@ def test_non_speculative_kimi_reserves_no_verify_workspace() -> None:
         speculative_num_draft_tokens=8,
     )
 
+    recipe.server_args.disaggregation_mode = "prefill"
     assert recipe.workspace_bytes() == 0
 
 
 def test_lcm_parent_demand_uses_per_group_packing() -> None:
     recipe, _, layout = kimi_tp8_layout(max_bs=1, max_scheduled_tokens=8_192)
 
-    # Non-overlap sparse state prefill needs one input, one cacheable aligned
-    # checkpoint, one final continuation block, and one banked growth block per
-    # KDA group. The search inverts that demand -- what 98 parents admit needs no more,
-    # and one parent fewer admits strictly less.
-    assert recipe.parents_needed(layout, 131_072) == 98
-    admitted = recipe.token_capacity(layout, 98)
+    # State groups hold only an input checkpoint and a live page. The full
+    # history uses ceil(1024 / 12) = 86 parents; three state groups use two
+    # parents each. The inverse capacity search must agree at the boundary.
+    assert recipe.parents_needed(layout, 131_072) == 92
+    admitted = recipe.token_capacity(layout, 92)
     assert admitted >= 131_072
-    assert recipe.parents_needed(layout, admitted) <= 98
-    assert recipe.token_capacity(layout, 97) < admitted
+    assert recipe.parents_needed(layout, admitted) <= 92
+    assert recipe.token_capacity(layout, 91) < admitted
 
 
 def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:
@@ -255,13 +264,10 @@ def test_sparse_state_parent_demand_tracks_decode_and_overlap_width() -> None:
         overlap_schedule_depth=1,
     )
 
-    # A full-block decode width plus overlap needs one more growth block per
-    # request and state group (3 requests x 3 groups). The full-attention
-    # protection term still fits in the same packed parent.
-    assert (
-        overlapped.parents_needed(layout, 131_072)
-        - baseline.parents_needed(layout, 131_072)
-        == 9
+    # State tables keep two slots regardless of decode width or overlap.
+    # Additional full-attention protection still fits in the same packed parent.
+    assert overlapped.parents_needed(layout, 131_072) == baseline.parents_needed(
+        layout, 131_072
     )
 
 

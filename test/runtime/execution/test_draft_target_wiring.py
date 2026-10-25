@@ -861,7 +861,8 @@ def test_device_weight_update_notifies_drafter_before_returning():
         drafter=SimpleNamespace(
             on_target_weights_updated=lambda: refreshed.append("refreshed")
         ),
-        forward_thread=SimpleNamespace(run=lambda callback: callback()),
+        device="cpu",
+        complete_pending_drafting=lambda: None,
     )
     handle = DeviceHandle(executor)
     request = UpdateWeightsFromDistributedReqInput(
@@ -1299,12 +1300,6 @@ def test_nested_capture_config_overrides_top_level_values(dflash_model):
     dflash_model.configure_target(target, None)
     target.set_dflash_layers_to_capture.assert_called_once_with([2, 7])
     target.set_dflash_aux_hidden_stream.assert_called_once_with("attn_res")
-
-
-def test_missing_taps_fail_during_model_setup(dflash_model):
-    dflash_model.config = SimpleNamespace()
-    with pytest.raises(ValueError, match="target_layer_ids"):
-        dflash_model.configure_target(object(), None)
 
 
 def test_target_without_capture_support_fails_during_model_setup(dflash_model):

@@ -676,10 +676,14 @@ class RowShardedEngramEmbedding(nn.Module):
         if indices.is_cuda and not self.host_table:
             from tokenspeed_kernel.ops.embedding import mxfp8_embedding
 
+            # Each layer's 2D hash slice can be gathered directly; retain the
+            # contiguous fallback for arbitrary leading dimensions.
+            if indices.ndim != 2:
+                indices = indices.contiguous()
             values = mxfp8_embedding(
                 self.weight,
                 self.scale,
-                indices.contiguous(),
+                indices,
                 self.row_start,
                 self.row_end,
             )

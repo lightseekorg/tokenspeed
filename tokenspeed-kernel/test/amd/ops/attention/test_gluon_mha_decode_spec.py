@@ -162,6 +162,8 @@ def test_spec_decode_graph_replay(concurrency, mode, context):
     )
     from utils import assert_no_triton_compile
 
+    # Measure this case, excluding peak allocations from earlier tests.
+    torch.cuda.reset_peak_memory_stats()
     case = DecodeCase(concurrency, mode, context)
     inputs = make_inputs(case)
     expected = reference(inputs)

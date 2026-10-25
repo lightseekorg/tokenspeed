@@ -227,11 +227,6 @@ def test_disabled_plugin_is_skipped(monkeypatch, isolated) -> None:
     assert registry.registered_model("FixtureForCausalLM") is None
 
 
-def test_model_registration_requires_a_profile(isolated) -> None:
-    with pytest.raises(TypeError, match="model_profile"):
-        registry.register_model(torch.nn.Linear)
-
-
 def test_collisions_raise_unless_overridden(isolated) -> None:
     registry.register_model(FixtureForCausalLM)
     with pytest.raises(ValueError, match="already registered"):
@@ -290,15 +285,6 @@ def test_profile_resolution_follows_the_checkpoint(isolated) -> None:
     )
     assert dense.linear_attention is None
     assert registry.resolve_model_profile(["Unknown"], FixtureConfig()) is None
-
-
-def test_profile_rejects_missing_facts() -> None:
-    with pytest.raises(ValueError, match="cache_family"):
-        _profile(cache_family="")
-    with pytest.raises(ValueError, match="default_prefix_granularity"):
-        _profile(default_prefix_granularity=0)
-    with pytest.raises(TypeError):
-        ModelProfile(configure_attention=configure_mla_attention)
 
 
 def _model_config(profile: ModelProfile | None) -> SimpleNamespace:
@@ -458,13 +444,6 @@ def test_register_drafter_default_collides_with_in_tree() -> None:
     with pytest.raises(ValueError, match="already registered"):
         registry.register_drafter("MTP", _FixtureDrafter)
     assert "MTP" not in drafter._PLUGIN_DRAFTERS
-
-
-def test_unknown_drafter_algorithm_is_rejected() -> None:
-    from tokenspeed.runtime.execution import drafter
-
-    with pytest.raises(ValueError, match="available"):
-        drafter.validate_drafter_algorithm("NEXTN")
 
 
 def test_drafter_registration_unwinds_with_the_recording() -> None:

@@ -1048,6 +1048,7 @@ class ForwardStepRunner:
         extend_prompt_lens_cpu: torch.Tensor,
         block_tables_cpu: dict,
         settle: Callable[[], None],
+        extend_state_checkpoint_lens_cpu: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         block_tables: dict | None = None,
     ):
@@ -1156,6 +1157,7 @@ class ForwardStepRunner:
                 extend_seq_lens_cpu=extend_seq_lens_cpu,
                 extend_replay_lens_cpu=extend_replay_lens_cpu,
                 extend_prompt_lens_cpu=extend_prompt_lens_cpu,
+                extend_state_checkpoint_lens_cpu=extend_state_checkpoint_lens_cpu,
                 query_shard=ctx.query_shard,
                 positions=positions,
                 global_num_tokens=ctx.global_num_tokens,
@@ -1228,10 +1230,8 @@ class ForwardStepRunner:
             ctx.bs = bs
             ctx.output_layout = live_output_layout
 
-        if self.drafter is not None and (
-            ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed()
-        ):
-            self.attn_backend.commit_speculative_state_after_verify(
+        if ctx.forward_mode.is_decode() or ctx.forward_mode.is_mixed():
+            self.attn_backend.commit_state_after_acceptance(
                 result[1],
                 num_extends=ctx.num_extends,
                 accepted_path=(

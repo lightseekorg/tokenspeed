@@ -90,7 +90,7 @@ def make_engine(Engine, model, *, enable_prefix_caching):
 
 
 def main() -> None:
-    model = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen2-0.5B-Instruct"
+    model = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-0.6B"
     from tokenspeed.runtime.entrypoints.engine import Engine
 
     sp = {"temperature": 0.0, "max_new_tokens": 16}

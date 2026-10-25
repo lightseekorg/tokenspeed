@@ -2,8 +2,8 @@
 
 Speculative verification runs the whole draft window, but only an unknown
 prefix of it is accepted. Rather than storing a recurrent state per draft
-position and committing the accepted one, verification stores nothing and the
-accepted prefix is replayed from the still-intact committed page.
+position and committing the accepted one, verification saves U/K/raw-g records and the
+accepted prefix is recovered from the still-intact committed page.
 
 What has to hold for that to be lossless:
 
@@ -15,15 +15,13 @@ What has to hold for that to be lossless:
 4. requests in one batch may accept different lengths;
 5. committing into the source page (the usual case -- the new position rarely
    crosses a flat page boundary) matches committing into a fresh page. The
-   conv window is committed by its own launch precisely so this holds: its
-   q/k channels are indexed by head alone, so every program of the recurrence
-   kernel's NV column split would otherwise rewrite channels its siblings
-   have not read yet.
+   conv history must have one writer per head. NVIDIA uses a separate
+   history launch; AMD's unsplit recovery program owns that head's history.
 """
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.attention.kda import torch_kda_conv_decode
+from kda_replay_reference import batched_recurrent_kda_replay_commit
 from utils import is_cdna4, is_cdna5
 
 if not torch.cuda.is_available():
@@ -36,17 +34,15 @@ from tokenspeed_kernel.ops.attention.kda import (  # noqa: E402
 from tokenspeed_kernel.platform import current_platform  # noqa: E402
 
 #: The registry entries behind the probe and the no-store fused verify are
-#: vendor-gated (NVIDIA today); direct Triton-kernel tests below run anywhere.
+#: vendor-gated; the shared records tests exercise the selected implementation.
 requires_registered_replay = pytest.mark.skipif(
     not kda_replay_commit_supported(torch.bfloat16),
     reason="KDA replay ops are not registered on this platform",
 )
 
+from kda_replay_reference import _gate_tiling
 from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (  # noqa: E402
-    _gate_tiling,
     batched_kda_commit_conv_window_kernel,
-    batched_recurrent_kda_replay_commit,
-    fused_recurrent_kda_replay_commit,
     fused_recurrent_kda_verify_megafuse,
 )
 
@@ -84,29 +80,156 @@ def _window(n, t, pages=32, seed=0, num_heads=HV):
     )
 
 
+def _prepare_records(x, t, *, raw_gate, original_qkv=None):
+    """Produce BF16 K/raw-gate and FP32 U through the registered serving path."""
+    from tokenspeed_kernel.ops.attention.kda import (
+        KdaReplayRecords,
+        kda_fused_paged_verify_uses_split_producers,
+        kda_verify_conv_update,
+        try_kda_fused_paged_verify,
+    )
+
+    n, heads = x["read_indices"].numel(), x["beta"].shape[-1]
+    producers = {}
+    if kda_fused_paged_verify_uses_split_producers(
+        x["qkv_raw"].dtype,
+        store_states=False,
+        recurrent_layout="v_major",
+        num_heads=heads,
+        head_dim=K,
+    ):
+        producers["conv_qkv"] = kda_verify_conv_update(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            x["read_indices"],
+            num_heads=heads,
+            head_dim=K,
+            draft_token_num=t,
+            bias=None,
+            recurrent_layout="v_major",
+            original_qkv=original_qkv,
+        )
+        original_qkv = None
+    if raw_gate is None and "conv_qkv" in producers:
+        raw_gate = torch.mm(x["f_a"], x["w_fb"].t())
+    x["correction"] = torch.empty(n, t, heads, V, device=DEV, dtype=torch.float32)
+    x["key_gate"] = torch.empty(n, t, heads, 2 * K, device=DEV, dtype=torch.bfloat16)
+    x["metadata"] = torch.zeros(n, 3, device=DEV, dtype=torch.int64)
+    x["metadata"][:, 0] = torch.arange(n, device=DEV)
+    # Exercise ring wrap and 64-bit absolute positions on every backend.
+    x["metadata"][:, 1] = 7
+    x["metadata"][:, 2] = 2**33 + 1
+    x["stamps"] = torch.full((n, t, 2), -1, device=DEV, dtype=torch.int64)
+    records = KdaReplayRecords(
+        original_qkv=original_qkv,
+        correction=x["correction"].transpose(1, 2),
+        key_gate=x["key_gate"].transpose(1, 2),
+        metadata=x["metadata"],
+        stamps=x["stamps"],
+        query_start_loc=torch.arange(n + 1, device=DEV, dtype=torch.int32) * t,
+    )
+
+    def verify():
+        x["verify_output"] = try_kda_fused_paged_verify(
+            x["qkv_raw"],
+            x["conv_w"],
+            x["conv_pool"],
+            x["conv_pool"],
+            x["f_a"],
+            x["w_fb"],
+            x["beta"],
+            x["A_log"],
+            x["dt_bias"],
+            state_pool=x["h_pool"],
+            state_scratch=None,
+            read_indices=x["read_indices"],
+            write_indices=x["read_indices"],
+            num_heads=heads,
+            head_dim=K,
+            draft_token_num=t,
+            lower_bound=LOWER_BOUND,
+            recurrent_layout="v_major",
+            store_states=False,
+            replay_records=records,
+            g_raw=raw_gate,
+            **producers,
+        )
+        assert x["verify_output"] is not None
+
+    verify()
+    return verify
+
+
+def _records_commit(xs, groups, reads, writes, accepted, t, *, corrupt=False):
+    kernel = resolve_kda_batched_replay_commit(
+        num_heads=xs[0]["beta"].shape[-1], head_dim=K
+    )
+    assert kernel is not None
+    verifies = []
+    for x, group in zip(xs, groups, strict=True):
+        x["read_indices"] = reads[group]
+        x["retained_qkv"] = torch.full_like(x["qkv_raw"], float("nan"))
+        verifies.append(
+            _prepare_records(
+                x,
+                t,
+                raw_gate=torch.mm(x["f_a"], x["w_fb"].t()),
+                original_qkv=x["retained_qkv"],
+            )
+        )
+        torch.testing.assert_close(x["retained_qkv"], x["qkv_raw"], atol=0, rtol=0)
+    addresses = _batched_descriptor(xs)
+    for layer, x in enumerate(xs):
+        addresses[layer, 0] = x["retained_qkv"].data_ptr()
+        addresses[layer, 3] = x["correction"].data_ptr()
+        addresses[layer, 5] = x["key_gate"].data_ptr()
+    if corrupt:
+        addresses[2, 5] = xs[1]["key_gate"].data_ptr()
+    x = xs[0]
+    group_tensor = torch.tensor(groups, device=DEV, dtype=torch.int32)
+    accepted_counts = accepted.clamp(0, t)
+    stamps = torch.stack([layer["stamps"] for layer in xs])
+
+    def commit():
+        for verify in verifies:
+            verify()
+        kernel(
+            descriptors=addresses,
+            group_indices=group_tensor,
+            read_indices=reads,
+            write_indices=writes,
+            accepted_length=accepted_counts,
+            activation_dtype=x["qkv_raw"].dtype,
+            conv_state_dtype=x["conv_pool"].dtype,
+            draft_token_num=t,
+            num_heads=x["beta"].shape[-1],
+            head_dim=K,
+            qkv_stride=x["qkv_raw"].stride(0),
+            conv_stride=x["conv_pool"].stride(0),
+            correction_stride=x["correction"].stride(1),
+            key_gate_stride=x["key_gate"].stride(1),
+            state_stride=x["h_pool"].stride(0),
+            conv_width=4,
+            lower_bound=LOWER_BOUND,
+            record_metadata=x["metadata"],
+            record_stamps=stamps,
+        )
+
+    commit()
+    return commit
+
+
 def _replay(x, write_indices, accepted, t):
-    """Commit ``accepted`` replayed positions; returns the mutated pools."""
+    """Verify once, then recover the accepted prefix into the destination pool."""
     x = {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
-    fused_recurrent_kda_replay_commit(
-        x["qkv_raw"],
-        x["conv_w"],
-        x["conv_pool"],
-        x["conv_pool"],
-        x["f_a"],
-        x["w_fb"],
-        x["beta"],
-        x["A_log"],
-        x["dt_bias"],
-        x["h_pool"],
-        x["h_pool"],
-        x["read_indices"],
-        write_indices,
+    _records_commit(
+        [x],
+        [0],
+        x["read_indices"][None],
+        write_indices[None],
         accepted,
-        num_heads=HV,
-        head_dim=V,
-        draft_token_num=t,
-        lower_bound=LOWER_BOUND,
-        gate_scratch=x["gate_scratch"],
+        t,
     )
     return x
 
@@ -180,6 +303,8 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
             (layers, n, (conv_dim + block_size - 1) // block_size)
         ](
             _batched_descriptor(xs),
+            xs[0]["qkv_raw"],
+            xs[0]["conv_pool"],
             torch.arange(layers, device=DEV, dtype=torch.int32),
             reads,
             writes,
@@ -226,32 +351,13 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     ]
     for x, group in zip(batched, groups, strict=True):
         x["read_indices"] = reads[group]
-    descriptors = _batched_descriptor(batched)
-    batched_recurrent_kda_replay_commit(
-        descriptors,
-        group_indices,
-        reads,
-        writes,
-        accepted,
-        draft_token_num=t,
-        num_heads=HV,
-        head_dim=K,
-        f_a_dim=D_FA,
-        **_batched_static_args(batched[0]),
-    )
+    _records_commit(batched, groups, reads, writes, accepted, t)
     for expected, actual in zip(loop, batched, strict=True):
-        accepted_rows = torch.cat(
-            [
-                torch.arange(i * t, i * t + count, device=DEV)
-                for i, count in enumerate(accepted.tolist())
-                if count
-            ]
+        torch.testing.assert_close(
+            actual["correction"], expected["correction"], atol=0, rtol=0
         )
         torch.testing.assert_close(
-            actual["gate_scratch"][accepted_rows],
-            expected["gate_scratch"][accepted_rows],
-            atol=1e-6,
-            rtol=0,
+            actual["key_gate"], expected["key_gate"], atol=0, rtol=0
         )
         torch.testing.assert_close(
             actual["conv_pool"], expected["conv_pool"], atol=0, rtol=0
@@ -264,20 +370,7 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
         {k: (v.clone() if torch.is_tensor(v) else v) for k, v in x.items()}
         for x in source
     ]
-    bad = _batched_descriptor(negative)
-    bad[2, 1] = negative[1]["conv_w"].data_ptr()
-    batched_recurrent_kda_replay_commit(
-        bad,
-        group_indices,
-        reads,
-        writes,
-        accepted,
-        draft_token_num=t,
-        num_heads=HV,
-        head_dim=K,
-        f_a_dim=D_FA,
-        **_batched_static_args(negative[0]),
-    )
+    _records_commit(negative, groups, reads, writes, accepted, t, corrupt=True)
     with pytest.raises(AssertionError):
         torch.testing.assert_close(
             negative[2]["h_pool"], loop[2]["h_pool"], atol=0, rtol=0
@@ -288,17 +381,13 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
     not (is_cdna4() or is_cdna5()),
     reason="AMD CDNA4 or CDNA5 is required for Gluon KDA replay execution",
 )
-def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
-    """The Gluon all-layer launch honors each descriptor's cache-group row."""
-    layers, n, t, pages, num_heads = 5, 2, 8, 10, 12
+@pytest.mark.parametrize("t", [1, 4, 8])
+@pytest.mark.parametrize("graph", [False, True])
+def test_gluon_batched_replay_uneven_groups_match_per_layer_launches(t, graph):
+    """Records verify and recovery honor uneven groups in decode and speculation."""
+    layers, n, pages = 5, 2, 10
     groups = [0, 0, 0, 1, 1]
-    source = [
-        _window(n, t, pages=pages, seed=500 + layer, num_heads=num_heads)
-        for layer in range(layers)
-    ]
-    projection_width = num_heads * K
-    for layer in source:
-        layer["gate_scratch"] = layer["qkv_raw"][:, :projection_width].clone()
+    source = [_window(n, t, pages=pages, seed=500 + layer) for layer in range(layers)]
     batched = [
         {name: value.clone() for name, value in layer.items()} for layer in source
     ]
@@ -308,47 +397,154 @@ def test_gluon_batched_replay_uneven_groups_match_per_layer_launches():
     reads = torch.tensor([[1, 2], [3, 4]], device=DEV, dtype=torch.int32)
     writes = torch.tensor([[5, 6], [7, 8]], device=DEV, dtype=torch.int32)
     accepted = torch.tensor([1, t], device=DEV, dtype=torch.int32)
-    kernel = resolve_kda_batched_replay_commit()
-    assert kernel is not None
-    arch = "gfx950" if is_cdna4() else "gfx1250"
-    assert kernel.name == f"gluon_kda_fused_replay_{arch}"
-
-    def launch(xs, group_indices, read_indices, write_indices):
-        kernel(
-            descriptors=_batched_descriptor(xs),
-            group_indices=group_indices,
-            read_indices=read_indices,
-            write_indices=write_indices,
-            accepted_length=accepted,
-            draft_token_num=t,
-            num_heads=num_heads,
-            head_dim=K,
-            f_a_dim=D_FA,
-            **_batched_static_args(xs[0]),
-        )
-
-    launch(
-        batched,
-        torch.tensor(groups, device=DEV, dtype=torch.int32),
-        reads,
-        writes,
-    )
+    run = _records_commit(batched, groups, reads, writes, accepted, t)
+    if graph:
+        capture = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(capture):
+            run()
+        capture.replay()
     for layer, group in zip(per_layer, groups, strict=True):
-        launch(
+        _records_commit(
             [layer],
-            torch.zeros(1, device=DEV, dtype=torch.int32),
+            [0],
             reads[group : group + 1],
             writes[group : group + 1],
+            accepted,
+            t,
         )
     torch.cuda.synchronize()
+    for original, actual, expected, group in zip(
+        source, batched, per_layer, groups, strict=True
+    ):
+        original["read_indices"] = reads[group]
+        _check_against_reference(original, actual, writes[group], n, t, accepted)
+        _, _, outputs, corrections = _reference(original, n, t, [t] * n)
+        expected_outputs = torch.stack([torch.stack(row) for row in outputs])
+        expected_corrections = torch.stack([torch.stack(row) for row in corrections])
+        torch.testing.assert_close(
+            actual["verify_output"].view_as(expected_outputs),
+            expected_outputs,
+            atol=1.6e-2,
+            rtol=1e-2,
+        )
+        positions = (2**33 + 1 + torch.arange(t, device=DEV)) % t
+        torch.testing.assert_close(
+            actual["correction"].index_select(1, positions),
+            expected_corrections,
+            atol=2e-6,
+            rtol=2e-5,
+        )
+        torch.testing.assert_close(
+            actual["h_pool"][reads[group].long()],
+            original["h_pool"][reads[group].long()],
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            actual["conv_pool"][reads[group].long()],
+            original["conv_pool"][reads[group].long()],
+            atol=0,
+            rtol=0,
+        )
 
-    for actual, expected in zip(batched, per_layer, strict=True):
         torch.testing.assert_close(
-            actual["conv_pool"], expected["conv_pool"], atol=0.0, rtol=0.0
+            actual["conv_pool"], expected["conv_pool"], atol=0, rtol=0
         )
+        torch.testing.assert_close(actual["h_pool"], expected["h_pool"], atol=0, rtol=0)
         torch.testing.assert_close(
-            actual["h_pool"], expected["h_pool"], atol=0.0, rtol=0.0
+            actual["verify_output"], expected["verify_output"], atol=0, rtol=0
         )
+
+    # Batch/descriptor strides vary during serving without changing the model.
+    from utils import assert_no_triton_compile
+
+    if is_cdna4():
+        from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+            gluon_kda_fused_paged_verify_nostore_vmajor_gfx950 as verify_kernel,
+        )
+        from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+            gluon_kda_fused_replay_gfx950 as commit_kernel,
+        )
+    else:
+        from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
+            gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250 as verify_kernel,
+        )
+        from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
+            gluon_kda_fused_replay_gfx1250 as commit_kernel,
+        )
+    wider = _window(3, t, pages=10, seed=730)
+    original = {name: value.clone() for name, value in wider.items()}
+    next_reads = torch.tensor([[1, 2, 3]], device=DEV, dtype=torch.int32)
+    next_writes = torch.tensor([[4, 5, 6]], device=DEV, dtype=torch.int32)
+    next_accepted = torch.tensor([0, 1, t], device=DEV, dtype=torch.int32)
+    # Verify keeps the original power-of-two value-split buckets.
+    # Warm B=4, then B=3 must reuse that bucket despite its different strides.
+    warm = _window(4, t, pages=10, seed=731)
+    _records_commit(
+        [warm],
+        [0],
+        torch.tensor([[1, 2, 3, 4]], device=DEV, dtype=torch.int32),
+        torch.tensor([[5, 6, 7, 8]], device=DEV, dtype=torch.int32),
+        torch.full((4,), t, device=DEV, dtype=torch.int32),
+        t,
+    )
+    with assert_no_triton_compile(verify_kernel, commit_kernel):
+        _records_commit([wider], [0], next_reads, next_writes, next_accepted, t)
+    _check_against_reference(original, wider, next_writes[0], 3, t, next_accepted)
+
+    # Check automatic gate production below and above the gfx950 GEMM cutoff.
+    # Dyadic inputs make the FP32 reduction exact, isolating projection indexing
+    # from BF16 midpoint differences between otherwise valid reduction orders.
+    for batch in (3, 17):
+        projected = _window(batch, t, pages=2 * batch + 2, seed=740 + batch)
+        projected["f_a"].round_()
+        projected["w_fb"].mul_(32).round_().div_(8)
+        raw_gate = torch.mm(projected["f_a"], projected["w_fb"].t())
+        activation = projected["f_a"].clone()
+        rows, width = projected["qkv_raw"].shape
+        for padding in (7, 16):
+            projected["f_a"] = torch.empty_strided(
+                activation.shape,
+                (D_FA + padding, 1),
+                device=DEV,
+                dtype=torch.bfloat16,
+            )
+            projected["f_a"].copy_(activation)
+            destination = torch.full(
+                (rows, width + padding), float("nan"), device=DEV, dtype=torch.bfloat16
+            )
+            retained = destination[:, :width]
+            if padding == 7:
+                _prepare_records(projected, t, raw_gate=None, original_qkv=retained)
+            with assert_no_triton_compile(verify_kernel):
+                verify = _prepare_records(
+                    projected, t, raw_gate=None, original_qkv=retained
+                )
+                if graph:
+                    capture = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(capture):
+                        verify()
+                    retained.fill_(float("nan"))
+                    capture.replay()
+            torch.testing.assert_close(retained, projected["qkv_raw"], atol=0, rtol=0)
+            assert torch.isnan(destination[:, width:]).all()
+            actual = {
+                name: projected[name].clone()
+                for name in ("verify_output", "correction", "key_gate")
+            }
+            _prepare_records(projected, t, raw_gate=raw_gate)
+            torch.testing.assert_close(
+                actual["verify_output"],
+                projected["verify_output"],
+                atol=1.6e-2,
+                rtol=1e-2,
+            )
+            torch.testing.assert_close(
+                actual["correction"], projected["correction"], atol=2e-6, rtol=2e-5
+            )
+            torch.testing.assert_close(
+                actual["key_gate"], projected["key_gate"], atol=0, rtol=0
+            )
 
 
 @pytest.mark.parametrize(
@@ -424,18 +620,7 @@ def test_batched_replay_checkpoint_boundary_matches_layer_loop(accepted, crossin
         x["conv_pool"].zero_()
         x["h_pool"].zero_()
         x["read_indices"] = reads[group]
-    batched_recurrent_kda_replay_commit(
-        _batched_descriptor(batched),
-        torch.tensor(groups, device=DEV, dtype=torch.int32),
-        reads,
-        writes,
-        accepted_tensor,
-        draft_token_num=t,
-        num_heads=HV,
-        head_dim=K,
-        f_a_dim=D_FA,
-        **_batched_static_args(batched[0]),
-    )
+    _records_commit(batched, groups, reads, writes, accepted_tensor, t)
     for expected, actual in zip(loop, batched, strict=True):
         torch.testing.assert_close(
             actual["conv_pool"], expected["conv_pool"], atol=0, rtol=0
@@ -451,45 +636,79 @@ def _canonical(page):
 
 
 def _reference(x, n, t, accepted):
-    """fp32 torch reference: ``accepted[i]`` sequential decode steps.
+    """Independent recurrence from the rounded serving producer inputs.
 
-    An ordinary decode loop with no notion of a draft window, so agreeing
-    with it IS the statement that replay is equivalent to non-speculative
-    decoding.
+    Producer accuracy is checked by test_verify_derived_records_with_serving_producers.
+    Reusing its inputs here isolates accepted-state recovery from producer FMA
+    differences that can round to adjacent BF16 values.
     """
-    return torch_kda_conv_decode(
+    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
+        fused_kda_verify_conv_update,
+    )
+
+    windows, states, outputs, corrections = [], [], [], []
+    conv_qkv = fused_kda_verify_conv_update(
         x["qkv_raw"],
         x["conv_w"],
         x["conv_pool"],
-        x["h_pool"],
-        x["read_indices"][:n],
-        x["w_fb"],
-        x["f_a"],
-        x["A_log"],
-        x["dt_bias"],
-        x["beta"],
-        accepted,
-        tokens_per_request=t,
+        x["read_indices"],
         num_heads=HV,
-        head_k_dim=K,
-        head_v_dim=V,
-        lower_bound=LOWER_BOUND,
-    )
+        head_dim=K,
+        draft_token_num=t,
+    ).float()
+    raw_gate = torch.mm(x["f_a"], x["w_fb"].t()).float()
+    for request in range(n):
+        page = int(x["read_indices"][request])
+        window = (
+            x["conv_pool"][page, : 3 * P].float().clone()
+            if page >= 0
+            else torch.zeros(3 * P, 3, device=DEV)
+        )
+        state = (
+            x["h_pool"][page, :HV].float().clone()
+            if page >= 0
+            else torch.zeros(HV, V, K, device=DEV)
+        )
+        request_outputs, request_corrections = [], []
+        for step in range(int(accepted[request])):
+            token = request * t + step
+            raw = x["qkv_raw"][token, : 3 * P].float()
+            convolved = conv_qkv[token]
+            query = convolved[:P].view(HV, K)
+            query *= torch.rsqrt(query.square().sum(-1, keepdim=True) + 1e-6) * K**-0.5
+            key = convolved[P : 2 * P].view(HV, K)
+            key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+            value = convolved[2 * P :].view(HV, V)
+            gate_input = (raw_gate[token] + x["dt_bias"]).view(HV, K)
+            decay = (
+                LOWER_BOUND * torch.sigmoid(x["A_log"].exp()[:, None] * gate_input)
+            ).exp()
+            state *= decay[:, None, :]
+            correction = value - torch.einsum("hvk,hk->hv", state, key)
+            correction *= x["beta"][token].float().sigmoid()[:, None]
+            state += correction[:, :, None] * key[:, None, :]
+            request_outputs.append(
+                torch.einsum("hvk,hk->hv", state, query).to(torch.bfloat16)
+            )
+            request_corrections.append(correction.clone())
+            window = torch.cat((window[:, 1:], raw[:, None]), -1)
+        windows.append(window)
+        states.append(state.transpose(-1, -2))
+        outputs.append(request_outputs)
+        corrections.append(request_corrections)
+    return windows, states, outputs, corrections
 
 
 def _check_against_reference(x, out, write_indices, n, t, accepted):
-    windows, states = _reference(x, n, t, accepted)
+    windows, states, _, _ = _reference(x, n, t, accepted)
     for i in range(n):
         w = int(write_indices[i])
         torch.testing.assert_close(
             out["conv_pool"][w].float(), windows[i], atol=0.0, rtol=0.0
         )
-        # Both sides carry the recurrence in fp32 from identical bf16 inputs,
-        # so only reduction order differs: measured worst case 4.8e-7. Keep
-        # atol tight enough to catch a wrong update; rtol stays loose because
-        # the state has near-zero entries.
+        # Producers round to BF16; recurrence and saved correction stay FP32.
         torch.testing.assert_close(
-            _canonical(out["h_pool"][w]), states[i], atol=1e-5, rtol=1e-2
+            _canonical(out["h_pool"][w]), states[i], atol=2e-6, rtol=2e-5
         )
 
 
@@ -594,15 +813,16 @@ def test_accepted_length_clamps_at_and_past_the_window_boundary():
 
 
 def test_fresh_request_zero_accept_commits_zero_state():
-    """read = -1 with a = 0 must commit an all-zero window and state.
+    """A fresh request's zero checkpoint is copied even with zero acceptance.
 
-    A request that joined mid-round has no committed page; committing its
-    all-rejected window means materializing the zero state, not garbage from
-    a masked load at a negative page offset.
+    The scheduler allocates and zeros a real source page for a fresh request.
+    Negative source pages identify padding and do not request state recovery.
     """
     n, t = 3, 2
     x = _window(n, t, seed=31)
-    x["read_indices"] = torch.full((n,), -1, device=DEV, dtype=torch.int32)
+    x["read_indices"] = torch.ones(n, device=DEV, dtype=torch.int32)
+    x["conv_pool"][1].zero_()
+    x["h_pool"][1].zero_()
     fresh = torch.arange(1, n + 1, device=DEV, dtype=torch.int32) + 16
     out = _replay(x, fresh, torch.zeros(n, device=DEV, dtype=torch.int32), t)
     for i in range(n):
@@ -810,7 +1030,9 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
         x["dt_bias"],
     )
     fused = triton_nvidia_kda_fused_paged_verify_no_store(*args, **kwargs)
-    split = triton_nvidia_kda_fused_paged_verify_split(*args, **kwargs)
+    split = triton_nvidia_kda_fused_paged_verify_split(
+        *args, **kwargs, replay_records=None
+    )
     conv_qkv = fused_kda_verify_conv_update(
         x["qkv_raw"],
         x["conv_w"],
@@ -822,7 +1044,7 @@ def test_split_verify_wrapper_matches_fused_wrapper(n):
     )
     g_raw = torch.mm(x["f_a"], x["w_fb"].t())
     precomputed = triton_nvidia_kda_fused_paged_verify_split(
-        *args, **kwargs, g_raw=g_raw, conv_qkv=conv_qkv
+        *args, **kwargs, g_raw=g_raw, conv_qkv=conv_qkv, replay_records=None
     )
     torch.testing.assert_close(split, fused, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(precomputed, split, atol=0.0, rtol=0.0)

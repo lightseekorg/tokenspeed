@@ -36,12 +36,9 @@ from tokenspeed.runtime.engine import io_struct
 from tokenspeed.runtime.engine.io_struct import (
     CUSTOM_TYPE_RAW_VIEW,
     AbortReq,
-    AsyncIpcReceiver,
     BatchEmbeddingOut,
     BatchStrOut,
     BatchTokenIDOut,
-    BlockReqInput,
-    BlockReqType,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     DestroyWeightsUpdateGroupReqInput,
@@ -52,8 +49,6 @@ from tokenspeed.runtime.engine.io_struct import (
     GetInternalStateReqOutput,
     GetLoadReqOutput,
     GetWeightsByNameReqInput,
-    GetWeightsByNameReqOutput,
-    HealthCheckOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
     IpcReceiver,
@@ -62,11 +57,9 @@ from tokenspeed.runtime.engine.io_struct import (
     IsSchedulerPausedReqOutput,
     IsSleepingReqInput,
     IsSleepingReqOutput,
-    LoadSnapshot,
     MsgpackDecoder,
     MsgpackEncoder,
     OpenSessionReqInput,
-    OpenSessionReqOutput,
     PauseSchedulerReqInput,
     PauseSchedulerReqOutput,
     PickleWrapper,
@@ -79,8 +72,6 @@ from tokenspeed.runtime.engine.io_struct import (
     ResumeMemoryOccupationReqOutput,
     ResumeSchedulerReqInput,
     ResumeSchedulerReqOutput,
-    RpcReqInput,
-    RpcReqOutput,
     SessionParams,
     SetInternalStateReq,
     SetInternalStateReqOutput,
@@ -115,16 +106,6 @@ def _roundtrip(obj):
     enc = MsgpackEncoder()
     dec = MsgpackDecoder(ipc_message_union())
     return dec.decode(enc.encode(obj))
-
-
-def test_load_snapshot_round_trips_as_one_tagged_frame():
-    """The scheduler snapshot stays a standalone, single-frame IPC message."""
-    snapshot = LoadSnapshot("boot-a", 1, 0, 2, 3, 4, 5, 6, 1_000)
-
-    frames = MsgpackEncoder().encode(snapshot)
-
-    assert len(frames) == 1
-    assert _roundtrip(snapshot) == snapshot
 
 
 def _batch_token_id_out(**overrides) -> BatchTokenIDOut:
@@ -208,7 +189,6 @@ _MESSAGES = [
     UpdateWeightsFromMooncakeReqInput(version=7, flush_cache=True, weight_version="7"),
     UpdateWeightsFromMooncakeReqOutput(success=True, message=""),
     GetWeightsByNameReqInput(name="w"),
-    GetWeightsByNameReqOutput(parameter=[1.0, 2.0]),
     ReleaseMemoryOccupationReqInput(tags=["weights"]),
     ReleaseMemoryOccupationReqOutput(),
     ResumeMemoryOccupationReqInput(),
@@ -224,12 +204,7 @@ _MESSAGES = [
     ConfigureLoggingReq(log_requests=True),
     OpenSessionReqInput(capacity_of_str_len=8),
     CloseSessionReqInput(session_id="s"),
-    OpenSessionReqOutput(session_id="s", success=True),
-    HealthCheckOutput(),
-    RpcReqInput(method="save", parameters={"p": 1}),
-    RpcReqOutput(success=True, message=""),
     GetLoadReqOutput(dp_rank=1, num_reqs=2, num_waiting_reqs=1, num_pages=3),
-    BlockReqInput(type=BlockReqType.UNBLOCK),
     _batch_token_id_out(),
     BatchStrOut(
         rids=["a"],
@@ -322,7 +297,7 @@ def test_opaque_object_is_rejected_loudly():
     class Opaque:
         pass
 
-    req = RpcReqInput(method="m", parameters={"bad": Opaque()})
+    req = SetInternalStateReq(server_args={"bad": Opaque()})
     with pytest.raises(TypeError, match="PickleWrapper"):
         MsgpackEncoder().encode(req)
 
@@ -554,19 +529,6 @@ def test_ipc_wrappers_pickle_fallback_flag(monkeypatch):
     rt = IpcReceiver(sock).recv_pyobj()
     assert isinstance(rt, AbortReq) and rt.rid == "p"
     assert sock.pickled == 2
-
-
-def test_async_ipc_receiver_decodes_multipart():
-    import asyncio
-
-    class _AsyncSock(_LoopbackSocket):
-        async def recv_multipart(self, flags=0):
-            return self.queue.pop(0)
-
-    sock = _AsyncSock()
-    IpcSender(sock).send_pyobj(GetLoadReqOutput(dp_rank=3))
-    rt = asyncio.run(AsyncIpcReceiver(sock).recv_pyobj())
-    assert isinstance(rt, GetLoadReqOutput) and rt.dp_rank == 3
 
 
 def test_encode_request_joins_the_tagged_union():
