@@ -219,6 +219,10 @@ def test_muse_spark_aime26_uses_validated_mxfp4_configuration(tp_size, ep_size):
     eval_tokens = shlex.split(task["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
 
+    expected_triggers = (
+        ["per-commit", "manual"] if (tp_size, ep_size) == (8, 1) else ["manual"]
+    )
+    assert task["triggers"] == expected_triggers
     assert task["runner"]["labels"] == [f"amd-mi35x-{tp_size}gpu-test"]
     assert (
         flag_value(server_tokens, "--model")
