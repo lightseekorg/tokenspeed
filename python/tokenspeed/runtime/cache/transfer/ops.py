@@ -40,8 +40,9 @@ ACK. The ACKs are the binding's ``Cache.SnapshotDoneEvent`` /
 replica-intersected by the same hooks.
 
 Host-only ``Cache.StorageQueryOp`` / ``StorageGetOp`` / ``StoragePutOp`` /
-``StorageCancelOp`` pass through that same adapter to L3Executor. They use
-``StorageDone`` retirement facts, independently of GPU copy completion.
+``StorageCancelOp`` are the engine host's L3 executor's (``ts-l3``); the
+adapter sets them aside. They use ``StorageDone`` retirement facts,
+independently of GPU copy completion.
 """
 
 from __future__ import annotations

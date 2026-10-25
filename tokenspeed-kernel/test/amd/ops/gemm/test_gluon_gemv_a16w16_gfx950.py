@@ -49,8 +49,18 @@ _RTOL = {torch.bfloat16: 2**-7, torch.float16: 2**-10}
 _ATOL = 1e-3
 
 # (N, K): the register FMA tile (one chunk and several), the LDS-staged FMA
-# tile, ragged N, and a tiny N below one row per CU.
-_SHAPES = [(2560, 320), (2560, 3072), (512, 2560), (6656, 2560), (1000, 1040), (8, 64)]
+# tile, ragged N, a tiny N below one row per CU, and a long row whose MFMA
+# tile splits K over eight waves (with a K tail).
+_SHAPES = [
+    (2560, 320),
+    (2560, 3072),
+    (512, 2560),
+    (6656, 2560),
+    (1000, 1040),
+    (8, 64),
+    (2304, 8192),
+    (300, 8208),
+]
 
 
 def _reference(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

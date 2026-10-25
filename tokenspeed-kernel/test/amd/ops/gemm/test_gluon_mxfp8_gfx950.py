@@ -254,7 +254,7 @@ def test_mxfp8_gemm_public_api_selects_prefill_rows(
 def test_mxfp8_gemm_rejects_non_mxfp8_scale_contract() -> None:
     a, b, a_scales, b_scales = _inputs(256, 256, 512)
 
-    with pytest.raises(ValueError, match=r"block_size=\[1, 32\]"):
+    with pytest.raises(ValueError, match="must be FP32"):
         launch_gluon_mm_mxfp8_gfx950(
             a,
             b,
@@ -295,7 +295,14 @@ def test_mxfp8_launch_metadata_reports_flops_and_tensor_bytes(
     metadata = _mxfp8_launch_metadata(
         None,
         SimpleNamespace(name="mxfp8"),
-        {"M": m, "N": n, "K": k, "SPLITS": splits, "c_ptr": output},
+        {
+            "M": m,
+            "N": n,
+            "K": k,
+            "SPLITS": splits,
+            "c_ptr": output,
+            "FP32_SCALES": False,
+        },
     )
 
     expected_bytes = (

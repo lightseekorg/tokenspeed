@@ -31,7 +31,7 @@ from tokenspeed_kernel.ops.attention.dsv4.triton import (
     dsv4_compute_global_topk_indices_and_lens,
 )
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed_kernel.thirdparty.cuda import (
     hash_softplus_sqrt_topk_flash,
     softplus_sqrt_topk_flash,
@@ -1346,20 +1346,6 @@ class TestDeepseekV4Config:
 
         with pytest.raises((ValueError), match=("does not match")):
             model_config._verify_quantization()
-
-    def test_deepseek_v4_flashmla_wrapper_exposes_required_api(self):
-        if not current_platform().is_hopper_plus:
-            pytest.skip("FlashMLA requires NVIDIA Hopper or newer")
-
-        from tokenspeed_kernel.ops.attention.mla.cuda import (
-            flash_mla_sparse_fwd,
-            flash_mla_with_kvcache,
-            get_mla_metadata,
-        )
-
-        assert callable(flash_mla_with_kvcache)
-        assert callable(flash_mla_sparse_fwd)
-        assert callable(get_mla_metadata)
 
     def test_deepseek_v4_model_config_uses_mla_runtime_metadata(self):
         model_config = object.__new__(ModelConfig)

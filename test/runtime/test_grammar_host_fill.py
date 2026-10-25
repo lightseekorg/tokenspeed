@@ -20,7 +20,8 @@
 
 """The capturable grammar's host node writes the eager walk's masks.
 
-Real xgrammar matchers on a small vocabulary. The eager producer walks the
+Real xgrammar matchers on a small vocabulary, behind the engine host's
+grammar entries (``grammar_test_utils``). The eager producer walks the
 draft chain position by position; the host node, C++ that calls the
 matchers without the GIL, fills it with one matcher call and resets only
 the rows it wrote before. Both must give the same bits on every bound row,
@@ -48,16 +49,14 @@ register_cuda_ci(
     disabled_on_runners_reason="the host node builds against the CUDA runtime",
 )
 
+from test.runtime.grammar_test_utils import host_grammar  # noqa: E402
+
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
 from tokenspeed.runtime.grammar.capturable_grammar import (  # noqa: E402
     CapturableGrammarExecutor,
     _fill_eager_bitmask,
-)
-from tokenspeed.runtime.grammar.xgrammar_backend import (  # noqa: E402
-    XGrammarGrammar,
-    keep_gil_in_matcher_calls,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -78,16 +77,12 @@ W = 4
 
 @pytest.fixture(scope="module")
 def compiled():
-    keep_gil_in_matcher_calls()
     info = xgr.TokenizerInfo(VOCAB, stop_token_ids=[EOS])
     return xgr.GrammarCompiler(info).compile_grammar('root ::= "a" ("b" | "c")* "}"')
 
 
 def _grammar(compiled, accepted):
-    grammar = XGrammarGrammar(xgr.GrammarMatcher(compiled), len(VOCAB), compiled, None)
-    for token in accepted:
-        grammar.accept_token(token)
-    return grammar
+    return host_grammar(compiled, accepted)
 
 
 # (accepted so far, drafts; column 0 is the last accepted token) per request.

@@ -24,13 +24,16 @@ Hosts:
 
 * ``ReqState`` — per-request bookkeeping that ``AsyncLLM`` keeps in
   its ``rid_to_state`` map.
-* ``OutputProcessor`` — owns the hot-path translation from scheduler
-  output frames (``BatchStrOut`` / ``BatchTokenIDOut`` /
-  ``BatchEmbeddingOut``) into the dict-
+* ``EngineStream`` — what the frontend tracks of a request's engine-side
+  outputs: its tokens, the detokenizer's window over the prompt and the
+  stop strings, which the engine does not match.
+* ``OutputProcessor`` — owns the hot-path translation from the engines'
+  outputs (``tokenspeed_engine.Frontend.next_outputs``) into the dict-
   shaped payload the per-request ``RequestOutputCollector`` merges.
   Also owns logprob detokenization, per-request streaming metrics,
-  and request dumping. Stop authority stays with the scheduler —
-  finish reasons are consumed as input flags, not invented here.
+  and request dumping. The engines decide every ending but a stop
+  string; a stop string ends the request here, and the engine-side
+  request is aborted.
 """
 
 from __future__ import annotations
@@ -51,6 +54,11 @@ from tokenspeed.runtime.engine.io_struct import (
     BatchTokenIDOut,
 )
 from tokenspeed.runtime.engine.logprobs import LogprobsProcessor
+from tokenspeed.runtime.engine.request_types import (
+    FINISH_ABORT,
+    FINISH_MATCHED_STR,
+    INIT_INCREMENTAL_DETOKENIZATION_OFFSET,
+)
 from tokenspeed.runtime.metrics.collector import (
     RequestFinishStats,
     finish_reason_label,
@@ -95,6 +103,91 @@ class ReqState:
     # See runtime/engine/detokenizer.py::IncrementalDetokenizer.
     inline_detokenizer: IncrementalDetokenizer | None = None
 
+    # The request's engine-side outputs; None for a request the engines do
+    # not serve (an embedding).
+    stream: EngineStream | None = None
+
+
+@dataclasses.dataclass
+class EngineStream:
+    """A request's outputs as the engines produce them, tracked to render
+    them as the in-process scheduler did.
+
+    The engines match stop tokens, budgets and grammars; stop strings need
+    detokenized text, so the frontend matches them here, token by token in
+    the order the scheduler's finish check ran: a stop string ends the
+    request at the token that completes it, unless the engine ended it on
+    that very token.
+
+    Attributes:
+        prompt_ids: The tokenizer-valid prompt, which the detokenizer's
+            first window reads (``input_ids_unpadded``).
+        stop_strs: The request's stop strings.
+        stop_str_max_len: The longest stop string, in tokens.
+        skip_special_tokens: The request's detokenization options.
+        spaces_between_special_tokens: Likewise.
+        no_stop_trim: Likewise.
+        output_ids: The tokens kept so far.
+        stopped: The finish reason (``FINISH_MATCHED_STR.to_json()``) once a
+            stop string ended the request; later outputs are the engine's
+            until its abort lands, and are dropped.
+    """
+
+    prompt_ids: list[int]
+    stop_strs: tuple[str, ...]
+    stop_str_max_len: int
+    skip_special_tokens: bool
+    spaces_between_special_tokens: bool
+    no_stop_trim: bool
+    output_ids: list[int] = dataclasses.field(default_factory=list)
+    stopped: dict | None = None
+    _surr_offset: int | None = None
+    _read_offset: int | None = None
+    _sent_decode_ids: int = 0
+
+    def keep(self, tokens: list[int], engine_finished: bool, tokenizer) -> int:
+        """Keep this output's ``tokens``, up to one that completes a stop
+        string; return how many were kept. ``engine_finished``: the engine
+        ended the request on the last of them, which then outranks a stop
+        string completed by the same token."""
+        if not self.stop_strs:
+            self.output_ids.extend(tokens)
+            return len(tokens)
+        for kept, token in enumerate(tokens, start=1):
+            self.output_ids.append(token)
+            if engine_finished and kept == len(tokens):
+                return kept
+            tail = tokenizer.decode(self.output_ids[-(self.stop_str_max_len + 1) :])
+            for stop_str in self.stop_strs:
+                if stop_str in tail:
+                    self.stopped = FINISH_MATCHED_STR(matched=stop_str).to_json()
+                    return kept
+        return len(tokens)
+
+    def take_unsent_decode_ids(self) -> tuple[list[int], int]:
+        """The detokenizer ids not sent yet and the read offset
+        (``RequestState.take_unsent_decode_ids``): the prompt from the
+        surrounding offset on, then the output; the read offset is relative
+        to the surrounding offset."""
+        if self._surr_offset is None or self._read_offset is None:
+            self._read_offset = len(self.prompt_ids)
+            self._surr_offset = max(
+                self._read_offset - INIT_INCREMENTAL_DETOKENIZATION_OFFSET, 0
+            )
+        prompt_tail = len(self.prompt_ids) - self._surr_offset
+        sent = self._sent_decode_ids
+        if sent < prompt_tail:
+            unsent = self.prompt_ids[self._surr_offset + sent :] + self.output_ids
+        else:
+            unsent = self.output_ids[sent - prompt_tail :]
+        self._sent_decode_ids = prompt_tail + len(self.output_ids)
+        return unsent, self._read_offset - self._surr_offset
+
+
+def _engine_error_finish(error: Exception) -> dict:
+    """The finish of a request whose engines went away mid-stream."""
+    return FINISH_ABORT(message=f"The engine stream ended: {error!s}").to_json()
+
 
 class OutputProcessor:
     """Translate scheduler output frames into per-request collector payloads.
@@ -109,6 +202,133 @@ class OutputProcessor:
     def __init__(self, engine: AsyncLLM):
         self.engine = engine
         self.logprobs_processor = LogprobsProcessor(engine)
+
+    def handle_engine_outputs(self, outputs: list[tuple[str, Any]]) -> list[str]:
+        """Render a batch of engine outputs (``Frontend.next_outputs``: a
+        ``(rid, chunk)`` per output, the chunk a dict or the error that ended
+        its stream) as the scheduler's ``BatchTokenIDOut`` rows and hand them
+        to :meth:`handle_batch_output`. Returns the requests a stop string
+        ended here, whose engine-side requests the caller aborts."""
+        engine = self.engine
+        speculative = engine.server_args.speculative_algorithm is not None
+        columns: dict[str, list] = {
+            name: []
+            for name in (
+                "rids",
+                "finished_reasons",
+                "decoded_texts",
+                "decode_ids",
+                "read_offsets",
+                "output_ids",
+                "output_multi_ids",
+                "skip_special_tokens",
+                "spaces_between_special_tokens",
+                "no_stop_trim",
+                "prompt_tokens",
+                "completion_tokens",
+                "cached_tokens",
+                "spec_verify_ct",
+                "batch_accept_draft_tokens",
+                "output_extra_infos",
+                "output_token_logprobs_val",
+                "output_token_logprobs_idx",
+                "input_token_logprobs_val",
+                "input_token_logprobs_idx",
+                "input_top_logprobs_val",
+                "input_top_logprobs_idx",
+                "output_top_logprobs_val",
+                "output_top_logprobs_idx",
+            )
+        }
+        stopped: list[str] = []
+        ships_top_logprobs = False
+        for rid, chunk in outputs:
+            state = engine.rid_to_state.get(rid)
+            if state is None or state.stream is None:
+                # Aborted by the client, or finished here by a stop string:
+                # the engine's remaining outputs go nowhere.
+                continue
+            stream = state.stream
+            if stream.stopped is not None:
+                continue
+            if isinstance(chunk, Exception):
+                tokens, finish, kept = [], _engine_error_finish(chunk), 0
+                chunk = {}
+            else:
+                tokens = chunk["output_ids"]
+                finish = chunk["finish_details"]
+                kept = stream.keep(tokens, finish is not None, engine.tokenizer)
+                if stream.stopped is not None:
+                    finish = stream.stopped
+                    stopped.append(rid)
+            decode_ids, read_offset = stream.take_unsent_decode_ids()
+            columns["rids"].append(rid)
+            columns["finished_reasons"].append(finish)
+            columns["decoded_texts"].append("")
+            columns["decode_ids"].append(decode_ids)
+            columns["read_offsets"].append(read_offset)
+            columns["output_ids"].append(tokens[:kept])
+            columns["output_multi_ids"].append([])
+            columns["skip_special_tokens"].append(stream.skip_special_tokens)
+            columns["spaces_between_special_tokens"].append(
+                stream.spaces_between_special_tokens
+            )
+            columns["no_stop_trim"].append(stream.no_stop_trim)
+            columns["prompt_tokens"].append(chunk.get("prompt_tokens", 0))
+            columns["completion_tokens"].append(len(stream.output_ids))
+            columns["cached_tokens"].append(chunk.get("cached_tokens", 0))
+            if speculative:
+                columns["spec_verify_ct"].append(chunk.get("spec_verify_ct") or 0)
+                columns["batch_accept_draft_tokens"].append(
+                    chunk.get("accept_draft_tokens")
+                )
+            columns["output_extra_infos"].append({"decode_prefix_len": 0})
+            logprobs = chunk.get("output_token_logprobs") or []
+            columns["output_token_logprobs_val"].append(logprobs[:kept])
+            columns["output_token_logprobs_idx"].append(
+                tokens[:kept] if logprobs else []
+            )
+            prompt = chunk.get("input_token_logprobs")
+            columns["input_token_logprobs_val"].append(prompt[0] if prompt else [])
+            columns["input_token_logprobs_idx"].append(prompt[1] if prompt else [])
+            prompt_top = chunk.get("input_top_logprobs")
+            output_top = chunk.get("output_top_logprobs")
+            ships_top_logprobs |= prompt_top is not None or output_top is not None
+            columns["input_top_logprobs_val"].append(
+                prompt_top[0] if prompt_top else []
+            )
+            columns["input_top_logprobs_idx"].append(
+                prompt_top[1] if prompt_top else []
+            )
+            columns["output_top_logprobs_val"].append(
+                output_top[0][:kept] if output_top else []
+            )
+            columns["output_top_logprobs_idx"].append(
+                output_top[1][:kept] if output_top else []
+            )
+        if not columns["rids"]:
+            return stopped
+        if not ships_top_logprobs:
+            # The frame shape the scheduler sends without top-k requests.
+            for name in (
+                "input_top_logprobs_val",
+                "input_top_logprobs_idx",
+                "output_top_logprobs_val",
+                "output_top_logprobs_idx",
+            ):
+                columns[name] = []
+        self.handle_batch_output(
+            BatchTokenIDOut(
+                **columns,
+                input_token_ids_logprobs_val=[],
+                input_token_ids_logprobs_idx=[],
+                output_token_ids_logprobs_val=[],
+                output_token_ids_logprobs_idx=[],
+                output_hidden_states=[],
+                generated_time=time.time(),
+            )
+        )
+        return stopped
 
     def handle_batch_output(
         self,

@@ -36,6 +36,9 @@ from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4._common import (
     partial_tdm_warp_hint,
     reverse_tdm_warp_used_hint,
 )
+from tokenspeed_kernel_amd.ops.gfx1250.moe.mxfp4.quantize import (
+    store_mxfp4_tile_gfx1250,
+)
 
 # Reduction length from which the decode tile streams 256-byte weight rows.
 _DECODE_LONG_K = 2048
@@ -80,7 +83,11 @@ def _decode_launch_metadata(grid, kernel, args):
 
     w_bytes = n * row_bytes(args["W"], args["WMxScale"])
     x_bytes = m * row_bytes(args["X"], args["XMxScale"])
-    y_bytes = m * (n // args["ACTIVATION_REDUCTION_N"]) * args["Y"].element_size()
+    y_values = m * (n // args["ACTIVATION_REDUCTION_N"])
+    if args["YMxScale"] is None:
+        y_bytes = y_values * args["Y"].element_size()
+    else:
+        y_bytes = y_values // 2 + y_values // args["SCALE_BLOCK"]
     return {
         "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
         "flops8": 2 * m * n * k,
@@ -416,6 +423,8 @@ def _matmul_decode(
     stride_y_m,
     stride_y_n,
     YGlobalScale,
+    YMxScale,
+    stride_y_mx_m,
     XGlobalScale,
     X,
     stride_x_z,
@@ -699,6 +708,25 @@ def _matmul_decode(
             ACTIVATION_REDUCTION_N == 1,
             "Activation reduction must be 1 if no activation fn is provided",
         )
+
+    if YMxScale is not None:
+        gl.static_assert(
+            WriteBackIndx is None and YGlobalScale is None,
+            "MXFP4 output supports neither scatter nor a global output scale",
+        )
+        store_mxfp4_tile_gfx1250(
+            out,
+            Y_ptr,
+            stride_y_m,
+            YMxScale,
+            stride_y_mx_m,
+            start_m + off_m,
+            eM - off_m,
+            OUT_BLOCK_N * pid_n,
+            yN,
+            cfg.NUM_WARPS,
+        )
+        return
 
     BLOCKED_LAYOUT_Y: gl.constexpr = get_blocked_layout(
         [BLOCK_M, OUT_BLOCK_N], Y.dtype, cfg.NUM_WARPS

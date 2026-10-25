@@ -60,7 +60,7 @@ import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("sentinel",))
 def _init_kernel(
     sti_ptr, sw_ptr, EM_max, sentinel, BLOCK: gl.constexpr, NW: gl.constexpr
 ):
@@ -72,7 +72,7 @@ def _init_kernel(
     gl.store(sw_ptr + offs, gl.full([BLOCK], 0.0, gl.float32, layout=L), mask=mask)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("N",))
 def _count_kernel(
     exp_ptr,
     N,
@@ -141,7 +141,7 @@ def _offsets_kernel(
         fill_ctr_ptr + e_ids,
         gl.full([BLOCK_E], 0.0, gl.float32, layout=LE),
         mask=valid_e,
-    )  # noqa: E501
+    )
     gl.store(num_valid_ptr, EM)
     gl.store(num_blocks_ptr, num_blocks)
 
@@ -165,7 +165,7 @@ def _offsets_kernel(
         gl.store(sei_ptr + bbL, sei_val, mask=bbL < nb_max)
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("N", "sentinel"))
 def _prepare_small_kernel(
     exp_ptr,
     N,
@@ -250,7 +250,7 @@ def _prepare_small_kernel(
         )
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("N",))
 def _scatter_kernel(
     exp_ptr,  # [N] int32 flat topk_ids
     w_ptr,  # [N] float32 flat topk_weights
@@ -324,8 +324,11 @@ def moe_align_block_size_device(
     exp_flat = topk_ids.reshape(-1).to(torch.int32).contiguous()
     w_flat = topk_weights.reshape(-1).to(torch.float32).contiguous()
 
-    EM_max = N + num_experts * block_m
-    nb_max = EM_max // block_m + 1
+    # Bucket static preparation bounds so changing live route counts does not
+    # compile a new sorter for each token count. Consumers read num_valid_ids.
+    route_bucket = triton.next_power_of_2(max(1, N))
+    EM_max = route_bucket + num_experts * block_m
+    nb_max = triton.cdiv(EM_max, block_m) + 1
     BLOCK_E = triton.next_power_of_2(num_experts + 1)  # +1 so the dump bin is in-range
 
     sti = torch.empty(EM_max, dtype=torch.int32, device=device)
@@ -356,7 +359,7 @@ def moe_align_block_size_device(
             # N is the flattened route count (token rows * top-k), not a GEMM dimension.
             # block_m is routed rows per expert block; this matches the worst
             # case, where all routes hit one expert.
-            MAX_BLOCKS_PER_EXPERT=triton.cdiv(N, block_m),
+            MAX_BLOCKS_PER_EXPERT=triton.cdiv(route_bucket, block_m),
             EM_MAX=EM_max,
             INIT_TILE=triton.next_power_of_2(min(1024, EM_max)),
             EXPERT_START=expert_start,

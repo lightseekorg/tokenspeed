@@ -491,6 +491,21 @@ computes the stored width and consumes only logical columns, while CuTe gives
 TMA a logical view of that same storage. Eager and CUDA graph calls therefore
 share both the weight layout and its update semantics.
 
+Startup uses the ordinary dummy model traversal with `kernel_warmup` to
+prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
+normal dispatch overrides and scratch budgets, independently of optional
+FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
+
+CuTe QSA keeps query rows and selected-slot row strides dynamic; model
+geometry, selection budgets and launch configurations stay static. Warmup
+covers encountered static signatures, including aligned and partial stream
+top-k query groups; other variants compile on demand.
+
+PrimTS prepares native group/scheduler variants only during FlashInfer
+autotuning, retaining its runtime heuristic. Preparation uses scratch state
+independent of serving KV bindings and graph plans. Each actual geometry still
+needs an eager plan before graph capture.
+
 QSA logits scoring uses the same paged kernel for every query layout. A batch
 whose request lengths are all available on the host may shorten its compressed
 block-table view to the maximum prefix-plus-query length, rounded to the cache
@@ -686,6 +701,16 @@ Prefill writes context KV; if another rank has decodes, prefill-only and
 idle ranks join its draft collectives with empty rows. A round with no
 decodes performs no draft forward. Decode graph warmup and capture use the
 same uniform padded decode counts as their target batches.
+
+V4.1 completes deferred HC posts and reductions before stage handoffs or
+Engram updates. The fixed graph input state contains only completed residuals.
+Prefill warmup runs on the eventual capture stream because MegaMHC initializes
+per-stream barriers. Allocation observers wrap capture alone, leaving eager
+warmup allocations in utilization headroom. Fused HC all-reduce admission
+respects both deterministic and batch-invariant collective settings. Empty
+consumer rows carry no deferred post. Cache-only narrowing completes the incoming
+post before the global KV producer and skips new HC mixes; idle ranks still
+participate in expert-owned dispatch/combine, which never defers another reduction.
 
 ### Prefill requests without generated outputs
 
@@ -1240,10 +1265,26 @@ recurrent consumers, but neither uses Mamba metadata nor depends on Mamba's
 verify context or auxiliary-state hooks. GDN claims only the recurrent
 groups that back its own state fields.
 
-The runner calls `commit_speculative_state_after_verify` once on the target
-after drafted decode/mixed execution or graph replay, with live acceptance
-and `num_extends`. Since forward mode is derived from the extend count,
-zero means decode at this entry. Hybrid commits GDN/KDA only then; the
+The runner calls `commit_state_after_acceptance` once on the target
+after decode/mixed execution or graph replay, with live acceptance and
+`num_extends`. KDA uses the same replay lifecycle for standard target decode:
+its verify width and accepted count are one when there are no draft tokens.
+Its cache recipe reserves the record workspace for this case before sizing
+the arena. Replay capability determines this reservation even without a drafter;
+prefill-only engines do not reserve decode records. NVIDIA target verification and
+commit use saved corrections for both BF16 and FP16 activations; the same
+batched recovery also handles a layer subset. AMD uses its registered
+batched recovery over saved records. Fused convolution verification retains
+original QKV in its records workspace. The registered backend owns the gate
+projection when the model does not supply a gate. Split convolution producers
+retain original QKV in the same launch that computes convolved rows. Both
+arrangements write the existing replay workspace; commit reads that workspace
+after acceptance. A missing batched binding is an error,
+not a reason to recompute each layer through a second commit path. Since forward
+mode is derived from the extend count, zero means decode at this entry. Hybrid
+delegates to the recurrent child.
+A mixed batch gives prefill and decode rows their existing metadata and
+forwards; only the decode suffix enters the acceptance commit. The
 Qwen4-Exp root invokes its attention child, then PLE for decode and QSA for
 decode/mixed, excluding leading extends from QSA acceptance. Mixed rounds
 retain PLE's direct state writes. Each consumer commits once; stateless
@@ -1532,8 +1573,8 @@ refuses it again at executor construction. The MTP shape is:
   registers the draft-final step counter; the others count target layers only.
 * **Handoff.** The last stage samples, runs the drafter over the completing
   chunk and writes the candidate block into the reserved decode slot; the
-  event loop broadcasts `(output_tokens, output_lengths, next_input_ids)`
-  over the PP gloo group at commit -- with the logprob vectors and the NaN
+  control plane shares `(output_tokens, output_lengths, next_input_ids)`
+  with the other stages at commit -- with the logprob vectors and the NaN
   guard's per-request flags, see the QCP section -- so every rank's
   scheduler stamps the same bootstrap token and candidate window onto the
   remote decode. The PD wire and the decode side are untouched.
@@ -1961,9 +2002,10 @@ The contract a model (in tree or a plugin) implements:
   that trades the `[rows, vocab]` all-gather for per-row partials is the
   deferred `logprob.topology-invariant` item of `numerics.md`.)
 * Pipeline parallelism: the last stage scores the prompt logprobs (on its
-  shard, under QCP) and `_pp_broadcast_output_tokens` carries
-  `output_logprobs`, `input_token_logprobs`, and the NaN guard's
-  `output_nan_flags` to the other stages with the sampled tokens; every
+  shard, under QCP) and the control plane's share of its result
+  (`adopt_last_stage`) carries `output_logprobs`, `input_token_logprobs`,
+  and the NaN guard's `output_nan_flags` to the other stages with the
+  sampled tokens; every
   stage pairs the vector with its own mirrored plan, which
   `ModelExecutionResult` carries whether or not the stage scored the rows.
   The flags travel with the values they audit: only the last stage holds

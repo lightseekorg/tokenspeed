@@ -20,10 +20,12 @@
 
 """AsyncLLM is the main-process async frontend.
 
-Owns request intake, per-request state, scheduler IPC, and the
-output-dispatch loop. Inherits from ``EngineClient`` (explicit
-structural conformance) and ``SchedulerControlClient`` (scheduler
-control-plane helpers).
+Owns request intake (tokenization and validation), per-request state and
+the output-dispatch loop; the engine ranks, Rust hosts, are reached through
+``tokenspeed_engine.Frontend`` over the msgpack wire. The frontend renders
+their token outputs (detokenization, stop strings, logprob dialects).
+Inherits from ``EngineClient`` (explicit structural conformance) and
+``SchedulerControlClient`` (control operations).
 """
 
 import asyncio
@@ -34,44 +36,37 @@ import signal
 import sys
 import threading
 import time
-import uuid
-from collections import deque
-from collections.abc import Awaitable
 from enum import Enum
 from http import HTTPStatus
 from typing import (
     Any,
-    Generic,
-    TypeVar,
 )
 
 import uvloop
 
 from tokenspeed.runtime.configs.model_config import ModelConfig
+from tokenspeed.runtime.engine import zmq_wire
 from tokenspeed.runtime.engine.aio_rwlock import RWLock
 from tokenspeed.runtime.engine.collector import RequestOutputCollector
-from tokenspeed.runtime.engine.core_client import EngineCoreClient
 from tokenspeed.runtime.engine.exceptions import EngineGenerateError
 from tokenspeed.runtime.engine.input_processor import InputProcessor
 from tokenspeed.runtime.engine.io_struct import (
-    AbortReq,
-    BatchEmbeddingOut,
-    BatchStrOut,
-    BatchTokenIDOut,
     CloseSessionReqInput,
     ConfigureLoggingReq,
     EmbeddingReqInput,
     GenerateReqInput,
-    HealthCheckOutput,
+    IpcSender,
+    MsgpackEncoder,
     OpenSessionReqInput,
-    OpenSessionReqOutput,
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
 )
-from tokenspeed.runtime.engine.load_snapshot import LoadSnapshotStore
-from tokenspeed.runtime.engine.output_processor import OutputProcessor, ReqState
+from tokenspeed.runtime.engine.output_processor import (
+    EngineStream,
+    OutputProcessor,
+    ReqState,
+)
 from tokenspeed.runtime.engine.parallel_sampling import (
     prepare_parallel_sampling_replica,
     prepare_prefix_warmup,
@@ -82,30 +77,20 @@ from tokenspeed.runtime.engine.scheduler_control_client import (
 )
 from tokenspeed.runtime.entrypoints import rl_control
 from tokenspeed.runtime.metrics.collector import RequestMetrics
+from tokenspeed.runtime.metrics.relay import MetricsRelay
 from tokenspeed.runtime.metrics.service import metrics_service
-from tokenspeed.runtime.pd.utils import (
-    DisaggregationMode,
-    KVClassType,
-    TransferBackend,
-    get_kv_class,
-)
 from tokenspeed.runtime.utils import (
     dataclass_to_string_truncated,
     get_colorful_logger,
 )
-from tokenspeed.runtime.utils.dispatch import TypeBasedDispatcher
 from tokenspeed.runtime.utils.exceptions import get_exception_traceback
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 from tokenspeed.runtime.utils.process import kill_process_tree
-from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 logger = get_colorful_logger(__name__)
-
-
-def _ignore_health_check_output(_: HealthCheckOutput) -> None:
-    return None
 
 
 class ServerStatus(Enum):
@@ -118,16 +103,26 @@ class ServerStatus(Enum):
 class AsyncLLM(SchedulerControlClient, EngineClient):
     """Main-process async frontend for the tokenspeed runtime.
 
-    Owns request intake, per-request state, scheduler IPC, and the
-    output-dispatch loop. Structurally satisfies :class:`EngineClient`
-    via the explicit inheritance declaration above.
+    Owns request intake, per-request state and the output-dispatch loop.
+    Structurally satisfies :class:`EngineClient` via the explicit
+    inheritance declaration above.
     """
 
     def __init__(
         self,
         server_args: ServerArgs,
-        port_args: PortArgs,
+        frontend,
+        encode_sender: IpcSender | None,
     ):
+        """
+        Args:
+            server_args: The engine's server arguments.
+            frontend: The connected engine ranks
+                (``tokenspeed_engine.Frontend``); None on an EPD encode
+                server, which runs no engine ranks.
+            encode_sender: On an EPD encode server, the channel to its
+                encode ranks (``submit_encode``); None elsewhere.
+        """
         # Parse args
         self.server_args = server_args
         self.enable_metrics = server_args.enable_metrics
@@ -135,8 +130,15 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.log_requests_level = server_args.log_requests_level
         self.logger = logger
 
-        # Init inter-process communication (scheduler IPC owned by EngineCoreClient).
-        self.engine_core_client = EngineCoreClient(port_args)
+        self.frontend = frontend
+        self._encode_sender = encode_sender
+        self._wire_encoder = MsgpackEncoder()
+        # The prefill role's KV bootstrap server, which the launcher starts;
+        # closed with the engine.
+        self.bootstrap_server = None
+        # The node's metrics relay, which runs the output plugins for the
+        # engine hosts; the launcher starts it, and it closes with the engine.
+        self.metrics_relay: MetricsRelay | None = None
 
         # Read model args
         self.model_path = server_args.model
@@ -183,11 +185,11 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.log_request_metadata = self.get_log_request_metadata()
         self.server_status = ServerStatus.Starting
 
-        # The event to notify the weight sync is finished.
+        # Held for writing while a weight update rewrites the model.
         self.model_update_lock = RWLock()
-        self.model_update_result: Awaitable[UpdateWeightFromDiskReqOutput] | None = None
         self.asyncio_tasks = set()
-        self.load_snapshot_store = LoadSnapshotStore(server_args.mapping.attn.dp_size)
+        # In-flight aborts sent to the engines (``_abort_on_engine``).
+        self._abort_tasks: set[asyncio.Task] = set()
 
         # Frontend admission barrier paired with the scheduler's native pause.
         # It prevents requests buffered by a paused scheduler from holding the
@@ -198,9 +200,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         # The SGLang-compatible RL control app is launched lazily on this
         # object's event loop (see auto_create_handle_loop).
         self._rl_control_task = None
-
-        # For session info
-        self.session_futures = {}  # session_id -> asyncio event
 
         # Set after scheduler is initialized
         self.max_req_input_len = None
@@ -222,43 +221,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         )
 
         self.output_processor = OutputProcessor(self)
-
-        self._result_dispatcher = TypeBasedDispatcher(
-            [
-                (
-                    (
-                        BatchStrOut,
-                        BatchEmbeddingOut,
-                        BatchTokenIDOut,
-                    ),
-                    self.output_processor.handle_batch_output,
-                ),
-                (OpenSessionReqOutput, self._handle_open_session_req_output),
-                (
-                    UpdateWeightFromDiskReqOutput,
-                    self._handle_update_weights_from_disk_req_output,
-                ),
-                (HealthCheckOutput, _ignore_health_check_output),
-            ]
-        )
-
-        self.disaggregation_mode = DisaggregationMode(
-            self.server_args.disaggregation_mode
-        )
-        self.transfer_backend = TransferBackend(
-            self.server_args.disaggregation_transfer_backend
-        )
-        # for disaggregation, start kv bootstrap server on prefill
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # only start bootstrap server on prefill tm
-            kv_bootstrap_server_class = get_kv_class(
-                self.transfer_backend, KVClassType.BOOTSTRAP_SERVER
-            )
-            self.bootstrap_server = kv_bootstrap_server_class(
-                self.server_args.disaggregation_bootstrap_port
-            )
-
-        self.init_communicators(server_args)
 
         # Tokenization lives in :class:`InputProcessor`; see
         # :meth:`_tokenize_one_request` for the delegation.
@@ -288,7 +250,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             is_single = obj.is_single
             if is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                self._send_one_request(obj, tokenized_obj, created_time)
+                await self._send_one_request(obj, tokenized_obj, created_time)
                 async for response in self._wait_one_response(obj):
                     yield response
             else:
@@ -308,12 +270,24 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         """
         return await self.input_processor.tokenize_one_request(obj)
 
-    def _send_one_request(
+    async def _send_one_request(
         self,
         obj: GenerateReqInput | EmbeddingReqInput,
         tokenized_obj: TokenizedGenerateReqInput | TokenizedEmbeddingReqInput,
         created_time: float | None = None,
     ):
+        if not isinstance(tokenized_obj, TokenizedGenerateReqInput):
+            raise ValueError("this engine serves generate requests only")
+        if self.frontend is None:
+            raise ValueError("an EPD encode server serves no generate requests")
+        sampling_params = tokenized_obj.sampling_params
+        stop_strs = tuple(sampling_params.stop_strs or ())
+        if stop_strs and self.tokenizer is None:
+            raise ValueError(
+                "stop strings are matched on detokenized text, and this engine "
+                "runs without a tokenizer (--skip-tokenizer-init); send "
+                "stop_token_ids"
+            )
         state = ReqState(
             RequestOutputCollector(),
             False,
@@ -321,25 +295,59 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             obj,
             created_time=created_time,
             tokenized_time=tokenized_obj.created_time,
+            stream=EngineStream(
+                prompt_ids=list(
+                    tokenized_obj.input_ids_unpadded
+                    if tokenized_obj.input_ids_unpadded is not None
+                    else tokenized_obj.input_ids
+                ),
+                stop_strs=stop_strs,
+                stop_str_max_len=sampling_params.stop_str_max_len,
+                skip_special_tokens=sampling_params.skip_special_tokens,
+                spaces_between_special_tokens=(
+                    sampling_params.spaces_between_special_tokens
+                ),
+                no_stop_trim=sampling_params.no_stop_trim,
+            ),
         )
         self.rid_to_state[obj.rid] = state
-        mm_inputs = getattr(tokenized_obj, "multimodal_inputs", None)
+        mm_inputs = tokenized_obj.multimodal_inputs
         if mm_inputs is not None:
             mm_inputs.publish_shm_features()
-        self.engine_core_client.send_to_scheduler.send_pyobj(tokenized_obj)
+        try:
+            await self.frontend.generate(self._wire_frames(tokenized_obj))
+        except BaseException:
+            self.rid_to_state.pop(obj.rid, None)
+            raise
+
+    def _wire_frames(self, tokenized_obj: TokenizedGenerateReqInput) -> list[bytes]:
+        """The request as the engines take it: one sample (the frontend fans
+        out ``n``) and no stop strings, which the frontend matches, so it
+        streams every token when it has any."""
+        params = copy.copy(tokenized_obj.sampling_params)
+        stop_strs = params.stop_strs
+        params.n = 1
+        params.stop = None
+        params.stop_strs = []
+        params.stop_str_max_len = 0
+        wire = copy.copy(tokenized_obj)
+        wire.sampling_params = params
+        wire.stream = tokenized_obj.stream or bool(stop_strs)
+        return [bytes(frame) for frame in self._wire_encoder.encode(wire)]
 
     def submit_encode(self, encode_request) -> None:
-        """Send an EPD encode request to the encode-worker scheduler subprocess.
+        """Send an EPD encode request to this encode server's ranks.
 
-        Fire-and-forget over the same scheduler-input channel the LM uses (the
-        encode subprocess runs ``run_encode_loop``, not the LM EventLoop). The
-        encode worker runs the vision tower and ships the embeddings to prefill
-        over Mooncake; the gateway gets no streamed response, only the gRPC ack.
-        ``encode_request`` is an ``encode_worker.EncodeRequest`` whose multimodal
-        tensors are CPU (gateway-reconstructed) and pickle over ZMQ directly; shm
-        publishing of the pixels is a follow-up optimization.
+        Fire-and-forget over the request channel the first encode rank binds
+        (``ts-host`` in encode mode, ``epd/encode_host.py``), which relays it
+        to the others. The ranks run the vision tower and ship the embedding
+        to prefill over Mooncake; the gateway gets no streamed response, only
+        the gRPC ack. ``encode_request`` is an ``encode_worker.EncodeRequest``
+        whose pixels ride the channel as tensors or shared-memory handles.
         """
-        self.engine_core_client.send_to_scheduler.send_pyobj(encode_request)
+        if self._encode_sender is None:
+            raise RuntimeError("only an EPD encode server runs encode ranks")
+        self._encode_sender.send_pyobj(encode_request)
 
     async def _wait_one_response(
         self,
@@ -450,7 +458,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             for i in range(batch_size):
                 tmp_obj = obj[i]
                 tokenized_obj = await self._tokenize_one_request(tmp_obj)
-                self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                await self._send_one_request(tmp_obj, tokenized_obj, created_time)
                 generators.append(self._wait_one_response(tmp_obj))
                 rids.append(tmp_obj.rid)
         else:
@@ -471,7 +479,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
             for i in range(batch_size):
                 tmp_obj = copy.copy(objs[i])
                 warmup_obj = prepare_prefix_warmup(tmp_obj, tokenized_objs[i])
-                self._send_one_request(tmp_obj, warmup_obj, created_time)
+                await self._send_one_request(tmp_obj, warmup_obj, created_time)
                 await self._wait_one_response(tmp_obj).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -481,7 +489,7 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
                     replica_obj = prepare_parallel_sampling_replica(
                         tmp_obj, tokenized_objs[i], replica_index
                     )
-                    self._send_one_request(tmp_obj, replica_obj, created_time)
+                    await self._send_one_request(tmp_obj, replica_obj, created_time)
                     generators.append(self._wait_one_response(tmp_obj))
                     rids.append(tmp_obj.rid)
 
@@ -513,8 +521,18 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         if rid not in self.rid_to_state:
             return
         del self.rid_to_state[rid]
-        req = AbortReq(rid=rid)
-        self.engine_core_client.send_to_scheduler.send_pyobj(req)
+        self._abort_on_engine(rid)
+
+    def _abort_on_engine(self, rid: str) -> None:
+        """Ask the engine to abort ``rid``, without waiting for it. The task
+        is held until it finishes, then dropped."""
+
+        async def abort() -> None:
+            await self.frontend.abort(rid)
+
+        task = asyncio.get_running_loop().create_task(print_exception_wrapper(abort))
+        self._abort_tasks.add(task)
+        task.add_done_callback(self._abort_tasks.discard)
 
     def block_generation_admission(self) -> None:
         """Stop requests before they acquire the model-update reader lock."""
@@ -543,47 +561,31 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
     async def _wait_for_model_update_from_disk(
         self, obj: UpdateWeightFromDiskReqInput
     ) -> tuple[bool, str]:
-        self.engine_core_client.send_to_scheduler.send_pyobj(obj)
-        self.model_update_result = asyncio.Future()
+        results = await self._control(obj)
         if not self.server_args.mapping.attn.has_dp:
-            result = await self.model_update_result
+            (result,) = results
             if result.success:
                 self.served_model_name = obj.model_path
                 self.server_args.model = obj.model_path
                 self.server_args.load_format = obj.load_format
                 self.model_path = obj.model_path
             return result.success, result.message, result.num_paused_requests
-        else:  # self.server_args.mapping.has_attn_dp
-            self.model_update_tmp = []
-            result = await self.model_update_result
-
-            all_success = all([r.success for r in result])
-            if all_success is True:
-                self.server_args.model = obj.model_path
-                self.server_args.load_format = obj.load_format
-                self.model_path = obj.model_path
-            all_message = [r.message for r in result]
-            all_message = " | ".join(all_message)
-            all_paused_requests = [r.num_paused_requests for r in result]
-            return all_success, all_message, all_paused_requests
+        all_success = all(r.success for r in results)
+        if all_success:
+            self.server_args.model = obj.model_path
+            self.server_args.load_format = obj.load_format
+            self.model_path = obj.model_path
+        all_message = " | ".join(r.message for r in results)
+        all_paused_requests = [r.num_paused_requests for r in results]
+        return all_success, all_message, all_paused_requests
 
     async def open_session(self, obj: OpenSessionReqInput) -> str | None:
-        self.auto_create_handle_loop()
-
-        if obj.session_id is None:
-            obj.session_id = uuid.uuid4().hex
-        elif obj.session_id in self.session_futures:
-            return None
-
-        self.engine_core_client.send_to_scheduler.send_pyobj(obj)
-
-        self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
+        """Sessions are not served: the engines refuse a request that names
+        one, so no session ever opens."""
+        return None
 
     async def close_session(self, obj: CloseSessionReqInput) -> None:
-        await self.engine_core_client.send_to_scheduler.send_pyobj(obj)
+        return None
 
     def get_log_request_metadata(self):
         max_length = None
@@ -681,9 +683,6 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.asyncio_tasks.add(
             loop.create_task(print_exception_wrapper(self.sigterm_watchdog))
         )
-        self.asyncio_tasks.add(
-            loop.create_task(print_exception_wrapper(self.load_snapshot_loop))
-        )
 
     def _maybe_launch_rl_control_plane(self, loop):
         """Launch the SGLang-compatible RL control app on this event loop."""
@@ -748,26 +747,22 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         sys.exit(0)
 
     async def handle_loop(self):
-        """The event loop that handles requests"""
-
+        """Hand the engines' outputs to their requests, a batch per wakeup."""
+        if self.frontend is None:
+            return
         while True:
-            recv_obj = await self.engine_core_client.recv_from_detokenizer.recv_pyobj()
-            self._result_dispatcher(recv_obj)
+            outputs = await self.frontend.next_outputs()
+            for rid in self.output_processor.handle_engine_outputs(outputs):
+                # A stop string ended it here; the engine is still running it.
+                self._abort_on_engine(rid)
             self.last_receive_tstamp = time.time()
 
-    def _handle_open_session_req_output(self, recv_obj):
-        self.session_futures[recv_obj.session_id].set_result(
-            recv_obj.session_id if recv_obj.success else None
-        )
-
-    def _handle_update_weights_from_disk_req_output(self, recv_obj):
-        if not self.server_args.mapping.attn.has_dp:
-            self.model_update_result.set_result(recv_obj)
-        else:  # self.server_args.mapping.has_attn_dp
-            self.model_update_tmp.append(recv_obj)
-            # set future if the all results are received
-            if len(self.model_update_tmp) == self.server_args.mapping.attn.dp_size:
-                self.model_update_result.set_result(self.model_update_tmp)
+    async def _control(self, obj) -> list:
+        """Run a control operation on every engine; each one's reply, in
+        arrival order. Control messages carry no tensors, so each is one
+        frame."""
+        replies = await self.frontend.control([zmq_wire.encode_control(obj)])
+        return [zmq_wire.decode_control_output(payload) for (payload,) in replies]
 
 
 async def print_exception_wrapper(func):
@@ -794,44 +789,3 @@ class SignalHandler:
             "and shutting down...",
         )
         self.tokenizer_manager.gracefully_exit = True
-
-
-T = TypeVar("T")
-
-
-class _Communicator(Generic[T]):
-    """Note: The communicator now only run up to 1 in-flight request at any time."""
-
-    def __init__(self, sender, fan_out: int):
-        self._sender = sender
-        self._fan_out = fan_out
-        self._result_event: asyncio.Event | None = None
-        self._result_values: list[T] | None = None
-        self._ready_queue: deque[asyncio.Future] = deque()
-
-    async def __call__(self, obj):
-        ready_event = asyncio.Event()
-        if self._result_event is not None or len(self._ready_queue) > 0:
-            self._ready_queue.append(ready_event)
-            await ready_event.wait()
-            if self._result_event is not None or self._result_values is not None:
-                raise RuntimeError("Communicator result state was not reset.")
-
-        if obj:
-            self._sender.send_pyobj(obj)
-
-        self._result_event = asyncio.Event()
-        self._result_values = []
-        await self._result_event.wait()
-        result_values = self._result_values
-        self._result_event = self._result_values = None
-
-        if len(self._ready_queue) > 0:
-            self._ready_queue.popleft().set()
-
-        return result_values
-
-    def handle_recv(self, recv_obj: T):
-        self._result_values.append(recv_obj)
-        if len(self._result_values) == self._fan_out:
-            self._result_event.set()

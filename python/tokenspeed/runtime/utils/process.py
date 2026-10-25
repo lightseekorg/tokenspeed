@@ -38,15 +38,6 @@ import psutil
 _process_shutdown_started = False
 
 
-def register_usr_signal():
-    parent_pid = os.getppid()
-
-    def signal_handler(sig, frame):
-        os.kill(parent_pid, signal.SIGUSR1)
-
-    signal.signal(signal.SIGUSR1, signal_handler)
-
-
 def begin_process_shutdown() -> bool:
     """Latch owner cleanup, returning whether this is the first shutdown request.
 

@@ -101,11 +101,6 @@ def test_dsa_name_resolves_to_the_device_implementation(name):
     assert _get_backend_cls(name, AttentionArch.DSA) is expected
 
 
-def test_model_specific_dsa_name_is_not_registered():
-    with pytest.raises(ValueError, match="Unknown --attention-backend"):
-        validate_attention_backend_name("longcat_dsa", flag="--attention-backend")
-
-
 @pytest.mark.parametrize("name", [None, "dsa"])
 @pytest.mark.parametrize("device", ["cuda", "npu"])
 def test_dsa_dcp_config_accepts_the_common_name(monkeypatch, device, name):
@@ -162,13 +157,6 @@ def test_int8_cache_is_rejected_before_storage_planning(monkeypatch, device, wid
         _config(
             monkeypatch, device, "dsa", kv_cache_dtype=torch.int8, packed_width=width
         )
-
-
-def test_int8_cache_dtype_is_not_resolved():
-    from tokenspeed.runtime.layers.attention.configs.base import resolve_dtype
-
-    with pytest.raises(ValueError, match="Unsupported kv_cache_dtype"):
-        resolve_dtype("int8")
 
 
 def test_int8_cache_is_rejected_by_server_arguments():

@@ -289,17 +289,34 @@ null, so the first decode reads the landed state). When the decode role's
 own prefix cache holds the state for the prompt end -- a state hit counts
 only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
-and both sides omit the group from the manifest (`pd/cache_protocol.py`).
+and both sides omit the group from the manifest (`ts-pd`'s `layout::manifest`).
 
-Speculative KDA verification stores no per-position recurrent states: it
-captures each window's raw projections in a compact payload and commits by
-replaying the accepted prefix from the committed block. The Kimi-K3 and
-GLM-5.3-Flash recipes share this workspace calculation and reserve it before
-sizing the arena -- the transient conv rows plus the per-layer capture
-payloads. GLM also reserves its target/draft-shared KPool tails once, so state
-memory does not disappear from the GPU budget. (Platforms without the replay
-kernels fall back to the dense `max_bs * (draft_tokens + 1)` per-position
-state workspace, reserved the same way.)
+KDA targets with a batched commit kernel use the same deferred-state lifecycle
+for ordinary decode (`T=1`) and speculative verification. Verify leaves the
+committed recurrent and convolution state unchanged; acceptance selects the
+prefix to commit into the live block.
+
+On NVIDIA and AMD, verify saves FP32 corrections plus unnormalized keys and raw gates
+in the activation dtype (BF16 or FP16). Recovery recomputes key normalization
+and gate decay, then applies the saved corrections to the input checkpoint.
+It does not recompute the state-dependent correction or the gate projection.
+Original QKV rows are retained only for convolution-history commit. The
+persistent convolution pool keeps its cache dtype, independently of activation
+dtype. Records and position/generation stamps cover the current verify round;
+they are transient workspace, not prefix-cache entries.
+
+Both vendors consume the same post-convolution activation values in verify
+and save those unnormalized keys for recovery. NVIDIA uses Triton recovery;
+AMD uses Gluon recovery. Neither recomputes the state-dependent correction.
+Convolution history is committed separately so in-place pages are safe.
+Platforms without a matching batched commit and no-store verify keep the dense
+`max_bs * (draft_tokens + 1)` per-position state workspace.
+
+The Kimi-K3 and GLM-5.3-Flash recipes share the backend's payload specification
+and reserve transient convolution rows, payloads, descriptors and record
+metadata before sizing the arena. Prefill-only engines reserve no decode
+records. GLM also reserves its target/draft-shared KPool tails once, so state
+memory does not disappear from the GPU budget.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 
@@ -461,8 +478,9 @@ the same plan). The restore is one op: on the load stream behind the
 zeroing, the L2-tier rows, the pool-tier rows, the slot-state import, one
 event — no layerwise tracker, because the request is `Restoring` and
 unschedulable until the ACK. Three ACK kinds ride the one cache poll
-(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and `CacheOpHooks`
-replica-intersects them alike; a readmission needs both store ACKs.
+(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and the control plane
+(`ts-control`'s `cache_ops`) replica-intersects them alike; a readmission
+needs both store ACKs.
 
 **Slot-state image.** Device state keyed by `req_pool_index` that lives in no
 cache group must travel with the pages or the continuation is not exact: the
@@ -517,7 +535,8 @@ owners is an error, and a replicated group translates to the identity. Each
 Host tier holds one translation (same Device bound, its own Host bound,
 `1 + host_lcm_blocks × packing × shard_count`). An op whose every row belongs
 to other ranks is still acknowledged by this rank from an empty copy; the
-hooks' replica intersection completes the op only once every owner has. The
+control plane's replica intersection completes the op only once every owner
+has. The
 scheduler side (residue-class allocation for every tier transfer, the Host
 pools registered with each group's `shard_count`) is what makes the
 translation exact, so both Host tiers serve a KV-page-sharded engine. L3
@@ -895,9 +914,10 @@ Its responsibilities:
   positional-encoding or kernel changes that alter KV without changing the
   checkpoint, layout or recorded producer choices. A git SHA would split
   caches on unrelated changes; a package version may stay unchanged across
-  KV-affecting edits. Static facts are captured once. `storage_key_prefix`
-  combines their digest with explicit target/draft weight versions, without
-  re-reading mutable launch options or checkpoint files on version updates.
+  KV-affecting edits. Static facts are captured once. The namespace
+  (`ts-l3`'s `key_prefix`) combines their digest with explicit target/draft
+  weight versions, without re-reading mutable launch options or checkpoint
+  files on version updates.
   Use resolved `mapping.attn.tp_size`, not `--attn-tp-size` alone: different TP
   widths can have identical per-rank packed geometry while assigning different
   heads to a rank.
@@ -1348,13 +1368,13 @@ contributed.
 
 PD transfer supports independently sharded prefill and decode roles. Manifests carry scheduler (virtual) IDs on both sides and are bounded
 by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
-the physical page count. The route planner (`pd/transfer_plan.py`) reads
+the physical page count. The route planner (`ts-pd`'s `layout::route`) reads
 `shard_count` from the wire `group_specs`: for a sharded group it fans a
 decode rank's replica out to the whole KVP subgroup (consecutive attention-TP
 ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
 the sender keeps the manifest blocks with `(v - 1) % owner_count ==
-owner_rank`, translates them to local pages through the same
-`owned_local_pages` placement zeroing uses, and matches them to destination blocks at the same manifest positions.
+owner_rank`, translates them to local pages with the placement zeroing uses
+(`owned_local_pages`), and matches them to destination blocks at the same manifest positions.
 Only pairs owned by the destination rank are copied, after translating both
 virtual IDs to local pages. Every rank of the subgroup therefore
 serves every decode rank and none is a control-only dummy; the decode receiver

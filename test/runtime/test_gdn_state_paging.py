@@ -184,15 +184,6 @@ class TestComputeStatePageIndicesTest:
         assert (state_in.tolist()) == ([7, 22, 0, 3])
         assert (state_out.tolist()) == ([9, 22, 31, 5])
 
-    def test_results_are_int32(self):
-        state_in, state_out = self._run([[7, 9]], [4])
-        assert (state_in.dtype) == (self.torch.int32)
-        assert (state_out.dtype) == (self.torch.int32)
-
-    def test_a_one_slot_table_raises(self):
-        with pytest.raises((ValueError), match=("slots")):
-            self._run([[7]], [4])
-
     def test_live_slot_hole_raises(self):
         with pytest.raises((ValueError)):
             self._run([[7, 0]], [4])

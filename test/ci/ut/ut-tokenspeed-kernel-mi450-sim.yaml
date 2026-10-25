@@ -76,13 +76,13 @@ env:
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_project_value_amd_batches[8]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/attention.mla_project_value/gluon_mla_project_value_gfx1250/batch8-sigmoid-gate@mi450]
     # KDA: native-layout paged prefill, specialized paged decode, fused paged
-    # decode, fused verify into replay, and all-layer replay with uneven cache
-    # groups.
+    # decode, records-based verify/replay, uneven cache groups, and in-place commit.
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_prefill_preserves_native_state_layout
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_paged_decode_defaults_to_specialized_kernel_on_amd[2-8-8-False--5.0]
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_paged_decode_matches_reference[1-1-12]
     tokenspeed-kernel/test/ops/test_kda_recurrent.py::test_kda_fused_verify_and_replay_match_sequential_reference[1-8]
     tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_gluon_batched_replay_uneven_groups_match_per_layer_launches
+    tokenspeed-kernel/test/ops/attention/test_kda_replay_commit.py::test_in_place_commit_full_pool_accounting
     # DeepSeek V4.1 index top-k: CSA2 scoring, reindexing, missing and
     # out-of-table latest pages, arena page strides, raw gfx1250 logits, and
     # the Gluon row selector: a width below k, boundary ties past k, and the
@@ -106,8 +106,8 @@ env:
     # GLM-5.2 DSA: FP8 top-k decode and prefill, rank-128 BF16 dense cache.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_topk_fp8_glm52_cases[decode_trivial_q2_2048]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_fp8_glm52_cases[prefill_short_512]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-decode]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-q_bf16-prefill]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-bf16-decode]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_128-bf16-prefill]
     # GLM-5.3-Flash full attention: 256-wide NoPE scores, rank-512 values, the
     # 2051-slot KPool-plus-tail ABI in both stages, standard-cache graph replay.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_glm53_flash_bf16_split_matrix[16]
@@ -132,8 +132,8 @@ env:
     # valid length in both stages, prefill top-k over ragged row ranges.
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache[q_bf16-decode]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_with_sparse_kvcache[q_e4m3-prefill]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e4m3-decode]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-q_e4m3-prefill]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-e4m3-decode]
+    tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_kvcache[rank_512-e4m3-prefill]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_decode_sparse_kvcache_trims_large_topk_for_tiny_lens
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_standard_cache.py::test_standard_cache_prefill_uses_workspace_rows_not_global_slots[32-q_dtype0-weight_dtype0]
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_dense_fp8_ignores_poisoned_unselected_rows[decode]
@@ -280,6 +280,8 @@ env:
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_cuda_graph_replay[24]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[1792-5120-129]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[4096-1280-129]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-129]
+    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-2048]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-32-gluon_mm_mxfp8_ue8m0_largem_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-True-32-gluon_mm_mxfp8_ue8m0_largem_gfx1250]
     tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[17-128-6144]

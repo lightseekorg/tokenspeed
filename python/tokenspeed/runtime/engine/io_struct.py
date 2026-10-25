@@ -540,8 +540,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Set by a transport that validates requests itself (the msgpack ZMQ path,
     # which bypasses the tokenizer_manager's input processor). A non-None value
-    # makes RequestHandler admit the request pre-finished with FINISH_ABORT so
-    # the client receives a terminal abort instead of a silent drop.
+    # makes the engine admit the request pre-finished with an abort so the
+    # client receives a terminal abort instead of a silent drop.
     validation_error: str | None = None
 
     # Hard-pin to an attention-DP rank. Keep last: array_like declaration
@@ -718,27 +718,18 @@ class BatchTokenIDOut(BaseBatchReq, kw_only=True):
     generated_time: float
 
 
-def _finish_type(finished_reason) -> str:
-    """Reduce an OutputProcesser finish reason to its wire type string."""
-    if not finished_reason:
-        return ""
-    if isinstance(finished_reason, dict):
-        return finished_reason.get("type", "")
-    return str(finished_reason)
-
-
 class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
-    """Per-request slice of ``BatchTokenIDOut`` for a frontend that
-    detokenizes itself (the direct ZMQ scheduler drive).
+    """One step's outputs as an engine sends them to a frontend that
+    detokenizes itself (the msgpack wire).
 
-    Carries only what that frontend consumes, so per-step outputs skip the
-    incremental-detokenization columns (decoded_texts, decode_ids, ...) the
-    in-process frontend needs. Field ORDER is a cross-language wire
+    The engine (``ts-wire``) encodes them; this struct is their schema as a
+    Python consumer decodes them, and the source of ``ts-wire``'s conformance
+    fixtures. It carries only what such a frontend consumes: no
+    incremental-detokenization columns. Field ORDER is a cross-language wire
     contract — do not reorder.
     """
 
-    # Newly generated token ids per request this step, sourced from
-    # ``BatchTokenIDOut.output_ids``.
+    # Newly generated token ids per request this step.
     output_ids: list[list[int]]
     # "" (not finished) or the finish-reason type ("stop", "length", "abort").
     finished_reasons: list[str]
@@ -748,11 +739,7 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     # Sampled-token logprobs, parallel to rids: one inner list per request,
     # holding the value/token-id of each newly-decoded token this step. Empty []
     # for a request that did not ask for logprobs, so the columns stay
-    # non-ragged (always length == len(rids)). Prompt (input) logprobs have no
-    # column here: the msgpack ingress refuses a ``logprob_start_len`` that
-    # would produce them (``MsgpackRecvSocket._validation_error``). Carrying
-    # them means appending ``input_token_logprobs_val/idx`` at the wire tail
-    # together with the frontend's decoder.
+    # non-ragged (always length == len(rids)). Prompt logprobs ride the tail.
     output_token_logprobs_val: list[list[float]]
     output_token_logprobs_idx: list[list[int]]
     # Producing DP rank's engine index (the identity it dialed the frontend
@@ -766,53 +753,28 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     num_waiting: int = 0
     kv_active_pages: int = 0
     kv_total_pages: int = 0
-
-    @classmethod
-    def from_full(
-        cls,
-        out: BatchTokenIDOut,
-        engine_index: int = 0,
-        *,
-        num_running: int = 0,
-        num_waiting: int = 0,
-        kv_active_pages: int = 0,
-        kv_total_pages: int = 0,
-    ) -> "BatchTokenIDOutSlim":
-        # Token source: ``out.output_ids`` — the not-yet-sent slice of each
-        # request's generated ids. NOT ``out.decode_ids``: that is the
-        # incremental-detokenization window, which starts at the prompt tail
-        # for context and would leak prompt tokens to a frontend that
-        # detokenizes from scratch.
-        if out.output_ids is None:
-            # Substituting empty lists here while completion_tokens advances
-            # would silently lose tokens on the frontend; fail loud instead.
-            raise ValueError(
-                "BatchTokenIDOut.output_ids is None; the msgpack wire needs "
-                "the per-request generated token ids"
-            )
-        return cls(
-            engine_index=engine_index,
-            num_running=num_running,
-            num_waiting=num_waiting,
-            kv_active_pages=kv_active_pages,
-            kv_total_pages=kv_total_pages,
-            rids=list(out.rids),
-            output_ids=[list(ids) for ids in out.output_ids],
-            finished_reasons=[_finish_type(fr) for fr in out.finished_reasons],
-            prompt_tokens=list(out.prompt_tokens),
-            completion_tokens=list(out.completion_tokens),
-            cached_tokens=list(out.cached_tokens),
-            output_token_logprobs_val=(
-                list(out.output_token_logprobs_val)
-                if out.output_token_logprobs_val is not None
-                else [[] for _ in out.rids]
-            ),
-            output_token_logprobs_idx=(
-                list(out.output_token_logprobs_idx)
-                if out.output_token_logprobs_idx is not None
-                else [[] for _ in out.rids]
-            ),
-        )
+    # Appended wire tail: what a frontend renders beyond the tokens, as the
+    # in-process frontend's ``BatchTokenIDOut`` rows carry it. An older
+    # producer omits these and they decode as [].
+    # The finish reason as ``BaseFinishReason.to_json()`` gives it (the
+    # matched token, the abort's message and codes), None mid-stream; one
+    # entry per request.
+    finish_reason_details: list[FinishReasonDict | None] = []
+    # With speculative decoding, one entry per request: its verify rounds
+    # so far and, once finished, its accepted tokens per round (None before);
+    # [] without speculation.
+    spec_verify_ct: list[int] = []
+    accept_draft_tokens: list[float | None] = []
+    # Prompt logprobs, shipped once per request as ``BatchTokenIDOut`` does,
+    # and the top-k alternatives (``top_logprobs_num``). Each column has one
+    # entry per request in a frame where some request carries one, and is []
+    # for the whole frame otherwise.
+    input_token_logprobs_val: list[list[float | None]] = []
+    input_token_logprobs_idx: list[list[int]] = []
+    input_top_logprobs_val: list[list] = []
+    input_top_logprobs_idx: list[list] = []
+    output_top_logprobs_val: list[list] = []
+    output_top_logprobs_idx: list[list] = []
 
 
 class BatchStrOut(BaseBatchReq, kw_only=True):
@@ -1055,10 +1017,6 @@ class GetWeightsByNameReqInput(BaseReq, kw_only=True):
     truncate_size: int = 100
 
 
-class GetWeightsByNameReqOutput(BaseReq, kw_only=True):
-    parameter: list
-
-
 class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
     # Memory regions to release. None ⇒ all ("weights" and "kv_cache").
     tags: list[str] | None = None
@@ -1147,59 +1105,11 @@ class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
 
 
-class OpenSessionReqOutput(BaseReq, kw_only=True):
-    session_id: str | None
-    success: bool
-
-
-class HealthCheckOutput(BaseReq, kw_only=True):
-    pass
-
-
-class RpcReqInput(BaseReq, kw_only=True):
-    method: str
-    parameters: dict | None = None
-
-
-class RpcReqOutput(BaseReq, kw_only=True):
-    success: bool
-    message: str
-
-
 class GetLoadReqOutput(BaseReq, kw_only=True):
     dp_rank: int = 0
     num_reqs: int = 0
     num_waiting_reqs: int = 0
     num_pages: int = 0
-
-
-class LoadSnapshot(
-    msgspec.Struct, frozen=True, tag=True, tag_field="_tag", array_like=True
-):
-    """Immutable scheduler load replica sent over engine IPC.
-
-    Fields are positional on the wire. Append any future fields only at the
-    end so older decoders can retain their prefix compatibility.
-    """
-
-    epoch: str
-    sequence: int
-    dp_rank: int
-    num_running_reqs: int
-    num_waiting_reqs: int
-    num_active_pages: int
-    num_used_pages: int
-    max_total_pages: int
-    valid_for_ms: int
-
-
-class BlockReqType(Enum):
-    BLOCK = 1
-    UNBLOCK = 2
-
-
-class BlockReqInput(BaseReq, kw_only=True):
-    type: BlockReqType = BlockReqType.BLOCK
 
 
 # ============================================================================
@@ -1212,11 +1122,6 @@ class BlockReqInput(BaseReq, kw_only=True):
 # (frame 0 is the primary msgpack buffer, so indices are one-based).
 # ============================================================================
 
-# msgpack extension type codes. 1 and 2 are reserved for pickled payloads in
-# the shared cross-codec numbering; this codec never emits them (opaque
-# objects must use an explicit PickleWrapper field instead).
-CUSTOM_TYPE_PICKLE = 1
-CUSTOM_TYPE_CLOUDPICKLE = 2
 CUSTOM_TYPE_RAW_VIEW = 3
 
 # Tensors/ndarrays below this many bytes are inlined in the primary buffer;
@@ -1371,28 +1276,17 @@ def _walk_subclasses(base: type) -> list:
 def ipc_message_union():
     """The tagged union of every registered IPC message type.
 
-    Computed lazily so process roles that define extra ``BaseReq`` subclasses
-    (e.g. the EPD encode worker) are included as long as the defining module
-    is imported before the receiving socket is constructed.
+    Computed lazily so modules that define extra ``BaseReq`` subclasses
+    (e.g. ``epd/encode_worker.py``'s ``EncodeRequest``) are included as long
+    as the defining module is imported before the receiving socket is
+    constructed.
     """
     types = tuple(
         dict.fromkeys(
-            _walk_subclasses(BaseReq)
-            + _walk_subclasses(BaseBatchReq)
-            + [LoadSnapshot, PickleWrapper]
+            _walk_subclasses(BaseReq) + _walk_subclasses(BaseBatchReq) + [PickleWrapper]
         )
     )
     return Union[types]  # noqa: UP007 — dynamic union over a runtime tuple
-
-
-class NullSender:
-    """No-op stand-in for the engine's reply sender on ranks that don't own
-    request I/O (non-rank-0 workers), so control-reply call sites are safe to
-    run on every rank."""
-
-    @staticmethod
-    def send_pyobj(x):
-        return None
 
 
 class IpcSender:
@@ -1449,25 +1343,6 @@ class IpcReceiver:
         if USE_PICKLE_IPC:
             return self._socket.recv_pyobj(flags)
         return self._decoder.decode(self._socket.recv_multipart(flags))
-
-    def close(self, linger: int | None = None) -> None:
-        self._socket.close(linger=linger)
-
-    def __getattr__(self, name: str):
-        return getattr(self._socket, name)
-
-
-class AsyncIpcReceiver:
-    """Engine-IPC receiver wrapping a ``zmq.asyncio`` PULL socket."""
-
-    def __init__(self, socket) -> None:
-        self._socket = socket
-        self._decoder = MsgpackDecoder(ipc_message_union())
-
-    async def recv_pyobj(self, flags: int = 0) -> Any:
-        if USE_PICKLE_IPC:
-            return await self._socket.recv_pyobj(flags)
-        return self._decoder.decode(await self._socket.recv_multipart(flags))
 
     def close(self, linger: int | None = None) -> None:
         self._socket.close(linger=linger)

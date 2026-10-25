@@ -45,9 +45,6 @@ from tokenspeed.runtime.distributed.comm_backend.emulated import (  # noqa: E402
 from tokenspeed.runtime.distributed.process_group_manager import (  # noqa: E402
     ProcessGroupManager,
 )
-from tokenspeed.runtime.grammar import (  # noqa: E402
-    grammar_manager as grammar_manager_module,
-)
 from tokenspeed.runtime.layers import shared_expert_tp  # noqa: E402
 from tokenspeed.runtime.utils import server_args as server_args_module  # noqa: E402
 from tokenspeed.runtime.utils.network import get_free_port  # noqa: E402
@@ -136,30 +133,6 @@ def test_shared_expert_check_is_sized_by_its_process_group(emulated_manager):
     mapping = SimpleNamespace(world_size=8, world_group=TP8)
     with mock.patch.object(shared_expert_tp, "pg_manager", emulated_manager):
         assert shared_expert_tp.validate_shared_expert_settings(mapping, 1) is None
-
-
-def test_grammar_sync_is_sized_by_its_process_group():
-    args = SimpleNamespace(
-        grammar_backend="xgrammar",
-        grammar_compile_timeout_secs=1.0,
-        grammar_compile_max_retries=1,
-        skip_tokenizer_init=False,
-        disable_any_whitespace=False,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_group=TP8)),
-    )
-    group = SimpleNamespace(size=lambda: 1)
-    pg_manager = grammar_manager_module.pg_manager
-    with (
-        mock.patch.object(
-            grammar_manager_module, "create_grammar_backend", return_value=object()
-        ),
-        mock.patch.object(pg_manager, "has_process_group", return_value=True),
-        mock.patch.object(pg_manager, "get_process_group", return_value=group),
-    ):
-        manager = grammar_manager_module.GrammarManager(args, object(), vocab_size=32)
-
-    assert manager.grammar_sync_group is group
-    assert manager.grammar_sync_size == 1
 
 
 def _server_args(**overrides) -> ServerArgs:

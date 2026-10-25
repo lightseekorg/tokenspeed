@@ -18,56 +18,32 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Construct Host-only L3 storage from startup configuration and CPU facts."""
+"""Resolve the L3 tier's settings from startup configuration and CPU facts.
+
+The engine host runs the tier (``ts-l3``): this module only freezes what it
+starts from -- the deployment identity, the Host pool's geometry and the
+store client's settings (``L3Settings``).
+"""
 
 from __future__ import annotations
 
+import importlib.util
+import os
 from typing import TYPE_CHECKING, Any
 
-from tokenspeed.runtime.cache.l3.backend import KvStoreStorage, MemoryKvStore
-from tokenspeed.runtime.cache.l3.config import parse_extra_config
+from tokenspeed.runtime.cache.l3.config import (
+    L3Settings,
+    MooncakeStoreSettings,
+    parse_extra_config,
+)
+from tokenspeed.runtime.utils.env import envs
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
     from tokenspeed.runtime.cache.host_storage import HostCacheResources
-    from tokenspeed.runtime.cache.l3.executor import L3Executor
     from tokenspeed.runtime.configs.model_config import ModelConfig
     from tokenspeed.runtime.utils.server_args import ServerArgs
-
-
-def create_storage_backend(
-    backend_name: str | None,
-    extra_config: str | None,
-    *,
-    host_buffer: Any,
-    tp_size: int,
-    pp_size: int,
-) -> KvStoreStorage | None:
-    """Return an L3 backend for ``backend_name``, or None when L3 is unset.
-
-    ``memory`` is a test-only in-process store. ``mooncake`` is the production
-    Mooncake Store client (SGLang/vLLM HiCache equivalent). ``tp_size`` and
-    ``pp_size`` divide ``global_segment_size`` so every cache-owning rank
-    (attention TP × PP) mounts an equal share of the configured total. Pass
-    the resolved ``mapping.attn.tp_size``.
-    """
-
-    if backend_name is None:
-        return None
-    name = backend_name.strip().lower()
-    if name == "memory":
-        return MemoryKvStore()
-    if name == "mooncake":
-        from tokenspeed.runtime.cache.l3.mooncake import MooncakeKvStore
-
-        return MooncakeKvStore(
-            extra_config=parse_extra_config(extra_config),
-            host_buffer=host_buffer,
-            tp_size=tp_size,
-            pp_size=pp_size,
-        )
-    raise ValueError(f"unsupported KVStore storage backend {backend_name!r}")
 
 
 def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any]:
@@ -116,15 +92,37 @@ def _kv_producer_options(args: ServerArgs, *, draft_dtype: str) -> dict[str, Any
     }
 
 
-def create_l3_executor(
+def mooncake_store_library() -> str:
+    """The Mooncake store library the engine host loads:
+    ``TOKENSPEED_MOONCAKE_STORE_LIBRARY``, else the store's C ABI the
+    tokenspeed-mooncake wheel installs."""
+    override = envs.TOKENSPEED_MOONCAKE_STORE_LIBRARY.get()
+    if override:
+        return override
+    spec = importlib.util.find_spec("mooncake")
+    if spec is None or not spec.submodule_search_locations:
+        raise ImportError(
+            "Please install tokenspeed-mooncake to use --kvstore-storage-backend "
+            "mooncake."
+        )
+    path = os.path.join(spec.submodule_search_locations[0], "libmooncake_store.so")
+    if not os.path.exists(path):
+        raise RuntimeError(
+            f"{path} is missing: the L3 store needs a tokenspeed-mooncake build "
+            "with the store's C ABI"
+        )
+    return path
+
+
+def l3_settings(
     server_args: ServerArgs,
     model_config: ModelConfig,
     draft_model_config: ModelConfig | None,
     *,
     host_cache: HostCacheResources | None,
     world_cpu_group: ProcessGroup | None,
-) -> L3Executor | None:
-    """Build an independent L3 executor without retaining device capabilities.
+) -> L3Settings | None:
+    """The settings the engine host starts this rank's L3 executor from.
 
     Args:
         server_args: Resolved launch settings; numerical choices are snapshotted.
@@ -136,13 +134,18 @@ def create_l3_executor(
             None in a single-process deployment.
 
     Returns:
-        Host-only executor, carrying its storage configuration. No L2 executor,
-        device handle or attention buffer is retained. Namespace inputs are
-        frozen before the backend is created and workers start. Returns None
-        without a storage backend; no client, worker or collective runs.
+        The settings, with the Host pool by address: the caller keeps
+        ``host_cache.storage`` for the process. None without a storage
+        backend; then no collective runs.
     """
     if server_args.kvstore_storage_backend is None:
         return None
+    backend = server_args.kvstore_storage_backend.strip().lower()
+    if backend not in ("memory", "mooncake"):
+        raise ValueError(
+            "unsupported KVStore storage backend "
+            f"{server_args.kvstore_storage_backend!r}"
+        )
     if host_cache is None:
         raise ValueError("L3 construction requires a Host L2 allocation")
     host_storage = host_cache.storage
@@ -185,8 +188,8 @@ def create_l3_executor(
                 eagle3_layers_to_capture = tuple(int(layer) for layer in draft_layers)
     attention_backend_name = host_cache.attention_backend_name
     draft_attention_backend_name = host_cache.draft_attention_backend_name
-    from tokenspeed.runtime.cache.l3.backend import cache_layout_signature
     from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+    from tokenspeed.runtime.cache.l3.identity import cache_layout_signature
 
     cache_signature = cache_layout_signature(
         host_cache,
@@ -199,13 +202,12 @@ def create_l3_executor(
     )
     import torch.distributed as dist
 
-    from tokenspeed.runtime.cache.l3.backend import (
+    from tokenspeed.runtime.cache.l3.identity import (
         L3_RUNTIME_COMPAT,
         l3_cache_quantization_id,
         l3_checkpoint_id,
         share_l3_checkpoint_ids,
         storage_deployment_id,
-        storage_key_prefix,
     )
 
     initialized = dist.is_available() and dist.is_initialized()
@@ -287,31 +289,36 @@ def create_l3_executor(
         ),
     )
 
-    def prefix_for_weight_version(weight_version: str) -> str:
-        return storage_key_prefix(
-            deployment_id,
-            weight_version=weight_version,
-            draft_weight_version=weight_version if draft_model else "",
-        )
-
-    from tokenspeed.runtime.cache.l3.executor import L3Executor
-
-    key_prefix = prefix_for_weight_version(server_args.weight_version)
-    storage_backend = create_storage_backend(
-        server_args.kvstore_storage_backend,
-        server_args.kvstore_storage_backend_extra_config,
-        host_buffer=host_storage.host_buffer,
-        tp_size=server_args.mapping.attn.tp_size,
-        pp_size=(server_args.mapping.pp_size if server_args.mapping.has_pp else 1),
+    pp_size = server_args.mapping.pp_size if server_args.mapping.has_pp else 1
+    return L3Settings(
+        runtime=config,
+        deployment_id=deployment_id,
+        has_draft=bool(draft_model),
+        weight_version=str(server_args.weight_version),
+        host_buffer=int(host_storage.host_buffer.data_ptr()),
+        host_buffer_bytes=int(host_storage.host_buffer_bytes),
+        groups=tuple(
+            (int(packing), int(block_bytes), int(shards))
+            for packing, block_bytes, shards in zip(
+                host_storage.group_packing,
+                host_storage.host_cache_block_bytes,
+                ownership.shard_counts,
+                strict=True,
+            )
+        ),
+        lcm_block_bytes=int(host_storage.host_lcm_block_bytes),
+        num_lcm_blocks=int(host_storage.num_host_lcm_blocks),
+        owner_rank=int(ownership.rank),
+        tp_rank=int(server_args.mapping.attn.tp_rank),
+        backend=backend,
+        mooncake=(
+            MooncakeStoreSettings.resolve(
+                parse_extra_config(server_args.kvstore_storage_backend_extra_config),
+                library=mooncake_store_library(),
+                tp_size=server_args.mapping.attn.tp_size,
+                pp_size=pp_size,
+            )
+            if backend == "mooncake"
+            else None
+        ),
     )
-    l3_executor = L3Executor(
-        storage_backend,
-        host_storage,
-        key_prefix=key_prefix,
-        rank=server_args.mapping.attn.tp_rank,
-        ownership=ownership,
-        config=config,
-        prefix_for_weight_version=prefix_for_weight_version,
-    )
-
-    return l3_executor

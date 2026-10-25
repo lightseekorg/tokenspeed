@@ -303,12 +303,14 @@ in the configured runtime environment:
 ```bash
 PYTHONPATH=python:tokenspeed-kernel/python:tokenspeed-scheduler/python:test \
 python -m pytest -q \
-  test/runtime/distributed/test_pd_transfer_plan.py \
-  test/runtime/distributed/test_cache_pd_manifest.py \
+  test/runtime/distributed/test_cache_pd_contract.py \
   test/runtime/test_cli_config_compat.py \
   test/runtime/test_kimi_k3_cache_spec.py \
   test/runtime/test_model_executor_cache_state.py
 ```
+
+The transfer planning between the two roles (routes, block manifests,
+copies) is the engine's: run `cargo test -p tokenspeed-pd` in `tokenspeed-engine/`.
 
 Also run the existing K3 DSpark/capture tests. Keep runtime and kernel test
 roots in separate pytest invocations to avoid their conflicting `conftest` module names.

@@ -89,6 +89,7 @@ switch an envelope folds is also available individually under `auto`.
 | Parameter | Purpose |
 | --- | --- |
 | `--numerics {auto,rl-bitwise}` | `auto` keeps every performance default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
+| `--disable-autotune` | Disable startup FlashInfer tactic profiling. Matching caches still load; CuTe warmup continues except under pipeline parallelism. PrimTS skips extra group enumeration. |
 | `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
 | `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
 | `--sampling-stream {batch,per-request}` | `per-request` draws every non-greedy row from a stream keyed by the request's seed and position only, so a request samples the same tokens alone and inside any batch. Folded in by `rl-bitwise`. |
@@ -1317,7 +1318,10 @@ inference jobs sharing a namespace are outside this flush agreement.
 
 Omitting `--kvstore-storage-backend` creates no L3 executor, workers or SDK
 client. `--kvstore-storage-backend memory` selects an in-process test store;
-it is separate from Mooncake's distributed DRAM mode. CPU tests cover the
+it is separate from Mooncake's distributed DRAM mode. The engine host loads
+the Mooncake store client from the `tokenspeed-mooncake` wheel's
+`libmooncake_store.so` (the store's C ABI);
+`TOKENSPEED_MOONCAKE_STORE_LIBRARY` names another build. CPU tests cover the
 scheduler, executor and replica agreement; GPU tests cover packed-byte
 D2H/PUT/GET/H2D round trips. See the
 [validation scope](../design/async-l3-cache.md#initial-scope-and-validation)

@@ -17,9 +17,9 @@ import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.platform import current_platform
 
-from tokenspeed.runtime.engine import request_handler as request_handler_mod
+from tokenspeed.runtime.engine import profiler as profiler_mod
 from tokenspeed.runtime.engine.io_struct import ProfileReq, ProfileReqType
-from tokenspeed.runtime.engine.request_handler import RequestHandler
+from tokenspeed.runtime.engine.profiler import Profiler
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 
 
@@ -31,21 +31,17 @@ def _attn_mapping(tp_rank: int = 0, dp_rank: int | None = None) -> SimpleNamespa
     )
 
 
-def _make_handler(attn_mapping: SimpleNamespace | None = None) -> RequestHandler:
-    handler = RequestHandler.__new__(RequestHandler)
-    handler.forward_ct = 0
-    # EXPERT_LOAD is refused under --enable-eplb; plain serving here.
-    handler.server_args = SimpleNamespace(enable_eplb=False)
+def _make_handler(attn_mapping: SimpleNamespace | None = None) -> Profiler:
     attn_mapping = attn_mapping or _attn_mapping()
-    handler.attn_tp_rank = attn_mapping.tp_rank
-    handler.attn_tp_cpu_group = None
-    # __init__ is bypassed here, so mirror the state _profile_sync needs: the
-    # peer count it short-circuits on and the preallocated rendezvous buffer.
-    handler.attn_tp_size = getattr(attn_mapping, "tp_size", 2)
-    handler._profile_sync_buf = torch.zeros(1, dtype=torch.int32, device="cpu")
-    handler.profile_rank_tag = request_handler_mod._profile_rank_tag(attn_mapping)
-    handler.init_profiler()
-    return handler
+    return Profiler(
+        # EXPERT_LOAD is refused under --enable-eplb; plain serving here.
+        server_args=SimpleNamespace(enable_eplb=False),
+        device=None,
+        attn_mapping=attn_mapping,
+        # Two peers, so _profile_sync rendezvouses (tests patch it).
+        sync_size=getattr(attn_mapping, "tp_size", 2),
+        sync_group=None,
+    )
 
 
 def _start_req(output_dir: str, **kwargs) -> ProfileReq:
@@ -148,16 +144,12 @@ class TestRequestHandlerProtonProfile:
         # than calling barrier (barrier would allocate on the bound CUDA
         # device and trip the control-plane guard). No real process group
         # exists in unit tests.
-        sync_patcher = mock.patch.object(
-            request_handler_mod.torch.distributed, "all_reduce"
-        )
+        sync_patcher = mock.patch.object(profiler_mod.torch.distributed, "all_reduce")
         self.profile_sync = sync_patcher.start()
         request.addfinalizer(sync_patcher.stop)
 
     def test_init_fails_when_proton_unavailable(self):
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=False
-        ):
+        with mock.patch.object(profiler_mod, "proton_available", return_value=False):
             result = self.handler.profile(_start_req(self.output_dir))
 
         assert not (result.success)
@@ -219,9 +211,9 @@ class TestRequestHandlerProtonProfile:
                         target = GPUTarget(backend, arch, warp_size)
                         discovery = SimpleNamespace(get_current_target=lambda: target)
                         with mock.patch.object(DriverConfig, 'active', new_callable=mock.PropertyMock, return_value=discovery):
-                            from tokenspeed.runtime.engine import request_handler as handler_module
-                            audit['real_request_handler_import'] = str(Path(handler_module.__file__).resolve())
-                            assert audit['real_request_handler_import'] == os.environ['TOKENSPEED_CPU_PROFILE_EXPECTED_HANDLER']
+                            from tokenspeed.runtime.engine import profiler as profiler_module
+                            audit['real_profiler_import'] = str(Path(profiler_module.__file__).resolve())
+                            assert audit['real_profiler_import'] == os.environ['TOKENSPEED_CPU_PROFILE_EXPECTED_HANDLER']
                             status = int(pytest.main([
                                 '-q', '-p', 'no:cacheprovider',
                                 sys.argv[1] + '::TestRequestHandlerProtonProfile::test_cpu_profile_captures_a_worker_started_before_the_session',
@@ -237,7 +229,7 @@ class TestRequestHandlerProtonProfile:
             """)
             environment = _canary_child_environment(
                 os.environ,
-                expected_handler=str(Path(request_handler_mod.__file__).resolve()),
+                expected_handler=str(Path(profiler_mod.__file__).resolve()),
             )
             platform = current_platform()
             target = triton.runtime.driver.active.get_current_target()
@@ -424,9 +416,7 @@ class TestRequestHandlerProtonProfile:
         req = _start_req(self.output_dir)
         req.activities = ["CPU", "MEM", "VIZTRACER", "PROTON"]
 
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ):
+        with mock.patch.object(profiler_mod, "proton_available", return_value=True):
             result = self.handler.init_profile(
                 output_dir=self.output_dir,
                 start_step=None,
@@ -445,9 +435,7 @@ class TestRequestHandlerProtonProfile:
         state.enabled = True
         state._session = 1
 
-        with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ):
+        with mock.patch.object(profiler_mod, "proton_available", return_value=True):
             result = self.handler.profile(_start_req(self.output_dir))
 
         assert not (result.success)
@@ -456,13 +444,9 @@ class TestRequestHandlerProtonProfile:
 
     def test_init_rejects_hip_visible_devices_for_amd_proton(self):
         with (
-            mock.patch.object(
-                request_handler_mod, "proton_available", return_value=True
-            ),
-            mock.patch.object(request_handler_mod.torch.version, "hip", "7.2"),
-            mock.patch.dict(
-                request_handler_mod.os.environ, {"HIP_VISIBLE_DEVICES": "0"}
-            ),
+            mock.patch.object(profiler_mod, "proton_available", return_value=True),
+            mock.patch.object(profiler_mod.torch.version, "hip", "7.2"),
+            mock.patch.dict(profiler_mod.os.environ, {"HIP_VISIBLE_DEVICES": "0"}),
         ):
             result = self.handler.profile(_start_req(self.output_dir))
 
@@ -472,9 +456,9 @@ class TestRequestHandlerProtonProfile:
 
     def test_start_returns_failure_when_proton_cannot_initialize(self):
         with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
+            profiler_mod, "proton_available", return_value=True
         ), mock.patch.object(
-            request_handler_mod,
+            profiler_mod,
             "start_profiling",
             side_effect=RuntimeError("rocprofiler unavailable"),
         ):
@@ -487,11 +471,11 @@ class TestRequestHandlerProtonProfile:
     def test_start_and_stop_drive_proton_session_per_rank(self):
         self.handler = _make_handler(_attn_mapping(tp_rank=3))
         with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
+            profiler_mod, "proton_available", return_value=True
         ), mock.patch.object(
-            request_handler_mod, "start_profiling"
+            profiler_mod, "start_profiling"
         ) as start_profiling, mock.patch.object(
-            request_handler_mod, "stop_profiling"
+            profiler_mod, "stop_profiling"
         ) as stop_profiling:
             result = self.handler.profile(_start_req(self.output_dir))
             assert result.success
@@ -508,14 +492,12 @@ class TestRequestHandlerProtonProfile:
             assert not (self.handler.profile_in_progress)
 
     def test_rank_tag_includes_dp_rank_when_present(self):
-        assert (request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=3))) == (
-            "TP3"
-        )
+        assert (profiler_mod._profile_rank_tag(_attn_mapping(tp_rank=3))) == ("TP3")
         assert (
-            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=0, dp_rank=1))
+            profiler_mod._profile_rank_tag(_attn_mapping(tp_rank=0, dp_rank=1))
         ) == ("DP1-TP0")
         assert (
-            request_handler_mod._profile_rank_tag(_attn_mapping(tp_rank=2, dp_rank=1))
+            profiler_mod._profile_rank_tag(_attn_mapping(tp_rank=2, dp_rank=1))
         ) == ("DP1-TP2")
 
     def test_proton_outputs_do_not_collide_across_dp_ranks(self):
@@ -524,11 +506,11 @@ class TestRequestHandlerProtonProfile:
         for dp_rank in (0, 1):
             handler = _make_handler(_attn_mapping(tp_rank=0, dp_rank=dp_rank))
             with mock.patch.object(
-                request_handler_mod, "proton_available", return_value=True
+                profiler_mod, "proton_available", return_value=True
             ), mock.patch.object(
-                request_handler_mod, "start_profiling"
+                profiler_mod, "start_profiling"
             ) as start_profiling, mock.patch.object(
-                request_handler_mod, "stop_profiling"
+                profiler_mod, "stop_profiling"
             ):
                 result = handler.profile(_start_req(self.output_dir))
                 assert result.success
@@ -545,9 +527,9 @@ class TestRequestHandlerProtonProfile:
         self.handler.attn_tp_cpu_group = object()
 
         with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod, "stop_profiling"
+            profiler_mod, "proton_available", return_value=True
+        ), mock.patch.object(profiler_mod, "start_profiling"), mock.patch.object(
+            profiler_mod, "stop_profiling"
         ) as stop_profiling:
 
             def sync_after_finalize(tensor, group):
@@ -574,9 +556,7 @@ class TestRequestHandlerProtonProfile:
         """
         self.handler.attn_tp_cpu_group = object()
 
-        with mock.patch.object(
-            request_handler_mod.torch.distributed, "barrier"
-        ) as barrier:
+        with mock.patch.object(profiler_mod.torch.distributed, "barrier") as barrier:
             self.handler._profile_sync()
 
         barrier.assert_not_called()
@@ -593,9 +573,9 @@ class TestRequestHandlerProtonProfile:
         self.handler.attn_tp_cpu_group = object()
 
         with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod,
+            profiler_mod, "proton_available", return_value=True
+        ), mock.patch.object(profiler_mod, "start_profiling"), mock.patch.object(
+            profiler_mod,
             "stop_profiling",
             side_effect=RuntimeError("finalize failed"),
         ):
@@ -611,9 +591,9 @@ class TestRequestHandlerProtonProfile:
 
     def test_num_steps_window_finalizes_proton(self):
         with mock.patch.object(
-            request_handler_mod, "proton_available", return_value=True
-        ), mock.patch.object(request_handler_mod, "start_profiling"), mock.patch.object(
-            request_handler_mod, "stop_profiling"
+            profiler_mod, "proton_available", return_value=True
+        ), mock.patch.object(profiler_mod, "start_profiling"), mock.patch.object(
+            profiler_mod, "stop_profiling"
         ) as stop_profiling:
             result = self.handler.profile(_start_req(self.output_dir, num_steps=2))
             assert result.success
@@ -644,7 +624,7 @@ class TestRequestHandlerExpertLoadProfile:
         self.handler._device = self.device
         self.handler.attn_tp_size = 1
         recording = mock.patch.object(
-            request_handler_mod, "expert_load_recording_enabled", return_value=True
+            profiler_mod, "expert_load_recording_enabled", return_value=True
         )
         recording.start()
         request.addfinalizer(recording.stop)
@@ -689,7 +669,7 @@ class TestRequestHandlerExpertLoadProfile:
 
     def test_init_refuses_without_recording_or_device(self):
         with mock.patch.object(
-            request_handler_mod, "expert_load_recording_enabled", return_value=False
+            profiler_mod, "expert_load_recording_enabled", return_value=False
         ):
             result = self.handler.profile(self._start())
         assert not (result.success)

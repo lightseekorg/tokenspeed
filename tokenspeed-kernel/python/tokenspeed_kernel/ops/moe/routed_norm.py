@@ -26,6 +26,35 @@ from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_format_signature
 
 
+def gather_moe_routes(
+    routes: torch.Tensor,
+    route_map: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+    hidden_size: int,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Gather deferred expert rows into token/route order; absent routes are zero.
+
+    Args:
+        routes: Expert outputs ``[rows, padded_width]``.
+        route_map: Contiguous ``[tokens * topk]`` row indices; ``-1`` marks absence.
+        num_tokens: Number of tokens.
+        topk: Routes per token.
+        hidden_size: Output width (``<= padded_width``).
+        output: Optional contiguous destination that overlaps no input.
+
+    Returns:
+        ``[tokens, topk, hidden_size]`` routes in ``routes.dtype``.
+    """
+    kernel = select_kernel(
+        "moe",
+        "gather_moe_routes",
+        dense_format_signature(("routes",), (routes.dtype,)),
+    )
+    return kernel(routes, route_map, num_tokens, topk, hidden_size, output)
+
+
 def routed_input_scale_rmsnorm_sum(
     routes: torch.Tensor,
     route_weights: torch.Tensor,
@@ -128,6 +157,7 @@ def routed_input_scale_rmsnorm_sum_gathered(
 
 
 __all__ = [
+    "gather_moe_routes",
     "routed_input_scale_rmsnorm_sum",
     "routed_input_scale_rmsnorm_sum_gathered",
 ]
