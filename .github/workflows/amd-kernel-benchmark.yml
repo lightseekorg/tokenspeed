@@ -11,6 +11,7 @@ on:
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
       - "tokenspeed-kernel-amd/**"
+      - "tokenspeed-engine/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-kernel-benchmark.yml"
@@ -23,6 +24,7 @@ on:
       - "python/tokenspeed/**"
       - "tokenspeed-kernel/**"
       - "tokenspeed-kernel-amd/**"
+      - "tokenspeed-engine/**"
       - "tokenspeed-scheduler/**"
       - "test/**"
       - ".github/workflows/amd-kernel-benchmark.yml"
@@ -91,7 +93,7 @@ jobs:
               ;;
           esac
           python3 test/ci_system/ci_path_filter.py \
-            --runner-group amd \
+            --runner-group amd-mi350 \
             --event-name "${{ github.event_name }}" \
             --repo-root "$GITHUB_WORKSPACE" \
             "$changed_files" >> "$GITHUB_OUTPUT"
@@ -106,7 +108,7 @@ jobs:
             --root test/ci \
             --changed-files "$RUNNER_TEMP/tokenspeed-changed-files.txt" \
             --trigger "${{ github.event_name == 'workflow_dispatch' && 'manual' || github.event_name == 'push' && 'post-submit' || 'per-commit' }}" \
-            --runner-group "amd" \
+            --runner-group amd-mi350 \
             --workflow-stage "kernel-benchmark")
           echo "kernel_benchmark_matrix=${matrix}" >> "$GITHUB_OUTPUT"
           printf '%s' "$matrix" | python3 -c "import json, sys; print('kernel_benchmark_has_tasks=' + ('true' if json.load(sys.stdin).get('include') else 'false'))" >> "$GITHUB_OUTPUT"

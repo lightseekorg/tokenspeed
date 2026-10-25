@@ -5,14 +5,42 @@ on:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
-      - "test/test_l3_mooncake_master.py"
+      - "python/tokenspeed/runtime/cache/l2/executor.py"
+      - "python/tokenspeed/runtime/cache/host_storage.py"
+      - "python/tokenspeed/runtime/cache/transfer/ownership.py"
+      - "python/tokenspeed/runtime/cache/transfer/layout.py"
+      - "python/tokenspeed/runtime/engine/rust_host.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "python/tokenspeed/runtime/utils/server_args.py"
+      - "tokenspeed-scheduler/**"
+      - "tokenspeed-engine/crates/ts-l3/**"
+      - "tokenspeed-engine/crates/ts-metrics/**"
+      - "tokenspeed-engine/crates/ts-mooncake/**"
+      - "tokenspeed-engine/crates/ts-py/**"
+      - "test/l3_test_utils.py"
+      - "test/test_host_cache_storage.py"
+      - "test/test_l3_tail_roundtrip.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
   pull_request:
     branches: [main]
     paths:
       - "python/tokenspeed/runtime/cache/l3/**"
-      - "test/test_l3_mooncake_master.py"
+      - "python/tokenspeed/runtime/cache/l2/executor.py"
+      - "python/tokenspeed/runtime/cache/host_storage.py"
+      - "python/tokenspeed/runtime/cache/transfer/ownership.py"
+      - "python/tokenspeed/runtime/cache/transfer/layout.py"
+      - "python/tokenspeed/runtime/engine/rust_host.py"
+      - "python/tokenspeed/runtime/execution/device.py"
+      - "python/tokenspeed/runtime/utils/server_args.py"
+      - "tokenspeed-scheduler/**"
+      - "tokenspeed-engine/crates/ts-l3/**"
+      - "tokenspeed-engine/crates/ts-metrics/**"
+      - "tokenspeed-engine/crates/ts-mooncake/**"
+      - "tokenspeed-engine/crates/ts-py/**"
+      - "test/l3_test_utils.py"
+      - "test/test_host_cache_storage.py"
+      - "test/test_l3_tail_roundtrip.py"
       - "test/test_l3_kvstore.py"
       - ".github/workflows/mooncake-l3-test.yml"
   workflow_dispatch:
@@ -34,11 +62,13 @@ jobs:
         with:
           python-version: "3.12"
 
+      # The tokenspeed-mooncake the runtime requires ships the store's C ABI
+      # (libmooncake_store.so) and mooncake_master.
       - name: Install Mooncake master runtime
         run: |
+          mooncake=$(python -c 'import tomllib; print(next(r for r in tomllib.load(open("python/pyproject.toml", "rb"))["project"]["dependencies"] if r.startswith("tokenspeed-mooncake")))')
           python -m pip install --retries 10 --timeout 60 \
-            'tokenspeed-mooncake==0.3.13.post20260825' \
-            'nvidia-cuda-runtime==13.0.96' 'pytest>=9'
+            "$mooncake" 'nvidia-cuda-runtime==13.0.96' 'pytest>=9'
           # The wheel links CUDA 13 and libcuda even for Host-only TCP tests.
           # Install user-space driver libraries; no GPU or kernel driver is used.
           if ! sudo apt-get install -y --no-install-recommends \
@@ -49,10 +79,82 @@ jobs:
               libcurl4 libibverbs1 librdmacm1 libnuma1 liburing2 rdma-core \
               libnvidia-compute-580-server
           fi
+          echo "TS_MOONCAKE_STORE_LIBRARY=$(python -c 'import mooncake, os; print(os.path.join(os.path.dirname(mooncake.__file__), "libmooncake_store.so"))')" >> "$GITHUB_ENV"
+
+      - name: Install CPU scheduler roundtrip dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install -e 'tokenspeed-scheduler[test]'
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"
+
+      # The executor against a live master: round trips, objects outliving
+      # their writer, KVP owner relocation, tenant isolation, master restart.
+      - name: Run the L3 executor's live master tests
+        working-directory: tokenspeed-engine
+        env:
+          MOONCAKE_REQUIRE_MASTER: "1"
+        run: cargo test --locked -p tokenspeed-l3 --test mooncake -- --test-threads=1
+
+      # tokenspeed_engine.L3Executor without ts-host, which needs no C++
+      # scheduler build.
+      - name: Build the L3 executor's Python module
+        working-directory: tokenspeed-engine
+        run: |
+          PYO3_BUILD_EXTENSION_MODULE=1 cargo build --release --locked -p tokenspeed-py
+          cp target/release/lib_native.so \
+            "python/tokenspeed_engine/_native$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
 
       - name: Run L3 unit tests and live master roundtrip
         env:
           MOONCAKE_REQUIRE_MASTER: "1"
-          PYTHONPATH: python
+          PYTHONPATH: python:tokenspeed-engine/python
         run: |
-          python -m pytest test/test_l3_kvstore.py test/test_l3_mooncake_master.py -v -s --log-cli-level=INFO
+          python -m pytest \
+            test/test_l3_kvstore.py \
+            test/test_l3_tail_roundtrip.py -v -s --log-cli-level=INFO
+
+  async-protocol:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.12"
+
+      - name: Install CPU protocol test dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install psutil prometheus-client -e 'tokenspeed-scheduler[test]'
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Build the L3 executor's Python module
+        working-directory: tokenspeed-engine
+        run: |
+          PYO3_PYTHON=$(which python) PYO3_BUILD_EXTENSION_MODULE=1 \
+            cargo build --release --locked -p tokenspeed-py
+          cp target/release/lib_native.so \
+            "python/tokenspeed_engine/_native$(python -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+
+      # The executor's own tests, the replica agreement and the L3 metrics
+      # run in the engine's Rust tests (tokenspeed-engine-test.yml); without
+      # Mooncake the native tail round trips skip.
+      - name: Run asynchronous storage tests
+        env:
+          PYTHONPATH: python:tokenspeed-engine/python
+        run: |
+          python -m pytest -q \
+            test/test_host_cache_storage.py \
+            test/test_l3_tail_roundtrip.py

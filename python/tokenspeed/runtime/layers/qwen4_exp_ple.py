@@ -52,6 +52,9 @@ from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp_ple import 
     PLEForwardMetadata,
     Qwen4ExpPLEBackend,
 )
+from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+    InForwardStateCheckpoints,
+)
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_PLE_CACHE_GROUP,
     qwen4_exp_ple_context_field,
@@ -1073,7 +1076,52 @@ class Qwen4ExpPLELayer(nn.Module):
         elif not verify:
             self._write_pages(context_field, output_pages, final_context)
             self._write_pages(conv_field, output_pages, final_conv)
+            checkpoints = plan.metadata.state_checkpoints
+            if checkpoints is not None:
+                self._write_checkpoints(
+                    checkpoints,
+                    flat_ids,
+                    initial_context,
+                    normalized,
+                    starts,
+                    context_field,
+                    conv_field,
+                )
         return conv_output
+
+    def _write_checkpoints(
+        self,
+        checkpoints: InForwardStateCheckpoints,
+        flat_ids: torch.Tensor,
+        initial_context: torch.Tensor,
+        conv_inputs: torch.Tensor,
+        starts: torch.Tensor,
+        context_field: torch.Tensor,
+        conv_field: torch.Tensor,
+    ) -> None:
+        """Store the PLE state at each in-forward State checkpoint.
+
+        A checkpoint ``offset`` tokens into its row's chunk holds what the
+        prefix up to it leaves: the trailing ``context_len`` token ids before
+        it and the short conv's window of the ``conv_state_len`` inputs
+        before it. Offsets are whole prefix pages, longer than either.
+        """
+        device = flat_ids.device
+        rows = checkpoints.rows.to(device)
+        offsets = checkpoints.offsets.to(device)
+        row_starts = starts[rows]
+        blocks = checkpoints.blocks_by_group[QWEN4_EXP_PLE_CACHE_GROUP]
+        context = self._final_context(
+            flat_ids, initial_context[rows], offsets, row_starts
+        )
+        self._write_pages(context_field, blocks, context)
+        if self.conv_state_len:
+            window = (row_starts + offsets).unsqueeze(1) + torch.arange(
+                -self.conv_state_len, 0, device=device
+            )
+            self._write_pages(
+                conv_field, blocks, conv_inputs[window].transpose(1, 2).contiguous()
+            )
 
 
 __all__ = [

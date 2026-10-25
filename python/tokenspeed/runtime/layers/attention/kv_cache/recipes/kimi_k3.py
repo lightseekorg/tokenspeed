@@ -39,7 +39,6 @@ from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnCo
 from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CacheRecipe,
-    kda_verify_scratch_in_pool,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
@@ -317,29 +316,21 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def replay_kda(self) -> bool:
-        """Whether verify commits by replaying from one conv checkpoint row."""
-        if self.server_args.speculative_algorithm is None:
-            return False
+        """Whether target decode uses replay, including the one-token window."""
         return kda_replay_supported(self.attn_config)
-
-    @override
-    def verify_scratch_in_pool(self) -> bool:
-        return kda_verify_scratch_in_pool(self.server_args, self.attn_config)
 
     @override
     def workspace_bytes(self) -> int:
         """KDA verify staging reserved outside the cache arena."""
-        if (
-            self.server_args.speculative_algorithm is None
-            or self.server_args.disaggregation_mode == "prefill"
-        ):
-            # Verify staging exists for the target's verify step; the prefill
-            # role only ever writes committed prompt state.
+        if self.server_args.disaggregation_mode == "prefill":
+            return 0
+        width = max(int(self.attn_config.speculative_num_draft_tokens or 1), 1)
+        if width == 1 and not self.replay_kda:
             return 0
         return kda_verify_workspace_bytes(
             self.attn_config,
             self.groups(),
-            draft_token_num=int(self.server_args.speculative_num_draft_tokens),
+            draft_token_num=width,
             replay_kda=self.replay_kda,
         )
 

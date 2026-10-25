@@ -20,13 +20,14 @@
 
 """Multi-token CTA scheduling, output coverage and workspace reuse."""
 
+from contextlib import nullcontext
 from unittest import mock
 
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -135,6 +136,10 @@ def test_batched_default_dispatch_respects_row_limit(
 @pytest.mark.parametrize(
     ("rows", "expected_kernel"),
     [
+        (16, "cute_fused_hyperconnection_mix"),
+        (32, "cute_fused_hyperconnection_mix"),
+        (64, "cute_fused_hyperconnection_mix"),
+        (65, "cute_fused_hyperconnection_mix"),
         (256, "cute_fused_hyperconnection_mix"),
         (257, "triton_hyperconnection_mix"),
         (1024, "triton_hyperconnection_mix"),
@@ -196,8 +201,13 @@ def test_default_dispatch_boundary_graph_replays(rows, expected_kernel, dtype):
         127,
         128,
         129,
+        160,
         192,
         193,
+        207,
+        223,
+        224,
+        225,
         255,
         256,
         257,
@@ -237,13 +247,58 @@ def test_batched_fp64_and_changed_input_graph(rows):
                 assert torch.equal(actual, first)
 
 
-@pytest.mark.parametrize("rows", [17, 33, 97, 193, 385, 1024])
+@pytest.mark.parametrize("rows", [17, 32, 33, 64, 97, 193, 224, 225, 256, 385, 1024])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("has_inject", [False, True])
 def test_fp16_optional_inject_and_pdl(rows, enable_pdl, has_inject):
     values = inputs(rows, torch.float16, has_inject)
     pdl_enabled(enable_pdl)
     check(mix(values, 1.0, False), reference(values, 1.0), torch.float16)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("has_inject", [False, True])
+def test_up_activation_reuse_across_token_tiles(
+    dtype, enable_pdl, has_inject, monkeypatch
+):
+    _reset_caches(monkeypatch)
+    # Limit residency to one worker so its activation slot is overwritten for
+    # five token tiles, including a tail, within each launch.
+    monkeypatch.setattr(
+        cute_fused,
+        "_capacity",
+        lambda compiled, kernel, device, stream: kernel.clusters,
+    )
+    values = inputs(129, dtype, has_inject)
+    pdl_enabled(enable_pdl)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        mix(values, 0.25, True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = [mix(values, 0.25, True) for _ in range(2)]
+    atol, rtol = (0.002, 0.008) if dtype == torch.bfloat16 else (0.0005, 0.002)
+    for factor in (0.75, -0.5):
+        values[0].mul_(factor)
+        for output in outputs:
+            for tensor in output:
+                if tensor is not None:
+                    tensor.fill_(float("nan"))
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        expected = reference(values, 0.25)
+        for output in outputs:
+            for tensor, wanted in zip(output, expected):
+                if wanted is None:
+                    assert tensor is None
+                else:
+                    torch.testing.assert_close(
+                        tensor.cpu().double(), wanted, atol=atol, rtol=rtol
+                    )
 
 
 @pytest.mark.parametrize(
@@ -429,6 +484,68 @@ def test_stream_capacity_selects_worker_key_without_stream_key(monkeypatch):
     assert {workspace_key[2] for workspace_key in cute_fused._WORKSPACES} == {1, 2}
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("has_inject", [False, True])
+def test_mid_batch_replay_with_limited_cluster_capacity(
+    dtype, enable_pdl, has_inject, monkeypatch
+):
+    if current_platform().arch_version != ArchVersion(10, 7):
+        pytest.skip("requires the SM107 medium-tile preference")
+    _reset_caches(monkeypatch)
+    pdl_enabled(enable_pdl)
+    real_capacity = cute_fused._capacity
+
+    def limited_capacity(compiled, kernel, device, stream):
+        # Model a smaller GPU context without requiring a green context in CI.
+        return min(real_capacity(compiled, kernel, device, stream), 36)
+
+    monkeypatch.setattr(cute_fused, "_capacity", limited_capacity)
+    values = [
+        inputs(rows, dtype, has_inject) for rows in (193, 224, 225, 207, 223, 239)
+    ]
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for value in values[:3]:
+            mix(value, 0.25, True)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with (
+        mock.patch.object(
+            cute_fused.cute_ext,
+            "compile",
+            side_effect=AssertionError("warmed fallback must not compile new rows"),
+        ),
+        mock.patch.object(
+            cute_fused,
+            "_capacity",
+            side_effect=AssertionError("capture must reuse the stream capacity"),
+        ),
+        torch.cuda.graph(graph, stream=stream),
+    ):
+        outputs = [mix(value, 0.25, True) for value in values[3:]]
+    for factor in (0.75, -0.5):
+        for value in values:
+            value[0].mul_(factor)
+        for output in outputs:
+            for tensor in output:
+                if tensor is not None:
+                    tensor.fill_(float("nan"))
+        for _ in range(3):
+            graph.replay()
+        torch.cuda.synchronize()
+        atol, rtol = (0.002, 0.008) if dtype == torch.bfloat16 else (0.0005, 0.002)
+        for actual, value in zip(outputs, values[3:]):
+            for tensor, expected in zip(actual, reference(value, 0.25)):
+                if expected is None:
+                    assert tensor is None
+                else:
+                    torch.testing.assert_close(
+                        tensor.cpu().double(), expected, atol=atol, rtol=rtol
+                    )
+
+
 def test_compiled_capacity_guards_cooperative_grid(monkeypatch):
     _reset_caches(monkeypatch)
     values = inputs(33, torch.bfloat16, True)
@@ -490,7 +607,7 @@ def test_exact_override_rejects_unvalidated_row_count():
         (33, 47, 63),
         (97, 111, 127),
         (193, 207, 223),
-        (224, 256),
+        (225, 239, 255),
     ],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -539,6 +656,151 @@ def test_dynamic_rows_reuse_plan_in_eager_and_capture(row_counts, dtype, monkeyp
     assert all(
         cute_fused._WORKSPACES[key] is value for key, value in workspaces.items()
     )
+
+
+def test_startup_warms_full_tail_tiles_and_rounds(monkeypatch):
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+
+    _reset_caches(monkeypatch)
+    monkeypatch.setattr(cute_fused, "_WARMED", set())
+    values = inputs(256, torch.bfloat16, True)
+    pdl_enabled(True)
+
+    def forward(rows):
+        return gated_residual_mix(
+            values[0][:rows],
+            values[1],
+            values[2],
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            projection_scale=0.25,
+            weights_independent=True,
+            override=None,
+            solution=None,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        with kernel_warmup(enabled=True):
+            forward(1)
+    stream.synchronize()
+    plans = dict(cute_fused._PLANS)
+    row_counts = (13, 16, 23, 32, 33, 64, 95, 96, 97, 128, 191, 192, 193, 224, 255, 256)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = [forward(rows) for rows in row_counts]
+    for factor in (0.75, -0.5):
+        values[0].mul_(factor)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = reference(values, 0.25)
+        for rows, actual in zip(row_counts, outputs):
+            check(actual, tuple(value[:rows] for value in expected), torch.bfloat16)
+    assert cute_fused._PLANS == plans
+
+
+@pytest.mark.parametrize("override_source", ["environment", "context"])
+@pytest.mark.parametrize(
+    ("override", "solution"),
+    [(None, None), ("triton_hyperconnection_mix", "triton")],
+    ids=["default", "conflicting"],
+)
+def test_startup_warms_global_fused_override(
+    monkeypatch, override_source, override, solution
+):
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.selection import kernel_override
+
+    _reset_caches(monkeypatch)
+    monkeypatch.setattr(cute_fused, "_WARMED", set())
+    values = inputs(1024, torch.bfloat16, True)
+    pdl_enabled(True)
+    env_key = "TOKENSPEED_KERNEL_OVERRIDE_RESIDUAL_HYPERCONNECTION_MIX"
+    forced = "cute_fused_hyperconnection_mix"
+    monkeypatch.delenv(env_key, raising=False)
+    if override_source == "environment":
+        monkeypatch.setenv(env_key, forced)
+        context = nullcontext()
+    else:
+        context = kernel_override("residual", "hyperconnection_mix", forced)
+
+    def forward(rows):
+        return gated_residual_mix(
+            values[0][:rows],
+            values[1],
+            values[2],
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            projection_scale=0.25,
+            weights_independent=True,
+            override=override,
+            solution=solution,
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    row_counts = (520, 257, 385, 512, 768, 1024)
+    with context:
+        with torch.cuda.stream(stream), kernel_warmup(enabled=True):
+            forward(1)
+        stream.synchronize()
+        plans = dict(cute_fused._PLANS)
+        assert plans
+        with torch.cuda.stream(stream):
+            for rows in row_counts:
+                forward(rows)
+                assert cute_fused._PLANS == plans
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = [forward(rows) for rows in row_counts]
+        for factor in (0.75, -0.5):
+            values[0].mul_(factor)
+            graph.replay()
+            torch.cuda.synchronize()
+            expected = reference(values, 0.25)
+            for rows, actual in zip(row_counts, outputs):
+                check(actual, tuple(value[:rows] for value in expected), torch.bfloat16)
+        assert cute_fused._PLANS == plans
+
+
+@pytest.mark.parametrize("override_source", ["environment", "context"])
+def test_startup_skips_global_nonfused_override(monkeypatch, override_source):
+    from tokenspeed_kernel.ops.tuning import kernel_warmup
+    from tokenspeed_kernel.selection import kernel_override
+
+    _reset_caches(monkeypatch)
+    monkeypatch.setattr(cute_fused, "_WARMED", set())
+    values = inputs(1, torch.bfloat16, True)
+    env_key = "TOKENSPEED_KERNEL_OVERRIDE_RESIDUAL_HYPERCONNECTION_MIX"
+    forced = "triton_hyperconnection_mix"
+    monkeypatch.delenv(env_key, raising=False)
+    if override_source == "environment":
+        monkeypatch.setenv(env_key, forced)
+        context = nullcontext()
+    else:
+        context = kernel_override("residual", "hyperconnection_mix", forced)
+
+    with context, kernel_warmup(enabled=True):
+        actual = gated_residual_mix(
+            *values,
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            projection_scale=0.25,
+            weights_independent=True,
+            override="cute_fused_hyperconnection_mix",
+            solution="cute_fused",
+        )
+    check(actual, reference(values, 0.25), torch.bfloat16)
+    assert not cute_fused._PLANS
+    assert not cute_fused._WARMED
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -590,7 +852,7 @@ def test_dynamic_rows_reuse_round_bucket_and_workspace(dtype, enable_pdl, monkey
     assert set(cute_fused._WORKSPACES) == workspace_keys
 
 
-@pytest.mark.parametrize("rows", [3, 193, 385, 513, 1023])
+@pytest.mark.parametrize("rows", [3, 17, 31, 33, 63, 193, 385, 513, 1023])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_tail_preserves_output_guards(rows, dtype):
     values = inputs(rows, dtype, True)
@@ -616,3 +878,146 @@ def test_dynamic_tail_preserves_output_guards(rows, dtype):
         assert torch.all(storage[:2] == 123)
         assert torch.all(storage[-2:] == 123)
     check(result, reference(values, 0.25), dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize("has_inject", [False, True])
+@torch.inference_mode()
+def test_prefill_up_mix_dynamic_graph(dtype, enable_pdl, has_inject):
+    from tokenspeed_kernel.ops.residual import (
+        pad_gated_residual_projection_weight,
+        prepare_gated_residual_up_weight,
+        select_gated_residual_mix_kernel,
+    )
+    from tokenspeed_kernel.ops.residual.cute_dsl import supports_up_mix
+
+    if not supports_up_mix(torch.device("cuda")):
+        pytest.skip("requires SM107 and CuTe DSL")
+    pdl_enabled(enable_pdl)
+    x, projection, up = inputs(16385, dtype, has_inject)
+    logical_rows = projection.shape[0]
+    projection = pad_gated_residual_projection_weight(
+        projection, projection_rows=logical_rows
+    )
+    packed = prepare_gated_residual_up_weight(up, 4, 2560, 320)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    def invoke(value, override):
+        return gated_residual_mix(
+            value,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            projection_rows=logical_rows,
+            weights_independent=True,
+            projection_scale=0.25,
+            packed_up_weight=packed,
+            override=override,
+        )
+
+    # Only warm the first large shape. Unseen tails must capture without JIT.
+    with torch.cuda.stream(stream):
+        invoke(x[:4096], None)
+    stream.synchronize()
+    for rows in (4095, 4096, 4097, 8192, 16385):
+        value = x[:rows]
+        kernel, _ = select_gated_residual_mix_kernel(
+            value,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            weights_independent=True,
+            packed_up_weight=packed,
+            override=None,
+            solution=None,
+        )
+        expected_name = (
+            "triton_hyperconnection_mix"
+            if rows < 4096
+            else "cute_dsl_prefill_hyperconnection_mix"
+        )
+        assert kernel.name == expected_name
+        if rows < 4096:
+            invoke(value, None)
+            continue
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            outputs = invoke(value, None)
+        for scale in (1.0, 8.0):
+            value.normal_().mul_(scale)
+            graph.replay()
+            expected = invoke(value, "triton_hyperconnection_mix")
+            torch.cuda.synchronize()
+            for actual, wanted in zip(outputs, expected):
+                if wanted is None:
+                    assert actual is None
+                else:
+                    assert torch.isfinite(actual).all()
+                    torch.testing.assert_close(actual, wanted, rtol=0.005, atol=0.002)
+        graph.reset()
+
+
+@torch.inference_mode()
+def test_prefill_up_mix_fallback_contract():
+    from tokenspeed_kernel.ops.residual import (
+        prepare_gated_residual_up_weight,
+        select_gated_residual_mix_kernel,
+    )
+    from tokenspeed_kernel.ops.residual.cute_dsl import supports_up_mix
+
+    if not supports_up_mix(torch.device("cuda")):
+        pytest.skip("requires SM107 and CuTe DSL")
+    value, projection, up = inputs(4097, torch.bfloat16, True)
+    packed = prepare_gated_residual_up_weight(up, 4, 2560, 320)
+    storage = torch.empty(packed.numel() + 1, dtype=packed.dtype, device=packed.device)
+    unaligned = storage[1:].reshape_as(packed).copy_(packed)
+    strided = torch.empty(4097, 20480, device=value.device, dtype=value.dtype)[:, ::2]
+    strided.copy_(value)
+    expected = gated_residual_mix(
+        value,
+        projection,
+        up,
+        4,
+        2560,
+        320,
+        projection_rows=324,
+        weights_independent=True,
+        override="triton_hyperconnection_mix",
+    )
+    for x, prepared, independent in (
+        (value, None, True),
+        (value, packed, False),
+        (value, unaligned, True),
+        (strided, packed, True),
+    ):
+        kernel, _ = select_gated_residual_mix_kernel(
+            x,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            weights_independent=independent,
+            packed_up_weight=prepared,
+            override=None,
+            solution=None,
+        )
+        assert kernel.name == "triton_hyperconnection_mix"
+        actual = gated_residual_mix(
+            x,
+            projection,
+            up,
+            4,
+            2560,
+            320,
+            projection_rows=324,
+            weights_independent=independent,
+            packed_up_weight=prepared,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0.005, atol=0.002)

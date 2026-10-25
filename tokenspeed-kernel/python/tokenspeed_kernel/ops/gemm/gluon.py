@@ -110,7 +110,7 @@ if platform.is_amd:
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
-        gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
+        launch_gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         transpose_fp32_router_weight_gfx950 as _transpose_fp32_router_weight,
@@ -118,14 +118,8 @@ if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
         launch_gluon_mm_mxfp8_decode_gfx950 as _mm_mxfp8_decode_impl,
     )
-    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.decode import (
-        supports_gluon_mm_mxfp8_decode_gfx950 as _supports_mxfp8_decode_problem,
-    )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
         launch_gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
-    )
-    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
-        supports_mxfp8_gemm_shape as _supports_mxfp8_gemm_shape,
     )
 
     @register_kernel(
@@ -196,13 +190,9 @@ if platform.is_amd:
         enable_pdl: bool,
     ) -> torch.Tensor:
         """Dispatch decode-sized FP32 router GEMV to the gfx950 kernel."""
-        return _fp32_router_gemv_impl(
-            x,
-            weight,
-            multiplier,
-            counters,
-            enable_pdl,
-        )
+        # Split-K counters belong to the portable kernel; this one keeps no state.
+        del counters
+        return _fp32_router_gemv_impl(x, weight, multiplier, enable_pdl)
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (
@@ -570,6 +560,12 @@ if platform.is_amd:
         supports_gluon_mm_mxfp8_decode_gfx950 as _supports_mxfp8_decode_problem,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        is_fp32_blockscale_decode_problem as _is_fp32_blockscale_decode_problem,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
+        launch_gluon_mm_fp8_blockscale_gfx950 as _mm_fp8_blockscale_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
         launch_gluon_mm_mxfp8_gfx950 as _mm_mxfp8_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8.mm import (
@@ -584,12 +580,17 @@ if platform.is_amd:
             )
         }
     )
+    _FP32_BLOCK_SIGNATURES = frozenset(
+        {
+            format_signature(
+                a=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
+                b=tensor_format("mxfp8", _FP8_DTYPE, scale=_FP8_BLOCK_SCALE),
+            )
+        }
+    )
 
     def _prefers_mxfp8_large_tiles(m: int, n: int, k: int) -> bool:
-        # Up to 256 rows the weight-streaming decode kernel wins, except on
-        # weights of 64 Mi elements or more (V4.1 25600x6144 and 5120x15360):
-        # there the two tie near 48-64 rows and the large-tile kernel is up to
-        # 1.6x faster from 96 rows on.
+        # Large weights favor the matrix path from 64 rows onward.
         return m > 256 or (m >= 64 and n * k >= 1 << 26)
 
     def _is_mxfp8_prefill_problem(m: int, n: int, k: int) -> bool:
@@ -601,6 +602,11 @@ if platform.is_amd:
         return _supports_mxfp8_decode_problem(
             m, n, k
         ) and not _prefers_mxfp8_large_tiles(m, n, k)
+
+    def _is_fp32_blockscale_problem(m: int, n: int, k: int) -> bool:
+        return _supports_mxfp8_gemm_shape(
+            m, n, k
+        ) or _is_fp32_blockscale_decode_problem(m, n, k)
 
     @register_kernel(
         "gemm",
@@ -644,6 +650,47 @@ if platform.is_amd:
             alpha=alpha,
             block_size=block_size,
             out=out,
+        )
+
+    @register_kernel(
+        "gemm",
+        "mm",
+        name="gluon_mm_fp8_blockscale_gfx950",
+        solution="gluon",
+        capability=_GFX950_CAPABILITY,
+        signatures=_FP32_BLOCK_SIGNATURES,
+        priority=Priority.SPECIALIZED,
+        traits={
+            "mnk_problem_filter": frozenset({_is_fp32_blockscale_problem}),
+            "a_inner_stride_one": frozenset({True}),
+            "b_inner_stride_one": frozenset({True}),
+            "block_scale_layout": frozenset({"canonical"}),
+            "out_dtype": frozenset({torch.bfloat16}),
+            "out_inner_stride_one": frozenset({True}),
+        },
+    )
+    def gluon_mm_fp8_blockscale_gfx950(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        A_scales: torch.Tensor | None,
+        B_scales: torch.Tensor | None,
+        out_dtype: torch.dtype,
+        *,
+        alpha: torch.Tensor | None,
+        block_size: list[int] | None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Multiply canonical E4M3 matrices with exact FP32 K128 block scales."""
+        return _mm_fp8_blockscale_impl(
+            A,
+            B,
+            A_scales,
+            B_scales,
+            out_dtype,
+            alpha=alpha,
+            block_size=block_size,
+            out=out,
+            allocate_zeroed=zeroed_state,
         )
 
     @register_kernel(
@@ -702,6 +749,11 @@ else:
 
     def gluon_mm_mxfp8_gfx950(**kwargs):
         raise ImportError("gluon_mm_mxfp8_gfx950 requires tokenspeed-kernel-amd")
+
+    def gluon_mm_fp8_blockscale_gfx950(**kwargs):
+        raise ImportError(
+            "gluon_mm_fp8_blockscale_gfx950 requires tokenspeed-kernel-amd"
+        )
 
     def gluon_mm_mxfp8_decode_gfx950(**kwargs):
         raise ImportError("gluon_mm_mxfp8_decode_gfx950 requires tokenspeed-kernel-amd")
@@ -1356,6 +1408,7 @@ __all__ = [
     "prepare_mxfp4_linear_mfma_weight",
     "gluon_mm_a16w16_prefill_gfx950",
     "gluon_mm_mxfp8_gfx950",
+    "gluon_mm_fp8_blockscale_gfx950",
     "gluon_mm_mxfp8_decode_gfx950",
     "gluon_mm_fp8_blockscale_gfx1250",
     "gluon_mm_mxfp8_ue8m0_gfx1250",

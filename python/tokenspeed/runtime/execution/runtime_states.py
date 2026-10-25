@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.types import (
     RequestHistorySeeds,
     StopCriteria,
 )
+from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 
 
 class RuntimeStates:
@@ -101,6 +102,7 @@ class RuntimeStates:
         # Draft trees (init_draft_trees): next round's parents next to its tokens.
         self.chain_parents: torch.Tensor | None = None
         self.future_parent_map: torch.Tensor | None = None
+        self.future_draft_q: DraftTreeQ | None = None
         # Each slot's StopCriteria (bind_stop_criteria), read by the sampling
         # epilogue that cuts verify rounds where the request ends
         # (apply_stop_conditions), and the request that last bound them.
@@ -182,6 +184,19 @@ class RuntimeStates:
         )
         self.future_parent_map = self.chain_parents.repeat(
             self.future_input_map.shape[0], 1
+        )
+
+    def init_draft_tree_q(
+        self, num_nodes: int, num_slots: int, num_candidates: int
+    ) -> None:
+        """Allocate each pool slot's next-round draft distributions (sampled
+        trees); every node starts deterministic."""
+        self.future_draft_q = DraftTreeQ.zeros(
+            self.future_input_map.shape[0],
+            num_slots,
+            num_candidates,
+            num_nodes,
+            self.device,
         )
 
     def init_ngram_state(self, context_len: int) -> None:
@@ -377,6 +392,9 @@ class RuntimeStates:
             rows.append(self.draft_probs[slot])
         if self.future_parent_map is not None:
             rows.append(self.future_parent_map[slot])
+        if self.future_draft_q is not None:
+            q = self.future_draft_q
+            rows += [q.q[slot], q.q_ids[slot], q.slot[slot], q.pos[slot]]
         return rows
 
     def slot_state_bytes(self) -> int:
@@ -516,11 +534,15 @@ class RuntimeStates:
         nothing, the contract graph padding rows already follow, so a
         forward dispatched behind the one that ended a request leaves the
         request's live state block as that forward found it.
+
+        The tables are this step's own upload, so the rows are padded in
+        place: they stay views of the one packed upload, which the attention
+        routers unpack in a single launch.
         """
         stopped_rows = self.stopped.index_select(0, req_pool_indices)[:, None]
         tables = dict(block_tables)
         for group_id in state_group_ids:
-            tables[group_id] = tables[group_id].masked_fill(stopped_rows, -1)
+            tables[group_id].masked_fill_(stopped_rows, -1)
         return tables
 
     def mark_spec_candidates_drafted(self, req_pool_indices: torch.Tensor) -> None:

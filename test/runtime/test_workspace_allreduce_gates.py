@@ -35,7 +35,12 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=30,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the TRT-LLM workspace all-reduce is NVIDIA-only",
+)
 
 
 def _nvidia_cuda_available() -> bool:

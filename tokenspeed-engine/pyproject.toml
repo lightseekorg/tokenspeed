@@ -1,0 +1,21 @@
+[build-system]
+requires = [
+    "setuptools>=70",
+    "wheel",
+    "nanobind>=2.13.0",
+    "tokenspeed-spdlog==1.15.1",
+    "cmake>=3.22",
+    "ninja>=1.11",
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tokenspeed-engine"
+version = "0.1.0"
+description = "TokenSpeed's engine control plane: the ts-host rank binary and the Python frontend's connection to the ranks"
+requires-python = ">=3.10"
+license = "MIT"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["tokenspeed_engine"]

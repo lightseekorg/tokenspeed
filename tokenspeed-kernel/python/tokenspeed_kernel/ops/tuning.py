@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Kernel startup tuning and FlashInfer-native cache persistence."""
+"""Kernel startup warmup, tuning, and FlashInfer-native cache persistence."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ import logging
 import os
 import tempfile
 from collections.abc import Generator
+from contextvars import ContextVar
 from pathlib import Path
 
 import torch.distributed as dist
@@ -43,6 +44,8 @@ __all__ = [
     "autotune_cache_path",
     "get_autotune_max_num_tokens",
     "is_autotuning",
+    "is_warming_up",
+    "kernel_warmup",
     "load_autotune_cache",
     "save_autotune_cache",
     "set_autotune_max_num_tokens",
@@ -57,11 +60,38 @@ _AUTOTUNE_CACHE_DIR_ENV = "TOKENSPEED_FLASHINFER_AUTOTUNE_CACHE_DIR"
 
 _autotune_max_num_tokens = _DEFAULT_AUTOTUNE_MAX_NUM_TOKENS
 _autotune_process_group: dist.ProcessGroup | None = None
+_warmup_enabled: ContextVar[bool] = ContextVar("kernel_warmup_enabled", default=False)
+
+
+@contextlib.contextmanager
+def kernel_warmup(*, enabled: bool) -> Generator[None]:
+    """Allow encountered kernels to prepare their finite compile variants.
+
+    This state is independent of FlashInfer and tactic profiling. Kernels own
+    variant enumeration and cache reuse; the caller runs the normal dummy
+    forward inside this scope before graph capture.
+
+    Args:
+        enabled: Whether kernels may run their startup warmup helpers.
+
+    Yields:
+        ``None``. The previous state is restored on exit, including on error.
+    """
+    token = _warmup_enabled.set(enabled)
+    try:
+        yield
+    finally:
+        _warmup_enabled.reset(token)
+
+
+def is_warming_up() -> bool:
+    """Return whether kernel warmup is enabled in the current context."""
+    return _warmup_enabled.get()
 
 
 @contextlib.contextmanager
 def _reuse_autotune_cache():
-    """Reuse compatible persisted entries regardless of measurement policy."""
+    """Reuse serving entries while preserving explicit cache lookup policies."""
     # Legacy bundled entries are not validated or included in saved configs.
     if os.environ.get("FLASHINFER_AUTOTUNER_LOAD_FROM_FILE") == "1":
         yield
@@ -82,6 +112,8 @@ def _reuse_autotune_cache():
         with tuner._lock:
             # FI 0.7 skips persisted entries for cold-L2 tuning. Use serving
             # lookup rules, then restore tuning so cache misses still profile.
+            # Preserve explicit require_profiling_policy for managed and
+            # in-memory entries, even while the implicit tuning flag is off.
             was_tuning = tuner.is_tuning_mode
             tuner.is_tuning_mode = False
             try:

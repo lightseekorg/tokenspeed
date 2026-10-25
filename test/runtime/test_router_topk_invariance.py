@@ -29,7 +29,12 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=20,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the batch-invariant torch router is registered for NVIDIA only",
+)
 
 from tokenspeed_kernel.ops.moe import plan_softmax_bias_topk, softmax_bias_topk
 from tokenspeed_kernel.platform import current_platform

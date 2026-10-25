@@ -299,6 +299,9 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         ForwardMode,
     )
     from tokenspeed.runtime.execution.prefill_graph import PrefillGraph
+    from tokenspeed.runtime.layers.attention.backends.hybrid.linear import (
+        HybridLinearAttnBackend,
+    )
     from tokenspeed.runtime.layers.attention.backends.state.kda import KdaAttnBackend
 
     if not cutedsl_kda_supported():
@@ -309,7 +312,11 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     conv = torch.randn(12, 3 * channels, 3, device="cuda", dtype=torch.bfloat16)
     states = torch.randn(12, heads, dim, dim, device="cuda", dtype=torch.float32)
     initial_conv, initial_states = conv.clone(), states.clone()
-    raw = torch.randn(bucket, 3 * channels, device="cuda", dtype=torch.bfloat16)
+    # The live input of the captured projection: merged rows [q|k|v|g|f_a|b],
+    # padded to the 128-row grid.
+    projection = torch.randn(
+        bucket, 4 * channels + 2 * dim, device="cuda", dtype=torch.bfloat16
+    )
     backend = object.__new__(KdaAttnBackend)
     configure_prefill(backend)
     backend.__dict__.update(
@@ -334,28 +341,43 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         attention_tp_size=1,
         head_k_dim=dim,
         head_v_dim=dim,
-        g_raw=torch.randn(bucket, channels, device="cuda", dtype=torch.bfloat16),
-        beta_raw=torch.randn(bucket, heads, device="cuda", dtype=torch.bfloat16),
+        f_b_weight=torch.randn(channels, dim, device="cuda", dtype=torch.bfloat16)
+        * 0.1,
         A_log=torch.zeros(heads, device="cuda"),
         dt_bias=torch.zeros(channels, device="cuda"),
         lower_bound=-5.0,
         layer_id=0,
         seq_len=bucket,
     )
+    # Layer 1 would be full attention; this forward has only the KDA layer 0.
+    full = object.__new__(KdaAttnBackend)
+    full.forward_metadata = None
+    full.device = torch.device("cuda")
+    hybrid = HybridLinearAttnBackend(full, backend, [1])
 
-    def forward():
-        return backend.forward_extend(
+    def forward(compact):
+        # As in the model: the captured projection writes fresh rows (the
+        # capacity scrub zeroes padded rows in place), the attention gets
+        # sibling views of them and the output gate is read after it.
+        # ``compact`` is the q|k|v copy the model used to make.
+        rows = projection.clone()
+        mixed_qkv = rows[:, : 3 * channels]
+        core = hybrid.forward(
             None,
             None,
             None,
             None,
             None,
-            backend.forward_metadata.extend_seq_lens_cpu.numel(),
             ForwardMode.EXTEND,
-            save_kv_cache=True,
-            mixed_qkv=raw.clone(),
+            backend.forward_metadata.extend_seq_lens_cpu.numel(),
+            True,
+            None,
+            mixed_qkv=mixed_qkv.contiguous() if compact else mixed_qkv,
+            f_a_out=rows[:, 4 * channels : 4 * channels + dim],
+            beta_raw=rows[:, 4 * channels + dim : 4 * channels + dim + heads],
             **kwargs,
         )
+        return core.flatten(1) * rows[: core.shape[0], 3 * channels : 4 * channels]
 
     def reset():
         conv.copy_(initial_conv)
@@ -434,8 +456,8 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     owner.input_buffers = SimpleNamespace(input_ids_buf=torch.ones(bucket))
     owner._embed_tokens = lambda ids: ids
     owner._land_input_embeds = lambda *args: None
-    owner.attn_backend = backend
-    owner._run_inner = lambda bucket: (forward(), None)
+    owner.attn_backend = hybrid
+    owner._run_inner = lambda bucket: (forward(compact=False), None)
 
     def dummy(bucket, bs):
         backend.forward_metadata = live_metadata([bucket // bs] * bs, [0] * bs, 2)
@@ -451,6 +473,12 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
     capture, captured = owner._captures[bucket, batch_size]
     output = captured.hidden_states
     assert capture.num_segments == 1
+    # The ordinary capture: projection graph, eager attention break, gate graph.
+    ordinary, ordinary_captured = owner._captures[bucket, None]
+    ordinary_output = ordinary_captured.hidden_states
+    assert ordinary.num_segments == 3
+    # Compared bytewise below; same dtypes make same-shape byte views.
+    assert output.dtype == ordinary_output.dtype == torch.bfloat16
     fixed = backend._prefill_metadata[bucket, batch_size]
     retained = {
         "query_start_loc": fixed.query_start_loc,
@@ -464,10 +492,13 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
         forward_mode=ForwardMode.EXTEND, bs=batch_size, num_extends=batch_size
     )
     for index, (lengths, prefixes) in enumerate(cases * 2):
+        # New live input rows for every forward.
+        projection.normal_()
         backend.forward_metadata = live_metadata(lengths, prefixes, 2 + index % 2)
         source = backend.forward_metadata
         reset()
-        expected = forward()[: sum(lengths)].clone()
+        expected = forward(compact=True)[: sum(lengths)].clone()
+        assert expected.dtype == torch.bfloat16
         expected_conv, expected_states = conv.clone(), states.clone()
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
@@ -475,27 +506,46 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size):
             source, bucket, None
         )
         reset()
-        fresh_eager = forward()[: sum(lengths)].clone()
-        torch.testing.assert_close(fresh_eager, expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        fresh_eager = forward(compact=False)[: sum(lengths)].clone()
+        assert torch.equal(fresh_eager.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
+        # The ordinary capture hands the eager break views of the projection
+        # its graph just wrote, on that transient metadata (an uncaptured
+        # request count) or on the plain one (forwards the capacity layout
+        # does not admit, such as MIXED batches).
+        for metadata in (backend.forward_metadata, source):
+            backend.forward_metadata = metadata
+            reset()
+            ordinary.replay(valid_rows=sum(lengths))
+            assert torch.equal(
+                ordinary_output[: sum(lengths)].view(torch.uint8),
+                expected.view(torch.uint8),
+            )
+            assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+            assert torch.equal(
+                states.view(torch.uint8), expected_states.view(torch.uint8)
+            )
+            assert torch.count_nonzero(ordinary_output[sum(lengths) :]) == 0
         backend.forward_metadata = source
         backend.prepare_prefill_metadata(
             bucket, batch_size, ctx.forward_mode, capture=False
         )
         reset()
-        eager = forward()[: sum(lengths)].clone()
-        torch.testing.assert_close(eager, expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        eager = forward(compact=False)[: sum(lengths)].clone()
+        assert torch.equal(eager.view(torch.uint8), expected.view(torch.uint8))
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
         reset()
         capture.replay(valid_rows=sum(lengths))
         assert addresses == {
             name: tensor.data_ptr() for name, tensor in retained.items()
         }
-        torch.testing.assert_close(output[: sum(lengths)], expected, rtol=0, atol=0)
-        torch.testing.assert_close(conv, expected_conv, rtol=0, atol=0)
-        torch.testing.assert_close(states, expected_states, rtol=0, atol=0)
+        assert torch.equal(
+            output[: sum(lengths)].view(torch.uint8), expected.view(torch.uint8)
+        )
+        assert torch.equal(conv.view(torch.uint8), expected_conv.view(torch.uint8))
+        assert torch.equal(states.view(torch.uint8), expected_states.view(torch.uint8))
         assert torch.count_nonzero(output[sum(lengths) :]) == 0
 
 

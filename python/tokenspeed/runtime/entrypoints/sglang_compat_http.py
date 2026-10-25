@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, get_args
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from tokenspeed.runtime.cache.l3.backend import (
+from tokenspeed.runtime.cache.l3.identity import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     resolve_l3_weight_version,
 )
@@ -228,12 +228,7 @@ async def update_weights_from_distributed(request: Request) -> JSONResponse:
                 "success": False,
                 "message": L3_FLUSH_REQUIRES_WEIGHT_VERSION,
             }
-        weight_version = resolve_l3_weight_version(
-            llm.server_args.weight_version,
-            requested_version,
-            flush_cache=flush_cache,
-            storage_backend=storage_backend,
-        )
+        weight_version = resolve_l3_weight_version(requested_version)
         obj = UpdateWeightsFromDistributedReqInput(
             names=names,
             dtype_names=dtypes,  # translate dtypes -> dtype_names
@@ -275,7 +270,6 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
         llm = _llm(request)
         requested_version = body.get("weight_version")
         weight_version = resolve_l3_weight_version(
-            llm.server_args.weight_version,
             mooncake_load_weight_version(
                 version=version,
                 flush_cache=flush_cache,
@@ -283,8 +277,6 @@ async def update_weights_from_mooncake(request: Request) -> JSONResponse:
                     None if requested_version is None else str(requested_version)
                 ),
             ),
-            flush_cache=flush_cache,
-            storage_backend=llm.server_args.kvstore_storage_backend,
         )
         obj = UpdateWeightsFromMooncakeReqInput(
             version=version,
@@ -351,6 +343,7 @@ async def update_weights_from_disk(request: Request) -> JSONResponse:
         obj = UpdateWeightFromDiskReqInput(
             model_path=str(body["model_path"]),
             load_format=body.get("load_format"),
+            flush_cache=bool(body.get("flush_cache", True)),
             weight_version=body.get("weight_version"),
         )
         success, message, *_ = await _llm(request).update_weights_from_disk(obj)
@@ -410,8 +403,16 @@ async def continue_generation(request: Request) -> JSONResponse:
 @router.api_route("/flush_cache", methods=["GET", "POST"])
 async def flush_cache(request: Request) -> JSONResponse:
     async def _do() -> dict[str, Any]:
-        await _llm(request).flush_cache()
-        return {"success": True, "message": "Cache flushed."}
+        result = await _llm(request).flush_cache()
+        return {
+            "success": result.success,
+            "message": (
+                "Cache flushed."
+                if result.success
+                else "Cache flush failed; active requests, cache I/O, or storage "
+                "availability may prevent clearing. Retry after they settle."
+            ),
+        }
 
     return await _guarded(_do)
 

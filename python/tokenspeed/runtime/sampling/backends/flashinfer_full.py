@@ -98,6 +98,9 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
     mask. Both remain silently-ignored no-ops.
     """
 
+    # verify() here adds penalties and logit processors with no tree path yet.
+    supports_tree_verify = False
+
     _SUPPORTS_DP_VERIFY = False
 
     def __init__(self, config: SamplingBackendConfig) -> None:
@@ -333,6 +336,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                     probs,
                     top_ks,
                     top_ps,
+                    in_place_skip=False,
                 )
             else:
                 probs = top_k_renorm_prob(probs, top_ks)
@@ -454,6 +458,7 @@ class FlashInferFullSamplingBackend(FlashInferSamplingBackend):
                 target_probs,
                 top_ks,
                 top_ps,
+                in_place_skip=False,
             )
         else:
             target_probs = top_k_renorm_prob(target_probs, top_ks)

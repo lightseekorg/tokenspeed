@@ -220,11 +220,12 @@ class TestFinishTailHitCopyCudaTest:
 
     def test_the_hitters_block_holds_the_published_partial_page_byte_for_byte(self):
         ts = pytest.importorskip("tokenspeed_scheduler")
-        from tokenspeed.runtime.engine.scheduler_utils import (
+        from test.runtime.scheduler_driver import (
             advance_scheduler,
-            make_config,
             make_extend_result_event,
         )
+
+        from tokenspeed.runtime.engine.scheduler_utils import make_config
 
         arena = self._arena()
         contract = arena.runtime_contract
@@ -241,7 +242,7 @@ class TestFinishTailHitCopyCudaTest:
                 role="fused",
                 num_snapshot_pages=1,
                 max_retracted_requests=0,
-                l3_prefetch_min_pages=0,
+                storage_config=None,
                 cache_groups=[
                     ts.CacheGroupConfig(
                         group_id="kv",

@@ -646,6 +646,59 @@ def test_index_pack_matches_independent_fp4_oracle(
         assert output_weights is weights
 
 
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+def test_index_pack_large_inner_stride(device, weight_dtype):
+    stride = 1 << 25
+    elements = 191 * stride + 1
+    required_bytes = elements * torch.bfloat16.itemsize
+    if torch.cuda.mem_get_info(device)[0] < required_bytes + (256 << 20):
+        pytest.skip("requires space for a large-stride query view")
+    storage = torch.empty(elements, dtype=torch.bfloat16, device=device)
+    # Keep wrapped int32 reads in bounds so a regression fails by value.
+    storage.as_strided((192,), (stride,)).fill_(-17)
+    q = storage.as_strided((1, 1, 128), (0, 0, stride), storage_offset=64 * stride)
+    q.copy_(torch.arange(128, dtype=torch.bfloat16, device=device).view(1, 1, 128))
+    weights = torch.ones(1, 1, dtype=weight_dtype, device=device)
+    (data, scales), output_weights = pack_index_inputs(q, weights, weight_dtype)
+    expected, _ = torch_dsv41_cache_quantize(q.contiguous(), "index")
+    packed = torch.cat(
+        (data.cpu().reshape(-1, 64), scales.cpu().view(torch.uint8).reshape(-1, 4)), 1
+    )
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+    assert output_weights is weights
+
+
+@pytest.mark.parametrize("width", [128, 131200])
+@pytest.mark.parametrize("rows", [1, 3])
+def test_block_select_visible_stride_contract(device, width, rows):
+    logits = torch.randn(rows, width, device=device)
+    visible = torch.full((2 * rows,), width, dtype=torch.int64, device=device)[::2]
+    out = torch.empty(rows, 4, dtype=torch.int32, device=device)
+    lengths = torch.empty(rows, dtype=torch.int32, device=device)
+    if rows > 1:
+        with pytest.raises(ValueError, match="contiguous visible row counts"):
+            implementation.index_block_select(
+                logits, visible, 4, out, lengths, visible_capacity=width
+            )
+        return
+    # A single element has no stride-dependent addressing, in either selector.
+    expected_out = torch.empty_like(out)
+    expected_lengths = torch.empty_like(lengths)
+    implementation.index_block_select(
+        logits, visible, 4, out, lengths, visible_capacity=width
+    )
+    implementation.index_block_select(
+        logits,
+        visible.clone(),
+        4,
+        expected_out,
+        expected_lengths,
+        visible_capacity=width,
+    )
+    torch.testing.assert_close(out, expected_out, rtol=0, atol=0)
+    torch.testing.assert_close(lengths, expected_lengths, rtol=0, atol=0)
+
+
 def test_index_pack_boundaries_and_graph_refresh(device):
     q = torch.zeros(8, 32, 128, device=device, dtype=torch.bfloat16)
     weights = torch.zeros(8, 32, device=device, dtype=torch.bfloat16)

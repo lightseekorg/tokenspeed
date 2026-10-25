@@ -712,6 +712,7 @@ class TritonSamplingBackend(SamplingBackend):
                 accept_token_num=accept_length,
                 candidates=candidates,
                 target_sampled=target_sampled,
+                write_rejected_targets=False,
             )
             accept_length += 1
 

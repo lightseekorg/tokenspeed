@@ -2,31 +2,34 @@
 
 ## Triggers and change selection
 
-The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `PR Test Ascend NPU ARM`.
+The workflow is `.github/workflows/pr-test-ascendnpu-arm.yml`, displayed as `Ascend NPU Tests`.
 It runs in `lightseekorg/tokenspeed` or the repository identified by the full `owner/repository` value of the `TOKENSPEED_NPU_CI_REPOSITORY` repository variable. Forks must explicitly set that variable.
 Triggers include pushes to main, `pull_request` events targeting main, and `workflow_dispatch`.
 The `select` job can run in an allowed repository. The hardware job additionally requires `TOKENSPEED_NPU_ARM_CI_ENABLED` to be set to `true`.
 When that variable is absent or disabled, the hardware job is skipped without entering a runner queue. A positive selection result does not mean the operators have run.
 The NPU allowlist uses its own `TOKENSPEED_NPU_CI_REPOSITORY` variable; it does not require the shared repository variable used by GPU workflows, so enabling NPU CI does not also enable other vendors' scheduling.
 
-Supported PR events are `opened`, `synchronize`, `reopened`, `ready_for_review`, and `labeled`. Only the `high priority` label triggers a run on a labeling event. Draft PRs do not start the NPU job.
-The label does not change the order: accuracy always precedes performance.
+Supported PR events are `opened`, `synchronize`, `reopened`, and `ready_for_review`. Draft PRs do not start the NPU job.
+Accuracy always precedes performance.
 The independent `pr-test-npu-arm` concurrency group is keyed by PR or ref. Automatic events cancel older runs in the same group; manual events do not initiate cancellation.
-Unrelated label events use a separate group to avoid canceling an active test run. Test code never runs through `pull_request_target`.
+Test code never runs through `pull_request_target`.
 
-The GitHub-hosted `select` job fetches complete Git history, runs the CPU-only regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`:
+The GitHub-hosted `select` job checks out the event commit, runs the CPU-only API regression tests with `python3 -B -m unittest ci.npu_ops_test.test_changes`, then runs `ci/npu_ops_test/changes.py`. Selection uses the same GitHub API change-list checks as the independent NPU workflow:
 
-- Pushes compare the `before` and `after` commits. An all-zero `before` conservatively selects the full suite. With the current main-only trigger, this applies when creating main or invoking the selector independently.
-- PRs require the checkout to be the two-parent merge commit identified by `GITHUB_SHA`, with its second parent matching the event's head SHA. Its first parent must equal or descend from the event's base SHA, allowing the target branch to advance. Selection compares `merge-base(first_parent, head)..head`, excluding changes introduced only on base, including base updates already incorporated by the PR. Tests execute the merge SHA, not the head SHA.
-- Manual runs execute the full suite at the selected branch or tag's `GITHUB_SHA`.
-- Invalid SHAs, refs, missing Git objects, or comparison failures fail selection instead of silently skipping tests. Tag pushes and branch deletion do not start operator tests.
+- PRs read every page of `/pulls/<number>/files` with 100 files per page. The current PR head and base must match the event before and after reading; the file count must remain stable and match the complete response. More than 3,000 files, duplicates, malformed paths, or partial responses fail selection.
+- Pushes read `/compare/<before>...<after>`. Both SHAs must be nonzero. Responses with 300 or more files fail because the compare API may truncate the list. Creating a branch with an all-zero `before` fails selection instead of guessing missing changes.
+- Manual runs select the full suite without an API file request.
+- Renames check both `filename` and `previous_filename`; API failures fail the job instead of silently skipping tests.
 
-Path rules in `ci/npu_ops_test/manifest.json` cover the NPU package, the shared `tokenspeed-kernel/python/` dependency, dependency configuration, NPU CI scripts, and this workflow.
-Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename, without a file-count limit.
+The selector uses the event's PR identity and the complete API file list, without depending on the parents of GitHub's temporary test-merge commit. GitHub may supply an older test-merge SHA while refreshing that reference. The hardware job still checks out and verifies the event's exact `GITHUB_SHA`; selection does not substitute the PR head SHA. The selection step receives only the read-permission `GITHUB_TOKEN` through `GH_TOKEN`; no token is passed to operator test processes.
+
+Path rules in `ci/npu_ops_test/manifest.json` cover the NPU package, the shared `tokenspeed-kernel/python/` dependency, dependency configuration, NPU CI scripts, the task YAML and pipeline, and both the NPU caller and shared task workflow.
+Documentation changes ending in `.md` or `.rst` are excluded. Matching is case-sensitive and includes additions, modifications, deletions, and both sides of a rename within the API completeness limits above.
 Any matching path selects every registered operator. Unrelated changes emit `should_run=false` and `reason=no-watched-changes`.
 The workflow has no top-level path filter, so unrelated changes still produce a selection result.
-NVIDIA/AMD workflows, shared path filters, task pipelines, and cancellation/retry controllers are unchanged.
-NPU CI implementation and operator tests live under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists under `test/**`.
+The caller passes the selected `test/ci/ut/npu-operators.yaml` task to `.github/workflows/run-ci-task-matrix.yml`, using the dedicated NPU runner label. This shared workflow invokes `test/ci_system/pipeline.py` in the existing NPU environment; the task has no dependency-install stage or Docker requirement.
+NPU CI implementation and operator tests remain under `ci/npu_ops_test/`; new operators do not require changes to GPU task lists.
+The dedicated `npu` matrix group selects only `tokenspeed-npu-arm64`; AMD MI350, AMD MI450, and NVIDIA groups exclude that runner. GPU path selection also ignores NPU-only task YAML changes.
 
 ## Components and execution order
 
@@ -41,13 +44,12 @@ NPU CI implementation and operator tests live under `ci/npu_ops_test/`; new oper
 
 The `tests/` directory contains the registered operator scripts. Each `<operator>-test.py` runs by file path through the manifest or an explicit command and requires an NPU for accuracy and performance modes. The hyphenated names are executable script paths, not Python module import names.
 
-The NPU job has exactly two authored steps: accuracy tests for all operators, followed by performance tests for all operators.
+The task has exactly two sequential commands: `bash ci/npu_ops_test/run_step.sh accuracy "$NPU_CI_WORK"`, then the same entry point with `performance`. Accuracy tests for all operators finish before performance tests begin.
 The executor starts each manifest `script` with `--mode accuracy` or `--mode performance`; it has no operator-name branches.
 The standalone `--mode all` option is a convenience for one operator only. CI does not use it: CI preserves the global ordering of all accuracy tests before any performance test.
-Both steps share the bootstrap through a YAML anchor. Before fetching repository scripts, the accuracy step validates deployment, platform, and event inputs, creates an isolated run/attempt directory, and checks out the requested SHA.
-Only then can it invoke the repository entry point.
-The performance step reuses the directory only after accuracy succeeds. Both steps require Linux, `uname -m` equal to `aarch64` or `arm64`, the expected SHA, and a checkout without modified or untracked files.
-Checkout uses the format-checked, allowlisted `GITHUB_REPOSITORY` to fetch public source from `https://github.com/<owner>/<repository>.git` without forwarding access tokens.
+Before invoking the pipeline, the shared workflow validates NPU deployment, platform, and event inputs, creates an isolated run/attempt directory, and checks out the requested SHA. `NPU_CI_WORK` identifies that directory; commands run from its `checkout/` directory.
+Performance reuses the directory only after accuracy succeeds. Both commands retain the existing Linux, ARM64, SHA, and clean-checkout checks, host lock, fixed environment, and cache preparation in `run_step.sh`.
+The shared workflow checks out the requested SHA with `actions/checkout` and does not persist checkout credentials for NPU tasks.
 The interpreter path is fixed. Scripts use that interpreter with `-B -u`, and the two kernel package directories in the checkout precede other entries in `PYTHONPATH`.
 
 | Operator | Accuracy cases | Performance configurations | Performance samples |
@@ -64,18 +66,19 @@ There are no latency thresholds. A `completed` result does not mean performance 
 ## Failures, logs, and cleanup
 
 Any case, configuration, script, checkout, environment, or required evidence-write failure returns nonzero and stops subsequent tests.
-Later operators in the current phase are recorded as `not_run`; if accuracy fails, the performance step is skipped.
+Later operators in the current phase are recorded as `not_run`; if accuracy fails, the performance command is skipped.
 Only necessary evidence saving and resource cleanup continue after failure. Report or Actions summary write failures also fail the step.
 Each script has a 600-second timeout, and the job has a 60-minute timeout. These limits are not performance thresholds.
 
 Merged stdout/stderr is written to disk and flushed to the console as it arrives. Python output is unbuffered.
 Each operator prints its start, finish, elapsed time, and exit code. A heartbeat is printed every 30 seconds while a script remains active.
 Original exceptions are preserved. Error annotations escape `%`, CR, and LF; failure explanations and English summaries are generated within the same step.
-Bootstrap failures produce a summary naming the failed stage. Executor exceptions also include a traceback.
+Executor exceptions also include a traceback.
 
 Test subprocesses run in private process groups. Completion, nonzero exit, timeout, SIGINT, and SIGTERM all attempt to terminate remaining processes in that group.
 Test processes must not escape supervision by starting a new session. SIGKILL or host failure may leave partial logs without a final summary.
 The host lock covers environment preparation and execution within each phase and is released when the executor exits after child-process cleanup.
+Source recording, artifact upload, and work-directory cleanup use the shared workflow. Cleanup runs even after a task failure; phase process cleanup remains in the existing executor.
 
 ## Runner deployment contract and evidence locations
 
@@ -95,14 +98,14 @@ If no online runner has the required label, the job waits for scheduling and can
 The environment entry point is `/srv/tokenspeed-npu/cann9-torch29-py312-root/env.sh`, and the interpreter is `venv/bin/python` under the same directory.
 Working CANN, torch, torch_npu, and Triton Ascend dependencies and NPU device access for that account are required. Installing the runner alone is insufficient.
 The account must have read/write access to `/srv/npu-ci/locks/host-all.lock`. An occupied lock fails immediately without starting tests.
-Create `/srv/npu-ci/jobs/slot0` in advance and allow `ci-npu` to create run and cache directories there. These account and path requirements remain fixed deployment contracts.
+The runner account must be able to create and remove job directories under `GITHUB_WORKSPACE`. The existing environment and lock paths remain deployment requirements.
 PRs execute repository test code. Use a dedicated isolated runner, preserve GitHub's external-contributor approval policy, and do not inject deployment credentials into test processes.
 
-The console prints the run directory `/srv/npu-ci/jobs/slot0/actions-<run_id>-<attempt>.*`.
-It contains `source.txt`, `checkout/`, separate `accuracy/` and `performance/` result directories, and caches.
+The shared workflow creates `GITHUB_WORKSPACE/run-<run_id>-<attempt>-<task>-<runner>/`, with `checkout/`, separate `accuracy/` and `performance/` result directories, and caches.
 Each phase directory contains `context.json`, `report.json`, and `summary.md`. Operator directories contain raw logs, `process.json`, `result.json`, and known exit codes.
-Summaries are appended to `GITHUB_STEP_SUMMARY`. JSON reports and raw logs remain on the VM and are not currently uploaded as artifacts.
-Run directories are retained for verification; operators must arrange cleanup. Deploy from a clean baseline worktree rather than reusing a fault-injection branch.
+Summaries are appended to `GITHUB_STEP_SUMMARY`. After execution, the workflow collects phase evidence under `checkout/.ci-artifacts/published/npu/` alongside the pipeline's `result.json` and the shared source reporter's `source.json` in `.ci-artifacts/`, then uploads the artifact.
+The phase directories remain outside the checkout during execution so both commands can verify a clean source tree; `.ci-artifacts` is created only when the pipeline writes its final result.
+Use the uploaded artifacts for verification after shared cleanup removes the entire run directory, including checkout and caches. Deploy from a clean baseline worktree rather than reusing a fault-injection branch.
 
 ## Adding cases, operators, and structured events
 

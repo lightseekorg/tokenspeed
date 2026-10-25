@@ -19,7 +19,6 @@
 # SOFTWARE.
 
 from dataclasses import dataclass
-from enum import Enum
 from typing import TYPE_CHECKING
 
 from tokenspeed.runtime.engine.request_types import ABORT_CODE, BaseFinishReason
@@ -31,124 +30,6 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.compile_monitor import CompileStats
 
 TOKENSPEED_TEST_REQUEST_TIME_STATS = envs.TOKENSPEED_TEST_REQUEST_TIME_STATS.get()
-
-
-def _raise_for_negative_durations(**durations: float) -> None:
-    negative_durations = [
-        f"{name}={duration} < 0" for name, duration in durations.items() if duration < 0
-    ]
-    if negative_durations:
-        raise ValueError(" or ".join(negative_durations))
-
-
-@dataclass
-class TimeStats:
-    """
-    Store the timestamps for each stage of a request.
-
-    Unified: wait_queue -> forward -> completion
-    Prefill: bootstrap_queue -> wait_queue -> forward -> transfer_queue -> completion
-    Decode: prealloc_queue -> transfer_queue -> wait_queue -> forward -> completion
-    """
-
-    lb_entry_time: float = 0.0
-    wait_queue_entry_time: float = 0.0
-    forward_entry_time: float = 0.0
-    completion_time: float = 0.0
-    prefill_bootstrap_queue_entry_time: float = 0.0
-    prefill_transfer_queue_entry_time: float = 0.0
-    decode_prealloc_queue_entry_time: float = 0.0
-    decode_transfer_queue_entry_time: float = 0.0
-
-    class RequestType(Enum):
-        UNIFIED = "unified"
-        PREFILL = "prefill"
-        DECODE = "decode"
-        INVALID = "invalid"
-
-    def get_queueing_time(self) -> float:
-        return self.forward_entry_time - self.wait_queue_entry_time
-
-    def __str__(self) -> str:
-        # if unified
-        _type = self.get_type()
-
-        if _type == self.RequestType.UNIFIED:
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                _raise_for_negative_durations(
-                    queue_duration=queue_duration,
-                    forward_duration=forward_duration,
-                )
-
-            return f"queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.wait_queue_entry_time}"
-        if _type == self.RequestType.PREFILL:
-            bootstrap_duration = (
-                self.wait_queue_entry_time - self.prefill_bootstrap_queue_entry_time
-            )
-
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                _raise_for_negative_durations(
-                    bootstrap_duration=bootstrap_duration,
-                    queue_duration=queue_duration,
-                    forward_duration=forward_duration,
-                )
-            return f"bootstrap_duration={self.format_duration(bootstrap_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.prefill_bootstrap_queue_entry_time}"
-        # if decode
-        if _type == self.RequestType.DECODE:
-            prealloc_duration = (
-                self.decode_transfer_queue_entry_time
-                - self.decode_prealloc_queue_entry_time
-            )
-
-            transfer_duration = (
-                self.wait_queue_entry_time - self.decode_transfer_queue_entry_time
-            )
-            queue_duration = self.forward_entry_time - self.wait_queue_entry_time
-            forward_duration = self.completion_time - self.forward_entry_time
-
-            if TOKENSPEED_TEST_REQUEST_TIME_STATS:
-                _raise_for_negative_durations(
-                    prealloc_duration=prealloc_duration,
-                    transfer_duration=transfer_duration,
-                    queue_duration=queue_duration,
-                    forward_duration=forward_duration,
-                )
-
-            return f"prealloc_duration={self.format_duration(prealloc_duration)}, transfer_duration={self.format_duration(transfer_duration)}, queue_duration={self.format_duration(queue_duration)}, forward_duration={self.format_duration(forward_duration)}, start_time={self.decode_prealloc_queue_entry_time}"
-        return "Invalid Time Stats"
-
-    def format_duration(self, duration: float) -> str:
-        return f"{duration * 1e3:.2f}ms"
-
-    def get_type(self) -> RequestType:
-        """Determine the type of request based on timestamp values."""
-        if (
-            self.prefill_bootstrap_queue_entry_time == 0.0
-            and self.prefill_transfer_queue_entry_time == 0.0
-            and self.decode_prealloc_queue_entry_time == 0.0
-            and self.decode_transfer_queue_entry_time == 0.0
-        ):
-            return self.RequestType.UNIFIED
-        elif (
-            self.prefill_bootstrap_queue_entry_time > 0.0
-            and self.prefill_transfer_queue_entry_time > 0.0
-        ):
-            return self.RequestType.PREFILL
-        elif (
-            self.decode_prealloc_queue_entry_time > 0.0
-            and self.decode_transfer_queue_entry_time > 0.0
-            and self.wait_queue_entry_time > 0.0
-        ):
-            return self.RequestType.DECODE
-        else:
-            return self.RequestType.INVALID
 
 
 # Stable snake_case strings for the bounded ABORT_CODE enum, used in the
@@ -278,6 +159,14 @@ _INTER_TOKEN_LATENCY_BUCKETS = [
 
 
 class EngineMetrics:
+    """The scheduler loop's metrics: their names, labels and buckets.
+
+    Every engine rank records them in Rust (``ts-metrics``), which keeps
+    these definitions; its fixtures are generated from this class
+    (``tokenspeed-engine/crates/ts-metrics/tests/fixtures/generate.py``), so
+    a change here is a change of the Rust metrics too.
+    """
+
     def __init__(
         self,
         labels: dict[str, str],
@@ -764,11 +653,11 @@ class RequestMetrics:
 
 
 class KVTransferMetrics:
-    """PD KV transfer metrics, recorded by the transfer managers.
+    """PD KV transfer metrics: their names, labels and buckets.
 
-    Lives on every PD engine (prefill and decode roles each record their own
-    view); series from the node's transfer processes aggregate in Prometheus
-    multiprocess mode.
+    Every PD engine rank records them in Rust (``ts-metrics``; prefill and
+    decode roles each record their own view), which keeps these
+    definitions, as for ``EngineMetrics``.
     """
 
     def __init__(

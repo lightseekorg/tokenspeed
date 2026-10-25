@@ -114,6 +114,8 @@ ensure_workspace_initialized = error_fn
 group_spans_nodes = error_fn
 allreduce_residual_attnres_combine = error_fn
 allreduce_lane_latent_norm = error_fn
+allreduce_mhc_post_norm = error_fn
+supports_allreduce_mhc_post_norm = error_fn
 reducescatter_residual_rmsnorm = error_fn
 trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
@@ -675,6 +677,133 @@ if current_platform().is_nvidia:
         manager = _manager_for_group(group)
         return int(manager.hidden_dim) if manager.initialized else 0
 
+    def supports_allreduce_mhc_post_norm(
+        x: torch.Tensor, norm_weight: torch.Tensor, group: dist.ProcessGroup
+    ) -> bool:
+        """Admit an anticipated producer output and target norm storage for fusion.
+
+        x describes the output's final shape/dtype/device/layout. norm_weight
+        supplies the target norm's storage metadata and may be another norm
+        with the same layout. Neither tensor's values are read or retained.
+        HC residual/coefficient formats are a fixed producer contract,
+        validated at execution. The group's configuration and workspace must
+        remain fixed between admission and execution.
+        """
+        if (
+            not x.is_cuda
+            or x.dtype != torch.bfloat16
+            or norm_weight.dtype != torch.bfloat16
+            or not x.is_contiguous()
+            or norm_weight.device != x.device
+            or norm_weight.shape != (5120,)
+            or not norm_weight.is_contiguous()
+            or x.ndim != 2
+            or x.shape[1] != 5120
+            or not 0 < x.shape[0] <= MNNVL_TWOSHOT_MAX_TOKEN
+        ):
+            return False
+        manager = _manager_for_group(group)
+        ws = manager.mnnvl_workspace
+        if (
+            not manager.initialized
+            or manager.world_size not in _MNNVL_SUPPORTED_WORLD_SIZES
+            or manager.use_fp32_lamport
+            or ws is None
+            or not ws.supports(
+                x.shape[0],
+                x.shape[1],
+                x.dtype,
+                manager.world_size,
+                AllReduceFusionPattern.kAllReduce,
+                use_oneshot=ws.resolve_use_oneshot(x.shape[0], None, x.shape[1]),
+            )
+        ):
+            return False
+        return True
+
+    def allreduce_mhc_post_norm(
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+        pre: torch.Tensor,
+        weight: torch.Tensor,
+        eps: float,
+        group: dist.ProcessGroup,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Reduce x, update four residual streams, then collapse and RMS-normalize.
+
+        x is [T, H], residual is [T, 4, H], post/pre are FP32 [T, 4],
+        comb is FP32 [T, 4, 4], and weight is BF16 [H]. All tensors must be
+        contiguous and on the same CUDA device, with positive eps. Returns the
+        updated residual and normalized [T, H] input. The caller must select
+        this operation through supports_allreduce_mhc_post_norm before deferring
+        communication. Invalid inputs raise; this operation never declines.
+        Reuses the group's armed MNNVL workspace without allocating communication
+        storage and uses its ordinary one-shot/two-shot selection. Supports
+        groups of 2, 4, 8 or 16 ranks with H=5120 and up to the MNNVL token
+        limit, subject to workspace capacity; the four HC streams are
+        independent of the collective's rank count.
+        """
+        if (
+            x.ndim != 2
+            or not x.is_cuda
+            or not 0 < x.shape[0] <= MNNVL_TWOSHOT_MAX_TOKEN
+        ):
+            raise ValueError(
+                f"mHC fusion requires CUDA x [T,5120] with 0<T<={MNNVL_TWOSHOT_MAX_TOKEN}"
+            )
+        expected = (
+            ("x", x, (x.shape[0], 5120), torch.bfloat16),
+            ("residual", residual, (x.shape[0], 4, 5120), torch.bfloat16),
+            ("post", post, (x.shape[0], 4), torch.float32),
+            ("comb", comb, (x.shape[0], 4, 4), torch.float32),
+            ("pre", pre, (x.shape[0], 4), torch.float32),
+            ("weight", weight, (5120,), torch.bfloat16),
+        )
+        for name, tensor, shape, dtype in expected:
+            if (
+                tensor.shape != shape
+                or tensor.dtype != dtype
+                or tensor.device != x.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"mHC fusion requires {name} to be contiguous {dtype} "
+                    f"{shape} on {x.device}"
+                )
+        if not eps > 0:
+            raise ValueError("mHC fusion requires positive eps")
+        manager = _manager_for_group(group)
+        ws = manager.mnnvl_workspace
+        if ws is None:
+            raise RuntimeError("mHC fusion requires a prepared MNNVL workspace")
+        from tokenspeed_kernel.platform import pdl_enabled
+        from tokenspeed_kernel.thirdparty.cuda.trtllm import _load_trtllm_mhc_module
+
+        residual_out, norm_out = torch.empty_like(residual), torch.empty_like(x)
+        _mark_captured(manager, ws)
+        _load_trtllm_mhc_module().trtllm_mnnvl_mhc(
+            x,
+            residual,
+            post,
+            comb,
+            pre,
+            weight,
+            residual_out,
+            norm_out,
+            eps,
+            manager.rank,
+            ws.multicast_ptr,
+            ws.local_ptr,
+            ws.peer_ptrs,
+            ws.buffer_flags,
+            ws.buffer_size_bytes,
+            ws.resolve_use_oneshot(x.shape[0], None, x.shape[1]),
+            pdl_enabled(),
+        )
+        return residual_out, norm_out
+
     def trtllm_workspace_allreduce(
         input_tensor: torch.Tensor,
         group: dist.ProcessGroup,
@@ -986,7 +1115,9 @@ if current_platform().is_nvidia:
         max_token_num: int = 2048,
         trigger_completion_at_end: bool = True,
         launch_with_pdl: bool | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        token_fp8_out: tuple[torch.Tensor, torch.Tensor] | None = None,
+        norm_out_bf16: bool,
+    ) -> tuple[torch.Tensor | None, torch.Tensor] | None:
         """All-reduce a sublayer partial and run the pre/post norm boundary on
         the sum in one MNNVL launch.
 
@@ -1019,6 +1150,14 @@ if current_platform().is_nvidia:
                 store (otherwise after the inputs are loaded).
             launch_with_pdl: Programmatic dependent launch; None follows
                 ``pdl_enabled()``.
+            token_fp8_out: Optional ``(codes, scales)`` buffers, contiguous FP8
+                E4M3 ``[T, H]`` and FP32 ``[T, 1]``: the launch also writes
+                ``norm_out`` quantized per token, the codes and scales
+                ``ops/quantization/triton.py``'s ``fp8_quantize_per_token``
+                gives for that BF16 ``norm_out`` (as ``rmsnorm``'s
+                ``token_fp8_out``).
+            norm_out_bf16: With ``token_fp8_out``, False skips the BF16
+                ``norm_out`` store (``norm_out`` is returned as None).
 
         Returns:
             ``(norm_out, residual_out)``, or None when no fused kernel serves
@@ -1051,6 +1190,26 @@ if current_platform().is_nvidia:
                     f"{tuple(tensor.shape)} on {tensor.device}"
                 )
         x_scale, residual_scale = _sandwich_scale_pair(x_scale, residual_scale)
+        if token_fp8_out is not None:
+            codes, scales = token_fp8_out
+            if (
+                codes.dtype != torch.float8_e4m3fn
+                or tuple(codes.shape) != (tokens, hidden)
+                or not codes.is_contiguous()
+                or codes.device != input_tensor.device
+                or scales.dtype != torch.float32
+                or scales.numel() != tokens
+                or not scales.is_contiguous()
+                or scales.device != input_tensor.device
+            ):
+                raise ValueError(
+                    "token_fp8_out takes contiguous FP8 E4M3 codes shaped "
+                    f"{(tokens, hidden)} and FP32 [{tokens}, 1] scales on "
+                    f"{input_tensor.device}, got {codes.dtype} "
+                    f"{tuple(codes.shape)} and {scales.dtype} {tuple(scales.shape)}"
+                )
+        elif not norm_out_bf16:
+            raise ValueError("norm_out_bf16=False needs token_fp8_out")
         world_size = group.size()
         if world_size <= 1 or not 1 <= tokens <= max_token_num:
             return None
@@ -1077,8 +1236,9 @@ if current_platform().is_nvidia:
         ):
             return None
         _mark_captured(manager, mnnvl)
-        norm_out = torch.empty_like(input_tensor)
+        norm_out = torch.empty_like(input_tensor) if norm_out_bf16 else None
         residual_out = torch.empty_like(residual)
+        fp8_kwargs = {} if token_fp8_out is None else {"token_fp8_out": token_fp8_out}
         trtllm_mnnvl_sandwich_norm_allreduce(
             mnnvl,
             input_tensor,
@@ -1094,6 +1254,7 @@ if current_platform().is_nvidia:
             residual_scale=residual_scale,
             trigger_completion_at_end=trigger_completion_at_end,
             launch_with_pdl=launch_with_pdl,
+            **fp8_kwargs,
         )
         return norm_out, residual_out
 

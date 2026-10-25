@@ -97,17 +97,20 @@ class SparseTopKShare:
 
     ``prefill`` covers the extend rows, ``decode`` the decode rows (or the
     verify window); each family stores its own record type. ``qsa_metadata``
-    holds QSA's layer-invariant row geometry so it is built once per forward.
+    holds QSA's layer-invariant row geometry so it is built once per forward;
+    ``qsa_selection`` retains its logical candidates alongside physical slots.
     """
 
     prefill: Any | None = None
     decode: Any | None = None
     qsa_metadata: Any | None = None
+    qsa_selection: Any | None = None
 
     def clear(self) -> None:
         self.prefill = None
         self.decode = None
         self.qsa_metadata = None
+        self.qsa_selection = None
 
 
 class CachePoolBinding:
@@ -265,6 +268,18 @@ class AttentionBackend(CachePoolBinding, ABC):
     cache_consumer_attn_kinds: frozenset[str] = frozenset(
         {"full_history", "sliding_window"}
     )
+
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        """Whether every State group this node consumes stores in-forward checkpoints.
+
+        With ``--enable-state-checkpoint-in-forward``, the state at a checkpoint
+        goes into the third block of an extend row. A node consuming no State
+        group has none to miss; a State consumer opts in, and a composite answers
+        for its children.
+        """
+        return "state" not in self.cache_consumer_attn_kinds
+
     # Only backends whose model skips incomplete-prefill outputs opt in.
     skips_incomplete_prefill_outputs: bool = False
     # MLA sharded history reads/writes and global attention-partial merging,
@@ -369,8 +384,10 @@ class AttentionBackend(CachePoolBinding, ABC):
 
         ``capture`` only retains startup buffers at their captured addresses;
         it must not select different computation. Returns the same answer as
-        :meth:`admits_prefill_graph`; the prefill capture raises if an override
-        refuses a shape that query admitted. Other backends keep
+        :meth:`admits_prefill_graph`, except that a forward writing in-forward
+        State checkpoints keeps its live metadata and gets False; the prefill
+        capture raises if an override refuses a shape that query admitted.
+        Other backends keep
         their existing metadata and attention breaks. Call on the consumer
         stream, after the scheduler-derived metadata is built and before any
         layer consumes it.
@@ -689,14 +706,14 @@ class AttentionBackend(CachePoolBinding, ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_acceptance(
         self,
         accepted_lengths: torch.Tensor,
         *,
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        """Commit live acceptance after drafted decode/mixed execution or replay.
+        """Commit live acceptance after decode/mixed execution or replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
         lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted

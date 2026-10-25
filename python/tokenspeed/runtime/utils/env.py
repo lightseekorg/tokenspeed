@@ -271,6 +271,8 @@ class Envs:
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
+    # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
+    TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     # torch.cuda sync-debug mode armed once serving starts (after capture and
     # tuning, which synchronize legitimately): "warn" reports every host
@@ -297,6 +299,17 @@ class Envs:
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
+    # The ts-host binary each engine rank runs; by default the one installed
+    # with the tokenspeed-engine wheel (``tokenspeed_engine.host_binary()``).
+    TOKENSPEED_HOST_BINARY = EnvStr(None)
+    # The Mooncake library the Rust host's PD peer loads
+    # (libtokenspeed_transfer_engine.so); by default the one installed with
+    # the tokenspeed-mooncake wheel.
+    TOKENSPEED_MOONCAKE_LIBRARY = EnvStr(None)
+    # The Mooncake store library the Rust host's L3 executor loads
+    # (libmooncake_store.so); by default the one installed with the
+    # tokenspeed-mooncake wheel.
+    TOKENSPEED_MOONCAKE_STORE_LIBRARY = EnvStr(None)
 
     # Mooncake
     TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH = EnvStr(None)

@@ -154,6 +154,19 @@ def _dist_argmax_vetoed() -> bool:
     )
 
 
+def prepare_logits_communication(model: nn.Module) -> None:
+    """Prepare distributed argmax for registered head/processor pairs.
+
+    Traverse the loaded model after shared heads and sampling configuration
+    are wired. Nested language models and draft models use the same boundary;
+    models without a logits processor have no communication to prepare.
+    """
+    for owner in model.modules():
+        processor = owner._modules.get("logits_processor")
+        if isinstance(processor, LogitsProcessor):
+            processor.prepare_communication(owner.lm_head)
+
+
 class VocabParallelArgmax:
     """Greedy token ids from logits left sharded over the vocabulary.
 
@@ -172,6 +185,20 @@ class VocabParallelArgmax:
         vocab_parallel_argmax_keys(logits, vocab_offset=self.vocab_offset, out=keys)
         keys = all_reduce(keys, self.tp_group, op=torch.distributed.ReduceOp.MAX)
         return argmax_key_index(keys, out=torch.empty_like(keys))
+
+
+@dataclasses.dataclass(frozen=True)
+class DistArgmaxPrepared:
+    """Distributed-argmax states resolved once at startup.
+
+    ``states`` maps each supported logits dtype to its prepared state (the
+    fused kernel state, or the portable packed-key all-reduce when the kernel
+    is unavailable); the forward selects by ``logits.dtype`` and never
+    constructs. ``fallback`` serves a logits dtype outside the prepared set.
+    """
+
+    states: dict[torch.dtype, object]
+    fallback: VocabParallelArgmax
 
 
 @dataclasses.dataclass
@@ -313,6 +340,9 @@ class LogitsProcessor(nn.Module):
     _LOGITS_DIST_ARGMAX_MAX_TOKENS = 8192
     _LOGITS_DIST_ARGMAX_UNINITIALIZED = object()
     _LOGITS_DIST_ARGMAX_STATES = {}
+    # Prepare every dtype supported by the fused kernel; quantized weight
+    # storage does not determine which logits dtype a forward emits.
+    _LOGITS_DIST_ARGMAX_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
     def __init__(
         self,
@@ -381,6 +411,7 @@ class LogitsProcessor(nn.Module):
 
         self._all_gather_state = self._LOGITS_AG_STATE_UNINITIALIZED
         self._dist_argmax_state = self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+        self._dist_argmax_binding: tuple[object, ...] | None = None
 
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
@@ -594,14 +625,19 @@ class LogitsProcessor(nn.Module):
         self._LOGITS_DIST_ARGMAX_STATES[key] = state
         return state
 
+    def _dist_argmax_eligible(self) -> bool:
+        # The kernel's cross-rank reduce is a single warp shuffle.
+        return (
+            not _dist_argmax_vetoed()
+            and 2 <= self.tp_size <= 32
+            and not self.skip_all_gather
+            and not self.dp_sampling_enabled
+        )
+
     def _init_dist_argmax_state(
         self, lm_head: VocabParallelEmbedding, logits_dtype: torch.dtype
     ):
-        if _dist_argmax_vetoed():
-            return None
-        if not 2 <= self.tp_size <= 32:
-            return None  # the kernel's cross-rank reduce is a single warp shuffle
-        if self.skip_all_gather or self.dp_sampling_enabled:
+        if not self._dist_argmax_eligible():
             return None
 
         # A quantized head may keep its weight transposed or packed, so take the shard width and logits dtype instead.
@@ -619,6 +655,85 @@ class LogitsProcessor(nn.Module):
         if state is None and not is_current_stream_capturing(lm_head.weight.device):
             state = VocabParallelArgmax(self.tp_group, self.tp_rank * vocab_per_rank)
         return state
+
+    def prepare_communication(self, lm_head: VocabParallelEmbedding) -> None:
+        """Resolve distributed argmax once at startup, outside graph capture.
+
+        A None state is a prepared fallback, distinct from the uninitialized
+        sentinel. The kernel state is built per logits dtype because the
+        runtime logits dtype is only known on the forward path (a quantized
+        head may store its weight transposed or packed, in a narrower dtype):
+        every supported dtype is prepared up front and the forward selects by
+        ``logits.dtype``. The state depends on head geometry, not weight
+        values, so in-place weight updates reuse it; a startup head
+        replacement reprobes only when its shard width, device or the
+        sampling gate changes.
+        """
+        enabled = self.do_argmax and self._dist_argmax_eligible()
+        geometry = (
+            (lm_head.num_embeddings_per_partition, lm_head.weight.device)
+            if enabled
+            else None
+        )
+        binding = (
+            self.do_argmax,
+            self.skip_all_gather,
+            self.dp_sampling_enabled,
+            self.tp_group,
+            self.tp_rank,
+            self.tp_size,
+            self.config.vocab_size,
+            geometry,
+        )
+        if (
+            self._dist_argmax_state is not self._LOGITS_DIST_ARGMAX_UNINITIALIZED
+            and self._dist_argmax_binding == binding
+        ):
+            return
+        if enabled and is_current_stream_capturing(lm_head.weight.device):
+            raise RuntimeError(
+                "Distributed argmax must be prepared before CUDA graph capture"
+            )
+        self._dist_argmax_state = (
+            self._prepare_dist_argmax_states(lm_head) if enabled else None
+        )
+        self._dist_argmax_binding = binding
+
+    def _prepare_dist_argmax_states(
+        self, lm_head: VocabParallelEmbedding
+    ) -> DistArgmaxPrepared | None:
+        """Build the per-dtype states; None when the head cannot shard-argmax."""
+        states = {
+            dtype: self._init_dist_argmax_state(lm_head, dtype)
+            for dtype in self._LOGITS_DIST_ARGMAX_DTYPES
+        }
+        if all(state is None for state in states.values()):
+            return None  # padded vocab: gather, then argmax the full vocab
+        fallback = next(
+            (
+                state
+                for state in states.values()
+                if isinstance(state, VocabParallelArgmax)
+            ),
+            None,
+        )
+        if fallback is None:
+            fallback = VocabParallelArgmax(
+                self.tp_group, self.tp_rank * lm_head.num_embeddings_per_partition
+            )
+        return DistArgmaxPrepared(states=states, fallback=fallback)
+
+    def _prepared_dist_argmax_state(self, logits_dtype: torch.dtype):
+        """The startup-prepared state for ``logits_dtype``; None to gather.
+
+        Never constructs: every rendezvous belongs to ``prepare_communication``.
+        An uninitialized or rejected gate gathers (or argmaxes locally); a
+        prepared dtype outside the startup set uses the portable fallback.
+        """
+        prepared = self._dist_argmax_state
+        if prepared is None or prepared is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
+            return None
+        return prepared.states.get(logits_dtype, prepared.fallback)
 
     def forward(
         self,
@@ -866,8 +981,8 @@ class LogitsProcessor(nn.Module):
                 have no activations to read.
             RuntimeError: The head is vocab-sharded over attention-DP ranks
                 (``dp_lm_head_tp``); admission refuses such requests
-                (``RequestHandler.supports_input_logprobs``), so reaching here
-                is a routing error.
+                (``LogprobServability``), so reaching here is a routing
+                error.
         """
         plan = logits_metadata.input_logprob_rows
         if self.dp_lm_head_tp:
@@ -1092,17 +1207,14 @@ class LogitsProcessor(nn.Module):
 
         elif not dp_sampling and self.tp_size > 1 and not self.skip_all_gather:
             if self.do_argmax and not require_full_vocab:
-                if (
-                    self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED
-                    and not is_current_stream_capturing(logits.device)
-                ):
-                    self._dist_argmax_state = self._init_dist_argmax_state(
-                        lm_head, logits.dtype
+                if self._dist_argmax_state is self._LOGITS_DIST_ARGMAX_UNINITIALIZED:
+                    raise RuntimeError(
+                        "Distributed argmax must be prepared before forwarding"
                     )
 
+                argmax_state = self._prepared_dist_argmax_state(logits.dtype)
                 if (
-                    self._dist_argmax_state
-                    not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
+                    argmax_state is not None
                     and not self.final_logit_softcapping
                     and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
                 ):
@@ -1172,15 +1284,15 @@ class LogitsProcessor(nn.Module):
         return logits
 
     def _argmax(self, logits: torch.Tensor) -> torch.Tensor:
+        state = self._prepared_dist_argmax_state(logits.dtype)
         if (
-            self._dist_argmax_state
-            not in (self._LOGITS_DIST_ARGMAX_UNINITIALIZED, None)
+            state is not None
             and not self.final_logit_softcapping
             and logits.size(0) <= self._LOGITS_DIST_ARGMAX_MAX_TOKENS
         ):
-            if isinstance(self._dist_argmax_state, VocabParallelArgmax):
-                return self._dist_argmax_state(logits)
-            _, idx = distributed_argmax(self._dist_argmax_state, logits)
+            if isinstance(state, VocabParallelArgmax):
+                return state(logits)
+            _, idx = distributed_argmax(state, logits)
             return idx
         else:
             return sampling_argmax(logits)

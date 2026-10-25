@@ -21,6 +21,7 @@
 """Tests for the scheduler ready pipe when a child dies before it reports."""
 
 import contextlib
+import multiprocessing as mp
 import os
 import signal
 import sys
@@ -43,6 +44,25 @@ from tokenspeed.runtime.utils.process import (  # noqa: E402
 _TIMEOUT_S = 60
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _spawn_start_method():
+    """Run this module's children on production's spawn start method.
+
+    Several children import the engine stack inside the child; a forked child
+    cannot re-initialize a parent's CUDA state on that import path, which is
+    why production sets spawn in ``_set_envs_and_config``. These tests bypass
+    that entry point, so set the same method here: every process, Event and
+    Barrier created in this module then shares one context. Restore the
+    previous method so other modules are unaffected.
+    """
+    previous = mp.get_start_method(allow_none=True)
+    mp.set_start_method("spawn", force=True)
+    try:
+        yield
+    finally:
+        mp.set_start_method(previous, force=True)
+
+
 def _report_ready(value, writer):
     writer.send({"status": "ready", "value": value})
     # A scheduler keeps running after it reports.
@@ -63,12 +83,63 @@ def _never_ready(writer):
     time.sleep(_TIMEOUT_S * 10)
 
 
-class TestReadyPipe:
-    def test_ready_message_reaches_parent(self, start_process) -> None:
-        proc, reader = start_process(_report_ready, (7,))
-        assert reader.poll(_TIMEOUT_S)
-        assert reader.recv() == {"status": "ready", "value": 7}
+def _report_close_and_wait(finish_cleanup, writer):
+    writer.send({"status": "ready"})
+    writer.close()
+    finish_cleanup.wait(_TIMEOUT_S * 10)
 
+
+def _fail_with_lingering_cleanup(finish_cleanup, writer):
+    # A rank whose startup failed: it closes its ready channel first, so the
+    # launcher can stop the other ranks while its own cleanup (here a
+    # transport thread a partial constructor started) still runs.
+    threading.Thread(target=finish_cleanup.wait, daemon=False).start()
+    writer.close()
+
+
+def _engine_owns_failed_startup_cleanup(writer):
+    from tokenspeed.runtime.entrypoints.engine import Engine
+
+    finish_cleanup = mp.Event()
+    started = [
+        start_process_with_ready_pipe(_never_ready, (), contextlib.nullcontext()),
+        start_process_with_ready_pipe(
+            _fail_with_lingering_cleanup,
+            (finish_cleanup,),
+            contextlib.nullcontext(),
+        ),
+    ]
+    # The constructor's existing failure handler calls shutdown before its
+    # frontend has been installed. Bypass only model/network construction.
+    engine = Engine.__new__(Engine)
+    engine.llm = None
+    engine.tokenizer_manager = None
+    try:
+        try:
+            receive_ready_messages(
+                [reader for _, reader in started], [proc for proc, _ in started]
+            )
+        except RuntimeError as exc:
+            engine.shutdown()
+            for proc, _ in started:
+                proc.join(_TIMEOUT_S)
+            writer.send(
+                {
+                    "error": str(exc),
+                    "alive": [proc.is_alive() for proc, _ in started],
+                    "exitcodes": [proc.exitcode for proc, _ in started],
+                }
+            )
+    finally:
+        for proc, reader in started:
+            if proc.is_alive():
+                proc.kill()
+            proc.join(_TIMEOUT_S)
+            reader.close()
+        writer.close()
+
+
+class TestReadyPipe:
     def test_killed_child_raises_eof_instead_of_blocking(self) -> None:
         proc, reader = start_process_with_ready_pipe(
             _die_before_ready, (), contextlib.nullcontext()
@@ -104,7 +175,14 @@ class TestReadyPipe:
             proc, reader = start_process_with_ready_pipe(
                 target, args, contextlib.nullcontext()
             )
-            request.addfinalizer(proc.kill)
+
+            def cleanup():
+                if proc.is_alive():
+                    proc.kill()
+                proc.join(_TIMEOUT_S)
+                reader.close()
+
+            request.addfinalizer(cleanup)
             return proc, reader
 
         return start
@@ -125,6 +203,49 @@ class TestReadyPipe:
         # its process exit, not its pipe, shows it.
         started = [start_process(_never_ready), start_process(_report_then_die)]
         assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
+
+    def test_receive_fails_when_reported_rank_closes_pipe_while_alive(
+        self, start_process
+    ) -> None:
+        finish_cleanup = mp.Event()
+        started = [
+            start_process(_never_ready),
+            start_process(_report_close_and_wait, (finish_cleanup,)),
+        ]
+        failed, _ = started[1]
+        assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
+        # Detecting EOF must neither wait for nor terminate the worker's cleanup.
+        assert failed.is_alive()
+        assert failed.exitcode is None
+        finish_cleanup.set()
+        failed.join(_TIMEOUT_S)
+        assert failed.exitcode == 0
+
+    def test_failed_startup_reports_without_killing_worker_cleanup(
+        self, start_process
+    ) -> None:
+        finish_cleanup = mp.Event()
+        started = [
+            start_process(_never_ready),
+            start_process(_fail_with_lingering_cleanup, (finish_cleanup,)),
+        ]
+        failed, _ = started[1]
+        assert "Scheduler process 1" in str(self._receive_or_fail(started)["error"])
+        assert failed.is_alive()
+        finish_cleanup.set()
+        failed.join(_TIMEOUT_S)
+        assert not failed.is_alive()
+        assert failed.exitcode == 0
+
+    def test_engine_failure_cleanup_reaps_workers(self, start_process) -> None:
+        supervisor, reader = start_process(_engine_owns_failed_startup_cleanup)
+        assert reader.poll(_TIMEOUT_S), "launcher failed to unwind startup"
+        result = reader.recv()
+        assert "Scheduler process 1" in result["error"]
+        assert result["alive"] == [False, False]
+        assert result["exitcodes"] == [-signal.SIGKILL, -signal.SIGKILL]
+        supervisor.join(_TIMEOUT_S)
+        assert supervisor.exitcode == 0
 
 
 if __name__ == "__main__":

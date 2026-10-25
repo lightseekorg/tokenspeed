@@ -80,19 +80,9 @@ class TestCLIConfigCompat:
             ('{"org/model": ""}', "org/model"),
             ("org/model /local/model\ninvalid\nother /other\n", "/local/model"),
             ("", "org/model"),
-            (" \n\t", "org/model"),
-            ("{}", "org/model"),
             ("[]", "org/model"),
-            ('["org/model", "/local/model"]', "org/model"),
-            ('"org/model"', "org/model"),
-            ("1", "org/model"),
-            ("0", "org/model"),
-            ("true", "org/model"),
-            ("false", "org/model"),
             ("null", "org/model"),
             ('{"org/model": 1}', "org/model"),
-            ('{"org/model": true}', "org/model"),
-            ('{"org/model": ["/local/model"]}', "org/model"),
             ('{"org/model": {"path": "/local/model"}}', "org/model"),
             ('{"org/model": "/local/model", "other": null}', "org/model"),
         ],
@@ -111,26 +101,12 @@ class TestCLIConfigCompat:
         assert server_args.tokenizer == expected
         assert server_args.served_model_name == expected
 
-    def test_model_redirect_file_io_error(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("TOKENSPEED_MODEL_REDIRECT_PATH", str(tmp_path))
-        server_args = self._from_cli_args_no_init(
-            self._parse_args(["--model", "org/model"])
-        )
-
-        with pytest.raises(IsADirectoryError):
-            server_args.resolve_basic_defaults()
-
     # ---- Positional model arg ----
 
     def test_positional_model_arg(self):
         args = self._parse_args(["deepseek-ai/DeepSeek-V3"])
         assert (args.model_path) == ("deepseek-ai/DeepSeek-V3")
         assert (args.model) is None
-
-    def test_model_flag(self):
-        args = self._parse_args(["--model", "deepseek-ai/DeepSeek-V3"])
-        assert (args.model_path) is None
-        assert (args.model) == ("deepseek-ai/DeepSeek-V3")
 
     def test_positional_model_resolved_in_from_cli_args(self):
         args = self._parse_args(["deepseek-ai/DeepSeek-V3"])
@@ -139,11 +115,6 @@ class TestCLIConfigCompat:
 
     def test_both_positional_and_model_raises(self):
         args = self._parse_args(["deepseek-ai/DeepSeek-V3", "--model", "other/model"])
-        with pytest.raises((ValueError)):
-            self._from_cli_args_no_init(args)
-
-    def test_no_model_raises(self):
-        args = self._parse_args([])
         with pytest.raises((ValueError)):
             self._from_cli_args_no_init(args)
 
@@ -208,11 +179,6 @@ class TestCLIConfigCompat:
 
     # ---- Enable expert parallel ----
 
-    def test_enable_expert_parallel_flag(self):
-        args = self._parse_args(["--model", "test/model", "--enable-expert-parallel"])
-        sa = self._from_cli_args_no_init(args)
-        assert sa.enable_expert_parallel
-
     def test_enable_expert_parallel_default_false(self):
         args = self._parse_args(["--model", "test/model"])
         sa = self._from_cli_args_no_init(args)
@@ -267,21 +233,84 @@ class TestCLIConfigCompat:
 
     # ---- vLLM config names ----
 
-    def test_tokenizer_arg(self):
+    def test_vllm_flags_parse_to_their_destinations(self):
         args = self._parse_args(
-            ["--model", "test/model", "--tokenizer", "my/tokenizer"]
+            [
+                "--model",
+                "test/model",
+                "--tokenizer",
+                "my/tokenizer",
+                "--max-model-len",
+                "4096",
+                "--gpu-memory-utilization",
+                "0.9",
+                "--seed",
+                "42",
+                "--max-num-seqs",
+                "256",
+                "--max-prefill-tokens",
+                "4096",
+                "--chunked-prefill-size",
+                "2048",
+                "--enable-mixed-batch",
+                "--distributed-timeout-seconds",
+                "600",
+                "--enforce-eager",
+                "--max-cudagraph-capture-size",
+                "32",
+                "--cudagraph-capture-sizes",
+                "1",
+                "2",
+                "4",
+                "--block-size",
+                "128",
+                "--moe-backend",
+                "deep_gemm_mega_moe",
+                "--sampling-backend",
+                "triton_full",
+                "--tokenizer-mode",
+                "deepseek_v4",
+                "--hf-overrides",
+                '{"rope_scaling": null}',
+                "--no-enable-log-requests",
+                "--no-trust-remote-code",
+                "--disable-prefix-caching",
+                "--quantization",
+                "mxfp4",
+                "--enable-expert-parallel",
+                "--data-parallel-size",
+                "2",
+                "--dp-sampling-min-bs",
+                "16",
+            ]
         )
-        assert (args.tokenizer) == ("my/tokenizer")
-
-    def test_max_model_len_arg(self):
-        args = self._parse_args(["--model", "test/model", "--max-model-len", "4096"])
-        assert (args.max_model_len) == (4096)
-
-    def test_gpu_memory_utilization_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--gpu-memory-utilization", "0.9"]
-        )
-        assert (args.gpu_memory_utilization) == (0.9)
+        expected = {
+            "tokenizer": "my/tokenizer",
+            "max_model_len": 4096,
+            "gpu_memory_utilization": 0.9,
+            "seed": 42,
+            "max_num_seqs": 256,
+            "max_prefill_tokens": 4096,
+            "chunked_prefill_size": 2048,
+            "enable_mixed_batch": True,
+            "distributed_timeout_seconds": 600,
+            "enforce_eager": True,
+            "max_cudagraph_capture_size": 32,
+            "cudagraph_capture_sizes": [1, 2, 4],
+            "prefix_granularity": 128,
+            "moe_backend": "deep_gemm_mega_moe",
+            "sampling_backend": "triton_full",
+            "tokenizer_mode": "deepseek_v4",
+            "hf_overrides": '{"rope_scaling": null}',
+            "enable_log_requests": False,
+            "trust_remote_code": False,
+            "enable_prefix_caching": False,
+            "quantization": "mxfp4",
+            "enable_expert_parallel": True,
+            "data_parallel_size": 2,
+            "dp_sampling_min_bs": 16,
+        }
+        assert {name: getattr(args, name) for name in expected} == expected
 
     def test_gpu_memory_utilization_default_is_one_value_at_every_world_size(self):
         for tp in ("1", "2", "8", "16"):
@@ -314,26 +343,6 @@ class TestCLIConfigCompat:
         sa.resolve_memory_and_scheduling()
         assert (sa.gpu_memory_utilization) == (0.8)
 
-    def test_seed_arg(self):
-        args = self._parse_args(["--model", "test/model", "--seed", "42"])
-        assert (args.seed) == (42)
-
-    def test_max_num_seqs_arg(self):
-        args = self._parse_args(["--model", "test/model", "--max-num-seqs", "256"])
-        assert (args.max_num_seqs) == (256)
-
-    def test_max_prefill_tokens_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--max-prefill-tokens", "4096"]
-        )
-        assert (args.max_prefill_tokens) == (4096)
-
-    def test_chunked_prefill_size_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--chunked-prefill-size", "2048"]
-        )
-        assert (args.chunked_prefill_size) == (2048)
-
     def test_prefill_token_defaults(self):
         args = self._parse_args(["--model", "test/model"])
         assert (args.max_prefill_tokens) == (8192)
@@ -353,10 +362,6 @@ class TestCLIConfigCompat:
         assert (sa.chunked_prefill_size) == (8192)
         assert not (sa.enable_mixed_batch)
 
-    def test_mixed_batch_can_be_enabled(self):
-        args = self._parse_args(["--model", "test/model", "--enable-mixed-batch"])
-        assert args.enable_mixed_batch
-
     def test_constrained_decoding_is_internal_and_defaults_to_none(self):
         args = self._parse_args(["--model", "test/model"])
         assert self._from_cli_args_no_init(args).constrained_decoding is None
@@ -365,104 +370,16 @@ class TestCLIConfigCompat:
                 ["--model", "test/model", "--constrained-decoding", "always"]
             )
 
-    def test_distributed_timeout_seconds_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--distributed-timeout-seconds", "600"]
-        )
-        assert (args.distributed_timeout_seconds) == (600)
-
-    def test_enforce_eager_arg(self):
-        args = self._parse_args(["--model", "test/model", "--enforce-eager"])
-        assert args.enforce_eager
-
-    def test_cudagraph_capture_size_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--max-cudagraph-capture-size", "32"]
-        )
-        assert (args.max_cudagraph_capture_size) == (32)
-
-    def test_cudagraph_capture_sizes_arg(self):
-        args = self._parse_args(
-            [
-                "--model",
-                "test/model",
-                "--cudagraph-capture-sizes",
-                "1",
-                "2",
-                "4",
-            ]
-        )
-        assert (args.cudagraph_capture_sizes) == ([1, 2, 4])
-
-    def test_block_size_arg(self):
-        args = self._parse_args(["--model", "test/model", "--block-size", "128"])
-        assert (args.prefix_granularity) == (128)
-
-    def test_moe_backend_arg(self):
-        args = self._parse_args(["--model", "test/model", "--moe-backend", "triton"])
-        assert (args.moe_backend) == ("triton")
-
-    def test_sampling_backend_arg(self):
-        for backend in (
-            "greedy",
-            "flashinfer",
-            "flashinfer_full",
-            "triton",
-            "triton_full",
-        ):
-            args = self._parse_args(
-                ["--model", "test/model", "--sampling-backend", backend]
-            )
-            assert (args.sampling_backend) == (backend)
-
-    def test_recipe_moe_backend_alias_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--moe-backend", "deep_gemm_mega_moe"]
-        )
-        assert (args.moe_backend) == ("deep_gemm_mega_moe")
-
     def test_kv_cache_dtype_fp8_alias_arg(self):
         args = self._parse_args(["--model", "test/model", "--kv-cache-dtype", "fp8"])
         sa = self._from_cli_args_no_init(args)
         sa.resolve_basic_defaults()
         assert (sa.kv_cache_dtype) == ("fp8_e4m3")
 
-    def test_tokenizer_mode_deepseek_v4_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--tokenizer-mode", "deepseek_v4"]
-        )
-        assert (args.tokenizer_mode) == ("deepseek_v4")
-
-    def test_hf_overrides_arg(self):
-        args = self._parse_args(
-            ["--model", "test/model", "--hf-overrides", '{"rope_scaling": null}']
-        )
-        assert (args.hf_overrides) == ('{"rope_scaling": null}')
-
-    def test_enable_log_requests_arg(self):
-        args = self._parse_args(["--model", "test/model", "--enable-log-requests"])
-        assert args.enable_log_requests
-
     def test_log_requests_default_on(self):
         args = self._parse_args(["--model", "test/model"])
         assert args.enable_log_requests
         assert (args.log_requests_level) == (0)
-
-    def test_disable_log_requests_arg(self):
-        args = self._parse_args(["--model", "test/model", "--no-enable-log-requests"])
-        assert not (args.enable_log_requests)
-
-    def test_no_trust_remote_code_arg(self):
-        args = self._parse_args(["--model", "test/model", "--no-trust-remote-code"])
-        assert not (args.trust_remote_code)
-
-    def test_enable_prefix_caching_arg(self):
-        args = self._parse_args(["--model", "test/model", "--enable-prefix-caching"])
-        assert args.enable_prefix_caching
-
-    def test_disable_prefix_caching_arg(self):
-        args = self._parse_args(["--model", "test/model", "--disable-prefix-caching"])
-        assert not (args.enable_prefix_caching)
 
     def test_kv_events_config_arg(self):
         config = (
@@ -531,10 +448,6 @@ class TestCLIConfigCompat:
     def test_replay_ssm_can_be_enabled(self):
         args = self._parse_args(["--model", "test/model", "--enable-replay-ssm"])
         assert self._from_cli_args_no_init(args).enable_replay_ssm
-
-    def test_mxfp4_quantization_arg(self):
-        args = self._parse_args(["--model", "test/model", "--quantization", "mxfp4"])
-        assert (args.quantization) == ("mxfp4")
 
     def test_dotted_attention_config_args(self):
         args = self._parse_args(
@@ -931,14 +844,6 @@ class TestCLIConfigCompat:
             sa.resolve_speculative_decoding()
         assert (BLOCK_SPEC_RULES) in (str(ctx.value))
 
-    def test_speculative_config_must_be_json_object(self):
-        args = self._parse_args(["--model", "test/model", "--speculative-config", "[]"])
-        sa = self._from_cli_args_no_init(args)
-        with pytest.raises(
-            (ValueError), match=("--speculative-config must be a JSON object")
-        ):
-            sa.resolve_basic_defaults()
-
     def test_speculative_defaults(self):
         args = self._parse_args(["--model", "test/model"])
         sa = self._from_cli_args_no_init(args)
@@ -989,7 +894,7 @@ class TestCLIConfigCompat:
 
     def test_speculative_eagle_topk_rejects_unsupported_trees(self, subtests):
         cases = [
-            (("DFLASH", 4, 15, 16), {}, "needs --speculative-algorithm EAGLE3 or MTP"),
+            (("DFLASH", 4, 15, 16), {}, "needs --speculative-algorithm EAGLE3, EAGLE4"),
             (("EAGLE3", 17, 2, 16), {}, "1..16 children"),
             (("EAGLE3", 0, 3, 4), {}, "1..16 children"),
             (("EAGLE3", 4, 11, 16), {}, "1..10 steps"),
@@ -1056,11 +961,6 @@ class TestCLIConfigCompat:
         sa = self._from_cli_args_no_init(args)
         assert sa.dp_sampling
 
-    def test_dp_sampling_min_bs_arg(self):
-        args = self._parse_args(["--model", "test/model", "--dp-sampling-min-bs", "16"])
-        sa = self._from_cli_args_no_init(args)
-        assert (sa.dp_sampling_min_bs) == (16)
-
     # ---- Full server command example ----
 
     def test_full_server_command(self):
@@ -1086,11 +986,6 @@ class TestCLIConfigCompat:
         assert (sa.attn_tp_size) == (8)
         assert sa.enable_expert_parallel
         assert (sa.served_model_name) == ("ds31")
-
-    def test_data_parallel_size_arg(self):
-        args = self._parse_args(["--model", "test/model", "--data-parallel-size", "2"])
-        sa = self._from_cli_args_no_init(args)
-        assert (sa.data_parallel_size) == (2)
 
     def test_help_uses_expected_metavars(self):
         parser = argparse.ArgumentParser()

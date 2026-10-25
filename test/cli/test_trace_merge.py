@@ -299,7 +299,7 @@ def test_merge_all_ranks_aligns_timelines_and_namespaces_flow_ids(tmp_path):
         for event in merged["traceEvents"]
         if event["name"] == "forward"
     )
-    assert forwards == [(4242, 100.0), (4243, 110.0)]
+    assert forwards == [(20000, 100.0), (20001, 110.0)]
 
     proton_processes = {
         event["pid"]: event["args"]["name"]
@@ -364,6 +364,70 @@ def test_merge_all_ranks_namespaces_viztracer_proton_flows(tmp_path):
     assert {(event["pid"], event["id"]) for event in finishes} == {
         (10000, (1 << 52) | scope_id),
         (10001, (1 << 52) | (1 << 32) | scope_id),
+    }
+
+
+@pytest.mark.parametrize("viztracer_pid", [42, 10000])
+def test_merge_all_ranks_separates_ranks_recording_the_same_viztracer_pid(
+    tmp_path, viztracer_pid
+):
+    def rank_report(rank: int) -> dict:
+        report = _rank_viztracer_report(
+            base_time_ns=VIZTRACER_BASE_NS, pid=viztracer_pid
+        )
+        report["traceEvents"].insert(
+            0,
+            {
+                "ph": "M",
+                "pid": viztracer_pid,
+                "tid": viztracer_pid,
+                "name": "process_name",
+                "args": {"name": f"Scheduler TP{rank}"},
+            },
+        )
+        report["traceEvents"][1]["name"] = f"forward TP{rank}"
+        return report
+
+    rank0_viz = _write(tmp_path, "run-TP0.viztracer.json", rank_report(0))
+    rank0_proton = _write(
+        tmp_path,
+        "run-TP0.proton.chrome_trace",
+        _rank_proton_trace(base_time_ns=PROTON_BASE_NS),
+    )
+    rank1_viz = _write(tmp_path, "run-TP1.viztracer.json", rank_report(1))
+    rank1_proton = _write(
+        tmp_path,
+        "run-TP1.proton.chrome_trace",
+        _rank_proton_trace(base_time_ns=PROTON_BASE_NS),
+    )
+    output_path = tmp_path / "all-ranks.json"
+
+    merge_all_ranks(
+        [(0, rank0_viz, rank0_proton), (1, rank1_viz, rank1_proton)],
+        output_path,
+    )
+
+    events = json.loads(output_path.read_text())["traceEvents"]
+    forwards = {
+        event["name"]: (event["pid"], event["tid"])
+        for event in events
+        if event["name"].startswith("forward")
+    }
+    assert forwards == {
+        "forward TP0": (20000, viztracer_pid),
+        "forward TP1": (20001, viztracer_pid),
+    }
+
+    process_names = {
+        event["pid"]: event["args"]["name"]
+        for event in events
+        if event["ph"] == "M" and event["name"] == "process_name"
+    }
+    assert process_names == {
+        20000: "Scheduler TP0",
+        20001: "Scheduler TP1",
+        10000: "Proton TP0",
+        10001: "Proton TP1",
     }
 
 

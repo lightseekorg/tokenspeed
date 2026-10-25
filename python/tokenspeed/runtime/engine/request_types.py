@@ -33,18 +33,6 @@ class BaseFinishReason:
         raise NotImplementedError()
 
 
-class FINISH_MATCHED_TOKEN(BaseFinishReason):
-    def __init__(self, matched: int | list[int]):
-        super().__init__()
-        self.matched = matched
-
-    def to_json(self):
-        return {
-            "type": "stop",
-            "matched": self.matched,
-        }
-
-
 class FINISH_MATCHED_STR(BaseFinishReason):
     def __init__(self, matched: str):
         super().__init__()
@@ -54,18 +42,6 @@ class FINISH_MATCHED_STR(BaseFinishReason):
         return {
             "type": "stop",
             "matched": self.matched,
-        }
-
-
-class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int):
-        super().__init__()
-        self.length = length
-
-    def to_json(self):
-        return {
-            "type": "length",
-            "length": self.length,
         }
 
 

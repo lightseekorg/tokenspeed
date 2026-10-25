@@ -48,13 +48,13 @@ class TestRouterOverMhaLeavesTest:
         self.torch = torch
         self.MHAAttnBackend = MHAAttnBackend
 
-    def _leaf(self, kernel_page_size):
+    def _leaf(self, kernel_page_size, draft_tokens=1):
         torch = self.torch
         config = SimpleNamespace(
             device="cpu",
             dtype=torch.float16,
             is_draft=False,
-            speculative_num_draft_tokens=1,
+            speculative_num_draft_tokens=draft_tokens,
             context_len=24,
             kv_cache_dtype=torch.bfloat16,
             kv_cache_mxfp8=False,
@@ -72,7 +72,7 @@ class TestRouterOverMhaLeavesTest:
         )
         return self.MHAAttnBackend(config, spec, kernel_page_size=kernel_page_size)
 
-    def _router(self, group_ids=(FULL, SWA)):
+    def _router(self, group_ids=(FULL, SWA), draft_tokens=1):
         from tokenspeed.runtime.layers.attention.backends.paged.cache_group_geometry import (
             CacheGroupGeometry,
         )
@@ -81,11 +81,11 @@ class TestRouterOverMhaLeavesTest:
         )
 
         page_sizes = {FULL: 4, SWA: 2}
-        leaves = {gid: self._leaf(page_sizes[gid]) for gid in group_ids}
+        leaves = {gid: self._leaf(page_sizes[gid], draft_tokens) for gid in group_ids}
         router = CacheGroupRouter(
             None,
             is_draft=False,
-            spec_num_tokens=1,
+            spec_num_tokens=draft_tokens,
             device="cpu",
             consumed_group_ids=None,
         )
@@ -158,6 +158,37 @@ class TestRouterOverMhaLeavesTest:
         # own table, so the two groups disagree, proving no shared table.
         swa_locs = router.write_locations(_layer(SWA), ForwardMode.DECODE)
         assert (swa_locs.tolist()) == ([12])
+
+    def test_verify_refresh_matches_each_leafs_own_refresh(self):
+        # The router fills the verify leaves in one batched copy; a padding
+        # row (seq_len 1) must still present the verify floor, as the leaf's
+        # own refresh writes it.
+        torch = self.torch
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        router, leaves = self._router(draft_tokens=4)
+        seq_lens = torch.tensor([9, 1], dtype=torch.int32)
+        router.refresh_decode_metadata(
+            2,
+            1,
+            torch.arange(2, dtype=torch.int32),
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            block_tables={
+                FULL: torch.tensor([[5, 6, 7]], dtype=torch.int32),
+                SWA: torch.tensor([[9, 8, 3]], dtype=torch.int32),
+            },
+        )
+        for gid, page_size in ((FULL, 4), (SWA, 2)):
+            own = self._leaf(page_size, draft_tokens=4)
+            own.init_cuda_graph_state(4)
+            own.refresh_decode_metadata(2, 1, seq_lens, router.stacks.table(gid, 2))
+            assert leaves[gid].seq_lens_buf[:2].tolist() == [9, 4]
+            assert torch.equal(leaves[gid].seq_lens_buf, own.seq_lens_buf)
+            assert torch.equal(leaves[gid].page_table_buf, own.page_table_buf)
+            metadata = leaves[gid].forward_decode_metadata
+            assert metadata.seq_lens.data_ptr() == leaves[gid].seq_lens_buf.data_ptr()
+            assert metadata.seq_lens.shape == (2,)
 
     def test_unknown_group_id_raises_even_with_a_sole_leaf(self):
         # The old single-group fallback (empty/unknown group_id -> the only

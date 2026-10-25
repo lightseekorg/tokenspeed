@@ -298,9 +298,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
 
     from tokenspeed_kernel.thirdparty.cute_dsl.mega_moe.runner import get_runner
 
-    runner = get_runner(
-        dist.group.WORLD, w.num_experts, HIDDEN, INTERMEDIATE, TOP_K, 4.0, 25.0
-    )
+    runner = get_runner(plan, w)
     arena = runner.workspace
     pointers = (
         arena.storage.data_ptr(),
