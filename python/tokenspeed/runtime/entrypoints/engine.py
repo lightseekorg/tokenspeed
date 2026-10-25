@@ -874,13 +874,13 @@ def _apply_scheduler_info(tokenizer_manager: AsyncLLM, scheduler_info: dict) -> 
     ]
 
 
-def _launch_encode_server(
+def _start_encode_ranks(
     server_args: ServerArgs, port_args: PortArgs
-) -> tuple[AsyncLLM, None, dict]:
-    """An EPD encode server: its encode ranks (``ts-host`` in encode mode,
-    ``epd/encode_host.py``) and, on the first node, the frontend that pushes
-    them encode requests. The ranks run the vision tower and ship embeddings
-    to the prefill servers; no engine rank runs."""
+) -> tuple[list, list]:
+    """Start this node's EPD encode ranks, one ``ts-host`` process each in
+    encode mode (``epd/encode_host.py``), and return them with their ready
+    pipes. The first rank binds the request channel
+    (``port_args.scheduler_input_ipc_name``)."""
     binary = host_binary()
     procs, readers = [], []
     for rank in _scheduler_ranks(server_args):
@@ -892,6 +892,27 @@ def _launch_encode_server(
         )
         procs.append(proc)
         readers.append(reader)
+    return procs, readers
+
+
+def headless_encode_channel(server_args: ServerArgs) -> str:
+    """The request channel of a headless EPD encode server: the first encode
+    rank binds ``tcp://{--data-parallel-address}:{--data-parallel-rpc-port}``
+    and the external frontend pushes its ``EncodeRequest``s there."""
+    address = join_host_port(
+        server_args.data_parallel_address, server_args.data_parallel_rpc_port
+    )
+    return f"tcp://{address}"
+
+
+def _launch_encode_server(
+    server_args: ServerArgs, port_args: PortArgs
+) -> tuple[AsyncLLM, None, dict]:
+    """An EPD encode server: its encode ranks (``ts-host`` in encode mode,
+    ``epd/encode_host.py``) and, on the first node, the frontend that pushes
+    them encode requests. The ranks run the vision tower and ship embeddings
+    to the prefill servers; no engine rank runs."""
+    procs, readers = _start_encode_ranks(server_args, port_args)
     infos = []
     for data in receive_ready_messages(readers, procs):
         if data.get("status") != "ready":
@@ -1000,6 +1021,11 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
     binds it). Both flags always carry values — non-emptiness and the u16
     range are enforced at parse time. With attention DP each rank dials with
     its own engine identity, ``--zmq-engine-index`` plus its DP rank.
+
+    An EPD encode server (``--disaggregation-mode encode``) starts its encode
+    ranks instead, and its first rank binds that address as its request
+    channel (``headless_encode_channel``): the frontend pushes
+    ``EncodeRequest``s to it.
     """
     server_args.skip_tokenizer_init = True
 
@@ -1052,17 +1078,22 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
 
         metrics_service.start(server_args, port_args)
         kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
-        # Fail before any rank loads the model.
-        refusals = rust_host_refusals(server_args)
-        if refusals:
-            raise NotImplementedError(
-                "The engine host does not support " + ", ".join(refusals) + " yet"
-            )
-        # A host's control thread runs no Python: the selected output plugins
-        # run in the node's relay, which the ranks feed.
-        if port_args.metrics_producer_configs:
-            metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
-        procs, readers = _start_ranks(server_args, port_args, metrics_relay, False)
+        if server_args.disaggregation_mode == "encode":
+            # The encode ranks host the node's EPD bootstrap server themselves.
+            port_args.scheduler_input_ipc_name = headless_encode_channel(server_args)
+            procs, readers = _start_encode_ranks(server_args, port_args)
+        else:
+            # Fail before any rank loads the model.
+            refusals = rust_host_refusals(server_args)
+            if refusals:
+                raise NotImplementedError(
+                    "The engine host does not support " + ", ".join(refusals) + " yet"
+                )
+            # A host's control thread runs no Python: the selected output
+            # plugins run in the node's relay, which the ranks feed.
+            if port_args.metrics_producer_configs:
+                metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
+            procs, readers = _start_ranks(server_args, port_args, metrics_relay, False)
         scheduler_procs.extend(procs)
         scheduler_pipe_readers.extend(readers)
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
@@ -1070,10 +1101,16 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
                 raise RuntimeError(
                     "Scheduler initialization failed. See the error messages above."
                 )
-        logger.info(
-            "headless scheduler(s) ready; SMG handshake endpoint="
-            f"{server_args.zmq_handshake_endpoint()!s}",
-        )
+        if server_args.disaggregation_mode == "encode":
+            logger.info(
+                "headless encode rank(s) ready; request channel="
+                f"{port_args.scheduler_input_ipc_name}",
+            )
+        else:
+            logger.info(
+                "headless scheduler(s) ready; SMG handshake endpoint="
+                f"{server_args.zmq_handshake_endpoint()!s}",
+            )
 
         failed = _supervise_schedulers(
             scheduler_procs,

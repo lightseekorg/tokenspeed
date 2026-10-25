@@ -41,7 +41,8 @@ frontend. Each rank dials the frontend's handshake socket; the in-process
 frontend is `tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under
 `AsyncLLM`. An EPD encode node's ranks run the host's encode mode instead
 (`ts-control`'s `encode` loop over `epd/encode_host.py`): no scheduler, no
-event loop.
+event loop. Their first rank binds the request channel its frontend pushes
+encode requests to; headless, that is the address an engine rank would dial.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
