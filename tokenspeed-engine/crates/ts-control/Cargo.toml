@@ -25,7 +25,7 @@ ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-
 ts-pd = { package = "tokenspeed-pd", version = "0.1.0", path = "../ts-pd" }
 ts-scheduler = { package = "tokenspeed-scheduler", version = "0.1.0", path = "../ts-scheduler" }
 ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
-zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
+zeromq.workspace = true
 
 [dev-dependencies]
 pyo3 = "0.30"
