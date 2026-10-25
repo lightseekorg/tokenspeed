@@ -143,6 +143,8 @@ public:
     bool PdTransferPinned(const std::string& request_id) const;
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
+    // Host pool parents, empty or not (0 without a Host pool).
+    std::int32_t HostPoolTotalBlocks() const { return host_pool_.NumLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
     HostCacheStats GetHostCacheStats() const;
     // Published tail boundaries the probe can enumerate, and how many the

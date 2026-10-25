@@ -145,6 +145,15 @@ def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks() -> None:
         host_rows
     ), "only pages not yet on Host are stored"
     assert scheduler.host_pool_pinned_blocks() == 2
+    # The Host counters see the same L2 leg: of the five published slots, two
+    # were Host entries already and three are this retraction's own store.
+    stats = scheduler.host_cache_stats()
+    assert stats.retraction_stores.ops == 1
+    assert list(stats.retraction_stores.blocks) == [len(stored_keys)] == [3]
+    assert stats.retraction_stores.host_cached == 2
+    assert stats.retraction_stores.in_flight == 0
+    assert stats.retraction_stores.snapshot_fallback == 0
+    assert stats.retraction_stores.image_refused == 0
     # No tail: the snapshot leg carries only the slot-state blob.
     assert list(snapshot.request_ids) == ["a"]
     assert [list(row) for row in snapshot.src_pages] == [[]]
@@ -189,6 +198,9 @@ def test_image_splits_into_l2_prefix_and_blob_and_waits_for_both_acks() -> None:
     assert set(tiers) == {int(ts.Cache.HostTier.L2)}
     assert 0 < len(sources) <= 5
     assert [host_rows[key] for key in keys] == list(sources)
+    stats = scheduler.host_cache_stats()
+    assert stats.restore_loads.ops == 1
+    assert list(stats.restore_loads.blocks) == [len(sources)]
     # A copy fills its destination whole: the plan zeroes none of them.
     zeroed = set(dict(restore_plan.pages_to_zero)["full"])
     assert not set(destinations) & zeroed

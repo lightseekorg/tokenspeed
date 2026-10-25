@@ -22,6 +22,7 @@
 
 import pytest
 import tokenspeed_scheduler as ts
+from conftest import K3_GROUP_IDS, _advance, _finish, _make_k3_config, _spec
 from tokenspeed_scheduler import Cache, ExecutionEvent
 
 
@@ -153,7 +154,99 @@ def test_snapshot_pool_is_stated_explicitly():
     assert scheduler.snapshot_pool_free_blocks() == 8
     assert scheduler.retracted_size() == 0
     assert scheduler.host_pool_pinned_blocks() == 0
+    # No Host pool: its gauges read 0.
+    assert scheduler.host_pool_total_blocks() == 0
+    assert scheduler.host_pool_free_blocks() == 0
     cfg.role = ts.SchedulerConfig.Role.P
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
     with pytest.raises(ValueError, match="P role"):
         ts.Scheduler(cfg)
+
+
+def test_host_cache_stats_count_publication_and_finish_stores():
+    cfg = _make_k3_config()
+    cfg.num_host_pages = 33  # page 0 = null sentinel, 32 usable parents
+    cfg.disable_l2_cache = False
+    # Two History blocks per parent; a State block still takes a whole
+    # parent.
+    history = cfg.cache_groups[0]
+    history.cache_blocks_per_lcm_block = 2
+    history.total_pages = 2 * 32 + 1
+    scheduler = ts.Scheduler(cfg)
+    num_groups = len(K3_GROUP_IDS)
+
+    # A fresh scheduler: what this test counts reads 0, and every by-group
+    # block list has one entry per cache group.
+    fresh = scheduler.host_cache_stats()
+    assert (
+        len(fresh.publication_stores.blocks)
+        == len(fresh.prefix_loads.blocks)
+        == num_groups
+    )
+    assert fresh.host_evictions.lru.blocks == fresh.host_evictions.flush.blocks == 0
+    assert fresh.device_evictions.admission.blocks == 0
+    assert fresh.publication_stores.ops == fresh.finish_stores.ops == 0
+    assert list(fresh.publication_stores.blocks) == [0] * num_groups
+    assert list(fresh.finish_stores.blocks) == [0] * num_groups
+    assert fresh.finish_stores.host_cached == 0
+    assert fresh.prefix_loads.ops == 0
+    assert fresh.prefix_hits.prompt_tokens == 0
+    assert scheduler.host_pool_total_blocks() == 32
+    assert scheduler.host_pool_free_blocks() == 32
+
+    # Prefill, then the first decode, ACKing every write-back. The fused role
+    # publishes the prompt at its end -- three full pages, the one-token tail
+    # and each State group's checkpoint -- and streams it to Host in one
+    # pinned write-back.
+    scheduler.submit_requests([_spec("r", [1, 2, 3, 4, 5, 6, 7])])
+    publication_rows = [0] * num_groups
+    for token in (100, 101):
+        plan = scheduler.next_execution_plan()
+        acks = ExecutionEvent()
+        for op in plan.cache:
+            if isinstance(op, Cache.WriteBackOp):
+                for op_id, groups in zip(op.op_ids, op.group_ids):
+                    for group in groups:
+                        publication_rows[group] += 1
+                    done = Cache.WriteBackDoneEvent()
+                    done.op_id = op_id
+                    acks.add_event(done)
+        scheduler.advance(acks)
+        _advance(scheduler, "r", [token])
+    stats = scheduler.host_cache_stats()
+    assert publication_rows == [4, 1, 1, 1]
+    assert list(stats.publication_stores.blocks) == publication_rows
+    assert stats.publication_stores.ops == 1
+    assert stats.prefix_hits.prompt_tokens == 7
+
+    # The decode token completed a fourth page. Finish stores it and its
+    # State checkpoints (the three earlier pages are on Host already), and
+    # drains inside the event: the op is counted before the plan that
+    # carries it.
+    _finish(scheduler, "r")
+    stats = scheduler.host_cache_stats()
+    assert stats.finish_stores.ops == 1
+    assert list(stats.finish_stores.blocks) == [1, 1, 1, 1]
+    assert stats.finish_stores.host_cached == 3
+    [store] = [
+        op
+        for op in scheduler.next_execution_plan().cache
+        if isinstance(op, Cache.WriteBackOp)
+    ]
+    [op_id] = store.op_ids
+    [groups] = store.group_ids
+    assert list(stats.finish_stores.blocks) == [
+        list(groups).count(group) for group in range(num_groups)
+    ]
+
+    done = Cache.WriteBackDoneEvent()
+    done.op_id = op_id
+    acks = ExecutionEvent()
+    acks.add_event(done)
+    scheduler.advance(acks)
+    assert scheduler.host_cache_stats().finish_stores.ops == 1
+    # Every stored block is now a published Host entry: five History blocks
+    # fill three parents, and six State blocks take a parent each.
+    assert scheduler.host_pool_cached_blocks() == 5 + 6
+    assert scheduler.host_pool_total_blocks() == 32
+    assert scheduler.host_pool_free_blocks() == 32 - 3 - 6

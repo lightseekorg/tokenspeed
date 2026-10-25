@@ -256,6 +256,51 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("disabled_dropped_backup_keys", &tokenspeed::StorageStats::disabled_dropped_backup_keys)
         .def_ro("cleanup_dropped_backup_keys", &tokenspeed::StorageStats::cleanup_dropped_backup_keys);
 
+    // Host L2 counters (Scheduler.host_cache_stats), read-only. Every by-group
+    // list is indexed like SchedulerConfig.cache_groups.
+    nb::class_<tokenspeed::CacheCoordinator::HostEvictionCounts>(m, "HostEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheCoordinator::HostEvictionCounts::blocks)
+        .def_ro("device_resident", &tokenspeed::CacheCoordinator::HostEvictionCounts::device_resident);
+    nb::class_<tokenspeed::CacheCoordinator::HostEvictionStats>(m, "HostEvictionStats")
+        .def_ro("lru", &tokenspeed::CacheCoordinator::HostEvictionStats::lru)
+        .def_ro("flush", &tokenspeed::CacheCoordinator::HostEvictionStats::flush);
+    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionCounts>(m, "DeviceEvictionCounts")
+        .def_ro("blocks", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::blocks)
+        .def_ro("host_resident", &tokenspeed::CacheCoordinator::DeviceEvictionCounts::host_resident);
+    nb::class_<tokenspeed::CacheCoordinator::DeviceEvictionStats>(m, "DeviceEvictionStats")
+        .def_ro("admission", &tokenspeed::CacheCoordinator::DeviceEvictionStats::admission)
+        .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
+        .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
+        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap);
+    nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
+        .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
+        .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)
+        .def_ro("host_cached", &tokenspeed::TierTransferManager::WriteBackStats::host_cached)
+        .def_ro("in_flight", &tokenspeed::TierTransferManager::WriteBackStats::in_flight)
+        .def_ro("evicted_before_drain", &tokenspeed::TierTransferManager::WriteBackStats::evicted_before_drain)
+        .def_ro("no_placement", &tokenspeed::TierTransferManager::WriteBackStats::no_placement)
+        .def_ro("snapshot_fallback", &tokenspeed::TierTransferManager::WriteBackStats::snapshot_fallback)
+        .def_ro("image_refused", &tokenspeed::TierTransferManager::WriteBackStats::image_refused);
+    nb::class_<tokenspeed::TierTransferManager::LoadBackStats>(m, "LoadBackStats")
+        .def_ro("ops", &tokenspeed::TierTransferManager::LoadBackStats::ops)
+        .def_ro("blocks", &tokenspeed::TierTransferManager::LoadBackStats::blocks);
+    nb::class_<tokenspeed::PrefixHitStats>(m, "PrefixHitStats")
+        .def_ro("prompt_tokens", &tokenspeed::PrefixHitStats::prompt_tokens)
+        .def_ro("device_hit_tokens", &tokenspeed::PrefixHitStats::device_hit_tokens)
+        .def_ro("host_hit_tokens", &tokenspeed::PrefixHitStats::host_hit_tokens)
+        .def_ro("host_gain_tokens", &tokenspeed::PrefixHitStats::host_gain_tokens)
+        .def_ro("unresumable_kv_tokens", &tokenspeed::PrefixHitStats::unresumable_kv_tokens);
+    nb::class_<tokenspeed::HostCacheStats>(m, "HostCacheStats")
+        .def_ro("prefix_hits", &tokenspeed::HostCacheStats::prefix_hits)
+        .def_ro("publication_stores", &tokenspeed::HostCacheStats::publication_stores)
+        .def_ro("finish_stores", &tokenspeed::HostCacheStats::finish_stores)
+        .def_ro("retraction_stores", &tokenspeed::HostCacheStats::retraction_stores)
+        .def_ro("prefix_loads", &tokenspeed::HostCacheStats::prefix_loads)
+        .def_ro("restore_loads", &tokenspeed::HostCacheStats::restore_loads)
+        .def_ro("host_evictions", &tokenspeed::HostCacheStats::host_evictions)
+        .def_ro("store_candidates_dropped_by_flush", &tokenspeed::HostCacheStats::store_candidates_dropped_by_flush)
+        .def_ro("device_evictions", &tokenspeed::HostCacheStats::device_evictions);
+
     // ─── ExecutionEvent ─────────────────────────────────────────────
 
     nb::module_ pd = m.def_submodule("PD");
@@ -593,6 +638,14 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("clear_cache", &tokenspeed::Scheduler::ClearCache)
         .def("can_clear_cache", &tokenspeed::Scheduler::CanClearCache)
         .def("host_pool_cached_blocks", &tokenspeed::Scheduler::HostPoolCachedBlocks)
+        .def("host_pool_free_blocks", &tokenspeed::Scheduler::HostPoolFreeBlocks,
+             "Empty Host L2 pool parents; a parent with any occupied slot counts as used.")
+        .def("host_pool_total_blocks", &tokenspeed::Scheduler::HostPoolTotalBlocks,
+             "Host L2 pool parents (0 without a Host pool).")
+        .def("host_cache_stats", &tokenspeed::Scheduler::GetHostCacheStats,
+             "Host L2 counters and the Device evictions they are read against, cumulative since start. "
+             "Accounting only, for tests and inspection: no scheduling decision reads them, the runtime "
+             "exports none, and reading them changes nothing.")
         .def("storage_pending", &tokenspeed::Scheduler::StoragePending)
         .def("storage_stats", &tokenspeed::Scheduler::GetStorageStats)
         .def("storage_held_blocks", &tokenspeed::Scheduler::StorageHeldBlocks)
