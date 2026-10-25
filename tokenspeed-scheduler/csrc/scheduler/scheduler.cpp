@@ -427,6 +427,7 @@ HostCacheStats Scheduler::GetHostCacheStats() const {
         .restore_loads = tier_transfers_.RestoreLoadStats(),
         .host_evictions = coordinator_.HostEvictions(),
         .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
+        .device_evictions = coordinator_.DeviceEvictions(),
     };
 }
 

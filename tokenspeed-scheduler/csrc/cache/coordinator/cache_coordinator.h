@@ -449,6 +449,32 @@ public:
     const HostEvictionStats& HostEvictions() const { return host_evictions_; }
     std::uint64_t StoreCandidatesDroppedByFlush() const { return store_candidates_dropped_by_flush_; }
 
+    // Device entries evicted for one reason, each also counted as
+    // host_resident when the Host index still held its key (never without a
+    // Host pool).
+    struct DeviceEvictionCounts {
+        std::uint64_t blocks{0};
+        std::uint64_t host_resident{0};
+    };
+    // Device evictions over every cache group, by what started them. The
+    // blocks a victim takes along (its tail's companions, the state
+    // checkpoints under its hash) count under its reason. Only blocks that left
+    // the index count; a companion still referenced elsewhere (a request
+    // table, a copy awaiting its ACK) stays indexed.
+    struct DeviceEvictionStats {
+        // An admission's planned victims.
+        DeviceEvictionCounts admission;
+        // A restore's planned victims.
+        DeviceEvictionCounts restore;
+        // ClearDeviceCache.
+        DeviceEvictionCounts flush;
+        // The per-prior tail cap dropping a tail; with no single victim, it
+        // evicts every block it drops itself.
+        DeviceEvictionCounts tail_cap;
+    };
+    // Cumulative, never reset (accounting only).
+    const DeviceEvictionStats& DeviceEvictions() const { return device_evictions_; }
+
     // Publishes a Device block a restore filled from Host L2
     // (CompleteSnapshotRestore): the entry comes back with the logical block
     // index and boundary kind it was published under before the retraction,
@@ -608,12 +634,21 @@ private:
     void recordPublishedTail(const CompletedPages& completed);
     void recordTail(const ContentHash& prior, const TailPublication& tail);
     // Evicts every group's Device entries under a tail hash: a tail's blocks
-    // are usable only together, so they leave together.
-    void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens);
-    bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location);
+    // are usable only together, so they leave together. `reason` (the
+    // DeviceEvictionStats field of what started the eviction) only picks the
+    // counter each eviction lands in; eviction order and cascades never
+    // depend on it.
+    void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens,
+                          DeviceEvictionCounts DeviceEvictionStats::*reason);
+    // Device eviction of a planned or flushed victim, with its cascade (its
+    // tail's companions or the state checkpoints under its hash), all counted
+    // under `reason`.
+    bool evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
+                          DeviceEvictionCounts DeviceEvictionStats::*reason);
     // Device eviction of one entry without the tail cascade; the cascade
     // calls it for the companions of the block that left.
-    bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location);
+    bool evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                               DeviceEvictionCounts DeviceEvictionStats::*reason);
     // Evicts an unpinned Host entry and counts it under
     // host_evictions_.*reason, as device_resident too when the Device index
     // still holds its key.
@@ -663,6 +698,7 @@ private:
     // Accounting only.
     HostEvictionStats host_evictions_;
     std::uint64_t store_candidates_dropped_by_flush_{0};
+    DeviceEvictionStats device_evictions_;
 };
 
 // The prefix-match policy of one spec: full attention is prefix-closed with

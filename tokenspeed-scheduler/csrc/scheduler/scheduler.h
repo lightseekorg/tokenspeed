@@ -62,9 +62,9 @@ struct PrefixHitStats {
     std::uint64_t unresumable_kv_tokens{0};
 };
 
-// Host L2 counters: cumulative since start and never reset. Accounting
-// only, for tests and inspection: no scheduling decision reads them and the
-// runtime exports none.
+// Host L2 counters, and the Device evictions they are read against:
+// cumulative since start and never reset. Accounting only, for tests and
+// inspection: no scheduling decision reads them and the runtime exports none.
 struct HostCacheStats {
     PrefixHitStats prefix_hits;
     TierTransferManager::WriteBackStats publication_stores;
@@ -74,6 +74,7 @@ struct HostCacheStats {
     TierTransferManager::LoadBackStats restore_loads;
     CacheCoordinator::HostEvictionStats host_evictions;
     std::uint64_t store_candidates_dropped_by_flush{0};
+    CacheCoordinator::DeviceEvictionStats device_evictions;
 };
 
 class Scheduler {

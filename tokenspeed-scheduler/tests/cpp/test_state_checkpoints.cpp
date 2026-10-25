@@ -1067,6 +1067,13 @@ TEST_F(StateRestoreClaimSuite, TheRestoreClaimsTheCheckpointBeforeEvictingItsTai
     EXPECT_EQ(unkeyed_state_rows, 1) << "slot 1 is a private copy";
     EXPECT_EQ(keyed_state_rows, 0) << "slot 0 was claimed on the Device, not loaded";
     EXPECT_EQ(restore->group_ids.at(0).size(), 2u) << "the tail copy and the live slot";
+    // Three blocks count as a restore's: the full group's tail block at 6,
+    // whose claimed checkpoint stays and is not counted, the State group's
+    // checkpoint at 7, and the tail block at 7 it takes along. The stream to
+    // Host and the image's L2 leg left Host holding all three.
+    const CacheCoordinator::DeviceEvictionCounts restored = scheduler_->GetHostCacheStats().device_evictions.restore;
+    EXPECT_EQ(restored.blocks, 3u);
+    EXPECT_EQ(restored.host_resident, 3u);
     AckRestores(readmit);
     // The resumed decode releases the claimed slot 0 and writes its copy of
     // slot 1 in place.

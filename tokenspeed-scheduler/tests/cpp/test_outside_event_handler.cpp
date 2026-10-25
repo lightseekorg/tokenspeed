@@ -245,6 +245,10 @@ protected:
 // the host cache and be scheduled with reduced input_length (host pages already cached).
 TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
     SetupHostCache();
+    // The fills' admissions evicted r1's two pages after they reached Host.
+    const CacheCoordinator::DeviceEvictionCounts seeded = scheduler_->GetHostCacheStats().device_evictions.admission;
+    EXPECT_EQ(seeded.blocks, 2u);
+    EXPECT_EQ(seeded.host_resident, 2u);
 
     Submit(MakeRequestSpec("r2", /*num_pages=*/2, /*start=*/1));
     auto plan = PlanOnce();

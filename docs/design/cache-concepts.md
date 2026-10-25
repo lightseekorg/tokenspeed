@@ -985,7 +985,10 @@ Its responsibilities:
   for deployment settings.
 * **Reclamation and lifecycle.** `ReclaimExpired`, `Free`,
   `ClearDeviceCache`/`ClearCache`, and `NumNewlyReleasableLcmBlocks` for
-  ranking retraction (preemption) victims.
+  ranking retraction (preemption) victims. Device and Host evictions are
+  counted by reason (`DeviceEvictionStats`, `HostEvictionStats` in
+  `cache_coordinator.h`); the counts are accounting only and never change
+  what is evicted.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially, or not

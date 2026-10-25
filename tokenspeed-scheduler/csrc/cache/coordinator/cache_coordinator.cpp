@@ -147,7 +147,7 @@ bool CacheCoordinator::ClearDeviceCache() {
     pending_stores_.clear();
     for (const auto& [group_id, location] : cached_locations) {
         // The cascade of an earlier eviction may already have taken this one.
-        evictCachedBlock(group_id, location);
+        evictCachedBlock(group_id, location, &DeviceEvictionStats::flush);
         FatalCheck(!pool_.IsOccupied(location), "clearable Device cache entry disappeared");
     }
     return true;
@@ -1236,19 +1236,27 @@ CacheBlockRef CacheCoordinator::FindHostCachedBlock(const CacheKey& key) const {
     return groups_[key.group_id].Index().Find(*host_pool_, key);
 }
 
-bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location) {
+bool CacheCoordinator::evictCachedBlockAlone(std::uint32_t group_id, CacheBlockLocation location,
+                                             DeviceEvictionCounts DeviceEvictionStats::*reason) {
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
     if (!removed) {
         return false;
     }
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
+    }
+    DeviceEvictionCounts& evicted = device_evictions_.*reason;
+    ++evicted.blocks;
+    // Contains takes no reference, so it pins nothing on the Host tier.
+    if (host_pool_ != nullptr && groups_[group_id].Index().Contains(*host_pool_, *removed)) {
+        ++evicted.host_resident;
     }
     pruneTailIfUnreferenced(removed->content_hash);
     return true;
 }
 
-bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location) {
+bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocation location,
+                                        DeviceEvictionCounts DeviceEvictionStats::*reason) {
     std::optional<CacheKey> removed = groups_[group_id].Index().Evict(pool_, location);
     if (!removed) {
         return false;
@@ -1256,8 +1264,13 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
     if (cache_mutation_sink_) {
         cache_mutation_sink_(*removed, CacheMutation::kRemoved);
     }
+    DeviceEvictionCounts& evicted = device_evictions_.*reason;
+    ++evicted.blocks;
+    if (host_pool_ != nullptr && groups_[group_id].Index().Contains(*host_pool_, *removed)) {
+        ++evicted.host_resident;
+    }
     if (const std::optional<std::int32_t> tail_tokens = tails_.TailTokensOf(removed->content_hash)) {
-        evictTailEntries(removed->content_hash, *tail_tokens);
+        evictTailEntries(removed->content_hash, *tail_tokens, reason);
     } else if (!GroupIsState(group_id)) {
         // A state checkpoint is matched only with the KV below it: a KV block
         // of its page gone, it is dead weight and leaves too.
@@ -1267,7 +1280,7 @@ bool CacheCoordinator::evictCachedBlock(std::uint32_t group_id, CacheBlockLocati
             }
             const CacheKey key{.group_id = groups_[i].Id(), .content_hash = removed->content_hash, .page_offset = 0};
             if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
-                evictCachedBlockAlone(groups_[i].Id(), *location);
+                evictCachedBlockAlone(groups_[i].Id(), *location, reason);
             }
         }
     }
@@ -1299,7 +1312,8 @@ std::optional<CacheBlockLocation> CacheCoordinator::deviceLocationOf(std::size_t
     return block ? std::optional<CacheBlockLocation>{block->Location()} : std::nullopt;
 }
 
-void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens) {
+void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens,
+                                        DeviceEvictionCounts DeviceEvictionStats::*reason) {
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         const std::int32_t blocks = TailBlocksFor(static_cast<std::int32_t>(i), tail_tokens);
         for (std::int32_t offset = 0; offset < blocks; ++offset) {
@@ -1307,7 +1321,7 @@ void CacheCoordinator::evictTailEntries(const ContentHash& hash, std::int32_t ta
             // A companion still pinned by a request table stays indexed; it
             // ages out through the ordinary eviction order.
             if (const std::optional<CacheBlockLocation> location = deviceLocationOf(i, key)) {
-                evictCachedBlockAlone(groups_[i].Id(), *location);
+                evictCachedBlockAlone(groups_[i].Id(), *location, reason);
             }
         }
     }
@@ -1341,7 +1355,7 @@ void CacheCoordinator::recordPublishedTail(const CompletedPages& completed) {
 
 void CacheCoordinator::recordTail(const ContentHash& prior, const TailPublication& tail) {
     if (const std::optional<TailTable::Tail> dropped = tails_.Add(prior, tail.tail_tokens, tail.hash)) {
-        evictTailEntries(dropped->hash, dropped->tail_tokens);
+        evictTailEntries(dropped->hash, dropped->tail_tokens, &DeviceEvictionStats::tail_cap);
     }
 }
 

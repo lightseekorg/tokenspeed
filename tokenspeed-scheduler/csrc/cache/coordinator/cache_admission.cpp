@@ -862,7 +862,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // retry the blocks whose request reference has just been released.
     for (const auto& victim : plan.victims) {
         const auto& [group_id, location] = victim;
-        if (!evictCachedBlock(group_id, location)) {
+        if (!evictCachedBlock(group_id, location, &DeviceEvictionStats::admission)) {
             prospective_victims.push_back(victim);
         }
     }
@@ -904,7 +904,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         recordPublishedTail(*effective.completed_pages);
     }
     for (const auto& [group_id, location] : prospective_victims) {
-        if (!evictCachedBlock(group_id, location)) {
+        if (!evictCachedBlock(group_id, location, &DeviceEvictionStats::admission)) {
             FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");
         }
     }
@@ -1089,7 +1089,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
     // cache-only block the planner saw as evictable (or a tail companion an
     // earlier victim's eviction already took).
     for (const auto& [group_id, location] : candidate->victims) {
-        if (!evictCachedBlock(group_id, location)) {
+        if (!evictCachedBlock(group_id, location, &DeviceEvictionStats::restore)) {
             FatalCheck(!pool_.IsOccupied(location), "restore victim changed before acquisition");
         }
     }

@@ -598,6 +598,9 @@ TEST(CacheCoordinatorTest, ClearDeviceCacheLeavesHostCacheUntouched) {
     EXPECT_EQ(probe.host.num_common_tokens, 4);
     EXPECT_EQ(device_pool.NumEmptyLcmBlocks(), 4);
     EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 3);
+    const CacheCoordinator::DeviceEvictionCounts& flushed = coordinator.DeviceEvictions().flush;
+    EXPECT_EQ(flushed.blocks, 1u);
+    EXPECT_EQ(flushed.host_resident, 1u) << "the Host tier still holds the page";
 }
 
 TEST(CacheCoordinatorTest, ClearCacheRemovesDeviceAndHostEntries) {
@@ -639,11 +642,14 @@ TEST(CacheCoordinatorTest, ClearDeviceCacheRejectsPinnedEntryWithoutPartialMutat
     EXPECT_FALSE(coordinator.ClearDeviceCache());
     EXPECT_FALSE(coordinator.CacheIsClearable(/*include_host=*/false));
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 8);
+    EXPECT_EQ(coordinator.DeviceEvictions().flush.blocks, 0u) << "a refused clear evicts nothing";
 
     pin.reset();
     EXPECT_TRUE(coordinator.CacheIsClearable(/*include_host=*/false));
     EXPECT_TRUE(coordinator.ClearDeviceCache());
     EXPECT_EQ(coordinator.ProbePrefix(hashes).device.num_common_tokens, 0);
+    EXPECT_EQ(coordinator.DeviceEvictions().flush.blocks, 2u);
+    EXPECT_EQ(coordinator.DeviceEvictions().flush.host_resident, 0u) << "no Host pool";
 }
 
 std::vector<GroupDemand> FreshDemands(std::vector<BlockTable>& tables, std::span<const std::int32_t> tokens) {
@@ -4942,8 +4948,8 @@ TEST_F(TailPublicationTest, EvictingOneTailBlockTakesItsCompanionsAndPrunesTheTa
     ASSERT_EQ(coordinator_.NumTailEntries(), 1u);
 
     // Evicting group 1's partial block through the planner's path takes group
-    // 0's two blocks and the sliding group's block with it: a tail is usable
-    // only whole.
+    // 0's two blocks and the sliding group's two blocks with it: a tail is
+    // usable only whole.
     CacheBlockLocation location{};
     {
         const CacheBlockRef victim = coordinator_.GroupPrefixIndex(1).Find(pool_, Key(tail.hash, 1, 0));
@@ -4954,6 +4960,12 @@ TEST_F(TailPublicationTest, EvictingOneTailBlockTakesItsCompanionsAndPrunesTheTa
     EXPECT_FALSE(Cached(0, tail.hash, 0));
     EXPECT_FALSE(Cached(0, tail.hash, 1));
     EXPECT_FALSE(Cached(2, tail.hash, 1));
+    EXPECT_FALSE(Cached(2, tail.hash, 0));
+    // The victim and its four companions count under the same reason; there
+    // is no Host tier to hold any of them.
+    const CacheCoordinator::DeviceEvictionCounts& evicted = coordinator_.DeviceEvictions().admission;
+    EXPECT_EQ(evicted.blocks, 5u);
+    EXPECT_EQ(evicted.host_resident, 0u);
     EXPECT_EQ(coordinator_.NumTailEntries(), 0u) << "no tier holds the hash any more";
     EXPECT_TRUE(Cached(0, hashes_[1], 0)) << "the full pages stay";
     EXPECT_EQ(coordinator_.DeviceBoundaryResidency(Key(tail.hash, 0), tail.tail_tokens),
@@ -5098,9 +5110,46 @@ TEST_F(TailPublicationTest, CapDropsTheLeastRecentlyUsedTailUnderOnePriorWithIts
     EXPECT_FALSE(Cached(0, tails[1].hash, 0)) << "the least recently used tail's blocks left the index";
     EXPECT_FALSE(Cached(1, tails[1].hash, 0));
     EXPECT_FALSE(Cached(2, tails[1].hash, 1));
+    EXPECT_FALSE(Cached(0, tails[1].hash, 1));
+    EXPECT_FALSE(Cached(2, tails[1].hash, 0));
+    // The cap evicts the dropped tail's blocks itself: the three rows [4, 7)
+    // in two blocks of group 0, one of group 1, and two of the sliding group
+    // (its window behind 7 starts at row 5).
+    EXPECT_EQ(coordinator_.DeviceEvictions().tail_cap.blocks, 5u);
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 0u) << "the pool never ran short";
     for (std::size_t i = 2; i < tails.size(); ++i) {
         EXPECT_TRUE(Cached(0, tails[i].hash, 0)) << "tail " << i;
     }
+}
+
+TEST_F(TailPublicationTest, CapCountsOnlyTheBlocksItEvictsAndLeavesAPinnedCompanionIndexed) {
+    // Nine tails under one prior: the ninth drops the first, whose first
+    // block in group 0 is still referenced, as a request table would hold it.
+    std::vector<TailPublication> tails;
+    CacheBlockRef pinned;
+    for (std::int32_t extra = 1; extra <= TailTable::kMaxTailsPerPrior + 1; ++extra) {
+        std::vector<std::int32_t> tokens = MakeTokens(kP);
+        for (std::int32_t i = 0; i < 3; ++i) {
+            tokens.push_back(1000 * extra + i);
+        }
+        if (extra == TailTable::kMaxTailsPerPrior + 1) {
+            pinned = coordinator_.GroupPrefixIndex(0).Find(pool_, Key(tails.front().hash, 0, 0));
+            ASSERT_TRUE(static_cast<bool>(pinned));
+        }
+        std::vector<BlockTable> tables(3);
+        tails.push_back(PublishFinal(tables, tokens, /*num_computed_tokens=*/kP + 3));
+        coordinator_.Free(tables);
+    }
+    EXPECT_EQ(coordinator_.TailCapEvictions(), 1);
+    EXPECT_TRUE(Cached(0, tails.front().hash, 0)) << "the pinned companion stays indexed";
+    EXPECT_FALSE(Cached(0, tails.front().hash, 1));
+    EXPECT_FALSE(Cached(1, tails.front().hash, 0));
+    EXPECT_FALSE(Cached(2, tails.front().hash, 0));
+    EXPECT_FALSE(Cached(2, tails.front().hash, 1));
+    // Only the blocks the cap evicted count: group 0's second block, but not
+    // its pinned first one.
+    EXPECT_EQ(coordinator_.DeviceEvictions().tail_cap.blocks, 4u);
+    EXPECT_EQ(coordinator_.DeviceEvictions().admission.blocks, 0u) << "the pool never ran short";
 }
 
 }  // namespace

@@ -3864,6 +3864,10 @@ TEST_F(JunctionCutHostSuite, HostKvWithoutAStateCheckpointCutsNoJunction) {
     AckWriteBacks(PlanOnce());
     ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "six KV pages and state@12";
     ASSERT_TRUE(scheduler_->ClearL1Cache());
+    // The clear evicts the six pages and state@12; Host holds all seven.
+    const CacheCoordinator::DeviceEvictionCounts flushed = scheduler_->GetHostCacheStats().device_evictions.flush;
+    EXPECT_EQ(flushed.blocks, 7u);
+    EXPECT_EQ(flushed.host_resident, 7u);
 
     RequestSpec first = seed;
     first.request_id = "first";
@@ -4442,6 +4446,12 @@ TEST_F(PrefixHitSuite, ClearL1CacheRemovesAnIdlePrefix) {
     const auto [cleared, log] = ClearL1CacheWithCapturedLog(scheduler_.get());
     ASSERT_TRUE(cleared);
     EXPECT_NE(log.find("flush L1 cache completed"), std::string::npos);
+    // r1 published 9 computed tokens: four pages and a one-token tail in each
+    // of the two groups. No Host pool holds anything.
+    const CacheCoordinator::DeviceEvictionStats evictions = scheduler_->GetHostCacheStats().device_evictions;
+    EXPECT_EQ(evictions.flush.blocks, 10u);
+    EXPECT_EQ(evictions.flush.host_resident, 0u);
+    EXPECT_EQ(evictions.admission.blocks + evictions.restore.blocks + evictions.tail_cap.blocks, 0u);
     Submit(RequestSpec{.request_id = "r2", .tokens = first.tokens});
     const ExecutionPlan second_plan = PlanOnce();
     const ForwardBatch* second = FindForwardBatch(second_plan);
