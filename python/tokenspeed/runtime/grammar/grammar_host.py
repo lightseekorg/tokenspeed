@@ -375,13 +375,16 @@ class Filler {
         int64_t num_decodes,
         int64_t decode_width) {
         std::vector<bool> advance(matchers.size(), false);
-        Fill(*MakeBatch(
-            std::move(matchers), std::move(advance), has_candidates, num_extends,
-            num_prefill_outputs, num_decodes, decode_width));
+        if (!Fill(*MakeBatch(
+                std::move(matchers), std::move(advance), has_candidates, num_extends,
+                num_prefill_outputs, num_decodes, decode_width))) {
+            throw std::runtime_error("a grammar matcher did not fill its mask");
+        }
     }
 
-    // Writes a forward's masks; only rows written since their last reset are reset.
-    void Fill(const Batch& batch) {
+    // Writes a forward's masks, resetting rows written before; false if a matcher failed (rows allow all).
+    bool Fill(const Batch& batch) {
+        bool ok = true;
         const int64_t per_request_rows = batch.has_candidates() ? n_ : 1;
         ++epoch_;
         filled_rows_.clear();
@@ -391,7 +394,15 @@ class Filler {
         };
         for (int64_t i = 0; i < batch.bs(); ++i) {
             const Matcher* matcher = batch.matcher(i).get();
-            if (matcher == nullptr || IsTerminated(*matcher)) {
+            if (matcher == nullptr) {
+                continue;
+            }
+            const int32_t terminated = matcher->entries->is_terminated(matcher->handle);
+            if (terminated < 0) {
+                LogError("is_terminated", "the matcher did not answer");
+                ok = false;
+            }
+            if (terminated != 0) {
                 continue;
             }
             const int64_t row = i * per_request_rows;
@@ -401,6 +412,8 @@ class Filler {
                 dirty_rows_.push_back(row);
                 if (FillRow(*matcher, row)) {
                     filled(row);
+                } else {
+                    ok = false;
                 }
             } else if (positions) {
                 // Draft 0 was accepted by an earlier advance; a later advance
@@ -415,6 +428,8 @@ class Filler {
                     for (int64_t k = 0; k < masked; ++k) {
                         filled(row + k);
                     }
+                } else {
+                    ok = false;
                 }
             }
         }
@@ -424,6 +439,7 @@ class Filler {
             }
         }
         dirty_rows_.swap(filled_rows_);
+        return ok;
     }
 
   private:
@@ -571,6 +587,7 @@ class Host {
             if (previous != nullptr) {
                 previous->Advance(output_tokens_, filler_->rows(), accept_lengths_);
             }
+            // The node cannot raise: a failed fill is logged and its rows allow every token.
             filler_->Fill(*batch);
         } catch (...) {
             Retire(std::move(previous));

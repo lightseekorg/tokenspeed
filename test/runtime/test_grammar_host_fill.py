@@ -31,6 +31,7 @@ batches change.
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 from types import SimpleNamespace
@@ -55,6 +56,9 @@ from tokenspeed.runtime.grammar.capturable_grammar import (  # noqa: E402
     EagerGrammarBuffers,
     GrammarStepInputs,
     setup_grammar_step,
+)
+from tokenspeed.runtime.grammar.grammar_host import (  # noqa: E402
+    load_grammar_host_ext,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
@@ -283,3 +287,55 @@ def test_one_runtime_serves_verify_plain_and_grammar_free_steps(compiled, kind):
         none = [None] * 3
         assert (_fill(runtime, none, verify_layout, drafts=drafts) == -1).all()
         assert (_fill(runtime, none[:2], plain_layout) == -1).all()
+
+
+# Entries a C++ matcher may still call while the process runs.
+_FAILING_ENTRIES: list = []
+
+
+def _matcher_that_fills_nothing():
+    """A grammar whose entries answer state reads but write no mask."""
+    i32, u64, i64, usize = (
+        ctypes.c_int32,
+        ctypes.c_uint64,
+        ctypes.c_int64,
+        ctypes.c_size_t,
+    )
+    entries = {
+        "is_terminated": ctypes.CFUNCTYPE(i32, u64)(lambda handle: 0),
+        "accept_token": ctypes.CFUNCTYPE(i32, u64, i32)(lambda handle, token: 1),
+        "fill_bitmask": ctypes.CFUNCTYPE(i32, u64, usize, i64, i64, i32)(
+            lambda *args: -1
+        ),
+        "traverse_draft_tree": ctypes.CFUNCTYPE(
+            i32, u64, usize, usize, usize, i64, usize, i64
+        )(lambda *args: -1),
+        "retain": ctypes.CFUNCTYPE(i32, u64)(lambda handle: 0),
+        "free": ctypes.CFUNCTYPE(None, u64)(lambda handle: None),
+    }
+    _FAILING_ENTRIES.append(entries)
+    ext = load_grammar_host_ext()
+    native = ext.Entries(
+        {
+            name: ctypes.cast(entry, ctypes.c_void_p).value
+            for name, entry in entries.items()
+        }
+    )
+    matcher = ext.Matcher(native, 1, [EOS])
+    return SimpleNamespace(finished=False, native_matcher=lambda: matcher)
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_without_a_host_node_a_mask_the_matcher_did_not_fill_fails_the_forward(
+    verify,
+):
+    # The host node cannot raise; the eager fill must not sample from every token instead.
+    runtime = _runtime("eager", max_bs=1, tokens_per_req=W)
+    drafts = torch.tensor([(A, B, C, BRACE)], dtype=torch.int32) if verify else None
+    with pytest.raises(RuntimeError, match="did not fill its mask"):
+        _setup(
+            runtime,
+            [_matcher_that_fills_nothing()],
+            ForwardOutputLayout(0, 0, 1, W),
+            drafts=drafts,
+        )
