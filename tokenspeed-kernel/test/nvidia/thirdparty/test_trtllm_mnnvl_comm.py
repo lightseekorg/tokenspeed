@@ -243,7 +243,10 @@ def test_trtllm_workspace_allreduce(token_num):
     )
 
     # Non-contiguous input is served through a contiguous copy, never mutated.
-    strided = torch.randn(token_num, 2 * H, dtype=torch.bfloat16, device=dev)[:, ::2]
+    # Scaled like x: at 8+ ranks the bf16 sum's rounding of unit-scale inputs exceeds the tolerance.
+    strided = (torch.randn(token_num, 2 * H, dtype=torch.bfloat16, device=dev) * 0.1)[
+        :, ::2
+    ]
     keep = strided.clone()
     out_nc = trtllm_workspace_allreduce(strided, dist.group.WORLD, fp32_acc=False)
     assert out_nc is not None
