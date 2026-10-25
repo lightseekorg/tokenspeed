@@ -690,6 +690,7 @@ CacheCoordinator::PrefixProbe CacheCoordinator::probePrefixWithOrder(const Promp
     // Device's result when it reaches further.
     out.host = probeTier<CacheTier::kHost>(prompt, out.group_keys, match_order, out.device.full_page_tokens,
                                            claim_partial, nullptr);
+    out.device_only_hit_tokens = out.device.num_common_tokens;
     if (out.host.num_common_tokens > out.device.num_common_tokens) {
         // The Device keeps its full pages below the Host's floor; its tail and
         // its state hit (a shorter checkpoint) give way to the Host's.

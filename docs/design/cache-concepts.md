@@ -707,7 +707,13 @@ Its responsibilities:
   page-aligned boundary when the window's first row falls inside a block;
   the tail's blocks below that window stay holes). The Host tier runs the same two phases from the Device's
   full-page coverage and wins when it reaches further by a page or a longer
-  tail. Storage (L3) uses the same boundary matcher with temporary object
+  tail. A Host win cuts the Device back to its full pages (its tail and state
+  hit give way). `AdmissionResult::host_prefix_tokens` is a boundary, not a
+  token count: the Host's on a Host win, the Device's otherwise (0 without a
+  Host pool and on the D role). A Host win loads that boundary less the
+  Device's full pages and adds, over a Device-only hit, that boundary less the
+  Device-only one (the scheduler's `PrefixHitStats` counts both). Storage (L3)
+  uses the same boundary matcher with temporary object
   hints: candidates are full pages, matching local `TailTable` entries and
   the exact reusable request bound. It has no shared index for discovering
   other nonaligned remote checkpoints. The probe is bounded

@@ -419,6 +419,7 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
 
 HostCacheStats Scheduler::GetHostCacheStats() const {
     return HostCacheStats{
+        .prefix_hits = prefix_hit_stats_,
         .publication_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kPublication),
         .finish_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kFinish),
         .retraction_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kRetraction),

@@ -209,9 +209,11 @@ protected:
         return cfg;
     }
 
-    // Both seeds finish right after their prefill (a zero decode width plans
+    // The seeds finish right after their prefill (a zero decode width plans
     // no decode step): the quiescent finish publishes the prompt pages, whose
-    // stream to Host rides the next plan.
+    // stream to Host rides the next plan. Of the four usable Device pages,
+    // r_fill's three evict r1's last page and r_fill2's one evicts r1's first,
+    // the least recently used, so r1's prompt stays on Host alone.
     void SetupHostCache() {
         Submit(MakeRequestSpec("r1", /*num_pages=*/2, /*start=*/1));
         PlanOnce();
@@ -227,6 +229,13 @@ protected:
         PlanOnce();
         SendForwardDone("r_fill", {200});
         SendFinish("r_fill");
+        AckWriteBacks(PlanOnce());
+        PlanOnce();
+
+        Submit(MakeRequestSpec("r_fill2", /*num_pages=*/1, /*start=*/300));
+        PlanOnce();
+        SendForwardDone("r_fill2", {201});
+        SendFinish("r_fill2");
         AckWriteBacks(PlanOnce());
         PlanOnce();
     }
@@ -253,6 +262,15 @@ TEST_F(LoadBackDoneTestSuite, LoadBackDonePrefixLenChangesInForward) {
         EXPECT_EQ(fwd->extend_prefix_lens[idx], 1 * PrefixGranularity())
             << "extend_prefix_len should cover the 1 loadback page";
     }
+    // The Device holds none of r2's prompt, so the Host wins with the one page
+    // and loads it: all of it counts as a Host hit and as a Host gain.
+    const HostCacheStats stats = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(stats.prefix_hits.device_hit_tokens, 0u);
+    EXPECT_EQ(stats.prefix_hits.host_hit_tokens, 2u);
+    EXPECT_EQ(stats.prefix_hits.host_gain_tokens, 2u);
+    EXPECT_EQ(stats.prefix_hits.prompt_tokens, 4u + 6u + 2u + 4u);
+    EXPECT_EQ(stats.prefix_loads.ops, 1u) << "r2's load-back of the one page";
+    EXPECT_EQ(stats.prefix_loads.blocks, (std::vector<std::uint64_t>{1}));
 }
 
 class DisaggDecodeAdmissionTestSuite : public SchedulerTestSuite {

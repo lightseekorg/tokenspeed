@@ -3795,6 +3795,9 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
         << "no checkpoint: the chunk starts from a zeroed block";
     EXPECT_NE(state_row[1], 0);
     SendForwardDone("first");
+    const PrefixHitStats at_first = scheduler_->GetHostCacheStats().prefix_hits;
+    EXPECT_EQ(at_first.unresumable_kv_tokens, 6u) << "first's six cached KV tokens are recomputed";
+    EXPECT_EQ(at_first.device_hit_tokens, 0u);
 
     // The next chunk's admission publishes the junction's natural checkpoint
     // (state@6 under the sixth token's page hash) and rotates the slots. The
@@ -3829,9 +3832,52 @@ TEST_F(JunctionCutSuite, CutsTheFirstChunkAtTheJunctionAndPublishesTheCheckpoint
         const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
         EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "the junction checkpoint is a hit";
         EXPECT_EQ(batch->block_tables.at("state").at(row)[0], rotated[0]) << "resumes from the published checkpoint";
+        const PrefixHitStats at_third = scheduler_->GetHostCacheStats().prefix_hits;
+        EXPECT_EQ(at_third.device_hit_tokens, 6u);
+        EXPECT_EQ(at_third.unresumable_kv_tokens, 6u) << "third's KV ends at its hit";
+        EXPECT_EQ(at_third.host_hit_tokens, 0u) << "no Host pool";
         return;
     }
     FAIL() << "third was never scheduled";
+}
+
+class JunctionCutHostSuite : public JunctionCutSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = JunctionCutSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        return cfg;
+    }
+};
+
+// The same prompts with the seed on Host alone: the Host's KV reaches 6 but
+// it holds no state checkpoint there, so it loses to the Device's empty
+// match and its junction is not cut.
+TEST_F(JunctionCutHostSuite, HostKvWithoutAStateCheckpointCutsNoJunction) {
+    RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
+    Submit(seed);
+    AckWriteBacks(PlanOnce());  // chunk end at token 8
+    SendForwardDone("seed");
+    AckWriteBacks(PlanOnce());  // prompt end at token 12
+    SendForwardDone("seed", {42});
+    SendFinish("seed");
+    AckWriteBacks(PlanOnce());
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 7) << "six KV pages and state@12";
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+
+    RequestSpec first = seed;
+    first.request_id = "first";
+    for (std::size_t i = 6; i < first.tokens.size(); ++i) {
+        first.tokens[i] += 1000;
+    }
+    Submit(first);
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{8}) << "no junction: the chunk is not cut at 6";
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.unresumable_kv_tokens, 0u);
 }
 
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {
@@ -5769,6 +5815,7 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     EXPECT_FALSE(FindLoadBack(blocked).has_value());
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "an abandoned admission must unpin its host match";
     EXPECT_EQ(scheduler_->WaitingSize(), 1u);
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.host_hit_tokens, 0u) << "a failed attempt counts no hit";
 
     // Free the filler (its write-back pins included): both decodes planned so
     // far land and it finishes -> r2 admits with the load-back.
@@ -5787,6 +5834,9 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     EXPECT_EQ(lb->src_pages.at(0).size(), 6u);
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 6);
     EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+    const PrefixHitStats admitted_hits = scheduler_->GetHostCacheStats().prefix_hits;
+    EXPECT_EQ(admitted_hits.host_hit_tokens, 8u) << "r1's 8 tokens, counted once at the admission";
+    EXPECT_EQ(admitted_hits.device_hit_tokens, 0u);
 
     SendLoadBackDone(lb->op_ids.at(0));
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0);
@@ -5800,6 +5850,72 @@ TEST_F(HostHitSuite, AbandonedAdmissionUnpins) {
     AckWriteBacks(PlanOnce());
     PlanOnce();
     EXPECT_EQ(scheduler_->AvailableLcmBlocks(), free_at_start) << "pool balances after the deferred host hit";
+}
+
+// A Host win cuts the Device back to its full pages: the Device's tail gives
+// way, so the Host loads more than it adds over the Device's own boundary.
+TEST_F(SchedulerTestSuite, AHostWinOverADeviceTailLoadsMoreThanItGains) {
+    // r0 = [1..8] leaves its four pages on Host alone.
+    Submit(MakeRequestSpec("r0", /*num_pages=*/4));
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("r0", {42});
+    SendFinish("r0");
+    AckWriteBacks(PlanOnce());
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    // r1 = [1..5] loads pages 0 and 1 from Host and republishes them on the
+    // Device; its finish publishes the tail [5] at token 5 there.
+    Submit(RequestSpec{.request_id = "r1", .tokens = MakeTokens(5)});
+    const ExecutionPlan r1_admitted = PlanOnce();
+    for (const CacheOperation& op : ExtractCacheOpsOfKind<LoadBackBatch>(r1_admitted)) {
+        SendLoadBackDone(std::get<LoadBackBatch>(op).op_ids.at(0));
+    }
+    SendForwardDone("r1", {43});
+    SendFinish("r1");
+    AckWriteBacks(PlanOnce());
+    const HostCacheStats before = scheduler_->GetHostCacheStats();
+
+    // r2 = [1..8, 77, 78]: the Device reaches 5 (pages 0 and 1, then the
+    // tail), the Host 8 from the Device's four full-page tokens.
+    std::vector<std::int32_t> tokens = MakeTokens(8);
+    tokens.insert(tokens.end(), {77, 78});
+    Submit(RequestSpec{.request_id = "r2", .tokens = tokens});
+    const ExecutionPlan plan = PlanOnce();
+    const ForwardBatch* batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{8});
+    const HostCacheStats after = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(after.prefix_loads.ops - before.prefix_loads.ops, 1u);
+    EXPECT_EQ(after.prefix_hits.device_hit_tokens - before.prefix_hits.device_hit_tokens, 4u)
+        << "the Device's full pages";
+    EXPECT_EQ(after.prefix_hits.host_hit_tokens - before.prefix_hits.host_hit_tokens, 4u)
+        << "the Host loads the boundary less the Device's full pages";
+    EXPECT_EQ(after.prefix_hits.host_gain_tokens - before.prefix_hits.host_gain_tokens, 3u)
+        << "and adds the boundary less the Device's own boundary at 5";
+    EXPECT_EQ(after.prefix_loads.ops, 2u) << "r1's load and r2's";
+    EXPECT_EQ(after.prefix_loads.blocks, (std::vector<std::uint64_t>{4})) << "r1's two pages and r2's two";
+}
+
+// A Submitted request that waits for a slot counts its prompt and its hit
+// once, when it is admitted.
+TEST_F(SchedulerTestSuite, AFirstAdmissionWaitingForASlotCountsItsHitOnce) {
+    config_.max_batch_size = 1;
+    scheduler_ = std::make_unique<Scheduler>(config_);
+    Submit(MakeRequestSpec("r0", /*num_pages=*/2));
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"r0"});
+    SendForwardDone("r0", {42});
+    Submit(MakeRequestSpec("r1", /*num_pages=*/2));
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"r0"});
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.prompt_tokens, 4u) << "r0 holds the one slot";
+
+    SendForwardDone("r0", {43});
+    SendFinish("r0");
+    const ExecutionPlan admitted = PlanOnce();
+    ASSERT_NE(FindForwardBatch(admitted), nullptr);
+    ASSERT_EQ(FindForwardBatch(admitted)->request_ids, std::vector<std::string>{"r1"});
+    const PrefixHitStats hits = scheduler_->GetHostCacheStats().prefix_hits;
+    EXPECT_EQ(hits.device_hit_tokens, 2u) << "r0's first page; the probe stops before r1's last token";
+    EXPECT_EQ(hits.prompt_tokens, 4u + 4u);
 }
 
 TEST_F(HostHitSuite, AbortDuringLoadKeepsPagesPinned) {
@@ -6295,6 +6411,26 @@ TEST_F(BoundedReplaySuite, ReplayRowsDebitTokenBudget) {
     ASSERT_EQ(op->request_ids, (std::vector<std::string>{"r2", "r3"}));
     EXPECT_EQ(op->extend_replay_lens, (std::vector<std::int32_t>{kReplayWindow, 0}));
     EXPECT_EQ(op->input_lengths, (std::vector<std::int32_t>{kReplayWindow + 8, 64 - kReplayWindow - 8}));
+}
+
+// r1's 60 tokens leave r2 a budget of 4: its 10-token prompt would end in a
+// 6-token chunk, shorter than the window, and no earlier cut leaves the
+// window whole. r2 waits a round, and its prompt counts once, when it is
+// admitted the next round.
+TEST_F(BoundedReplaySuite, AFirstChunkWithNoRoomForTheFinalWindowWaitsARound) {
+    Submit({MakeSpecWithTokens("r1", MakeTokens(/*count=*/60)),
+            MakeSpecWithTokens("r2", MakeTokens(/*count=*/10, /*start=*/5001))});
+    const ExecutionPlan first = PlanOnce();
+    ASSERT_NE(FindForwardBatch(first), nullptr);
+    EXPECT_EQ(FindForwardBatch(first)->request_ids, std::vector<std::string>{"r1"});
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.prompt_tokens, 60u) << "r1's alone";
+
+    SendForwardDone("r1", {9001});
+    const ExecutionPlan second = PlanOnce();
+    ASSERT_NE(FindForwardBatch(second), nullptr);
+    EXPECT_EQ(FindForwardBatch(second)->request_ids, std::vector<std::string>{"r2"});
+    EXPECT_EQ(FindForwardBatch(second)->input_lengths, std::vector<std::int32_t>{10});
+    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.prompt_tokens, 60u + 10u);
 }
 
 // The DSpark cap (prefix_replay_tokens) shortens the probe first; bounded

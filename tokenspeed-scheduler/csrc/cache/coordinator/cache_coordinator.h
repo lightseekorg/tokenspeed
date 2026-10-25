@@ -192,6 +192,10 @@ public:
         // Entries the Host tier holds beyond the Device hit. Admission loads
         // these; nothing an admission touches can miss.
         Tier host;
+        // Accounting only, never read by a decision: the Device's own
+        // boundary before a Host win cuts it to full pages. Zero without a
+        // Host pool and on the D role.
+        std::int32_t device_only_hit_tokens{0};
     };
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};

@@ -48,10 +48,25 @@
 
 namespace tokenspeed {
 
+// The first admission's prefix hit by tier, per admitted request.
+// device_hit + host_hit is the hit: host_hit is what the Host loads (its
+// boundary less the Device's full pages, so it includes a Device tail and state
+// hit that gave way), host_gain is what the Host adds over the Device-only hit
+// (PrefixProbe::device_only_hit_tokens). unresumable_kv is the KV cached beyond
+// the hit (the junction).
+struct PrefixHitStats {
+    std::uint64_t prompt_tokens{0};
+    std::uint64_t device_hit_tokens{0};
+    std::uint64_t host_hit_tokens{0};
+    std::uint64_t host_gain_tokens{0};
+    std::uint64_t unresumable_kv_tokens{0};
+};
+
 // Host L2 counters: cumulative since start and never reset. Accounting
 // only, for tests and inspection: no scheduling decision reads them and the
 // runtime exports none.
 struct HostCacheStats {
+    PrefixHitStats prefix_hits;
     TierTransferManager::WriteBackStats publication_stores;
     TierTransferManager::WriteBackStats finish_stores;
     TierTransferManager::WriteBackStats retraction_stores;
@@ -461,6 +476,8 @@ private:
     std::vector<WriteBackOperation> pending_write_back_operations_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
+    // Accounting only (schedulePrefillFirstChunk); no decision reads it.
+    PrefixHitStats prefix_hit_stats_;
 
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (rankedReadmissions).
