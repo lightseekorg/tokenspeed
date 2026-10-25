@@ -3830,6 +3830,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
             elif isinstance(module, MoELayer):
                 module.process_weights_after_loading(module)
         from test.runtime.test_deepseek_v41_cache import _pool, _recipe
+
         from tokenspeed.runtime.layers.attention.backends.specific.deepseek_v41 import (
             DeepseekV41AttentionBackend,
         )
@@ -3912,9 +3913,7 @@ def test_distributed_model_qcp_four_way(monkeypatch, tmp_path):
                     engram_token_mask=mask[rows],
                     image_mask=None,
                 )
-                assert torch.isfinite(result).all(), (
-                    length, sharded, backend.kvp_size
-                )
+                assert torch.isfinite(result).all(), (length, sharded, backend.kvp_size)
                 outputs.append(result[-1:].clone())
             # Different GEMM row shapes and EP reduction order may round BF16
             # differently; this checks the sampled hidden output, not task accuracy.

@@ -3502,9 +3502,7 @@ def test_pd_prefill_to_sharded_decode_contract(dspark, prefill_kvp):
                     source_owner_rank=source_rank,
                     destination_owner_rank=rank,
                 )
-                restored_src = (
-                    (src - 1) * source_count + source_rank + 1
-                ).tolist()
+                restored_src = ((src - 1) * source_count + source_rank + 1).tolist()
                 restored_dst = (
                     (dst - 1) * count + (rank if count > 1 else 0) + 1
                 ).tolist()

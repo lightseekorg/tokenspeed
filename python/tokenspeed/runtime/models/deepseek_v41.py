@@ -1821,7 +1821,10 @@ class DeepseekV41DecoderLayer(nn.Module):
             residual,
             attn_pre,
             V41HCPost(
-                x, post, comb, self.attn.mapping.attn.head_tp_group if defer_attn else None
+                x,
+                post,
+                comb,
+                self.attn.mapping.attn.head_tp_group if defer_attn else None,
             ),
             hc_weights=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base),
             norm=self.ffn_norm,

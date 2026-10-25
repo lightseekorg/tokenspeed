@@ -103,12 +103,17 @@ def gather_decode_history(
     ):
         raise ValueError("V4.1 decode history requires a page table and scalar length")
     if cache.is_cuda:
-        from tokenspeed_kernel.ops.attention.dsv41._triton.kvp import pack_decode_history
+        from tokenspeed_kernel.ops.attention.dsv41._triton.kvp import (
+            pack_decode_history,
+        )
 
         result = pack_decode_history(
-            cache, table, visible_rows,
+            cache,
+            table,
+            visible_rows,
             virtual_block_count=placement.virtual_block_count,
-            degree=len(placement.group), rank=placement.rank,
+            degree=len(placement.group),
+            rank=placement.rank,
         )
         # Including the zero null page avoids a post-reduction allocation/copy.
         return all_reduce(result, placement.group, op=torch.distributed.ReduceOp.MAX)
