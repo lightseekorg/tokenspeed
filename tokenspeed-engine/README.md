@@ -70,6 +70,32 @@ build instead, put `_native` on the Python path and point
 filter (`info` by default; `ts_control=debug` logs admissions and cache-op
 acknowledgments).
 
+## Releasing Rust crates
+
+Use **Release TokenSpeed Engine Crates** in GitHub Actions. Select `dry-run`
+to build and verify the workspace's package archives without uploading.
+Select `publish` on `main` to publish missing versions in dependency order;
+versions already on crates.io are skipped, so a partial release can be rerun.
+The run summary lists each package's version and the source commit.
+
+Before a release, update `[workspace.package].version` in `Cargo.toml` and
+the internal dependency versions in `crates/*/Cargo.toml`, run
+`cargo update --workspace` to refresh `Cargo.lock`, and merge the version
+change. The workflow publishes the committed versions; it does not bump them.
+
+Publishing uses crates.io Trusted Publishing rather than a stored API token.
+Configure it once:
+
+1. Create the GitHub environment `crates-io` and restrict its deployment
+   branches to `main`.
+2. In each published crate's **Settings → Trusted Publishing**, add a GitHub
+   publisher with repository owner `lightseekorg`, repository `tokenspeed`,
+   workflow filename `release-tokenspeed-engine-crates.yml`, and environment
+   `crates-io`.
+
+New crates need their initial token-based publication before Trusted
+Publishing can be configured. Registry rate limits still apply.
+
 ## Running against an engine
 
 Start a headless engine (one rank process per GPU is launched for you); it
