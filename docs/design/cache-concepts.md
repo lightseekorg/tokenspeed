@@ -657,8 +657,9 @@ Perception rules per directory:
   with no node yet (an L3 GET, a store whose Device entry left before its ACK,
   a restore's republication) starts one without a parent. It is kept in step
   with the indexes: no match reads it, evicting by segments selects along it
-  (`AdmissionPlanner`), and its walks follow parent pointers and
-  insertion-ordered lists, never the map, so mirrored ranks agree.
+  (`AdmissionPlanner`, and the Host's segment plan, `AcquireHostSegments`),
+  and its walks follow parent pointers and insertion-ordered lists, never the
+  map, so mirrored ranks agree.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
@@ -956,6 +957,19 @@ Its responsibilities:
   The way back is one `SnapshotRestoreOperation` whose rows name their Host
   tier; its L2-tier destinations are republished at the ACK
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
+  Those stores, retraction images and L3 prefetches take Host blocks one
+  by one (`AcquireHostBlocks`). What the write-back policy writes back takes
+  them per segment (`AcquireHostSegments`; nothing calls it yet), and a
+  segment arrives whole: every segment's blocks are fitted jointly before
+  anything is evicted, a segment is placed whole or not at all, and nothing
+  is evicted for a dropped one. Host victims are whole as well — a Host
+  checkpoint boundary with the Host pages only it depends on, or a Host page no
+  checkpoint boundary depends on — and one block in use passes the whole victim
+  over. They go by class: dead entries, then duplicates of a boundary the
+  Device resumes and checkpoint boundaries a deeper Device checkpoint boundary
+  supersedes (the newest Device copy first), then Host-only cache (least
+  recently used first). `AcquireHostSegments` documents the victim shapes, the
+  ranking and the restore pass.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at
@@ -1087,7 +1101,8 @@ by set, oldest first, and counts the request's own released slots apart
 (`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
 empty parents, the occupants left in each parent a victim leaves — with the
 pool's own fit formula, so a planner on any pool the coordinator registered
-its groups in tries victims the same way.
+its groups in tries victims the same way: the Host's segment plan
+(`AcquireHostSegments`) fits on it over Host L2.
 
 A victim set is the candidate block alone unless the coordinator evicts by
 *segments* (`write_back_evictions`, the Host write-back policy). Then the set
@@ -1486,11 +1501,12 @@ pool and the snapshot pool are registered with the same `shard_count` as the
 Device pool, and every transfer the scheduler emits — L2 store, L2 prefix
 load, both legs of a retraction image, the restore — acquires its destination
 in its source's bucket (`AcquireHostBlocks(group_ids, buckets)`,
-`AcquireBlocksInBuckets`, `TakeImage`, `Restore`), so `(src - 1) % D ==
-(dst - 1) % D` for every row; `TierTransferManager` asserts it when it builds
-a batch. A Host block's residue is therefore its owner exactly as a Device
-block's is, and one `owned_local_pages` translation serves both ends of every
-row: a rank keeps the rows it owns and translates both ids to local pages, a
+`AcquireHostSegments`, `AcquireBlocksInBuckets`, `TakeImage`, `Restore`),
+so `(src - 1) % D == (dst - 1) % D` for every row; `TierTransferManager`
+asserts it when it builds a batch. A Host block's residue is therefore its
+owner exactly as a Device block's is, and one `owned_local_pages`
+translation serves both ends of every row: a rank keeps the rows it owns
+and translates both ids to local pages, a
 replicated group (`D = 1`) owns every row. L3 probes replica-stable keys on
 all owners, then reads or writes only the Host blocks this rank owns. A rank
 with no local bytes reports neutral success and proven retirement, performs

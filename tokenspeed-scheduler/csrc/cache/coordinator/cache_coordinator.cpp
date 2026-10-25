@@ -60,6 +60,7 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         const std::int32_t group_block_granularity = groups_[i].Spec().block_granularity;
         if (groups_[i].Spec().attn_kind == AttnKind::kState) {
             _assert(group_block_granularity == 0, "a State group has no token span");
+            ++num_state_groups_;
         } else {
             _assert(group_block_granularity > 0 && prefix_granularity_ % group_block_granularity == 0,
                     "group block_granularity must be a positive divisor of the prefix granularity");

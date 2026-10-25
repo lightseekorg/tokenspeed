@@ -401,8 +401,17 @@ public:
     struct HostEvictionStats {
         // AcquireHostBlocks' global LRU took it, as one child or with a whole
         // parent, whoever asked (a publication, finish or retraction store, an
-        // L3 prefetch).
+        // L3 prefetch), or a segment plan (AcquireHostSegments) took it as
+        // Host-only cache.
         HostEvictionCounts lru;
+        // A segment plan took it as a duplicate of a boundary the Device
+        // resumes.
+        HostEvictionCounts duplicate;
+        // A segment plan took it as a checkpoint boundary a deeper Device one
+        // supersedes.
+        HostEvictionCounts superseded;
+        // A segment plan took it as a dead entry.
+        HostEvictionCounts dead_entry;
         // The per-prior tail cap dropped its tail, entry by entry after the
         // tail's Device blocks (device_resident when the Device kept a pinned
         // companion).
@@ -438,9 +447,45 @@ public:
     // shortfall leaves an empty reference. Evicting a State checkpoint takes
     // the other State groups' at its hash along; every block retries free
     // capacity before it picks a victim, so it places in the room such a
-    // cascade freed before another victim goes.
+    // cascade freed before another victim goes. Block by block: it serves
+    // publication and finish stores, retraction images and L3 prefetches;
+    // the Host blocks of what an eviction writes back come from
+    // AcquireHostSegments.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
+    // One segment of an AcquireHostSegments batch: rows [first_row,
+    // past_end_row) of its group_ids and buckets.
+    struct HostSegmentRows {
+        std::size_t first_row{0};
+        std::size_t past_end_row{0};
+    };
+    // Host blocks for segments that must arrive whole, each block in the
+    // bucket of the Device block it mirrors. The segments cover the rows in
+    // order, the one to keep first. It plans, then evicts, then allocates:
+    // the rows of every segment fit jointly against the capacity the chosen
+    // victims leave, a segment is placed whole or not at all -- the last ones
+    // go while the rest cannot fit -- and nothing is evicted that the placed
+    // segments do not need. A victim is a Host checkpoint boundary (a
+    // BoundaryTree node with has_checkpoint set on the Host: some State group
+    // holds a checkpoint there; one missing another group's is dead) with the
+    // Host pages above it that only it depends on, up to one in use, and the
+    // Host pages under them, or only its checkpoints while deeper Host
+    // checkpoint boundaries still read its page; a Host page no Host checkpoint
+    // boundary depends on (without State groups: a page no Host page continues,
+    // a Host leaf) goes with the Host pages under it. One member in use passes the whole
+    // victim over. Victims go by class: dead entries (a checkpoint boundary
+    // missing a State group's checkpoint, a tail no probe enumerates, a page no
+    // Host checkpoint boundary depends on) first; then duplicates of a boundary
+    // the Device resumes and checkpoint boundaries a deeper Device checkpoint
+    // boundary on their chain supersedes, the newest Device copy first; then
+    // Host-only cache, least recently used first. Once a victim took every Host
+    // page under the page above it, that page is a candidate too. The restore
+    // pass then returns, newest first, each victim the placed segments can do
+    // without and whose parent page stays. A dropped segment's rows hold empty
+    // references.
+    HostAllocationBatch AcquireHostSegments(std::span<const std::uint32_t> group_ids,
+                                            std::span<const std::int32_t> buckets,
+                                            std::span<const HostSegmentRows> segments);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket);
     CacheBlockRef FindHostCachedBlock(const CacheKey& key) const;
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
@@ -787,6 +832,9 @@ private:
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
     std::int32_t replay_window_tokens_{0};
+    // How many groups are State groups. With any, a boundary serves a resume
+    // only with a checkpoint boundary at or under it.
+    std::int32_t num_state_groups_{0};
     std::uint64_t next_access_epoch_{0};
     struct HostParentCandidate {
         std::uint64_t newest_access_epoch{0};
