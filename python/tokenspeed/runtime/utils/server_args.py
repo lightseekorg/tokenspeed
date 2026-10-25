@@ -3411,7 +3411,9 @@ class ServerArgs:
             "temperature; greedy rows stay argmax) and verify accepts with "
             "coin * q(x) < p(x) instead of the target-only rule. Needs EAGLE3 "
             "or MTP with --speculative-eagle-topk 1 and the flashinfer or "
-            "flashinfer_full sampling backend; refused on the prefill role of "
+            "flashinfer_full sampling backend, or EAGLE4 on EAGLE-Harness "
+            "(--speculative-exec-mode 0 or 1, trees or chains) and the "
+            "flashinfer backend; refused on the prefill role of "
             "a disaggregated deployment. Costs a per-request fp32 draft "
             "distribution buffer; see docs/configuration/server.md.",
         )

@@ -615,7 +615,7 @@ parser option keeps its existing behavior.
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
-| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees (see below). Off by default. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees and chains (see below). Off by default. |
 | `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
@@ -730,7 +730,7 @@ run on the draft-tree path and share its requirements, with these limits:
 - `--speculative-num-steps` 2 to 32 (64 when measuring), with
   `(steps - 1) * topk` at most 128 and `1 + topk + (steps - 1) * topk^2` at
   most 1024.
-- `--enable-speculative-sampling` samples harness trees (not chains, and not
+- `--enable-speculative-sampling` samples harness trees and chains (not
   when measuring) and needs `--sampling-backend flashinfer`, which accepts
   them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
 
