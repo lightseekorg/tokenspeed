@@ -6,7 +6,10 @@
     "python/pyproject.toml",
     "ci/npu_ops_test/**",
     ".github/workflows/pr-test-ascendnpu-arm.yml",
-    "test/ci_system/*ascend*"
+    ".github/workflows/run-ci-task-matrix.yml",
+    "test/ci_system/*ascend*",
+    "test/ci/ut/npu-operators.yaml",
+    "test/ci_system/pipeline.py"
   ],
   "expected_plans": "ci/npu_ops_test/expected-plans.json",
   "execution": {

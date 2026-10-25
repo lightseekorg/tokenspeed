@@ -328,6 +328,7 @@ def test_packed_refresh_positions_padding_and_token_count(
             torch.tensor([129 + verify_width, 3 + verify_width]),
             ForwardMode.DECODE,
             use_graph=for_graph_replay,
+            settle=lambda: None,
             block_tables=tables,
         )
         assert backend.query_metadata(ForwardMode.DECODE) is meta
@@ -1127,7 +1128,7 @@ def test_dspark_windows_join_the_swa_group():
     )
 
     contract, _ = build_arena_cache_transfer_contract(_pool(recipe, "cpu").arena)
-    assert {f.field_id for f in contract.fields_for_group(SWA)} >= {
+    assert _group_fields(contract, SWA) >= {
         f"layer.39.dspark_kv{stage}" for stage in range(3)
     }
     recipe.server_args.speculative_algorithm = None
@@ -1139,16 +1140,20 @@ def test_dspark_windows_join_the_swa_group():
         recipe.groups()
 
 
-@pytest.mark.parametrize("dspark", [False, True])
-def test_pd_contract_plan_and_manifest(dspark):
-    import numpy as np
+def _group_fields(contract, group_id: str) -> set[str]:
+    return {
+        field.field_id for field in contract.plan.fields if field.group_id == group_id
+    }
 
+
+@pytest.mark.parametrize("dspark", [False, True])
+def test_pd_contract_describes_every_group_and_field(dspark):
+    """The contract a V4.1 rank publishes: the engine host plans its routes,
+    manifests and copies (``ts-pd``, whose planning fixtures include this
+    contract's)."""
     from tokenspeed.runtime.pd.cache_protocol import (
         build_arena_cache_transfer_contract,
-        build_cache_block_manifest,
-        validate_cache_peer_layout,
     )
-    from tokenspeed.runtime.pd.transfer_plan import CacheTransferPlanner
 
     recipe = _dspark_recipe("cpu") if dspark else _recipe("cpu")
     recipe.attn_config = replace(recipe.attn_config, pd_disaggregation_enabled=True)
@@ -1156,7 +1161,6 @@ def test_pd_contract_plan_and_manifest(dspark):
     assert pool.arena.supports_disaggregation is True
     contract, base_addr = build_arena_cache_transfer_contract(pool.arena)
     assert base_addr == pool.arena.buffer.data_ptr()
-    validate_cache_peer_layout(contract, contract)
     assert [spec.group_id for spec in contract.group_specs] == [SWA, R2, R1, TAIL]
     # The replayable groups keep their declaration under PD (a peer that
     # cached them would disagree on what a hit means) and travel as ordinary
@@ -1166,79 +1170,16 @@ def test_pd_contract_plan_and_manifest(dspark):
     for gid in (SWA, TAIL):
         assert specs_by_id[gid].replayable
     assert all(spec.transfer_policy == "full_suffix" for spec in contract.group_specs)
-    cached_peer = replace(
-        contract,
-        group_specs=tuple(
-            replace(spec, replayable=False) if spec.group_id == SWA else spec
-            for spec in contract.group_specs
-        ),
-    )
-    with pytest.raises(Exception, match="semantics"):
-        validate_cache_peer_layout(contract, cached_peer)
     swa_fields = {f"layer.{i}.swa" for i in range(40)}
     if dspark:
         swa_fields.update(f"layer.39.dspark_kv{stage}" for stage in range(3))
-    assert {f.field_id for f in contract.fields_for_group(SWA)} == swa_fields
-    assert {f.field_id for f in contract.fields_for_group(R2)} == {
+    assert _group_fields(contract, SWA) == swa_fields
+    assert _group_fields(contract, R2) == {
         f"layer.{o}.{name}" for o in (2, 8, 14) for name in ("global_kv", "index_k")
     }
-    assert {f.field_id for f in contract.fields_for_group(TAIL)} == {
+    assert _group_fields(contract, TAIL) == {
         f"layer.{o}.compressor_tail" for o in (2, 8, 14)
     }
-    # No V4.1 field is head-sharded, so unequal TP copies whole fields from
-    # one replicated source rank per decode rank.
-    planner = CacheTransferPlanner(
-        prefill_tp_size=4,
-        decode_tp_size=2,
-        prefill_layout=contract,
-        decode_layout=contract,
-        # A single-stage prefill owns every field.
-        prefill_field_ids=None,
-    )
-    for decode_rank, source in ((0, 0), (1, 2)):
-        plan = planner.plan_for_decode_rank(decode_rank)
-        assert plan.target_prefill_ranks == (source,)
-        fragments = plan.fragments_by_prefill_rank[source]
-        assert len(fragments) == len(contract.plan.fields)
-        by_field = {f.field_id: f for f in contract.plan.fields}
-        assert all(
-            fragment.rows_per_page == 1
-            and fragment.bytes_per_row == by_field[fragment.field_id].payload_bytes
-            for fragment in fragments
-        )
-
-    # An odd prompt leaves an unfinished ratio-2 pair: its input lives in the
-    # compressor tail, so the tail and the last global_r2 page must both ship.
-    prompt_len, prefix_len = 4097, 3840
-    tables = {}
-    for spec in contract.group_specs:
-        columns = prompt_len // spec.block_granularity + 2
-        capacity = contract.plan.group(spec.group_id).page_count
-        # Any non-null page ID inside the group's capacity is a valid block.
-        tables[spec.group_id] = (
-            1 + np.arange(2 * columns).reshape(2, columns) % (capacity - 1)
-        ).astype(np.int32)
-    manifest = build_cache_block_manifest(
-        SimpleNamespace(block_tables_arrays=lambda: tables),
-        layout=contract,
-        request_row=1,
-        prefix_len=prefix_len,
-        prompt_len=prompt_len,
-        state_prefix_cached=False,
-    )
-    blocks = {group.group_id: group.block_ids for group in manifest.groups}
-    specs = {spec.group_id: spec for spec in contract.group_specs}
-
-    def logical(gid, begin, end):
-        return tuple(int(tables[gid][1, slot]) for slot in range(begin, end))
-
-    assert blocks[R2] == logical(R2, prefix_len // 128, (prompt_len + 127) // 128)
-    assert blocks[R1] == logical(R1, prefix_len // 64, (prompt_len + 63) // 64)
-    swa_begin = (prompt_len - specs[SWA].sliding_window_tokens + 1) // 64
-    assert blocks[SWA] == logical(SWA, swa_begin, (prompt_len + 63) // 64)
-    tail_begin = (prompt_len - specs[TAIL].sliding_window_tokens + 1) // 2
-    assert blocks[TAIL] == logical(TAIL, tail_begin, (prompt_len + 1) // 2)
-    assert (prompt_len - 1) // 2 in range(tail_begin, (prompt_len + 1) // 2)
 
 
 @pytest.mark.parametrize("cache_format", ["v41", "v4"])
@@ -1504,6 +1445,7 @@ def test_target_runner_refresh_omits_num_extends_after_mixed_metadata():
             seq_lens,
             ForwardMode.DECODE,
             use_graph=False,
+            settle=lambda: None,
             block_tables=tables,
         )
         meta = backend.query_metadata(ForwardMode.DECODE)

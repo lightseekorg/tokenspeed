@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
+    from tokenspeed.runtime.sampling.sampling_params import SamplingParams
 
 
 class BaseDrafter:
@@ -322,6 +323,44 @@ class BaseDrafter:
         accept_lengths: torch.Tensor,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+    def rewrite_verify_outputs(
+        self,
+        ctx: ForwardContext,
+        output_tokens: torch.Tensor,
+        accept_lengths: torch.Tensor,
+    ) -> None:
+        """Rewrite the verify's outputs in place before anything reads them."""
+
+    def prepare_round_sampling(
+        self, sampling_params_list: list[SamplingParams]
+    ) -> None:
+        """Take the forward's sampling parameters before it runs (host-side).
+        Default: ignored."""
+
+    def replay_decode_graph(
+        self, graph: torch.cuda.CUDAGraph, *, bs: int, graph_bs: int
+    ) -> None:
+        """Replay the target's decode graph for ``bs`` live requests padded to
+        ``graph_bs``, the forward's stream ordered after it; a drafter may
+        start its round behind it on another stream. Default: replays it on
+        the current stream."""
+        del bs, graph_bs
+        graph.replay()
+
+    def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
+        """Draft after the forward at its decode graph's padded batch (None: eager)."""
+
+    def complete_round(self) -> None:
+        """Finish a round ``finish_round`` left pending (the next round's inputs)."""
+
+    def capture_round_graphs(
+        self, graph_bs: int, *, stream: torch.cuda.Stream, pool: tuple[int, int]
+    ) -> None:
+        """Capture ``finish_round``'s graphs at a decode graph's padded batch."""
+
+    def release_round_graphs(self) -> None:
+        """Drop the graphs ``capture_round_graphs`` recorded (they name the cache pool)."""
 
     @abstractmethod
     def draft(self, *args, **kwargs) -> torch.Tensor | None:

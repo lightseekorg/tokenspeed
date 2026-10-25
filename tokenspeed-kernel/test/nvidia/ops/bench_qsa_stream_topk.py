@@ -22,6 +22,9 @@
 
 The benchmark clears the device cache before every invocation. CUDA events
 bracket only score/top-k, so cache clearing is not included in reported time.
+Unequal ``--query-lengths`` use ragged runs; equal lengths select uniform runs.
+Use ``--max-partial-mb 0`` to benchmark the workspace-free grouped fallback.
+KV token counts may leave an incomplete ratio-four compressed block.
 """
 
 from __future__ import annotations
@@ -42,17 +45,35 @@ from tokenspeed_kernel.platform import pdl_enabled
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, required=True)
-    parser.add_argument("--pages", type=int, required=True)
+    parser.add_argument(
+        "--pages",
+        type=int,
+        required=True,
+        help="Per-request page-table capacity in 64-block compressed pages",
+    )
     parser.add_argument(
         "--kv-tokens",
         type=int,
         help="Live uncompressed KV length; omission uses the page-table capacity",
     )
-    parser.add_argument("--queries-per-request", type=int, required=True)
+    layout = parser.add_mutually_exclusive_group(required=True)
+    layout.add_argument("--queries-per-request", type=int)
+    layout.add_argument(
+        "--query-lengths",
+        type=int,
+        nargs="+",
+        help="Consecutive request query counts; equal lengths select uniform, unequal lengths ragged",
+    )
     parser.add_argument(
         "--solution", choices=("auto", "cute_dsl", "triton", "logits"), required=True
     )
     parser.add_argument("--max-logits-mb", type=int, required=True)
+    parser.add_argument(
+        "--max-partial-mb",
+        type=int,
+        required=True,
+        help="Streaming scratch budget in MiB; zero disables split scratch",
+    )
     parser.add_argument("--timing", choices=("eager", "graph"), required=True)
     parser.add_argument("--frontier", choices=("full", "causal"), required=True)
     parser.add_argument("--distribution", choices=("random", "ties"), required=True)
@@ -170,8 +191,18 @@ def main() -> None:
         raise ValueError("rows and pages must be positive")
     if args.warmups < 1 or args.iterations < 1:
         raise ValueError("warmups and iterations must be positive")
-    if args.queries_per_request < 1 or args.rows % args.queries_per_request:
-        raise ValueError("queries-per-request must be positive and divide rows")
+    if args.max_partial_mb < 0:
+        raise ValueError("max-partial-mb must be non-negative")
+    if args.query_lengths is not None:
+        lengths = args.query_lengths
+        if min(lengths) < 1 or sum(lengths) != args.rows:
+            raise ValueError("query-lengths must be positive and sum to rows")
+        width = lengths[0] if len(set(lengths)) == 1 else None
+    else:
+        width = args.queries_per_request
+        if width < 1 or args.rows % width:
+            raise ValueError("queries-per-request must be positive and divide rows")
+        lengths = [width] * (args.rows // width)
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         raise RuntimeError("QSA stream score/top-k benchmark requires Blackwell")
 
@@ -181,12 +212,10 @@ def main() -> None:
     page_size = 64
     block_topk = 512
     head_dim = 128
-    requests = args.rows // args.queries_per_request
+    requests = len(lengths)
     kv_tokens = args.pages * page_size * 4 if args.kv_tokens is None else args.kv_tokens
-    if kv_tokens < 1 or kv_tokens % 4 or kv_tokens > args.pages * page_size * 4:
-        raise ValueError(
-            "kv-tokens must fit the table capacity and be divisible by four"
-        )
+    if kv_tokens < 1 or kv_tokens > args.pages * page_size * 4:
+        raise ValueError("kv-tokens must be positive and fit the table capacity")
     live_blocks = kv_tokens // 4
     live_pages = math.ceil(live_blocks / page_size)
     query_storage = torch.randn(
@@ -211,7 +240,7 @@ def main() -> None:
     ).reshape(requests, live_pages)
     request_indices = torch.arange(
         requests, dtype=torch.int32, device=device
-    ).repeat_interleave(args.queries_per_request)
+    ).repeat_interleave(torch.tensor(lengths, device=device))
     complete_blocks = torch.full(
         (args.rows,),
         live_blocks,
@@ -221,14 +250,18 @@ def main() -> None:
     if args.frontier == "causal":
         # A ratio-four compressed cache: a fresh prefill completes one block
         # per four tokens. Shorter chunks start after a cached prefix.
-        positions = torch.arange(
-            args.queries_per_request, device=device, dtype=torch.int32
-        )
-        prefix_tokens = max(0, kv_tokens - args.queries_per_request)
-        complete_blocks = (
-            ((prefix_tokens + positions + 1) // 4)
-            .clamp_max(live_blocks)
-            .repeat(requests)
+        complete_blocks = torch.cat(
+            [
+                (
+                    (
+                        max(0, kv_tokens - length)
+                        + torch.arange(length, device=device, dtype=torch.int32)
+                        + 1
+                    )
+                    // 4
+                ).clamp_max(live_blocks)
+                for length in lengths
+            ]
         )
     enable_pdl = args.pdl == "on"
     pdl_enabled(enable_pdl)
@@ -243,8 +276,8 @@ def main() -> None:
             *tensors,
             page_size=page_size,
             block_topk=block_topk,
-            queries_per_request=args.queries_per_request,
-            max_partial_bytes=32 * 1024 * 1024,
+            queries_per_request=width,
+            max_partial_bytes=args.max_partial_mb << 20,
             max_logits_bytes=args.max_logits_mb << 20,
             path=path,
             solution=backend,
@@ -328,8 +361,10 @@ def main() -> None:
                 "blocks": args.pages * page_size,
                 "kv_tokens": kv_tokens,
                 "physical_key_pages": key_cache.shape[0] // page_size,
-                "queries_per_request": args.queries_per_request,
+                "queries_per_request": width,
+                "query_lengths": args.query_lengths,
                 "max_logits_mb": args.max_logits_mb,
+                "max_partial_mb": args.max_partial_mb,
                 "pdl": enable_pdl,
                 "warmups": args.warmups,
                 "iterations": args.iterations,

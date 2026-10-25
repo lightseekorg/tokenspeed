@@ -23,54 +23,105 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, triton
 
-_BLOCK_K = 256
+# Rows above this go to torch.matmul.
+MAX_ROWS = 16
+# A program stages its whole weight row in LDS; longer rows go to torch.matmul.
+MAX_K = 16384
 _NUM_WARPS = 4
-_SUBGROUP_SIZE = 64
+# K values a lane reads per load (16 bytes).
+_VECTOR = 4
+
+
+def _launch_metadata(grid, kernel, args):
+    """Report weight, activation and output traffic to Proton."""
+    m, n, k = args["M"], args["N"], args["K"]
+    return {
+        "name": kernel.name,
+        "flops32": 2 * m * n * k,
+        "bytes": (n * k + m * k + m * n) * 4,
+    }
 
 
 @gluon.jit
-def _fp32_router_gemv_kernel(
+def _load_x_step(x_ptr, x_offs, row_mask, k, step, K: gl.constexpr, STEP: gl.constexpr):
+    """Load K step ``step`` of every row's activations, zero past ``K``."""
+    return gl.amd.cdna4.buffer_load(
+        x_ptr,
+        x_offs + step * STEP,
+        mask=row_mask & (k + step * STEP < K)[None, :],
+        other=0.0,
+    )
+
+
+@gluon.jit(launch_metadata=_launch_metadata, do_not_specialize=("M",))
+def gluon_fp32_router_gemv_gfx950(
     x_ptr,
     weight_ptr,
     out_ptr,
+    M,
     K: gl.constexpr,
     N: gl.constexpr,
-    BLOCK_K: gl.constexpr,
-    NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    VECTOR: gl.constexpr,
     MULTIPLIER: gl.constexpr,
 ):
     output = gl.program_id(0)
-    row = gl.program_id(1)
+    # [rows, K step]: a lane holds VECTOR contiguous K values of every row.
     layout: gl.constexpr = gl.BlockedLayout(
-        [BLOCK_K // (SUBGROUP_SIZE * NUM_WARPS)],
-        [SUBGROUP_SIZE],
-        [NUM_WARPS],
-        [0],
+        [BLOCK_M, VECTOR], [1, 64], [1, gl.num_warps()], [1, 0]
     )
-    offsets = gl.arange(0, BLOCK_K, layout=layout)
-    accumulator = gl.zeros((BLOCK_K,), gl.float32, layout=layout)
-    for start in range(0, K, BLOCK_K):
-        columns = start + offsets
-        valid = columns < K
-        x = gl.amd.cdna4.buffer_load(
-            x_ptr,
-            row * K + columns.to(gl.int32),
-            mask=valid,
-            other=0.0,
-        )
-        weight = gl.amd.cdna4.buffer_load(
+    STEP: gl.constexpr = VECTOR * 64 * gl.num_warps()
+    STEPS: gl.constexpr = (K + STEP - 1) // STEP
+    k = gl.arange(0, STEP, gl.SliceLayout(0, layout))
+    rows = gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
+    row_mask = (rows < M)[:, None]
+    x_offs = rows[:, None] * K + k[None, :]
+    w_offs = output * K + k
+
+    # The whole weight row goes to LDS at once, one commit group per step, so
+    # all of it is in flight; each lane later reads back only what it copied.
+    smem = gl.allocate_shared_memory(
+        weight_ptr.dtype.element_ty,
+        [STEPS, STEP],
+        gl.SwizzledSharedLayout(1, 1, 1, [0]),
+    )
+    for step in gl.static_range(STEPS):
+        gl.amd.cdna4.async_copy.buffer_load_to_shared(
+            smem.index(step),
             weight_ptr,
-            (output * K + columns).to(gl.int32),
-            mask=valid,
-            other=0.0,
-            cache=".cg",
+            w_offs + step * STEP,
+            mask=k + step * STEP < K,
+            cache_modifier=".cg",
         )
-        accumulator += x * weight
-    result = gl.sum(accumulator, axis=0) * MULTIPLIER
-    gl.store(out_ptr + row * N + output, result)
+        gl.amd.cdna4.async_copy.commit_group()
+    x = _load_x_step(x_ptr, x_offs, row_mask, k, 0, K, STEP)
+    acc = gl.zeros((BLOCK_M, STEP), gl.float32, layout)
+    # Unrolled, with the next step's activations in flight during this step's
+    # FMAs; a loop-carried copy of a pending load would wait for it.
+    for step in gl.static_range(STEPS):
+        if step + 1 < STEPS:
+            x_next = _load_x_step(x_ptr, x_offs, row_mask, k, step + 1, K, STEP)
+        gl.amd.cdna4.async_copy.wait_group(STEPS - 1 - step)
+        w = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            smem.index(step), gl.SliceLayout(0, layout)
+        )
+        acc = gl.fma(x, w[None, :], acc)
+        # Pin this step's FMAs here: left free, the compiler sinks them below
+        # the last load and keeps every step's activations live at once.
+        acc = gl.inline_asm_elementwise(
+            asm="",
+            constraints="=v,0",
+            args=[acc],
+            dtype=gl.float32,
+            is_pure=False,
+            pack=1,
+        )
+        if step + 1 < STEPS:
+            x = x_next
+    result = gl.sum(acc, axis=1) * MULTIPLIER
+    gl.store(out_ptr + rows * N + output, result, mask=rows < M)
 
 
 def transpose_fp32_router_weight_gfx950(weight: torch.Tensor) -> torch.Tensor:
@@ -80,14 +131,26 @@ def transpose_fp32_router_weight_gfx950(weight: torch.Tensor) -> torch.Tensor:
     return weight.T.contiguous()
 
 
-def gluon_fp32_router_gemv_gfx950(
+def launch_gluon_fp32_router_gemv_gfx950(
     x: torch.Tensor,
     weight: torch.Tensor,
     multiplier: float,
-    counters: torch.Tensor,
     enable_pdl: bool,
 ) -> torch.Tensor:
-    """Project up to two FP32 decode rows through a transposed router weight."""
+    """Project up to ``MAX_ROWS`` FP32 decode rows through a transposed router weight.
+
+    More rows, or rows longer than ``MAX_K``, take ``torch.matmul``.
+
+    Args:
+        x: Contiguous FP32 ``[M, K]`` rows.
+        weight: Contiguous FP32 ``[N, K]`` weight from
+            :func:`transpose_fp32_router_weight_gfx950`.
+        multiplier: Scale applied to every logit.
+        enable_pdl: Accepted for the registry signature; unused.
+
+    Returns:
+        FP32 ``[M, N]`` logits.
+    """
     del enable_pdl
     if (
         x.ndim != 2
@@ -104,27 +167,23 @@ def gluon_fp32_router_gemv_gfx950(
         or not weight.is_contiguous()
     ):
         raise ValueError("weight must be contiguous transposed FP32 [N, K] beside x")
-    if (
-        counters.dtype != torch.int32
-        or counters.device != x.device
-        or counters.numel() != (weight.shape[0] + 31) // 32
-    ):
-        raise ValueError("counters must match the router output width")
-    rows = x.shape[0]
+    rows, k = x.shape
     if rows == 0:
         return x.new_empty((0, weight.shape[0]))
-    if rows > 2:
+    if rows > MAX_ROWS or k > MAX_K:
         return torch.matmul(x, weight.T) * multiplier
     out = torch.empty((rows, weight.shape[0]), dtype=x.dtype, device=x.device)
-    _fp32_router_gemv_kernel[(weight.shape[0], rows)](
+    gluon_fp32_router_gemv_gfx950[(weight.shape[0],)](
         x,
         weight,
         out,
-        K=x.shape[1],
+        rows,
+        K=k,
         N=weight.shape[0],
-        BLOCK_K=_BLOCK_K,
-        NUM_WARPS=_NUM_WARPS,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
+        # Bucketed so at most five variants compile per (K, N).
+        BLOCK_M=triton.next_power_of_2(rows),
+        # Scalar loads keep K values that are not 16-byte aligned addressable.
+        VECTOR=_VECTOR if k % _VECTOR == 0 else 1,
         MULTIPLIER=float(multiplier),
         num_warps=_NUM_WARPS,
     )
@@ -132,6 +191,6 @@ def gluon_fp32_router_gemv_gfx950(
 
 
 __all__ = [
-    "gluon_fp32_router_gemv_gfx950",
+    "launch_gluon_fp32_router_gemv_gfx950",
     "transpose_fp32_router_weight_gfx950",
 ]

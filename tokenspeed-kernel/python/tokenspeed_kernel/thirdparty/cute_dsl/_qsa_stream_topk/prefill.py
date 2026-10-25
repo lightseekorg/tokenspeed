@@ -29,7 +29,8 @@ from cutlass import cute, pipeline, utils
 from cutlass._mlir.dialects import llvm as _llvm
 from cutlass.cute.nvgpu import OperandMajorMode, cpasync, tcgen05
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_stream_topk.common import (
-    _copy_u128 as _copy_gmem_to_smem_u128,
+    QueryGroups,
+    _copy_u128,
 )
 
 _QUERY_GROUP = 8
@@ -48,9 +49,10 @@ _TOPK_FIRST_WARP = 8
 _MMA_WARP = _TOPK_FIRST_WARP + _QUERY_GROUP * _SELECTOR_WARPS_PER_ROW
 
 
-class PrefillTopK:
-    def __init__(self, enable_pdl: bool):
+class PrefillTopK(QueryGroups):
+    def __init__(self, enable_pdl: bool, group_layout: str):
         self.enable_pdl = enable_pdl
+        self.group_layout = group_layout
         self.query_group = _QUERY_GROUP
         self.stream_tile = _STREAM_TILE
         self.selector_warps_per_row = _SELECTOR_WARPS_PER_ROW
@@ -75,6 +77,7 @@ class PrefillTopK:
         selected: cute.Tensor,
         q_stride_row: cutlass.Int32,
         q_stride_head: cutlass.Int32,
+        queries_per_request: cutlass.Int32,
         page_size: cutlass.Constexpr[int],
         stream: cuda.CUstream,
     ):
@@ -112,9 +115,10 @@ class PrefillTopK:
             selected,
             q_stride_row,
             q_stride_head,
+            queries_per_request,
             page_size,
         ).launch(
-            grid=(query.shape[0] // self.query_group, 1, 1),
+            grid=(self._group_count(query.shape[0], queries_per_request), 1, 1),
             block=(self.threads, 1, 1),
             stream=stream,
             min_blocks_per_mp=1,
@@ -713,6 +717,49 @@ class PrefillTopK:
         selected: cute.Tensor,
         q_stride_row: cutlass.Int32,
         q_stride_head: cutlass.Int32,
+        queries_per_request: cutlass.Int32,
+        page_size: cutlass.Constexpr[int],
+    ):
+        block_idx, _, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.enable_pdl and self.group_layout == "ragged"):
+            cute.arch.griddepcontrol_wait()
+        row_base, valid_rows = self._query_group(
+            request_indices, query.shape[0], queries_per_request, block_idx
+        )
+        if valid_rows > 0:
+            self._run_group(
+                tiled_mma,
+                smem_layout_k,
+                smem_layout_q,
+                query,
+                keys,
+                page_table,
+                request_indices,
+                complete_blocks,
+                selected,
+                q_stride_row,
+                q_stride_head,
+                row_base,
+                valid_rows,
+                page_size,
+            )
+
+    @cute.jit
+    def _run_group(
+        self,
+        tiled_mma: cute.TiledMma,
+        smem_layout_k: cute.ComposedLayout,
+        smem_layout_q: cute.ComposedLayout,
+        query: cute.Tensor,
+        keys: cute.Tensor,
+        page_table: cute.Tensor,
+        request_indices: cute.Tensor,
+        complete_blocks: cute.Tensor,
+        selected: cute.Tensor,
+        q_stride_row: cutlass.Int32,
+        q_stride_head: cutlass.Int32,
+        row_base: cutlass.Int32,
+        valid_rows: cutlass.Int32,
         page_size: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -721,14 +768,16 @@ class PrefillTopK:
         warp_idx = cute.arch.make_warp_uniform(tidx // 32)
         warpgroup_idx = cute.arch.make_warp_uniform(tidx // 128)
         warpgroup_tidx = tidx % 128
-        row_base = block_idx * self.query_group
+        # Preserve the aligned row arithmetic through the grouped helper.
+        if cutlass.const_expr(self.group_layout == "aligned"):
+            row_base = block_idx * self.query_group
         num_blocks = page_table.shape[1] * page_size
 
-        if cutlass.const_expr(self.enable_pdl):
+        if cutlass.const_expr(self.enable_pdl and self.group_layout != "ragged"):
             cute.arch.griddepcontrol_wait()
         frontier = cutlass.Int32(0)
         for row in cutlass.range_constexpr(self.query_group):
-            count = complete_blocks[row_base + row]
+            count = self._row_complete(complete_blocks, row_base, row, valid_rows)
             if count > frontier:
                 frontier = count
         if frontier > num_blocks:
@@ -742,11 +791,20 @@ class PrefillTopK:
                 if index < self.query_group * _TOPK:
                     query_row = index // _TOPK
                     block_id = index % _TOPK
-                    count = complete_blocks[row_base + query_row]
+                    count = self._row_complete(
+                        complete_blocks, row_base, query_row, valid_rows
+                    )
                     value = cutlass.Int32(-1)
                     if block_id < count and block_id < num_blocks:
                         value = block_id
-                    selected[row_base + query_row, block_id] = value
+                    self._store_selected(
+                        selected,
+                        row_base + query_row,
+                        block_id,
+                        value,
+                        row_base,
+                        valid_rows,
+                    )
             cute.arch.sync_threads()
             if cutlass.const_expr(self.enable_pdl):
                 cute.arch.griddepcontrol_launch_dependents()
@@ -848,7 +906,7 @@ class PrefillTopK:
 
             # Producers may release us before publishing Q or the row frontiers.
             # Wait before either read, including the asynchronous Q copy.
-            if cutlass.const_expr(self.enable_pdl):
+            if cutlass.const_expr(self.enable_pdl and self.group_layout != "ragged"):
                 cute.arch.griddepcontrol_wait()
 
             if warpgroup_idx == _K_COPY_WARPGROUP:
@@ -878,7 +936,7 @@ class PrefillTopK:
                         cute.AddressSpace.smem,
                         assumed_align=16,
                     )
-                    _copy_gmem_to_smem_u128(destination, source)
+                    self._copy_query(destination, source, q_row, valid_rows)
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.fence_view_async_shared()
@@ -902,7 +960,9 @@ class PrefillTopK:
                     if thread_in_row == 0:
                         for item in cutlass.range_constexpr(6):
                             scalars[row_in_group, item] = cutlass.Int32(0)
-                        row_complete = complete_blocks[row_base + row_in_group]
+                        row_complete = self._row_complete(
+                            complete_blocks, row_base, row_in_group, valid_rows
+                        )
                         if row_complete > num_blocks:
                             row_complete = cutlass.Int32(num_blocks)
                         row_completes[row_in_group] = row_complete
@@ -914,7 +974,9 @@ class PrefillTopK:
             request = request_indices[row_base]
             group_complete = cutlass.Int32(0)
             for query_row in cutlass.range_constexpr(self.query_group):
-                count = complete_blocks[row_base + query_row]
+                count = self._row_complete(
+                    complete_blocks, row_base, query_row, valid_rows
+                )
                 if count > group_complete:  # noqa: PLR1730
                     group_complete = count
             if group_complete > num_blocks:
@@ -979,7 +1041,7 @@ class PrefillTopK:
                                 cute.AddressSpace.smem,
                                 assumed_align=16,
                             )
-                            _copy_gmem_to_smem_u128(destination, source)
+                            _copy_u128(destination, source)
                         cute.arch.cp_async_commit_group()
                         cute.arch.cp_async_wait_group(0)
                         cute.arch.fence_view_async_shared()
@@ -1176,4 +1238,6 @@ class PrefillTopK:
                                 value = cutlass.Int32(
                                     running_values[item] & cutlass.Int64(0xFFFFFFFF)
                                 )
-                        selected_row[index] = value
+                        self._store_row(
+                            selected_row, index, value, row_in_group, valid_rows
+                        )

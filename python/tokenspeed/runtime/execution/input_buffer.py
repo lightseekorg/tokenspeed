@@ -55,8 +55,14 @@ class InputBuffers:
         max_num_tokens: int,
         state_write_padding_pool_index: int,
         device: str = "cuda",
+        reads_state_checkpoints: bool = False,
     ):
         self.device = device
+        # Whether the scheduler may give extend rows in-forward State
+        # checkpoints (--enable-state-checkpoint-in-forward), so the batch
+        # carries extend_state_checkpoint_lens (a scheduler build without the
+        # option has no such field).
+        self.reads_state_checkpoints = reads_state_checkpoints
         self.max_num_tokens = max_num_tokens
         self.state_write_padding_pool_index = state_write_padding_pool_index
         self.max_bs = max_bs
@@ -120,6 +126,9 @@ class InputBuffers:
         # and each request's whole prompt length (whether this chunk ends it).
         self.extend_replay_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self.extend_prompt_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
+        # Host-only: tokens of each extend row's chunk before its in-forward
+        # State checkpoint, 0 for none.
+        self.extend_state_checkpoint_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
 
     def prepare_request_token_history_inputs(
@@ -325,16 +334,19 @@ class InputBuffers:
     def _record_pad_tape(self) -> "PrepTape | None":
         """One launch for the whole padding-tail scrub.
 
-        The six fills below are independent and touch persistent buffers, so a
+        The fills below are independent and touch persistent buffers, so a
         tape records them once and replays them as a single kernel instead of
-        six launches on every step's critical path. Non-CUDA callers keep the
-        torch spelling.
+        one launch each on every step's critical path. Non-CUDA callers keep
+        the torch spelling.
         """
         if torch.device(self.device).type != "cuda":
             return None
         tape = PrepTape(self.device)
         tape.filltail(self.input_ids_buf, Reg.TOKENS, self.max_num_tokens, 1)
         tape.filltail(self.positions_buf, Reg.TOKENS, self.max_num_tokens, 0)
+        for row in self.mrope_positions_buf:
+            tape.filltail(row, Reg.TOKENS, self.max_num_tokens, 0)
+        tape.filltail(self.input_lengths_buf, Reg.BS, self.max_num_tokens, 0)
         tape.filltail(self.req_pool_indices_buf, Reg.BS, self.max_bs, 0)
         tape.filltail(
             self.state_write_req_pool_indices_buf,
@@ -391,9 +403,9 @@ class InputBuffers:
         forward_op,
         runtime_states: RuntimeStates,
         total_tokens: int,
-        *,
-        ngram_inputs: NGramInputs | None,
     ):
+        """The inputs the batch fixes on its own; a pending draft round reads
+        and writes none of them (see ``load_round_inputs``)."""
         batch_size = len(forward_op.request_ids)
         num_extends = forward_op.num_extends()
 
@@ -457,6 +469,10 @@ class InputBuffers:
             self.extend_prompt_lens_cpu[:num_extends] = torch.as_tensor(
                 forward_op.prefill_lengths[:num_extends], dtype=torch.int32
             )
+            if self.reads_state_checkpoints:
+                self.extend_state_checkpoint_lens_cpu[:num_extends] = torch.as_tensor(
+                    forward_op.extend_state_checkpoint_lens, dtype=torch.int32
+                )
             ext_prefix_cpu, ext_seq_cpu, ext_prompt_cpu = self._bulk_pinned(
                 (num_extends, torch.int32),
                 (num_extends, torch.int32),
@@ -476,63 +492,6 @@ class InputBuffers:
         # Get valid cache lengths for requests
         req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
         input_lengths_device = self.input_lengths_buf[:batch_size]
-
-        def write_decode_input_ids(
-            decode_req_pool_indices: torch.Tensor,
-            decode_input_ids: list[int],
-            row_offset: int,
-            expected_count: int,
-            context: str,
-        ) -> None:
-            if len(decode_input_ids) != expected_count:
-                raise RuntimeError(
-                    f"{context} decode_input_ids length mismatch: "
-                    f"got {len(decode_input_ids)}, expected {expected_count}"
-                )
-            decode_input_ids_tensor = torch.tensor(
-                decode_input_ids,
-                dtype=torch.int32,
-                device="cpu",
-                pin_memory=True,
-            ).to(req_pool_indices_device.device, non_blocking=True)
-            mask = (decode_input_ids_tensor != -1).unsqueeze(1)
-            ids = decode_input_ids_tensor.unsqueeze(1)
-
-            # Col 0: verified token (mask preserves drafter-owned rows).
-            first_slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
-            runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
-                mask, ids, first_slot
-            )
-            # Cols 1.. are real candidates only when the local drafter, the
-            # remote P-side path or a restored image populated them
-            # (``spec_candidates_ready``). Bootstrap rows with no candidate
-            # source still feed a full-width target forward, so use a valid
-            # dummy token in model inputs and force the verifier to consume
-            # only the first target token for those rows.
-            width = runtime_states.future_input_map.shape[1]
-            candidates_ready = runtime_states.spec_candidates_ready[
-                decode_req_pool_indices
-            ]
-            force_single_token = mask.squeeze(1) & ~candidates_ready
-            if width > 1:
-                tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
-                dummy_tail = ids.expand(-1, width - 1)
-                runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
-                    torch.where(force_single_token.unsqueeze(1), dummy_tail, tail)
-                )
-            if runtime_states.future_parent_map is not None:
-                parents = runtime_states.future_parent_map[decode_req_pool_indices]
-                runtime_states.future_parent_map[decode_req_pool_indices] = torch.where(
-                    force_single_token.unsqueeze(1),
-                    runtime_states.chain_parents,
-                    parents,
-                )
-            self.force_single_token_verify_buf[
-                row_offset : row_offset + expected_count
-            ] = force_single_token
-            runtime_states.spec_candidates_ready.index_fill_(
-                0, decode_req_pool_indices, False
-            )
 
         # Decode-only fast path: one fused Triton kernel writes positions and
         # seq_lens in a single launch and reads valid_cache_lengths[pool_idx]
@@ -601,6 +560,123 @@ class InputBuffers:
                     self.shifted_prefill_ids_buf[:prefill_token_count],
                     self.mm_pad_substitute_ids,
                 )
+
+        if valid_cache_lengths is not None:
+            torch.add(
+                input_lengths_device,
+                valid_cache_lengths,
+                out=self.seq_lens_buf[:batch_size],
+            )
+
+        # Refresh the padding tail of the persistent buffers every iteration.
+        # The captured graph replays at a padded batch size and DOES read the
+        # padded rows; a previous iter with a *larger* total_tokens / batch_size
+        # leaves stale values in the tail (per-request seq lengths, positions,
+        # token ids, req-pool slots). Reusing those for padded tokens forces
+        # attention to scan oversize ranges and -- for a stale out-of-range
+        # token id -- trips the embedding gather's device-side assert that
+        # tears the server down. The __init__ safe defaults (input_ids=1,
+        # req_pool=0, positions=0) are not enough on their own once a larger
+        # iter has overwritten the tail, so scrub it back here (cheap
+        # tail-only fills; the active prefix was written above).
+        if self._pad_tape is not None:
+            self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
+        else:
+            if total_tokens < self.max_num_tokens:
+                self.input_ids_buf[total_tokens:].fill_(1)
+                self.positions_buf[total_tokens:].fill_(0)
+                self.mrope_positions_buf[:, total_tokens:].zero_()
+            if batch_size < self.max_bs:
+                self.req_pool_indices_buf[batch_size:].fill_(0)
+                self.state_write_req_pool_indices_buf[batch_size:].fill_(
+                    self.state_write_padding_pool_index
+                )
+                self.seq_lens_buf[batch_size:].fill_(1)
+            self.input_lengths_buf[batch_size:].zero_()
+        return decode_input_ids
+
+    @nvtx_range("input_prep_load", color="cyan")
+    def load_round_inputs(
+        self,
+        forward_op,
+        runtime_states: RuntimeStates,
+        total_tokens: int,
+        decode_input_ids: list[int] | None,
+        *,
+        ngram_inputs: NGramInputs | None,
+    ) -> None:
+        """The inputs the previous draft round writes (decode ids, n-gram
+        inputs), after ``fill_input_buffers`` and once that round completes."""
+        batch_size = len(forward_op.request_ids)
+        num_extends = forward_op.num_extends()
+        req_pool_indices_device = self.req_pool_indices_buf[:batch_size]
+
+        def write_decode_input_ids(
+            decode_req_pool_indices: torch.Tensor,
+            decode_input_ids: list[int],
+            row_offset: int,
+            expected_count: int,
+            context: str,
+        ) -> None:
+            if len(decode_input_ids) != expected_count:
+                raise RuntimeError(
+                    f"{context} decode_input_ids length mismatch: "
+                    f"got {len(decode_input_ids)}, expected {expected_count}"
+                )
+            decode_input_ids_tensor = torch.tensor(
+                decode_input_ids,
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            ).to(req_pool_indices_device.device, non_blocking=True)
+            mask = (decode_input_ids_tensor != -1).unsqueeze(1)
+            ids = decode_input_ids_tensor.unsqueeze(1)
+
+            # Col 0: verified token (mask preserves drafter-owned rows).
+            first_slot = runtime_states.future_input_map[decode_req_pool_indices, :1]
+            runtime_states.future_input_map[decode_req_pool_indices, :1] = torch.where(
+                mask, ids, first_slot
+            )
+            # Cols 1.. are real candidates only when the local drafter, the
+            # remote P-side path or a restored image populated them
+            # (``spec_candidates_ready``). Bootstrap rows with no candidate
+            # source still feed a full-width target forward, so use a valid
+            # dummy token in model inputs and force the verifier to consume
+            # only the first target token for those rows.
+            width = runtime_states.future_input_map.shape[1]
+            candidates_ready = runtime_states.spec_candidates_ready[
+                decode_req_pool_indices
+            ]
+            force_single_token = mask.squeeze(1) & ~candidates_ready
+            if width > 1:
+                tail = runtime_states.future_input_map[decode_req_pool_indices, 1:]
+                dummy_tail = ids.expand(-1, width - 1)
+                runtime_states.future_input_map[decode_req_pool_indices, 1:] = (
+                    torch.where(force_single_token.unsqueeze(1), dummy_tail, tail)
+                )
+            if runtime_states.future_parent_map is not None:
+                parents = runtime_states.future_parent_map[decode_req_pool_indices]
+                runtime_states.future_parent_map[decode_req_pool_indices] = torch.where(
+                    force_single_token.unsqueeze(1),
+                    runtime_states.chain_parents,
+                    parents,
+                )
+            draft_q = runtime_states.future_draft_q
+            if draft_q is not None:
+                # The dummy chain's nodes are deterministic.
+                slots = draft_q.slot[decode_req_pool_indices]
+                draft_q.slot[decode_req_pool_indices] = torch.where(
+                    force_single_token.unsqueeze(1), -1, slots
+                )
+            self.force_single_token_verify_buf[
+                row_offset : row_offset + expected_count
+            ] = force_single_token
+            runtime_states.spec_candidates_ready.index_fill_(
+                0, decode_req_pool_indices, False
+            )
+
+        if num_extends > 0:
+            prefill_token_count = sum(forward_op.input_lengths[:num_extends])
             if num_extends < batch_size:
                 decode_req_pool_indices = req_pool_indices_device[
                     num_extends:batch_size
@@ -655,43 +731,6 @@ class InputBuffers:
         vocab_size = runtime_states.vocab_size
         self.fill_ngram_inputs(ngram_inputs, total_tokens, runtime_states, forward_op)
         self.input_ids_buf[:total_tokens].clamp_(0, vocab_size - 1)
-
-        if valid_cache_lengths is not None:
-            torch.add(
-                input_lengths_device,
-                valid_cache_lengths,
-                out=self.seq_lens_buf[:batch_size],
-            )
-
-        # Refresh the padding tail of the persistent buffers every iteration.
-        # The captured graph replays at a padded batch size and DOES read the
-        # padded rows; a previous iter with a *larger* total_tokens / batch_size
-        # leaves stale values in the tail (per-request seq lengths, positions,
-        # token ids, req-pool slots). Reusing those for padded tokens forces
-        # attention to scan oversize ranges and -- for a stale out-of-range
-        # token id -- trips the embedding gather's device-side assert that
-        # tears the server down. The __init__ safe defaults (input_ids=1,
-        # req_pool=0, positions=0) are not enough on their own once a larger
-        # iter has overwritten the tail, so scrub it back here (cheap
-        # tail-only fills; the active prefix was written above).
-        if self._pad_tape is not None:
-            self._pad_tape.run({Reg.TOKENS: total_tokens, Reg.BS: batch_size})
-            if total_tokens < self.max_num_tokens:
-                self.mrope_positions_buf[:, total_tokens:].zero_()
-        else:
-            if total_tokens < self.max_num_tokens:
-                self.input_ids_buf[total_tokens:].fill_(1)
-                self.positions_buf[total_tokens:].fill_(0)
-                self.mrope_positions_buf[:, total_tokens:].zero_()
-            if batch_size < self.max_bs:
-                self.req_pool_indices_buf[batch_size:].fill_(0)
-                self.state_write_req_pool_indices_buf[batch_size:].fill_(
-                    self.state_write_padding_pool_index
-                )
-                self.seq_lens_buf[batch_size:].fill_(1)
-
-        self.input_lengths_buf[batch_size:].zero_()
-        return decode_input_ids
 
     def fill_dummy_decode_buffers(self, batch_size: int, total_tokens: int):
         """Prepare padded decode graph inputs for a rank with no real tokens."""

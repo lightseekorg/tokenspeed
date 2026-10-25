@@ -49,6 +49,9 @@ from tokenspeed_kernel.platform import pdl_enabled
 
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.distributed.dp_sampling_comm import DpSamplingComm
+from tokenspeed.runtime.execution.drafter.eagle_harness.tree_verify import (
+    TreeRejectionSampler,
+)
 from tokenspeed.runtime.execution.slot_state import aligned_slot_state_bytes
 from tokenspeed.runtime.sampling.backends.base import (
     SPECULATIVE_ACCEPT_THRESHOLD_ACC,
@@ -63,6 +66,7 @@ from tokenspeed.runtime.sampling.dp_sampling_config import (
     slice_dp_vocab_mask,
 )
 from tokenspeed.runtime.sampling.registry import register_backend
+from tokenspeed.runtime.sampling.tree_verify import accepted_path_rows
 from tokenspeed.runtime.sampling.utils import (
     coin_eps,
     gather_token_logprobs,
@@ -168,6 +172,7 @@ class FlashInferSamplingBackend(SamplingBackend):
     """
 
     _HAS_POOL_STATE = True
+    supports_tree_verify = True
     _SUPPORTS_DP_VERIFY = True
 
     def __init__(self, config: SamplingBackendConfig) -> None:
@@ -176,6 +181,9 @@ class FlashInferSamplingBackend(SamplingBackend):
         self._init_dp_sampling(config)
         self._init_shared_buffers(config)
         self._init_pool_scalars(config)
+        self._tree_sampler = TreeRejectionSampler(
+            self.speculative_sampling_pools(), self._dp_max_pad_bs, config.device
+        )
         if _FUSED_TOPK_TOPP_AVAILABLE:
             # Pre-create the fused renorm side stream: cudaStreamCreate is
             # illegal inside capture, and verify() runs from the captured graph.
@@ -301,6 +309,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         return SpeculativeSamplingPools(
             temperature=self._temperature_pool,
             top_k=self._top_k_pool,
+            top_p=self._top_p_pool,
             seed=self._seed_pool,
         )
 
@@ -646,9 +655,7 @@ class FlashInferSamplingBackend(SamplingBackend):
         tree: TreeVerifyBatch | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if tree is not None:
-            raise NotImplementedError(
-                f"{type(self).__name__} cannot verify draft trees"
-            )
+            return self._verify_tree(logits_output, sampling_info, candidates, tree)
 
         bs = candidates.shape[0]
         num_tokens_per_req = candidates.shape[1]
@@ -799,6 +806,7 @@ class FlashInferSamplingBackend(SamplingBackend):
                     target_probs,
                     top_ks,
                     top_ps,
+                    in_place_skip=False,
                 )
             else:
                 target_probs = top_k_renorm_prob(target_probs, top_ks)
@@ -889,6 +897,43 @@ class FlashInferSamplingBackend(SamplingBackend):
                 logits, predict, logprob_order=self.config.logprob_order
             )
 
+        return predict, accept_length
+
+    def _verify_tree(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        candidates: torch.Tensor,
+        tree: TreeVerifyBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Accept each request's draft tree by rejection sampling (``TreeRejectionSampler``)."""
+        if logits_output.logits_layout_plan is not None:
+            raise NotImplementedError("draft trees take no DP sampling")
+        bs, n = candidates.shape
+        row0 = sampling_info.batch_row_offset
+        logits = logits_output.next_token_logits
+        predict = self._predict_buf[: bs * n]
+        path = self._accept_index_buf[: bs * n].view(bs, n)
+        accept_length = self._accept_length_buf[:bs]
+        self._tree_sampler(
+            logits,
+            candidates,
+            tree,
+            sampling_info.req_pool_indices,
+            coins=self._coins_buf[row0 : row0 + bs, :n],
+            final_coins=self._final_coins_buf[row0 : row0 + bs],
+            path=path,
+            predict=predict,
+            accept_length=accept_length,
+        )
+        # Rank 0's outputs win: the renorm is not bit-identical across ranks.
+        self.broadcast_verify_outputs()
+        if self.config.enable_output_logprobs:
+            # predict is packed along the path; score it against the path's own rows.
+            path_logits = logits.index_select(0, accepted_path_rows(path))
+            logits_output.next_token_logprobs = gather_token_logprobs(
+                path_logits, predict, logprob_order=self.config.logprob_order
+            )
         return predict, accept_length
 
     def get_packed_output_d2h(

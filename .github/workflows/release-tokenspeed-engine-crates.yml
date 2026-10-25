@@ -1,0 +1,165 @@
+name: Release TokenSpeed Engine Crates
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Validate package archives or publish missing versions
+        required: true
+        type: choice
+        options:
+          - dry-run
+          - publish
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-tokenspeed-engine-crates
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    outputs:
+      packages: ${{ steps.plan.outputs.packages }}
+    defaults:
+      run:
+        working-directory: tokenspeed-engine
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Plan publication
+        id: plan
+        env:
+          RELEASE_MODE: ${{ inputs.mode }}
+          RELEASE_REF: ${{ github.ref }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import urllib.error
+          import urllib.request
+
+          mode = os.environ["RELEASE_MODE"]
+          if mode not in {"dry-run", "publish"}:
+              raise SystemExit(f"Unknown release mode: {mode}")
+          if mode == "publish" and (
+              os.environ["RELEASE_REF"] != "refs/heads/main"
+              or os.environ["RELEASE_REPOSITORY"] != "lightseekorg/tokenspeed"
+          ):
+              raise SystemExit("Publish releases from lightseekorg/tokenspeed main only")
+
+          metadata = json.loads(subprocess.check_output(
+              ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
+              text=True,
+          ))
+          members = set(metadata["workspace_members"])
+          pending = []
+          summary = [
+              f"Source commit: `{os.environ['GITHUB_SHA']}`",
+              "",
+              "| Package | Version | Registry status |",
+              "| --- | --- | --- |",
+          ]
+          for package in metadata["packages"]:
+              if package["id"] not in members or package["publish"] == []:
+                  continue
+              name, version = package["name"], package["version"]
+              request = urllib.request.Request(
+                  f"https://crates.io/api/v1/crates/{name}/{version}",
+                  headers={"User-Agent": "tokenspeed-release-workflow (https://github.com/lightseekorg/tokenspeed)"},
+              )
+              try:
+                  with urllib.request.urlopen(request, timeout=30):
+                      status = "already published"
+              except urllib.error.HTTPError as error:
+                  if error.code != 404:
+                      raise
+                  pending.append(name)
+                  status = "pending"
+              summary.append(f"| `{name}` | `{version}` | {status} |")
+
+          with pathlib.Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"packages={json.dumps(pending)}\n")
+          with pathlib.Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as output:
+              output.write("\n".join(summary) + "\n")
+          PY
+
+      - name: Install native build dependencies
+        if: inputs.mode == 'dry-run' || steps.plan.outputs.packages != '[]'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build libssl-dev
+          python -m pip install "nanobind>=2.13.0" tokenspeed-spdlog==1.15.1
+          echo "PYO3_PYTHON=$(which python)" >> "$GITHUB_ENV"
+
+      - name: Build and verify package archives
+        if: inputs.mode == 'dry-run' || steps.plan.outputs.packages != '[]'
+        run: cargo package --workspace --locked
+
+  publish:
+    needs: validate
+    if: >-
+      inputs.mode == 'publish' &&
+      github.repository == 'lightseekorg/tokenspeed' &&
+      github.ref == 'refs/heads/main' &&
+      needs.validate.outputs.packages != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: tokenspeed-engine
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install the Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Authenticate with crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish pending versions in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          PACKAGES: ${{ needs.validate.outputs.packages }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          command = ["cargo", "publish", "--locked", "--no-verify", "--registry", "crates-io"]
+          for package in json.loads(os.environ["PACKAGES"]):
+              command.extend(["--package", package])
+          subprocess.run(command, check=True)
+          PY

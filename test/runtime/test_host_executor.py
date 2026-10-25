@@ -170,38 +170,6 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     return executor_module
 
 
-class TestCacheEventPayloadTest:
-    def setup_method(self):
-        try:
-            from tokenspeed_scheduler import Cache
-
-            from tokenspeed.runtime.engine.scheduler_utils import (
-                cache_event_from_payload,
-                cache_event_to_payload,
-                pop_common_cache_event_payloads,
-            )
-        except (ImportError, ModuleNotFoundError) as exc:
-            pytest.skip(f"needs runtime dependencies: {exc}")
-        self.Cache = Cache
-        self.from_payload = cache_event_from_payload
-        self.to_payload = cache_event_to_payload
-        self.pop_common = pop_common_cache_event_payloads
-
-    def test_cache_completion_payload_round_trips_load_back_and_prefetch(self):
-        write_back = self.Cache.WriteBackDoneEvent()
-        write_back.op_id = 7
-        write_payload = self.to_payload(write_back)
-        assert (write_payload) == ({"kind": "WriteBackDoneEvent", "op_id": 7})
-
-        # A load-back lands or does not happen: the ACK carries no outcome.
-        load_back = self.Cache.LoadBackDoneEvent(8)
-        load_payload = self.to_payload(load_back)
-        assert (load_payload) == ({"kind": "LoadBackDoneEvent", "op_id": 8})
-        restored = self.from_payload(load_payload)
-        assert isinstance((restored), (self.Cache.LoadBackDoneEvent))
-        assert (int(restored.op_id)) == (8)
-
-
 def _lanes_module():
     """The shared Host-transfer lane module the L2 write path delegates to."""
     return import_module("tokenspeed.runtime.cache.transfer.lanes")

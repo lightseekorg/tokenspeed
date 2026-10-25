@@ -664,6 +664,38 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     }
 }
 
+TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching) {
+    // The checkpoint only pays off through a prefix hit on it; without prefix
+    // caching it would hold a State block for nothing.
+    SchedulerConfig config = MakeValidConfig();
+    config.state_checkpoint_in_forward = true;
+    EXPECT_NO_THROW(config.Validate());
+    config.disable_prefix_cache = true;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.state_checkpoint_in_forward = false;
+    EXPECT_NO_THROW(config.Validate());
+
+    // The D role computes no prompt, so it takes the flag without prefix
+    // caching (PD launchers share one argument list between the roles); the
+    // P role still refuses it.
+    for (const Role role : {Role::kP, Role::kD}) {
+        SchedulerConfig pd = MakeValidConfig();
+        pd.role = role;
+        for (CacheGroupConfig& group : pd.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(pd);
+        pd.disable_prefix_cache = true;
+        EXPECT_NO_THROW(pd.Validate());
+        pd.state_checkpoint_in_forward = true;
+        if (role == Role::kD) {
+            EXPECT_NO_THROW(pd.Validate());
+        } else {
+            EXPECT_THROW(pd.Validate(), std::invalid_argument);
+        }
+    }
+}
+
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
     // The pool is explicit on every role: 0 pages says nothing, the null page
     // alone says "never retract" (and takes no blob slots), anything above it

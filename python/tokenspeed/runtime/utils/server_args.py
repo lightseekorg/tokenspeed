@@ -46,6 +46,9 @@ from tokenspeed.runtime.configs.numerics import (
     YARN_RAMP_MASK_DEVICES,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
+from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
+    validate_server_args as validate_eagle_harness_args,
+)
 from tokenspeed.runtime.metrics.config import resolve_metrics_options
 from tokenspeed.runtime.moe.dispatch_algorithm import (
     EP_DISPATCH_ALGORITHMS,
@@ -118,6 +121,10 @@ def spec_rope_positions(context: int, verify_width: int) -> int:
 # carries them through the stage boundary. See
 # ServerArgs.resolve_disaggregation.
 PIPELINE_SPEC_ALGORITHMS = ("DSPARK", "MTP")
+#: Drafters fed by the target's aux hidden-state taps (``eagle3_layers_to_capture``).
+AUX_CAPTURE_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4")
+#: Drafters that propose one token per draft step (a chain of steps + 1 tokens, or a tree).
+STEP_SPEC_ALGORITHMS = ("EAGLE3", "EAGLE4", "MTP")
 
 
 def expert_placement_requested(server_args) -> bool:
@@ -353,12 +360,8 @@ class ServerArgs:
     revision: str | None = None
     language_model_only: bool = False
 
-    # Direct SMG msgpack ZMQ path. When enabled, the scheduler skips the pickle
-    # PULL/PUSH IPC and instead connects to SMG (which binds the handshake/input/
-    # output sockets) over the msgpack wire. Default OFF;
-    # SMG tokenizes/detokenizes, so pair with --skip-tokenizer-init.
-    zmq_msgpack: bool = False
-    # The frontend handshake endpoint dialed by each scheduler DP rank.
+    # The frontend handshake endpoint dialed by each engine rank: the
+    # frontend binds the handshake/input/output sockets of the msgpack wire.
     data_parallel_address: str = "127.0.0.1"
     # Default chosen to avoid the 20000-29999 range used for derived
     # per-worker handshake ports and common rendezvous defaults of
@@ -379,6 +382,11 @@ class ServerArgs:
     enable_mixed_batch: bool = False
     # Scheduler cache-reuse identity granularity in tokens.
     prefix_granularity: int = 64
+    # Opt-in: the prefill forward that spans a long prompt's last prefix-page
+    # boundary before its replay tail (normally the final token) also writes
+    # the recurrent state there, where hybrid models publish a checkpoint;
+    # no chunk is cut for it.
+    enable_state_checkpoint_in_forward: bool = False
     # JSON on the CLI, normalized once to generic runtime options.
     kv_offload_config: str | dict | None = None
     # special kv cache
@@ -614,6 +622,12 @@ class ServerArgs:
     spec_reject_draft_prob_threshold: float = 2.0
     enable_replay_ssm: bool = True
     eagle3_layers_to_capture: str | None = None
+    # EAGLE-Harness dynamic draft trees for EAGLE4 (see the flags' help).
+    speculative_exec_mode: int = -1
+    speculative_data_path: str | None = None
+    speculative_compute_intensity: str = "high_intensity"
+    # EAGLE-Harness chains: the verify width per live batch size ("MIN_BS:WIDTH,...", or "off").
+    speculative_chain_width_table: str = "off"
     # Logprob support flags — all OFF by default. Enabling extends the
     # captured CUDA-graph footprint; requests asking for logprobs on a
     # server started without the matching flag will receive empty logprobs.
@@ -1319,6 +1333,18 @@ class ServerArgs:
         return self.disaggregation_mode not in ("prefill", "encode")
 
     @property
+    def writes_state_checkpoints_in_forward(self) -> bool:
+        """Whether this engine's prefill forwards write in-forward State checkpoints.
+
+        This is the flag, except on a decode server, whose prompts arrive by
+        transfer.
+        """
+        return (
+            self.enable_state_checkpoint_in_forward
+            and self.disaggregation_mode != "decode"
+        )
+
+    @property
     def retraction_snapshot_pool_disabled(self) -> bool:
         """Whether no image can ever be taken, so a capacity block aborts.
 
@@ -1555,10 +1581,11 @@ class ServerArgs:
                 int(x) for x in self.eagle3_layers_to_capture.split(",")
             ]
 
-        if self.speculative_algorithm is not None and self.speculative_eagle_topk != 1:
+        validate_eagle_harness_args(self)
+        if self.speculative_draft_tree:
             self._validate_tree_speculation()
         elif (
-            self.speculative_algorithm in ("EAGLE3", "MTP")
+            self.speculative_algorithm in STEP_SPEC_ALGORITHMS
             and self.speculative_num_draft_tokens != self.speculative_num_steps + 1
         ):
             raise ValueError(
@@ -1570,21 +1597,37 @@ class ServerArgs:
         if self.enable_speculative_sampling:
             self._validate_speculative_sampling()
 
+    @property
+    def eagle_harness(self) -> bool:
+        """EAGLE-4 drafting through the EAGLE-Harness dynamic trees."""
+        return (
+            self.speculative_algorithm == "EAGLE4" and self.speculative_exec_mode >= 0
+        )
+
+    @property
+    def speculative_draft_tree(self) -> bool:
+        """Whether drafts go through the draft-tree path: ``topk > 1``, or any
+        EAGLE-Harness round (a ``chain_intensity`` chain is a one-child tree)."""
+        return self.speculative_algorithm is not None and (
+            self.speculative_eagle_topk != 1 or self.eagle_harness
+        )
+
     def _validate_tree_speculation(self) -> None:
-        """Draft trees: EAGLE3/MTP with a node budget the draft can fill and a mask word can hold."""
+        """Draft trees: EAGLE3/EAGLE4/MTP with a node budget the draft can fill and a mask word can hold."""
         topk = self.speculative_eagle_topk
         steps = self.speculative_num_steps
         nodes = self.speculative_num_draft_tokens
-        if self.speculative_algorithm not in ("EAGLE3", "MTP"):
+        if self.speculative_algorithm not in STEP_SPEC_ALGORITHMS:
             raise ValueError(
                 f"speculative_eagle_topk={topk} (tree drafting) needs "
-                f"--speculative-algorithm EAGLE3 or MTP, got {self.speculative_algorithm}"
+                f"--speculative-algorithm EAGLE3, EAGLE4 or MTP, got {self.speculative_algorithm}"
             )
-        if not 1 <= topk <= 16 or not 1 <= steps <= 10:
+        # EAGLE-Harness trees have their own limits (eagle_harness/config.py).
+        if not self.eagle_harness and (not 1 <= topk <= 16 or not 1 <= steps <= 10):
             raise ValueError(
                 f"tree drafting needs 1..16 children per node and 1..10 steps: {topk=}, {steps=}"
             )
-        if (steps - 1) * topk > nodes:
+        if not self.eagle_harness and (steps - 1) * topk > nodes:
             raise ValueError(
                 f"tree drafting writes (steps - 1) * topk = {(steps - 1) * topk} lane slots per "
                 f"request into its {nodes}-slot draft window "
@@ -1649,7 +1692,8 @@ class ServerArgs:
                 "one token per step from its own distribution; "
                 f"{self.speculative_algorithm} proposes a whole block greedily"
             )
-        if self.speculative_eagle_topk != 1:
+        # EAGLE-Harness samples its trees (validate_eagle_harness_args).
+        if self.speculative_eagle_topk != 1 and not self.eagle_harness:
             raise ValueError(
                 "--enable-speculative-sampling supports only the topk=1 chain: "
                 f"{self.speculative_eagle_topk=}"
@@ -1977,6 +2021,12 @@ class ServerArgs:
                 "KVStore and disabled prefix caching are mutually exclusive "
                 "and cannot be used at the same time. Please use only one of them."
             )
+        if self.writes_state_checkpoints_in_forward:
+            if not self.enable_prefix_caching:
+                raise ValueError(
+                    "--enable-state-checkpoint-in-forward writes a checkpoint only "
+                    "the prefix cache can reuse; it requires prefix caching"
+                )
 
     def validate_model_update_options(self):
         """Require the Model Updater SDK flags together, or none of them.
@@ -2324,20 +2374,11 @@ class ServerArgs:
             "run text-only. Multimodal requests are rejected.",
         )
         parser.add_argument(
-            "--zmq-msgpack",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.zmq_msgpack,
-            help="Drive the scheduler directly from SMG over the msgpack ZMQ "
-            "wire instead of the Python tokenizer_manager (pickle IPC). SMG "
-            "binds the handshake/input/output sockets; the scheduler connects "
-            "in. Pair with --skip-tokenizer-init.",
-        )
-        parser.add_argument(
             "--data-parallel-address",
             type=_nonempty_str,
             default=ServerArgs.data_parallel_address,
-            help="Host of the frontend-bound handshake ROUTER the scheduler "
-            "connects to under --zmq-msgpack (default "
+            help="Host of the frontend-bound handshake ROUTER the engine "
+            "ranks connect to (default "
             f"{ServerArgs.data_parallel_address}).",
         )
         parser.add_argument(
@@ -2354,7 +2395,7 @@ class ServerArgs:
             "--zmq-engine-index",
             type=_uint16,
             default=ServerArgs.zmq_engine_index,
-            help="This engine's index under --zmq-msgpack; used as the two-byte "
+            help="This engine's index on the msgpack wire; used as the two-byte "
             "little-endian ZMQ routing identity SMG addresses it by "
             "(0..65535).",
         )
@@ -2519,6 +2560,19 @@ class ServerArgs:
             default=ServerArgs.prefix_granularity,
             help="Scheduler prefix granularity in tokens: the identity "
             "boundary of cache reuse. (--block-size is a deprecated alias.)",
+        )
+        parser.add_argument(
+            "--enable-state-checkpoint-in-forward",
+            action="store_true",
+            dest="enable_state_checkpoint_in_forward",
+            default=ServerArgs.enable_state_checkpoint_in_forward,
+            help="Hybrid (recurrent-state) models: the prefill forward that spans "
+            "the last prefix-page boundary before a long prompt's replay tail "
+            "(normally the final token) also writes the recurrent state there, so "
+            "a later request that resends the prompt or diverges from it after "
+            "that boundary resumes there. No extra prefill round; that forward "
+            "holds one more state block. Requires prefix caching. See "
+            "docs/design/scheduler.md section 1.2.",
         )
 
         # KVStore
@@ -3265,7 +3319,7 @@ class ServerArgs:
         parser.add_argument(
             "--speculative-algorithm",
             type=str,
-            help="Speculative algorithm. In-tree: EAGLE3, MTP, DFLASH, "
+            help="Speculative algorithm. In-tree: EAGLE3, EAGLE4, MTP, DFLASH, "
             "DSPARK, DUMMY; plugins may register more (validated after plugin "
             "discovery).",
         )
@@ -3298,6 +3352,45 @@ class ServerArgs:
             type=int,
             help="The number of tokens sampled from the draft model in Speculative Decoding.",
             default=ServerArgs.speculative_num_draft_tokens,
+        )
+        parser.add_argument(
+            "--speculative-exec-mode",
+            type=int,
+            choices=[-1, 0, 1, 2],
+            help="EAGLE4 drafting: -1 a static chain or tree; 0 EAGLE-Harness dynamic "
+            "trees sized from --speculative-data-path (serving); 1 the same for "
+            "evaluation; 2 measures that cost data.",
+            default=ServerArgs.speculative_exec_mode,
+        )
+        parser.add_argument(
+            "--speculative-data-path",
+            type=str,
+            help="EAGLE-Harness cost data directory (the cost/bs_<N> tree).",
+            default=ServerArgs.speculative_data_path,
+        )
+        parser.add_argument(
+            "--speculative-compute-intensity",
+            type=str,
+            choices=["high_intensity", "low_intensity", "chain_intensity"],
+            help="EAGLE-Harness policy tier (high_intensity: the verify buckets "
+            "and thresholds of compute-bound targets; chain_intensity: a one-child "
+            "chain of dynamic depth, with --speculative-eagle-topk 1).",
+            default=ServerArgs.speculative_compute_intensity,
+        )
+        parser.add_argument(
+            "--speculative-chain-width-table",
+            type=str,
+            help="EAGLE-Harness chains (chain_intensity, exec modes 0 and 1): "
+            "'MIN_BS:WIDTH,...'. A round of B >= MIN_BS live requests (the entry "
+            "with the largest such MIN_BS) drafts WIDTH - 1 tokens per request (a "
+            "verify tree of WIDTH nodes) without the confidence rule; smaller "
+            "batches keep the rule, which decides at most 256 requests. Widths "
+            "are capped at --speculative-num-draft-tokens. 'off' (the default): "
+            "the rule decides every round, of at most 256 requests. The verify "
+            "still runs every node of the window, so calibrate a table per "
+            "workload (e.g. '64:4,384:3'). Ignored by trees and by the cost "
+            "measurement (exec mode 2).",
+            default=ServerArgs.speculative_chain_width_table,
         )
         parser.add_argument(
             "--synthetic-acceptance-length",
@@ -3398,7 +3491,8 @@ class ServerArgs:
             "--disable-autotune",
             "--disable-flashinfer-autotune",
             action="store_true",
-            help="Skip profiling missing kernel tactics during startup. A matching "
+            help="Skip profiling missing kernel tactics during startup; kernel "
+            "compilation warmup still runs. A matching "
             "persistent FlashInfer cache is still loaded; uncovered shapes use "
             "the library's heuristic fallback.",
         )
@@ -4054,8 +4148,7 @@ class ServerArgs:
         return f"http://{self.host}:{self.port}"
 
     def zmq_handshake_endpoint(self) -> str:
-        """The frontend handshake endpoint dialed under ``--zmq-msgpack``,
-        composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
+        """The frontend handshake endpoint the engine ranks dial, composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
         return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
 
 

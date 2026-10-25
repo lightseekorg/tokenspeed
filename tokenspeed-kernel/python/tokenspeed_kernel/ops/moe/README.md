@@ -9,6 +9,11 @@ execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
 
+`gather_moe_routes` restores token/route order from a deferred output map and
+zeros absent routes. A kernel declaring `deferred_output_is_token_order` writes
+each route it owns to row `token * topk + slot`; with EP > 1 the other rows are
+stale, so `gather_moe_routes` still zeros them.
+
 The solution modules register these operations. Shared Triton helpers live in
 `_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
 the same registry and public dispatchers as the other MoE operations.
@@ -92,6 +97,17 @@ metadata would exceed the shared-memory budget retain the upstream scheduler.
 Regression tests compare eager and graph outputs with upstream at
 `atol=rtol=0`. Performance depends on shape and routing; the mean hint alone
 can regress on concentrated routes, so benchmark the intended settings.
+
+Both private modes also change how the SwapAB grouped GEMM moves data, without
+changing its accumulation order. When a weight-scale row is a multiple of 16
+bytes, the TMA thread prefetches each tile's weight scales with the tile's first
+pipeline stage, so the math warps no longer load scales and synchronize at every
+tile boundary. Weight loads carry an L2 evict-first hint: weights are read once
+per call, and evicting them first keeps the GEMM from evicting, and writing
+back, data that earlier kernels left in L2, which would otherwise fill the
+pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
+reads the expert offsets once into shared memory while its barriers are set up,
+and fills the lookup table per expert instead of searching per tile.
 
 ### NVFP4 routing-map padding
 
@@ -212,6 +228,17 @@ The SwiGLU recipe folds the up-half dequant into the second scale, which would
 be wrong here. The kernel test checks non-unit input scales against a
 dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
 experts and top-22.
+
+### Packed FP8 expert intermediate
+
+The matrix-based routed-expert path converts the clamped gate/up result into
+E4M3 inputs for the down projection, with one FP32 scale per 128 activations.
+It preserves BF16 intermediate rounding and clipping before conversion.
+Unsplit projections
+fuse conversion into the activation producer; split projections combine their
+partial results before the nonlinear activation and conversion. Only FP8 values
+and scales are materialized. The first BF16 input conversion still uses the
+shared quantizer rather than an upstream model operation.
 
 ### Unquantized CUTLASS MoE workspace
 

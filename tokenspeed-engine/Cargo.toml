@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ts-wire",
+    "crates/ts-client",
+    "crates/ts-collective",
+    "crates/ts-scheduler",
+    "crates/ts-control",
+    "crates/ts-grammar",
+    "crates/ts-host",
+    "crates/ts-l3",
+    "crates/ts-metrics",
+    "crates/ts-mooncake",
+    "crates/ts-pd",
+    "crates/ts-py",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/lightseekorg/tokenspeed"
+rust-version = "1.85"
+readme = "README.md"
+
+[workspace.dependencies]
+bytes = "1"
+thiserror = "2"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -42,6 +42,8 @@ struct ForwardOperationBase {
     // compacted. A State group's row is its two slots [input, live]: a
     // prefill row reads slot 0 (0 = the zero state) and writes slot 1; a
     // decode row reads slot 0 when it is set, else slot 1, and writes slot 1.
+    // A prefill that writes an in-forward State checkpoint appends a third
+    // entry, the block that receives the state at its checkpoint.
     std::map<std::string, std::vector<std::int32_t>> block_tables;
 };
 
@@ -59,6 +61,12 @@ struct PrefillOperation : public ForwardOperationBase {
     // extend_replay_len) regenerate replayable cache groups only; every
     // other group already holds their rows and must not be rewritten.
     std::int32_t extend_replay_len{0};
+    // Tokens of this chunk before its in-forward State checkpoint
+    // (SchedulerConfig::state_checkpoint_in_forward), 0 for none: every State
+    // group writes the state after position extend_prefix_len +
+    // extend_state_checkpoint_len into its row's third entry, besides the
+    // final state into slot 1.
+    std::int32_t extend_state_checkpoint_len{0};
 };
 
 struct DecodeOperation : public ForwardOperationBase {
@@ -84,6 +92,8 @@ struct ForwardBatch {
     std::vector<std::int32_t> extend_replay_lens;
     // Parallel to extend_prefix_lens: PrefillOperation::state_prefix_cached.
     std::vector<bool> state_prefix_cached;
+    // Parallel to extend_prefix_lens: PrefillOperation::extend_state_checkpoint_len.
+    std::vector<std::int32_t> extend_state_checkpoint_lens;
     std::vector<std::int32_t> decode_input_ids;
     // Parallel to decode_input_ids (one entry per decode row); rows without
     // candidates hold an empty vector.
@@ -119,6 +129,7 @@ struct ForwardBatch {
                 extend_prefix_lens.push_back(prefill->extend_prefix_len);
                 extend_replay_lens.push_back(prefill->extend_replay_len);
                 state_prefix_cached.push_back(prefill->state_prefix_cached);
+                extend_state_checkpoint_lens.push_back(prefill->extend_state_checkpoint_len);
             } else if (auto* decode = std::get_if<DecodeOperation>(&op)) {
                 decode_input_ids.push_back(decode->decode_input_id);
                 spec_candidate_ids.push_back(std::move(decode->spec_candidate_ids));

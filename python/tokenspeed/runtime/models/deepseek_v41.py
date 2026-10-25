@@ -82,6 +82,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     index_query_rope_weights,
     rope_inplace,
     rope_pad_query,
+    rope_weights_inplace,
 )
 from tokenspeed_kernel.ops.gemm import (
     dsv4_linear_fp32,
@@ -90,28 +91,36 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_mxfp8_weight_scales,
 )
+from tokenspeed_kernel.ops.moe import moe_topk
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
     silu_and_mul_quantize_fp8_group32,
 )
-from tokenspeed_kernel.ops.residual import mhc_apply_pre_quantize_fp8
+from tokenspeed_kernel.ops.residual import (
+    mhc_apply_pre_quantize_fp8,
+    try_mhc_shifted_post_pre_norm,
+)
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.selection import NoKernelFoundError
 from torch import nn
 
 from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41Config
 from tokenspeed.runtime.distributed import Mapping
+from tokenspeed.runtime.distributed.comm_backend import Group
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.comm_ops import (
     acquire_all_reduce_outputs,
     all_reduce,
-    all_reduce_mhc_post,
+    all_reduce_mhc_norm,
     can_acquire_all_reduce_outputs,
+    supports_all_reduce_mhc_norm,
 )
 from tokenspeed.runtime.distributed.pp_stage import PPStageState
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     break_point,
     current_forward_ctx,
+    is_breakable_capture_active,
     slice_to_real_tokens,
 )
 from tokenspeed.runtime.execution.context import (
@@ -136,6 +145,7 @@ from tokenspeed.runtime.layers.linear import (
 from tokenspeed.runtime.layers.moe.expert import MoELayer
 from tokenspeed.runtime.layers.moe.loader import build_moe_checkpoint_loader
 from tokenspeed.runtime.layers.moe.schema import ExpertCheckpointSchema
+from tokenspeed.runtime.layers.moe.topk import StandardTopKOutput
 from tokenspeed.runtime.layers.moe.utils import get_moe_backend
 from tokenspeed.runtime.layers.parameter import ModelWeightParameter
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
@@ -672,24 +682,6 @@ def _all_reduce_output(
     return acquire_all_reduce_outputs((shape,), like, group)[0]
 
 
-def _reduce_hc_post(
-    x: torch.Tensor,
-    residual: torch.Tensor,
-    post: torch.Tensor,
-    comb: torch.Tensor,
-    group,
-) -> torch.Tensor:
-    """mHC post of x, all-reduced over group first unless group is None."""
-    if group is not None:
-        fused = (
-            all_reduce_mhc_post(x, residual, post, comb, group) if x.is_cuda else None
-        )
-        if fused is not None:
-            return fused
-        x = all_reduce(x, group=group, backend=None, op=torch.distributed.ReduceOp.SUM)
-    return v41_hc_post(x, residual, post, comb)
-
-
 def _v41_hc_input_fp8(
     x: torch.Tensor, pre: torch.Tensor, norm: RMSNorm
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -827,6 +819,11 @@ class DeepseekV41Indexer(nn.Module):
                 positions,
                 rotary.cos_sin_cache,
                 self.scale,
+            )
+        if q.is_cuda and current_platform().is_cdna4:
+            rotary._prepare_cache(q.device)
+            return rope_weights_inplace(
+                q, positions, rotary.cos_sin_cache, weights, self.scale, None
             )
         return rotary.apply_owned(q, positions, False), weights * self.scale
 
@@ -1337,14 +1334,121 @@ class DeepseekV41MoE(DeepseekV4MoE):
         logits = F.linear(hidden_states.float(), self.gate.weight.float())
         return logits, bias, None, None
 
+    def _compute_topk_output(self, hidden_states, image_mask):
+        gate, config = self.gate, self.topk.topk_config
+        if (
+            hidden_states.is_cuda
+            and (gate.bias_vl is None or image_mask is None)
+            and gate.tid2eid is None
+            and not self.topk.simulate_routing
+            and self.experts.supports_precomputed_topk
+        ):
+            # moe_topk fuses the router GEMM when a kernel supports it.
+            try:
+                topk_weights, topk_ids = moe_topk(
+                    None,
+                    config.top_k,
+                    "sqrt_softplus",
+                    "topk",
+                    config.renormalize,
+                    config.routed_scaling_factor,
+                    correction_bias=gate.e_score_correction_bias,
+                    topk_weights_dtype=self.topk.weights_dtype,
+                    hidden_states=hidden_states,
+                    gate_weight=gate.weight,
+                )
+            except NoKernelFoundError:
+                pass
+            else:
+                return StandardTopKOutput(topk_weights, topk_ids, None)
+        return super()._compute_topk_output(hidden_states, image_mask)
+
+
+@dataclass(frozen=True)
+class V41HCPost:
+    """A sublayer output whose HC post is completed by its consumer.
+
+    ``reduce_group`` is present only after the producer admitted communication
+    fusion. Otherwise ``x`` is already reduced, including MegaMoE outputs.
+    The residual and shifted pre-mix travel alongside this value. No weights
+    or next-layer objects cross a layer boundary.
+    """
+
+    x: torch.Tensor
+    post: torch.Tensor
+    comb: torch.Tensor
+    reduce_group: Group | None
+
+    def finish(self, residual: torch.Tensor) -> torch.Tensor:
+        """Materialize the HC stream at a stage end or before Engram."""
+        # These boundaries prohibit deferral before the producer is run.
+        if self.reduce_group is not None:
+            raise RuntimeError("HC post with a deferred reduction cannot be finished")
+        return v41_hc_post(self.x, residual, self.post, self.comb)
+
+
+def _v41_hc_post_pre(
+    residual,
+    pre_mix,
+    pending: V41HCPost | None,
+    *,
+    hc_weights: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    norm: RMSNorm,
+    hc_norm_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    prefer_overlap: bool,
+):
+    """Prepare a consumer with its own weights at either sublayer boundary.
+
+    Returns the completed residual, optional normalized input and optional
+    consumer coefficients. Missing outputs are computed in the consumer's
+    stream fork, preserving input/coefficient overlap on the local path.
+    """
+    if pending is None:
+        return residual, None, None
+    if pending.reduce_group is not None:
+        residual, x = all_reduce_mhc_norm(
+            pending.x,
+            residual,
+            pending.post,
+            pending.comb,
+            pre_mix,
+            norm.weight,
+            norm.variance_epsilon,
+            pending.reduce_group,
+        )
+        return residual, x, None
+    # DeepGEMM mega_mhc split barriers race under CUDA graph replay: a replay can
+    # read the previous replay's partials, so keep it out of captured segments.
+    if not prefer_overlap and not is_breakable_capture_active():
+        shifted = try_mhc_shifted_post_pre_norm(
+            pending.x,
+            residual,
+            pre_mix,
+            pending.post,
+            pending.comb,
+            *hc_weights,
+            hc_norm_eps,
+            hc_eps,
+            sinkhorn_iters,
+            norm.weight,
+            norm.variance_epsilon,
+        )
+        if shifted is not None:
+            residual, x, pre, post, comb = shifted
+            return residual, x, (pre, post, comb)
+    return pending.finish(residual), None, None
+
 
 class DeepseekV41DecoderLayer(nn.Module):
-    """Overlap HC coefficients with decode sublayer work on CUDA.
+    """Consume the previous HC post and leave this FFN's post to the next input.
 
-    Sublayer inputs use the previous pre-mix, so the current coefficients need
-    only join before HC post. Eager and captured forwards use the same forks.
-    Prefill stays on the main stream: extra stream submissions can outweigh
-    overlap in small eager batches. Decode has no token-count threshold.
+    Decode selects communication fusion, local coefficient overlap, then
+    MegaMHC. Prefill and mixed batches select MegaMHC before local operations,
+    with coefficient overlap available only for the FFN.
+    Ordinary reduction stays inside the producer's stream fork. Only admitted
+    communication fusion crosses its coefficient join, without a late fallback.
     """
 
     def __init__(
@@ -1423,62 +1527,125 @@ class DeepseekV41DecoderLayer(nn.Module):
                 param.weight_loader = default_weight_loader
                 self.register_parameter(f"hc_{name}_{suffix}", param)
 
-    def forward(self, hidden_states, pre_mix, positions, image_mask, ctx):
+    def forward(
+        self,
+        hidden_states,
+        pre_mix,
+        positions,
+        image_mask,
+        ctx,
+        *,
+        pending_post: V41HCPost | None,
+        allow_ffn_reduce_fusion: bool,
+        capture_input: bool,
+    ):
+        if ctx.forward_mode is None:
+            raise ValueError("V4.1 attention requires an explicit forward mode")
         if hidden_states.shape[0] == 0:
-            self._forward_ffn(hidden_states[:, 0, :], image_mask, ctx, False)
-            return hidden_states, pre_mix
+            self._forward_ffn(
+                hidden_states[:, 0, :], image_mask, ctx, defer_reduce=False
+            )
+            captured = hidden_states[:, 0, :] if capture_input else None
+            return hidden_states, pre_mix, None, captured
         rows = _row_plan(self.layer_id, self.ced_decoder_start, ctx)
-        residual = hidden_states
         if rows.keep_rows is not None and rows.keep_rows.numel() == 0:
-            # HC input is needed by the global producer; output mixes and
-            # every decoder consumer are unnecessary for an open chunk.
+            # Only the global cache producer runs for an open prefill chunk.
+            # Finish the preceding HC post without computing unused mixes.
+            residual = (
+                hidden_states
+                if pending_post is None
+                else pending_post.finish(hidden_states)
+            )
+            captured = residual.mean(dim=1) if capture_input else None
             x = _v41_hc_input(residual, pre_mix, self.attn_norm)
             self.attn(positions, x, ctx, reduce_output=True)
             if self.ffn.owns_ep_communication:
                 self._forward_ffn(
-                    x[:0], None if image_mask is None else image_mask[:0], ctx, False
+                    x[:0],
+                    None if image_mask is None else image_mask[:0],
+                    ctx,
+                    defer_reduce=False,
                 )
-            return residual[:0], pre_mix[:0]
-        overlap = (
-            residual.is_cuda
-            and ctx.forward_mode is not None
-            and ctx.forward_mode.is_decode()
+            return residual[:0], pre_mix[:0], None, captured
+        decode_hc = ctx.forward_mode.is_decode()
+        can_overlap = (
+            hidden_states.is_cuda
             and self.hc_stream_fork.aux_stream is not None
-            and self.hc_stream_fork.aux_stream.device == residual.device
+            and self.hc_stream_fork.aux_stream.device == hidden_states.device
         )
-        consumer = torch.cuda.current_stream() if overlap else None
+        # Restrict attention HC overlap to decode so prefill and mixed batches
+        # never fork across an attention graph break, including during warmup.
+        # The FFN fork stays within its segment and is available in every phase.
+        attn_overlap = decode_hc and can_overlap
+        residual, x, attn_mixes = _v41_hc_post_pre(
+            hidden_states,
+            pre_mix,
+            pending_post,
+            hc_weights=(self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base),
+            norm=self.attn_norm,
+            hc_norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            prefer_overlap=attn_overlap,
+        )
+        # The model applies Engram before entry. Taps read the completed stream
+        # even when MegaMHC also prepared this attention's input and coefficients.
+        captured = residual.mean(dim=1) if capture_input else None
+        overlap = attn_overlap and attn_mixes is None
+        consumer = torch.cuda.current_stream() if can_overlap else None
         if overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
         with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
+            # Submit independent coefficients before the sublayer, also in eager.
             with fork.branch():
-                attn_pre, post, comb = v41_hc_mixes(
-                    residual,
-                    self.hc_attn_fn,
-                    self.hc_attn_scale,
-                    self.hc_attn_base,
-                    self.norm_eps,
-                    self.hc_eps,
-                    self.hc_sinkhorn_iters,
+                if attn_mixes is None:
+                    attn_mixes = v41_hc_mixes(
+                        residual,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.norm_eps,
+                        self.hc_eps,
+                        self.hc_sinkhorn_iters,
+                    )
+            codes, scales = None, None
+            if x is None:
+                if isinstance(
+                    self.attn.wq_a_wkv.quant_method, _ReferenceFp8LinearMethod
+                ):
+                    x, codes, scales = _v41_hc_input_fp8(
+                        residual, pre_mix, self.attn_norm
+                    )
+                else:
+                    x = _v41_hc_input(residual, pre_mix, self.attn_norm)
+            # wo_b returns contiguous BF16 with these rows and hidden width;
+            # CED narrows, while graph handoffs keep padding. HC mixes have
+            # fixed contiguous FP32 layouts, sliced with residual below.
+            # Unsupported fusion must not move all-reduce past the HC join.
+            attn_rows = (
+                rows.keep_rows.numel() if rows.keep_rows is not None else x.shape[0]
+            )
+            defer_attn = (
+                decode_hc
+                and self.attn.mapping.attn.has_tp
+                and supports_all_reduce_mhc_norm(
+                    x if x.shape[0] == attn_rows else x[:attn_rows],
+                    self.ffn_norm.weight,
+                    self.attn.mapping.attn.tp_group,
                 )
-            if overlap:
-                for tensor in (attn_pre, post, comb):
-                    tensor.record_stream(consumer)
-            if isinstance(self.attn.wq_a_wkv.quant_method, _ReferenceFp8LinearMethod):
-                x, codes, scales = _v41_hc_input_fp8(residual, pre_mix, self.attn_norm)
-            else:
-                x, codes, scales = (
-                    _v41_hc_input(residual, pre_mix, self.attn_norm),
-                    None,
-                    None,
-                )
+            )
             x = self.attn(
                 positions,
                 x,
                 ctx,
-                reduce_output=False,
+                reduce_output=not defer_attn,
                 hidden_codes=codes,
                 hidden_scales=scales,
             )
+            attn_pre, post, comb = attn_mixes
+            if overlap:
+                for tensor in (attn_pre, post, comb):
+                    tensor.record_stream(consumer)
         if rows.keep_rows is not None:
             # Keep mHC's original split-K shape before selecting the tail.
             residual, post, comb, attn_pre = (
@@ -1487,46 +1654,87 @@ class DeepseekV41DecoderLayer(nn.Module):
             )
             if image_mask is not None:
                 image_mask = image_mask.index_select(0, rows.keep_rows)
-        hidden_states = _reduce_hc_post(
-            x,
+        residual, x, ffn_mixes = _v41_hc_post_pre(
             residual,
-            post,
-            comb,
-            self.attn.mapping.attn.tp_group if self.attn.mapping.attn.has_tp else None,
+            attn_pre,
+            V41HCPost(
+                x, post, comb, self.attn.mapping.attn.tp_group if defer_attn else None
+            ),
+            hc_weights=(self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base),
+            norm=self.ffn_norm,
+            hc_norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+            sinkhorn_iters=self.hc_sinkhorn_iters,
+            prefer_overlap=decode_hc and can_overlap,
         )
-        residual = hidden_states
-        if overlap:
+        if x is None:
+            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
+        ffn_overlap = (
+            can_overlap
+            and ffn_mixes is None
+            and (decode_hc or not is_breakable_capture_active())
+        )
+        defer_moe = (
+            decode_hc
+            and allow_ffn_reduce_fusion
+            and not self.ffn.owns_ep_communication
+            and self.comm_manager.moe_output_all_reduced(ctx)
+            # All V4.1 norms share storage metadata. Admission only inspects
+            # the layout; execution uses the consumer's own weight and epsilon.
+            # This topology preserves rows and produces contiguous BF16.
+            and supports_all_reduce_mhc_norm(
+                x,
+                self.ffn_norm.weight,
+                self.comm_manager.mapping.moe.tp_ep_group,
+            )
+        )
+        if ffn_overlap:
             residual.record_stream(self.hc_stream_fork.aux_stream)
-        with self.hc_stream_fork.scope(enable=overlap, overlap=True) as fork:
+        with self.hc_stream_fork.scope(enable=ffn_overlap, overlap=True) as fork:
+            # Submit independent coefficients before the sublayer, also in eager.
             with fork.branch():
-                ffn_pre, post, comb = v41_hc_mixes(
-                    residual,
-                    self.hc_ffn_fn,
-                    self.hc_ffn_scale,
-                    self.hc_ffn_base,
-                    self.norm_eps,
-                    self.hc_eps,
-                    self.hc_sinkhorn_iters,
-                )
-            if overlap:
+                if ffn_mixes is None:
+                    ffn_mixes = v41_hc_mixes(
+                        residual,
+                        self.hc_ffn_fn,
+                        self.hc_ffn_scale,
+                        self.hc_ffn_base,
+                        self.norm_eps,
+                        self.hc_eps,
+                        self.hc_sinkhorn_iters,
+                    )
+            x = self._forward_ffn(x, image_mask, ctx, defer_reduce=defer_moe)
+            ffn_pre, post, comb = ffn_mixes
+            if ffn_overlap:
                 for tensor in (ffn_pre, post, comb):
                     tensor.record_stream(consumer)
-            x = _v41_hc_input(residual, attn_pre, self.ffn_norm)
-            x, group = self._forward_ffn(x, image_mask, ctx, True)
-        return _reduce_hc_post(x, residual, post, comb, group), ffn_pre
+        return (
+            residual,
+            ffn_pre,
+            V41HCPost(
+                x,
+                post,
+                comb,
+                self.comm_manager.mapping.moe.tp_ep_group if defer_moe else None,
+            ),
+            captured,
+        )
 
-    def _forward_ffn(self, x, image_mask, ctx, defer_reduce):
+    def _forward_ffn(self, x, image_mask, ctx, *, defer_reduce: bool):
         """MoE output after its communication.
 
-        With defer_reduce, return (output, group): a pending plain all-reduce
-        over group is left to the caller, or group is None when the output is
-        final.
+        With defer_reduce, the pending plain all-reduce over the MoE TPxEP
+        group is left to the caller; admission guarantees one is required.
         """
         # Fused EP returns this rank's rows, including an empty tensor on idle
         # ranks. HC residuals therefore stay local across dispatch/combine.
         if self.ffn.owns_ep_communication:
+            if defer_reduce:
+                raise ValueError(
+                    "Expert-owned communication cannot defer its reduction"
+                )
             counts = self.comm_manager.moe_tp_ep_group_scattered_num_tokens(ctx)
-            out = self.ffn(
+            return self.ffn(
                 x,
                 image_mask,
                 sum(counts),
@@ -1534,22 +1742,22 @@ class DeepseekV41DecoderLayer(nn.Module):
                 ctx=ctx if self.ffn.use_mega_moe else None,
                 comm_manager=self.comm_manager if self.ffn.use_mega_moe else None,
             )
-            return (out, None) if defer_reduce else out
         x = self.comm_manager.pre_mlp_comm(x, ctx)
         total, maximum = self.comm_manager.get_num_tokens(ctx)
         all_reduced = self.comm_manager.moe_output_all_reduced(ctx)
-        group = self.comm_manager.mapping.moe.tp_ep_group
         target = None
         if x.shape[0] and all_reduced:
             # The routed + shared sum lands where the all-reduce reads it.
-            target = _all_reduce_output(tuple(x.shape), x, group)
+            target = _all_reduce_output(
+                tuple(x.shape), x, self.comm_manager.mapping.moe.tp_ep_group
+            )
         x = self.ffn(
             x, image_mask, total, maximum, ctx=None, comm_manager=None, out=target
         )
         if defer_reduce and all_reduced:
-            return x, group
+            return x
         x, _ = self.comm_manager.post_mlp_comm(x, None, ctx)
-        return (x, None) if defer_reduce else x
+        return x
 
 
 def _ced_decoder_start(config) -> int:
@@ -1587,6 +1795,8 @@ class V41RowState:
     tensor per tap layer. The prefill graph allocates a zero state of a fixed
     row count as the decoder graph's input (``allocate_decoder_state``) and
     lands each forward's narrowed state into it (``land_into``).
+    Every stage completes its last HC post before handing this state off;
+    pending posts and communication never enter fixed graph input buffers.
     """
 
     hidden: torch.Tensor
@@ -1615,7 +1825,13 @@ class V41RowState:
     def _rebuilt(self, tensors: list[torch.Tensor | None]) -> V41RowState:
         hidden, pre_mix, positions, image_mask, hashes, mask, *captured = tensors
         return V41RowState(
-            hidden, pre_mix, positions, image_mask, hashes, mask, list(captured)
+            hidden,
+            pre_mix,
+            positions,
+            image_mask,
+            hashes,
+            mask,
+            list(captured),
         )
 
     def leading(self, rows: int) -> V41RowState:
@@ -1786,7 +2002,16 @@ class DeepseekV41Model(nn.Module):
                     (0, self.config.hc_mult), dtype=torch.float32, device=hidden.device
                 )
                 for layer in self.layers:
-                    hidden, pre_mix = layer(hidden, pre_mix, positions, image_mask, ctx)
+                    hidden, pre_mix, _, _ = layer(
+                        hidden,
+                        pre_mix,
+                        positions,
+                        image_mask,
+                        ctx,
+                        pending_post=None,
+                        allow_ffn_reduce_fusion=False,
+                        capture_input=False,
+                    )
             return (
                 self.embed_tokens.weight.new_empty((0, self.config.hidden_size)),
                 None,
@@ -1817,21 +2042,36 @@ class DeepseekV41Model(nn.Module):
         state: V41RowState,
         ctx: ForwardContext,
         captured: list[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """One layer on ``hidden``/``pre_mix`` over the rows ``state`` describes.
-
-        Engram and the DSpark taps sit at the layer input; a tap is the
-        unweighted HC mean the draft was trained on, appended to ``captured``.
-        """
+        pending_post: V41HCPost | None,
+        *,
+        stage_end: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, V41HCPost | None]:
+        """Finish an incoming post before Engram; capture the input after it."""
         if layer.engram is not None:
+            if pending_post is not None:
+                hidden = pending_post.finish(hidden)
+                pending_post = None
             hidden = layer.engram(
                 hidden,
                 state.hashes[:, layer.engram.layer_hash_index],
                 state.engram_token_mask,
             )
-        if layer.layer_id in self.dspark_capture_layers:
-            captured.append(hidden.mean(dim=1))
-        return layer(hidden, pre_mix, state.positions, state.image_mask, ctx)
+        hidden, pre_mix, pending_post, tap = layer(
+            hidden,
+            pre_mix,
+            state.positions,
+            state.image_mask,
+            ctx,
+            pending_post=pending_post,
+            # Stage handoffs and Engram require a complete HC stream. Admit
+            # deferred reduction only when the next input can consume it fused.
+            allow_ffn_reduce_fusion=layer.layer_id + 1 < stage_end
+            and self.layers[layer.layer_id + 1].engram is None,
+            capture_input=layer.layer_id in self.dspark_capture_layers,
+        )
+        if tap is not None:
+            captured.append(tap)
+        return hidden, pre_mix, pending_post
 
     def encoder_forward(
         self,
@@ -1876,14 +2116,31 @@ class DeepseekV41Model(nn.Module):
         h = self.embed_tokens(input_ids) if input_embeds is None else input_embeds
         if h.shape != (input_ids.numel(), self.config.hidden_size):
             raise ValueError("V4.1 input embeddings have the wrong shape")
-        h = h.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
-        pre_mix = torch.zeros(h.shape[:2], dtype=torch.float32, device=h.device)
-        pre_mix[:, 0] = 1
+        if h.is_cuda:
+            from tokenspeed_kernel.ops.residual import mhc_init
+
+            h, pre_mix = mhc_init(h, self.config.hc_mult)
+        else:
+            h = h.unsqueeze(1).repeat(1, self.config.hc_mult, 1)
+            pre_mix = torch.zeros(h.shape[:2], dtype=torch.float32, device=h.device)
+            pre_mix[:, 0] = 1
         state = V41RowState(
             h, pre_mix, positions, image_mask, hashes, engram_token_mask, []
         )
+        pending_post = None
         for layer in self.layers[: self.ced_decoder_start]:
-            h, pre_mix = self._run_layer(layer, h, pre_mix, state, ctx, state.captured)
+            h, pre_mix, pending_post = self._run_layer(
+                layer,
+                h,
+                pre_mix,
+                state,
+                ctx,
+                state.captured,
+                pending_post,
+                stage_end=self.ced_decoder_start,
+            )
+        if pending_post is not None:
+            h = pending_post.finish(h)
         state.hidden, state.pre_mix = h, pre_mix
         return state
 
@@ -1923,9 +2180,18 @@ class DeepseekV41Model(nn.Module):
         # original DP counts remain valid capacity bounds after CED narrowing;
         # no host exchange is needed for its routed or rank-local shared experts.
         with report_collective_sizing(ctx, view.metadata.positions.numel(), None):
-            hidden, pre_mix = self._run_layer(
-                self.layers[start], state.hidden, state.pre_mix, state, ctx, captured
+            hidden, pre_mix, pending_post = self._run_layer(
+                self.layers[start],
+                state.hidden,
+                state.pre_mix,
+                state,
+                ctx,
+                captured,
+                None,
+                stage_end=start + 1,
             )
+            if pending_post is not None:
+                hidden = pending_post.finish(hidden)
         hashes, mask = (
             (state.hashes, state.engram_token_mask)
             if self.decoder_uses_engram
@@ -1967,13 +2233,23 @@ class DeepseekV41Model(nn.Module):
             )
             return hidden, captured
         ctx.attn_backend.begin_indexer_stage()
+        pending_post = None
         layers = self.layers[start + 1 :]
         if layers:
             with report_collective_sizing(ctx, state.rows, None):
                 for layer in layers:
-                    h, pre_mix = self._run_layer(
-                        layer, h, pre_mix, state, ctx, captured
+                    h, pre_mix, pending_post = self._run_layer(
+                        layer,
+                        h,
+                        pre_mix,
+                        state,
+                        ctx,
+                        captured,
+                        pending_post,
+                        stage_end=len(self.layers),
                     )
+                if pending_post is not None:
+                    h = pending_post.finish(h)
         return _norm(v41_hc_pre(h, pre_mix), self.norm), captured
 
     def finish_forward(

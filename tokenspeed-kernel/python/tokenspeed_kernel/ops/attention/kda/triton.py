@@ -14,7 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult, KdaReplayRecords
 from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -22,8 +22,6 @@ from tokenspeed_kernel.signature import format_signatures
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
-# Descriptor addresses are dereferenced as bf16, so registrations exclude fp16.
-_DENSE_BF16_SIGNATURES = format_signatures(("q", "k", "v"), "dense", {torch.bfloat16})
 
 
 def kda_recurrent_decode_mtp(
@@ -195,10 +193,10 @@ def _nvidia_fused_verify(
 @register_kernel(
     "attention",
     "kda_verify_conv_update",
-    name="triton_nvidia_kda_verify_conv_update",
+    name="triton_kda_verify_conv_update",
     solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
+    capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
+    signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
         "paged_state": frozenset({True}),
@@ -206,7 +204,7 @@ def _nvidia_fused_verify(
         "split_producers": frozenset({True}),
     },
 )
-def triton_nvidia_kda_verify_conv_update(
+def triton_kda_verify_conv_update(
     mixed_qkv: torch.Tensor,
     conv_weights: torch.Tensor,
     conv_states: torch.Tensor,
@@ -215,8 +213,10 @@ def triton_nvidia_kda_verify_conv_update(
     num_heads: int,
     head_dim: int,
     draft_token_num: int,
+    bias: torch.Tensor | None = None,
+    original_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Materialize the NVIDIA split-verify convolution producer."""
+    """Materialize the shared split-verify convolution producer."""
     from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
         fused_kda_verify_conv_update,
     )
@@ -229,6 +229,8 @@ def triton_nvidia_kda_verify_conv_update(
         num_heads=num_heads,
         head_dim=head_dim,
         draft_token_num=draft_token_num,
+        bias=bias,
+        original_qkv=original_qkv,
     )
 
 
@@ -356,9 +358,8 @@ def triton_nvidia_kda_fused_paged_verify_no_store(
     name="triton_nvidia_kda_fused_paged_verify_split",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
-    # Outranks the inline-producer twin so bf16 gets it without asking; fp16
-    # is filtered out by signature and falls back to that twin.
+    signatures=_DENSE_HALF_SIGNATURES,
+    # Serving enables this producer arrangement only with compatible recovery.
     priority=Priority.SPECIALIZED + 1,
     traits={
         "paged_state": frozenset({True}),
@@ -386,10 +387,62 @@ def triton_nvidia_kda_fused_paged_verify_split(
     head_dim: int,
     draft_token_num: int,
     lower_bound: float | None,
+    replay_records: KdaReplayRecords | None,
     g_raw: torch.Tensor | None = None,
     conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run target verify with split convolution and gate producers."""
+    if replay_records is not None:
+        from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+            vllm_triton_kda_recoverssm_verify,
+        )
+
+        if conv_qkv is None or g_raw is None:
+            raise ValueError("record verify requires precomputed conv and gates")
+        if replay_records.original_qkv is not None:
+            destination = replay_records.original_qkv
+            if (
+                destination.shape != mixed_qkv.shape
+                or destination.dtype != mixed_qkv.dtype
+                or destination.device != mixed_qkv.device
+                or destination.stride(-1) != 1
+                or destination.stride(0) < destination.shape[-1]
+            ):
+                raise ValueError("Original QKV destination must match the input rows")
+            storage = destination.untyped_storage()
+            begin, end = storage.data_ptr(), storage.data_ptr() + storage.nbytes()
+            for source in (mixed_qkv, g_raw, beta_logits):
+                source_storage = source.untyped_storage()
+                if (
+                    begin < source_storage.data_ptr() + source_storage.nbytes()
+                    and source_storage.data_ptr() < end
+                ):
+                    raise ValueError(
+                        "Original QKV destination must not overlap producers"
+                    )
+            destination.copy_(mixed_qkv)
+        q, k, v = (
+            part.view(1, -1, num_heads, head_dim) for part in conv_qkv.chunk(3, dim=-1)
+        )
+        return vllm_triton_kda_recoverssm_verify(
+            q,
+            k,
+            v,
+            g_raw.view_as(q),
+            beta_logits.view(1, -1, num_heads),
+            A_log,
+            dt_bias,
+            checkpoint_state=state_pool[:, :num_heads],
+            correction_cache=replay_records.correction,
+            kg_cache=replay_records.key_gate,
+            query_start_loc=replay_records.query_start_loc,
+            state_indices=read_indices,
+            spec_query_len=draft_token_num,
+            lower_bound=lower_bound,
+            out=torch.empty_like(v),
+            record_metadata=replay_records.metadata,
+            record_stamps=replay_records.stamps,
+        )
     return _nvidia_fused_verify(
         mixed_qkv,
         conv_weights,
@@ -499,73 +552,10 @@ def _nvidia_kda_prefill(
 @register_kernel(
     "attention",
     "kda_replay_commit",
-    name="triton_nvidia_kda_replay_commit",
-    solution="triton",
-    capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_HALF_SIGNATURES,
-    priority=Priority.SPECIALIZED,
-    traits={
-        "flat_state": frozenset({True}),
-        "recurrent_layout": frozenset({"v_major"}),
-    },
-)
-def triton_nvidia_kda_replay_commit(
-    mixed_qkv: torch.Tensor,
-    conv_weights: torch.Tensor,
-    conv_states: torch.Tensor,
-    conv_out: torch.Tensor,
-    f_a_out: torch.Tensor,
-    f_b_weight: torch.Tensor,
-    beta_logits: torch.Tensor,
-    A_log: torch.Tensor,
-    dt_bias: torch.Tensor,
-    *,
-    state_pool: torch.Tensor,
-    state_out: torch.Tensor,
-    read_indices: torch.Tensor,
-    write_indices: torch.Tensor,
-    accepted_length: torch.Tensor,
-    num_heads: int,
-    head_dim: int,
-    draft_token_num: int,
-    lower_bound: float | None,
-    gate_scratch: torch.Tensor | None = None,
-) -> None:
-    """Replay the accepted prefix of a verified window into the state pool."""
-    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-        fused_recurrent_kda_replay_commit,
-    )
-
-    fused_recurrent_kda_replay_commit(
-        mixed_qkv,
-        conv_weights,
-        conv_states,
-        conv_out,
-        f_a_out,
-        f_b_weight,
-        beta_logits,
-        A_log,
-        dt_bias,
-        state_pool,
-        state_out,
-        read_indices,
-        write_indices,
-        accepted_length,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        draft_token_num=draft_token_num,
-        lower_bound=lower_bound,
-        gate_scratch=gate_scratch,
-    )
-
-
-@register_kernel(
-    "attention",
-    "kda_replay_commit",
     name="triton_nvidia_kda_batched_replay_commit",
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia"})),
-    signatures=_DENSE_BF16_SIGNATURES,
+    signatures=_DENSE_HALF_SIGNATURES,
     priority=Priority.SPECIALIZED,
     traits={
         "batched_layers": frozenset({True}),
@@ -580,20 +570,22 @@ def triton_nvidia_kda_batched_replay_commit(
     read_indices: torch.Tensor,
     write_indices: torch.Tensor,
     accepted_length: torch.Tensor,
+    activation_dtype: torch.dtype,
+    conv_state_dtype: torch.dtype,
     draft_token_num: int,
     num_heads: int,
     head_dim: int,
-    f_a_dim: int,
     qkv_stride: int,
     conv_stride: int,
-    f_a_stride: int,
-    beta_stride: int,
+    correction_stride: int,
+    key_gate_stride: int,
     state_stride: int,
-    gate_stride: int,
     conv_width: int,
-    lower_bound: float,
+    lower_bound: float | None,
+    record_metadata: torch.Tensor,
+    record_stamps: torch.Tensor,
 ) -> None:
-    """Replay every KDA layer described by stable device pointer tables.
+    """Recover every KDA layer from FP32 U and saved K/raw-gate records.
 
     Args:
         descriptors: Device pointers for every layer's inputs, weights, and state.
@@ -601,43 +593,45 @@ def triton_nvidia_kda_batched_replay_commit(
         read_indices: Source page indices, shaped ``[groups, batch]``.
         write_indices: Destination page indices, shaped ``[groups, batch]``.
         accepted_length: Accepted draft-token count for each request.
+        activation_dtype: Storage dtype of raw QKV and saved K/raw-gate records.
+        conv_state_dtype: Storage dtype of the bound convolution history pool.
         draft_token_num: Maximum number of draft tokens in the replay window.
         num_heads: Number of local KDA value heads.
         head_dim: Per-head key and value dimension.
-        f_a_dim: Width of the low-rank gate projection.
         qkv_stride: Token stride of the packed QKV payload.
         conv_stride: Page stride of the convolution state.
-        f_a_stride: Token stride of the low-rank gate payload.
-        beta_stride: Token stride of beta.
+        correction_stride: Token stride of the FP32 correction payload.
+        key_gate_stride: Token stride of unnormalized key/raw-gate records.
         state_stride: Page stride of the recurrent state.
-        gate_stride: Token stride of the gate scratch tensor.
         conv_width: Width of the depthwise convolution kernel.
-        lower_bound: Lower bound used by the KDA decay gate.
+        lower_bound: Bound used to transform saved raw gates during commit.
 
     Returns:
         None.
     """
-    from tokenspeed_kernel.ops.attention.kda._triton.recurrent import (
-        batched_recurrent_kda_replay_commit,
+    from tokenspeed_kernel.ops.attention.kda.vllm_recoverssm import (
+        batched_recoverssm_commit,
     )
 
-    batched_recurrent_kda_replay_commit(
+    batched_recoverssm_commit(
         descriptors,
         group_indices,
         read_indices,
         write_indices,
         accepted_length,
+        activation_dtype=activation_dtype,
+        conv_state_dtype=conv_state_dtype,
         draft_token_num=draft_token_num,
         num_heads=num_heads,
         head_dim=head_dim,
-        f_a_dim=f_a_dim,
         qkv_stride=qkv_stride,
         conv_stride=conv_stride,
-        f_a_stride=f_a_stride,
-        beta_stride=beta_stride,
+        correction_stride=correction_stride,
+        key_gate_stride=key_gate_stride,
         state_stride=state_stride,
-        gate_stride=gate_stride,
         conv_width=conv_width,
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
         lower_bound=lower_bound,
     )
 
@@ -662,10 +656,8 @@ def triton_nvidia_kda_paged_prefill(**kwargs) -> KdaPrefillResult:
     return _nvidia_kda_prefill(kda_chunk_prefill, **kwargs)
 
 
-from tokenspeed_kernel.ops.attention.kda._triton.capture_payload import (  # noqa: E402
-    capture_replay_payload,
-)
 from tokenspeed_kernel.ops.attention.kda._triton.state_pages import (  # noqa: E402
+    commit_state_groups,
     commit_state_pages,
     verify_state_blocks,
 )

@@ -39,15 +39,142 @@ if _IS_NVIDIA_BLACKWELL:
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
         kernel as _cute_dsl_qsa_sparse_attention,
     )
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_sparse import (
+        warmup as _warmup_sparse,
+    )
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
         _configuration,
     )
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
         kernel as _cute_dsl_qsa_stream_block_topk,
     )
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_stream_topk import (
+        warmup as _warmup_stream,
+    )
 
 _HEAD_DIM = 256
 _SELECTED_WIDTH = 2051
+
+
+def _supported_stream_topk_tensors(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    request_indices: torch.Tensor,
+    complete_blocks: torch.Tensor,
+    *,
+    page_size: int,
+    block_topk: int,
+) -> bool:
+    """Validate tensor geometry independently of the scratch-dependent tactic."""
+    if not _IS_NVIDIA_BLACKWELL:
+        return False
+    if query.ndim != 3 or key_cache.ndim != 3 or page_table.ndim != 2:
+        return False
+    rows = query.shape[0]
+    if rows == 0:
+        return False
+    if (
+        query.shape[1:] != (4, 128)
+        or key_cache.shape[0] < 64
+        or key_cache.shape[0] % 64
+        or key_cache.shape[1:] != (1, 128)
+    ):
+        return False
+    if page_size != 64 or block_topk != 512 or not 0 < page_table.shape[1] <= 2048:
+        return False
+    if query.dtype is not torch.bfloat16 or key_cache.dtype is not torch.bfloat16:
+        return False
+    if page_table.dtype is not torch.int32:
+        return False
+    if request_indices.dtype not in (torch.int32, torch.int64):
+        return False
+    if complete_blocks.dtype is not torch.int32:
+        return False
+    if request_indices.shape != (rows,) or complete_blocks.shape != (rows,):
+        return False
+    tensors = (query, key_cache, page_table, request_indices, complete_blocks)
+    if not query.is_cuda or any(tensor.device != query.device for tensor in tensors):
+        return False
+    if query.stride(2) != 1 or query.stride(0) % 8 or query.stride(1) % 8:
+        return False
+    if query.data_ptr() % 16 or not key_cache.is_contiguous():
+        return False
+    if key_cache.data_ptr() % 16:
+        return False
+    if page_table.stride(1) != 1 or page_table.stride(0) < page_table.shape[1]:
+        return False
+    if page_table.data_ptr() % 16:
+        return False
+    return all(
+        tensor.is_contiguous() and tensor.data_ptr() % 16 == 0
+        for tensor in (request_indices, complete_blocks)
+    )
+
+
+def _warmup_qsa_stream_topk(
+    query,
+    keys,
+    page_table,
+    requests,
+    complete,
+    *,
+    page_size,
+    block_topk,
+    max_partial_bytes,
+    enable_pdl,
+):
+    """Compile every stream top-k tactic these tensors and the scratch budget allow."""
+    # A single-row tactic needs scratch even when grouped prefill needs none.
+    # Warmup checks the shared tensor contract, then enumerates valid tactics
+    # with the caller's actual budget.
+    if not _supported_stream_topk_tensors(
+        query,
+        keys,
+        page_table,
+        requests,
+        complete,
+        page_size=page_size,
+        block_topk=block_topk,
+    ):
+        return
+    # A shortened prefill view retains the allocation's full row stride.
+    _warmup_stream(
+        query,
+        keys,
+        requests,
+        max_capacity=max(page_table.shape[1], page_table.stride(0)) * page_size,
+        max_partial_bytes=max_partial_bytes,
+        enable_pdl=enable_pdl,
+    )
+
+
+def _warmup_qsa_sparse_attention(q, k, v, selected, *, max_rows):
+    """Warm the CuTe sparse-attention configurations these tensors legally select."""
+    if (
+        not _IS_NVIDIA_BLACKWELL
+        or q.ndim != 3
+        or k.ndim != 3
+        or v.ndim != 3
+        or selected.ndim != 2
+        or not q.is_cuda
+        or any(tensor.device != q.device for tensor in (k, v, selected))
+        or q.shape[1] not in (6, 12, 24)
+        or k.shape[1] not in (1, 2, 4)
+        or k.shape[0] < 2
+        or q.shape[1] <= k.shape[1]
+        or q.shape[1] % k.shape[1]
+        or q.shape[2] != _HEAD_DIM
+        or k.shape[2] != _HEAD_DIM
+        or v.shape != k.shape
+        or selected.shape != (q.shape[0], _SELECTED_WIDTH)
+        or q.dtype is not torch.bfloat16
+        or k.dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+        or v.dtype is not k.dtype
+        or selected.dtype is not torch.int32
+    ):
+        return
+    _warmup_sparse(q, k, v, max_rows=max_rows, enable_pdl=pdl_enabled())
 
 
 def can_use_cute_dsl_qwen4_exp_qsa_block_topk(
@@ -84,62 +211,29 @@ def can_use_cute_dsl_qwen4_exp_qsa_block_topk(
         Whether the tensors satisfy a tuned MMA specialization's contract.
     """
 
-    if not _IS_NVIDIA_BLACKWELL:
-        return False
-    if query.ndim != 3 or key_cache.ndim != 3 or page_table.ndim != 2:
+    if not _supported_stream_topk_tensors(
+        query,
+        key_cache,
+        page_table,
+        request_indices,
+        complete_blocks,
+        page_size=page_size,
+        block_topk=block_topk,
+    ):
         return False
     rows = query.shape[0]
-    if rows == 0:
-        return False
     if queries_per_request is not None and (
         queries_per_request < 1 or rows % queries_per_request
     ):
         return False
-    if (
-        query.shape[1:] != (4, 128)
-        or key_cache.shape[0] < 64
-        or key_cache.shape[0] % 64
-        or key_cache.shape[1:] != (1, 128)
-    ):
-        return False
-    if page_size != 64 or block_topk != 512:
-        return False
-    if (
+    return (
         _configuration(
             rows,
             page_table.shape[1] * page_size,
             queries_per_request,
             max_partial_bytes,
         )
-        is None
-    ):
-        return False
-    if query.dtype is not torch.bfloat16 or key_cache.dtype is not torch.bfloat16:
-        return False
-    if page_table.dtype is not torch.int32:
-        return False
-    if request_indices.dtype not in (torch.int32, torch.int64):
-        return False
-    if complete_blocks.dtype is not torch.int32:
-        return False
-    if request_indices.shape != (rows,) or complete_blocks.shape != (rows,):
-        return False
-    tensors = (query, key_cache, page_table, request_indices, complete_blocks)
-    if not query.is_cuda or any(tensor.device != query.device for tensor in tensors):
-        return False
-    if query.stride(2) != 1 or query.stride(0) % 8 or query.stride(1) % 8:
-        return False
-    if query.data_ptr() % 16 or not key_cache.is_contiguous():
-        return False
-    if key_cache.data_ptr() % 16:
-        return False
-    if page_table.stride(1) != 1 or page_table.stride(0) < page_table.shape[1]:
-        return False
-    if page_table.data_ptr() % 16:
-        return False
-    return all(
-        tensor.is_contiguous() and tensor.data_ptr() % 16 == 0
-        for tensor in (request_indices, complete_blocks)
+        is not None
     )
 
 
@@ -168,7 +262,7 @@ def cute_dsl_qwen4_exp_qsa_block_topk(
         page_size: Number of compressed blocks per page; must be 64.
         block_topk: Number of selected blocks; must be 512.
         queries_per_request: Uniform consecutive query-run width, or ``None``
-            for ragged rows; required for grouped scoring optimizations.
+            for ragged rows. Groups mask tails and never cross requests.
         max_partial_bytes: Budget for global scratch, excluding the output.
         enable_pdl: Whether to use programmatic dependent launch ordering.
 

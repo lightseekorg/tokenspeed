@@ -656,16 +656,18 @@ def test_route_tiled_gemms_preserve_route_slots(rows: int) -> None:
     )
 
 
-@pytest.mark.parametrize("ep_size", [4, 8])
+@pytest.mark.parametrize("ep_size", [1, 4, 8])
 def test_package_muse_changed_graph_inputs(ep_size) -> None:
 
     local_experts = 256 // ep_size
+    intermediate_size = 512 if ep_size == 1 else 4096
+    expert_start = 0 if ep_size == 1 else local_experts
     generator = torch.Generator(device="cuda").manual_seed(20261003)
     runtime = _make_runtime_weights(
         generator,
         num_experts=local_experts,
         hidden_size=4096,
-        intermediate_size=4096,
+        intermediate_size=intermediate_size,
         scale=120,
     )
     w13, s13, w2, s2 = runtime[4:]
@@ -676,7 +678,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
         num_local_experts=local_experts,
         num_experts=256,
         top_k=8,
-        ep_rank=1,
+        ep_rank=0 if ep_size == 1 else 1,
         w13_weight_triton_tensor=w13,
         w2_weight_triton_tensor=w2,
         w13_precision_config=SimpleNamespace(b_mx_scale=s13),
@@ -689,7 +691,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
         requires_deferred_finalize=True,
         routing_mode="precomputed_topk",
         ep_size=ep_size,
-        ispp=4096,
+        ispp=intermediate_size,
         hidden=4096,
         swiglu_form="standard",
         activation_clamped=False,
@@ -731,7 +733,11 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
     )
     # The actual startup lifecycle warms families; these held-out tails must
     # execute through public dispatch without compiling new variants.
-    for rows in (3, 5, 31, 53, 128, 191, 207, 8191, 8192):
+    row_counts = (3, 5, 31, 53, 128, 191, 207, 8191, 8192)
+    if ep_size == 1:
+        # Exercise every density-selected row tile with an unwarmed token tail.
+        row_counts = (*row_counts[:-2], 263, 1031, 2055, 4103, *row_counts[-2:])
+    for rows in row_counts:
         if rows == 53:
             warmup(128)
         elif rows == 191:
@@ -740,18 +746,24 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
         packed, scales = _quantize_mxfp4_activation(hidden)
         ids = (
             torch.arange(
-                local_experts, local_experts + 8, device="cuda", dtype=torch.int32
+                expert_start, expert_start + 8, device="cuda", dtype=torch.int32
             )
             .expand(rows, 8)
             .clone()
         )
         weights = torch.full((rows, 8), 0.125, device="cuda")
-        intermediate = torch.empty((rows * 8, 2048), dtype=torch.uint8, device="cuda")
+        intermediate = torch.empty(
+            (rows * 8, intermediate_size // 2), dtype=torch.uint8, device="cuda"
+        )
         intermediate_scales = empty_swizzled_cdna4_mxfp4_scale(
-            rows * 8, 128, device="cuda"
+            rows * 8, intermediate_size // 32, device="cuda"
         )
         reference = torch.empty((rows * 8, 4096), dtype=torch.bfloat16, device="cuda")
         reference_map = torch.empty(rows * 8, dtype=torch.int32, device="cuda")
+        guarded = torch.full(
+            (rows * 8 + 2, 4096), 17, dtype=torch.bfloat16, device="cuda"
+        )
+        destination = guarded[1:-1]
 
         def run_reference():
             invoke_stage1_mxfp4_mfma_decode_gluon(
@@ -762,7 +774,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 ids,
                 intermediate,
                 8,
-                local_experts,
+                expert_start,
                 intermediate_scales,
                 BLOCK_N=64,
                 swiglu_alpha=1.0,
@@ -778,7 +790,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 weights,
                 reference,
                 8,
-                local_experts,
+                expert_start,
                 False,
                 reference_map,
                 BLOCK_N=16,
@@ -786,7 +798,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 PIPELINE_K=False,
             )
 
-        def run_actual():
+        def run_actual(output):
             return moe_apply(
                 plan,
                 (packed, scales),
@@ -795,21 +807,26 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 topk_weights=weights,
                 topk_ids=ids,
                 do_finalize=False,
+                deferred_out=output,
             )
 
         run_reference()
         with assert_no_triton_compile(*kernels):
-            run_actual()
+            allocated, _, allocated_map = run_actual(None)
+            supplied, _, supplied_map = run_actual(destination)
+            torch.testing.assert_close(supplied, allocated, atol=0, rtol=0)
+            torch.testing.assert_close(supplied_map, allocated_map, atol=0, rtol=0)
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 run_reference()
-                actual, _, actual_map = run_actual()
+                actual, _, actual_map = run_actual(destination)
+        assert actual.data_ptr() == destination.data_ptr()
         for phase in range(3):
             new_hidden = _exact_mxfp4_activation(rows, 4096, generator)
             new_packed, new_scales = _quantize_mxfp4_activation(new_hidden)
             packed.copy_(new_packed)
             scales.copy_(new_scales)
-            if phase == 0 and rows == 191:
+            if phase == 0 and rows == 191 and ep_size > 1:
                 # Maximizes B32 padding while keeping each token's top8 distinct.
                 remaining = (
                     [161] * 9 + [89 - local_experts] + [1] * (local_experts - 10)
@@ -826,7 +843,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 assert not any(remaining)
                 ids.copy_(
                     torch.tensor(routes, device="cuda", dtype=torch.int32)
-                    + local_experts
+                    + expert_start
                 )
                 sorted_ids, _, _, valid, _ = gluon_moe_sorting(
                     ids,
@@ -837,7 +854,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                     32,
                     runtime_rows=True,
                     use_minimum_route_chunks=False,
-                    expert_start=local_experts,
+                    expert_start=expert_start,
                 )
                 assert (
                     int(valid[0])
@@ -847,9 +864,9 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 )
             elif phase == 0:
                 ids.copy_(
-                    torch.arange(
-                        local_experts, local_experts + 8, device="cuda"
-                    ).expand(rows, 8)
+                    torch.arange(expert_start, expert_start + 8, device="cuda").expand(
+                        rows, 8
+                    )
                 )
             elif phase == 1:
                 ids.copy_(torch.arange(128, 136, device="cuda").expand(rows, 8))
@@ -868,8 +885,8 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
             actual_map.fill_(-123)
             graph.replay()
             torch.cuda.synchronize()
-            owned = (ids.flatten() >= local_experts) & (
-                ids.flatten() < 2 * local_experts
+            owned = (ids.flatten() >= expert_start) & (
+                ids.flatten() < expert_start + local_experts
             )
             expected_map = torch.where(
                 owned, torch.arange(rows * 8, device="cuda", dtype=torch.int32), -1
@@ -883,3 +900,9 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
                 atol=0,
             )
             assert bool(torch.isfinite(actual[owned]).all())
+            torch.testing.assert_close(
+                guarded[0], torch.full_like(guarded[0], 17), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                guarded[-1], torch.full_like(guarded[-1], 17), rtol=0, atol=0
+            )

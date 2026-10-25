@@ -202,6 +202,7 @@ def torch_hyperconnection_mix(
     projection_rows: int,
     projection_scale: float,
     weights_independent: bool,
+    packed_up_weight: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Low-rank gated mix of ``hc_count`` streams, in FP64.
 

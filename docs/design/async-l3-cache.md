@@ -12,40 +12,47 @@ asynchronous implementation; there is no second synchronous scheduling mode.
 | --- | --- |
 | C++ scheduler and `StorageTransferManager` | Request preparation, prefix boundaries, pressure admission, soft deadlines, operation IDs, credits, Host references, publication, cancellation and quarantine |
 | `CacheCoordinator` | Group matching, allocation and pinning; ordinary probes see published Device/Host data only |
-| Python `L3Executor` | Immutable Host jobs, backend and Host-buffer lifetime, bounded query/read/write queues, completion/pressure facts, and backend health monitoring |
-| `L3CacheHooks` | Replica agreement on time, permissions and completion facts; feedback to the existing event-loop head |
+| The engine host's L3 executor (`ts-l3`) | Immutable Host jobs, the store client and its registration of the Host buffer, bounded query/read/write queues, completion/pressure facts, and backend health monitoring |
+| The control plane's `l3` module (`ts-control`) | Submission of the plans' storage operations; replica agreement on time, permissions and completion facts; feedback to the existing event-loop head |
+| `cache/l3/factory.py` (startup) | The deployment identity and the executor's `L3Settings` |
 | `HostCacheStorage` | Shared pinned Host allocation and CPU-only block geometry; holds no device buffers or transfer layout |
 | `DeviceHandle` / `HostCacheExecutor` | Ordered D2H/H2D and device completion fences |
 
 The C++ cache subsystem selects reusable prefixes, allocates blocks and owns
-their references. Python workers receive immutable keys and Host byte ranges;
-they call neither the scheduler nor GPU APIs or collectives. Native I/O references
-remain held until every cache-owning rank proves retirement. L2 and
-L3 independently retain the shared Host allocation, so either can shut down
-without invalidating memory still used by the other.
+their references. The executor's workers receive immutable keys and Host byte
+ranges; they call neither the scheduler nor GPU APIs or collectives, and no
+L3 path takes the Python GIL. Native I/O references remain held until every
+cache-owning rank proves retirement. The executor addresses the shared Host
+allocation by pointer, so the data plane keeps that allocation for the
+process once L3 runs: native I/O that cannot prove its retirement may
+outlive the executor.
 
 Device construction returns startup-only `HostCacheResources`: shared storage,
 owner translation, CPU cache geometry and resolved attention choices. This
 record contains no Device buffers or executor. The separate L3 factory derives
 the storage schema and immutable deployment identity, validates sharded payloads,
-and constructs the backend and executor. Static checkpoint/layout/producer facts
-are collected once; weight-version changes combine that identity with explicit
-target/draft versions. Checkpoint agreement uses the caller's explicit CPU group.
+and resolves the `L3Settings` the engine host starts the executor from: limits
+and workers, the identity, the Host allocation's address and geometry, and the
+store client's settings. Static checkpoint/layout/producer facts are collected
+once; weight-version changes combine that identity with explicit target/draft
+versions. Checkpoint agreement uses the caller's explicit CPU group.
 Device construction retains responsibility for L2 copies and their Device
 buffers, streams and slot-state exporters.
 
-The control plane adapts `plan.cache` once. Its immutable `CacheOperations`
-snapshot preserves order within the Device and storage subsets. The loop
-submits storage operations to L3 and passes the Device subset to both cache-op
-accounting and `DeviceHandle.execute`. The two executors depend on scheduler
-tickets rather than their submission order. Completions enter the existing
-head feedback point, including during frozen and DP-idle rounds.
+The control plane submits a plan's storage operations to the executor, in
+plan order, when it dispatches the plan. The data plane adapts `plan.cache`
+once (`CacheOperations`), sets the storage subset aside and passes the Device
+subset to `DeviceHandle.execute`; the control plane counts the same Device
+operations from the plan. The two executors depend on scheduler tickets rather
+than their submission order. Completions enter the existing head feedback
+point, including during frozen and DP-idle rounds.
 
 Configuration follows the same ownership boundary. `StorageConfig` is the
 read-only scheduling contract for credits, deadlines and pressure watermarks.
-`StorageRuntimeConfig` contains that contract plus Python worker counts and
-backend-health settings. `MooncakeStoreConfig` contains connection and segment
-settings. The JSON `async` object tunes this one asynchronous path; it does
+`StorageRuntimeConfig` contains that contract plus the executor's worker counts
+and backend-health settings. `MooncakeStoreSettings` contains connection
+settings and this rank's segment share. The JSON `async` object tunes this one
+asynchronous path; it does
 not select another execution mode. See
 [server configuration](../configuration/server.md#host-l2-and-mooncake-store-l3)
 for settings and defaults.
@@ -235,13 +242,14 @@ same lock: the number and payload bytes of queued QUERY/GET/PUT jobs, and the
 age of the oldest queued or running job. Query payload bytes are zero. Retired
 work is excluded; detached native work remains included until it retires.
 Sampling scans at most the configured operation limit and never calls storage
-or the GPU. Metrics snapshots remain a separate, lower-frequency observation.
-L3 exports use the shared metric adapter and process-local metrics service.
+or the GPU. Metrics snapshots remain a separate, lower-frequency observation
+(at most once a second, and when storage turns pending or idle), exported by
+the engine host (`ts-metrics`).
 Local I/O remains labeled by TP rank; exporters do not make storage admission
 or retirement decisions.
 
-Hooks MAX-reduce these durations and counts across cache owners through the
-existing fixed CPU header. C++ closes a shared read/write admission gate when
+The control plane MAX-reduces these durations and counts across cache owners
+from the round's reports. C++ closes a shared read/write admission gate when
 any high watermark is reached and reopens it only when all observations reach
 their low watermarks. Local wall-clock timestamps never cross this boundary.
 The gate is independent of pause/freeze, backend health and quarantine. It does
@@ -281,28 +289,30 @@ and a successful backend call does not override C++ pressure admission.
 
 ## Completion agreement and ordering
 
-Every attention-TP owner sends its newly completed records once over the CPU
-group. Hooks retain partial-owner records until the other owners finish.
-Each round first exchanges a named CPU header: the TP leader's monotonic clock,
-forward/storage permissions, completion count, an error flag and the three
-pressure observations. Buffer width follows these fields, independently of
-model attention heads and the number of owners. Permissions are intersected
-and pressure is MAX-reduced. Idle and pressure-only rounds exchange only
-headers; completion/error facts trigger a bounded payload exchange. The agreed
-tick is delivered every round, including idle and frozen rounds.
+Every attention-TP owner sends its newly completed records once over the
+replica's collective mesh. The control plane retains partial-owner records
+until the other owners finish.
+Each round every owner's report rides the replica's relay exchange, one CPU
+all-gather that also carries the TP leader's frontend messages: the owner's
+monotonic clock, the three pressure observations, its completions, and an
+error when its poll was invalid. The TP leader's clock becomes the tick's and
+pressure is MAX-reduced; the forward/storage permissions come from the
+control state, which every owner holds alike. The report's size follows its
+completions, independently of model attention heads and the number of
+owners. The agreed tick is delivered every round, including idle and frozen
+rounds.
 Results are agreed per operation, so a slow earlier operation cannot block a
 later complete one. Per-key validity and retirement are AND-reduced;
 confirmed missing/invalid object facts are OR-reduced. A single missing shard
 invalidates the shared object, but a peer that did not read contributes no
 object-failure evidence. The window is bounded by operation and key credits;
-it is not truncated to a prefix of pending operations. A local polling error
-joins the collective before every owner raises the protocol error.
-Local completion records are validated and captured inside that same error
-boundary, before header exchange. Success, object-failure and retirement
-fields must be actual booleans; per-key masks have equal lengths and success
+it is not truncated to a prefix of pending operations. An invalid local
+report joins the collective as an error before every owner raises the
+protocol error: local completion records are validated inside that same error
+boundary, before the exchange. Per-key masks have equal lengths and success
 cannot also report an object failure. Query/PUT cannot report read failures.
-A truthy value is not proof of native retirement. Malformed backend
-results follow the backend's explicit exception-retirement contract.
+Malformed store results follow the store's explicit failure-retirement
+contract.
 
 Page-cyclic groups use the existing Host owner translation. Each worker copies
 only its locally owned rows; other rows contribute success and retirement but
@@ -311,7 +321,10 @@ no object failure or transferred bytes. Their keys name the payload replica
 same object on another cyclic owner. Replicated state groups retain rank-local
 keys. Startup rejects head-partitioned fields in a page-sharded group: changing
 page owner must not change what bytes an object means. The producer namespace
-also includes KVP, QCP and linear-attention TP geometry.
+also includes KVP, QCP and linear-attention TP geometry. Page-sharded layouts
+include the ordered group shard counts: identical byte layouts with different
+replica numbering must not alias. All-replicated layouts retain their existing
+namespace. Host allocation IDs and cyclic owner ranks are never namespace inputs.
 
 The head advance applies that tick and cancellation before completion records,
 so an already expired/detached read cannot publish a late result. The scheduler
@@ -331,11 +344,12 @@ the page unacknowledged for the scheduler to re-offer, never a quarantine.
 Other negative transfer errors, exceptions after native submission,
 and malformed transfer results do not prove retirement.
 
-`failures_retire` declares the backend's guarantee when a call raises or returns
-a malformed result: whether it has stopped accessing the supplied Host buffers.
+`Store::failures_retire` declares the store's guarantee when a call fails or
+returns a malformed result: whether it has stopped accessing the supplied Host
+buffers.
 It is not an operation's success flag. Valid results carry their own `retired`
 fact, including safely retired misses. The in-process store guarantees retirement
-on failure; Mooncake does not infer it from an exceptional SDK return. QUERY
+on failure; Mooncake does not infer it from a failed SDK call. QUERY
 accesses no supplied Host payload, so its failure does not retain payload buffers.
 
 Only confirmed missing or invalid GET objects enter C++'s bounded negative
@@ -344,7 +358,7 @@ exceptions carry no object evidence. They still complete the request's attempt
 and preserve the retirement contract, but the same keys can be queried and read
 by a new request after recovery. Genuine negative metadata retains its existing
 bounded FIFO lifetime; expiry/reprobe after external object repair is separate
-work. Python reports facts and does not choose negative-cache policy.
+work. The executor reports facts and does not choose negative-cache policy.
 
 An unretired result quarantines every reference of that job. It is never
 published, freed or repaired by an existence recheck. One generic negative
@@ -365,10 +379,11 @@ control processing until the backend returns; preparation soft timeouts do not
 bound or cancel it. A deletion failure prevents local cache clearing.
 Asynchronous administrative purge is outside the first-version scope.
 L1-only clear may proceed while Host-only storage I/O remains active.
-Shutdown attempts device-copy cleanup and L3 retirement independently from the
-control plane. L3 joins its workers with a deadline and then closes its backend;
-if native retirement remains unknown it refuses backend close/Host deregistration
-and retains the backend and Host allocation even if the runtime owner is collected.
+Shutdown closes the L3 executor when the host's event loop ends, before the
+data plane's device-copy cleanup. L3 joins its workers with a deadline and then
+closes its store; if native retirement remains unknown it refuses store
+close/Host deregistration and keeps the store client for the process, as the
+data plane keeps the Host allocation.
 
 ## Initial scope and validation
 
@@ -407,15 +422,19 @@ read deduplication or layer-wise GET publication.
 
 Scheduler tests exercise mixed block granularities, sliding windows, sparse
 state, partial results, deadline expiry, cancellation, ID reuse and ownership.
-Executor tests cover bounded queues, health epochs, queued cancellation,
-shared-store byte round trips and quarantine. Two-process Gloo tests cover
-out-of-order owner agreement and collective error handling. GPU H2D/D2H and
-real Mooncake/RDMA validation are distinct from these CPU protocol tests.
+Executor tests (`ts-l3`) cover bounded queues, health epochs, queued
+cancellation, shared-store byte round trips, KVP ownership, quarantine and the
+Mooncake result codes. Multi-rank tests over the control plane's TCP mesh
+(`ts-control`'s `l3` module) cover out-of-order owner agreement and collective
+error handling, and its serving tests the executor inside the round. GPU
+H2D/D2H and real Mooncake/RDMA validation are distinct from these CPU
+protocol tests.
 
-The Mooncake CI workflow defines CPU KVP owner-relocation tests and scheduler
-tail round trips through memory and native storage. Its native job starts a
-local master and independent DRAM provider with `MOONCAKE_REQUIRE_MASTER=1`,
-then checks exact Host bytes after the writer closes. These CPU tests do not
+The Mooncake CI workflow runs the executor against a local master and an
+independent provider with `MOONCAKE_REQUIRE_MASTER=1`: byte round trips,
+objects outliving their writer, KVP owner relocation, tenant isolation and
+recovery after a master restart (`ts-l3`'s live tests), plus scheduler tail
+round trips through the in-memory and native stores. These CPU tests do not
 establish native RDMA or GPU-byte correctness.
 
 `test/runtime/test_l3_flat_kv_e2e.py` checks packed history/state groups through
@@ -445,7 +464,7 @@ token (TTFT), compared with recomputation when the tested prefix is absent
 from both Device and Host caches. Report the prefix actually used by admission,
 remaining prefill work and fallback frequency alongside TTFT. Separate remote
 DRAM hits, SSD hits with warm or cold file caches, and misses. Concurrent decode
-time per output token (TPOT) is an interference check; reducing idle L3 hook
+time per output token (TPOT) is an interference check; reducing idle L3 agreement
 overhead does not establish a prefill benefit. A storage call overlapping GPU
 work also does not establish how much latency was hidden on the request's
 critical path. PD measurements must include transfer and decode-side
@@ -467,8 +486,8 @@ centralized feedback points.
 
 ## Disabled storage and scope
 
-Without a storage backend, startup creates no L3 executor or SDK client, hooks
-return without I/O or owner agreement, and the scheduler skips storage
+Without a storage backend, startup creates no L3 executor or SDK client, the
+control plane runs no storage poll or owner agreement, and the scheduler skips storage
 preparation and reference-handoff scans. Ordinary Device/Host matching,
 admission and execution remain the same path. The runtime requires the
 scheduler built from matching source even when storage is disabled.

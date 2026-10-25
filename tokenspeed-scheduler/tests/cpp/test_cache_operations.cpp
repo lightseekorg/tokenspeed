@@ -434,7 +434,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     EXPECT_TRUE(coordinator.ClearDeviceCache());
 }
 
-TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
+TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
     BlockPool device_pool{3, {2, 1}};
     BlockPool host_pool{1, {2, 1}};
     const std::array specs{
@@ -471,30 +471,30 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
     cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = "old-1"});
 
     const CacheKey group_one{.group_id = 1, .content_hash = "new-1"};
-    cache_block(device_pool, group_one);
+    const std::int32_t group_one_source = cache_block(device_pool, group_one);
     const std::array group_one_hashes{group_one.content_hash};
     coordinator.QueueCachedBlocksForStore(group_one_hashes);
 
     const CacheKey group_zero_first{.group_id = 0, .content_hash = "new-0"};
     const CacheKey group_zero_second{.group_id = 0, .content_hash = "new-2"};
-    const std::int32_t first_source = cache_block(device_pool, group_zero_first);
-    const std::int32_t second_source = cache_block(device_pool, group_zero_second);
+    cache_block(device_pool, group_zero_first);
+    cache_block(device_pool, group_zero_second);
     const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
     coordinator.QueueCachedBlocksForStore(group_zero_hashes);
 
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
 
     ASSERT_TRUE(write_back);
-    ASSERT_EQ(write_back->transfers.size(), 2u);
-    EXPECT_EQ(write_back->transfers[0].group_id, 0u);
-    EXPECT_EQ(write_back->transfers[0].source_page, first_source);
-    EXPECT_EQ(write_back->transfers[1].group_id, 0u);
-    EXPECT_EQ(write_back->transfers[1].source_page, second_source);
+    // The first candidate reclaims the old parent across groups. Its new
+    // destination is pinned until the ACK, so the later stores cannot take it.
+    ASSERT_EQ(write_back->transfers.size(), 1u);
+    EXPECT_EQ(write_back->transfers[0].group_id, 1u);
+    EXPECT_EQ(write_back->transfers[0].source_page, group_one_source);
 
     transfers.CompleteWriteBack(write_back->op_id);
-    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_one));
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_zero_first));
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_zero_second));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_one));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_zero_first));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_zero_second));
 }
 
 TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRequest) {
@@ -1300,6 +1300,96 @@ TEST_F(AsyncStorageTransactionTest, NegativeMetadataRemainsBoundedAfterRetiremen
     EXPECT_EQ(storage.NumNegativeKeys(), 3u);
     EXPECT_FALSE(storage.HasPending());
     EXPECT_EQ(host.NumEmptyLcmBlocks(), 4);
+}
+
+TEST(CacheOperationTest, ShardedL3PartialReadUsesOrdinaryOwnerPreservingAdmission) {
+    for (const std::int32_t shards : {2, 4}) {
+        SCOPED_TRACE(shards);
+        BlockPool device{16, {4, 1}};
+        BlockPool host{16, {4, 1}};
+        const std::array specs{
+            CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                           .cache_blocks_per_lcm_block = 4,
+                           .block_granularity = 2,
+                           .shard_count = shards},
+            CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+        };
+        auto coordinator = MakeCoordinator(specs, 4, device, true, &host, nullptr, true);
+        StorageTransferManager storage{
+            coordinator, StorageConfig{4, 32, 16, 16, 32, 1, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}}};
+        const std::array<std::string, 3> hashes{"h0", "h1", "h2"};
+        const auto id = storage.StartRead(StoragePrompt(hashes, 4), coordinator.ExpandPrefixKeys(hashes));
+        ASSERT_NE(id, 0u);
+        const auto commands = storage.TakeCommands();
+        ASSERT_EQ(commands.size(), 1u);
+        const auto& get = std::get<StorageGetOperation>(commands[0]);
+        ASSERT_EQ(get.keys.size(), 9u);
+        EXPECT_EQ(device.NumEmptyLcmBlocks(), 16) << "L3 reads hold no Device capacity";
+        std::vector<std::uint8_t> successes;
+        std::vector<std::uint8_t> failures;
+        for (std::size_t i = 0; i < get.keys.size(); ++i) {
+            const auto& key = get.keys[i];
+            const auto page = std::find(hashes.begin(), hashes.end(), key.content_hash) - hashes.begin();
+            const auto bucket = key.group_id == 0 ? (page * 2 + key.page_offset) % shards : 0;
+            EXPECT_EQ((get.host_blocks[i] - 1) % specs[key.group_id].shard_count, bucket);
+            successes.push_back(key.content_hash != "h2");
+            failures.push_back(key.content_hash == "h2");
+        }
+        storage.Complete(cache::StorageDone{id, successes, true, failures});
+        EXPECT_EQ(coordinator.ProbePrefix(hashes).host.num_common_tokens, 8);
+        EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 6);
+        std::vector<BlockTable> tables(2);
+        std::vector<GroupDemand> demands{
+            {.table = &tables[0], .extent = DenseGrowth{12}},
+            {.table = &tables[1], .extent = DenseGrowth{12}},
+        };
+        auto admission = coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{},
+                                           /*request_access_epoch=*/std::nullopt);
+        ASSERT_TRUE(admission);
+        EXPECT_EQ(admission->host_prefix_tokens, 8);
+        ASSERT_EQ(admission->load_pairs.size(), 6u);
+        for (const auto& pair : admission->load_pairs) {
+            const auto& allocator = coordinator.Allocator(pair.group_id);
+            EXPECT_EQ(allocator.BucketOf(pair.source->Location()), allocator.BucketOf(pair.destination->Location()));
+        }
+        storage.Detach(id);
+        TierTransferManager transfers(coordinator);
+        auto load = transfers.StartPrefixLoad(std::move(admission->load_pairs));
+        transfers.CompleteLoadBack(load.op_id);
+        EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
+        coordinator.Free(tables);
+    }
+}
+
+TEST(CacheOperationTest, ShardedL3ReservationRespectsBucketPressureAndExistingHostPrefix) {
+    BlockPool device{4, {4}};
+    BlockPool host{1, {4}};
+    const std::array specs{CacheGroupSpec{
+        .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2, .shard_count = 4}};
+    auto coordinator = MakeCoordinator(specs, 2, device, true, &host, nullptr, true);
+    const std::array<std::string, 4> hashes{"h0", "h1", "h2", "h3"};
+    auto pinned = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{2});
+    auto warm = host.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0});
+    coordinator.CacheHostBlock(warm.front(), CacheKey{.group_id = 0, .content_hash = "h0"});
+    warm.clear();
+    const auto prompt = StoragePrompt(hashes, 2);
+    const auto query = coordinator.MissingStorageKeys(prompt, 16);
+    ASSERT_EQ(query.keys.size(), 3u);
+    // Bucket 2 cannot accept h2, so only the shorter complete prefix fits.
+    auto short_read = coordinator.ReserveStoragePrefix(prompt, query.keys, 4);
+    ASSERT_EQ(short_read.keys.size(), 1u);
+    EXPECT_EQ(short_read.keys[0].content_hash, "h1");
+    EXPECT_EQ(coordinator.Allocator(0).BucketOf(short_read.blocks[0]->Location()), 1);
+    short_read.blocks.clear();
+    pinned.clear();
+    const auto full_read = coordinator.ReserveStoragePrefix(prompt, query.keys, 4);
+    ASSERT_EQ(full_read.keys.size(), 3u);
+    for (std::size_t i = 0; i < full_read.keys.size(); ++i) {
+        EXPECT_EQ(full_read.keys[i].content_hash, hashes[i + 1]);
+        EXPECT_EQ(coordinator.Allocator(0).BucketOf(full_read.blocks[i]->Location()), static_cast<std::int32_t>(i + 1));
+    }
+    EXPECT_EQ(device.NumEmptyLcmBlocks(), 4);
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
 }
 
 TEST(CacheOperationTest, StorageReservationPinsAllWarmHitsBeforeEviction) {

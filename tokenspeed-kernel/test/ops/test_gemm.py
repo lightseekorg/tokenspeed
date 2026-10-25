@@ -31,7 +31,27 @@ from tokenspeed_kernel.ops.gemm import (
     linear_attnres_partials_available,
 )
 from tokenspeed_kernel.ops.gemm import mm as kernel_mm
+from tokenspeed_kernel.platform import Platform
+from tokenspeed_kernel.registry import KernelRegistry
 from utils import kernel_supported, make_fp8_per_channel_gemm_operands
+
+
+def test_gluon_fp32_blockscale_import_on_non_amd(h100_platform):
+    gluon = importlib.import_module("tokenspeed_kernel.ops.gemm.gluon")
+    host_platform = Platform.get()
+    host_registry = KernelRegistry.get()
+    try:
+        Platform.override(h100_platform)
+        KernelRegistry.reset()
+        importlib.reload(gluon)
+        exports = {}
+        exec("from tokenspeed_kernel.ops.gemm.gluon import *", exports)
+        with pytest.raises(ImportError, match="requires tokenspeed-kernel-amd"):
+            exports["gluon_mm_fp8_blockscale_gfx950"]()
+    finally:
+        Platform.override(host_platform)
+        KernelRegistry._instance = host_registry
+        importlib.reload(gluon)
 
 
 def test_mm_rejects_bad_out_layout() -> None:

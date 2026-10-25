@@ -111,12 +111,31 @@ def test_target_capture_is_mean_layer_input_after_engram(capture_mode):
             self.layer_id = layer_id
             self.engram = Engram(layer_id) if layer_id >= 37 else None
 
-        def forward(self, hidden, pre_mix, positions, image_mask, ctx):
+        def forward(
+            self,
+            hidden,
+            pre_mix,
+            positions,
+            image_mask,
+            ctx,
+            *,
+            pending_post,
+            allow_ffn_reduce_fusion,
+            capture_input,
+        ):
             events.append(("layer", self.layer_id))
+            assert allow_ffn_reduce_fusion == (
+                self.layer_id not in (19, 20) and self.layer_id < 36
+            )
             rows = v41._row_plan(self.layer_id, 20, ctx)
             assert rows.keep_rows is None and rows.source is rows.query
             # Distinct HC streams and a non-mean final mix catch weighted/output taps.
-            return embeddings[:, None, :] + streams + 10 * self.layer_id, pre_mix
+            return (
+                embeddings[:, None, :] + streams + 10 * self.layer_id,
+                pre_mix,
+                SimpleNamespace(finish=lambda residual: residual),
+                hidden.mean(dim=1) if capture_input else None,
+            )
 
     target = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
     nn.Module.__init__(target)
@@ -486,6 +505,24 @@ def test_window_attention_kernel_matches_reference():
     kv = backend._workspace(
         swa, positions, rotary.cos_sin_cache, None, config.rms_norm_eps
     )
+    current = dsv41.dspark_rows(
+        swa,
+        None,
+        None,
+        positions,
+        rotary.cos_sin_cache,
+        None,
+        None,
+        torch.empty_like(swa),
+    )
+    separate = torch.cat(
+        (
+            field[backend.selection.page, backend.selection.row],
+            current.reshape(batch, block, dim),
+        ),
+        dim=1,
+    )
+    torch.testing.assert_close(kv, separate, rtol=0, atol=0)
     expected = backend._reference_forward(q, kv, sink, dim**-0.5)
     # Both branches feed the kernel the very same quantized block rows.
     torch.testing.assert_close(

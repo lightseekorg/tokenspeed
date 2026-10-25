@@ -76,7 +76,11 @@ def _executor(monkeypatch, log, *, with_draft: bool):
     executor = ModelExecutor.__new__(ModelExecutor)
     executor.device = "cuda"
     executor.config = SimpleNamespace(
-        spec_algo=None, enforce_eager=False, pp_size=1, max_req_pool_size=3
+        spec_algo=None,
+        enforce_eager=False,
+        pp_size=1,
+        max_req_pool_size=3,
+        state_checkpoint_in_forward=False,
     )
     executor.model_runner = SimpleNamespace(model="target model")
     executor.attn_backend = _Holder("target", log)
@@ -177,7 +181,11 @@ def test_a_block_drafter_is_rechecked_against_the_targets_new_pool(
     log = []
     executor = _executor(monkeypatch, log, with_draft=True)
     executor.config = SimpleNamespace(
-        spec_algo=spec_algo, enforce_eager=False, pp_size=1, max_req_pool_size=3
+        spec_algo=spec_algo,
+        enforce_eager=False,
+        pp_size=1,
+        max_req_pool_size=3,
+        state_checkpoint_in_forward=False,
     )
     monkeypatch.setattr(
         module, "check_block_drafter_storage", lambda m, p: log.append(("check", m, p))
@@ -237,7 +245,8 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
         release_graphs=lambda: order.append("prefill")
     )
     executor.drafter = SimpleNamespace(
-        release_prefill_graph=lambda: order.append("drafter")
+        release_prefill_graph=lambda: order.append("drafter"),
+        release_round_graphs=lambda: order.append("drafter rounds"),
     )
     monkeypatch.setattr(
         module,
@@ -250,7 +259,14 @@ def test_releasing_frees_both_owners_the_drafter_and_the_workspace(monkeypatch):
 
     executor.release_graphs()
 
-    assert order == ["decode", "prefill", "drafter", ("unfreeze", "cuda"), "collect"]
+    assert order == [
+        "decode",
+        "prefill",
+        "drafter",
+        "drafter rounds",
+        ("unfreeze", "cuda"),
+        "collect",
+    ]
 
 
 def test_the_drafter_hooks_take_the_pool_and_drop_what_named_the_old_one(monkeypatch):

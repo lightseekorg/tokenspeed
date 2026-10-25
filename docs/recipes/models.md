@@ -249,6 +249,45 @@ Notes:
   0.9704 without speculative decoding (paired disagreement 10 versus 8, McNemar
   p ~ 0.81 -- within run-to-run noise), so the draft does not move accuracy.
 
+## MiniMax M3.1 {#minimax-m3-1}
+
+For checkpoints that declare `quant_method: mxfp8` with
+`moe_quant_algo: NVFP4`, TokenSpeed automatically selects `mxfp8_nvfp4`:
+projections use MXFP8 and routed experts use NVFP4. This quantization requires
+Blackwell.
+
+Download the target and bundled DSpark draft together. The draft is in the
+`dspark/` subdirectory and declares `DSparkMiniMaxDraftModel`. This example uses
+seven draft queries and an eight-token verify window; match those widths to
+the draft checkpoint's configuration.
+
+```bash
+model_dir=$(hf download MiniMaxAI/MiniMax-M3.1-Flash --quiet)
+
+tokenspeed serve "$model_dir" \
+    --tensor-parallel-size 4 \
+    --max-model-len 1048576 \
+    --gpu-memory-utilization 0.95 \
+    --attention-backend trtllm \
+    --kv-cache-dtype fp8 \
+    --moe-backend flashinfer_trtllm \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path "$model_dir/dspark" \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --prefix-granularity 128 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+Set `--speculative-num-steps` to the DSpark checkpoint's `block_size` and
+`--speculative-num-draft-tokens` to `block_size + 1`. See
+[Speculative decoding](../configuration/server.md#speculative-decoding) for
+the width conventions. To serve the target alone, drop the `--speculative-*`
+options.
+
 ## Kimi K2.5 / K2.6
 
 Kimi-style MoE launches usually need remote code, long context, reasoning and
@@ -1374,6 +1413,14 @@ path, with no flag. Use these supported Hub revisions:
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
 
+For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
+per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or
+dense gate/up projection. This reuses the BF16-rounded norm output and its
+existing quantizer contract. The consumer accepts at most 64 rows; other
+shapes and checkpoint formats retain their existing path. No extra flag is
+required. If the fused collective declines, the second norm fills the same
+buffers before the projection consumes them.
+
 The command below runs one TP8 replica over two 4-GPU nodes, as in the
 recipe's GB200 measurements. Run it on both nodes, changing only
 `--node-rank`, and point `--dist-init-addr` at node 0, the only rank that
@@ -1415,8 +1462,9 @@ Notes:
   `TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` unset. With the drafter the
   default batch limit is 80 requests, not 160.
 - Name no `--reasoning-parser` or `--tool-call-parser`. The bundled
-  `tokenspeed-smg==1.13.0.post20261016` that TokenSpeed pins reads the output
-  through the checkpoint's `response_template`.
+  `tokenspeed-smg` version pinned in
+  [python/pyproject.toml](https://github.com/lightseekorg/tokenspeed/blob/main/python/pyproject.toml)
+  reads the output through the checkpoint's `response_template`.
 
 The first start on a fresh machine tunes kernels for 30 to 45 minutes; pass
 `--engine-startup-timeout 5400`. Later starts reuse the caches.

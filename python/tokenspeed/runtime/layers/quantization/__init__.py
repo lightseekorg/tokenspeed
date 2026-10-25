@@ -30,12 +30,14 @@ from tokenspeed.runtime.layers.quantization.compressed_tensors.compressed_tensor
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config, Mxfp8Config
 from tokenspeed.runtime.layers.quantization.modelopt_mixed import ModelOptMixedConfig
 from tokenspeed.runtime.layers.quantization.mxfp4 import Mxfp4Config
+from tokenspeed.runtime.layers.quantization.mxfp8_nvfp4 import Mxfp8Nvfp4Config
 from tokenspeed.runtime.layers.quantization.nvfp4 import Nvfp4Config
 from tokenspeed.runtime.layers.quantization.w8a8_fp8 import W8A8Fp8Config
 
 BASE_QUANTIZATION_METHODS: dict[str, type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "mxfp8": Mxfp8Config,
+    "mxfp8_nvfp4": Mxfp8Nvfp4Config,
     "w8a8_fp8": W8A8Fp8Config,
     "compressed-tensors": CompressedTensorsConfig,
     "nvfp4": Nvfp4Config,

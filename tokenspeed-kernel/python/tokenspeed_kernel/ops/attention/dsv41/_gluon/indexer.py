@@ -23,13 +23,14 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsv41.triton import (
     _index_gather_heads,
     _index_topk_outputs,
-    cache_pack,
+    _mxfp4_index_rows,
+    _ue8m0_word,
 )
 
-_MFMA_HEADS = 32
 _PAGE_SIZE = 64
 # Match the native paged scorer's transient score budget. Heads are gathered
 # once per API chunk; only score/selection work is split at wider histories.
@@ -45,21 +46,68 @@ def _score_query_tile(queries: int, width: int) -> int:
     )
 
 
+@triton.jit(
+    do_not_specialize=["Q0", "Q1", "Q2", "W0", "W1"],
+    do_not_specialize_on_alignment=["Q0", "Q1", "Q2", "W0", "W1"],
+)
+def _pack_index_queries_padded(
+    Q,
+    W,
+    V,
+    S,
+    F,
+    Q0,
+    Q1,
+    Q2,
+    W0,
+    W1,
+    HEADS: tl.constexpr,
+):
+    token = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    d = tl.arange(0, 128)
+    live = head < HEADS
+    # Inner-strided views can span more than int32 elements within one head.
+    x = tl.load(Q + token * Q0 + head * Q1 + d.to(tl.int64) * Q2, live, 0.0).to(
+        tl.float32
+    )
+    grouped = tl.reshape(x, (4, 32))
+    # Match cache_pack(index): multiplication by the rounded reciprocal of six.
+    raw = tl.maximum(tl.max(tl.abs(grouped), 1), 6 * 2.0**-126) * (1.0 / 6.0)
+    packed, exponent = _mxfp4_index_rows(
+        tl.reshape(grouped, (1, 4, 32)), tl.reshape(raw, (1, 4)), 1
+    )
+    packed = tl.reshape(packed, (64,))
+    word = tl.sum(_ue8m0_word(exponent), 0)
+    row = token * 32 + head
+    tl.store(V + row * 64 + tl.arange(0, 64), tl.where(live, packed, 0))
+    tl.store(S + row, tl.where(live, word.to(tl.int32), 0))
+    weight = tl.load(W + token * W0 + head * W1, live, 0.0).to(tl.float32)
+    tl.store(F + row, weight)
+
+
 def _pack_index_q(q: torch.Tensor, weights: torch.Tensor):
+    """Write AMD's dense 32-head FP4 planes and FP32 weights without relayouts."""
     tokens, heads, _ = q.shape
-    packed = cache_pack(q.contiguous().reshape(tokens * heads, 128), "index", None)
-    values = packed[:, :64].reshape(tokens, heads, 64)
-    scales = packed[:, 64:68].contiguous().view(torch.int32).reshape(tokens, heads)
-    pad = _MFMA_HEADS - heads
-    if pad < 0:
-        raise ValueError(f"AMD CSA2 MXFP4 indexer supports at most {_MFMA_HEADS} heads")
-    if pad:
-        values = torch.nn.functional.pad(values, (0, 0, 0, pad))
-        scales = torch.nn.functional.pad(scales, (0, pad))
-        weights = torch.nn.functional.pad(weights.float(), (0, pad))
-    else:
-        weights = weights.float()
-    return values.contiguous(), scales.contiguous(), weights.contiguous()
+    if not 1 <= heads <= 32:
+        raise ValueError("AMD CSA2 MXFP4 indexer supports 1..32 heads")
+    values = torch.empty((tokens, 32, 64), dtype=torch.uint8, device=q.device)
+    scales = torch.empty((tokens, 32), dtype=torch.int32, device=q.device)
+    folded = torch.empty((tokens, 32), dtype=torch.float32, device=q.device)
+    if tokens:
+        _pack_index_queries_padded[(tokens, 32)](
+            q,
+            weights,
+            values,
+            scales,
+            folded,
+            *q.stride(),
+            *weights.stride(),
+            heads,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+    return values, scales, folded
 
 
 def _logical_from_scan(columns: torch.Tensor, candidate_blocks: torch.Tensor | None):
@@ -182,7 +230,9 @@ def run_dsv41_csa2_index_topk(
             index_q[start:end], weights[start:end], process_group
         )
         table = page_table[start:end].contiguous()
-        visible = visible_lens[start:end].clamp(0, int(table.shape[1]) * _PAGE_SIZE)
+        # Consumers bound raw int64 lengths before narrowing. A dense input
+        # needs no launch here; preserve the previous strided-input support.
+        visible = visible_lens[start:end].contiguous()
         candidates = (
             None
             if candidate_blocks is None
@@ -233,6 +283,7 @@ def run_dsv41_csa2_index_topk(
                     int(candidate_topk),
                     block_out[output_begin:output_end],
                     block_lens[output_begin:output_end],
+                    visible_capacity=int(table.shape[1]) * _PAGE_SIZE,
                 )
     return out
 

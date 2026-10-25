@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, get_args
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from tokenspeed.runtime.cache.l3.backend import (
+from tokenspeed.runtime.cache.l3.identity import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     resolve_l3_weight_version,
 )

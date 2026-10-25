@@ -123,6 +123,12 @@ change.
   boundary.
 * Third-party kernel libraries belong under `tokenspeed-kernel`; avoid direct
   runtime dependencies or imports that bypass it.
+* Runtime code (`python/tokenspeed/`) should dispatch kernels across hardware
+  platforms through the `tokenspeed-kernel` registry (`select_kernel`,
+  `KernelPlan.select()`, or the family-level ops built on them) rather than
+  importing a specific solution or branching on the platform at the call site.
+  When a call site must bypass the registry, add a comment there explaining
+  why.
 * If a dependency repeatedly breaks during version upgrades or slows project
   progress, consider removing it entirely or at least making it optional.
 
