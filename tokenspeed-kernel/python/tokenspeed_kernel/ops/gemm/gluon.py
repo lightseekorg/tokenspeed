@@ -110,7 +110,7 @@ if platform.is_amd:
         supports_gluon_mm_a16w16_decode_gfx950 as _supports_mm_a16w16_decode,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
-        gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
+        launch_gluon_fp32_router_gemv_gfx950 as _fp32_router_gemv_impl,
     )
     from tokenspeed_kernel_amd.ops.gfx950.gemm.fp32.router_gemv import (
         transpose_fp32_router_weight_gfx950 as _transpose_fp32_router_weight,
@@ -190,13 +190,9 @@ if platform.is_amd:
         enable_pdl: bool,
     ) -> torch.Tensor:
         """Dispatch decode-sized FP32 router GEMV to the gfx950 kernel."""
-        return _fp32_router_gemv_impl(
-            x,
-            weight,
-            multiplier,
-            counters,
-            enable_pdl,
-        )
+        # Split-K counters belong to the portable kernel; this one keeps no state.
+        del counters
+        return _fp32_router_gemv_impl(x, weight, multiplier, enable_pdl)
 
     try:
         from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.linear_attnres_partials_gfx950 import (

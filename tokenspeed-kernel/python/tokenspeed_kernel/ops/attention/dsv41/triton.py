@@ -1684,9 +1684,18 @@ def _rope_inplace_kernel(
     R: tl.constexpr,
     MAX_POS: tl.constexpr,
     B: tl.constexpr,
+    WEIGHTS,
+    W0,
+    W1,
+    WEIGHT_SCALE,
+    SCALE_WEIGHTS: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
+    if SCALE_WEIGHTS:
+        weight_ptr = WEIGHTS + token * W0 + head * W1
+        weight = tl.load(weight_ptr).to(tl.float32)
+        tl.store(weight_ptr, weight * WEIGHT_SCALE)
     # Keep padding/compressor sentinels in the caller's metadata. Only this
     # frequency-table lookup maps negative positions to the identity row.
     position = tl.maximum(tl.load(POS + token * P0).to(tl.int64), 0)
@@ -1707,10 +1716,24 @@ def _rope_inplace_kernel(
 
 @_register_rope("dsv41_rope_inplace")
 def rope_inplace(values, positions, cache):
+    return _launch_rope_inplace(values, positions, cache, None, 1.0)
+
+
+@_register_rope("dsv41_rope_weights_inplace")
+def rope_weights_inplace(values, positions, cache, weights, weight_scale):
+    return _launch_rope_inplace(values, positions, cache, weights, weight_scale)
+
+
+def _launch_rope_inplace(values, positions, cache, weights, weight_scale):
     if values.numel() == 0:
         return values
     rotary_dim = cache.shape[1]
     heads = 1 if values.ndim == 2 else values.shape[1]
+    # The extra scalar store helps small indexer launches, but loses its
+    # launch-saving benefit for larger grids on gfx950. Keep the ordinary RoPE
+    # launch there and scale the owned weights with the existing tensor op.
+    scale_separately = weights is not None and values.shape[0] * heads > 4096
+    fused_weights = None if scale_separately else weights
     _rope_inplace_kernel[(values.shape[0], heads)](
         values[..., -rotary_dim:],
         positions,
@@ -1722,10 +1745,17 @@ def rope_inplace(values, positions, cache):
         rotary_dim,
         cache.shape[0],
         max(triton.next_power_of_2(rotary_dim // 2), 16),
+        fused_weights,
+        0 if fused_weights is None else fused_weights.stride(0),
+        0 if fused_weights is None else fused_weights.stride(1),
+        weight_scale,
+        fused_weights is not None,
         num_warps=4,
         enable_fp_fusion=False,
         debug=True,
     )
+    if scale_separately:
+        weights.mul_(weight_scale)
     return values
 
 

@@ -23,9 +23,12 @@
 A ``Host`` owns the per-forward grammar work that runs as a CUDA host node
 (``cudaLaunchHostFunc``) on the grammar side stream: it advances the
 previous forward's matchers by that forward's sampled tokens, then fills
-this forward's bitmask rows. It calls xgrammar's ``GrammarMatcher`` methods
-through tvm-ffi's C ABI, so the node never takes the GIL; taking it, even
-for a callback that does nothing, measured ~3% of a decode step.
+this forward's bitmask rows. It reaches the matchers the engine host owns
+through their C entries (``HostGrammarEntries``), so the node never takes
+the GIL; taking it, even for a callback that does nothing, measured ~3% of
+a decode step. A ``Matcher`` holds its handle (the ``retain`` entry) until
+the last batch that refers to it is done, so a request's release does not
+pull the matcher from under a queued forward.
 
 Each forward adds one ``Batch`` and each execution of the node pops one.
 A ``Batch`` is also the forward's completion: ``wait`` blocks until its
@@ -47,18 +50,18 @@ _ext_lock = threading.Lock()
 
 _CPP_SRC = r"""
 #include <cuda_runtime.h>
-#include <dlpack/dlpack.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
-#include <tvm/ffi/c_api.h>
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -71,147 +74,95 @@ namespace py = pybind11;
 
 namespace {
 
-TVMFFIAny ObjectArg(TVMFFIObject* object) {
-    TVMFFIAny any{};
-    any.type_index = object->type_index;
-    any.v_obj = object;
-    return any;
-}
-
-TVMFFIAny IntArg(int64_t value) {
-    TVMFFIAny any{};
-    any.type_index = kTVMFFIInt;
-    any.v_int64 = value;
-    return any;
-}
-
-TVMFFIAny BoolArg(bool value) {
-    TVMFFIAny any{};
-    any.type_index = kTVMFFIBool;
-    any.v_int64 = value;
-    return any;
-}
-
-TVMFFIAny FloatArg(double value) {
-    TVMFFIAny any{};
-    any.type_index = kTVMFFIFloat;
-    any.v_float64 = value;
-    return any;
-}
-
-TVMFFIAny NoneArg() {
-    TVMFFIAny any{};
-    any.type_index = kTVMFFINone;
-    return any;
-}
-
-TVMFFIAny TensorArg(DLTensor* tensor) {
-    TVMFFIAny any{};
-    any.type_index = kTVMFFIDLTensorPtr;
-    any.v_ptr = tensor;
-    return any;
-}
-
-DLTensor HostTensor(void* data, int64_t* shape, int32_t ndim, uint8_t bits) {
-    DLTensor tensor{};
-    tensor.data = data;
-    tensor.device = DLDevice{kDLCPU, 0};
-    tensor.ndim = ndim;
-    tensor.dtype = DLDataType{kDLInt, bits, 1};
-    tensor.shape = shape;
-    return tensor;
-}
-
-std::string TakeError() {
-    TVMFFIObjectHandle error = nullptr;
-    TVMFFIErrorMoveFromRaised(&error);
-    if (error == nullptr) {
-        return "unknown error";
-    }
-    TVMFFIErrorCell* cell = TVMFFIErrorGetCellPtr(error);
-    std::string message(cell->kind.data, cell->kind.size);
-    message += ": ";
-    message.append(cell->message.data, cell->message.size);
-    TVMFFIObjectDecRef(error);
-    return message;
-}
-
 // Logs from the host node, which cannot raise and holds no GIL; allocates nothing.
 void LogError(const char* what, const char* message) noexcept {
     std::fprintf(stderr, "[grammar host] %s failed: %s\n", what, message);
 }
 
-// An xgrammar GrammarMatcher method; held for the process lifetime.
-class Method {
-  public:
-    explicit Method(uintptr_t function)
-        : function_(reinterpret_cast<TVMFFIObjectHandle>(function)) {
-        TVMFFIObjectIncRef(function_);
-    }
+// The engine host's matcher entries (ts_grammar::table::entries), by
+// handle; a negative status is a failure.
+struct Entries {
+    // 1 terminated, 0 not.
+    using IsTerminatedFn = int32_t (*)(uint64_t handle);
+    // 1 accepted, 0 rejected (the matcher unchanged).
+    using AcceptTokenFn = int32_t (*)(uint64_t handle, int32_t token);
+    // Row `row` of the [rows, width] int32 bitmask at `data`.
+    using FillBitmaskFn =
+        int32_t (*)(uint64_t handle, size_t data, int64_t rows, int64_t width, int32_t row);
+    // One row per draft-tree node, from num_nodes-long int64 columns.
+    using TraverseDraftTreeFn = int32_t (*)(
+        uint64_t handle, size_t next_node, size_t next_sibling, size_t draft_tokens,
+        int64_t num_nodes, size_t bitmask, int64_t width);
+    using RetainFn = int32_t (*)(uint64_t handle);
+    using FreeFn = void (*)(uint64_t handle);
 
-    // Returns the method's bool result; throws on a raised error.
-    bool operator()(TVMFFIAny* args, int32_t num_args) const {
-        TVMFFIAny result{};
-        result.type_index = kTVMFFINone;
-        if (TVMFFIFunctionCall(function_, args, num_args, &result) != 0) {
-            throw std::runtime_error(TakeError());
-        }
-        return result.type_index == kTVMFFIBool && result.v_int64 != 0;
-    }
+    explicit Entries(const std::map<std::string, uintptr_t>& addresses)
+        : is_terminated(Lookup<IsTerminatedFn>(addresses, "is_terminated")),
+          accept_token(Lookup<AcceptTokenFn>(addresses, "accept_token")),
+          fill_bitmask(Lookup<FillBitmaskFn>(addresses, "fill_bitmask")),
+          traverse_draft_tree(Lookup<TraverseDraftTreeFn>(addresses, "traverse_draft_tree")),
+          retain(Lookup<RetainFn>(addresses, "retain")),
+          free(Lookup<FreeFn>(addresses, "free")) {}
+
+    const IsTerminatedFn is_terminated;
+    const AcceptTokenFn accept_token;
+    const FillBitmaskFn fill_bitmask;
+    const TraverseDraftTreeFn traverse_draft_tree;
+    const RetainFn retain;
+    const FreeFn free;
 
   private:
-    TVMFFIObjectHandle function_;
+    template <typename Entry>
+    static Entry Lookup(const std::map<std::string, uintptr_t>& addresses, const char* name) {
+        auto found = addresses.find(name);
+        if (found == addresses.end() || found->second == 0) {
+            throw py::value_error(std::string("no grammar entry ") + name);
+        }
+        return reinterpret_cast<Entry>(found->second);
+    }
 };
 
-struct Methods {
-    Method accept_token;
-    Method fill_next_token_bitmask;
-    Method traverse_draft_tree;
-    Method is_terminated;
-};
-
-// One request's matcher: a strong reference and the tokens that end its grammar.
+// One request's matcher: a hold on its handle and the tokens that end its grammar.
 struct Matcher {
-    Matcher(uintptr_t handle, const std::vector<int64_t>& stop_token_ids)
-        : object(reinterpret_cast<TVMFFIObject*>(handle)),
+    Matcher(
+        std::shared_ptr<Entries> entries, uint64_t handle,
+        const std::vector<int64_t>& stop_token_ids)
+        : entries(std::move(entries)),
+          handle(handle),
           stop_token_ids(stop_token_ids.begin(), stop_token_ids.end()) {
-        TVMFFIObjectIncRef(object);
+        if (this->entries->retain(handle) != 0) {
+            throw py::value_error("unknown grammar handle " + std::to_string(handle));
+        }
     }
 
-    ~Matcher() { TVMFFIObjectDecRef(object); }
+    ~Matcher() { entries->free(handle); }
 
     Matcher(const Matcher&) = delete;
     Matcher& operator=(const Matcher&) = delete;
 
-    TVMFFIObject* const object;
+    const std::shared_ptr<const Entries> entries;
+    const uint64_t handle;
     const std::unordered_set<int64_t> stop_token_ids;
 };
 
-bool IsTerminated(const Methods& methods, const Matcher& matcher) {
-    TVMFFIAny args[1] = {ObjectArg(matcher.object)};
-    try {
-        return methods.is_terminated(args, 1);
-    } catch (const std::exception& error) {
+bool IsTerminated(const Matcher& matcher) {
+    const int32_t status = matcher.entries->is_terminated(matcher.handle);
+    if (status < 0) {
         // A matcher that cannot answer gets no mask and no tokens.
-        LogError("is_terminated", error.what());
+        LogError("is_terminated", "the matcher did not answer");
         return true;
     }
+    return status != 0;
 }
 
-bool AcceptToken(const Methods& methods, const Matcher& matcher, int64_t token) {
-    TVMFFIAny args[3] = {ObjectArg(matcher.object), IntArg(token), BoolArg(false)};
-    try {
-        return methods.accept_token(args, 3);
-    } catch (const std::exception&) {
-        return false;
-    }
+bool AcceptToken(const Matcher& matcher, int32_t token) {
+    return matcher.entries->accept_token(matcher.handle, token) == 1;
 }
 
 // One forward's grammar work, and its completion.
 class Batch {
   public:
     Batch(
-        std::shared_ptr<const Methods> methods,
         std::vector<std::shared_ptr<Matcher>> matchers,
         std::vector<bool> advance,
         bool has_candidates,
@@ -219,8 +170,7 @@ class Batch {
         int64_t num_prefill_outputs,
         int64_t num_decodes,
         int64_t decode_width)
-        : methods_(std::move(methods)),
-          matchers_(std::move(matchers)),
+        : matchers_(std::move(matchers)),
           advance_(std::move(advance)),
           has_candidates_(has_candidates),
           num_extends_(num_extends),
@@ -322,15 +272,15 @@ class Batch {
         }
         for (int64_t i = 0; i < bs(); ++i) {
             const Matcher* matcher = matchers_[i].get();
-            if (matcher == nullptr || !advance_[i] || IsTerminated(*methods_, *matcher)) {
+            if (matcher == nullptr || !advance_[i] || IsTerminated(*matcher)) {
                 continue;
             }
             const int64_t offset = TokenOffset(i);
             for (int64_t j = 0; j < accept_lengths[i] && offset + j < num_tokens; ++j) {
-                if (!AcceptToken(*methods_, *matcher, tokens[offset + j])) {
+                if (!AcceptToken(*matcher, tokens[offset + j])) {
                     break;
                 }
-                if (IsTerminated(*methods_, *matcher)) {
+                if (IsTerminated(*matcher)) {
                     terminated_at[i] = static_cast<int32_t>(j);
                     break;
                 }
@@ -355,7 +305,6 @@ class Batch {
         done_.wait(lock, [this] { return state_ == kDone; });
     }
 
-    const std::shared_ptr<const Methods> methods_;
     const std::vector<std::shared_ptr<Matcher>> matchers_;
     const std::vector<bool> advance_;
     const bool has_candidates_;
@@ -372,7 +321,6 @@ class Batch {
 class Host {
   public:
     Host(
-        std::vector<uintptr_t> methods,
         uintptr_t bitmask,
         int64_t max_bs,
         int64_t tokens_per_request,
@@ -380,8 +328,7 @@ class Host {
         uintptr_t candidates,
         uintptr_t output_tokens,
         uintptr_t accept_lengths)
-        : methods_(MakeMethods(methods)),
-          bitmask_(reinterpret_cast<int32_t*>(bitmask)),
+        : bitmask_(reinterpret_cast<int32_t*>(bitmask)),
           max_bs_(max_bs),
           n_(tokens_per_request),
           rows_(max_bs * tokens_per_request),
@@ -390,9 +337,6 @@ class Host {
           candidates_(reinterpret_cast<const int32_t*>(candidates)),
           output_tokens_(reinterpret_cast<const int32_t*>(output_tokens)),
           accept_lengths_(reinterpret_cast<const int32_t*>(accept_lengths)),
-          bitmask_shape_{rows_, width_},
-          chain_shape_{n_},
-          request_mask_shape_{n_, width_},
           chain_next_(n_),
           chain_sibling_(n_, -1),
           draft_tokens_(n_),
@@ -401,7 +345,6 @@ class Host {
         for (int64_t k = 0; k < n_; ++k) {
             chain_next_[k] = k + 1 < n_ ? k + 1 : -1;
         }
-        bitmask_tensor_ = HostTensor(bitmask_, bitmask_shape_, 2, 32);
     }
 
     std::shared_ptr<Batch> Add(
@@ -416,8 +359,8 @@ class Host {
             throw py::value_error("the batch is larger than max_bs");
         }
         auto batch = std::make_shared<Batch>(
-            methods_, std::move(matchers), std::move(advance), has_candidates,
-            num_extends, num_prefill_outputs, num_decodes, decode_width);
+            std::move(matchers), std::move(advance), has_candidates, num_extends,
+            num_prefill_outputs, num_decodes, decode_width);
         std::vector<std::shared_ptr<Batch>> retired;
         std::lock_guard<std::mutex> lock(queue_mutex_);
         retired.swap(retired_);
@@ -450,14 +393,6 @@ class Host {
     }
 
   private:
-    static std::shared_ptr<const Methods> MakeMethods(const std::vector<uintptr_t>& handles) {
-        if (handles.size() != 4) {
-            throw py::value_error("expected four matcher methods");
-        }
-        return std::make_shared<const Methods>(Methods{
-            Method(handles[0]), Method(handles[1]), Method(handles[2]), Method(handles[3])});
-    }
-
     static void CUDART_CB Execute(void* self) {
         try {
             static_cast<Host*>(self)->Run();
@@ -503,33 +438,26 @@ class Host {
     }
 
     bool FillRow(const Matcher& matcher, int64_t row) {
-        TVMFFIAny args[4] = {
-            ObjectArg(matcher.object), TensorArg(&bitmask_tensor_), IntArg(row), BoolArg(false)};
-        try {
-            methods_->fill_next_token_bitmask(args, 4);
-            return true;
-        } catch (const std::exception& error) {
-            LogError("fill_next_token_bitmask", error.what());
+        if (matcher.entries->fill_bitmask(
+                matcher.handle, reinterpret_cast<size_t>(bitmask_), rows_, width_,
+                static_cast<int32_t>(row)) != 0) {
+            LogError("fill_bitmask", "the matcher did not fill the row");
             return false;
         }
+        return true;
     }
 
     // Fills rows row..row+n-1 with the masks after drafts 1..k; the matcher is left as it was.
     bool FillAlongDrafts(const Matcher& matcher, int64_t row) {
-        DLTensor next = HostTensor(chain_next_.data(), chain_shape_, 1, 64);
-        DLTensor sibling = HostTensor(chain_sibling_.data(), chain_shape_, 1, 64);
-        DLTensor drafts = HostTensor(draft_tokens_.data(), chain_shape_, 1, 64);
-        DLTensor masks = HostTensor(bitmask_ + row * width_, request_mask_shape_, 2, 32);
-        TVMFFIAny args[7] = {
-            ObjectArg(matcher.object), TensorArg(&next), TensorArg(&sibling), TensorArg(&drafts),
-            TensorArg(&masks), FloatArg(-1.0), NoneArg()};
-        try {
-            methods_->traverse_draft_tree(args, 7);
-            return true;
-        } catch (const std::exception& error) {
-            LogError("traverse_draft_tree", error.what());
+        if (matcher.entries->traverse_draft_tree(
+                matcher.handle, reinterpret_cast<size_t>(chain_next_.data()),
+                reinterpret_cast<size_t>(chain_sibling_.data()),
+                reinterpret_cast<size_t>(draft_tokens_.data()), n_,
+                reinterpret_cast<size_t>(bitmask_ + row * width_), width_) != 0) {
+            LogError("traverse_draft_tree", "the matcher did not walk the drafts");
             return false;
         }
+        return true;
     }
 
     // How many leading positions of a draft walk got a mask: position k does
@@ -565,7 +493,7 @@ class Host {
         };
         for (int64_t i = 0; i < batch.bs(); ++i) {
             const Matcher* matcher = batch.matcher(i).get();
-            if (matcher == nullptr || IsTerminated(*methods_, *matcher)) {
+            if (matcher == nullptr || IsTerminated(*matcher)) {
                 continue;
             }
             const int64_t row = i * per_request_rows;
@@ -600,7 +528,6 @@ class Host {
         dirty_rows_.swap(filled_rows_);
     }
 
-    const std::shared_ptr<const Methods> methods_;
     int32_t* const bitmask_;
     const int64_t max_bs_;
     const int64_t n_;
@@ -611,10 +538,6 @@ class Host {
     const int32_t* const output_tokens_;
     const int32_t* const accept_lengths_;
 
-    int64_t bitmask_shape_[2];
-    int64_t chain_shape_[1];
-    int64_t request_mask_shape_[2];
-    DLTensor bitmask_tensor_;
     std::vector<int64_t> chain_next_;
     std::vector<int64_t> chain_sibling_;
     std::vector<int64_t> draft_tokens_;
@@ -635,16 +558,16 @@ class Host {
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    py::class_<Entries, std::shared_ptr<Entries>>(m, "Entries")
+        .def(py::init<const std::map<std::string, uintptr_t>&>());
     py::class_<Matcher, std::shared_ptr<Matcher>>(m, "Matcher")
-        .def(py::init<uintptr_t, const std::vector<int64_t>&>());
+        .def(py::init<std::shared_ptr<Entries>, uint64_t, const std::vector<int64_t>&>());
     py::class_<Batch, std::shared_ptr<Batch>>(m, "Batch")
         .def("wait", &Batch::Wait)
         .def("advance_on_host", &Batch::AdvanceOnHost)
         .def("terminated_at", &Batch::TerminatedAt);
     py::class_<Host, std::shared_ptr<Host>>(m, "Host")
-        .def(py::init<
-             std::vector<uintptr_t>, uintptr_t, int64_t, int64_t, int64_t, uintptr_t,
-             uintptr_t, uintptr_t>())
+        .def(py::init<uintptr_t, int64_t, int64_t, int64_t, uintptr_t, uintptr_t, uintptr_t>())
         .def("add", &Host::Add)
         .def("clear", &Host::Clear)
         .def("__len__", &Host::Queued)
@@ -654,7 +577,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 def load_grammar_host_ext() -> Any:
-    """The JIT-compiled extension: ``Host``, ``Batch`` and ``Matcher``."""
+    """The JIT-compiled extension: ``Host``, ``Batch``, ``Matcher`` and
+    ``Entries``."""
     global _ext
     if _ext is not None:
         return _ext
@@ -666,10 +590,9 @@ def load_grammar_host_ext() -> Any:
         import sys
 
         from torch.utils.cpp_extension import CUDA_HOME, load_inline
-        from tvm_ffi import libinfo
 
         cuda_home = CUDA_HOME or os.environ.get("CUDA_HOME")
-        include_dirs = list(libinfo.include_paths())
+        include_dirs = []
         library_dirs = []
         if cuda_home:
             inc = os.path.join(cuda_home, "include")
@@ -686,20 +609,12 @@ def load_grammar_host_ext() -> Any:
                 glob.glob(os.path.join(root, "targets", "*", "include"))
             )
             library_dirs += sorted(glob.glob(os.path.join(root, "targets", "*", "lib")))
-        # Link the libtvm_ffi xgrammar already loaded: the error state is per library.
-        tvm_ffi_dir = os.path.dirname(libinfo.find_libtvm_ffi())
 
         _ext = load_inline(
             name="tokenspeed_grammar_host_ext",
             cpp_sources=[_CPP_SRC],
             extra_cflags=["-O2"] + [f"-I{d}" for d in include_dirs],
-            extra_ldflags=[f"-L{d}" for d in library_dirs]
-            + [
-                "-lcudart",
-                f"-L{tvm_ffi_dir}",
-                "-ltvm_ffi",
-                f"-Wl,-rpath,{tvm_ffi_dir}",
-            ],
+            extra_ldflags=[f"-L{d}" for d in library_dirs] + ["-lcudart"],
             verbose=False,
         )
         return _ext

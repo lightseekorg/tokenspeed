@@ -1318,7 +1318,10 @@ inference jobs sharing a namespace are outside this flush agreement.
 
 Omitting `--kvstore-storage-backend` creates no L3 executor, workers or SDK
 client. `--kvstore-storage-backend memory` selects an in-process test store;
-it is separate from Mooncake's distributed DRAM mode. CPU tests cover the
+it is separate from Mooncake's distributed DRAM mode. The engine host loads
+the Mooncake store client from the `tokenspeed-mooncake` wheel's
+`libmooncake_store.so` (the store's C ABI);
+`TOKENSPEED_MOONCAKE_STORE_LIBRARY` names another build. CPU tests cover the
 scheduler, executor and replica agreement; GPU tests cover packed-byte
 D2H/PUT/GET/H2D round trips. See the
 [validation scope](../design/async-l3-cache.md#initial-scope-and-validation)

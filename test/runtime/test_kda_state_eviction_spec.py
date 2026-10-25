@@ -50,22 +50,21 @@ from ci_system.ci_register import register_cuda_ci
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
-from tokenspeed.runtime.engine.generation_output_processor import (  # noqa: E402
-    OutputProcesser,
-    RequestState,
-)
-from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
+from test.runtime.scheduler_driver import (  # noqa: E402
+    advance_scheduler,
     make_extend_result_event,
-    pool_to_cache_groups,
+    make_finish_event,
+    make_update_reserve_tokens_event,
 )
+
+from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.execution.runtime_states import RuntimeStates  # noqa: E402
-from tokenspeed.runtime.execution.types import ModelExecutionResult  # noqa: E402
+from tokenspeed.runtime.execution.types import StopCriteria  # noqa: E402
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     STATE_INPUT_SLOT,
     STATE_LIVE_SLOT,
 )
-from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 
 register_cuda_ci(
     est_time=180,
@@ -478,50 +477,33 @@ def test_speculative_decode_evolves_the_live_block_and_preserves_the_checkpoints
             )
 
 
-class _Sender:
-    """Stands in for the detokenizer socket."""
-
-    def __init__(self):
-        self.items = []
-
-    def send_pyobj(self, obj):
-        self.items.append(obj)
-
-
-class _Tokenizer:
-    eos_token_id = None
-    additional_stop_token_ids = None
-
-    def decode(self, ids):
-        return " ".join(str(i) for i in ids)
-
-
-class _Metrics:
-    enabled = False
-
-
 _STOP = 99
 
 
-def _land(scheduler, processor, batch, sampled: list[int], accepted: int):
-    """Report a landed forward the way the event loop does: the output
-    processor turns the sampled rows into scheduler events. Returns the tokens
-    the scheduler was told the forward produced."""
-    torch.cuda.synchronize()
-    result = ModelExecutionResult(
-        output_tokens=torch.tensor(sampled, dtype=torch.int32),
-        output_lengths=torch.tensor([accepted], dtype=torch.int32),
-    )
-    event = ts.ExecutionEvent()
-    reported = []
-    for change in processor.post_process_forward_op(
-        batch, result, is_prefill_instance=False
-    ):
-        if type(change).__name__ == "ExtendResult":
-            reported += list(change.tokens)
-        event.add_event(change)
-    scheduler.advance(event)
-    return reported
+class _Commit:
+    """What the control plane reports to the scheduler for the one request
+    (``ts-control``'s commit): every token a forward kept; then a finish on
+    the stop token, or the decode row's reserve; and once the request
+    finished, only the kept tokens of a forward still in flight."""
+
+    def __init__(self) -> None:
+        self.finished = False
+
+    def land(self, scheduler, batch, sampled: list[int], accepted: int) -> list[int]:
+        """Report a landed forward; returns the tokens the scheduler was told
+        it produced."""
+        torch.cuda.synchronize()
+        rid = batch.request_ids[0]
+        kept = sampled[:accepted]
+        events = [make_extend_result_event(rid, kept)]
+        if not self.finished:
+            if _STOP in kept:
+                self.finished = True
+                events.append(make_finish_event(rid))
+            elif batch.num_extends() == 0:
+                events.append(make_update_reserve_tokens_event(rid, accepted))
+        advance_scheduler(scheduler, events)
+        return kept
 
 
 def _masked_tables(runtime, tables, slot):
@@ -562,24 +544,9 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
     runtime = RuntimeStates(
         req_pool_size=8, vocab_size=1024, output_length=width, device="cuda"
     )
-    processor = OutputProcesser(
-        _Sender(),
-        attn_tp_rank=0,
-        metrics=_Metrics(),
-        spec_algorithm="EAGLE" if width > 1 else None,
-        spec_num_tokens=width if width > 1 else None,
-    )
+    commit = _Commit()
     prompt = list(range(4))
-    processor.rid_to_state["source"] = RequestState(
-        prompt_input_ids=prompt,
-        sampling_params=SamplingParams(
-            max_new_tokens=40, stop=[], stop_token_ids={_STOP}
-        ),
-        stream=False,
-        tokenizer=_Tokenizer(),
-        computes_prompt_logprobs=True,
-    )
-    criteria = processor.rid_to_state["source"].stop_criteria
+    criteria = StopCriteria(stop_token_ids=(_STOP,), token_limit=len(prompt) + 40)
     request = ts.RequestSpec()
     request.request_id = "source"
     request.tokens = prompt
@@ -596,7 +563,7 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
         prompt_tokens=batch.prefill_lengths[0],
     )
     actual.forward(inputs, begin=0, end=4, prefill=True)
-    reported = prompt + _land(scheduler, processor, batch, [104], accepted=1)
+    reported = prompt + commit.land(scheduler, batch, [104], accepted=1)
     # The device-side length: the tokens the live slot has consumed. A round
     # starting there samples the token at sequence index consumed + j as its
     # j-th output.
@@ -648,7 +615,7 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
         batch, tables = _batch(scheduler, "source")
         sampled, kept = run_round(batch, tables, accepted)
         assert kept == accepted
-        reported += _land(scheduler, processor, batch, sampled, kept)
+        reported += commit.land(scheduler, batch, sampled, kept)
 
     batch, tables = _batch(scheduler, "source")
     sampled, kept = run_round(batch, tables, width, samples_stop=True)
@@ -656,12 +623,12 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
     if overlap:
         # Planned while the finishing round is still in flight.
         next_batch, next_tables = _batch(scheduler, "source")
-    reported += _land(scheduler, processor, batch, sampled, kept)
-    assert "source" not in processor.rid_to_state
+    reported += commit.land(scheduler, batch, sampled, kept)
+    assert commit.finished
     if overlap:
         next_sampled, next_kept = run_round(next_batch, next_tables, min(2, width))
         assert next_kept == 0
-        reported += _land(scheduler, processor, next_batch, next_sampled, next_kept)
+        reported += commit.land(scheduler, next_batch, next_sampled, next_kept)
     published = actual.states(tables)
 
     # A prompt extending the reported tokens resumes at the frontier, the

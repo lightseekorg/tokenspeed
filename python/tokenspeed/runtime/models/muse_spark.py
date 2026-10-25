@@ -256,13 +256,19 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Apply an unbiased projection, writing into ``out`` when supplied."""
-        if x.shape[0] == 1 and (
-            (
-                current_platform().is_cdna4
-                and x.dtype == weight.dtype
-                and not _gemm_dispatch_required()
+        if (
+            current_platform().is_cdna4
+            and x.dtype == weight.dtype
+            and not _gemm_dispatch_required()
+            # Rows gemm.mm would route to gemm.mv go there directly, writing a
+            # contiguous ``out`` in place.
+            and (
+                x.shape[0] == 1
+                or ((out is None or out.is_contiguous()) and _use_mv(x, weight))
             )
-            or (
+        ) or (
+            x.shape[0] == 1
+            and (
                 not current_platform().is_cdna4
                 and resolve_kernel_override("gemm", "mm", None) is None
                 and _use_mv(x, weight)
@@ -936,6 +942,7 @@ class PreparedFP32RouterGEMV(nn.Module):
             output_size=output_size,
             dtype=torch.float32,
             solution=solution,
+            batch_invariant=global_server_args_dict["numerics"] in BITWISE_ENVELOPES,
         )
         self.register_buffer("prepared_weight", None, persistent=False)
 

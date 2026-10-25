@@ -77,41 +77,6 @@ class TestDraftTableWidth:
         assert width * block_granularity >= context_len + spec
 
 
-class TestOutputProcessorTripwire:
-    def _processor(self, physical_context_len):
-        from tokenspeed.runtime.engine.generation_output_processor import (
-            OutputProcesser,
-        )
-
-        return OutputProcesser(
-            send_to_tokenizer=lambda *_: None,
-            spec_algorithm="DFLASH",
-            spec_num_tokens=4,
-            physical_context_len=physical_context_len,
-            metrics=SimpleNamespace(),
-        )
-
-    @staticmethod
-    def _state(prompt_len, prior_output):
-        return SimpleNamespace(
-            prompt_input_ids=list(range(prompt_len)),
-            output_ids=list(range(prior_output)),
-        )
-
-    def test_at_the_physical_limit_passes(self):
-        p = self._processor(physical_context_len=100)
-        p._check_physical_extent("r0", self._state(50, 46), output_length=4)
-
-    def test_past_the_physical_limit_raises(self):
-        p = self._processor(physical_context_len=100)
-        with pytest.raises(RuntimeError, match="physical_context_len=100"):
-            p._check_physical_extent("r0", self._state(50, 47), output_length=4)
-
-    def test_disabled_when_none(self):
-        p = self._processor(physical_context_len=None)
-        p._check_physical_extent("r0", self._state(50, 470), output_length=4)
-
-
 class TestRopeTableWarning:
     @pytest.fixture
     def warning(self, monkeypatch, caplog):

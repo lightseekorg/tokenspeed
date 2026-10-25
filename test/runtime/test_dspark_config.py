@@ -376,10 +376,9 @@ def test_dspark_draft_keeps_the_window_transformers_would_null(
 
 
 def _draft_dtype(server_dtype: str, target_dtype: torch.dtype) -> object:
-    from tokenspeed.runtime.engine import event_loop as event_loop_module
+    from tokenspeed.runtime.engine import rank_setup
 
-    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
-    loop.server_args = SimpleNamespace(
+    server_args = SimpleNamespace(
         dtype=server_dtype,
         quantization=None,
         speculative_draft_model_quantization=None,
@@ -388,10 +387,10 @@ def _draft_dtype(server_dtype: str, target_dtype: torch.dtype) -> object:
         max_model_len=262144,
         hf_overrides="{}",
     )
-    loop.model_config = SimpleNamespace(dtype=target_dtype)
+    target = SimpleNamespace(dtype=target_dtype)
 
-    with mock.patch.object(event_loop_module, "ModelConfig") as model_config:
-        loop._load_model_config("draft", is_draft_worker=True)
+    with mock.patch.object(rank_setup, "ModelConfig") as model_config:
+        rank_setup.load_model_config(server_args, "draft", draft_of=target)
 
     return model_config.call_args.kwargs["dtype"]
 

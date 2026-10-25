@@ -46,14 +46,9 @@ _process_shutdown_started = False
 
 _PR_SET_PDEATHSIG = 1
 
-
-def register_usr_signal():
-    parent_pid = os.getppid()
-
-    def signal_handler(sig, frame):
-        os.kill(parent_pid, signal.SIGUSR1)
-
-    signal.signal(signal.SIGUSR1, signal_handler)
+if sys.platform.startswith("linux"):
+    # Bound once so a post-fork child (a ``preexec_fn``) only calls prctl.
+    _libc = ctypes.CDLL(None, use_errno=True)
 
 
 def begin_process_shutdown() -> bool:
@@ -117,23 +112,32 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
+def set_parent_death_signal(parent_pid: int) -> None:
+    """Ask the kernel to SIGKILL this process when ``parent_pid`` dies.
+
+    The kernel sends SIGKILL even when the parent itself was SIGKILLed.
+    Linux only; elsewhere this does nothing. The signal follows the parent
+    *thread* this process was started from, so start the process from a
+    thread that lives as long as the parent needs it.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    if _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    # The parent may have died before the signal was set up.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
 def run_with_parent_death_signal(parent_pid: int, target: Callable, *args):
     """Run ``target(*args)`` in a process that is killed when its parent dies.
 
     Meant as a ``multiprocessing.Process`` target, with ``parent_pid`` the
-    parent's ``os.getpid()``. The kernel sends SIGKILL even when the parent
-    itself was SIGKILLed. Linux only; elsewhere ``target`` just runs. The
-    signal follows the parent *thread* that started this process, so start
-    it from a thread that lives as long as the parent needs it.
+    parent's ``os.getpid()``; see ``set_parent_death_signal``. Elsewhere
+    than Linux ``target`` just runs.
     """
-    if sys.platform.startswith("linux"):
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) != 0:
-            errno = ctypes.get_errno()
-            raise OSError(errno, os.strerror(errno))
-        # The parent may have died before the signal was set up.
-        if os.getppid() != parent_pid:
-            os.kill(os.getpid(), signal.SIGKILL)
+    set_parent_death_signal(parent_pid)
     return target(*args)
 
 

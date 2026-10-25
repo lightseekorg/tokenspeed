@@ -273,9 +273,9 @@ result lands, at the frontier the tokens it reports leave. The live slot is
 therefore never published while a forward writes it, and a paused loop, which
 drains its forwards without building plans, settles its finishes all the
 same. The runtime reports every landed forward row, tracked or not
-(`generation_output_processor`), so the count always reaches zero. A
-`Finishing` request is never scheduled and never a retraction victim; an
-abort releases it without publishing.
+(the control plane's forward commit, `ts-control`'s `output`), so the count
+always reaches zero. A `Finishing` request is never scheduled and never a
+retraction victim; an abort releases it without publishing.
 
 **A finish publishes the state before the stop token.** The device ends a
 request where the control plane does: a verify round keeps its accepted

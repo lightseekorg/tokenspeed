@@ -39,11 +39,13 @@ import os
 import signal
 import sys
 import threading
-from collections.abc import AsyncIterator, Iterator
+import time
+from collections.abc import AsyncIterator, Callable, Iterator
 
 from tokenspeed.runtime.engine.async_llm import AsyncLLM
 from tokenspeed.runtime.engine.llm import LLM
 from tokenspeed.runtime.metrics.config import metrics_enabled
+from tokenspeed.runtime.metrics.relay import MetricsRelay
 from tokenspeed.runtime.metrics.service import metrics_service
 
 
@@ -56,21 +58,20 @@ setattr(threading, "_register_atexit", _ignore_threading_atexit)
 
 import torch
 import uvloop
+import zmq
+from tokenspeed_engine import BootstrapServer, FrontendListener
 
-from tokenspeed.runtime.cache.l3.backend import (
+from tokenspeed.runtime.cache.l3.identity import (
     L3_FLUSH_REQUIRES_WEIGHT_VERSION,
     resolve_l3_weight_version,
 )
 from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
-from tokenspeed.runtime.engine.data_parallel_controller import (
-    run_data_parallel_controller_process,
-)
-from tokenspeed.runtime.engine.event_loop import run_event_loop
 from tokenspeed.runtime.engine.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
+    IpcSender,
     RebalanceExpertsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -80,11 +81,18 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromTensorReqInput,
     mooncake_load_weight_version,
 )
+from tokenspeed.runtime.engine.rust_host import (
+    host_binary,
+    rust_host_refusals,
+    start_rust_host,
+)
 from tokenspeed.runtime.entrypoints.engine_base import EngineBase
+from tokenspeed.runtime.pd.utils import DisaggregationMode, TransferBackend
 from tokenspeed.runtime.utils import (
     MultiprocessingSerializer,
     configure_logger,
     get_colorful_logger,
+    get_zmq_socket,
     launch_dummy_health_check_server,
     launch_metrics_server,
     prepare_model_and_tokenizer,
@@ -93,13 +101,12 @@ from tokenspeed.runtime.utils import (
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.launcher import interface_for_host
+from tokenspeed.runtime.utils.network import join_host_port
 from tokenspeed.runtime.utils.process import (
     begin_process_shutdown,
     kill_process_tree,
     receive_ready_messages,
     register_child_failure_signals,
-    run_with_parent_death_signal,
-    start_process_with_ready_pipe,
     stop_processes,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
@@ -140,6 +147,10 @@ class Engine(EngineBase):
             server_args = ServerArgs(**kwargs)
 
         self.server_args = server_args
+        # Set once the subprocesses run; `shutdown` may run before that, on a
+        # failed launch or at interpreter exit.
+        self.tokenizer_manager: AsyncLLM | None = None
+        self.llm: LLM | None = None
         # Shutdown the subprocesses automatically when the program exits
         atexit.register(self.shutdown)
 
@@ -290,20 +301,25 @@ class Engine(EngineBase):
         # Stop the sync-facade event loop before subprocess teardown so any
         # in-flight blocking callers see a clean loop close instead of a
         # stale-reference error.
-        if getattr(self, "llm", None) is not None:
+        if self.llm is not None:
             self.llm.shutdown()
-        bootstrap_server = getattr(
-            getattr(self, "tokenizer_manager", None),
-            "bootstrap_server",
-            None,
-        )
-        close_bootstrap = getattr(bootstrap_server, "close", None)
+        tokenizer_manager = self.tokenizer_manager
         try:
-            if callable(close_bootstrap):
-                close_bootstrap()
+            if (
+                tokenizer_manager is not None
+                and tokenizer_manager.bootstrap_server is not None
+            ):
+                tokenizer_manager.bootstrap_server.close()
         except Exception:
             logger.exception("Failed to close the disaggregation bootstrap server")
         finally:
+            # Before the process tree goes down: the relay flushes its sinks
+            # on a stop, and would be killed with the tree.
+            if (
+                tokenizer_manager is not None
+                and tokenizer_manager.metrics_relay is not None
+            ):
+                tokenizer_manager.metrics_relay.close(timeout=2.0)
             kill_process_tree(os.getpid(), include_parent=False)
             metrics_service.close(timeout=2.0)
 
@@ -654,11 +670,80 @@ def _stop_schedulers_on_signal(scheduler_procs: list[mp.Process]) -> None:
         signal.signal(signum, stop_schedulers_and_exit)
 
 
+def _frontend_addresses(server_args: ServerArgs) -> tuple[str, int]:
+    """Where an in-process frontend binds its sockets: loopback on one node,
+    with a free port; across nodes, the first node's address
+    (``--dist-init-addr``) and ``--data-parallel-rpc-port``, which every
+    node's ranks can compute."""
+    if server_args.mapping.nnodes == 1:
+        return "127.0.0.1", 0
+    host = server_args.dist_init_addr.rsplit(":", 1)[0].strip("[]")
+    return host, server_args.data_parallel_rpc_port
+
+
+def _frontend_routing(server_args: ServerArgs) -> str:
+    """How the frontend places requests on the attention-DP ranks
+    (``--load-balance-method``); the disaggregated roles place by bootstrap
+    room, the rule both roles apply."""
+    if server_args.disaggregation_mode != "null" and server_args.mapping.attn.has_dp:
+        return "bootstrap_room"
+    return {
+        "round_robin": "round_robin",
+        "shortest_queue": "least_in_flight",
+        "minimum_cache_usage": "minimum_cache_usage",
+    }[server_args.load_balance_method]
+
+
+# How long the frontend waits for every rank to finish loading and register.
+# Model loading (and kernel autotuning) bounds it, not the handshake itself;
+# a rank that dies first fails the launch through its ready pipe.
+_FRONTEND_HANDSHAKE_TIMEOUT_S = 24 * 3600.0
+# How long a request may wait to enter a rank's input socket.
+_FRONTEND_SEND_TIMEOUT_S = 60.0
+
+
+def _start_ranks(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    metrics_relay: MetricsRelay | None,
+    parent_death_signal: bool,
+) -> tuple[list, list]:
+    """Start this node's engine ranks, one ``ts-host`` process each, and
+    return them with their ready pipes. ``parent_death_signal`` asks the
+    kernel to kill a rank when this node dies (see
+    ``utils.process.set_parent_death_signal``)."""
+    binary = host_binary()
+    memory_saver_adapter = TorchMemorySaverAdapter.create(
+        enable=server_args.enable_memory_saver
+    )
+    procs, readers = [], []
+    for rank in _scheduler_ranks(server_args):
+        rank_server_args = copy.copy(server_args)
+        rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+        rank_server_args.mapping.rank = rank
+        proc, reader = start_rust_host(
+            binary,
+            rank_server_args,
+            port_args,
+            memory_saver_adapter.configure_subprocess(),
+            metrics_relay.endpoint if metrics_relay is not None else None,
+            parent_death_signal,
+        )
+        procs.append(proc)
+        readers.append(reader)
+    return procs, readers
+
+
 def _launch_subprocesses(
     server_args: ServerArgs, port_args: PortArgs | None = None
 ) -> tuple[AsyncLLM, None, dict]:
-    """
-    Launch the TokenizerManager in the main process, the Scheduler in a subprocess, and the DetokenizerManager in another subprocess.
+    """Launch this node's engine ranks and, on the first node, the
+    in-process frontend (``AsyncLLM``) they register with.
+
+    Every rank is a ``ts-host`` process; its attention-TP group's first
+    rank dials the frontend over the msgpack wire, so the frontend tokenizes
+    and detokenizes and the ranks see token ids only. An EPD encode server
+    runs encode ranks instead (``_launch_encode_server``).
     """
     # Configure global environment
     configure_logger(server_args)
@@ -676,58 +761,59 @@ def _launch_subprocesses(
     )
 
     metrics_service.start(server_args, port_args)
+    if server_args.disaggregation_mode == "encode":
+        return _launch_encode_server(server_args, port_args)
+    # Fail before any rank loads the model.
+    refusals = rust_host_refusals(server_args)
+    if refusals:
+        raise NotImplementedError(
+            "The engine host does not support " + ", ".join(refusals) + " yet"
+        )
+    pending_frontend = None
+    if server_args.node_rank == 0:
+        host, port = _frontend_addresses(server_args)
+        listener = FrontendListener.bind(
+            handshake_address=f"tcp://{join_host_port(host, port)}",
+            input_address=f"tcp://{join_host_port(host, 0)}",
+            output_address=f"tcp://{join_host_port(host, 0)}",
+            first_engine_index=server_args.zmq_engine_index,
+            num_engines=server_args.mapping.attn.dp_size,
+            routing=_frontend_routing(server_args),
+            handshake_timeout_s=_FRONTEND_HANDSHAKE_TIMEOUT_S,
+            send_timeout_s=_FRONTEND_SEND_TIMEOUT_S,
+        )
+        bound_host, bound_port = listener.handshake_address[len("tcp://") :].rsplit(
+            ":", 1
+        )
+        server_args.data_parallel_address = bound_host.strip("[]")
+        server_args.data_parallel_rpc_port = int(bound_port)
+        pending_frontend = listener.accept()
+    else:
+        host, port = _frontend_addresses(server_args)
+        server_args.data_parallel_address = host
+        server_args.data_parallel_rpc_port = port
+
+    # A host's control thread runs no Python: the selected output plugins
+    # run in the node's relay, which the ranks feed.
+    metrics_relay = (
+        MetricsRelay(port_args.metrics_producer_configs)
+        if port_args.metrics_producer_configs
+        else None
+    )
+    kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
 
     # A node of rank >= 1 that blocks below is the only owner of its
     # schedulers: they must not outlive it, even when it is SIGKILLed.
     owns_schedulers = (
         server_args.node_rank >= 1 and envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get()
     )
-
-    def with_parent_death_signal(target, *args):
-        if owns_schedulers:
-            return run_with_parent_death_signal, (os.getpid(), target, *args)
-        return target, args
-
-    scheduler_procs = []
-    if not server_args.mapping.attn.has_dp:
-        # Launch tensor parallel scheduler processes
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=server_args.enable_memory_saver
-        )
-
-        scheduler_pipe_readers = []
-        for rank in _scheduler_ranks(server_args):
-            # Create per-rank server_args with rank-initialized mapping
-            rank_server_args = copy.copy(server_args)
-            rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-            rank_server_args.mapping.rank = rank
-
-            target, args = with_parent_death_signal(
-                run_event_loop, rank_server_args, port_args
-            )
-            proc, reader = start_process_with_ready_pipe(
-                target,
-                args,
-                memory_saver_adapter.configure_subprocess(),
-            )
-            scheduler_procs.append(proc)
-            scheduler_pipe_readers.append(reader)
-    else:
-        # Launch the data parallel controller
-        target, args = with_parent_death_signal(
-            run_data_parallel_controller_process, server_args, port_args
-        )
-        proc, reader = start_process_with_ready_pipe(
-            target,
-            args,
-            contextlib.nullcontext(),
-        )
-        scheduler_pipe_readers = [reader]
-        scheduler_procs.append(proc)
+    scheduler_procs, scheduler_pipe_readers = _start_ranks(
+        server_args, port_args, metrics_relay, owns_schedulers
+    )
 
     if server_args.node_rank >= 1:
-        # In multi-node cases, non-zero rank nodes do not need to run tokenizer or detokenizer,
-        # so they can just wait here.
+        # In multi-node cases, non-zero rank nodes run no frontend, so they
+        # can just wait here.
         if owns_schedulers:
             _stop_schedulers_on_signal(scheduler_procs)
 
@@ -749,21 +835,15 @@ def _launch_subprocesses(
 
         for proc in scheduler_procs:
             proc.join()
-            logger.error(
-                f"Scheduler or DataParallelController {proc.pid!s} terminated with "
-                f"{proc.exitcode!s}",
-            )
+            logger.error(f"Engine rank {proc.pid!s} terminated with {proc.exitcode!s}")
         return None, None, None
 
     # Follower nodes (node_rank >= 1) serve /metrics from the dummy
     # health-check server above; the main node gets the dedicated endpoint.
     launch_metrics_server(server_args)
 
-    # Launch the main-process async frontend. The detokenizer runs
-    # inline inside AsyncLLM — no separate subprocess.
-    tokenizer_manager = AsyncLLM(server_args, port_args)
-
-    # Wait for the model to finish loading
+    # Wait for the model to finish loading: a rank reports ready once it
+    # registered with the frontend.
     scheduler_infos = []
     for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
         if data["status"] != "ready":
@@ -771,9 +851,19 @@ def _launch_subprocesses(
                 "Initialization failed. Please see the error messages above."
             )
         scheduler_infos.append(data)
+    frontend = pending_frontend.wait()
 
+    tokenizer_manager = AsyncLLM(server_args, frontend, None)
+    tokenizer_manager.bootstrap_server = kv_bootstrap_server
+    tokenizer_manager.metrics_relay = metrics_relay
     # Assume all schedulers have the same scheduler_info
     scheduler_info = scheduler_infos[0]
+    _apply_scheduler_info(tokenizer_manager, scheduler_info)
+    return tokenizer_manager, None, scheduler_info
+
+
+def _apply_scheduler_info(tokenizer_manager: AsyncLLM, scheduler_info: dict) -> None:
+    """What the frontend learns from the ranks' ready messages."""
     tokenizer_manager.max_req_input_len = scheduler_info["max_req_input_len"]
     tokenizer_manager.max_single_request_tokens = scheduler_info[
         "max_single_request_tokens"
@@ -782,39 +872,151 @@ def _launch_subprocesses(
     tokenizer_manager.supports_prompt_logprobs = scheduler_info[
         "supports_prompt_logprobs"
     ]
-    return tokenizer_manager, None, scheduler_info
+
+
+def _launch_encode_server(
+    server_args: ServerArgs, port_args: PortArgs
+) -> tuple[AsyncLLM, None, dict]:
+    """An EPD encode server: its encode ranks (``ts-host`` in encode mode,
+    ``epd/encode_host.py``) and, on the first node, the frontend that pushes
+    them encode requests. The ranks run the vision tower and ship embeddings
+    to the prefill servers; no engine rank runs."""
+    binary = host_binary()
+    procs, readers = [], []
+    for rank in _scheduler_ranks(server_args):
+        rank_server_args = copy.copy(server_args)
+        rank_server_args.mapping = copy.deepcopy(server_args.mapping)
+        rank_server_args.mapping.rank = rank
+        proc, reader = start_rust_host(
+            binary, rank_server_args, port_args, contextlib.nullcontext(), None, False
+        )
+        procs.append(proc)
+        readers.append(reader)
+    infos = []
+    for data in receive_ready_messages(readers, procs):
+        if data.get("status") != "ready":
+            raise RuntimeError(
+                "Initialization failed. Please see the error messages above."
+            )
+        infos.append(data)
+    if server_args.node_rank >= 1:
+        if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
+            return None, None, None
+        for proc in procs:
+            proc.join()
+        return None, None, None
+    launch_metrics_server(server_args)
+    # The first encode rank binds the request channel.
+    encode_sender = IpcSender(
+        get_zmq_socket(
+            zmq.Context(1), zmq.PUSH, port_args.scheduler_input_ipc_name, False
+        )
+    )
+    tokenizer_manager = AsyncLLM(server_args, None, encode_sender)
+    _apply_scheduler_info(tokenizer_manager, infos[0])
+    return tokenizer_manager, None, infos[0]
+
+
+# How long a headless launcher waits for its schedulers to exit after asking
+# them to, before killing them.
+_SCHEDULER_EXIT_GRACE_S = 30.0
+
+
+def _start_kv_bootstrap_server(server_args: ServerArgs):
+    """Start a prefill engine's KV bootstrap server, or return None.
+
+    Decode ranks look up the prefill ranks holding a request's KV through
+    this server; the launcher hosts it, one per prefill deployment, on node
+    0.
+    """
+    mode = DisaggregationMode(server_args.disaggregation_mode)
+    if mode != DisaggregationMode.PREFILL or server_args.node_rank != 0:
+        return None
+    # Mooncake is the only transfer backend.
+    TransferBackend(server_args.disaggregation_transfer_backend)
+    return BootstrapServer(
+        server_args.disaggregation_bootstrap_port, cache_layouts=True
+    )
+
+
+def _supervise_schedulers(
+    procs: list[mp.Process],
+    terminate: Callable[[], None],
+    terminate_requested_at: list[float],
+    *,
+    exit_grace_s: float,
+) -> bool:
+    """Wait until every scheduler exits; return whether any failed.
+
+    A rank that dies with a nonzero code (e.g. an OOM SIGKILL) takes the
+    others down through ``terminate``, which records its first call in
+    ``terminate_requested_at``. Schedulers still running ``exit_grace_s``
+    after that count as failed and are left for the caller to kill: one
+    blocked in a collective or a transfer never acts on SIGTERM.
+    """
+    failed = False
+    alive = list(procs)
+    while alive:
+        if (
+            terminate_requested_at
+            and time.monotonic() - terminate_requested_at[0] > exit_grace_s
+        ):
+            logger.error(
+                f"{len(alive):d} scheduler(s) still running {exit_grace_s:.0f}s "
+                "after termination; killing them",
+            )
+            return True
+        for proc in list(alive):
+            proc.join(timeout=1)
+            if proc.exitcode is None:
+                continue
+            alive.remove(proc)
+            if proc.exitcode == 0:
+                logger.info(
+                    f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}"
+                )
+            else:
+                logger.error(
+                    f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}; "
+                    "terminating the remaining scheduler(s)",
+                )
+                failed = True
+                terminate()
+    return failed
 
 
 def launch_scheduler_headless(server_args: ServerArgs) -> None:
-    """Launch scheduler process(es) driven directly by SMG over msgpack ZMQ.
+    """Launch this node's engine ranks for an external frontend (SMG,
+    Dynamo) that drives them over msgpack ZMQ.
 
-    Headless: no in-process tokenizer_manager and no AsyncLLM detokenizer (SMG
-    owns both). This process only spawns and
-    supervises the scheduler workers, which connect out to the SMG-bound
-    handshake/input/output sockets (see zmq_msgpack.connect_msgpack_engine_for_loop),
-    then blocks until they exit.
+    Headless: no in-process frontend (the external one tokenizes and
+    detokenizes). This process only spawns and supervises the ranks, one
+    ``ts-host`` process each, which connect out to the frontend-bound
+    handshake/input/output sockets, then blocks until they exit.
 
-    Forces ``--zmq-msgpack`` + ``--skip-tokenizer-init`` since SMG passes
-    token ids. The workers dial ``tcp://{--data-parallel-address}:
+    Forces ``--skip-tokenizer-init`` since the frontend passes token ids.
+    The ranks dial ``tcp://{--data-parallel-address}:
     {--data-parallel-rpc-port}`` (defaults ``127.0.0.1:30500``; the frontend
     binds it). Both flags always carry values — non-emptiness and the u16
-    range are enforced at parse time.
+    range are enforced at parse time. With attention DP each rank dials with
+    its own engine identity, ``--zmq-engine-index`` plus its DP rank.
     """
-    server_args.zmq_msgpack = True
     server_args.skip_tokenizer_init = True
-    # DP > 1: each rank dials the frontend with its own engine identity
-    # (zmq_engine_index + dp_rank) in zmq_msgpack.connect_msgpack_engine_for_loop, the
-    # choke point shared with the non-headless --zmq-msgpack launch path.
 
     configure_logger(server_args)
     _set_envs_and_config(server_args)
     scheduler_procs: list[mp.Process] = []
     scheduler_pipe_readers = []
+    kv_bootstrap_server = None
+    metrics_relay = None
 
-    # SIGUSR1 is what a scheduler sends its parent on an internal exception
-    # (see run_event_loop) — the child itself then exits 0, so record the
-    # failure here or the supervisor would report success.
+    # SIGUSR1 reports a child's internal failure (a rank's host sends it as
+    # it fails), so record the failure here: an exit status alone may not
+    # tell the supervisor.
     child_failed = threading.Event()
+    # When the first termination was requested; schedulers still running a
+    # grace period later are killed with the rest of the tree.
+    terminate_requested_at: list[float] = []
 
     def _terminate_schedulers(signum=None, _frame=None):
         """Forward a shutdown (or child-failure SIGUSR1) to every scheduler."""
@@ -822,6 +1024,8 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             logger.info(f"received signal {signum!s}; terminating scheduler(s)")
         if signum == signal.SIGUSR1:
             child_failed.set()
+        if not terminate_requested_at:
+            terminate_requested_at.append(time.monotonic())
         for proc in scheduler_procs:
             if proc.is_alive():
                 proc.terminate()
@@ -847,30 +1051,20 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         signal.signal(signal.SIGUSR1, _terminate_schedulers)
 
         metrics_service.start(server_args, port_args)
-        if not server_args.mapping.attn.has_dp:
-            memory_saver_adapter = TorchMemorySaverAdapter.create(
-                enable=server_args.enable_memory_saver
+        kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
+        # Fail before any rank loads the model.
+        refusals = rust_host_refusals(server_args)
+        if refusals:
+            raise NotImplementedError(
+                "The engine host does not support " + ", ".join(refusals) + " yet"
             )
-            for rank in _scheduler_ranks(server_args):
-                rank_server_args = copy.copy(server_args)
-                rank_server_args.mapping = copy.deepcopy(server_args.mapping)
-                rank_server_args.mapping.rank = rank
-
-                proc, reader = start_process_with_ready_pipe(
-                    run_event_loop,
-                    (rank_server_args, port_args),
-                    memory_saver_adapter.configure_subprocess(),
-                )
-                scheduler_procs.append(proc)
-                scheduler_pipe_readers.append(reader)
-        else:
-            proc, reader = start_process_with_ready_pipe(
-                run_data_parallel_controller_process,
-                (server_args, port_args),
-                contextlib.nullcontext(),
-            )
-            scheduler_pipe_readers.append(reader)
-            scheduler_procs.append(proc)
+        # A host's control thread runs no Python: the selected output plugins
+        # run in the node's relay, which the ranks feed.
+        if port_args.metrics_producer_configs:
+            metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
+        procs, readers = _start_ranks(server_args, port_args, metrics_relay, False)
+        scheduler_procs.extend(procs)
+        scheduler_pipe_readers.extend(readers)
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
                 raise RuntimeError(
@@ -881,29 +1075,12 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
             f"{server_args.zmq_handshake_endpoint()!s}",
         )
 
-        # Supervise until every scheduler exits. If any rank dies (e.g. OOM
-        # SIGKILL) take the survivors down and exit nonzero instead of
-        # reporting success.
-        failed = False
-        alive = list(scheduler_procs)
-        while alive:
-            for proc in list(alive):
-                proc.join(timeout=1)
-                if proc.exitcode is None:
-                    continue
-                alive.remove(proc)
-                if proc.exitcode == 0:
-                    logger.info(
-                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}",
-                    )
-                else:
-                    logger.error(
-                        f"scheduler {proc.pid!s} exited with code {proc.exitcode!s}; "
-                        "terminating the "
-                        "remaining scheduler(s)",
-                    )
-                    failed = True
-                    _terminate_schedulers()
+        failed = _supervise_schedulers(
+            scheduler_procs,
+            _terminate_schedulers,
+            terminate_requested_at,
+            exit_grace_s=_SCHEDULER_EXIT_GRACE_S,
+        )
         if failed or child_failed.is_set():
             sys.exit(1)
     finally:
@@ -912,8 +1089,14 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         _terminate_schedulers()
         for proc in scheduler_procs:
             proc.join(timeout=5)
+        # The ranks sent their last events: the relay flushes its sinks
+        # before the process tree, which it belongs to, goes down.
+        if metrics_relay is not None:
+            metrics_relay.close(timeout=2.0)
         if scheduler_procs:
             kill_process_tree(os.getpid(), include_parent=False)
+        if kv_bootstrap_server is not None:
+            kv_bootstrap_server.close()
         metrics_service.close(timeout=2.0)
 
 

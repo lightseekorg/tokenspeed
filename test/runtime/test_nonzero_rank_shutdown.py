@@ -21,8 +21,11 @@
 """Stopping a non-zero-rank node of a multi-node deployment (CPU-only).
 
 Each test runs ``_launch_subprocesses`` as node rank 1 in a subprocess, with
-stand-in schedulers in place of ``run_event_loop``, signals the node and
-checks that none of its schedulers is left running.
+a stand-in ``ts-host`` binary in place of the real one, signals the node and
+checks that none of its schedulers is left running. Only ``host_binary`` is
+substituted: the ranks start through the real ``start_rust_host``, so the
+parent-death signal they report is the one the launcher asked the kernel
+for.
 """
 
 from __future__ import annotations
@@ -31,8 +34,10 @@ import contextlib
 import json
 import os
 import signal
+import stat
 import subprocess
 import sys
+import textwrap
 import time
 
 import psutil
@@ -48,22 +53,76 @@ pytestmark = pytest.mark.skipif(
     not sys.platform.startswith("linux"), reason="parent-death signal is Linux-only"
 )
 
-# Node rank 1 with two stand-in schedulers. Each one reports its parent-death
-# signal, starts a helper process of its own, reports ready and sleeps. On
-# SIGTERM a "cooperative" scheduler leaves a marker file and exits 0, like
-# run_event_loop's graceful stop; a "stuck" one ignores SIGTERM. With
-# IN_EVENT_LOOP=1 the node launches inside asyncio.run, as the gRPC server
-# does under `tokenspeed serve`.
+# Node rank 1 with two stand-in schedulers: the FAKE_HOST binary, started by
+# the real start_rust_host. With IN_EVENT_LOOP=1 the node launches inside
+# asyncio.run, as the gRPC server does under `tokenspeed serve`.
 NODE = """
-import asyncio, ctypes, json, multiprocessing, os, pathlib, signal, subprocess, sys
-import time
+import asyncio, json, os, signal, sys
 from types import SimpleNamespace as NS
-
-PR_GET_PDEATHSIG = 2
 
 
 def emit(**fields):
     print(json.dumps(fields), flush=True)
+
+
+if __name__ == "__main__":
+    from tokenspeed.runtime.entrypoints import engine
+
+    engine.configure_logger = engine._set_envs_and_config = lambda args: None
+    engine.prepare_model_and_tokenizer = lambda *names: names
+    engine.host_binary = lambda: os.environ["FAKE_HOST"]
+    engine.launch_dummy_health_check_server = lambda *args: emit(waiting=True)
+    mapping = NS(
+        attn=NS(has_dp=False, tp_rank=0, has_kvp=False),
+        moe=NS(has_ep=False),
+        nprocs_per_node=2,
+        nnodes=2,
+        has_pp=False,
+    )
+    args = NS(
+        mapping=mapping,
+        node_rank=1,
+        model="",
+        tokenizer="",
+        host="",
+        port=0,
+        disaggregation_mode="null",
+        kv_events_config=None,
+        dist_init_addr="127.0.0.1:25000",
+        data_parallel_rpc_port=25001,
+    )
+    args.enable_memory_saver = args.enable_metrics = False
+    args.emulate_rank_zero = False
+    port_args = NS(metrics_producer_configs=None)
+    if os.environ.get("IN_EVENT_LOOP") == "1":
+
+        async def launch():
+            engine._launch_subprocesses(args, port_args)
+
+        asyncio.run(launch())
+    else:
+        engine._launch_subprocesses(args, port_args)
+    sigterm_default = signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+    emit(returned=True, sigterm_default=sigterm_default)
+"""
+
+# A stand-in `ts-host`: takes the host command line, reports its parent-death
+# signal, starts a helper process of its own, reports ready on the control
+# connection and sleeps. On SIGTERM a "cooperative" stand-in leaves a marker
+# file and exits 0, like a rank's graceful stop; a "stuck" one ignores
+# SIGTERM. The report is printed before the ready message so it always
+# reaches the node's stdout before the node's own first report.
+FAKE_HOST = """
+import ctypes, json, os, pathlib, signal, subprocess, sys, time
+from multiprocessing.connection import Connection
+
+PR_GET_PDEATHSIG = 2
+
+args = dict(zip(sys.argv[1::2], sys.argv[2::2]))
+connection = Connection(int(args["--control-fd"]))
+
+pdeathsig = ctypes.c_int()
+ctypes.CDLL(None).prctl(PR_GET_PDEATHSIG, ctypes.byref(pdeathsig), 0, 0, 0)
 
 
 def stopped_gracefully(signum, frame):
@@ -71,39 +130,15 @@ def stopped_gracefully(signum, frame):
     sys.exit(0)
 
 
-def scheduler(server_args, port_args, writer):
-    pdeathsig = ctypes.c_int()
-    ctypes.CDLL(None).prctl(PR_GET_PDEATHSIG, ctypes.byref(pdeathsig), 0, 0, 0)
-    if os.environ["STAND_IN"] == "stuck":
-        signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    else:
-        signal.signal(signal.SIGTERM, stopped_gracefully)
-    subprocess.Popen(["sleep", "300"])
-    emit(scheduler=os.getpid(), pdeathsig=pdeathsig.value)
-    writer.send({"status": "ready"})
-    time.sleep(300)
-
-
-if __name__ == "__main__":
-    from tokenspeed.runtime.entrypoints import engine
-
-    multiprocessing.set_start_method("spawn", force=True)
-    engine.configure_logger = engine._set_envs_and_config = lambda args: None
-    engine.prepare_model_and_tokenizer = lambda *names: names
-    engine.run_event_loop = scheduler
-    engine.launch_dummy_health_check_server = lambda *args: emit(waiting=True)
-    mapping = NS(attn=NS(has_dp=False), nprocs_per_node=2)
-    args = NS(mapping=mapping, node_rank=1, model="", tokenizer="", host="", port=0)
-    args.enable_memory_saver = args.enable_metrics = False
-    args.emulate_rank_zero = False
-    if os.environ.get("IN_EVENT_LOOP") == "1":
-        async def launch():
-            engine._launch_subprocesses(args, NS())
-        asyncio.run(launch())
-    else:
-        engine._launch_subprocesses(args, NS())
-    sigterm_default = signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
-    emit(returned=True, sigterm_default=sigterm_default)
+server_args, port_args, relay = connection.recv()
+if os.environ["STAND_IN"] == "stuck":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+else:
+    signal.signal(signal.SIGTERM, stopped_gracefully)
+subprocess.Popen(["sleep", "300"])
+print(json.dumps({"scheduler": os.getpid(), "pdeathsig": pdeathsig.value}), flush=True)
+connection.send({"status": "ready"})
+time.sleep(300)
 """
 
 
@@ -113,7 +148,16 @@ def node_rank_1(tmp_path, stand_in, **env):
     node's first report after they are ready. Kill what is left on exit."""
     script = tmp_path / "node.py"
     script.write_text(NODE)
-    env = {**os.environ, "STAND_IN": stand_in, "MARKER_DIR": str(tmp_path), **env}
+    fake_host = tmp_path / "ts-host"
+    fake_host.write_text(f"#!{sys.executable}\n" + textwrap.dedent(FAKE_HOST))
+    fake_host.chmod(fake_host.stat().st_mode | stat.S_IXUSR)
+    env = {
+        **os.environ,
+        "STAND_IN": stand_in,
+        "MARKER_DIR": str(tmp_path),
+        "FAKE_HOST": str(fake_host),
+        **env,
+    }
     node = subprocess.Popen(
         [sys.executable, str(script)], stdout=subprocess.PIPE, text=True, env=env
     )

@@ -50,6 +50,7 @@ from test.runtime.conftest import (  # noqa: E402
     KIMI_STATE_GROUPS,
     requires_cuda,
 )
+from test.runtime.scheduler_driver import make_extend_result_event  # noqa: E402
 from test.runtime.test_kimi_k3_kda import (  # noqa: E402
     _LOWER_BOUND,
     _assert_close,
@@ -61,10 +62,7 @@ from test.runtime.test_kimi_k3_kda import (  # noqa: E402
     requires_fla,
 )
 
-from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
-    make_extend_result_event,
-    pool_to_cache_groups,
-)
+from tokenspeed.runtime.engine.scheduler_utils import pool_to_cache_groups  # noqa: E402
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
     STATE_INPUT_SLOT,

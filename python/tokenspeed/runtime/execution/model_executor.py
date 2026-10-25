@@ -65,7 +65,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
-from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -788,17 +787,6 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
-        # The data plane: every CUDA-touching operation after startup is
-        # submitted here and runs in FIFO order on one thread. The event loop
-        # (control plane) never waits on the GPU along the per-round path —
-        # dispatch submits and moves on, only commit joins — so a round stays
-        # microseconds and its cross-rank gloo collectives always find every
-        # rank promptly regardless of GPU depth. (A few low-rate paths do
-        # block on purpose: the DP idle forward, the PD receive and landing,
-        # the post-wake KV repair, RL weight updates. See DeviceHandle.)
-        self.forward_thread = ForwardThread(
-            self.device, settle=self.complete_pending_drafting
-        )
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
@@ -1913,7 +1901,7 @@ class ModelExecutor:
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
-        Called by the EventLoop when this DP rank has no work but other
+        Called by the control plane when this DP rank has no work but other
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """

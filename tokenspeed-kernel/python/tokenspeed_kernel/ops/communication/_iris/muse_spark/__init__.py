@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.communication._iris import (
 from tokenspeed_kernel.ops.communication._iris.all_gather import (
     IrisAllGather,
     all_gather_columns_can_run,
+    iris_fused_lamport_allgather_rmsnorm_mxfp4,
     iris_fused_pull_allgather_rmsnorm_mxfp4,
     iris_pull_allgather_rows,
 )
@@ -51,8 +52,8 @@ from tokenspeed_kernel.ops.communication._iris.muse_spark.all_to_all import (
     iris_fused_a2a_transpose_qkvg_norm_rope,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+    iris_fused_lamport_allreduce_muse_attntail,
     iris_fused_pull_allgather_muse_attntail,
-    iris_fused_push_oneshot_allreduce_muse_attntail,
 )
 from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
     iris_fused_lamport_allreduce_routed_rmsnorm_sum,
@@ -69,6 +70,10 @@ from tokenspeed_kernel.platform import current_platform
 _MUSE_BOUNDARY_MAX_ROWS = 26
 _MUSE_WEIGHTED_BOUNDARY_MAX_ROWS = 25
 _MUSE_BOUNDARY_WIDTH = 8192
+# Workgroups that push each small-boundary row; one more waits and normalizes.
+_MUSE_BOUNDARY_SENDERS = 8
+# From this many rows, staggering each sender's peer order spreads link load.
+_MUSE_BOUNDARY_ROTATE_MIN_ROWS = 5
 _MUSE_ROW_BOUNDARY_MIN_ROWS = 512
 _MUSE_OWNED_MIN_ROWS = 192
 _MUSE_ROW_SCATTER_PROGRAMS = 24
@@ -103,9 +108,8 @@ class MuseIrisState:
             size += IrisBroadcast.heap_bytes(max_numel)
         if rows:
             size += allocation_bytes(
-                (2, world_size, rows, _MUSE_BOUNDARY_WIDTH), torch.bfloat16
+                (3, world_size, rows, _MUSE_BOUNDARY_WIDTH), torch.bfloat16
             )
-            size += allocation_bytes((2, rows, world_size), torch.int32)
         if max_numel >= _MUSE_ROW_BOUNDARY_MIN_ROWS * _MUSE_BOUNDARY_WIDTH:
             size += allocation_bytes(
                 (_MUSE_ROW_SCATTER_PROGRAMS, world_size), torch.uint32
@@ -148,23 +152,23 @@ class MuseIrisState:
             >= triton.cdiv(_MUSE_ROW_BOUNDARY_MIN_ROWS, self.world_size)
             * _MUSE_BOUNDARY_WIDTH
         )
-        self.boundary_inbox = (
+        # Three rotating Lamport slots per row; 0x8000 (negative zero) marks empty.
+        self.boundary_mailbox = (
             peers.ctx.empty(
-                (2, self.world_size, self.boundary_max_rows, _MUSE_BOUNDARY_WIDTH),
+                (3, self.world_size, self.boundary_max_rows, _MUSE_BOUNDARY_WIDTH),
                 dtype=all_reduce.dtype,
             )
             if self.boundary_max_rows
             else None
         )
-        self.boundary_ready_flags = (
-            peers.ctx.zeros(
-                (2, self.boundary_max_rows, self.world_size), dtype=torch.int32
+        if self.boundary_mailbox is not None:
+            self.boundary_mailbox.view(torch.int16).fill_(-32768)
+        self.boundary_epochs = (
+            torch.zeros(
+                (self.boundary_max_rows, _MUSE_BOUNDARY_SENDERS + 1),
+                dtype=torch.int32,
+                device=peers.device,
             )
-            if self.boundary_max_rows
-            else None
-        )
-        self.boundary_generations = (
-            torch.zeros(self.boundary_max_rows, dtype=torch.int32, device=peers.device)
             if self.boundary_max_rows
             else None
         )
@@ -820,15 +824,14 @@ class MuseIrisState:
                 num_warps=16,
             )
             return out_stream, pre_fp32, pre_bf16
-        assert self.boundary_inbox is not None
-        assert self.boundary_ready_flags is not None
-        assert self.boundary_generations is not None
+        assert self.boundary_mailbox is not None
+        assert self.boundary_epochs is not None
         out_stream = torch.empty_like(stream)
         pre_fp32 = torch.empty_like(stream)
         pre_bf16 = torch.empty_like(branch)
-        iris_fused_push_oneshot_allreduce_muse_attntail[(rows,)](
+        iris_fused_lamport_allreduce_muse_attntail[(rows, _MUSE_BOUNDARY_SENDERS + 1)](
             branch,
-            self.boundary_inbox,
+            self.boundary_mailbox,
             stream,
             post_weight if post_weight is not None else branch,
             alpha,
@@ -837,8 +840,7 @@ class MuseIrisState:
             out_stream,
             pre_fp32,
             pre_bf16,
-            self.boundary_generations,
-            self.boundary_ready_flags,
+            self.boundary_epochs,
             self.all_reduce.peers.addresses[: self.world_size],
             RANK=self.all_reduce.rank_in_group,
             WORLD_SIZE=self.all_reduce.world_size,
@@ -849,8 +851,11 @@ class MuseIrisState:
             PRE_EPS=pre_eps,
             PRE_WEIGHT_OFFSET=pre_weight_offset,
             POST_HAS_WEIGHT=post_weight is not None,
+            SENDERS=_MUSE_BOUNDARY_SENDERS,
+            ROTATE_PEERS=rows >= _MUSE_BOUNDARY_ROTATE_MIN_ROWS,
             ELEMENTS_PER_THREAD=8,
             NUM_WARPS=16,
+            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
             num_warps=16,
         )
         return out_stream, pre_fp32, pre_bf16
@@ -1049,6 +1054,41 @@ class MuseIrisState:
             device=self.all_reduce.producer.data.device,
         )
         block_k = triton.next_power_of_2(total_width)
+        if (
+            self.reduction.lamport_region is not None
+            and self.reduction.lamport_epochs is not None
+            and local_width % 512 == 0
+            and block_k == total_width
+            and total_width % 1024 == 0
+            and rows * local_width <= self.reduction.lamport_max_numel
+        ):
+            if local.data_ptr() % 4:
+                # Rank-local fallback could split ranks across protocols.
+                raise ValueError(
+                    "iris_fused_lamport_allgather_rmsnorm_mxfp4 reads BF16 pairs as "
+                    f"32-bit words; local starts at byte {local.data_ptr() % 4} of a word"
+                )
+            # Sentinel mailboxes replace both peer rendezvous of the pull path.
+            iris_fused_lamport_allgather_rmsnorm_mxfp4[(rows,)](
+                local,
+                weight,
+                packed,
+                scales,
+                self.reduction.lamport_region,
+                self.reduction.lamport_epochs,
+                self.reduction.lamport_peer_addresses[: self.world_size],
+                rank=self.all_reduce.rank_in_group,
+                local_width=local_width,
+                total_width=total_width,
+                eps=eps,
+                weight_offset=weight_offset,
+                scale_stride_linear=scales.stride(0),
+                scale_stride_mblock=scales.stride(1),
+                max_elements=self.reduction.lamport_max_numel,
+                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+                num_warps=1,
+            )
+            return packed, scales
         iris_fused_pull_allgather_rmsnorm_mxfp4[(rows,)](
             local,
             self.all_reduce.producer.data,

@@ -289,7 +289,7 @@ null, so the first decode reads the landed state). When the decode role's
 own prefix cache holds the state for the prompt end -- a state hit counts
 only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
-and both sides omit the group from the manifest (`pd/cache_protocol.py`).
+and both sides omit the group from the manifest (`ts-pd`'s `layout::manifest`).
 
 KDA targets with a batched commit kernel use the same deferred-state lifecycle
 for ordinary decode (`T=1`) and speculative verification. Verify leaves the
@@ -478,8 +478,9 @@ the same plan). The restore is one op: on the load stream behind the
 zeroing, the L2-tier rows, the pool-tier rows, the slot-state import, one
 event — no layerwise tracker, because the request is `Restoring` and
 unschedulable until the ACK. Three ACK kinds ride the one cache poll
-(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and `CacheOpHooks`
-replica-intersects them alike; a readmission needs both store ACKs.
+(`WriteBackDone`, `SnapshotDone`, `RestoreDone`) and the control plane
+(`ts-control`'s `cache_ops`) replica-intersects them alike; a readmission
+needs both store ACKs.
 
 **Slot-state image.** Device state keyed by `req_pool_index` that lives in no
 cache group must travel with the pages or the continuation is not exact: the
@@ -534,7 +535,8 @@ owners is an error, and a replicated group translates to the identity. Each
 Host tier holds one translation (same Device bound, its own Host bound,
 `1 + host_lcm_blocks × packing × shard_count`). An op whose every row belongs
 to other ranks is still acknowledged by this rank from an empty copy; the
-hooks' replica intersection completes the op only once every owner has. The
+control plane's replica intersection completes the op only once every owner
+has. The
 scheduler side (residue-class allocation for every tier transfer, the Host
 pools registered with each group's `shard_count`) is what makes the
 translation exact, so both Host tiers serve a KV-page-sharded engine. L3
@@ -912,9 +914,10 @@ Its responsibilities:
   positional-encoding or kernel changes that alter KV without changing the
   checkpoint, layout or recorded producer choices. A git SHA would split
   caches on unrelated changes; a package version may stay unchanged across
-  KV-affecting edits. Static facts are captured once. `storage_key_prefix`
-  combines their digest with explicit target/draft weight versions, without
-  re-reading mutable launch options or checkpoint files on version updates.
+  KV-affecting edits. Static facts are captured once. The namespace
+  (`ts-l3`'s `key_prefix`) combines their digest with explicit target/draft
+  weight versions, without re-reading mutable launch options or checkpoint
+  files on version updates.
   Use resolved `mapping.attn.tp_size`, not `--attn-tp-size` alone: different TP
   widths can have identical per-rank packed geometry while assigning different
   heads to a rank.
@@ -1365,13 +1368,13 @@ contributed.
 
 PD transfer supports independently sharded prefill and decode roles. Manifests carry scheduler (virtual) IDs on both sides and are bounded
 by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
-the physical page count. The route planner (`pd/transfer_plan.py`) reads
+the physical page count. The route planner (`ts-pd`'s `layout::route`) reads
 `shard_count` from the wire `group_specs`: for a sharded group it fans a
 decode rank's replica out to the whole KVP subgroup (consecutive attention-TP
 ranks), tagging every member with an owner filter `(owner_rank, owner_count)`;
 the sender keeps the manifest blocks with `(v - 1) % owner_count ==
-owner_rank`, translates them to local pages through the same
-`owned_local_pages` placement zeroing uses, and matches them to destination blocks at the same manifest positions.
+owner_rank`, translates them to local pages with the placement zeroing uses
+(`owned_local_pages`), and matches them to destination blocks at the same manifest positions.
 Only pairs owned by the destination rank are copied, after translating both
 virtual IDs to local pages. Every rank of the subgroup therefore
 serves every decode rank and none is a control-only dummy; the decode receiver

@@ -1573,8 +1573,8 @@ refuses it again at executor construction. The MTP shape is:
   registers the draft-final step counter; the others count target layers only.
 * **Handoff.** The last stage samples, runs the drafter over the completing
   chunk and writes the candidate block into the reserved decode slot; the
-  event loop broadcasts `(output_tokens, output_lengths, next_input_ids)`
-  over the PP gloo group at commit -- with the logprob vectors and the NaN
+  control plane shares `(output_tokens, output_lengths, next_input_ids)`
+  with the other stages at commit -- with the logprob vectors and the NaN
   guard's per-request flags, see the QCP section -- so every rank's
   scheduler stamps the same bootstrap token and candidate window onto the
   remote decode. The PD wire and the decode side are untouched.
@@ -2002,9 +2002,10 @@ The contract a model (in tree or a plugin) implements:
   that trades the `[rows, vocab]` all-gather for per-row partials is the
   deferred `logprob.topology-invariant` item of `numerics.md`.)
 * Pipeline parallelism: the last stage scores the prompt logprobs (on its
-  shard, under QCP) and `_pp_broadcast_output_tokens` carries
-  `output_logprobs`, `input_token_logprobs`, and the NaN guard's
-  `output_nan_flags` to the other stages with the sampled tokens; every
+  shard, under QCP) and the control plane's share of its result
+  (`adopt_last_stage`) carries `output_logprobs`, `input_token_logprobs`,
+  and the NaN guard's `output_nan_flags` to the other stages with the
+  sampled tokens; every
   stage pairs the vector with its own mirrored plan, which
   `ModelExecutionResult` carries whether or not the stage scored the rows.
   The flags travel with the values they audit: only the last stage holds

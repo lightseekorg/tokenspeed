@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +49,51 @@ class DpForwardMetadata:
     all_decode_or_idle: bool
     all_extend: bool
     need_idle_forward: bool
+
+    @classmethod
+    def from_ranks(
+        cls,
+        *,
+        global_num_tokens: list[int],
+        global_batch_size: list[int],
+        global_num_extends: list[int],
+        need_idle_forward: bool,
+    ) -> DpForwardMetadata:
+        """The metadata from every rank's batch, in rank order.
+
+        Args:
+            global_num_tokens: Tokens each rank forwards.
+            global_batch_size: Requests in each rank's batch; 0 for a rank
+                without model work.
+            global_num_extends: Prefill rows in each rank's batch.
+            need_idle_forward: This rank has no batch while another has one.
+        """
+        from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+
+        global_forward_mode = [
+            int(ForwardMode.from_num_extends(num_extends, batch_size))
+            for num_extends, batch_size in zip(global_num_extends, global_batch_size)
+        ]
+        return cls(
+            global_num_tokens=list(global_num_tokens),
+            global_batch_size=list(global_batch_size),
+            global_num_decodes=[
+                batch_size - num_extends
+                for batch_size, num_extends in zip(
+                    global_batch_size, global_num_extends
+                )
+            ],
+            global_forward_mode=global_forward_mode,
+            all_decode_or_idle=all(
+                mode in (int(ForwardMode.DECODE), int(ForwardMode.IDLE))
+                for mode in global_forward_mode
+            ),
+            # Replicated prefill-graph gate (see PrefillGraph._select_bucket).
+            all_extend=all(
+                mode == int(ForwardMode.EXTEND) for mode in global_forward_mode
+            ),
+            need_idle_forward=need_idle_forward,
+        )
 
 
 @dataclass(frozen=True)
@@ -174,11 +218,11 @@ class StopCriteria:
 class PlannedForward:
     """One round's planned work, as the device side needs to see it.
 
-    Everything the data plane learns about a round arrives through here and
-    is captured into the submitted closure, so every field must be something
-    the control plane will not touch again once the round is dispatched (the
-    capture contract in ``forward_thread.py``). A new field either satisfies
-    that, or it is a new registered exception — not a comment.
+    Everything the forward learns about a round arrives through here, so
+    every field must be something nothing edits again once the forward is
+    launched (the capture contract in ``execution/device.py``). A new field
+    either satisfies that, or it is a new registered exception — not a
+    comment.
 
     Attributes:
         forward_op: The scheduler's op for this round. A per-round value copy
@@ -306,44 +350,18 @@ class ModelExecutionResult:
     def sync(self) -> None:
         """Block until this result's D2H copy has landed.
 
-        Called exactly once, by ``PendingExecution.result()`` — the single
-        gate between the forward thread and the control plane. Consumers
-        receive an already-synced result and must not call this again; a
-        second call means a redundant sync path was reintroduced, so it
-        raises instead of silently costing a no-op event join.
+        Called exactly once, by the commit (``HostDataPlane.complete``) — the
+        single gate between the forward thread and the control plane.
+        Consumers receive an already-synced result and must not call this
+        again; a second call means a redundant sync path was reintroduced, so
+        it raises instead of silently costing a no-op event join.
         """
         if self._synced:
             raise RuntimeError(
-                "ModelExecutionResult is synced exactly once, by "
-                "PendingExecution.result(); consumers get a synced result."
+                "ModelExecutionResult is synced exactly once, by the commit; "
+                "consumers get a synced result."
             )
         if self.copy_event is None:
             raise RuntimeError("copy_event is required before synchronizing results.")
         self.copy_event.synchronize()
         self._synced = True
-
-
-@dataclass
-class PendingExecution:
-    """A forward submitted to the forward thread, awaiting its result.
-
-    The control plane's ``in_flight`` queue holds these instead of raw
-    ``ModelExecutionResult``s. ``result()`` joins the forward-thread future
-    (all launches + D2H issued) and then syncs the copy event (D2H landed).
-    Only commit blocks here — the dispatch path never waits, which is what
-    keeps a backpressured stage's launches from stalling the control plane.
-
-    Also the only place a ``ModelExecutionResult`` crosses back, which is
-    what makes the sync exactly-once: the future is private and the result
-    is memoized.
-    """
-
-    _future: Future
-    _result: ModelExecutionResult | None = field(default=None, init=False, repr=False)
-
-    def result(self) -> ModelExecutionResult:
-        if self._result is None:
-            results = self._future.result()
-            results.sync()
-            self._result = results
-        return self._result

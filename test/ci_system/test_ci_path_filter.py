@@ -63,6 +63,7 @@ def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
         f"{KERNEL}/ops/gemm/triton.py",
         f"{KERNEL}/thirdparty/__init__.py",
         "python/tokenspeed/runtime/sampling/backends/flashinfer.py",
+        "tokenspeed-engine/crates/ts-control/src/event_loop.rs",
     ],
 )
 def test_shared_paths_require_every_group(path):

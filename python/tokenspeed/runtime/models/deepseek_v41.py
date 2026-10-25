@@ -82,6 +82,7 @@ from tokenspeed_kernel.ops.attention.dsv41 import (
     index_query_rope_weights,
     rope_inplace,
     rope_pad_query,
+    rope_weights_inplace,
 )
 from tokenspeed_kernel.ops.gemm import (
     dsv4_linear_fp32,
@@ -818,6 +819,11 @@ class DeepseekV41Indexer(nn.Module):
                 positions,
                 rotary.cos_sin_cache,
                 self.scale,
+            )
+        if q.is_cuda and current_platform().is_cdna4:
+            rotary._prepare_cache(q.device)
+            return rope_weights_inplace(
+                q, positions, rotary.cos_sin_cache, weights, self.scale, None
             )
         return rotary.apply_owned(q, positions, False), weights * self.scale
 
