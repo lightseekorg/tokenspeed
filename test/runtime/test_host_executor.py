@@ -1685,6 +1685,86 @@ class TestCompactLayoutRoundTripTest:
                 [1, 2, 3, 9]
             )
 
+    @pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+    @pytest.mark.parametrize(
+        "source_pinned", [False, True], ids=["stream_ordered", "pinned_control"]
+    )
+    def test_a_stream_ordered_write_back_reads_blocks_the_plan_reuses(
+        self, io_backend, source_pinned
+    ):
+        """An eviction's store reads what the evicted block held, though the
+        same plan overwrites the block right after submitting the store.
+
+        The copy is held back on the write stream, so the overwrite, enqueued
+        on the fence stream right after the submission, would land first
+        unless the fence orders it behind the copy. The control submits the
+        same row as a pinned store, which fences nothing: its copy reads the
+        overwritten bytes, so the test tells the two apart.
+        """
+        torch = self.torch
+        device = torch.zeros((128,), dtype=torch.uint8, device="cuda")
+        layout = self._single_group_layout(
+            device, self.CacheField("layer.0.k", 0, 8, 8, 4)
+        )
+        executor, pool, _ = self._make_executor(layout, io_backend=io_backend)
+        fence_stream = torch.cuda.current_stream()
+
+        class WriteBackOp:
+            # Cache.WriteBackOp has no Python constructor.
+            def __init__(self, op_id: int) -> None:
+                self.op_ids = [op_id]
+                self.group_ids = [[0]]
+                self.src_pages = [[1]]
+                self.dst_pages = [[2]]
+                self.source_pinned = [source_pinned]
+
+        def submit(op_id: int) -> None:
+            with patch.object(self.executor_module.Cache, "WriteBackOp", WriteBackOp):
+                executor.submit_write_backs(
+                    [WriteBackOp(op_id)],
+                    prerequisite_stream=fence_stream,
+                    fence_stream=fence_stream,
+                )
+
+        # The same store first, on the lane the round below takes, so that
+        # round loads no kernel and allocates no staging memory: the process's
+        # first copy kernel launch, or a lane's first pinned allocation, waits
+        # for the device, the held-back copy included, which would close the
+        # window.
+        submit(6)
+        torch.cuda.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [6]
+        generator = torch.Generator(device="cpu").manual_seed(13)
+        evicted = torch.randint(0, 0xEE, (4,), dtype=torch.uint8, generator=generator)
+        device[16:20].copy_(evicted)  # block 1, the evicted one
+        torch.cuda.synchronize()
+
+        with torch.cuda.stream(executor.write_stream):
+            torch.cuda._sleep(200_000_000)
+        submit(7)
+        # The copy has not run yet: the window in which the plan reuses the
+        # block is open.
+        assert not executor.write_stream.query()
+        # The plan re-grants the block at once, on the fence stream.
+        device[16:20].fill_(0xEE)
+        torch.cuda.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [7]
+
+        load_index = executor._start_loading(  # pylint: disable=protected-access
+            [9], [(0, 3, 2)], prerequisite_stream=fence_stream
+        )
+        pool.load_tracker.set_consumers(load_index)
+        pool.load_tracker.wait_for_layer(0)
+        torch.cuda.synchronize()
+        assert [int(event.op_id) for event in executor.poll_results()] == [9]
+        expected = (
+            torch.full((4,), 0xEE, dtype=torch.uint8) if source_pinned else evicted
+        )
+        assert torch.equal(device[32:36].cpu(), expected)  # block 3
+        assert torch.equal(
+            device[16:20].cpu(), torch.full((4,), 0xEE, dtype=torch.uint8)
+        )
+
     def test_real_transfer_restores_merged_owner_draft_subset_once(self):
         torch = self.torch
         device = torch.full((128,), 0xCC, dtype=torch.uint8, device="cuda")

@@ -58,7 +58,7 @@ _CACHE_EVENT_TYPES = {
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
-# make_config's host_write_policy names.
+# make_config's host_write_policy names; ServerArgs validates the flag.
 _HOST_WRITE_POLICIES = {
     "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
     "write_back": SchedulerConfig.HostWritePolicy.WriteBack,
@@ -151,14 +151,13 @@ def make_config(
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
-        host_write_policy: What feeds Host L2 from ordinary Device prefix
-            entries: ``"write_through"`` streams published entries to Host (at
-            chunk ends, the prompt end and finish); ``"write_back"`` writes
-            back what an admission evicts, in the same plan
-            (``SchedulerConfig::Validate`` refuses it where it cannot run).
-            Required on every role; without a Host tier write_through has no
-            effect, and the decode role's Host tier holds retraction images
-            only.
+        host_write_policy: ``--kvstore-write-policy``: ``"write_through"``
+            streams published entries to Host (at chunk ends, the prompt end
+            and finish); ``"write_back"`` writes back what an admission
+            evicts, in the same plan (``SchedulerConfig::Validate`` refuses it
+            where it cannot run). Required on every role; without a Host tier
+            write_through has no effect, and the decode role's Host tier holds
+            retraction images only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request

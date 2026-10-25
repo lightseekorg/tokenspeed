@@ -23,8 +23,9 @@
 One executor, two pinned Host buffers over the same field geometry:
 
 * the **L2 prefix tier** (``--enable-kvstore``): hash-complete prefix pages the
-  scheduler publishes, stored by ``WriteBackOp``, loaded by ``LoadBackOp``
-  with layerwise consumer fences, optionally backed by L3;
+  scheduler publishes (``--kvstore-write-policy write_through``) or evicts
+  (``write_back``), stored by ``WriteBackOp``, loaded by ``LoadBackOp`` with
+  layerwise consumer fences, optionally backed by L3;
 * the **retraction snapshot pool** (on by default where the engine retracts;
   sized by ``tokenspeed.runtime.cache.l2.sizing``): the request-private tail
   of a retracted request's image -- its unaligned tail
@@ -364,12 +365,14 @@ class HostCacheExecutor:
         # stream the caller names per submission: for a store the one the
         # forwards wrote the source pages on, for a load the one that zeroed
         # the destination pages. What differs per store is who waits on the
-        # copy: a stream-ordered op (a retraction image's L2 leg, and every
-        # snapshot store, whose sources this very plan may re-grant) fences
-        # the fence stream the caller names on its completion, so the plan's
-        # zeroing, load-backs, restores and forwards stay behind it; a pinned
-        # op (an ordinary publication, whose sources the scheduler holds
-        # until the ACK) fences nothing and never holds up the round. An L2
+        # copy: a stream-ordered op (a retraction image's L2 leg, every
+        # snapshot store, and under the Host write-back policy the store of
+        # what the plan's admissions evicted: sources this very plan may
+        # re-grant) fences the fence stream the caller names on its
+        # completion, so the plan's copies, zeroing, load-backs, restores and
+        # forwards stay behind it; a pinned op (an ordinary publication under
+        # write-through, whose sources the scheduler holds until the ACK)
+        # fences nothing and never holds up the round. An L2
         # load's consumers are fenced per layer by the tracker events; a
         # restore's by its ACK.
         self.write_stream = new_cache_stream(None)
@@ -459,19 +462,19 @@ class HostCacheExecutor:
     ) -> None:
         """Enqueue the plan's D2H copies on the write stream.
 
-        Must run BEFORE the plan's page zeroing. Every copy is ordered behind
-        ``prerequisite_stream`` -- here the stream the forwards wrote the
-        source pages on -- so it reads their final bytes. The scheduler marks
-        each L2 op ``source_pinned``: a pinned op's sources stay cached and
-        unevictable until the ACK, so its copy rides the write stream and
-        nobody waits on it; an unpinned op's sources may already be granted to
-        another request in this very plan, so it goes first and
-        ``fence_stream`` waits on its completion -- the plan's zeroing,
-        load-backs, restores and forwards are ordered behind that wait. A
-        retraction image's snapshot leg (``SnapshotOp``: tail pages into the
-        pool, then the victim's slot state into the arena) follows the
-        stream-ordered L2 rows on the same stream, so the one fence covers
-        both legs.
+        Must run BEFORE the plan's Device-to-Device copies and page zeroing.
+        Every copy is ordered behind ``prerequisite_stream`` -- here the
+        stream the forwards wrote the source pages on -- so it reads their
+        final bytes. The scheduler marks each L2 op ``source_pinned``: a
+        pinned op's sources stay cached and unevictable until the ACK, so its
+        copy rides the write stream and nobody waits on it; an unpinned op's
+        sources may already be granted to another request in this very plan,
+        so it goes first and ``fence_stream`` waits on its completion -- the
+        plan's copies, zeroing, load-backs, restores and forwards are ordered
+        behind that wait. A retraction image's snapshot leg (``SnapshotOp``:
+        tail pages into the pool, then the victim's slot state into the
+        arena) follows the stream-ordered L2 rows on the same stream, so the
+        one fence covers both legs.
 
         Args:
             cache_ops: The round's cache ops as ``scheduler_utils.
@@ -482,7 +485,8 @@ class HostCacheExecutor:
                 must observe -- the model executor's execution stream, where
                 the forwards wrote the source pages and the slot state.
             fence_stream: The stream a stream-ordered op's completion fences
-                -- the one the plan's page zeroing runs on next.
+                -- the one the plan's Device-to-Device copies and page zeroing
+                run on next.
         """
         ordered_op_ids: list[int] = []
         ordered_transfers: list[tuple[int, int, int]] = []

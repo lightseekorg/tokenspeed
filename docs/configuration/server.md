@@ -1039,6 +1039,10 @@ events. The scheduler caches block hash lineage on prefix-cache nodes, so
 publishing a stored block uses the parent node's cached hash instead of
 rebuilding the full ancestor prefix.
 
+Host L2 entries publish no events. Under `--kvstore-write-policy write_back`,
+a block the GPU evicts is reported `BlockRemoved` even when it is written
+back to the Host.
+
 Example:
 
 ```bash
@@ -1192,6 +1196,60 @@ Host pinned buffer (L2 / flat KV)
   ↕ batch_put_from / batch_get_into
 Mooncake Store (L3)
 ```
+
+**Write policy.** `--kvstore-write-policy` chooses when pages of the GPU
+prefix cache are copied to Host L2:
+
+- `write_through` (the default): on the fused and prefill roles, every page
+  the GPU caches is also copied to the Host, which keeps it after the GPU
+  evicts the page. The decode role's Host L2 holds retraction images only.
+- `write_back`: nothing is copied when a page is cached. When the GPU
+  evicts cached pages to make room for a request, it copies them to the Host
+  in the same scheduling step, and they can be reused from there once the
+  copy completes.
+
+`write_back` lets the two tiers cache more together: the GPU and the Host
+hold mostly different pages, up to about the sum of their capacities less
+pages in use or in transit, where under `write_through` the Host spends its
+room on a copy of what the GPU holds. Eviction trims a conversation from its
+end, so the GPU keeps its beginning and the Host the rest, and a later
+prompt resumes from both. The cost: a step that evicts must finish copying
+the evicted pages to the Host before its forward pass can write over them,
+so the copy adds to that step's time.
+
+`write_back` requires `--disaggregation-mode prefill` with Host L2, attention
+TP 1, `--pipeline-parallel-size 1`, `--kv-parallel-size 1` and no
+`--kvstore-storage-backend`, and a model whose KV cache has no sliding-window
+group (sliding-window attention layers make one) and at most 64 cache groups;
+startup refuses it otherwise, the last two once the model's cache groups are
+built.
+
+Under `write_back`:
+
+- Clearing only the GPU cache, as `POST /release_memory_occupation` does
+  when it releases `kv_cache`, loses what only the GPU holds. `/flush_cache`
+  clears both tiers under either policy.
+- Not everything the GPU evicts reaches the Host: what a request releases
+  itself, what nothing can resume from any more, and pages evicted together
+  that the Host cannot fit as a whole are dropped. On a hybrid
+  (recurrent-state) model, the first includes the state checkpoint a request
+  resumed from, once a later chunk or its own end state replaces it (see
+  the next item), and the second the pages no state checkpoint on either
+  tier depends on.
+- On a hybrid model, when a prompt resumes on the GPU from the state
+  checkpoint where the conversation's previous turn ended, that checkpoint
+  stays cached after the request's own end state replaces it (once the
+  transfer to the decode peer completes), so the same prompt sent again,
+  which cannot resume at its own end state, can still resume there. It is
+  then the GPU's first eviction candidate, ahead of the newer end state.
+- [KV cache events](#kv-cache-events) keep describing the GPU cache.
+
+Elsewhere on this page, "write-back" means any copy from the GPU to Host L2,
+whichever policy is set, not only the copies `write_back` makes. How the
+scheduler implements the two policies is in
+[cache concepts](../design/cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
+and, for `write_back`,
+[scheduler §3.1](../design/scheduler.md#31-p--prefill-worker).
 
 **Sizing.** `--kvstore-size` (gigabytes per rank) wins over
 `--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).

@@ -201,6 +201,78 @@ def test_host_write_policy_round_trips():
     assert ts.Scheduler(cfg).host_pool_total_blocks() == 8
 
 
+def test_an_eviction_store_is_stream_ordered_and_published_at_its_ack():
+    """Under Host write-back (the prefill role) nothing reaches the Host until
+    an admission evicts: a handed-off prompt's pages leave the Device for the
+    next prompt, in the plan that re-grants them, so their store is
+    stream-ordered. Its Host blocks are taken while the copy is in flight,
+    and the Host publishes its entries at the ACK."""
+    page = 16
+    cfg = ts.SchedulerConfig()
+    cfg.role = ts.SchedulerConfig.Role.P
+    cfg.prefix_granularity = page
+    cfg.max_scheduled_tokens = 256
+    cfg.max_batch_size = 4
+    # Four usable pages: two 40-token prompts do not fit together.
+    cfg.num_device_pages = 4 + 1
+    cfg.num_host_pages = 8 + 1
+    cfg.num_snapshot_pages = 1  # the P role never retracts
+    cfg.disable_l2_cache = False
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="history",
+            block_granularity=page,
+            total_pages=cfg.num_device_pages,
+            attn_kind=ts.AttnKind.Full,
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+        )
+    ]
+    scheduler = ts.Scheduler(cfg)
+
+    def prefill_and_hand_off(rid, tokens):
+        # The prompt's forward, then its hand-off to the decode peer, whose
+        # success caches the prompt on the Device; the two plans' cache ops.
+        scheduler.submit_requests([_spec(rid, tokens)])
+        scheduler.advance(ExecutionEvent().add_event(ts.PD.BootstrappedEvent(rid)))
+        prefill = scheduler.next_execution_plan()
+        assert list(_find_forward_op(prefill).request_ids) == [rid]
+        _advance(scheduler, rid, [1000])
+        hand_off = scheduler.next_execution_plan()
+        assert list(hand_off.remote_decode.request_ids) == [rid]
+        scheduler.advance(ExecutionEvent().add_event(ts.PD.SucceededEvent(rid)))
+        return list(prefill.cache), list(hand_off.cache)
+
+    # A 40-token prompt: two full pages and a tail, cached on the Device once
+    # the decode peer has it; nothing is stored to the Host meanwhile.
+    assert prefill_and_hand_off("a", list(range(40))) == ([], [])
+    assert scheduler.host_pool_cached_blocks() == 0
+    assert scheduler.host_pool_free_blocks() == 8
+
+    # The second prompt takes the free page and two of the first prompt's,
+    # its tail and the page under it: one store, stream-ordered, in the plan
+    # that re-grants them. It takes two Host blocks and publishes nothing
+    # while it is in flight, the hand-off's plan included.
+    prefill_ops, hand_off_ops = prefill_and_hand_off("b", list(range(500, 540)))
+    (store,) = prefill_ops
+    assert hand_off_ops == []
+    assert isinstance(store, Cache.WriteBackOp)
+    assert list(store.source_pinned) == [False]
+    assert [len(rows) for rows in store.src_pages] == [2]
+    assert scheduler.host_pool_cached_blocks() == 0
+    assert scheduler.host_pool_free_blocks() == 6
+
+    # The ACK publishes both entries.
+    acks = ExecutionEvent()
+    for op_id in store.op_ids:
+        done = Cache.WriteBackDoneEvent()
+        done.op_id = op_id
+        acks.add_event(done)
+    scheduler.advance(acks)
+    assert scheduler.host_pool_cached_blocks() == 2
+    assert scheduler.host_pool_free_blocks() == 6
+
+
 def test_device_evictions_count_a_requests_own_reclaim_apart():
     """K3 shape on twelve Device parents, a block each, a page per chunk. a
     publishes two pages and its checkpoint at 4 (five parents); b resumes

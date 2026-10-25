@@ -437,15 +437,17 @@ class DeviceHandle:
 
         The whole plan, explicitly ordered streams, in an order
         that IS the correctness argument for same-round page reuse: the
-        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: a
-        retraction image's two legs -- the stream-ordered L2 write-back of
-        the victim's hash-complete pages and the snapshot store of its tail
-        pages and slot state -- read pages this plan re-grants, so they ride
-        the write stream consecutively and ONE completion event fences the
-        forward thread's default stream before anything else of the plan is
-        enqueued; a pinned write-back -- an ordinary publication, whose
-        sources the scheduler holds until the ACK -- rides the write stream
-        and fences nothing), then the Device-to-Device block copies
+        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: the
+        stream-ordered ones -- a retraction image's two legs (the L2
+        write-back of the victim's hash-complete pages, the snapshot store of
+        its tail pages and slot state) and, under ``--kvstore-write-policy
+        write_back``, the L2 write-back of what the plan's admissions
+        evicted -- read pages this plan re-grants, so they ride the write
+        stream consecutively and ONE completion event fences the forward
+        thread's default stream before anything else of the plan is enqueued;
+        a pinned write-back -- an ordinary publication under write-through,
+        whose sources the scheduler holds until the ACK -- rides the write
+        stream and fences nothing), then the Device-to-Device block copies
         (``pages_to_copy``: a prefix hit's private copy of the block holding
         its boundary, an owner's move off the block it just published; the
         source may be re-granted by this very plan, so the copy precedes the

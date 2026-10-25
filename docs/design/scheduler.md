@@ -771,12 +771,13 @@ its full pages, its partial page as a tail and each State group's prompt-end
 state (§1.2) — and releases request ownership; cached entries remain subject
 to normal eviction.
 
-**Host L2: write-back.** With `host_write_policy` `kWriteBack` (this role
-only, unsharded groups, no sliding-window group, no L3) nothing streams to
-the Host at publication. Instead what an admission evicts for the cache leaves
-by whole segments and is written back in the same plan, by the drain right
-after the build (one stream-ordered op, §2); how a segment is recorded,
-placed, published or dropped is in [Cache
+**Host L2: write-back.** With `host_write_policy` `kWriteBack`
+(`--kvstore-write-policy write_back`; this role only, unsharded groups, no
+sliding-window group, no L3, and in the runtime attention TP 1 and PP 1, where
+every ACK is rank-local) nothing streams to the Host at publication. Instead
+what an admission evicts for the cache leaves by whole segments and is written
+back in the same plan, by the drain right after the build (one stream-ordered
+op, §2); how a segment is recorded, placed, published or dropped is in [Cache
 concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator). At
 overlap depth 0 the op's ACK lands before the next plan is built: the forward
 the copy is fenced ahead of commits first, and the round's head advances

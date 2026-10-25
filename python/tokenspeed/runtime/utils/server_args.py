@@ -508,6 +508,8 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
+    kvstore_write_policy: str = "write_through"
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -2027,6 +2029,44 @@ class ServerArgs:
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
                 )
+        _require_choice(
+            "--kvstore-write-policy",
+            self.kvstore_write_policy,
+            ("write_through", "write_back"),
+        )
+        if self.kvstore_write_policy == "write_back":
+            # The scheduler writes back on the prefill role alone, with Host
+            # L2, unsharded pages and no L3 (whose staging would split what it
+            # writes back); the runtime also needs one attention-TP rank and
+            # one stage, where each eviction store is ACKed before the next
+            # plan is built. A model with a sliding-window cache group or more
+            # than 64 cache groups is refused by the scheduler at startup
+            # (SchedulerConfig.Validate), not here: the cache groups exist
+            # only once the model is loaded.
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                    (
+                        f"--disaggregation-mode {self.disaggregation_mode} "
+                        "(prefill only)",
+                        self.disaggregation_mode != "prefill",
+                    ),
+                    (
+                        "--kvstore-storage-backend",
+                        self.kvstore_storage_backend is not None,
+                    ),
+                    ("--kv-parallel-size > 1", self.kv_parallel_size > 1),
+                    ("attention TP > 1", self.mapping.attn.tp_size != 1),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    "--kvstore-write-policy write_back does not support "
+                    f"{', '.join(unsupported)}"
+                )
 
     def validate_model_update_options(self):
         """Require the Model Updater SDK flags together, or none of them.
@@ -2609,6 +2649,24 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
+        )
+        parser.add_argument(
+            "--kvstore-write-policy",
+            type=str,
+            choices=["write_through", "write_back"],
+            default=ServerArgs.kvstore_write_policy,
+            help="What feeds Host L2 (the KVStore) from the GPU prefix cache. "
+            "'write_through' (the default) copies every page the fused or "
+            "prefill role caches. "
+            "'write_back' copies only the pages the GPU evicts, in the "
+            "scheduling step that evicts them (that step's forward waits for "
+            "the copy), so the two tiers hold mostly different pages. "
+            "write_back requires --disaggregation-mode prefill and is refused "
+            "with --disable-kvstore, --kvstore-storage-backend, "
+            "--kv-parallel-size > 1, attention TP > 1 or "
+            "--pipeline-parallel-size > 1, and at startup for a model with a "
+            "sliding-window cache group or more than 64 cache groups; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

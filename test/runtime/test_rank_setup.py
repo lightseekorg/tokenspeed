@@ -30,6 +30,7 @@ here rather than at the binding on startup.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from types import SimpleNamespace
 
@@ -42,6 +43,11 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
 ts = pytest.importorskip("tokenspeed_scheduler")
 
+from test.runtime.cache_pool_test_utils import (  # noqa: E402
+    make_layer_group_ids,
+    specs_for_layers,
+)
+
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
@@ -49,6 +55,9 @@ from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
     scheduler_config_from_args,
 )
 from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge import (  # noqa: E402
+    cache_group_config,
+)
 from tokenspeed.runtime.utils.server_args import (  # noqa: E402
     ServerArgs,
     prepare_server_args,
@@ -175,6 +184,145 @@ def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
             enable_prefix_caching=False,
             enable_state_checkpoint_in_forward=True,
         )
+
+
+@pytest.mark.parametrize(
+    "flags, policy, pool",
+    [
+        ([], ts.SchedulerConfig.HostWritePolicy.WriteThrough, (5, 8)),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--kvstore-write-policy",
+                "write_back",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (1, 0),
+        ),
+    ],
+    ids=["default", "prefill_write_back"],
+)
+def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
+    args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
+    cfg = _config(
+        args,
+        _specs(num_host_pages=17, num_snapshot_pages=pool[0], max_retracted=pool[1]),
+    )
+    assert cfg.host_write_policy == policy
+
+
+@pytest.mark.parametrize(
+    "flags, refused",
+    [
+        ([], "--disaggregation-mode null (prefill only)"),
+        (
+            ["--disaggregation-mode", "decode"],
+            "--disaggregation-mode decode (prefill only)",
+        ),
+        (
+            ["--disaggregation-mode", "prefill", "--disable-kvstore"],
+            "--disable-kvstore (no Host L2)",
+        ),
+        (
+            ["--disaggregation-mode", "prefill", "--kvstore-storage-backend", "memory"],
+            "--kvstore-storage-backend",
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--attn-tp-size",
+                "2",
+                "--kv-parallel-size",
+                "2",
+            ],
+            "--kv-parallel-size > 1",
+        ),
+        (
+            ["--disaggregation-mode", "prefill", "--attn-tp-size", "2"],
+            "attention TP > 1",
+        ),
+        (
+            ["--disaggregation-mode", "prefill", "--pipeline-parallel-size", "2"],
+            "--pipeline-parallel-size > 1",
+        ),
+    ],
+    ids=["fused", "decode", "no_host", "l3", "kvp", "attention_tp", "pp"],
+)
+def test_write_back_runs_only_on_a_single_rank_prefill_engine_with_host_l2(
+    flags, refused
+):
+    # The scheduler writes back on the prefill role alone; the runtime with
+    # one attention-TP rank and one stage, unsharded pages and no L3.
+    with pytest.raises(ValueError, match=re.escape(refused)):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--max-num-seqs",
+                "8",
+                "--kvstore-write-policy",
+                "write_back",
+                *flags,
+            ]
+        )
+
+
+def test_write_back_beside_a_sliding_window_group_is_refused_at_startup():
+    # The server arguments cannot see the model's cache groups; the scheduler
+    # built from the device side's groups refuses write-back beside a
+    # sliding-window one, naming it, and takes the same groups under
+    # write-through.
+    layer_types = ("full_attention", "sliding_attention")
+    group_specs = specs_for_layers(
+        layer_types=layer_types,
+        group_ids=make_layer_group_ids(
+            layer_num=2, layer_types=layer_types, sliding_window_tokens=32
+        ),
+        sliding_window_tokens=32,
+        prefix_granularity=16,
+        pd_disaggregation_enabled=True,
+    )
+    specs = _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    specs.cache_groups = [
+        cache_group_config(spec, total_pages=64, cache_blocks_per_lcm_block=1)
+        for spec in group_specs
+    ]
+    (sliding,) = (
+        spec.group_id for spec in group_specs if spec.attn_kind == "sliding_window"
+    )
+
+    def config(policy: str):
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--max-num-seqs",
+                "8",
+                "--disaggregation-mode",
+                "prefill",
+                "--kvstore-write-policy",
+                policy,
+            ]
+        )
+        return _config(args, specs)
+
+    ts.Scheduler(config("write_through"))
+    with pytest.raises(
+        ValueError,
+        match=re.escape(
+            f"'{sliding}': host_write_policy WriteBack does not support a "
+            "sliding-window group"
+        ),
+    ):
+        ts.Scheduler(config("write_back"))
+
+
+def test_an_unknown_host_write_policy_is_refused():
+    # The command line offers the two policies; the dataclass checks the same.
+    with pytest.raises(ValueError, match="--kvstore-write-policy must be one of"):
+        ServerArgs(model="x", max_num_seqs=8, kvstore_write_policy="write_around")
 
 
 def test_a_decode_server_takes_the_in_forward_state_checkpoint_flag_as_a_no_op():

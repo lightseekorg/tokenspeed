@@ -111,6 +111,9 @@ enum Tiers {
     ForcedRetraction,
     /// A Host L2 tier that published prefixes are written back to.
     HostL2,
+    /// A Host L2 tier that what the prefill role's admissions evict is
+    /// written back to.
+    HostL2WriteBack,
     /// A Host L2 tier backed by an L3 store, which holds every prefix page
     /// a query asks for.
     L3,
@@ -134,6 +137,11 @@ fn new_scheduler(tiers: Tiers, role: Role) -> Scheduler {
             "cfg.disable_l2_cache = False\n\
              cfg.num_host_pages = 1025\n\
              cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough"
+        }
+        Tiers::HostL2WriteBack => {
+            "cfg.disable_l2_cache = False\n\
+             cfg.num_host_pages = 1025\n\
+             cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack"
         }
         Tiers::L3 => {
             "cfg.disable_l2_cache = False\n\
@@ -2299,8 +2307,12 @@ async fn engram_windows_follow_each_requests_tokens() {
     }
 }
 
-/// A prefill engine and a decode engine joined by one wire.
-async fn start_pd_pair(in_flight_depth: usize) -> (Engine, Engine, Arc<Mutex<Wire>>) {
+/// A prefill engine over `prefill_tiers` and a decode engine joined by one
+/// wire.
+async fn start_pd_pair(
+    in_flight_depth: usize,
+    prefill_tiers: Tiers,
+) -> (Engine, Engine, Arc<Mutex<Wire>>) {
     let wire = Arc::new(Mutex::new(Wire::default()));
     let half = |role| {
         Some(Pd {
@@ -2311,7 +2323,7 @@ async fn start_pd_pair(in_flight_depth: usize) -> (Engine, Engine, Arc<Mutex<Wir
     let prefill = start_ranks_with(
         Layout::Single,
         in_flight_depth,
-        Tiers::DeviceOnly,
+        prefill_tiers,
         Setup {
             pd: half(Role::Prefill),
             ..Setup::default()
@@ -2348,7 +2360,7 @@ fn disaggregated(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prompt_prefills_on_one_engine_and_decodes_on_the_other() {
     for depth in [0, 1] {
-        let (prefill, decode, _wire) = start_pd_pair(depth).await;
+        let (prefill, decode, _wire) = start_pd_pair(depth, Tiers::DeviceOnly).await;
         // As a gateway does: the same request to both nodes at once.
         let requests: Vec<_> = (0..3)
             .map(|i| disaggregated(&format!("r{i}"), 70 + i, 20 + 300 * i as usize, 4))
@@ -2386,8 +2398,53 @@ async fn a_prompt_prefills_on_one_engine_and_decodes_on_the_other() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
+    // Under Host write-back the prefill engine stores nothing to the Host as
+    // it caches a prompt; what an admission evicts is written back in the
+    // round that evicts it and published on the Host at its acknowledgment.
+    for depth in [0, 1] {
+        let (prefill, decode, _wire) = start_pd_pair(depth, Tiers::HostL2WriteBack).await;
+        // Three 3000-token prompts, 187 full pages and a tail each, on 512
+        // Device pages: the third one's admission evicts the first one's
+        // last pages. Then the first one is sent again.
+        let mut cached = Vec::new();
+        let prompts = [("a", 0), ("b", 10_000), ("c", 20_000), ("a-again", 0)];
+        for (room, (rid, first)) in (70_u64..).zip(prompts) {
+            if rid == "c" {
+                // Caching the first two stored nothing to the Host.
+                assert_eq!(
+                    prefill.cache_ops(CacheOpKind::WriteBack),
+                    0,
+                    "depth {depth}"
+                );
+            }
+            let request = TokenizedGenerateReqInput {
+                input_ids: Some((first + 1..=first + 3000).collect()),
+                ..disaggregated(rid, room, 1, 2)
+            };
+            let (prefilled, decoded) = tokio::join!(
+                run(&prefill.client, request.clone()),
+                run(&decode.client, request)
+            );
+            assert_eq!(tokens(&prefilled), [1000], "{rid} at depth {depth}");
+            assert_eq!(tokens(&decoded), [1000, 1001], "{rid} at depth {depth}");
+            cached.push(prefilled.last().unwrap().cached_tokens);
+        }
+        // The eviction's write-backs were acknowledged: the first prompt hits
+        // all its full pages again, loading the written-back ones from the
+        // Host. Unacknowledged, the Host would hold none of them.
+        assert!(
+            prefill.cache_ops(CacheOpKind::WriteBack) > 0,
+            "depth {depth}"
+        );
+        assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1, "depth {depth}");
+        assert_eq!(cached, [0, 0, 0, 187 * 16], "depth {depth}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_transfer_aborts_the_request_on_both_engines() {
-    let (prefill, decode, wire) = start_pd_pair(1).await;
+    let (prefill, decode, wire) = start_pd_pair(1, Tiers::DeviceOnly).await;
     wire.lock().unwrap().rooms.entry(5).or_default().fails = true;
     let doomed = disaggregated("doomed", 5, 30, 4);
     let (prefilled, decoded) = tokio::join!(
@@ -2677,7 +2734,7 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
-    let (prefill, decode, _wire) = start_pd_pair(1).await;
+    let (prefill, decode, _wire) = start_pd_pair(1, Tiers::DeviceOnly).await;
     let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
         rid: None,
         http_worker_ipc: None,
