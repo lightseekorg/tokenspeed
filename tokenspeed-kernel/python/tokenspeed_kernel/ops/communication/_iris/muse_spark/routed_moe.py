@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_group_heap_base,
     _iris_sanitize_lamport_bf16,
     _iris_sync_peers,
+    _iris_wait_lamport_peers,
 )
 
 
@@ -123,71 +124,6 @@ def iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum(
 
 
 @gluon.jit
-def _iris_lamport_poll_bf16(addresses):
-    """Wait for every peer BF16 pack and return its packed 32-bit words."""
-    # Native Gluon waits for the whole workgroup; each lane reads 16 aligned bytes.
-    layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [8, 1], [0, 1])
-    source_layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [8, 1], [0, 1])
-    element = gl.arange(0, 4, layout=gl.SliceLayout(0, layout))
-    pointers = ()
-    values = ()
-    missing = gl.full((512, 4), False, gl.int1, layout)
-    for peer in gl.static_range(len(addresses)):
-        address = gl.convert_layout(addresses[peer], gl.SliceLayout(1, layout))
-        pointer = gl.multiple_of(address.to(gl.pointer_type(gl.uint32)), 16)
-        pointers += (pointer,)
-        value = gl.load(
-            pointer[:, None] + element[None, :], cache_modifier=".cv", volatile=True
-        )
-        values += (value,)
-        missing |= ((value & 0xFFFF) == 0x8000) | ((value >> 16) == 0x8000)
-    while gl.sum(gl.sum(missing.to(gl.int32), 1), 0) != 0:
-        values = ()
-        missing = gl.full((512, 4), False, gl.int1, layout)
-        for peer in gl.static_range(len(addresses)):
-            value = gl.load(
-                pointers[peer][:, None] + element[None, :],
-                cache_modifier=".cv",
-                volatile=True,
-            )
-            values += (value,)
-            missing |= ((value & 0xFFFF) == 0x8000) | ((value >> 16) == 0x8000)
-    words = ()
-    for peer in gl.static_range(len(addresses)):
-        even, odd = gl.split(values[peer].reshape(512, 2, 2))
-        w0, w2 = gl.split(even)
-        w1, w3 = gl.split(odd)
-        words += (
-            (
-                gl.convert_layout(w0, gl.SliceLayout(1, source_layout)),
-                gl.convert_layout(w1, gl.SliceLayout(1, source_layout)),
-                gl.convert_layout(w2, gl.SliceLayout(1, source_layout)),
-                gl.convert_layout(w3, gl.SliceLayout(1, source_layout)),
-            ),
-        )
-    return words
-
-
-@gluon.jit
-def _iris_lamport_unpack_bf16(w0, w1, w2, w3, element):
-    """Extract BF16 elements from four packed 32-bit words."""
-    bits = gl.where(
-        element[None, :] < 2,
-        w0[:, None],
-        gl.where(
-            element[None, :] < 4,
-            w1[:, None],
-            gl.where(element[None, :] < 6, w2[:, None], w3[:, None]),
-        ),
-    )
-    return (
-        (bits >> ((element[None, :] % 2) * 16))
-        .to(gl.uint16)
-        .to(gl.bfloat16, bitcast=True)
-    )
-
-
-@gluon.jit
 def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
     routes,
     route_map,
@@ -203,9 +139,11 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
     EPS: gl.constexpr,
     MAX_ELEMENTS: gl.constexpr,
     PORTABLE_MATH: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """Normalize eight local routes per token and all-reduce their weighted sum.
 
+    Launch one single-wave program for each 512-feature tile of each token.
     route_map selects local rows in routes; negative entries are ignored. Apply
     per-route RMSNorm before weighting and summing, round locally to BF16, and
     exchange sums through sentinel-marked mailboxes. Write BF16 output and clear
@@ -213,42 +151,59 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
     multiplication and rank-addition order; epochs select the rotating slot.
     """
     WORLD_SIZE: gl.constexpr = len(regions)
+    TILES: gl.constexpr = WIDTH // 512
     # Preserve the arithmetic of each existing routed normalization path.
     gl.static_assert(WIDTH == 4096)
-    gl.static_assert(gl.num_warps() == 8)
-    token = gl.program_id(0)
-    norm_layout: gl.constexpr = gl.BlockedLayout([8], [64], [8], [0])
-    columns = gl.arange(0, WIDTH, layout=norm_layout)
-    weight = gl.load(norm_weight + columns).to(gl.float32)
-    weight = (weight + 1.0).to(gl.bfloat16).to(gl.float32)
-    combined = gl.zeros((WIDTH,), gl.float32, layout=norm_layout)
-    for slot in gl.static_range(8):
-        route = token * 8 + slot
-        source_row = gl.load(route_map + route)
-        if source_row >= 0:
-            values = gl.load(
-                routes + source_row.to(gl.int64) * row_stride + columns
-            ).to(gl.float32)
-            values *= weight
-            variance = gl.sum(values * values, 0) / WIDTH
-            inv_rms = gl.rsqrt(variance + EPS)
-            route_weight = gl.load(route_weights + route).to(gl.float32)
-            if PORTABLE_MATH:
-                combined += (values * inv_rms) * route_weight
-            else:
-                combined += values * (inv_rms * route_weight)
-    packed_layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [8, 1], [0, 1])
-    pack = gl.arange(0, WIDTH // 8, layout=gl.SliceLayout(1, packed_layout))
-    element = gl.arange(0, 8, layout=gl.SliceLayout(0, packed_layout))
-    offsets = token * WIDTH + pack[:, None] * 8 + element[None, :]
-    tile = token * (WIDTH // 512) + pack // 64
-    stage = gl.load(epochs + tile).to(gl.uint32).to(gl.uint64) % 3
-    slot = stage[:, None] * WORLD_SIZE * MAX_ELEMENTS
-    local = _iris_sanitize_lamport_bf16(
-        gl.convert_layout(
-            gl.reshape(combined.to(gl.bfloat16), [WIDTH // 8, 8]), packed_layout
-        )
+    gl.static_assert(gl.num_warps() == 1)
+    program = gl.program_id(0)
+    token = program // TILES
+    tile = program % TILES
+    stage = gl.load(epochs + program).to(gl.uint32) % 3
+    # Every program reads whole routes for their variance. As in an eight-warp
+    # row, lane l holds features t * 512 + l * 8 + [0, 8) of each tile t.
+    row_layout: gl.constexpr = gl.BlockedLayout([1, 8], [1, 64], [1, 1], [1, 0])
+    tiles = gl.arange(0, TILES, layout=gl.SliceLayout(1, row_layout))
+    columns = (
+        tiles[:, None] * 512
+        + gl.arange(0, 512, layout=gl.SliceLayout(0, row_layout))[None, :]
     )
+    packed_layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
+    pack = gl.arange(0, 64, layout=gl.SliceLayout(1, packed_layout))
+    element = gl.arange(0, 8, layout=gl.SliceLayout(0, packed_layout))
+    tile_columns = tile * 512 + pack[:, None] * 8 + element[None, :]
+    weight = gl.load(norm_weight + columns).to(gl.float32)
+    tile_weight = gl.load(norm_weight + tile_columns).to(gl.float32)
+    source_rows = ()
+    route_weight_values = ()
+    for slot in gl.static_range(8):
+        source_rows += (gl.load(route_map + token * 8 + slot),)
+        route_weight_values += (gl.load(route_weights + token * 8 + slot),)
+    weight = (weight + 1.0).to(gl.bfloat16).to(gl.float32)
+    tile_weight = (tile_weight + 1.0).to(gl.bfloat16).to(gl.float32)
+    combined = gl.zeros((64, 8), gl.float32, layout=packed_layout)
+    for slot in gl.static_range(8):
+        if source_rows[slot] >= 0:
+            source = routes + source_rows[slot].to(gl.int64) * row_stride
+            values = gl.load(source + columns).to(gl.float32) * weight
+            tile_values = gl.load(source + tile_columns).to(gl.float32) * tile_weight
+            partials = gl.sum(values * values, 1)
+            # Add tile partials in the eight-warp reduction's butterfly order.
+            tile_sums = ()
+            for t in gl.static_range(TILES):
+                tile_sums += (gl.sum(gl.where(tiles == t, partials, 0.0), 0),)
+            variance = (
+                ((tile_sums[0] + tile_sums[4]) + (tile_sums[2] + tile_sums[6]))
+                + ((tile_sums[1] + tile_sums[5]) + (tile_sums[3] + tile_sums[7]))
+            ) / WIDTH
+            inv_rms = gl.rsqrt(variance + EPS)
+            route_weight = route_weight_values[slot].to(gl.float32)
+            if PORTABLE_MATH:
+                combined += (tile_values * inv_rms) * route_weight
+            else:
+                combined += tile_values * (inv_rms * route_weight)
+    offsets = token * WIDTH + tile_columns
+    stage_base = (stage * (WORLD_SIZE * MAX_ELEMENTS)).to(gl.int32)
+    local = _iris_sanitize_lamport_bf16(combined.to(gl.bfloat16))
     for delta in gl.static_range(1, WORLD_SIZE):
         peer = (RANK + delta) % WORLD_SIZE
         address = _iris_group_heap_base(peer, regions)
@@ -256,35 +211,26 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
         gl.amd.cdna4.buffer_store(
             local,
             target,
-            (slot + RANK * MAX_ELEMENTS + offsets).to(gl.int32),
-            cache=".wt",
+            stage_base + RANK * MAX_ELEMENTS + offsets,
+            cache=PEER_SIGNAL_STORE_CACHE,
         )
-    addresses = ()
-    for delta in gl.static_range(1, WORLD_SIZE):
-        peer = (RANK + delta) % WORLD_SIZE
-        addresses += (
-            (
-                region
-                + stage * WORLD_SIZE * MAX_ELEMENTS
-                + peer * MAX_ELEMENTS
-                + token * WIDTH
-                + pack * 8
-            ).to(gl.uint64),
-        )
-    words = _iris_lamport_poll_bf16(addresses)
-    values = ()
-    for peer in gl.static_range(WORLD_SIZE - 1):
-        word = words[peer]
-        values += (
-            _iris_lamport_unpack_bf16(word[0], word[1], word[2], word[3], element),
-        )
+    received = _iris_wait_lamport_peers(
+        region,
+        stage.to(gl.uint64),
+        offsets,
+        pack >= 0,
+        RANK,
+        WORLD_SIZE,
+        MAX_ELEMENTS,
+        packed_layout,
+    )
     if PORTABLE_MATH:
         # The portable two-pass path rounds locally, then sums global rank order.
         for peer in gl.static_range(WORLD_SIZE):
             if peer == RANK:
                 term = local
             else:
-                term = values[(peer - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
+                term = received[(peer - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
             if peer == 0:
                 reduced = term.to(gl.float32)
             else:
@@ -294,7 +240,7 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
         reduced = local.to(gl.float32)
         for peer in gl.static_range(WORLD_SIZE):
             if peer != RANK:
-                reduced += values[(peer - RANK + WORLD_SIZE) % WORLD_SIZE - 1].to(
+                reduced += received[(peer - RANK + WORLD_SIZE) % WORLD_SIZE - 1].to(
                     gl.float32
                 )
     gl.amd.cdna4.buffer_store(reduced.to(gl.bfloat16), output, offsets)
@@ -306,15 +252,11 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
     for delta in gl.static_range(1, WORLD_SIZE):
         peer = (RANK + delta) % WORLD_SIZE
         gl.amd.cdna4.buffer_store(
-            sentinel,
-            region,
-            (slot + peer * MAX_ELEMENTS + offsets).to(gl.int32),
-            cache=".wt",
+            sentinel, region, stage_base + peer * MAX_ELEMENTS + offsets, cache=".wt"
         )
-    # Every subgroup finishes resetting the mailbox before the next use.
+    # Finish resetting the mailbox before advancing this tile's epoch.
     _iris_drain_subgroup_vmem()
-    gl.barrier()
-    gl.store(epochs + tile, ((stage + 1) % 3).to(gl.int32), mask=pack % 64 == 0)
+    gl.store(epochs + program, ((stage + 1) % 3).to(gl.int32))
 
 
 @gluon.jit(do_not_specialize=["row_stride"])

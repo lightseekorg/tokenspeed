@@ -170,6 +170,7 @@ def _deployment_facts():
         "cache_signature": "layout",
         "pipeline_rank": 0,
         "attn_tp_size": 1,
+        "group_shard_counts": (1,),
         "draft_model": "",
         "draft_revision": "",
         "cache_quantization": "",
@@ -183,6 +184,37 @@ def _deployment_facts():
 
 
 class TestStorageKeyTest:
+    def test_cp_group_layouts_do_not_share_replica_keys(self):
+        facts = _deployment_facts()
+        facts.update(
+            attn_tp_size=4,
+            kv_producer={
+                "attn_kvp_size": 4,
+                "attn_qcp_size": 2,
+                "attn_head_tp_size": 1,
+            },
+        )
+        identities = set()
+        for shards in ((1, 1), (2, 1), (4, 1), (1, 4), (4, 4)):
+            facts["group_shard_counts"] = shards
+            identities.add(storage_deployment_id(**facts))
+        assert len(identities) == 5
+        assert storage_deployment_id(**facts) == storage_deployment_id(
+            **{**facts, "group_shard_counts": list(facts["group_shard_counts"])}
+        )
+
+    @pytest.mark.parametrize("shards", ["41", b"41"])
+    def test_cp_group_layout_rejects_text(self, shards):
+        facts = {**_deployment_facts(), "group_shard_counts": shards}
+        with pytest.raises(TypeError, match="group_shard_counts"):
+            storage_deployment_id(**facts)
+
+    @pytest.mark.parametrize("shards", [(), (0,), (2, -1)])
+    def test_cp_group_layout_requires_positive_counts(self, shards):
+        facts = {**_deployment_facts(), "group_shard_counts": shards}
+        with pytest.raises(ValueError, match="group_shard_counts"):
+            storage_deployment_id(**facts)
+
     def test_object_key_includes_group_offset_and_rank(self):
         # The trailing ``|c0`` is the retired context-parallel shard id, kept
         # literal so objects written before its removal stay addressable.

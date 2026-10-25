@@ -277,7 +277,7 @@ def _reference(inputs, num_positions: int):
     """Per-position outputs and the state after every token count.
 
     The oracle never allocates or publishes checkpoints: every token updates
-    the same live block through q_len=1 decode.
+    the same live block through q_len=1 decode and its accepted-state commit.
     """
     reference = _KDA(width=1, replay=False)
     tables = {spec.group_id: [[0, 1]] for spec in reference.contract.group_specs}
@@ -294,6 +294,11 @@ def _reference(inputs, num_positions: int):
         )
         step = reference.forward(
             inputs, begin=position, end=position + 1, prefill=False
+        )
+        reference.backend.commit_state_after_acceptance(
+            torch.ones(1, dtype=torch.int32, device="cuda"),
+            num_extends=0,
+            accepted_path=None,
         )
         for layer in _LAYERS:
             outputs[layer].append(step[layer])
@@ -632,8 +637,9 @@ def test_the_checkpoint_published_at_finish_holds_the_state_its_key_names(
             decode_width=width,
             padding_index=runtime.valid_cache_lengths.shape[0] - 1,
         )
-        if width > 1:
-            actual.backend.commit_verified_state(accept_lengths, accepted_path=None)
+        actual.backend.commit_state_after_acceptance(
+            accept_lengths, num_extends=0, accepted_path=None
+        )
         kept = int(accept_lengths[0])
         consumed += kept
         return sampled, kept

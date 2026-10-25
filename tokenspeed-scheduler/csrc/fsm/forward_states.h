@@ -51,6 +51,18 @@ struct CacheProgress {
     // there publishes its natural checkpoint where the KV is already cached,
     // so the next prompt resumes at the junction. Zero once passed or absent.
     std::int32_t junction_tokens{0};
+    // The in-forward State checkpoint a scheduled forward writes
+    // (SchedulerConfig::state_checkpoint_in_forward): the page boundary it
+    // sits at and, per cache group, the block it is written to (null for
+    // non-State groups). The request's next publication point publishes it
+    // (AdvanceRequestProgress); zero tokens means none is pending.
+    std::int32_t state_checkpoint_tokens{0};
+    std::vector<CacheBlockRef> state_checkpoint_blocks;
+    // The blocks of the checkpoint the latest publication point published,
+    // held until the next one so the publication's spans stay valid; the
+    // index keeps them cached. A retraction drops them once its publication
+    // is applied (a Retracted request holds no Device block).
+    std::vector<CacheBlockRef> published_state_checkpoint_blocks;
 };
 
 inline std::vector<std::int32_t> ComputeShiftedInputIds(const TokenContainer* token_container,

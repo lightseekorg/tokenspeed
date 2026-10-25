@@ -253,8 +253,16 @@ A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), the chunk the junction cut ended, or the
 retraction image -- published under the hash of that token count, page
-boundary or not. No forward computes an interior checkpoint, no scan is split
-into body and tail, and no state group declares a token span: a hit resumes
+boundary or not. The one interior checkpoint is opt-in
+(`--enable-state-checkpoint-in-forward`): the forward that spans a long
+prompt's last page boundary before its replay tail also stores the state at
+that boundary into a third block of its rows (`STATE_CHECKPOINT_SLOT`,
+`InForwardStateCheckpoints`) -- the GDN scan emits it from inside the kernel,
+the conv and PLE windows are the inputs before it -- which is then published
+like a natural checkpoint
+([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
+No scan is split into body and tail, and no state group declares a token
+span: a hit resumes
 at the published token count `T` exactly, with its state in slot 0 and the KV
 tail of the same instant in the history groups
 ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)
@@ -270,7 +278,10 @@ masked state writer (`store_state_rows`) drops its result, and the padded
 output rows are zeroed by a device-side bound the capture cannot freeze. The
 live tokens keep the packing of the unpadded forward, so a capture of any
 request count matches eager bit for bit; nothing about padding reaches the
-cache or the scheduler.
+cache or the scheduler. A forward that writes an in-forward State checkpoint
+keeps its live metadata instead (`prepare_prefill_metadata` returns False):
+the capacity layout carries no checkpoint, so the layer runs at its eager
+break of the ordinary prefill graph.
 
 PD moves exactly one block per state group: `latest_snapshot` is slot 1 of
 the prefill's final state, landing in the decode's slot 1 (its slot 0 stays
@@ -280,15 +291,32 @@ only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
 and both sides omit the group from the manifest (`pd/cache_protocol.py`).
 
-Speculative KDA verification stores no per-position recurrent states: it
-captures each window's raw projections in a compact payload and commits by
-replaying the accepted prefix from the committed block. The Kimi-K3 and
-GLM-5.3-Flash recipes share this workspace calculation and reserve it before
-sizing the arena -- the transient conv rows plus the per-layer capture
-payloads. GLM also reserves its target/draft-shared KPool tails once, so state
-memory does not disappear from the GPU budget. (Platforms without the replay
-kernels fall back to the dense `max_bs * (draft_tokens + 1)` per-position
-state workspace, reserved the same way.)
+KDA targets with a batched commit kernel use the same deferred-state lifecycle
+for ordinary decode (`T=1`) and speculative verification. Verify leaves the
+committed recurrent and convolution state unchanged; acceptance selects the
+prefix to commit into the live block.
+
+On NVIDIA and AMD, verify saves FP32 corrections plus unnormalized keys and raw gates
+in the activation dtype (BF16 or FP16). Recovery recomputes key normalization
+and gate decay, then applies the saved corrections to the input checkpoint.
+It does not recompute the state-dependent correction or the gate projection.
+Original QKV rows are retained only for convolution-history commit. The
+persistent convolution pool keeps its cache dtype, independently of activation
+dtype. Records and position/generation stamps cover the current verify round;
+they are transient workspace, not prefix-cache entries.
+
+Both vendors consume the same post-convolution activation values in verify
+and save those unnormalized keys for recovery. NVIDIA uses Triton recovery;
+AMD uses Gluon recovery. Neither recomputes the state-dependent correction.
+Convolution history is committed separately so in-place pages are safe.
+Platforms without a matching batched commit and no-store verify keep the dense
+`max_bs * (draft_tokens + 1)` per-position state workspace.
+
+The Kimi-K3 and GLM-5.3-Flash recipes share the backend's payload specification
+and reserve transient convolution rows, payloads, descriptors and record
+metadata before sizing the arena. Prefill-only engines reserve no decode
+records. GLM also reserves its target/draft-shared KPool tails once, so state
+memory does not disappear from the GPU budget.
 
 ### Python runtime: maps logical to physical, perceives as little as possible
 

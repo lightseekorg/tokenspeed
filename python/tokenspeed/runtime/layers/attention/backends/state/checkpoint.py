@@ -42,20 +42,158 @@ The debug checks below cannot tell such a row from one corrupted to
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+
 import torch
 
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    STATE_CHECKPOINT_SLOT,
     STATE_INPUT_SLOT,
     STATE_LIVE_SLOT,
     STATE_TABLE_SLOTS,
 )
 
 __all__ = [
+    "STATE_CHECKPOINT_SLOT",
     "STATE_INPUT_SLOT",
     "STATE_LIVE_SLOT",
     "STATE_TABLE_SLOTS",
+    "InForwardStateCheckpoints",
     "compute_state_block_indices",
+    "in_forward_state_checkpoints",
+    "scan_checkpoint_plan",
 ]
+
+
+@dataclass(frozen=True)
+class InForwardStateCheckpoints:
+    """The in-forward State checkpoints one extend forward writes.
+
+    The scheduler gives an extend row a checkpoint when its chunk spans the
+    page boundary before a long prompt's replay tail: besides its final state
+    (slot 1), every State group of that row stores the state after the
+    chunk's first ``offsets[i]`` tokens into the row's third block (slot 2),
+    which the scheduler publishes as a prefix-cache checkpoint.
+
+    Args:
+        rows: Host int64 batch rows that write a checkpoint.
+        offsets: Host int64 tokens of each such row's chunk before its
+            checkpoint (a positive multiple of the prefix page).
+        token_index: Device int64 packed-input index of the first token after
+            each checkpoint (the row's first token plus its offset).
+        blocks_by_group: Per State group, the device int32 receiving block of
+            each checkpoint.
+    """
+
+    rows: torch.Tensor
+    offsets: torch.Tensor
+    token_index: torch.Tensor
+    blocks_by_group: dict[str, torch.Tensor]
+
+
+def in_forward_state_checkpoints(
+    checkpoint_lens_cpu: torch.Tensor | None,
+    extend_seq_lens_cpu: torch.Tensor,
+    num_extends: int,
+    block_tables: Mapping[str, torch.Tensor],
+    group_ids: Sequence[str],
+) -> InForwardStateCheckpoints | None:
+    """Resolve this forward's in-forward State checkpoints, if any.
+
+    Args:
+        checkpoint_lens_cpu: Host ``[>= num_extends]`` tokens of each extend
+            row's chunk before its checkpoint (0 for none), or ``None`` when
+            the forward path delivers none.
+        extend_seq_lens_cpu: Host ``[>= num_extends]`` new tokens per extend
+            row, which pack the input in row order.
+        num_extends: Leading extend rows.
+        block_tables: The forward's raw per-group block tables.
+        group_ids: The State groups the caller writes.
+
+    Returns:
+        The checkpoints, or ``None`` when no row writes one.
+
+    Raises:
+        RuntimeError: A State table carries checkpoint blocks but the forward
+            path dropped their positions (the scheduler would publish blocks
+            nobody wrote), a checkpointed row's table lacks one, or a
+            checkpoint lies at or past the end of its chunk.
+    """
+    rows = torch.empty(0, dtype=torch.int64)
+    if checkpoint_lens_cpu is not None:
+        lens = checkpoint_lens_cpu[:num_extends].to(torch.int64)
+        rows = torch.nonzero(lens > 0).flatten()
+    if rows.numel() == 0:
+        # The scheduler appends a third entry only for a row it gave a
+        # checkpoint, so one without positions means the forward path lost
+        # them.
+        for group_id in group_ids:
+            if block_tables[group_id].shape[1] > STATE_CHECKPOINT_SLOT:
+                raise RuntimeError(
+                    f"state paging: {group_id!r} rows carry in-forward checkpoint "
+                    "blocks, but this forward path delivered no checkpoint positions"
+                )
+        return None
+    offsets = lens[rows]
+    seq_lens = extend_seq_lens_cpu[:num_extends].to(torch.int64)
+    past_end = offsets >= seq_lens[rows]
+    if bool(past_end.any()):
+        row = int(rows[past_end][0])
+        raise RuntimeError(
+            f"state paging: extend row {row}'s in-forward checkpoint lies at or "
+            f"past the end of its chunk (offset {int(lens[row])}, chunk "
+            f"{int(seq_lens[row])} tokens)"
+        )
+    starts = torch.cumsum(seq_lens, 0) - seq_lens
+    blocks_by_group: dict[str, torch.Tensor] = {}
+    device = None
+    for group_id in group_ids:
+        table = block_tables[group_id]
+        if table.shape[1] <= STATE_CHECKPOINT_SLOT:
+            raise RuntimeError(
+                f"state paging: {group_id!r} rows lack the in-forward checkpoint block"
+            )
+        device = table.device
+        blocks_by_group[group_id] = (
+            table[rows.to(table.device), STATE_CHECKPOINT_SLOT]
+            .to(torch.int32)
+            .contiguous()
+        )
+    return InForwardStateCheckpoints(
+        rows=rows,
+        offsets=offsets,
+        token_index=(starts[rows] + offsets).to(device),
+        blocks_by_group=blocks_by_group,
+    )
+
+
+def scan_checkpoint_plan(
+    checkpoints: InForwardStateCheckpoints, scan_seq_lens_cpu: torch.Tensor
+) -> tuple[int, torch.Tensor, torch.Tensor]:
+    """Where a chunked scan stores this forward's in-forward checkpoints.
+
+    A scan stores states at one interval for every sequence it covers, the
+    ``j``-th of sequence ``i`` (0-based) after ``(j + 1) * interval`` of its
+    tokens at row ``cu_starts[i] + j``. The interval is the checkpoint
+    offsets' greatest common divisor, so each checkpoint is one of those rows
+    and the scan stores as few others as one interval allows.
+
+    Args:
+        checkpoints: This forward's checkpoints.
+        scan_seq_lens_cpu: Host ``[bs]`` tokens of each scanned sequence, in
+            batch-row order.
+
+    Returns:
+        ``(interval, host int64 [bs + 1] cumulative state counts, host int64
+        buffer row of each checkpoint)``.
+    """
+    interval = math.gcd(*(int(x) for x in checkpoints.offsets.tolist()))
+    counts = scan_seq_lens_cpu.to(torch.int64) // interval
+    cu_starts = torch.cat((torch.zeros(1, dtype=torch.int64), counts.cumsum(0)))
+    rows = cu_starts[checkpoints.rows] + checkpoints.offsets // interval - 1
+    return interval, cu_starts, rows
 
 
 def compute_state_block_indices(
@@ -95,8 +233,12 @@ def compute_state_block_indices(
         torch.where(checkpoint > 0, checkpoint, live),
         torch.zeros_like(live),
     )
-    # The kernels take unit-stride block vectors; a table column is not one.
-    state_out = live.contiguous()
+    # The kernels take unit-stride block vectors; a table column is not one,
+    # and contiguous() leaves a one-row column at the table's stride, which
+    # the kernels would compile per table width.
+    state_out = torch.empty_like(live, memory_format=torch.contiguous_format).copy_(
+        live
+    )
 
     if validate:
         real = (checkpoint != -1) | (live != -1)

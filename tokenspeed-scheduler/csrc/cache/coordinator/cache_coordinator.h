@@ -221,6 +221,11 @@ public:
         // block at a publication point it keeps writing past. Both ends share
         // a bucket; the destination sits in the request's table.
         std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
+        // Aligned by group_id: the fresh block each State group's
+        // StateStep::checkpoint acquired outside the table (also listed in
+        // new_page_ids), null elsewhere. The caller holds it until the
+        // request's next publication point publishes it.
+        std::vector<CacheBlockRef> state_checkpoint_blocks;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -540,6 +545,13 @@ private:
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+    // Registers blocks[j] under keys[j] (logical block first_logical_block + j)
+    // and reports and streams what was newly cached; cacheFullBlocksForGroup
+    // passes a table window, an in-forward State checkpoint its own block.
+    template <CacheTier Tier>
+    void cacheBlocksForGroup(std::size_t group_index, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                             std::int32_t first_logical_block, std::uint64_t access_epoch,
+                             CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     // One run of table slots a publication registers in a group, the key of
     // each (keys[j] is slot first_cache_block + j), and the boundary kind it
     // registers them under.

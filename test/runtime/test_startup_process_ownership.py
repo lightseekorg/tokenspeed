@@ -27,6 +27,7 @@ import os
 import signal
 import sys
 import threading
+import time
 
 import psutil
 import pytest
@@ -123,7 +124,38 @@ def _notify_failure(start, notified, signum, writer):
     threading.Event().wait(_TIMEOUT_S * 10)
 
 
-def _repeated_failure_cleanup(writer):
+@contextlib.contextmanager
+def _failure_signals_on_thread(trigger, pending_failure):
+    """Route worker signals away from the blocked main thread."""
+    failures = {signal.SIGUSR1, signal.SIGQUIT}
+    ready = threading.Event()
+    stop = threading.Event()
+
+    def receive_signals():
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, failures)
+        ready.set()
+        # The owner holds this condition until wait() releases it. Its native
+        # wait must therefore start before the worker can send the first signal.
+        with pending_failure:
+            trigger.set()
+        stop.wait(_TIMEOUT_S * 10)
+
+    receiver = threading.Thread(target=receive_signals)
+    receiver.start()
+    try:
+        assert ready.wait(_TIMEOUT_S), "signal receiver did not start"
+        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, failures)
+        try:
+            yield
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+    finally:
+        stop.set()
+        receiver.join(_TIMEOUT_S)
+        assert not receiver.is_alive(), "signal receiver did not stop"
+
+
+def _repeated_failure_cleanup(signal_on_thread, writer):
     from tokenspeed.runtime.entrypoints.engine import Engine
 
     # A launcher installed after a failed instance must receive its own first
@@ -159,11 +191,22 @@ def _repeated_failure_cleanup(writer):
             assert reader.poll(_TIMEOUT_S)
             assert reader.recv() == {"status": "ready"}
         try:
-            triggers[0].set()
-            # A signal received by another thread does not wake this wait.
-            # Return to Python so its handler runs before the peer times out.
-            for _ in range(_TIMEOUT_S * 10):
-                threading.Event().wait(0.1)
+            pending_failure = threading.Condition()
+            with pending_failure:
+                signal_context = (
+                    _failure_signals_on_thread(triggers[0], pending_failure)
+                    if signal_on_thread
+                    else contextlib.nullcontext()
+                )
+                with signal_context:
+                    if not signal_on_thread:
+                        triggers[0].set()
+                    # A native library thread may receive the OS signal while
+                    # Python's handler stays pending until the main thread runs
+                    # again. Return to Python before the second worker times out.
+                    deadline = time.monotonic() + _TIMEOUT_S
+                    while time.monotonic() < deadline:
+                        pending_failure.wait(0.1)
         except SystemExit as exc:
             outcome = exc.code
         finally:
@@ -365,9 +408,10 @@ def test_engine_startup_signal_owns_worker_cleanup(signum):
         reader.close()
 
 
-def test_repeated_failure_signals_cannot_interrupt_owner_cleanup():
+@pytest.mark.parametrize("signal_on_thread", [False, True], ids=["main", "thread"])
+def test_repeated_failure_signals_cannot_interrupt_owner_cleanup(signal_on_thread):
     proc, reader = start_process_with_ready_pipe(
-        _repeated_failure_cleanup, (), contextlib.nullcontext()
+        _repeated_failure_cleanup, (signal_on_thread,), contextlib.nullcontext()
     )
     try:
         # The child imports the engine stack and waits on two spawned workers

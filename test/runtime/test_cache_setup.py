@@ -127,9 +127,7 @@ def test_glm_workspace_budget_includes_kda_and_shared_kpool_tails(width):
     # The tail allocation is shared by target/draft views; count its storage
     # once, together with the verify buffers owned by the target backend.
     tail_bytes = pool._kpool_tail_workspace.storage.nbytes
-    verify_bytes = (
-        backend.preallocate_verify_workspace(config.max_bs, width) if width > 1 else 0
-    )
+    verify_bytes = backend.preallocate_verify_workspace(config.max_bs, width)
     assert setup.fixed_workspace_bytes == tail_bytes + verify_bytes
 
 
@@ -440,6 +438,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
         max_total_tokens=None,
         speculative_num_draft_tokens=0,
         speculative_eagle_topk=1,
+        speculative_draft_tree=False,
     )
 
     setup = prepare_cache_setup(
@@ -539,6 +538,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         max_total_tokens=None,
         speculative_num_draft_tokens=draft_tokens,
         speculative_eagle_topk=topk,
+        speculative_draft_tree=topk > 1,
         enable_replay_ssm=replay_enabled,
     )
 
@@ -607,6 +607,7 @@ def test_qwen4_exp_workspace_budget_includes_preallocated_ple_commit_rows(
         max_total_tokens=None,
         speculative_num_draft_tokens=width,
         speculative_eagle_topk=1,
+        speculative_draft_tree=False,
         enable_replay_ssm=False,
         disaggregation_mode=role,
     )
@@ -1187,6 +1188,7 @@ def _qwen_gdn_setup(
             max_total_tokens=None,
             speculative_num_draft_tokens=3,
             speculative_eagle_topk=1,
+            speculative_draft_tree=False,
             enable_replay_ssm=False,
         ),
         model_config=SimpleNamespace(

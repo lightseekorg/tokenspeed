@@ -372,3 +372,101 @@ def test_minimax_m3_language_only_keeps_vision_modules_disabled(
 
     with pytest.raises(RuntimeError, match="vision tower is disabled"):
         model.get_image_feature([])
+
+
+def test_minimax_m3_mxfp8_nvfp4_quant_dispatch_and_expert_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tokenspeed.runtime.layers.dense import Fp8LinearMethod
+    from tokenspeed.runtime.layers.quantization.mxfp8_nvfp4 import (
+        Mxfp8Nvfp4Config,
+        preprocess_mxfp8_nvfp4_weights,
+    )
+
+    hf_quant_config = {
+        "quant_method": "mxfp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [1, 32],
+        "moe_quant_algo": "NVFP4",
+        "moe_quant_format": "nvfp4-pack-quantized",
+        "group_size": 16,
+    }
+    assert (
+        Mxfp8Nvfp4Config.override_quantization_method(hf_quant_config, None)
+        == "mxfp8_nvfp4"
+    )
+    quant_config = Mxfp8Nvfp4Config.from_config(hf_quant_config)
+    model = _build_model(monkeypatch, quant_config=quant_config)
+    layer = model.model.layers[3]
+    assert isinstance(layer.self_attn.qkv_proj.quant_method, Fp8LinearMethod)
+    assert isinstance(
+        layer.mlp.shared_experts.gate_up_proj.quant_method, Fp8LinearMethod
+    )
+    assert layer.mlp.experts._quant_kind == "nvfp4"
+
+    # compressed-tensors global scales are multipliers; the runtime loads
+    # their reciprocals under the ModelOpt names.
+    expert = "language_model.model.layers.3.block_sparse_moe.experts.0.w1"
+    renamed = dict(
+        preprocess_mxfp8_nvfp4_weights(
+            [
+                (f"{expert}.weight_packed", torch.zeros(4, 8, dtype=torch.uint8)),
+                (f"{expert}.weight_global_scale", torch.tensor([4.0])),
+                (f"{expert}.input_global_scale", torch.tensor([0.5])),
+            ],
+            quant_config,
+        )
+    )
+    assert renamed.keys() == {
+        f"{expert}.weight",
+        f"{expert}.weight_scale_2",
+        f"{expert}.input_scale",
+    }
+    assert renamed[f"{expert}.weight_scale_2"].item() == 0.25
+    assert renamed[f"{expert}.input_scale"].item() == 2.0
+
+
+def test_minimax_m3_dspark_draft_layout_and_checkpoint_names() -> None:
+    from tokenspeed.runtime.models.minimax_m3_dspark import DSparkMiniMaxDraftModel
+
+    config = MiniMaxM3VLTextConfig(
+        vocab_size=96,
+        hidden_size=64,
+        dense_intermediate_size=128,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        rotary_dim=8,
+        max_position_embeddings=256,
+        rope_parameters={
+            "rope_type": "default",
+            "rope_theta": 10_000_000,
+            "partial_rotary_factor": 0.5,
+        },
+        layer_types=["sliding_attention"],
+        sliding_window=32,
+        dflash_config={"target_layer_ids": [1, 3], "block_size": 7},
+        dspark_config={"markov_rank": 8, "markov_head_type": "vanilla"},
+    )
+    model = DSparkMiniMaxDraftModel(config, Mapping(rank=0, world_size=1))
+    attn = model.layers[0].self_attn
+
+    # Checkpoint names nest the draft under the target; the loader strips the
+    # nesting, folds k_proj into the fused qkv, renames final_norm to norm, and
+    # skips the unused confidence head.
+    k_proj = torch.randn(32, 64)
+    final_norm = torch.randn(64)
+    model.load_weights(
+        [
+            (
+                "language_model.model.dspark.layers.0.decoder_layer."
+                "self_attn.k_proj.weight",
+                k_proj,
+            ),
+            ("language_model.model.dspark.final_norm.weight", final_norm),
+            ("language_model.model.dspark.confidence_head.proj.weight", torch.ones(1)),
+        ]
+    )
+    torch.testing.assert_close(attn.qkv_proj.weight[64:96], k_proj, atol=0, rtol=0)
+    torch.testing.assert_close(model.norm.weight, final_norm, atol=0, rtol=0)

@@ -291,10 +291,8 @@ class QwenGDNRecipe(CacheRecipe):
 
     @cached_property
     def draft_tree(self) -> bool:
-        """Whether verify windows are draft trees (--speculative-eagle-topk > 1)."""
-        return bool(self.num_draft_layers) and (
-            int(self.server_args.speculative_eagle_topk) > 1
-        )
+        """Whether verify windows are draft trees (``speculative_draft_tree``)."""
+        return bool(self.num_draft_layers) and self.server_args.speculative_draft_tree
 
     @cached_property
     def replay_ssm(self) -> bool:

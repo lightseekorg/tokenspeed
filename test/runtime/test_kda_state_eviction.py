@@ -277,6 +277,10 @@ class _ScheduledKDA:
                 else self.kernel.decode(*inputs, bs=1)
             )
             outputs[layer] = output.clone()
+        if not is_prefill:
+            self.kernel.commit_decode(1)
+        for layer, group in zip(_LAYERS, KIMI_STATE_GROUPS, strict=True):
+            stream = streams[layer]
             state_block = tables[group][0][STATE_LIVE_SLOT]
             for component in _COMPONENTS:
                 states[layer, component] = self.pool.get_component(layer, component)[

@@ -359,14 +359,26 @@ def test_two_slot_resolve_runs_once_per_group_and_groups_are_independent(
     backend = _backend("cpu", contract_pool=pool)
 
     resolve_calls = 0
-    real = mamba.compute_state_block_indices
+    real = (
+        mamba.verify_state_blocks
+        if backend.deferred_state_commit
+        else mamba.compute_state_block_indices
+    )
 
     def counting(*args, **kwargs):
         nonlocal resolve_calls
         resolve_calls += 1
         return real(*args, **kwargs)
 
-    monkeypatch.setattr(mamba, "compute_state_block_indices", counting)
+    monkeypatch.setattr(
+        mamba,
+        (
+            "verify_state_blocks"
+            if backend.deferred_state_commit
+            else "compute_state_block_indices"
+        ),
+        counting,
+    )
 
     bs = 2
     tables = _kimi_tables(bs, width=2)
@@ -536,18 +548,19 @@ class _KDAHarness:
         }
         return _tables_for(self.contract, np_tables, self.device)
 
-    def extend_metadata(self, tables, seq_lens, extend_prefix_lens):
-        """An EXTEND batch: every row extends, the executor's host mirrors
-        carry each row's new-token and prefix lengths."""
+    def extend_metadata(self, tables, seq_lens, extend_prefix_lens, num_extends):
+        """An EXTEND batch, or a MIXED one whose rows past ``num_extends``
+        decode one token each; the executor's host mirrors carry each row's
+        new-token and prefix lengths."""
         bs = len(seq_lens)
         prefix_cpu = torch.tensor(extend_prefix_lens, dtype=torch.int32)
         new_cpu = torch.tensor(seq_lens, dtype=torch.int32) - prefix_cpu
         self.backend.init_forward_metadata(
             bs=bs,
-            num_extends=bs,
+            num_extends=num_extends,
             req_pool_indices=torch.arange(bs, dtype=torch.int32, device=self.device),
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32, device=self.device),
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=ForwardMode.from_num_extends(num_extends, bs),
             block_tables=self._delivered(tables),
             extend_seq_lens=new_cpu.to(self.device),
             extend_seq_lens_cpu=new_cpu,
@@ -571,30 +584,62 @@ class _KDAHarness:
             block_tables=self._delivered(tables),
         )
 
-    def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1):
+    def extend(self, layer_id, mixed, g_raw, beta_raw, bs=1, *, forward_mode):
         seq_len = mixed.shape[0]
-        # The conv kernels write their output IN PLACE into mixed_qkv (a
-        # fresh projection in production); clone so the oracle can reuse the
-        # raw token stream afterwards.
-        return self.backend.forward_extend(
-            None,
-            None,
-            None,
-            layer=None,
-            out_cache_loc=None,
-            token_to_kv_pool=self.pool,
-            bs=bs,
-            forward_mode=ForwardMode.EXTEND,
-            mixed_qkv=mixed.clone(),
-            save_kv_cache=True,
-            g_raw=g_raw,
-            beta_raw=beta_raw,
-            seq_len=seq_len,
-            **self.common_kwargs(layer_id),
-        ).flatten(0, 1)
+        # The model hands over the q|k|v slice of its merged projection rows
+        # (here [q|k|v|g]); it used to pass a compact copy. From the same
+        # states, both must leave the same output and state bytes. The slice
+        # runs last, so its states carry on. Fresh rows keep the raw token
+        # stream intact for the oracle.
+        rows = torch.cat((mixed, g_raw), dim=-1)
+        states = [
+            self.pool.get_component(layer_id, name)
+            for name in ("conv_state", "recurrent_state")
+        ]
+        initial = [state.clone() for state in states]
+        results = []
+        for mixed_qkv in (
+            rows[:, : mixed.shape[1]].contiguous(),
+            rows[:, : mixed.shape[1]],
+        ):
+            for state, start in zip(states, initial):
+                state.copy_(start)
+            out = self.backend.forward_extend(
+                None,
+                None,
+                None,
+                layer=None,
+                out_cache_loc=None,
+                token_to_kv_pool=self.pool,
+                bs=bs,
+                forward_mode=forward_mode,
+                mixed_qkv=mixed_qkv,
+                save_kv_cache=True,
+                g_raw=g_raw,
+                beta_raw=beta_raw,
+                seq_len=seq_len,
+                **self.common_kwargs(layer_id),
+            ).flatten(0, 1)
+            results.append([out, *(state.clone() for state in states)])
+        for compact, view in zip(*results):
+            assert view.dtype == compact.dtype
+            assert torch.equal(
+                view.contiguous().view(torch.uint8),
+                compact.contiguous().view(torch.uint8),
+            )
+        return results[1][0]
+
+    def commit_decode(self, bs):
+        self.backend.commit_state_after_acceptance(
+            torch.ones(bs, dtype=torch.int32, device=self.device),
+            num_extends=0,
+            accepted_path=None,
+        )
 
     def decode(self, layer_id, mixed, g_raw, beta_raw, bs):
-        # mixed cloned for the same reason as in extend().
+        # The conv kernels may write their output in place into mixed_qkv (a
+        # fresh projection in production); clone so the oracle can reuse the
+        # raw token stream afterwards.
         return self.backend.forward_decode(
             None,
             None,
@@ -607,7 +652,7 @@ class _KDAHarness:
             g_raw=g_raw,
             beta_raw=beta_raw,
             **self.common_kwargs(layer_id),
-        ).flatten(0, 1)
+        ).reshape(-1, self.D)
 
     def oracle(self, layer_id, mixed, g_raw, beta_raw):
         """(naive_out, naive_state, fla_out, fla_state) over one contiguous
@@ -735,6 +780,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
         {gid: [[0, checkpoint]] for gid, (checkpoint, _) in blocks.items()},
         seq_lens=[3],
         extend_prefix_lens=[0],
+        num_extends=1,
     )
     md = h.backend.forward_metadata
     for gid in _STATE_GROUPS:
@@ -743,7 +789,13 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
     for layer_id in [0, 1, 2]:
         s = streams[layer_id]
         outputs[layer_id].append(
-            h.extend(layer_id, s["mixed"][:3], s["g_raw"][:3], s["beta_raw"][:3])
+            h.extend(
+                layer_id,
+                s["mixed"][:3],
+                s["g_raw"][:3],
+                s["beta_raw"][:3],
+                forward_mode=ForwardMode.EXTEND,
+            )
         )
     # The prompt-end block is published: read-only from here on.
     snapshot = {}
@@ -786,6 +838,7 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
                     bs=1,
                 )
             )
+        h.commit_decode(1)
 
     for layer_id, gid in zip([0, 1, 2], _STATE_GROUPS):
         s = streams[layer_id]
@@ -824,7 +877,8 @@ def test_kda_three_groups_zero_state_same_page_and_crossing() -> None:
 @requires_fla
 def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     """Prefix hit at a published prompt-end checkpoint: the shared block is
-    read-only for both branches, and batched decode keeps requests isolated."""
+    read-only for both branches, and a MIXED forward and batched decode keep
+    requests isolated."""
     P, usable = 4, 16
     contract = _stub_contract(prefix_granularity=P, usable_pages=usable)
     pool = _StubContractPool(
@@ -843,11 +897,11 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
             "linear_attention_2": [[p + 8 if p else 0 for p in row] for row in rows0],
         }
 
-    # Shared prefix: 4 tokens (exactly one page). Branch A continues with 2
+    # Shared prefix: 4 tokens (exactly one page). Branch A continues with 3
     # decodes; branch B resumes from the snapshot with a 3-token extend and
-    # one decode. Total streams: A = prefix + a4 a5; B = prefix + b4 b5 b6 b7.
+    # one decode. Total streams: A = prefix + a4 a5 a6; B = prefix + b4 b5 b6 b7.
     prefix = h.token_stream(4)
-    a_new = h.token_stream(2)
+    a_new = h.token_stream(3)
     b_new = h.token_stream(4)
 
     def cat(*streams):
@@ -860,8 +914,18 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     b_full = cat(prefix, b_new)
 
     # 1) A prefills the shared 4-token prefix -> its prompt-end state, block 1.
-    h.extend_metadata(tables_for([[0, 1]]), seq_lens=[4], extend_prefix_lens=[0])
-    a_outs = [h.extend(layer_id, prefix["mixed"], prefix["g_raw"], prefix["beta_raw"])]
+    h.extend_metadata(
+        tables_for([[0, 1]]), seq_lens=[4], extend_prefix_lens=[0], num_extends=1
+    )
+    a_outs = [
+        h.extend(
+            layer_id,
+            prefix["mixed"],
+            prefix["g_raw"],
+            prefix["beta_raw"],
+            forward_mode=ForwardMode.EXTEND,
+        )
+    ]
     conv = pool.get_component(layer_id, "conv_state")
     ssm = pool.get_component(layer_id, "recurrent_state")
     snap_conv = conv[1].clone()
@@ -883,35 +947,49 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
             bs=1,
         )
     )
+    h.commit_decode(1)
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 3) B hits the published checkpoint: extend prefix=4 -> 7 tokens
-    #    (in = shared block 1, out = fresh block 3; block 1 must stay intact).
-    h.extend_metadata(tables_for([[1, 3]]), seq_lens=[7], extend_prefix_lens=[4])
+    # 3) One MIXED forward: B hits the published checkpoint, extend prefix=4
+    #    -> 7 tokens (in = shared block 1, out = fresh block 3; block 1 must
+    #    stay intact), while A decodes token 6 in place on block 2 (slot 0
+    #    released).
+    h.extend_metadata(
+        tables_for([[1, 3], [0, 2]]),
+        seq_lens=[7, 6],
+        extend_prefix_lens=[4, 5],
+        num_extends=1,
+    )
     md = h.backend.forward_metadata
-    assert md.state_in_blocks_by_group[gid].tolist() == [1]
-    assert md.state_out_blocks_by_group[gid].tolist() == [3]
-    b_outs = [
-        h.extend(
-            layer_id, b_new["mixed"][:3], b_new["g_raw"][:3], b_new["beta_raw"][:3]
-        )
-    ]
+    assert md.state_in_blocks_by_group[gid].tolist() == [1, 2]
+    assert md.state_out_blocks_by_group[gid].tolist() == [3, 2]
+    both = h.extend(
+        layer_id,
+        torch.cat([b_new["mixed"][:3], a_new["mixed"][1:2]], dim=0),
+        torch.cat([b_new["g_raw"][:3], a_new["g_raw"][1:2]], dim=0),
+        torch.cat([b_new["beta_raw"][:3], a_new["beta_raw"][1:2]], dim=0),
+        bs=2,
+        forward_mode=ForwardMode.MIXED,
+    )
+    b_outs = [both[: 3 * h.H]]
+    a_outs.append(both[3 * h.H :])
     assert torch.equal(conv[1], snap_conv)
     assert torch.equal(ssm[1], snap_ssm)
 
-    # 4) Batched decode: A token 6 (in place on block 2, slot 0 released) and
-    #    B's first decode, token 8 (its prompt-end block 3 rotated into slot 0,
-    #    fresh live block 5), in ONE forward -- isolation between requests.
-    h.decode_metadata(tables_for([[0, 2], [3, 5]]), seq_lens=[6, 8])
+    # 4) Batched decode: A token 7 (in place on block 2) and B's first
+    #    decode, token 8 (its prompt-end block 3 rotated into slot 0, fresh
+    #    live block 5), in ONE forward -- isolation between requests.
+    h.decode_metadata(tables_for([[0, 2], [3, 5]]), seq_lens=[7, 8])
     md = h.backend.forward_metadata
     assert md.state_in_blocks_by_group[gid].tolist() == [2, 3]
     assert md.state_out_blocks_by_group[gid].tolist() == [2, 5]
     b_prompt_end = (conv[3].clone(), ssm[3].clone())
-    mixed = torch.cat([a_new["mixed"][1:2], b_new["mixed"][3:4]], dim=0)
-    g_raw = torch.cat([a_new["g_raw"][1:2], b_new["g_raw"][3:4]], dim=0)
-    beta_raw = torch.cat([a_new["beta_raw"][1:2], b_new["beta_raw"][3:4]], dim=0)
+    mixed = torch.cat([a_new["mixed"][2:3], b_new["mixed"][3:4]], dim=0)
+    g_raw = torch.cat([a_new["g_raw"][2:3], b_new["g_raw"][3:4]], dim=0)
+    beta_raw = torch.cat([a_new["beta_raw"][2:3], b_new["beta_raw"][3:4]], dim=0)
     both = h.decode(layer_id, mixed, g_raw, beta_raw, bs=2)
+    h.commit_decode(2)
     a_outs.append(both[: h.H])
     b_outs.append(both[h.H :])
 
@@ -928,7 +1006,7 @@ def test_kda_prefix_resume_copy_on_write_and_isolation() -> None:
     naive_b, state_b, fla_b, fla_state_b = h.oracle(
         layer_id, b_full["mixed"], b_full["g_raw"], b_full["beta_raw"]
     )
-    flat_a = torch.cat(a_outs, dim=0)  # tokens 1..6
+    flat_a = torch.cat(a_outs, dim=0)  # tokens 1..7
     flat_b = torch.cat(b_outs, dim=0)  # tokens 5..8 (B computes only its new)
     _assert_close(flat_a, naive_a, "branch A out vs naive")
     _assert_close(flat_a, fla_a, "branch A out vs FLA")
@@ -968,11 +1046,17 @@ def test_kda_cache_pool_component_views_end_to_end(
     streams = {layer_id: h.token_stream(total) for layer_id in layer_ids}
 
     outputs = {layer_id: [] for layer_id in layer_ids}
-    h.extend_metadata(tables, seq_lens=[8], extend_prefix_lens=[0])
+    h.extend_metadata(tables, seq_lens=[8], extend_prefix_lens=[0], num_extends=1)
     for layer_id in layer_ids:
         s = streams[layer_id]
         outputs[layer_id].append(
-            h.extend(layer_id, s["mixed"][:8], s["g_raw"][:8], s["beta_raw"][:8])
+            h.extend(
+                layer_id,
+                s["mixed"][:8],
+                s["g_raw"][:8],
+                s["beta_raw"][:8],
+                forward_mode=ForwardMode.EXTEND,
+            )
         )
 
     from tokenspeed_kernel.ops.attention.kda._triton import recurrent
@@ -1011,6 +1095,7 @@ def test_kda_cache_pool_component_views_end_to_end(
                     bs=1,
                 )
             )
+        h.commit_decode(1)
 
     assert indexed_decode_calls == len(layer_ids) * (total - 8)
 
@@ -1097,7 +1182,10 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
     for harness in harnesses:
         harness.backend.kda_backend = "cutedsl_kda"
         harness.extend_metadata(
-            tables, seq_lens=[prefix + 868], extend_prefix_lens=[prefix]
+            tables,
+            seq_lens=[prefix + 868],
+            extend_prefix_lens=[prefix],
+            num_extends=1,
         )
 
     def pytorch_staging(conv, state, sources, destinations):
@@ -1114,10 +1202,20 @@ def test_kda_prefill_fused_staging_matches_pytorch(prefix, monkeypatch):
         with monkeypatch.context() as patch:
             patch.setattr(mamba, "_prepare_cache_prefill_state_inputs", pytorch_staging)
             expected = before.extend(
-                layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+                layer_id,
+                stream["mixed"],
+                stream["g_raw"],
+                stream["beta_raw"],
+                bs=1,
+                forward_mode=ForwardMode.EXTEND,
             )
         actual = after.extend(
-            layer_id, stream["mixed"], stream["g_raw"], stream["beta_raw"], bs=1
+            layer_id,
+            stream["mixed"],
+            stream["g_raw"],
+            stream["beta_raw"],
+            bs=1,
+            forward_mode=ForwardMode.EXTEND,
         )
         assert torch.equal(actual, expected)
         for component in ("conv_state", "recurrent_state"):

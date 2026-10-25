@@ -42,12 +42,14 @@ from tokenspeed_kernel.ops.layernorm import (
 )
 from tokenspeed_kernel.ops.moe import bf16_moe_routes
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
+    _gather_moe_routes_kernel,
     _launch_routed_input_scale_sum,
 )
 from tokenspeed_kernel.ops.moe._triton.routed_norm import (
     triton_routed_input_scale_rmsnorm_sum_gathered as triton_routed_sum_gathered,
 )
 from tokenspeed_kernel.ops.moe.routed_norm import (
+    gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
 )
 from tokenspeed_kernel.ops.residual import (
@@ -332,6 +334,81 @@ def test_fused_boundary_keeps_the_post_norm_in_fp32(
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_gathered_routes_replay_and_vary_token_count(device: str) -> None:
+    """Route alignment and destination storage survive capture and batch changes."""
+    from utils import assert_no_triton_compile
+
+    topk, width, padded_width = 8, 257, 288
+
+    def make_case(tokens: int):
+        routes = torch.randn(
+            tokens * topk + 7, padded_width, device=device, dtype=torch.bfloat16
+        )
+        mapping = torch.randperm(routes.shape[0], device=device)[: tokens * topk].int()
+        mapping[::3] = -1
+        output = torch.full(
+            (tokens, topk, width), torch.nan, device=device, dtype=routes.dtype
+        )
+        return routes, mapping, tokens, topk, width, output
+
+    def check(case):
+        routes, mapping, tokens, topk, width, output = case
+        actual = gather_moe_routes(*case)
+        assert actual is output
+        indices = mapping.long()
+        expected = routes[indices.clamp_min(0), :width]
+        expected[indices < 0] = 0
+        torch.testing.assert_close(
+            actual, expected.reshape(tokens, topk, width), atol=0, rtol=0
+        )
+
+    # Warm each runtime integer alignment class, including a partial workgroup.
+    for tokens in (1, 2):
+        check(make_case(tokens))
+    with assert_no_triton_compile(_gather_moe_routes_kernel):
+        for tokens in (3, 5, 16, 33):
+            check(make_case(tokens))
+    case = make_case(5)
+    gather_moe_routes(*case)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        gather_moe_routes(*case)
+    routes, mapping, _, _, _, output = case
+    routes.neg_()
+    mapping.copy_(mapping.flip(0))
+    output.fill_(torch.nan)
+    graph.replay()
+    torch.cuda.synchronize()
+    indices = mapping.long()
+    expected = routes[indices.clamp_min(0), :width]
+    expected[indices < 0] = 0
+    torch.testing.assert_close(output, expected.reshape(output.shape), atol=0, rtol=0)
+
+    # Rejection must happen before a permuted gather can corrupt its source.
+    source = torch.randn(8, width, device=device, dtype=torch.bfloat16)
+    before = source.clone()
+    mapping = torch.arange(7, -1, -1, device=device, dtype=torch.int32)
+    with pytest.raises(ValueError, match="overlap"):
+        gather_moe_routes(source, mapping, 1, 8, width, source.view(1, 8, width))
+    torch.testing.assert_close(source, before, atol=0, rtol=0)
+
+    destination = torch.zeros(1, 8, width, device=device, dtype=torch.bfloat16)
+    mapping = destination.flatten().view(torch.int32)[:8]
+    mapping.copy_(torch.arange(7, -1, -1, device=device, dtype=torch.int32))
+    before_destination = destination.clone()
+    with pytest.raises(ValueError, match="overlap"):
+        gather_moe_routes(source, mapping, 1, 8, width, destination)
+    torch.testing.assert_close(
+        destination.view(torch.int16),
+        before_destination.view(torch.int16),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(source, before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_gathered_route_reduction_matches_materialized_routes(device: str) -> None:
     """Reading routes through the permute map must equal gathering them first."""
     torch.manual_seed(5)
@@ -349,6 +426,8 @@ def test_gathered_route_reduction_matches_materialized_routes(device: str) -> No
     routes = gemm2_out.index_select(0, permuted.clamp_min(0))[:, :width]
     routes = torch.where((permuted >= 0).unsqueeze(-1), routes, routes.new_zeros(()))
     routes = routes.view(tokens, topk, width)
+    gathered = gather_moe_routes(gemm2_out, permute_map, tokens, topk, width)
+    torch.testing.assert_close(gathered, routes, atol=0, rtol=0)
     expected = routed_input_scale_rmsnorm_sum(
         routes, route_weights, norm_weight, 1e-8, 1.0, False
     )

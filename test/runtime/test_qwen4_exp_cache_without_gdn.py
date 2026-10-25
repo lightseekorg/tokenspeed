@@ -117,6 +117,7 @@ def _recipe(
             max_total_tokens=None,
             speculative_num_draft_tokens=width,
             speculative_eagle_topk=1,
+            speculative_draft_tree=False,
             enable_replay_ssm=True,
         ),
         model_config=model_config,

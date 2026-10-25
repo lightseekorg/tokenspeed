@@ -18,28 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Record the latency of selected functions."""
+"""Activation-tile conversion matching the shared 128-value quantizer."""
 
-from tokenspeed.runtime.metrics.utils import exponential_buckets
-
-enable_metrics = False
+from tokenspeed_kernel_amd._triton import gl, gluon
 
 
-def enable_func_timer():
-    """Enable Prometheus-backed function latency metrics."""
-    # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
-    from prometheus_client import Histogram
-
-    global enable_metrics, FUNC_LATENCY
-    enable_metrics = True
-
-    FUNC_LATENCY = Histogram(
-        "tokenspeed:func_latency_seconds",
-        "Function latency in seconds",
-        # captures latency in range [50ms - ~50s]
-        buckets=exponential_buckets(start=0.05, width=1.5, length=18),
-        labelnames=["name"],
-    )
-
-
-FUNC_LATENCY = None
+@gluon.jit
+def quantize_intermediate_tile(value, USE_RECIPROCAL: gl.constexpr):
+    # The separate path stores BF16 before its FP32 scale reduction.
+    rounded = value.to(gl.bfloat16).to(gl.float32)
+    scale = gl.maximum(gl.max(gl.abs(rounded), 1), 1.0e-10) / 448.0
+    # Match the shared quantizer's size-selected arithmetic, including midpoints.
+    if USE_RECIPROCAL:
+        inverse_scale = 1.0 / scale
+        scaled = rounded * inverse_scale[:, None]
+    else:
+        scaled = rounded / scale[:, None]
+    quantized = gl.clamp(scaled, -448.0, 448.0).to(gl.float8e4nv)
+    return quantized, scale

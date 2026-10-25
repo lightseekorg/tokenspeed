@@ -374,6 +374,40 @@ def test_scale_bytes_and_loader_validation():
         embed.weight_loader(embed.weight, codes[:, :32])
 
 
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="requires a GPU"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("ndim", [1, 2, 3])
+def test_embedding_noncontiguous_ids(device, ndim):
+    embed = RowShardedEngramEmbedding(
+        64, 256, _mapping(0, 1, 1), device, False, "gpu", 1
+    )
+    codes = torch.randn(64, 256, device=device).to(torch.float8_e4m3fn)
+    scales = torch.randint(120, 132, (64, 8), dtype=torch.uint8, device=device)
+    embed.weight_loader(embed.weight, codes)
+    embed.weight_loader(embed.scale, scales)
+    storage = torch.arange(96, device=device, dtype=torch.int64) % 70
+    if ndim == 1:
+        ids = storage[::2]
+    elif ndim == 2:
+        ids = storage.reshape(2, 2, 24)[:, 1]
+    else:
+        ids = storage.reshape(2, 4, 12).transpose(0, 1)
+    assert not ids.is_contiguous()
+    expected = _dequant(codes, scales)[ids.clamp(0, 63)]
+    expected[ids >= 64] = 0
+    torch.testing.assert_close(embed(ids), expected, rtol=0, atol=0)
+
+
 def _model(device, quant_config):
     return DeepseekV41Engram(
         _config(),

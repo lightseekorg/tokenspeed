@@ -18,7 +18,8 @@ SLURM_RUNNER_PREFIXES = (
     "slurm-gb300-",
 )
 PR_TEST_WORKFLOWS = (
-    "amd-tests.yml",
+    "amd-mi350-tests.yml",
+    "amd-mi450-tests.yml",
     "nvidia-b200-tests.yml",
     "pr-test-nvidia-arm.yml",
 )
@@ -351,7 +352,7 @@ def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
 def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     # AMD Tests keeps unit and model tests; the benchmark lives in a separate
     # workflow so it starts alongside unit tests and completes on its own.
-    tests = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")["jobs"]
+    tests = load_yaml(REPO_ROOT / ".github/workflows/amd-mi350-tests.yml")["jobs"]
     assert "kernel-benchmark" not in tests
     assert "kernel-benchmark" not in tests["finish"]["needs"]
     assert (
@@ -366,8 +367,6 @@ def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml")
     assert workflow["name"] == "AMD Kernel Benchmark"
     triggers = workflow.get("on") or workflow.get(True)
-    # The `high priority` label only affects model tests; it must not restart
-    # the benchmark.
     assert "labeled" not in triggers["pull_request"]["types"]
     # tokenspeed-mla is NVIDIA-only, so its changes must not start the workflow.
     for event in ("push", "pull_request"):

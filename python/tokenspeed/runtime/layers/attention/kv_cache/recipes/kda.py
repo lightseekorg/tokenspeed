@@ -20,8 +20,6 @@
 
 """KDA verify workspace shared by the Kimi-K3 and GLM cache recipes."""
 
-import torch
-
 from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
@@ -67,8 +65,8 @@ def kda_verify_workspace_bytes(
 
     Returns:
         Transient convolution rows and captured replay payloads, or the dense
-        state tape. Raw-gate replay's convolution scratch aliases the arena
-        and contributes zero. Callers decide whether this engine verifies.
+        state tape. Records metadata is required for both fused and split
+        producers. Callers decide whether this engine verifies.
     """
     state_fields = tuple(
         field
@@ -83,25 +81,33 @@ def kda_verify_workspace_bytes(
             * sum(field.payload_bytes for field in state_fields)
         )
 
-    from tokenspeed_kernel.ops.attention.kda import kda_batched_replay_uses_raw_gate
+    from tokenspeed_kernel.ops.attention.kda import (
+        kda_replay_payload_specs,
+    )
 
     linear = config.component(LinearAttnConfig)
     heads, head_dim, _ = linear.temporal_state_shape
-    raw_gate = kda_batched_replay_uses_raw_gate(
-        config.dtype, num_heads=heads, head_dim=head_dim
-    )
     conv_fields = tuple(
         field for field in state_fields if field.field_id.endswith(".conv_state")
     )
-    conv_bytes = (
-        0
-        if raw_gate
-        else config.max_bs * sum(field.payload_bytes for field in conv_fields)
+    conv_bytes = config.max_bs * sum(field.payload_bytes for field in conv_fields)
+    row_bytes = sum(
+        channels * payload_dtype.itemsize
+        for channels, payload_dtype in kda_replay_payload_specs(
+            config.dtype,
+            conv_channels=linear.conv_state_shape[0],
+            num_heads=heads,
+            head_dim=head_dim,
+        )
     )
-    row_bytes = (linear.conv_state_shape[0] + head_dim + heads) * config.dtype.itemsize
-    row_bytes += (
-        heads
-        * head_dim
-        * (torch.bfloat16.itemsize if raw_gate else torch.float32.itemsize)
+    group_count = sum(spec.attn_kind == "state" for spec, _ in groups)
+    metadata_bytes = len(conv_fields) * (10 * 8 + 4)
+    metadata_bytes += group_count * 4 * 8
+    metadata_bytes += (2 * group_count + 1) * config.max_bs * 4
+    metadata_bytes += config.max_bs * 3 * 8
+    metadata_bytes += len(conv_fields) * config.max_bs * draft_token_num * 2 * 8
+    return (
+        conv_bytes
+        + len(conv_fields) * config.max_bs * draft_token_num * row_bytes
+        + metadata_bytes
     )
-    return conv_bytes + len(conv_fields) * config.max_bs * draft_token_num * row_bytes

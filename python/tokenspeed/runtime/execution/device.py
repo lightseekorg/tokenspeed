@@ -615,7 +615,7 @@ class DeviceHandle:
                     stop_criteria=planned.stop_criteria,
                 )
 
-        return PendingExecution(self._thread.submit(_forward))
+        return PendingExecution(self._thread.submit_forward(_forward))
 
     def poll_cache_results(self) -> list:
         """Collect completed Host cache ops (both tiers); never blocks.
@@ -658,8 +658,9 @@ class DeviceHandle:
 
         A cache plan, a PD transfer or a page copy the last round queued is
         settled by the next round's execute or poll; at shutdown there is no
-        next round, so they are joined here and the first failure re-raised
-        after the Device copy executors and their Host pools are drained.
+        next round, so they are joined here, a drafter's pending round is
+        finished, and the first failure re-raised after the Device copy
+        executors and their Host pools are drained.
         """
         errors = []
         for submissions in (
@@ -673,8 +674,8 @@ class DeviceHandle:
                     future.result()
                 except BaseException as exc:  # noqa: BLE001 — surface after close
                     errors.append(exc)
-        if self._l2 is not None:
-            self._thread.run(self._l2.shutdown)
+        # The task settles the last forward's pending draft round first, even with no Host cache.
+        self._thread.run(self._l2.shutdown if self._l2 is not None else lambda: None)
         if errors:
             raise errors[0]
 
