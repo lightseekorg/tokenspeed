@@ -334,9 +334,11 @@ private:
         _assert(host_pool_ != nullptr, "Host prefix hits require a Host pool");
         const GroupPrefixProbe& probe = prefix_.host.per_group[group_index];
         const std::span<const CacheKey> keys = prefix_.group_keys[group_index];
+        // A State group's hits count from page 0 (PrefixProbe::Tier).
         const std::int32_t floor_pages =
-            prefix_.device.full_page_tokens /
-            (geometry_[group_index].HasTokenSpan() ? geometry_[group_index].BlockGranularity() : prefix_granularity_);
+            geometry_[group_index].HasTokenSpan()
+                ? prefix_.device.full_page_tokens / geometry_[group_index].BlockGranularity()
+                : 0;
         const GroupAllocator& allocator = groups_[group_index].Allocator();
         const auto count_hit = [&](const CacheKey& key) {
             const CacheBlockRef host_block = groups_[group_index].Index().Find(*host_pool_, key);

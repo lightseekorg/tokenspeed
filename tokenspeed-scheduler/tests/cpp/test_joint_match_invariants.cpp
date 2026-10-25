@@ -34,14 +34,17 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <random>
+#include <span>
 #include <string>
 #include <vector>
 
 #include "cache/coordinator/cache_coordinator.h"
 #include "cache/core/block_pool.h"
 #include "cache/core/cache_types.h"
+#include "cache/prefix/prefix_hasher.h"
 #include "cache_test_access.h"
 #include "unit_test_helper.h"
 
@@ -218,6 +221,222 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
         EXPECT_TRUE(match.per_group[1].blocks.empty()) << "round " << round;
         // The closed group still honours hit => warm on its own.
         EXPECT_EQ(GroupPrefixBlocks(coordinator, pool, hashes, 0, full_depth), full_depth) << "round " << round;
+    }
+}
+
+// The Host-suffix rule (a hit is a Device KV prefix plus a Host suffix) under
+// random two-tier layouts on the K3 shape (P = 4; a Full group, one block per
+// page; three State groups): each page's Full block, each page's checkpoints
+// and two tails with their checkpoints in one page (each its Full block and
+// checkpoints, as a prompt end and the finish after a short output publish
+// them) land on either tier at random, the Device's pages with gaps in every
+// other round. An inline oracle computes the Device-only hit D, the Device's KV
+// coverage L (its pages from page 0 to the first gap), the Host's run C of
+// pages from L, and the best boundary T* the rule allows: pages below min(L, p)
+// from the Device, [L, p) from the Host, the tail whole from one tier (the
+// Device's only at p <= L), each checkpoint from either. The probe hits exactly
+// T* >= D, the admission succeeds and holds every page below the hit, no page
+// below L is loaded (no sliding group lowers the split), and the Host loads
+// exactly the checkpoints the Device lacks. With L3 on, the storage query never
+// asks for a Device-resident checkpoint or page below L, and with a gapless
+// Device prefix for no Device-resident key at all.
+TEST(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv) {
+    constexpr auto kDevice = static_cast<std::size_t>(CacheTier::kDevice);
+    constexpr auto kHost = static_cast<std::size_t>(CacheTier::kHost);
+    constexpr std::int32_t kP = 4;
+    constexpr std::int32_t kPages = 8;
+    constexpr std::int32_t kMaxTokens = kPages * kP + 1;
+    constexpr std::size_t kNumTails = 2;
+    constexpr std::size_t kFirstTailRow = kPages;  // the first tail's row in the layout
+    constexpr std::size_t kRows = kFirstTailRow + kNumTails;
+    const std::vector<CacheGroupSpec> specs = {
+        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    const std::vector<std::int32_t> tokens = test::MakeTokens(kMaxTokens + 1);
+    std::vector<std::span<const std::int32_t>> pages;
+    for (std::int32_t page = 0; page < kPages; ++page) {
+        pages.emplace_back(tokens.data() + page * kP, kP);
+    }
+    const std::vector<std::string> hashes = ComputePrefixHashes(pages, "");
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes, .tokens = tokens, .max_tokens = kMaxTokens};
+    std::mt19937 rng(20261023);
+    std::uniform_int_distribution<std::int32_t> page_dist(0, kPages - 1);
+    std::uniform_int_distribution<std::int32_t> tail_dist(1, kP - 1);
+    std::uniform_int_distribution<std::int32_t> other_tail_dist(1, kP - 2);
+    // Presence odds by [tier][Full, State], for pages and for tails with their
+    // checkpoints; a tail is published whole, so its checkpoints more often
+    // stay together.
+    const std::array<std::array<double, 2>, 2> page_odds{{{0.75, 0.3}, {0.6, 0.4}}};
+    const std::array<std::array<double, 2>, 2> tail_odds{{{0.75, 0.7}, {0.6, 0.7}}};
+
+    for (const bool l3 : {false, true}) {
+        for (int round = 0; round < 200; ++round) {
+            BlockPool device(64, {4, 1, 1, 1});
+            BlockPool host(64, {4, 1, 1, 1});
+            CacheCoordinator coordinator = MakeCoordinator(specs, kP, device, /*enable_l3_storage=*/l3, &host,
+                                                           /*snapshot_pool=*/nullptr,
+                                                           /*stream_device_cache_to_host=*/true);
+            const bool gapless_device = round % 2 == 0;
+            const std::int32_t tail_page = page_dist(rng);
+            const std::int32_t tail_page_tokens = tail_page * kP;
+            const ContentHash tail_prior =
+                tail_page == 0 ? ContentHash{} : hashes[static_cast<std::size_t>(tail_page) - 1];
+            std::array<std::int32_t, kNumTails> tail_tokens{tail_dist(rng), other_tail_dist(rng)};
+            if (tail_tokens[1] >= tail_tokens[0]) {
+                ++tail_tokens[1];
+            }
+            std::array<std::int32_t, kNumTails> tail_boundary{};
+            std::array<ContentHash, kNumTails> tail_hash;
+            for (std::size_t t = 0; t < kNumTails; ++t) {
+                tail_boundary[t] = tail_page_tokens + tail_tokens[t];
+                tail_hash[t] = HashPrefixPage(
+                    std::span<const std::int32_t>(tokens).subspan(static_cast<std::size_t>(tail_page_tokens),
+                                                                  static_cast<std::size_t>(tail_tokens[t])),
+                    tail_prior);
+            }
+            // present[tier][row][group]: row b < kPages is page b's Full block
+            // and the checkpoints at (b + 1) * kP; row kFirstTailRow + t is
+            // tail t.
+            std::array<std::array<std::array<bool, 4>, kRows>, 2> present{};
+            for (std::size_t tier = 0; tier < 2; ++tier) {
+                for (std::size_t row = 0; row < kRows; ++row) {
+                    for (std::size_t group = 0; group < 4; ++group) {
+                        const auto& odds = row < kFirstTailRow ? page_odds : tail_odds;
+                        present[tier][row][group] = std::bernoulli_distribution(odds[tier][group == 0 ? 0 : 1])(rng);
+                    }
+                }
+            }
+            std::int32_t device_pages = 0;
+            while (device_pages < kPages && present[kDevice][static_cast<std::size_t>(device_pages)][0]) {
+                ++device_pages;
+            }
+            if (gapless_device) {
+                for (std::size_t row = static_cast<std::size_t>(device_pages); row < kFirstTailRow; ++row) {
+                    present[kDevice][row][0] = false;
+                }
+                for (std::size_t row = kFirstTailRow; row < kRows; ++row) {
+                    present[kDevice][row][0] = present[kDevice][row][0] && tail_page <= device_pages;
+                }
+            }
+            for (std::size_t tier = 0; tier < 2; ++tier) {
+                BlockPool& pool = tier == kDevice ? device : host;
+                for (std::size_t row = 0; row < kRows; ++row) {
+                    for (std::uint32_t group = 0; group < 4; ++group) {
+                        if (present[tier][row][group]) {
+                            CacheBlockFor(coordinator, pool,
+                                          row < kFirstTailRow ? hashes[row] : tail_hash[row - kFirstTailRow], group);
+                        }
+                    }
+                }
+            }
+            std::array<bool, kNumTails> hinted{};
+            for (std::size_t t = 0; t < kNumTails; ++t) {
+                hinted[t] = std::ranges::any_of(present[kHost][kFirstTailRow + t], [](bool held) { return held; });
+                if (hinted[t]) {
+                    coordinator.CacheHostTail(tail_prior,
+                                              TailPublication{.tail_tokens = tail_tokens[t], .hash = tail_hash[t]});
+                }
+            }
+
+            // The oracle.
+            const auto checkpoints_on = [&](std::size_t tier, std::size_t row) {
+                return present[tier][row][1] && present[tier][row][2] && present[tier][row][3];
+            };
+            const auto checkpoints_anywhere = [&](std::size_t row) {
+                return (present[kDevice][row][1] || present[kHost][row][1]) &&
+                       (present[kDevice][row][2] || present[kHost][row][2]) &&
+                       (present[kDevice][row][3] || present[kHost][row][3]);
+            };
+            const std::int32_t device_kv = device_pages * kP;  // L
+            std::int32_t host_pages = device_pages;
+            while (host_pages < kPages && present[kHost][static_cast<std::size_t>(host_pages)][0]) {
+                ++host_pages;
+            }
+            const std::int32_t host_kv = host_pages * kP;  // C
+            std::int32_t device_hit = 0;                   // D
+            for (std::int32_t page = 0; page < device_pages; ++page) {
+                if (checkpoints_on(kDevice, static_cast<std::size_t>(page))) {
+                    device_hit = (page + 1) * kP;
+                }
+            }
+            for (std::size_t t = 0; t < kNumTails; ++t) {
+                if (hinted[t] && tail_page <= device_pages && present[kDevice][kFirstTailRow + t][0] &&
+                    checkpoints_on(kDevice, kFirstTailRow + t)) {
+                    device_hit = std::max(device_hit, tail_boundary[t]);
+                }
+            }
+            std::int32_t best = device_hit;  // T*
+            for (std::int32_t page = 0; page < kPages; ++page) {
+                const std::int32_t boundary = (page + 1) * kP;
+                if (boundary > device_hit && boundary <= host_kv &&
+                    checkpoints_anywhere(static_cast<std::size_t>(page))) {
+                    best = std::max(best, boundary);
+                }
+            }
+            for (std::size_t t = 0; t < kNumTails; ++t) {
+                const std::size_t row = kFirstTailRow + t;
+                const bool kv_tail_on_device = tail_page_tokens <= device_kv && present[kDevice][row][0];
+                if (hinted[t] && tail_boundary[t] > device_hit && tail_page_tokens <= host_kv &&
+                    (kv_tail_on_device || present[kHost][row][0]) && checkpoints_anywhere(row)) {
+                    best = std::max(best, tail_boundary[t]);
+                }
+            }
+
+            CacheCoordinator::PrefixProbe probe = coordinator.ProbePromptPrefix(prompt);
+            const std::int32_t hit = std::max(probe.device.num_common_tokens, probe.host.num_common_tokens);
+            EXPECT_EQ(probe.device_only_hit_tokens, device_hit) << "l3=" << l3 << " round " << round;
+            EXPECT_EQ(hit, best) << "l3=" << l3 << " round " << round << ": D=" << device_hit << " L=" << device_kv
+                                 << " C=" << host_kv << " tails@" << tail_boundary[0] << "," << tail_boundary[1]
+                                 << " hinted=" << hinted[0] << hinted[1];
+            EXPECT_GE(hit, device_hit);
+            const std::int32_t hit_pages = (hit - hit % kP) / kP;
+            if (best > device_hit) {
+                EXPECT_EQ(probe.device.full_page_tokens, std::min(device_kv, hit_pages * kP)) << "round " << round;
+            }
+            std::vector<BlockTable> tables(4);
+            const std::optional<CacheCoordinator::AdmissionResult> result = AdmitForTest(
+                coordinator, tables, CacheCoordinator::PrefixProbe{probe}, GroupDemand{.extent = DenseGrowth{1}});
+            ASSERT_TRUE(result) << "l3=" << l3 << " round " << round;
+            for (std::int32_t page = 0; page < hit_pages; ++page) {
+                EXPECT_TRUE(tables[0].Blocks()[static_cast<std::size_t>(page)]) << "round " << round;
+            }
+            std::size_t checkpoint_loads = 0;
+            for (const BlockTransfer& load : result->load_pairs) {
+                if (load.group_id != 0) {
+                    ++checkpoint_loads;
+                    continue;
+                }
+                const auto slot = std::ranges::find(tables[0].Blocks(), load.destination) - tables[0].Blocks().begin();
+                if (slot < hit_pages) {
+                    EXPECT_GE(slot * kP, device_kv) << "round " << round << ": a Device KV page was loaded";
+                }
+            }
+            std::size_t missing_on_device = 0;
+            if (best > device_hit) {
+                const std::size_t row = best % kP == 0             ? static_cast<std::size_t>(best / kP - 1)
+                                        : best == tail_boundary[0] ? kFirstTailRow
+                                                                   : kFirstTailRow + 1;
+                missing_on_device = static_cast<std::size_t>(
+                    std::ranges::count(std::span<const bool>(present[kDevice][row]).subspan(1), false));
+            }
+            EXPECT_EQ(checkpoint_loads, missing_on_device) << "round " << round;
+
+            if (!l3) {
+                continue;
+            }
+            for (const CacheKey& key : coordinator.MissingStorageKeys(prompt, /*max_keys=*/64).keys) {
+                if (!coordinator.GroupPrefixIndex(static_cast<std::int32_t>(key.group_id)).Contains(device, key)) {
+                    continue;
+                }
+                EXPECT_FALSE(gapless_device) << "round " << round << ": a gapless Device prefix is asked for";
+                EXPECT_FALSE(coordinator.GroupIsState(key.group_id)) << "round " << round;
+                const auto page = std::ranges::find(hashes, key.content_hash) - hashes.begin();
+                EXPECT_FALSE(page < device_pages) << "round " << round << ": a page below L is asked for";
+            }
+        }
     }
 }
 

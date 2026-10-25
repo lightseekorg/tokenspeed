@@ -705,18 +705,41 @@ Its responsibilities:
   `[T − W + 1, T)` the first query after `T` attends --
   `CacheCoordinator::SlidingWindowBlocks`, one block more than behind a
   page-aligned boundary when the window's first row falls inside a block;
-  the tail's blocks below that window stay holes). The Host tier runs the same two phases from the Device's
-  full-page coverage and wins when it reaches further by a page or a longer
-  tail. A Host win cuts the Device back to its full pages (its tail and state
-  hit give way). `AdmissionResult::host_prefix_tokens` is a boundary, not a
-  token count: the Host's on a Host win, the Device's otherwise (0 without a
-  Host pool and on the D role). A Host win loads that boundary less the
-  Device's full pages and adds, over a Device-only hit, that boundary less the
-  Device-only one (the scheduler's `PrefixHitStats` counts both). Storage (L3)
-  uses the same boundary matcher with temporary object
-  hints: candidates are full pages, matching local `TailTable` entries and
-  the exact reusable request bound. It has no shared index for discovering
-  other nonaligned remote checkpoints. The probe is bounded
+  the tail's blocks below that window stay holes). The Host tier extends
+  the Device under the **Host-suffix rule**
+  (`CacheCoordinator::probeHostSuffix`): a hit at `T = p + t` takes the
+  Device's KV pages below a split `F` -- the Device's own KV coverage `L` in
+  full pages, or `p` when lower, lowered further to the page of the first
+  block a sliding group's window behind `T` needs and the Device lacks --
+  the Host's KV pages `[F, p)`, the KV tail whole from one tier (the
+  Device's only when `F == p`), and each State group's checkpoint at `T`
+  from the Device when it holds it, else from the Host. So Device KV plus a
+  Host checkpoint resumes -- a checkpoint on the Device's last full page, or
+  a shorter one under longer Device KV -- and a Host hit never reloads KV
+  the Device holds below the split. (A sliding window that lowers the split
+  does load the pages `[F, min(L, p))` from the Host though the Device holds
+  them: the split is one page for every KV group.) Boundaries are tried
+  longest first above the Device-only hit, longer tails in its page
+  included; a gap stops a tier's run, so a hit is always one
+  contiguous Device prefix plus one Host suffix (KV interleaved
+  Device/Host/Device is not stitched together). `PrefixProbe::device` then
+  holds the Device part (`full_page_tokens == F`, a Device KV tail and the
+  Device's checkpoints), `PrefixProbe::host` the Host part from `F` on (a
+  State group's hits count from page 0 on both tiers, since a Host
+  checkpoint may sit on the Device's last page); when the Device alone
+  resumes furthest the Host tier mirrors its boundary and claims nothing.
+  `AdmissionResult::host_prefix_tokens` is a boundary, not a token count:
+  the Host's when a Host suffix carries the hit, the Device's otherwise (0
+  without a Host pool and on the D role). Such a hit loads the KV beyond the
+  Device's prefix (none when only checkpoints come from Host) and adds, over a
+  Device-only hit, that boundary less the Device-only one (the scheduler's
+  `PrefixHitStats` counts both).
+  Storage (L3) queries and reserves under the same rule, with temporary object
+  hints standing in for Host entries only, so it never asks for KV
+  or a checkpoint the Device's prefix supplies: candidates are full pages,
+  matching local `TailTable` entries and the exact reusable request bound.
+  It has no shared index for discovering other nonaligned remote
+  checkpoints. The probe is bounded
   in tokens, not pages, so a hit may end exactly at the bound. `Admit` then
   allocates, pins the hit prefix, and produces host→device `load_pairs`
   plus each group's fresh pages and `pages_to_copy`. **A table never keeps a

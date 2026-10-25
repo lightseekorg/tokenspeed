@@ -466,9 +466,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                        config_.max_scheduled_tokens, coordinator_.PrefixGranularity());
     bool writes_checkpoint =
         writesInForwardCheckpoint(state_checkpoint, hit_tokens, tokens_this_round, coordinator_.PrefixGranularity());
-    // Accounting only, read before Admit takes the probe: what the Host adds
-    // over the Device's own boundary when its boundary won the probe.
-    const bool host_won = match.probe.host.num_common_tokens > match.probe.device.num_common_tokens;
+    // Accounting only, read before Admit takes the probe: what a Host suffix
+    // adds when it carries the hit past the Device's own boundary (even when
+    // it adds only a State checkpoint over Device KV).
+    const bool host_won = match.probe.host.num_common_tokens > match.probe.device_only_hit_tokens;
     const std::int32_t host_gain_tokens = host_won ? hit_tokens - match.probe.device_only_hit_tokens : 0;
     // First admission has computed nothing to publish or reclaim. A failed
     // admission changes nothing; one that cannot also hold the in-forward
@@ -501,8 +502,9 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
             "an admission claims exactly the prefix it probed");
     _assert(admission->junction_tokens == junction_tokens, "the junction changed between probe and admission");
     recordAdmittedPages(plan, *admission);
-    // host_prefix_tokens is a boundary: the Host loads what lies beyond the
-    // Device's full pages, and nothing when the Device won.
+    // host_prefix_tokens is a boundary: the Host loads the KV that lies beyond
+    // the Device's prefix (0 when only checkpoints come from Host), and
+    // nothing when the Device won.
     const std::int32_t host_hit_tokens = std::max(admission->host_prefix_tokens - admission->device_prefix_tokens, 0);
     prefix_hit_stats_.prompt_tokens += request->PrefillSize();
     prefix_hit_stats_.device_hit_tokens += hit_tokens - host_hit_tokens;

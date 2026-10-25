@@ -852,6 +852,40 @@ TEST_F(StateCheckpointSuite, AHostCheckpointLoadsIntoSlotZero) {
     EXPECT_EQ(host_hit.load_rows, 1 + 1 + 3) << "page, tail block and one state per group";
 }
 
+// The Host-suffix rule (a hit is a Device KV prefix plus a Host suffix) through
+// the scheduler. A Host hit publishes the KV pages it loads on the Device but
+// keeps its loaded checkpoint private, so the next prompt finds the KV of h0,
+// h1 on the Device and the checkpoint at 8 on the Host alone. It resumes at 8
+// and loads only the three checkpoints -- the Device's pages are claimed, not
+// reloaded -- and counts as a Host win that loads no KV and gains the whole
+// hit.
+TEST_F(StateCheckpointSuite, ADeviceKvHitLoadsOnlyTheHostCheckpoint) {
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    Submit(RequestWithTokens("r", MakeTokens(8)));
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("r", {101});
+    AckWriteBacks(PlanOnce());  // prompt end: two pages and the three states stream to Host
+    SendForwardDone("r", {102});
+    SendFinish("r");
+    AckWriteBacks(PlanOnce());
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+
+    std::vector<std::int32_t> prompt = MakeTokens(8);
+    prompt.push_back(77);
+    const Resume warm = Probe("warm", prompt);
+    EXPECT_EQ(warm.prefix_tokens, 8);
+    EXPECT_EQ(warm.load_rows, 2 + 3) << "two pages and one state per group";
+    const HostCacheStats before = scheduler_->GetHostCacheStats();
+    const Resume hit = Probe("hit", prompt);
+    const HostCacheStats after = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(hit.prefix_tokens, 8);
+    EXPECT_GT(hit.state_row.at(0), 0);
+    EXPECT_EQ(hit.load_rows, 3) << "one state per group";
+    EXPECT_EQ(after.prefix_loads.ops - before.prefix_loads.ops, 1u);
+    EXPECT_EQ(after.prefix_hits.host_hit_tokens - before.prefix_hits.host_hit_tokens, 0u);
+    EXPECT_EQ(after.prefix_hits.host_gain_tokens - before.prefix_hits.host_gain_tokens, 8u);
+}
+
 class StateOnlySuite : public StateCheckpointSuite {
 protected:
     SchedulerConfig MakeConfig() override {

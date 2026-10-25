@@ -295,7 +295,12 @@ instead, so the frontier still names the state the device holds
 at the longest `T` with a published state checkpoint in every State group and
 KV coverage in every token-spanned group; the state lands in slot 0 as a
 claimed cache block (a Host checkpoint is loaded into a fresh slot 0 like any
-Host hit). When the KV groups reach further than the state (`kv_tokens >
+Host hit). The tiers combine under the Host-suffix rule
+([Cache concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)):
+the KV is the Device's prefix plus a Host suffix, and each State group's
+checkpoint comes from whichever tier holds it, the Device first -- so Device
+KV with a Host checkpoint resumes, loading the checkpoint alone. When the KV
+groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
 shares the prefix resumes at the KV boundary in every group. No alignment is

@@ -3573,6 +3573,505 @@ TEST(CacheCoordinatorHostExtension, MultiWindowCascadeConvergesToZeroExtension) 
 }
 
 // ---------------------------------------------------------------------------
+// The Host-suffix rule (a hit is a Device KV prefix plus a Host suffix) on the
+// K3 shape: P = 4, one Full group (one block per page, four per parent) and
+// three State groups (one per parent). A hit takes the Device's KV prefix, then
+// a Host suffix, and each State group's checkpoint from whichever tier holds
+// it, the Device first. Layouts are registered straight into each tier's index;
+// the prompt is 40 tokens, of which nine pages are hashed and 37 may be
+// matched. The parameter turns L3 on, which must not change any local match.
+// ---------------------------------------------------------------------------
+
+class HostSuffixHitTest : public ::testing::TestWithParam<bool> {
+protected:
+    static constexpr std::int32_t kP = 4;
+    static constexpr std::int32_t kMaxTokens = 37;
+
+    HostSuffixHitTest()
+        : coordinator_{MakeCoordinator(
+              std::vector<CacheGroupSpec>{
+                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+                  {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
+              kP, device_, /*enable_l3_storage=*/GetParam(), &host_, /*snapshot_pool=*/nullptr,
+              /*stream_device_cache_to_host=*/true)} {
+        std::vector<std::span<const std::int32_t>> pages;
+        for (std::size_t start = 0; start + kP <= 36; start += kP) {
+            pages.emplace_back(tokens_.data() + start, kP);
+        }
+        hashes_ = ComputePrefixHashes(pages, "");
+    }
+
+    CacheCoordinator::PromptPrefix Prompt() const {
+        return {.prefix_hashes = hashes_, .tokens = tokens_, .max_tokens = kMaxTokens};
+    }
+    // The prompt's hash at an unaligned boundary.
+    ContentHash TailHash(std::int32_t tokens) const {
+        const std::int32_t page_tokens = tokens - tokens % kP;
+        return HashPrefixPage(std::span<const std::int32_t>(tokens_).subspan(static_cast<std::size_t>(page_tokens),
+                                                                             static_cast<std::size_t>(tokens % kP)),
+                              hashes_[static_cast<std::size_t>(page_tokens / kP) - 1]);
+    }
+    CacheBlockLocation Put(BlockPool& pool, const std::string& hash, std::uint32_t group) {
+        return CacheBoundaryForGroup(coordinator_, pool, hash, group,
+                                     CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
+                                     /*logical_block_index=*/-1);
+    }
+
+    BlockPool device_{64, {4, 1, 1, 1}};
+    BlockPool host_{64, {4, 1, 1, 1}};
+    CacheCoordinator coordinator_;
+    const std::vector<std::int32_t> tokens_ = MakeTokens(40);
+    std::vector<std::string> hashes_;
+};
+
+INSTANTIATE_TEST_SUITE_P(L3OffAndOn, HostSuffixHitTest, ::testing::Bool());
+
+// A checkpoint on the Device's last full page, aligned: the Device keeps the KV
+// of pages h0-h3, the Host the three checkpoints at 16. The hit is 16 with no
+// KV loaded; a Host copy of the same pages changes nothing.
+TEST_P(HostSuffixHitTest, ADeviceKvPrefixResumesAtAHostCheckpointOnItsLastPage) {
+    std::vector<CacheBlockLocation> device_pages;
+    for (std::size_t page = 0; page < 4; ++page) {
+        device_pages.push_back(Put(device_, hashes_[page], 0));
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        Put(host_, hashes_[3], group);
+    }
+    for (const bool host_duplicates : {false, true}) {
+        if (host_duplicates) {
+            for (std::size_t page = 0; page < 4; ++page) {
+                Put(host_, hashes_[page], 0);
+            }
+        }
+        CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+        EXPECT_EQ(probe.device_only_hit_tokens, 0) << "no checkpoint on the Device";
+        EXPECT_EQ(probe.device.num_common_tokens, 16);
+        EXPECT_EQ(probe.device.full_page_tokens, 16);
+        EXPECT_EQ(probe.host.num_common_tokens, 16);
+        EXPECT_EQ(probe.host.full_page_tokens, 16);
+        std::vector<BlockTable> tables(4);
+        const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->device_prefix_tokens, 16);
+        EXPECT_EQ(result->host_prefix_tokens, 16);
+        EXPECT_EQ(result->junction_tokens, 0);
+        ASSERT_EQ(result->load_pairs.size(), 3u) << "host_duplicates=" << host_duplicates;
+        for (std::size_t i = 0; i < 3; ++i) {
+            EXPECT_EQ(result->load_pairs[i].group_id, i + 1) << "only the checkpoints are loaded";
+        }
+        ASSERT_EQ(tables[0].NumBlocks(), 5);
+        for (std::size_t page = 0; page < 4; ++page) {
+            EXPECT_EQ(tables[0].Blocks()[page]->Location(), device_pages[page]) << "the Device's own KV page";
+        }
+    }
+}
+
+// A Host tail -- the KV tail and its checkpoints -- continues the Device's full
+// pages: one tail block and three checkpoints load, and the tail lands on a
+// fresh block with two tokens of room that the growth fills.
+TEST_P(HostSuffixHitTest, AHostTailWithItsCheckpointsResumesAfterTheDevicePages) {
+    for (std::size_t page = 0; page < 4; ++page) {
+        Put(device_, hashes_[page], 0);
+    }
+    const ContentHash tail = TailHash(18);
+    for (std::uint32_t group = 0; group <= 3; ++group) {
+        Put(host_, tail, group);
+    }
+    coordinator_.CacheHostTail(hashes_[3], TailPublication{.tail_tokens = 2, .hash = tail});
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_FALSE(probe.device.tail);
+    EXPECT_EQ(probe.host.num_common_tokens, 18);
+    EXPECT_EQ(probe.host.full_page_tokens, 16);
+    ASSERT_TRUE(probe.host.tail);
+    EXPECT_EQ(probe.host.tail->tail_tokens, 2);
+    EXPECT_EQ(probe.host.kv_tokens, 18) << "the Host's KV tail";
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{2}});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->load_pairs.size(), 4u);
+    EXPECT_EQ(std::ranges::count(result->load_pairs, 0u, &BlockTransfer::group_id), 1);
+    EXPECT_TRUE(result->pages_to_copy[0].empty());
+    EXPECT_EQ(tables[0].NumBlocks(), 5) << "four claimed pages and the tail's destination";
+    EXPECT_EQ(tables[0].AvailableTokens(), 0) << "the two tokens of growth fill the tail's block";
+}
+
+// The Device holds the KV tail at 18, the Host only its checkpoints: the
+// hitter copies the Device's tail block and loads the three checkpoints.
+TEST_P(HostSuffixHitTest, ADeviceKvTailIsCopiedWhenOnlyItsCheckpointIsOnHost) {
+    for (std::size_t page = 0; page < 4; ++page) {
+        Put(device_, hashes_[page], 0);
+    }
+    const ContentHash tail = TailHash(18);
+    const CacheBlockLocation device_tail = Put(device_, tail, 0);
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        Put(host_, tail, group);
+    }
+    coordinator_.CacheHostTail(hashes_[3], TailPublication{.tail_tokens = 2, .hash = tail});
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device.num_common_tokens, 18);
+    EXPECT_EQ(probe.device.full_page_tokens, 16);
+    ASSERT_TRUE(probe.device.tail);
+    EXPECT_EQ(probe.device.tail->group_keys[0].size(), 1u);
+    EXPECT_TRUE(probe.device.tail->group_keys[1].empty());
+    EXPECT_EQ(probe.host.num_common_tokens, 18);
+    ASSERT_TRUE(probe.host.tail);
+    EXPECT_TRUE(probe.host.tail->group_keys[0].empty()) << "the KV tail comes whole from the Device";
+    EXPECT_EQ(probe.host.kv_tokens, 0) << "the Host adds no KV";
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{2}});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->pages_to_copy[0].size(), 1u);
+    EXPECT_EQ(result->pages_to_copy[0][0].first, coordinator_.Allocator(0).ResolveCacheBlockId(device_tail));
+    EXPECT_EQ(result->load_pairs.size(), 3u);
+    EXPECT_EQ(std::ranges::count(result->load_pairs, 0u, &BlockTransfer::group_id), 0);
+}
+
+// Two tails in one page, as a prompt end and the finish after a short output
+// publish them: the Device holds the tail at 18 with all its checkpoints, the
+// Host (write-through) that one and the checkpoint boundary at 19. The Host
+// suffix is probed above the Device-only hit 18, inside the page it ends in, so
+// 19 resumes: the Host's tail block and three checkpoints load.
+TEST_P(HostSuffixHitTest, AHostTailAboveADeviceTailInTheSamePageResumes) {
+    std::vector<CacheBlockLocation> device_pages;
+    for (std::size_t page = 0; page < 4; ++page) {
+        device_pages.push_back(Put(device_, hashes_[page], 0));
+    }
+    const ContentHash short_tail = TailHash(18);
+    const ContentHash long_tail = TailHash(19);
+    for (std::uint32_t group = 0; group <= 3; ++group) {
+        Put(device_, short_tail, group);
+        Put(host_, short_tail, group);
+        Put(host_, long_tail, group);
+    }
+    coordinator_.CacheHostTail(hashes_[3], TailPublication{.tail_tokens = 2, .hash = short_tail});
+    coordinator_.CacheHostTail(hashes_[3], TailPublication{.tail_tokens = 3, .hash = long_tail});
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device_only_hit_tokens, 18);
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.full_page_tokens, 16);
+    EXPECT_FALSE(probe.device.tail) << "the Device's tail at 18 gives way";
+    EXPECT_EQ(probe.host.num_common_tokens, 19);
+    EXPECT_EQ(probe.host.full_page_tokens, 16);
+    ASSERT_TRUE(probe.host.tail);
+    EXPECT_EQ(probe.host.tail->tail_tokens, 3);
+    EXPECT_EQ(probe.host.kv_tokens, 19);
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->host_prefix_tokens, 19);
+    EXPECT_EQ(result->junction_tokens, 0);
+    EXPECT_EQ(result->load_pairs.size(), 4u);
+    EXPECT_EQ(std::ranges::count(result->load_pairs, 0u, &BlockTransfer::group_id), 1);
+    EXPECT_TRUE(result->pages_to_copy[0].empty());
+    ASSERT_EQ(tables[0].NumBlocks(), 5) << "four claimed pages and the tail's destination";
+    for (std::size_t page = 0; page < 4; ++page) {
+        EXPECT_EQ(tables[0].Blocks()[page]->Location(), device_pages[page]);
+    }
+}
+
+// The same two tails for the storage query: the Device holds the checkpoint
+// boundary at 18, the Host that one and only the KV block of the checkpoint
+// boundary at 19. The query and the reservation reach 19 above the Device-only
+// hit and ask for the three checkpoints alone.
+TEST_P(HostSuffixHitTest, AStorageQueryAboveADeviceTailReachesALongerTailInTheSamePage) {
+    for (std::size_t page = 0; page < 4; ++page) {
+        Put(device_, hashes_[page], 0);
+    }
+    const ContentHash short_tail = TailHash(18);
+    const ContentHash long_tail = TailHash(19);
+    for (std::uint32_t group = 0; group <= 3; ++group) {
+        Put(device_, short_tail, group);
+        Put(host_, short_tail, group);
+    }
+    Put(host_, long_tail, 0);
+    coordinator_.CacheHostTail(hashes_[3], TailPublication{.tail_tokens = 2, .hash = short_tail});
+    coordinator_.CacheHostTail(hashes_[3], TailPublication{.tail_tokens = 3, .hash = long_tail});
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = hashes_, .tokens = tokens_, .max_tokens = 19};
+    EXPECT_EQ(coordinator_.ProbePromptPrefix(prompt).host.num_common_tokens, 18);
+    const std::vector<CacheKey> checkpoints{Key(long_tail, 1), Key(long_tail, 2), Key(long_tail, 3)};
+    const CacheCoordinator::StorageQuery query = coordinator_.MissingStorageKeys(prompt, /*max_keys=*/64);
+    EXPECT_EQ(query.max_tokens, 19);
+    EXPECT_EQ(query.keys, checkpoints);
+    const CacheCoordinator::StorageReservation reservation =
+        coordinator_.ReserveStoragePrefix(prompt, query.keys, /*max_blocks=*/64);
+    EXPECT_EQ(reservation.keys, checkpoints);
+    EXPECT_EQ(reservation.blocks.size(), 3u);
+    EXPECT_EQ(reservation.tail_prior, hashes_[3]);
+    ASSERT_TRUE(reservation.tail);
+    EXPECT_EQ(reservation.tail->tail_tokens, 3);
+    EXPECT_EQ(reservation.tail->hash, long_tail);
+}
+
+// A shorter checkpoint under longer Device KV: the Device's KV reaches 32, the
+// only checkpoint is the Host's at 16. The hit stops at 16, claims the four
+// Device pages below it, and the first chunk is cut at the KV boundary 32.
+TEST_P(HostSuffixHitTest, AShorterHostCheckpointResumesUnderLongerDeviceKv) {
+    std::vector<CacheBlockLocation> device_pages;
+    for (std::size_t page = 0; page < 8; ++page) {
+        device_pages.push_back(Put(device_, hashes_[page], 0));
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        Put(host_, hashes_[3], group);
+    }
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.full_page_tokens, 16);
+    EXPECT_EQ(probe.device.kv_tokens, 32);
+    EXPECT_EQ(probe.host.num_common_tokens, 16);
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->junction_tokens, 32);
+    EXPECT_EQ(result->load_pairs.size(), 3u);
+    ASSERT_EQ(tables[0].NumBlocks(), 5);
+    for (std::size_t page = 0; page < 4; ++page) {
+        EXPECT_EQ(tables[0].Blocks()[page]->Location(), device_pages[page]);
+    }
+}
+
+// KV on Host alone, no checkpoint on either tier: nothing resumes, and the
+// first chunk is cut at the Host's KV reach 32.
+TEST_P(HostSuffixHitTest, HostOnlyKvSetsTheJunctionAtItsReach) {
+    for (std::size_t page = 0; page < 8; ++page) {
+        Put(host_, hashes_[page], 0);
+    }
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device.num_common_tokens, 0);
+    EXPECT_EQ(probe.device.kv_tokens, 0);
+    EXPECT_EQ(probe.host.num_common_tokens, 0) << "the Device alone resumes furthest";
+    EXPECT_EQ(probe.host.kv_tokens, 32);
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->host_prefix_tokens, 0);
+    EXPECT_EQ(result->junction_tokens, 32);
+    EXPECT_TRUE(result->load_pairs.empty());
+}
+
+// The Device's KV h0-h3 continued by the Host's h4-h7, no checkpoint: the
+// junction is the two tiers' KV reach 32, not the Device's 16.
+TEST_P(HostSuffixHitTest, HostKvPastTheDeviceKvSetsTheJunctionAtTheHostReach) {
+    for (std::size_t page = 0; page < 4; ++page) {
+        Put(device_, hashes_[page], 0);
+    }
+    for (std::size_t page = 4; page < 8; ++page) {
+        Put(host_, hashes_[page], 0);
+    }
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device.num_common_tokens, 0);
+    EXPECT_EQ(probe.device.kv_tokens, 16);
+    EXPECT_EQ(probe.host.num_common_tokens, 0) << "the Device alone resumes furthest";
+    EXPECT_EQ(probe.host.kv_tokens, 32);
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->junction_tokens, 32);
+    EXPECT_TRUE(result->load_pairs.empty());
+}
+
+// The Device's checkpoint is at 8 but its KV reaches 16; the Host continues
+// the KV with h4, h5 and holds the checkpoint at 24. The Host suffix starts
+// at the Device's KV coverage, not at its checkpoint: h2, h3 are not loaded.
+TEST_P(HostSuffixHitTest, AHostSuffixContinuesTheDevicePrefixAboveAShorterDeviceCheckpoint) {
+    std::vector<CacheBlockLocation> device_pages;
+    for (std::size_t page = 0; page < 4; ++page) {
+        device_pages.push_back(Put(device_, hashes_[page], 0));
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        Put(device_, hashes_[1], group);
+        Put(host_, hashes_[5], group);
+    }
+    Put(host_, hashes_[4], 0);
+    Put(host_, hashes_[5], 0);
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device_only_hit_tokens, 8);
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.full_page_tokens, 16) << "the Device's KV coverage, not its checkpoint";
+    EXPECT_EQ(probe.host.num_common_tokens, 24);
+    EXPECT_EQ(probe.host.full_page_tokens, 24);
+    EXPECT_EQ(probe.host.per_group[0].hits, (std::vector<std::uint8_t>{1, 1}));
+    EXPECT_EQ(probe.host.kv_tokens, 24);
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->device_prefix_tokens, 16);
+    EXPECT_EQ(result->host_prefix_tokens, 24);
+    EXPECT_EQ(result->load_pairs.size(), 5u) << "h4, h5 and three checkpoints";
+    EXPECT_EQ(std::ranges::count(result->load_pairs, 0u, &BlockTransfer::group_id), 2);
+    ASSERT_EQ(tables[0].NumBlocks(), 7);
+    for (std::size_t page = 0; page < 4; ++page) {
+        EXPECT_EQ(tables[0].Blocks()[page]->Location(), device_pages[page]) << "h0-h3 are claimed, not loaded";
+    }
+}
+
+// A gap stops a tier's run, so the hit is the longest contiguous Device
+// prefix plus Host suffix. (a) The Host lacks h5: its checkpoint at 24 is
+// unreachable and the Device's own hit at 8 stands, with nothing loaded; (b)
+// a Host checkpoint at 20 is reachable through h4. (c) After a flush the
+// Device lacks h2: its h3 beyond the gap is never stitched in, so the Host's
+// checkpoint at 16 needs the Host's own h2 and h3.
+TEST_P(HostSuffixHitTest, AGapDegradesToTheLongestContiguousRun) {
+    for (std::size_t page = 0; page < 4; ++page) {
+        Put(device_, hashes_[page], 0);
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        Put(device_, hashes_[1], group);
+        Put(host_, hashes_[5], group);
+    }
+    Put(host_, hashes_[4], 0);
+    {
+        CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+        EXPECT_EQ(probe.device.num_common_tokens, 8);
+        EXPECT_EQ(probe.host.num_common_tokens, 8) << "the Device alone resumes furthest";
+        std::vector<BlockTable> tables(4);
+        const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+        ASSERT_TRUE(result);
+        EXPECT_TRUE(result->load_pairs.empty());
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        Put(host_, hashes_[4], group);
+    }
+    {
+        CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+        EXPECT_EQ(probe.device.full_page_tokens, 16);
+        EXPECT_EQ(probe.host.num_common_tokens, 20);
+        std::vector<BlockTable> tables(4);
+        const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->load_pairs.size(), 4u) << "h4 and three checkpoints";
+    }
+
+    ASSERT_TRUE(coordinator_.ClearCache());
+    for (const std::size_t page : {0, 1, 3}) {
+        Put(device_, hashes_[page], 0);
+    }
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        Put(device_, hashes_[1], group);
+        Put(host_, hashes_[3], group);
+    }
+    Put(host_, hashes_[3], 0);
+    EXPECT_EQ(coordinator_.ProbePromptPrefix(Prompt()).host.num_common_tokens, 8) << "the Host lacks h2";
+    Put(host_, hashes_[2], 0);
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device.full_page_tokens, 8);
+    EXPECT_EQ(probe.host.num_common_tokens, 16);
+    EXPECT_EQ(probe.host.per_group[0].hits, (std::vector<std::uint8_t>{1, 1})) << "h2 and h3 from the Host";
+}
+
+// A checkpoint is matched only when every State group holds it on some tier:
+// two of three on Host, or one on each tier and none for the third, is no
+// boundary at all.
+TEST_P(HostSuffixHitTest, APartialHostCheckpointIsNeverMatched) {
+    for (std::size_t page = 0; page < 4; ++page) {
+        Put(device_, hashes_[page], 0);
+    }
+    Put(host_, hashes_[3], 1);
+    Put(host_, hashes_[3], 2);
+    for (const bool device_has_first : {false, true}) {
+        if (device_has_first) {
+            Put(device_, hashes_[3], 1);
+        }
+        CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+        EXPECT_EQ(probe.device.num_common_tokens, 0) << "device_has_first=" << device_has_first;
+        EXPECT_EQ(probe.host.num_common_tokens, 0) << "device_has_first=" << device_has_first;
+        std::vector<BlockTable> tables(4);
+        const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+        ASSERT_TRUE(result);
+        EXPECT_TRUE(result->load_pairs.empty());
+    }
+}
+
+// Each State group takes its checkpoint from the Device when it holds it and
+// from the Host otherwise: the first group claims its Device block as slot
+// 0, the other two load theirs.
+TEST_P(HostSuffixHitTest, EachStateGroupMayComeFromEitherTier) {
+    for (std::size_t page = 0; page < 4; ++page) {
+        Put(device_, hashes_[page], 0);
+    }
+    const CacheBlockLocation device_state = Put(device_, hashes_[3], 1);
+    Put(host_, hashes_[3], 1);
+    Put(host_, hashes_[3], 2);
+    Put(host_, hashes_[3], 3);
+    CacheCoordinator::PrefixProbe probe = coordinator_.ProbePromptPrefix(Prompt());
+    EXPECT_EQ(probe.device.num_common_tokens, 16);
+    EXPECT_EQ(probe.device.per_group[1].hits, (std::vector<std::uint8_t>{0, 0, 0, 1})) << "from page 0";
+    EXPECT_TRUE(probe.host.per_group[1].hits.empty()) << "the Device's checkpoint comes first";
+    EXPECT_EQ(probe.host.per_group[2].hits, (std::vector<std::uint8_t>{0, 0, 0, 1})) << "from page 0";
+    std::vector<BlockTable> tables(4);
+    const auto result = AdmitForTest(coordinator_, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->load_pairs.size(), 2u);
+    EXPECT_EQ(result->load_pairs[0].group_id, 2u);
+    EXPECT_EQ(result->load_pairs[1].group_id, 3u);
+    EXPECT_EQ(tables[1].Blocks()[0]->Location(), device_state);
+    EXPECT_EQ(tables[2].Blocks()[0], result->load_pairs[0].destination);
+    EXPECT_EQ(tables[3].Blocks()[0], result->load_pairs[1].destination);
+}
+
+// Full + SWA (W = 8, two blocks of lookback) + State. The Device holds the
+// Full pages h0-h3 and the window blocks h2, h3 behind 16; the checkpoint at
+// 12 is on Host. (a) The window behind 12 needs block 1, which only the Host
+// holds, so the split drops to 4 and the Host supplies h1, h2 in both groups
+// -- a hit the probe from the Device's full pages (0) misses for want of a
+// Host h0. (b) Once the Device holds block 1 the split stays at 12 and only
+// the checkpoint loads.
+TEST(HostSuffixHitSlidingWindowTest, ASlidingWindowCapLowersTheSplit) {
+    BlockPool device(64, {1, 1, 1});
+    BlockPool host(64, {1, 1, 1});
+    CacheCoordinator coordinator = MakeCoordinator(
+        std::vector<CacheGroupSpec>{
+            {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 4},
+            {.attn_kind = AttnKind::kSlidingWindow,
+             .sliding_window = 8,
+             .cache_blocks_per_lcm_block = 1,
+             .block_granularity = 4},
+            {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
+        /*prefix_granularity=*/4, device, /*enable_l3_storage=*/false, &host, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/true);
+    const std::vector<std::string> hashes =
+        ContentHashes({{1, 2, 3, 4}, {5, 6, 7, 8}, {9, 10, 11, 12}, {13, 14, 15, 16}, {17, 18, 19, 20}});
+    for (std::size_t page = 0; page < 4; ++page) {
+        CacheForGroup(coordinator, device, hashes[page], 0);
+    }
+    CacheForGroup(coordinator, device, hashes[2], 1);
+    CacheForGroup(coordinator, device, hashes[3], 1);
+    for (std::uint32_t group = 0; group <= 1; ++group) {
+        CacheForGroup(coordinator, host, hashes[1], group);
+        CacheForGroup(coordinator, host, hashes[2], group);
+    }
+    CacheForGroup(coordinator, host, hashes[2], 2);
+    {
+        CacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+        EXPECT_EQ(probe.device_only_hit_tokens, 0);
+        EXPECT_EQ(probe.device.kv_tokens, 16);
+        EXPECT_EQ(probe.device.full_page_tokens, 4) << "the window behind 12 lowers the split";
+        EXPECT_EQ(probe.device.per_group[0].hits, (std::vector<std::uint8_t>{1}));
+        EXPECT_EQ(probe.device.per_group[1].hits, (std::vector<std::uint8_t>{0}));
+        EXPECT_EQ(probe.host.num_common_tokens, 12);
+        EXPECT_EQ(probe.host.full_page_tokens, 12);
+        EXPECT_EQ(probe.host.per_group[0].hits, (std::vector<std::uint8_t>{1, 1}));
+        EXPECT_EQ(probe.host.per_group[1].hits, (std::vector<std::uint8_t>{1, 1}));
+        std::vector<BlockTable> tables(3);
+        const auto result = AdmitForTest(coordinator, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->load_pairs.size(), 5u) << "h1, h2 in both KV groups and the checkpoint";
+    }
+    CacheForGroup(coordinator, device, hashes[1], 1);
+    CacheCoordinator::PrefixProbe probe = coordinator.ProbePrefix(hashes);
+    EXPECT_EQ(probe.device.full_page_tokens, 12);
+    EXPECT_EQ(probe.device.per_group[1].hits, (std::vector<std::uint8_t>{0, 1, 1}));
+    EXPECT_EQ(probe.host.num_common_tokens, 12);
+    std::vector<BlockTable> tables(3);
+    const auto result = AdmitForTest(coordinator, tables, std::move(probe), GroupDemand{.extent = DenseGrowth{4}});
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->load_pairs.size(), 1u);
+    EXPECT_EQ(result->load_pairs[0].group_id, 2u);
+}
+
+// ---------------------------------------------------------------------------
 // Mamba-analog semantics: vLLM reduces a mamba/linear-attention group to the
 // cache machinery via (a) hit = ONE aligned state snapshot found right-to-left,
 // padded with nulls ([null]*i + [state]); (b) retention = only the last token's

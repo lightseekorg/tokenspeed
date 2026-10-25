@@ -174,6 +174,77 @@ TEST(StorageQueryTest, OversizedHighestCandidateStillAllowsACompleteLowerBoundar
     EXPECT_EQ(cache.coordinator.ProbePromptPrefix(prefix).host.num_common_tokens, 8);
 }
 
+// The query under the Host-suffix rule (a hit is a Device KV prefix plus a Host
+// suffix): the Device holds the KV of h0-h2 but no checkpoint, so the cheapest
+// complete restore at 12 is its three checkpoints alone -- never the KV the
+// Device already has. (Asking from page 0, every boundary would cost its pages
+// too and none would fit three keys.)
+TEST(StorageQueryTest, ADeviceKvPrefixQueriesOnlyTheMissingCheckpoint) {
+    QueryCache cache(4, FullAndStates(4, 4, 3), 64);
+    QueryPrompt prompt(14, 4);
+    for (std::size_t page = 0; page < 3; ++page) {
+        CacheBlockRef block = cache.device.AcquireBlock(0);
+        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
+                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk);
+    }
+    const auto prefix = prompt.Prefix(13, false);
+    const auto query = cache.coordinator.MissingStorageKeys(prefix, 3);
+    EXPECT_EQ(query.max_tokens, 12);
+    const std::vector<CacheKey> checkpoints{{.group_id = 1, .content_hash = prompt.hashes[2]},
+                                            {.group_id = 2, .content_hash = prompt.hashes[2]},
+                                            {.group_id = 3, .content_hash = prompt.hashes[2]}};
+    EXPECT_EQ(query.keys, checkpoints);
+    EXPECT_EQ(cache.Restore(prefix, query.keys), checkpoints);
+    const auto probe = cache.coordinator.ProbePromptPrefix(prefix);
+    EXPECT_EQ(probe.device.full_page_tokens, 12);
+    EXPECT_EQ(probe.host.num_common_tokens, 12);
+}
+
+// The reservation fetches only the Host suffix above the Device's KV: with
+// the Device holding h0-h2 and L3 h3, h4 and the checkpoints at 20, exactly
+// those five keys, none of the Device's pages.
+TEST(StorageQueryTest, ADeviceKvPrefixReservesOnlyItsHostSuffix) {
+    QueryCache cache(4, FullAndStates(4, 4, 3), 64);
+    QueryPrompt prompt(22, 4);
+    for (std::size_t page = 0; page < 3; ++page) {
+        CacheBlockRef block = cache.device.AcquireBlock(0);
+        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
+                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk);
+    }
+    const auto prefix = prompt.Prefix(21, false);
+    const std::vector<CacheKey> hits{{.group_id = 0, .content_hash = prompt.hashes[3]},
+                                     {.group_id = 0, .content_hash = prompt.hashes[4]},
+                                     {.group_id = 1, .content_hash = prompt.hashes[4]},
+                                     {.group_id = 2, .content_hash = prompt.hashes[4]},
+                                     {.group_id = 3, .content_hash = prompt.hashes[4]}};
+    const auto reservation = cache.coordinator.ReserveStoragePrefix(prefix, hits, 64);
+    EXPECT_EQ(reservation.keys, hits);
+    EXPECT_EQ(reservation.blocks.size(), 5u);
+    EXPECT_FALSE(reservation.tail);
+}
+
+// A shorter checkpoint under longer Device KV, in a reservation: the Device's
+// KV reaches 16 and L3 holds only the checkpoints at 8, so the restore resumes
+// at 8 under the Device's KV and fetches just those three.
+TEST(StorageQueryTest, AReservationResumesBelowTheDeviceKvCoverage) {
+    QueryCache cache(4, FullAndStates(4, 4, 3), 64);
+    QueryPrompt prompt(18, 4);
+    for (std::size_t page = 0; page < 4; ++page) {
+        CacheBlockRef block = cache.device.AcquireBlock(0);
+        cache.coordinator.CacheDeviceBlock(block, {.group_id = 0, .content_hash = prompt.hashes[page]},
+                                           static_cast<std::int32_t>(page), CacheBoundaryKind::kChunk);
+    }
+    const auto prefix = prompt.Prefix(17, false);
+    const std::vector<CacheKey> hits{{.group_id = 1, .content_hash = prompt.hashes[1]},
+                                     {.group_id = 2, .content_hash = prompt.hashes[1]},
+                                     {.group_id = 3, .content_hash = prompt.hashes[1]}};
+    EXPECT_EQ(cache.Restore(prefix, hits), hits);
+    const auto probe = cache.coordinator.ProbePromptPrefix(prefix);
+    EXPECT_EQ(probe.device.kv_tokens, 16);
+    EXPECT_EQ(probe.device.full_page_tokens, 8);
+    EXPECT_EQ(probe.host.num_common_tokens, 8);
+}
+
 class StorageQueryWindowTest : public ::testing::TestWithParam<std::int32_t> {};
 
 TEST_P(StorageQueryWindowTest, AShorterCheckpointQueriesItsOwnSlidingWindow) {

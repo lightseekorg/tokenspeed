@@ -3872,9 +3872,10 @@ protected:
 };
 
 // The same prompts with the seed on Host alone: the Host's KV reaches 6 but
-// it holds no state checkpoint there, so it loses to the Device's empty
-// match and its junction is not cut.
-TEST_F(JunctionCutHostSuite, HostKvWithoutAStateCheckpointCutsNoJunction) {
+// it holds no state checkpoint there, so `first` resumes at the Device's
+// empty match, its first chunk is cut at the Host's KV reach, and `third`
+// resumes at the checkpoint published there.
+TEST_F(JunctionCutHostSuite, HostOnlyKvCutsTheFirstChunkAtTheJunction) {
     RequestSpec seed = MakeRequestSpec("seed", /*num_pages=*/6);
     Submit(seed);
     AckWriteBacks(PlanOnce());  // chunk end at token 8
@@ -3896,13 +3897,54 @@ TEST_F(JunctionCutHostSuite, HostKvWithoutAStateCheckpointCutsNoJunction) {
         first.tokens[i] += 1000;
     }
     Submit(first);
-    const ExecutionPlan plan = PlanOnce();
+    ExecutionPlan plan = PlanOnce();
+    AckWriteBacks(plan);
     const ForwardBatch* batch = FindForwardBatch(plan);
     ASSERT_NE(batch, nullptr);
     ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
     EXPECT_EQ(batch->extend_prefix_lens, std::vector<std::int32_t>{0});
-    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{8}) << "no junction: the chunk is not cut at 6";
-    EXPECT_EQ(scheduler_->GetHostCacheStats().prefix_hits.unresumable_kv_tokens, 0u);
+    EXPECT_EQ(batch->input_lengths, std::vector<std::int32_t>{6}) << "the chunk ends at the junction";
+    SendForwardDone("first");
+    const PrefixHitStats at_first = scheduler_->GetHostCacheStats().prefix_hits;
+    EXPECT_EQ(at_first.unresumable_kv_tokens, 6u) << "first's six Host KV tokens are recomputed";
+    EXPECT_EQ(at_first.host_hit_tokens, 0u);
+
+    // The next chunk's admission publishes the junction's natural checkpoint
+    // (state@6) over the KV the Host already holds.
+    plan = PlanOnce();
+    AckWriteBacks(plan);
+    batch = FindForwardBatch(plan);
+    ASSERT_NE(batch, nullptr);
+    ASSERT_EQ(batch->request_ids, std::vector<std::string>{"first"});
+    EXPECT_EQ(batch->extend_prefix_lens.at(0), 6);
+    const std::int32_t checkpoint = batch->block_tables.at("state").at(0)[0];
+    SendForwardDone("first", {7});
+
+    // `third` shares the same six tokens and resumes at the junction.
+    RequestSpec third = seed;
+    third.request_id = "third";
+    for (std::size_t i = 6; i < third.tokens.size(); ++i) {
+        third.tokens[i] += 3000;
+    }
+    Submit(third);
+    for (int round = 0; round < 4; ++round) {
+        plan = PlanOnce();
+        AckWriteBacks(plan);
+        batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        const auto it = std::ranges::find(batch->request_ids, "third");
+        if (it == batch->request_ids.end()) {
+            continue;
+        }
+        const auto row = static_cast<std::size_t>(it - batch->request_ids.begin());
+        EXPECT_EQ(batch->extend_prefix_lens.at(row), 6) << "the junction checkpoint is a hit";
+        EXPECT_EQ(batch->block_tables.at("state").at(row)[0], checkpoint) << "resumes from the published checkpoint";
+        const PrefixHitStats at_third = scheduler_->GetHostCacheStats().prefix_hits;
+        EXPECT_EQ(at_third.device_hit_tokens, 6u);
+        EXPECT_EQ(at_third.host_hit_tokens, 0u) << "the Device holds the junction's KV and checkpoint";
+        return;
+    }
+    FAIL() << "third was never scheduled";
 }
 
 TEST(CacheProgressTest, RemotePrefillPreservesDecodeReserve) {

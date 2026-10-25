@@ -49,11 +49,11 @@
 namespace tokenspeed {
 
 // The first admission's prefix hit by tier, per admitted request.
-// device_hit + host_hit is the hit: host_hit is what the Host loads (its
-// boundary less the Device's full pages, so it includes a Device tail and state
-// hit that gave way), host_gain is what the Host adds over the Device-only hit
-// (PrefixProbe::device_only_hit_tokens). unresumable_kv is the KV cached beyond
-// the hit (the junction).
+// device_hit + host_hit is the hit: host_hit is the KV the Host loads (the
+// hit less the Device's prefix -- its full pages, and its KV tail when the
+// Device holds the tail), host_gain is what the Host adds over the Device-only
+// hit (PrefixProbe::device_only_hit_tokens). unresumable_kv is the KV cached
+// beyond the hit (the junction).
 struct PrefixHitStats {
     std::uint64_t prompt_tokens{0};
     std::uint64_t device_hit_tokens{0};

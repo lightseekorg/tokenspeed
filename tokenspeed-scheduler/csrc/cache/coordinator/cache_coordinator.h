@@ -173,12 +173,17 @@ public:
             std::int32_t full_page_tokens{0};
             // The KV groups' own boundary before the State groups shortened
             // it: the junction a chunk may be cut at so the next prompt
-            // resumes there.
+            // resumes there. On the Host tier, the KV reach of the Device's
+            // prefix plus a Host suffix when the Host holds part of that KV,
+            // else 0; the junction takes the larger of the two tiers'.
             std::int32_t kv_tokens{0};
-            // Hits over group_keys (the full pages), relative to the tier's
-            // floor.
+            // Hits over group_keys (the full pages): a token-spanned group's
+            // relative to the tier's floor (the Device's full pages for the
+            // Host tier), a State group's from page 0 on both tiers, since a
+            // Host checkpoint may sit on the Device's last full page.
             std::vector<GroupPrefixProbe> per_group;
-            // Present when T is not page-aligned.
+            // Present when T is not page-aligned and the tier holds some
+            // group's blocks of the tail.
             std::optional<TailHit> tail;
         };
 
@@ -188,13 +193,19 @@ public:
         // slot 0 so the peer's transfer can omit the state. Absent when any
         // State group lacks it.
         std::optional<TailHit> state_at_prompt_end;
+        // The Host-suffix rule: a hit at T takes the Device's KV pages up to
+        // its full_page_tokens and the Host's from there on (the Host's floor),
+        // the KV tail whole from one tier, and each State group's checkpoint
+        // from whichever tier holds it, the Device first. When the Device alone
+        // resumes furthest the Host tier mirrors its boundary and claims
+        // nothing.
         Tier device;
-        // Entries the Host tier holds beyond the Device hit. Admission loads
-        // these; nothing an admission touches can miss.
+        // The Host suffix of the hit. Admission loads these; nothing an
+        // admission touches can miss.
         Tier host;
-        // Accounting only, never read by a decision: the Device's own
-        // boundary before a Host win cuts it to full pages. Zero without a
-        // Host pool and on the D role.
+        // Accounting only, never read by a decision: the Device-only
+        // boundary before a Host suffix replaced it. Zero without a Host pool
+        // and on the D role.
         std::int32_t device_only_hit_tokens{0};
     };
     struct AdmissionResult {
@@ -564,27 +575,41 @@ private:
                                         const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
     // Whether group i can resume at the boundary full_tokens + tail_tokens on
     // this tier; on success fills tail_hits over tail_keys and, when asked,
-    // page_hits over the group's full-page keys above the floor.
+    // page_hits over the group's full-page keys above the floor (from page 0
+    // for a State group).
     template <CacheTier Tier>
     bool groupAcceptsBoundary(std::size_t i, std::span<const std::string> prefix_hashes, std::int32_t floor_tokens,
                               std::int32_t full_tokens, std::int32_t tail_tokens, std::span<const CacheKey> tail_keys,
                               GroupPrefixProbe& tail_hits, GroupPrefixProbe* page_hits,
                               const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
-    // Visits the published boundaries in (floor_tokens, from_tokens], longest
-    // first, as (page_tokens, tail_tokens, published hash); the visitor
-    // returns false to stop.
+    // Visits the published boundaries in (floor_tokens, from_tokens] that the
+    // prompt's own tokens reach, longest first, as (page_tokens, tail_tokens,
+    // published hash); the visitor returns false to stop.
     template <typename Visit>
     void forEachCandidateBoundary(const PromptPrefix& prompt, std::int32_t floor_tokens, std::int32_t from_tokens,
                                   const Visit& visit) const;
-    // One tier of a probe above floor_tokens: the aligned phase, then the
-    // candidate phase. `claim_partial` false leaves the partial block of a
-    // tail a hole in the hits.
-    template <CacheTier Tier>
+    // The Device's probe: the aligned phase, then the candidate phase.
+    // `claim_partial` false leaves the partial block of a tail a hole in the
+    // hits.
     PrefixProbe::Tier probeTier(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
-                                std::span<const std::size_t> match_order, std::int32_t floor_tokens, bool claim_partial,
-                                const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
+                                std::span<const std::size_t> match_order, bool claim_partial) const;
+    // The Host-suffix probe over boundaries above above_tokens: the Device's KV
+    // prefix (device.kv_tokens, of the Device-only probe, bounds it), then a
+    // Host suffix, the State checkpoints from either tier. extra_hits are
+    // assumed on the Host tier only. On a hit `device` becomes its Device part
+    // and `host` its Host part; otherwise `device` is left alone and
+    // host.num_common_tokens is 0. Either way host.kv_tokens is the longest
+    // boundary whose KV the two tiers hold together when the Host holds part of
+    // it -- the KV reach the Host adds past the Device's own -- and 0
+    // otherwise.
+    void probeHostSuffix(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
+                         std::span<const std::size_t> match_order, std::int32_t above_tokens,
+                         const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits, PrefixProbe::Tier& device,
+                         PrefixProbe::Tier& host) const;
     // The complete dependency set selected by a matcher, with each key's
-    // absolute logical block index (including holes before an SWA window).
+    // absolute logical block index (including holes before an SWA window);
+    // floor_tokens is the tier's floor, where a token-spanned group's hits
+    // start.
     template <typename Visit>
     void forEachStorageDependency(const PrefixProbe::Tier& probe, std::span<const std::vector<CacheKey>> group_keys,
                                   std::int32_t floor_tokens, const Visit& visit) const;
