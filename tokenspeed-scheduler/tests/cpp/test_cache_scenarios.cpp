@@ -140,6 +140,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;  // 4 tokens = 2 pages per chunk
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -224,6 +225,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -283,6 +285,7 @@ protected:
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 96;
         cfg.host_allocator.total_pages = 96;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -362,6 +365,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -415,6 +419,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -601,6 +606,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -715,6 +721,7 @@ protected:
         cfg.prefix_granularity = 1;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -786,6 +793,7 @@ protected:
         // one 4-page prompt over 2 groups (8 prefill + 2 reserve) = the pool.
         cfg.device_allocator.total_pages = 11;
         cfg.host_allocator.total_pages = 11;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -851,7 +859,8 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 13;
         cfg.host_allocator.total_pages = 16;  // 15 usable + the null placeholder (page 0): 12 pages + a tail per group
-        cfg.max_scheduled_tokens = 4;         // 4-token prefill chunks
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        cfg.max_scheduled_tokens = 4;  // 4-token prefill chunks
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
         cfg.disable_l2_cache = true;
@@ -916,6 +925,7 @@ TEST_F(PrefillSlideAdmissionSuite, InFlightStorePinsItsSourcesUntilAck) {
     // itself) for capacity that the ACK is about to return.
     config_.disable_l2_cache = false;
     config_.host_allocator.total_pages = 15;  // 12 streamed pages plus the finish-time tail in both groups
+    config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
     ASSERT_EQ(free_at_start, 12);
@@ -992,6 +1002,7 @@ protected:
         SchedulerConfig cfg = PrefillSlideAdmissionSuite::MakeConfig();
         cfg.device_allocator.total_pages = 17;
         cfg.host_allocator.total_pages = 17;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         SetTestSnapshotPool(cfg);
         return cfg;
     }
@@ -1046,6 +1057,7 @@ protected:
         // 2*ceil(5/2) = 6 blocks each at admission = exactly the pool.
         cfg.device_allocator.total_pages = 13;
         cfg.host_allocator.total_pages = 14;  // 13 usable + the null placeholder (page 0)
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -1307,6 +1319,7 @@ protected:
         // Room for a finished request's partial page in both groups beside
         // the pinned image and the streamed prompt pages.
         cfg.host_allocator.total_pages = 16;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         SetTestSnapshotPool(cfg);
         return cfg;
     }
@@ -1998,6 +2011,7 @@ protected:
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 128;
         cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 128;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
@@ -2235,6 +2249,7 @@ protected:
         // 2*ceil(7/2) = 8 and "b" (2-page prompt) 2*ceil(5/2) = 6 = the pool.
         cfg.device_allocator.total_pages = 15;
         cfg.host_allocator.total_pages = 16;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -2683,6 +2698,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = L2TailOnlyPoolSuite::MakeConfig();
         cfg.host_allocator.total_pages = 2;  // one usable Host block: the L2 leg cannot hold a prefix
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         return cfg;
     }
 };
@@ -2930,6 +2946,7 @@ protected:
         // first chunk of "active" owns 8, leaving just enough for "queued".
         cfg.device_allocator.total_pages = 19;
         cfg.host_allocator.total_pages = 20;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         for (auto& group : cfg.cache_groups) {
             group.total_pages = cfg.device_allocator.total_pages;
@@ -3409,6 +3426,7 @@ protected:
         // 9 physical pages -> 8 usable: one 3-page prompt charges exactly the pool.
         cfg.device_allocator.total_pages = 9;
         cfg.host_allocator.total_pages = 10;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -3526,6 +3544,7 @@ protected:
         // 25 physical pages -> 24 usable: r1 charges 10, r2 8, r3 6 = the pool.
         cfg.device_allocator.total_pages = 25;
         cfg.host_allocator.total_pages = 26;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -3637,6 +3656,7 @@ protected:
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.device_allocator.total_pages = 9;  // 8 usable
         cfg.host_allocator.total_pages = 10;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.cache_groups = {
             MakeGroup("full", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kFull),
             MakeGroup("state", cfg.prefix_granularity, cfg.device_allocator.total_pages, AttnKind::kState),
@@ -3744,6 +3764,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 64;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -4217,6 +4238,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 11;
         cfg.host_allocator.total_pages = 11;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -4316,6 +4338,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = TotalPages();
         cfg.host_allocator.total_pages = TotalPages();
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -4771,6 +4794,7 @@ protected:
         // 4: too few for the second chunk's 2*4 pages plus its decode slot.
         cfg.device_allocator.total_pages = 31;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -5403,6 +5427,7 @@ protected:
         cfg.prefix_granularity = 2;
         cfg.device_allocator.total_pages = 64;
         cfg.host_allocator.total_pages = 7;  // 6 usable + the null placeholder (page 0, device convention)
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -5545,6 +5570,7 @@ TEST_F(StreamingSinkSuite, SameRoundDuplicateKeysDedupeAtDrain) {
     // dedupe, NOT by pool exhaustion: two IDENTICAL prompts registering in one round drain
     // 12 candidates into 6 pairs.
     config_.host_allocator.total_pages = 13;
+    config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
@@ -5585,6 +5611,7 @@ TEST_F(StreamingSinkSuite, MidDrainPoolFillEmitsPartialOp) {
     // 4 usable host pages against 6 candidates: the drain emits the 4 that fit and drops the
     // rest -- a partial op IS the contract when the pool fills mid-batch.
     config_.host_allocator.total_pages = 5;
+    config_.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     scheduler_ = std::make_unique<Scheduler>(config_);
     const std::int32_t free_at_start = scheduler_->AvailableLcmBlocks();
 
@@ -5637,6 +5664,7 @@ protected:
         cfg.device_allocator.total_pages = 15;
         cfg.host_allocator.total_pages =
             49;  // ample (+null page 0): r1's, both churns' and a filler's entries fit un-evicted
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -6039,6 +6067,7 @@ protected:
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 13;  // twelve usable
         cfg.host_allocator.total_pages = 33;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 64;
         cfg.max_batch_size = 8;
         cfg.enable_l3_storage = false;
@@ -6116,6 +6145,7 @@ protected:
         // 36 usable: both seeding requests' pages and tails stay Host-resident
         // (32 entries) with room for r2's own streams.
         cfg.host_allocator.total_pages = 37;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         for (auto& g : cfg.cache_groups) {
             g.total_pages = cfg.device_allocator.total_pages;
         }
@@ -6223,6 +6253,7 @@ protected:
         cfg.prefix_granularity = 8;
         cfg.device_allocator.total_pages = 256;
         cfg.host_allocator.total_pages = 256;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = MaxScheduledTokens();
         cfg.max_batch_size = MaxBatchSize();
         cfg.enable_l3_storage = false;

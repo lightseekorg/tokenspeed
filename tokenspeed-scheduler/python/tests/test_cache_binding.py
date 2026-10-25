@@ -163,9 +163,40 @@ def test_snapshot_pool_is_stated_explicitly():
         ts.Scheduler(cfg)
 
 
+def test_host_write_policy_round_trips():
+    policy = ts.SchedulerConfig.HostWritePolicy
+    cfg = ts.SchedulerConfig()
+    cfg.prefix_granularity = 16
+    cfg.max_scheduled_tokens = 32
+    cfg.max_batch_size = 4
+    cfg.num_device_pages = 64
+    cfg.num_host_pages = 9
+    cfg.num_snapshot_pages = 1
+    cfg.cache_groups = [
+        ts.CacheGroupConfig(
+            group_id="full_attention",
+            block_granularity=16,
+            total_pages=64,
+            attn_kind=ts.AttnKind.Full,
+        )
+    ]
+    # Unset: what feeds Host L2 is a behavioural choice, not a default.
+    assert cfg.host_write_policy == policy.Unspecified
+    with pytest.raises(ValueError, match="explicit host_write_policy"):
+        ts.Scheduler(cfg)
+    cfg.host_write_policy = policy.WriteBack
+    assert cfg.host_write_policy == policy.WriteBack
+    with pytest.raises(ValueError, match="host_write_policy WriteBack"):
+        ts.Scheduler(cfg)
+    cfg.host_write_policy = policy.WriteThrough
+    assert cfg.host_write_policy == policy.WriteThrough
+    assert ts.Scheduler(cfg).host_pool_total_blocks() == 8
+
+
 def test_host_cache_stats_count_publication_and_finish_stores():
     cfg = _make_k3_config()
     cfg.num_host_pages = 33  # page 0 = null sentinel, 32 usable parents
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.disable_l2_cache = False
     # Two History blocks per parent; a State block still takes a whole
     # parent.

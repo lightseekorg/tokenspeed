@@ -55,6 +55,7 @@ protected:
         cfg.prefix_granularity = kP;
         cfg.device_allocator.total_pages = 257;
         cfg.host_allocator.total_pages = 257;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 8;
         cfg.max_batch_size = 2;
         cfg.disable_l2_cache = true;

@@ -57,6 +57,7 @@ protected:
         SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 8;
         cfg.host_allocator.total_pages = 8;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
         return cfg;
@@ -152,6 +153,7 @@ protected:
         SchedulerConfig cfg = FinishOnlyWriteBackTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;
         cfg.host_allocator.total_pages = 16;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         for (std::int32_t i = 0; i < 3; ++i) {
             CacheGroupConfig state = cfg.cache_groups.front();
@@ -205,6 +207,7 @@ protected:
         cfg.decode_input_tokens = 0;
         cfg.device_allocator.total_pages = 5;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.enable_l3_storage = false;
         return cfg;
     }
@@ -285,6 +288,7 @@ protected:
         // Cache block 0 is the null page, leaving three usable pages.
         cfg.device_allocator.total_pages = 4;
         cfg.host_allocator.total_pages = 4;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 2;
         cfg.max_batch_size = 1;
         cfg.decode_input_tokens = 1;
@@ -391,6 +395,7 @@ protected:
         cfg.disable_prefix_cache = false;
         cfg.device_allocator.total_pages = 7;
         cfg.host_allocator.total_pages = 7;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 2;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
@@ -450,6 +455,7 @@ protected:
         SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 16;
         cfg.host_allocator.total_pages = 6;  // null parent + five retraction parents
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_batch_size = 3;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
         SetTestSnapshotPool(cfg);
@@ -490,6 +496,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = DecodeRetractionL2TestSuite::MakeConfig();
         cfg.host_allocator.total_pages = 2;  // null parent + one
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         return cfg;
     }
 };
@@ -896,6 +903,7 @@ protected:
         SchedulerConfig cfg = DisaggDecodeAdmissionTestSuite::MakeConfig();
         cfg.device_allocator.total_pages = 7;  // null parent + six usable LCM parents
         cfg.host_allocator.total_pages = 32;   // Keep retraction capacity outside these placement tests.
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 2;
         cfg.overlap_schedule_depth = 0;
         cfg.disable_prefix_cache = false;
@@ -942,6 +950,7 @@ protected:
         cfg.prefix_granularity = 4;
         cfg.device_allocator.total_pages = 65;
         cfg.host_allocator.total_pages = 65;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.max_scheduled_tokens = 4;
         cfg.max_batch_size = 4;
         cfg.disable_prefix_cache = false;

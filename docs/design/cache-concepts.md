@@ -849,9 +849,14 @@ Its responsibilities:
   model regenerates from re-fed tokens, not a function of the prefix alone.
   Retention (`ExpiredBlocksAt`/`ReclaimExpired`) still slides their
   request-private pages out.
-* **Two tiers (Device/Host).** Device prefix publication can optionally
-  stream to the Host tier (`stream_device_cache_to_host_`); a
-  `pending_stores_` queue drives D2H transfers, alongside Host-side
+* **Two tiers (Device/Host).** What feeds the Host tier from ordinary
+  Device prefix entries is an explicit cache policy,
+  `SchedulerConfig::host_write_policy`: `Validate` requires it with a Host
+  tier and has no default to fall back on. Under `kWriteThrough`, the only
+  policy implemented so far (`Validate` refuses `kWriteBack`), Device prefix
+  publication streams to the Host tier (`stream_device_cache_to_host_`) on
+  the fused and P roles; the D role's Host tier holds retraction images
+  only. A `pending_stores_` queue drives D2H transfers, alongside Host-side
   acquire/contains/pin queries. Host L2 uses free capacity first, then global
   LRU across cache groups: a compatible child in the requested group competes
   with fully evictable LCM parents across groups. When only one group needs

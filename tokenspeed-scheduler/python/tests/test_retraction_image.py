@@ -44,6 +44,7 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.prefix_granularity = PAGE
     cfg.num_device_pages = DEVICE_PAGES
     cfg.num_host_pages = 33
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 9
     cfg.max_retracted_requests = 2
     cfg.max_scheduled_tokens = 64

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <type_traits>
 #include <vector>
 
@@ -208,21 +209,36 @@ TEST(CacheOperationTest, LoadBackPreservesTransferOrder) {
     EXPECT_EQ(batch.dst_pages[0], std::vector<std::int32_t>({20, 40}));
 }
 
-TEST(CacheOperationTest, HostCacheAndContinuousStreamingAreSeparatePolicies) {
-    SchedulerConfig config;
-    config.host_allocator.total_pages = 2;
-
-    config.role = Role::kFused;
-    EXPECT_TRUE(config.HasHostCache());
-    EXPECT_TRUE(config.StreamsDeviceCacheToHost());
-
-    config.role = Role::kD;
-    EXPECT_TRUE(config.HasHostCache());
-    EXPECT_FALSE(config.StreamsDeviceCacheToHost());
-
-    config.disable_l2_cache = true;
-    EXPECT_FALSE(config.HasHostCache());
-    EXPECT_FALSE(config.StreamsDeviceCacheToHost());
+// Ordinary Device prefix entries feed Host L2 only under the write-through
+// policy and never on the D role, whose Host tier holds retraction images
+// only; a Host tier that is absent (the null page alone) or disabled feeds
+// nothing whatever the policy says.
+TEST(CacheOperationTest, HostWritePolicySelectsWhatFeedsHost) {
+    using Policy = SchedulerConfig::HostWritePolicy;
+    using Case = std::tuple<Role, Policy, std::int32_t, bool>;  // host pages, disable_l2_cache
+    std::vector<Case> streaming;
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        for (const Policy policy : {Policy::kUnspecified, Policy::kWriteThrough, Policy::kWriteBack}) {
+            for (const std::int32_t host_pages : {1, 2}) {
+                for (const bool disable_l2_cache : {false, true}) {
+                    SchedulerConfig config;
+                    config.role = role;
+                    config.host_write_policy = policy;
+                    config.host_allocator.total_pages = host_pages;
+                    config.disable_l2_cache = disable_l2_cache;
+                    EXPECT_EQ(config.HasHostCache(), host_pages == 2 && !disable_l2_cache);
+                    if (config.StreamsDeviceCacheToHost()) {
+                        streaming.emplace_back(role, policy, host_pages, disable_l2_cache);
+                    }
+                }
+            }
+        }
+    }
+    const std::vector<Case> expected{
+        {Role::kFused, Policy::kWriteThrough, 2, false},
+        {Role::kP, Policy::kWriteThrough, 2, false},
+    };
+    EXPECT_EQ(streaming, expected);
 }
 
 TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
@@ -231,6 +247,7 @@ TEST(CacheOperationTest, DecodeCanStartWithoutHostL2) {
         config.prefix_granularity = 2;
         config.device_allocator.total_pages = 4;
         config.host_allocator.total_pages = 4;
+        config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         config.max_scheduled_tokens = 2;
         config.max_batch_size = 1;
         config.role = Role::kD;
@@ -262,6 +279,7 @@ TEST(CacheOperationTest, DeviceRequestLimitDoesNotDependOnHostCapacity) {
         config.prefix_granularity = 2;
         config.device_allocator.total_pages = 9;
         config.host_allocator.total_pages = host_pages;
+        config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         config.max_scheduled_tokens = 8;
         config.max_batch_size = 2;
         config.role = Role::kD;
@@ -614,6 +632,7 @@ TEST(CacheOperationTest, DecodeRejectsRequestWhoseMaximumExtentCannotFitDevice) 
     config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 10;
+    config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
     config.role = Role::kD;
@@ -641,6 +660,7 @@ TEST(CacheOperationTest, PrefillAcceptsPromptThatFitsWithoutReservingDecodeToken
     config.prefix_granularity = 2;
     config.device_allocator.total_pages = 5;
     config.host_allocator.total_pages = 10;
+    config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.max_scheduled_tokens = 8;
     config.max_batch_size = 2;
     config.role = Role::kP;
@@ -760,6 +780,7 @@ TEST(CacheOperationTest, L3StorageAcceptsHostCache) {
     config.prefix_granularity = 2;
     config.device_allocator.total_pages = 4;
     config.host_allocator.total_pages = 8;
+    config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.max_scheduled_tokens = 2;
     config.max_batch_size = 1;
     config.enable_l3_storage = true;

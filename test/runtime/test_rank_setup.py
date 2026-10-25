@@ -40,7 +40,7 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=10, suite="runtime-1gpu")
 
-pytest.importorskip("tokenspeed_scheduler")
+ts = pytest.importorskip("tokenspeed_scheduler")
 
 from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig  # noqa: E402
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
@@ -48,6 +48,7 @@ from tokenspeed.runtime.engine.rank_setup import (  # noqa: E402
     rank_process_title,
     scheduler_config_from_args,
 )
+from tokenspeed.runtime.engine.scheduler_utils import make_config  # noqa: E402
 from tokenspeed.runtime.utils.server_args import (  # noqa: E402
     ServerArgs,
     prepare_server_args,
@@ -92,7 +93,33 @@ def test_an_engine_without_l3_passes_no_prefetch_threshold():
     assert cfg.enable_l3_storage is False
     assert cfg.storage_config is None
     assert cfg.disable_l2_cache is False and cfg.num_host_pages == 17
+    assert cfg.host_write_policy == ts.SchedulerConfig.HostWritePolicy.WriteThrough
     assert (cfg.num_snapshot_pages, cfg.max_retracted_requests) == (5, 8)
+
+
+def test_make_config_requires_and_maps_the_host_write_policy():
+    fields = dict(
+        num_device_pages=32,
+        max_scheduled_tokens=64,
+        max_batch_size=8,
+        prefix_granularity=2,
+        num_host_pages=0,
+        disable_l2_cache=True,
+        enable_l3_storage=False,
+        role="fused",
+        num_snapshot_pages=1,
+        max_retracted_requests=0,
+        storage_config=None,
+    )
+    # Keyword-only and required, with or without a Host tier.
+    with pytest.raises(TypeError, match="host_write_policy"):
+        make_config(**fields)
+    policy = ts.SchedulerConfig.HostWritePolicy
+    cfg = make_config(**fields, host_write_policy="write_through")
+    assert cfg.host_write_policy == policy.WriteThrough
+    # Mapped as given: the scheduler, not make_config, decides what it runs.
+    cfg = make_config(**fields, host_write_policy="write_back")
+    assert cfg.host_write_policy == policy.WriteBack
 
 
 def test_an_engine_with_l3_passes_its_prefetch_threshold():

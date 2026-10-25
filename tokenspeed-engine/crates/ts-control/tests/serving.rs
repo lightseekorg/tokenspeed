@@ -130,10 +130,15 @@ fn new_scheduler(tiers: Tiers, role: Role) -> Scheduler {
              cfg.max_retracted_requests = 8\n\
              cfg.debug_force_retraction_interval = 3"
         }
-        Tiers::HostL2 => "cfg.disable_l2_cache = False\ncfg.num_host_pages = 1025",
+        Tiers::HostL2 => {
+            "cfg.disable_l2_cache = False\n\
+             cfg.num_host_pages = 1025\n\
+             cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough"
+        }
         Tiers::L3 => {
             "cfg.disable_l2_cache = False\n\
              cfg.num_host_pages = 1025\n\
+             cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough\n\
              cfg.enable_l3_storage = True\n\
              cfg.storage_config = ts.StorageConfig(\n\
                  8, 8, 64, 64, 1024, 1, 10**9, 10**9,\n\

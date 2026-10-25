@@ -769,6 +769,7 @@ TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
 TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     SchedulerConfig config = MakeValidConfig();
     config.host_allocator.total_pages = 32;
+    config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.enable_l3_storage = true;
     config.storage_config = StorageConfig{
         8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
@@ -777,6 +778,50 @@ TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     EXPECT_NO_THROW(config.Validate());
     config.cache_groups[0].shard_count = 1;
     EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
+    // What feeds Host L2 is a cache policy, so a Host tier states it on every
+    // role; without a Host tier (the null page alone, or disabled) there is
+    // nothing to feed and the policy may stay unspecified.
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        SchedulerConfig config = MakeValidConfig();
+        config.role = role;
+        if (role != Role::kFused) {
+            config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(config);
+        config.host_allocator.total_pages = 1;
+        EXPECT_NO_THROW(config.Validate());
+        config.host_allocator.total_pages = 2;
+        ExpectRejectedNamingGroup(config, "explicit host_write_policy");
+        config.disable_l2_cache = true;
+        EXPECT_NO_THROW(config.Validate());
+        config.disable_l2_cache = false;
+        config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        EXPECT_NO_THROW(config.Validate());
+    }
+}
+
+TEST(SchedulerConfigValidateTest, WriteBackIsRefusedUntilItIsImplemented) {
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        SchedulerConfig config = MakeValidConfig();
+        config.role = role;
+        if (role != Role::kFused) {
+            config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(config);
+        config.host_allocator.total_pages = 2;
+        config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        try {
+            config.Validate();
+            FAIL() << "write_back must be refused";
+        } catch (const std::invalid_argument& error) {
+            EXPECT_NE(std::string{error.what()}.find("host_write_policy WriteBack"), std::string::npos) << error.what();
+        }
+    }
 }
 
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {

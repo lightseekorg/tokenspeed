@@ -95,6 +95,11 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
+    nb::enum_<tokenspeed::SchedulerConfig::HostWritePolicy>(scheduler_config, "HostWritePolicy")
+        .value("Unspecified", tokenspeed::SchedulerConfig::HostWritePolicy::kUnspecified)
+        .value("WriteThrough", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteThrough)
+        .value("WriteBack", tokenspeed::SchedulerConfig::HostWritePolicy::kWriteBack);
+
     nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
         .value("Full", tokenspeed::AttnKind::kFull)
         .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
@@ -156,6 +161,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("debug_force_retraction_interval", &tokenspeed::SchedulerConfig::debug_force_retraction_interval)
         .def_rw("cache_groups", &tokenspeed::SchedulerConfig::cache_groups)
         .def_rw("disable_l2_cache", &tokenspeed::SchedulerConfig::disable_l2_cache)
+        .def_rw("host_write_policy", &tokenspeed::SchedulerConfig::host_write_policy)
         .def_rw("enable_l3_storage", &tokenspeed::SchedulerConfig::enable_l3_storage)
         .def_rw("enable_kv_cache_events", &tokenspeed::SchedulerConfig::enable_kv_cache_events)
         .def_rw("enable_mixed_prefill_decode", &tokenspeed::SchedulerConfig::enable_mixed_prefill_decode)

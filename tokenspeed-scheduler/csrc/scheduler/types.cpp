@@ -78,6 +78,12 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
+    if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
+        throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
+    }
+    if (host_write_policy == HostWritePolicy::kWriteBack) {
+        throw std::invalid_argument("Scheduler: host_write_policy WriteBack is not available yet");
+    }
     // The snapshot pool is stated explicitly on every role: the null page
     // alone (and no slots) says "never retract", anything more needs slots.
     // The messages name the binding field and the server arg that sets it,
