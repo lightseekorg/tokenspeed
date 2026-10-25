@@ -69,6 +69,8 @@ VENDOR_PATHS = {
         "tokenspeed-kernel/test/amd",
     ),
     "npu": (
+        "test/ci/npu",
+        "test/ci_system/npu",
         "test/ci_system/install_triton_ascend.sh",
         "test/ci_system/verify_triton_ascend.py",
     ),
