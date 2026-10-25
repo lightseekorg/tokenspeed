@@ -33,7 +33,7 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyBytes};
 use ts_control::output::Role;
 use ts_pd::{
-    epd::receiver::{PoolRegion, ReceiverConfig},
+    epd::receiver::{PoolRegion, Receiver, ReceiverConfig},
     layout::{
         contract::Contract,
         manifest::{BlockTable, BlockTables},
@@ -233,9 +233,23 @@ fn receiver_config(epd: &Bound<'_, PyAny>) -> PyResult<ReceiverConfig> {
     })
 }
 
+fn peer_config(
+    settings: &Bound<'_, PyAny>,
+    metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
+) -> PyResult<PeerConfig> {
+    Ok(PeerConfig {
+        library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
+        local_ip: settings.getattr("local_ip")?.extract()?,
+        ib_device: settings.getattr("ib_device")?.extract()?,
+        regions: settings.getattr("regions")?.extract()?,
+        engine_rank: settings.getattr("engine_rank")?.extract()?,
+        metrics,
+    })
+}
+
 /// The rank's role and peers, started from the settings of the peer object
 /// the bootstrap built (`HostBootstrap.transfer_peer`) and, on an EPD
-/// Prefill rank's first stage, of its embedding receive (`epd`); the PD
+/// receiving rank's first stage, of its embedding receive (`epd`); the PD
 /// peer's outcomes are counted in `metrics`, and `outbox` reaches it from
 /// then on. `Role::Plain` and no peer outside disaggregation.
 pub fn start(
@@ -246,28 +260,28 @@ pub fn start(
     metrics: Option<Arc<ts_metrics::KvTransferMetrics>>,
 ) -> PyResult<Peers> {
     let refuse_epd =
-        || PyRuntimeError::new_err("EPD embeddings are received only on a PD Prefill node");
+        || PyRuntimeError::new_err("EPD embeddings cannot be received on a PD Decode node");
     if peer.is_none() {
-        if !epd.is_none() {
-            return Err(refuse_epd());
-        }
+        let embeddings = if epd.is_none() {
+            None
+        } else {
+            let config = receiver_config(&epd)?;
+            let transport = peer_config(&epd.getattr("transport")?, None)?;
+            let receiver = py
+                .detach(|| Receiver::start_standalone(config, transport))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Some(Box::new(receiver) as Box<dyn EmbeddingReceiver + Send>)
+        };
         return Ok(Peers {
             role: Role::Plain,
             transfer: None,
             streams: None,
-            embeddings: None,
+            embeddings,
         });
     }
     let settings = peer.getattr("settings")?;
     let role_settings = peer.getattr("role_settings")?;
-    let config = PeerConfig {
-        library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
-        local_ip: settings.getattr("local_ip")?.extract()?,
-        ib_device: settings.getattr("ib_device")?.extract()?,
-        regions: settings.getattr("regions")?.extract()?,
-        engine_rank: settings.getattr("engine_rank")?.extract()?,
-        metrics,
-    };
+    let config = peer_config(&settings, metrics)?;
     let mode: String = peer.getattr("mode")?.extract()?;
     let failed = |error: ts_pd::StartError| PyRuntimeError::new_err(error.to_string());
     match mode.as_str() {

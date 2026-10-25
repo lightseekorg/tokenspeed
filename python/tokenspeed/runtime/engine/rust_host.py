@@ -99,6 +99,7 @@ from tokenspeed.runtime.epd.prefill_receive import (
     assert_embeddings_received,
     build_epd_receive,
 )
+from tokenspeed.runtime.epd.recv_pool import receives_encoder_embeddings
 from tokenspeed.runtime.execution.device import (
     arm_data_plane_sync_debug,
     build_device_side,
@@ -1151,6 +1152,7 @@ class HostBootstrap:
             epd_receive = build_epd_receive(
                 server_args,
                 model_config=model_config,
+                global_rank=global_rank,
                 encoder_model_facts=device.encoder_model_facts,
                 mapping=mapping,
                 attn_tp_rank=attn_tp_rank,
@@ -1238,7 +1240,7 @@ class HostBootstrap:
                     else None
                 ),
                 epd_prefill=(
-                    server_args.disaggregation_mode == "prefill"
+                    receives_encoder_embeddings(server_args)
                     and model_config.is_multimodal_active
                 ),
                 grammar=(

@@ -38,6 +38,7 @@
 //! same way.
 
 mod bootstrap;
+mod epd;
 mod l3;
 
 use std::sync::{Arc, Mutex};
@@ -129,7 +130,7 @@ impl FrontendListener {
             other => {
                 return Err(pyo3::exceptions::PyValueError::new_err(format!(
                     "unknown routing {other:?}"
-                )))
+                )));
             }
         };
         let config = ClientConfig {
@@ -435,6 +436,7 @@ fn value_to_py(py: Python<'_>, value: Value) -> PyResult<Py<PyAny>> {
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<bootstrap::BootstrapServer>()?;
+    module.add_class::<epd::EmbeddingSender>()?;
     module.add_class::<l3::L3Executor>()?;
     module.add_class::<FrontendListener>()?;
     module.add_class::<PendingFrontend>()?;

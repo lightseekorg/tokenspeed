@@ -33,16 +33,18 @@ if TYPE_CHECKING:
 _SLOT_ALIGN = 256
 
 
+def receives_encoder_embeddings(server_args: ServerArgs) -> bool:
+    """Whether the serving role accepts externally encoded embeddings."""
+    return server_args.disaggregation_mode == "prefill" or (
+        server_args.disaggregation_mode == "null"
+        and server_args.enable_encoder_disaggregation
+    )
+
+
 def is_epd_prefill_node(server_args: ServerArgs, is_multimodal_active: bool) -> bool:
-    """Only the embedding stage receives encoder payloads and owns their pool."""
+    """Only the first stage of an EPD receiver owns embedding receive pools."""
     return (
-        (
-            server_args.disaggregation_mode == "prefill"
-            or (
-                server_args.disaggregation_mode == "null"
-                and server_args.enable_encoder_disaggregation
-            )
-        )
+        receives_encoder_embeddings(server_args)
         and is_multimodal_active
         and server_args.mapping.is_first_pp_rank
     )

@@ -54,7 +54,13 @@ from tokenspeed.runtime.epd.recv_pool import (
     split_slot,
 )
 from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
+from tokenspeed.runtime.pd.host_peer import (
+    PeerSettings,
+    enable_mooncake_ipv6_for_host,
+    mooncake_library,
+)
 from tokenspeed.runtime.utils.env import envs
+from tokenspeed.runtime.utils.network import get_local_ip_by_remote
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +90,8 @@ class EpdReceiveSettings:
     ``receiver_config``).
 
     Attributes:
+        transport: Standalone transfer engine settings in aggregated mode; None
+            when the receiver shares the existing PD peer. No KV regions.
         slots: Receive slots; 0 when the pool is disabled, which fails every
             item.
         slot_bytes: Bytes of one slot of the rows' pool.
@@ -104,6 +112,7 @@ class EpdReceiveSettings:
             (``TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT``).
     """
 
+    transport: PeerSettings | None
     slots: int
     slot_bytes: int
     pool_base: int
@@ -317,6 +326,7 @@ def build_epd_receive(
     server_args,
     *,
     model_config,
+    global_rank: int,
     encoder_model_facts: Callable[[], Any],
     mapping,
     attn_tp_rank: int,
@@ -360,7 +370,19 @@ def build_epd_receive(
             f"EPD receive pool: {slots} slots x {slot_mb} MB "
             f"({pools.slot_bytes} B rows, {pools.deepstack_slot_bytes} B deepstack)"
         )
+    transport = None
+    if server_args.disaggregation_mode == "null":
+        local_ip = get_local_ip_by_remote()
+        enable_mooncake_ipv6_for_host(local_ip)
+        transport = PeerSettings(
+            library=mooncake_library(),
+            local_ip=local_ip,
+            ib_device=server_args.disaggregation_ib_device or "",
+            engine_rank=global_rank,
+            regions=(),
+        )
     settings = EpdReceiveSettings(
+        transport=transport,
         slots=slots,
         slot_bytes=pools.slot_bytes if pools is not None else 0,
         pool_base=pools.base if pools is not None else 0,

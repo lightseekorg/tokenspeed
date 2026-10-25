@@ -27,7 +27,6 @@
 
 use std::{
     path::PathBuf,
-    sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -40,7 +39,7 @@ use super::{
 use crate::{
     bootstrap::{BootstrapServer, Registry},
     control::{EmbeddingChunk, EmbeddingItem, EmbeddingReceiver, EmbeddingSender, LandedRequest},
-    PeerConfig, Transport,
+    PeerConfig,
 };
 
 const HIDDEN: i64 = 8;
@@ -90,10 +89,7 @@ fn encode_node(library: PathBuf, bootstrap_timeout: Duration) -> Node {
 /// A prefill rank's receiver over its own transfer engine, with one-slot
 /// pools.
 fn receiver(library: PathBuf, pool: &[u8], tp_size: i64, tp_rank: i64, shard: bool) -> Receiver {
-    let (incoming, _messages) = mpsc::channel();
-    let transport: Arc<Transport> =
-        Transport::start(&peer(library, Vec::new(), 10 + tp_rank), incoming).unwrap();
-    Receiver::start(
+    Receiver::start_standalone(
         ReceiverConfig {
             tp_size,
             tp_rank,
@@ -110,7 +106,7 @@ fn receiver(library: PathBuf, pool: &[u8], tp_size: i64, tp_rank: i64, shard: bo
             deepstack_pool: None,
             timeout: Duration::from_secs(30),
         },
-        transport,
+        peer(library, Vec::new(), 10 + tp_rank),
     )
     .unwrap()
 }

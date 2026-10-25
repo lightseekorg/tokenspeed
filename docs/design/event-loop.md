@@ -775,3 +775,16 @@ requests carrying encoder handshakes until their embeddings are published;
 local image and text requests retain their normal admission path. The device
 side owns receive buffers and reassembly as on a prefill node. This does not
 construct a P/D KV-transfer peer or change where decode executes.
+
+In aggregated mode, `HostBootstrap` enables the same EPD admission gate on
+all pipeline stages. Only the first stage allocates a receive pool and
+passes standalone transport settings to the Rust host. `ts-pd` starts its
+existing embedding receiver over a dedicated Mooncake engine, registering
+only the embedding pools. The host stays `Role::Plain`, with no KV-transfer
+peer or remote-prefill/decode streams. A PD prefill node continues sharing
+its existing peer's transfer engine; decode nodes reject embedding receive.
+
+External encoders can use the `tokenspeed_engine.EmbeddingSender` binding
+to drive the same Rust sender without constructing a model or scheduler.
+The caller owns the registered send buffers and keeps each submitted region
+unchanged until its room concludes, including when a failure is requested.

@@ -36,6 +36,7 @@ from pathlib import Path
 
 from tokenspeed_engine._native import (
     BootstrapServer,
+    EmbeddingSender,
     EngineError,
     Frontend,
     FrontendListener,
@@ -45,6 +46,7 @@ from tokenspeed_engine._native import (
 
 __all__ = [
     "BootstrapServer",
+    "EmbeddingSender",
     "EngineError",
     "Frontend",
     "FrontendListener",

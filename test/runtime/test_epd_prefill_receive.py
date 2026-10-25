@@ -277,27 +277,49 @@ def test_a_slot_returns_only_once_its_copy_finished():
 # --- building the receive ---
 
 
-def _server_args(mode, *, first_stage=True):
+def _server_args(mode, *, external, first_stage=True):
     return SimpleNamespace(
         disaggregation_mode=mode,
-        enable_encoder_disaggregation=False,
+        enable_encoder_disaggregation=external,
+        disaggregation_ib_device=None,
         mapping=SimpleNamespace(is_first_pp_rank=first_stage),
     )
 
 
 @pytest.mark.parametrize(
-    "mode, active, first_stage",
+    "mode, external, receives",
     [
-        ("decode", True, True),
+        ("null", False, False),
         ("null", True, True),
-        ("encode", True, True),
         ("prefill", False, True),
+        ("decode", False, False),
+        ("encode", False, False),
+    ],
+)
+@pytest.mark.parametrize("first_stage", [False, True])
+def test_receiver_role_is_identical_on_every_pipeline_stage(
+    mode, external, receives, first_stage
+):
+    args = _server_args(mode, external=external, first_stage=first_stage)
+    assert recv_pool.receives_encoder_embeddings(args) is receives
+    assert recv_pool.is_epd_prefill_node(args, True) is (receives and first_stage)
+
+
+@pytest.mark.parametrize(
+    "mode, active, first_stage, external",
+    [
+        ("decode", True, True, False),
+        ("null", True, True, False),
+        ("null", False, True, True),
+        ("null", True, False, True),
+        ("encode", True, True, False),
+        ("prefill", False, True, False),
         # A later pipeline stage follows the first's decisions.
-        ("prefill", True, False),
+        ("prefill", True, False, False),
     ],
 )
 def test_only_a_multimodal_prefill_first_stage_receives(
-    monkeypatch, mode, active, first_stage
+    monkeypatch, mode, active, first_stage, external
 ):
     """The facts callable must not fire elsewhere: reading the vision tower's
     dtype raises on a text-only model, and every text-only PD node builds
@@ -308,10 +330,11 @@ def test_only_a_multimodal_prefill_first_stage_receives(
     def facts():  # pragma: no cover — reaching this is the failure
         raise AssertionError("encoder facts read on a node that does not receive")
 
-    server_args = _server_args(mode, first_stage=first_stage)
+    server_args = _server_args(mode, external=external, first_stage=first_stage)
     receive = build_epd_receive(
         server_args,
         model_config=SimpleNamespace(is_multimodal_active=active),
+        global_rank=0,
         encoder_model_facts=facts,
         mapping=server_args.mapping,
         attn_tp_rank=0,
@@ -324,15 +347,22 @@ def test_only_a_multimodal_prefill_first_stage_receives(
     assert recv_pool.recv_pool_bytes(server_args, active) == 0
 
 
+@pytest.mark.parametrize("mode, external", [("prefill", False), ("null", True)])
 @pytest.mark.parametrize("slots, slot_mb", [(2, 1), (0, 1), (2, 0)])
 @pytest.mark.parametrize("num_deepstack", [0, 3])
 def test_the_receive_builds_the_pool_the_budget_left_out(
-    monkeypatch, slots, slot_mb, num_deepstack
+    monkeypatch, slots, slot_mb, num_deepstack, mode, external
 ):
     monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", str(slots))
     monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", str(slot_mb))
     monkeypatch.setenv("TOKENSPEED_DISAGGREGATION_WAITING_TIMEOUT", "30")
-    server_args = _server_args("prefill")
+    from tokenspeed.runtime.epd import prefill_receive
+
+    monkeypatch.setattr(prefill_receive, "get_local_ip_by_remote", lambda: "127.0.0.1")
+    monkeypatch.setattr(
+        prefill_receive, "mooncake_library", lambda: "/unused/libmooncake.so"
+    )
+    server_args = _server_args(mode, external=external)
     facts = SimpleNamespace(
         device="cpu", hidden=16, num_deepstack=num_deepstack, dtype=torch.bfloat16
     )
@@ -340,6 +370,7 @@ def test_the_receive_builds_the_pool_the_budget_left_out(
     receive = build_epd_receive(
         server_args,
         model_config=SimpleNamespace(is_multimodal_active=True),
+        global_rank=0,
         encoder_model_facts=lambda: facts,
         mapping=server_args.mapping,
         attn_tp_rank=0,
@@ -349,6 +380,12 @@ def test_the_receive_builds_the_pool_the_budget_left_out(
     )
 
     settings = receive.settings
+    if mode == "null":
+        assert settings.transport.regions == ()
+        assert settings.transport.local_ip == "127.0.0.1"
+        assert settings.transport.engine_rank == 0
+    else:
+        assert settings.transport is None
     budget = recv_pool.recv_pool_bytes(server_args, True)
     pool = settings.slots * (settings.slot_bytes + settings.deepstack_slot_bytes)
     assert pool <= budget

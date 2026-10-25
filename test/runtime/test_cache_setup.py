@@ -1492,16 +1492,18 @@ def _receive_pool_env(monkeypatch, slots, slot_mb):
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("probe", [False, True])
 @pytest.mark.parametrize(
-    "mode, active, pool",
+    "mode, active, external, pool",
     [
-        ("prefill", True, 4 << 30),
-        ("prefill", False, 0),
-        ("decode", True, 0),
-        ("null", True, 0),
+        ("prefill", True, False, 4 << 30),
+        ("prefill", False, False, 0),
+        ("decode", True, False, 0),
+        ("null", True, False, 0),
+        ("null", True, True, 4 << 30),
+        ("null", False, True, 0),
     ],
 )
 def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
-    monkeypatch, rank, probe, mode, active, pool
+    monkeypatch, rank, probe, mode, active, external, pool
 ) -> None:
     from tokenspeed.runtime.execution import device, factory
 
@@ -1516,7 +1518,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
-        enable_encoder_disaggregation=False,
+        enable_encoder_disaggregation=external,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -1624,9 +1626,14 @@ def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
     from tokenspeed.runtime.epd import prefill_receive, recv_pool
 
     _receive_pool_env(monkeypatch, slots, slot_mb)
+    monkeypatch.setattr(prefill_receive, "get_local_ip_by_remote", lambda: "127.0.0.1")
+    monkeypatch.setattr(
+        prefill_receive, "mooncake_library", lambda: "/unused/libmooncake.so"
+    )
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
         enable_encoder_disaggregation=external,
+        disaggregation_ib_device=None,
         mapping=SimpleNamespace(is_first_pp_rank=True),
     )
     facts = SimpleNamespace(
@@ -1635,6 +1642,7 @@ def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
     receive = prefill_receive.build_epd_receive(
         server_args,
         model_config=SimpleNamespace(is_multimodal_active=active),
+        global_rank=0,
         encoder_model_facts=lambda: facts,
         mapping=server_args.mapping,
         attn_tp_rank=0,
@@ -1646,6 +1654,12 @@ def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
     built = 0
     if receive is not None:
         settings = receive.settings
+        if mode == "null":
+            assert settings.transport.regions == ()
+            assert settings.transport.local_ip == "127.0.0.1"
+            assert settings.transport.engine_rank == 0
+        else:
+            assert settings.transport is None
         built = settings.slots * (settings.slot_bytes + settings.deepstack_slot_bytes)
         # A slot splits between an item's rows and its deepstack rows within
         # the bytes the budget left out, losing at most their alignment.
