@@ -1142,8 +1142,8 @@ impl OutputProcessor {
                         None => {}
                     }
                 }
-                if terminated_at == j as i32 {
-                    // Ahead of length and stop tokens at the same step.
+                if terminated_at == j as i32 && !state.finished() {
+                    // Ahead of length and stop tokens at the same step, not of an abort.
                     state.finished_reason = Some(FinishReason::MatchedToken(token));
                 } else {
                     state.check_finished(hostfunc);
@@ -1836,6 +1836,57 @@ mod tests {
             ]
         );
         assert_eq!(c.outputs[0].finish_reason, Some("abort"));
+    }
+
+    /// A matcher for `a` then `b` over `ts-grammar`'s nine-token vocabulary.
+    fn grammar() -> crate::request::RequestGrammar {
+        let info = ts_grammar::TokenizerInfo::from_json(include_str!(
+            "../../ts-grammar/tests/fixtures/toy_tokenizer_info.json"
+        ))
+        .unwrap();
+        let compiled = ts_grammar::Compiler::new(&info, 1)
+            .unwrap()
+            .compile(ts_grammar::GrammarKind::Regex, "ab", true)
+            .unwrap();
+        let (handle, matcher) = ts_grammar::table::register(compiled.matcher(8).unwrap());
+        crate::request::RequestGrammar { handle, matcher }
+    }
+
+    #[test]
+    fn the_token_that_ended_the_grammar_on_the_data_plane_finishes_the_request() {
+        let mut p = processor(Some(3));
+        register(&mut p, "r", 2, 10, &[]);
+        p.attach_grammar("r", grammar());
+        p.commit(&batch(&[("r", 2, 0, 2)], 1), None, &result(&[0], &[1]))
+            .unwrap();
+        let mut verify = result(&[1, 8, 5], &[3]);
+        verify.grammar_terminated_at = Some(vec![1]);
+        let c = p
+            .commit(&batch(&[("r", 3, 0, 2)], 0), None, &verify)
+            .unwrap();
+        assert_eq!(c.outputs[0].output_ids, [1, 8]);
+        assert_eq!(c.outputs[0].finish_reason, Some("stop"));
+    }
+
+    #[test]
+    fn an_abort_outranks_the_grammar_ending_at_the_same_token() {
+        // A NaN abort, and one a pause set before the commit.
+        for pause in [false, true] {
+            let mut p = processor(None);
+            register(&mut p, "r", 2, 10, &[]);
+            p.attach_grammar("r", grammar());
+            p.commit(&batch(&[("r", 2, 0, 2)], 1), None, &result(&[0], &[1]))
+                .unwrap();
+            let mut step = result(&[1], &[1]);
+            step.grammar_terminated_at = Some(vec![0]);
+            if pause {
+                p.mark_abort("r", true);
+            } else {
+                step.nan_flags = Some(vec![1]);
+            }
+            let c = p.commit(&batch(&[("r", 1, 0, 2)], 0), None, &step).unwrap();
+            assert_eq!(c.outputs[0].finish_reason, Some("abort"), "pause: {pause}");
+        }
     }
 
     #[test]
