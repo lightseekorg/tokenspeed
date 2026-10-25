@@ -73,7 +73,7 @@ jobs:
       - name: Install Mooncake master runtime
         run: |
           python -m pip install --retries 10 --timeout 60 \
-            'tokenspeed-mooncake==0.3.13.post20260825' \
+            'tokenspeed-mooncake==0.3.13.post20261026' \
             'nvidia-cuda-runtime==13.0.96' 'pytest>=9'
           # The wheel links CUDA 13 and libcuda even for Host-only TCP tests.
           # Install user-space driver libraries; no GPU or kernel driver is used.
