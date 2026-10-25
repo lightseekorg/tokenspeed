@@ -325,6 +325,16 @@ class TestInklingConvRingState:
                 group_id="state",
                 buffers=(buf.clone(),),
             )
+        with pytest.raises(
+            ValueError, match=f"cover {self.DIM + 1} channels, expected {self.DIM}"
+        ):
+            backend.register_shortconv_checkpoint_stream(
+                layer_id=1,
+                channel_offset=0,
+                dim=self.DIM,
+                group_id="state",
+                buffers=(buf, buf[..., :1]),
+            )
 
     def test_ring_holds_window_for_every_accept(self):
         """One verify round writes all K candidate rows; for EVERY accept

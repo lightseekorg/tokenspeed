@@ -722,9 +722,11 @@ class InklingAttnBackend(AttentionBackend):
     ) -> None:
         """Record one fixed checkpoint view for post-verify publication."""
         key = (layer_id, channel_offset, dim, group_id)
-        if sum(buffer.shape[-1] for buffer in buffers) != dim:
+        total = sum(buffer.shape[-1] for buffer in buffers)
+        if total != dim:
             raise ValueError(
-                f"ShortConv checkpoint stream {key!r} fields miss its channels"
+                f"ShortConv checkpoint stream {key!r} fields cover {total} "
+                f"channels, expected {dim}"
             )
         if key not in self._checkpoint_streams:
             self._commit_tables = None
