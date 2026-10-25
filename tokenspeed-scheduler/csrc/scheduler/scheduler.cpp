@@ -500,6 +500,10 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
     }
+    // The prefix entries the build's evictions (and everything since the last
+    // plan) left dead on both tiers. Nothing is queued unless the Host
+    // write-back policy evicts by segments.
+    coordinator_.CollectDeadEntries();
     std::vector<StorageOperation> storage_operations;
     if (storage_transfers_) {
         if (storage_allowed_)

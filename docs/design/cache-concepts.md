@@ -652,14 +652,14 @@ Perception rules per directory:
   pages that an entry started without a parent (below) — before any group
   registers under them, so a checkpoint counts in every ancestor as it is
   published; a node lives while either tier holds its hash or a child hangs
-  under it (a page whose entries all left but whose successors remain is a
-  *gap*), and goes with its tail hint once neither holds. An entry registered
-  with no node yet (an L3 GET, a store whose Device entry left before its ACK,
-  a restore's republication) starts one without a parent. It is kept in step
-  with the indexes: no match reads it, evicting by segments selects along it
-  (`AdmissionPlanner`, and the Host's segment plan, `AcquireHostSegments`),
-  and its walks follow parent pointers and insertion-ordered lists, never the
-  map, so mirrored ranks agree.
+  under it, and goes with its tail hint once neither holds. An entry
+  registered with no node yet (an L3 GET, a store whose Device entry left
+  before its ACK, a restore's republication) starts one without a parent. It
+  is kept in step with the indexes: no match reads it, evicting by segments
+  selects along it (`AdmissionPlanner`, and the Host's segment plan,
+  `AcquireHostSegments`), the collection of dead prefix entries finds them
+  through it, and its walks follow parent pointers and insertion-ordered
+  lists, never the map, so mirrored ranks agree.
 * **`prefix_hasher.h`** — SHA-256 prefix-page hashing (moved from
   `scheduler/`).
 
@@ -1056,7 +1056,20 @@ Its responsibilities:
   ranking retraction (preemption) victims. Device and Host evictions are
   counted by reason (`DeviceEvictionStats`, `HostEvictionStats` in
   `cache_coordinator.h`); the counts are accounting only and never change
-  what is evicted.
+  what is evicted. Under the write-back policy (`write_back_evictions`) the
+  coordinator also collects *dead prefix entries* on both tiers, entries no
+  probe can resume from any more: everything under a page no checkpoint
+  boundary is left under on either tier (with State groups), a tail whose
+  hint the per-prior cap dropped, and everything at and under a *gap* — a
+  page no prefix-closed group holds on either tier, whatever State entries
+  or successors it keeps: a prefix-closed group cannot cross it, so not
+  even the page's own checkpoints resume. Eviction queues candidates as it goes,
+  and `CollectDeadEntries`, once per plan after the build, judges each again by
+  the state it finds (a live request may have published a checkpoint under it
+  since), then evicts the dead subtree on both tiers, deepest boundary first
+  (`DeviceEvictionStats::dead_entry_collection`); nothing a live request's table
+  holds is taken, and what is in use waits for a later plan. `ClearDeviceCache`
+  empties the queue, so a Device-only clear never collects Host L2.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially, or not

@@ -279,7 +279,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_ro("stranded_suffix", &tokenspeed::CacheCoordinator::DeviceEvictionStats::stranded_suffix)
         .def_ro("restore", &tokenspeed::CacheCoordinator::DeviceEvictionStats::restore)
         .def_ro("flush", &tokenspeed::CacheCoordinator::DeviceEvictionStats::flush)
-        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap);
+        .def_ro("tail_cap", &tokenspeed::CacheCoordinator::DeviceEvictionStats::tail_cap)
+        .def_ro("dead_entry_collection", &tokenspeed::CacheCoordinator::DeviceEvictionStats::dead_entry_collection);
     nb::class_<tokenspeed::TierTransferManager::WriteBackStats>(m, "WriteBackStats")
         .def_ro("ops", &tokenspeed::TierTransferManager::WriteBackStats::ops)
         .def_ro("blocks", &tokenspeed::TierTransferManager::WriteBackStats::blocks)

@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -73,8 +74,9 @@ public:
     // The Host pool is available to explicit tier operations. Streaming controls
     // whether ordinary Device prefix publication also feeds the Host tier;
     // write_back_evictions whether an admission evicts Device cache by
-    // segments, so what leaves can be written back (the Host write-back policy;
-    // it needs a Host pool and excludes streaming). The
+    // segments, so what leaves can be written back, and dead prefix entries are
+    // collected on both tiers (the Host write-back policy; it needs a Host pool
+    // and excludes streaming). The
     // snapshot pool holds retracted requests' private KV images (Snapshot /
     // Restore); nullptr means the engine never retracts. enable_l3_storage,
     // host_pool, snapshot_pool, stream_device_cache_to_host and
@@ -385,6 +387,21 @@ public:
     // Same pin checks as ClearDeviceCache / ClearCache, with no mutation.
     // include_host selects both tiers (Host is a no-op without a host pool).
     bool CacheIsClearable(bool include_host) const;
+    // Evicts, on both tiers, the prefix entries no probe can resume from any
+    // more (write_back_evictions only; nothing is queued otherwise). A node is
+    // dead when no checkpoint boundary is left in its subtree on either tier
+    // (with State groups), when it is a tail no probe enumerates (its hint is
+    // gone), or when it is a gap a prefix-closed group cannot cross: no
+    // prefix-closed group holds it on either tier, whatever State entries or
+    // children it keeps. Evicting and syncing tree nodes queue the candidates:
+    // the node syncTreeNode stops at once no checkpoint boundary is left under
+    // it, a gap, a tail the cap left behind. Each is checked again when
+    // collected -- a live request may have published a checkpoint boundary
+    // under it since -- then the collection climbs while the parent is dead and
+    // none of its entries is in use, and takes every entry of that subtree not
+    // in use, deepest boundary first. A root with an entry in use waits for the
+    // next call. The scheduler calls it once per plan, after the build.
+    void CollectDeadEntries();
 
     struct StoreCandidate {
         CacheKey key;
@@ -410,7 +427,8 @@ public:
         // A segment plan took it as a checkpoint boundary a deeper Device one
         // supersedes.
         HostEvictionCounts superseded;
-        // A segment plan took it as a dead entry.
+        // A segment plan took it as a dead entry, or CollectDeadEntries
+        // evicted it.
         HostEvictionCounts dead_entry;
         // The per-prior tail cap dropped its tail, entry by entry after the
         // tail's Device blocks (device_resident when the Device kept a pinned
@@ -545,6 +563,9 @@ public:
         // The per-prior tail cap dropping a tail; with no single victim, it
         // evicts every block it drops itself.
         DeviceEvictionCounts tail_cap;
+        // The collection of dead prefix entries, which like the tail cap evicts
+        // every block it drops itself; only when evicting by segments.
+        DeviceEvictionCounts dead_entry_collection;
     };
     // Cumulative, never reset (accounting only).
     const DeviceEvictionStats& DeviceEvictions() const { return device_evictions_; }
@@ -598,9 +619,10 @@ public:
             }
         }
     }
-    // One entry a BoundaryTree node holds on a tier: in use when anything
-    // beside the index holds its block.
+    // One entry a BoundaryTree node holds on the tier of `pool`: in use when
+    // anything beside the index holds its block.
     struct NodeEntry {
+        const BlockPool* pool{nullptr};
         std::uint32_t group_id{0};
         CacheBlockLocation location;
         bool in_use{false};
@@ -801,7 +823,11 @@ private:
     // entry under it left either tier: its checkpoint flags and Host presence
     // follow the entries that remain, and a node no tier holds and no child
     // hangs under leaves the tree with its tail hint, as does each parent left
-    // the same way.
+    // the same way. Under write_back_evictions it queues for CollectDeadEntries
+    // the node it stops at when taking a checkpoint boundary or a node away
+    // left no checkpoint boundary under it (the deepest such node left; the
+    // collection climbs from it), and a node no prefix-closed group holds on
+    // either tier (a gap).
     void syncTreeNode(const ContentHash& hash);
     // Whether an imaged slot belongs to the page the computed frontier ends
     // inside: the restored request writes and later republishes those blocks,
@@ -827,7 +853,8 @@ private:
     bool stream_device_cache_to_host_{false};
     // An admission evicts Device cache by segments: a checkpoint boundary with
     // the pages only it depends on and everything under them, so the Device's
-    // coverage stays closed from the root.
+    // coverage stays closed from the root; and the dead prefix entries either
+    // tier is left with are collected.
     bool write_back_evictions_{false};
     bool enable_l3_storage_{false};
     std::int32_t prefix_granularity_{0};
@@ -835,6 +862,9 @@ private:
     // How many groups are State groups. With any, a boundary serves a resume
     // only with a checkpoint boundary at or under it.
     std::int32_t num_state_groups_{0};
+    // Some group is prefix-closed, and needs every page below a boundary: a
+    // State or sliding group resumes past a page that holds nothing.
+    bool has_prefix_closed_groups_{false};
     std::uint64_t next_access_epoch_{0};
     struct HostParentCandidate {
         std::uint64_t newest_access_epoch{0};
@@ -849,6 +879,10 @@ private:
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.
     BoundaryTree boundary_tree_;
+    // Hashes of possibly dead tree nodes, in the order they were queued, for
+    // CollectDeadEntries (write_back_evictions only). A node may be gone or
+    // alive again by the time it is collected.
+    std::deque<ContentHash> dead_candidates_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;
     // Accounting only.
