@@ -63,7 +63,9 @@ class BuildPyWithRust(build_py):
 
     def run(self) -> None:
         super().run()
-        package = Path(self.build_lib) / "tokenspeed_engine"
+        # An editable install imports from the source tree, not build_lib.
+        root = ROOT / "python" if self.editable_mode else Path(self.build_lib)
+        package = root / "tokenspeed_engine"
         release = _cargo_build("tokenspeed-py", extension_module=True)
         shutil.copy2(
             release / "lib_native.so",
