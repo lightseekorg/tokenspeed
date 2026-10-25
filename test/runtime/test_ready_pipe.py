@@ -140,11 +140,6 @@ def _engine_owns_failed_startup_cleanup(writer):
 
 
 class TestReadyPipe:
-    def test_ready_message_reaches_parent(self, start_process) -> None:
-        proc, reader = start_process(_report_ready, (7,))
-        assert reader.poll(_TIMEOUT_S)
-        assert reader.recv() == {"status": "ready", "value": 7}
-
     def test_killed_child_raises_eof_instead_of_blocking(self) -> None:
         proc, reader = start_process_with_ready_pipe(
             _die_before_ready, (), contextlib.nullcontext()

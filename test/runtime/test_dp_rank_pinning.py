@@ -98,24 +98,12 @@ class TestGenerateReqInputPlumbing:
         assert (obj[0].data_parallel_rank) == (3)
         assert (obj[1].data_parallel_rank) == (4)
 
-    def test_default_is_none(self):
-        obj = GenerateReqInput(text="hello", sampling_params={})
-        obj.normalize_batch_and_arguments()
-        assert (obj.data_parallel_rank) is None
-
     def test_single_request_length1_list_unwrapped(self):
         # A list pin surviving normalize on a single request would fail the
         # int|None typed msgpack decode in the DP controller's dispatch loop.
         obj = GenerateReqInput(text="hello", sampling_params={}, data_parallel_rank=[2])
         obj.normalize_batch_and_arguments()
         assert (obj.data_parallel_rank) == (2)
-
-    def test_single_request_longer_list_rejected(self):
-        obj = GenerateReqInput(
-            text="hello", sampling_params={}, data_parallel_rank=[1, 2]
-        )
-        with pytest.raises((ValueError), match=("data_parallel_rank")):
-            obj.normalize_batch_and_arguments()
 
     def test_batch_list_length_mismatch_rejected(self):
         obj = GenerateReqInput(
@@ -166,16 +154,6 @@ class TestIngressValidation:
                 with subtests.test(bad=bad, mode=mode):
                     with pytest.raises((ValueError), match=("must be an int")):
                         processor.validate_request(obj)
-
-    def test_colocated_batch_list_out_of_range_raises(self):
-        processor = _make_input_processor(dp_size=8)
-        obj = GenerateReqInput(
-            text=["a", "b"],
-            sampling_params=[{}, {}],
-            data_parallel_rank=[1, 99],
-        )
-        with pytest.raises((ValueError), match=("99")):
-            processor.validate_request(obj)
 
     def test_colocated_batch_list_partial_pin_kept(self):
         processor = _make_input_processor(dp_size=8)

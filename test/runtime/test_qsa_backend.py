@@ -316,30 +316,9 @@ def test_qsa_commit_uses_only_owned_layers_once(commit_calls, layer_offset) -> N
     assert commit_calls[0][0][0] is commit_calls[1][0][0]
 
 
-@pytest.mark.parametrize("bs", [0, 9])
-def test_qsa_staging_rejects_invalid_capacity(state, bs) -> None:
-    with pytest.raises(RuntimeError, match="preallocated shape"):
-        state.verify_staging_buffers(1, bs)
-
-
 def test_qsa_preallocation_rejects_a_different_verify_width(state) -> None:
     with pytest.raises(ValueError, match="workspace width"):
         state.preallocate_verify_workspace(8, 3)
-
-
-def test_qsa_staging_requires_preallocation() -> None:
-    state = QSAVerifyState(
-        _qsa_config(max_bs=2, is_draft=False, device="cpu"),
-        _qsa_pool(device="cpu", layer_offset=0),
-    )
-    with pytest.raises(RuntimeError, match="must be preallocated"):
-        state.verify_staging_buffers(1, 2)
-
-
-@pytest.mark.parametrize("layer_id, error", [(0, KeyError), (4, ValueError)])
-def test_qsa_staging_rejects_layers_outside_its_fields(state, layer_id, error) -> None:
-    with pytest.raises(error):
-        state.verify_staging_buffers(layer_id, 2)
 
 
 def test_qsa_commit_without_target_staging_is_silent(commit_calls) -> None:

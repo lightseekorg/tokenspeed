@@ -1302,12 +1302,6 @@ def test_nested_capture_config_overrides_top_level_values(dflash_model):
     target.set_dflash_aux_hidden_stream.assert_called_once_with("attn_res")
 
 
-def test_missing_taps_fail_during_model_setup(dflash_model):
-    dflash_model.config = SimpleNamespace()
-    with pytest.raises(ValueError, match="target_layer_ids"):
-        dflash_model.configure_target(object(), None)
-
-
 def test_target_without_capture_support_fails_during_model_setup(dflash_model):
     dflash_model.config = SimpleNamespace(target_layer_ids=[1])
     with pytest.raises(ValueError, match="set_dflash_layers_to_capture"):

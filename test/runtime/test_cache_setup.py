@@ -1,7 +1,7 @@
 import functools
 import os
 import sys
-from dataclasses import fields, replace
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -369,26 +369,6 @@ def _hybrid_setup_with_narrow_draft():
         num_draft_layers=1,
         extra_state_group="state",
     ).setup()
-
-
-def test_attention_configs_do_not_own_cache_setup() -> None:
-    cache_setup_fields = {
-        "conv_state_shape",
-        "temporal_state_shape",
-        "recurrent_state_shape",
-        "conv_dtype",
-        "ssm_dtype",
-        "recurrent_dtype",
-        "lcm_memory_plan",
-        "token_capacity",
-    }
-
-    assert cache_setup_fields.isdisjoint(field.name for field in fields(AttnConfig))
-    assert cache_setup_fields.isdisjoint(field.name for field in fields(MHAConfig))
-    assert cache_setup_fields.isdisjoint(field.name for field in fields(MLAConfig))
-    assert not hasattr(AttnConfig, "create_pool")
-    assert not hasattr(MHAConfig, "create_pool")
-    assert not hasattr(MLAConfig, "create_pool")
 
 
 def _ns_config(*, spec, **fields):

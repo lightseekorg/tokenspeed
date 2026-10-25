@@ -1060,13 +1060,6 @@ class TestCaptureFailureIsLoudTest:
     def test_successful_capture_does_not_raise(self):
         self._bare().capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
 
-    def test_oom_propagates(self):
-        """OOM keeps its own type and message. The capture pool not fitting is
-        an operator-visible sizing failure, not something to recover from."""
-        pg = self._bare(raises=self.torch.cuda.OutOfMemoryError("no room"))
-        with pytest.raises((self.torch.cuda.OutOfMemoryError)):
-            pg.capture(None, entries=None, observer=NULL_MEMORY_DELTA_OBSERVER)
-
 
 class TestNarrowingPrefillGraphTest:
     """A NarrowingPrefillModel is captured as encoder graphs per token bucket

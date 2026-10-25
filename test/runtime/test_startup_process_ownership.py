@@ -316,10 +316,11 @@ def _stop_supervisor(proc):
     proc.join(_TIMEOUT_S)
 
 
-@pytest.mark.parametrize("signum", [signal.SIGUSR1, signal.SIGQUIT])
-def test_engine_startup_signal_owns_worker_cleanup(signum):
+def test_engine_startup_signal_owns_worker_cleanup():
+    # SIGUSR1 and SIGQUIT share one handler; the repeated-signal test below
+    # delivers both.
     proc, reader = start_process_with_ready_pipe(
-        _engine_startup_failure, (signum,), contextlib.nullcontext()
+        _engine_startup_failure, (signal.SIGUSR1,), contextlib.nullcontext()
     )
     try:
         assert reader.poll(_TIMEOUT_S), "Engine did not finish startup cleanup"
