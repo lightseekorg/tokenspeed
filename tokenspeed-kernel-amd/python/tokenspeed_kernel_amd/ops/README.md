@@ -644,7 +644,8 @@ KPool launchers return the scores for the caller's selection.
 
 - Each score is `softmax_scale * sum_h w[h] * relu(q[h] . k)` over the index
   heads, with `q` and `k` dequantized and NaN propagated. Heads are added in
-  FP32 in logical order, so scores are deterministic.
+  FP32, in logical order for DSA and for KPool with `ordered_head_fold`, and
+  in a fixed balanced order otherwise, so scores are deterministic.
 - Each cache page holds `page_size` rows of 128 FP8 E4M3 key bytes followed by
   their `page_size` FP32 scales. Page strides and the storage offset are
   4-byte aligned; pages may be padded.
@@ -661,34 +662,41 @@ KPool launchers return the scores for the caller's selection.
   sees the physical slots `[row_starts, row_ends)` of `pool_workspace_slots`.
   Output column `c` holds visible pool `pool_offset + c` for `window_cols`
   columns, `row_ends_out` holds each row's valid column count, and later
-  columns are not written. `ordered_head_fold` selects nothing on gfx1250.
+  columns are not written.
 
 #### Algorithm
 
-A program owns one query row and a span of its candidate columns. It loads
-the row's queries once, per 32-head group, in the WMMA A-operand layout, with
-the weights already multiplied by the query scales. It then walks the span in
-column tiles: 256 columns on eight waves for DSA prefill, 128 on four waves
-for KPool, and two 32-column tiles on one wave per 64-column decode program.
-DSA prefill waves split the 32 heads before the columns; KPool waves split
-only the columns, so each wave holds all heads of its columns.
+A program owns one query row and a span of its candidate columns. A planned
+KPool program owns two adjacent rows when they share a workspace start, so
+both rows score each key tile it loads; otherwise it scores the rows one
+after the other. A program loads each row's queries once, per 32-head group,
+in the WMMA A-operand layout, with the weights already multiplied by the
+query scales. It then walks the span in column tiles: 256 columns on eight
+waves for DSA prefill, 128 on four waves for KPool, and two 32-column tiles
+on one wave per 64-column decode program. DSA prefill waves split the 32
+heads before the columns; KPool waves split only the columns, so each wave
+holds all heads of its columns.
 
 For each tile, the program looks up the candidates' cache slots, from the
 workspace or plan slots or through the block table, and loads their keys.
-DSA prefill loads eight adjacent key bytes per lane and KPool sixteen, then
-converts the tile through LDS to the WMMA B-operand layout; decode loads the
-operand layout directly. FP8 queries use FP8 WMMA; BF16 queries upcast the
-keys to BF16. Each head group's WMMA result goes through ReLU and the head
-weights, then one layout conversion gives each lane all 32 heads of one
-column. The lane adds them in head order with register adds; a second head
-group continues the same sum. The column's key scale and `softmax_scale`
-apply last.
+Columns past the span read slot 0 and are not stored, so storages above
+2 GiB, which need 64-bit global loads, load without masks. DSA prefill loads
+eight adjacent key bytes per lane and KPool sixteen, then converts the tile
+through LDS to the WMMA B-operand layout; decode loads the operand layout
+directly. FP8 queries use FP8 WMMA; BF16 queries upcast the keys to BF16.
+Each head group's WMMA result goes through ReLU and the head weights. For the
+logical order, one layout conversion gives each lane all 32 heads of one
+column, and the lane adds them in head order with register adds; a second
+head group continues the same sum. The balanced KPool fold keeps eight heads
+of a column per lane and reduces them in the WMMA layout without LDS. The
+column's key scale and `softmax_scale` apply last.
 
 Prefill and KPool launches split each row's columns over a second grid
 dimension so that the grid has about four programs per compute unit; with
-enough rows, each row stays in one program. The span is a multiple of the
-tile and a runtime argument, so batch-size changes do not recompile the
-scorer. Only the first program of a KPool row writes its `row_ends_out`.
+enough rows, each row stays in one program; paired KPool programs count as
+one row. The span is a multiple of the tile and a runtime argument, so
+batch-size changes do not recompile the scorer. Only the first program of a
+KPool row writes its `row_ends_out`.
 
 ### gfx950 selected-slot sparse attention
 
