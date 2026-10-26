@@ -631,6 +631,35 @@ store, and K advances shrink the bounds so tiles past K zero-fill.
   partition stores FP32, and `_mxfp8_split_reduce_gfx1250` sums them into
   the BF16 output in a second launch.
 
+### gfx1250 FP32 block-scale large-M projection
+
+`gluon_mm_fp8_blockscale_largem_gfx1250` covers the canonical FP32
+block-scale contract (see the gfx950 FP32 block scales section) from 65 rows,
+above the decode projection's range. GLM-5.3 uses it for its FP8 dense,
+shared-expert, and attention projections.
+
+#### Contract
+
+- The operation computes `A @ B.T` from row-major E4M3 matrices shaped `[M, K]`
+  and `[N, K]`, with `N` divisible by 128 and `K` by 512.
+- Scales are FP32 `[M, K/128]` and `[N/128, K/128]` with unit inner stride
+  and an explicit `[128, 128]` block. Output is BF16; `alpha` is not
+  supported.
+- Automatic selection requires `M >= 65`. When `K` is a single 512-wide step,
+  it also requires `M <= 4096`; larger batches keep the Triton GEMM.
+
+#### Algorithm
+
+The kernel reuses the unclustered eight-wave `64 x 64` warp pipeline of
+`gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250`: TDM double-buffers 512-wide K
+steps of A and B, bounded at the real M, N, and K. Each 128-wide slice runs raw
+FP8 WMMA into a zeroed partial, which receives its activation scale and then
+its weight scale before accumulation. A `64 x 64` tile lies inside one
+128-column weight block, so its weight scale is one uniform load per slice.
+The next step's scales load while the current step computes. `128 x 128`
+tiles spill the extra partial accumulator, so every batch uses `64 x 64`
+tiles. The row count is a runtime argument.
+
 ## Attention
 
 ### gfx1250 standard-cache DSA and KPool scoring

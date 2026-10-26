@@ -1002,6 +1002,9 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
         ("fp32", False, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", True, 1, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", False, 64, "gluon_mm_fp8_blockscale_gfx1250"),
+        ("fp32", False, 65, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", True, 4096, "gluon_mm_fp8_blockscale_largem_gfx1250"),
+        ("fp32", False, 4097, "triton_mm_fp8_blockscale"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(
@@ -1021,7 +1024,7 @@ def test_public_mm_selects_gfx1250_decode_kernel(
         pytest.skip(f"{expected_name!r} is not registered (optional backend missing)")
     assert expected_spec.capability.satisfied_by(mi450_platform)
 
-    n, k = 128, 256
+    n, k = 128, 512
     a_dtype = torch.bfloat16 if online else _fp8_dtype()
     a = torch.empty((m, k), dtype=a_dtype)
     b = torch.empty((n, k), dtype=_fp8_dtype())

@@ -48,6 +48,9 @@ _BK512 = 512
 _BK256 = 256
 _BK256_TILE = 256
 _BK256_MIN_M = 512
+# Unclustered 64 x 64 FP32-scale tiles measured fastest from 65 to 8192 rows;
+# 128-row tiles spill the extra per-partial accumulator.
+_FP32_TILE = 64
 
 
 @gluon.constexpr_function
@@ -674,6 +677,354 @@ def gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250(
         shape=(M - off_m, N - off_n),
         strides=(stride_om, 1),
         block_shape=(BLOCK, BLOCK),
+        layout=SHARED_OUT,
+    )
+    gl.amd.cdna5.tdm.async_store(out_desc, [0, 0], out_smem)
+    gl.amd.cdna5.tdm.async_wait(0)
+
+
+def _fp32_launch_metadata(grid, kernel, args):
+    """Report useful FLOPs, the per-tile A/B panel reads and the store."""
+    m, n, k = args["M"], args["N"], args["K"]
+    grid_m = triton.cdiv(m, _FP32_TILE)
+    grid_n = triton.cdiv(n, _FP32_TILE)
+    return {
+        "name": f"{kernel.name} [M={m}, N={n}, K={k}]",
+        "flops8": 2 * m * n * k,
+        "bytes": (grid_n * m + grid_m * n) * k + 2 * m * n,
+    }
+
+
+def _fp32_repr(specialization):
+    single = specialization.constants.get("SINGLE_K_TILE")
+    return f"gluon_mm_fp8_blockscale_largem_gfx1250_k{1 if single else 'n'}"
+
+
+@gluon.jit
+def _fp32_refill(a_desc, b_desc, a_smem, b_smem, slot, BLOCK_K: gl.constexpr):
+    gl.amd.cdna5.tdm.async_load(a_desc, [0, 0], a_smem.index(slot), warp_used_hint=15)
+    gl.amd.cdna5.tdm.async_load(b_desc, [0, 0], b_smem.index(slot), warp_used_hint=15)
+    a_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
+        a_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
+    )
+    b_desc = gl.amd.cdna5.tdm.update_tensor_descriptor(
+        b_desc, add_offsets=[0, BLOCK_K], clamp_bounds=True
+    )
+    return a_desc, b_desc
+
+
+@gluon.jit
+def _fp32_tile_scales(
+    a_scale_ptr, b_scale_ptr, a_scale_offsets, b_scale_offset, kb, kb_end
+):
+    """Load a 512-wide K tile's four row-scale vectors, then its weight scales."""
+    # The prefetch past the last tile is never used; clamping keeps it in bounds.
+    kb = gl.minimum(kb, kb_end)
+    a_scales = a_scale_offsets + kb
+    b_scales = b_scale_ptr + b_scale_offset + kb
+    return (
+        gl.amd.cdna5.buffer_load(a_scale_ptr, a_scales),
+        gl.amd.cdna5.buffer_load(a_scale_ptr, a_scales + 1),
+        gl.amd.cdna5.buffer_load(a_scale_ptr, a_scales + 2),
+        gl.amd.cdna5.buffer_load(a_scale_ptr, a_scales + 3),
+        gl.load(b_scales),
+        gl.load(b_scales + 1),
+        gl.load(b_scales + 2),
+        gl.load(b_scales + 3),
+    )
+
+
+@gluon.jit
+def _fp32_operands(
+    a_smem, b_smem, slot, k: gl.constexpr, DOT_A: gl.constexpr, DOT_B: gl.constexpr
+):
+    a = a_smem.index(slot).slice(k, 128, 1).load(layout=DOT_A)
+    b = b_smem.index(slot).slice(k, 128, 1).permute([1, 0]).load(layout=DOT_B)
+    return a, b
+
+
+@gluon.jit
+def _fp32_accumulate(a, b, a_scale, b_scale, acc):
+    partial = gl.amd.cdna5.wmma(a, b, gl.zeros_like(acc))
+    return acc + partial * a_scale[:, None] * b_scale
+
+
+@gluon.jit
+def _fp32_consume_refill(
+    a_smem,
+    b_smem,
+    slot,
+    a_desc,
+    b_desc,
+    a_scale_ptr,
+    b_scale_ptr,
+    a_scale_offsets,
+    b_scale_offset,
+    scales,
+    kb,
+    kb_end,
+    acc,
+    DOT_A: gl.constexpr,
+    DOT_B: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+):
+    # The BK512 MXFP8 stages with raw WMMAs, loading the next tile's scales.
+    gl.amd.cdna5.tdm.async_wait(2)
+    with gl.amd.warp_pipeline_stage("stage0_load_k0", phase_gap=1):
+        next_scales = _fp32_tile_scales(
+            a_scale_ptr,
+            b_scale_ptr,
+            a_scale_offsets,
+            b_scale_offset,
+            kb + BLOCK_K // 128,
+            kb_end,
+        )
+        a0, b0 = _fp32_operands(a_smem, b_smem, slot, 0, DOT_A, DOT_B)
+        a1, b1 = _fp32_operands(a_smem, b_smem, slot, 128, DOT_A, DOT_B)
+    with gl.amd.warp_pipeline_stage("stage1_compute_k0"):
+        acc = _fp32_accumulate(a0, b0, scales[0], scales[4], acc)
+        acc = _fp32_accumulate(a1, b1, scales[1], scales[5], acc)
+    with gl.amd.warp_pipeline_stage("stage2_load_k2"):
+        a2, b2 = _fp32_operands(a_smem, b_smem, slot, 256, DOT_A, DOT_B)
+        a3, b3 = _fp32_operands(a_smem, b_smem, slot, 384, DOT_A, DOT_B)
+    with gl.amd.warp_pipeline_stage("stage3_compute_k2"):
+        acc = _fp32_accumulate(a2, b2, scales[2], scales[6], acc)
+        acc = _fp32_accumulate(a3, b3, scales[3], scales[7], acc)
+    with gl.amd.warp_pipeline_stage("stage4_refill"):
+        a_desc, b_desc = _fp32_refill(a_desc, b_desc, a_smem, b_smem, slot, BLOCK_K)
+        # Advancing the scale column here keeps every op inside a stage.
+        kb += BLOCK_K // 128
+    return a_desc, b_desc, next_scales, kb, acc
+
+
+@gluon.jit
+def _fp32_consume_tail(
+    a_smem,
+    b_smem,
+    slot,
+    a_scale_ptr,
+    b_scale_ptr,
+    a_scale_offsets,
+    b_scale_offset,
+    scales,
+    kb,
+    kb_end,
+    acc,
+    DOT_A: gl.constexpr,
+    DOT_B: gl.constexpr,
+    PREFETCH: gl.constexpr,
+):
+    next_scales = scales
+    for j in gl.static_range(4):
+        with gl.amd.warp_pipeline_stage("tail_load"):
+            if PREFETCH and j == 0:
+                next_scales = _fp32_tile_scales(
+                    a_scale_ptr,
+                    b_scale_ptr,
+                    a_scale_offsets,
+                    b_scale_offset,
+                    kb + 4,
+                    kb_end,
+                )
+            a, b = _fp32_operands(a_smem, b_smem, slot, j * 128, DOT_A, DOT_B)
+        with gl.amd.warp_pipeline_stage("tail_compute"):
+            acc = _fp32_accumulate(a, b, scales[j], scales[4 + j], acc)
+    return next_scales, acc
+
+
+# The live row count varies with the batch, so it must not split the compile
+# cache on its divisibility.
+@gluon.jit(
+    launch_metadata=_fp32_launch_metadata,
+    repr=_fp32_repr,
+    do_not_specialize=["M"],
+)
+def gluon_mm_fp8_blockscale_largem_gfx1250(
+    a_ptr,
+    b_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    out_ptr,
+    stride_am,
+    stride_bn,
+    stride_asm,
+    stride_bsn,
+    stride_om,
+    M,
+    N,
+    K,
+    TILE: gl.constexpr,
+    GROUP_M: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    SINGLE_K_TILE: gl.constexpr,
+):
+    """Eight-wave E4M3 GEMM with canonical FP32 ``[128,128]`` block scales.
+
+    The BK512 MXFP8 kernel's tiling and warp pipeline over raw E4M3 WMMA,
+    unclustered with ``TILE x TILE`` outputs. Each 128-wide partial is
+    multiplied by its rows' activation scales, then by its weight-block
+    scale, before accumulation, as the decode kernel does. A tile's columns
+    lie in one 128-column weight block, so its weight scales are uniform
+    loads. Scales load one K tile ahead. K must be whole 512-wide tiles; a
+    single tile skips the two-slot pipeline, which would add a zero tile.
+    """
+    gl.static_assert(gl.num_warps() == 8, "the warp pipeline needs two waves per SIMD")
+    gl.static_assert(TILE <= 128, "a tile spans one weight-scale block")
+    BLOCK_K: gl.constexpr = 512
+    layouts: gl.constexpr = _bk512_layouts(TILE, 1)
+    SHARED_A: gl.constexpr = layouts[0]
+    SHARED_B: gl.constexpr = layouts[1]
+    WMMA_LAYOUT: gl.constexpr = layouts[4]
+    SHARED_OUT: gl.constexpr = layouts[5]
+    pid_m, pid_n = _largem_warp_pipeline_xcd_tile(
+        gl.program_id(0), gl.cdiv(M, TILE), gl.cdiv(N, TILE), NUM_XCDS, GROUP_M
+    )
+    off_m = pid_m * TILE
+    off_n = pid_n * TILE
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 16)
+    a_smem = gl.allocate_shared_memory(
+        a_ptr.dtype.element_ty, [2, TILE, BLOCK_K], SHARED_A
+    )
+    b_smem = gl.allocate_shared_memory(
+        b_ptr.dtype.element_ty, [2, TILE, BLOCK_K], SHARED_B
+    )
+    a_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=a_ptr + off_m * stride_am,
+        shape=(M - off_m, K),
+        strides=(stride_am, 1),
+        block_shape=(TILE, BLOCK_K),
+        layout=SHARED_A,
+    )
+    b_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=b_ptr + off_n * stride_bn,
+        shape=(N - off_n, K),
+        strides=(stride_bn, 1),
+        block_shape=(TILE, BLOCK_K),
+        layout=SHARED_B,
+    )
+    # Rows past M read the last row's scales; the output store clips them.
+    rows = gl.arange(0, TILE, gl.SliceLayout(1, WMMA_LAYOUT))
+    a_scale_offsets = gl.minimum(off_m + rows, M - 1) * stride_asm
+    b_scale_offset = (off_n // 128) * stride_bsn
+    kb = 0
+    kb_end = K // 128 - BLOCK_K // 128
+    acc = gl.zeros((TILE, TILE), dtype=gl.float32, layout=WMMA_LAYOUT)
+    if SINGLE_K_TILE:
+        _fp32_refill(a_desc, b_desc, a_smem, b_smem, 0, BLOCK_K)
+        scales = _fp32_tile_scales(
+            a_scale_ptr, b_scale_ptr, a_scale_offsets, b_scale_offset, kb, kb_end
+        )
+        gl.amd.cdna5.tdm.async_wait(0)
+        _, acc = _fp32_consume_tail(
+            a_smem,
+            b_smem,
+            0,
+            a_scale_ptr,
+            b_scale_ptr,
+            a_scale_offsets,
+            b_scale_offset,
+            scales,
+            kb,
+            kb_end,
+            acc,
+            dot_a,
+            dot_b,
+            False,
+        )
+    else:
+        for slot in gl.static_range(2):
+            a_desc, b_desc = _fp32_refill(a_desc, b_desc, a_smem, b_smem, slot, BLOCK_K)
+        scales = _fp32_tile_scales(
+            a_scale_ptr, b_scale_ptr, a_scale_offsets, b_scale_offset, kb, kb_end
+        )
+        num_k_tiles = K // BLOCK_K
+        gl.assume(num_k_tiles >= 2)
+        # Unrolling six tiles keeps the two-slot parity static in the body.
+        for _ in range((num_k_tiles - 2) // 6):
+            for inner in gl.static_range(6):
+                a_desc, b_desc, scales, kb, acc = _fp32_consume_refill(
+                    a_smem,
+                    b_smem,
+                    inner % 2,
+                    a_desc,
+                    b_desc,
+                    a_scale_ptr,
+                    b_scale_ptr,
+                    a_scale_offsets,
+                    b_scale_offset,
+                    scales,
+                    kb,
+                    kb_end,
+                    acc,
+                    dot_a,
+                    dot_b,
+                    BLOCK_K,
+                )
+        for tile in range((num_k_tiles - 2) // 6 * 6, num_k_tiles - 2):
+            a_desc, b_desc, scales, kb, acc = _fp32_consume_refill(
+                a_smem,
+                b_smem,
+                tile % 2,
+                a_desc,
+                b_desc,
+                a_scale_ptr,
+                b_scale_ptr,
+                a_scale_offsets,
+                b_scale_offset,
+                scales,
+                kb,
+                kb_end,
+                acc,
+                dot_a,
+                dot_b,
+                BLOCK_K,
+            )
+        gl.amd.cdna5.tdm.async_wait(2)
+        scales, acc = _fp32_consume_tail(
+            a_smem,
+            b_smem,
+            num_k_tiles % 2,
+            a_scale_ptr,
+            b_scale_ptr,
+            a_scale_offsets,
+            b_scale_offset,
+            scales,
+            kb,
+            kb_end,
+            acc,
+            dot_a,
+            dot_b,
+            True,
+        )
+        gl.amd.cdna5.tdm.async_wait(0)
+        _, acc = _fp32_consume_tail(
+            a_smem,
+            b_smem,
+            (num_k_tiles - 1) % 2,
+            a_scale_ptr,
+            b_scale_ptr,
+            a_scale_offsets,
+            b_scale_offset,
+            scales,
+            kb,
+            kb_end,
+            acc,
+            dot_a,
+            dot_b,
+            False,
+        )
+    a_smem._keep_alive()
+    b_smem._keep_alive()
+    out_smem = gl.allocate_shared_memory(
+        out_ptr.dtype.element_ty, [TILE, TILE], SHARED_OUT
+    )
+    out_smem.store(acc.to(out_ptr.dtype.element_ty))
+    out_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=out_ptr + off_m * stride_om + off_n,
+        shape=(M - off_m, N - off_n),
+        strides=(stride_om, 1),
+        block_shape=(TILE, TILE),
         layout=SHARED_OUT,
     )
     gl.amd.cdna5.tdm.async_store(out_desc, [0, 0], out_smem)
@@ -1489,4 +1840,112 @@ def launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250(
     return out
 
 
-__all__ = ["launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250"]
+def launch_gluon_mm_fp8_blockscale_largem_gfx1250(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    A_scales: torch.Tensor | None,
+    B_scales: torch.Tensor | None,
+    out_dtype: torch.dtype,
+    *,
+    alpha: torch.Tensor | None = None,
+    block_size: list[int] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Project E4M3 matrices with canonical FP32 ``[128,128]`` block scales.
+
+    Args:
+        A: Row-major E4M3 activation matrix ``[M,K]``; K divisible by 512.
+        B: Row-major E4M3 weight matrix ``[N,K]``; N divisible by 128.
+        A_scales: Per-row FP32 scales ``[M,K/128]`` with unit column stride.
+        B_scales: FP32 scales ``[N/128,K/128]`` with unit column stride.
+        out_dtype: Explicit output dtype; only BF16 is supported.
+        alpha: Unsupported global output scale.
+        block_size: Explicit scale block, which must be ``[128,128]``.
+        out: Optional BF16 output buffer ``[M,N]`` with unit column stride.
+
+    Returns:
+        The caller-owned ``out`` tensor or a newly allocated BF16 result.
+    """
+    if alpha is not None:
+        raise ValueError("gfx1250 FP8 block-scale GEMM does not support alpha")
+    if block_size is None or tuple(block_size) != (128, 128):
+        raise ValueError("gfx1250 FP8 block-scale GEMM requires block_size=[128, 128]")
+    if A.ndim != 2 or B.ndim != 2:
+        raise ValueError("A and B must be 2D")
+    m, k = A.shape
+    n = B.shape[0]
+    if B.shape[1] != k:
+        raise ValueError(f"B must be [N, {k}], got {tuple(B.shape)}")
+    for name, tensor in (("A", A), ("B", B)):
+        if (
+            tensor.dtype != torch.float8_e4m3fn
+            or not tensor.is_cuda
+            or tensor.device != A.device
+            or tensor.stride(-1) != 1
+        ):
+            raise ValueError(f"{name} must be row-major GPU E4M3 colocated with A")
+    if m < 1 or k < _BK512 or k % _BK512 or n % 128:
+        raise ValueError(
+            "gfx1250 FP8 block-scale GEMM requires M >= 1, N divisible by 128 "
+            f"and K by {_BK512}, got M={m}, N={n}, K={k}"
+        )
+    if A_scales is None or B_scales is None:
+        raise ValueError("A_scales and B_scales are required")
+    for name, scales, shape in (
+        ("A_scales", A_scales, (m, k // 128)),
+        ("B_scales", B_scales, (n // 128, k // 128)),
+    ):
+        if (
+            scales.dtype != torch.float32
+            or tuple(scales.shape) != shape
+            or scales.device != A.device
+            or scales.stride(-1) != 1
+        ):
+            raise ValueError(
+                f"{name} must be row-major GPU FP32 {shape} colocated with A"
+            )
+    if out_dtype != torch.bfloat16:
+        raise ValueError(
+            f"gfx1250 FP8 block-scale GEMM requires BF16 output, got {out_dtype}"
+        )
+    if out is None:
+        out = A.new_empty((m, n), dtype=out_dtype)
+    elif (
+        tuple(out.shape) != (m, n)
+        or out.dtype != out_dtype
+        or out.device != A.device
+        or out.stride(-1) != 1
+    ):
+        raise ValueError(
+            f"out must be row-major GPU {out_dtype} ({m}, {n}) colocated with A"
+        )
+    gluon_mm_fp8_blockscale_largem_gfx1250[
+        (triton.cdiv(m, _FP32_TILE) * triton.cdiv(n, _FP32_TILE),)
+    ](
+        A,
+        B,
+        A_scales,
+        B_scales,
+        out,
+        A.stride(0),
+        B.stride(0),
+        A_scales.stride(0),
+        B_scales.stride(0),
+        out.stride(0),
+        m,
+        n,
+        k,
+        TILE=_FP32_TILE,
+        GROUP_M=_GROUP_M,
+        NUM_XCDS=_NUM_XCDS,
+        SINGLE_K_TILE=k == _BK512,
+        num_warps=8,
+        waves_per_eu=2,
+    )
+    return out
+
+
+__all__ = [
+    "launch_gluon_mm_fp8_blockscale_largem_gfx1250",
+    "launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250",
+]
