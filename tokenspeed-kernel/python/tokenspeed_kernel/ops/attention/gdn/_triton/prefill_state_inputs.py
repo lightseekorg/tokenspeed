@@ -22,9 +22,16 @@
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.platform import current_platform
 
 
-@triton.jit(do_not_specialize_on_alignment=["state_in", "state_out"])
+@triton.jit(
+    **(
+        {"do_not_specialize_on_alignment": ["state_in", "state_out"]}
+        if current_platform().is_npu
+        else {}
+    )
+)
 def _prepare_prefill_state_inputs_kernel(
     conv_states,
     ssm_states,

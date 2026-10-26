@@ -69,7 +69,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
     layer_plane_bindings: ClassVar[dict[str, str]] = {
         **MLATokenToKVPool.layer_plane_bindings,
         "conv_state": "_conv_state",
-        "conv_state_channels_last": "_conv_state_channels_last",
         "recurrent_state": "_recurrent_state",
     }
 
@@ -77,13 +76,6 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
         if self.quant_method == "per_token_head":
             raise ValueError("KDA cache does not support per-token-head KV")
         super()._bind_layer_planes()
-        # Physical channels-last checkpoints expose the existing logical
-        # [page, channel, history] compute view without copying payloads.
-        for layer_id, raw in enumerate(self._conv_state_channels_last):
-            if raw is not None:
-                if self._conv_state[layer_id] is not None:
-                    raise ValueError("KDA layer declares both convolution layouts")
-                self._conv_state[layer_id] = raw.transpose(1, 2)
         # A state layer with no planned planes belongs to another pipeline
         # stage (the PP-narrowed plan drops its fields); this view never
         # executes it, so it gets no entry.
@@ -105,11 +97,7 @@ class HybridKDATokenToKVPool(MLATokenToKVPool):
                 for layer_id, label in enumerate(self._layer_types)
                 if label in STATE_LAYER_TYPES
             ),
-            state_field_suffixes=(
-                "conv_state",
-                "conv_state_channels_last",
-                "recurrent_state",
-            ),
+            state_field_suffixes=("conv_state", "recurrent_state"),
         )
 
     def get_component(self, layer_id: int, component_name: str) -> torch.Tensor:
