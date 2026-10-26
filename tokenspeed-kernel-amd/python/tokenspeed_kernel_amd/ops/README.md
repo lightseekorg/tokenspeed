@@ -623,9 +623,10 @@ store, and K advances shrink the bounds so tiles past K zero-fill.
   least four steps. It takes batches from 512 rows when N is divisible by 256
   and its tiles exceed half the CUs.
 - `gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250` takes the rest in 512-wide K
-  steps, at least two. It uses `64 x 64` tiles while those fit one wave of
-  CUs, then `128 x 128` tiles, in 2 x 2 clusters. Both run unclustered up
-  to 128 rows, and the 128-row tiles also for two K steps.
+  steps: one when K fits a single step, otherwise at least two. It uses
+  `64 x 64` tiles while those fit one wave of CUs, then `128 x 128` tiles,
+  in 2 x 2 clusters. Both run unclustered up to 128 rows, and the 128-row
+  tiles also for two K steps.
 - Up to 64 rows, a call with at least eight K steps splits K into the most
   partitions of two or more steps that still fit one wave of CUs. Each
   partition stores FP32, and `_mxfp8_split_reduce_gfx1250` sums them into
@@ -650,15 +651,18 @@ shared-expert, and attention projections.
 
 #### Algorithm
 
-The kernel reuses the unclustered eight-wave `64 x 64` warp pipeline of
-`gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250`: TDM double-buffers 512-wide K
-steps of A and B, bounded at the real M, N, and K. Each 128-wide slice runs raw
-FP8 WMMA into a zeroed partial, which receives its activation scale and then
-its weight scale before accumulation. A `64 x 64` tile lies inside one
-128-column weight block, so its weight scale is one uniform load per slice.
-The next step's scales load while the current step computes. `128 x 128`
-tiles spill the extra partial accumulator, so every batch uses `64 x 64`
-tiles. The row count is a runtime argument.
+The projection runs the FP32 mode of
+`gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250`, with the MXFP8 large-M
+projection's BK512 tile, cluster, and split-K choice; the BK256 kernel has no
+FP32 mode. TDM stages both scale planes in LDS beside A and B: the activation
+scales of each 512-wide step, and one weight-scale row per 128 output
+columns, which each CTA widens in registers to its columns. Each 128-wide
+slice runs raw FP8 WMMA into a zeroed partial, which receives its activation
+scale and then its weight scale before accumulation. An empty inline asm with
+side effects consumes the sum in each compute stage. Without it LLVM sinks
+the scale math past the branches of the warp pipeline's closing barrier and
+of the cluster arrive, which keeps every partial live and spills. The row
+count is a runtime argument.
 
 ## Attention
 

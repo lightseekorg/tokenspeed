@@ -284,10 +284,13 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_wide_tile_preserves_strided_out
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_reuses_kernels_across_row_counts
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-False-64-gluon_mm_fp8_blockscale_gfx1250]
-    # FP8 block-scale above 64 rows: a single K tile, a multi-tile K walk with
-    # ragged rows, and selection.
+    # FP8 block-scale through the BK512 kernel's FP32 mode: a single K tile, a
+    # clustered multi-tile K walk with ragged rows, split K, and selection;
+    # and a partial single UE8M0 K tile.
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_fp8_blockscale_largem_gfx1250.py::test_fp8_blockscale_largem_matches_dequantized_reference[4096-512-65]
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_fp8_blockscale_largem_gfx1250.py::test_fp8_blockscale_largem_matches_dequantized_reference[1024-4096-129]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_fp8_blockscale_largem_gfx1250.py::test_fp8_blockscale_largem_matches_dequantized_reference[1024-4096-16]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_single_k_tile_matches_dequantized_reference[2048-288-17]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-False-65-gluon_mm_fp8_blockscale_largem_gfx1250]
 install:
   - |

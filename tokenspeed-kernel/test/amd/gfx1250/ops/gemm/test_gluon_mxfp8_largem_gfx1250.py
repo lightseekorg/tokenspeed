@@ -88,6 +88,20 @@ def test_mxfp8_largem_matches_dequantized_reference(m: int, n: int, k: int) -> N
     )
 
 
+@pytest.mark.parametrize("m", [17, 96, 848, 2048])
+@pytest.mark.parametrize("n,k", [(4096, 512), (2048, 288)])
+def test_mxfp8_largem_single_k_tile_matches_dequantized_reference(
+    m: int, n: int, k: int
+) -> None:
+    operands = _operands(m, n, k, seed=m + n + k)
+    torch.testing.assert_close(
+        _run(*operands).float(),
+        _reference(*operands),
+        atol=_BF16_ATOL,
+        rtol=_BF16_RTOL,
+    )
+
+
 @pytest.mark.parametrize("m", [24, 96, 4096])
 def test_mxfp8_largem_cuda_graph_replay(m: int) -> None:
     n, k = 1792, 5120

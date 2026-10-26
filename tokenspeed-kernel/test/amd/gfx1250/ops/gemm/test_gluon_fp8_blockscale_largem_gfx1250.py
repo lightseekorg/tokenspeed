@@ -71,7 +71,7 @@ def _assert_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
     )
 
 
-@pytest.mark.parametrize("m", [65, 96, 128, 129, 848, 2048, 8192])
+@pytest.mark.parametrize("m", [16, 65, 96, 128, 129, 848, 2048, 8192])
 @pytest.mark.parametrize(
     "n,k",
     [
@@ -124,7 +124,7 @@ def test_fp8_blockscale_largem_varying_rows_reuse_compiled_kernels() -> None:
 
     for m in (65, 96, 128, 512, 1024, 2048, 4096, 6000):
         run(m)
-    with assert_no_triton_compile(largem_mod.gluon_mm_fp8_blockscale_largem_gfx1250):
+    with assert_no_triton_compile(largem_mod.gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250):
         for m in (72, 112, 200, 848, 1000, 3000, 8192):
             run(m)
 
