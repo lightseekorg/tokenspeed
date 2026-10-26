@@ -20,18 +20,18 @@
 
 //! The client against fake engines over real ZMQ sockets.
 
-mod common;
-
 use std::time::Duration;
 
-use common::{ipc_address, start, FakeEngine};
+use bytes::Bytes;
 use ts_client::{
-    ClientConfig, ClientListener, EngineClient, Error, LoadBalance, OutputChunk, RequestStream,
-    Routing, StreamError,
+    fake::{self, ipc_address, FakeEncodeIntake, FakeEngine, Row, ServingFake},
+    ClientConfig, ClientListener, EncodeClient, EncodeConfig, EngineClient, EngineLoad, Error,
+    LoadBalance, OutputChunk, RequestStream, Routing, StreamError,
 };
 use ts_wire::{
     control::{FlushCacheReqInput, IsSchedulerPausedReqInput},
-    ControlOutput, ControlRequest, EngineRequest, SamplingParams, TokenizedGenerateReqInput,
+    ControlOutput, ControlRequest, Dict, EncodeRequest, EngineOutput, EngineRequest, Modality,
+    MultimodalDataItem, SamplingParams, Tensor, TokenizedGenerateReqInput,
 };
 
 fn config(handshake_address: &str, num_engines: u16, routing: Routing) -> ClientConfig {
@@ -47,7 +47,17 @@ fn config(handshake_address: &str, num_engines: u16, routing: Routing) -> Client
     }
 }
 
-async fn connect(num_engines: u16, routing: Routing) -> (EngineClient, Vec<FakeEngine>) {
+/// A serving fake engine `index` of `num_engines`, dialing before the
+/// client's handshake completes.
+fn start(handshake_address: &str, index: u16, dp_rank: i64, dp_size: i64) -> ServingFake {
+    fake::spawn_serving(
+        handshake_address,
+        index,
+        FakeEngine::ready_response(dp_rank, dp_size),
+    )
+}
+
+async fn connect(num_engines: u16, routing: Routing) -> (EngineClient, Vec<ServingFake>) {
     let handshake_address = ipc_address("handshake");
     let client = tokio::spawn(EngineClient::connect(config(
         &handshake_address,
@@ -231,11 +241,11 @@ async fn dropping_a_stream_aborts_the_request() {
     next(&mut stream).await.unwrap().unwrap();
     drop(stream);
     assert!(matches!(
-        engines[0].next_received().await,
+        engines[0].next_received().await.unwrap(),
         EngineRequest::Add(_)
     ));
     assert_eq!(
-        engines[0].next_received().await,
+        engines[0].next_received().await.unwrap(),
         EngineRequest::Abort(vec!["r1".to_owned()])
     );
     assert_eq!(client.in_flight(), [0]);
@@ -357,7 +367,7 @@ async fn a_control_operation_gathers_every_engines_reply() {
     // Every engine got the operation.
     for engine in &mut engines {
         assert_eq!(
-            engine.next_received().await,
+            engine.next_received().await.unwrap(),
             EngineRequest::Control(Box::new(flush.clone()))
         );
     }
@@ -385,5 +395,157 @@ async fn a_control_operation_fails_when_an_engine_dies() {
     assert!(matches!(
         client.control(flush).await,
         Err(Error::Unavailable(StreamError::EngineDead))
+    ));
+}
+
+#[tokio::test]
+async fn a_scripted_fake_answers_what_the_test_sends() {
+    let handshake_address = ipc_address("handshake");
+    let client = tokio::spawn(EngineClient::connect(config(
+        &handshake_address,
+        1,
+        Routing::Aggregated(LoadBalance::RoundRobin),
+    )));
+    let mut engine = FakeEngine::connect(&handshake_address, 0, FakeEngine::ready_response(0, 1))
+        .await
+        .unwrap();
+    let client = client.await.unwrap().unwrap();
+    assert_eq!(engine.index(), 0);
+    assert_eq!(engine.init().addresses.inputs.len(), 1);
+
+    let mut stream = client.generate(request("r1", Some(2))).await.unwrap();
+    let EngineRequest::Add(received) = engine.recv().await.unwrap() else {
+        panic!("expected the ADD");
+    };
+    assert_eq!(received.input_ids, Some(vec![1, 2, 3]));
+    let load = EngineLoad {
+        num_running: 1,
+        num_waiting: 0,
+        kv_active_pages: 3,
+        kv_total_pages: 8,
+    };
+    let rows = vec![Row {
+        rid: "r1",
+        output_ids: vec![7, 8],
+        finish_reason: Some("stop"),
+        prompt_tokens: 3,
+        completion_tokens: 2,
+    }];
+    engine.send_batch(fake::batch(0, rows, load)).await.unwrap();
+    let chunk = next(&mut stream).await.unwrap().unwrap();
+    assert_eq!(chunk.output_ids, [7, 8]);
+    assert_eq!(chunk.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(client.loads(), [load]);
+
+    // A scripted control reply: the operation completes once the test
+    // answers it; then the shutdown sentinel.
+    let mut flush = std::pin::pin!(client.control(ControlRequest::FlushCache(
+        FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        }
+    )));
+    let received = tokio::select! {
+        received = engine.recv() => received.unwrap(),
+        _ = &mut flush => panic!("a control operation completed before its reply"),
+    };
+    assert!(matches!(received, EngineRequest::Control(_)));
+    engine
+        .send(&EngineOutput::Control(Box::new(ControlOutput::FlushCache(
+            ts_wire::control::FlushCacheReqOutput {
+                rid: None,
+                http_worker_ipc: None,
+                success: true,
+            },
+        ))))
+        .await
+        .unwrap();
+    let replies = flush.await.unwrap();
+    assert!(matches!(
+        replies.as_slice(),
+        [ControlOutput::FlushCache(reply)] if reply.success
+    ));
+
+    // The sentinel ends a waiting stream, and the client takes nothing more.
+    let mut waiting = client.generate(request("r2", None)).await.unwrap();
+    assert!(matches!(
+        engine.recv().await.unwrap(),
+        EngineRequest::Add(_)
+    ));
+    engine.shut_down().await.unwrap();
+    assert_eq!(next(&mut waiting).await, Some(Err(StreamError::EngineDead)));
+    assert!(matches!(
+        client.generate(request("r3", Some(1))).await,
+        Err(Error::Unavailable(StreamError::EngineDead))
+    ));
+}
+
+fn encode_request(request_id: &str, feature_bytes: usize) -> EncodeRequest {
+    EncodeRequest {
+        rid: None,
+        http_worker_ipc: None,
+        request_id: request_id.to_owned(),
+        bootstrap_host: "10.0.0.5".to_owned(),
+        bootstrap_port: 9001,
+        bootstrap_room: 42,
+        items: vec![MultimodalDataItem {
+            modality: Modality::Image,
+            hash: Some(7),
+            pad_value: Some(151700),
+            offsets: Some(vec![(3, 66)]),
+            feature: Some(Tensor {
+                dtype: "uint8".to_owned(),
+                shape: vec![feature_bytes as i64],
+                data: Bytes::from(vec![9u8; feature_bytes]),
+            }),
+            feature_shm: None,
+            model_specific_data: Dict::default(),
+            encoded: None,
+            encoded_deepstack: None,
+            encode_handshake: None,
+        }],
+    }
+}
+
+#[tokio::test]
+async fn encode_requests_reach_the_intake() {
+    let mut intake = FakeEncodeIntake::bind("tcp://127.0.0.1:0").await.unwrap();
+    let client = EncodeClient::connect(EncodeConfig {
+        intake_address: intake.endpoint().to_owned(),
+        send_timeout: Duration::from_secs(5),
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.intake_address(), intake.endpoint());
+
+    // A small feature rides inline, a large one as its own frame; the intake
+    // decodes both to the request as submitted.
+    for (request_id, feature_bytes) in [("e-inline", 16), ("e-aux", 4096)] {
+        let request = encode_request(request_id, feature_bytes);
+        client.submit(request.clone()).await.unwrap();
+        assert_eq!(intake.recv().await.unwrap(), request);
+    }
+}
+
+#[tokio::test]
+async fn an_encode_request_carries_one_item() {
+    let intake = FakeEncodeIntake::bind("tcp://127.0.0.1:0").await.unwrap();
+    let client = EncodeClient::connect(EncodeConfig {
+        intake_address: intake.endpoint().to_owned(),
+        send_timeout: Duration::from_secs(5),
+    })
+    .await
+    .unwrap();
+    let mut two_items = encode_request("e-2", 16);
+    two_items.items.push(two_items.items[0].clone());
+    assert!(matches!(
+        client.submit(two_items).await,
+        Err(Error::InvalidRequest(message)) if message.contains("one item")
+    ));
+    let mut no_item = encode_request("e-0", 16);
+    no_item.items.clear();
+    assert!(matches!(
+        client.submit(no_item).await,
+        Err(Error::InvalidRequest(_))
     ));
 }

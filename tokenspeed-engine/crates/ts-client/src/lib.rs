@@ -27,6 +27,12 @@
 //! matches stop strings itself. The engine refuses requests that carry stop
 //! strings on this wire; send stop token ids.
 //!
+//! With prefill/decode disaggregation and separate encode nodes, the frontend
+//! also pushes each request's media to an encode node through
+//! [`EncodeClient`]; that link has no handshake and no reply. The
+//! `fake-engine` feature adds [`fake`], a stand-in engine and encode intake
+//! for a frontend's tests.
+//!
 //! ```no_run
 //! # async fn run() -> ts_client::Result<()> {
 //! use std::time::Duration;
@@ -62,10 +68,14 @@
 
 mod client;
 mod config;
+mod encode;
 mod error;
+#[cfg(feature = "fake-engine")]
+pub mod fake;
 mod handshake;
 
 pub use client::{ClientListener, EngineClient, EngineLoad, OutputChunk, RequestStream};
 pub use config::{ClientConfig, LoadBalance, Routing};
+pub use encode::{EncodeClient, EncodeConfig};
 pub use error::{Error, Result, StreamError};
 pub use handshake::EngineInfo;

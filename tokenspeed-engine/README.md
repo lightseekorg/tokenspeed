@@ -9,7 +9,7 @@ embeds CPython for the data plane. The design rules of the loop are in
 | Source crate | Published package | Role |
 | --- | --- | --- |
 | `ts-wire` | `tokenspeed-wire` | The engine IPC schema and its msgpack codec, byte-compatible with the Python structs in `python/tokenspeed/runtime/engine/io_struct.py` and `zmq_wire.py`. |
-| `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts and control operations. |
+| `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts and control operations; the push link to an encode node's request intake; with the `fake-engine` feature, a stand-in engine and encode intake for a frontend's tests. |
 | `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for the Python frontend (`AsyncLLM`, under the `Engine` API and the gRPC servicer), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
 | `ts-collective` | `tokenspeed-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
 | `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. |

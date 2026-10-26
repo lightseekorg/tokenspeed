@@ -61,6 +61,12 @@ pub enum Error {
     /// The engines are gone; see [`StreamError`] for why.
     #[error("engines unavailable: {0}")]
     Unavailable(StreamError),
+    /// An encode node's intake did not accept the message in time.
+    #[error("sending to the encode intake timed out after {timeout:?}")]
+    IntakeSendTimeout {
+        /// The configured send timeout.
+        timeout: Duration,
+    },
 }
 
 /// Why a request's output stream ended without a finished output.

@@ -19,8 +19,15 @@ tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 tracing = "0.1"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
 
+[features]
+# `ts_client::fake`: a stand-in engine and encode intake for a frontend's
+# tests. Test support only; it adds no dependency.
+fake-engine = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# The crate's own tests run against its fake engine.
+ts-client = { package = "tokenspeed-client", path = ".", features = ["fake-engine"] }
 
 [[example]]
 name = "generate"
