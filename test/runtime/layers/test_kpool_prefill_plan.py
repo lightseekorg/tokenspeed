@@ -18,11 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Building the KPool prefill plan neither waits on the stream nor recompiles
-the kernels reading it.
+"""Behavior of the KPool prefill plan, seen through what it drives.
 
 The plan is built at the first sparse layer, behind the forward's queued GPU
-work, so a synchronizing upload would stall the forward thread there.
+work, so a synchronizing upload would stall the forward thread there. Triton
+keys pointer arguments on 16-byte alignment, so plan arrays whose alignment
+moved with the batch shape would recompile the kernels reading them.
 """
 
 from __future__ import annotations
@@ -50,6 +51,16 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 KPOOL = 4
 TAIL_ROWS = 6
 HEAD_DIM = 128
+# (prefix lengths, extend lengths) per batch: unaligned prefixes, chunks that
+# complete no pool, and batch sizes that move every array's upload offset.
+BATCHES = (
+    ([0, 0], [7, 9]),
+    ([1, 2, 3], [5, 6, 7]),
+    ([0], [3]),
+    ([2, 5, 1, 0, 3], [9, 2, 7, 1, 6]),
+    ([3, 1], [13, 22]),
+    ([0, 1, 2, 3, 0, 1, 2], [1, 2, 3, 5, 6, 7, 9]),
+)
 
 
 def _plan(starts, lengths, token_capacity=None):
@@ -64,6 +75,50 @@ def _plan(starts, lengths, token_capacity=None):
         tail_rows_per_request=TAIL_ROWS,
         token_capacity=token_capacity,
     )
+
+
+def _tails() -> tuple[torch.Tensor, torch.Tensor]:
+    tail_k = torch.zeros(8, TAIL_ROWS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    return tail_k, torch.zeros_like(tail_k)
+
+
+def _write_tails(tail_k, tail_gate, starts, lengths) -> torch.Tensor:
+    """Write one prefill chunk per request into the tails; return its keys."""
+    write = _plan(starts, lengths).write
+    key = torch.randn(sum(lengths), HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    kpool_prefill_tail_write(
+        key,
+        key,
+        tail_k,
+        tail_gate,
+        write.tail_chunk_src,
+        write.tail_slots,
+        write.tail_dst_positions,
+        write.tail_write_counts,
+        pool_size=KPOOL,
+    )
+    return key
+
+
+def test_prefill_leaves_the_incomplete_pool_in_the_tail() -> None:
+    """Tokens past a request's last complete pool land in its tail ring."""
+    tail_k, tail_gate = _tails()
+    for starts, lengths in BATCHES:
+        key = _write_tails(tail_k, tail_gate, starts, lengths)
+        offset = 0
+        for slot, (start, length) in enumerate(zip(starts, lengths)):
+            end = start + length
+            for position in range(max(start, end // KPOOL * KPOOL), end):
+                assert torch.equal(
+                    tail_k[slot, position % TAIL_ROWS],
+                    key[offset + position - start],
+                ), (starts, lengths, slot, position)
+            offset += length
+
+
+def test_plan_rejects_capacity_below_the_tokens() -> None:
+    with pytest.raises(ValueError, match="capacity is smaller"):
+        _plan([0], [9], token_capacity=8)
 
 
 def test_plan_builds_without_synchronizing() -> None:
@@ -85,35 +140,12 @@ def serving(monkeypatch):
 
 
 def test_batch_shapes_do_not_recompile_the_tail_write(serving) -> None:
-    """Triton keys pointer arguments on 16-byte alignment, so plan arrays whose
-    alignment moved with the batch shape would recompile while serving."""
-    tail_k = torch.zeros(8, TAIL_ROWS, HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    tail_gate = torch.zeros_like(tail_k)
-
-    def run(starts, lengths):
-        write = _plan(starts, lengths).write
-        key = torch.randn(sum(lengths), HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-        kpool_prefill_tail_write(
-            key,
-            key,
-            tail_k,
-            tail_gate,
-            write.tail_chunk_src,
-            write.tail_slots,
-            write.tail_dst_positions,
-            write.tail_write_counts,
-            pool_size=KPOOL,
-        )
-
-    run([0, 0], [7, 9])
+    """Plans of different batch shapes reuse one tail-write binary."""
+    tail_k, tail_gate = _tails()
+    first, *rest = BATCHES
+    _write_tails(tail_k, tail_gate, *first)
     compile_monitor.mark_serving()
-    for starts, lengths in (
-        ([1, 2, 3], [5, 6, 7]),
-        ([0], [3]),
-        ([2, 5, 1, 0, 3], [9, 2, 7, 1, 6]),
-        ([3, 1], [13, 22]),
-        ([0, 1, 2, 3, 0, 1, 2], [1, 2, 3, 5, 6, 7, 9]),
-    ):
-        run(starts, lengths)
+    for starts, lengths in rest:
+        _write_tails(tail_k, tail_gate, starts, lengths)
     torch.cuda.synchronize()
     assert compile_monitor.compile_stats().serving_compiles == 0

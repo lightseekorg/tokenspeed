@@ -93,7 +93,10 @@ class KPoolPrefillTopK:
 
 
 def _segment_offsets(counts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Owner index and index within the owner for ``counts[i]`` rows of each owner."""
+    """Return each row's owner and its index within that owner.
+
+    Owner ``i`` has ``counts[i]`` consecutive rows.
+    """
     owners = torch.repeat_interleave(torch.arange(counts.numel()), counts)
     first_rows = counts.cumsum(0) - counts
     return owners, torch.arange(owners.numel()) - first_rows[owners]
