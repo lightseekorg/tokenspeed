@@ -129,7 +129,7 @@ def cutedsl_kda_nvidia_paged_prefill(**kwargs) -> KdaPrefillResult:
             kwargs["dt_bias"].reshape(q.shape[2], 128).contiguous(),
             beta,
             kwargs["cu_seqlens"].to(torch.int64),
-            kwargs["initial_state"].contiguous(),
+            kwargs["initial_state"].float().contiguous(),
             token_capacity=capacity.token_capacity,
             cu_chunks=chunks,
             chunk_to_seq=chunk_rows,
@@ -178,7 +178,7 @@ def cutedsl_kda_chunk_prefill(
         beta: Raw beta logits ``[B, T, HV]``; sigmoid is applied in-kernel.
         A_log: Per-head FP32 decay parameter ``[HV]``.
         dt_bias: FP32 gate bias with ``HV * K`` elements.
-        initial_state: Optional FP32 recurrent state per packed sequence in
+        initial_state: Optional BF16 or FP32 stored state, accumulated in FP32, per sequence in
             the native ``[N, HV, V, K]`` convention; ``None`` starts from
             zero.
         cu_seqlens: Cumulative sequence boundaries ``[N + 1]`` (``B`` must
@@ -254,7 +254,7 @@ def cutedsl_kda_chunk_prefill(
     # The dispatch layout trait already matches the native [N, HV, V, K]
     # ABI. A second transpose here would undo the dispatcher's conversion.
     if initial_state is not None:
-        state_in = initial_state.contiguous()
+        state_in = initial_state.float().contiguous()
     else:
         state_in = torch.zeros(
             num_sequences,

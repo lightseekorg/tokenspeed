@@ -403,6 +403,10 @@ class KdaAttnBackend(CapacityPrefillBackend):
                     layer_gate.stride(0),
                 ) != strides:
                     raise RuntimeError("batched KDA replay requires uniform strides")
+                if layer_state.dtype != first_state.dtype:
+                    raise RuntimeError(
+                        "batched KDA replay requires uniform state dtype"
+                    )
                 lower_bounds.add(layer_weights[-1])
             if len(lower_bounds) != 1:
                 raise RuntimeError("batched KDA replay requires one lower bound")
@@ -429,6 +433,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         f_a_stride=strides[2],
                         beta_stride=strides[3],
                         state_stride=strides[4],
+                        state_dtype=first_state.dtype,
                         gate_stride=strides[5],
                         conv_width=conv_width,
                         lower_bound=next(iter(lower_bounds)),

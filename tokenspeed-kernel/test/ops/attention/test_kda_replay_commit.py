@@ -138,6 +138,7 @@ def _batched_static_args(x):
         f_a_stride=x["f_a"].stride(0),
         beta_stride=x["beta"].stride(0),
         state_stride=x["h_pool"].stride(0),
+        state_dtype=x["h_pool"].dtype,
         gate_stride=x["gate_scratch"].stride(0),
         conv_width=x["conv_w"].shape[1],
         lower_bound=LOWER_BOUND,
@@ -198,10 +199,13 @@ def test_batched_conv_window_is_independent_of_its_column_block(block):
         torch.testing.assert_close(narrow, wide, atol=0, rtol=0)
 
 
-def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_batched_replay_matches_layer_loop_and_checks_descriptors(state_dtype):
     """One launch matches the layer loop; a wrong descriptor must be detected."""
     layers, n, t = 5, 5, 4
     source = [_window(n, t, seed=100 + layer) for layer in range(layers)]
+    for layer in source:
+        layer["h_pool"] = layer["h_pool"].to(state_dtype)
     loop = []
     writes = torch.stack(
         [
@@ -257,7 +261,12 @@ def test_batched_replay_is_bit_identical_and_descriptor_sensitive():
             actual["conv_pool"], expected["conv_pool"], atol=0, rtol=0
         )
         torch.testing.assert_close(
-            actual["h_pool"], expected["h_pool"], atol=1e-6, rtol=0
+            actual["h_pool"],
+            expected["h_pool"],
+            atol=1e-6,
+            rtol=(
+                torch.finfo(torch.bfloat16).eps if state_dtype == torch.bfloat16 else 0
+            ),
         )
 
     negative = [

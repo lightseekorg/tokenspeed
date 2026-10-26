@@ -334,3 +334,39 @@ def test_token_limit_retains_kda_working_set(limit, kvp_size):
     assert recipe.parents_needed(layout, limit) > (
         limit // (recipe._max_packing(layout) * layout.prefix_granularity)
     )
+
+
+@pytest.mark.parametrize("tp_size", [1, 8, 16])
+def test_kda_storage_dtype_changes_state_bytes_without_changing_mla(tp_size):
+    from test.runtime.conftest import kimi_recipe
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    layouts = {}
+    for dtype in ("float32", "bfloat16"):
+        recipe = kimi_recipe(tp_size=tp_size)
+        recipe.server_args.mamba_ssm_dtype = dtype
+        groups = recipe.groups()
+        layout = pack(
+            groups,
+            prefix_granularity=recipe.prefix_granularity,
+            cache_blocks_per_lcm_block=recipe.packing(groups),
+            alignment=recipe.alignment,
+            max_padding_fraction=recipe.max_padding_fraction,
+        )
+        recipe.check_layout(layout)
+        layouts[dtype] = layout.bind(7)
+    fp32 = {f.field_id: f for f in layouts["float32"].fields}
+    bf16 = {f.field_id: f for f in layouts["bfloat16"].fields}
+    for name, field in fp32.items():
+        other = bf16[name]
+        assert other.shape == field.shape
+        if name.endswith(".recurrent_state"):
+            assert other.dtype == "bfloat16"
+            assert other.payload_bytes * 2 == field.payload_bytes
+        else:
+            assert other.dtype == field.dtype
+            assert other.payload_bytes == field.payload_bytes
+        if name.endswith(".latent_kv"):
+            assert other.page_stride_bytes == field.page_stride_bytes
+    assert layouts["bfloat16"].lcm_block_bytes < layouts["float32"].lcm_block_bytes

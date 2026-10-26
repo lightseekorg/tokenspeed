@@ -131,7 +131,7 @@ def flash_kda_chunk_prefill(
         boundaries = None
     # FLA-native [N, HV, K, V] -> FlashKDA [N, HV, V, K].
     state_in = (
-        initial_state.transpose(-1, -2).contiguous()
+        initial_state.float().transpose(-1, -2).contiguous()
         if initial_state is not None
         else None
     )

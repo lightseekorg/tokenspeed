@@ -261,7 +261,11 @@ class KimiK3Recipe(CacheRecipe):
                 f"layer.{layer_id}.recurrent_state",
                 plane_id,
                 recurrent_shape,
-                cache_dtype_name(torch.float32),
+                cache_dtype_name(
+                    {"float32": torch.float32, "bfloat16": torch.bfloat16}[
+                        self.server_args.mamba_ssm_dtype
+                    ]
+                ),
                 exact_page_stride=False,
             ),
         )

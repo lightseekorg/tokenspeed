@@ -271,3 +271,31 @@ def test_native_prefill_cuda_graph_replay(native_cuda):
         graph.replay()
         assert torch.equal(actual.out, expected_out)
         assert torch.equal(actual.final_state, expected_state)
+
+
+@pytest.mark.parametrize("capacity", [False, True])
+def test_bf16_checkpoint_is_read_as_bf16_and_accumulated_in_fp32(native_cuda, capacity):
+    inputs, state, bounds, cpu = _inputs("cuda", [128, 128])
+    stored = state.to(torch.bfloat16)
+    original = stored.clone()
+    results = []
+    for initial in (stored, stored.float()):
+        results.append(
+            kda_paged_prefill(
+                *inputs,
+                initial_state=initial,
+                cu_seqlens=bounds,
+                cu_seqlens_cpu=cpu,
+                capacity=KdaPrefillCapacity(256, 2) if capacity else None,
+                lower_bound=-5.0,
+                override=None,
+                solution="cutedsl_kda",
+                recurrent_layout="v_major",
+            )
+        )
+    torch.testing.assert_close(results[0].out, results[1].out, rtol=0, atol=0)
+    torch.testing.assert_close(
+        results[0].final_state, results[1].final_state, rtol=0, atol=0
+    )
+    assert results[0].final_state.dtype == torch.float32
+    torch.testing.assert_close(stored, original, rtol=0, atol=0)

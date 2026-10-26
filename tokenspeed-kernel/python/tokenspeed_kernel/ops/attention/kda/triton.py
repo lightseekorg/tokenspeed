@@ -589,6 +589,7 @@ def triton_nvidia_kda_batched_replay_commit(
     f_a_stride: int,
     beta_stride: int,
     state_stride: int,
+    state_dtype: torch.dtype,
     gate_stride: int,
     conv_width: int,
     lower_bound: float,
@@ -610,6 +611,7 @@ def triton_nvidia_kda_batched_replay_commit(
         f_a_stride: Token stride of the low-rank gate payload.
         beta_stride: Token stride of beta.
         state_stride: Page stride of the recurrent state.
+        state_dtype: Storage dtype of every recurrent-state descriptor.
         gate_stride: Token stride of the gate scratch tensor.
         conv_width: Width of the depthwise convolution kernel.
         lower_bound: Lower bound used by the KDA decay gate.
@@ -636,6 +638,7 @@ def triton_nvidia_kda_batched_replay_commit(
         f_a_stride=f_a_stride,
         beta_stride=beta_stride,
         state_stride=state_stride,
+        state_dtype=state_dtype,
         gate_stride=gate_stride,
         conv_width=conv_width,
         lower_bound=lower_bound,

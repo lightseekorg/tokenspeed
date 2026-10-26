@@ -2197,6 +2197,7 @@ def batched_recurrent_kda_replay_commit_kernel(
     STRIDE_CONV: tl.constexpr,
     STRIDE_BETA: tl.constexpr,
     STRIDE_STATE: tl.constexpr,
+    STATE_DTYPE: tl.constexpr,
     STRIDE_GATE: tl.constexpr,
     CONV_WIDTH: tl.constexpr,
     HV: tl.constexpr,
@@ -2213,7 +2214,7 @@ def batched_recurrent_kda_replay_commit_kernel(
     conv_w = tl.load(addresses + ab + 1).to(tl.pointer_type(tl.bfloat16))
     conv_pool = tl.load(addresses + ab + 2).to(tl.pointer_type(tl.bfloat16))
     beta = tl.load(addresses + ab + 5).to(tl.pointer_type(tl.bfloat16))
-    state = tl.load(addresses + ab + 8).to(tl.pointer_type(tl.float32))
+    state = tl.load(addresses + ab + 8).to(tl.pointer_type(STATE_DTYPE))
     gate_scratch = tl.load(addresses + ab + 9).to(tl.pointer_type(tl.float32))
     group = tl.load(group_indices + i_l).to(tl.int64)
 
@@ -2396,11 +2397,14 @@ def batched_recurrent_kda_replay_commit(
     f_a_stride: int,
     beta_stride: int,
     state_stride: int,
+    state_dtype: torch.dtype,
     gate_stride: int,
     conv_width: int,
     lower_bound: float,
 ) -> None:
     """Commit descriptor-table KDA layers using an explicit cache-group map."""
+    if state_dtype not in (torch.float32, torch.bfloat16):
+        raise ValueError("KDA replay requires FP32 or BF16 stored state")
     if head_dim != 128:
         raise ValueError("batched KDA replay currently requires head_dim=128")
     layers = addresses.shape[0]
@@ -2458,6 +2462,7 @@ def batched_recurrent_kda_replay_commit(
         STRIDE_CONV=conv_stride,
         STRIDE_BETA=beta_stride,
         STRIDE_STATE=state_stride,
+        STATE_DTYPE=tl.float32 if state_dtype == torch.float32 else tl.bfloat16,
         STRIDE_GATE=gate_stride,
         CONV_WIDTH=conv_width,
         HV=num_heads,

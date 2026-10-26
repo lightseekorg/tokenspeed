@@ -1984,3 +1984,17 @@ KVStore disabled, using the target router directly. Local offloaded prefill
 and mixed-arena sleep/wake are unsupported. Eager and CUDA-graph decode
 use the same batch, access, and accepted-writeback hooks; execution details are
 in `unified_path.md`, "Sparse KV offloading".
+
+### Kimi-K3 recurrent-state storage precision
+
+`--mamba-ssm-dtype` selects FP32 or BF16 storage for Kimi-K3 KDA states.
+The cache recipe carries that dtype through device/host views, checkpoints,
+packing, and the PD transfer schema. Both serving roles must use matching
+field dtypes. MLA and convolution storage are unchanged.
+
+NVIDIA KDA arithmetic remains FP32: prefill adapters widen stored checkpoints
+for native FP32 scan kernels, while decode and replay widen state loads and
+round only when publishing the accepted state. Pointer-table replay receives
+its storage dtype explicitly. Gluon batched replay currently requires FP32
+state. BF16 changes numerical precision and needs model-level accuracy
+validation; it is not a lossless cache compression.
