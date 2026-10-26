@@ -515,6 +515,8 @@ def causal_conv1d_update(
     validate_data=False,
     *,
     parent_indices: torch.Tensor | None,
+    out: torch.Tensor | None = None,
+    replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
     """Select a decode/tree convolution leaf for the supplied state indices."""
     kernel = select_kernel(
@@ -541,4 +543,6 @@ def causal_conv1d_update(
         pad_slot_id=pad_slot_id,
         validate_data=validate_data,
         parent_indices=parent_indices,
+        out=out,
+        replay_payload=replay_payload,
     )
