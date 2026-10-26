@@ -11,6 +11,11 @@ On CDNA4, ordinary GEMM dispatch admits the measured single-row
 Callers that publish directly into a collective buffer pass that buffer as
 `out` to the same `mv` operation.
 
+On SM107, FlashInfer's TGV/CuTe DSL search supports BF16 output projections
+with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
+The kernels accumulate in FP32 and return BF16; reduction order can change
+rounding relative to the original GEMM.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output
