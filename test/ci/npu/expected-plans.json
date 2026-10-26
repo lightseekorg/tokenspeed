@@ -1,5 +1,5 @@
 {
-  "manifest_sha256": "96b4a6357c9264f072140319c8eecf08b1b000c45f14df6114543b67c5eb2287",
+  "manifest_sha256": "ec3b8d4a2d5a0ebb86a2888f270a8675c11b0bfd16038e8791350d69cf091aae",
   "operators": {
     "scatter": {
       "accuracy": [
@@ -1035,7 +1035,7 @@
   },
   "schema_version": 2,
   "source_sha256": {
-    "ci/npu_ops_test/tests/scatter-test.py": "0e6f760f185dbfe5380cfa55fe55828bdef94984e7bd1cb585a201ed9ed3e19a",
-    "ci/npu_ops_test/tests/virtual_slots_to_local-test.py": "5b3065251e71235afa046de3cba8a30ff23a677c904dea0f632b730583cea4ed"
+    "test/ci/npu/tests/scatter-test.py": "0e6f760f185dbfe5380cfa55fe55828bdef94984e7bd1cb585a201ed9ed3e19a",
+    "test/ci/npu/tests/virtual_slots_to_local-test.py": "5b3065251e71235afa046de3cba8a30ff23a677c904dea0f632b730583cea4ed"
   }
 }

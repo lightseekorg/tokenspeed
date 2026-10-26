@@ -187,7 +187,7 @@ def rust_host_refusals(server_args: ServerArgs) -> list[str]:
     """What in ``server_args`` the Rust host cannot serve yet, empty when
     it can serve all of it."""
     refusals = []
-    # An EPD encode server starts its ranks itself (``_launch_encode_server``):
+    # An EPD encode server starts its ranks itself (``_start_encode_ranks``):
     # they take encode requests, not the engine wire.
     if server_args.disaggregation_mode not in ("null", "prefill", "decode"):
         refusals.append(f"--disaggregation-mode {server_args.disaggregation_mode}")

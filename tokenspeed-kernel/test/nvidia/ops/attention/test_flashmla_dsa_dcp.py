@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 import torch
 from tokenspeed_kernel.ops.attention.dsa import (
@@ -400,3 +402,100 @@ def test_deep_gemm_facade_selects_with_original_empty_lengths(monkeypatch, deep_
     )
     assert (logical[1:] == -1).all()
     assert torch.isneginf(values[1:]).all()
+
+
+@pytest.mark.skipif(
+    not (platform.is_nvidia and platform.is_hopper_plus),
+    reason="FlashMLA query padding requires Hopper+ NVIDIA GPUs",
+)
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_flashmla_query_padding_lifetime(phase):
+    from tokenspeed_kernel.ops.attention.dsa.cuda import (
+        _pad_decode_query,
+        _pad_prefill_query,
+    )
+
+    def pad(q):
+        return (
+            _pad_prefill_query(q)[0]
+            if phase == "prefill"
+            else _pad_decode_query(q, 1)[0].flatten(0, 1)
+        )
+
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    for length in range(31, 63):
+        q = torch.full((length, 4, 576), 1.25, device="cuda", dtype=torch.bfloat16)
+        padded = pad(q)
+        torch.testing.assert_close(padded[:, :4], q, atol=0, rtol=0)
+        assert not padded[:, 4:].any()
+        del q, padded
+    torch.cuda.synchronize()
+    # Check live allocations, not reusable allocator reservations.
+    assert torch.cuda.memory_allocated() <= baseline + 1024**2
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+
+    def enqueue(index):
+        with torch.cuda.stream(streams[index]):
+            q = torch.full((7, 4, 576), index + 1, device="cuda", dtype=torch.bfloat16)
+            return pad(q)
+
+    # Hold both results alive: calls with identical shapes must not alias.
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outputs = list(executor.map(enqueue, range(2)))
+    for stream in streams:
+        stream.synchronize()
+    for index, output in enumerate(outputs):
+        assert (output[:, :4] == index + 1).all()
+        assert not output[:, 4:].any()
+
+
+@pytest.mark.skipif(
+    not (platform.is_nvidia and platform.is_hopper_plus),
+    reason="FlashMLA query padding requires Hopper+ NVIDIA GPUs",
+)
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_flashmla_query_padding_independent_graphs(phase):
+    from tokenspeed_kernel.ops.attention.dsa.cuda import (
+        _pad_decode_query,
+        _pad_prefill_query,
+    )
+
+    def pad(q):
+        return (
+            _pad_prefill_query(q)[0]
+            if phase == "prefill"
+            else _pad_decode_query(q, 3)[0].flatten(0, 1)
+        )
+
+    inputs = [
+        torch.full((6, 4, 576), i + 1, device="cuda", dtype=torch.bfloat16)
+        for i in range(2)
+    ]
+    # Warmup must not cause captures to share eager storage.
+    for q in inputs:
+        pad(q)
+    torch.cuda.synchronize()
+    graphs, outputs = [], []
+    for q in inputs:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = pad(q)
+        graphs.append(graph)
+        outputs.append(output)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for iteration in range(3):
+        for i, q in enumerate(inputs):
+            q.fill_(10 * iteration + i + 1)
+        torch.cuda.synchronize()
+        for graph, stream in zip(graphs, streams, strict=True):
+            with torch.cuda.stream(stream):
+                graph.replay()
+        # Exercise the same eager shape while both graphs remain live.
+        eager = pad(torch.full_like(inputs[0], -1))
+        torch.cuda.synchronize()
+        for q, output in zip(inputs, outputs, strict=True):
+            torch.testing.assert_close(output[:, :4], q, atol=0, rtol=0)
+            assert not output[:, 4:].any()
+        assert (eager[:, :4] == -1).all()

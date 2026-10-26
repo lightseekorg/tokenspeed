@@ -147,9 +147,12 @@ if gemm_fp8_nt_groupwise is not error_fn:
             "n_align": frozenset({128}),
             "k_align": frozenset({128}),
             "mnk_problem_filter": frozenset({_supports_flashinfer_fp8_blockscale}),
+            "a_contiguous": frozenset({True}),
+            "b_contiguous": frozenset({True}),
             "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+            "operands_aligned_16": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED + 2,
     )
     def flashinfer_mm_fp8_blockscale(
         A: torch.Tensor,
@@ -188,6 +191,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
             out is not None
             and out.is_contiguous()
             and out.shape == (orig_m, B.shape[0])
+            and out.data_ptr() % 16 == 0
         )
         output = gemm_fp8_nt_groupwise(
             A,

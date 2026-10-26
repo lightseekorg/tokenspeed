@@ -697,20 +697,52 @@ def mm(
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
+    # Supported online FP32/UE8M0 quantizers materialize contiguous FP8 operands.
+    # Describe the layout seen by GEMM, not the original dense activation view.
+    online_contiguous_a = (
+        quant == "mxfp8"
+        and A_scales is None
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and B_scales is not None
+        and block_size is not None
+        and (
+            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
+            or (
+                B_scales.dtype == torch.uint8
+                and block_size[1] == 32
+                and A.stride(-1) == 1
+            )
+        )
+    )
     traits: dict[str, object] = {
         "m": M,
         "n": N,
         "k": K,
         "b_layout": b_layout,
-        "a_inner_stride_one": A.stride(-1) == 1,
+        "a_contiguous": online_contiguous_a or A.is_contiguous(),
+        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
+        "b_contiguous": B.is_contiguous(),
         "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
         "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
         "block_scale_layout": block_scale_layout,
+        "has_alpha": alpha is not None,
+        "out_contiguous": out is None or out.is_contiguous(),
         "out_dtype": out_dtype,
         "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "pdl_enabled": enable_pdl,
     }
+    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
+        # Contiguous offset views can still violate a backend's pointer alignment.
+        # Online quantization allocates aligned activation values and scales.
+        traits["operands_aligned_16"] = (
+            online_contiguous_a or A.data_ptr() % 16 == 0
+        ) and B.data_ptr() % 16 == 0
+        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
+        traits["scales_aligned_16"] = (
+            A_scales is None or A_scales.data_ptr() % 16 == 0
+        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size

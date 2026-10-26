@@ -1777,6 +1777,10 @@ class ServerArgs:
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
         if self.numerics != "auto":
             self._resolve_rl_bitwise()
+        if self.batch_invariant_collectives:
+            # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
+            self.enable_allreduce_fusion = False
+            self.comm_fusion_max_num_tokens = -1
         # Individual switches that veto a fusion resolve_communication may
         # have auto-enabled, whatever the envelope. CommManager.should_fuse
         # re-derives the veto from the switches, so the fused kernels stay off
@@ -1785,6 +1789,7 @@ class ServerArgs:
             # The fused all-reduce+norm kernels add the residual inside the
             # fusion; the unfused boundary norm needs the bf16 sum first.
             self.enable_allreduce_fusion = False
+            self.comm_fusion_max_num_tokens = -1
         if self.moe_combine_order == "slot":
             # The MoE leaf returns complete rows; a fused all-reduce+norm at
             # the next layer boundary would sum them tp_size times.
@@ -2964,6 +2969,7 @@ class ServerArgs:
             default=ServerArgs.dense_gemm_backend,
             choices=["auto", "trtllm_cutedsl", "deepgemm"],
             help="Backend for standard 128x128 block-FP8 dense linears. "
+            "auto prefers compatible CuTe-DSL on Blackwell at M > 16 GEMM rows. "
             "trtllm_cutedsl requires Blackwell and preserves checkpoint FP8 "
             "weights and FP32 scales without requantization. "
             "deepgemm requires Hopper and preserves FP32 scales. "
@@ -3827,13 +3833,14 @@ class ServerArgs:
             "--batch-invariant-collectives",
             action="store_true",
             help="One association order per reduction, independent of the "
-            "batch: every reduction runs as NCCL data movement plus a "
-            "fixed-rank-order fp32 fold, which for an all-reduce costs "
+            "batch: every reduction is a fixed-rank-order fp32 fold, on the "
+            "trtllm workspace kernels where one is armed, otherwise as data "
+            "movement plus the fold, which for an all-reduce costs "
             "world_size times the traffic. NCCL sums are run-stable but chunk "
             "by message size, and the NVLS in-switch reduction's order moves "
             "with a row's offset in the buffer, so neither is "
-            "batch-invariant. Gathers keep the multicast kernels. Folded in "
-            "by --numerics rl-bitwise.",
+            "batch-invariant. Gathers keep the multicast kernels. Turns off "
+            "the fused all-reduce+norm. Folded in by --numerics rl-bitwise.",
         )
         parser.add_argument(
             "--numerics",

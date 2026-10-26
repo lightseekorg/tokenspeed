@@ -399,7 +399,7 @@ def test_muse_spark_moe_matches_torch_reference(bf16_default_dtype) -> None:
     hidden = torch.randn(5, 256, dtype=torch.bfloat16, device="cuda")
     router_input = hidden.float()
     output, sentinel = module_(
-        hidden, router_input, hidden.shape[0], hidden.shape[0], None
+        hidden, router_input, hidden.shape[0], hidden.shape[0], None, project=True
     )
     assert sentinel is None
 

@@ -63,10 +63,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          python3 -B -m unittest ci.npu_ops_test.test_changes
-          python3 -B ci/npu_ops_test/changes.py \
+          python3 -B -m unittest discover -s test/ci_system/npu -p test_changes.py
+          python3 -B test/ci_system/npu/changes.py \
             --repo-root "$GITHUB_WORKSPACE" \
-            --manifest ci/npu_ops_test/manifest.json \
+            --manifest test/ci/npu/manifest.json \
             --event-name "$GITHUB_EVENT_NAME" \
             --event-path "$GITHUB_EVENT_PATH" \
             --repository "$GITHUB_REPOSITORY" \

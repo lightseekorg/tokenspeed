@@ -204,7 +204,9 @@ _MESSAGES = [
     ConfigureLoggingReq(log_requests=True),
     OpenSessionReqInput(capacity_of_str_len=8),
     CloseSessionReqInput(session_id="s"),
-    GetLoadReqOutput(dp_rank=1, num_reqs=2, num_waiting_reqs=1, num_pages=3),
+    GetLoadReqOutput(
+        dp_rank=1, num_reqs=2, num_waiting_reqs=1, num_pages=3, num_total_pages=12
+    ),
     _batch_token_id_out(),
     BatchStrOut(
         rids=["a"],

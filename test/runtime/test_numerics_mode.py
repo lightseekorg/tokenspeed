@@ -84,6 +84,16 @@ class TestNumericsMode:
         args = ServerArgs(model="x", numerics="rl-bitwise", world_size=1)
         assert not (args.enable_allreduce_fusion)
 
+    def test_batch_invariant_collectives_vetoes_the_fused_all_reduce_norm(self):
+        args = ServerArgs(model="x", enable_allreduce_fusion=True)
+        assert args.enable_allreduce_fusion and args.comm_fusion_max_num_tokens > 0
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
+        args = ServerArgs(
+            model="x", batch_invariant_collectives=True, enable_allreduce_fusion=True
+        )
+        assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
+
     def test_unknown_mode_is_rejected(self):
         with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="bitwise")
@@ -118,11 +128,12 @@ class TestNumericsMode:
         assert (ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm) == (
             "unfused"
         )
-        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
         args = ServerArgs(
             model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
         )
         assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
         with pytest.raises((ValueError), match=("--layer-boundary-norm")):
             ServerArgs(model="x", layer_boundary_norm="half")
 

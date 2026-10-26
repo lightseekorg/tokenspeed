@@ -1110,6 +1110,9 @@ class GetLoadReqOutput(BaseReq, kw_only=True):
     num_reqs: int = 0
     num_waiting_reqs: int = 0
     num_pages: int = 0
+    # When present, both counts are physical allocator blocks, not token pages.
+    # None preserves the legacy token-page contract for older producers.
+    num_total_pages: int | None = None
 
 
 # ============================================================================
