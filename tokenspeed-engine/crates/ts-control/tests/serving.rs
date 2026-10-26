@@ -41,7 +41,7 @@ use pyo3::{prelude::*, types::PyDict};
 use ts_client::{
     ClientConfig, ClientListener, EngineClient, LoadBalance, OutputChunk, RequestStream, Routing,
 };
-use ts_collective::{Group, Listener, Mesh};
+use ts_collective::{Group, Listener, Mesh, Reduce};
 use ts_control::{
     batch_log::BatchLogConfig,
     control::ControlConfig,
@@ -61,7 +61,7 @@ use ts_l3::{
 };
 use ts_pd::{
     BootstrapInfo, EmbeddingItem, EmbeddingReceiver, LandedItem, LandedRequest, PdError, PdEvent,
-    RemotePrefill, TransferPeer,
+    RemotePrefill, TransferPeer, TransferPoll,
 };
 use ts_scheduler::{
     CacheEvent, CacheEventKind, CacheOpKind, CacheOpView, ExecutionPlan, Scheduler,
@@ -119,7 +119,11 @@ enum Tiers {
     L3,
 }
 
-fn new_scheduler(tiers: Tiers, role: Role) -> Scheduler {
+/// The scheduler over `tiers` for `role`, its KV cache split over
+/// `kv_shard_count` shards: an LCM block then packs one Full block per
+/// shard, so the Device keeps 512 usable Full blocks and a tier with Host
+/// pages 1024, the counts the tests' numbers rely on.
+fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize) -> Scheduler {
     interpreter();
     let role = match role {
         Role::Plain => "Fused",
@@ -161,14 +165,18 @@ cfg = ts.SchedulerConfig()
 cfg.prefix_granularity = 16
 cfg.max_scheduled_tokens = {MAX_SCHEDULED_TOKENS}
 cfg.max_batch_size = 8
-cfg.num_device_pages = 513
+cfg.num_device_pages = 512 // {kv_shard_count} + 1
 cfg.num_snapshot_pages = 1
 cfg.cache_groups = [ts.CacheGroupConfig(group_id="full_attention", block_granularity=16,
-                                        total_pages=513, attn_kind=ts.AttnKind.Full)]
+                                        total_pages=513, attn_kind=ts.AttnKind.Full,
+                                        cache_blocks_per_lcm_block={kv_shard_count},
+                                        shard_count={kv_shard_count})]
 cfg.role = ts.SchedulerConfig.Role.{role}
 if cfg.role != ts.SchedulerConfig.Role.Fused:
     cfg.cache_groups[0].transfer_policy = ts.CacheTransferPolicy.FullSuffix
 {tiers}
+if cfg.num_host_pages > 1:
+    cfg.num_host_pages = 1024 // {kv_shard_count} + 1
 result = ts.Scheduler(cfg)
 "#
     );
@@ -242,18 +250,36 @@ type NgramRow = (i64, Vec<i32>);
 /// budget is still running when the test acts on it.
 const FORWARD_TIME: Duration = Duration::from_millis(1);
 
+/// One plan as a rank ran it: the cache-event polls before it, its
+/// forward's request ids and its cache ops.
+type ExecutedPlan = (usize, Vec<String>, Vec<CacheOpView>);
+
 /// Stands in for the device: results are ready when the forward returns,
-/// and a cache op is acknowledged on the first poll after it ran.
+/// and a cache op is acknowledged once, on the first poll after it ran or
+/// `ack_polls` polls later, and never while `ack_gate` is closed.
 #[derive(Default)]
 struct FakeDevice {
+    /// This rank; PD names it as a sender of a request's KV.
+    rank: usize,
     /// Tokens generated per request so far.
     generated: HashMap<String, i32>,
     /// Each released request with the tokens it was given.
     released: Arc<Mutex<Vec<(String, i32)>>>,
-    /// Every cache op run, in order.
-    cache_ops: Arc<Mutex<Vec<CacheOpKind>>>,
-    /// Cache ops run and not acknowledged yet.
-    unacknowledged: Vec<CacheOpView>,
+    /// Every plan run, in order.
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    /// Cache ops run and not acknowledged yet, in the order they ran, each
+    /// with the polls it still waits.
+    unacknowledged: Vec<(usize, CacheOpView)>,
+    /// The polls a cache op waits after the first one before it is
+    /// acknowledged.
+    ack_polls: usize,
+    /// Cache-event polls so far.
+    polls: usize,
+    /// While closed, a poll acknowledges nothing.
+    ack_gate: Arc<Gate>,
+    /// Every acknowledgment sent, in order: the poll that sent it, its kind
+    /// and op id.
+    acknowledged: Arc<Mutex<Vec<(usize, CacheEventKind, u32)>>>,
     /// Idle forwards run for attention-DP peers.
     idle_forwards: Arc<Mutex<usize>>,
     /// A pipeline stage before the last: it samples nothing meaningful.
@@ -337,6 +363,9 @@ type Landing = (Option<(i32, Vec<i32>)>, Option<i32>);
 #[derive(Default)]
 struct Wire {
     rooms: HashMap<u64, WireRoom>,
+    /// How many attention-TP ranks the prefill engine has; each sends its
+    /// part of a request's KV.
+    prefill_ranks: usize,
 }
 
 #[derive(Default)]
@@ -347,14 +376,20 @@ struct WireRoom {
     preallocated: Option<i32>,
     /// The prefill engine sent the KV and this first token.
     sent: Option<i32>,
+    /// The prefill ranks that sent their part of the KV.
+    sent_by: Vec<usize>,
     /// The transfer breaks.
     fails: bool,
+    /// The transfer breaks on this prefill rank alone.
+    fails_on_prefill_rank: Option<usize>,
 }
 
 /// A stand-in transfer peer over a [`Wire`]: a transfer advances as soon as
-/// both engines' devices did their part.
+/// both engines' devices did their part, as every rank of the replica sees
+/// it.
 struct FakePeer {
     role: Role,
+    rank: usize,
     wire: Arc<Mutex<Wire>>,
     /// Tracked requests: rid, room, bootstrapped.
     tracked: Vec<(String, u64, bool)>,
@@ -375,42 +410,95 @@ impl TransferPeer for FakePeer {
         Ok(())
     }
 
-    fn poll(&mut self, _mesh: &mut Mesh, _replica: &Group) -> Result<Vec<PdEvent>, PdError> {
+    /// As `ts-pd`'s peers poll: each rank reads its view of every tracked
+    /// transfer, the replica agrees on the least advanced one, and the
+    /// agreed state is acted on. The wire is unlocked while the replica
+    /// agrees: the other ranks lock it to read their own views first.
+    fn poll(&mut self, mesh: &mut Mesh, replica: &Group) -> Result<Vec<PdEvent>, PdError> {
+        if self.tracked.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (role, rank) = (self.role, self.rank);
+        let polls: Vec<i64> = {
+            let mut wire = self.wire.lock().unwrap();
+            let prefill_ranks = wire.prefill_ranks;
+            self.tracked
+                .iter()
+                .map(|(_, room, bootstrapped)| {
+                    let room = wire.rooms.entry(*room).or_default();
+                    let poll = if room.fails
+                        || (role == Role::Prefill && room.fails_on_prefill_rank == Some(rank))
+                    {
+                        TransferPoll::Failed
+                    } else if !*bootstrapped {
+                        let connected = match role {
+                            Role::Prefill => room.preallocated.is_some(),
+                            _ => room.decode_registered,
+                        };
+                        if connected {
+                            TransferPoll::Bootstrapped
+                        } else {
+                            TransferPoll::Bootstrapping
+                        }
+                    } else {
+                        // The KV left this prefill rank, or arrived from
+                        // every one.
+                        let sent = match role {
+                            Role::Prefill => room.sent_by.contains(&rank),
+                            _ => room.sent_by.len() == prefill_ranks,
+                        };
+                        if sent {
+                            TransferPoll::Success
+                        } else {
+                            TransferPoll::Bootstrapped
+                        }
+                    };
+                    poll as i64
+                })
+                .collect()
+        };
+        let agreed = if replica.size() > 1 {
+            mesh.all_reduce(replica, &polls, Reduce::Min)?
+        } else {
+            polls
+        };
+
         let mut wire = self.wire.lock().unwrap();
         let mut events = Vec::new();
-        let role = self.role;
+        let mut agreed = agreed.into_iter();
         self.tracked.retain_mut(|(rid, room, bootstrapped)| {
+            let poll = agreed.next().expect("one state per tracked request");
             let room = wire.rooms.entry(*room).or_default();
-            if room.fails {
-                events.push(PdEvent::Failed(rid.clone()));
-                return false;
-            }
-            let connected = match role {
-                Role::Prefill => room.preallocated.is_some(),
-                _ => room.decode_registered,
-            };
-            if !*bootstrapped {
-                if connected {
+            match TransferPoll::from_wire(poll).unwrap_or(TransferPoll::Failed) {
+                TransferPoll::Failed => {
+                    // The peer engine sees the failure only on the wire.
+                    room.fails = true;
+                    events.push(PdEvent::Failed(rid.clone()));
+                    false
+                }
+                TransferPoll::Bootstrapped if !*bootstrapped => {
                     *bootstrapped = true;
                     events.push(PdEvent::Bootstrapped(rid.clone()));
+                    true
                 }
-                return true;
+                TransferPoll::Success => {
+                    events.push(match role {
+                        Role::Prefill => PdEvent::Succeeded(rid.clone()),
+                        _ => PdEvent::RemotePrefillDone(RemotePrefill {
+                            rid: rid.clone(),
+                            bootstrap_token: room.sent.expect("sent with the KV"),
+                            cached_tokens: 0,
+                            bootstrap_logprob: None,
+                            spec_candidate_ids: None,
+                            request_pool_index: room
+                                .preallocated
+                                .expect("admitted before the KV moved"),
+                        }),
+                    });
+                    false
+                }
+                _ => true,
             }
-            let Some(token) = room.sent else {
-                return true;
-            };
-            events.push(match role {
-                Role::Prefill => PdEvent::Succeeded(rid.clone()),
-                _ => PdEvent::RemotePrefillDone(RemotePrefill {
-                    rid: rid.clone(),
-                    bootstrap_token: token,
-                    cached_tokens: 0,
-                    bootstrap_logprob: None,
-                    spec_candidate_ids: None,
-                    request_pool_index: room.preallocated.expect("admitted before the KV moved"),
-                }),
-            });
-            false
         });
         Ok(events)
     }
@@ -549,11 +637,13 @@ impl DataPlane for FakeDevice {
             *self.idle_forwards.lock().unwrap() += 1;
         }
         let ops = plan.cache_ops();
-        self.cache_ops
-            .lock()
-            .unwrap()
-            .extend(ops.iter().map(|op| op.kind));
-        self.unacknowledged.extend(ops);
+        self.plans.lock().unwrap().push((
+            self.polls,
+            forward.map_or_else(Vec::new, |batch| batch.request_ids.clone()),
+            ops.clone(),
+        ));
+        self.unacknowledged
+            .extend(ops.into_iter().map(|op| (self.ack_polls, op)));
         if let Some(wire) = &self.wire {
             let mut wire = wire.lock().unwrap();
             if let Some(admitted) = plan.remote_prefill() {
@@ -570,7 +660,9 @@ impl DataPlane for FakeDevice {
             if let Some(prompts) = plan.remote_decode() {
                 for rid in &prompts.request_ids {
                     let first = 1000 + self.generated[rid] - 1;
-                    wire.rooms.entry(self.rooms[rid]).or_default().sent = Some(first);
+                    let room = wire.rooms.entry(self.rooms[rid]).or_default();
+                    room.sent = Some(first);
+                    room.sent_by.push(self.rank);
                 }
             }
         }
@@ -619,8 +711,16 @@ impl DataPlane for FakeDevice {
     }
 
     fn poll_cache_events(&mut self) -> Result<Vec<CacheEvent>, DataPlaneError> {
+        self.polls += 1;
         let mut events = Vec::new();
-        for op in self.unacknowledged.drain(..) {
+        if !*self.ack_gate.open.lock().unwrap() {
+            return Ok(events);
+        }
+        for (polls_left, op) in std::mem::take(&mut self.unacknowledged) {
+            if polls_left > 0 {
+                self.unacknowledged.push((polls_left - 1, op));
+                continue;
+            }
             let kind = match op.kind {
                 CacheOpKind::WriteBack => CacheEventKind::WriteBackDone,
                 CacheOpKind::LoadBack => CacheEventKind::LoadBackDone,
@@ -628,6 +728,10 @@ impl DataPlane for FakeDevice {
                 CacheOpKind::SnapshotRestore => CacheEventKind::RestoreDone,
                 kind => return Err(DataPlaneError(format!("no fake for {kind:?}"))),
             };
+            self.acknowledged
+                .lock()
+                .unwrap()
+                .push((self.polls, kind, op.op_id));
             events.push(CacheEvent {
                 kind,
                 op_id: op.op_id,
@@ -771,7 +875,7 @@ fn ipc(name: &str) -> String {
     )
 }
 
-/// A latch a store's queries wait on.
+/// A latch a store's queries wait on, or a device's cache acknowledgments.
 #[derive(Default)]
 struct Gate {
     open: Mutex<bool>,
@@ -907,7 +1011,11 @@ fn l3_executor(store: ScriptedStore, rank: usize) -> Executor {
 struct Rank {
     thread: Option<thread::JoinHandle<()>>,
     released: Arc<Mutex<Vec<(String, i32)>>>,
-    cache_ops: Arc<Mutex<Vec<CacheOpKind>>>,
+    plans: Arc<Mutex<Vec<ExecutedPlan>>>,
+    /// What the rank's cache acknowledgments wait on.
+    ack_gate: Arc<Gate>,
+    /// The rank's cache acknowledgments: poll, kind, op id.
+    acknowledged: Arc<Mutex<Vec<(usize, CacheEventKind, u32)>>>,
     idle_forwards: Arc<Mutex<usize>>,
     ngram: Arc<Mutex<Vec<NgramRow>>>,
     history: Arc<Mutex<Vec<HistorySeed>>>,
@@ -930,6 +1038,9 @@ enum Layout {
     Single,
     /// One scheduler mirrored on this many attention-TP ranks.
     Tp(usize),
+    /// One scheduler mirrored on this many attention-TP ranks (the first
+    /// count), its KV cache split over this many shards (the second).
+    TpKvp(usize, usize),
     /// This many attention-DP ranks, one scheduler and frontend each.
     Dp(usize),
     /// One scheduler mirrored on this many pipeline stages; the last samples.
@@ -955,11 +1066,12 @@ impl Engine {
 
     fn cache_ops(&self, kind: CacheOpKind) -> usize {
         self.ranks[0]
-            .cache_ops
+            .plans
             .lock()
             .unwrap()
             .iter()
-            .filter(|seen| **seen == kind)
+            .flat_map(|(_, _, ops)| ops)
+            .filter(|op| op.kind == kind)
             .count()
     }
 
@@ -1078,6 +1190,11 @@ struct Setup {
     l3_landed_keys: Option<fn(usize) -> usize>,
     /// L3: the stores' queries wait until the test opens their gates.
     l3_held_queries: bool,
+    /// The polls each rank's cache ops wait after the first before they are
+    /// acknowledged; none when unset.
+    cache_ack_polls: Option<fn(usize) -> usize>,
+    /// The devices acknowledge no cache op until the test opens their gates.
+    held_cache_acks: bool,
 }
 
 impl Layout {
@@ -1085,7 +1202,7 @@ impl Layout {
     fn sizes(self) -> (usize, usize, usize) {
         match self {
             Layout::Single => (1, 1, 1),
-            Layout::Tp(size) | Layout::Pp(size) => (size, size, 1),
+            Layout::Tp(size) | Layout::TpKvp(size, _) | Layout::Pp(size) => (size, size, 1),
             Layout::Dp(size) => (size, 1, size),
         }
     }
@@ -1199,6 +1316,7 @@ fn run_rank<F: Frontend>(
     let transfer = pd.map(|pd| {
         Box::new(FakePeer {
             role: pd.role,
+            rank,
             wire: pd.wire,
             tracked: Vec::new(),
         }) as Box<dyn TransferPeer + Send>
@@ -1216,8 +1334,12 @@ fn run_rank<F: Frontend>(
         dp,
         ep,
     };
+    let kv_shard_count = match layout {
+        Layout::TpKvp(_, shards) => shards,
+        _ => 1,
+    };
     let mut event_loop = EventLoop::new(
-        new_scheduler(tiers, role),
+        new_scheduler(tiers, role, kv_shard_count),
         device,
         frontend,
         outputs,
@@ -1258,6 +1380,13 @@ fn run_rank<F: Frontend>(
 fn fake_device(layout: Layout, rank: usize, setup: &Setup) -> FakeDevice {
     let (world, _, _) = layout.sizes();
     FakeDevice {
+        rank,
+        ack_polls: setup.cache_ack_polls.map_or(0, |polls| polls(rank)),
+        ack_gate: if setup.held_cache_acks {
+            Gate::closed()
+        } else {
+            Gate::opened()
+        },
         placeholder_stage: matches!(layout, Layout::Pp(_)) && rank + 1 < world,
         wire: setup.pd.as_ref().map(|pd| pd.wire.clone()),
         ep_rank: rank,
@@ -1322,7 +1451,9 @@ async fn start_ranks_with(
             let handle = Rank {
                 thread: None,
                 released: device.released.clone(),
-                cache_ops: device.cache_ops.clone(),
+                plans: device.plans.clone(),
+                ack_gate: device.ack_gate.clone(),
+                acknowledged: device.acknowledged.clone(),
                 idle_forwards: device.idle_forwards.clone(),
                 ngram: device.ngram.clone(),
                 history: device.history.clone(),
@@ -1462,8 +1593,7 @@ fn run_scripted(
         .enumerate()
         .map(|(rank, mesh_listener)| {
             let device = fake_device(layout, rank, &setup);
-            let (cache_ops, idle_forwards) =
-                (device.cache_ops.clone(), device.idle_forwards.clone());
+            let (plans, idle_forwards) = (device.plans.clone(), device.idle_forwards.clone());
             let replies = Arc::new(Mutex::new(Vec::new()));
             let finished = Arc::new(Mutex::new(Vec::new()));
             let frontend = (rank % tp_size == 0).then(|| ScriptedFrontend {
@@ -1489,7 +1619,7 @@ fn run_scripted(
                 done.send(rank).unwrap();
                 outcome
             });
-            (thread, replies, finished, cache_ops, idle_forwards)
+            (thread, replies, finished, plans, idle_forwards)
         })
         .collect();
     for _ in 0..world {
@@ -1501,11 +1631,16 @@ fn run_scripted(
     ranks
         .into_iter()
         .map(
-            |(thread, replies, finished, cache_ops, idle_forwards)| ScriptedRank {
+            |(thread, replies, finished, plans, idle_forwards)| ScriptedRank {
                 outcome: thread.join().unwrap(),
                 replies: replies.lock().unwrap().clone(),
                 finished: finished.lock().unwrap().clone(),
-                cache_ops: cache_ops.lock().unwrap().clone(),
+                cache_ops: plans
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|(_, _, ops)| ops.iter().map(|op| op.kind))
+                    .collect(),
                 idle_forwards: *idle_forwards.lock().unwrap(),
             },
         )
@@ -1853,18 +1988,31 @@ async fn retracted_requests_resume_where_they_stopped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn written_back_prefixes_are_acknowledged() {
-    let engine = start_engine_with(1, Tiers::HostL2).await;
-    let shared: Vec<i32> = (1..=64).collect();
-    let requests = (0..3)
-        .map(|i| TokenizedGenerateReqInput {
-            input_ids: Some(shared.iter().copied().chain([100 + i]).collect()),
-            ..request(&format!("r{i}"), 1, budget(4))
-        })
-        .collect();
-    for chunks in run_all(&engine.client, requests).await {
-        assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003]);
+    // Also on KV-sharded attention-TP ranks, the second of which
+    // acknowledges three polls after the first.
+    for layout in [Layout::Single, Layout::TpKvp(2, 2)] {
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::HostL2,
+            Setup {
+                cache_ack_polls: Some(|rank| 3 * rank),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let shared: Vec<i32> = (1..=64).collect();
+        let requests = (0..3)
+            .map(|i| TokenizedGenerateReqInput {
+                input_ids: Some(shared.iter().copied().chain([100 + i]).collect()),
+                ..request(&format!("r{i}"), 1, budget(4))
+            })
+            .collect();
+        for chunks in run_all(&engine.client, requests).await {
+            assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003], "{layout:?}");
+        }
+        assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0, "{layout:?}");
     }
-    assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1944,8 +2092,19 @@ async fn an_abort_while_storage_prepares_finishes_the_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tensor_parallel_ranks_mirror_one_scheduler() {
+    // The follower acknowledges each cache op three polls after the first
+    // member, so for a while the members hold different acknowledgments.
     for depth in [0, 1] {
-        let engine = start_ranks(Layout::Tp(2), depth, Tiers::ForcedRetraction).await;
+        let engine = start_ranks_with(
+            Layout::Tp(2),
+            depth,
+            Tiers::ForcedRetraction,
+            Setup {
+                cache_ack_polls: Some(|rank| 3 * rank),
+                ..Setup::default()
+            },
+        )
+        .await;
         let requests = (0..4)
             .map(|i| request(&format!("r{i}"), 20 + i, budget(8 + i as i64)))
             .collect();
@@ -1960,6 +2119,80 @@ async fn tensor_parallel_ranks_mirror_one_scheduler() {
         assert_eq!(engine.released_on(1), engine.released_on(0));
         assert_eq!(engine.released_on(0).len(), 4);
         assert!(engine.cache_ops(CacheOpKind::SnapshotStore) > 0);
+        let plans = engine.ranks[0].plans.lock().unwrap().clone();
+        assert_eq!(
+            *engine.ranks[1].plans.lock().unwrap(),
+            plans,
+            "depth {depth}"
+        );
+        // Each member acknowledged every op once, the follower at least
+        // three polls after the first member.
+        let mut dispatched: Vec<u32> = plans
+            .iter()
+            .flat_map(|(_, _, ops)| ops)
+            .map(|op| op.op_id)
+            .collect();
+        dispatched.sort_unstable();
+        let [first, follower] = [0, 1].map(|rank| {
+            let mut acknowledged = engine.ranks[rank].acknowledged.lock().unwrap().clone();
+            acknowledged.sort_by_key(|&(_, _, op_id)| op_id);
+            acknowledged
+        });
+        let op_ids: Vec<u32> = first.iter().map(|&(_, _, op_id)| op_id).collect();
+        assert_eq!(op_ids, dispatched, "depth {depth}");
+        assert_eq!(follower.len(), first.len(), "depth {depth}");
+        for (&(early, kind, op_id), &(late, follower_kind, follower_op_id)) in
+            first.iter().zip(&follower)
+        {
+            assert_eq!((follower_kind, follower_op_id), (kind, op_id));
+            assert!(
+                late >= early + 3,
+                "op {op_id} at depth {depth}: polls {early} and {late}"
+            );
+        }
+        // A restored request forwards again only from the poll that brought
+        // the follower a restore's acknowledgment: in order, the k-th
+        // request to resume does so no earlier than the k-th such poll. A
+        // forced retraction can take a restored request back before it
+        // forwards, so fewer requests may resume than were restored; at
+        // depth 1 that happens often, and the check is looser there. A
+        // prefill runs alone outside mixed mode, so a decoding request also
+        // sits out the plan that prefills a later prompt: it resumes only
+        // where a plan decoded others since its last forward. Every prompt
+        // here prefills in one forward, so a plan that forwards a request
+        // again decodes.
+        let mut restored: Vec<usize> = follower
+            .iter()
+            .filter(|(_, kind, _)| *kind == CacheEventKind::RestoreDone)
+            .map(|&(poll, _, _)| poll)
+            .collect();
+        restored.sort_unstable();
+        let mut last_forward: HashMap<&str, usize> = HashMap::new();
+        let mut decoded = Vec::with_capacity(plans.len());
+        let mut resumed = Vec::new();
+        for (index, (polls, rids, _)) in plans.iter().enumerate() {
+            decoded.push(
+                rids.iter()
+                    .any(|rid| last_forward.contains_key(rid.as_str())),
+            );
+            for rid in rids {
+                // A plan decoded others since the request's last forward.
+                let returned = last_forward
+                    .insert(rid, index)
+                    .is_some_and(|last| decoded[last + 1..index].contains(&true));
+                if returned {
+                    resumed.push(*polls);
+                }
+            }
+        }
+        assert!(!resumed.is_empty(), "depth {depth}");
+        assert!(resumed.len() <= restored.len(), "depth {depth}");
+        for (resumed, restored) in resumed.iter().zip(&restored) {
+            assert!(
+                resumed >= restored,
+                "depth {depth}: resumed at poll {resumed}, restored at poll {restored}"
+            );
+        }
     }
 }
 
@@ -2307,13 +2540,19 @@ async fn engram_windows_follow_each_requests_tokens() {
     }
 }
 
-/// A prefill engine over `prefill_tiers` and a decode engine joined by one
-/// wire.
+/// A prefill engine over `prefill_layout` and `prefill_tiers`, with
+/// `prefill_setup` besides its PD half, and a single-rank decode engine,
+/// joined by one wire.
 async fn start_pd_pair(
     in_flight_depth: usize,
+    prefill_layout: Layout,
     prefill_tiers: Tiers,
+    prefill_setup: Setup,
 ) -> (Engine, Engine, Arc<Mutex<Wire>>) {
-    let wire = Arc::new(Mutex::new(Wire::default()));
+    let wire = Arc::new(Mutex::new(Wire {
+        prefill_ranks: prefill_layout.sizes().1,
+        ..Wire::default()
+    }));
     let half = |role| {
         Some(Pd {
             role,
@@ -2321,12 +2560,12 @@ async fn start_pd_pair(
         })
     };
     let prefill = start_ranks_with(
-        Layout::Single,
+        prefill_layout,
         in_flight_depth,
         prefill_tiers,
         Setup {
             pd: half(Role::Prefill),
-            ..Setup::default()
+            ..prefill_setup
         },
     )
     .await;
@@ -2359,8 +2598,14 @@ fn disaggregated(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prompt_prefills_on_one_engine_and_decodes_on_the_other() {
-    for depth in [0, 1] {
-        let (prefill, decode, _wire) = start_pd_pair(depth, Tiers::DeviceOnly).await;
+    for (prefill_layout, depth) in [
+        (Layout::Single, 0),
+        (Layout::Single, 1),
+        (Layout::Tp(2), 0),
+        (Layout::Tp(2), 1),
+    ] {
+        let (prefill, decode, _wire) =
+            start_pd_pair(depth, prefill_layout, Tiers::DeviceOnly, Setup::default()).await;
         // As a gateway does: the same request to both nodes at once.
         let requests: Vec<_> = (0..3)
             .map(|i| disaggregated(&format!("r{i}"), 70 + i, 20 + 300 * i as usize, 4))
@@ -2372,7 +2617,11 @@ async fn a_prompt_prefills_on_one_engine_and_decodes_on_the_other() {
         for (i, chunks) in prefilled.iter().enumerate() {
             // The prefill node streams only its first token, once the KV
             // reached the decode node.
-            assert_eq!(tokens(chunks), [1000], "r{i} at depth {depth}");
+            assert_eq!(
+                tokens(chunks),
+                [1000],
+                "r{i} at depth {depth} on {prefill_layout:?}"
+            );
             assert_eq!(
                 chunks.last().unwrap().finish_reason.as_deref(),
                 Some("length")
@@ -2383,10 +2632,15 @@ async fn a_prompt_prefills_on_one_engine_and_decodes_on_the_other() {
             assert_eq!(
                 tokens(chunks),
                 [1000, 1001, 1002, 1003],
-                "r{i} at depth {depth}"
+                "r{i} at depth {depth} on {prefill_layout:?}"
             );
         }
         assert_eq!(prefill.released().len(), 3);
+        prefill.settle().await;
+        assert_eq!(
+            prefill.released_on(prefill.ranks.len() - 1),
+            prefill.released()
+        );
         assert_eq!(decode.released().len(), 3);
         // Each request's slot was made ready for its first decode.
         let landed = decode.ranks[0].landed.lock().unwrap().clone();
@@ -2402,8 +2656,26 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
     // Under Host write-back the prefill engine stores nothing to the Host as
     // it caches a prompt; what an admission evicts is written back in the
     // round that evicts it and published on the Host at its acknowledgment.
-    for depth in [0, 1] {
-        let (prefill, decode, _wire) = start_pd_pair(depth, Tiers::HostL2WriteBack).await;
+    // Each prompt takes a dozen rounds or more, so acknowledgments three
+    // polls late land before the next admission: the numbers stay the same.
+    let three_polls_late: fn(usize) -> usize = |_| 3;
+    for (depth, cache_ack_polls) in [
+        (0, None),
+        (1, None),
+        (0, Some(three_polls_late)),
+        (1, Some(three_polls_late)),
+    ] {
+        let (prefill, decode, _wire) = start_pd_pair(
+            depth,
+            Layout::Single,
+            Tiers::HostL2WriteBack,
+            Setup {
+                cache_ack_polls,
+                ..Setup::default()
+            },
+        )
+        .await;
+        let case = format!("depth {depth}, delayed {}", cache_ack_polls.is_some());
         // Three 3000-token prompts, 187 full pages and a tail each, on 512
         // Device pages: the third one's admission evicts the first one's
         // last pages. Then the first one is sent again.
@@ -2412,11 +2684,7 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
         for (room, (rid, first)) in (70_u64..).zip(prompts) {
             if rid == "c" {
                 // Caching the first two stored nothing to the Host.
-                assert_eq!(
-                    prefill.cache_ops(CacheOpKind::WriteBack),
-                    0,
-                    "depth {depth}"
-                );
+                assert_eq!(prefill.cache_ops(CacheOpKind::WriteBack), 0, "{case}");
             }
             let request = TokenizedGenerateReqInput {
                 input_ids: Some((first + 1..=first + 3000).collect()),
@@ -2426,25 +2694,23 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
                 run(&prefill.client, request.clone()),
                 run(&decode.client, request)
             );
-            assert_eq!(tokens(&prefilled), [1000], "{rid} at depth {depth}");
-            assert_eq!(tokens(&decoded), [1000, 1001], "{rid} at depth {depth}");
+            assert_eq!(tokens(&prefilled), [1000], "{rid} at {case}");
+            assert_eq!(tokens(&decoded), [1000, 1001], "{rid} at {case}");
             cached.push(prefilled.last().unwrap().cached_tokens);
         }
         // The eviction's write-backs were acknowledged: the first prompt hits
         // all its full pages again, loading the written-back ones from the
         // Host. Unacknowledged, the Host would hold none of them.
-        assert!(
-            prefill.cache_ops(CacheOpKind::WriteBack) > 0,
-            "depth {depth}"
-        );
-        assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1, "depth {depth}");
-        assert_eq!(cached, [0, 0, 0, 187 * 16], "depth {depth}");
+        assert!(prefill.cache_ops(CacheOpKind::WriteBack) > 0, "{case}");
+        assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1, "{case}");
+        assert_eq!(cached, [0, 0, 0, 187 * 16], "{case}");
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_transfer_aborts_the_request_on_both_engines() {
-    let (prefill, decode, wire) = start_pd_pair(1, Tiers::DeviceOnly).await;
+    let (prefill, decode, wire) =
+        start_pd_pair(1, Layout::Single, Tiers::DeviceOnly, Setup::default()).await;
     wire.lock().unwrap().rooms.entry(5).or_default().fails = true;
     let doomed = disaggregated("doomed", 5, 30, 4);
     let (prefilled, decoded) = tokio::join!(
@@ -2464,6 +2730,43 @@ async fn a_failed_transfer_aborts_the_request_on_both_engines() {
         chunks.last().unwrap().finish_reason.as_deref(),
         Some("abort")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_transfer_failing_on_one_prefill_rank_fails_on_every_rank() {
+    // Only the second prefill rank sees the transfer break. The decode
+    // engine connects first, so on its own the first rank would go on to
+    // prefill; the replica agrees on the failure instead, and the decode
+    // engine learns of it from the wire.
+    let (prefill, decode, wire) =
+        start_pd_pair(1, Layout::Tp(2), Tiers::DeviceOnly, Setup::default()).await;
+    wire.lock()
+        .unwrap()
+        .rooms
+        .entry(5)
+        .or_default()
+        .fails_on_prefill_rank = Some(1);
+    let doomed = disaggregated("doomed", 5, 30, 4);
+    let decoding = decode.client.generate(doomed.clone()).await.unwrap();
+    for _ in 0..500 {
+        if wire.lock().unwrap().rooms[&5].preallocated.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(wire.lock().unwrap().rooms[&5].preallocated.is_some());
+    let (prefilled, decoded) = tokio::join!(run(&prefill.client, doomed), collect(decoding));
+    for chunks in [prefilled, decoded] {
+        assert!(tokens(&chunks).is_empty());
+        assert_eq!(
+            chunks.last().unwrap().finish_reason.as_deref(),
+            Some("abort")
+        );
+    }
+    // Both prefill ranks released it without a forward.
+    prefill.settle().await;
+    assert_eq!(prefill.released_on(0), [("doomed".to_owned(), 0)]);
+    assert_eq!(prefill.released_on(1), prefill.released_on(0));
 }
 
 fn pause(mode: &str) -> ControlRequest {
@@ -2734,7 +3037,8 @@ async fn flushes_and_weight_updates_run_on_every_data_parallel_rank() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_released_pd_engine_refuses_requests_until_it_wakes() {
-    let (prefill, decode, _wire) = start_pd_pair(1, Tiers::DeviceOnly).await;
+    let (prefill, decode, _wire) =
+        start_pd_pair(1, Layout::Single, Tiers::DeviceOnly, Setup::default()).await;
     let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
         rid: None,
         http_worker_ipc: None,
@@ -2840,6 +3144,71 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
         [("ProfileReqOutput", true)]
     );
     let chunks = run(&engine.client, request("r2", 3, budget(2))).await;
+    assert_eq!(tokens(&chunks), [1000, 1001]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_release_waits_for_the_host_stores_in_flight() {
+    // The device holds every cache acknowledgment. A finished request's
+    // prefix is stored to the Host, so the KV cache cannot be cleared, nor
+    // released, until the stores land.
+    let engine = start_ranks_with(
+        Layout::Single,
+        1,
+        Tiers::HostL2,
+        Setup {
+            held_cache_acks: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let chunks = run(&engine.client, request("r1", 65, budget(2))).await;
+    assert_eq!(tokens(&chunks), [1000, 1001]);
+    for _ in 0..500 {
+        if engine.cache_ops(CacheOpKind::WriteBack) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0);
+    assert!(engine.ranks[0].acknowledged.lock().unwrap().is_empty());
+    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags: Some(vec!["kv_cache".to_owned()]),
+    });
+    let mut release = std::pin::pin!(engine.client.control(release));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), release.as_mut())
+            .await
+            .is_err(),
+        "released with Host stores in flight"
+    );
+    assert!(engine.ranks[0].device_ops.lock().unwrap().is_empty());
+    engine.ranks[0].ack_gate.open();
+    let released = tokio::time::timeout(Duration::from_secs(10), release)
+        .await
+        .expect("no reply to the release once the stores landed")
+        .unwrap();
+    assert_eq!(
+        outcome(released),
+        [("ReleaseMemoryOccupationReqOutput", true)]
+    );
+    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+        rid: None,
+        http_worker_ipc: None,
+        tags: Some(vec!["kv_cache".to_owned()]),
+    });
+    assert_eq!(
+        control(&engine, wake).await,
+        [("ResumeMemoryOccupationReqOutput", true)]
+    );
+    assert_eq!(
+        *engine.ranks[0].device_ops.lock().unwrap(),
+        ["release kv_cache", "resume kv_cache"]
+    );
+    // The same prompt is served exactly after the wake.
+    let chunks = run(&engine.client, request("r2", 65, budget(2))).await;
     assert_eq!(tokens(&chunks), [1000, 1001]);
 }
 
