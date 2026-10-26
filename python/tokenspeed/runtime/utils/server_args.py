@@ -2641,7 +2641,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kvstore_size,
             help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set. "
-            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available.",
+            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available, "
+            "or if the ranks resolve it to different page counts, as pipeline stages may (use --kvstore-ratio there).",
         )
         parser.add_argument(
             "--kvstore-io-backend",

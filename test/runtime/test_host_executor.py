@@ -1278,9 +1278,13 @@ class TestHostMemoryShareTest:
         nprocs_per_node,
         device_lcm_blocks,
         host_size_gb=0,
+        host_lcm_block_bytes=BLOCK_BYTES,
+        l2_tier=True,
+        snapshot_pool=NO_POOL,
         world_cpu_group=None,
     ):
-        """An L2-only executor at --kvstore-ratio 2 and its mocked logger."""
+        """An executor at --kvstore-ratio 2, L2-only by default, and its mocked
+        logger."""
         executor_module = self.executor_module
         lanes_module = _lanes_module()
         field = SimpleNamespace(
@@ -1306,9 +1310,9 @@ class TestHostMemoryShareTest:
             virtual_block_counts={"group": 1 + device_lcm_blocks},
         )
         storage = SimpleNamespace(
-            host_cache_block_bytes=(self.BLOCK_BYTES,),
+            host_cache_block_bytes=(host_lcm_block_bytes,),
             host_field_offsets=((0,),),
-            host_lcm_block_bytes=self.BLOCK_BYTES,
+            host_lcm_block_bytes=host_lcm_block_bytes,
             num_host_lcm_blocks=0,
             host_buffer="host",
         )
@@ -1320,7 +1324,7 @@ class TestHostMemoryShareTest:
             patch.object(
                 executor_module,
                 "compute_host_lcm_block_bytes",
-                return_value=self.BLOCK_BYTES,
+                return_value=host_lcm_block_bytes,
             ),
             patch.object(executor_module, "HostCacheStorage", return_value=storage),
             patch.object(lanes_module.psutil, "virtual_memory", return_value=available),
@@ -1344,11 +1348,11 @@ class TestHostMemoryShareTest:
         ):
             executor = executor_module.HostCacheExecutor(
                 pool,
-                l2_tier=True,
+                l2_tier=l2_tier,
                 host_ratio=2.0,
                 host_size_gb=host_size_gb,
-                snapshot_pool=NO_POOL,
-                slot_state_exporters=None,
+                snapshot_pool=snapshot_pool,
+                slot_state_exporters=None if snapshot_pool.disabled else (),
                 io_backend="direct",
                 attn_tp_rank=0,
                 kvp_rank=0,
@@ -1423,7 +1427,10 @@ class TestHostMemoryShareTest:
 
     def test_every_rank_takes_the_l2_size_the_smallest_share_holds(self):
         # A peer node has 500 GB available: every rank takes what it holds,
-        # and the agreement runs before any rank pins, explicit size or not.
+        # then the ranks compare equal counts and start. The peer adds
+        # peer_blocks to the agreement and, capped to the same size, this
+        # rank's own counts to the comparison; none of them exceeds
+        # peer_blocks, so the minimum with it stands for the peer each time.
         torch = import_module("torch")
         group = object()
         peer_blocks = self._fitting_blocks(500, 4)
@@ -1442,16 +1449,124 @@ class TestHostMemoryShareTest:
                 device_lcm_blocks=self.LARGE_POOL_BLOCKS,
                 world_cpu_group=group,
             )
-            assert (executor.num_host_pages - 1) == (peer_blocks)
-            explicit, _ = self._build(
+        assert (executor.num_host_pages - 1) == (peer_blocks)
+        assert all(c.kwargs["group"] is group for c in reduce.call_args_list)
+
+    def test_pp_stages_with_unequal_block_bytes_refuse_one_explicit_size(
+        self, subtests
+    ):
+        # Pipeline stages store different layers, so their Host LCM blocks
+        # differ in bytes and one --kvstore-size is a different page count on
+        # each: 64 GB is 64,000 blocks of 1 MB and 32,000 of 2 MB. The
+        # mirrored schedulers would diverge, so both stages refuse, after the
+        # same collectives: neither waits in one the other skips. Each stage
+        # counts in its own block, so the other stage's count is this rank's
+        # scaled by the ratio of their block bytes. A pipeline runs only on
+        # the prefill role, which has no snapshot pool, but a pool sized in
+        # gigabytes is compared the same way: 4 GB is 4,000 blocks of 1 MB and
+        # 2,000 of 2 MB. That case runs without L2: the fake scales every
+        # count, so an L2 count would be refused first.
+        torch = import_module("torch")
+        group = object()
+        pool_in_gigabytes = RetractionPoolRequest(
+            host_gb=4.0,
+            ratio=None,
+            max_retracted_requests=8,
+            tail_lcm_blocks_per_request=1,
+        )
+        collectives = {}
+        for l2_tier, host_size_gb, snapshot_pool, mismatch, ratio_flag in (
+            (
+                True,
+                64,
+                NO_POOL,
+                "32000 to 64000 Host L2 LCM blocks",
+                "--kvstore-ratio",
+            ),
+            (
+                False,
+                0,
+                pool_in_gigabytes,
+                "2000 to 4000 snapshot pool LCM blocks",
+                "--retraction-snapshot-ratio",
+            ),
+        ):
+            for block_bytes, peer_block_bytes in (
+                (self.BLOCK_BYTES, 2 * self.BLOCK_BYTES),
+                (2 * self.BLOCK_BYTES, self.BLOCK_BYTES),
+            ):
+
+                def all_reduce(tensor, *, op, group):
+                    assert (op) is (torch.distributed.ReduceOp.MIN)
+                    count = int(tensor.item())
+                    tensor.fill_(min(count, count * block_bytes // peer_block_bytes))
+
+                with (
+                    subtests.test(mismatch=mismatch, block_bytes=block_bytes),
+                    patch.object(
+                        torch.distributed, "all_reduce", side_effect=all_reduce
+                    ) as reduce,
+                ):
+                    with pytest.raises(
+                        (ValueError),
+                        match=(
+                            rf"{mismatch} \(this rank's Host LCM block is "
+                            rf"{block_bytes} bytes\).*{ratio_flag}"
+                        ),
+                    ):
+                        self._build(
+                            available_gb=956,
+                            nprocs_per_node=4,
+                            device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                            host_size_gb=host_size_gb,
+                            host_lcm_block_bytes=block_bytes,
+                            l2_tier=l2_tier,
+                            snapshot_pool=snapshot_pool,
+                            world_cpu_group=group,
+                        )
+                    collectives.setdefault(mismatch, []).append(reduce.call_count)
+        for first_stage, second_stage in collectives.values():
+            assert (first_stage) == (second_stage)
+        # Stages whose blocks are the same size add the same counts, so the
+        # group's minimum of each is this rank's own: they start.
+        with patch.object(torch.distributed, "all_reduce"):
+            executor, _ = self._build(
+                available_gb=956,
+                nprocs_per_node=4,
+                device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                host_size_gb=64,
+                world_cpu_group=group,
+            )
+        assert (executor.num_host_pages - 1) == (64_000)
+
+    def test_a_rank_refused_after_the_comparison_leaves_no_rank_waiting(self):
+        # Every rank asks for 128 GB, which a rank on a 500 GB node cannot pin
+        # in its 114.26 GB share: it refuses, but only after joining every
+        # collective the ranks that start make, so none of them waits on it.
+        # The ranks differ only in the share's fit, which an explicit size
+        # never reads, and compare equal counts, so the group's minimum of
+        # each is this rank's own.
+        torch = import_module("torch")
+        group = object()
+        with patch.object(torch.distributed, "all_reduce") as reduce:
+            executor, _ = self._build(
                 available_gb=956,
                 nprocs_per_node=4,
                 device_lcm_blocks=self.LARGE_POOL_BLOCKS,
                 host_size_gb=128,
                 world_cpu_group=group,
             )
-            assert (explicit.num_host_pages - 1) == (128_000)
-        assert (reduce.call_count) == (2)
+            assert (executor.num_host_pages - 1) == (128_000)
+            collectives = reduce.call_count
+            with pytest.raises((ValueError), match=("Not enough Host memory")):
+                self._build(
+                    available_gb=500,
+                    nprocs_per_node=4,
+                    device_lcm_blocks=self.LARGE_POOL_BLOCKS,
+                    host_size_gb=128,
+                    world_cpu_group=group,
+                )
+        assert (reduce.call_count) == (2 * collectives)
         assert all(c.kwargs["group"] is group for c in reduce.call_args_list)
 
     def test_a_pinned_buffer_takes_the_power_of_two_it_rounds_up_to(self):

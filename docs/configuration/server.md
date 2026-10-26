@@ -1254,7 +1254,13 @@ LCM blocks in the largest power of two that fits, and one size on every
 rank, since the ranks' schedulers mirror each other -- and each rank logs a
 warning with the requested and the capped size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
-startup, as is a share without room for a single LCM block.
+startup, as is a share without room for a single LCM block. Every rank
+must also resolve the same page counts: startup compares them across the
+ranks and refuses a difference on every rank. A size in gigabytes is a
+different page count wherever the ranks' LCM blocks differ in bytes, as
+they usually do on pipeline stages, which store different layers, so with
+`--pipeline-parallel-size > 1` size Host L2 with `--kvstore-ratio` rather
+than `--kvstore-size`.
 
 **Requirements and deployment.** L3 requires Host L2 (omit
 `--disable-kvstore`) and currently supports PP=1. Cyclic KV-page sharding

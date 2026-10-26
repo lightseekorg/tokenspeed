@@ -205,8 +205,8 @@ class HostCacheExecutor:
             nprocs_per_node: The ranks on this node. They all pin their Host
                 tiers here at once, so each checks against an equal share
                 of the Host memory the node has available.
-            world_cpu_group: The gloo group of every rank, over which the L2
-                size is agreed; None with a single rank.
+            world_cpu_group: The gloo group of every rank, over which the Host
+                tier sizes are agreed and compared; None with a single rank.
         """
         if io_backend not in ("direct", "kernel"):
             raise ValueError(f"unsupported KVStore IO backend {io_backend!r}")
@@ -288,6 +288,31 @@ class HostCacheExecutor:
                 f"{_HOST_MEM_HEADROOM_BYTES / 1e9:.2f} GB headroom each)"
             )
             host_lcm_blocks = fitting_l2_blocks
+        # The ranks' mirrored schedulers share one page count per Host tier,
+        # so every rank must resolve the same counts. A size in gigabytes
+        # resolves to different counts where the ranks' Host LCM blocks differ
+        # in bytes, as they can on pipeline stages, which store different
+        # layers. The comparison is a collective, so it runs before
+        # check_host_memory, whose rank-local refusal would otherwise leave
+        # the other ranks waiting in it; every rank raises together.
+        for name, count in (
+            ("Host L2 LCM blocks", host_lcm_blocks),
+            ("snapshot pool LCM blocks", snapshot_lcm_blocks),
+            ("snapshot pool slot-state rows", self.max_retracted_requests),
+        ):
+            smallest = _min_over_ranks(count, world_cpu_group)
+            largest = -_min_over_ranks(-count, world_cpu_group)
+            if smallest != largest:
+                raise ValueError(
+                    f"the ranks size the Host tiers differently: {smallest} to "
+                    f"{largest} {name} (this rank's Host LCM block is "
+                    f"{host_lcm_block_bytes} bytes). The mirrored schedulers "
+                    "need the same page counts on every rank: size Host L2 with "
+                    "--kvstore-ratio, which every rank resolves to one count, "
+                    "rather than --kvstore-size, and the snapshot pool with "
+                    "--retraction-snapshot-ratio rather than "
+                    "--retraction-snapshot-host-gb"
+                )
         l2_bytes = host_lcm_blocks * host_lcm_block_bytes
         # Both tiers count against the one check, at the sizes they pin.
         check_host_memory(
