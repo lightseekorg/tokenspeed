@@ -7,14 +7,37 @@ Its original Apache-2.0 and BSD-3-Clause notices are retained; local source
 changes are limited to repository formatting. The adapter uses
 the upstream dynamic-shape wrapper; it does not require importing TensorRT-LLM.
 
+`__init__.py` exposes the public entry points and loads the autotuner lazily.
+`runner.py` owns tactic search and cache lookup; `_launch.py` owns compilation,
+scale-layout copies and launch. The runner imports the launch module directly,
+so neither implementation module imports the package entry points.
+
 The contract is E4M3 A[M,K], E4M3 B[N,K], FP32 activation scales [M,K/128],
 and FP32 weight scales [N/128,K/128]. Output is BF16, accumulation is FP32.
 N and K must be divisible by 128. Scale layout copies do not change values.
 No E8M0 conversion or weight requantization is performed.
 
 CuTe-DSL and TVM-FFI load when this backend is first prepared.
-Preparation compiles three dynamic-shape tile variants (M=64/128/256) per GPU.
-The adapter selects a tile by token count, not a runtime autotuning loop.
+During startup autotuning, the adapter searches the configurations enumerated by
+TRT-LLM's `CuteDSLFp8BlackwellRunner` at the source commit above: MMA tiles
+64x128, 128x128 and 256x128, 1-CTA/2-CTA instructions, and clusters whose
+M/N dimensions are 1, 2 or 4. The upstream `can_implement` check filters invalid
+combinations. The kernel source itself is unchanged.
+
+The runner uses TokenSpeed's shared FlashInfer autotuner. It measures the
+adapter, including scale-layout copies, with CUDA graphs and a cold L2 cache.
+M uses powers-of-two buckets rounded down; N/K and the scale contract remain
+in the cache key. Activation scales and output rows follow each M bucket.
+The normal startup cache save/load path persists the selected configurations.
+Startup prepares valid dynamic-shape variants before tuning or using cached
+choices, so later M buckets do not require compilation during serving.
+
+Outside the tuning context, calls use the cached choice. Without a matching
+entry, the previous rule applies: M <= 64 uses tile 64x128, M <= 128 uses
+128x128, and larger M uses 256x128 with 2-CTA instructions. `--disable-autotune`
+skips new searches; an existing loaded cache can still be used. Eager warmup
+must precede CUDA graph capture. `prepare(device)` prepares the three fallback
+configurations for callers that do not run startup tuning.
 The adapter passes the current PyTorch stream on every launch, so the same
 call path works in eager execution, auxiliary streams, and CUDA graphs.
 Input pointers and stream handles are never cached.
