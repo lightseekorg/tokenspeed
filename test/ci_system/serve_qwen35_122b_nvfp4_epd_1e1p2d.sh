@@ -59,6 +59,9 @@ startup_deadline=$((SECONDS + ${EPD_STARTUP_TIMEOUT:-7200}))
 # TOKENSPEED_GRPC_MAX_MESSAGE_BYTES.
 export TOKENSPEED_GRPC_MAX_MESSAGE_BYTES=${TOKENSPEED_GRPC_MAX_MESSAGE_BYTES:-536870912}
 export TOKENSPEED_SKIP_GRPC_WARMUP=${TOKENSPEED_SKIP_GRPC_WARMUP:-1}
+# The pinned servicer's off-loop ingest still uses the removed engine-core
+# client. Parse on the loop and send through AsyncLLM.submit_encode instead.
+export EPD_INGEST_OFFLOOP=${EPD_INGEST_OFFLOOP:-0}
 export MC_INTRANODE_NVLINK=${MC_INTRANODE_NVLINK:-1}
 export MC_INTRA_NVLINK=${MC_INTRA_NVLINK:-1}
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
