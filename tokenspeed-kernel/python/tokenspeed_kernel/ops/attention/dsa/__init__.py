@@ -521,8 +521,6 @@ def dsa_decode(
     if kernel_plan is not None:
         kernel_plan.validate(
             "attention",
-            "DSAResources",
-            "prepare_dsa_resources",
             "dsa_decode",
             signature,
             traits=traits,
@@ -534,8 +532,6 @@ def dsa_decode(
     else:
         kernel = select_kernel(
             "attention",
-            "DSAResources",
-            "prepare_dsa_resources",
             "dsa_decode",
             signature,
             traits=traits,
