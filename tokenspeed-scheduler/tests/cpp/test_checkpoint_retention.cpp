@@ -422,5 +422,43 @@ TEST(CheckpointRetention, DeviceHitRefreshesExistingHostCopy) {
     EXPECT_FALSE(cache.GroupPrefixIndex(0).Contains(host, b));
 }
 
+TEST(CheckpointRetention, DeviceRepublicationRefreshesExistingHostCopy) {
+    for (const bool state : {false, true}) {
+        SCOPED_TRACE(state);
+        BlockPool device(8, {1});
+        BlockPool host(2, {1});
+        const std::array specs{CacheGroupSpec{.attn_kind = state ? AttnKind::kState : AttnKind::kFull,
+                                              .cache_blocks_per_lcm_block = 1,
+                                              .block_granularity = state ? 0 : 4}};
+        auto cache = MakeCoordinator(specs, 4, device, false, &host, nullptr, false);
+        Checkpoint a{Sequence(4)}, b{{90, 91, 92, 93}};
+        const auto publish = [&](const Checkpoint& point) {
+            std::vector<BlockTable> tables(1);
+            const auto admission = AdmitForTest(cache, tables, state ? 0 : 4);
+            ASSERT_TRUE(admission);
+            cache.CacheCompletedBlocks(
+                tables, RequestProgress{.completed_pages = point.Publication(), .num_computed_tokens = 4},
+                admission->access_epoch);
+            cache.Free(tables);
+        };
+        for (const auto* point : {&a, &b}) {
+            publish(*point);
+            auto cpu = cache.AcquireHostBlock(0, 0);
+            ASSERT_TRUE(cpu);
+            cache.CacheHostBlock(cpu, CacheKey{.group_id = 0, .content_hash = point->Hash()});
+        }
+        publish(a);
+        const CacheKey a_key{.group_id = 0, .content_hash = a.Hash()};
+        const CacheKey b_key{.group_id = 0, .content_hash = b.Hash()};
+        EXPECT_TRUE(cache.ContainsHostCachedBlock(a_key));
+        EXPECT_TRUE(cache.ContainsHostCachedBlock(b_key));
+        EXPECT_TRUE(cache.TakePendingStores().empty());
+        auto incoming = cache.AcquireHostBlock(0, 0);
+        ASSERT_TRUE(incoming);
+        EXPECT_TRUE(cache.ContainsHostCachedBlock(a_key));
+        EXPECT_FALSE(cache.ContainsHostCachedBlock(b_key));
+    }
+}
+
 }  // namespace
 }  // namespace tokenspeed::test

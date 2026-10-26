@@ -1036,6 +1036,12 @@ void CacheCoordinator::cacheBlocksForGroup(std::size_t group_index, std::span<Ca
     if constexpr (Tier == CacheTier::kHost) {
         return;
     }
+    if (host_pool_ != nullptr) {
+        GroupPrefixProbe published;
+        published.hits.reserve(blocks.size());
+        for (const auto& block : blocks) published.hits.push_back(block ? 1 : 0);
+        groups_[group_index].Index().TouchMatched(*host_pool_, keys, 0, published, access_epoch);
+    }
     for (auto& [key, block_ref] : newly_cached) {
         if (cache_mutation_sink_) {
             cache_mutation_sink_(key, CacheMutation::kStored);

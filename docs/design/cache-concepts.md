@@ -1007,8 +1007,9 @@ and reverse minimization through `CacheEvictionPlan`. Host allocations compare
 across groups from the first victim, so old State entries cannot reserve capacity
 while newer KV entries replace one another. Host preserves candidate order and
 partial allocation: an impossible row stays empty, and its unsatisfied demand
-never causes cache eviction. Device hits
-refresh existing Host copies without pinning or allocating them; a lifetime
+never causes cache eviction. Device hits and publications
+refresh existing Host copies without pinning or allocating them, including when
+recomputed bytes reuse a key already stored on Host; a lifetime
 `was_acquired` bit does not outweigh recency on Host. Successful flushes
 report demoted victim selections and ancestry metadata sizes for the preceding
 interval; Device and Host counters reset when their respective tier is cleared.
