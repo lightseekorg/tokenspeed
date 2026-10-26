@@ -58,6 +58,7 @@ from tokenspeed.runtime.pd.host_peer import (
     PeerSettings,
     enable_mooncake_ipv6_for_host,
     mooncake_library,
+    mooncake_protocol,
 )
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import get_local_ip_by_remote
@@ -373,6 +374,7 @@ def build_epd_receive(
         enable_mooncake_ipv6_for_host(local_ip)
         transport = PeerSettings(
             library=mooncake_library(),
+            protocol=mooncake_protocol(),
             local_ip=local_ip,
             ib_device=server_args.disaggregation_ib_device or "",
             engine_rank=mapping.rank,
