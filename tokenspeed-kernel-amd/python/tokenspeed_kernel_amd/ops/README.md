@@ -1273,11 +1273,100 @@ FP8 conversion. A wave skips the rescale when none of its rows moved. Empty
 asm statements keep LLVM from moving each cluster's results across cluster
 barriers.
 
+### gfx950 MHA decode
+
+`gluon_mha_decode_gfx950` computes paged MHA decode with grouped-query
+attention. Full attention always splits the KV stream, and
+`gluon_mha_decode_reduce_gfx950` merges the partials by LSE; sliding-window
+attention uses its own split kernels.
+
+#### Contract
+
+- The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
+  64 or 128. FP8 queries produce a BF16 output. Sinks are supported;
+  `logit_cap` and LSE output are not.
+- Full attention takes the split count from the base CTAs (requests x KV heads
+  x query-head groups) and `max_seqlen_k`, capped at 64 splits. The count does
+  not read device-resident lengths, so graphs pass the maximum context as
+  `max_seqlen_k` and replay for any batch composition.
+
+#### Algorithm
+
+Each workgroup is a single wave that owns one KV head, up to 16 of its query
+heads and one split of the request's pages. K/V pages are copied into LDS with
+`buffer_load_dwordx4 ... lds`. When the grid already holds enough waves to
+cover the load latency, the split loop is single-buffered: it copies a page,
+waits for it (`s_waitcnt vmcnt`) and consumes it before copying the next.
+
+When `select_kv_splits` returns its maximum of 64, even the most splits leave
+the grid below its occupancy target, so each wave streams a long split. Its
+page loads are then software-pipelined four deep: four LDS buffers, three pages
+prefetched while one is consumed, provided their copies fit the 6-bit vmcnt
+count (BF16 head dim 128 does not). Splits with fewer pages than buffers stay
+single-buffered. vmcnt retires a wave's loads in issue order, so page indices
+load two loop iterations before use; reading an index loaded after the
+prefetches would wait for all of them. The index loads are volatile: the page
+table is read-only (`tl.const`), so the compiler could otherwise move them
+below the prefetches. Volatile also makes them skip the CU and L2 caches
+(`sc0 sc1`); loading two iterations ahead hides the extra latency. Each lane
+loads a different entry, which keeps them vector loads: scalar loads of the
+read-only table can only be waited on with `lgkmcnt(0)`, which the compiler
+places just before the copies that need the index, so each copy waits for a
+scalar-load round trip. Prefetches
+past the split repeat its last page rather than masking the copy, since a
+masked copy becomes a scalar branch after which the compiler waits for every
+outstanding load (`s_waitcnt vmcnt(0)`); only the split's last page is masked.
+The loop waits for those prefetches before the epilogue, whose layout
+conversions reuse the page buffers' LDS. `v_readfirstlane` moves each page
+index into an SGPR, so each copy takes its 64-bit page address from a buffer
+descriptor based at that page, the KV head from the scalar offset, and reuses
+loop-invariant 32-bit lane offsets within the page.
+
+Every split stores its partial output and LSE, with an LSE of -inf when it has
+no tokens, so the reduce merges stored partials without reading the cache
+lengths.
+
 ### gfx950 MHA cached extension
 
-Cached attention supports grouped-query attention even when the number of
-query heads per KV head is not a power of two. Multi-token extensions preserve
-the masking semantics of full and sliding-window attention.
+`gluon_mha_extend_gfx950` computes paged MHA attention for multi-token queries
+over cached keys, as in prefix-cached and chunked prefill. When the grid is
+short of workgroups, full attention splits the KV stream with
+`gluon_mha_extend_split_gfx950`, and `gluon_mha_extend_reduce_gfx950` merges
+the partials by LSE.
+
+#### Contract
+
+- The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
+  64 or 128. Query heads per KV head need not be a power of two. Full,
+  causal and sliding-window masking, sinks and LSE output are supported;
+  `logit_cap` is not.
+- The split count comes from the query blocks and `max_seqlen_k`, not from
+  device-resident lengths, so graphs replay for any batch composition.
+  Sliding-window attention does not split.
+
+#### Algorithm
+
+Each workgroup owns one KV head and packs its query-head group with up to 16
+query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
+two when no request has more than 64 queries. Unused head lanes are masked.
+
+K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. The copies are
+software-pipelined four deep: four LDS buffers, three pages prefetched per wave
+while one is consumed, provided the buffers leave two workgroups per CU (head
+dim 64). Split launches always pipeline. Unsplit ones pipeline only if the lower
+occupancy adds no round of workgroups, since single-buffered they fit three per
+CU. Ranges with fewer pages than buffers stay single-buffered. Every lane
+reads the same entries of the read-only (`tl.const`) page table, so the page
+indices are scalar loads (`s_load`), counted by lgkmcnt rather than vmcnt, and
+reading them does not wait for the prefetched copies. The compiler moves these
+loads down to their use, so each costs a scalar-cache round trip. Prefetches
+past the range repeat its last page rather than masking the copy, which would
+become a scalar branch followed by `s_waitcnt vmcnt(0)`, and those pages are
+not consumed; only pages that cross the range end, a causal diagonal or a
+window edge are masked. Each page index is already in an SGPR from its scalar
+load, so each copy takes its 64-bit page address from a buffer descriptor based
+at that page, the KV head from the scalar offset, and reuses loop-invariant
+32-bit lane offsets within the page.
 
 ### gfx950 MLA extend
 
