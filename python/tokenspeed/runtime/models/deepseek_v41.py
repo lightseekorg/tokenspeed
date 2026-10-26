@@ -820,7 +820,7 @@ class DeepseekV41Indexer(nn.Module):
                 rotary.cos_sin_cache,
                 self.scale,
             )
-        if q.is_cuda and current_platform().is_cdna4:
+        if q.is_cuda and (current_platform().is_cdna4 or current_platform().is_cdna5):
             rotary._prepare_cache(q.device)
             return rope_weights_inplace(
                 q, positions, rotary.cos_sin_cache, weights, self.scale, None
