@@ -81,6 +81,10 @@ _MLA_ARCHITECTURES = frozenset(
         # The K3 DSpark draft is MLA-native (DeepSeek-V3 layout, RoPE + YaRN),
         # so it must resolve to the MLA family rather than defaulting to MHA.
         "K3DSparkModel",
+        # The LongCat-Flash N-gram checkpoint keeps the in-tree LongCat MLA
+        # body; the plugin model profile already carries the family facts, and
+        # this table entry keeps table-driven geometry correct for it too.
+        "LongcatFlashNgramForCausalLM",
     }
 )
 _DSA_ARCHITECTURES = frozenset(
@@ -103,6 +107,8 @@ _MSA_ARCHITECTURES = frozenset(
 _DOUBLE_ATTENTION_LAYER_ARCHITECTURES = frozenset(
     {
         "LongcatFlashForCausalLM",
+        # N-gram checkpoint: same two attention branches per ScMoE layer.
+        "LongcatFlashNgramForCausalLM",
     }
 )
 # Architectures whose attention caches follow the config's cache_layer_types
