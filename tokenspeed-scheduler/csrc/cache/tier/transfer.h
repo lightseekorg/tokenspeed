@@ -125,6 +125,8 @@ struct WriteBackBatch {
             source_pinned.push_back(op.source_pinned);
         }
     }
+
+    bool operator==(const WriteBackBatch&) const = default;
 };
 
 struct LoadBackOperation {
@@ -168,6 +170,8 @@ struct LoadBackBatch {
             page_offsets.push_back(std::move(operation_offsets));
         }
     }
+
+    bool operator==(const LoadBackBatch&) const = default;
 };
 
 // Which Host buffer a restore row reads: the Host L2 prefix tier or the
@@ -255,6 +259,8 @@ struct SnapshotStoreBatch {
             dst_pages.push_back(std::move(operation_destinations));
         }
     }
+
+    bool operator==(const SnapshotStoreBatch&) const = default;
 };
 
 struct SnapshotRestoreBatch {
@@ -302,6 +308,8 @@ struct SnapshotRestoreBatch {
             source_tiers.push_back(std::move(operation_tiers));
         }
     }
+
+    bool operator==(const SnapshotRestoreBatch&) const = default;
 };
 
 using CacheOperation =

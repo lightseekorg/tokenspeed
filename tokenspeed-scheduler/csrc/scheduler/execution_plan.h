@@ -47,6 +47,8 @@ struct SchedulerAbort {
     std::string request_id;
     AbortReason reason{AbortReason::kImageDoesNotFit};
     std::string detail;
+
+    bool operator==(const SchedulerAbort&) const = default;
 };
 
 class ExecutionPlan {
@@ -98,6 +100,8 @@ public:
     // rounds): the last resort of a capacity retraction whose victim could
     // not be imaged.
     std::vector<SchedulerAbort> aborts;
+
+    bool operator==(const ExecutionPlan&) const = default;
 
 private:
     std::vector<Operation> operations_;
