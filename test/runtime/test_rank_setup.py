@@ -29,6 +29,7 @@ here rather than at the binding on startup.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import re
 import sys
@@ -200,8 +201,54 @@ def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
             ts.SchedulerConfig.HostWritePolicy.WriteBack,
             (1, 0),
         ),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--kvstore-write-policy",
+                "write_back",
+                "--attn-tp-size",
+                "2",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (1, 0),
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--kvstore-write-policy",
+                "write_back",
+                "--attn-tp-size",
+                "2",
+                "--kv-parallel-size",
+                "2",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (1, 0),
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--kvstore-write-policy",
+                "write_back",
+                "--attn-tp-size",
+                "4",
+                "--kv-parallel-size",
+                "2",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (1, 0),
+        ),
     ],
-    ids=["default", "prefill_write_back"],
+    ids=[
+        "default",
+        "prefill_write_back",
+        "prefill_write_back_attention_tp",
+        "prefill_write_back_kvp",
+        "prefill_write_back_tp_wider_than_kvp",
+    ],
 )
 def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
     args = prepare_server_args(["--model", "x", "--max-num-seqs", "8", *flags])
@@ -236,26 +283,28 @@ def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
                 "2",
                 "--kv-parallel-size",
                 "2",
+                "--query-context-parallel-size",
+                "2",
+                "--attention-backend",
+                "dsa",
             ],
-            "--kv-parallel-size > 1",
-        ),
-        (
-            ["--disaggregation-mode", "prefill", "--attn-tp-size", "2"],
-            "attention TP > 1",
+            "--query-context-parallel-size > 1",
         ),
         (
             ["--disaggregation-mode", "prefill", "--pipeline-parallel-size", "2"],
             "--pipeline-parallel-size > 1",
         ),
     ],
-    ids=["fused", "decode", "no_host", "l3", "kvp", "attention_tp", "pp"],
+    ids=["fused", "decode", "no_host", "l3", "qcp", "pp"],
 )
-def test_write_back_runs_only_on_a_single_rank_prefill_engine_with_host_l2(
-    flags, refused
-):
+def test_write_back_is_refused_without_its_prerequisites(flags, refused):
     # The scheduler writes back on the prefill role alone; the runtime with
-    # one attention-TP rank and one stage, unsharded pages and no L3.
-    with pytest.raises(ValueError, match=re.escape(refused)):
+    # Host L2 and no L3, on one pipeline stage, and not yet under a query
+    # shard. Attention TP and KV parallelism are accepted (above). Each case
+    # breaks one prerequisite, which the write_back check names.
+    with pytest.raises(
+        ValueError, match=re.escape(f"write_back does not support {refused}")
+    ):
         prepare_server_args(
             [
                 "--model",
@@ -317,6 +366,75 @@ def test_write_back_beside_a_sliding_window_group_is_refused_at_startup():
         ),
     ):
         ts.Scheduler(config("write_back"))
+
+
+def test_a_kv_parallel_prefill_engine_writes_back_its_sharded_group():
+    # A KV-parallel prefill engine shards its full-attention group over the
+    # KVP ranks, as the Kimi K3 recipe does; the scheduler built from it
+    # takes write-back as it takes write-through.
+    layer_types = ("full_attention",)
+    (full,) = specs_for_layers(
+        layer_types=layer_types,
+        group_ids=make_layer_group_ids(layer_num=1, layer_types=layer_types),
+        prefix_granularity=16,
+        pd_disaggregation_enabled=True,
+    )
+    specs = _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    specs.cache_groups = [
+        cache_group_config(
+            dataclasses.replace(full, shard_count=2),
+            total_pages=1 + 63 * 2,
+            cache_blocks_per_lcm_block=2,
+        )
+    ]
+    policies = ts.SchedulerConfig.HostWritePolicy
+    for flag, policy in (
+        ("write_back", policies.WriteBack),
+        ("write_through", policies.WriteThrough),
+    ):
+        args = prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--max-num-seqs",
+                "8",
+                "--disaggregation-mode",
+                "prefill",
+                "--attn-tp-size",
+                "2",
+                "--kv-parallel-size",
+                "2",
+                "--kvstore-write-policy",
+                flag,
+            ]
+        )
+        cfg = _config(args, specs)
+        assert cfg.host_write_policy == policy
+        assert cfg.cache_groups[0].shard_count == 2
+        ts.Scheduler(cfg)
+
+
+@pytest.mark.parametrize(
+    "world, attn_tp, attn_dp, kvp",
+    [(8, 8, 1, 8), (8, 8, 1, 4), (16, 8, 2, 8), (8, 8, 1, 1), (4, 2, 2, 2)],
+)
+def test_every_kv_group_lies_in_its_attention_tp_group(world, attn_tp, attn_dp, kvp):
+    # A segment written back publishes once every rank of the replica holds
+    # its ACK, and without a pipeline rust_host.py passes the attention TP
+    # group as ``replica_ranks`` (this checks the Mapping, not that wiring).
+    # The ranks that own a page between them, its KVP group, must all be in
+    # that group, or the segment could publish before an owner copied its
+    # rows.
+    for rank in range(world):
+        mapping = Mapping(
+            rank=rank,
+            world_size=world,
+            attn_tp_size=attn_tp,
+            attn_dp_size=attn_dp,
+            attn_kvp_size=kvp,
+        )
+        assert len(mapping.attn.kvp_group) == kvp
+        assert set(mapping.attn.kvp_group) <= set(mapping.attn.tp_group)
 
 
 def test_an_unknown_host_write_policy_is_refused():

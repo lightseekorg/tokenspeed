@@ -1217,8 +1217,8 @@ prompt resumes from both. The cost: a step that evicts must finish copying
 the evicted pages to the Host before its forward pass can write over them,
 so the copy adds to that step's time.
 
-`write_back` requires `--disaggregation-mode prefill` with Host L2, attention
-TP 1, `--pipeline-parallel-size 1`, `--kv-parallel-size 1` and no
+`write_back` requires `--disaggregation-mode prefill` with Host L2,
+`--pipeline-parallel-size 1`, `--query-context-parallel-size 1` and no
 `--kvstore-storage-backend`, and a model whose KV cache has no sliding-window
 group (sliding-window attention layers make one) and at most 64 cache groups;
 startup refuses it otherwise, the last two once the model's cache groups are
@@ -1233,6 +1233,12 @@ Under `write_back`:
   itself, what nothing can resume from any more, and pages evicted together
   that the Host cannot fit as a whole are dropped.
 - [KV cache events](#kv-cache-events) keep describing the GPU cache.
+- Under attention TP, every rank copies its own part of what the engine
+  evicts to its own Host L2 (under `--kv-parallel-size`, the pages it owns),
+  and an evicted page can be reused from the Host once every rank's copy has
+  completed. Where every rank holds whole pages (an MLA cache without
+  `--kv-parallel-size`), the ranks copy the same bytes: attention TP then
+  multiplies the copy traffic without letting the Host hold more pages.
 
 Elsewhere on this page, "write-back" means any copy from the GPU to Host L2,
 whichever policy is set, not only the copies `write_back` makes. How the

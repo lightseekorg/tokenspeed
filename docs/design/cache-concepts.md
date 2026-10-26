@@ -1574,6 +1574,29 @@ balanced allocator keeps ordinary admissions within one block per bucket, so
 the imbalance a restore sees is bounded by what its own victim table
 contributed.
 
+**No rank reads or writes another rank's Device KV.** A page an eviction
+write-back copies may be granted again in the same plan -- zeroed, loaded
+into, written by the forward -- and each rank orders its own copies ahead of
+all of that with one store fence on its default stream
+(`HostCacheExecutor.submit_write_backs`); a rank holding no row of an op
+still records the fence and acknowledges the op. One fence per rank is enough
+because every path keeps three invariants:
+
+1. Every KV write is the owner's: the attention prologue's owner-masked
+   store, page copies and zeroing within one owner's pages, Host rows through
+   the owner translation. What KVP, DCP and QCP exchange across ranks is
+   copies -- gathered history rows, query heads, attention partials -- never
+   a peer's cache.
+2. Off the execution stream, a read of a page the plan grants again forks
+   from it after the forward's prologue, which waits on the default stream
+   and with it on the plan's store fence and zeroing; the history gather's
+   all-gather, for one, reads rows the execution stream copied out. Only the
+   eviction copies, which the fence orders, read such a page earlier: on the
+   write stream, behind the forward that wrote it.
+3. A kernel that would read a peer's KV in place (one-sided or
+   symmetric-memory access) must also order behind that owner's store fence,
+   a cross-rank edge nothing provides today.
+
 PD transfer supports independently sharded prefill and decode roles. Manifests carry scheduler (virtual) IDs on both sides and are bounded
 by each side's virtual count, `1 + (page_count - 1) * shard_count`, never by
 the physical page count. The route planner (`ts-pd`'s `layout::route`) reads

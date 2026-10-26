@@ -800,18 +800,19 @@ to normal eviction.
 
 **Host L2: write-back.** With `host_write_policy` `kWriteBack`
 (`--kvstore-write-policy write_back`; this role only, no sliding-window group,
-no L3, and in the runtime attention TP 1 and PP 1, where every ACK is
-rank-local) nothing streams to the Host at publication. Instead what an
-admission evicts for the cache leaves by whole segments and is written back in
-the same plan, by the drain right after the build (one stream-ordered op, §2);
-how a segment is recorded, placed, published or dropped is in [Cache
-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator). At
-overlap depth 0 the op's ACK lands before the next plan is built: the forward
-the copy is fenced ahead of commits first, and the round's head advances
-completed cache ops (`CacheOps::acknowledged`, `event-loop.md`) before it
-builds. The request's own released slots are dropped, never written back, and
-so is a superseded input (§1.2) an admission evicts. So the two tiers together
-hold distinct content up to about the sum of their capacities, less pinned and
+no L3, and in the runtime one pipeline stage and no query shard) nothing
+streams to the Host at publication. Instead what an admission evicts for the
+cache leaves by whole segments and is written back in the same plan, by the
+drain right after the build (one stream-ordered op, §2); how a segment is
+recorded, placed, published or dropped is in [Cache
+concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator). Every
+attention-TP rank of the replica runs the same plan and copies the rows it
+owns, each Host block in its Device block's bucket (§5, "Every tier transfer
+pairs blocks of equal residue"), and each round's head hands the scheduler
+only the ACKs every rank holds (`CacheOps::acknowledged`, `event-loop.md`), a
+rank that owns none of an op's rows included. Nothing depends on an ACK
+arriving before the next plan is built. So the two tiers together hold
+distinct content up to about the sum of their capacities, less pinned and
 in-flight blocks, where write-through keeps on the Host a copy of what the
 Device holds.
 

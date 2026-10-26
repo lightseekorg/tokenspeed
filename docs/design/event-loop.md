@@ -597,6 +597,13 @@ every gather, even when its own part is empty. The poll runs these
 collectives only while a cache op is open: every rank counts the same plans
 and advances the same intersections, so the open count is the same
 everywhere and an idle replica polls nothing.
+The data plane acknowledges each op exactly once, one ACK per op of a batch,
+and the counts rely on it: `acknowledged` takes each polled ACK off the
+in-flight count before it deduplicates, so a repeated ACK breaks the counts.
+A poll then fails with `CacheOpError::Unaccounted` (at once, or once the
+remaining ops land), or the open count reaches zero while another op is in
+flight, and the loop stops polling before that op lands. Only the C++
+scheduler tolerates a repeated ACK.
 
 **L3** (`l3`, `--kvstore-storage-backend`). The C++ scheduler owns each
 request's storage transaction: it plans QUERY, GET, PUT and CANCEL

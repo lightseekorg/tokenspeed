@@ -236,12 +236,16 @@ def test_every_rank_reads_the_position_order_rows(
 class _StubLatentPool:
     """Per-layer ``[slots, 1, width]`` int32 latent planes, ``None`` for the
     layers without one (another history group's); reads are plain gathers
-    split in two halves."""
+    split in two halves. Like the MLA pool, a key-buffer read first waits for
+    its layer's Host load when a load tracker is set."""
 
     def __init__(self, planes: list[torch.Tensor | None]):
         self.kv_buffer = planes
+        self.layerwise_load_tracker = None
 
     def get_key_buffer(self, layer_id):
+        if self.layerwise_load_tracker is not None:
+            self.layerwise_load_tracker.wait_for_layer(layer_id)
         return self.kv_buffer[layer_id]
 
     def history_group_by_layer(self):
@@ -376,6 +380,151 @@ def test_read_prefix_history_prefetches_one_window_ahead():
         assert len(outputs[layer_id]) == len(chunks)
         for chunk, got in zip(chunks, outputs[layer_id]):
             torch.testing.assert_close(got, payload(layer_id, chunk).unsqueeze(1))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_a_prefetched_window_waits_for_its_layers_host_load():
+    """A Host load brings a prefix's later pages in layer by layer on a side
+    stream, held back before the second latent layer's copy, behind the
+    pools' real ``LayerwiseLoadTracker``. Reading the first latent layer
+    prefetches the second one's first window, and that gather reads the
+    loaded rows: it waits for its layer's load. The loaded pages are all rank
+    1's, so rank 0 arms no load and sends only rows it held already, yet
+    gathers every loaded row from rank 1."""
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
+    from tokenspeed.runtime.layers.attention.dcp.cache import PrefixHistoryGather
+    from tokenspeed.runtime.layers.attention.dcp.placement import (
+        resolve_cache_slots,
+    )
+
+    degree, page_size, subpages, chunk_len = 2, 32, 4, 512
+    virtual_block_count = 512
+    rows = page_size * subpages
+    # Blocks 1 to 3 (owners 0, 1, 0) stay on the Device; the Host load brings
+    # even blocks, rank 1's, for the rest of the prefix.
+    resident_blocks = [1, 2, 3]
+    blocks = resident_blocks + list(range(4, 44, 2))
+    prefix_len = len(blocks) * rows - 50
+    pages = [block * subpages + sub for block in blocks for sub in range(subpages)]
+    table = torch.zeros((1, len(pages) + 3), dtype=torch.int32)
+    table[0, : len(pages)] = torch.tensor(pages, dtype=torch.int32)
+    chunks = [
+        torch.tensor(chunk, dtype=torch.int32, device="cuda")
+        for chunk in _chunk_slots(
+            [
+                [
+                    pages[p // page_size] * page_size + p % page_size
+                    for p in range(prefix_len)
+                ]
+            ],
+            chunk_len,
+        )
+    ]
+    every_slot = torch.cat(chunks).to(torch.int64)
+    loaded = every_slot // rows > max(resident_blocks)
+    latent_layers = [1, 3, 4]
+    width = 8
+    local_rows = ((virtual_block_count - 2) // degree + 2) * rows
+    # Every layer's distinct payload of every slot, in loop order.
+    payloads = {
+        layer_id: (
+            layer_id * 1_000_000
+            + every_slot.unsqueeze(1) * width
+            + torch.arange(width, device="cuda")
+        ).to(torch.int32)
+        for layer_id in latent_layers
+    }
+
+    runs = {}
+    peer_sends = None
+    for rank in (1, 0):  # rank 1 first: rank 0 replays its sends
+        placement = CachePlacement(
+            block_granularity=rows,
+            virtual_block_count=virtual_block_count,
+            group=tuple(range(degree)),
+            rank=rank,
+        )
+        local, owned = resolve_cache_slots(every_slot, placement)
+        resident = owned & ~loaded
+        landing = owned & loaded
+        planes = [None] * 6
+        for layer_id in latent_layers:
+            plane = torch.full(
+                (local_rows, 1, width), -1, dtype=torch.int32, device="cuda"
+            )
+            plane[local[resident], 0] = payloads[layer_id][resident]
+            planes[layer_id] = plane
+        backend = _RecordingBackend(rank, peer_sends)
+        history = PrefixHistoryGather(placement, page_size=page_size, comm=backend)
+        history.prepare(
+            chunks,
+            page_table_cpu=table,
+            prefix_lens_cpu=torch.tensor([prefix_len]),
+            chunk_len=chunk_len,
+        )
+        # Planned before the load starts, so the reads below enqueue at once.
+        num_windows = len(history.windows)
+        assert num_windows > 1
+        pool = _StubLatentPool(planes)
+        pool.layerwise_load_tracker = LayerwiseLoadTracker(len(planes))
+        load_stream = None
+        if bool(landing.any()):
+            # Every layer's copy in order on the load's own stream, each
+            # recording its layer's event; the second latent layer's is late.
+            # The rows are selected first: a masked copy would wait for the
+            # load stream on the host.
+            landing_rows = local[landing]
+            landing_payloads = {
+                layer_id: payloads[layer_id][landing] for layer_id in latent_layers
+            }
+            index = pool.layerwise_load_tracker.begin_load()
+            events = pool.layerwise_load_tracker.event_sets[index].layer_done_events
+            load_stream = torch.cuda.Stream()
+            load_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(load_stream):
+                for layer_id, plane in enumerate(planes):
+                    if layer_id == latent_layers[1]:
+                        torch.cuda._sleep(200_000_000)
+                    if plane is not None:
+                        plane[landing_rows, 0] = landing_payloads[layer_id]
+                    events[layer_id].record(load_stream)
+            pool.layerwise_load_tracker.set_consumers(index)
+        else:
+            pool.layerwise_load_tracker.set_consumers(-1)
+        launched_after_layer = []
+        outputs = {}
+        for layer_id in latent_layers:
+            outputs[layer_id] = torch.cat(
+                [
+                    torch.cat(pair, dim=-1)
+                    for pair in history.read(
+                        pool,
+                        SimpleNamespace(layer_id=layer_id),
+                        chunks,
+                        dst_dtype=torch.int32,
+                    )
+                ]
+            )
+            launched_after_layer.append(len(backend.sends))
+        # The load has not landed yet: every read above was enqueued ahead of
+        # the delayed layers' copies.
+        assert load_stream is None or not load_stream.query()
+        torch.cuda.synchronize()
+        runs[rank] = (outputs, launched_after_layer)
+        peer_sends = backend.sends
+
+    outputs, launched_after_layer = runs[0]
+    # The second latent layer's first window was launched while the first
+    # layer was read, ahead of its own load.
+    assert launched_after_layer == [
+        num_windows + 1,
+        2 * num_windows + 1,
+        3 * num_windows,
+    ]
+    for layer_id in latent_layers:
+        torch.testing.assert_close(outputs[layer_id], payloads[layer_id].unsqueeze(1))
 
 
 def test_history_gather_plans_at_first_read():

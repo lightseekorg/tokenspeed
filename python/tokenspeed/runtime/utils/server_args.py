@@ -2037,12 +2037,13 @@ class ServerArgs:
         if self.kvstore_write_policy == "write_back":
             # The scheduler writes back on the prefill role alone, with Host
             # L2 and no L3 (whose staging would split what it writes back);
-            # the runtime also needs one attention-TP rank and one stage,
-            # where each eviction store is ACKed before the next plan is
-            # built. A model with a sliding-window cache group or more
-            # than 64 cache groups is refused by the scheduler at startup
-            # (SchedulerConfig.Validate), not here: the cache groups exist
-            # only once the model is loaded.
+            # pipeline stages and query context parallelism have not run
+            # write-back. Attention TP and --kv-parallel-size need no refusal:
+            # a written-back segment publishes once every rank of the replica
+            # has acknowledged it (docs/design/scheduler.md section 3.1). A
+            # sliding-window cache group or more than 64 cache groups is
+            # refused by SchedulerConfig.Validate, once the model's cache
+            # groups exist.
             unsupported = [
                 setting
                 for setting, refused in (
@@ -2056,8 +2057,10 @@ class ServerArgs:
                         "--kvstore-storage-backend",
                         self.kvstore_storage_backend is not None,
                     ),
-                    ("--kv-parallel-size > 1", self.kv_parallel_size > 1),
-                    ("attention TP > 1", self.mapping.attn.tp_size != 1),
+                    (
+                        "--query-context-parallel-size > 1",
+                        self.query_context_parallel_size > 1,
+                    ),
                     ("--pipeline-parallel-size > 1", self.mapping.has_pp),
                 )
                 if refused
@@ -2664,10 +2667,9 @@ class ServerArgs:
             "the copy), so the two tiers hold mostly different pages. "
             "write_back requires --disaggregation-mode prefill and is refused "
             "with --disable-kvstore, --kvstore-storage-backend, "
-            "--kv-parallel-size > 1, attention TP > 1 or "
-            "--pipeline-parallel-size > 1, and at startup for a model with a "
-            "sliding-window cache group or more than 64 cache groups; see "
-            "docs/configuration/server.md.",
+            "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
+            "and at startup for a model with a sliding-window cache group or "
+            "more than 64 cache groups; see docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

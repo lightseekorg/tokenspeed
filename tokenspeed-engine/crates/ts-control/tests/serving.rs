@@ -2705,6 +2705,178 @@ async fn a_prefill_engine_writes_back_what_it_evicts_and_loads_it_back() {
         assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1, "{case}");
         assert_eq!(cached, [0, 0, 0, 187 * 16], "{case}");
     }
+
+    // The device acknowledges nothing until the test opens its gate. While
+    // the third prompt's write-backs are unacknowledged, none of the pages
+    // they carry is reused from the Host: the first prompt sent again
+    // computes them anew, evicting the second prompt's last pages. Once the
+    // gate opens, the second prompt sent again loads those back.
+    let (prefill, decode, _wire) = start_pd_pair(
+        1,
+        Layout::Single,
+        Tiers::HostL2WriteBack,
+        Setup {
+            held_cache_acks: true,
+            ..Setup::default()
+        },
+    )
+    .await;
+    let mut cached = Vec::new();
+    let prompts = [
+        ("a", 0),
+        ("b", 10_000),
+        ("c", 20_000),
+        ("a-again", 0),
+        ("b-again", 10_000),
+    ];
+    for (room, (rid, first)) in (70_u64..).zip(prompts) {
+        if rid == "b-again" {
+            assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 0);
+            assert!(prefill.ranks[0].acknowledged.lock().unwrap().is_empty());
+            prefill.ranks[0].ack_gate.open();
+            let written_back = prefill.cache_ops(CacheOpKind::WriteBack);
+            for _ in 0..500 {
+                if prefill.ranks[0].acknowledged.lock().unwrap().len() == written_back {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert_eq!(
+                prefill.ranks[0].acknowledged.lock().unwrap().len(),
+                written_back
+            );
+        }
+        let request = TokenizedGenerateReqInput {
+            input_ids: Some((first + 1..=first + 3000).collect()),
+            ..disaggregated(rid, room, 1, 2)
+        };
+        let (prefilled, decoded) = tokio::join!(
+            run(&prefill.client, request.clone()),
+            run(&decode.client, request)
+        );
+        assert_eq!(tokens(&prefilled), [1000], "{rid} held");
+        assert_eq!(tokens(&decoded), [1000, 1001], "{rid} held");
+        cached.push(prefilled.last().unwrap().cached_tokens);
+    }
+    // The first prompt sent again hits only the full pages the Device kept;
+    // the second hits all of its own, loading the written-back ones.
+    assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1);
+    assert_eq!(cached, [0, 0, 0, 136 * 16, 187 * 16]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefill_replica_writes_back_what_it_evicts_on_every_rank() {
+    // The test above on mirrored prefill ranks, the odd ones acknowledging
+    // every cache op three polls after the even ones. Every rank copies its
+    // part of what the replica evicts, and a written-back segment publishes
+    // only once every rank holds its acknowledgment.
+    for (layout, depth) in [
+        (Layout::Tp(2), 0),
+        (Layout::TpKvp(2, 2), 0),
+        (Layout::TpKvp(2, 2), 1),
+        (Layout::TpKvp(4, 2), 0),
+    ] {
+        let (prefill, decode, _wire) = start_pd_pair(
+            depth,
+            layout,
+            Tiers::HostL2WriteBack,
+            Setup {
+                cache_ack_polls: Some(|rank| 3 * (rank % 2)),
+                ..Setup::default()
+            },
+        )
+        .await;
+        let case = format!("{layout:?} at depth {depth}");
+        let mut cached = Vec::new();
+        let prompts = [("a", 0), ("b", 10_000), ("c", 20_000), ("a-again", 0)];
+        for (room, (rid, first)) in (70_u64..).zip(prompts) {
+            let request = TokenizedGenerateReqInput {
+                input_ids: Some((first + 1..=first + 3000).collect()),
+                ..disaggregated(rid, room, 1, 2)
+            };
+            let (prefilled, decoded) = tokio::join!(
+                run(&prefill.client, request.clone()),
+                run(&decode.client, request)
+            );
+            assert_eq!(tokens(&prefilled), [1000], "{rid} on {case}");
+            assert_eq!(tokens(&decoded), [1000, 1001], "{rid} on {case}");
+            cached.push(prefilled.last().unwrap().cached_tokens);
+        }
+        prefill.settle().await;
+        // A request's release does not wait for its last plan's
+        // acknowledgments, which the odd ranks send three polls late.
+        let dispatched_ops: usize = [CacheOpKind::WriteBack, CacheOpKind::LoadBack]
+            .into_iter()
+            .map(|kind| prefill.cache_ops(kind))
+            .sum();
+        for _ in 0..500 {
+            if prefill
+                .ranks
+                .iter()
+                .all(|rank| rank.acknowledged.lock().unwrap().len() == dispatched_ops)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let plans: Vec<Vec<ExecutedPlan>> = prefill
+            .ranks
+            .iter()
+            .map(|rank| rank.plans.lock().unwrap().clone())
+            .collect();
+        let acknowledged: Vec<Vec<(usize, CacheEventKind, u32)>> = prefill
+            .ranks
+            .iter()
+            .map(|rank| rank.acknowledged.lock().unwrap().clone())
+            .collect();
+        // The ranks poll in the same rounds, so their poll counts are one
+        // timeline: on every rank, the first prompt's load-back comes no
+        // earlier than the poll at which the slowest rank acknowledged the
+        // write-backs dispatched before it.
+        for (rank, rank_plans) in plans.iter().enumerate() {
+            let load = rank_plans
+                .iter()
+                .position(|(_, _, ops)| ops.iter().any(|op| op.kind == CacheOpKind::LoadBack))
+                .unwrap_or_else(|| panic!("no load-back on rank {rank}, {case}"));
+            let written_back: Vec<u32> = rank_plans[..load]
+                .iter()
+                .flat_map(|(_, _, ops)| ops)
+                .filter(|op| op.kind == CacheOpKind::WriteBack)
+                .map(|op| op.op_id)
+                .collect();
+            let landed = acknowledged
+                .iter()
+                .flatten()
+                .filter(|&&(_, kind, op_id)| {
+                    kind == CacheEventKind::WriteBackDone && written_back.contains(&op_id)
+                })
+                .map(|&(poll, _, _)| poll)
+                .max()
+                .unwrap_or_else(|| panic!("no write-back before the load on rank {rank}, {case}"));
+            assert!(
+                rank_plans[load].0 >= landed,
+                "rank {rank}, {case}: loaded back at poll {}, written back at poll {landed}",
+                rank_plans[load].0
+            );
+        }
+        // Every rank ran the same plans and acknowledged each of their cache
+        // ops once.
+        let mut dispatched: Vec<u32> = plans[0]
+            .iter()
+            .flat_map(|(_, _, ops)| ops)
+            .map(|op| op.op_id)
+            .collect();
+        dispatched.sort_unstable();
+        for (rank, (rank_plans, rank_acks)) in plans.iter().zip(&acknowledged).enumerate() {
+            assert_eq!(rank_plans, &plans[0], "rank {rank}, {case}");
+            let mut op_ids: Vec<u32> = rank_acks.iter().map(|&(_, _, op_id)| op_id).collect();
+            op_ids.sort_unstable();
+            assert_eq!(op_ids, dispatched, "rank {rank}, {case}");
+        }
+        assert!(prefill.cache_ops(CacheOpKind::WriteBack) > 0, "{case}");
+        assert_eq!(prefill.cache_ops(CacheOpKind::LoadBack), 1, "{case}");
+        assert_eq!(cached, [0, 0, 0, 187 * 16], "{case}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2767,6 +2939,127 @@ async fn a_transfer_failing_on_one_prefill_rank_fails_on_every_rank() {
     prefill.settle().await;
     assert_eq!(prefill.released_on(0), [("doomed".to_owned(), 0)]);
     assert_eq!(prefill.released_on(1), prefill.released_on(0));
+
+    // Under Host write-back, with the second rank holding back every cache
+    // acknowledgment, the transfer breaks on that rank once the doomed
+    // prompt's admission has written back what it evicted. Both ranks
+    // release the prompt alike, and once the acknowledgments land nothing is
+    // pinned or in flight: the cache flushes and serving goes on.
+    for layout in [Layout::Tp(2), Layout::TpKvp(2, 2)] {
+        let (prefill, decode, wire) = start_pd_pair(
+            1,
+            layout,
+            Tiers::HostL2WriteBack,
+            Setup {
+                held_cache_acks: true,
+                ..Setup::default()
+            },
+        )
+        .await;
+        prefill.ranks[0].ack_gate.open();
+        // Three 3000-token prompts fill the Device; the third evicts the
+        // first one's last pages.
+        let prompts = [("a", 0), ("b", 10_000), ("c", 20_000)];
+        for (room, (rid, first)) in (70_u64..).zip(prompts) {
+            let request = TokenizedGenerateReqInput {
+                input_ids: Some((first + 1..=first + 3000).collect()),
+                ..disaggregated(rid, room, 1, 2)
+            };
+            let (prefilled, decoded) = tokio::join!(
+                run(&prefill.client, request.clone()),
+                run(&decode.client, request)
+            );
+            assert_eq!(tokens(&prefilled), [1000], "{rid} on {layout:?}");
+            assert_eq!(tokens(&decoded), [1000, 1001], "{rid} on {layout:?}");
+        }
+        let written_back = prefill.cache_ops(CacheOpKind::WriteBack);
+        assert!(written_back > 0, "{layout:?}");
+        // The doomed prompt's first chunk evicts more. Polling once per
+        // forward (FORWARD_TIME) sees that with a dozen chunks to go, and the
+        // transfer breaks then.
+        let doomed = TokenizedGenerateReqInput {
+            input_ids: Some((30_001..=33_500).collect()),
+            ..disaggregated("doomed", 90, 1, 2)
+        };
+        let decoding = decode.client.generate(doomed.clone()).await.unwrap();
+        let prefilling = prefill.client.generate(doomed).await.unwrap();
+        for _ in 0..5000 {
+            if prefill.cache_ops(CacheOpKind::WriteBack) > written_back {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            prefill.cache_ops(CacheOpKind::WriteBack) > written_back,
+            "{layout:?}"
+        );
+        wire.lock()
+            .unwrap()
+            .rooms
+            .entry(90)
+            .or_default()
+            .fails_on_prefill_rank = Some(1);
+        let (prefilled, decoded) = tokio::join!(collect(prefilling), collect(decoding));
+        for chunks in [prefilled, decoded] {
+            assert!(tokens(&chunks).is_empty(), "{layout:?}");
+            assert_eq!(
+                chunks.last().unwrap().finish_reason.as_deref(),
+                Some("abort"),
+                "{layout:?}"
+            );
+        }
+        prefill.settle().await;
+        assert!(
+            prefill.released_on(0).contains(&("doomed".to_owned(), 0)),
+            "{layout:?}"
+        );
+        assert_eq!(prefill.released_on(1), prefill.released_on(0), "{layout:?}");
+        assert!(
+            prefill.ranks[1].acknowledged.lock().unwrap().is_empty(),
+            "{layout:?}"
+        );
+        prefill.ranks[1].ack_gate.open();
+        let dispatched: usize = [CacheOpKind::WriteBack, CacheOpKind::LoadBack]
+            .into_iter()
+            .map(|kind| prefill.cache_ops(kind))
+            .sum();
+        for _ in 0..500 {
+            if prefill.ranks[1].acknowledged.lock().unwrap().len() == dispatched {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Both ranks ran the same plans.
+        let plans = prefill.ranks[0].plans.lock().unwrap().clone();
+        for (rank, member) in prefill.ranks.iter().enumerate() {
+            assert_eq!(
+                *member.plans.lock().unwrap(),
+                plans,
+                "rank {rank} on {layout:?}"
+            );
+            assert_eq!(
+                member.acknowledged.lock().unwrap().len(),
+                dispatched,
+                "rank {rank} on {layout:?}"
+            );
+        }
+        let flush = ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        });
+        assert_eq!(
+            control(&prefill, flush).await,
+            [("FlushCacheReqOutput", true)],
+            "{layout:?}"
+        );
+        let after = disaggregated("after", 91, 30, 2);
+        let (prefilled, decoded) = tokio::join!(
+            run(&prefill.client, after.clone()),
+            run(&decode.client, after)
+        );
+        assert_eq!(tokens(&prefilled), [1000], "{layout:?}");
+        assert_eq!(tokens(&decoded), [1000, 1001], "{layout:?}");
+    }
 }
 
 fn pause(mode: &str) -> ControlRequest {
