@@ -267,30 +267,7 @@ backend serves the layer. A per-token-head cache keeps the activation dtype.
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
 
-Ascend native DSA exposes BF16 KV cache storage in the runtime. Prefill
-keeps each CP rank's token rows, computes every attention head, and uses full
-QB/KC/VC/O weights prepared at load time. Decode retains the original sharded
-weights and native prologue. The common cache writer is unchanged.
-
-One AICPU communication stream serves both Index-K and latent KV. Historical
-owner cache planes are gathered during the preceding KDA layers. As soon as
-local Index-K is produced, its current rows are gathered directly into the
-prepared current receive region. After the MLA query/latent prologue, current
-KV is gathered on that same stream while the main stream runs Indexer.
-Indexer waits only for Index-K; sparse attention then waits for KV. Completion
-events preserve these dependencies without a host synchronize. The workspace
-is not reused until sparse attention finishes reading it.
-
-Device metadata prepares one compact page table and request numbering shared
-by Indexer and sparse attention; requests without local query rows are omitted.
-Complete aligned current pages map directly to their final rank-major receive
-addresses. Only pages crossing a request, prefix, or rank
-boundary are stitched into historical pages. A DSA-specific copy kernel also
-commits this rank's persistent owner rows. There is no full received-plane
-copy, query/output AllToAll, page deduplication, dynamic count readback, or
-CPU copy plan. Sanitization applies before communication when required by
-the cache target. Cache sizing reserves historical receives, bounded current
-receives, and uneven-row send padding before allocating the cache arena.
+Ascend native DSA exposes BF16 KV cache storage in the runtime.
 
 ## MLA shapes
 
@@ -345,69 +322,19 @@ behavioral trait (`has_norm`, `mrope`, `return_kv`, `expanded`, and the rest)
 the kernel does not implement for every value. An `override` naming a kernel
 this platform cannot run, or whose traits exclude the request, raises.
 
-## Ascend native DSA model components
+## Ascend integration
 
-`tokenspeed.runtime.layers.attention.dsa.ascend` owns `AscendDSAAttention`,
-`AscendDSAIndexer`, prepared `FusedDSADecode` and bit-preserving projection
-weight layouts. Models supply their configuration, projection dimensions and
-explicit independent-selection/separate-projection choices. The shared module
-has no dependency on model extensions.
+Shared Ascend DSA and MLA components own attention execution. Models supply
+configuration and checkpoint weights; kernel selection and weight preparation
+belong to the `attention` family in `tokenspeed-kernel`. Weight preparation
+preserves coefficients and dtype.
 
-The native decode ABI currently supports DCP8, draft8, hidden width 4096,
-64 global index heads and eight local attention heads. Its supported gathered
-row counts are 64/128/256/512. The prepared prologue owns normalization,
-optional independent MLA/indexer RoPE and BF16 cache writes;
-the existing paged backend owns sparse selection and attention. Unsupported
-execution shapes fail instead of selecting another projection path.
+Native prologues follow the normalization, rotation and cache-write contracts
+above. Owner-sharded transport may commit prepared KV rows on the prologue's
+behalf; router-provided slots, ownership masks and cache sanitization remain
+authoritative. Distributed execution preserves each request's causal visibility.
 
-`AscendDSAAttention` also owns the ordinary MLA/indexer projections used by
-Prefill and decode buckets outside the prepared native projection shape.
-Both paths share causal metadata, cache placement and the existing paged backend.
-Prefill gathers complete projection weights once after loading; Decode keeps
-its original head-sharded weights. No model extension supplies another forward.
-
-`AscendDSARuntime` prepares the existing HCCL window views before capture and
-binds them to replacement cache backends. `AscendMLARuntime` owns the analogous
-MLA prologue, FP32 FIA partials and direct LSE merge. Models construct these
-owners from their local attention layers through the existing startup hook and
-close them only after forwards drain and all referencing graphs are destroyed.
-The operators validate actual HCCL window capacity during preparation. No extra
-SHMEM arena, Python IPC registration or per-forward capacity query is added.
-Kernel registration and weight preparation belong to the `attention` family in
-`tokenspeed-kernel`; neither owner imports an external model extension.
-
-Device projection format conversion stays behind the kernel-package adapter.
-Preparing a weight allocates fresh NZ29 storage without changing coefficients
-or dtype; graph execution consumes the prepared buffers and communication state.
-
-## Ascend dense MLA Prefill over owner-sharded KV
-
-The Ascend MLA adapter keeps projection weights head-sharded. Local QKV-A
-and normalization produce the query latent and the normalized 576-wide KV rows.
-The current KV rows use the existing DSA AICPU gather/owner-commit transport,
-with no Index-K plane, while the query latent gathers over attention TP before
-the local QB projection. This is the same cache-write exception as native DSA:
-one exact byte-copy update commits each owned row and makes gathered rows
-visible through the prepared receive table. The persistent cache remains
-owner-sharded and the shared receive workspace is budgeted before arena sizing.
-The model passes the router's padded write slots into the commit; a paged leaf
-does not reconstruct request slots or own the router's write-location API.
-The shared Ascend transport accepts those int32 slots and widens them at its
-int64 native ABI boundary without changing the framework's slot layout.
-
-Historical gathers can be enqueued before preceding KDA computation; the next
-MLA layer consumes them only after its producer event. An aligned current page
-aliases its final receive address, while boundary pages are stitched by the
-existing transport kernel. The receive workspace cannot be reused until the
-consumer event from the preceding layer. Cache rebind and shutdown drain and
-close the owned communicator.
-
-Each rank reads the complete visible sequence and expands only its local heads.
-`AscendMLAAttention` expands only bounded history blocks for ungated BF16 NoPE
-Q-LoRA. History blocks are unmasked because they precede every current query;
-the final current block uses bottom-right causal alignment. Partial outputs and
-LSE merge in FP32 before rounding back to the query dtype. Short histories stay
-in one attention call. The original O shard and CommManager output reduction
-remain unchanged; no full-head projection-weight copy is retained.
-The NPU kernel package owns FIA graph-length updates and the capture-local FP32
-scratch for BF16 destinations. Models do not replace that handler.
+Weights and communication resources are prepared before graph capture. Native
+communication reuses the existing HCCL window and validates its capacity during
+preparation. Resource owners keep buffers alive until all referencing graphs
+are destroyed and outstanding work is drained, then release them.
