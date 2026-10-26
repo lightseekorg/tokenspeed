@@ -128,11 +128,12 @@ class TestNumericsMode:
         assert (ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm) == (
             "unfused"
         )
-        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
         args = ServerArgs(
             model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
         )
         assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
         with pytest.raises((ValueError), match=("--layer-boundary-norm")):
             ServerArgs(model="x", layer_boundary_norm="half")
 

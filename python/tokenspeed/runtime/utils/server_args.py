@@ -1789,6 +1789,7 @@ class ServerArgs:
             # The fused all-reduce+norm kernels add the residual inside the
             # fusion; the unfused boundary norm needs the bf16 sum first.
             self.enable_allreduce_fusion = False
+            self.comm_fusion_max_num_tokens = -1
         if self.moe_combine_order == "slot":
             # The MoE leaf returns complete rows; a fused all-reduce+norm at
             # the next layer boundary would sum them tp_size times.

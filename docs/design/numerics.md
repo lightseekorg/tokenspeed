@@ -54,7 +54,8 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 ├── collectives.deterministic       one association order per reduction
 │   ├── no fused AR+norm            enable_allreduce_fusion=False and
 │   │                               comm_fusion_max_num_tokens=-1, also set
-│   │                               by batch_invariant_collectives alone (the
+│   │                               by batch_invariant_collectives or
+│   │                               layer_boundary_norm=unfused alone (the
 │   │                               fused kernels make no bitwise claim)
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
