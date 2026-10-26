@@ -109,6 +109,30 @@ pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
 reads the expert offsets once into shared memory while its barriers are set up,
 and fills the lookup table per expert instead of searching per tile.
 
+### Fused SM90 gated FC1
+
+The private `optimized` mode fuses eligible block-FP8 SwiGLU calls with
+hidden size 512, intermediate size 1024, at most 256 input rows, and a positive
+`expected_m < 32`. Bias, LoRA, AWQ, min-latency mode and a separate FC2 FP8
+quantization scale retain their existing paths. The supported paired tile has
+128 output channels per half and at most 32 token rows; other shapes retain the
+existing execution path.
+
+A paired tile computes matching gate/up blocks and applies SwiGLU and 1x128
+FP8 quantization before writing its output. Both existing BF16 rounding points
+are preserved: after FC1 accumulation and after SwiGLU. FC2 consumes the dense
+FP8 buffer and padded scales directly. Its BF16 output uses separate workspace,
+and the input descriptor is bounded by the current invocation's capacity.
+
+With `enable_pdl=True`, the matching eight-stage FC2 can load its first weight
+tile and weight scales into shared memory before waiting for FC1. FC1 publishes
+immutable routing metadata before triggering dependents; activation and
+activation-scale reads remain after the dependency wait. `enable_pdl=False`
+keeps the grouped launches ordered and disables this first-tile prefetch.
+Prepare and warm the callable before graph capture. Fusion and prefetch variants
+have distinct content-keyed kernel caches, and route metadata is refreshed on
+replay. Performance depends on routing; benchmark the intended workload.
+
 ### NVFP4 routing-map padding
 
 The pinned FlashInfer version (0.7.2) initializes unused rows inside active

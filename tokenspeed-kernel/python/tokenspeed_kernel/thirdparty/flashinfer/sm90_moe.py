@@ -217,6 +217,7 @@ def _private_spec(
     flags.append(f"-DFLASHINFER_SM90_MOE_MAX_STAGES_FC2={max_num_stages_fc2}")
     if optimized:
         flags.append("-DFLASHINFER_SM90_GROUPED_MOE_OPTIMIZATIONS=1")
+        flags.append("-DFLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT=1")
     mode = "optimized" if optimized else "expected_m"
     return replace(
         spec,
