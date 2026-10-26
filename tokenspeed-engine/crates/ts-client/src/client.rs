@@ -171,6 +171,16 @@ impl Shared {
 
     fn route(&self, request: &TokenizedGenerateReqInput) -> Result<usize> {
         let count = self.engines.len();
+        let pinned = |rank: i64| {
+            usize::try_from(rank)
+                .ok()
+                .filter(|rank| *rank < count)
+                .ok_or_else(|| {
+                    Error::InvalidRequest(format!(
+                        "data_parallel_rank {rank} is outside 0..{count}"
+                    ))
+                })
+        };
         match self.routing {
             Routing::BootstrapRoom => {
                 let room = request.bootstrap_room.ok_or_else(|| {
@@ -178,18 +188,14 @@ impl Shared {
                         "disaggregated serving needs a bootstrap_room on every request".to_owned(),
                     )
                 })?;
-                Ok((room % count as u64) as usize)
+                match request.data_parallel_rank {
+                    Some(rank) => pinned(rank),
+                    None => Ok((room % count as u64) as usize),
+                }
             }
             Routing::Aggregated(policy) => {
                 if let Some(rank) = request.data_parallel_rank {
-                    return usize::try_from(rank)
-                        .ok()
-                        .filter(|rank| *rank < count)
-                        .ok_or_else(|| {
-                            Error::InvalidRequest(format!(
-                                "data_parallel_rank {rank} is outside 0..{count}"
-                            ))
-                        });
+                    return pinned(rank);
                 }
                 let start = self.round_robin.fetch_add(1, Ordering::Relaxed) % count;
                 Ok(match policy {

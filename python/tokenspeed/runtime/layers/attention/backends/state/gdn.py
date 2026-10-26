@@ -60,6 +60,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
     _verify_scan_writes_replay = True
+    _verify_scan_runs_chain_form = True
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)

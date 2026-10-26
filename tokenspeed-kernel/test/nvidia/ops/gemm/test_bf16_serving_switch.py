@@ -33,7 +33,9 @@ from tokenspeed_kernel.ops.gemm._triton.gemv import _rowcta_gemv_kernel
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not fi.has_flashinfer_cute_dsl_bf16(),
+    not torch.cuda.is_available()
+    or fi.platform.arch_version not in (fi.ArchVersion(10, 0), fi.ArchVersion(10, 3))
+    or not fi.has_flashinfer_cute_dsl_bf16(),
     reason="the joint BF16 GEMM needs FlashInfer's cute-dsl backend on SM100/SM103",
 )
 
