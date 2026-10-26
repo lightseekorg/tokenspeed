@@ -34,6 +34,7 @@
 #include <iterator>
 #include <utility>
 
+#include "cache/coordinator/shadow_occupancy.h"
 #include "cache/prefix/prefix_hasher.h"
 #include "cache/prefix/prefix_matcher.h"
 #include "utils.h"
@@ -1443,6 +1444,251 @@ CacheBlockRef CacheCoordinator::AcquireHostBlock(std::uint32_t group_id, std::in
     return batch.blocks.empty() ? CacheBlockRef{} : std::move(batch.blocks.front());
 }
 
+CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
+    std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
+    std::span<const HostSegmentRows> boundaries) const {
+    _assert(host_pool_ != nullptr, "Host placement requires a host pool");
+    _assert(group_ids.size() == buckets.size(), "Host allocation needs one bucket per requested block");
+    std::size_t next_row = 0;
+    for (const HostSegmentRows& boundary : boundaries) {
+        _assert(boundary.first_row == next_row && boundary.past_end_row >= boundary.first_row,
+                "Host boundaries cover the rows in order");
+        next_row = boundary.past_end_row;
+    }
+    _assert(next_row == group_ids.size(), "Host boundaries cover every row");
+    // The rows so far by group and bucket, the demand the shadow fits.
+    std::vector<std::vector<std::int64_t>> need_by_bucket(groups_.size());
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        need_by_bucket[i].assign(static_cast<std::size_t>(groups_[i].Allocator().ShardCount()), 0);
+    }
+    for (std::size_t row = 0; row < group_ids.size(); ++row) {
+        _assert(group_ids[row] < groups_.size(), "Host block group id out of range");
+        _assert(buckets[row] >= 0 && buckets[row] < groups_[group_ids[row]].Allocator().ShardCount(),
+                "Host block bucket is outside the group's shard count");
+        ++need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
+    }
+    const std::vector<std::int64_t> no_dense_need(groups_.size(), 0);
+    ShadowOccupancy shadow{*host_pool_, groups_};
+    HostBoundaryPlan plan;
+    // Every row fits the free capacity: no victim.
+    if (shadow.Fits(need_by_bucket, no_dense_need)) {
+        plan.num_boundaries = boundaries.size();
+        return plan;
+    }
+    for (std::vector<std::int64_t>& group_need : need_by_bucket) {
+        std::ranges::fill(group_need, 0);
+    }
+
+    // AcquireHostBlocks' candidates, in its order: per group and bucket the
+    // unpinned entries, the least recently accessed first (location breaks
+    // ties), and the parents whose every occupant is an unpinned entry, by
+    // their newest one, then group and id.
+    struct BucketCandidates {
+        std::vector<PrefixCacheIndex::EvictionCandidate> entries;
+        std::size_t next{0};
+    };
+    std::vector<std::vector<BucketCandidates>> children(groups_.size());
+    // Per parent holding an unpinned entry: how many it holds, the newest
+    // access among them, its occupants no victim has taken yet, and whether
+    // a row took the room one of its children left (AcquireHostBlocks places
+    // the row there, which keeps the parent from going whole later on) or
+    // the rows placed need its free slots.
+    struct ParentCandidate {
+        std::uint64_t newest_access_epoch{0};
+        std::int32_t evictable_children{0};
+        std::int32_t untaken_occupants{0};
+        bool allocated{false};
+    };
+    std::unordered_map<std::int32_t, ParentCandidate> parents;
+    for (std::uint32_t group_id = 0; group_id < groups_.size(); ++group_id) {
+        const GroupAllocator& allocator = groups_[group_id].Allocator();
+        children[group_id].resize(static_cast<std::size_t>(allocator.ShardCount()));
+        for (PrefixCacheIndex::EvictionCandidate& candidate :
+             groups_[group_id].Index().EvictableCandidates(*host_pool_)) {
+            ParentCandidate& parent = parents[candidate.location.lcm_block_id];
+            ++parent.evictable_children;
+            parent.newest_access_epoch = std::max(parent.newest_access_epoch, candidate.metadata.last_access_epoch);
+            children[group_id][allocator.BucketOf(candidate.location)].entries.push_back(std::move(candidate));
+        }
+        for (BucketCandidates& bucket : children[group_id]) {
+            std::ranges::sort(bucket.entries, {}, [&](const PrefixCacheIndex::EvictionCandidate& candidate) {
+                return std::tuple{candidate.metadata.last_access_epoch, group_id, candidate.location.lcm_block_id,
+                                  candidate.location.slot_index};
+            });
+        }
+    }
+    std::vector<std::tuple<std::uint64_t, std::uint32_t, std::int32_t>> victim_parents;
+    for (auto& [parent_id, parent] : parents) {
+        parent.untaken_occupants = host_pool_->OccupiedCount(parent_id);
+        if (parent.evictable_children == parent.untaken_occupants) {
+            victim_parents.emplace_back(parent.newest_access_epoch, *host_pool_->BoundGroup(parent_id), parent_id);
+        }
+    }
+    std::ranges::sort(victim_parents);
+    std::size_t next_parent = 0;
+
+    std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> taken;
+    const auto take_entry = [&](std::uint32_t group_id, CacheBlockLocation location) {
+        shadow.Remove(group_id, location);
+        taken.insert(location);
+        if (const auto parent = parents.find(location.lcm_block_id); parent != parents.end()) {
+            --parent->second.untaken_occupants;
+        }
+        plan.victims.emplace_back(group_id, location);
+    };
+    // As evictHostCachedBlock evicts: a checkpoint takes the other State
+    // groups' at its hash along, those not pinned (Find's reference is the
+    // second when the index alone holds one).
+    const auto take = [&](std::uint32_t group_id, CacheBlockLocation location) {
+        take_entry(group_id, location);
+        if (!GroupIsState(group_id)) {
+            return;
+        }
+        const std::optional<CacheKey> key = groups_[group_id].Index().KeyOf(*host_pool_, location);
+        ForEachBoundaryKey(*key, /*tail_tokens=*/0, [&](std::size_t i, const CacheKey& sibling_key) {
+            if (!GroupIsState(i)) {
+                return;
+            }
+            const CacheBlockRef sibling = groups_[i].Index().Find(*host_pool_, sibling_key);
+            if (sibling && sibling.use_count() == 2 && !taken.contains(sibling->Location())) {
+                take_entry(groups_[i].Id(), sibling->Location());
+            }
+        });
+    };
+
+    // A boundary at a time, as AcquireHostBlocks takes a batch: the rows that
+    // fit the capacity left go first, then each other row, in order, takes
+    // victims until it fits. A boundary short of a victim returns those it
+    // took and ends the plan.
+    for (const HostSegmentRows& boundary : boundaries) {
+        const std::size_t num_victims_before = plan.victims.size();
+        std::vector<std::size_t> short_rows;
+        for (std::size_t row = boundary.first_row; row < boundary.past_end_row; ++row) {
+            std::int64_t& need = need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
+            ++need;
+            if (!shadow.Fits(need_by_bucket, no_dense_need)) {
+                --need;
+                short_rows.push_back(row);
+            }
+        }
+        for (const std::size_t row : short_rows) {
+            const std::uint32_t group_id = group_ids[row];
+            const auto bucket = static_cast<std::size_t>(buckets[row]);
+            BucketCandidates& candidates = children[group_id][bucket];
+            ++need_by_bucket[group_id][bucket];
+            while (!shadow.Fits(need_by_bucket, no_dense_need)) {
+                while (candidates.next < candidates.entries.size() &&
+                       taken.contains(candidates.entries[candidates.next].location)) {
+                    ++candidates.next;
+                }
+                while (next_parent < victim_parents.size()) {
+                    const std::uint32_t bound_group = std::get<1>(victim_parents[next_parent]);
+                    const std::int32_t parent_id = std::get<2>(victim_parents[next_parent]);
+                    ParentCandidate& parent = parents.at(parent_id);
+                    if (parent.untaken_occupants > 0 && !parent.allocated) {
+                        // AcquireHostBlocks never takes a parent a row landed
+                        // in whole. The shadow does not track where the rows
+                        // placed before this one land, so a parent stays when
+                        // they need its free slots: with those filled as
+                        // well, they would not fit.
+                        const GroupAllocator& allocator = groups_[bound_group].Allocator();
+                        std::vector<std::int64_t> free_slots(
+                            static_cast<std::size_t>(allocator.ShardCount()),
+                            allocator.CacheBlocksPerLcmBlock() / allocator.ShardCount());
+                        for (const CacheBlockLocation& location : host_pool_->OccupiedLocations(parent_id)) {
+                            if (!taken.contains(location)) {
+                                --free_slots[static_cast<std::size_t>(allocator.BucketOf(location))];
+                            }
+                        }
+                        --need_by_bucket[group_id][bucket];
+                        for (std::size_t b = 0; b < free_slots.size(); ++b) {
+                            need_by_bucket[bound_group][b] += free_slots[b];
+                        }
+                        const bool rows_need_its_slots = !shadow.Fits(need_by_bucket, no_dense_need);
+                        for (std::size_t b = 0; b < free_slots.size(); ++b) {
+                            need_by_bucket[bound_group][b] -= free_slots[b];
+                        }
+                        ++need_by_bucket[group_id][bucket];
+                        if (!rows_need_its_slots) {
+                            break;
+                        }
+                        parent.allocated = true;
+                    }
+                    ++next_parent;
+                }
+                const bool has_child = candidates.next < candidates.entries.size();
+                const bool has_parent = next_parent < victim_parents.size();
+                if (!has_child && !has_parent) {
+                    plan.victims.resize(num_victims_before);
+                    return plan;
+                }
+                // Equal epochs prefer one child, as in AcquireHostBlocks.
+                if (has_child && (!has_parent || candidates.entries[candidates.next].metadata.last_access_epoch <=
+                                                     std::get<0>(victim_parents[next_parent]))) {
+                    const CacheBlockLocation location = candidates.entries[candidates.next++].location;
+                    parents.at(location.lcm_block_id).allocated = true;
+                    take(group_id, location);
+                } else {
+                    const std::uint32_t bound_group = std::get<1>(victim_parents[next_parent]);
+                    const std::int32_t parent_id = std::get<2>(victim_parents[next_parent]);
+                    ++next_parent;
+                    for (const CacheBlockLocation& location : host_pool_->OccupiedLocations(parent_id)) {
+                        if (!taken.contains(location)) {
+                            take(bound_group, location);
+                        }
+                    }
+                }
+            }
+        }
+        ++plan.num_boundaries;
+    }
+    return plan;
+}
+
+std::size_t CacheCoordinator::NumHostBoundariesThatFit(std::span<const std::uint32_t> group_ids,
+                                                       std::span<const std::int32_t> buckets,
+                                                       std::span<const HostSegmentRows> boundaries) const {
+    return planHostBoundaries(group_ids, buckets, boundaries).num_boundaries;
+}
+
+CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBoundaries(
+    std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
+    std::span<const HostSegmentRows> boundaries) {
+    const HostBoundaryPlan plan = planHostBoundaries(group_ids, buckets, boundaries);
+    // Evict, then allocate, as AcquireHostSegments does: the planned rows fit
+    // jointly once the victims are gone.
+    for (const auto& [group_id, location] : plan.victims) {
+        // A checkpoint takes the other State groups' at its hash along.
+        if (groups_[group_id].Index().Contains(*host_pool_, location)) {
+            FatalCheck(evictHostCachedBlock(group_id, location, &HostEvictionStats::lru),
+                       "a planned Host victim became pinned");
+        }
+        FatalCheck(!host_pool_->IsOccupied(location), "a planned Host victim's block is still occupied");
+    }
+    HostAllocationBatch batch;
+    batch.blocks.resize(group_ids.size());
+    batch.stats.requested = group_ids.size();
+    const std::size_t num_placed_rows = plan.num_boundaries == 0 ? 0 : boundaries[plan.num_boundaries - 1].past_end_row;
+    for (std::uint32_t group_id = 0; group_id < groups_.size(); ++group_id) {
+        std::vector<std::size_t> rows;
+        std::vector<std::int32_t> group_buckets;
+        for (std::size_t row = 0; row < num_placed_rows; ++row) {
+            if (group_ids[row] == group_id) {
+                rows.push_back(row);
+                group_buckets.push_back(buckets[row]);
+            }
+        }
+        std::vector<CacheBlockRef> blocks = host_pool_->AcquireBlocksInBuckets(group_id, group_buckets);
+        FatalCheck(blocks.size() == rows.size(), "a planned Host placement did not fit");
+        for (std::size_t j = 0; j < rows.size(); ++j) {
+            batch.blocks[rows[j]] = std::move(blocks[j]);
+        }
+    }
+    batch.stats.allocated = num_placed_rows;
+    batch.stats.unallocated = batch.stats.requested - num_placed_rows;
+    return batch;
+}
+
 CacheBlockRef CacheCoordinator::FindHostCachedBlock(const CacheKey& key) const {
     if (host_pool_ == nullptr) {
         return {};
@@ -2221,8 +2467,11 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlotsAfter(st
                     std::ranges::any_of(slots, [slot](const ImageSlot& s) { return s.slot_index == slot; })) {
                     continue;
                 }
+                // Register re-points a slot whose key the index holds already
+                // to that canonical block.
+                CacheBlockRef canonical = groups_[i].Index().Find(pool_, range.keys[j]);
                 slots.push_back(ImageSlot{.slot_index = slot,
-                                          .block = blocks[index],
+                                          .block = canonical ? std::move(canonical) : blocks[index],
                                           .key = range.keys[j],
                                           .logical_block_index = slot,
                                           .boundary_kind = range.boundary_kind});

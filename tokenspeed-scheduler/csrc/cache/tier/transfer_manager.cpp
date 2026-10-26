@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <numeric>
 #include <unordered_set>
 #include <utility>
 
@@ -379,74 +380,137 @@ TierTransferManager::InFlightHostBlocks TierTransferManager::inFlightHostBlocks(
     return by_key;
 }
 
-std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartRetractionStores(
-    const std::string& request_id, std::int32_t request_pool_index, std::shared_ptr<SnapshotSlotIndex> blob_slot,
-    std::span<const BlockTable> tables, std::int32_t num_tokens) {
-    _assert(blob_slot != nullptr && blob_slot->valid(), "a retraction image needs its blob slot");
+TierTransferManager::RetractionImageSplit TierTransferManager::SplitRetractionImage(
+    std::span<const BlockTable> tables, std::int32_t num_tokens, std::vector<std::vector<ImageSlot>> published) const {
     const std::int32_t num_groups = coordinator_.NumGroups();
-    std::vector<std::vector<ImageSlot>> published = coordinator_.PublishedDataSlots(tables, num_tokens);
-    std::vector<std::vector<ImageSlot>> host_slots(static_cast<std::size_t>(num_groups));
-    std::vector<std::uint32_t> pending_store_ops;
-    const auto wait_for = [&pending_store_ops](std::uint32_t op_id) {
-        if (std::find(pending_store_ops.begin(), pending_store_ops.end(), op_id) == pending_store_ops.end()) {
-            pending_store_ops.push_back(op_id);
-        }
-    };
-
-    // The L2 leg. A published slot rides Host L2 as its prefix entry: the
-    // existing entry when the key is already Host-cached, the in-flight
-    // ticket's block when an earlier store carries it (the image then waits
-    // for that store too), else a Host block acquired in the Device block's
-    // bucket and copied by this retraction's own write-back.
-    struct Pending {
-        std::uint32_t group_id;
-        ImageSlot slot;
-    };
-    std::vector<Pending> to_allocate;
-    std::vector<std::uint32_t> allocate_groups;
-    std::vector<std::int32_t> allocate_buckets;
-    WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kRetraction)];
+    RetractionImageSplit split{.host_slots = std::vector<std::vector<ImageSlot>>(static_cast<std::size_t>(num_groups))};
+    // A published slot rides Host L2 as its prefix entry: the existing entry
+    // when the key is already Host-cached, the in-flight ticket's block when
+    // an earlier store carries it (the image then waits for that store too),
+    // else a Host block acquired in the Device block's bucket and copied by
+    // the retraction's own write-back -- one row to place.
     if (coordinator_.HasHostPool()) {
         const InFlightHostBlocks in_flight = inFlightHostBlocks();
-        for (std::int32_t g = 0; g < num_groups; ++g) {
+        // The rows to place by boundary, each content hash numbered in the
+        // order the image's slots first name it, the prefix-closed groups'
+        // slots first so the shallowest boundary comes first whatever order
+        // the groups are declared in; within one, in that group order and slot
+        // order.
+        struct Row {
+            std::uint32_t group_id;
+            std::int32_t bucket;
+            ImageSlot slot;
+        };
+        std::unordered_map<ContentHash, std::size_t> boundary_of_hash;
+        std::vector<std::vector<Row>> rows_by_boundary;
+        std::vector<std::int32_t> group_order(static_cast<std::size_t>(num_groups));
+        std::iota(group_order.begin(), group_order.end(), 0);
+        std::ranges::stable_partition(group_order,
+                                      [&](std::int32_t g) { return coordinator_.GroupMatcher(g).IsPrefixClosed(); });
+        for (const std::int32_t g : group_order) {
             const GroupAllocator& allocator = coordinator_.Allocator(g);
             for (ImageSlot& slot : published[static_cast<std::size_t>(g)]) {
+                const auto [boundary, numbered] =
+                    boundary_of_hash.try_emplace(slot.key.content_hash, rows_by_boundary.size());
+                if (numbered) {
+                    rows_by_boundary.emplace_back();
+                }
                 if (CacheBlockRef cached = coordinator_.FindHostCachedBlock(slot.key)) {
-                    ++stats.host_cached;
                     slot.block = std::move(cached);
-                    host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
+                    split.host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
                     continue;
                 }
                 // Only a store whose ACK publishes the key: an eviction
                 // write-back's segment may publish it later or never, after
                 // the image has counted its L2 leg as landed.
                 if (const auto it = in_flight.find(slot.key); it != in_flight.end() && it->second.publishes_at_ack) {
-                    ++stats.in_flight;
-                    wait_for(it->second.op_id);
+                    if (std::ranges::find(split.pending_store_ops, it->second.op_id) == split.pending_store_ops.end()) {
+                        split.pending_store_ops.push_back(it->second.op_id);
+                    }
                     slot.block = it->second.block;
-                    host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
+                    split.host_slots[static_cast<std::size_t>(g)].push_back(std::move(slot));
                     continue;
                 }
-                allocate_groups.push_back(static_cast<std::uint32_t>(g));
-                allocate_buckets.push_back(allocator.BucketOf(slot.block->Location()));
-                to_allocate.push_back(Pending{.group_id = static_cast<std::uint32_t>(g), .slot = std::move(slot)});
+                const std::int32_t bucket = allocator.BucketOf(slot.block->Location());
+                rows_by_boundary[boundary->second].push_back(
+                    Row{.group_id = static_cast<std::uint32_t>(g), .bucket = bucket, .slot = std::move(slot)});
+            }
+        }
+        for (std::vector<Row>& rows : rows_by_boundary) {
+            if (rows.empty()) {
+                continue;  // the Host serves every slot at this hash already
+            }
+            split.boundaries.push_back(CacheCoordinator::HostSegmentRows{
+                .first_row = split.slots.size(), .past_end_row = split.slots.size() + rows.size()});
+            for (Row& row : rows) {
+                split.group_ids.push_back(row.group_id);
+                split.buckets.push_back(row.bucket);
+                split.slots.push_back(std::move(row.slot));
             }
         }
     }
+
+    // What the Host serves with the rows of the first `num_boundaries`
+    // boundaries placed, per group: the rest is the snapshot pool's.
+    const auto host_served = [&](std::size_t num_boundaries) {
+        std::vector<std::vector<ImageSlot>> served = split.host_slots;
+        const std::size_t num_rows = num_boundaries == 0 ? 0 : split.boundaries[num_boundaries - 1].past_end_row;
+        for (std::size_t row = 0; row < num_rows; ++row) {
+            served[split.group_ids[row]].push_back(split.slots[row]);
+        }
+        return served;
+    };
+    if (!split.boundaries.empty()) {
+        split.num_host_boundaries =
+            coordinator_.NumHostBoundariesThatFit(split.group_ids, split.buckets, split.boundaries);
+    }
+    if (!coordinator_.SnapshotPoolHolds(tables, num_tokens, host_served(split.boundaries.size()))) {
+        split.shortfall = ImageShortfall::kSnapshotPool;
+    } else if (!coordinator_.SnapshotPoolHolds(tables, num_tokens, host_served(split.num_host_boundaries))) {
+        split.shortfall = ImageShortfall::kHostL2;
+    }
+    return split;
+}
+
+std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartRetractionStores(
+    const std::string& request_id, std::int32_t request_pool_index, std::shared_ptr<SnapshotSlotIndex> blob_slot,
+    std::span<const BlockTable> tables, std::int32_t num_tokens, RetractionImageSplit split) {
+    _assert(blob_slot != nullptr && blob_slot->valid(), "a retraction image needs its blob slot");
+    _assert(!split.shortfall, "a retraction takes only an image its split holds");
+    WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(HostStoreCause::kRetraction)];
+    // The split's Host slots: Host entries, or the blocks of stores in flight.
+    for (const std::vector<ImageSlot>& slots : split.host_slots) {
+        for (const ImageSlot& slot : slots) {
+            if (coordinator_.ContainsHostCachedBlock(slot.key)) {
+                ++stats.host_cached;
+            } else {
+                ++stats.in_flight;
+            }
+        }
+    }
+    std::vector<std::vector<ImageSlot>> host_slots = std::move(split.host_slots);
+    std::vector<std::uint32_t> pending_store_ops = std::move(split.pending_store_ops);
+
+    // The L2 leg: the rows of the boundaries the split counted get Host
+    // blocks by its plan, copied by this retraction's own write-back.
     std::vector<StoreTicket> tickets;
     std::vector<BlockTransfer> host_store_pairs;
-    if (!to_allocate.empty()) {
+    if (!split.slots.empty()) {
         CacheCoordinator::HostAllocationBatch host_blocks =
-            coordinator_.AcquireHostBlocks(allocate_groups, allocate_buckets);
-        for (std::size_t i = 0; i < to_allocate.size(); ++i) {
+            coordinator_.AcquireHostBoundaries(split.group_ids, split.buckets, split.boundaries);
+        const std::size_t num_host_rows =
+            split.num_host_boundaries == 0 ? 0 : split.boundaries[split.num_host_boundaries - 1].past_end_row;
+        _assert(host_blocks.stats.allocated == num_host_rows,
+                "the Host places the rows of the boundaries the split counted");
+        for (std::size_t i = 0; i < split.slots.size(); ++i) {
             CacheBlockRef& host_block = host_blocks.blocks[i];
             if (!host_block) {
                 ++stats.snapshot_fallback;
-                continue;  // L2 is full of pinned entries: this slot rides the snapshot pool instead
+                continue;  // a boundary past the ones the Host holds: this slot rides the snapshot pool instead
             }
-            ImageSlot& slot = to_allocate[i].slot;
+            ImageSlot& slot = split.slots[i];
             host_store_pairs.push_back(BlockTransfer{
-                .group_id = to_allocate[i].group_id,
+                .group_id = split.group_ids[i],
                 .source = slot.block,
                 .destination = host_block,
                 .key = slot.key,
@@ -455,7 +519,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
             // entry; the image's own pin on the same block outlives it.
             tickets.push_back(StoreTicket{slot.key, CacheBlockRef{}, host_block});
             slot.block = std::move(host_block);
-            host_slots[to_allocate[i].group_id].push_back(std::move(slot));
+            host_slots[split.group_ids[i]].push_back(std::move(slot));
         }
         for (std::vector<ImageSlot>& slots : host_slots) {
             std::ranges::sort(slots, {}, &ImageSlot::slot_index);
@@ -465,8 +529,8 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
     // The tail leg: every other data slot, in the snapshot pool.
     std::optional<CacheCoordinator::ImageTaken> taken = coordinator_.TakeImage(tables, num_tokens, host_slots);
     if (!taken) {
-        stats.image_refused += tickets.size();
-        return std::nullopt;  // the acquired Host blocks and tickets die here, unused
+        ++stats.image_refused;
+        return std::nullopt;  // the acquired Host blocks and tickets die here, unused (no plan reaches this)
     }
 
     RetractionStores stores{.image = std::move(taken->image)};
@@ -490,7 +554,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
             .transfers = std::move(transfers),
             .source_pinned = false,
         };
-        wait_for(op_id);
+        pending_store_ops.push_back(op_id);
     }
     {
         const std::uint32_t op_id = nextOpId();
@@ -512,7 +576,7 @@ std::optional<TierTransferManager::RetractionStores> TierTransferManager::StartR
                                                                         .blob_slot = std::move(blob_slot)})
                                   .second;
         _assert(inserted, "duplicate snapshot store op id");
-        wait_for(op_id);
+        pending_store_ops.push_back(op_id);
     }
     stores.pending_store_ops = std::move(pending_store_ops);
     return stores;

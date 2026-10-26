@@ -401,32 +401,24 @@ private:
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
     // Who gives way, and whether it can be imaged. `victim` is nullptr when
-    // nobody can (every resident is exempt or there is no resident); with
-    // image_fits false it is the newest retractable resident, to be aborted
-    // because no candidate's image fits the host budgets.
+    // nobody can (every resident is exempt or there is no resident); with a
+    // shortfall it is the newest retractable resident, to be aborted because
+    // no candidate's image fits the host budgets, and the shortfall is its.
     struct VictimChoice {
         Request* victim{nullptr};
-        bool image_fits{false};
+        std::optional<ImageShortfall> shortfall;
     };
     // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
     VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
-    // Whether the host budgets hold the request's image right now: a blob
-    // slot is free and the snapshot pool holds everything the L2 leg would
-    // not carry once the retraction has published the request's completed
-    // pages (projected, nothing mutated). An L2 allocation shortfall can still
-    // send published slots to the pool at retraction time, where the image can
-    // then turn out not to fit.
-    bool imageFits(const Request& request) const;
-    // Why a victim could not be imaged: no snapshot pool at all (the null
-    // page alone is configured, so nothing is ever imaged), no blob slot
-    // free, or a pool too small for the image.
-    enum class ImageShortfall { kNoPool, kBlobSlot, kSnapshotPool };
-    // Images the victim and suspends it, or returns the shortfall; past the
-    // blob-slot check its completed pages stay published, and the Host
-    // entries evicted for the attempt stay evicted (see forward.cpp).
+    // Why the host budgets cannot hold the request's image right now
+    // (projected, nothing mutated), unset when they can (see forward.cpp).
+    std::optional<ImageShortfall> imageShortfall(const Request& request) const;
+    // Images the victim and suspends it, or returns the shortfall before
+    // anything is acquired or evicted for the image; past the blob-slot check
+    // its completed pages stay published (see forward.cpp).
     std::optional<ImageShortfall> retractVictim(Request& victim, PlanBuild& build,
                                                 std::vector<WriteBackOperation>& write_back_operations);
     // The one site of the last-resort policy: a capacity retraction whose
@@ -439,8 +431,8 @@ private:
     // The debug_force_retraction_interval knob: arms the oldest Decoding
     // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
     // the batch until it is quiescent, then retracts it. A victim whose image
-    // does not fit (imageFits) runs on with nothing published; one refused
-    // only after its publication is aborted.
+    // does not fit (imageShortfall) runs on with nothing published; one
+    // refused only after its publication is aborted.
     void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
                               std::vector<WriteBackOperation>& write_back_operations);
 

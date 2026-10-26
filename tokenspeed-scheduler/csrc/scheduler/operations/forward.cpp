@@ -772,10 +772,10 @@ std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPla
 // fewest clients, and among equal frees the client that has streamed least
 // is interrupted. (On the D role everything resident is decoding.)
 //
-// Only candidates whose image fits the host budgets (imageFits) are ranked.
-// When none does, the host side is out of room and the last resort is to
-// abort a resident instead of imaging one: the newest retractable resident
-// (the least work lost) is returned with image_fits = false. Without a
+// Only candidates whose image fits the host budgets (imageShortfall) are
+// ranked. When none does, the host side is out of room and the last resort
+// is to abort a resident instead of imaging one: the newest retractable
+// resident (the least work lost) is returned with its shortfall. Without a
 // snapshot pool nothing ever fits, so a capacity block there always ends in
 // that abort rather than in a wait that could deadlock once every resident
 // needs a page.
@@ -815,12 +815,17 @@ Scheduler::VictimChoice Scheduler::chooseVictim(std::span<Request* const> candid
     std::ranges::stable_sort(
         decodes, [&decode_rank](const Request* a, const Request* b) { return decode_rank(a) < decode_rank(b); });
     ranked.insert(ranked.end(), decodes.begin(), decodes.end());
+    VictimChoice newest_choice{.victim = newest};
     for (Request* request : ranked) {
-        if (imageFits(*request)) {
-            return VictimChoice{.victim = request, .image_fits = true};
+        const std::optional<ImageShortfall> shortfall = imageShortfall(*request);
+        if (!shortfall) {
+            return VictimChoice{.victim = request};
+        }
+        if (request == newest) {
+            newest_choice.shortfall = shortfall;
         }
     }
-    return VictimChoice{.victim = newest, .image_fits = false};
+    return newest_choice;
 }
 
 // The first half of a retraction: hashes the prefix pages the victim
@@ -850,61 +855,78 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
     victim.CacheProgressRef() = std::move(cache_progress);
 }
 
-bool Scheduler::imageFits(const Request& request) const {
+std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) const {
+    if (!config_.HasSnapshotPool()) {
+        return ImageShortfall::kNoPool;
+    }
     if (snapshot_slots_.AvailableSlots() == 0) {
-        return false;
+        return ImageShortfall::kBlobSlot;
     }
     // The retraction publishes the candidate's completed pages before it
     // images it, and those pages ride the L2 leg. The probe projects that
     // publication on a copy of the progress (hashing the same pages
-    // publishCompletedPrefix will) and reads the L2/pool split off
+    // publishCompletedPrefix will) and splits the image off
     // PublishedDataSlotsAfter -- the publication's own slot rule -- so it
-    // counts against the pool exactly what StartRetractionStores will put
-    // there. Nothing is mutated: a candidate that does not fit is left as it
-    // was. Without a Host pool everything is the pool's.
+    // plans the L2 leg and counts against the pool what StartRetractionStores
+    // will, unless the publication itself changes what that plan reads: a
+    // tail it drops under the per-prior cap takes its Host entries along;
+    // and under KV parallelism a slot it re-points to the Device entry
+    // already holding its key rides the pool in that entry's bucket, not the
+    // one counted here. The split retractVictim makes after the publication
+    // can then refuse the image. Nothing is mutated: a candidate that does
+    // not fit is left as it was, and so is the Host.
     fsm::CacheProgress cache_progress = request.CacheProgress();
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     const RequestProgress progress =
         AdvanceRequestProgress(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
-    const std::vector<std::vector<ImageSlot>> published =
-        coordinator_.PublishedDataSlotsAfter(request.BlockTablesRef(), num_computed_tokens, progress);
-    return coordinator_.SnapshotPoolHolds(
-        request.BlockTablesRef(), num_computed_tokens,
-        coordinator_.HasHostPool() ? published : std::vector<std::vector<ImageSlot>>(published.size()));
+    return tier_transfers_
+        .SplitRetractionImage(
+            request.BlockTablesRef(), num_computed_tokens,
+            coordinator_.PublishedDataSlotsAfter(request.BlockTablesRef(), num_computed_tokens, progress))
+        .shortfall;
 }
 
 // Suspends a quiescent victim with its image. First the completed prefix
 // pages are published into the Device index (publishCompletedPrefix: a
 // finish-like publication other requests may hit; it costs only the hashes
 // of pages not yet hashed, and the image's L2 leg is built from exactly
-// those entries). Then the transfer manager takes the image -- published
-// slots as pinned Host L2 entries, everything else in the snapshot pool, each
-// in its Device block's bucket -- and issues both store legs; the victim's
-// Device pages are released by the retract event and may be granted away in
-// this very round, because the runtime orders both copies on the forward
-// thread's stream ahead of the plan's page reuse. A victim whose image cannot
-// be held, or with no blob slot free, is not retracted: the shortfall is
-// returned, and the publication it did stands as its progress. Both callers
-// then abort it rather than let it run on: the publication registered blocks
-// the victim would write again (a partial page as a tail, and a State group's
-// end state, which a decode step writes in place).
-std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
-    Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations) {
+// those entries). Then the transfer manager splits the image again on what
+// the publication left -- the published slots the Host serves or places by
+// plan, everything else in the snapshot pool, each in its Device block's
+// bucket -- takes it and issues both store legs; the victim's Device pages
+// are released by the retract event and may be granted away in this very
+// round, because the runtime orders both copies on the forward thread's
+// stream ahead of the plan's page reuse. A victim whose image cannot be held,
+// or with no blob slot free, is not retracted: the shortfall is returned
+// before anything is acquired or evicted for the image, and the publication
+// it did stands as its progress. Both callers then abort it rather than let
+// it run on: the publication registered blocks the victim would write again (a
+// partial page as a tail, and a State group's end state, which a decode step
+// writes in place).
+std::optional<ImageShortfall> Scheduler::retractVictim(Request& victim, PlanBuild& build,
+                                                       std::vector<WriteBackOperation>& write_back_operations) {
     if (snapshot_slots_.AvailableSlots() == 0) {
         return ImageShortfall::kBlobSlot;
     }
     publishCompletedPrefix(victim);
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
+    TierTransferManager::RetractionImageSplit split = tier_transfers_.SplitRetractionImage(
+        victim.BlockTablesRef(), num_computed_tokens,
+        coordinator_.PublishedDataSlots(victim.BlockTablesRef(), num_computed_tokens));
+    if (split.shortfall) {
+        return split.shortfall;  // the publication stands; the caller aborts the victim
+    }
 
     // The blob slot is shared with the store that exports into it (and later
     // the restore that imports from it): an abort before either ACK leaves
     // the slot with the op until the copy is done.
     auto blob_slot = std::make_shared<SnapshotSlotIndex>(snapshot_slots_.Allocate());
-    std::optional<TierTransferManager::RetractionStores> stores = tier_transfers_.StartRetractionStores(
-        victim.Id(), victim.RequestPoolIndex(), blob_slot, victim.BlockTablesRef(), num_computed_tokens);
+    std::optional<TierTransferManager::RetractionStores> stores =
+        tier_transfers_.StartRetractionStores(victim.Id(), victim.RequestPoolIndex(), blob_slot,
+                                              victim.BlockTablesRef(), num_computed_tokens, std::move(split));
     if (!stores) {
-        return ImageShortfall::kSnapshotPool;  // the publication stands; the caller aborts the victim
+        return ImageShortfall::kSnapshotPool;  // unreachable: the split held the image
     }
     victim.NoteRetracted();
     if (stores->host_store) {
@@ -936,6 +958,16 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
             detail = "the snapshot pool cannot hold the image (num_snapshot_pages=" +
                      std::to_string(config_.snapshot_allocator.total_pages) +
                      "; raise --retraction-snapshot-ratio / --retraction-snapshot-host-gb)";
+            break;
+        case ImageShortfall::kHostL2:
+            detail =
+                "the Host L2 cache cannot take the image's published pages the snapshot pool cannot hold "
+                "(num_host_pages=" +
+                std::to_string(config_.host_allocator.total_pages) + ", " +
+                std::to_string(coordinator_.NumPinnedHostCachedBlocks()) +
+                " Host entries pinned by images and copies, " +
+                (tier_transfers_.HasAnyInFlight() ? "copies in flight" : "no copy in flight") +
+                "; raise --kvstore-size (or --kvstore-ratio when no size is given))";
             break;
     }
     spdlog::warn(
@@ -977,9 +1009,10 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
 // for capacity they hold would be the same thrash.
 //
 // The host side is finite too. When no candidate's image fits (no blob slot,
-// or a snapshot pool too small for the tail -- always, without a pool) the
-// last resort is to ABORT the newest retractable resident instead of imaging
-// anyone (onImageDoesNotFit): its pages free in this round exactly as a
+// a snapshot pool too small for the tail, or a Host L2 that cannot take the
+// published pages the pool cannot -- always, without a pool) the last resort
+// is to ABORT the newest retractable resident instead of imaging anyone
+// (onImageDoesNotFit): its pages free in this round exactly as a
 // retraction's would and the grant proceeds. The alternative, waiting, can
 // deadlock once every resident needs a page.
 //
@@ -1060,17 +1093,11 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                 return;
             }
         }
-        // A victim nobody can image (or whose image turns out not to fit
-        // once the L2 leg is tried) is aborted: the last resort frees its
-        // pages for the grant all the same.
-        std::optional<ImageShortfall> shortfall;
-        if (choice.image_fits) {
+        // A victim nobody can image, or one retractVictim refuses after
+        // publishing, is aborted: the last resort frees its pages all the same.
+        std::optional<ImageShortfall> shortfall = choice.shortfall;
+        if (!shortfall) {
             shortfall = retractVictim(*victim, build, write_back_operations);
-        } else if (!config_.HasSnapshotPool()) {
-            shortfall = ImageShortfall::kNoPool;
-        } else {
-            shortfall =
-                snapshot_slots_.AvailableSlots() == 0 ? ImageShortfall::kBlobSlot : ImageShortfall::kSnapshotPool;
         }
         if (shortfall) {
             onImageDoesNotFit(*victim, *shortfall, build);
@@ -1172,7 +1199,7 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
     // The knob is not capacity pressure: a victim the probe refuses runs on
     // with nothing published; one retractVictim refuses after its
     // publication is aborted (see retractVictim).
-    if (!imageFits(*armed)) {
+    if (imageShortfall(*armed)) {
         spdlog::info("[Scheduler] forced retraction of request {} refused: its image does not fit", armed->Id());
         return;
     }

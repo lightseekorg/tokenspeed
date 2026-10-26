@@ -34,8 +34,8 @@ namespace tokenspeed {
 // Why the scheduler finished a request on its own.
 enum class AbortReason : std::uint8_t {
     // A capacity retraction chose it and its KV image did not fit the host
-    // budgets (snapshot pool or blob slots), so its pages were freed by
-    // aborting it instead of imaging it (Scheduler::onImageDoesNotFit); or
+    // budgets (snapshot pool, blob slots or Host L2), so its pages were freed
+    // by aborting it instead of imaging it (Scheduler::onImageDoesNotFit); or
     // the debug knob's retraction was refused after publishing its pages.
     kImageDoesNotFit = 0,
 };

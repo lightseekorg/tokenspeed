@@ -11653,6 +11653,726 @@ TEST_P(ShardedRestoreWriteBackTest, ARestoreWritesBackWhatItEvicts) {
     coordinator.Free(restored);
 }
 
+// ---------------------------------------------------------------------------
+// A retraction image's Host L2 leg is planned before anything is acquired or
+// evicted for it (TierTransferManager::SplitRetractionImage): the published
+// slots the Host serves already, the rest as rows by boundary, how many
+// boundaries the Host takes (CacheCoordinator::NumHostBoundariesThatFit) and
+// whether the snapshot pool holds what is left. The victim probe asks the
+// split; StartRetractionStores carries out the same plan, so an image the
+// split holds is always taken and one it refuses leaves the Host as it was.
+// One Full group, a block per page of two tokens, unless a test says else.
+// ---------------------------------------------------------------------------
+
+// Four Host blocks hold other prompts' pages. The image has six published
+// pages and a snapshot pool of one block: the Host could take four of them
+// by evicting every entry, which leaves two for the pool. The split refuses
+// the image on the Host's account, and every entry stays.
+TEST(RetractionImageSplitTest, ARefusedImageLeavesTheHostAsItWas) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    BlockPool pool(8, {1});
+    BlockPool host_pool(4, {1});
+    BlockPool snapshot_pool(1, {1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers(coordinator);
+    const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}, {97, 98}});
+    for (const std::string& hash : cached) {
+        CacheBlockRef block = host_pool.AcquireBlock(0);
+        coordinator.CacheHostBlock(block, Key(hash, 0), std::nullopt);
+    }
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/12));
+    const std::vector<std::string> image_pages = ContentHashes({{1, 2}, {3, 4}, {5, 6}, {7, 8}, {9, 10}, {11, 12}});
+    CacheCompletedBlocksForTest(coordinator, tables, image_pages,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/12, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+
+    const TierTransferManager::RetractionImageSplit split =
+        transfers.SplitRetractionImage(tables, /*num_tokens=*/12, coordinator.PublishedDataSlots(tables, 12));
+    EXPECT_EQ(split.shortfall, ImageShortfall::kHostL2);
+    EXPECT_EQ(split.boundaries.size(), 6u);
+    EXPECT_EQ(split.num_host_boundaries, 4u) << "the Host takes four pages by evicting all four entries";
+    for (const std::string& hash : cached) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+    }
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 0u);
+    EXPECT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+    coordinator.Free(tables);
+}
+
+// A Full group of four blocks per parent and a State group. The Host's two
+// parents both hold Full entries: X four unpinned ones, the oldest, and Y one
+// pinned and three unpinned. The image needs a Full block and a State block
+// at its one page. Freeing every unpinned entry would make room for both --
+// the Full block in Y, X emptied for the State block -- but the allocator
+// takes the oldest Full entry, in X, for the Full block, which keeps X, and
+// Y never empties: the State block has no parent. The Host takes no
+// boundary, and keeps every entry: with a snapshot pool for the State
+// group's working slot alone, the split refuses the image on the Host's
+// account; with one that holds both rows as well, the retraction takes the
+// image and evicts nothing for the boundary the Host does not take.
+TEST(RetractionImageSplitTest, AnImageFitsOnlyWhereTheAllocatorWouldPlaceIt) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    for (const std::int32_t snapshot_parents : {1, 3}) {
+        SCOPED_TRACE(snapshot_parents);
+        BlockPool pool(8, {4, 1});
+        BlockPool host_pool(2, {4, 1});
+        BlockPool snapshot_pool(snapshot_parents, {4, 1});
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        // Outlives the transfer manager, whose snapshot store holds a slot.
+        SnapshotSlotAllocator blob_slots(1);
+        TierTransferManager transfers(coordinator);
+        const std::vector<std::string> cached =
+            ContentHashes({{91, 92}, {93, 94}, {95, 96}, {97, 98}, {81, 82}, {83, 84}, {85, 86}, {87, 88}});
+        CacheBlockRef pinned;
+        for (const std::string& hash : cached) {
+            CacheBlockRef block = host_pool.AcquireBlock(0);
+            coordinator.CacheHostBlock(block, Key(hash, 0), std::nullopt);
+            if (hash == cached[4]) {
+                pinned = std::move(block);
+            }
+        }
+        ASSERT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+        std::vector<BlockTable> tables(2);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
+        const std::vector<std::string> image_page = ContentHashes({{1, 2}});
+        CacheCompletedBlocksForTest(coordinator, tables, image_page,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2,
+                                    CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                    /*publish_state=*/true);
+
+        TierTransferManager::RetractionImageSplit split =
+            transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
+        ASSERT_EQ(split.boundaries.size(), 1u);
+        EXPECT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 1}))
+            << "one boundary: the Full row, then the State row";
+        EXPECT_EQ(split.num_host_boundaries, 0u);
+        if (snapshot_parents == 1) {
+            EXPECT_EQ(split.shortfall, ImageShortfall::kHostL2);
+        } else {
+            ASSERT_FALSE(split.shortfall.has_value());
+            std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+                "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+                /*num_tokens=*/2, std::move(split));
+            ASSERT_TRUE(stores.has_value());
+            EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kRetraction).snapshot_fallback, 2u);
+        }
+        for (const std::string& hash : cached) {
+            EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+        }
+        EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 0u);
+        coordinator.Free(tables);
+    }
+}
+
+// A Full group and two State groups, one block per parent each; the Host's
+// four parents hold, oldest first, the State checkpoints of one hash in the
+// first State group, a Full entry F, a Full entry G, and the second State
+// group's checkpoint at that hash. The image's one page needs a Full block
+// and both State blocks. The Full block's victim is the oldest parent, the
+// first checkpoint, which takes its sibling along: two parents free. The
+// first State block fits beside it, and the second takes F. G stays: the
+// plan counts the sibling the cascade frees rather than taking another
+// victim for its room.
+TEST(RetractionImageSplitTest, ACheckpointVictimFreesItsStateSiblingInThePlan) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    BlockPool pool(8, {1, 1, 1});
+    BlockPool host_pool(4, {1, 1, 1});
+    BlockPool snapshot_pool(2, {1, 1, 1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    SnapshotSlotAllocator blob_slots(1);
+    TierTransferManager transfers(coordinator);
+    const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}});
+    const std::vector<CacheKey> host_keys{Key(cached[0], 1), Key(cached[1], 0), Key(cached[2], 0), Key(cached[0], 2)};
+    for (const CacheKey& key : host_keys) {
+        CacheBlockRef block = host_pool.AcquireBlock(key.group_id);
+        coordinator.CacheHostBlock(block, key, std::nullopt);
+    }
+    ASSERT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+    std::vector<BlockTable> tables(3);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
+    CacheCompletedBlocksForTest(coordinator, tables, ContentHashes({{1, 2}}),
+                                CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/true);
+
+    TierTransferManager::RetractionImageSplit split =
+        transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
+    ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 1, 2}));
+    ASSERT_EQ(split.num_host_boundaries, 1u);
+    ASSERT_FALSE(split.shortfall.has_value());
+    std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+        "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+        /*num_tokens=*/2, std::move(split));
+    ASSERT_TRUE(stores.has_value());
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[0]));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[1]));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(host_keys[2])) << "G is no victim";
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[3]));
+    coordinator.Free(tables);
+}
+
+// A Full group of two blocks per parent and a State group. The Host's
+// parents hold, oldest first, a Full entry c, a State checkpoint w, a second
+// Full entry beside c and a State checkpoint q. The image's two pages need a
+// Full block each and a State block at the second. The first Full block
+// takes c's place, which keeps c's parent from going whole, as in
+// AcquireHostBlocks; the second Full block takes w's parent, whose other
+// slot could hold the first Full block as well, and still the State block
+// takes q, not c's parent: the second Full entry stays.
+TEST(RetractionImageSplitTest, ARowsChildVictimKeepsItsParentFromGoingWhole) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    BlockPool pool(8, {2, 1});
+    BlockPool host_pool(3, {2, 1});
+    BlockPool snapshot_pool(1, {2, 1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    SnapshotSlotAllocator blob_slots(1);
+    TierTransferManager transfers(coordinator);
+    const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}, {97, 98}});
+    const std::vector<CacheKey> host_keys{Key(cached[0], 0), Key(cached[1], 1), Key(cached[2], 0), Key(cached[3], 1)};
+    {
+        // c and the second Full entry share a parent; w and q have one each.
+        std::vector<CacheBlockRef> blocks{host_pool.AcquireBlock(0), host_pool.AcquireBlock(1),
+                                          host_pool.AcquireBlock(0), host_pool.AcquireBlock(1)};
+        for (std::size_t i = 0; i < host_keys.size(); ++i) {
+            coordinator.CacheHostBlock(blocks[i], host_keys[i], std::nullopt);
+        }
+    }
+    ASSERT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    CacheCompletedBlocksForTest(coordinator, tables, ContentHashes({{1, 2}, {3, 4}}),
+                                CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/true);
+
+    TierTransferManager::RetractionImageSplit split =
+        transfers.SplitRetractionImage(tables, /*num_tokens=*/4, coordinator.PublishedDataSlots(tables, 4));
+    ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 0, 1}));
+    ASSERT_EQ(split.num_host_boundaries, 2u);
+    ASSERT_FALSE(split.shortfall.has_value());
+    std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+        "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+        /*num_tokens=*/4, std::move(split));
+    ASSERT_TRUE(stores.has_value());
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[0]));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[1]));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(host_keys[2])) << "the second Full entry is no victim";
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[3]));
+    coordinator.Free(tables);
+}
+
+// Two Full groups A and B, two blocks per parent. The Host's parent X holds
+// a pinned A entry and an unpinned one, Y a B entry, the oldest, and a free
+// slot. One boundary needs an A block and a B block. The B block fits Y's
+// free slot, so Y cannot go whole, though it is the oldest parent: the A
+// block takes X's unpinned entry, as AcquireHostBlocks places the B block
+// before it picks a victim. Taking Y would leave the B block without room.
+TEST(RetractionImageSplitTest, ARowInFreeRoomKeepsItsParentFromGoingWhole) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2},
+    };
+    BlockPool pool(8, {2, 2});
+    BlockPool host_pool(2, {2, 2});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}, {95, 96}});
+    CacheBlockRef pinned = host_pool.AcquireBlock(0);
+    {
+        CacheBlockRef x_entry = host_pool.AcquireBlock(0);
+        CacheBlockRef y_entry = host_pool.AcquireBlock(1);
+        coordinator.CacheHostBlock(y_entry, Key(cached[0], 1), std::nullopt);
+        coordinator.CacheHostBlock(x_entry, Key(cached[1], 0), std::nullopt);
+    }
+    coordinator.CacheHostBlock(pinned, Key(cached[2], 0), std::nullopt);
+    ASSERT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+
+    const std::vector<std::uint32_t> group_ids{0, 1};
+    const std::vector<std::int32_t> buckets{0, 0};
+    const std::vector<CacheCoordinator::HostSegmentRows> boundaries{{.first_row = 0, .past_end_row = 2}};
+    EXPECT_EQ(coordinator.NumHostBoundariesThatFit(group_ids, buckets, boundaries), 1u);
+    const CacheCoordinator::HostAllocationBatch batch =
+        coordinator.AcquireHostBoundaries(group_ids, buckets, boundaries);
+    EXPECT_EQ(batch.stats.allocated, 2u);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(cached[0], 1))) << "Y's entry is no victim";
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(cached[1], 0)));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(cached[2], 0)));
+    EXPECT_EQ(coordinator.HostEvictions().lru.blocks, 1u);
+}
+
+// A Full group and a State group, one block per parent each. The Host holds
+// a State checkpoint, the oldest, and a Full entry. A Full block's victim is
+// the older of the two: the State parent, whole, rather than the Full
+// group's own younger entry.
+TEST(RetractionImageSplitTest, AnOlderParentOfAnotherGroupBeatsAYoungerEntry) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    BlockPool pool(8, {1, 1});
+    BlockPool host_pool(2, {1, 1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}});
+    const std::vector<CacheKey> host_keys{Key(cached[0], 1), Key(cached[1], 0)};
+    for (const CacheKey& key : host_keys) {
+        CacheBlockRef block = host_pool.AcquireBlock(key.group_id);
+        coordinator.CacheHostBlock(block, key, std::nullopt);
+    }
+    ASSERT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+
+    const std::vector<std::uint32_t> group_ids{0};
+    const std::vector<std::int32_t> buckets{0};
+    const std::vector<CacheCoordinator::HostSegmentRows> boundaries{{.first_row = 0, .past_end_row = 1}};
+    EXPECT_EQ(coordinator.NumHostBoundariesThatFit(group_ids, buckets, boundaries), 1u);
+    const CacheCoordinator::HostAllocationBatch batch =
+        coordinator.AcquireHostBoundaries(group_ids, buckets, boundaries);
+    EXPECT_EQ(batch.stats.allocated, 1u);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[0]));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(host_keys[1])) << "the younger Full entry is no victim";
+}
+
+// KV parallelism over two shards, two Full blocks per parent; the Host's one
+// parent holds an entry in bucket 0, the older, and one in bucket 1. A block
+// in bucket 1 takes the bucket-1 entry: the oldest of its own bucket, and one
+// entry rather than the whole parent its newest occupant dates. The older
+// bucket-0 entry stays.
+TEST(RetractionImageSplitTest, ARowTakesTheOldestEntryOfItsBucketNotItsWholeParent) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
+    };
+    BlockPool pool(4, {2});
+    BlockPool host_pool(1, {2});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}});
+    for (std::int32_t bucket = 0; bucket < 2; ++bucket) {
+        CacheBlockRef block = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{bucket}).front();
+        coordinator.CacheHostBlock(block, Key(cached[static_cast<std::size_t>(bucket)], 0), std::nullopt);
+    }
+    ASSERT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+
+    const std::vector<std::uint32_t> group_ids{0};
+    const std::vector<std::int32_t> buckets{1};
+    const std::vector<CacheCoordinator::HostSegmentRows> boundaries{{.first_row = 0, .past_end_row = 1}};
+    EXPECT_EQ(coordinator.NumHostBoundariesThatFit(group_ids, buckets, boundaries), 1u);
+    const CacheCoordinator::HostAllocationBatch batch =
+        coordinator.AcquireHostBoundaries(group_ids, buckets, boundaries);
+    ASSERT_EQ(batch.stats.allocated, 1u);
+    EXPECT_EQ(coordinator.Allocator(0).BucketOf(batch.blocks.front()->Location()), 1);
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(cached[0], 0))) << "the bucket-0 entry is no victim";
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(cached[1], 0)));
+}
+
+// KV parallelism over two shards, two Full blocks per parent: a page's block
+// lies in bucket page % 2, and its Host copy must too. Of the Host's two
+// parents, one holds a pinned entry in bucket 0 and the other an unpinned
+// one, each with bucket 1 free: the first page takes the unpinned entry's
+// place (its parent empties, a parent for both buckets), the second page the
+// other parent's bucket-1 block, and the third page finds no Host block in
+// bucket 0 -- the Host takes two boundaries, though it has a free block in
+// bucket 1 for the fourth. Without a snapshot pool block for the last two
+// pages, the split refuses the image and nothing is evicted; with one, the
+// retraction places exactly the first two pages, each beside its Device
+// block's bucket, and the last two ride the pool as the split predicted.
+TEST(RetractionImageSplitTest, OneFullHostBucketDecidesTheSplitBeforeAnyEviction) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
+    };
+    for (const std::int32_t snapshot_parents : {0, 1}) {
+        SCOPED_TRACE(snapshot_parents);
+        BlockPool pool(4, {2});
+        BlockPool host_pool(2, {2});
+        BlockPool snapshot_pool(snapshot_parents, {2});
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        // Outlives the transfer manager, whose snapshot store holds a slot.
+        SnapshotSlotAllocator blob_slots(1);
+        TierTransferManager transfers(coordinator);
+        const std::vector<std::string> cached = ContentHashes({{91, 92}, {93, 94}});
+        CacheBlockRef pinned = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0}).front();
+        coordinator.CacheHostBlock(pinned, Key(cached[0], 0), std::nullopt);
+        {
+            CacheBlockRef unpinned = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0}).front();
+            coordinator.CacheHostBlock(unpinned, Key(cached[1], 0), std::nullopt);
+        }
+        ASSERT_EQ(host_pool.NumEmptyLcmBlocks(), 0);
+        std::vector<BlockTable> tables(1);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+        const std::vector<std::string> image_pages = ContentHashes({{1, 2}, {3, 4}, {5, 6}, {7, 8}});
+        CacheCompletedBlocksForTest(coordinator, tables, image_pages,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, /*num_computed_tokens=*/8,
+                                    CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                    /*publish_state=*/false);
+
+        TierTransferManager::RetractionImageSplit split =
+            transfers.SplitRetractionImage(tables, /*num_tokens=*/8, coordinator.PublishedDataSlots(tables, 8));
+        EXPECT_EQ(split.buckets, (std::vector<std::int32_t>{0, 1, 0, 1}));
+        EXPECT_EQ(split.num_host_boundaries, 2u);
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(cached[1], 0))) << "the split evicts nothing";
+        if (snapshot_parents == 0) {
+            EXPECT_EQ(split.shortfall, ImageShortfall::kHostL2);
+            coordinator.Free(tables);
+            continue;
+        }
+        ASSERT_FALSE(split.shortfall.has_value());
+        std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+            "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+            /*num_tokens=*/8, std::move(split));
+        ASSERT_TRUE(stores.has_value());
+        ASSERT_TRUE(stores->host_store.has_value());
+        const std::vector<CacheTransfer>& copies = stores->host_store->transfers;
+        ASSERT_EQ(copies.size(), 2u);
+        for (std::size_t page = 0; page < copies.size(); ++page) {
+            EXPECT_EQ(copies[page].content_hash, image_pages[page]);
+            EXPECT_EQ((copies[page].source_page - 1) % 2, (copies[page].destination_page - 1) % 2)
+                << "page " << page << " keeps its owner";
+        }
+        const TierTransferManager::WriteBackStats& stats = transfers.WriteBackStatsFor(HostStoreCause::kRetraction);
+        EXPECT_EQ(stats.snapshot_fallback, 2u);
+        EXPECT_EQ(stats.image_refused, 0u);
+        EXPECT_EQ(stores->snapshot_store.transfers.size(), 2u) << "the last two pages ride the pool";
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(cached[1], 0))) << "the first page took its place";
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(cached[0], 0)));
+        coordinator.Free(tables);
+    }
+}
+
+// KV parallelism over two shards, two Full blocks per parent. Another request
+// publishes the image's one page first, from a block in bucket 0; the
+// victim's own block for that page lies in bucket 1, and its publication
+// re-points the slot to the indexed block. The probe, made before that
+// publication on PublishedDataSlotsAfter, reads the slot on the indexed block
+// as well: the row goes to bucket 0, where the Host's one parent has a free
+// block, not to bucket 1, which a pinned entry fills. The probe's split and
+// the one made after the publication agree.
+TEST(RetractionImageSplitTest, TheProbeCountsARowInTheBucketOfTheBlockItsPublicationDedupesOnto) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{
+            .attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 2, .block_granularity = 2, .shard_count = 2},
+    };
+    BlockPool pool(4, {2});
+    BlockPool host_pool(1, {2});
+    BlockPool snapshot_pool(1, {2});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    TierTransferManager transfers(coordinator);
+    const GroupAllocator& allocator = coordinator.Allocator(0);
+    // Both compute the page. The publisher's block opens a parent at its
+    // bucket-0 slot; the victim's takes that parent's bucket-1 hole, which
+    // goes before a new parent.
+    std::vector<BlockTable> publisher(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, publisher, /*num_tokens=*/2));
+    std::vector<BlockTable> victim(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, victim, /*num_tokens=*/2));
+    ASSERT_EQ(allocator.BucketOf(publisher[0].Blocks()[0]->Location()), 0);
+    ASSERT_EQ(allocator.BucketOf(victim[0].Blocks()[0]->Location()), 1);
+    const std::vector<std::string> page = ContentHashes({{1, 2}});
+    CacheCompletedBlocksForTest(coordinator, publisher, page, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    CacheBlockRef pinned = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1}).front();
+    coordinator.CacheHostBlock(pinned, Key(ContentHashes({{91, 92}})[0], 0), std::nullopt);
+
+    const RequestProgress progress{
+        .completed_pages =
+            CompletedPages{
+                .prefix_hashes = page,
+                .first_new_prefix_page = 0,
+                .boundary_kind = CacheBoundaryKind::kEndpoint,
+            },
+        .num_computed_tokens = 2,
+    };
+    const std::vector<std::vector<ImageSlot>> probed =
+        coordinator.PublishedDataSlotsAfter(victim, /*num_tokens=*/2, progress);
+    ASSERT_EQ(probed[0].size(), 1u);
+    EXPECT_EQ(probed[0][0].block, publisher[0].Blocks()[0]) << "the block the publication leaves the slot on";
+    const TierTransferManager::RetractionImageSplit probe =
+        transfers.SplitRetractionImage(victim, /*num_tokens=*/2, probed);
+    EXPECT_EQ(probe.buckets, (std::vector<std::int32_t>{0}));
+    EXPECT_EQ(probe.num_host_boundaries, 1u);
+
+    coordinator.CacheCompletedBlocks(victim, progress, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator));
+    ASSERT_EQ(victim[0].Blocks()[0], publisher[0].Blocks()[0]);
+    const TierTransferManager::RetractionImageSplit retraction =
+        transfers.SplitRetractionImage(victim, /*num_tokens=*/2, coordinator.PublishedDataSlots(victim, 2));
+    EXPECT_EQ(retraction.buckets, probe.buckets);
+    EXPECT_EQ(retraction.num_host_boundaries, probe.num_host_boundaries);
+    EXPECT_EQ(retraction.shortfall, probe.shortfall);
+    coordinator.Free(victim);
+    coordinator.Free(publisher);
+}
+
+// The boundaries go shallowest first whatever order the groups are declared
+// in; K3 declares a State group before its Full group. A Full group and a
+// State group, a block per page; the image's three pages publish the State
+// checkpoint at the last one. The Host's one empty parent takes the first
+// page's Full block, and the snapshot pool of four blocks the rest: the later
+// pages' Full blocks and both State slots. Numbered in declaration order, the
+// State checkpoint would put the last page first, whose two rows the one
+// parent cannot take, and the pool could not hold the rest.
+TEST(RetractionImageSplitTest, BoundariesGoShallowestFirstWhateverTheGroupOrder) {
+    const CacheGroupSpec full{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2};
+    const CacheGroupSpec state{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0};
+    for (const bool state_first : {false, true}) {
+        SCOPED_TRACE(state_first);
+        const std::vector<CacheGroupSpec> specs =
+            state_first ? std::vector<CacheGroupSpec>{state, full} : std::vector<CacheGroupSpec>{full, state};
+        const std::uint32_t full_group = state_first ? 1 : 0;
+        BlockPool pool(8, {1, 1});
+        BlockPool host_pool(1, {1, 1});
+        BlockPool snapshot_pool(4, {1, 1});
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+        // Outlives the transfer manager, whose snapshot store holds a slot.
+        SnapshotSlotAllocator blob_slots(1);
+        TierTransferManager transfers(coordinator);
+        std::vector<BlockTable> tables(2);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
+        const std::vector<std::string> image_pages = ContentHashes({{1, 2}, {3, 4}, {5, 6}});
+        CacheCompletedBlocksForTest(coordinator, tables, image_pages,
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, /*num_computed_tokens=*/6,
+                                    CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                    /*publish_state=*/true);
+
+        TierTransferManager::RetractionImageSplit split =
+            transfers.SplitRetractionImage(tables, /*num_tokens=*/6, coordinator.PublishedDataSlots(tables, 6));
+        ASSERT_EQ(split.boundaries.size(), 3u);
+        for (std::size_t page = 0; page < split.boundaries.size(); ++page) {
+            EXPECT_EQ(split.slots[split.boundaries[page].first_row].key.content_hash, image_pages[page])
+                << "boundary " << page;
+        }
+        EXPECT_EQ(split.num_host_boundaries, 1u);
+        ASSERT_FALSE(split.shortfall.has_value());
+        std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+            "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+            /*num_tokens=*/6, std::move(split));
+        ASSERT_TRUE(stores.has_value());
+        ASSERT_TRUE(stores->host_store.has_value());
+        ASSERT_EQ(stores->host_store->transfers.size(), 1u);
+        EXPECT_EQ(stores->host_store->transfers[0].content_hash, image_pages[0]);
+        EXPECT_EQ(stores->host_store->transfers[0].group_id, full_group);
+        EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kRetraction).snapshot_fallback, 3u);
+        coordinator.Free(tables);
+    }
+}
+
+// Random images on random Hosts. Per geometry -- a Full group alone or with
+// State groups, its blocks dealt over one, two or eight KV-parallel shards
+// (eight Full blocks and one State block per parent is K3's KVP8 shape) --
+// each trial fills a Host of two to six parents with other prompts' entries,
+// some pinned, and the Host's copies of none, some or all of the image's own
+// pages (all of them: no row is left to copy), then splits an image of one to
+// eight pages beside a snapshot pool of one to four parents. The split
+// mutates nothing, and the plan of its first j boundaries counts min(j, k) of
+// them, k the whole plan's count. An image the split holds is taken: the Host
+// copies the rows of its first k boundaries, in order, and nothing else, the
+// pool takes every later row, no image is refused, and no pinned entry or
+// copy the image reuses moves. An image the split refuses is never taken, and
+// leaves every Host entry where it was.
+TEST(RetractionImageSplitTest, ProbeAndCommitAgreeOnEveryImage) {
+    struct Geometry {
+        std::int32_t shards;
+        std::int32_t packing;
+        std::int32_t num_state_groups;
+    };
+    std::mt19937 rng(20261026);
+    std::size_t num_taken = 0;
+    std::size_t num_taken_after_evicting = 0;
+    std::size_t num_taken_with_pool_rows = 0;
+    std::size_t num_refused = 0;
+    std::size_t num_without_rows = 0;
+    std::size_t num_short_of_the_host = 0;
+    for (const Geometry geometry :
+         {Geometry{1, 1, 0}, Geometry{1, 2, 2}, Geometry{2, 2, 1}, Geometry{2, 4, 2}, Geometry{8, 8, 2}}) {
+        std::vector<CacheGroupSpec> specs{CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                                         .cache_blocks_per_lcm_block = geometry.packing,
+                                                         .block_granularity = 2,
+                                                         .shard_count = geometry.shards}};
+        std::vector<std::int32_t> packings{geometry.packing};
+        for (std::int32_t i = 0; i < geometry.num_state_groups; ++i) {
+            specs.push_back(
+                CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0});
+            packings.push_back(1);
+        }
+        const auto num_groups = static_cast<std::uint32_t>(specs.size());
+        for (std::int32_t trial = 0; trial < 120; ++trial) {
+            SCOPED_TRACE(testing::Message() << "shards " << geometry.shards << ", packing " << geometry.packing
+                                            << ", State groups " << geometry.num_state_groups << ", trial " << trial);
+            BlockPool pool(32, packings);
+            BlockPool host_pool(2 + static_cast<std::int32_t>(rng() % 5), packings);
+            BlockPool snapshot_pool(1 + static_cast<std::int32_t>(rng() % 4), packings);
+            CacheCoordinator coordinator =
+                MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+            // Outlives the transfer manager, whose snapshot store holds a slot.
+            SnapshotSlotAllocator blob_slots(1);
+            TierTransferManager transfers(coordinator);
+            std::vector<BlockTable> tables(num_groups);
+            const auto num_pages = 1 + static_cast<std::int32_t>(rng() % 8);
+            ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2 * num_pages));
+            std::vector<std::vector<std::int32_t>> page_tokens;
+            for (std::int32_t page = 0; page < num_pages; ++page) {
+                page_tokens.push_back({1000 * trial + 2 * page + 1, 1000 * trial + 2 * page + 2});
+            }
+            CacheCompletedBlocksForTest(coordinator, tables, ContentHashes(page_tokens),
+                                        CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                        /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2 * num_pages,
+                                        CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                        /*publish_state=*/geometry.num_state_groups > 0 && rng() % 2 == 0);
+            const std::vector<std::vector<ImageSlot>> published = coordinator.PublishedDataSlots(tables, 2 * num_pages);
+
+            // The Host: the image's own pages (none, some or all of them, each
+            // in its Device block's bucket) and other prompts' entries, in a
+            // random order, while blocks are left. One in four is pinned.
+            std::vector<CacheKey> host_keys;
+            std::vector<CacheBlockRef> pinned;
+            const std::uint32_t reuse = rng() % 3;
+            std::vector<std::pair<CacheKey, std::int32_t>> placements;
+            for (const std::vector<ImageSlot>& slots : published) {
+                for (const ImageSlot& slot : slots) {
+                    if (reuse == 2 || (reuse == 1 && rng() % 2 == 0)) {
+                        placements.emplace_back(slot.key,
+                                                coordinator.Allocator(static_cast<std::int32_t>(slot.key.group_id))
+                                                    .BucketOf(slot.block->Location()));
+                    }
+                }
+            }
+            // Other prompts' hashes repeat across groups, so a State entry may
+            // have siblings at its hash.
+            for (std::int32_t other = 0; other < 6 * geometry.packing; ++other) {
+                const std::uint32_t group_id = rng() % num_groups;
+                placements.emplace_back(Key("other" + std::to_string(rng() % (2 * geometry.packing)), group_id),
+                                        static_cast<std::int32_t>(rng() % (group_id == 0 ? geometry.shards : 1)));
+            }
+            std::shuffle(placements.begin(), placements.end(), rng);
+            for (const auto& [key, bucket] : placements) {
+                if (coordinator.ContainsHostCachedBlock(key)) {
+                    continue;
+                }
+                std::vector<CacheBlockRef> blocks =
+                    host_pool.AcquireBlocksInBuckets(key.group_id, std::array<std::int32_t, 1>{bucket});
+                if (blocks.empty()) {
+                    continue;
+                }
+                coordinator.CacheHostBlock(blocks.front(), key, std::nullopt);
+                host_keys.push_back(key);
+                if (rng() % 4 == 0) {
+                    pinned.push_back(std::move(blocks.front()));
+                }
+            }
+            const auto host_locations = [&] {
+                std::vector<std::optional<CacheBlockLocation>> locations;
+                for (const CacheKey& key : host_keys) {
+                    const CacheBlockRef block = coordinator.FindHostCachedBlock(key);
+                    locations.push_back(block ? std::optional{block->Location()} : std::nullopt);
+                }
+                return locations;
+            };
+            const std::vector<std::optional<CacheBlockLocation>> before = host_locations();
+
+            TierTransferManager::RetractionImageSplit split =
+                transfers.SplitRetractionImage(tables, 2 * num_pages, published);
+            EXPECT_EQ(host_locations(), before) << "the split mutates nothing";
+            const std::size_t k = split.num_host_boundaries;
+            ASSERT_LE(k, split.boundaries.size());
+            for (std::size_t j = 0; j <= split.boundaries.size(); ++j) {
+                const std::size_t num_rows = j == 0 ? 0 : split.boundaries[j - 1].past_end_row;
+                EXPECT_EQ(coordinator.NumHostBoundariesThatFit(std::span(split.group_ids).first(num_rows),
+                                                               std::span(split.buckets).first(num_rows),
+                                                               std::span(split.boundaries).first(j)),
+                          std::min(j, k))
+                    << j << " boundaries";
+            }
+            num_without_rows += split.slots.empty() ? 1 : 0;
+            num_short_of_the_host += k < split.boundaries.size() ? 1 : 0;
+            if (split.shortfall) {
+                ++num_refused;
+                EXPECT_EQ(host_locations(), before);
+                coordinator.Free(tables);
+                continue;
+            }
+            ++num_taken;
+            const std::uint64_t num_evicted_before = coordinator.HostEvictions().lru.blocks;
+            const std::size_t num_host_rows = k == 0 ? 0 : split.boundaries[k - 1].past_end_row;
+            std::vector<CacheTransfer> expected_copies;
+            for (std::size_t row = 0; row < num_host_rows; ++row) {
+                expected_copies.push_back(CacheTransfer{.group_id = split.group_ids[row],
+                                                        .content_hash = split.slots[row].key.content_hash,
+                                                        .page_offset = split.slots[row].key.page_offset});
+            }
+            const std::size_t num_pool_rows = split.slots.size() - num_host_rows;
+            std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+                "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
+                2 * num_pages, std::move(split));
+            ASSERT_TRUE(stores.has_value());
+            std::vector<CacheTransfer> copies;
+            if (stores->host_store) {
+                for (const CacheTransfer& copy : stores->host_store->transfers) {
+                    copies.push_back(CacheTransfer{
+                        .group_id = copy.group_id, .content_hash = copy.content_hash, .page_offset = copy.page_offset});
+                }
+            }
+            EXPECT_EQ(copies, expected_copies);
+            const TierTransferManager::WriteBackStats& stats = transfers.WriteBackStatsFor(HostStoreCause::kRetraction);
+            EXPECT_EQ(stats.snapshot_fallback, num_pool_rows);
+            EXPECT_EQ(stats.image_refused, 0u);
+            num_taken_after_evicting += coordinator.HostEvictions().lru.blocks > num_evicted_before ? 1 : 0;
+            num_taken_with_pool_rows += num_pool_rows > 0 ? 1 : 0;
+            const std::vector<std::optional<CacheBlockLocation>> after = host_locations();
+            for (std::size_t i = 0; i < host_keys.size(); ++i) {
+                const bool is_pinned = std::ranges::any_of(
+                    pinned, [&](const CacheBlockRef& block) { return block->Location() == before[i]; });
+                const bool reused = host_keys[i].content_hash.rfind("other", 0) != 0;
+                if (is_pinned || reused) {
+                    EXPECT_EQ(after[i], before[i]) << host_keys[i].content_hash;
+                }
+            }
+            coordinator.Free(tables);
+        }
+    }
+    // Every case occurred.
+    EXPECT_GT(num_taken, 0u);
+    EXPECT_GT(num_taken_after_evicting, 0u);
+    EXPECT_GT(num_taken_with_pool_rows, 0u);
+    EXPECT_GT(num_refused, 0u);
+    EXPECT_GT(num_without_rows, 0u);
+    EXPECT_GT(num_short_of_the_host, 0u);
+}
+
 // Random K3 sessions -- forked from earlier ones at random pages, resumed on
 // what either tier holds, with a checkpoint at a chunk end now and then --
 // published and evicted under pressure on a Device of 64 Full blocks, written

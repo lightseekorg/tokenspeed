@@ -2689,10 +2689,12 @@ TEST_F(L2TailOnlyPoolSuite, AnUnhashedCompletedPageRidesL2AndTheVictimIsRetracte
     EXPECT_EQ(granted->request_ids, std::vector<std::string>{"b"}) << "the blocked decode runs on a's pages";
 }
 
-// The probe assumes the published pages ride Host L2; a Host pool too small
-// for the L2 leg sends them to the snapshot pool at retraction time, where
-// the image can turn out not to fit after all. That is the one abort decided
-// after a passed probe, and it aborts the chosen victim.
+// The probe plans the L2 leg as the retraction places it, so a published
+// page the Host cannot take counts against the pool, and a candidate whose
+// pool cannot hold those pages fails the probe -- before anything is acquired
+// or evicted for it -- under write-through as under write-back. One usable
+// Host block: neither a's eight published blocks nor b's six fit beside the
+// one-block pool.
 class L2LegFallbackSuite : public L2TailOnlyPoolSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -2703,7 +2705,7 @@ protected:
     }
 };
 
-TEST_F(L2LegFallbackSuite, AnL2LegThatFallsBackToATooSmallPoolAbortsTheChosenVictim) {
+TEST_F(L2LegFallbackSuite, WhenNoL2LegFitsTheAbortNamesTheHostSize) {
     Submit(MakeRequestSpec("a", /*num_pages=*/3));
     Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
     AckWriteBacks(PlanOnce());
@@ -2716,27 +2718,81 @@ TEST_F(L2LegFallbackSuite, AnL2LegThatFallsBackToATooSmallPoolAbortsTheChosenVic
     SendForwardDone("a", {44});
     SendForwardDone("b", {144});
     ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    const std::int32_t host_cached = scheduler_->HostPoolCachedBlocks();
+    ASSERT_EQ(host_cached, 1) << "the prompts' write-through filled the one Host block";
 
-    // a passes the probe (its tail is empty), but of its eight published
-    // blocks at most one gets a Host block; the rest fall back to a pool of
-    // one block and the image does not fit. a -- the victim the policy
-    // chose, not the newest resident -- is aborted and its pages serve b.
+    // Neither image fits, so the newest resident, b, is aborted -- not a,
+    // the victim the policy ranks first -- and the abort names the Host's
+    // size; the Host is as it was.
     const ExecutionPlan round = PlanOnce();
     ASSERT_EQ(round.aborts.size(), 1u);
-    EXPECT_EQ(round.aborts.front().request_id, "a");
+    EXPECT_EQ(round.aborts.front().request_id, "b");
     EXPECT_EQ(round.aborts.front().reason, AbortReason::kImageDoesNotFit);
-    EXPECT_NE(round.aborts.front().detail.find("snapshot pool"), std::string::npos) << round.aborts.front().detail;
+    const std::string& detail = round.aborts.front().detail;
+    EXPECT_NE(detail.find("--kvstore-size"), std::string::npos) << detail;
+    EXPECT_NE(detail.find("num_host_pages=2"), std::string::npos) << detail;
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
     EXPECT_EQ(FindSnapshotStore(round), nullptr);
     const ForwardBatch* granted = FindForwardBatch(round);
     ASSERT_NE(granted, nullptr);
-    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"b"});
-    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the attempt's Host block is released with it";
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"});
+    EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), host_cached);
+    const HostCacheStats stats = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(stats.host_evictions.lru.blocks, 0u) << "nothing was evicted for either probe";
+    EXPECT_EQ(stats.retraction_stores.ops, 0u);
+    EXPECT_EQ(stats.retraction_stores.snapshot_fallback, 0u);
+    EXPECT_EQ(stats.retraction_stores.image_refused, 0u);
 }
 
-// The knob's victim takes the same probe: an L2 leg that falls back to a
-// too small pool refuses its image only after the retraction published its
-// pages, partial page included, so the victim cannot run on.
+// Seven Host pages: the write-through fills six usable Host blocks with a's
+// prompt pages, which a's own image would pin, so a's last completed page
+// finds no Host block and its two blocks do not fit the one-block pool. b's
+// six published blocks take the Host blocks a's prompt pages leave.
+class L2LegOfTheSecondCandidateFitsSuite : public L2LegFallbackSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = L2LegFallbackSuite::MakeConfig();
+        cfg.host_allocator.total_pages = 7;
+        return cfg;
+    }
+};
+
+TEST_F(L2LegOfTheSecondCandidateFitsSuite, TheVictimRuleSkipsACandidateWhoseL2LegTheHostCannotHold) {
+    Submit(MakeRequestSpec("a", /*num_pages=*/3));
+    Submit(MakeRequestSpec("b", /*num_pages=*/2, /*start=*/101));
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {42});
+    SendForwardDone("b", {142});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {43});
+    SendForwardDone("b", {143});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("a", {44});
+    SendForwardDone("b", {144});
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    ASSERT_EQ(scheduler_->HostPoolFreeBlocks(), 0);
+
+    // a ranks first but its L2 leg does not fit: b is retracted instead,
+    // nobody is aborted, and a's blocked decode runs on b's pages.
+    const ExecutionPlan round = PlanOnce();
+    EXPECT_TRUE(round.aborts.empty());
+    EXPECT_EQ(scheduler_->RetractedSize(), 1u);
+    const SnapshotStoreBatch* store = FindSnapshotStore(round);
+    ASSERT_NE(store, nullptr);
+    EXPECT_EQ(store->request_ids, std::vector<std::string>{"b"});
+    const ForwardBatch* granted = FindForwardBatch(round);
+    ASSERT_NE(granted, nullptr);
+    EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"});
+    const TierTransferManager::WriteBackStats retraction_stores = scheduler_->GetHostCacheStats().retraction_stores;
+    EXPECT_EQ(retraction_stores.blocks, (std::vector<std::uint64_t>{3, 3})) << "b's three pages in both groups";
+    EXPECT_EQ(retraction_stores.snapshot_fallback, 0u);
+    EXPECT_EQ(retraction_stores.image_refused, 0u);
+}
+
+// The knob's victim takes the same probe, which plans the L2 leg: a victim
+// whose published pages the Host cannot take beside a too small pool is
+// refused before the retraction publishes anything, so it runs on.
 class ForcedL2LegFallbackSuite : public L2LegFallbackSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -2746,7 +2802,7 @@ protected:
     }
 };
 
-TEST_F(ForcedL2LegFallbackSuite, AForcedVictimRefusedAfterItsPublicationIsAborted) {
+TEST_F(ForcedL2LegFallbackSuite, AForcedVictimWhoseL2LegTheHostCannotTakeRunsOnWithNothingPublished) {
     Submit(MakeRequestSpec("a", /*num_pages=*/2));
     AckWriteBacks(PlanOnce());  // plan 1: prefill
     SendForwardDone("a", {42});
@@ -2754,21 +2810,26 @@ TEST_F(ForcedL2LegFallbackSuite, AForcedVictimRefusedAfterItsPublicationIsAborte
     SendForwardDone("a", {43});
 
     // Plan 3 arms a = [1 2 3 4 42 43], quiescent: 5 computed tokens, the
-    // partial page [42]. a passes the probe (every slot is published, so
-    // the pool holds the blob alone), but of its six published blocks at
-    // most one gets a Host block and the rest fall back to a pool of one
-    // block. The page [42] is a tail on a's own block now: a is aborted.
+    // partial page [42]. Of its six published blocks at most one gets a Host
+    // block and the rest do not fit a pool of one block: the probe refuses
+    // a, nothing is published, and a decodes on.
     const ExecutionPlan forced = PlanOnce();
-    ASSERT_EQ(forced.aborts.size(), 1u);
-    EXPECT_EQ(forced.aborts.front().request_id, "a");
-    EXPECT_EQ(forced.aborts.front().reason, AbortReason::kImageDoesNotFit);
-    EXPECT_NE(forced.aborts.front().detail.find("snapshot pool"), std::string::npos) << forced.aborts.front().detail;
-    EXPECT_EQ(scheduler_->TailEntries(), 1u) << "the publication stands";
+    EXPECT_TRUE(forced.aborts.empty());
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
     EXPECT_EQ(FindSnapshotStore(forced), nullptr);
-    EXPECT_TRUE(FindForwardBatch(forced)->request_ids.empty()) << "a never writes its published tail block";
-    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the attempt's Host block is released with it";
-    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "a's pages return in this round";
+    EXPECT_EQ(scheduler_->TailEntries(), 0u) << "the partial page is not published";
+    ASSERT_EQ(FindForwardBatch(forced)->request_ids, std::vector<std::string>{"a"}) << "a keeps its pages and runs";
+    EXPECT_EQ(scheduler_->GetHostCacheStats().host_evictions.lru.blocks, 0u) << "nothing was evicted for the probe";
+    SendForwardDone("a", {44});
+
+    // Plan 4 publishes the page [42 43] a completed on its own block.
+    const ExecutionPlan next = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(next)->request_ids, std::vector<std::string>{"a"});
+    AckWriteBacks(next);
+    SendForwardDone("a", {45});
+    SendFinish("a");
+    AckWriteBacks(PlanOnce());
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14);
 }
 
 // The null page alone: the engine never images, and says so.

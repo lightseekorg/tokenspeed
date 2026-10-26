@@ -558,8 +558,9 @@ edges of the loop:
 publishes the victim's computed frontier into the Device index exactly as a
 finish does (`AdvanceRequestProgress` at `PublicationPoint::kFinal` +
 `CacheCompletedBlocks`: the full pages, the partial page as a tail, and each
-State group's slot 1; §1.2), then `TierTransferManager::StartRetractionStores`
-classifies every data slot of every table:
+State group's slot 1; §1.2), then `TierTransferManager::SplitRetractionImage`
+classifies every data slot of every table and `StartRetractionStores` takes
+the image as the split planned:
 
 - *The L2 leg.* A slot whose Device block is a published prefix entry becomes
   an ordinary Host L2 entry, acquired — like every Host copy — in the Device
@@ -580,42 +581,60 @@ classifies every data slot of every table:
   image therefore never pins a Host block the index does not know, and the
   restore's L2 rows always come from published entries.
 - *The pool leg.* Every other slot — a State group's unpublished slot 0,
-  replayable groups, any block the index did not take, and with no Host cache
-  the whole image — gets a block of the request-private
-  **snapshot pool** (`snapshot_allocator`; never prefix-indexed, never
-  evicted), again in the Device block's bucket. These rows, plus the
-  **slot-state blob** of the request's runtime row (sampling state, speculative
-  readiness — exported by the runtime into `snapshot_slot`), ride one
-  `SnapshotStoreOperation`; the op may carry zero page rows, the blob always.
-  A published slot whose Host L2 block cannot be acquired after evicting
-  unpinned entries falls back to the pool.
+  replayable groups, any block the index did not take, the published slots
+  the Host does not take (below), and with no Host cache the whole image —
+  gets a block of the request-private **snapshot pool** (`snapshot_allocator`;
+  never prefix-indexed, never evicted), again in the Device block's bucket.
+  These rows, plus the **slot-state blob** of the request's runtime row
+  (sampling state, speculative readiness — exported by the runtime into
+  `snapshot_slot`), ride one `SnapshotStoreOperation`; the op may carry zero
+  page rows, the blob always.
 
-An image **does not fit** when the pool cannot hold tail plus fallback, or
-when no blob slot is free (`SnapshotSlotAllocator`, `max_retracted_requests`
-slots). `retractVictim` then changes nothing (the publication it did is
-written back as the victim's progress; unpinned Host entries evicted for the
-attempt stay evicted) and reports the shortfall. **The last resort is an
-abort, in one place.** `chooseVictim` ranks only candidates whose image fits
-(`imageFits`: a blob slot is free and `CacheCoordinator::SnapshotPoolHolds`
-the tail, the published pages being assumed to ride L2); when none does — and
+The split plans the L2 leg before anything is acquired or evicted for it. The
+slots to copy are grouped by boundary (a content hash, with every group's slot
+at it), the shallowest first, and the Host takes the leading boundaries that
+fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, planned in
+`AcquireHostBlocks`' order and with its victim ranking against a shadow of the
+Host); the retraction (`AcquireHostBoundaries`) evicts exactly the planned
+victims and places exactly those rows. The first boundary the Host cannot take
+whole goes to the pool with every later one, even where the Host has room for
+some of their rows.
+
+An image **does not fit** when no blob slot is free (`SnapshotSlotAllocator`,
+`max_retracted_requests` slots) or when the pool cannot hold what the split
+leaves it (`ImageShortfall`): `kSnapshotPool` when it could not even with
+every published slot on the Host, `kHostL2` when it could but the Host takes
+too few of them. `retractVictim` then reports the shortfall before anything is
+acquired or evicted for the image (the publication it did is written back as
+the victim's progress). **The last resort is an abort, in one place.**
+`chooseVictim` ranks only candidates whose image fits (`imageShortfall`: a
+blob slot is free and the split of the image the retraction would take once it
+has published, projected without mutation, has no shortfall — the probe and
+the retraction run the same plan of the L2 leg); when none does — and
 without a pool none ever does — it names the newest retractable resident (the
 least work lost; exempt requests excluded, they finish on their own reserve,
-except in the empty-round retraction below)
-and `Scheduler::onImageDoesNotFit` aborts it: `fsm::AbortEvent` frees its
-pages and slot in that very round, the blocked grant proceeds exactly as after
-a retraction, and the plan records it (`ExecutionPlan::aborts`, a
+except in the empty-round retraction below) and `Scheduler::onImageDoesNotFit`
+aborts it with that resident's shortfall: `fsm::AbortEvent` frees its pages
+and slot in that very round, the blocked grant proceeds exactly as after a
+retraction, and the plan records it (`ExecutionPlan::aborts`, a
 `SchedulerAbort{request_id, AbortReason::kImageDoesNotFit, detail}`) so the
-runtime fails the request toward its client with the shortfall and the knob
-to raise (`--retraction-snapshot-host-gb` / `--retraction-snapshot-ratio`,
-`--retraction-snapshot-max-requests`).
-The same site handles a victim that passed the probe but whose L2 leg fell
-back to a pool that then could not take it. Waiting instead would deadlock
-once every resident needs a page; charging worst-case host room at admission
-would cost concurrency on every request to protect against a rare shortfall.
+runtime fails the request toward its client with the shortfall and the knob to
+raise (`--retraction-snapshot-host-gb` / `--retraction-snapshot-ratio`,
+`--retraction-snapshot-max-requests`, or for `kHostL2` `--kvstore-size` (or
+`--kvstore-ratio` when no size is given), with the Host's size, its pinned
+entries and whether copies are in flight). The same site aborts a chosen
+victim whose image its own publication left without room, which the probe does
+not foresee: a tail that publication drops under the per-prior cap takes its
+Host entries along; and under KV parallelism a slot the publication re-points
+to the Device entry already holding its key rides the snapshot pool in that
+entry's bucket, not the one the probe counted. The split made after the
+publication can then fall short. Waiting instead would deadlock once every
+resident needs a page; charging worst-case host room at admission would cost
+concurrency on every request to protect against a rare shortfall.
 The debug knob (below) is not capacity pressure: it probes its victim with
-`imageFits` before `retractVictim` publishes anything, and a victim that does
+`imageShortfall` before `retractVictim` publishes anything; a victim that does
 not fit is refused, logged and left running. A victim refused only after the
-publication (that L2 fallback) is aborted at the same site, never left
+publication (either way above) is aborted at the same site, never left
 running: the publication registered blocks it would write again (its partial
 page as a tail, and a State group's end state, which a decode step writes in
 place), and a published block is never written again by its owner (the prefix
@@ -707,12 +726,13 @@ shortest path out of head-of-line — largest first, freeing the most at once;
 then decode work by most newly releasable LCM blocks and fewest **generated**
 tokens — the needed pages with the fewest victims disturb the fewest clients,
 and among equal frees the client that has streamed least is interrupted.
-Only candidates whose image fits are ranked (the abort fallback above takes
-over when none does). Exempt in both tiers: a request whose reserve already
-covers its whole generation (`Request::ReserveCoversGeneration`) — retracting
-it frees exactly what its restore must take back, pure thrash — and it is not
-aborted either, except in the empty-round retraction below. Excluded by state:
-`Retracted`, `Restoring`, `RemotePrefilling`.
+Only candidates whose image fits are ranked, the Host L2 leg planned as the
+retraction places it (the abort fallback above takes over when none does).
+Exempt in both tiers: a request whose reserve already covers its whole
+generation (`Request::ReserveCoversGeneration`) — retracting it frees exactly
+what its restore must take back, pure thrash — and it is not aborted either,
+except in the empty-round retraction below. Excluded by state: `Retracted`,
+`Restoring`, `RemotePrefilling`.
 
 **Empty-round retraction.** The exemption trusts the admission reserve to cover
 all growth, and a sliding-window group's does not always: it prepays only

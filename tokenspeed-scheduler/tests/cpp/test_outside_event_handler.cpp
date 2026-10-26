@@ -489,8 +489,8 @@ protected:
     }
 };
 
-// One usable Host L2 parent: of the victim's three published slots, one gets
-// a Host block and two fall back to the snapshot pool.
+// One usable Host L2 parent: of the victim's three published slots, the split
+// places one on the Host and sends two to the snapshot pool.
 class DecodeRetractionOneHostParentTestSuite : public DecodeRetractionL2TestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -501,8 +501,7 @@ protected:
     }
 };
 
-// And a one-page snapshot pool. The fit check counts every published slot on
-// Host L2, so only taking the image finds the two fallback slots too many.
+// And a one-page snapshot pool: the split's two pool slots are too many.
 class DecodeRetractionOneSnapshotPageTestSuite : public DecodeRetractionOneHostParentTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {
@@ -707,7 +706,7 @@ TEST_F(DecodeRetractionOneHostParentTestSuite, PublishedSlotsWithoutAHostBlockRi
     EXPECT_EQ(scheduler_->DecodingSize(), 1u);
 }
 
-TEST_F(DecodeRetractionOneSnapshotPageTestSuite, ARefusedImageDropsTheHostBlocksItAcquired) {
+TEST_F(DecodeRetractionOneSnapshotPageTestSuite, ARefusedImageAcquiresAndEvictsNothing) {
     Submit({MakeRequestSpec("running", /*num_pages=*/2, /*start=*/1),
             MakeRequestSpec("other", /*num_pages=*/2, /*start=*/201)});
     SendBootstrapped("running");
@@ -723,16 +722,23 @@ TEST_F(DecodeRetractionOneSnapshotPageTestSuite, ARefusedImageDropsTheHostBlocks
     }
 
     // running needs a page and is the only victim: its image would put two
-    // slots in a one-page pool, so the attempt is refused.
+    // slots in a one-page pool, so the probe refuses it before a Host block
+    // is acquired for it -- no slot is counted -- and running is aborted for
+    // the Host's size.
+    const std::int32_t host_free = scheduler_->HostPoolFreeBlocks();
     const ExecutionPlan refused = PlanOnce();
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
     EXPECT_TRUE(ExtractCacheOpsOfKind<WriteBackBatch>(refused).empty());
     const TierTransferManager::WriteBackStats retraction_stores = scheduler_->GetHostCacheStats().retraction_stores;
     EXPECT_EQ(retraction_stores.ops, 0u);
     EXPECT_EQ(retraction_stores.blocks, (std::vector<std::uint64_t>{0}));
-    EXPECT_EQ(retraction_stores.snapshot_fallback, 2u);
-    EXPECT_EQ(retraction_stores.image_refused, 1u) << "the attempt's one Host block and ticket";
+    EXPECT_EQ(retraction_stores.snapshot_fallback, 0u);
+    EXPECT_EQ(retraction_stores.image_refused, 0u);
     EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 0);
+    EXPECT_EQ(scheduler_->HostPoolFreeBlocks(), host_free);
+    ASSERT_EQ(refused.aborts.size(), 1u);
+    EXPECT_EQ(refused.aborts.front().request_id, "running");
+    EXPECT_NE(refused.aborts.front().detail.find("--kvstore-size"), std::string::npos) << refused.aborts.front().detail;
 }
 
 TEST_F(DecodeRetractionNoPrefixCacheTestSuite, RestoreUsesItsOwnImageWithPrefixCachingDisabled) {

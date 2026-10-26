@@ -45,6 +45,12 @@ namespace tokenspeed {
 // branches on StoreSourceGuard), and no scheduling decision reads it.
 enum class HostStoreCause : std::uint8_t { kPublication, kFinish, kRetraction, kEviction };
 
+// Why a retraction image cannot be held: no snapshot pool at all (the null
+// page alone is configured, so nothing is ever imaged), no blob slot free, a
+// pool too small for the image even with every published page on the Host,
+// or a Host L2 too small to take the published pages the pool cannot.
+enum class ImageShortfall : std::uint8_t { kNoPool, kBlobSlot, kSnapshotPool, kHostL2 };
+
 // Owns the mechanics and asynchronous lifetime of transfers between Device and
 // Host cache tiers. Scheduling policy and request state transitions stay in
 // Scheduler.
@@ -89,20 +95,55 @@ public:
         SnapshotStoreOperation snapshot_store;
         std::vector<std::uint32_t> pending_store_ops;
     };
+    // A retraction image's Host L2 leg, planned before anything is acquired
+    // or evicted for it, so the victim probe and the retraction run one plan.
+    struct RetractionImageSplit {
+        // Per group, the published slots the Host serves already, held so the
+        // plan never takes them: the key's Host entry, or the block of an
+        // unacknowledged store that publishes it at its ACK
+        // (InFlightWriteBack::publishes_at_ack).
+        std::vector<std::vector<ImageSlot>> host_slots;
+        // The ops of the stores whose blocks host_slots holds.
+        std::vector<std::uint32_t> pending_store_ops;
+        // The other published slots, the rows to place: each row's group, its
+        // Device block's bucket and the slot.
+        std::vector<std::uint32_t> group_ids;
+        std::vector<std::int32_t> buckets;
+        std::vector<ImageSlot> slots;
+        // The rows by boundary, one per content hash with every group's rows
+        // at it, the shallowest first.
+        std::vector<CacheCoordinator::HostSegmentRows> boundaries;
+        // The Host takes the rows of the first num_host_boundaries
+        // (CacheCoordinator::NumHostBoundariesThatFit), the snapshot pool every
+        // later one.
+        std::size_t num_host_boundaries{0};
+        // kSnapshotPool when the pool cannot hold the image even with every
+        // published slot on the Host (without a Host pool, every slot is the
+        // pool's), kHostL2 when it can but not with the rows the Host does not
+        // take, else unset.
+        std::optional<ImageShortfall> shortfall;
+    };
+    // `published` names the data slots of [0, num_tokens) that are published
+    // entries (CacheCoordinator::PublishedDataSlots, or PublishedDataSlotsAfter
+    // for a publication still to come: the split reads keys, never the
+    // BoundaryTree). Nothing is mutated or counted.
+    RetractionImageSplit SplitRetractionImage(std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                              std::vector<std::vector<ImageSlot>> published) const;
     // Takes the image of a quiescent victim's tables ([0, num_tokens) are its
-    // computed tokens) and starts both store legs. nullopt when the image
-    // cannot be held: a published slot whose Host L2 block cannot be acquired
-    // (after evicting unpinned entries) falls back to the snapshot pool, and
-    // the retraction is refused only when the pool cannot hold tail plus
-    // fallback -- then nothing is kept, though unpinned Host entries evicted
-    // for the attempt stay evicted.
+    // computed tokens) as `split` planned it -- with no shortfall, and nothing
+    // changed since -- and starts both store legs: the Host takes the rows of
+    // the first split.num_host_boundaries boundaries, evicting the victims
+    // the plan chose, and the later rows ride the snapshot pool. The image
+    // therefore fits; nullopt (the pool refusing it after all) is a safety
+    // net no plan reaches.
     // blob_slot is the slot-state blob's arena slot the tail leg exports into;
     // the store shares it with the Retracted state so an abort before the ACK
     // cannot hand the slot to a new victim while the export still writes it.
     std::optional<RetractionStores> StartRetractionStores(const std::string& request_id,
                                                           std::int32_t request_pool_index,
                                                           std::shared_ptr<SnapshotSlotIndex> blob_slot,
-                                                          std::span<const BlockTable> tables, std::int32_t num_tokens);
+                                                          std::span<const BlockTable> tables, std::int32_t num_tokens,
+                                                          RetractionImageSplit split);
     // One restore op for both legs: load_pairs are the Host L2 rows (keyed),
     // snapshot_pairs the snapshot-pool rows. Both ends of every pair, the blob
     // slot (shared) and the request-pool row the blob is imported into
@@ -155,15 +196,14 @@ public:
     }
 
     // Cumulative Host L2 counters, never reset. Accounting only: no
-    // scheduling decision reads them. Each candidate a StartPendingStores
-    // drain takes lands in exactly one outcome -- host_cached, in_flight,
-    // evicted_before_drain, no_placement, or stored (counted in blocks) -- and
-    // so does each published slot of one retraction attempt: host_cached,
-    // in_flight, stored, snapshot_fallback or image_refused, and each member
-    // of a StartEvictionStores drain: host_cached, in_flight, no_placement
-    // (its segment was dropped) or stored (in blocks; recopied counts the
-    // ones copied again). Of an eviction's placed members, cancelled counts
-    // those its segment's settlement did not publish.
+    // scheduling decision reads them. What a drain takes lands in exactly one
+    // outcome each (stored counts in blocks):
+    // - StartPendingStores, per candidate: host_cached | in_flight |
+    //   evicted_before_drain | no_placement | stored.
+    // - StartRetractionStores, per published slot: host_cached | in_flight |
+    //   snapshot_fallback | stored.
+    // - StartEvictionStores, per segment member: host_cached | in_flight |
+    //   no_placement (its segment was dropped) | stored.
     struct WriteBackStats {
         std::uint64_t ops{0};
         std::vector<std::uint64_t> blocks;      // stored, by cache group index
@@ -172,7 +212,9 @@ public:
         std::uint64_t evicted_before_drain{0};  // left the Device index before the drain
         std::uint64_t no_placement{0};          // no Host block in its group and bucket
         std::uint64_t snapshot_fallback{0};     // retraction: the slot rides the snapshot pool instead
-        std::uint64_t image_refused{0};         // retraction: the Host block died with a refused image
+        // Retraction: images the pool refused after their split (no plan
+        // does), one each; their slots land in no outcome.
+        std::uint64_t image_refused{0};
         // Eviction: of the stored blocks, those an earlier eviction had
         // written back already (the Host dropped that copy since).
         std::uint64_t recopied{0};

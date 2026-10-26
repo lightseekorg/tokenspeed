@@ -958,12 +958,16 @@ Its responsibilities:
   queue: the scheduler publishes the victim's computed prefix the same way,
   `CacheCoordinator::PublishedDataSlots` names the data slots that are
   published entries (with the key, logical index, and boundary kind each was
-  published under), `TierTransferManager::StartRetractionStores` gives those
-  their Host blocks — keys already Host-cached, or carried by a store in
-  flight, are pinned; the rest become one stream-ordered write-back whose
-  Host entries the image pins — and `CacheCoordinator::TakeImage` places only
-  the remainder (unpublished slots, and published ones L2 could not take) in
-  the request-private **snapshot pool** on the same stream-ordered footing —
+  published under), `TierTransferManager::SplitRetractionImage` plans their
+  Host blocks before anything is acquired or evicted for them — keys already
+  Host-cached, or carried by a store in flight, are pinned; of the rest, the
+  Host takes the leading boundaries that fit whole
+  (`CacheCoordinator::NumHostBoundariesThatFit`) — and
+  `StartRetractionStores` carries out that plan: the taken rows become one
+  stream-ordered write-back whose Host entries the image pins, and
+  `CacheCoordinator::TakeImage` places only the remainder (unpublished slots,
+  and the published rows the Host does not take, as planned) in the
+  request-private **snapshot pool** on the same stream-ordered footing —
   because the victim's sources are re-granted in the same round
   (`scheduler.md` §2).
   The snapshot pool is a third `BlockPool` the coordinator owns beside Device
@@ -992,8 +996,9 @@ Its responsibilities:
   meanwhile).
   A superseded input (above) an admission or a restore evicts is dropped, as
   the reclaim of the request that superseded it.
-  Write-through's publication and finish stores, retraction images and L3
-  prefetches take Host blocks one by one (`AcquireHostBlocks`). What the
+  Write-through's publication and finish stores and L3 prefetches take Host
+  blocks one by one (`AcquireHostBlocks`), a retraction image's leg by the
+  plan `SplitRetractionImage` made (`AcquireHostBoundaries`). What the
   write-back policy writes back takes them per segment
   (`AcquireHostSegments`), and a segment arrives whole: every segment's blocks
   are fitted jointly before anything is evicted, a segment is placed whole or
@@ -1156,8 +1161,9 @@ plan's write-back drain. The shadow occupancy is a class of its own
 (`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
 empty parents, the occupants left in each parent a victim leaves — with the
 pool's own fit formula, so a planner on any pool the coordinator registered
-its groups in tries victims the same way: the Host's segment plan
-(`AcquireHostSegments`) fits on it over Host L2.
+its groups in tries victims the same way. Both Host plans fit on it over Host
+L2: the segment plan (`AcquireHostSegments`) and the boundary plan
+(`NumHostBoundariesThatFit`, `AcquireHostBoundaries`).
 
 A victim set is the candidate block alone unless the coordinator evicts by
 *segments* (`write_back_evictions`, the Host write-back policy). Then the set

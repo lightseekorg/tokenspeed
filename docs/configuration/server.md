@@ -1155,26 +1155,29 @@ roles never retract: their pool arguments are ignored with a log.
 admission gate charges a request's worst-case image -- and retraction never
 waits on Host capacity or falls back to recomputation. The capacity policy
 ranks only victims whose image fits (a free slot-state row and pool room for
-the tail; hash-complete pages ride Host L2, whose shortfall falls back to
-the pool). When no resident fits, the scheduler **aborts the newest
+the tail and for the hash-complete pages Host L2 does not take: which ones
+it takes is planned before anything is evicted for the image, under either
+write policy). When no resident fits, the scheduler **aborts the newest
 retractable resident** in the same round and grants its pages to the
 blocked request. The client sees the finish `{"type": "abort", "err_type":
 524, "message": "Request aborted by the scheduler: <detail>"}`
 (`ABORT_CODE.CapacityAbort`; the detail names the shortfall -- "snapshot
-pool cannot hold the image" or "no blob slot free
-(max_retracted_requests=N)" -- and the argument to raise), distinguishable from
-a NaN abort (523) or a transfer failure (521), so a caller that can retry --
-an RL rollout, a batch job -- resubmits; the engine counts them in
-`tokenspeed:num_capacity_aborted_requests`. The two arguments therefore size how
-much work may be suspended at once, and exceeding them costs an abort of
-one request, never latency for everyone else. With no pool
+pool cannot hold the image", "Host L2 cache cannot take the image's
+published pages" or "no blob slot free (max_retracted_requests=N)" -- and
+the argument to raise), distinguishable from a NaN abort (523) or a transfer
+failure (521), so a caller that can retry -- an RL rollout, a batch job --
+resubmits; the engine counts them in
+`tokenspeed:num_capacity_aborted_requests`. The two arguments therefore size
+how much work may be suspended at once (with Host L2, so does
+`--kvstore-size`, which takes the hash-complete pages), and exceeding them
+costs an abort of one request, never latency for everyone else. With no pool
 (`--retraction-snapshot-ratio 0`) nothing can be imaged, so a
 capacity-blocked round aborts the newest resident instead of imaging
 anyone. A forced retraction (`--debug-force-retraction-interval`) whose
 image does not fit is refused and logged, and the request runs on; only a
-request whose image is refused after its pages were published (the Host L2
-leg fell back to a pool too small) is aborted as above. The scheduler's
-victim choice is in `docs/design/scheduler.md` section 2.
+request whose image is refused after its pages were published is aborted as
+above. The scheduler's victim choice is in `docs/design/scheduler.md` section
+2.
 
 The ops ride the round's `DeviceHandle.execute` with the L2 write-backs and
 load-backs (`docs/design/event-loop.md`), their ACKs the same cache poll, and

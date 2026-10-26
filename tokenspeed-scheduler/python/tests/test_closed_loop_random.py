@@ -39,7 +39,16 @@ Host op is acknowledged zero to three plans late, out of order and now and
 then twice. Under write-back every write-back must be stream-ordered (no
 pinned source); every history copy keeps its two ends in one shard's bucket;
 under either policy, once everything is acknowledged no Host entry is pinned
-and nothing is in flight.
+and nothing is in flight. These rows declare the cache groups in a random
+order, as K3 declares a State group before its history group.
+
+The fused role under write-through also runs with a snapshot pool, retracting
+its oldest decode or prefill every third plan, each image's Host leg planned
+before anything is evicted for it. That pool is too small for some of the
+images the knob takes, so those are refused, and image_refused must stay 0
+after every plan: a refused image is refused by its plan, before the Host
+leg is taken. These rows exercise the planned Host placement, its ACKs and
+the restores under churn.
 """
 
 from __future__ import annotations
@@ -64,12 +73,17 @@ def _config(
     host_pages: int,
     policy,
     kv_shards: int,
+    num_snapshot_pages: int,
+    max_retracted_requests: int,
+    force_retraction_interval: int,
 ) -> "ts.SchedulerConfig":
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = P
     cfg.num_device_pages = pages
     cfg.num_host_pages = host_pages
-    cfg.num_snapshot_pages = 1
+    cfg.num_snapshot_pages = num_snapshot_pages
+    cfg.max_retracted_requests = max_retracted_requests
+    cfg.debug_force_retraction_interval = force_retraction_interval
     cfg.max_scheduled_tokens = 48
     cfg.max_batch_size = 6
     cfg.enable_l3_storage = False
@@ -125,25 +139,47 @@ def _event(kind: str, request_id: str, **fields):
 
 
 class _Loop:
-    def __init__(self, seed: int, role, host_pages: int, policy, kv_shards: int):
+    def __init__(
+        self,
+        seed: int,
+        role,
+        host_pages: int,
+        policy,
+        kv_shards: int,
+        num_snapshot_pages: int,
+        max_retracted_requests: int,
+        force_retraction_interval: int,
+        shuffle_groups: bool,
+    ):
         self.rng = random.Random(seed)
         self.role = role
         self.kv_shards = kv_shards
         self.uses_write_back = policy == ts.SchedulerConfig.HostWritePolicy.WriteBack
         self.remote = role == ts.SchedulerConfig.Role.D
         self.prefill_only = role == ts.SchedulerConfig.Role.P
-        self.scheduler = ts.Scheduler(
-            _config(
-                role,
-                pages=self.rng.choice([24, 40, 64]),
-                history_block=self.rng.choice([P, P // 2]),
-                # Drawn either way, so a seed keeps its other draws.
-                sliding=self.rng.random() < 0.4 and not self.uses_write_back,
-                host_pages=host_pages,
-                policy=policy,
-                kv_shards=kv_shards,
-            )
+        cfg = _config(
+            role,
+            pages=self.rng.choice([24, 40, 64]),
+            history_block=self.rng.choice([P, P // 2]),
+            # Drawn either way, so a seed keeps its other draws.
+            sliding=self.rng.random() < 0.4 and not self.uses_write_back,
+            host_pages=host_pages,
+            policy=policy,
+            kv_shards=kv_shards,
+            num_snapshot_pages=num_snapshot_pages,
+            max_retracted_requests=max_retracted_requests,
+            force_retraction_interval=force_retraction_interval,
         )
+        if shuffle_groups:
+            # The declaration order draws from its own stream, so a seed
+            # keeps its other draws.
+            groups = list(cfg.cache_groups)
+            random.Random(seed + 2).shuffle(groups)
+            cfg.cache_groups = groups
+        self.history_group = [group.group_id for group in cfg.cache_groups].index(
+            HISTORY
+        )
+        self.scheduler = ts.Scheduler(cfg)
         # Unacknowledged cache ops: (the round their ACK is due, the ACK).
         self.acks: list[tuple[int, object]] = []
         self.round = 0
@@ -282,15 +318,14 @@ class _Loop:
                     assert not any(
                         op.source_pinned
                     ), "a write-back pins no Device source"
-                # A page's shard is (page id - 1) % kv_shards; the history
-                # group is group 0.
+                # A page's shard is (page id - 1) % kv_shards.
                 for groups, sources, destinations in zip(
                     op.group_ids, op.src_pages, op.dst_pages
                 ):
                     for group, source, destination in zip(
                         groups, sources, destinations
                     ):
-                        if group == 0:
+                        if group == self.history_group:
                             assert (source - 1) % self.kv_shards == (
                                 destination - 1
                             ) % self.kv_shards, "a copy stays within one shard"
@@ -332,6 +367,9 @@ class _Loop:
             if self.remote or self.prefill_only:
                 self.peer(None)
             plan = self.scheduler.next_execution_plan()
+            assert (
+                self.scheduler.host_cache_stats().retraction_stores.image_refused == 0
+            )
             self.queue_acks(plan)
             self.pending.append(plan)
             if self.remote or self.prefill_only:
@@ -364,26 +402,42 @@ def test_random_closed_loop_never_raises(role: str, seed: int) -> None:
         host_pages=0,
         policy=ts.SchedulerConfig.HostWritePolicy.Unspecified,
         kv_shards=1,
+        num_snapshot_pages=1,
+        max_retracted_requests=0,
+        force_retraction_interval=0,
+        shuffle_groups=False,
     ).run(ROUNDS)
 
 
 # Write-back runs on the P role alone; write-through on both roles that
-# compute prompts. The P role also shards its history group.
+# compute prompts. The P role also shards its history group; the fused role
+# also retracts every third plan, a decode (3) or a prefill (-3), into a
+# snapshot pool too small for some of the images the knob takes.
 @pytest.mark.parametrize(
-    "policy, role, kv_shards",
+    "policy, role, kv_shards, num_snapshot_pages, max_retracted_requests, "
+    "force_retraction_interval",
     [
-        ("WriteBack", "P", 1),
-        ("WriteBack", "P", 2),
-        ("WriteBack", "P", 4),
-        ("WriteThrough", "P", 1),
-        ("WriteThrough", "P", 2),
-        ("WriteThrough", "Fused", 1),
+        ("WriteBack", "P", 1, 1, 0, 0),
+        ("WriteBack", "P", 2, 1, 0, 0),
+        ("WriteBack", "P", 4, 1, 0, 0),
+        ("WriteThrough", "P", 1, 1, 0, 0),
+        ("WriteThrough", "P", 2, 1, 0, 0),
+        ("WriteThrough", "Fused", 1, 1, 0, 0),
+        ("WriteThrough", "Fused", 1, 17, 2, 3),
+        ("WriteThrough", "Fused", 1, 17, 2, -3),
     ],
 )
 @pytest.mark.parametrize("host_pages", [9, 17, 33])
 @pytest.mark.parametrize("seed", range(12))
 def test_random_host_acks_leave_nothing_in_flight(
-    policy: str, role: str, kv_shards: int, host_pages: int, seed: int
+    policy: str,
+    role: str,
+    kv_shards: int,
+    num_snapshot_pages: int,
+    max_retracted_requests: int,
+    force_retraction_interval: int,
+    host_pages: int,
+    seed: int,
 ) -> None:
     loop = _Loop(
         seed,
@@ -391,6 +445,10 @@ def test_random_host_acks_leave_nothing_in_flight(
         host_pages=host_pages,
         policy=getattr(ts.SchedulerConfig.HostWritePolicy, policy),
         kv_shards=kv_shards,
+        num_snapshot_pages=num_snapshot_pages,
+        max_retracted_requests=max_retracted_requests,
+        force_retraction_interval=force_retraction_interval,
+        shuffle_groups=True,
     )
     loop.run(ROUNDS)
     # No new prompt: land what is out and acknowledge everything, round after
@@ -405,6 +463,7 @@ def test_random_host_acks_leave_nothing_in_flight(
         if loop.remote or loop.prefill_only:
             loop.peer(None)
         plan = loop.scheduler.next_execution_plan()
+        assert loop.scheduler.host_cache_stats().retraction_stores.image_refused == 0
         loop.queue_acks(plan)
         if loop.remote or loop.prefill_only:
             loop.peer(plan)

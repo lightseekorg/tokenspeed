@@ -296,10 +296,11 @@ public:
                                                            std::int32_t num_tokens) const;
     // The same slots once `progress` has been published as well: the entries
     // that exist now plus the slots CacheCompletedBlocks(progress) would
-    // register (the single publication rule, completedBlockRanges). The
-    // victim probe reads the image's L2/pool split off this before the
-    // retraction publishes, so it sees exactly what StartRetractionStores
-    // will see afterwards. Without completed pages it is PublishedDataSlots.
+    // register (the single publication rule, completedBlockRanges), each on
+    // the block the publication leaves it on: a key the Device index holds
+    // already re-points the slot to that entry's block. The victim probe
+    // reads the image's L2/pool split off this before the retraction
+    // publishes. Without completed pages it is PublishedDataSlots.
     std::vector<std::vector<ImageSlot>> PublishedDataSlotsAfter(std::span<const BlockTable> tables,
                                                                 std::int32_t num_tokens,
                                                                 const RequestProgress& progress) const;
@@ -543,12 +544,14 @@ public:
     // the other State groups' at its hash along; every block retries free
     // capacity before it picks a victim, so it places in the room such a
     // cascade freed before another victim goes. Block by block: it serves
-    // publication and finish stores, retraction images and L3 prefetches;
-    // the Host blocks of what an eviction writes back come from
-    // AcquireHostSegments.
+    // publication and finish stores and L3 prefetches. A retraction image's
+    // Host blocks come from AcquireHostBoundaries, whose plan ranks victims
+    // as this does (change the two together), and the Host blocks of what an
+    // eviction writes back from AcquireHostSegments.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
-    // One segment of an AcquireHostSegments batch: rows [first_row,
+    // One segment of an AcquireHostSegments batch, or one boundary of a
+    // retraction image's (NumHostBoundariesThatFit): rows [first_row,
     // past_end_row) of its group_ids and buckets.
     struct HostSegmentRows {
         std::size_t first_row{0};
@@ -583,6 +586,24 @@ public:
     HostAllocationBatch AcquireHostSegments(std::span<const std::uint32_t> group_ids,
                                             std::span<const std::int32_t> buckets,
                                             std::span<const HostSegmentRows> segments);
+    // How many of `boundaries` -- a retraction image's rows by content hash,
+    // covering the rows in order, the shallowest first -- the Host can take
+    // whole from the first on, each row in its Device block's bucket. Nothing
+    // is evicted or acquired; AcquireHostBoundaries carries out the same plan.
+    // It plans block by block with AcquireHostBlocks' victim ranking against
+    // a shadow of the Host, which does not know which parent the pool gives
+    // each row, so where several parents have room the victims can
+    // differ from those AcquireHostBlocks would take.
+    std::size_t NumHostBoundariesThatFit(std::span<const std::uint32_t> group_ids,
+                                         std::span<const std::int32_t> buckets,
+                                         std::span<const HostSegmentRows> boundaries) const;
+    // Places what NumHostBoundariesThatFit counts, by the plan it makes: its
+    // victims are evicted, then the rows of the boundaries it counts take
+    // the room they leave, a boundary whole or not at all. The rows of the
+    // later boundaries hold empty references.
+    HostAllocationBatch AcquireHostBoundaries(std::span<const std::uint32_t> group_ids,
+                                              std::span<const std::int32_t> buckets,
+                                              std::span<const HostSegmentRows> boundaries);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket);
     CacheBlockRef FindHostCachedBlock(const CacheKey& key) const;
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
@@ -778,6 +799,16 @@ private:
     };
     std::optional<SnapshotPoolPlan> planSnapshotPool(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                                      std::span<const std::vector<ImageSlot>> host_served_slots) const;
+    // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
+    // carries out: how many boundaries the Host places, and the victims they
+    // need, in eviction order (a checkpoint's State siblings after it). Its
+    // victim ranking is AcquireHostBlocks'; change the two together.
+    struct HostBoundaryPlan {
+        std::size_t num_boundaries{0};
+        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
+    };
+    HostBoundaryPlan planHostBoundaries(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
+                                        std::span<const HostSegmentRows> boundaries) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
