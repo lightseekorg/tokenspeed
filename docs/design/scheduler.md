@@ -323,14 +323,14 @@ every role, under either Host write policy and without a Host tier: its
 checkpoints and its tail's KV blocks are registered again at access epoch 0,
 level with the blocks no cache entry holds. It stays cached and matchable -- the
 same prompt sent again resumes there -- and is the first eviction candidate: an
-admission that needs its room evicts it, counted as request reclaim, and one
-whose later victims make the room alone keeps it. A request that resumes there
-again unmarks it until its own finish (an earlier request finishing
-meanwhile leaves it unmarked, even once an older request's publication of
-the same tail has dated it back; a request's own restore, which dates what
-it loads back with the request's epoch, is no later hit), and a request that
-fails before its finish (a transfer that fails) marks nothing, nor does a
-finish whose end state is the input itself (a D request that claimed its
+admission or a restore that needs its room evicts it, counted as request
+reclaim, and one whose later victims make the room alone keeps it. A request
+that resumes there again unmarks it until its own finish (an earlier request
+finishing meanwhile leaves it unmarked, even once an older request's
+publication of the same tail has dated it back; a request's own restore, which
+dates what it loads back with the request's epoch, is no later hit), and a
+request that fails before its finish (a transfer that fails) marks nothing, nor
+does a finish whose end state is the input itself (a D request that claimed its
 prompt-end checkpoint and leaves before any decode). One at a page
 boundary -- a junction or an in-forward checkpoint, which other prompts
 resume at -- is never marked. On the fused role a turn also publishes its
@@ -629,10 +629,10 @@ pages — that stream carries the zeroing, fences the forwards, and gates a
 granted remote prefill's RDMA trigger (see `DeviceHandle.execute` and
 `event-loop.md`) — so the copies read the old bytes whatever the scheduler
 does with the pages. The Host write-back policy's eviction stores (§3.1) are
-the third stream-ordered kind, for the same reason: the pages an admission
-evicts fund the admissions of the same plan. These are the only stores that
-pay for their ordering on the forward's critical path, and they have to: the
-pages are gone in the same round.
+the third stream-ordered kind, for the same reason: the pages an admission or
+a restore evicts fund the admissions and restores of the same plan. These are
+the only stores that pay for their ordering on the forward's critical path,
+and they have to: the pages are gone in the same round.
 
 **Every other store pins its Device sources until the ack.** Boundary
 publications of a live request and the finish-time flush (write-through only)
@@ -647,9 +647,9 @@ by its owner (prefix reuse already depends on that), so the pin alone makes
 the copy race-free. Both guards share one ticket (`StartPendingStores(guard,
 cause)` drains the publication queue; `StartRetractionStores` builds the
 image's L2 leg from the victim's tables; `StartEvictionStores` drains what the
-plan's admissions evicted), and the op carries `source_pinned` to the runtime,
-which branches on the guard and never on the cause. Whatever its guard or
-cause, the op is a `WriteBackOperation`, batched in the plan's
+plan's admissions and restores evicted), and the op carries `source_pinned` to
+the runtime, which branches on the guard and never on the cause. Whatever its
+guard or cause, the op is a `WriteBackOperation`, batched in the plan's
 `WriteBackBatch` (`WriteBackOp` in Python) and acknowledged by
 `CompleteWriteBack`: "write back" in these names means any copy from the
 Device to Host L2, under either Host write policy, not only under
@@ -992,7 +992,10 @@ pages:
   admission headroom (`Request::AdmissionHeadroom`, below): the restore is the
   admission that re-secures the room the retraction proved too optimistic,
   whichever state the victim was in. Cache-only blocks are evicted for it as
-  for any admission, and a failed restore leaves nothing allocated.
+  for any admission, and a failed restore leaves nothing allocated. Under the
+  write-back policy the cache victims a restore evicts are written back in
+  the plan that evicts them, as an admission's are (§3.1), ahead of the
+  restore's own copies: the plan's stores run before its loads.
 - An L2 slot whose key still has a Device-cached canonical block is
   **claimed** instead of copied (the same bytes by construction — the victim's
   own block, cache-only since it was freed — and protected from the planner's
@@ -1232,14 +1235,14 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   the plan's page reuse by the runtime. A new store site chooses its guard
   explicitly (`StartPendingStores` has no default). Under write-back no
   store pins its sources.
-- What an admission evicts under write-back is drained in the plan that
-  evicted it (`StartEvictionStores`, right after the build); no record
-  outlives its plan (by construction: only the build records, and that drain
-  takes every record; `ClearDeviceCache`, which runs between plans, asserts
-  none is left), and the segments of one plan that depend on each other — a
-  later admission's segment taking pages an earlier one's checkpoint still
-  needs — are merged before the Host places them, so they arrive together or
-  not at all (3.1).
+- What an admission or a restore evicts under write-back is drained in the
+  plan that evicted it (`StartEvictionStores`, right after the build); no
+  record outlives its plan (by construction: only the build records, and that
+  drain takes every record; `ClearDeviceCache`, which runs between plans,
+  asserts none is left), and the segments of one plan that depend on each
+  other — a later admission's segment taking pages an earlier one's
+  checkpoint still needs — are merged before the Host places them, so they
+  arrive together or not at all (3.1).
 - Every tier transfer pairs blocks of equal residue (bucket): L2 store, L2
   prefix load, both image legs and the restore; the transfer manager asserts
   it when it builds a batch, so under page-cyclic sharding the rank that owns

@@ -39,9 +39,9 @@ namespace tokenspeed {
 
 // Which call drained a Host L2 store (not which code queued its candidates):
 // boundary publication or finish through StartPendingStores, a retraction
-// image through StartRetractionStores, what an admission evicted under the
-// write-back policy through StartEvictionStores. Accounting only -- it
-// selects the counters a store lands in, never reaches the runtime (which
+// image through StartRetractionStores, what an admission or a restore evicted
+// under the write-back policy through StartEvictionStores. Accounting only --
+// it selects the counters a store lands in, never reaches the runtime (which
 // branches on StoreSourceGuard), and no scheduling decision reads it.
 enum class HostStoreCause : std::uint8_t { kPublication, kFinish, kRetraction, kEviction };
 
@@ -60,8 +60,8 @@ public:
     // queue -- StartRetractionStores builds it from the victim's tables.
     // `cause` (kPublication or kFinish) only picks the counters.
     std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause);
-    // Drains the segments this plan's admissions recorded under the
-    // write-back policy (CacheCoordinator::TakeEvictedSegments) into one
+    // Drains the segments this plan's admissions and restores recorded under
+    // the write-back policy (CacheCoordinator::TakeEvictedSegments) into one
     // stream-ordered write-back op: their Device pages may be granted away
     // in this same plan, so the runtime orders the copies ahead of the plan's
     // page reuse. Segments go newest Device access first, so the oldest are

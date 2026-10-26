@@ -502,11 +502,11 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
     }
-    // What the build's admissions evicted under the write-back policy goes to
-    // the Host in this plan: their pages may already be granted again, so the
-    // copy is stream-ordered and the runtime runs it ahead of the plan's page
-    // reuse. Every eviction record is taken here, never in a later plan. A
-    // no-op with nothing recorded.
+    // What the build's admissions and restores evicted under the write-back
+    // policy goes to the Host in this plan: their pages may already be granted
+    // again, so the copy is stream-ordered and the runtime runs it ahead of
+    // the plan's page reuse. Every eviction record is taken here, never in a
+    // later plan. A no-op with nothing recorded.
     if (auto store = tier_transfers_.StartEvictionStores()) {
         write_back_operations.push_back(std::move(*store));
     }

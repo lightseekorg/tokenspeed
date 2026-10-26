@@ -392,8 +392,8 @@ class HostCacheExecutor:
         # the destination pages. What differs per store is who waits on the
         # copy: a stream-ordered op (a retraction image's L2 leg, every
         # snapshot store, and under the Host write-back policy the store of
-        # what the plan's admissions evicted: sources this very plan may
-        # re-grant) fences the fence stream the caller names on its
+        # what the plan's admissions and restores evicted: sources this very
+        # plan may re-grant) fences the fence stream the caller names on its
         # completion, so the plan's copies, zeroing, load-backs, restores and
         # forwards stay behind it; a pinned op (an ordinary publication under
         # write-through, whose sources the scheduler holds until the ACK)

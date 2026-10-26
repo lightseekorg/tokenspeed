@@ -441,9 +441,9 @@ class DeviceHandle:
         stream-ordered ones -- a retraction image's two legs (the L2
         write-back of the victim's hash-complete pages, the snapshot store of
         its tail pages and slot state) and, under ``--kvstore-write-policy
-        write_back``, the L2 write-back of what the plan's admissions
-        evicted -- read pages this plan re-grants, so they ride the write
-        stream consecutively and ONE completion event fences the forward
+        write_back``, the L2 write-back of what the plan's admissions and
+        restores evicted -- read pages this plan re-grants, so they ride the
+        write stream consecutively and ONE completion event fences the forward
         thread's default stream before anything else of the plan is enqueued;
         a pinned write-back -- an ordinary publication under write-through,
         whose sources the scheduler holds until the ACK -- rides the write

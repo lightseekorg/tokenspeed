@@ -1119,8 +1119,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         prospective_victims;
     // Under the write-back policy each set of cache victims is recorded as
     // one segment for this plan's drain; the request's own released slots are
-    // dropped. The segments this admission starts follow every earlier one.
-    const std::size_t first_new_segment_index = evicted_segments_.size();
+    // dropped.
     // A reclaimable table block may still be pinned by both the request and
     // cache here. Evict what is already free, then slide the request tables and
     // retry the blocks whose request reference has just been released.
@@ -1186,15 +1185,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             FatalCheck(!pool_.IsOccupied(location), "admission victim changed before acquisition");
         }
     }
-    // A set whose every block was dropped records nothing; the rest are
-    // dated by their newest member.
+    // A set whose every block was dropped records nothing: this admission's
+    // empty records go, and an earlier call left none.
     std::erase_if(evicted_segments_, [](const EvictedSegment& segment) { return segment.members.empty(); });
-    for (std::size_t s = first_new_segment_index; s < evicted_segments_.size(); ++s) {
-        for (const EvictedBlock& member : evicted_segments_[s].members) {
-            evicted_segments_[s].newest_access_epoch =
-                std::max(evicted_segments_[s].newest_access_epoch, member.metadata.last_access_epoch);
-        }
-    }
 
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         // A group's bucket-exact blocks (the owner's copy-in, a hitter's tail
@@ -1383,17 +1376,24 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
             claimed[i][j] = std::move(hit.blocks.front());
         }
     }
-    // Nothing is published or reclaimed here, so every planned victim is a
-    // cache-only block the planner saw as evictable (or a tail companion or
-    // same-hash State checkpoint an earlier victim's cascade already took).
+    // Nothing is published here and the tables start empty, so no set is the
+    // request's own reclaim: every planned victim is a cache-only block the
+    // planner saw as evictable (or a tail companion or same-hash State
+    // checkpoint an earlier victim's cascade already took). Under the
+    // write-back policy each set is recorded whole as one segment for this
+    // plan's drain, as Admit does.
     for (const VictimSet& set : candidate->victims) {
+        _assert(!set.is_request_reclaim, "a restore rebuilds empty tables and reclaims nothing of its own");
+        EvictedSegment* segment = write_back_evictions_ ? &evicted_segments_.emplace_back() : nullptr;
         for (const VictimSet::Member& member : set.members) {
-            if (!evictCachedBlock(member.group_id, member.location, &DeviceEvictionStats::restore,
-                                  /*write_back_segment=*/nullptr)) {
+            if (!evictCachedBlock(member.group_id, member.location, &DeviceEvictionStats::restore, segment)) {
                 FatalCheck(!pool_.IsOccupied(member.location), "restore victim changed before acquisition");
             }
         }
     }
+    // A set whose every block was dropped records nothing: this restore's
+    // empty records go, and an earlier call left none.
+    std::erase_if(evicted_segments_, [](const EvictedSegment& segment) { return segment.members.empty(); });
 
     AdmissionResult result{
         .access_epoch = request_access_epoch,

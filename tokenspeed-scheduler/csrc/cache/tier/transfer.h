@@ -69,7 +69,8 @@ enum class StoreSourceGuard : std::uint8_t {
     // store issues; the runtime must order the copy on the forward thread's
     // stream ahead of the plan's page reuse. A retraction's snapshot (the
     // victim's pages are granted away in the same round) and an eviction
-    // write-back (the evicted pages fund the admissions of the same plan).
+    // write-back (the evicted pages fund the admissions and restores of the
+    // same plan).
     kStreamOrdered,
 };
 

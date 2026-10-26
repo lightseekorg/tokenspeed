@@ -5207,7 +5207,8 @@ TEST(RetractionImageTest, HostAllocationFollowsTheSourceBucket) {
 // Write-through evicts them block by block. Under write-back the segment of
 // each holds the claimed page 3, so the claims leave no plan; claiming
 // nothing, the restore copies page 3 back from Host L2 too and evicts pages
-// 0-3 as one segment.
+// 0-3 as one segment, which the plan's drain writes back: pages 0-2 are
+// copied, page 3 rides the Host entry it has.
 TEST(RestoreWriteBackTest, ARestoreEvictsItsOwnPagesAboveAPageItClaims) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -5253,6 +5254,23 @@ TEST(RestoreWriteBackTest, ARestoreEvictsItsOwnPagesAboveAPageItClaims) {
             ASSERT_EQ(restore->load_pairs.size(), 1u);
             EXPECT_EQ(restore->load_pairs[0].key, Key(hashes[3], 0)) << "page 3, republished at the ACK";
             EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
+            TierTransferManager transfers(coordinator);
+            const std::optional<WriteBackOperation> op = transfers.StartEvictionStores();
+            ASSERT_TRUE(op.has_value());
+            ASSERT_EQ(op->transfers.size(), 3u);
+            for (std::size_t row = 0; row < 3; ++row) {
+                EXPECT_EQ(op->transfers[row].content_hash, hashes[2 - row]) << "deepest page first";
+            }
+            const TierTransferManager::WriteBackStats& stats = transfers.WriteBackStatsFor(HostStoreCause::kEviction);
+            EXPECT_EQ(stats.blocks, (std::vector<std::uint64_t>{3}));
+            EXPECT_EQ(stats.host_cached, 1u) << "page 3";
+            EXPECT_EQ(stats.no_placement, 0u);
+            EXPECT_EQ(coordinator.DeviceEvictions().request_reclaim.blocks, 0u);
+            transfers.CompleteWriteBack(op->op_id);
+            coordinator.CollectDeadEntries();
+            for (const std::string& hash : hashes) {
+                EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+            }
         } else {
             EXPECT_EQ(coordinator.DeviceEvictions().restore.blocks, 3u) << "pages 0-2";
             EXPECT_TRUE(restore->load_pairs.empty()) << "page 3 is claimed";
@@ -5272,7 +5290,8 @@ TEST(RestoreWriteBackTest, ARestoreEvictsItsOwnPagesAboveAPageItClaims) {
 // Write-through evicts the checkpoint alone. Under write-back its segment
 // holds page 1, so the claims leave no plan; claiming nothing, the restore
 // copies pages 0 and 1 back from Host L2 too and evicts them with the
-// checkpoint as one segment.
+// checkpoint as one segment. The image's Host entries hold all three, so the
+// plan's drain copies nothing: the segment rides them.
 TEST(RestoreWriteBackTest, ARestoreEvictsItsOwnCheckpointBesideAPageItClaims) {
     const std::vector<CacheGroupSpec> specs{
         CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
@@ -5328,6 +5347,12 @@ TEST(RestoreWriteBackTest, ARestoreEvictsItsOwnCheckpointBesideAPageItClaims) {
             EXPECT_TRUE(restore->load_pairs[2].key.content_hash.empty()) << "State slot 1 stays private";
             EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
             EXPECT_EQ(coordinator.GroupPrefixIndex(1).NumEntries(pool), 0);
+            TierTransferManager transfers(coordinator);
+            EXPECT_FALSE(transfers.StartEvictionStores().has_value());
+            const TierTransferManager::WriteBackStats& stats = transfers.WriteBackStatsFor(HostStoreCause::kEviction);
+            EXPECT_EQ(stats.host_cached, 3u);
+            EXPECT_EQ(stats.no_placement, 0u);
+            EXPECT_EQ(coordinator.DeviceEvictions().request_reclaim.blocks, 0u);
         } else {
             EXPECT_EQ(coordinator.DeviceEvictions().restore.blocks, 1u) << "the checkpoint";
             ASSERT_EQ(restore->load_pairs.size(), 1u) << "State slot 1";
@@ -11141,6 +11166,491 @@ TEST_F(ShardedWriteBackTransactionTest, MembersInAnotherBucketThanTheirDeviceCop
     EXPECT_EQ(HostEntries(y_own), 4);
     EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 8 + 1 + 4);
     EXPECT_EQ(stats.cancelled, 0u);
+}
+
+// ---------------------------------------------------------------------------
+// A restore under the write-back policy evicts cache for the tables it
+// rebuilds through the admission planner, and records what it evicts as an
+// admission does -- each victim set as one segment, every set it takes -- so
+// the plan's drain (StartEvictionStores, called here where the scheduler calls
+// it, right after the build) writes it back and the ACK publishes it on the
+// Host. One Full group, a block per page of two tokens, and a snapshot pool
+// for the retracted request's image.
+// ---------------------------------------------------------------------------
+
+// With the demand of an admission -- six blocks on a Device whose six parents
+// hold two other prompts' pages, X's four and Y's two -- a restore records the
+// same two segments, one per prompt with every page of it, and its drain
+// copies the same rows into the same Host blocks; at the ACK every page is on
+// the Host. Each path runs twice from the same start: once to read its
+// records, once to drain them.
+TEST(RestoreWriteBackTest, ARestoreWritesBackWhatItEvicts) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    const std::vector<std::string> x = ContentHashes({{1, 2}, {3, 4}, {5, 6}, {7, 8}});
+    const std::vector<std::string> y = ContentHashes({{9, 10}, {11, 12}});
+    // The admission's, then the restore's: the keys each recorded, segment by
+    // segment, and the rows each drain copied.
+    std::vector<std::vector<std::vector<CacheKey>>> recorded;
+    std::vector<std::vector<CacheTransfer>> copied;
+    for (const bool restore : {false, true}) {
+        for (const bool drain : {false, true}) {
+            SCOPED_TRACE(testing::Message() << "restore " << restore << ", drain " << drain);
+            BlockPool pool(6, {1});
+            BlockPool host_pool(8, {1});
+            BlockPool snapshot_pool(8, {1});
+            CacheCoordinator coordinator =
+                MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                                /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+            TierTransferManager transfers(coordinator);
+            // A retracted request's five blocks, imaged into the snapshot pool.
+            std::vector<BlockTable> tables(1);
+            ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/10));
+            auto image = coordinator.TakeImage(tables, /*num_tokens=*/10, NoHostSlots(1));
+            ASSERT_TRUE(image);
+            image->store_pairs.clear();
+            coordinator.Free(tables);
+            // X's four pages, then Y's two, fill the Device.
+            ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+            CacheCompletedBlocksForTest(coordinator, tables, x,
+                                        CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                        /*first_new_prefix_page=*/0, /*num_computed_tokens=*/8,
+                                        CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                        /*publish_state=*/false);
+            coordinator.Free(tables);
+            ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+            CacheCompletedBlocksForTest(coordinator, tables, y,
+                                        CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                        /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4,
+                                        CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                        /*publish_state=*/false);
+            coordinator.Free(tables);
+            ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+
+            // The image's five blocks and the reserve's one, or six fresh ones.
+            if (restore) {
+                std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
+                ASSERT_TRUE(RestoreDemands(coordinator, image->image, tables, demands, /*access_epoch=*/1));
+            } else {
+                ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/12));
+            }
+            EXPECT_EQ(coordinator.GroupPrefixIndex(0).NumEntries(pool), 0);
+            if (!drain) {
+                std::vector<std::vector<CacheKey>>& segment_keys = recorded.emplace_back();
+                for (CacheCoordinator::EvictedSegment& segment : coordinator.TakeEvictedSegments()) {
+                    std::vector<CacheKey>& member_keys = segment_keys.emplace_back();
+                    for (const CacheCoordinator::EvictedBlock& member : segment.members) {
+                        member_keys.push_back(member.key);
+                    }
+                    coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+                }
+                coordinator.Free(tables);
+                continue;
+            }
+            const std::optional<WriteBackOperation> op = transfers.StartEvictionStores();
+            ASSERT_TRUE(op.has_value());
+            copied.push_back(op->transfers);
+            transfers.CompleteWriteBack(op->op_id);
+            for (const std::vector<std::string>& prompt : {x, y}) {
+                for (const std::string& hash : prompt) {
+                    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+                }
+            }
+            EXPECT_FALSE(transfers.HasAnyInFlight());
+            coordinator.Free(tables);
+        }
+    }
+    ASSERT_EQ(recorded.size(), 2u);
+    // Deepest page first, X (the older) before Y.
+    EXPECT_EQ(recorded[0], (std::vector<std::vector<CacheKey>>{
+                               {Key(x[3], 0), Key(x[2], 0), Key(x[1], 0), Key(x[0], 0)},
+                               {Key(y[1], 0), Key(y[0], 0)},
+                           }));
+    EXPECT_EQ(recorded[1], recorded[0]);
+    ASSERT_EQ(copied.size(), 2u);
+    EXPECT_EQ(copied[0].size(), 6u);
+    EXPECT_EQ(copied[1], copied[0]);
+}
+
+// The Host holds pages 2 and 3, written back earlier, and the Device the
+// pages 0 and 1 they continue. A restore that evicts pages 0 and 1 writes
+// them back, so after its ACK the Host holds the whole chain and the
+// collection of dead entries takes none of it. Dropped, they would leave
+// pages 2 and 3 under a gap on both tiers, for the collection to take too.
+TEST(RestoreWriteBackTest, ARestoreKeepsTheHostSuffixItsVictimsContinue) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    BlockPool pool(4, {1});
+    BlockPool host_pool(8, {1});
+    BlockPool snapshot_pool(8, {1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    TierTransferManager transfers(coordinator);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
+    auto image = coordinator.TakeImage(tables, /*num_tokens=*/6, NoHostSlots(1));
+    ASSERT_TRUE(image);
+    image->store_pairs.clear();
+    coordinator.Free(tables);
+    const std::vector<std::string> hashes = ContentHashes({{1, 2}, {3, 4}, {5, 6}, {7, 8}});
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+    CacheCompletedBlocksForTest(coordinator, tables, hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/8, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    coordinator.Free(tables);
+    for (const std::string& hash : {hashes[2], hashes[3]}) {
+        CacheBlockRef block = host_pool.AcquireBlock(0);
+        coordinator.CacheHostBlock(block, Key(hash, 0), std::nullopt);
+        const std::optional<CacheBlockLocation> location =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(hash, 0));
+        ASSERT_TRUE(location.has_value());
+        ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, 0, *location));
+    }
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 2);
+
+    std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
+    ASSERT_TRUE(RestoreDemands(coordinator, image->image, tables, demands, /*access_epoch=*/1));
+    EXPECT_EQ(coordinator.DeviceEvictions().restore.blocks, 2u);
+    const std::optional<WriteBackOperation> op = transfers.StartEvictionStores();
+    ASSERT_TRUE(op.has_value()) << "the restore recorded pages 0 and 1";
+    EXPECT_EQ(op->transfers.size(), 2u);
+    transfers.CompleteWriteBack(op->op_id);
+    coordinator.CollectDeadEntries();
+    for (const std::string& hash : hashes) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+    }
+    coordinator.Free(tables);
+}
+
+// The oldest entry a restore short of one block finds is a tail a turn's
+// finish marked superseded (MarkSupersededStateInput). It leaves as the
+// reclaim of the request that superseded it, as under an admission and under
+// either write policy: recorded nowhere, written back never, and not counted
+// as the restore's, so every block counted as evicted for the cache still
+// lands in one outcome of the drain.
+TEST(RestoreWriteBackTest, ARestoreDropsASupersededInputRatherThanWritingItBack) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    for (const bool write_back : {true, false}) {
+        SCOPED_TRACE(write_back);
+        BlockPool pool(4, {1});
+        BlockPool host_pool(8, {1});
+        BlockPool snapshot_pool(8, {1});
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                            /*stream_device_cache_to_host=*/!write_back, /*write_back_evictions=*/write_back);
+        TierTransferManager transfers(coordinator);
+        std::vector<BlockTable> tables(1);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
+        auto image = coordinator.TakeImage(tables, /*num_tokens=*/2, NoHostSlots(1));
+        ASSERT_TRUE(image);
+        image->store_pairs.clear();
+        coordinator.Free(tables);
+        // Two pages and a one-token tail, the tail marked superseded once published.
+        const std::vector<std::int32_t> tokens = MakeTokens(5);
+        const std::vector<std::string> pages = ContentHashes({{tokens[0], tokens[1]}, {tokens[2], tokens[3]}});
+        const TailPublication tail{.tail_tokens = 1,
+                                   .hash = HashPrefixPage(token_span(tokens).subspan(4), pages.back())};
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/5));
+        const std::uint64_t epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+        coordinator.CacheCompletedBlocks(
+            tables,
+            RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = pages,
+                                                              .first_new_prefix_page = 0,
+                                                              .tail = tail,
+                                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
+                            .num_computed_tokens = 5},
+            epoch);
+        coordinator.Free(tables);
+        coordinator.MarkSupersededStateInput(tail.hash, epoch);
+        ASSERT_EQ(pool.NumEmptyLcmBlocks(), 1);
+
+        std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
+        ASSERT_TRUE(RestoreDemands(coordinator, image->image, tables, demands, /*access_epoch=*/1));
+        EXPECT_FALSE(CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(tail.hash, 0)).has_value());
+        const CacheCoordinator::DeviceEvictionStats& evictions = coordinator.DeviceEvictions();
+        EXPECT_EQ(evictions.request_reclaim.blocks, 1u);
+        EXPECT_EQ(evictions.restore.blocks, 0u);
+        EXPECT_FALSE(transfers.StartEvictionStores().has_value()) << "nothing was recorded";
+        EXPECT_EQ(coordinator.NumHostCachedBlocks(), 0);
+        const TierTransferManager::WriteBackStats& stats = transfers.WriteBackStatsFor(HostStoreCause::kEviction);
+        std::uint64_t outcomes =
+            stats.host_cached + stats.in_flight + stats.no_placement + coordinator.DeadEntriesNotWrittenBack();
+        for (const std::uint64_t blocks : stats.blocks) {
+            outcomes += blocks;
+        }
+        EXPECT_EQ(outcomes, evictions.admission.blocks + evictions.stranded_suffix.blocks + evictions.restore.blocks);
+        coordinator.Free(tables);
+    }
+}
+
+// A restore whose only victim is a superseded tail adds a record that stays
+// empty, and erases it before it returns. An admission later in the same
+// plan then records the one segment the drain takes, dated by its newest
+// member; and a cache clear before any drain finds no record left behind.
+TEST(RestoreWriteBackTest, AnEmptyRestoreRecordDoesNotShiftTheAdmissionsEpochs) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    for (const bool admit_after_restore : {true, false}) {
+        SCOPED_TRACE(admit_after_restore);
+        BlockPool pool(4, {1});
+        BlockPool host_pool(8, {1});
+        BlockPool snapshot_pool(8, {1});
+        CacheCoordinator coordinator =
+            MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                            /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+        std::vector<BlockTable> tables(1);
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2));
+        auto image = coordinator.TakeImage(tables, /*num_tokens=*/2, NoHostSlots(1));
+        ASSERT_TRUE(image);
+        image->store_pairs.clear();
+        coordinator.Free(tables);
+        const std::vector<std::int32_t> tokens = MakeTokens(5);
+        const std::vector<std::string> pages = ContentHashes({{tokens[0], tokens[1]}, {tokens[2], tokens[3]}});
+        const TailPublication tail{.tail_tokens = 1,
+                                   .hash = HashPrefixPage(token_span(tokens).subspan(4), pages.back())};
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/5));
+        const std::uint64_t epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+        coordinator.CacheCompletedBlocks(
+            tables,
+            RequestProgress{.completed_pages = CompletedPages{.prefix_hashes = pages,
+                                                              .first_new_prefix_page = 0,
+                                                              .tail = tail,
+                                                              .boundary_kind = CacheBoundaryKind::kEndpoint},
+                            .num_computed_tokens = 5},
+            epoch);
+        coordinator.Free(tables);
+        coordinator.MarkSupersededStateInput(tail.hash, epoch);
+
+        std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
+        ASSERT_TRUE(RestoreDemands(coordinator, image->image, tables, demands, /*access_epoch=*/1));
+        ASSERT_EQ(coordinator.DeviceEvictions().request_reclaim.blocks, 1u);
+        if (!admit_after_restore) {
+            EXPECT_TRUE(coordinator.ClearDeviceCache());
+            coordinator.Free(tables);
+            continue;
+        }
+        // One block on a full Device: page 1 leaves, a segment of its own.
+        std::vector<BlockTable> admitted(1);
+        ASSERT_TRUE(AdmitForTest(coordinator, admitted, /*num_tokens=*/2));
+        std::vector<CacheCoordinator::EvictedSegment> segments = coordinator.TakeEvictedSegments();
+        ASSERT_EQ(segments.size(), 1u);
+        ASSERT_EQ(segments[0].members.size(), 1u);
+        EXPECT_EQ(segments[0].members[0].key, Key(pages[1], 0));
+        EXPECT_EQ(segments[0].newest_access_epoch, epoch);
+        coordinator.SettleEvictedSegment(std::move(segments[0]), /*placed_on_host=*/false);
+        coordinator.Free(admitted);
+        coordinator.Free(tables);
+    }
+}
+
+// A restore evicts X's four pages, and its write-back stays unacknowledged
+// across three more plans, each draining and collecting dead entries as the
+// scheduler does: the first admits a request that evicts Y's two pages and
+// drains them in an op of its own, the other two drain nothing. Until the
+// restore's ACK, the pending stores alone hold X's tree nodes -- neither tier
+// holds X, the collection leaves it -- and nothing of X is published, while
+// Y's segment publishes at its own ACK. Once both ACKs are in, no Host entry
+// is pinned, no store is out, and the cache clears.
+TEST(RestoreWriteBackTest, ARestoreRecordWaitsForItsAckAcrossPlans) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+    };
+    BlockPool pool(6, {1});
+    BlockPool host_pool(8, {1});
+    BlockPool snapshot_pool(8, {1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    TierTransferManager transfers(coordinator);
+    const BoundaryTree& tree = CacheCoordinatorTestAccess::BoundaryTreeOf(coordinator);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/6));
+    auto image = coordinator.TakeImage(tables, /*num_tokens=*/6, NoHostSlots(1));
+    ASSERT_TRUE(image);
+    image->store_pairs.clear();
+    coordinator.Free(tables);
+    // X's four pages, then Y's two, fill the Device.
+    const std::vector<std::string> x = ContentHashes({{1, 2}, {3, 4}, {5, 6}, {7, 8}});
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/8));
+    CacheCompletedBlocksForTest(coordinator, tables, x, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/8, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    coordinator.Free(tables);
+    const std::vector<std::string> y = ContentHashes({{9, 10}, {11, 12}});
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
+    CacheCompletedBlocksForTest(coordinator, tables, y, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    coordinator.Free(tables);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+
+    // The image's three blocks and the reserve's one: X, the older, leaves.
+    std::vector<BlockTable> restored(1);
+    std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
+    ASSERT_TRUE(RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1));
+    const std::optional<WriteBackOperation> restore_op = transfers.StartEvictionStores();
+    ASSERT_TRUE(restore_op.has_value());
+    ASSERT_EQ(restore_op->transfers.size(), 4u);
+    coordinator.CollectDeadEntries();
+
+    // Two blocks on the full Device: Y leaves, in an op of its own.
+    std::vector<BlockTable> admitted(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, admitted, /*num_tokens=*/4));
+    const std::optional<WriteBackOperation> admission_op = transfers.StartEvictionStores();
+    ASSERT_TRUE(admission_op.has_value());
+    EXPECT_EQ(admission_op->transfers.size(), 2u);
+    coordinator.CollectDeadEntries();
+    for (std::int32_t plan = 0; plan < 2; ++plan) {
+        EXPECT_FALSE(transfers.StartEvictionStores().has_value());
+        coordinator.CollectDeadEntries();
+    }
+    for (const std::string& hash : x) {
+        const BoundaryTree::Node* node = tree.Find(hash);
+        ASSERT_NE(node, nullptr) << hash;
+        EXPECT_EQ(node->pending_host_stores, 1) << hash;
+        EXPECT_FALSE(node->on_device) << hash;
+        EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+    }
+
+    EXPECT_EQ(transfers.CompleteWriteBack(admission_op->op_id).size(), 2u) << "Y's pages";
+    EXPECT_EQ(transfers.CompleteWriteBack(restore_op->op_id).size(), 4u) << "X's pages";
+    for (const std::string& hash : x) {
+        EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key(hash, 0))) << hash;
+        EXPECT_EQ(tree.Find(hash)->pending_host_stores, 0) << hash;
+    }
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
+    EXPECT_FALSE(transfers.HasAnyInFlight());
+    coordinator.Free(restored);
+    coordinator.Free(admitted);
+    EXPECT_TRUE(coordinator.ClearCache());
+}
+
+// ARestoreWritesBackWhatItEvicts under KV parallelism, a parent holding one
+// block of each bucket. X's pages fill the first parent, page j in bucket j,
+// and the Host holds X's deepest page, written back earlier, in bucket 0. The
+// image's two published pages ride Host entries in bucket 1, page 1's own
+// bucket and not page 0's; page 0 is still cached on the Device, page 1 is
+// not. With one bucket-1 hole left on the Device, the restore is short of
+// room only in the bucket of the image's tail, yet X's pages leave deepest
+// first, down to the one in that bucket, as one segment over every bucket
+// they span: every member is written back, each copy within one bucket, X's
+// deepest page as its Host entry. The restore claims page 0, copying nothing
+// for it although its Host entry lies in another bucket, loads page 1 within
+// bucket 1, and copies the tail onto the page X left in the tail's bucket,
+// behind that page's write-back: both copies stay in that bucket.
+class ShardedRestoreWriteBackTest : public ::testing::TestWithParam<std::int32_t> {};
+
+INSTANTIATE_TEST_SUITE_P(KvShards, ShardedRestoreWriteBackTest, ::testing::Values(2, 8));
+
+TEST_P(ShardedRestoreWriteBackTest, ARestoreWritesBackWhatItEvicts) {
+    const std::int32_t shards = GetParam();
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                       .cache_blocks_per_lcm_block = shards,
+                       .block_granularity = 2,
+                       .shard_count = shards},
+    };
+    BlockPool pool(3, {shards});
+    BlockPool host_pool(4, {shards});
+    BlockPool snapshot_pool(2, {shards});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    TierTransferManager transfers(coordinator);
+    const GroupAllocator& allocator = coordinator.Allocator(0);
+    std::vector<std::vector<std::int32_t>> x_pages;
+    for (std::int32_t page = 0; page < shards; ++page) {
+        x_pages.push_back({2 * page + 1, 2 * page + 2});
+    }
+    const std::vector<std::string> x = ContentHashes(x_pages);
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/2 * shards));
+    CacheCompletedBlocksForTest(coordinator, tables, x, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2 * shards,
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/false);
+    coordinator.Free(tables);
+    CacheBlockRef written_back = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0}).front();
+    coordinator.CacheHostBlock(written_back, Key(x.back(), 0), std::nullopt);
+    written_back.reset();
+
+    const std::vector<std::string> image_pages = ContentHashes({{101, 102}, {103, 104}});
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/5));
+    CacheCompletedBlocksForTest(coordinator, tables, image_pages,
+                                CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/5, CacheBoundaryKind::kChunk,
+                                /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    std::vector<std::int32_t> image_buckets;
+    for (const CacheBlockRef& block : tables[0].Blocks()) {
+        image_buckets.push_back(allocator.BucketOf(block->Location()));
+    }
+    ASSERT_EQ(image_buckets, (std::vector<std::int32_t>{0, 1, 2 % shards}));
+    const std::int32_t tail_bucket = image_buckets[2];
+    const CacheBlockLocation page0 = tables[0].Blocks()[0]->Location();
+    std::vector<std::vector<ImageSlot>> host_slots = coordinator.PublishedDataSlots(tables, /*num_tokens=*/5);
+    ASSERT_EQ(host_slots[0].size(), 2u);
+    for (ImageSlot& slot : host_slots[0]) {
+        CacheBlockRef host = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1}).front();
+        coordinator.CacheHostBlock(host, slot.key, std::nullopt);
+        slot.block = std::move(host);
+    }
+    auto image = coordinator.TakeImage(tables, /*num_tokens=*/5, host_slots);
+    ASSERT_TRUE(image);
+    image->store_pairs.clear();
+    host_slots.clear();
+    coordinator.Free(tables);
+    const std::optional<CacheBlockLocation> page1 =
+        CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(image_pages[1], 0));
+    ASSERT_TRUE(page1.has_value());
+    ASSERT_TRUE(CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, 0, *page1));
+    // Every Device hole and empty parent held but one bucket-1 hole.
+    std::vector<CacheBlockRef> held = pool.AcquireBlocks(0, pool.NumFreeSlots(0) + shards * pool.NumEmptyLcmBlocks());
+    held.erase(std::ranges::find_if(
+        held, [&](const CacheBlockRef& block) { return allocator.BucketOf(block->Location()) == 1; }));
+
+    std::vector<BlockTable> restored(1);
+    std::vector<GroupDemand> demands{GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1}};
+    const std::optional<CacheCoordinator::AdmissionResult> restore =
+        RestoreDemands(coordinator, image->image, restored, demands, /*access_epoch=*/1);
+    ASSERT_TRUE(restore.has_value());
+    EXPECT_EQ(coordinator.DeviceEvictions().restore.blocks, static_cast<std::uint64_t>(shards - tail_bucket));
+    EXPECT_EQ(restored[0].Blocks()[0]->Location(), page0) << "page 0 is claimed";
+    EXPECT_NE(allocator.BucketOf(image->image.tables[0].slots[0].block->Location()), allocator.BucketOf(page0));
+    ASSERT_EQ(restore->load_pairs.size(), 1u) << "page 1 alone is loaded";
+    EXPECT_EQ(restore->load_pairs[0].key, Key(image_pages[1], 0));
+    EXPECT_EQ(allocator.BucketOf(restore->load_pairs[0].source->Location()),
+              allocator.BucketOf(restore->load_pairs[0].destination->Location()));
+    ASSERT_EQ(restore->snapshot_pairs.size(), 1u);
+    const BlockTransfer& tail_copy = restore->snapshot_pairs[0];
+    EXPECT_EQ(allocator.BucketOf(tail_copy.source->Location()), allocator.BucketOf(tail_copy.destination->Location()));
+
+    const std::optional<WriteBackOperation> op = transfers.StartEvictionStores();
+    ASSERT_TRUE(op.has_value());
+    EXPECT_EQ(op->transfers.size(), static_cast<std::size_t>(shards - tail_bucket - 1)) << "all but the deepest";
+    EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kEviction).host_cached, 1u);
+    for (const CacheTransfer& transfer : op->transfers) {
+        // A page's bucket is (page id - 1) % shard_count (BucketOf).
+        EXPECT_EQ((transfer.source_page - 1) % shards, (transfer.destination_page - 1) % shards);
+    }
+    const auto tail_page_write_back = std::ranges::find(
+        op->transfers, allocator.ResolveCacheBlockId(tail_copy.destination->Location()), &CacheTransfer::source_page);
+    ASSERT_NE(tail_page_write_back, op->transfers.end()) << "the tail lands on a page X's write-back reads";
+    EXPECT_EQ((tail_page_write_back->destination_page - 1) % shards, allocator.BucketOf(tail_copy.source->Location()));
+    transfers.CompleteWriteBack(op->op_id);
+    for (std::int32_t page = 0; page < shards; ++page) {
+        const CacheKey key = Key(x[static_cast<std::size_t>(page)], 0);
+        EXPECT_EQ(coordinator.ContainsHostCachedBlock(key), page >= tail_bucket) << "page " << page;
+        EXPECT_EQ(CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, key).has_value(), page < tail_bucket)
+            << "page " << page;
+    }
+    EXPECT_FALSE(transfers.HasAnyInFlight());
+    coordinator.Free(restored);
 }
 
 // Random K3 sessions -- forked from earlier ones at random pages, resumed on

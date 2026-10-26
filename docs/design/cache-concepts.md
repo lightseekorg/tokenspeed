@@ -394,9 +394,9 @@ Each op says how the scheduler guards its Device sources
 (`source_pinned`, see `scheduler.md` §2). A pinned op's sources stay cached
 and unevictable until the ACK, so its copy overlaps whatever the round does
 next and nobody waits on it. An unpinned op's sources (a retraction image's
-pages, or what an admission evicted under the write-back policy) may be
-re-granted in the same plan, so it is launched first and the fence stream the
-caller names --
+pages, or what an admission or a restore evicted under the write-back policy)
+may be re-granted in the same plan, so it is launched first and the fence
+stream the caller names --
 the default stream, where the plan's page zeroing runs -- waits on its
 completion event before the zeroing is enqueued — the zeroing, load-backs,
 forwards and RDMA triggers behind it inherit the fence (the forward by
@@ -900,7 +900,7 @@ Its responsibilities:
   Device tail checkpoint marks that input superseded
   (`MarkSupersededStateInput`): its Device entries are registered again at
   access epoch 0, still matchable but first in the eviction order, and an
-  admission that evicts them counts them as request reclaim
+  admission or a restore that evicts them counts them as request reclaim
   ([Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)
   gives why and when a later request unmarks it).
   Replayable groups are outside `match_order_` and skip publication on both
@@ -974,10 +974,10 @@ Its responsibilities:
   The way back is one `SnapshotRestoreOperation` whose rows name their Host
   tier; its L2-tier destinations are republished at the ACK
   (`CompleteSnapshotRestore`) exactly as a prefix load-back's are.
-  Under write-back (`write_back_evictions`), each victim set an admission
-  evicts for the cache is recorded as one *segment* as it leaves the index
-  (`evictCachedBlockAlone`); the request's own released slots are dropped,
-  and so is a block no probe could resume from on the Host
+  Under write-back (`write_back_evictions`), each victim set an admission or
+  a restore evicts for the cache is recorded as one *segment* as it leaves
+  the index (`evictCachedBlockAlone`); the request's own released slots are
+  dropped, and so is a block no probe could resume from on the Host
   (`DeadEntriesNotWrittenBack`). A record holds its tree node, tail hint and
   Host presence until its segment settles, and a block the Host holds already
   rides as that entry, never copied again. The invariants: the Device's
@@ -990,7 +990,8 @@ Its responsibilities:
   Device metadata, or not at all (`SettleEvictedSegment`, which also drops
   what a cap or the loss of every checkpoint boundary under it made dead
   meanwhile).
-  A superseded input (above) an admission evicts is dropped, never recorded.
+  A superseded input (above) an admission or a restore evicts is dropped, as
+  the reclaim of the request that superseded it.
   Write-through's publication and finish stores, retraction images and L3
   prefetches take Host blocks one by one (`AcquireHostBlocks`). What the
   write-back policy writes back takes them per segment
@@ -1145,12 +1146,12 @@ the next request-reclaimable candidate using one policy: LRU access epoch,
 then tier (uncached request-only block → probationary boundary → established
 boundary → suffix of a closed prefix). Each candidate expands into a
 *victim set* that is selected, restored and evicted whole. Finally, walk the
-selected sets in reverse and restore every set that is not strictly
-required, yielding a minimal eviction plan in `victims`; `Admit` evicts set
-by set, oldest first, and counts the request's own released slots apart
-(`DeviceEvictionStats::request_reclaim`), and so a superseded input, which
-ranks at epoch 0 with the uncached blocks, in whichever set it leaves; under
-the write-back policy it records every other set as one segment for the
+selected sets in reverse and restore every set that is not strictly required,
+yielding a minimal eviction plan in `victims`. `Admit` and `Restore` evict set
+by set, oldest first. The admitted request's own released slots (Admit only; a
+restore rebuilds empty tables) and a superseded input, which ranks at epoch 0
+with the uncached blocks, count as `DeviceEvictionStats::request_reclaim`;
+under the write-back policy every other set is recorded as one segment for the
 plan's write-back drain. The shadow occupancy is a class of its own
 (`ShadowOccupancy`, `shadow_occupancy.h`) over one pool — holes per bucket,
 empty parents, the occupants left in each parent a victim leaves — with the

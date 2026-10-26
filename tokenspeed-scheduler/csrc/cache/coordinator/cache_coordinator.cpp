@@ -140,8 +140,8 @@ bool CacheCoordinator::CacheIsClearable(bool include_host) const {
 }
 
 bool CacheCoordinator::ClearDeviceCache() {
-    // Every plan drains what its admissions recorded; a clear runs between
-    // plans and drops what it evicts.
+    // Every plan drains what its admissions and restores recorded; a clear
+    // runs between plans and drops what it evicts.
     _assert(evicted_segments_.empty(), "a cache clear runs with no eviction left undrained");
     std::vector<std::pair<std::uint32_t, CacheBlockLocation>> cached_locations;
     for (const CacheGroup& group : groups_) {
@@ -1457,12 +1457,12 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
     // Read while the entry is still there: the Host entry inherits it.
     const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
         groups_[group_id].Index().MetadataFor(pool_, location);
-    // A superseded input an admission evicts leaves as the reclaim of the
-    // request that superseded it, under either write policy, and is never
-    // written back. It is never a stranded suffix: a tail at epoch 0 is a
-    // candidate of its own before any page above it.
+    // A superseded input an admission or a restore evicts leaves as the
+    // reclaim of the request that superseded it, under either write policy,
+    // and is never written back. It is never a stranded suffix: a tail at
+    // epoch 0 is a candidate of its own before any page above it.
     if (metadata && metadata->last_access_epoch == kSupersededAccessEpoch &&
-        reason == &DeviceEvictionStats::admission) {
+        (reason == &DeviceEvictionStats::admission || reason == &DeviceEvictionStats::restore)) {
         reason = &DeviceEvictionStats::request_reclaim;
         write_back_segment = nullptr;
     }
@@ -1500,6 +1500,8 @@ std::optional<CacheKey> CacheCoordinator::evictCachedBlockAlone(std::uint32_t gr
                              .metadata = *metadata,
                              .host_block = FindHostCachedBlock(*removed),
                              .written_back_before = (node->written_back_group_bits >> removed->group_id & 1U) != 0});
+            write_back_segment->newest_access_epoch =
+                std::max(write_back_segment->newest_access_epoch, metadata->last_access_epoch);
             // Held until the segment settles: the node, its tail hint and its
             // Host presence stay (syncTreeNode below sees the hold).
             ++node->pending_host_stores;

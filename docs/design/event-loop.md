@@ -701,13 +701,13 @@ For orientation, one `EventLoop::round`:
    image's two legs (the L2 write-back of the victim's hash-complete pages
    and the snapshot store of its tail pages and slot state) and, under the
    Host write-back policy (`--kvstore-write-policy write_back`), the L2
-   write-back of what the plan's admissions evicted, must read the reused
-   pages' old bytes, so they ride the write stream consecutively and ONE
-   completion event fences the forward thread's default stream here, before
-   anything else of the plan is enqueued; an ordinary store's sources (a
-   write-through publication's) are pinned by the scheduler until the ACK,
-   so its copy rides the write stream and fences nothing -- then the plan's
-   Device-to-Device block copies
+   write-back of what the plan's admissions and restores evicted, must
+   read the reused pages' old bytes, so they ride the write stream
+   consecutively and ONE completion event fences the forward thread's
+   default stream here, before anything else of the plan is enqueued; an
+   ordinary store's sources (a write-through publication's) are pinned by
+   the scheduler until the ACK, so its copy rides the write stream and
+   fences nothing -- then the plan's Device-to-Device block copies
    (`pages_to_copy`: a prefix hit's private copy of the block holding its
    boundary, an owner's move off the block it published at its prompt end;
    the copy waits on the execution stream and precedes the zeroing because
