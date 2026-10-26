@@ -33,10 +33,13 @@ The fused and P roles also run with a Host L2: under the write-through
 policy, which stores what is published, and on the P role under the
 write-back policy, which copies what an admission evicts to the Host in the
 same plan (without the sliding-window group, which write-back refuses).
-Every Host op is acknowledged zero to three plans late, out of order and now
-and then twice. Under write-back every write-back must be stream-ordered (no
-pinned source); under either policy, once everything is acknowledged no Host
-entry is pinned and nothing is in flight.
+The P role also runs with the history group's pages dealt over two and four
+KV-parallel shards under write-back, and over two under write-through. Every
+Host op is acknowledged zero to three plans late, out of order and now and
+then twice. Under write-back every write-back must be stream-ordered (no
+pinned source); every history copy keeps its two ends in one shard's bucket;
+under either policy, once everything is acknowledged no Host entry is pinned
+and nothing is in flight.
 """
 
 from __future__ import annotations
@@ -54,7 +57,13 @@ ROUNDS = 300
 
 
 def _config(
-    role, pages: int, history_block: int, sliding: bool, host_pages: int, policy
+    role,
+    pages: int,
+    history_block: int,
+    sliding: bool,
+    host_pages: int,
+    policy,
+    kv_shards: int,
 ) -> "ts.SchedulerConfig":
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = P
@@ -75,9 +84,11 @@ def _config(
         ts.CacheGroupConfig(
             group_id=HISTORY,
             block_granularity=history_block,
-            total_pages=pages * (P // history_block),
+            total_pages=pages * (P // history_block) * kv_shards,
             attn_kind=ts.AttnKind.Full,
+            cache_blocks_per_lcm_block=kv_shards,
             transfer_policy=ts.CacheTransferPolicy.FullSuffix,
+            shard_count=kv_shards,
         )
     ]
     if sliding:
@@ -114,9 +125,10 @@ def _event(kind: str, request_id: str, **fields):
 
 
 class _Loop:
-    def __init__(self, seed: int, role, host_pages: int, policy):
+    def __init__(self, seed: int, role, host_pages: int, policy, kv_shards: int):
         self.rng = random.Random(seed)
         self.role = role
+        self.kv_shards = kv_shards
         self.uses_write_back = policy == ts.SchedulerConfig.HostWritePolicy.WriteBack
         self.remote = role == ts.SchedulerConfig.Role.D
         self.prefill_only = role == ts.SchedulerConfig.Role.P
@@ -129,6 +141,7 @@ class _Loop:
                 sliding=self.rng.random() < 0.4 and not self.uses_write_back,
                 host_pages=host_pages,
                 policy=policy,
+                kv_shards=kv_shards,
             )
         )
         # Unacknowledged cache ops: (the round their ACK is due, the ACK).
@@ -269,6 +282,18 @@ class _Loop:
                     assert not any(
                         op.source_pinned
                     ), "a write-back pins no Device source"
+                # A page's shard is (page id - 1) % kv_shards; the history
+                # group is group 0.
+                for groups, sources, destinations in zip(
+                    op.group_ids, op.src_pages, op.dst_pages
+                ):
+                    for group, source, destination in zip(
+                        groups, sources, destinations
+                    ):
+                        if group == 0:
+                            assert (source - 1) % self.kv_shards == (
+                                destination - 1
+                            ) % self.kv_shards, "a copy stays within one shard"
                 self.write_back_rows += sum(len(rows) for rows in op.src_pages)
                 done = ts.Cache.WriteBackDoneEvent
             elif isinstance(op, ts.Cache.LoadBackOp):
@@ -338,25 +363,34 @@ def test_random_closed_loop_never_raises(role: str, seed: int) -> None:
         getattr(ts.SchedulerConfig.Role, role),
         host_pages=0,
         policy=ts.SchedulerConfig.HostWritePolicy.Unspecified,
+        kv_shards=1,
     ).run(ROUNDS)
 
 
 # Write-back runs on the P role alone; write-through on both roles that
-# compute prompts.
+# compute prompts. The P role also shards its history group.
 @pytest.mark.parametrize(
-    "policy, role",
-    [("WriteBack", "P"), ("WriteThrough", "P"), ("WriteThrough", "Fused")],
+    "policy, role, kv_shards",
+    [
+        ("WriteBack", "P", 1),
+        ("WriteBack", "P", 2),
+        ("WriteBack", "P", 4),
+        ("WriteThrough", "P", 1),
+        ("WriteThrough", "P", 2),
+        ("WriteThrough", "Fused", 1),
+    ],
 )
 @pytest.mark.parametrize("host_pages", [9, 17, 33])
 @pytest.mark.parametrize("seed", range(12))
 def test_random_host_acks_leave_nothing_in_flight(
-    policy: str, role: str, host_pages: int, seed: int
+    policy: str, role: str, kv_shards: int, host_pages: int, seed: int
 ) -> None:
     loop = _Loop(
         seed,
         getattr(ts.SchedulerConfig.Role, role),
         host_pages=host_pages,
         policy=getattr(ts.SchedulerConfig.HostWritePolicy, policy),
+        kv_shards=kv_shards,
     )
     loop.run(ROUNDS)
     # No new prompt: land what is out and acknowledge everything, round after

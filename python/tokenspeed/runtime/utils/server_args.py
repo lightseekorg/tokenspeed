@@ -2036,10 +2036,10 @@ class ServerArgs:
         )
         if self.kvstore_write_policy == "write_back":
             # The scheduler writes back on the prefill role alone, with Host
-            # L2, unsharded pages and no L3 (whose staging would split what it
-            # writes back); the runtime also needs one attention-TP rank and
-            # one stage, where each eviction store is ACKed before the next
-            # plan is built. A model with a sliding-window cache group or more
+            # L2 and no L3 (whose staging would split what it writes back);
+            # the runtime also needs one attention-TP rank and one stage,
+            # where each eviction store is ACKed before the next plan is
+            # built. A model with a sliding-window cache group or more
             # than 64 cache groups is refused by the scheduler at startup
             # (SchedulerConfig.Validate), not here: the cache groups exist
             # only once the model is loaded.

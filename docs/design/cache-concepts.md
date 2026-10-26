@@ -916,9 +916,9 @@ Its responsibilities:
   prefix publication streams to the Host tier
   (`stream_device_cache_to_host_`) on the fused and P roles; the D role's
   Host tier holds retraction images only. Under `kWriteBack` (the P role
-  only, every group unsharded, no sliding-window group, at most 64 groups,
-  no L3: `Validate`) nothing streams at publication; what an admission
-  evicts is written back instead (below).
+  only, no sliding-window group, at most 64 groups, no L3: `Validate`)
+  nothing streams at publication; what an admission evicts is written back
+  instead (below).
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
   alongside Host-side acquire/contains/pin queries. Host L2 uses free
   capacity first, then global LRU across cache groups: a compatible child in
@@ -996,8 +996,11 @@ Its responsibilities:
   write-back policy writes back takes them per segment
   (`AcquireHostSegments`), and a segment arrives whole: every segment's blocks
   are fitted jointly before anything is evicted, a segment is placed whole or
-  not at all, and nothing is evicted for a dropped one. Host victims are whole
-  as well, never in use, and never take or sit right under a page an eviction
+  not at all, and nothing is evicted for a dropped one. Each row's Host block
+  is fitted and placed in its Device block's bucket, so under KV parallelism
+  every rank copies only the rows it owns; a segment one bucket cannot fill is
+  dropped whole, even when another bucket has room. Host victims are whole as
+  well, never in use, and never take or sit right under a page an eviction
   write-back is still bringing, which would otherwise arrive with nothing
   under it; dead entries go first, Host-only cache last. `AcquireHostSegments`
   documents the victim shapes, the ranking and the restore pass.

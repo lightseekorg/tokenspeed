@@ -806,10 +806,10 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
     }
 }
 
-// Write-back is the P role's alone for now (attention TP and PP are the
-// runtime's to refuse): it needs a Host tier, and refuses the other roles, L3,
-// a sharded group, a sliding-window group and more groups than the 64 bits
-// that mark a hash's written-back groups.
+// Write-back is the P role's alone for now (which parallel layouts run it is
+// the runtime's to decide): it needs a Host tier, takes a sharded group, and
+// refuses the other roles, L3, a sliding-window group and more groups than the
+// 64 bits that mark a hash's written-back groups.
 TEST(SchedulerConfigValidateTest, WriteBackOnlyOnThePrefillRole) {
     const auto prefill = [] {
         SchedulerConfig config = MakeValidConfig();
@@ -841,7 +841,8 @@ TEST(SchedulerConfigValidateTest, WriteBackOnlyOnThePrefillRole) {
     SchedulerConfig sharded = prefill();
     sharded.cache_groups[0].cache_blocks_per_lcm_block = 2;
     sharded.cache_groups[0].shard_count = 2;
-    ExpectRejectedNamingGroup(sharded, "requires shard_count 1");
+    EXPECT_NO_THROW(sharded.Validate());
+    EXPECT_NO_THROW(Scheduler{sharded});
 
     // A sliding-window group beside the full one, replayable or not: named.
     for (const bool replayable : {false, true}) {

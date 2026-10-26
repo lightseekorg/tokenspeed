@@ -81,10 +81,9 @@ void SchedulerConfig::Validate() const {
     if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
         throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
     }
-    // Write-back is the P role's alone for now: a single replica on every
-    // group (an eviction's ACK is this rank's), and no L3 staging through
-    // the Host. Attention TP and PP are the runtime's to refuse; the
-    // scheduler does not see them.
+    // Write-back is the P role's alone for now, with no L3 staging through
+    // the Host. It needs no KV-parallel check: each Host block takes its
+    // Device block's bucket (docs/design/scheduler.md §5).
     //
     // No sliding-window group yet. Such a group takes Device copies (a hit's
     // private copy of a tail block) as a full-attention group does, and the
@@ -101,11 +100,6 @@ void SchedulerConfig::Validate() const {
         }
         if (enable_l3_storage) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");
-        }
-        if (std::ranges::any_of(cache_groups, [](const CacheGroupConfig& group) { return group.shard_count > 1; })) {
-            throw std::invalid_argument(
-                "Scheduler: host_write_policy WriteBack requires shard_count 1 on every cache group (no KV "
-                "parallelism)");
         }
         for (const CacheGroupConfig& group : cache_groups) {
             if (group.attn_kind == AttnKind::kSlidingWindow) {

@@ -241,8 +241,14 @@ TEST(JointMatchInvariantsTest, ReplayableGroupIsNotPartOfTheJointInvariant) {
 // below L is loaded (no sliding group lowers the split), and the Host loads
 // exactly the checkpoints the Device lacks. With L3 on, the storage query never
 // asks for a Device-resident checkpoint or page below L, and with a gapless
-// Device prefix for no Device-resident key at all.
-TEST(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv) {
+// Device prefix for no Device-resident key at all. The parameter deals the Full
+// group's pages over that many KV-parallel shards: every load lands in its Host
+// block's bucket.
+class HostSuffixHitInvariantsTest : public ::testing::TestWithParam<std::int32_t> {};
+
+INSTANTIATE_TEST_SUITE_P(KvShards, HostSuffixHitInvariantsTest, ::testing::Values(1, 2, 4));
+
+TEST_P(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv) {
     constexpr auto kDevice = static_cast<std::size_t>(CacheTier::kDevice);
     constexpr auto kHost = static_cast<std::size_t>(CacheTier::kHost);
     constexpr std::int32_t kP = 4;
@@ -252,7 +258,10 @@ TEST(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv
     constexpr std::size_t kFirstTailRow = kPages;  // the first tail's row in the layout
     constexpr std::size_t kRows = kFirstTailRow + kNumTails;
     const std::vector<CacheGroupSpec> specs = {
-        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+        {.attn_kind = AttnKind::kFull,
+         .cache_blocks_per_lcm_block = 4,
+         .block_granularity = kP,
+         .shard_count = GetParam()},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
@@ -408,6 +417,9 @@ TEST(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv
             }
             std::size_t checkpoint_loads = 0;
             for (const BlockTransfer& load : result->load_pairs) {
+                const GroupAllocator& allocator = coordinator.Allocator(static_cast<std::int32_t>(load.group_id));
+                EXPECT_EQ(allocator.BucketOf(load.source->Location()), allocator.BucketOf(load.destination->Location()))
+                    << "round " << round;
                 if (load.group_id != 0) {
                     ++checkpoint_loads;
                     continue;
@@ -451,11 +463,19 @@ TEST(HostSuffixHitInvariantsTest, HitsAreRestorableMaximalAndNeverReloadDeviceKv
 // and every tail its prior page -- also when the dead prefix entries are
 // collected after every round, which then leaves no Device page without a
 // checkpoint boundary under it. K3 shape (P = 4; a Full group, one block per
-// page, four per parent; three State groups) in a Device pool of 24 parents.
-TEST(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderSegmentEviction) {
+// page, four per parent, dealt over the parameter's KV-parallel shards; three
+// State groups) in a Device pool of 24 parents.
+class SegmentEvictionInvariantsTest : public ::testing::TestWithParam<std::int32_t> {};
+
+INSTANTIATE_TEST_SUITE_P(KvShards, SegmentEvictionInvariantsTest, ::testing::Values(1, 2, 4));
+
+TEST_P(SegmentEvictionInvariantsTest, DeviceCoverageStaysClosedFromTheRootUnderSegmentEviction) {
     constexpr std::int32_t kP = 4;
     const std::vector<CacheGroupSpec> specs = {
-        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+        {.attn_kind = AttnKind::kFull,
+         .cache_blocks_per_lcm_block = 4,
+         .block_granularity = kP,
+         .shard_count = GetParam()},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},

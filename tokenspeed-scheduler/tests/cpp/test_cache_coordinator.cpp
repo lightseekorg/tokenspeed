@@ -6591,12 +6591,15 @@ protected:
     using Node = BoundaryTree::Node;
     using CheckpointBoundaryCounts = std::array<std::int32_t, 2>;  // checkpoint_boundaries_in_subtree by CacheTier
 
-    explicit BoundaryTreeCoordinatorFixture(bool write_back_evictions)
+    BoundaryTreeCoordinatorFixture(bool write_back_evictions, std::int32_t full_shard_count)
         : pool_(/*num_lcm_blocks=*/32, {4, 1, 1, 1}),
           host_pool_(/*num_lcm_blocks=*/32, {4, 1, 1, 1}),
           coordinator_{MakeCoordinator(
               std::vector<CacheGroupSpec>{
-                  {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+                  {.attn_kind = AttnKind::kFull,
+                   .cache_blocks_per_lcm_block = 4,
+                   .block_granularity = kP,
+                   .shard_count = full_shard_count},
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
                   {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
@@ -6704,7 +6707,8 @@ protected:
 
 class BoundaryTreeCoordinatorTest : public BoundaryTreeCoordinatorFixture {
 protected:
-    BoundaryTreeCoordinatorTest() : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/false) {}
+    BoundaryTreeCoordinatorTest()
+        : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/false, /*full_shard_count=*/1) {}
 };
 
 TEST_F(BoundaryTreeCoordinatorTest, TreeNodesFollowPublication) {
@@ -7223,7 +7227,7 @@ TEST_F(BoundaryTreeCoordinatorTest, WriteThroughEvictsBlocksAsBefore) {
 // ---------------------------------------------------------------------------
 class SegmentEvictionTest : public BoundaryTreeCoordinatorFixture {
 protected:
-    SegmentEvictionTest() : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true) {}
+    SegmentEvictionTest() : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true, /*full_shard_count=*/1) {}
 };
 
 // A's checkpoint at its tail is the oldest candidate. Its segment climbs to a2,
@@ -8125,12 +8129,20 @@ TEST(SegmentEvictionWithoutAClosedGroupTest, TheClimbStopsBelowAPageTheWindowLef
 
 // Two coordinators fed the same publications and admissions evict the same
 // segments in the same order: every decision follows the tree's insertion order
-// and the planner's keys, never an address. K3 shape in a pool of 16 parents;
+// and the planner's keys, never an address. K3 shape in a pool of 16 parents,
+// the Full group's pages dealt over the parameter's KV-parallel shards;
 // sessions of 18 tokens fork from the first at varying pages.
-TEST(SegmentEvictionMirrorTest, EvictionSetsMatchOnTwoMirroredCoordinators) {
+class SegmentEvictionMirrorTest : public ::testing::TestWithParam<std::int32_t> {};
+
+INSTANTIATE_TEST_SUITE_P(KvShards, SegmentEvictionMirrorTest, ::testing::Values(1, 2, 4));
+
+TEST_P(SegmentEvictionMirrorTest, EvictionSetsMatchOnTwoMirroredCoordinators) {
     constexpr std::int32_t kP = 4;
     const std::vector<CacheGroupSpec> specs{
-        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+        {.attn_kind = AttnKind::kFull,
+         .cache_blocks_per_lcm_block = 4,
+         .block_granularity = kP,
+         .shard_count = GetParam()},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
@@ -8206,7 +8218,9 @@ class HostSegmentPlanTest : public BoundaryTreeCoordinatorFixture {
 protected:
     using HostSegmentRows = CacheCoordinator::HostSegmentRows;
 
-    HostSegmentPlanTest() : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true) {}
+    HostSegmentPlanTest() : HostSegmentPlanTest(/*full_shard_count=*/1) {}
+    explicit HostSegmentPlanTest(std::int32_t full_shard_count)
+        : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true, full_shard_count) {}
 
     // The session over `tokens` as a write-back leaves it: published on the
     // Device (PublishFinal), every entry it published copied to the Host,
@@ -8829,6 +8843,268 @@ TEST_F(HostSegmentPlanTest, AShallowerDeviceCheckpointDoesNotSupersedeATail) {
     EXPECT_EQ(coordinator_.HostEvictions().lru.blocks, 8u);
 }
 
+// ---------------------------------------------------------------------------
+// Host placement per segment under KV parallelism: the fixture's Full group
+// dealt over two shards, a block's bucket its slot % 2. A row is fitted and
+// placed in its Device block's bucket only, so a victim that frees room in
+// another bucket funds nothing.
+// ---------------------------------------------------------------------------
+class ShardedHostSegmentPlanTest : public HostSegmentPlanTest {
+protected:
+    ShardedHostSegmentPlanTest() : HostSegmentPlanTest(/*full_shard_count=*/2) {}
+};
+
+// The Host holds one page P of a session in bucket 0, its parent's bucket-1
+// slots held and its other bucket-0 slot free; every other Host parent is
+// held. Two segments of Full rows: one row in bucket 0, then a row in bucket 0
+// and one in bucket 1. Bucket 0 can place both bucket-0 rows (the free slot,
+// and P's once P, the only victim, is evicted), but bucket 1 cannot place the
+// other row: the second segment is dropped whole, the restore pass returns P,
+// and the first segment takes the free slot. Nothing leaves the Host. Segments
+// are dropped from the back, so with the two-bucket segment first both go.
+TEST_F(ShardedHostSegmentPlanTest, ABucketTheHostCannotFillDropsItsSegmentWhole) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(4 * kP));
+    coordinator_.Free(tables);
+    CacheBlockRef page = host_pool_.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0}).front();
+    coordinator_.CacheHostBlock(page, Key(hashes_[0], 0), std::nullopt);
+    page.reset();
+    for (CacheBlockRef& block : host_pool_.AcquireBlocksInBuckets(0, std::array<std::int32_t, 2>{1, 1})) {
+        held_.push_back(std::move(block));
+    }
+    for (CacheBlockRef& block : host_pool_.AcquireBlocks(1, host_pool_.NumEmptyLcmBlocks())) {
+        held_.push_back(std::move(block));
+    }
+    ASSERT_EQ(host_pool_.FreeSlotsByBucket(0)[0], 1);
+    ASSERT_EQ(host_pool_.FreeSlotsByBucket(0)[1], 0);
+    ASSERT_EQ(host_pool_.NumEmptyLcmBlocks(), 0);
+    const std::vector<std::uint32_t> groups{0, 0, 0};
+    for (const bool two_bucket_segment_first : {false, true}) {
+        SCOPED_TRACE(two_bucket_segment_first);
+        const std::vector<std::int32_t> buckets =
+            two_bucket_segment_first ? std::vector<std::int32_t>{0, 1, 0} : std::vector<std::int32_t>{0, 0, 1};
+        const std::size_t first_segment_rows = two_bucket_segment_first ? 2 : 1;
+        const std::array segments{HostSegmentRows{.first_row = 0, .past_end_row = first_segment_rows},
+                                  HostSegmentRows{.first_row = first_segment_rows, .past_end_row = 3}};
+        const CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostSegments(groups, buckets, segments);
+
+        EXPECT_EQ(batch.stats.allocated, two_bucket_segment_first ? 0u : 1u);
+        EXPECT_EQ(static_cast<bool>(batch.blocks[0]), !two_bucket_segment_first);
+        EXPECT_FALSE(static_cast<bool>(batch.blocks[1]));
+        EXPECT_FALSE(static_cast<bool>(batch.blocks[2]));
+        if (batch.blocks[0]) {
+            EXPECT_EQ(coordinator_.Allocator(0).BucketOf(batch.blocks[0]->Location()), 0);
+        }
+        EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(hashes_[0], 0)));
+        for (const auto reason :
+             {&CacheCoordinator::HostEvictionStats::lru, &CacheCoordinator::HostEvictionStats::duplicate,
+              &CacheCoordinator::HostEvictionStats::superseded, &CacheCoordinator::HostEvictionStats::dead_entry,
+              &CacheCoordinator::HostEvictionStats::tail_cap, &CacheCoordinator::HostEvictionStats::flush}) {
+            EXPECT_EQ((coordinator_.HostEvictions().*reason).blocks, 0u);
+        }
+    }
+}
+
+// The oldest victim X, a page no Host checkpoint boundary is under (dead), sits
+// in bucket 0 beside held blocks and frees a bucket-0 slot only; the newer
+// Host-only checkpoint boundary Y frees its three State parents. One Full row
+// in bucket 1 takes X, which does not fit it, then Y, which does; the restore
+// pass returns X, and the row lands in a parent Y emptied, in bucket 1. The
+// bucket-wise TheRestorePassReturnsUnneededVictims.
+TEST_F(ShardedHostSegmentPlanTest, AVictimInTheWrongBucketIsReturned) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(4 * kP));
+    coordinator_.Free(tables);
+    const std::string x = hashes_[0];
+    CacheBlockRef page = host_pool_.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0}).front();
+    coordinator_.CacheHostBlock(page, Key(x, 0), std::nullopt);
+    page.reset();
+    const std::string y = CheckpointOnHost(200, state_group_ids_, /*device_keeps_checkpoint=*/false);
+    HoldFreeCapacity(host_pool_, /*spare_parents=*/0);
+    const std::vector<std::uint32_t> groups{0};
+    const std::vector<std::int32_t> buckets{1};
+    const std::array segments{HostSegmentRows{.first_row = 0, .past_end_row = 1}};
+    const CacheCoordinator::HostAllocationBatch batch = coordinator_.AcquireHostSegments(groups, buckets, segments);
+
+    EXPECT_EQ(batch.stats.allocated, 1u);
+    ASSERT_TRUE(static_cast<bool>(batch.blocks[0]));
+    EXPECT_EQ(coordinator_.Allocator(0).BucketOf(batch.blocks[0]->Location()), 1);
+    EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(x, 0)));
+    for (std::uint32_t group = 1; group <= 3; ++group) {
+        EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(y, group))) << "group " << group;
+    }
+    EXPECT_EQ(coordinator_.HostEvictions().lru.blocks, 3u);
+    EXPECT_EQ(coordinator_.HostEvictions().dead_entry.blocks, 0u);
+}
+
+// A Host suffix loads into Device blocks of its Host blocks' buckets, and an
+// admission evicts for those buckets. A KV-only coordinator (one Full group,
+// four blocks per parent, two shards: MLA or DSA under KV parallelism); with
+// State groups any Device segment frees whole State parents, which serve every
+// bucket. Session s resumes at its two Device pages and its third page from the
+// Host, in bucket 1, and grows one block. The Device's first parent holds s's
+// pages, a bucket-0 hole and a held block, its second a's page in bucket 0 and
+// b's in bucket 1 beside held blocks, a older than b. a goes first and frees no
+// bucket-1 slot, then b, and the restore pass returns a: only b is evicted and
+// recorded, and the load's two ends share bucket 1.
+TEST(ShardedSegmentEvictionTest, ADeviceBucketShortageEvictsOnlyWhatFundsTheBucket) {
+    constexpr std::int32_t kP = 4;
+    BlockPool pool(/*num_lcm_blocks=*/2, {4});
+    BlockPool host_pool(/*num_lcm_blocks=*/1, {4});
+    CacheCoordinator coordinator = MakeCoordinator(
+        std::vector<CacheGroupSpec>{
+            {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP, .shard_count = 2}},
+        kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    const std::vector<std::int32_t> s = MakeTokens(3 * kP + 1);
+    std::vector<std::vector<std::int32_t>> pages;
+    for (std::int32_t page = 0; page < 3; ++page) {
+        pages.emplace_back(s.begin() + page * kP, s.begin() + (page + 1) * kP);
+    }
+    const std::vector<std::string> s_hashes = ContentHashes(pages);
+    const std::vector<std::string> a_and_b{ContentHashes({MakeTokens(kP, 100)})[0],
+                                           ContentHashes({MakeTokens(kP, 200)})[0]};
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 3 * kP));
+    CacheCompletedBlocksForTest(coordinator, tables, s_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/3 * kP,
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/false);
+    coordinator.Free(tables);
+    // s's third page leaves the Device for the Host's bucket 1.
+    CacheBlockRef host_page = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1}).front();
+    coordinator.CacheHostBlock(host_page, Key(s_hashes[2], 0), std::nullopt);
+    host_page.reset();
+    const std::optional<CacheBlockLocation> third_page =
+        CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(s_hashes[2], 0));
+    ASSERT_TRUE(third_page && CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, 0, *third_page));
+    // The first parent's two free slots are held while a and b take the
+    // second parent's; the slot beside each in its bucket is held after it.
+    std::vector<CacheBlockRef> held = pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 2>{0, 1});
+    for (std::int32_t session = 0; session < 2; ++session) {
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, kP));
+        CacheCompletedBlocksForTest(coordinator, tables, std::span<const std::string>(a_and_b).subspan(session, 1),
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP,
+                                    CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                    /*publish_state=*/false);
+        coordinator.Free(tables);
+        held.push_back(pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{session}).front());
+    }
+    held[0].reset();
+    ASSERT_EQ(pool.FreeSlotsByBucket(0)[0], 1);
+    ASSERT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    for (std::int32_t session = 0; session < 2; ++session) {
+        const std::optional<CacheBlockLocation> location =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(a_and_b[session], 0));
+        ASSERT_TRUE(location.has_value());
+        ASSERT_EQ(coordinator.Allocator(0).BucketOf(*location), session) << "a in bucket 0, b in bucket 1";
+    }
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = s_hashes, .tokens = s, .max_tokens = 3 * kP};
+    const std::uint64_t evicted_before = coordinator.DeviceEvictions().admission.blocks;
+
+    const std::optional<CacheCoordinator::AdmissionResult> admitted =
+        AdmitForTest(coordinator, tables, coordinator.ProbePromptPrefix(prompt), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(admitted);
+    ASSERT_EQ(admitted->load_pairs.size(), 1u);
+    EXPECT_EQ(coordinator.Allocator(0).BucketOf(admitted->load_pairs[0].source->Location()), 1);
+    EXPECT_EQ(coordinator.Allocator(0).BucketOf(admitted->load_pairs[0].destination->Location()), 1);
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(a_and_b[0], 0)));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(a_and_b[1], 0)));
+    EXPECT_EQ(coordinator.DeviceEvictions().admission.blocks - evicted_before, 1u);
+    std::vector<CacheCoordinator::EvictedSegment> segments = coordinator.TakeEvictedSegments();
+    ASSERT_EQ(segments.size(), 1u);
+    ASSERT_EQ(segments[0].members.size(), 1u);
+    EXPECT_EQ(segments[0].members[0].key, Key(a_and_b[1], 0));
+    coordinator.SettleEvictedSegment(std::move(segments[0]), /*placed_on_host=*/false);
+    coordinator.Free(tables);
+}
+
+// As above, but a live request holds b: no victim funds bucket 1, so the
+// admission waits -- nothing is evicted or recorded, and no Host entry stays
+// pinned -- until the request lets go, when the same admission evicts b.
+TEST(ShardedSegmentEvictionTest, ADeviceBucketThatCannotBeFundedMakesTheAdmissionWait) {
+    constexpr std::int32_t kP = 4;
+    BlockPool pool(/*num_lcm_blocks=*/2, {4});
+    BlockPool host_pool(/*num_lcm_blocks=*/1, {4});
+    CacheCoordinator coordinator = MakeCoordinator(
+        std::vector<CacheGroupSpec>{
+            {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP, .shard_count = 2}},
+        kP, pool, /*enable_l3_storage=*/false, &host_pool, /*snapshot_pool=*/nullptr,
+        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/true);
+    const std::vector<std::int32_t> s = MakeTokens(3 * kP + 1);
+    std::vector<std::vector<std::int32_t>> pages;
+    for (std::int32_t page = 0; page < 3; ++page) {
+        pages.emplace_back(s.begin() + page * kP, s.begin() + (page + 1) * kP);
+    }
+    const std::vector<std::string> s_hashes = ContentHashes(pages);
+    const std::vector<std::string> a_and_b{ContentHashes({MakeTokens(kP, 100)})[0],
+                                           ContentHashes({MakeTokens(kP, 200)})[0]};
+    std::vector<BlockTable> tables(1);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, 3 * kP));
+    CacheCompletedBlocksForTest(coordinator, tables, s_hashes, CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                /*first_new_prefix_page=*/0, /*num_computed_tokens=*/3 * kP,
+                                CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                /*publish_state=*/false);
+    coordinator.Free(tables);
+    // s's third page leaves the Device for the Host's bucket 1.
+    CacheBlockRef host_page = host_pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{1}).front();
+    coordinator.CacheHostBlock(host_page, Key(s_hashes[2], 0), std::nullopt);
+    host_page.reset();
+    const std::optional<CacheBlockLocation> third_page =
+        CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(s_hashes[2], 0));
+    ASSERT_TRUE(third_page && CacheCoordinatorTestAccess::EvictCachedBlock(coordinator, 0, *third_page));
+    // The first parent's two free slots are held while a and b take the
+    // second parent's; the slot beside each in its bucket is held after it.
+    std::vector<CacheBlockRef> held = pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 2>{0, 1});
+    for (std::int32_t session = 0; session < 2; ++session) {
+        ASSERT_TRUE(AdmitForTest(coordinator, tables, kP));
+        CacheCompletedBlocksForTest(coordinator, tables, std::span<const std::string>(a_and_b).subspan(session, 1),
+                                    CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
+                                    /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP,
+                                    CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
+                                    /*publish_state=*/false);
+        coordinator.Free(tables);
+        held.push_back(pool.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{session}).front());
+    }
+    held[0].reset();
+    ASSERT_EQ(pool.FreeSlotsByBucket(0)[0], 1);
+    ASSERT_EQ(pool.FreeSlotsByBucket(0)[1], 0);
+    ASSERT_EQ(pool.NumEmptyLcmBlocks(), 0);
+    for (std::int32_t session = 0; session < 2; ++session) {
+        const std::optional<CacheBlockLocation> location =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator, 0, Key(a_and_b[session], 0));
+        ASSERT_TRUE(location.has_value());
+        ASSERT_EQ(coordinator.Allocator(0).BucketOf(*location), session) << "a in bucket 0, b in bucket 1";
+    }
+    const CacheCoordinator::PromptPrefix prompt{.prefix_hashes = s_hashes, .tokens = s, .max_tokens = 3 * kP};
+    const std::uint64_t evicted_before = coordinator.DeviceEvictions().admission.blocks;
+    CacheBlockRef reader = coordinator.GroupPrefixIndex(0).Find(pool, Key(a_and_b[1], 0));
+    ASSERT_TRUE(static_cast<bool>(reader));
+    EXPECT_FALSE(AdmitForTest(coordinator, tables, coordinator.ProbePromptPrefix(prompt),
+                              GroupDemand{.extent = DenseGrowth{1}}));
+    EXPECT_EQ(coordinator.DeviceEvictions().admission.blocks, evicted_before);
+    EXPECT_TRUE(coordinator.TakeEvictedSegments().empty());
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(a_and_b[0], 0)));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(a_and_b[1], 0)));
+    EXPECT_EQ(coordinator.NumPinnedHostCachedBlocks(), 0);
+
+    reader.reset();
+    const std::optional<CacheCoordinator::AdmissionResult> admitted =
+        AdmitForTest(coordinator, tables, coordinator.ProbePromptPrefix(prompt), GroupDemand{.extent = DenseGrowth{1}});
+    ASSERT_TRUE(admitted);
+    ASSERT_EQ(admitted->load_pairs.size(), 1u);
+    EXPECT_EQ(coordinator.Allocator(0).BucketOf(admitted->load_pairs[0].source->Location()),
+              coordinator.Allocator(0).BucketOf(admitted->load_pairs[0].destination->Location()));
+    EXPECT_TRUE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(a_and_b[0], 0)));
+    EXPECT_FALSE(coordinator.GroupPrefixIndex(0).Contains(pool, Key(a_and_b[1], 0)));
+    for (CacheCoordinator::EvictedSegment& segment : coordinator.TakeEvictedSegments()) {
+        coordinator.SettleEvictedSegment(std::move(segment), /*placed_on_host=*/false);
+    }
+    coordinator.Free(tables);
+}
+
 // The batch-greedy starvation of #2593 (placing a batch block by block, an
 // earlier block can take the room a later one needs), without State groups:
 // a pinned entry P and C share group 0's parent, V fills group 1's.
@@ -9283,13 +9559,21 @@ TEST(HostSegmentPlanWithoutStateTest, AWideForkPageBecomesAHostLeafOnceItsLastBr
 
 // Two coordinators fed the same publications, Host copies and Device
 // evictions plan the same victims and the same rows: every decision follows the
-// tree's insertion order and the plan's ranks, never an address. K3 shape;
-// sessions of 18 tokens fork from the first at varying pages, every other one
-// keeps its Device copy.
-TEST(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
+// tree's insertion order and the plan's ranks, never an address. K3 shape, the
+// Full group's pages dealt over the parameter's KV-parallel shards; sessions of
+// 18 tokens fork from the first at varying pages, every other one keeps its
+// Device copy.
+class HostSegmentPlanMirrorTest : public ::testing::TestWithParam<std::int32_t> {};
+
+INSTANTIATE_TEST_SUITE_P(KvShards, HostSegmentPlanMirrorTest, ::testing::Values(1, 2, 4));
+
+TEST_P(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
     constexpr std::int32_t kP = 4;
     const std::vector<CacheGroupSpec> specs{
-        {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+        {.attn_kind = AttnKind::kFull,
+         .cache_blocks_per_lcm_block = 4,
+         .block_granularity = kP,
+         .shard_count = GetParam()},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
         {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}};
@@ -9368,7 +9652,12 @@ TEST(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
         }
     }
     const std::vector<std::uint32_t> groups{1, 2, 3, 0, 0, 0, 0, 0, 1, 2, 3, 1, 2, 3};
-    const std::vector<std::int32_t> buckets(groups.size(), 0);
+    // The Full rows spread over the buckets (row % shards), as a drain's rows
+    // follow their Device blocks; the State groups are unsharded.
+    std::vector<std::int32_t> buckets;
+    for (std::size_t row = 0; row < groups.size(); ++row) {
+        buckets.push_back(groups[row] == 0 ? static_cast<std::int32_t>(row) % GetParam() : 0);
+    }
     const std::array segments{CacheCoordinator::HostSegmentRows{.first_row = 0, .past_end_row = 3},
                               CacheCoordinator::HostSegmentRows{.first_row = 3, .past_end_row = 8},
                               CacheCoordinator::HostSegmentRows{.first_row = 8, .past_end_row = 14}};
@@ -9383,6 +9672,11 @@ TEST(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
             ASSERT_EQ(static_cast<bool>(lhs.blocks[row]), static_cast<bool>(rhs.blocks[row])) << "row " << row;
             if (lhs.blocks[row]) {
                 EXPECT_EQ(lhs.blocks[row]->Location(), rhs.blocks[row]->Location()) << "row " << row;
+                EXPECT_EQ(coordinators[0]
+                              .Allocator(static_cast<std::int32_t>(groups[row]))
+                              .BucketOf(lhs.blocks[row]->Location()),
+                          buckets[row])
+                    << "row " << row;
             }
         }
         EXPECT_EQ(lhs.stats.allocated, rhs.stats.allocated) << "round " << round;
@@ -9418,7 +9712,7 @@ TEST(HostSegmentPlanMirrorTest, PlansMatchOnTwoMirroredCoordinators) {
 // ---------------------------------------------------------------------------
 class DeadEntryTest : public BoundaryTreeCoordinatorFixture {
 protected:
-    DeadEntryTest() : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true) {}
+    DeadEntryTest() : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true, /*full_shard_count=*/1) {}
 
     // PublishTwoSessionsSharingTwoPages, then the end of A as a write-back
     // leaves it: its last page and its tail with the checkpoints copied to
@@ -9912,7 +10206,9 @@ TEST(DeadEntryWithoutAClosedGroupTest, AStateCheckpointResumesPastAPageHoldingNo
 // ---------------------------------------------------------------------------
 class WriteBackTransactionTest : public BoundaryTreeCoordinatorFixture {
 protected:
-    WriteBackTransactionTest() : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true) {}
+    WriteBackTransactionTest() : WriteBackTransactionTest(/*full_shard_count=*/1) {}
+    explicit WriteBackTransactionTest(std::int32_t full_shard_count)
+        : BoundaryTreeCoordinatorFixture(/*write_back_evictions=*/true, full_shard_count) {}
 
     // An admission of one Full block with no free Device slot: it evicts the
     // oldest segment. Then the plan's drain, whose op it returns (nullopt
@@ -10770,27 +11066,116 @@ TEST_F(WriteBackTransactionTest, HostEntriesInheritDeviceMetadata) {
     }
 }
 
+// The write-back transaction under KV parallelism: the fixture's Full group
+// dealt over two shards, a block's bucket its slot % 2.
+class ShardedWriteBackTransactionTest : public WriteBackTransactionTest {
+protected:
+    ShardedWriteBackTransactionTest() : WriteBackTransactionTest(/*full_shard_count=*/2) {}
+};
+
+// MembersAlreadyOnTheHostBorrowedAndCopiedPublishTogether with the members in
+// other buckets than their Device copies. X's pages alternate buckets 0 and 1,
+// and X's write-back carries them into Host blocks of the same buckets. The
+// Device's bucket-0 slots are held before Y is admitted, so every Full block of
+// Y lands in bucket 1, and the Host holds Y's page at 20 in bucket 0. Y's
+// segment borrows X's pages and holds that entry, whatever their buckets, and
+// copies only its tail and checkpoints, each row within one bucket; it
+// publishes at X's ACK.
+TEST_F(ShardedWriteBackTransactionTest, MembersInAnotherBucketThanTheirDeviceCopyAreNotCopied) {
+    std::vector<BlockTable> tables(4);
+    const TailPublication x_tail = *PublishFinal(tables, MakeTokens(18));
+    const std::vector<CacheKey> x = KeysOf(hashes_, x_tail);
+    coordinator_.Free(tables);
+    const std::optional<WriteBackOperation> x_op = EvictOldestAndDrain();
+    ASSERT_TRUE(x_op.has_value());
+    // The bucket of each of X's pages on the Host.
+    std::vector<std::int32_t> x_host_buckets;
+    for (std::size_t page = 0; page < 4; ++page) {
+        const auto row = std::ranges::find_if(x_op->transfers, [&](const CacheTransfer& transfer) {
+            return transfer.group_id == 0 && transfer.content_hash == x[page].content_hash;
+        });
+        ASSERT_NE(row, x_op->transfers.end());
+        x_host_buckets.push_back((row->destination_page - 1) % 2);
+    }
+    ASSERT_EQ(x_host_buckets, (std::vector<std::int32_t>{0, 1, 0, 1}));
+    // Six bucket-0 slots held in three parents leave six bucket-1 slots, as
+    // many as Y's Full blocks.
+    const std::size_t held_before = held_.size();
+    for (CacheBlockRef& block : pool_.AcquireBlocksInBuckets(0, std::array<std::int32_t, 6>{})) {
+        held_.push_back(std::move(block));
+    }
+    std::vector<std::int32_t> y_tokens = MakeTokens(16);
+    for (std::int32_t i = 0; i < 6; ++i) {
+        y_tokens.push_back(700 + i);
+    }
+    const TailPublication y_tail = *PublishFinal(tables, y_tokens);
+    coordinator_.Free(tables);
+    held_.resize(held_before);
+    for (std::size_t page = 0; page < 5; ++page) {
+        const std::optional<CacheBlockLocation> location =
+            CacheCoordinatorTestAccess::DeviceLocationOf(coordinator_, 0, Key(hashes_[page], 0));
+        ASSERT_TRUE(location.has_value());
+        ASSERT_EQ(coordinator_.Allocator(0).BucketOf(*location), 1) << "page " << page;
+    }
+    CacheBlockRef page = host_pool_.AcquireBlocksInBuckets(0, std::array<std::int32_t, 1>{0}).front();
+    coordinator_.CacheHostBlock(page, Key(hashes_[4], 0), std::nullopt);
+    page.reset();
+    const std::vector<CacheKey> y_own = KeysOf({}, y_tail);
+    const std::optional<WriteBackOperation> y_op = EvictOldestAndDrain();
+    ASSERT_TRUE(y_op.has_value());
+    ASSERT_EQ(y_op->transfers.size(), 4u) << "the tail's KV block and its three checkpoints";
+    for (const CacheTransfer& transfer : y_op->transfers) {
+        EXPECT_EQ(transfer.content_hash, y_tail.hash);
+        const std::int32_t shards = coordinator_.Allocator(static_cast<std::int32_t>(transfer.group_id)).ShardCount();
+        EXPECT_EQ((transfer.source_page - 1) % shards, (transfer.destination_page - 1) % shards);
+    }
+    const TierTransferManager::WriteBackStats& stats = transfers_.WriteBackStatsFor(HostStoreCause::kEviction);
+    EXPECT_EQ(stats.host_cached, 1u);
+    EXPECT_EQ(stats.in_flight, 4u);
+    EXPECT_EQ(stats.ops, 2u);
+
+    EXPECT_TRUE(transfers_.CompleteWriteBack(y_op->op_id).empty());
+    EXPECT_EQ(HostEntries(y_own), 0);
+    EXPECT_EQ(transfers_.CompleteWriteBack(x_op->op_id).size(), 8u + 9u);
+    EXPECT_EQ(HostEntries(x), 8);
+    EXPECT_EQ(HostEntries(y_own), 4);
+    EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 8 + 1 + 4);
+    EXPECT_EQ(stats.cancelled, 0u);
+}
+
 // Random K3 sessions -- forked from earlier ones at random pages, resumed on
 // what either tier holds, with a checkpoint at a chunk end now and then --
-// published and evicted under pressure on a 16-parent Device, written back to
-// a 10-parent Host by each round's drain, the ACKs landing zero to three rounds
-// late, out of order and now and then twice, the dead entries collected every
-// round, and now and then eight tails without a checkpoint capping a session's
-// own. A next turn that resumed at a tail checkpoint on the Device marks it
-// superseded once it publishes, as the P role's finish does, so marked entries
-// leave in segments beside recorded ones. After every round a hash has a tree
-// node exactly while either tier holds an entry of it, a store is bringing one,
-// or a node hangs under it, and every page or tail the Device holds has the
-// page it follows there; every eviction an admission recorded or dropped lands
-// in exactly one outcome of the drain; and once every ACK is in, no node holds
-// a store and no Host entry is pinned.
-TEST(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
+// published and evicted under pressure on a Device of 64 Full blocks, written
+// back to a Host of 48 (16 and 12 parents at four Full blocks per parent) by
+// each round's drain, the ACKs landing zero to three rounds late, out of order
+// and now and then twice, the dead entries collected every round, and now and
+// then eight tails without a checkpoint capping a session's own. A next turn
+// that resumed at a tail checkpoint on the Device marks it superseded once it
+// publishes, as the P role's finish does, so marked entries leave in segments
+// beside recorded ones. After every round a hash has a tree node exactly while
+// either tier holds an entry of it, a store is bringing one, or a node hangs
+// under it, and every page or tail the Device holds has the page it follows
+// there; every eviction an admission recorded or dropped lands in exactly one
+// outcome of the drain; and once every ACK is in, no node holds a store and no
+// Host entry is pinned. The parameter deals the Full group's pages over that
+// many KV-parallel shards, so every copy row keeps its two ends in one bucket;
+// a parent holds at least one Full block per shard, and the pools keep their
+// Full capacity.
+class WriteBackRandomTest : public ::testing::TestWithParam<std::int32_t> {};
+
+INSTANTIATE_TEST_SUITE_P(KvShards, WriteBackRandomTest, ::testing::Values(1, 2, 4, 8));
+
+TEST_P(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
     constexpr std::int32_t kP = 4;
-    BlockPool pool(/*num_lcm_blocks=*/16, {4, 1, 1, 1});
-    BlockPool host_pool(/*num_lcm_blocks=*/12, {4, 1, 1, 1});
+    const std::int32_t packing = std::max(4, GetParam());
+    BlockPool pool(/*num_lcm_blocks=*/64 / packing, {packing, 1, 1, 1});
+    BlockPool host_pool(/*num_lcm_blocks=*/48 / packing, {packing, 1, 1, 1});
     CacheCoordinator coordinator = MakeCoordinator(
         std::vector<CacheGroupSpec>{
-            {.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 4, .block_granularity = kP},
+            {.attn_kind = AttnKind::kFull,
+             .cache_blocks_per_lcm_block = packing,
+             .block_granularity = kP,
+             .shard_count = GetParam()},
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
             {.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0}},
@@ -10971,6 +11356,11 @@ TEST(WriteBackRandomTest, TreeNodesLiveExactlyAsLongAsAnEntryOrAStore) {
         if (const std::optional<WriteBackOperation> op = transfers.StartEvictionStores()) {
             for (const CacheTransfer& transfer : op->transfers) {
                 ASSERT_GT(transfer.source_page, 0);
+                // A page's bucket is (page id - 1) % shard_count (BucketOf).
+                const std::int32_t shards =
+                    coordinator.Allocator(static_cast<std::int32_t>(transfer.group_id)).ShardCount();
+                EXPECT_EQ((transfer.source_page - 1) % shards, (transfer.destination_page - 1) % shards)
+                    << "round " << round;
             }
             acks.push_back(
                 Ack{.due = round + std::uniform_int_distribution<std::int32_t>(0, 3)(rng), .op_id = op->op_id});
