@@ -262,7 +262,8 @@ pub fn start(
                 metrics,
             };
             let config = receiver_config(&epd)?;
-            let receiver = py.detach(|| ts_pd::epd::receiver::Receiver::start_standalone(config, peer))
+            let receiver = py
+                .detach(|| ts_pd::epd::receiver::Receiver::start_standalone(config, peer))
                 .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
             Some(Box::new(receiver) as Box<dyn EmbeddingReceiver + Send>)
         };

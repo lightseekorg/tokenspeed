@@ -297,10 +297,7 @@ pub struct Receiver {
 
 impl Receiver {
     /// Receive encoder embeddings without a P/D KV-transfer peer.
-    pub fn start_standalone(
-        config: ReceiverConfig,
-        peer: PeerConfig,
-    ) -> Result<Self, StartError> {
+    pub fn start_standalone(config: ReceiverConfig, peer: PeerConfig) -> Result<Self, StartError> {
         let (incoming, _unused) = mpsc::channel();
         let transport = Transport::start(&peer, incoming)?;
         Self::start(config, transport)

@@ -1120,9 +1120,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             submissions
         };
-        let (staged, submissions): (Vec<_>, Vec<_>) = submissions
-            .into_iter()
-            .partition(|submission| self.config.epd_receive_enabled && !submission.embeddings.is_empty());
+        let (staged, submissions): (Vec<_>, Vec<_>) =
+            submissions.into_iter().partition(|submission| {
+                self.config.epd_receive_enabled && !submission.embeddings.is_empty()
+            });
         if !staged.is_empty() {
             // Its transfer registers only once it reaches the scheduler: a
             // transfer event for a request the scheduler does not know is a
