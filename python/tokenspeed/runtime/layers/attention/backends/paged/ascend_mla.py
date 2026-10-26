@@ -32,21 +32,21 @@ from tokenspeed_kernel.ops.attention.mla.ascend import (
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
-    _AscendDSAPrefillPlan,
-)
 from tokenspeed.runtime.layers.attention.backends.paged.mla import (
     MLAAttnBackend,
     MLAPrefillMetadata,
 )
-from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPContext
+from tokenspeed.runtime.layers.attention.dcp.ascend import (
+    AscendDCPContext,
+    AscendPrefillCache,
+    AscendPrefillPlan,
+)
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
     refresh_dcp_page_table_metadata,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.registry import register_backend
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def ascend_mla_prefill_backend(backend):
@@ -122,17 +122,23 @@ class AscendMLABackend(MLAAttnBackend):
         self._page_metadata = {}
         self._current_local = None
         self._prefill_runtime = None
-        self._prefill_plan: _AscendDSAPrefillPlan | None = None
+        self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
         self._prefill_pages: torch.Tensor | None = None
-        self._prefill_enabled = (
-            global_server_args_dict.get("disaggregation_mode") != "decode"
-        )
-        self._prefill_max_rows = global_server_args_dict.get("max_prefill_tokens")
+        self._prefill_options = None
+
+    @property
+    def native_prefill_enabled(self):
+        return self._prefill_options is not None
 
     def _publish_cache_pool(self, cache_pool):
         self.close_prefill()
         super()._publish_cache_pool(cache_pool)
+        self._prefill_options = (
+            cache_pool.prefill_options
+            if isinstance(cache_pool, AscendPrefillCache)
+            else None
+        )
         self._page_metadata.clear()
         self._local_views.clear()
         self._current_local = None
@@ -143,31 +149,33 @@ class AscendMLABackend(MLAAttnBackend):
         self.prepare_prefill_workspace()
 
     def prepare_prefill_workspace(self):
-        if not self._prefill_enabled:
+        if not self.native_prefill_enabled:
             return 0
         if self._prefill_runtime is not None:
             return self._prefill_runtime.workspace_bytes
         if self.cache_pool is None:
             raise RuntimeError("Bind the MLA cache before preparing Prefill")
-        if self._prefill_max_rows is None or self._prefill_max_rows < 1:
-            raise ValueError("MLA Prefill requires positive max_prefill_tokens")
         from tokenspeed.runtime.distributed.process_group_manager import (
             process_group_manager,
         )
 
         layer_id = min(self.cache_pool.history_group_by_layer())
+        kv = self.cache_pool.get_key_buffer(layer_id)
+        self._prefill_options.check_workspace(
+            local_rows=kv.numel() // 576, degree=self._dcp.degree, index_width=0
+        )
         self._prefill_runtime = prepare_ascend_mla_prefill(
-            self.cache_pool.get_key_buffer(layer_id),
+            kv,
             ranks=self._dcp.ranks,
             bootstrap_group=process_group_manager.get_process_group(
                 "gloo", self._dcp.ranks
             ),
-            max_current_rows=self._prefill_max_rows,
+            max_current_rows=self._prefill_options.max_current_rows,
         )
         return self._prefill_runtime.workspace_bytes
 
     def _init_prefill_metadata(self, **kwargs):
-        if not self._prefill_enabled:
+        if not self.native_prefill_enabled:
             return super()._init_prefill_metadata(**kwargs)
         extends = kwargs["extend_seq_lens_cpu"].tolist()
         prefixes = kwargs["extend_prefix_lens_cpu"].tolist()
@@ -190,7 +198,7 @@ class AscendMLABackend(MLAAttnBackend):
         )
         if self._prefill_runtime is None or self._placement is None:
             raise RuntimeError("Prepare MLA Prefill cache and geometry before metadata")
-        plan = _AscendDSAPrefillPlan.build(
+        plan = AscendPrefillPlan.build(
             metadata,
             self._placement,
             degree=self._dcp.degree,

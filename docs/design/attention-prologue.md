@@ -334,6 +334,12 @@ above. Owner-sharded transport may commit prepared KV rows on the prologue's
 behalf; router-provided slots, ownership masks and cache sanitization remain
 authoritative. Distributed execution preserves each request's causal visibility.
 
+Native Prefill is selected by an explicit model-cache capability carrying its
+pre-arena workspace reservation. Ordinary cache views retain generic Prefill
+and its prefix-history metadata without loading the native transport. Generic
+MLA history gathers are temporary, never published as cache storage; their
+allocation and communication scale with the layer's cache capacity.
+
 Weights and communication resources are prepared before graph capture. Native
 communication reuses the existing HCCL window and validates its capacity during
 preparation. Resource owners keep buffers alive until all referencing graphs

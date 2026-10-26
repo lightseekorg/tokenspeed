@@ -25,13 +25,11 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
-    _AscendDSAPrefillPlan,
-)
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
     mla_prefill_spans,
 )
+from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillPlan
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.mla.ascend import AscendMLAAttention
 
@@ -128,7 +126,7 @@ def test_head_shards_share_full_query_metadata_and_receive_page_addresses(
     )
     placement = CachePlacement(128, 9, tuple(range(degree)), 0)
     plans = [
-        _AscendDSAPrefillPlan.build(
+        AscendPrefillPlan.build(
             metadata,
             placement,
             degree=degree,
@@ -187,7 +185,7 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     backend = object.__new__(AscendMLABackend)
     backend._prefill_runtime = CPUOwnerCommit(current, cache)
     backend._placement = CachePlacement(page, 7, (0,), 0)
-    backend._prefill_plan = _AscendDSAPrefillPlan.build(
+    backend._prefill_plan = AscendPrefillPlan.build(
         RequestMetadata(torch.tensor(extends), torch.tensor(prefixes), table),
         backend._placement,
         degree=1,
@@ -445,3 +443,152 @@ def test_mla_projection_panels_reject_incomplete_tiles():
     ):
         with pytest.raises(ValueError):
             pack_mla_panels(torch.empty(shape, dtype=dtype), width=width)
+
+
+def _prefill_cache_and_backend(monkeypatch, *, options):
+    pytest.importorskip("torch_npu")
+    if not torch.npu.is_available():
+        pytest.skip("requires an NPU")
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillCache
+    from tokenspeed.runtime.layers.attention.kv_cache.arena import CacheArena
+    from tokenspeed.runtime.layers.attention.kv_cache.mla import MLATokenToKVPool
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
+        CacheFieldSpec,
+        pack,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import CacheGroupSpec
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "numerics", "fast")
+    monkeypatch.setitem(global_server_args_dict, "chunked_prefill_size", 128)
+    monkeypatch.setitem(global_server_args_dict, "mla_chunk_multiplier", 1)
+    group = CacheGroupSpec(
+        "full_attention",
+        "full_history",
+        rows_per_page=128,
+        entry_stride_tokens=1,
+        replayable=False,
+    )
+    field = CacheFieldSpec("layer.0.latent_kv", "latent", (128, 1, 576), "bfloat16")
+    layout = pack(
+        ((group, (field,)),),
+        prefix_granularity=128,
+        cache_blocks_per_lcm_block={"full_attention": 1},
+        max_padding_fraction=float("inf"),
+    )
+    arena = CacheArena(layout.bind(3), "npu", cache_group_specs=(group,))
+    kwargs = dict(
+        arena=arena,
+        dtype=torch.bfloat16,
+        model_dtype=torch.bfloat16,
+        quant_method="none",
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_num=1,
+        rank=0,
+    )
+    if options is None:
+        pool = MLATokenToKVPool(**kwargs)
+    else:
+
+        class NativePool(AscendPrefillCache, MLATokenToKVPool):
+            pass
+
+        pool = NativePool(prefill_options=options, **kwargs)
+    spec = MLAConfig(
+        backend_name=None,
+        num_attention_heads=2,
+        num_kv_heads=1,
+        head_dim=576,
+        attn_tp_size=1,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        scaling=192**-0.5,
+        kv_cache_dim=576,
+    )
+    config = AttnConfig(
+        device="npu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        prefix_granularity=128,
+        context_len=512,
+        max_bs=4,
+        components=(spec,),
+    )
+    return pool, AscendMLABackend(config, spec, kernel_page_size=128)
+
+
+@pytest.mark.parametrize("engine", ["null", "prefill", "decode"])
+def test_ordinary_mla_cache_keeps_prefix_history_without_native_library(
+    monkeypatch, engine
+):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "disaggregation_mode", engine)
+    monkeypatch.setitem(global_server_args_dict, "max_prefill_tokens", None)
+    monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
+    pool, backend = _prefill_cache_and_backend(monkeypatch, options=None)
+    backend.set_cache_pool(pool)
+    assert backend.prepare_prefill_workspace() == 0
+    rows = pool.get_key_buffer(0).view(-1, 576)
+    rows[128:255].fill_(7)
+    backend._init_prefill_metadata(
+        seq_lens=torch.tensor([130], device="npu", dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([127], device="npu", dtype=torch.int32),
+        extend_prefix_lens_cpu=torch.tensor([127], dtype=torch.int32),
+        extend_seq_lens=torch.tensor([3], device="npu", dtype=torch.int32),
+        extend_seq_lens_cpu=torch.tensor([3], dtype=torch.int32),
+        page_table=torch.tensor([[1, 2, 3, 0]], device="npu", dtype=torch.int32),
+    )
+    meta = backend.chunked_prefill_metadata
+    assert meta.chunked_loop_num > 0
+    from tokenspeed.runtime.layers.paged_attention import PagedAttention
+
+    layer = PagedAttention(2, 576, 192**-0.5, 1, 0, rotary_emb=None, qk_norm=None)
+    chunks = list(
+        backend.read_prefix_history(
+            pool, layer, meta.chunk_kv_indices_list, dst_dtype=torch.bfloat16
+        )
+    )
+    assert sum(k.shape[0] for k, _ in chunks) == 127
+    for latent, rotary in chunks:
+        torch.testing.assert_close(latent.cpu(), torch.full_like(latent.cpu(), 7))
+        torch.testing.assert_close(rotary.cpu(), torch.full_like(rotary.cpu(), 7))
+
+
+def test_native_prefill_requires_its_reserved_budget_before_loading_library(
+    monkeypatch,
+):
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
+    pool, backend = _prefill_cache_and_backend(
+        monkeypatch, options=AscendPrefillOptions(129, 1)
+    )
+    with pytest.raises(ValueError, match="cache recipe reserved"):
+        backend.set_cache_pool(pool)
+
+
+@pytest.mark.parametrize("degree", [1, 8, 16])
+@pytest.mark.parametrize("index_width", [0, 128])
+def test_native_workspace_reservation_includes_history_current_and_send(
+    degree, index_width
+):
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    # One history page per owner, one current page per owner and one send page.
+    size = (degree * 128 * 2 + 128) * (576 + index_width) * 2
+    exact = AscendPrefillOptions(1, size)
+    assert (
+        exact.check_workspace(local_rows=128, degree=degree, index_width=index_width)
+        == size
+    )
+    with pytest.raises(ValueError, match="cache recipe reserved"):
+        AscendPrefillOptions(1, size - 1).check_workspace(
+            local_rows=128, degree=degree, index_width=index_width
+        )

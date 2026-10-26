@@ -30,7 +30,6 @@ import torch
 from tokenspeed_kernel.ops.attention.dsa.ascend import (
     ascend_dsa_cp_metadata,
     ascend_dsa_kernels,
-    ascend_prefill_cache_metadata,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -38,7 +37,11 @@ from tokenspeed.runtime.configs.model_config import AttentionArch
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.paged.dsa import DSABackend
 from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPContext
+from tokenspeed.runtime.layers.attention.dcp.ascend import (
+    AscendDCPContext,
+    AscendPrefillCache,
+    AscendPrefillPlan,
+)
 from tokenspeed.runtime.layers.attention.dcp.placement import (
     CachePlacement,
     resolve_cache_slots,
@@ -66,187 +69,6 @@ def ascend_dsa_prefill_backend(backend):
     if len(leaves) != 1:
         raise ValueError("DSA Prefill prefetch needs exactly one DSA cache leaf")
     return leaves[0]
-
-
-@dataclass(frozen=True)
-class _AscendDSAPrefillPlan:
-    """Device-derived causal spans and addresses in a fixed rank-major cache."""
-
-    row_counts: list[int]
-    row_start: int
-    row_end: int
-    page_table: torch.Tensor
-    index_table: torch.Tensor
-    query_cu: torch.Tensor
-    key_cu: torch.Tensor
-    query_seq: torch.Tensor
-    scan_count: torch.Tensor
-    current_direct: torch.Tensor
-    cold: bool
-
-    @classmethod
-    def build(
-        cls,
-        metadata,
-        placement,
-        *,
-        degree,
-        rank,
-        page_size,
-        topk,
-        local_cache_pages,
-        query_partition=None,
-    ):
-        # Scheduler lengths already exist on the host. Only the scalar row
-        # partition uses them; no page/copy plan is constructed on the CPU.
-        extends = metadata.extend_seq_lens_cpu.tolist()
-        prefixes = metadata.extend_prefix_lens_cpu.tolist()
-        if not (len(extends) == len(prefixes) == metadata.page_table.shape[0]):
-            raise ValueError("Prefill lengths must match the request page-table rows")
-        if degree < 1 or not 0 <= rank < degree or local_cache_pages <= 0:
-            raise ValueError("invalid Prefill context-parallel cache geometry")
-        if any(n < 0 for n in extends + prefixes):
-            raise ValueError("Prefill prefix and extend lengths must be nonnegative")
-        if placement is not None and placement.block_granularity % page_size:
-            raise ValueError("Prefill ownership blocks must contain whole kernel pages")
-        rows = sum(extends)
-        counts = [rows // degree + (r < rows % degree) for r in range(degree)]
-        first, count = sum(counts[:rank]), counts[rank]
-        if query_partition is not None:
-            first, count = query_partition
-            if first < 0 or count < 0 or first + count > rows:
-                raise ValueError("Prefill query partition exceeds current rows")
-        # The shared receive transport pads each rank's contribution to128
-        # rows, including MLA readers with64-token kernel pages.
-        send_rows = ((rows + degree * 128 - 1) // (degree * 128)) * 128
-        offset, active = 0, 0
-        for extent in extends:
-            active += offset < first + count and offset + extent > first and extent > 0
-            offset += extent
-        table = metadata.page_table
-        per_block = 1 if placement is None else placement.block_granularity // page_size
-        if table.device.type == "cpu":
-            pages = table.long()
-            block = pages // per_block
-            positive = (block - 1).clamp_min(0)
-            local = (positive // degree + 1) * per_block + pages % per_block
-            mapped = torch.where(
-                block > 0, positive % degree * local_cache_pages + local, 0
-            ).int()
-            cumulative = metadata.cum_extend_seq_lens.long()
-            prefix = metadata.extend_prefix_lens.long()
-            direct = torch.zeros(rows, dtype=torch.uint8)
-            base, extra = divmod(rows, degree)
-            for req in range(len(extends)):
-
-                def location(token):
-                    page_start = (
-                        token - (prefix[req] + token - cumulative[req]) % page_size
-                    )
-                    owner = torch.where(
-                        page_start < (base + 1) * extra,
-                        page_start // (base + 1),
-                        extra + (page_start - (base + 1) * extra) // max(base, 1),
-                    )
-                    owner_start = owner * base + owner.clamp_max(extra)
-                    owner_end = owner_start + base + (owner < extra)
-                    alias = (
-                        (page_start >= cumulative[req])
-                        & (page_start + page_size <= cumulative[req + 1])
-                        & ((page_start - owner_start) % page_size == 0)
-                        & (page_start + page_size <= owner_end)
-                    )
-                    return owner, page_start - owner_start, alias
-
-                page_token = (
-                    cumulative[req]
-                    + torch.arange(table.shape[1]) * page_size
-                    - prefix[req]
-                )
-                owner, offset, alias = location(page_token)
-                tail_page = (
-                    degree * local_cache_pages
-                    + (owner * send_rows + offset) // page_size
-                )
-                mapped[req] = torch.where(alias, tail_page, mapped[req]).int()
-                token = torch.arange(cumulative[req], cumulative[req + 1])
-                direct[cumulative[req] : cumulative[req + 1]] = location(token)[2].to(
-                    torch.uint8
-                )
-            ends = (
-                (first + count - cumulative[:-1])
-                .clamp_min(0)
-                .minimum(cumulative[1:] - cumulative[:-1])
-            )
-            qcu = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.int64),
-                    (cumulative[1:] - first).clamp(0, count),
-                )
-            )
-            kcu = torch.cat(
-                (torch.zeros(1, dtype=torch.int64), (prefix + ends).cumsum(0))
-            )
-            token = torch.arange(first, first + count)
-            sequence = torch.searchsorted(cumulative[1:], token, right=True)
-            scan = (prefix[sequence] + token - cumulative[sequence] + 1).clamp_max(topk)
-            sequence, scan = sequence.int(), scan.int()
-            active_mask = (
-                (cumulative[:-1] < first + count)
-                & (cumulative[1:] > first)
-                & (cumulative[1:] > cumulative[:-1])
-            )
-            mapped = mapped[active_mask]
-            sequence = (active_mask.int().cumsum(0)[sequence.long()] - 1).int()
-            qcu = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.int64),
-                    (torch.diff(qcu)[active_mask]).cumsum(0),
-                )
-            )
-            kcu = torch.cat(
-                (
-                    torch.zeros(1, dtype=torch.int64),
-                    (torch.diff(kcu)[active_mask]).cumsum(0),
-                )
-            )
-
-        else:
-            (
-                mapped,
-                qcu,
-                kcu,
-                sequence,
-                scan,
-                direct,
-            ) = ascend_prefill_cache_metadata(
-                table,
-                metadata.cum_extend_seq_lens,
-                metadata.extend_prefix_lens,
-                first=first,
-                rows=count,
-                total=rows,
-                per_block=per_block,
-                degree=degree,
-                local_pages=local_cache_pages,
-                send_rows=send_rows,
-                page_size=page_size,
-                topk=topk,
-                active_requests=active,
-            )
-        return cls(
-            counts,
-            first,
-            first + count,
-            mapped,
-            mapped,
-            qcu,
-            kcu,
-            sequence,
-            scan,
-            direct,
-            not any(prefixes),
-        )
 
 
 @dataclass(frozen=True)
@@ -606,20 +428,24 @@ class AscendDSABackend(DSABackend):
                 rank_size=dcp.degree, num_heads=spec.num_attention_heads
             )
         self._dcp = dcp
-        self._prefill_plan: _AscendDSAPrefillPlan | None = None
+        self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_runtime = None
-        from tokenspeed.runtime.utils.env import global_server_args_dict
+        self._prefill_options = None
 
-        self._prefill_enabled = (
-            global_server_args_dict.get("disaggregation_mode") != "decode"
-        )
-        self._prefill_max_rows = global_server_args_dict.get("max_prefill_tokens")
+    @property
+    def native_prefill_enabled(self):
+        return self._prefill_options is not None
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         self.close_prefill()
         self._ascend_placement = None
         self._dcp.clear_forward_metadata()
         super()._publish_cache_pool(cache_pool)
+        self._prefill_options = (
+            cache_pool.prefill_options
+            if isinstance(cache_pool, AscendPrefillCache)
+            else None
+        )
         if self._dcp.degree > 1:
             counts = cache_pool.arena.runtime_contract.virtual_block_counts
             if FULL_ATTENTION not in counts:
@@ -628,7 +454,7 @@ class AscendDSABackend(DSABackend):
         self.prepare_prefill_workspace()
 
     def prepare_prefill_workspace(self) -> int:
-        if not self._prefill_enabled:
+        if not self.native_prefill_enabled:
             return 0
         if self._prefill_runtime is not None:
             return self._prefill_runtime.workspace_bytes
@@ -642,14 +468,15 @@ class AscendDSABackend(DSABackend):
         kv = self.cache_pool.get_key_buffer(layer_id)
         index = self.cache_pool.get_component(layer_id, "dsa_index_k")
         group = process_group_manager.get_process_group("gloo", self._dcp.ranks)
-        if self._prefill_max_rows is None or self._prefill_max_rows <= 0:
-            raise ValueError("Prepare DSA Prefill with a positive max_prefill_tokens")
+        self._prefill_options.check_workspace(
+            local_rows=kv.numel() // 576, degree=self._dcp.degree, index_width=128
+        )
         self._prefill_runtime = self._indexer_kernels.prepare_prefill(
             kv,
             index,
             ranks=self._dcp.ranks,
             bootstrap_group=group,
-            max_current_rows=self._prefill_max_rows,
+            max_current_rows=self._prefill_options.max_current_rows,
         )
         return self._prefill_runtime.workspace_bytes
 
@@ -768,7 +595,7 @@ class AscendDSABackend(DSABackend):
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
         if num_extends > 0 and self._prefill_runtime is not None:
-            self._prefill_plan = _AscendDSAPrefillPlan.build(
+            self._prefill_plan = AscendPrefillPlan.build(
                 self.forward_prefill_metadata,
                 self.cache_placement(None),
                 degree=self._dcp.degree,
@@ -1173,6 +1000,65 @@ class AscendDSABackend(DSABackend):
             else result.transpose(0, 1).contiguous().flatten(1)
         )
 
+    def _forward_collective_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer,
+        out_cache_loc: torch.Tensor,
+        token_to_kv_pool,
+        bs: int,
+        *,
+        fused: bool,
+        **kwargs,
+    ) -> torch.Tensor:
+        self._validate_logit_cap(layer.logit_cap)
+        metadata = self.forward_prefill_metadata
+        head_major_output = kwargs.pop("head_major_output", False)
+        q_ends = metadata.cum_extend_seq_lens[1:].to(torch.int32)
+        kv_lengths = metadata.seq_lens.to(torch.int32)
+        table = metadata.page_table
+        context_parallel = self._dcp.degree > 1
+        if context_parallel:
+            # Compact history drops foreign pages. Translate each prefill
+            # query's global causal endpoint, as verify does; local KV lengths
+            # cannot be used to infer the global Q offsets.
+            starts = metadata.cum_extend_seq_lens[:-1]
+            requests = torch.repeat_interleave(
+                torch.arange(bs, device=q.device),
+                q_ends - starts,
+                output_size=q.shape[0],
+            )
+            positions = torch.arange(q.shape[0], device=q.device)
+            kv_lengths = (kv_lengths[requests] - q_ends[requests] + positions + 1).to(
+                torch.int32
+            )
+            table = table[requests]
+            q_ends = torch.arange(1, q.shape[0] + 1, device=q.device, dtype=torch.int32)
+        selection = self._select_indexed(
+            q,
+            k,
+            layer,
+            out_cache_loc,
+            token_to_kv_pool,
+            q_ends,
+            kv_lengths,
+            table,
+            kwargs,
+            fused=fused,
+            query_group_size=1,
+            context_parallel=context_parallel,
+            query_width=1,
+        )
+        return self._run_indexed_sparse_attention(
+            selection,
+            layer,
+            token_to_kv_pool,
+            head_major_output=head_major_output,
+            is_prefill=True,
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1186,6 +1072,18 @@ class AscendDSABackend(DSABackend):
         fused: bool,
         **kwargs,
     ) -> torch.Tensor:
+        if not self.native_prefill_enabled:
+            return self._forward_collective_extend(
+                q,
+                k,
+                v,
+                layer,
+                out_cache_loc,
+                token_to_kv_pool,
+                bs,
+                fused=fused,
+                **kwargs,
+            )
         self._validate_logit_cap(layer.logit_cap)
         if fused:
             raise ValueError("Native fused decode queries are not Prefill inputs")

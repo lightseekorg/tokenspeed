@@ -186,13 +186,18 @@ class AscendMLAAttention(KimiLinearMLAAttention):
         return self.o_proj(attended.flatten(1))[0]
 
     def forward(self, positions, hidden_states, ctx, comm_manager, *, projection_out):
-        if ctx.forward_mode.is_extend_or_mixed() and self.optimized_prefill:
+        if (
+            ctx.forward_mode.is_extend_or_mixed()
+            and self.optimized_prefill
+            and ascend_mla_prefill_backend(ctx.attn_backend).native_prefill_enabled
+        ):
             if projection_out is not None:
                 raise ValueError("MLA Prefill output reduction belongs to CommManager")
             return self._forward_prefill(positions, hidden_states, ctx, comm_manager)
         if (
             self.fused_decode is not None
             and ctx.forward_mode.is_decode()
+            and ctx.num_extends == 0
             and positions.numel() in self.fused_decode.outputs
         ):
             if projection_out is not None:

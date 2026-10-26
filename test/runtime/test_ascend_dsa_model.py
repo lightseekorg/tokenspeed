@@ -95,3 +95,47 @@ def test_unprepared_weights_fail_before_device_execution():
 def test_rejects_shared_cross_layer_selection():
     with pytest.raises(ValueError, match="independent per-layer selection"):
         make_attention(nope=True, separate=True, independent=False)
+
+
+def test_failed_native_initialization_releases_its_window(monkeypatch):
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg,
+    )
+    from tokenspeed.runtime.layers.attention.dsa import ascend
+
+    # Substitute only communication and its native window. The real fused
+    # constructor rejects this small model after the resource has been acquired.
+    class DeviceGroup:
+        def _get_backend(self, device):
+            return self
+
+        def get_hccl_comm_name(self, rank):
+            return "test-window"
+
+    @dataclass
+    class Window:
+        storage: torch.Tensor | None
+
+        def release(self, window):
+            assert window is self
+            self.storage = None
+
+    group = DeviceGroup()
+    window = Window(torch.ones(16))
+    resources = DSAResources(window, {}, {}, window.release)
+    monkeypatch.setattr(pg, "get_dedicated_device_group", lambda *args: group)
+    monkeypatch.setattr(pg, "init_process_group", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pg, "get_process_group", lambda *args: group)
+    monkeypatch.setattr(pg, "get_device_process_group", lambda *args: group)
+    monkeypatch.setattr(ascend.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(ascend.dist, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(ascend.dist, "barrier", lambda *args, **kwargs: None)
+    monkeypatch.setattr(torch.npu, "synchronize", lambda: None)
+    monkeypatch.setattr(ascend, "prepare_dsa_resources", lambda **kwargs: resources)
+    layer = make_attention(nope=True, separate=True, independent=True)
+    with pytest.raises(ValueError, match="eight local and 64 global heads"):
+        ascend.AscendDSARuntime([layer], Mapping(rank=0, world_size=8, attn_tp_size=8))
+    assert window.storage is None
+    assert layer._fused_decode_runtime is None

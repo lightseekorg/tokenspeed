@@ -25,9 +25,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
-    _AscendDSAPrefillPlan,
-)
+from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillPlan
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 
 
@@ -83,7 +81,7 @@ def test_request_pages_and_query_causal_spans(degree, granularity, extends, pref
     virtual_blocks = last_page // per_block + 1
     local_capacity = ((virtual_blocks - 2) // degree + 2) * per_block
     plans = [
-        _AscendDSAPrefillPlan.build(
+        AscendPrefillPlan.build(
             metadata,
             CachePlacement(granularity, virtual_blocks, tuple(range(degree)), rank),
             degree=degree,
@@ -182,7 +180,7 @@ def test_prefill_rejects_mismatched_request_lengths():
         torch.tensor([2, 3]), torch.tensor([0]), torch.ones(2, 1, dtype=torch.int32)
     )
     with pytest.raises(ValueError, match="request page-table"):
-        _AscendDSAPrefillPlan.build(
+        AscendPrefillPlan.build(
             metadata,
             None,
             degree=1,

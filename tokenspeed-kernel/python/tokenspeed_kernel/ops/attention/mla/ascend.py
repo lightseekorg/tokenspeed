@@ -54,9 +54,11 @@ def pack_mla_panels(weight: torch.Tensor, *, width: int) -> torch.Tensor:
     if weight.device.type != "cpu" or weight.dtype != torch.bfloat16:
         raise ValueError("MLA panel packing requires CPU BF16 weights")
     if width <= 0 or width % 16:
-        raise ValueError("MLA N tiles must be positive multiples of16")
+        raise ValueError("MLA N tiles must be positive multiples of 16")
     if weight.ndim != 2 or weight.shape[0] % width or weight.shape[1] % 512:
-        raise ValueError("MLA weights must cover complete N tiles and K512 panels")
+        raise ValueError(
+            "MLA weights must cover complete N tiles and 512-wide K panels"
+        )
     panels = []
     for col in range(0, weight.shape[0], width):
         for start in range(0, weight.shape[1], 512):

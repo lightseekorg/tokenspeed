@@ -621,7 +621,10 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         return F.linear(projected.flatten(1), wo)
 
     def forward(self, positions, hidden_states, ctx, comm_manager):
-        if ctx.forward_mode.is_extend_or_mixed():
+        if (
+            ctx.forward_mode.is_extend_or_mixed()
+            and ascend_dsa_prefill_backend(ctx.attn_backend).native_prefill_enabled
+        ):
             return self._forward_prefill(positions, hidden_states, ctx)
         if hidden_states.shape[0] == 0:
             return hidden_states
@@ -659,40 +662,16 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         slots = ctx.attn_backend.padded_write_locations(
             self.attn_mqa, ctx.forward_mode, query.shape[0]
         )
-        prefill_latent = None
-        if ctx.forward_mode.is_decode():
-            query = self.attn_mqa.latent_prologue(
-                query,
-                query[..., self.kv_lora_rank :],
-                latent_cache,
-                positions,
-                ctx,
-                slots=slots,
-                expanded=None,
-                key_rows=None,
-            ).query
-        else:
-            # The store-less contract returns rotated latent rows. Keep those
-            # exact BF16 bytes for the workspace update before SFA. The same
-            # update writes this rank's persistent owner rows once.
-            prologue = mla_prologue(
-                query,
-                query[..., self.kv_lora_rank :],
-                latent_cache,
-                expanded=None,
-                rotary=(
-                    None
-                    if self.rotary_emb is None
-                    else self.rotary_emb.as_rotary(positions)
-                ),
-                cache=None,
-                solution=None,
-                override=None,
-            )
-            prefill_latent = prologue.latent
-            if ctx.token_to_kv_pool.latent_write_sanitizes:
-                prefill_latent = torch.nan_to_num(prefill_latent)
-            query = prologue.query
+        query = self.attn_mqa.latent_prologue(
+            query,
+            query[..., self.kv_lora_rank :],
+            latent_cache,
+            positions,
+            ctx,
+            slots=slots,
+            expanded=None,
+            key_rows=None,
+        ).query
         indexer = self.indexer
         index_query = indexer.wq_b(q_lora)[0].view(
             -1, indexer.index_n_heads, indexer.index_head_dim
@@ -714,7 +693,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             save_kv_cache=False,
             index_query=index_query,
             index_key=index_key,
-            prefill_latent=prefill_latent,
+            prefill_latent=None,
             index_weights=index_weights,
             index_init_tokens=self.index_init_tokens,
             index_local_tokens=self.index_local_tokens,
@@ -767,23 +746,27 @@ class AscendDSARuntime:
         self.window = self.resources.window
         self.outputs = self.resources.outputs
         self.tables = self.resources.tables
-        torch.npu.synchronize()
-        dist.barrier(group=cpu_group)
         self.backends = weakref.WeakSet()
         self.runtimes = []
         self.closed = False
-        for layer in self.layers:
-            runtime = _RuntimeDSADecode(
-                layer,
-                rank=rank,
-                group=pg.get_device_process_group(self.ranks),
-                eps_q=layer.q_a_layernorm.variance_epsilon,
-                eps_kv=layer.kv_a_layernorm.variance_epsilon,
-                owner=self,
-            )
-            runtime.window = self.window
-            layer.configure_fused_decode(runtime)
-            self.runtimes.append(runtime)
+        try:
+            torch.npu.synchronize()
+            dist.barrier(group=cpu_group)
+            for layer in self.layers:
+                runtime = _RuntimeDSADecode(
+                    layer,
+                    rank=rank,
+                    group=pg.get_device_process_group(self.ranks),
+                    eps_q=layer.q_a_layernorm.variance_epsilon,
+                    eps_kv=layer.kv_a_layernorm.variance_epsilon,
+                    owner=self,
+                )
+                runtime.window = self.window
+                layer.configure_fused_decode(runtime)
+                self.runtimes.append(runtime)
+        except BaseException:
+            self.close()
+            raise
 
     def bind_backend(self, backend):
         if self.closed:
