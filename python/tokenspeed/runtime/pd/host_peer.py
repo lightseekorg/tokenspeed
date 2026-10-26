@@ -45,6 +45,8 @@ import socket
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from tokenspeed_kernel.platform import current_platform
+
 from tokenspeed.runtime.pd.topology import PDParallelTopology
 from tokenspeed.runtime.utils.env import envs
 from tokenspeed.runtime.utils.network import (
@@ -65,6 +67,7 @@ class PeerSettings:
     Attributes:
         library: The Mooncake library with the TokenSpeed C entry points.
         local_ip: Where peers reach this rank.
+        protocol: The Mooncake transport selected for this rank's device.
         ib_device: The RDMA devices to use, comma-separated; empty for all.
         engine_rank: This rank's global rank.
         regions: The device ranges the transfer engine registers.
@@ -72,6 +75,7 @@ class PeerSettings:
 
     library: str
     local_ip: str
+    protocol: str
     ib_device: str
     engine_rank: int
     regions: tuple[tuple[int, int], ...]
@@ -155,6 +159,11 @@ def enable_mooncake_ipv6_for_host(hostname: str) -> None:
     """
     if is_valid_ipv6_address(hostname):
         os.environ.setdefault("MC_USE_IPV6", "1")
+
+
+def mooncake_protocol() -> str:
+    """The native transport for this rank's device, resolved at startup."""
+    return "ascend_direct" if current_platform().is_npu else "rdma"
 
 
 def mooncake_library() -> str:
@@ -296,6 +305,7 @@ def build_host_peer(
     settings = PeerSettings(
         library=mooncake_library(),
         local_ip=local_ip,
+        protocol=mooncake_protocol(),
         ib_device=kv_args.ib_device or "",
         engine_rank=topology.global_rank,
         regions=tuple(

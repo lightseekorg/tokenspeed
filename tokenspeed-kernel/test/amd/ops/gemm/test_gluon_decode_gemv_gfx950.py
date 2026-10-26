@@ -42,9 +42,11 @@ from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.mm import (  # noqa: E402
 )
 
 
-# (257, 1000) and (7168, 1536) take the one-wave short-row config.
+# (257, 1000) takes the one-wave short-row config and (1024, 8192) the K rule;
+# (160, 4096), (512, 8192) and (7168, 1536) take their measured _CONFIGS entry.
 @pytest.mark.parametrize(
-    ("n", "k"), [(128, 128), (257, 1000), (7168, 1536), (1024, 8192)]
+    ("n", "k"),
+    [(128, 128), (257, 1000), (160, 4096), (512, 8192), (1024, 8192), (7168, 1536)],
 )
 def test_gluon_rowcta_bf16_gemv_matches_reference(n: int, k: int) -> None:
     generator = torch.Generator(device="cuda").manual_seed(20260915 + n + k)

@@ -263,6 +263,7 @@ pub fn start(
     let config = PeerConfig {
         library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
         local_ip: settings.getattr("local_ip")?.extract()?,
+        protocol: settings.getattr("protocol")?.extract()?,
         ib_device: settings.getattr("ib_device")?.extract()?,
         regions: settings.getattr("regions")?.extract()?,
         engine_rank: settings.getattr("engine_rank")?.extract()?,

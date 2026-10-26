@@ -30,8 +30,9 @@ aliases a live request.
 
 Every function takes the stacked ``[G, max_bs, max_num_pages]`` table the
 router fills (``group_tables.GroupTableStacks``) so all groups' locations
-come from one launch. CUDA tensors run the triton kernels; CPU tensors take the torch path
-(unit tests), which is the reference the kernels are pinned against.
+come from one launch. CUDA tensors run the triton kernels; CPU and NPU
+tensors take the Torch path. An optional immutable host page-size mirror
+avoids reading these static constants back from the device.
 
 The token-shaped sibling — arbitrary positions over one group's raw table,
 failing closed to the ``-1`` sentinel (V4's SWA / compressor-state /
@@ -152,6 +153,8 @@ def decode_write_locations(
     out: torch.Tensor,
     bs: int,
     tokens_per_req: int,
+    *,
+    page_sizes_cpu: tuple[int, ...] | None = None,
 ) -> None:
     """Fill ``out[:, : bs * tokens_per_req]`` with every group's decode
     write slots.
@@ -167,8 +170,20 @@ def decode_write_locations(
         bs: Requests to compute (padded requests read seq_len 1 and land on
             slot 0).
         tokens_per_req: Trailing window width ``n``.
+        page_sizes_cpu: Optional host tuple from the same group specs as
+            ``page_sizes``. Used only by the Torch fallback; absent keeps
+            the original device-scalar path.
     """
-    _write_locations(tables, page_sizes, seq_lens, out, bs, tokens_per_req, 0)
+    _write_locations(
+        tables,
+        page_sizes,
+        seq_lens,
+        out,
+        bs,
+        tokens_per_req,
+        0,
+        page_sizes_cpu=page_sizes_cpu,
+    )
 
 
 def window_write_locations(
@@ -178,11 +193,29 @@ def window_write_locations(
     out: torch.Tensor,
     bs: int,
     tokens_per_req: int,
+    *,
+    page_sizes_cpu: tuple[int, ...] | None = None,
 ) -> None:
     """:func:`decode_write_locations` of the windows ``start .. start + n - 1`` for ``window_starts[:bs]``."""
     _write_locations(
-        tables, page_sizes, window_starts, out, bs, tokens_per_req, tokens_per_req
+        tables,
+        page_sizes,
+        window_starts,
+        out,
+        bs,
+        tokens_per_req,
+        tokens_per_req,
+        page_sizes_cpu=page_sizes_cpu,
     )
+
+
+def _validate_cpu_page_sizes(page_sizes_cpu, num_groups):
+    if page_sizes_cpu is None:
+        return
+    if not isinstance(page_sizes_cpu, tuple) or len(page_sizes_cpu) != num_groups:
+        raise ValueError("host page sizes must be a tuple matching the cache groups")
+    if any(type(size) is not int or size <= 0 for size in page_sizes_cpu):
+        raise ValueError("host page sizes must contain positive integers")
 
 
 def _write_locations(
@@ -193,6 +226,8 @@ def _write_locations(
     bs: int,
     tokens_per_req: int,
     seq_len_offset: int,
+    *,
+    page_sizes_cpu: tuple[int, ...] | None = None,
 ) -> None:
     n = max(int(tokens_per_req), 1)
     num_tokens = bs * n
@@ -221,10 +256,12 @@ def _write_locations(
             BLOCK=block,
         )
         return
+    _validate_cpu_page_sizes(page_sizes_cpu, tables.shape[0])
     pos = _decode_positions(seq_lens[:bs].to(torch.int64) + seq_len_offset, n)
     req = torch.arange(bs, device=tables.device).repeat_interleave(n)
     for g in range(tables.shape[0]):
-        out[g, :num_tokens] = _gather_slots(tables[g], req, pos, int(page_sizes[g]))
+        page_size = int(page_sizes[g]) if page_sizes_cpu is None else page_sizes_cpu[g]
+        out[g, :num_tokens] = _gather_slots(tables[g], req, pos, page_size)
 
 
 def extend_write_locations(
@@ -234,6 +271,8 @@ def extend_write_locations(
     extend_seq_lens: torch.Tensor,
     total_tokens: int,
     out: torch.Tensor,
+    *,
+    page_sizes_cpu: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Every group's extend write slots, ``[G, total_tokens]`` in q/k/v
     token order (request-major, ``cu_extend_seq_lens`` layout), into ``out``.
@@ -250,7 +289,8 @@ def extend_write_locations(
             persistent buffer, so a captured graph can record its address.
 
     Returns:
-        ``out``.
+        ``out``. The optional ``page_sizes_cpu`` host tuple replaces only
+        static page-size scalar reads on the Torch fallback.
     """
     bs = extend_seq_lens.shape[0]
     if total_tokens == 0 or tables.shape[0] == 0 or bs == 0:
@@ -272,6 +312,7 @@ def extend_write_locations(
             BLOCK=128,
         )
         return out
+    _validate_cpu_page_sizes(page_sizes_cpu, tables.shape[0])
     lens = extend_seq_lens.to(torch.int64)
     req = torch.arange(bs, device=tables.device).repeat_interleave(lens)
     starts = cu_extend[:-1].to(torch.int64).repeat_interleave(lens)
@@ -279,5 +320,6 @@ def extend_write_locations(
         torch.arange(total_tokens, device=tables.device) - starts
     )
     for g in range(tables.shape[0]):
-        out[g] = _gather_slots(tables[g], req, pos, int(page_sizes[g]))
+        page_size = int(page_sizes[g]) if page_sizes_cpu is None else page_sizes_cpu[g]
+        out[g] = _gather_slots(tables[g], req, pos, page_size)
     return out

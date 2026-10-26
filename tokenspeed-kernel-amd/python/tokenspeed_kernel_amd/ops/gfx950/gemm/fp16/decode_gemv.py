@@ -28,8 +28,26 @@ from tokenspeed_kernel_amd._triton import gl, gluon
 _SUBGROUP_SIZE = 64
 
 
+# (N, K) -> (BLOCK_K, wave count) where another geometry beat the K rule below
+# by at least 1.5% in each of three cold-weight graph-replay sweeps on MI355X
+# (median of six runs alternating with the K rule).
+_CONFIGS: dict[tuple[int, int], tuple[int, int]] = {
+    (160, 4096): (2048, 4),  # GLM 5.3 Flash attention TP4
+    (288, 4096): (2048, 4),  # GLM 5.3 Flash MoE router gate
+    (512, 8192): (1024, 8),  # Muse Spark pre-expert projection TP8
+    (896, 21504): (1024, 2),
+    (2112, 14336): (1024, 2),
+    (2560, 3072): (512, 1),  # Qwen3.8-Flash-Next attention o_proj TP2
+    (4608, 7168): (512, 1),
+    (7168, 1536): (128, 1),  # Kimi K3 o_proj TP8
+    (7168, 2304): (512, 1),
+}
+
+
 def _rowcta_config(n: int, k: int) -> tuple[int, int]:
     """Choose the cold-weight reduction geometry for a one-row projection."""
+    if (n, k) in _CONFIGS:
+        return _CONFIGS[(n, k)]
     if k == 8192:
         return (256, 2) if n <= 1024 else (1024, 2)
     if k == 2048:
@@ -38,6 +56,15 @@ def _rowcta_config(n: int, k: int) -> tuple[int, int]:
         # Short rows: one wave with 16-byte loads measured fastest.
         return 512, 1
     return 512, 4
+
+
+def gluon_rowcta_bf16_gemv_geometry_gfx950(n: int, k: int) -> tuple[int, int]:
+    """Return the ``(BLOCK_K, wave count)`` a single row of ``[N, K]`` runs with.
+
+    A kernel that reproduces this GEMV's per-output reduction, bit for bit,
+    must use the same geometry.
+    """
+    return _rowcta_config(n, k)
 
 
 @gluon.jit
@@ -176,6 +203,7 @@ def prefers_gluon_rowcta_bf16_gemv_gfx950(n: int, k: int) -> bool:
 
 
 __all__ = [
+    "gluon_rowcta_bf16_gemv_geometry_gfx950",
     "gluon_rowcta_bf16_gemv_gfx950",
     "prefers_gluon_rowcta_bf16_gemv_gfx950",
 ]

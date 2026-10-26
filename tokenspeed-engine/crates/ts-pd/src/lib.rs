@@ -112,6 +112,8 @@ pub struct PeerConfig {
     pub library: PathBuf,
     /// This rank's address peers reach it at (`get_local_ip_by_remote`).
     pub local_ip: String,
+    /// The native transport selected by the data plane at startup.
+    pub protocol: String,
     /// The RDMA devices to use, comma-separated; empty for all.
     pub ib_device: String,
     /// The device ranges to register: the cache arena or its regions.
@@ -126,6 +128,7 @@ pub struct PeerConfig {
 struct Transport {
     library: Arc<ts_mooncake::Library>,
     local_ip: String,
+    protocol: String,
     ib_device: String,
     /// The device ranges registered with the engine.
     regions: Vec<(usize, usize)>,
@@ -140,12 +143,18 @@ impl Transport {
         incoming: std::sync::mpsc::Sender<Vec<bytes::Bytes>>,
     ) -> Result<Arc<Self>, StartError> {
         let library = ts_mooncake::Library::load(&config.library)?;
-        let engine = Engine::start(library.clone(), &config.local_ip, &config.ib_device)?;
+        let engine = Engine::start(
+            library.clone(),
+            &config.local_ip,
+            &config.protocol,
+            &config.ib_device,
+        )?;
         for &(addr, length) in &config.regions {
             engine.register(addr, length)?;
         }
         tracing::info!(
             session = engine.session_id(),
+            protocol = config.protocol,
             ib_device = config.ib_device,
             "Mooncake transfer engine ready"
         );
@@ -153,6 +162,7 @@ impl Transport {
         Ok(Arc::new(Self {
             library,
             local_ip: config.local_ip.clone(),
+            protocol: config.protocol.clone(),
             ib_device: config.ib_device.clone(),
             regions: config.regions.clone(),
             engine: RwLock::new(Arc::new(engine)),
@@ -195,8 +205,13 @@ impl Transport {
     fn restore_regions(&self, fresh_session: bool) -> Result<(), String> {
         let engine = if fresh_session {
             Arc::new(
-                Engine::start(self.library.clone(), &self.local_ip, &self.ib_device)
-                    .map_err(|error| error.to_string())?,
+                Engine::start(
+                    self.library.clone(),
+                    &self.local_ip,
+                    &self.protocol,
+                    &self.ib_device,
+                )
+                .map_err(|error| error.to_string())?,
             )
         } else {
             self.engine()

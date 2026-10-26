@@ -855,6 +855,16 @@ the draft's attention to the full history.
 Use `--attention-backend mha` and `--drafter-attention-backend mha` for
 standard or grouped-query attention in the target and draft, respectively.
 
+## PD transport
+
+Mooncake KV transfer selects `ascend_direct` on Ascend NPU and `rdma` on
+GPU platforms. Install a Mooncake build that supports the selected transport
+and provides the TokenSpeed C entry points in `libtokenspeed_transfer_engine.so`,
+including `ts_mooncake_write_pages` for page transfers.
+Both Prefill and Decode engines select their transport from the detected
+platform. Startup settings pass this protocol to the Rust transfer peer,
+which keeps it when recreating a session after a memory resume.
+
 ## Observability
 
 | Parameter | Purpose |

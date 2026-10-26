@@ -145,32 +145,56 @@ def cublaslt_mm_nvfp4(
 # ===-----------------------------------------------------------------------===#
 
 
-# Opt-in TRT-LLM CuTe-DSL FP8 GEMM with unmodified FP32 block scales.
+# TRT-LLM CuTe-DSL FP8 GEMM with unmodified FP32 block scales.
+
+_BLOCK_FP8_CAPABILITY = CapabilityRequirement(
+    min_arch_version=ArchVersion(10, 0),
+    max_arch_version=ArchVersion(10, 9),
+    vendors=frozenset({"nvidia"}),
+)
+_BLOCK_FP8_SIGNATURES = format_signatures(
+    ("a", "b"),
+    "mxfp8",
+    {torch.float8_e4m3fn},
+    scale=ScaleFormat(
+        storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
+    ),
+)
+_BLOCK_FP8_TRAITS = {
+    "n_align": frozenset({128}),
+    "k_align": frozenset({128}),
+    "a_contiguous": frozenset({True}),
+    "b_contiguous": frozenset({True}),
+    "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+    "has_alpha": frozenset({False}),
+    "operands_aligned_16": frozenset({True}),
+    "out_aligned_16": frozenset({True}),
+    "out_contiguous": frozenset({True}),
+    "out_dtype": frozenset({torch.bfloat16}),
+    "scales_aligned_16": frozenset({True}),
+}
 
 
+# Both registrations use one implementation. Keep the low-priority entry for
+# explicit solution selection below the automatic M=17 threshold.
+@register_kernel(
+    "gemm",
+    "mm",
+    name="trtllm_cutedsl_mm_fp8_blockscale_large_m",
+    solution="trtllm_cutedsl",
+    capability=_BLOCK_FP8_CAPABILITY,
+    signatures=_BLOCK_FP8_SIGNATURES,
+    traits={"m_min": frozenset({17}), **_BLOCK_FP8_TRAITS},
+    priority=Priority.SPECIALIZED + 3,
+)
 @register_kernel(
     "gemm",
     "mm",
     name="trtllm_cutedsl_mm_fp8_blockscale",
     solution="trtllm_cutedsl",
-    capability=CapabilityRequirement(
-        min_arch_version=ArchVersion(10, 0),
-        max_arch_version=ArchVersion(10, 9),
-        vendors=frozenset({"nvidia"}),
-    ),
-    signatures=format_signatures(
-        ("a", "b"),
-        "mxfp8",
-        {torch.float8_e4m3fn},
-        scale=ScaleFormat(
-            storage_dtype=torch.float32, granularity="block", block_shape=(128, 128)
-        ),
-    ),
-    traits={
-        "n_align": frozenset({128}),
-        "k_align": frozenset({128}),
-        "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
-    },
+    capability=_BLOCK_FP8_CAPABILITY,
+    signatures=_BLOCK_FP8_SIGNATURES,
+    traits=_BLOCK_FP8_TRAITS,
     priority=Priority.REFERENCE,
 )
 def trtllm_cutedsl_mm_fp8_blockscale(

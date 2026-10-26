@@ -52,8 +52,11 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   missing implementation fails at startup
 │                                   instead of silently falling back
 ├── collectives.deterministic       one association order per reduction
-│   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
-│   │                               kernels make no bitwise claim)
+│   ├── no fused AR+norm            enable_allreduce_fusion=False and
+│   │                               comm_fusion_max_num_tokens=-1, also set
+│   │                               by batch_invariant_collectives or
+│   │                               layer_boundary_norm=unfused alone (the
+│   │                               fused kernels make no bitwise claim)
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   ├── batch_invariant_collectives AutoBackend.route, one decision for every

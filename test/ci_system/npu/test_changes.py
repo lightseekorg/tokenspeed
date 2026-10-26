@@ -25,9 +25,9 @@ import subprocess
 import unittest
 from pathlib import Path
 
-from ci.npu_ops_test.changes import changed_paths, load_manifest, select_suite
+from changes import changed_paths, load_manifest, select_suite
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[3]
 REPOSITORY = "example/tokenspeed"
 HEAD_SHA = "1" * 40
 BASE_SHA = "2" * 40
@@ -73,7 +73,7 @@ def unavailable_api(endpoint, *, paginate):
 
 class ChangeSelectionTest(unittest.TestCase):
     def setUp(self):
-        self.manifest = load_manifest(ROOT / "ci/npu_ops_test/manifest.json")
+        self.manifest = load_manifest(ROOT / "test/ci/npu/manifest.json")
 
     def select_pr(self, event, api):
         paths = changed_paths(REPOSITORY, "pull_request", event, api=api)

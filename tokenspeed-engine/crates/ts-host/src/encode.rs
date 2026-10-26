@@ -94,6 +94,7 @@ impl Settings {
                 peer: PeerConfig {
                     library: get("library")?.extract::<String>()?.into(),
                     local_ip: get("local_ip")?.extract()?,
+                    protocol: get("protocol")?.extract()?,
                     ib_device: get("ib_device")?.extract()?,
                     regions,
                     engine_rank: rank as i64,

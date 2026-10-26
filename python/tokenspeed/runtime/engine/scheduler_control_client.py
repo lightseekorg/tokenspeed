@@ -305,8 +305,12 @@ class SchedulerControlClient:
                 num_reqs=num_running + num_waiting,
                 num_waiting_reqs=num_waiting,
                 num_pages=kv_active_pages,
+                num_total_pages=kv_total_pages,
             )
-            for dp_rank, (num_running, num_waiting, kv_active_pages, _) in enumerate(
-                self.frontend.loads()
-            )
+            for dp_rank, (
+                num_running,
+                num_waiting,
+                kv_active_pages,
+                kv_total_pages,
+            ) in enumerate(self.frontend.loads())
         ]

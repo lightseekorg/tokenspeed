@@ -71,12 +71,12 @@ dependencies = [
     "torch",
     "torchvision",
     "tokenspeed-kernel>=0.1.4.dev0",
-    "tokenspeed-mooncake>=0.3.13.post20261026",
+    "tokenspeed-mooncake>=0.3.13.post20261027",
     "tokenspeed-engine>=0.1.0",
     "tokenspeed-scheduler>=0.1.42",
     "tokenspeed-smg==1.13.0.post20261019",
     "tokenspeed-smg-grpc-proto==0.4.27.post20261019",
-    "tokenspeed-smg-grpc-servicer==0.14.0.post20261019",
+    "tokenspeed-smg-grpc-servicer==0.14.0.1.post20261026",
     # Tag-capable sleep/wake allocator (region(tag, enable_cpu_backup)/pause/
     # resume). Bundles cu12/cu13 binaries; import-guarded so it's a no-op unless
     # --enable-memory-saver is set. See runtime/utils/torch_memory_saver_adapter.py.
