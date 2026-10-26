@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import inspect
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -419,8 +419,9 @@ class ModelRunner:
             world_size = int(obj.world_size)
             group_name = str(getattr(obj, "group_name", "weight_update_group"))
             backend = Backend(str(getattr(obj, "backend", "nccl")))
-            device = torch.device(f"cuda:{self.gpu_id}")
-            torch.cuda.set_device(device)
+            device_type = torch.device(self.device).type
+            device = torch.device(f"{device_type}:{self.gpu_id}")
+            torch.get_device_module(device).set_device(device)
 
             timeout = default_pg_timeout
             init_method = f"tcp://{obj.master_address}:{int(obj.master_port)}"
@@ -502,7 +503,7 @@ class ModelRunner:
                 [self.model], require_complete=False, cpu_group=None
             ):
                 self.model.load_weights(record_non_unit_kv_scales(_recv(), rejected))
-            torch.cuda.synchronize(device)
+            torch.get_device_module(device).synchronize(device)
             if rejected:
                 return False, (
                     f"applied {len(names)} weights, but the update is rejected and "
@@ -670,7 +671,10 @@ class ModelRunner:
                     "tensors had reached the model)"
                 )
             if self.device != "cpu":
-                torch.cuda.synchronize(torch.device(f"cuda:{self.gpu_id}"))
+                sync_device = torch.device(
+                    f"{torch.device(self.device).type}:{self.gpu_id}"
+                )
+                torch.get_device_module(sync_device).synchronize(sync_device)
         except Exception as e:  # noqa: BLE001 - surface to the control plane
             logger.exception("update_weights_from_disk failed")
             if consumed == 0:

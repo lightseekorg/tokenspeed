@@ -162,13 +162,19 @@ class CapturableGrammarExecutor:
         max_bs: int,
         vocab_size: int,
         max_tokens_per_req: int = 1,
-        device: torch.device = torch.device("cuda"),
+        device: torch.device | None = None,
     ) -> None:
 
         self.max_bs = max_bs
         self.vocab_size = vocab_size
         self.max_tokens_per_req = max(1, max_tokens_per_req)
         self.bitmask_width = (vocab_size + 31) // 32
+        if device is None:
+            # Resolve the active accelerator ("cuda" / "npu") through the torch
+            # device-module abstraction instead of hard-coding cuda.
+            device_module = torch.get_device_module()
+            device_type = device_module.__name__.rsplit(".", 1)[-1]
+            device = torch.device(device_type, device_module.current_device())
         self.device = device
 
         n = self.max_tokens_per_req
@@ -215,11 +221,12 @@ class CapturableGrammarExecutor:
             )
         )
 
-        self.stream = torch.cuda.Stream()
-        self.fork_event = torch.cuda.Event()
-        self.bitmask_event = torch.cuda.Event()
-        self.sampled_event = torch.cuda.Event()
-        self.post_sampler_event = torch.cuda.Event()
+        self.device_module = torch.get_device_module(self.device)
+        self.stream = self.device_module.Stream()
+        self.fork_event = self.device_module.Event()
+        self.bitmask_event = self.device_module.Event()
+        self.sampled_event = self.device_module.Event()
+        self.post_sampler_event = self.device_module.Event()
 
     def add_batch(
         self,
@@ -291,16 +298,16 @@ class CapturableGrammarExecutor:
 
         self.fork_event.record()
 
-        with torch.cuda.stream(self.stream):
-            torch.cuda.current_stream().wait_event(self.fork_event)
-            self.host.launch(torch.cuda.current_stream().cuda_stream)
+        with self.device_module.stream(self.stream):
+            self.device_module.current_stream().wait_event(self.fork_event)
+            self.host.launch(self.device_module.current_stream().cuda_stream)
 
             self.bitmask.copy_(self.host_bitmask, non_blocking=True)
             self.bitmask_event.record()
 
     def wait_bitmask(self) -> None:
         """Join the side stream on the main stream before apply_mask."""
-        torch.cuda.current_stream().wait_event(self.bitmask_event)
+        self.device_module.current_stream().wait_event(self.bitmask_event)
 
     def schedule_post_sampler(
         self,
@@ -309,8 +316,8 @@ class CapturableGrammarExecutor:
     ) -> None:
         """Side-stream D2H of sampler output into the pinned buffer."""
         self.sampled_event.record()
-        with torch.cuda.stream(self.stream):
-            torch.cuda.current_stream().wait_event(self.sampled_event)
+        with self.device_module.stream(self.stream):
+            self.device_module.current_stream().wait_event(self.sampled_event)
 
             n = output_tokens.numel()
             self.output_tokens[:n].copy_(output_tokens.flatten(), non_blocking=True)
@@ -321,7 +328,7 @@ class CapturableGrammarExecutor:
 
     def join_post_sampler(self) -> None:
         """Join schedule_post_sampler's copies on the main stream."""
-        torch.cuda.current_stream().wait_event(self.post_sampler_event)
+        self.device_module.current_stream().wait_event(self.post_sampler_event)
 
 
 def _matchers(grammars: list) -> list:
@@ -430,6 +437,61 @@ def bind_grammar_mask_buf(
     n = runtime.max_tokens_per_req
     info.vocab_mask = runtime.bitmask[: bs * n] if spec else runtime.bitmask[:bs]
     info.apply_vocab_mask = get_apply_vocab_mask_func(grammar_backend)
+
+
+def _fill_eager_bitmask(
+    grammars: list,
+    bs: int,
+    eager_buffers: EagerGrammarBuffers,
+    spec_num_tokens: int,
+    is_spec_decode: bool,
+    input_ids_buf,
+    output_layout: ForwardOutputLayout,
+) -> None:
+    """Sync, walk grammars on host, H2D the bitmask. Non-CUDA path only."""
+    if is_spec_decode:
+        first = output_layout.num_extends
+        count = bs - first
+        candidates = input_ids_buf[-count * spec_num_tokens :]
+        eager_buffers.candidates_cpu_buf[first:bs].copy_(
+            candidates.view(count, spec_num_tokens), non_blocking=True
+        )
+        device_module = torch.get_device_module()
+        sync_ev = device_module.Event()
+        sync_ev.record()
+        sync_ev.synchronize()
+        cand_cpu = eager_buffers.candidates_cpu_buf
+        active = bs * spec_num_tokens
+        cpu_buf = eager_buffers.vocab_mask_spec_cpu_buf
+        gpu_buf = eager_buffers.vocab_mask_spec_buf
+        cpu_buf[:active].fill_(-1)
+        for i, grammar in enumerate(grammars):
+            if grammar is None or grammar.finished or grammar.is_terminated():
+                continue
+            row_base = i * spec_num_tokens
+            advanced = 0
+            positions = output_layout.output_width(i)
+            for pos in range(positions):
+                if grammar.is_terminated():
+                    break
+                grammar.fill_vocab_mask(cpu_buf, row_base + pos)
+                if pos + 1 == positions:
+                    break
+                next_tok = int(cand_cpu[i, pos + 1].item())
+                if not grammar.try_accept_token(next_tok):
+                    break
+                advanced += 1
+            if advanced:
+                grammar.rollback(advanced)
+        gpu_buf[:active].copy_(cpu_buf[:active], non_blocking=True)
+    else:
+        cpu_buf = eager_buffers.vocab_mask_cpu_buf
+        gpu_buf = eager_buffers.vocab_mask_buf
+        cpu_buf[:bs].fill_(-1)
+        for i, grammar in enumerate(grammars):
+            if grammar and not grammar.finished and not grammar.is_terminated():
+                grammar.fill_vocab_mask(cpu_buf, i)
+        gpu_buf[:bs].copy_(cpu_buf[:bs], non_blocking=True)
 
 
 GrammarRuntime = CapturableGrammarExecutor | EagerGrammarBuffers

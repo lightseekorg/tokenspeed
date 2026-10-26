@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable as _Iterable
+from typing import Any as _Any
 
 import torch
 import torch.nn as nn
@@ -271,7 +272,7 @@ class _RuntimeLongcatMoE(nn.Module):
         quant_config: _QuantizationConfig | None = None,
         layer_index: int = -1,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: _Any | None = None,
     ):
         super().__init__()
         self.mapping = mapping
@@ -532,7 +533,7 @@ class _RuntimeLongcatDecoderLayer(nn.Module):
         mapping: _Mapping,
         quant_config: _QuantizationConfig | None = None,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: _Any | None = None,
     ) -> None:
         super().__init__()
         self.mapping = mapping
@@ -894,7 +895,14 @@ class _RuntimeLongcatModel(nn.Module):
             tp_size=self.mapping.attn.tp_size,
             tp_group=self.mapping.attn.tp_group,
         )
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        # NPU 下 alt_stream 恒为 None（退化串行主流，语义等价于 CUDA 面创建
+        # 辅助流分流）；经 torch.get_device_module() 分派避免裸 torch.cuda.*。
+        device_module = torch.get_device_module()
+        self.alt_stream = (
+            device_module.Stream()
+            if device_module.is_available() and not _longcat_platform.is_npu
+            else None
+        )
         self.layers = nn.ModuleList(
             [
                 _RuntimeLongcatDecoderLayer(
@@ -1175,8 +1183,9 @@ class LongcatFlashForCausalLM(_BaseCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_module = torch.get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):

@@ -58,7 +58,8 @@ class PyNcclCommunicator:
             group: the process group to work on. If None, it will use the
                 default process group.
             device: the device to bind the PyNcclCommunicator to. If None,
-                it will be bind to f"cuda:{local_rank}".
+                it will be bound to the active accelerator (e.g. "cuda" on
+                NVIDIA, "npu" on Ascend).
             library_path: the path to the NCCL library. If None, it will
                 use the default library path.
         It is the caller's responsibility to make sure each communicator
@@ -119,7 +120,9 @@ class PyNcclCommunicator:
         else:
             self.unique_id = group.broadcast_obj(self.unique_id, src=0)
         if isinstance(device, int):
-            device = torch.device(f"cuda:{device}")
+            device = torch.device(
+                f"{torch.get_device_module().__name__.rsplit('.', 1)[-1]}:{device}"
+            )
         elif isinstance(device, str):
             device = torch.device(device)
         # now `device` is a `torch.device` object

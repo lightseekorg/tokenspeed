@@ -208,6 +208,8 @@ class IrisBackend(CommBackend):
     ) -> "IrisAllReduce":
         from tokenspeed_kernel.ops.communication.iris import create_iris_state
 
+        device_module = torch.get_device_module()
+        device_type = device_module.__name__.rsplit(".", 1)[-1]
         state = create_iris_state(
             group=pg_manager.get_process_group("nccl", group),
             rank_in_group=group.index(dist.get_rank()),
@@ -215,7 +217,9 @@ class IrisBackend(CommBackend):
             producer_direct_max_numel=producer_direct_max_numel,
             dtype=dtype,
             heap_size=None,
-            device=torch.device(f"cuda:{torch.cuda.current_device()}"),
+            device=torch.device(
+                f"{device_type}:{device_module.current_device()}"
+            ),
         )
         self.install(group, state)
         return state

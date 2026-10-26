@@ -946,7 +946,7 @@ def _instanttensor_tensors(
     hf_weights_files: list[str],
     process_group: torch.distributed.ProcessGroup | None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
-    device = torch.cuda.current_device()
+    device = torch.get_device_module().current_device()
 
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
@@ -982,7 +982,7 @@ def pt_weights_iterator(
         state = torch.load(bin_file, map_location="cpu")
         yield from state.items()
         del state
-        torch.cuda.empty_cache()
+        torch.get_device_module().empty_cache()
 
 
 def bind_checkpoint_dir(model: torch.nn.Module, checkpoint_dir: str) -> None:

@@ -366,7 +366,7 @@ class DeepseekV3MoE(MoEBlock):
         quant_config: QuantizationConfig | None = None,
         layer_index: int = -1,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: Any | None = None,
     ):
         if mapping.moe.ep_size > config.n_routed_experts:
             raise ValueError(
@@ -543,7 +543,7 @@ class DeepseekV3AttentionMLA(nn.Module):
         layer_id=None,
         prefix: str = "",
         reduce_attn_results=True,
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: Any | None = None,
         skip_rope: bool = False,
         q_lora_scale: float | None = None,
         kv_lora_scale: float | None = None,
@@ -1768,7 +1768,7 @@ class DeepseekV3DecoderLayer(BaseDecoderLayer[PretrainedConfig]):
         quant_config: QuantizationConfig | None = None,
         is_nextn: bool = False,
         prefix: str = "",
-        alt_stream: torch.cuda.Stream | None = None,
+        alt_stream: Any | None = None,
     ) -> None:
         # Set before the base constructor, whose resolve_*() hooks read them.
         self.is_nextn = is_nextn
@@ -1931,7 +1931,15 @@ class DeepseekV3Model(nn.Module):
             config.vocab_size,
             config.hidden_size,
         )
-        self.alt_stream = torch.cuda.Stream()
+        # NPU 下 alt_stream 退化为串行主流（语义等价于 LongCat 面）；经
+        # torch.get_device_module() 分派避免裸 torch.cuda.*。
+        device_module = torch.get_device_module()
+        self.alt_stream = (
+            device_module.Stream()
+            if device_module.is_available() and not _platform.is_npu
+            else None
+        )
+        # config.num_hidden_layers = 5; self.start_layer,self.end_layer = 0, 5
         self.layers = nn.ModuleList(
             [
                 DeepseekV3DecoderLayer(
@@ -2213,8 +2221,9 @@ class DeepseekV3ForCausalLM(BaseCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_module = torch.get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
@@ -2712,8 +2721,9 @@ class Eagle3DeepseekV2ForCausalLM(DeepseekV3ForCausalLM):
         if head is not None and self.load_lm_head_from_target:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        device_module = torch.get_device_module()
+        device_module.empty_cache()
+        device_module.synchronize()
 
 
 EntryClass = [

@@ -37,6 +37,7 @@ from tokenspeed_kernel.thirdparty.cuda import routing_flash as cuda_routing_flas
 
 from tokenspeed.runtime.moe.dispatch_algorithm import STATIC_EP_DISPATCH_ALGORITHMS
 from tokenspeed.runtime.moe.expert_load_rows import LayerExpertLoad
+from tokenspeed.runtime.utils.device_stream import is_current_stream_capturing
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict
 
 
@@ -454,7 +455,7 @@ def simulated_router_logits(router_logits: torch.Tensor) -> torch.Tensor:
     key = (router_logits.device, router_logits.dtype, experts)
     table = _simulated_logits.get(key)
     if table is None or table.shape[0] < tokens:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        if is_current_stream_capturing(router_logits.device):
             raise RuntimeError(
                 f"simulated routing table has no rows for {tokens} tokens "
                 "during graph capture"

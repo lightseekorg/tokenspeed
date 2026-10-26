@@ -40,6 +40,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 
 def host_to_device(
@@ -99,7 +100,9 @@ def allow_host_sync(reason: str) -> Iterator[None]:
     the data plane runs one round at a time, so nothing else is masked.
     """
     del reason
-    if not torch.cuda.is_available():
+    # Sync-debug mode is a CUDA-only facility; NPU (and CPU-only hosts) keep
+    # the block a no-op -- there is nothing to temporarily disable.
+    if current_platform().is_npu or not torch.get_device_module().is_available():
         yield
         return
     previous = torch.cuda.get_sync_debug_mode()

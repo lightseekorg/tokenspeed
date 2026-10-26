@@ -109,7 +109,11 @@ def maybe_warm_cupti_for_graph_capture() -> None:
 
     if not envs.TOKENSPEED_CUPTI_GRAPH_WARMUP.get():
         return
-    if not torch.cuda.is_available() or current_platform().is_amd:
+    if (
+        current_platform().is_npu
+        or not torch.get_device_module().is_available()
+        or current_platform().is_amd
+    ):
         return
 
     from torch.profiler._utils import _init_for_cuda_graphs

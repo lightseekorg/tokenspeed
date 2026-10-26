@@ -916,13 +916,15 @@ class PrefillGraph:
         cap = BreakableCapture(
             pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
         )
-        cap.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(cap.stream):
+        cap.stream.wait_stream(
+            torch.get_device_module(self.config.device).current_stream()
+        )
+        with torch.get_device_module(self.config.device).stream(cap.stream):
             spec = None
             for _ in range(self.num_warmup):
                 spec = _output_spec(CapturedForward(*self._run_inner(bucket)))
             self._reserve_outputs(spec)
-        torch.cuda.synchronize()
+        torch.get_device_module(self.config.device).synchronize()
         with observer, cap:
             output = self._land_output(CapturedForward(*self._run_inner(bucket)))
         if self._pool is None:
@@ -943,11 +945,13 @@ class PrefillGraph:
             stream=stream,
             handoff_storage=self._encoder_handoff_storage,
         )
-        cap.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(cap.stream):
+        cap.stream.wait_stream(
+            torch.get_device_module(self.config.device).current_stream()
+        )
+        with torch.get_device_module(self.config.device).stream(cap.stream):
             for _ in range(self.num_warmup):
                 self._run_encoder(bucket)
-        torch.cuda.synchronize()
+        torch.get_device_module(self.config.device).synchronize()
         with observer, cap:
             state = self._run_encoder(bucket)
         if self._pool is None:
@@ -973,8 +977,10 @@ class PrefillGraph:
         cap = BreakableCapture(
             pool=self._pool, stream=stream, handoff_storage=self._handoff_storage
         )
-        cap.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(cap.stream):
+        cap.stream.wait_stream(
+            torch.get_device_module(self.config.device).current_stream()
+        )
+        with torch.get_device_module(self.config.device).stream(cap.stream):
             spec = None
             for _ in range(self.num_warmup):
                 rearm()
@@ -984,7 +990,7 @@ class PrefillGraph:
                     )
                 )
             self._reserve_outputs(spec)
-        torch.cuda.synchronize()
+        torch.get_device_module(self.config.device).synchronize()
         rearm()
         with observer, cap:
             output = self._land_output(

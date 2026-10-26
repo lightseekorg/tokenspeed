@@ -175,7 +175,7 @@ def get_available_gpu_memory(
 
 
 def is_pin_memory_available() -> bool:
-    return torch.cuda.is_available()
+    return bool(torch.get_device_module().is_available())
 
 
 class LayerFn(Protocol):
@@ -231,8 +231,9 @@ def set_random_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    device_module = torch.get_device_module()
+    if device_module.is_available():
+        device_module.manual_seed_all(seed)
 
 
 def set_ulimit(target_soft_limit=65535):
@@ -354,6 +355,99 @@ def set_weight_attrs(
         setattr(weight, key, value)
 
 
+def broadcast_pyobj(
+    data: list[Any],
+    rank: int,
+    dist_group: torch.distributed.ProcessGroup | None = None,
+    src: int = 0,
+    force_cpu_device: bool = True,
+):
+    """Broadcast inputs from src rank to all other ranks with torch.dist backend.
+    The `rank` here refer to the source rank on global process group (regardless
+    of dist_group argument).
+    """
+    device_module = torch.get_device_module()
+    device_type = device_module.__name__.rsplit(".", 1)[-1]
+    device = torch.device(
+        device_type if device_module.is_available() and not force_cpu_device else "cpu"
+    )
+
+    if rank == src:
+        if len(data) == 0:
+            tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+        else:
+            serialized_data = pickle.dumps(data)
+            size = len(serialized_data)
+
+            tensor_data = torch.ByteTensor(
+                np.frombuffer(serialized_data, dtype=np.uint8)
+            ).to(device)
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
+
+            dist.broadcast(tensor_size, src=src, group=dist_group)
+            dist.broadcast(tensor_data, src=src, group=dist_group)
+        return data
+    else:
+        tensor_size = torch.tensor([0], dtype=torch.long, device=device)
+        dist.broadcast(tensor_size, src=src, group=dist_group)
+        size = tensor_size.item()
+
+        if size == 0:
+            return []
+
+        tensor_data = torch.empty(size, dtype=torch.uint8, device=device)
+        dist.broadcast(tensor_data, src=src, group=dist_group)
+
+        serialized_data = bytes(tensor_data.cpu().numpy())
+        data = pickle.loads(serialized_data)
+        return data
+
+
+step_counter = 0
+
+
+def get_zmq_socket(
+    context: zmq.Context, socket_type: zmq.SocketType, endpoint: str, bind: bool
+) -> zmq.Socket:
+    mem = psutil.virtual_memory()
+    total_mem = mem.total / 1024**3
+    available_mem = mem.available / 1024**3
+    if total_mem > 32 and available_mem > 16:
+        buf_size = int(0.5 * 1024**3)
+    else:
+        buf_size = -1
+
+    socket = context.socket(socket_type)
+    if endpoint.find("[") != -1:
+        socket.setsockopt(zmq.IPV6, 1)
+
+    def set_send_opt():
+        socket.setsockopt(zmq.SNDHWM, 0)
+        socket.setsockopt(zmq.SNDBUF, buf_size)
+
+    def set_recv_opt():
+        socket.setsockopt(zmq.RCVHWM, 0)
+        socket.setsockopt(zmq.RCVBUF, buf_size)
+
+    if socket_type == zmq.PUSH:
+        set_send_opt()
+    elif socket_type == zmq.PULL:
+        set_recv_opt()
+    elif socket_type == zmq.DEALER:
+        set_send_opt()
+        set_recv_opt()
+    else:
+        raise ValueError(f"Unsupported socket type: {socket_type}")
+
+    if bind:
+        socket.bind(endpoint)
+    else:
+        socket.connect(endpoint)
+
+    return socket
+
+
 # Temporary directory for prometheus multiprocess mode
 # Cleaned up automatically when this object is garbage collected
 prometheus_multiproc_dir: tempfile.TemporaryDirectory
@@ -393,18 +487,19 @@ def add_prometheus_middleware(app):
 
 
 def get_amdgpu_memory_capacity():
-    if not torch.cuda.is_available():
+    device_module = torch.get_device_module()
+    if not device_module.is_available():
         raise RuntimeError(
             "No AMD GPU available. Ensure ROCm drivers and a ROCm-enabled "
             "PyTorch build are installed and accessible."
         )
 
     # Query each visible device's total memory (bytes) via the torch API
-    # (torch.cuda is reused for ROCm/HIP), and return the minimum in MiB so
-    # the value matches the previous rocminfo-based implementation.
+    # (the device module is reused for ROCm/HIP), and return the minimum in
+    # MiB so the value matches the previous rocminfo-based implementation.
     memory_values = [
-        torch.cuda.get_device_properties(i).total_memory // (1024 * 1024)
-        for i in range(torch.cuda.device_count())
+        device_module.get_device_properties(i).total_memory // (1024 * 1024)
+        for i in range(device_module.device_count())
     ]
 
     if not memory_values:
@@ -433,13 +528,16 @@ def get_nvgpu_memory_capacity():
         ]
 
         if not memory_values:
-            # Fallback to torch.cuda.mem_get_info() when failed to get memory capacity from nvidia-smi,
-            # typically in NVIDIA MIG mode.
-            if torch.cuda.is_available():
+            # Fallback to the active device module's mem_get_info() when
+            # failed to get memory capacity from nvidia-smi, typically in
+            # NVIDIA MIG mode.
+            device_module = torch.get_device_module()
+            if device_module.is_available():
                 logger.warning(
-                    "Failed to get GPU memory capacity from nvidia-smi, falling back to torch.cuda.mem_get_info()."
+                    "Failed to get GPU memory capacity from nvidia-smi, "
+                    "falling back to the active device module's mem_get_info()."
                 )
-                return torch.cuda.mem_get_info()[1] // 1024 // 1024  # unit: MB
+                return device_module.mem_get_info()[1] // 1024 // 1024  # unit: MB
             raise ValueError("No GPU memory values found.")
 
         # Return the minimum memory value
@@ -457,20 +555,23 @@ def crash_on_warnings():
 
 
 def get_device_name(device_id: int = 0) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
-        return torch.cuda.get_device_name(device_id)
+    device_module = torch.get_device_module()
+    if device_module.is_available():
+        return device_module.get_device_name(device_id)
 
     return ""
 
 
 @lru_cache(maxsize=8)
 def get_device(device_id: int | None = None) -> str:
-    if hasattr(torch, "cuda") and torch.cuda.is_available():
+    device_module = torch.get_device_module()
+    if device_module.is_available():
+        device_type = device_module.__name__.rsplit(".", 1)[-1]
         if device_id is None:
-            return "cuda"
-        return f"cuda:{device_id}"
+            return device_type
+        return f"{device_type}:{device_id}"
 
-    raise RuntimeError("No accelerator (CUDA/ROCm) is available.")
+    raise RuntimeError("No accelerator (CUDA/ROCm/NPU) is available.")
 
 
 def dataclass_to_string_truncated(

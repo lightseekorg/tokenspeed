@@ -19,19 +19,29 @@
 # SOFTWARE.
 
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 
 
 class StreamFork:
-    def __init__(self, aux_stream: torch.cuda.Stream | None):
+    def __init__(self, aux_stream: Any | None = None):
+        # Dispatch through torch.get_device_module() so CUDA/ROCm keep the
+        # original stream/event semantics while NPU resolves to torch_npu.npu.
+        self._device_module = torch.get_device_module()
         self.aux_stream = aux_stream
-        self.fork_event = torch.cuda.Event() if aux_stream is not None else None
-        self.join_event = torch.cuda.Event() if aux_stream is not None else None
-        self.checkpoint_event = torch.cuda.Event() if aux_stream is not None else None
+        self.fork_event = (
+            self._device_module.Event() if aux_stream is not None else None
+        )
+        self.join_event = (
+            self._device_module.Event() if aux_stream is not None else None
+        )
+        self.checkpoint_event = (
+            self._device_module.Event() if aux_stream is not None else None
+        )
         self._active = False
         self._overlap = True
-        self._current: torch.cuda.Stream | None = None
+        self._current: Any | None = None
         # Whether main is ordered after every branch so far in this scope.
         self._joined = True
 
@@ -50,7 +60,7 @@ class StreamFork:
         self._active = enable and self.aux_stream is not None
         self._overlap = overlap
         if self._active:
-            self._current = torch.cuda.current_stream()
+            self._current = self._device_module.current_stream()
             self.fork_event.record(self._current)
             self._joined = True
         try:
@@ -105,7 +115,7 @@ class StreamFork:
         if not self._active:
             yield
             return
-        with torch.cuda.stream(self.aux_stream):
+        with self._device_module.stream(self.aux_stream):
             self.fork_event.wait(self.aux_stream)
             yield
             self.join_event.record(self.aux_stream)

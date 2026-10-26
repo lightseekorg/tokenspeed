@@ -305,8 +305,8 @@ class ProjectionWorkspace:
         """
         if self.closed:
             return
-        if self.spec.device.type == "cuda":
-            torch.cuda.synchronize(self.spec.device)
+        if self.spec.device.type in ("cuda", "npu"):
+            torch.get_device_module(self.spec.device).synchronize(self.spec.device)
         dist.barrier(group=pg_manager.get_device_process_group(self.spec.group))
         if self.fused_column is not None:
             self.fused_column.close()
