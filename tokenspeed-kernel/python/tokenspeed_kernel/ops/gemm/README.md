@@ -68,6 +68,11 @@ through the `("gemm", "mv_weightless_rmsnorm_gated_sigmoid")` operation. A
 registered kernel serves it only where the separate gated norm and `mv` select
 the kernels it reproduces bit for bit; otherwise callers keep the two calls.
 
+On SM107, FlashInfer's TGV/CuTe DSL search supports BF16 output projections
+with weight shape `[2560, 6144]` and M <= 4. Startup tuning covers M=1/2/4.
+The kernels accumulate in FP32 and return BF16; reduction order can change
+rounding relative to the original GEMM.
+
 ## Per-token/per-channel FP8
 
 Per-channel FP8 projections use FP8 E4M3 weights with FP32 scales per output

@@ -514,22 +514,58 @@ def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
     )
 
 
-# A ReplaySSM chain verifies faster in the chunked form from these sizes on, measured on Blackwell.
+class GdnChainVerifyForm(str, Enum):
+    """How a ReplaySSM chain verify runs (``gdn_chain_verify_form``)."""
+
+    # Step by step through ``gdn_decode_mtp``.
+    STEP = "step"
+    # Chunked as a one-path tree through ``gdn_decode_mtp``.
+    TREE = "tree"
+    # Chunked through ``gdn_chain_verify`` (16-bit state, tensor-core products).
+    CHAIN = "chain"
+
+
+# A ReplaySSM chain verifies faster in the tree form from these sizes on, measured on Blackwell.
 GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS = 13
 GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES = 24
 
+# State dtypes whose 2- to 16-token chains take the chain form (measured on Blackwell).
+GDN_CHAIN_VERIFY_CHAIN_STATE_DTYPES = frozenset({torch.bfloat16})
 
-def gdn_chain_verify_is_chunked(num_tokens: int, num_states: int) -> bool:
-    """Whether a ReplaySSM chain ``gdn_decode_mtp`` of ``num_tokens`` tokens over
-    ``num_states`` (request, value head) states verifies in the chunked form, as
-    a one-path tree, rather than step by step: only where that is faster."""
+
+def gdn_chain_verify_supported(
+    head_k_dim: int, head_v_dim: int, state_dtype: torch.dtype
+) -> bool:
+    """Whether ``gdn_chain_verify`` takes 16-bit state and equal power-of-two dims from 64."""
     return (
-        current_platform().is_blackwell
-        and GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
-        <= num_tokens
-        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
-        and num_states >= GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES
+        state_dtype in (torch.bfloat16, torch.float16)
+        and head_k_dim == head_v_dim
+        and head_k_dim >= 64
+        and head_k_dim & (head_k_dim - 1) == 0
     )
+
+
+def gdn_chain_verify_form(
+    num_tokens: int, num_states: int, state_dtype: torch.dtype, *, chain_form: bool
+) -> GdnChainVerifyForm:
+    """The fastest form of a chain of ``num_tokens`` over ``num_states`` states."""
+    if (
+        not current_platform().is_blackwell
+        or num_tokens > GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    ):
+        return GdnChainVerifyForm.STEP
+    if (
+        chain_form
+        and num_tokens >= 2
+        and state_dtype in GDN_CHAIN_VERIFY_CHAIN_STATE_DTYPES
+    ):
+        return GdnChainVerifyForm.CHAIN
+    if (
+        num_tokens >= GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
+        and num_states >= GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES
+    ):
+        return GdnChainVerifyForm.TREE
+    return GdnChainVerifyForm.STEP
 
 
 def gdn_decode_mtp(
@@ -730,6 +766,78 @@ def gdn_decode_mtp(
             output_state=output_state,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+        )
+
+
+def gdn_chain_verify(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None,
+    use_qk_l2norm: bool,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Read-only chain verify of whole windows from the committed states, in the chunked form.
+
+    Args:
+        q: Query ``[B, T, num_q_heads, head_dim]``, ``T <= 16``, request-major rows.
+        k: Key tensor shaped like ``q``.
+        v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``, dense heads.
+        A_log: Log decay parameter shaped ``[num_v_heads]``.
+        a: Input-dependent decay shaped ``[B, T, num_v_heads]``, unit head stride.
+        dt_bias: Decay bias shaped ``[num_v_heads]``.
+        b: Update-gate (beta) input shaped like ``a``.
+        initial_state: K-last 16-bit pool ``[pages, num_v_heads, head_v_dim, head_dim]``.
+        initial_state_indices: Per-request page ``[B]``; negative marks padding (zero outputs).
+        scale: Attention scale; ``None`` uses ``head_dim ** -0.5``.
+        use_qk_l2norm: Whether to L2-normalize q and k in the kernel.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Verify output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
+    """
+    head_dim = q.shape[-1]
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_chain_verify",
+        signature,
+        traits={"head_dim": head_dim},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_chain_verify",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0],
+        seq_len=q.shape[1],
+        num_v_heads=v.shape[-2],
+        head_dim=head_dim,
+        head_v_dim=v.shape[-1],
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
         )
 
 
@@ -1021,8 +1129,11 @@ __all__ = [
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
     "GDN_STATE_CHECKPOINT_GRANULARITY",
+    "GdnChainVerifyForm",
     "GdnStateCheckpoints",
-    "gdn_chain_verify_is_chunked",
+    "gdn_chain_verify",
+    "gdn_chain_verify_form",
+    "gdn_chain_verify_supported",
     "gdn_chunk_prefill",
     "gdn_chunk_prefill_capturable",
     "gdn_chunk_prefill_stores_state_checkpoints",

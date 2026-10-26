@@ -181,6 +181,37 @@ async fn bootstrap_room_selects_the_rank() {
 }
 
 #[tokio::test]
+async fn a_pinned_decode_request_goes_to_its_rank_not_the_rooms() {
+    let (client, _engines) = connect(2, Routing::BootstrapRoom).await;
+    // Room 7 names rank 1; the pin wins.
+    let pinned = TokenizedGenerateReqInput {
+        bootstrap_room: Some(7),
+        data_parallel_rank: Some(0),
+        ..request("pinned", Some(1))
+    };
+    let chunks = collect(client.generate(pinned).await.unwrap()).await;
+    assert_eq!(tokens(&chunks), [1]);
+    let out_of_range = TokenizedGenerateReqInput {
+        bootstrap_room: Some(7),
+        data_parallel_rank: Some(2),
+        ..request("bad-pin", Some(1))
+    };
+    assert!(matches!(
+        client.generate(out_of_range).await,
+        Err(Error::InvalidRequest(_))
+    ));
+    // A pin does not replace the room the engines bootstrap on.
+    let no_room = TokenizedGenerateReqInput {
+        data_parallel_rank: Some(0),
+        ..request("pin-no-room", Some(1))
+    };
+    assert!(matches!(
+        client.generate(no_room).await,
+        Err(Error::InvalidRequest(_))
+    ));
+}
+
+#[tokio::test]
 async fn abort_finishes_the_stream() {
     let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
     let mut stream = client.generate(request("r1", None)).await.unwrap();

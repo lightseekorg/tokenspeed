@@ -29,8 +29,10 @@ pub enum Routing {
     /// rank; other requests are placed by the policy.
     Aggregated(LoadBalance),
     /// Prefill/decode disaggregation: rank `bootstrap_room % num_engines`,
-    /// the rule both roles apply so a request's KV lands on the matching
-    /// rank. Every request must carry a `bootstrap_room`.
+    /// or the rank a request's `data_parallel_rank` pins it to. Every
+    /// request must carry a `bootstrap_room`. Pin decode requests only: any
+    /// decode rank finds the request's prefill rank from the room, so the
+    /// prefill request must stay on the room's rank.
     BootstrapRoom,
 }
 
