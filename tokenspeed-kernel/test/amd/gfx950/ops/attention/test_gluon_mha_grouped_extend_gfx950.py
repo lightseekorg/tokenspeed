@@ -102,14 +102,18 @@ class PagedCase:
         )
 
 
-def make_case(queries, prefixes, *, heads, kv_heads, window, causal, sinks):
+def make_case(
+    queries, prefixes, *, heads, kv_heads, window, causal, sinks, head_dim=128
+):
     torch.manual_seed(1357)
     lengths = [q + p for q, p in zip(queries, prefixes, strict=True)]
     pages_per_request = math.ceil(max(lengths) / 64)
     page_count = len(queries) * pages_per_request + 1
-    q = torch.randn((sum(queries), heads, 128), device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        (sum(queries), heads, head_dim), device="cuda", dtype=torch.bfloat16
+    )
     k = torch.randn(
-        (page_count, 64, kv_heads, 128), device="cuda", dtype=torch.bfloat16
+        (page_count, 64, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16
     )
     v = torch.randn_like(k)
     table = torch.arange(1, page_count, device="cuda", dtype=torch.int32).view(
@@ -117,6 +121,10 @@ def make_case(queries, prefixes, *, heads, kv_heads, window, causal, sinks):
     )
     # Noncontiguous physical pages catch accidental use of logical token order.
     table = table.flip(1).contiguous()
+    # Entries past a request's pages hold an out-of-range page id, so a copy
+    # that reads past them faults instead of passing silently.
+    for request, length in enumerate(lengths):
+        table[request, math.ceil(length / 64) :] = 1 << 30
     cu_q = [0]
     cu_kv = [0]
     for query, length in zip(queries, lengths, strict=True):
@@ -146,7 +154,7 @@ def reference(case: PagedCase):
     group = case.q.shape[1] // case.k.shape[2]
     for request, query_rows in enumerate(case.queries):
         length = int(case.lengths[request].item())
-        pages = case.table[request].long()
+        pages = case.table[request, : math.ceil(length / 64)].long()
         k = case.k[pages].flatten(0, 1)[:length].float().repeat_interleave(group, 1)
         v = case.v[pages].flatten(0, 1)[:length].float().repeat_interleave(group, 1)
         key_pos = torch.arange(length, device="cuda")
@@ -154,7 +162,7 @@ def reference(case: PagedCase):
         for offset in range(0, query_rows, 32):
             end = min(offset + 32, query_rows)
             q = case.q[start + offset : start + end].float()
-            scores = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(128)
+            scores = torch.einsum("qhd,khd->hqk", q, k) / math.sqrt(q.shape[-1])
             positions = prefix + torch.arange(offset, end, device="cuda")
             mask = torch.ones((end - offset, length), device="cuda", dtype=torch.bool)
             if case.causal:
@@ -251,6 +259,43 @@ def test_draft_and_multiple_kv_head_groups(heads, kv_heads, causal, window):
         window=window,
         causal=causal,
         sinks=True,
+    )
+    assert_reference(case)
+
+
+@pytest.mark.parametrize(
+    "queries,prefixes,window",
+    [
+        # Head dim 64 with 2 KV heads, so the pipeline's LDS buffers leave two
+        # work-groups per CU. Up to 64 rows use the 64-row tile; 32 rows leave
+        # the grid short, so 32 splits each pipeline about ten pages, and the
+        # last one ends mid-page.
+        pytest.param([32], [300 * 64 + 17], -1, id="split-pipelined"),
+        # An empty prefix, a split with fewer pages than buffers and a long row.
+        pytest.param([5, 64, 33], [0, 4 * 64, 1000 * 64 + 33], -1, id="split-ragged"),
+        # 128-row tiles: 1000 rows take five splits of about 65 pages.
+        pytest.param([1000], [20000 + 3], -1, id="split-pipelined-128"),
+        # 4096 rows fill the grid unsplit; pipelining adds no round of
+        # work-groups.
+        pytest.param([4096], [10000 + 11], -1, id="pipelined"),
+        # 6144 rows: pipelining would add a round of work-groups, so pages
+        # load single-buffered.
+        pytest.param([6144], [3000 + 7], -1, id="single-buffer"),
+        # Sliding windows never split; a window spans many loop iterations.
+        pytest.param([100, 37], [20000, 9000], 4095, id="window-pipelined"),
+    ],
+)
+@pytest.mark.usefixtures("require_gfx950")
+def test_kv_stream(queries, prefixes, window):
+    case = make_case(
+        queries,
+        prefixes,
+        heads=16,
+        kv_heads=2,
+        window=window,
+        causal=True,
+        sinks=window >= 0,
+        head_dim=64,
     )
     assert_reference(case)
 

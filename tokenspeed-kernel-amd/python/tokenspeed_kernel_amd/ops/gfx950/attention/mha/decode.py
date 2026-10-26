@@ -26,6 +26,7 @@ import math
 from typing import NamedTuple
 
 import torch
+from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
 from tokenspeed_kernel_amd._triton import gl, gluon
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
@@ -41,6 +42,18 @@ cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
 cdiv = gl.cdiv
 _GFX950_SM_COUNT = 256
+# Pipeline depth of the full-attention decode K/V page loads: LDS buffers per
+# wave, so NUM_STAGES - 1 pages are prefetched while one is consumed. At BF16
+# head dim 64 the three prefetched pages are 48 outstanding buffer_load ... lds
+# copies. The loop is either this deep or single-buffered.
+_FULL_DECODE_STAGES = 4
+# s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
+# 63 of its outstanding vector memory loads.
+_GFX950_MAX_VMCNT = 63
+# Full-attention decode takes its split count as a constexpr, so it is not held to
+# the runtime-reduce bound MAX_KV_SPLITS. Above 64, the split reduce and the
+# per-split prologue outweigh the extra waves.
+_FULL_DECODE_MAX_SPLITS = 64
 _SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
@@ -346,6 +359,43 @@ class AttentionProgram:
         )
 
     @gluon.jit
+    def load_page_indices(self, start_n, count: gl.constexpr):
+        """Physical pages of the count pages starting at token start_n.
+
+        Pages past the split repeat its last page instead of being masked: a
+        masked copy compiles to a scalar branch around the buffer_load, and
+        after it the compiler cannot count the wave's outstanding loads, so
+        it waits for all of them (s_waitcnt vmcnt(0)), prefetched pages
+        included. The repeated page was just loaded and hits in L2. An empty
+        split reads the row's first entry; select_page replaces it with page
+        0 for a row without cached tokens. vmcnt retires a wave's loads in
+        issue order, so reading this result waits for every load issued
+        before it; the caller loads indices well before it reads them.
+        """
+        cfg = self.cfg
+        layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+        offs = gl.arange(0, count, layout=layout)
+        last_page = gl.where(
+            self.split_start < self.split_end, (self.split_end - 1) // cfg.PAGE_SIZE, 0
+        )
+        page_index = gl.minimum(start_n // cfg.PAGE_SIZE + offs, last_page)
+        return gl.load(
+            self.page_table_ptr + self.batch * cfg.PAGE_TABLE_STRIDE + page_index
+        )
+
+    @gluon.jit
+    def select_page(self, pages, index: gl.constexpr):
+        """Entry index of load_page_indices' result, the same in every lane.
+
+        Every lane loaded the same entries; masking the others to 0 and
+        max-reducing selects the entry. A row without cached tokens maps to
+        page 0.
+        """
+        offs = gl.arange(0, pages.shape[0], layout=pages.type.layout)
+        page = max(gl.where(offs == index, pages, 0), axis=0)
+        return gl.where(self.cache_len > 0, page, 0)
+
+    @gluon.jit
     def issue_load_k(self, physical_page, k_smem):
         cfg = self.cfg
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
@@ -373,6 +423,41 @@ class AttentionProgram:
         )
         # can't use buffer_load: paged KV offsets may exceed its 32-bit range.
         async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)
+        async_copy.commit_group()
+
+    @gluon.jit
+    def page_tile_offsets(self):
+        """Element offsets of this KV head's [BLOCK_N, HEAD_DIM] tile within a page."""
+        cfg = self.cfg
+        offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
+        return offs_n[:, None] * (cfg.NUM_KV_HEADS * cfg.HEAD_DIM) + offs_d[None, :]
+
+    @gluon.jit
+    def issue_load_kv(self, physical_page, tile_offsets, k_smem, v_smem):
+        """Copy one page of K and V into LDS as a single async group.
+
+        The copies are buffer_load_dwordx4 ... lds with the page base in the
+        SGPR buffer resource and loop-invariant 32-bit per-lane tile offsets,
+        instead of 64-bit per-lane addresses rebuilt for every page.
+        """
+        cfg = self.cfg
+        # v_readfirstlane moves the page into an SGPR. Left in a VGPR, the page
+        # could differ across lanes for all the compiler knows, so it would
+        # wrap each copy in a loop that issues it once per distinct lane value
+        # (readfirstlane, compare, exec mask).
+        physical_page = wave_uniform_i32(physical_page)
+        page_offset = (
+            physical_page.to(gl.int64)
+            * (cfg.PAGE_SIZE * cfg.NUM_KV_HEADS * cfg.HEAD_DIM)
+            + self.kv_head * cfg.HEAD_DIM
+        )
+        async_copy.buffer_load_to_shared(
+            k_smem, self.k_cache_ptr + page_offset, tile_offsets
+        )
+        async_copy.buffer_load_to_shared(
+            v_smem, self.v_cache_ptr + page_offset, tile_offsets
+        )
         async_copy.commit_group()
 
     @gluon.jit
@@ -555,6 +640,115 @@ class AttentionProgram:
 
 
 @gluon.jit
+def _stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
+    """Load, wait for and consume one K/V page at a time; enough when other
+    waves of the grid cover the load latency."""
+    cfg = program.cfg
+    physical_page = program.load_page(program.split_start)
+
+    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
+        with gl.amd.warp_pipeline_stage("load", priority=1):
+            program.issue_load_k(physical_page, k_smem)
+            program.issue_load_v(physical_page, v_smem)
+            physical_page = program.load_page(start_n + cfg.BLOCK_N)
+
+        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
+            async_copy.wait_group(1)
+            k = program.shared_load_k(k_smem)
+            qk = program.compute_qk(q, k)
+            qk = program.apply_kv_mask(qk, start_n)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+
+        with gl.amd.warp_pipeline_stage("pv", priority=1):
+            async_copy.wait_group(0)
+            v = program.shared_load_v(v_smem)
+            acc = program.compute_pv(p, v, acc)
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def _stream_split_pipelined(
+    program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES: gl.constexpr
+):
+    cfg = program.cfg
+    # Software-pipelined K/V page loads, NUM_STAGES deep: page p + NUM_STAGES - 1
+    # is copied into the LDS buffer page p - 1 freed while page p is consumed,
+    # so a wave keeps NUM_STAGES - 1 pages of loads outstanding and a long split
+    # is not bound by one memory round trip per page. Each loop iteration
+    # consumes NUM_STAGES pages, one per buffer. Page indices are loaded two
+    # iterations before use: vmcnt retires in issue order, so reading an index
+    # loaded after the prefetched copies would wait for all of them.
+    k_smem = gl.allocate_shared_memory(
+        k_cache_ptr.dtype.element_ty,
+        [NUM_STAGES, cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.k_smem_layout,
+    )
+    v_smem = gl.allocate_shared_memory(
+        v_cache_ptr.dtype.element_ty,
+        [NUM_STAGES, cfg.BLOCK_N, cfg.HEAD_DIM],
+        cfg.v_smem_layout,
+    )
+
+    iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
+    # A split with fewer pages than buffers would spend more on the pipeline
+    # prologue than it hides.
+    if program.split_end - program.split_start < iteration_tokens:
+        return _stream_split_single_buffer(
+            program, q, m_i, l_i, acc, k_smem.index(0), v_smem.index(0)
+        )
+    # Prologue: prefetch the first NUM_STAGES - 1 pages.
+    pages = program.load_page_indices(program.split_start, NUM_STAGES)
+    next_pages = program.load_page_indices(
+        program.split_start + iteration_tokens, NUM_STAGES
+    )
+    tile_offsets = program.page_tile_offsets()
+    for buffer in gl.static_range(NUM_STAGES - 1):
+        program.issue_load_kv(
+            program.select_page(pages, buffer),
+            tile_offsets,
+            k_smem.index(buffer),
+            v_smem.index(buffer),
+        )
+
+    for iteration_start in range(
+        program.split_start, program.split_end, iteration_tokens
+    ):
+        later_pages = program.load_page_indices(
+            iteration_start + 2 * iteration_tokens, NUM_STAGES
+        )
+        for buffer in gl.static_range(NUM_STAGES):
+            # Prefetch the page NUM_STAGES - 1 ahead into the buffer the
+            # previous page freed.
+            if buffer == 0:
+                prefetch_page = program.select_page(pages, NUM_STAGES - 1)
+            else:
+                prefetch_page = program.select_page(next_pages, buffer - 1)
+            program.issue_load_kv(
+                prefetch_page,
+                tile_offsets,
+                k_smem.index((buffer + NUM_STAGES - 1) % NUM_STAGES),
+                v_smem.index((buffer + NUM_STAGES - 1) % NUM_STAGES),
+            )
+
+            start_n = iteration_start + buffer * cfg.BLOCK_N
+            # Wait for this page; the NUM_STAGES - 1 prefetched pages stay
+            # outstanding (s_waitcnt vmcnt(N), N = their copies).
+            async_copy.wait_group(NUM_STAGES - 1)
+            k = program.shared_load_k(k_smem.index(buffer))
+            qk = program.compute_qk(q, k)
+            # Full attention starts at token 0; only a split's last page is partial.
+            if start_n + cfg.BLOCK_N > program.split_end:
+                qk = program.apply_kv_mask(qk, start_n)
+            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
+            v = program.shared_load_v(v_smem.index(buffer))
+            acc = program.compute_pv(p, v, acc)
+        pages = next_pages
+        next_pages = later_pages
+
+    return m_i, l_i, acc
+
+
+@gluon.jit
 def gluon_mha_decode_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -579,6 +773,7 @@ def gluon_mha_decode_gfx950(
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
 ):
     cfg = AttentionConfig(
         SM_SCALE,
@@ -607,36 +802,22 @@ def gluon_mha_decode_gfx950(
         mid_o_ptr,
         mid_lse_ptr,
     )
-    k_smem = gl.allocate_shared_memory(
-        k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-    )
-    v_smem = gl.allocate_shared_memory(
-        v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-    )
-
     q = program.load_q()
     m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
-
-    physical_page = program.load_page(program.split_start)
-
-    for start_n in range(program.split_start, program.split_end, cfg.BLOCK_N):
-        with gl.amd.warp_pipeline_stage("load", priority=1):
-            program.issue_load_k(physical_page, k_smem)
-            program.issue_load_v(physical_page, v_smem)
-            physical_page = program.load_page(start_n + cfg.BLOCK_N)
-
-        with gl.amd.warp_pipeline_stage("qk_softmax", priority=0):
-            async_copy.wait_group(1)
-            k = program.shared_load_k(k_smem)
-            qk = program.compute_qk(q, k)
-            qk = program.apply_kv_mask(qk, start_n)
-            p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
-
-        with gl.amd.warp_pipeline_stage("pv", priority=1):
-            async_copy.wait_group(0)
-            v = program.shared_load_v(v_smem)
-            acc = program.compute_pv(p, v, acc)
-
+    if NUM_STAGES == 1:
+        k_smem = gl.allocate_shared_memory(
+            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
+        )
+        v_smem = gl.allocate_shared_memory(
+            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
+        )
+        m_i, l_i, acc = _stream_split_single_buffer(
+            program, q, m_i, l_i, acc, k_smem, v_smem
+        )
+    else:
+        m_i, l_i, acc = _stream_split_pipelined(
+            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        )
     program.store_split(acc, l_i, m_i)
 
 
@@ -815,7 +996,6 @@ def gluon_mha_decode_reduce_gfx950(
     mid_o_ptr,
     mid_lse_ptr,
     out_ptr,
-    cache_seqlens_ptr,
     sink_ptr,
     k_cache_ptr,  # unused for loads; only its dtype feeds the shared config
     SM_SCALE: gl.constexpr,
@@ -849,32 +1029,15 @@ def gluon_mha_decode_reduce_gfx950(
         InputStrides(1, 1, 1),
     )
     q_index = gl.program_id(0)
-    batch = q_index // MAX_SEQLEN_Q
-    q_pos = q_index - batch * MAX_SEQLEN_Q
     q_head = gl.program_id(1)
-    cache_len = gl.load(cache_seqlens_ptr + batch)
-    cache_len = cache_len - (MAX_SEQLEN_Q - 1 - q_pos)
-    cache_len = maximum(cache_len, 0)
-    first_page = 0
-    end_page = cdiv(cache_len, cfg.PAGE_SIZE)
-    num_pages = end_page - first_page
-    pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
 
     # SPLIT_TILE pads NUM_KV_SPLITS up to a power of 2.
     SPLIT_TILE: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
     offs_s = gl.arange(0, SPLIT_TILE, layout=gl.SliceLayout(1, cfg.reduce_layout))
     offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.reduce_layout))
-    # split_valid masks out empty splits and the power-of-2 padding tail.
-    split_start_page = first_page + offs_s * pages_per_split
-    split_end_page_raw = split_start_page + pages_per_split
-    split_end_page = gl.where(
-        split_end_page_raw < end_page, split_end_page_raw, end_page
-    )
-    split_start_tok = split_start_page * cfg.PAGE_SIZE
-    split_end_raw = split_end_page * cfg.PAGE_SIZE
-    split_end_tok = gl.where(split_end_raw < cache_len, split_end_raw, cache_len)
-    split_valid = (split_start_tok < split_end_tok) & (offs_s < cfg.NUM_KV_SPLITS)
-    # Load every split's partial output and lse.
+    # Every split stores its partial, with lse = -inf when it has no tokens, so
+    # the loads need not wait on cache_seqlens; only the padding tail is masked.
+    split_valid = offs_s < cfg.NUM_KV_SPLITS
     base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
     part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
     o_off = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]
@@ -905,6 +1068,7 @@ class LaunchConfig(NamedTuple):
     head_dim: int
     page_size: int
     num_kv_splits: int
+    num_stages: int
     block_m: int
     block_n: int
     sm_scale: float
@@ -941,6 +1105,26 @@ def _sliding_split_counters(
     return counters
 
 
+def _full_decode_stages(
+    num_kv_splits: int, page_size: int, head_dim: int, element_size: int
+) -> int:
+    """Pipeline the K/V page loads only when select_kv_splits returned its
+    maximum, _FULL_DECODE_MAX_SPLITS: even the most splits leave the grid below
+    its occupancy target, so each wave streams a long split.
+
+    With fewer splits the grid already holds enough waves to cover the load
+    latency, and the pipeline's LDS buffers would lower occupancy.
+    """
+    if num_kv_splits < _FULL_DECODE_MAX_SPLITS:
+        return 1
+    # A wave copies one KV head's K and V page tiles, 16 bytes per lane per
+    # buffer_load_dwordx4.
+    copies_per_page = 2 * page_size * head_dim * element_size // (64 * 16)
+    if (_FULL_DECODE_STAGES - 1) * copies_per_page > _GFX950_MAX_VMCNT:
+        return 1
+    return _FULL_DECODE_STAGES
+
+
 def get_config(
     *,
     q: torch.Tensor,
@@ -965,23 +1149,13 @@ def get_config(
         base_ctas=q.shape[0] * k_cache.shape[2] * num_groups,
         num_pages=num_pages,
         sm_count=_GFX950_SM_COUNT,
+        max_splits=_FULL_DECODE_MAX_SPLITS,
     )
     if is_sliding:
         target_splits = 8 if q.shape[0] <= 4 else 4
         num_kv_splits = min(target_splits, num_pages)
         if num_kv_splits < 1:
             num_kv_splits = 1
-    elif (
-        q.shape[0] == 1
-        and q.shape[1] == 32
-        and k_cache.shape[2] == 4
-        and head_dim == 64
-        and num_pages >= 80
-    ):
-        # Muse TP4 has only eight base CTAs.  A long full-attention row needs
-        # more than the generic 32-split ceiling to fill gfx950; 80 splits is
-        # the measured minimum of the compute/final-reduce trade-off at 50K.
-        num_kv_splits = 80
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=k_cache.shape[2],
@@ -989,6 +1163,9 @@ def get_config(
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=num_kv_splits,
+        num_stages=_full_decode_stages(
+            num_kv_splits, page_size, head_dim, k_cache.element_size()
+        ),
         block_m=block_m,
         block_n=block_n,
         sm_scale=softmax_scale * _INV_LN2_VALUE,
@@ -1150,7 +1327,9 @@ def launch_gluon_mha_decode_gfx950(
             config.is_sliding,
             config.window_left,
             is_fp8,
+            config.num_stages,
             num_warps=1,
+            **sched_compile_options(),
         )
 
         # Sink is a single global softmax entry, so split-k must merge it once in
@@ -1160,7 +1339,6 @@ def launch_gluon_mha_decode_gfx950(
             mid_o,
             mid_lse,
             output,
-            cache_seqlens,
             sink_arg,
             k_cache,
             config.sm_scale,
