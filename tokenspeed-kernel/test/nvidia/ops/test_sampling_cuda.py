@@ -30,6 +30,11 @@ from tokenspeed_kernel.ops.sampling.cuda import (
     fused_topk_topp_workspace_size,
 )
 from tokenspeed_kernel.ops.sampling.flashinfer import softmax
+from tokenspeed_kernel.platform import current_platform
+
+pytestmark = pytest.mark.skipif(
+    not current_platform().is_nvidia, reason="CUDA sampling kernels require NVIDIA"
+)
 
 _TOP_K_DISABLED = 1 << 30
 
