@@ -51,7 +51,6 @@ from tokenspeed.runtime.models.deepseek_v3 import (
     _prepare_mla_kv_b_proj_weights,
 )
 from tokenspeed.runtime.utils import add_prefix
-from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
 def _nk(weight, widths, kl1=512):
@@ -338,6 +337,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         *,
         lora_norm_eps: float,
         independent_selection: bool,
+        native_prefill: bool,
         separate_mla_projections: bool,
     ) -> None:
         if not independent_selection:
@@ -418,9 +418,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         self._scales_prepared = False
         self._fused_decode_runtime = None
         self._prefill_weights = None
-        self._prefill_enabled = (
-            global_server_args_dict.get("disaggregation_mode") != "decode"
-        )
+        self.native_prefill = native_prefill
 
     def configure_fused_decode(self, runtime) -> None:
         """Attach prepared weights and communication state outside forward."""
@@ -441,7 +439,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
                 self.kv_b_proj.weight, self
             )
 
-        if self._prefill_enabled and self._prefill_weights is None:
+        if self.native_prefill and self._prefill_weights is None:
             group = self.mapping.attn.head_tp_group
             pg = (
                 process_group_manager.get_device_process_group(group)
@@ -625,6 +623,10 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
             ctx.forward_mode.is_extend_or_mixed()
             and ascend_dsa_prefill_backend(ctx.attn_backend).native_prefill_enabled
         ):
+            if not self.native_prefill:
+                raise RuntimeError(
+                    "Native DSA cache requires model opt-in before loading weights"
+                )
             return self._forward_prefill(positions, hidden_states, ctx)
         if hidden_states.shape[0] == 0:
             return hidden_states

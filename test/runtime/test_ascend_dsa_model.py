@@ -31,7 +31,7 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAAttention
 
 
-def make_attention(*, nope, separate, independent):
+def make_attention(*, nope, separate, independent, native_prefill=False):
     config = PretrainedConfig(
         rms_norm_eps=1e-6,
         mla_use_nope=nope,
@@ -58,6 +58,7 @@ def make_attention(*, nope, separate, independent):
         lora_norm_eps=1e-6,
         separate_mla_projections=separate,
         independent_selection=independent,
+        native_prefill=native_prefill,
     )
 
 
@@ -139,3 +140,41 @@ def test_failed_native_initialization_releases_its_window(monkeypatch):
         ascend.AscendDSARuntime([layer], Mapping(rank=0, world_size=8, attn_tp_size=8))
     assert window.storage is None
     assert layer._fused_decode_runtime is None
+
+
+@pytest.mark.parametrize("role", [None, "prefill", "decode"])
+@pytest.mark.parametrize("native_prefill", [False, True])
+def test_prefill_weight_preparation_follows_model_opt_in(
+    monkeypatch, role, native_prefill
+):
+    from tokenspeed.runtime.utils.env import global_server_args_dict
+
+    monkeypatch.setitem(global_server_args_dict, "disaggregation_mode", role)
+    attention = make_attention(
+        nope=True, separate=True, independent=True, native_prefill=native_prefill
+    )
+    with torch.no_grad():
+        for index, parameter in enumerate(attention.parameters()):
+            parameter.copy_(
+                torch.sin(torch.arange(parameter.numel()).float() + index).reshape(
+                    parameter.shape
+                )
+            )
+    attention.process_weights_after_loading()
+    if not native_prefill:
+        assert attention._prefill_weights is None
+    else:
+        weights = attention._prefill_weights
+        assert weights is not None
+        for actual, expected in zip(
+            weights,
+            (
+                attention.q_b_proj.weight,
+                attention.w_kc,
+                attention.w_vc,
+                attention.o_proj.weight,
+            ),
+        ):
+            torch.testing.assert_close(actual, expected)
+        attention.process_weights_after_loading()
+        assert attention._prefill_weights is weights

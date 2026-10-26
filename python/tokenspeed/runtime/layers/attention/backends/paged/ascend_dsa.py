@@ -1094,7 +1094,6 @@ class AscendDSABackend(DSABackend):
             or initial + window > self._indexer_spec.index_topk
         ):
             raise ValueError("Prefill init/local token counts must fit index_topk")
-        metadata = self.forward_prefill_metadata
         head_major_output = kwargs.pop("head_major_output", False)
         kernels, spec, dcp = self._indexer_kernels, self._indexer_spec, self._dcp
         placement = self.cache_placement(layer)
