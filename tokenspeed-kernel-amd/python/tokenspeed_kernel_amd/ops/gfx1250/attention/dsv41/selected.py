@@ -1386,12 +1386,18 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
     width = swa_slots.shape[1] + (global_slots.shape[1] if has_global else 0)
     if q.shape[0] == 0 or width == 0:
         return out.zero_()
+    # Scale copies are unmasked: invalid rows read page 0.
+    if swa_cache.shape[0] == 0 or (has_global and global_cache.shape[0] == 0):
+        raise ValueError("caches must have at least one page")
 
     scale = float(softmax_scale)
     if not math.isfinite(scale):
         raise ValueError("softmax_scale must be finite")
 
     q = q.contiguous()
+    # The zero-query check loads q as int32 words.
+    if q.data_ptr() % 4 != 0:
+        q = q.clone()
     sink = attn_sink.contiguous()
     swa_slots_i = swa_slots.to(torch.int32).contiguous()
     swa_lens_i = swa_lens.to(torch.int32).contiguous()
