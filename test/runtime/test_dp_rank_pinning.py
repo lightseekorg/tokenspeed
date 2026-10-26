@@ -165,33 +165,55 @@ class TestIngressValidation:
         processor.validate_request(obj)
         assert (obj.data_parallel_rank) == ([None, 3])
 
-    def test_disagg_room_authoritative_conflict_warns_and_drops(self, subtests):
-        for mode in ("prefill", "decode"):
-            with subtests.test(mode=mode):
-                processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
-                obj = GenerateReqInput(
-                    text="hello",
-                    sampling_params={},
-                    bootstrap_room=10,  # 10 % 8 == 2
-                    data_parallel_rank=5,
-                )
-                processor.validate_request(obj)
-                assert (obj.data_parallel_rank) is None
-                processor.engine.logger.warning.assert_called_once()
+    def test_prefill_room_authoritative_conflict_warns_and_drops(self):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode="prefill")
+        obj = GenerateReqInput(
+            text="hello",
+            sampling_params={},
+            bootstrap_room=10,  # 10 % 8 == 2
+            data_parallel_rank=5,
+        )
+        processor.validate_request(obj)
+        assert (obj.data_parallel_rank) is None
+        processor.engine.logger.warning.assert_called_once()
 
-    def test_disagg_consistent_pin_dropped_without_warning(self, subtests):
-        for mode in ("prefill", "decode"):
-            with subtests.test(mode=mode):
-                processor = _make_input_processor(dp_size=8, disaggregation_mode=mode)
-                obj = GenerateReqInput(
-                    text="hello",
-                    sampling_params={},
-                    bootstrap_room=10,
-                    data_parallel_rank=2,  # == 10 % 8, consistent
-                )
-                processor.validate_request(obj)
-                assert (obj.data_parallel_rank) is None
-                processor.engine.logger.warning.assert_not_called()
+    def test_prefill_consistent_pin_dropped_without_warning(self):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode="prefill")
+        obj = GenerateReqInput(
+            text="hello",
+            sampling_params={},
+            bootstrap_room=10,
+            data_parallel_rank=2,  # == 10 % 8, consistent
+        )
+        processor.validate_request(obj)
+        assert (obj.data_parallel_rank) is None
+        processor.engine.logger.warning.assert_not_called()
+
+    def test_decode_pin_kept_over_the_room_residue(self):
+        # Any decode rank finds the prefill rank from the room, so the pin
+        # places the request even where it differs from the residue.
+        processor = _make_input_processor(dp_size=8, disaggregation_mode="decode")
+        obj = GenerateReqInput(
+            text="hello",
+            sampling_params={},
+            bootstrap_room=10,  # 10 % 8 == 2
+            data_parallel_rank=5,
+        )
+        processor.validate_request(obj)
+        assert (obj.data_parallel_rank) == (5)
+        processor.engine.logger.warning.assert_not_called()
+
+    def test_decode_out_of_range_pin_warns_and_drops_never_raises(self):
+        processor = _make_input_processor(dp_size=8, disaggregation_mode="decode")
+        obj = GenerateReqInput(
+            text=["a", "b"],
+            sampling_params=[{}, {}],
+            bootstrap_room=[10, 11],
+            data_parallel_rank=[3, 8],
+        )
+        processor.validate_request(obj)
+        assert (obj.data_parallel_rank) == ([3, None])
+        processor.engine.logger.warning.assert_called_once()
 
     def test_disagg_non_int_room_warns_and_drops_never_raises(self):
         # A pinning gateway with a room-format bug must not turn into

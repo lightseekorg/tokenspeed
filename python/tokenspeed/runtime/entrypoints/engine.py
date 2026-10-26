@@ -684,7 +684,8 @@ def _frontend_addresses(server_args: ServerArgs) -> tuple[str, int]:
 def _frontend_routing(server_args: ServerArgs) -> str:
     """How the frontend places requests on the attention-DP ranks
     (``--load-balance-method``); the disaggregated roles place by bootstrap
-    room, the rule both roles apply."""
+    room, the rule both roles apply, except a decode request with a
+    ``data_parallel_rank`` pin."""
     if server_args.disaggregation_mode != "null" and server_args.mapping.attn.has_dp:
         return "bootstrap_room"
     return {
