@@ -199,6 +199,49 @@ def _check_replays(
             compare_outputs(actual, expected)
 
 
+@pytest.mark.skipif(
+    not current_platform().is_blackwell, reason="CuTe QSA requires Blackwell"
+)
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("uniform", [False, True])
+@pytest.mark.parametrize("pages", [9, 64, 129])
+def test_cute_grouped_topk_waits_for_query_and_ownership(
+    enabled, uniform, pages, restore_pdl
+):
+    """Grouping and scoring must wait for an early-releasing input producer."""
+    torch.manual_seed(337)
+    lengths = [65, 65] if uniform else [64, 66]
+    rows = sum(lengths)
+    capacity = pages * 64
+    query = torch.randn(rows, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn((pages + 1) * 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    table = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32).repeat(2, 1)
+    requests = torch.arange(2, device="cuda", dtype=torch.int64).repeat_interleave(
+        torch.tensor(lengths, device="cuda")
+    )
+    complete = torch.linspace(0, capacity, rows, device="cuda").to(torch.int32)
+    sources = query, cache, table, requests, complete
+    targets = tuple(torch.empty_like(source) for source in sources)
+
+    def forward(enable_pdl):
+        _publish(sources, targets)
+        selected = qwen4_exp_qsa_block_topk(
+            *targets,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=lengths[0] if uniform else None,
+            max_partial_bytes=0,
+            max_logits_bytes=256 << 20,
+            path="stream",
+            enable_pdl=enable_pdl,
+            solution="cute_dsl",
+            override=None,
+        )
+        return (selected,)
+
+    _check_replays(forward, sources, targets, enabled, unordered_outputs=True)
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("queries_per_request", [1, 3, 4])
 @pytest.mark.parametrize(

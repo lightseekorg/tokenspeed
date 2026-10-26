@@ -58,7 +58,12 @@ from tokenspeed_kernel.ops.attention.rmha import (
     rel_mha_plan,
     rel_mha_prefill,
 )
-from tokenspeed_kernel.ops.conv import seq_idx_from_cu_seqlens
+from tokenspeed_kernel.ops.conv import (
+    InklingCommitTable,
+    inkling_commit_tables,
+    inkling_ring_commit,
+    seq_idx_from_cu_seqlens,
+)
 
 from tokenspeed.runtime.configs.inkling_config import inkling_conv_total_dim
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
@@ -284,6 +289,9 @@ class InklingAttnBackend(AttentionBackend):
         self._checkpoint_streams: dict[
             tuple[int, int, int, str], tuple[torch.Tensor, ...]
         ] = {}
+        # The streams' device tables for the post-verify commit, rebuilt after a registration.
+        self._commit_tables: list[InklingCommitTable] | None = None
+        self._commit_groups: tuple[str, ...] = ()
 
     @property
     def _inner_max_context_len(self) -> int:
@@ -346,6 +354,7 @@ class InklingAttnBackend(AttentionBackend):
         super()._publish_cache_pool(cache_pool)
         # The recorded checkpoint streams are views into the old pool.
         self._checkpoint_streams.clear()
+        self._commit_tables = None
         self.conv_prefill_metadata = None
         self.conv_decode_metadata = None
         self._reset_graph_state()
@@ -472,54 +481,41 @@ class InklingAttnBackend(AttentionBackend):
         A verify round's kernel writes all K speculative rows into the ring
         but publishes nothing: the window ending at the committed frontier
         (``seq_lens - K + accepted``) is known only now, and the live slot
-        must hold exactly the state at the request's computed frontier.
+        must hold exactly the state at the request's computed frontier. One
+        launch covers every layer's streams (one per checkpoint dtype).
         """
         del accepted_path
         metadata = self.conv_decode_metadata
         if num_extends > 0 or metadata is None or metadata.col_block_table is None:
             return
-        if self.conv_spec_num_tokens == 1:
+        if self.conv_spec_num_tokens == 1 or not self._checkpoint_streams:
             return
+        if self._commit_tables is None:
+            groups = tuple(dict.fromkeys(key[3] for key in self._checkpoint_streams))
+            self._commit_tables = inkling_commit_tables(
+                self.conv_pool.conv_state,
+                [
+                    (key[0], key[1], groups.index(key[3]), buffers)
+                    for key, buffers in self._checkpoint_streams.items()
+                ],
+            )
+            self._commit_groups = groups
         bs = accepted_lengths.shape[0]
-        steps = (
-            accepted_lengths[:bs].to(torch.int64).clamp(1, self.conv_spec_num_tokens)
-        )
-        frontier = metadata.seq_lens[:bs].to(torch.int64) - self.conv_spec_num_tokens
-        frontier = frontier + steps
-        slots = metadata.cache_indices[:bs].to(torch.int64)
-        valid_slot = slots >= 0
-        for (
-            layer_id,
-            channel_offset,
-            dim,
-            group_id,
-        ), buffers in self._checkpoint_streams.items():
-            table = metadata.col_block_table[group_id][:bs]
-            pages = table[:, STATE_LIVE_SLOT].to(torch.int64)
-            valid = valid_slot & (pages > 0)
-            state = self.conv_pool.layer_state_wd(layer_id)[
-                :, :, channel_offset : channel_offset + dim
+        live_pages = torch.stack(
+            [
+                metadata.col_block_table[group_id][:bs, STATE_LIVE_SLOT]
+                for group_id in self._commit_groups
             ]
-            state_rows = int(buffers[0].shape[1])
-            absolute_rows = (
-                frontier.view(bs, 1)
-                - state_rows
-                + torch.arange(state_rows, device=state.device).view(1, state_rows)
-            )
-            rows = absolute_rows.remainder(state.shape[1])
-            window = state[slots.clamp_min(0).view(bs, 1), rows]
-            window = torch.where(
-                (absolute_rows >= 0).unsqueeze(-1), window, torch.zeros_like(window)
-            )
-            widths = tuple(int(buffer.shape[-1]) for buffer in buffers)
-            safe_pages = pages.clamp_min(0)
-            for buffer, values in zip(
-                buffers, window.split(widths, dim=-1), strict=True
-            ):
-                current = buffer[safe_pages]
-                buffer[safe_pages] = torch.where(
-                    valid.view(bs, 1, 1), values.to(buffer.dtype), current
-                )
+        )
+        inkling_ring_commit(
+            self.conv_pool.conv_state,
+            self._commit_tables,
+            live_pages,
+            metadata.cache_indices[:bs],
+            metadata.seq_lens[:bs],
+            accepted_lengths,
+            verify_width=self.conv_spec_num_tokens,
+        )
 
     # ------------------------------------------------------------------
     # Conv metadata
@@ -726,6 +722,14 @@ class InklingAttnBackend(AttentionBackend):
     ) -> None:
         """Record one fixed checkpoint view for post-verify publication."""
         key = (layer_id, channel_offset, dim, group_id)
+        total = sum(buffer.shape[-1] for buffer in buffers)
+        if total != dim:
+            raise ValueError(
+                f"ShortConv checkpoint stream {key!r} fields cover {total} "
+                f"channels, expected {dim}"
+            )
+        if key not in self._checkpoint_streams:
+            self._commit_tables = None
         existing = self._checkpoint_streams.setdefault(key, buffers)
         if len(existing) != len(buffers) or any(
             lhs.data_ptr() != rhs.data_ptr()

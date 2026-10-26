@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from cutlass import cute
@@ -63,7 +64,7 @@ class StreamConfig:
     compact_ids: bool
     linear_bins: bool
     partition_width: int
-    has_tail: bool
+    group_layout: Literal["aligned", "uniform", "ragged"]
 
 
 def _workspace_bytes(rows: int, config: StreamConfig) -> int:
@@ -81,8 +82,8 @@ def _workspace_bytes(rows: int, config: StreamConfig) -> int:
 def _configuration(
     rows: int, capacity: int, queries_per_request: int | None, max_partial_bytes: int
 ) -> StreamConfig | None:
-    # Only request alignment specializes the grouped kernels, not each width.
-    # Geometry and power-of-two capacity buckets retain bounded JIT variants.
+    # Request widths only establish ownership. Geometry and power-of-two
+    # capacity buckets specialize the JIT; live lengths and row counts do not.
     if rows < 1 or not 0 < capacity <= 131072:
         return None
     grouped = (
@@ -90,11 +91,15 @@ def _configuration(
         and queries_per_request >= 8
         and rows % queries_per_request == 0
     )
-    has_tail = grouped and queries_per_request % _QUERY_GROUP != 0
+    group_layout = (
+        "aligned"
+        if grouped and queries_per_request % _QUERY_GROUP == 0
+        else "uniform" if queries_per_request else "ragged"
+    )
     if rows <= 128:
         if grouped and capacity > 8192:
             splits = 1 << (((capacity + 4095) // 4096) - 1).bit_length()
-            config = StreamConfig("split", splits, 0, False, False, 64, has_tail)
+            config = StreamConfig("split", splits, 0, False, False, 64, group_layout)
         else:
             splits = 1 << (((capacity + 63) // 64) - 1).bit_length()
             keep = 0
@@ -112,19 +117,23 @@ def _configuration(
                 keep = 8
                 compact_ids = True
             config = StreamConfig(
-                "small", splits, keep, compact_ids, linear_bins, partition_width, False
+                "small",
+                splits,
+                keep,
+                compact_ids,
+                linear_bins,
+                partition_width,
+                "aligned",  # Unused by the independent-row small-grid kernels.
             )
         if _workspace_bytes(rows, config) <= max_partial_bytes:
             return config
-    if not grouped:
-        return None
     if capacity <= 2048:
         algorithm = "prefill"
     elif capacity <= 4096:
         algorithm = "dense"
     else:
         algorithm = "overlap"
-    return StreamConfig(algorithm, 1, 0, False, False, 64, has_tail)
+    return StreamConfig(algorithm, 1, 0, False, False, 64, group_layout)
 
 
 def _meta(tensor: torch.Tensor, leading_dim: int) -> cute.Tensor:
@@ -193,15 +202,15 @@ def _compile(
         )
         return score, merge
     if config.algorithm == "split":
-        op = SplitPrefillTopK(enable_pdl, config.splits, config.has_tail)
+        op = SplitPrefillTopK(enable_pdl, config.splits, config.group_layout)
         target = scratch[0]
     else:
         if config.algorithm == "prefill":
-            op = PrefillTopK(enable_pdl, config.has_tail)
+            op = PrefillTopK(enable_pdl, config.group_layout)
         elif config.algorithm == "dense":
-            op = DensePrefillTopK(enable_pdl, 1, config.has_tail)
+            op = DensePrefillTopK(enable_pdl, 1, config.group_layout)
         else:
-            op = OverlapPrefillTopK(enable_pdl, config.has_tail)
+            op = OverlapPrefillTopK(enable_pdl, config.group_layout)
         target = selected
     score = cute.compile(
         op,
@@ -213,7 +222,7 @@ def _compile(
         _meta(target, 1),
         int(query.stride(0)),
         int(query.stride(1)),
-        int(queries_per_request),
+        int(queries_per_request or 0),
         64,
         stream,
         options=options,
@@ -322,8 +331,7 @@ def kernel(
         page_size: Compressed blocks per page; must be 64.
         block_topk: Selected blocks per row; must be 512.
         queries_per_request: Uniform consecutive query-run width, or ``None``
-            for ragged rows. Grouped runs require at least eight rows; their
-            final partial group is masked within each request.
+            for ragged rows. Groups stop at request boundaries and mask tails.
         max_partial_bytes: Budget for global scratch, excluding the output.
             Grouped streaming needs none; split scoring respects this budget.
         enable_pdl: Explicit programmatic dependent launch ordering.
@@ -446,7 +454,7 @@ def kernel(
         *target,
         int(query.stride(0)),
         int(query.stride(1)),
-        *(() if config.algorithm == "small" else (int(queries_per_request),)),
+        *([] if config.algorithm == "small" else [int(queries_per_request or 0)]),
     )
     if len(compiled) > 1:
         compiled[1](*scratch, complete_blocks, selected, int(capacity))

@@ -1858,7 +1858,7 @@ def triton_mhc_mixes(residual, weight, scale, base, rms_eps, hc_eps, sinkhorn_it
     )
 
 
-@triton.jit(do_not_specialize=["X0", "X1"], do_not_specialize_on_alignment=["X0", "X1"])
+@triton.jit(do_not_specialize=["X0", "X1"])
 def _mhc_init_kernel(
     X, Y, PRE, X0, X1, H: tl.constexpr, HC: tl.constexpr, B: tl.constexpr
 ):

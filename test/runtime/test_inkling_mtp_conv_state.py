@@ -77,6 +77,7 @@ class TestInklingCacheContract:
             backend._consume_remote_restore_mask(torch.tensor([2]), out=one).item()
         )
 
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
     def test_committed_window_round_trip_through_the_live_slot(self):
         """A verify round's commit publishes the window at the accepted
         frontier from the ring into the live slot; a remote restore reads the
@@ -94,13 +95,13 @@ class TestInklingCacheContract:
             conv_dim=2,
             ring_size=ring_size,
             dtype=torch.float32,
-            device="cpu",
+            device="cuda",
         )
         backend = InklingAttnBackend.__new__(InklingAttnBackend)
         backend.conv_pool = pool
         backend.conv_spec_num_tokens = k
         backend._checkpoint_streams = {}
-        checkpoints = torch.zeros(8, 3, 2)
+        checkpoints = torch.zeros(8, 3, 2, device="cuda")
         backend.register_shortconv_checkpoint_stream(
             layer_id=0,
             channel_offset=0,
@@ -113,39 +114,49 @@ class TestInklingCacheContract:
         # the live slot is block 5, the input slot was released.
         for position in range(125, 132):
             state[1, position % ring_size] = torch.tensor(
-                [float(position), float(-position)]
+                [float(position), float(-position)], device="cuda"
             )
         backend.conv_decode_metadata = InklingConvMetadata(
-            query_start_loc=torch.tensor([0, k], dtype=torch.int32),
-            cache_indices=torch.tensor([1], dtype=torch.int32),
-            has_initial_state=torch.ones(1, dtype=torch.bool),
-            seq_lens=torch.tensor([132], dtype=torch.int32),
-            col_block_table={"state": torch.tensor([[0, 5]], dtype=torch.int32)},
+            query_start_loc=torch.tensor([0, k], dtype=torch.int32, device="cuda"),
+            cache_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(1, dtype=torch.bool, device="cuda"),
+            seq_lens=torch.tensor([132], dtype=torch.int32, device="cuda"),
+            col_block_table={
+                "state": torch.tensor([[0, 5]], dtype=torch.int32, device="cuda")
+            },
             num_extends=0,
         )
 
         # Two of the four candidates were accepted: the frontier is 130.
         backend.commit_state_after_acceptance(
-            torch.tensor([2], dtype=torch.int32), num_extends=0, accepted_path=None
+            torch.tensor([2], dtype=torch.int32, device="cuda"),
+            num_extends=0,
+            accepted_path=None,
         )
-        expected = torch.tensor([[127.0, -127.0], [128.0, -128.0], [129.0, -129.0]])
+        expected = torch.tensor(
+            [[127.0, -127.0], [128.0, -128.0], [129.0, -129.0]], device="cuda"
+        )
         assert torch.equal(checkpoints[5], expected)
-        assert torch.equal(checkpoints[:5], torch.zeros(5, 3, 2))
+        assert torch.equal(checkpoints[:5], torch.zeros(5, 3, 2, device="cuda"))
 
         # An extend round commits nothing: its chunk end is the frontier.
         backend.commit_state_after_acceptance(
-            torch.tensor([4], dtype=torch.int32), num_extends=1, accepted_path=None
+            torch.tensor([4], dtype=torch.int32, device="cuda"),
+            num_extends=1,
+            accepted_path=None,
         )
         assert torch.equal(checkpoints[5], expected)
 
         state[1].zero_()
         restore_md = InklingConvMetadata(
-            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
-            cache_indices=torch.tensor([1], dtype=torch.int32),
-            has_initial_state=torch.ones(1, dtype=torch.bool),
-            seq_lens=torch.tensor([131], dtype=torch.int32),
-            col_block_table={"state": torch.tensor([[0, 5]], dtype=torch.int32)},
-            remote_restore_mask=torch.tensor([True]),
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            cache_indices=torch.tensor([1], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(1, dtype=torch.bool, device="cuda"),
+            seq_lens=torch.tensor([131], dtype=torch.int32, device="cuda"),
+            col_block_table={
+                "state": torch.tensor([[0, 5]], dtype=torch.int32, device="cuda")
+            },
+            remote_restore_mask=torch.tensor([True], device="cuda"),
         )
         backend.restore_shortconv_endpoint(state, (checkpoints,), restore_md, "state")
         actual = torch.stack(
@@ -163,6 +174,93 @@ class TestInklingCacheContract:
             [state[1, position % ring_size] for position in range(127, 130)]
         )
         assert torch.equal(actual, expected + 1)
+
+    @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs CUDA"))
+    def test_commit_publishes_every_registered_stream(self):
+        """One commit publishes every layer's streams across groups, a stream's
+        fields splitting its channels; a stream registered after a commit
+        joins the next one."""
+        from tokenspeed.runtime.layers.attention.backends.specific.inkling import (
+            InklingAttnBackend,
+            InklingConvMetadata,
+            InklingConvStatePool,
+        )
+
+        ring_size, k = 7, 4
+        pool = InklingConvStatePool(
+            num_layers=2,
+            num_slots=4,
+            conv_dim=6,
+            ring_size=ring_size,
+            dtype=torch.float32,
+            device="cuda",
+        )
+        torch.manual_seed(3)
+        pool.conv_state.copy_(torch.randn_like(pool.conv_state))
+        backend = InklingAttnBackend.__new__(InklingAttnBackend)
+        backend.conv_pool = pool
+        backend.conv_spec_num_tokens = k
+        backend._checkpoint_streams = {}
+        k_field = torch.zeros(8, 3, 2, device="cuda")
+        v_field = torch.zeros(8, 3, 2, device="cuda")
+        hidden = torch.zeros(8, 2, 3, 2, device="cuda")
+
+        def register_hidden(layer):
+            backend.register_shortconv_checkpoint_stream(
+                layer_id=layer,
+                channel_offset=4,
+                dim=2,
+                group_id="hidden",
+                buffers=(hidden[:, layer],),
+            )
+
+        backend.register_shortconv_checkpoint_stream(
+            layer_id=0,
+            channel_offset=0,
+            dim=4,
+            group_id="kv",
+            buffers=(k_field, v_field),
+        )
+        register_hidden(0)
+        backend.conv_decode_metadata = InklingConvMetadata(
+            query_start_loc=torch.tensor([0, k], dtype=torch.int32, device="cuda"),
+            cache_indices=torch.tensor([2], dtype=torch.int32, device="cuda"),
+            has_initial_state=torch.ones(1, dtype=torch.bool, device="cuda"),
+            seq_lens=torch.tensor([130], dtype=torch.int32, device="cuda"),
+            col_block_table={
+                "kv": torch.tensor([[0, 5]], dtype=torch.int32, device="cuda"),
+                "hidden": torch.tensor([[0, 6]], dtype=torch.int32, device="cuda"),
+            },
+            num_extends=0,
+        )
+
+        def window(layer, lo, hi, frontier):
+            return torch.stack(
+                [
+                    pool.conv_state[layer, 2, position % ring_size, lo:hi]
+                    for position in range(frontier - 3, frontier)
+                ]
+            )
+
+        def commit(accepted):
+            backend.commit_state_after_acceptance(
+                torch.tensor([accepted], dtype=torch.int32, device="cuda"),
+                num_extends=0,
+                accepted_path=None,
+            )
+
+        commit(3)  # frontier 130 - 4 + 3
+        assert torch.equal(k_field[5], window(0, 0, 2, 129))
+        assert torch.equal(v_field[5], window(0, 2, 4, 129))
+        assert torch.equal(hidden[6, 0], window(0, 4, 6, 129))
+        assert not hidden[6, 1].any()
+
+        register_hidden(1)
+        commit(1)
+        assert torch.equal(hidden[6, 0], window(0, 4, 6, 127))
+        assert torch.equal(hidden[6, 1], window(1, 4, 6, 127))
+        assert torch.equal(k_field[5], window(0, 0, 2, 127))
+        assert not k_field[:5].any() and not hidden[:6].any()
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("needs a CUDA device"))
@@ -226,6 +324,16 @@ class TestInklingConvRingState:
                 dim=self.DIM,
                 group_id="state",
                 buffers=(buf.clone(),),
+            )
+        with pytest.raises(
+            ValueError, match=f"cover {self.DIM + 1} channels, expected {self.DIM}"
+        ):
+            backend.register_shortconv_checkpoint_stream(
+                layer_id=1,
+                channel_offset=0,
+                dim=self.DIM,
+                group_id="state",
+                buffers=(buf, buf[..., :1]),
             )
 
     def test_ring_holds_window_for_every_accept(self):

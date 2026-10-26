@@ -524,8 +524,12 @@ def test_device_replays_recorded_tree_rounds(
     assert got == _RECORDED[name, batch_size]
 
 
+@pytest.mark.parametrize("sampled", [False, True])
 @pytest.mark.parametrize("batch_size", sorted(_CHAIN_RECORDED))
-def test_device_replays_recorded_chain_rounds(tmp_path, batch_size: int) -> None:
+def test_device_replays_recorded_chain_rounds(
+    tmp_path, batch_size: int, sampled: bool
+) -> None:
+    """Recorded chain rounds; sampled (all but each fourth), a round stops at the plan its rule set."""
     _write_cost_dir(
         str(tmp_path), (1, 2, 4, 8), _CHAIN_LLM_WIDTHS, [0], bs_slope=0.3, cliff=0.08
     )
@@ -537,20 +541,35 @@ def test_device_replays_recorded_chain_rounds(tmp_path, batch_size: int) -> None
         intensity="chain_intensity",
     )
     device = _DeviceDrafter(chain, batch_size)
-    got = []
+    got, want = [], []
+    last = _CHAIN_DEPTH - 1
+    plan = last
     for i, (cache_len, deltas) in enumerate(_chain_rounds(batch_size, 24)):
         if i == 3:
             device.capture()
         top = torch.zeros((batch_size, 16))
+        sampled_round = sampled and i % 4 != 3
         device.load(
-            _Round(batch_size, cache_len * batch_size, False, torch.tensor(deltas), top)
+            _Round(
+                batch_size,
+                cache_len * batch_size,
+                sampled_round,
+                torch.tensor(deltas),
+                top,
+            )
         )
         device.step()
         o = device.outcome()
         assert o.verify_count == o.verify_num == o.last_depth + 2
         _assert_round(chain, o)
         got.append(o.last_depth)
-    assert got == _CHAIN_RECORDED[batch_size]
+        stop = _CHAIN_RECORDED[batch_size][i]
+        if sampled_round:
+            want.append(plan)
+            plan = stop if stop <= plan else min(plan + 2, last)
+        else:
+            want.append(stop)
+    assert got == want
 
 
 # Widths 4 from 4 requests, 2 from 8, 3 from 300 and the full 16 from 400.
@@ -626,7 +645,8 @@ def test_chain_width_table_rounds(tmp_path, protocol: str) -> None:
     no decision (eager: every decision launched; graph: the round captured
     once at 512 rows; poll: the drafter's protocol), whatever its work deltas;
     a round below the table decides as without one, bit for bit, on the
-    1..512 batch tables."""
+    1..512 batch tables. Two rounds in three are sampled: a table round leaves
+    the sampled plan to the rule's rounds."""
     rule = _DeviceDrafter(_chain_policy(tmp_path, ()), 512)
     device = _DeviceDrafter(_chain_policy(tmp_path, _CHAIN_TABLE), 512)
     rng = random.Random(protocol)
@@ -636,7 +656,10 @@ def test_chain_width_table_rounds(tmp_path, protocol: str) -> None:
     seen = set()
     for i, (cache_len, deltas) in enumerate(_chain_rounds(7, 60)):
         bs = rng.choice(sizes)
-        r = _Round(bs, cache_len * bs, False, torch.tensor(deltas), torch.zeros(1, 16))
+        sampled = i % 3 != 2
+        r = _Round(
+            bs, cache_len * bs, sampled, torch.tensor(deltas), torch.zeros(1, 16)
+        )
         if widths[bs] is None:
             rule.load(r)
             rule.step()

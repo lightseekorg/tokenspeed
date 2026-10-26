@@ -137,6 +137,7 @@ from tokenspeed.runtime.utils.jit_compile_check import (
     mark_jit_compile_serving,
 )
 from tokenspeed.runtime.utils.network import get_ip, join_host_port
+from tokenspeed.runtime.utils.process import set_parent_death_signal
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.startup_timing import startup_phase
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -230,6 +231,10 @@ class HostProcess:
         if self.is_alive():
             self._popen.terminate()
 
+    def kill(self) -> None:
+        if self.is_alive():
+            self._popen.kill()
+
 
 def start_rust_host(
     binary: str,
@@ -237,6 +242,7 @@ def start_rust_host(
     port_args: PortArgs,
     start_context: AbstractContextManager,
     metrics_relay_endpoint: str | None,
+    parent_death_signal: bool,
 ) -> tuple[HostProcess, Connection]:
     """Start ``binary`` for the rank ``server_args.mapping.rank`` names; the
     caller has checked ``rust_host_refusals``.
@@ -255,12 +261,19 @@ def start_rust_host(
         metrics_relay_endpoint: The node's metrics relay
             (``metrics/relay.py``), which runs the output plugins; None
             when no plugin is selected.
+        parent_death_signal: Kill the host with SIGKILL when this process
+            dies, even when it is SIGKILLed (Linux only; see
+            ``utils.process.set_parent_death_signal``). For a node that is
+            the only owner of its ranks.
 
     Returns:
         The process and the launcher's end of the pipe.
     """
     parent, child = Pipe(duplex=True)
     sentinel, held_until_exit = os.pipe()
+    preexec_fn = None
+    if parent_death_signal:
+        preexec_fn = functools.partial(set_parent_death_signal, os.getpid())
     with start_context:
         popen = subprocess.Popen(
             [
@@ -276,6 +289,7 @@ def start_rust_host(
             ],
             executable=binary,
             pass_fds=[child.fileno(), held_until_exit],
+            preexec_fn=preexec_fn,
         )
     child.close()
     os.close(held_until_exit)

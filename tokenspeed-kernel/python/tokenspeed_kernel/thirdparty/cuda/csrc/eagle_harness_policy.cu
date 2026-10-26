@@ -212,7 +212,7 @@ struct Round {
     return {false, 0, false};
   }
 
-  // Stops the round after depth d, setting verify count and flat flag; a chain verifies all ranked.
+  // Stops the round after depth d: verify count, flat flag (a chain verifies all ranked), sampled plan.
   __device__ void finish(int decided_width) {
     s[kLastDepth] = depth;
     s[kStopWidth] = decided_width;
@@ -228,6 +228,11 @@ struct Round {
           min(static_cast<int64_t>(min(verify_num, s[kCumuCount])),
               max(past * 2, static_cast<int64_t>(min_verify_count))));
       s[kFlat] = s[kTiny];
+    }
+    if (s[kSampled]) {
+      // The next sampled round's plan: the first depth whose rule said stop, else two deeper.
+      s[kSampledNext] = s[kSampledSeen] >= 0 ? s[kSampledSeen]
+                                             : min(s[kSampledPlan] + 2, tree_depth - 1);
     }
   }
 
@@ -705,7 +710,7 @@ __device__ void rank_scores(RankShared& rank, int rows, int cols, bool flat) {
   __syncthreads();
 }
 
-// Verify width and history, the sampled plan, and this round's ranked scores for the next round.
+// Verify width and history, and this round's ranked scores for the next round.
 __device__ int find_majority(const int32_t* nums, int n) {
   for (int i = 0; i < n; ++i) {
     int count = 0;
@@ -846,7 +851,7 @@ __global__ void __launch_bounds__(kRankThreads)
     select_verify_kernel(int32_t* state, int32_t* recent, int recent_len, int32_t* hist,
                          int hist_len, float* published, int64_t published_capacity,
                          const float* top, int64_t top_stride, VerifyTables tables,
-                         int tree_depth, int exec_mode) {
+                         int exec_mode) {
   __shared__ int32_t s[kNumState];
   __shared__ int32_t recent_sh[kMaxHistory];
   __shared__ int32_t hist_row[kMaxHistory];
@@ -932,11 +937,6 @@ __global__ void __launch_bounds__(kRankThreads)
   if (tid == 0) {
     s[kVerifyNum] = width;
     // The history shifts in the write-back below.
-    if (s[kSampled]) {
-      // The next sampled round's planned stop depth.
-      s[kSampledNext] = s[kSampledSeen] >= 0 ? s[kSampledSeen]
-                                             : min(s[kSampledPlan] + 2, tree_depth - 1);
-    }
     s[kRankedCount] = own_count;
   }
   __syncthreads();
@@ -1054,7 +1054,7 @@ void eagle_harness_policy_select_verify(TensorView state, TensorView recent, Ten
       static_cast<int>(recent.size(0)), static_cast<int32_t*>(hist.data_ptr()),
       static_cast<int>(hist.size(1)), static_cast<float*>(published.data_ptr()),
       published.size(0), static_cast<const float*>(top_scores.data_ptr()),
-      top_scores.stride(0), tables, static_cast<int>(tree_depth), static_cast<int>(exec_mode));
+      top_scores.stride(0), tables, static_cast<int>(exec_mode));
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(eagle_harness_policy_begin_round, eagle_harness_policy_begin_round);

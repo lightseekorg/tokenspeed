@@ -234,9 +234,11 @@ def test_bf16_moe_routes_beyond_int32_expert_stride(device: str) -> None:
         [[experts, experts], [0, experts + 1]], device=device, dtype=torch.int32
     )
 
-    routes = bf16_moe_routes(x.contiguous(), w13, w2, ids, 1)
+    routes = bf16_moe_routes(x.contiguous(), w13, w2, ids, 1, batch_invariant=False)
 
-    assert torch.equal(routes, bf16_moe_routes(x.contiguous(), w13, w2, ids, 1))
+    assert torch.equal(
+        routes, bf16_moe_routes(x.contiguous(), w13, w2, ids, 1, batch_invariant=False)
+    )
     assert not torch.isnan(routes.float()).any()
     assert not routes[1].any()
     top = experts - 1
@@ -285,9 +287,9 @@ def test_portable_kernels_capture_and_replay_with_fresh_inputs(device: str) -> N
             None,
             1,
         )
-        routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1)
+        routes = bf16_moe_routes(pre, w13, w2, topk_ids, 1, batch_invariant=False)
         combined = routed_input_scale_rmsnorm_sum(
-            routes, route_weights, norm_weight, 1e-8, 1.0, False
+            routes, route_weights, norm_weight, 1e-8, 1.0, False, None
         )
         return k_norm, stream, pre_fp32, combined
 
@@ -409,6 +411,74 @@ def test_gathered_routes_replay_and_vary_token_count(device: str) -> None:
 
 
 @pytest.mark.parametrize("device", ["cuda"])
+def test_bf16_moe_routes_write_a_supplied_destination(device: str) -> None:
+    """A caller-owned destination holds the same routes, zeroing stale and remote rows."""
+    experts, width, inter, tokens, topk = 4, 256, 128, 5, 2
+    torch.manual_seed(3)
+    w13 = (torch.randn(experts, 2 * inter, width, device=device) * 0.05).bfloat16()
+    w2 = (torch.randn(experts, width, inter, device=device) * 0.05).bfloat16()
+    x = (torch.randn(tokens, width, device=device) * 0.5).bfloat16()
+    # Expert 5 is outside this rank's [1, 5) shard, so its route stays zero.
+    ids = torch.tensor(
+        [[1, 2], [3, 4], [5, 1], [2, 2], [4, 3]], device=device, dtype=torch.int32
+    )
+    expected = bf16_moe_routes(x, w13, w2, ids, 1, batch_invariant=False)
+
+    storage = torch.full(
+        (tokens * topk + 2, width), 7.0, device=device, dtype=torch.bfloat16
+    )
+    destination = storage[1:-1]
+    actual = bf16_moe_routes(
+        x, w13, w2, ids, 1, output=destination, batch_invariant=False
+    )
+
+    assert actual.data_ptr() == destination.data_ptr()
+    assert actual.shape == (tokens, topk, width)
+    assert torch.equal(actual, expected)
+    assert not actual[2, 0].any()
+    assert torch.equal(storage[[0, -1]], torch.full_like(storage[[0, -1]], 7.0))
+    with pytest.raises(ValueError, match="overlap"):
+        bf16_moe_routes(
+            x,
+            w13,
+            w2,
+            ids,
+            1,
+            output=w2.view(-1)[: tokens * topk * width].view(tokens * topk, width),
+            batch_invariant=False,
+        )
+
+
+@pytest.mark.parametrize("device", ["cuda"])
+def test_routed_sum_writes_a_supplied_output(device: str) -> None:
+    """The route sum stored into caller-owned storage equals the allocated result."""
+    torch.manual_seed(4)
+    tokens, topk, width = 3, 8, 4096
+    routes = (torch.randn(tokens, topk, width, device=device) * 0.5).bfloat16()
+    route_weights = torch.rand(tokens, topk, device=device).softmax(-1)
+    norm_weight = torch.randn(width, device=device, dtype=torch.bfloat16) * 0.1
+    expected = routed_input_scale_rmsnorm_sum(
+        routes, route_weights, norm_weight, 1e-8, 1.0, False, None
+    )
+    output = torch.full_like(expected, float("nan"))
+    actual = routed_input_scale_rmsnorm_sum(
+        routes, route_weights, norm_weight, 1e-8, 1.0, False, output
+    )
+    assert actual is output
+    assert torch.equal(actual, expected)
+    with pytest.raises(ValueError, match="overlap"):
+        routed_input_scale_rmsnorm_sum(
+            routes,
+            route_weights,
+            norm_weight,
+            1e-8,
+            1.0,
+            False,
+            routes.view(-1)[: tokens * width].view(tokens, width),
+        )
+
+
+@pytest.mark.parametrize("device", ["cuda"])
 def test_gathered_route_reduction_matches_materialized_routes(device: str) -> None:
     """Reading routes through the permute map must equal gathering them first."""
     torch.manual_seed(5)
@@ -429,7 +499,7 @@ def test_gathered_route_reduction_matches_materialized_routes(device: str) -> No
     gathered = gather_moe_routes(gemm2_out, permute_map, tokens, topk, width)
     torch.testing.assert_close(gathered, routes, atol=0, rtol=0)
     expected = routed_input_scale_rmsnorm_sum(
-        routes, route_weights, norm_weight, 1e-8, 1.0, False
+        routes, route_weights, norm_weight, 1e-8, 1.0, False, None
     )
     actual = triton_routed_sum_gathered(
         gemm2_out,

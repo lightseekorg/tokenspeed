@@ -32,6 +32,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from tokenspeed_kernel.platform import ArchVersion, current_platform
+from utils import polling_cycles, votes_with_subgroup_mask
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_cdna4, reason="Muse Iris fusions require gfx950"
@@ -472,12 +473,9 @@ def _muse_collective_policy_worker(rank, world_size, device):
     def sequence():
         outputs = []
         for index, values in enumerate(inputs):
-            if index % 2 and state.can_reduce_borrowed(values):
-                outputs.append(state.reduce_borrowed(values).clone())
-            else:
-                branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
-                branch.copy_(values)
-                outputs.append(state.reduce_outputs((branch,))[0].clone())
+            branch = state.all_reduce.acquire_outputs((tuple(values.shape),))[0]
+            branch.copy_(values)
+            outputs.append(state.reduce_outputs((branch,))[0].clone())
             if index == 5:
                 boundary_branch = state.all_reduce.acquire_outputs(((26, 8192),))[0]
                 boundary_branch.copy_(boundary_values)
@@ -549,10 +547,10 @@ def _muse_collective_policy_worker(rank, world_size, device):
             ordinary = torch.full(
                 (rows, 8192), rank + 1, device=device, dtype=torch.bfloat16
             )
-            output = state.reduce_borrowed(ordinary)
+            result = state.reduce(ordinary)
             torch.testing.assert_close(
-                output,
-                torch.full_like(output, world_size * (world_size + 1) // 2),
+                result,
+                torch.full_like(result, world_size * (world_size + 1) // 2),
                 rtol=0,
                 atol=0,
             )
@@ -567,17 +565,6 @@ def _muse_collective_policy_worker(rank, world_size, device):
             )
     for numel in (512, 44 * 4096, 129 * 8192):
         ordinary = torch.full((numel,), rank + 1, dtype=torch.bfloat16, device=device)
-        borrowed = state.reduce_borrowed(ordinary)
-        assert borrowed.data_ptr() != ordinary.data_ptr()
-        torch.testing.assert_close(
-            borrowed,
-            torch.full_like(borrowed, world_size * (world_size + 1) // 2),
-            rtol=0,
-            atol=0,
-        )
-        torch.testing.assert_close(
-            ordinary, torch.full_like(ordinary, rank + 1), rtol=0, atol=0
-        )
         result = state.reduce(ordinary)
         assert result.data_ptr() == ordinary.data_ptr()
         torch.testing.assert_close(
@@ -983,15 +970,55 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _compile_gfx950(fn, types, constexprs, num_warps):
+    """Compile a Gluon kernel for gfx950 without launching it."""
+    from tokenspeed_kernel._triton import gluon, triton
+
+    attrs = {}
+    for index, name in enumerate(fn.arg_names):
+        if isinstance(types.get(name), tuple):
+            attrs.update(
+                {
+                    (index, peer): [["tt.divisibility", 16]]
+                    for peer in range(len(types[name]))
+                }
+            )
+        elif name in types:
+            attrs[(index,)] = [["tt.divisibility", 16]]
+    source = gluon._runtime.GluonASTSource(
+        fn,
+        {name: types[name] for name in fn.arg_names if name in types},
+        constexprs=constexprs,
+        attrs=attrs,
+    )
+    return triton.compile(
+        source,
+        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
+        options={"num_warps": num_warps},
+    )
+
+
+def _batched_peer_reads(cycle, reads):
+    """Return whether a cycle issues all system-scope peer reads before waiting."""
+    loads = [
+        index
+        for index, line in enumerate(cycle)
+        if "buffer_load_dwordx4" in line and "sc0 sc1" in line
+    ]
+    return len(loads) == reads and not any(
+        "s_waitcnt vmcnt(0)" in line for line in cycle[loads[0] : loads[-1]]
+    )
+
+
 @pytest.mark.parametrize("rank", [0, 5])
 def test_routed_lamport_polling_codegen(rank):
     """Keep the mailbox reads batched and on the retry path.
 
     Compile without launching. Each retry must issue all seven 16-byte
     cache-bypassing peer reads before waiting for any of them; one wait per
-    read would serialize seven memory round trips.
+    read would serialize seven memory round trips. The retry decision must
+    be the subgroup's lane mask rather than a cross-lane reduction.
     """
-    from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
         iris_fused_lamport_allreduce_routed_rmsnorm_sum as fn,
@@ -1008,18 +1035,10 @@ def test_routed_lamport_polling_codegen(rank):
         "regions": ("i64",) * 8,
         "row_stride": "i32",
     }
-    attrs = {}
-    for index, name in enumerate(fn.arg_names):
-        if name == "regions":
-            attrs.update(
-                {(index, peer): [["tt.divisibility", 16]] for peer in range(8)}
-            )
-        elif name in types:
-            attrs[(index,)] = [["tt.divisibility", 16]]
-    source = gluon._runtime.GluonASTSource(
+    kernel = _compile_gfx950(
         fn,
-        {name: types[name] for name in fn.arg_names if name in types},
-        constexprs={
+        types,
+        {
             "RANK": rank,
             "WIDTH": 4096,
             "EPS": 1e-5,
@@ -1029,44 +1048,128 @@ def test_routed_lamport_polling_codegen(rank):
                 ArchVersion(9, 5)
             ).peer_signal_store,
         },
-        attrs=attrs,
-    )
-    kernel = triton.compile(
-        source,
-        target=triton.backends.compiler.GPUTarget("hip", "gfx950", 64),
-        options={"num_warps": 1},
+        num_warps=1,
     )
     assembly = kernel.asm["amdgcn"]
     lines = assembly.splitlines()
-    labels = {
-        match[1]: index
-        for index, line in enumerate(lines)
-        if (match := re.match(r"^(\.LBB\w+):", line))
-    }
-    cycles = []
-    for index, line in enumerate(lines):
-        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
-        if match and labels[match[1]] < index:
-            cycles.append(lines[labels[match[1]] : index + 1])
+    cycles = polling_cycles(assembly)
     assert cycles, "polling loop was removed"
-
-    def batched_peer_reads(cycle):
-        reads = [
-            index
-            for index, line in enumerate(cycle)
-            if "buffer_load_dwordx4" in line and "sc0 sc1" in line
-        ]
-        return len(reads) == 7 and not any(
-            "s_waitcnt vmcnt(0)" in line for line in cycle[reads[0] : reads[-1]]
-        )
-
-    assert any(
-        batched_peer_reads(cycle) for cycle in cycles
-    ), "all seven system-cache reads must issue together on a retry"
+    polls = [cycle for cycle in cycles if _batched_peer_reads(cycle, 7)]
+    assert polls, "all seven system-cache reads must issue together on a retry"
+    assert all(
+        votes_with_subgroup_mask(cycle) for cycle in polls
+    ), "a retry must branch on one subgroup lane mask"
     assert (
         sum("buffer_store_dwordx4" in line and "sc0 sc1" in line for line in lines)
         == 14
     ), "publication and reset must use 16-byte system-cache stores"
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+def test_attntail_lamport_polling_codegen():
+    """Each subgroup of the 16-subgroup poller retries on its own.
+
+    A workgroup-wide readiness reduction would put shared-memory traffic and
+    barriers into every retry; the subgroup ballot keeps them out.
+    """
+    rank = 5
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.attntail import (
+        iris_fused_lamport_allreduce_muse_attntail as fn,
+    )
+
+    pointers = {
+        "branch_ptr": "*bf16",
+        "mailbox_ptr": "*bf16",
+        "stream_ptr": "*fp32",
+        "post_weight_ptr": "*bf16",
+        "alpha_ptr": "*fp32",
+        "beta_ptr": "*fp32",
+        "pre_weight_ptr": "*bf16",
+        "out_stream_ptr": "*fp32",
+        "pre_fp32_ptr": "*fp32",
+        "pre_bf16_ptr": "*bf16",
+        "epochs": "*i32",
+        "heaps": ("i64",) * 8,
+    }
+    kernel = _compile_gfx950(
+        fn,
+        pointers,
+        {
+            "RANK": rank,
+            "WORLD_SIZE": 8,
+            "WIDTH": 8192,
+            "MAX_ROWS": 26,
+            "POST_EPS": 1e-6,
+            "POST_WEIGHT_OFFSET": 1.0,
+            "PRE_EPS": 1e-6,
+            "PRE_WEIGHT_OFFSET": 1.0,
+            "POST_HAS_WEIGHT": True,
+            "SENDERS": 8,
+            "ROTATE_PEERS": False,
+            "ELEMENTS_PER_THREAD": 8,
+            "NUM_WARPS": 16,
+            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        num_warps=16,
+    )
+    assembly = kernel.asm["amdgcn"]
+    polls = [
+        cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 7)
+    ]
+    assert polls, "all seven system-cache reads must issue together on a retry"
+    assert all(
+        votes_with_subgroup_mask(cycle) for cycle in polls
+    ), "a retry must branch on one subgroup lane mask"
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+def test_gather_lamport_polling_codegen():
+    """The Lamport gather rereads all remote packs and votes once per retry."""
+    rank = 5
+    from tokenspeed_kernel.ops.communication._iris.all_gather import (
+        iris_fused_lamport_allgather_rmsnorm_mxfp4 as fn,
+    )
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+
+    types = {
+        "local_input": "*bf16",
+        "weight": "*bf16",
+        "packed_output": "*u8",
+        "scale_output": "*u8",
+        "region": "*bf16",
+        "epochs": "*i32",
+        "regions": ("i64",) * 8,
+        "scale_stride_linear": "i32",
+        "scale_stride_mblock": "i32",
+    }
+    kernel = _compile_gfx950(
+        fn,
+        types,
+        {
+            "rank": rank,
+            "local_width": 512,
+            "total_width": 4096,
+            "eps": 1e-6,
+            "weight_offset": 1.0,
+            "max_elements": 43 * 4096,
+            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        num_warps=1,
+    )
+    assembly = kernel.asm["amdgcn"]
+    # Each lane polls eight 16-byte packs; packs of its own shard are masked.
+    polls = [
+        cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 8)
+    ]
+    assert polls, "all remote system-cache reads must issue together on a retry"
+    assert all(
+        votes_with_subgroup_mask(cycle) for cycle in polls
+    ), "a retry must branch on one subgroup lane mask"
     assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
 
 
@@ -1215,9 +1318,33 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             num_warps=1,
         )
 
+    # The fused path ends at the one-shot mailbox capacity, or earlier where
+    # TP8's two-shot plus the separate routed norm is faster; above it the
+    # model normalizes locally and reduces through the generic policy.
+    max_rows = state.routed_lamport_max_rows
+    # This heap prepares the two-shot on 8 ranks only; pin the policy value.
+    assert max_rows == (32 if world_size == 8 else 43)
+    probe = torch.zeros((max_rows + 1) * 8, 4096, dtype=torch.bfloat16, device=device)
+    probe_map = torch.zeros((max_rows + 1) * 8, dtype=torch.int32, device=device)
+    probe_weights = torch.zeros(max_rows + 1, 8, device=device)
+    probe_norm = torch.zeros(4096, dtype=torch.bfloat16, device=device)
+    for count, eligible in ((max_rows, True), (max_rows + 1, False)):
+        assert (
+            state.can_all_reduce_routed_rmsnorm_sum(
+                probe[: count * 8],
+                probe_map[: count * 8],
+                count,
+                8,
+                probe_weights[:count],
+                probe_norm,
+                1.0,
+            )
+            == eligible
+        )
+
     state.all_reduce.producer_pull.ready_flags.fill_(-4)
     state.all_reduce.peers.ctx.device_barrier()
-    for rows in (16, 43, 1, 17):
+    for rows in (16, max_rows, 1, 17):
         torch.manual_seed(1300 + rows)
         values = torch.randn(rows * 8, 4096, device=device).bfloat16()
         routes = torch.empty_like(values)
@@ -1288,7 +1415,7 @@ def _muse_routed_lamport_worker(rank, world_size, device):
             return actual, expected
 
         update(0)
-        if rows in (16, 43):
+        if rows in (16, max_rows):
             run()
         else:
             with assert_no_triton_compile(
@@ -1437,7 +1564,11 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
                 routed = state.all_reduce_routed_rmsnorm_sum(
                     routes, mapping, rows, 8, route_weights, norm, 1e-5, 1.0
                 ).clone()
-                raw = [state.reduce_borrowed(value).clone() for value in raw_inputs]
+                raw = []
+                for value in raw_inputs:
+                    branch = state.all_reduce.acquire_outputs((tuple(value.shape),))[0]
+                    branch.copy_(value)
+                    raw.append(state.reduce_outputs((branch,))[0].clone())
                 outputs.append((boundary, packed, scales, routed, raw))
             return outputs
 
@@ -1986,6 +2117,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                None,
             )
             output = state.all_reduce.acquire_outputs((tuple(combined.shape),))[0]
             output.copy_(combined)

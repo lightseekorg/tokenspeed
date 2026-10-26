@@ -107,6 +107,7 @@ from tokenspeed.runtime.utils.process import (
     kill_process_tree,
     receive_ready_messages,
     register_child_failure_signals,
+    stop_processes,
 )
 from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -638,6 +639,37 @@ def _scheduler_ranks(server_args: ServerArgs) -> range:
     return range(rank_start, rank_start + server_args.mapping.nprocs_per_node)
 
 
+def _stop_schedulers_on_signal(scheduler_procs: list[mp.Process]) -> None:
+    """Make a node of rank >= 1 stop its schedulers before a signal ends it.
+
+    Nothing else stops them when the node exits, so they would keep their
+    GPUs. On SIGTERM, SIGINT or SIGUSR1 (sent by a failing scheduler) the
+    schedulers get SIGTERM and TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT
+    seconds to exit before they are killed; the node then still ends by
+    the signal it received.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return  # Signal handlers can only be set from the main thread.
+    timeout = envs.TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT.get()
+    stopping = False
+
+    def stop_schedulers_and_exit(signum, _frame):
+        nonlocal stopping
+        if stopping:
+            return
+        stopping = True
+        logger.info(f"Received signal {signum!s}; stopping scheduler processes")
+        try:
+            stop_processes(scheduler_procs, timeout)
+        finally:
+            # Whatever is left still gets the parent-death signal.
+            signal.signal(signum, signal.SIG_DFL)
+            signal.raise_signal(signum)
+
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGUSR1):
+        signal.signal(signum, stop_schedulers_and_exit)
+
+
 def _frontend_addresses(server_args: ServerArgs) -> tuple[str, int]:
     """Where an in-process frontend binds its sockets: loopback on one node,
     with a free port; across nodes, the first node's address
@@ -674,9 +706,12 @@ def _start_ranks(
     server_args: ServerArgs,
     port_args: PortArgs,
     metrics_relay: MetricsRelay | None,
+    parent_death_signal: bool,
 ) -> tuple[list, list]:
     """Start this node's engine ranks, one ``ts-host`` process each, and
-    return them with their ready pipes."""
+    return them with their ready pipes. ``parent_death_signal`` asks the
+    kernel to kill a rank when this node dies (see
+    ``utils.process.set_parent_death_signal``)."""
     binary = host_binary()
     memory_saver_adapter = TorchMemorySaverAdapter.create(
         enable=server_args.enable_memory_saver
@@ -692,6 +727,7 @@ def _start_ranks(
             port_args,
             memory_saver_adapter.configure_subprocess(),
             metrics_relay.endpoint if metrics_relay is not None else None,
+            parent_death_signal,
         )
         procs.append(proc)
         readers.append(reader)
@@ -765,13 +801,21 @@ def _launch_subprocesses(
         else None
     )
     kv_bootstrap_server = _start_kv_bootstrap_server(server_args)
+
+    # A node of rank >= 1 that blocks below is the only owner of its
+    # schedulers: they must not outlive it, even when it is SIGKILLed.
+    owns_schedulers = (
+        server_args.node_rank >= 1 and envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get()
+    )
     scheduler_procs, scheduler_pipe_readers = _start_ranks(
-        server_args, port_args, metrics_relay
+        server_args, port_args, metrics_relay, owns_schedulers
     )
 
     if server_args.node_rank >= 1:
         # In multi-node cases, non-zero rank nodes run no frontend, so they
         # can just wait here.
+        if owns_schedulers:
+            _stop_schedulers_on_signal(scheduler_procs)
 
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):
             if data.get("status") != "ready":
@@ -779,7 +823,7 @@ def _launch_subprocesses(
                     "Initialization failed. Please see the error messages above."
                 )
 
-        if not envs.TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN.get():
+        if not owns_schedulers:
             # When using `Engine` as a Python API, we don't want to block here.
             return None, None, None
 
@@ -844,7 +888,7 @@ def _launch_encode_server(
         rank_server_args.mapping = copy.deepcopy(server_args.mapping)
         rank_server_args.mapping.rank = rank
         proc, reader = start_rust_host(
-            binary, rank_server_args, port_args, contextlib.nullcontext(), None
+            binary, rank_server_args, port_args, contextlib.nullcontext(), None, False
         )
         procs.append(proc)
         readers.append(reader)
@@ -1018,7 +1062,7 @@ def launch_scheduler_headless(server_args: ServerArgs) -> None:
         # run in the node's relay, which the ranks feed.
         if port_args.metrics_producer_configs:
             metrics_relay = MetricsRelay(port_args.metrics_producer_configs)
-        procs, readers = _start_ranks(server_args, port_args, metrics_relay)
+        procs, readers = _start_ranks(server_args, port_args, metrics_relay, False)
         scheduler_procs.extend(procs)
         scheduler_pipe_readers.extend(readers)
         for data in receive_ready_messages(scheduler_pipe_readers, scheduler_procs):

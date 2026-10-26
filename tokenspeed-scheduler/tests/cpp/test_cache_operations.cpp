@@ -434,7 +434,7 @@ TEST(CacheOperationTest, RetractionStoreSkipsWhenHostHasNoPlacement) {
     EXPECT_TRUE(coordinator.ClearDeviceCache());
 }
 
-TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
+TEST(CacheOperationTest, PendingStoresAllocateInCandidateOrderAcrossGroups) {
     BlockPool device_pool{3, {2, 1}};
     BlockPool host_pool{1, {2, 1}};
     const std::array specs{
@@ -471,30 +471,30 @@ TEST(CacheOperationTest, PendingStoresUseBatchHostAllocation) {
     cache_block(host_pool, CacheKey{.group_id = 0, .content_hash = "old-1"});
 
     const CacheKey group_one{.group_id = 1, .content_hash = "new-1"};
-    cache_block(device_pool, group_one);
+    const std::int32_t group_one_source = cache_block(device_pool, group_one);
     const std::array group_one_hashes{group_one.content_hash};
     coordinator.QueueCachedBlocksForStore(group_one_hashes);
 
     const CacheKey group_zero_first{.group_id = 0, .content_hash = "new-0"};
     const CacheKey group_zero_second{.group_id = 0, .content_hash = "new-2"};
-    const std::int32_t first_source = cache_block(device_pool, group_zero_first);
-    const std::int32_t second_source = cache_block(device_pool, group_zero_second);
+    cache_block(device_pool, group_zero_first);
+    cache_block(device_pool, group_zero_second);
     const std::array group_zero_hashes{group_zero_first.content_hash, group_zero_second.content_hash};
     coordinator.QueueCachedBlocksForStore(group_zero_hashes);
 
     auto write_back = transfers.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
 
     ASSERT_TRUE(write_back);
-    ASSERT_EQ(write_back->transfers.size(), 2u);
-    EXPECT_EQ(write_back->transfers[0].group_id, 0u);
-    EXPECT_EQ(write_back->transfers[0].source_page, first_source);
-    EXPECT_EQ(write_back->transfers[1].group_id, 0u);
-    EXPECT_EQ(write_back->transfers[1].source_page, second_source);
+    // The first candidate reclaims the old parent across groups. Its new
+    // destination is pinned until the ACK, so the later stores cannot take it.
+    ASSERT_EQ(write_back->transfers.size(), 1u);
+    EXPECT_EQ(write_back->transfers[0].group_id, 1u);
+    EXPECT_EQ(write_back->transfers[0].source_page, group_one_source);
 
     transfers.CompleteWriteBack(write_back->op_id);
-    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_one));
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_zero_first));
-    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_zero_second));
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(group_one));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_zero_first));
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(group_zero_second));
 }
 
 TEST(CacheOperationTest, RetractionReleaseEstimateExcludesBlocksOwnedByAnotherRequest) {

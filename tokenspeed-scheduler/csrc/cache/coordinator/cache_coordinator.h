@@ -375,8 +375,10 @@ public:
         std::size_t requested{0};
         std::size_t allocated{0};
         std::size_t unallocated{0};
-        std::size_t same_group_scans{0};
-        std::size_t cross_group_scans{0};
+        // Prefix-index enumerations, including groups that can donate capacity.
+        std::size_t group_scans{0};
+        // Distinct touched parents checked for whole-parent reclamation.
+        std::size_t parent_candidates{0};
     };
     struct HostAllocationBatch {
         std::vector<CacheBlockRef> blocks;
@@ -391,9 +393,10 @@ public:
     // One Host block per (group, bucket) entry, in the bucket of the Device
     // block it will mirror -- under page-cyclic sharding the owner of a Host
     // page must be the owner of its Device page, so a copy's two ends select
-    // the same rows on every rank. Free capacity first, then the group's own
-    // least valuable entries in the needed buckets, then whole parents of
-    // any group; a shortfall leaves an empty reference.
+    // the same rows on every rank. Free capacity first, then global LRU over
+    // compatible children and fully evictable parents of any group. A parent
+    // is ranked by its newest child; equal epochs prefer one child. A
+    // shortfall leaves an empty reference.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket);
@@ -616,6 +619,15 @@ private:
     std::int32_t prefix_granularity_{0};
     std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
+    struct HostParentCandidate {
+        std::uint64_t newest_access_epoch{0};
+        std::int32_t evictable_children{0};
+        bool allocated{false};
+    };
+    // Reuse the direct-indexed scratch buffer; reset only the parents touched
+    // by the previous replacement batch, never the whole Host arena per call.
+    std::vector<HostParentCandidate> host_parent_candidates_;
+    std::vector<std::int32_t> host_touched_parents_;
     TailTable tails_;
     std::vector<StoreCandidate> pending_stores_;
     CacheMutationSink cache_mutation_sink_;

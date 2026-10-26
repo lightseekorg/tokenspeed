@@ -792,3 +792,65 @@ def test_grouped_bf16_projection_times_strided_view_without_out(
     assert weight.is_contiguous()
     assert out is None
     assert prepared.parameters["x_token_stride"] == 64
+
+
+def _router_request(**updates) -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="gemm",
+        mode="prepared_fp32_router_gemv",
+        parameters={
+            "M": 4,
+            "N": 256,
+            "K": 1024,
+            "multiplier": 2.0,
+            "dtype": "float32",
+            **updates,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"dtype": "bfloat16"}, "float32"),
+        ({"multiplier": 2}, "multiplier"),
+        ({"extra": 1}, "Unknown"),
+    ],
+)
+def test_prepared_router_gemv_rejects_invalid_parameters(updates, match):
+    with pytest.raises(BenchmarkCaseError, match=match):
+        gemm_generator.prepare_prepared_fp32_router_gemv(
+            _router_request(**updates), None
+        )
+
+
+def test_prepared_router_gemv_refuses_exact_registration():
+    request = BenchmarkRequest(
+        family="gemm",
+        mode="prepared_fp32_router_gemv",
+        parameters=_router_request().parameters,
+        solution=None,
+        registration="triton_prepared_fp32_router_gemv",
+        cold_cache=True,
+        seed=42,
+    )
+    with pytest.raises(BenchmarkCaseError, match="solution instead"):
+        gemm_generator.prepare_prepared_fp32_router_gemv(request, None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required")
+def test_prepared_router_gemv_runs_through_harness():
+    result = KernelBenchmarkHarness(
+        GraphTimer(
+            GraphBenchmarkConfig(eager_warmup_iterations=1, replay_warmup_iterations=1)
+        ),
+        platform_provider=current_platform,
+    ).run(_router_request(), measurement_blocks=3)
+
+    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
+    spec = KernelRegistry.get().get_by_name(result.registration_name)
+    assert (spec.family, spec.mode) == ("gemm", "prepared_fp32_router_gemv")

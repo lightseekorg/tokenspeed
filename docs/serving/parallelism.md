@@ -855,6 +855,19 @@ Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different
 `NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.
 
+### Stopping
+
+Stop every node. A node that stops does not stop the others: they find out
+at their next collective with it, which fails or can hang.
+
+A node of rank 1 or higher that receives SIGTERM or SIGINT, or whose
+scheduler fails, sends SIGTERM to the engine rank processes it started and
+gives them `TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT` seconds (default 10)
+to exit. It then kills whatever is left of them and of the processes they
+started, and exits by the signal it received. On Linux the rank processes
+are also killed when the node process itself is killed, for example with
+SIGKILL at the end of a grace period.
+
 ## Emulating rank 0 on one GPU
 
 `--emulate-rank-zero` runs only global rank 0 of the configured layout, so you

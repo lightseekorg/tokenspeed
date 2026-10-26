@@ -649,7 +649,10 @@ request waits in the loop's grammar queue until its grammar compiled (off the
 round, on compiler threads) on every replica rank, and fails if it timed out
 on any or does not compile; every rank admits the same ones in the same
 round. The matchers live in Rust (`ts-grammar`); the data plane fills
-bitmasks through their handles.
+bitmasks through their handles, with one C++ fill (`grammar_host.Filler`)
+on both paths: the capturable path's host node runs it inside the forward
+and advances the matchers there; the eager path runs it before the forward
+and the commit advances them.
 
 ## Anatomy of a round
 

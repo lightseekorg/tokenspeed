@@ -1263,7 +1263,6 @@ def _set_mla_kv_buffer_kernel(
 
 @triton.jit(
     do_not_specialize=["n_loc"],
-    do_not_specialize_on_alignment=["n_loc"],
 )
 def _set_mla_kv_buffer_per_loc_kernel(
     kv_buffer_ptr,

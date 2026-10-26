@@ -164,6 +164,43 @@ def test_plain_allreduce_matches_nccl(token_num):
     torch.testing.assert_close(out.float(), ref, atol=3e-2, rtol=3e-2)
 
 
+@pytest.mark.parametrize("token_num", [8, 147, 288, 1024, 2048])
+def test_trtllm_workspace_allreduce_fp32_acc_is_the_rank_ordered_fold(token_num):
+    """With fp32_acc every strategy (one-shot at 8 tokens, two-shot past it,
+    and payloads the plain all-reduce sends through the IPC workspace) folds
+    ranks 0..n-1 from rank 0's value in fp32 and rounds once: the
+    batch-invariant rank-ordered fold, bit for bit."""
+    from tokenspeed_kernel.ops.communication.triton import rank_ordered_fold
+    from tokenspeed_kernel.ops.communication.trtllm import (
+        ensure_workspace_initialized,
+        trtllm_workspace_allreduce,
+    )
+
+    rank, dev = _setup()
+    try:
+        armed = ensure_workspace_initialized(
+            rank=rank, group=dist.group.WORLD, max_token_num=2048, hidden_dim=H
+        )
+    except RuntimeError as exc:
+        pytest.skip(f"trtllm fusion workspace unavailable: {exc}")
+    if not armed:
+        pytest.skip("trtllm fusion workspace unavailable")
+    torch.manual_seed(500 + rank)
+    # Magnitudes spanning six decades make the association order visible.
+    scale = torch.logspace(-3, 3, H, device=dev)
+    x = (torch.randn(token_num, H, device=dev) * scale).to(torch.bfloat16)
+    x[0, :64] = -0.0
+    out = trtllm_workspace_allreduce(x, dist.group.WORLD, fp32_acc=True)
+    if out is None:
+        pytest.skip("no armed workspace serves this shape on this fabric")
+    world = dist.get_world_size()
+    parts = torch.empty((world, token_num, H), dtype=x.dtype, device=dev)
+    dist.all_gather_into_tensor(parts, x)
+    expected = rank_ordered_fold(parts, torch.empty_like(x))
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("token_num", [8, 147, 288, 576])
 def test_trtllm_workspace_allreduce(token_num):
     """The backend-facing plain AR serves the workspace's full token range.
@@ -188,7 +225,7 @@ def test_trtllm_workspace_allreduce(token_num):
         pytest.skip("trtllm fusion workspace unavailable")
     torch.manual_seed(300 + rank)
     x = (torch.randn(token_num, H, dtype=torch.bfloat16, device=dev) * 0.1).contiguous()
-    out = trtllm_workspace_allreduce(x, dist.group.WORLD)
+    out = trtllm_workspace_allreduce(x, dist.group.WORLD, fp32_acc=False)
     if out is None:
         pytest.skip("no armed workspace serves this shape on this fabric")
     torch.cuda.synchronize()
@@ -201,12 +238,17 @@ def test_trtllm_workspace_allreduce(token_num):
 
     cap = comm._manager_for_group(dist.group.WORLD).max_token_num
     oversized = torch.randn(cap + 1, H, dtype=torch.bfloat16, device=dev)
-    assert trtllm_workspace_allreduce(oversized, dist.group.WORLD) is None
+    assert (
+        trtllm_workspace_allreduce(oversized, dist.group.WORLD, fp32_acc=False) is None
+    )
 
     # Non-contiguous input is served through a contiguous copy, never mutated.
-    strided = torch.randn(token_num, 2 * H, dtype=torch.bfloat16, device=dev)[:, ::2]
+    # Scaled like x: at 8+ ranks the bf16 sum's rounding of unit-scale inputs exceeds the tolerance.
+    strided = (torch.randn(token_num, 2 * H, dtype=torch.bfloat16, device=dev) * 0.1)[
+        :, ::2
+    ]
     keep = strided.clone()
-    out_nc = trtllm_workspace_allreduce(strided, dist.group.WORLD)
+    out_nc = trtllm_workspace_allreduce(strided, dist.group.WORLD, fp32_acc=False)
     assert out_nc is not None
     torch.cuda.synchronize()
     torch.testing.assert_close(strided, keep, atol=0, rtol=0)

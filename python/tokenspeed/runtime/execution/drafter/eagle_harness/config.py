@@ -150,7 +150,7 @@ class EagleHarnessConfig:
     data_path: str
     compute_intensity: str
     is_moe_target: bool
-    # Temperature > 0 requests sample children from the draft q, accepted by rejection sampling.
+    # Temperature > 0 requests sample children (a chain: one) from the draft q, accepted by rejection.
     sampled_trees: bool
     # The TP-synced seed of the children's draws.
     seed: int
@@ -300,8 +300,10 @@ def validate_server_args(server_args: ServerArgs) -> None:
             and server_args.enable_speculative_sampling
         ):
             raise ValueError(
-                "--enable-speculative-sampling with EAGLE4 needs EAGLE-Harness trees: "
-                "its candidate head scores no full-vocabulary draft distribution"
+                "--enable-speculative-sampling with EAGLE4 needs EAGLE-Harness "
+                "(--speculative-exec-mode 0 or 1): "
+                "a static draft's candidate head scores no full-vocabulary draft "
+                "distribution"
             )
         return
     if mode > 2:
@@ -328,7 +330,7 @@ def validate_server_args(server_args: ServerArgs) -> None:
         server_args.sampling_backend != "flashinfer"
     ):
         raise ValueError(
-            "EAGLE-Harness sampled trees verify by tree rejection sampling, "
+            "EAGLE-Harness verifies sampled drafts by tree rejection sampling, "
             "which only --sampling-backend flashinfer has; got "
             f"{server_args.sampling_backend}"
         )
@@ -360,10 +362,6 @@ def validate_server_args(server_args: ServerArgs) -> None:
                 "EAGLE-Harness chains draft at most 15 steps and verify at most "
                 f"16 tokens: {server_args.speculative_num_steps=}, "
                 f"{server_args.speculative_num_draft_tokens=}"
-            )
-        if server_args.enable_speculative_sampling:
-            raise NotImplementedError(
-                "EAGLE-Harness samples draft trees (topk >= 2), not chains"
             )
     cap = max_batch_size(server_args.speculative_compute_intensity)
     if mode == 2:

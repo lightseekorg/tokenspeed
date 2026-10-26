@@ -61,6 +61,7 @@ from tokenspeed.runtime.multimodal.inputs import MultimodalDataItem
 from tokenspeed.runtime.pd.host_peer import (
     enable_mooncake_ipv6_for_host,
     mooncake_library,
+    mooncake_protocol,
 )
 from tokenspeed.runtime.utils import configure_logger
 from tokenspeed.runtime.utils.env import envs, global_server_args_dict_update
@@ -225,6 +226,7 @@ class EncodeSettings:
             registers with.
         library: The Mooncake library with the TokenSpeed C entry points.
         local_ip: Where prefill ranks reach this rank.
+        protocol: The Mooncake transport selected for this rank's device.
         ib_device: The RDMA devices to use, comma-separated; empty for all.
         bootstrap_timeout_s: How long a handed-over item waits for its
             prefill ranks to ask (``TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT``).
@@ -247,6 +249,7 @@ class EncodeSettings:
     bootstrap_url: str
     library: str
     local_ip: str
+    protocol: str
     ib_device: str
     bootstrap_timeout_s: float
     transfer_workers: int
@@ -541,6 +544,7 @@ class EncodeBootstrap:
             ),
             library=mooncake_library(),
             local_ip=local_ip,
+            protocol=mooncake_protocol(),
             ib_device=server_args.disaggregation_ib_device or "",
             bootstrap_timeout_s=float(
                 envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()

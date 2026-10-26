@@ -1186,23 +1186,46 @@ selection uses query rows, table capacity, and supported layouts, never the
 prefill/decode mode. The caller's logits budget forces streaming when the score
 matrix would exceed it. Explicit paths bypass that automatic budget.
 
-Supported Blackwell stream layouts use CuTe DSL; other layouts and vendors
-retain portable Triton. The Blackwell CuTe specializations use four
-BF16 index heads of width 128, 64-block pages, and block top-k 512. Grouped
-scoring uses eight-row CTAs within explicit uniform request runs of at least
-eight rows, including each run's partial final group. Small query grids can score
-rows independently, including ragged queries. Grouped streams keep exact
+Blackwell CuTe streaming supports four BF16 index heads of width 128,
+64-block pages, block top-k 512, and up to 2048 page-table columns. Within
+this geometry, ragged ownership and uniform tails stay on CuTe for every nonempty
+query count. Grids of at most 128 rows first try bounded scratch for split scoring;
+if that exceeds the caller's partial-workspace budget, they use workspace-free
+grouped scoring. This includes small decode grids with a zero-byte budget;
+capacities above 4096 compressed blocks use the overlap algorithm. Other
+geometries, larger page tables, and other GPU architectures retain portable
+Triton.
+
+CuTe grouped scoring handles up to eight rows from one request. Uniform runs
+resolve their groups arithmetically, including a masked final group. Ragged runs
+resolve group ownership from device request indices at eight-row boundaries and
+ownership changes, splitting at the next boundary. A ragged grid launches one
+CTA per query row; only those boundaries start scoring groups. Long runs leave
+most CTAs inactive, exiting before pipeline setup. This trades a larger launch
+grid for avoiding a global group table, metadata allocation, or device-to-host
+read; aligned uniform runs retain their original unmasked specialization.
+Invalid query rows are zero-filled, have zero complete blocks, and never write
+output, but their threads participate in the same pipeline synchronization.
+Small query grids can also score rows independently. Grouped streams keep exact
 running selections in selector registers, with double-buffered score
 candidates overlapping selection and MMA across tiles. Small grids can split
-the key range into bounded global scratch. The caller's partial-workspace
-budget bounds that scratch. Grouped CuTe and portable Triton streaming only
-allocate their output; each Triton program scans a group contained in an explicit
-uniform request run and keeps each row's running top-k locally, with no split/merge
-buffers. Ragged runs use group size one in the same kernel. Candidate pruning must
-prove that discarded scores cannot enter the top-k, or perform a full-score
-fallback. Each row retains its complete-block frontier. Query count, request
-count, page-table width, and Q strides remain runtime values; request alignment
-and bucketed split geometry specialize the compiled signature. PDL waits precede
+the key range into bounded global scratch, including uniform runs whose final
+group is partial. The caller's partial-workspace
+budget bounds that scratch; grouped CuTe streaming allocates only its output.
+Ragged grouping waits for PDL producers before reading request indices.
+Uniform and aligned grouping retain the internal waits before frontier reads
+and asynchronous Q copies.
+
+Portable Triton streaming also allocates only its output. Each program scans a
+group contained in an explicit uniform request run and keeps each row's running
+top-k locally, with no split/merge buffers. Triton ragged runs use group size one
+in that same kernel.
+
+For both implementations, candidate pruning must prove that discarded scores
+cannot enter the top-k, or perform a full-score fallback. Each row retains its
+complete-block frontier. Query count, request count, page-table width, and Q
+strides remain runtime values; group layout and bucketed split geometry
+specialize the compiled signature. PDL waits precede
 asynchronous Q copies and producer-owned metadata reads.
 Trimmed batched page-table views retain a runtime row stride. Speculative
 context padding counts toward their capacity; compact candidate offsets must

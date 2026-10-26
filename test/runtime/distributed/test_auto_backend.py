@@ -12,6 +12,7 @@ from tokenspeed.runtime.distributed.comm_backend.auto import (
     AutoBackend,
     Collective,
     Route,
+    ordered_fold_sum,
 )
 from tokenspeed.runtime.distributed.comm_backend.iris import (
     IrisBackend,
@@ -510,12 +511,16 @@ def test_batch_invariant_all_reduce_folds_the_gathered_partials_in_rank_order(
     routing, monkeypatch
 ):
     _switches(monkeypatch, force=False, invariant=True)
+    routing._trtllm_ar.has_trtllm_ar.return_value = False
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
+    )
     # Two partials whose sum rounds differently in bf16 than in fp32: the fold
     # accumulates in fp32 and rounds once.
     mine = torch.full((4, 16), 1.0, dtype=torch.bfloat16)
     peer = torch.full((4, 16), 2.0**-9, dtype=torch.bfloat16)
     routing._nccl.all_gather.side_effect = lambda tensor, group, dim: torch.cat(
-        [mine, peer]
+        [mine, peer], dim=dim
     )
     tensor = mine.clone()
 
@@ -529,6 +534,44 @@ def test_batch_invariant_all_reduce_folds_the_gathered_partials_in_rank_order(
     routing._nccl.all_gather.reset_mock()
     routing.all_reduce((mine.clone(), mine.clone()), GROUP)
     assert routing._nccl.all_gather.call_count == 2
+
+
+def test_batch_invariant_all_reduce_takes_the_trtllm_fold_where_it_serves(
+    routing, monkeypatch
+):
+    _switches(monkeypatch, force=False, invariant=True)
+    monkeypatch.setattr(
+        AutoBackend, "_multicast_reachable", staticmethod(lambda g: False)
+    )
+    routing._trtllm_ar.has_trtllm_ar.return_value = True
+    folded = torch.full((4, 16), 3.0, dtype=torch.bfloat16)
+    routing._trtllm_ar.ordered_all_reduce.return_value = folded
+    routing._nccl.all_gather.side_effect = lambda tensor, group, dim: torch.cat(
+        [tensor, tensor], dim=dim
+    )
+    gather_fold = torch.full((4, 16), 2.0, dtype=torch.bfloat16)
+    assert routing.all_reduce(torch.ones(4, 16, dtype=torch.bfloat16), GROUP) is folded
+
+    # The rsag override keeps the fold off the symmetric-memory workspace.
+    _switches(monkeypatch, force=True, invariant=True)
+    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
+    assert routing.all_reduce(tensor, GROUP) is tensor
+    assert torch.equal(tensor, gather_fold)
+
+    # A shape the workspace does not serve takes the gather and the fold.
+    _switches(monkeypatch, force=False, invariant=True)
+    routing._trtllm_ar.ordered_all_reduce.return_value = None
+    tensor = torch.ones(4, 16, dtype=torch.bfloat16)
+    assert routing.all_reduce(tensor, GROUP) is tensor
+    assert torch.equal(tensor, gather_fold)
+
+
+def test_ordered_fold_sum_stores_a_zero_sum_as_positive_zero():
+    # The torch fold matches the kernels: only an all -0.0 sum would keep its sign.
+    parts = torch.tensor([[-0.0, -0.0, 1.0], [-0.0, 0.0, -1.0]])
+    out = torch.empty(3)
+    ordered_fold_sum(parts, out)
+    assert out.view(torch.int32).tolist() == [0, 0, 0]
 
 
 def test_batch_invariant_all_reduce_refuses_order_dependent_non_sum(

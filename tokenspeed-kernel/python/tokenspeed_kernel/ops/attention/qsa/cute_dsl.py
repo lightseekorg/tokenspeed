@@ -262,7 +262,7 @@ def cute_dsl_qwen4_exp_qsa_block_topk(
         page_size: Number of compressed blocks per page; must be 64.
         block_topk: Number of selected blocks; must be 512.
         queries_per_request: Uniform consecutive query-run width, or ``None``
-            for ragged rows; required for grouped scoring optimizations.
+            for ragged rows. Groups mask tails and never cross requests.
         max_partial_bytes: Budget for global scratch, excluding the output.
         enable_pdl: Whether to use programmatic dependent launch ordering.
 

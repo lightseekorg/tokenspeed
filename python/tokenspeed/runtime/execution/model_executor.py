@@ -2366,7 +2366,6 @@ class ModelExecutor:
                         sampling_info=sampling_info,
                         bs=bs,
                         is_spec_decode=self.drafter is not None and num_extends < bs,
-                        spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
                         input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],

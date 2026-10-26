@@ -515,8 +515,9 @@ def _sampled_round(target_rows, draft_logits, cand, topk, generator):
         ranked, node_slot, node_pos, q_store, qid_store, rows, q_tab, qid_tab,
         slot_tab, pos_tab, _count(reqs), _count(nodes),
     )  # fmt: skip
-    # Every sampled node's published (slot, position) names its own candidate.
+    # Every drafted node publishes a q (slot, position) naming its own candidate.
     sampled = slot_tab >= 0
+    assert sampled[:, 1:].all()
     req = torch.arange(reqs, device=dev)[:, None].expand(-1, nodes)
     named = qid_tab[req, slot_tab.clamp(min=0).long(), pos_tab.long()]
     assert torch.equal(named[sampled], tokens[sampled])
@@ -532,11 +533,13 @@ def _sampled_round(target_rows, draft_logits, cand, topk, generator):
     return emitted, path.cpu()
 
 
-def test_sampled_tree_emits_the_target_distribution() -> None:
+# K = 1: a sampled chain.
+@pytest.mark.parametrize("topk", [3, 1])
+def test_sampled_tree_emits_the_target_distribution(topk: int) -> None:
     """Children drawn from the draft, recursive rejection and the residual bonus
     together emit exactly the target: the first token's law is the root's
     target, the second's (after an accepted child) that child's."""
-    topk, vocab, nc = 3, 48, 32
+    vocab, nc = 48, 32
     generator = torch.Generator().manual_seed(0)
     target = torch.softmax(
         torch.randn((1 + topk + topk * topk, vocab), generator=generator) * 1.5, dim=-1
@@ -547,18 +550,28 @@ def test_sampled_tree_emits_the_target_distribution() -> None:
     draft_logits = (torch.randn((1 + topk, nc), generator=generator) * 1.5).cuda()
     first = torch.zeros(vocab)
     second = torch.zeros((topk, vocab))
+    accepted = 0
     trials = 240
     for _ in range(trials):
         emitted, path = _sampled_round(target, draft_logits, cand, topk, generator)
         first += torch.bincount(emitted[:, 0], minlength=vocab).float()
         # Rows whose first token is an accepted child (node path[1]) and that emitted a second.
         child = path[:, 1].long() - 1
+        accepted += int((child >= 0).sum())
         has_second = (child >= 0) & (emitted[:, 1] >= 0)
         for c in range(topk):
             rows = has_second & (child == c)
             second[c] += torch.bincount(emitted[rows, 1], minlength=vocab).float()
     total = trials * 256
     torch.testing.assert_close(first / total, target[0].cpu(), rtol=0, atol=0.01)
+    if topk == 1:
+        # x ~ q accepted w.p. min(1, p(x) / q(x)): sum(min(p, q)), above sum(p * q) of accepting by p.
+        q = torch.softmax(draft_logits[0], dim=-1)
+        p = target[0, cand[0]]
+        want = float(torch.minimum(p, q).sum())
+        assert want > float((p * q).sum()) + 0.05
+        assert abs(accepted / total - want) < 0.01
+        assert second[0].sum() > 3000
     for c in range(topk):
         if second[c].sum() > 3000:
             torch.testing.assert_close(

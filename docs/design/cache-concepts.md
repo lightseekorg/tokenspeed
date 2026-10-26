@@ -290,6 +290,11 @@ own prefix cache holds the state for the prompt end -- a state hit counts
 only at the prompt end exactly, since the prefill's final state supersedes
 any shorter one -- `Forward.Batch.state_prefix_cached` is set for that row
 and both sides omit the group from the manifest (`ts-pd`'s `layout::manifest`).
+The decode admission copies this immutable input checkpoint into its private
+live block before consuming the bootstrap result, since that result can finish
+the request without another forward. KDA convolution history may use either
+channel-major or channels-last storage; the PD schema partitions the channel
+axis in each layout, preserving its separate Q/K/V channel segments.
 
 KDA targets with a batched commit kernel use the same deferred-state lifecycle
 for ordinary decode (`T=1`) and speculative verification. Verify leaves the
@@ -829,8 +834,9 @@ Its responsibilities:
   (`CompletedPages::publish_state`: a prompt end, a junction cut, finish,
   retraction); a chunk end or decode step publishes no state (see
   [Scheduler §1.2](scheduler.md#12-state-groups-two-slots-natural-checkpoints)).
-  Evicting a History block under a chain hash evicts the state checkpoints
-  under that hash as well, so a state never outlives the KV it continues.
+  On Device, evicting a History block under a chain hash also evicts the
+  State checkpoints under that hash, so Device state does not outlive the
+  KV it continues.
   Replayable groups are outside `match_order_` and skip publication on both
   tiers — never registered, never streamed to Host, never counted by
   `DeviceBoundaryResidency` — because their rows are approximations the
@@ -840,7 +846,27 @@ Its responsibilities:
 * **Two tiers (Device/Host).** Device prefix publication can optionally
   stream to the Host tier (`stream_device_cache_to_host_`); a
   `pending_stores_` queue drives D2H transfers, alongside Host-side
-  acquire/contains/pin queries. During prefill, each chunk end queues the
+  acquire/contains/pin queries. Host L2 uses free capacity first, then global
+  LRU across cache groups: a compatible child in the requested group competes
+  with fully evictable LCM parents across groups. When only one group needs
+  replacement, its own parents are omitted: the initial allocation pass
+  exhausted the requested buckets' holes, so each such parent has a compatible
+  child no newer than its newest child and cannot beat single-child eviction.
+  Cross-group reuse must free a whole parent, ranked by its most recently
+  accessed child, so a cold sibling cannot cause newer data to be discarded.
+  Equal epochs prefer
+  evicting one child; group and physical location break remaining ties. A
+  prefix hit refreshes its access epoch, and earlier reuse grants no
+  additional protection. Pinned entries, partially pinned foreign parents,
+  and blocks allocated earlier in the same batch remain protected. Parent
+  candidates are snapshots; selection skips parents that are now empty or
+  bound to another group. Parent aggregation reuses coordinator-owned scratch
+  storage and resets and examines only touched parents, rather than the whole
+  Host arena on every allocation batch. Child reuse preserves the requested
+  placement bucket. Host eviction removes each selected entry independently.
+  No group has an eviction preference or a fixed share of the pool; capacity follows the access
+  pattern, without guaranteeing that KV and every required state checkpoint
+  remain resident together. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
   admission, or a junction cut) queues its tail and state checkpoint too;
   the candidates are merged into a batched writeback. Ordinary decode

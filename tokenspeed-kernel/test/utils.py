@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from typing import Any
@@ -144,6 +145,35 @@ def assert_fp8_same_or_adjacent_at_midpoint(
         # Allow a few FP32 rounding steps, not an arbitrary neighboring code.
         tolerance = 8 * torch.finfo(torch.float32).eps * midpoint.abs().clamp_min(1)
         assert ((quotient - midpoint).abs() <= tolerance).all()
+
+
+def polling_cycles(assembly: str) -> list[list[str]]:
+    """Return each loop of ``assembly`` from its target label to its back branch."""
+    lines = assembly.splitlines()
+    labels = {
+        match[1]: index
+        for index, line in enumerate(lines)
+        if (match := re.match(r"^(\.LBB\w+):", line))
+    }
+    cycles = []
+    for index, line in enumerate(lines):
+        match = re.search(r"\bs_(?:cbranch_\w+|branch)\s+(\.LBB\w+)", line)
+        if match and labels[match[1]] < index:
+            cycles.append(lines[labels[match[1]] : index + 1])
+    return cycles
+
+
+def votes_with_subgroup_mask(cycle: list[str]) -> bool:
+    """Return whether a polling cycle exits on one v_cmp lane mask.
+
+    A cross-lane reduction (DPP steps and a lane read) or a workgroup
+    exchange (LDS and s_barrier) on every retry would delay noticing data.
+    """
+    text = "\n".join(cycle)
+    return (
+        len(re.findall(r"v_cmp_ne_u32_e64 s\[\d+:\d+\], 0, v\d+", text)) == 1
+        and re.search(r"_dpp|v_readlane|v_readfirstlane|s_barrier|\bds_", text) is None
+    )
 
 
 def int_specialization_class(value: int) -> str:

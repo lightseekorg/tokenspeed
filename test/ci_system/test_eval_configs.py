@@ -219,6 +219,10 @@ def test_muse_spark_aime26_uses_validated_mxfp4_configuration(tp_size, ep_size):
     eval_tokens = shlex.split(task["eval"]["command"])
     generation_config = json.loads(flag_value(eval_tokens, "--generation-config"))
 
+    expected_triggers = (
+        ["per-commit", "manual"] if (tp_size, ep_size) == (8, 1) else ["manual"]
+    )
+    assert task["triggers"] == expected_triggers
     assert task["runner"]["labels"] == [f"amd-mi35x-{tp_size}gpu-test"]
     assert (
         flag_value(server_tokens, "--model")
@@ -393,7 +397,7 @@ def test_kimi_k3_amd_gates_use_eagle3():
     assert flag_value(perf_server_tokens, "--max-num-seqs") == "16"
     assert flag_value(perf_server_tokens, "--chunked-prefill-size") == "8192"
     assert flag_value(perf_server_tokens, "--max-prefill-tokens") == "8192"
-    assert tasks[1]["perf_reference"] == {16: [60, 15]}
+    assert tasks[1]["perf_reference"] == {16: [65, 16]}
     assert tasks[1]["perf_threshold"] == 0.9
     assert "'evalscope[perf]==1.11.1'" in tasks[1]["perf"]["install"][0]
     perf_tokens = shlex.split(tasks[1]["perf"]["command"])

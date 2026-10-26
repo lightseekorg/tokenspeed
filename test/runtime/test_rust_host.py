@@ -170,7 +170,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(tmp_path):
         """,
     )
     proc, reader = start_rust_host(
-        binary, *_rank_args(3), nullcontext(), "ipc:///tmp/relay"
+        binary, *_rank_args(3), nullcontext(), "ipc:///tmp/relay", False
     )
     try:
         (ready,) = receive_ready_messages([reader], [proc])
@@ -190,7 +190,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(tmp_path):
 
 def test_a_host_that_dies_before_ready_fails_the_launch(tmp_path):
     binary = _fake_host(tmp_path, "connection.recv()\nsys.exit(3)\n")
-    proc, reader = start_rust_host(binary, *_rank_args(0), nullcontext(), None)
+    proc, reader = start_rust_host(binary, *_rank_args(0), nullcontext(), None, False)
     with pytest.raises(RuntimeError, match="Scheduler process 0"):
         receive_ready_messages([reader], [proc])
     proc.join(timeout=10)

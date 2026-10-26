@@ -11,39 +11,40 @@ performant kernels for multi-silicon AI inference. It features:
 TokenSpeed-kernel is pip-installable on its own. Others can use it
 directly.
 
-## Ascend source installation
+## Public API
 
-Select the NPU dependency set explicitly when installing from source:
-
-```bash
-TOKENSPEED_KERNEL_BACKEND=npu pip install --no-build-isolation ./python
+```python
+from tokenspeed_kernel.ops.gemm import mm
+from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
+from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, moe_topk
+from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
+from tokenspeed_kernel.ops.attention.gdn import gdn_chunk_prefill
+from tokenspeed_kernel.ops.attention.mha import (
+    mha_decode_with_kvcache,
+    mha_prefill,
+)
+from tokenspeed_kernel.ops.attention.msa import (
+    msa_decode_with_kvcache,
+    msa_extend_with_kvcache,
+)
 ```
 
-This installs the Python registry and Ascend Triton provider and skips CUDA
-compilation. Install a compatible Torch/TorchNPU stack first. The
-`tokenspeed-kernel-npu` package and its native operator dependencies are separate
-installations.
+The preceding platform- and solution-agnostic public APIs provide the most
+value from TokenSpeed-kernel. You can also call directly into a specific
+solution under `ops/<family>/`, or run `select_kernel` manually with
+targeted filters.
 
-## Nightly installation
+For targeted selection:
 
-CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
-ARM64, with Python 3.11–3.13. Versions append the UTC build date to the base
-version, for example `0.1.3.post20260929`.
-
-```bash
-pip install --upgrade tokenspeed-kernel \
-  --extra-index-url https://lightseek.org/whl/nightly
+```python
+from tokenspeed_kernel.selection import select_kernel, kernel_override
 ```
 
-PyPI supplies dependencies that are absent from the nightly index. To select a
-specific nightly, use `tokenspeed-kernel==0.1.3.post20260929`. Post releases sort
-above the corresponding base release and do not require `--pre`.
+For platform checks:
 
-The `Build and Release tokenspeed-kernel` workflow also supports manual nightly
-builds from pull request branches. To publish manually, run it from `main` with
-both `nightly` and `publish_github` enabled. Same-day reruns preserve already
-published wheels.
-Historical nightlies are retained. Automatic cleanup is deferred.
+```python
+from tokenspeed_kernel.platform  import current_platform
+```
 
 ## Design goals
 
@@ -139,39 +140,6 @@ All of them register through the same decorator, and the same selection
 logic scores them, so adding a backend is one new file in the right family
 folder.
 
-On Ascend, `_triton.py` supplies import-only `gluon.jit` decorators so shared
-registration modules do not require the GPU Gluon package. Calling or launching
-one of these kernels raises an error. Kernel capability declarations still
-exclude Ascend from GPU implementations; CUDA and ROCm use native Gluon.
-
-### Weight preprocessing
-
-Some kernels need loaded weights converted into a representation suited to their
-computation. During model initialization, the layer chooses a compatible
-preprocessor. A shared weight broker installs the transformed weights and tracks
-their storage layout, making that representation visible to kernel selection.
-
-At execution, the registry matches the prepared weights to kernels that support
-their layout alongside the operation's other requirements. This lets preparation
-and execution remain separate while different kernels can share prepared weights.
-
-### Kernel state and graph capture
-
-Some kernels keep device state that must start at zero and that every launch
-restores to zero, such as split-K arrival counters. Such kernels take the state
-as an argument and report how much they need; the registered op gets it from
-`tokenspeed_kernel.workspace.zeroed_state`. Eager launches share one buffer per
-stream. A graph captured inside `capture_session` gets buffers of its own,
-zeroed once after capture outside the graph and kept alive as long as the
-graph, so replays carry no zeroing node. The runtime opens a session around
-every graph it captures.
-Prepared plans can use `retain_for_capture` in that session to keep their
-allocations alive until the graph owner is released.
-
-Operators can prepare compilation variants during ordinary execution with
-`ops.tuning.kernel_warmup(enabled=True)` and `is_warming_up()`. FlashInfer
-profiling uses a separate `autotune` context.
-
 ### Solution choices
 
 - **Triton** — in-tree; default portable JIT path for various kernels, including
@@ -228,11 +196,47 @@ base and candidate revision. See the
 contract, and the [CI documentation](../test/ci/README.md#registration-level-kernel-benchmarks)
 for workflow behavior and runner requirements.
 
+### Plugins
+
+`python -m tokenspeed_kernel.plugins list` lists discovered out-of-tree backends.
+Plugins register through the same `@register_kernel` decorator from their
+own package, set their own priority, and participate in selection like
+in-tree backends. See `tokenspeed_kernel/plugins/README.md`.
+
+### Weight preprocessing
+
+Some kernels need loaded weights converted into a representation suited to their
+computation. During model initialization, the layer chooses a compatible
+preprocessor. A shared weight broker installs the transformed weights and tracks
+their storage layout, making that representation visible to kernel selection.
+
+At execution, the registry matches the prepared weights to kernels that support
+their layout alongside the operation's other requirements. This lets preparation
+and execution remain separate while different kernels can share prepared weights.
+
+### Kernel state and graph capture
+
+Some kernels keep device state that must start at zero and that every launch
+restores to zero, such as split-K arrival counters. Such kernels take the state
+as an argument and report how much they need; the registered op gets it from
+`tokenspeed_kernel.workspace.zeroed_state`. Eager launches share one buffer per
+stream. A graph captured inside `capture_session` gets buffers of its own,
+zeroed once after capture outside the graph and kept alive as long as the
+graph, so replays carry no zeroing node. The runtime opens a session around
+every graph it captures.
+Prepared plans can use `retain_for_capture` in that session to keep their
+allocations alive until the graph owner is released.
+
+Operators can prepare compilation variants during ordinary execution with
+`ops.tuning.kernel_warmup(enabled=True)` and `is_warming_up()`. FlashInfer
+profiling uses a separate `autotune` context.
+
 ### JIT compilation while serving
 
 Compile-time kernel parameters (`tl.constexpr`, `gl.constexpr`) key the
 Triton compile cache. A per-batch value passed as one compiles a new binary
 on the forward thread for every new batch shape (100 ms to seconds each).
+
 `tokenspeed_kernel.compile_monitor` hooks Triton's JIT (Gluon shares it) and
 records every compilation. The runtime installs it in each scheduler process
 and marks the end of startup. After that, the monitor logs each compilation
@@ -243,62 +247,58 @@ default) or raises (`error`, which CI serving jobs use). Kernel tests guard
 batch-varying launches with `assert_no_triton_compile` in `test/utils.py`.
 The monitor does not observe JITs outside Triton, such as DeepGEMM's
 per-shape kernels; they need the same discipline at their call sites.
+
 A runtime argument still keys the cache: Triton specializes an integer on
 whether it is 1 or divisible by 16, and a pointer on 16-byte alignment.
 Startup warms only the classes graph capture happens to see. On the serving
 path, a per-batch count (tokens, rows, requests) belongs in
 `do_not_specialize`, and a pointer into a buffer sliced at a per-batch
-offset belongs in `do_not_specialize_on_alignment`. A stride that changes
+offset belongs in `do_not_specialize_on_alignment`. `do_not_specialize`
+already drops the alignment key too, so its arguments need no second listing
+in `do_not_specialize_on_alignment`. A stride that changes
 between call sites but stays a multiple of 16, such as a projection's row
 width, stays a plain runtime argument: one class covers it, and the hint
-keeps row loads vectorized. Use a fixed block with a loop for a
-batch-derived block size rather than a power-of-two bucket; the bucket form
-still compiles once per new bucket while serving. The end-of-startup mark is
-also the package's compile switch, set whether or not the monitor is
-installed. A kernel whose library compiles once per batch
-shape and cannot bucket it, such as FlashInfer's joint BF16 GEMM (some runners
-compile per exact row count) or the ll_bf16 router's dot-product kernel, checks
-`compile_monitor.is_serving()` where it is dispatched: startup tuning and graph capture use it, and eager calls while
-serving take a GEMM that never compiles (cuBLAS through torch on NVIDIA).
+keeps row loads vectorized.
 
-### Plugins
+Use a fixed block with a loop for a batch-derived block size rather than a
+power-of-two bucket; the bucket form still compiles once per new bucket while
+serving. The end-of-startup mark is also the package's compile switch, set
+whether or not the monitor is installed. A kernel whose library compiles
+once per batch shape and cannot bucket it, such as FlashInfer's joint BF16
+GEMM, checks `compile_monitor.is_serving()` where it is dispatched: startup
+tuning and graph capture use it, and eager calls while serving take a GEMM
+that never compiles.
 
-`python -m tokenspeed_kernel.plugins list` lists discovered out-of-tree backends.
-Plugins register through the same `@register_kernel` decorator from their
-own package, set their own priority, and participate in selection like
-in-tree backends. See `tokenspeed_kernel/plugins/README.md`.
+## Nightly installation
 
-## Public API
+CUDA 13 nightly wheels are published daily from `main` for Linux x86_64 and
+ARM64, with Python 3.11–3.13. Versions append the UTC build date to the base
+version, for example `0.1.3.post20260929`.
 
-```python
-from tokenspeed_kernel.ops.gemm import mm
-from tokenspeed_kernel.ops.layernorm import grouped_gemma_rmsnorm
-from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights, moe_topk
-from tokenspeed_kernel.ops.residual import gated_residual_combine, gated_residual_mix
-from tokenspeed_kernel.ops.attention.gdn import gdn_chunk_prefill
-from tokenspeed_kernel.ops.attention.mha import (
-    mha_decode_with_kvcache,
-    mha_prefill,
-)
-from tokenspeed_kernel.ops.attention.msa import (
-    msa_decode_with_kvcache,
-    msa_extend_with_kvcache,
-)
+```bash
+pip install --upgrade tokenspeed-kernel \
+  --extra-index-url https://lightseek.org/whl/nightly
 ```
 
-The preceding platform- and solution-agnostic public APIs provide the most
-value from TokenSpeed-kernel. You can also call directly into a specific
-solution under `ops/<family>/`, or run `select_kernel` manually with
-targeted filters.
+PyPI supplies dependencies that are absent from the nightly index. To select a
+specific nightly, use `tokenspeed-kernel==0.1.3.post20260929`. Post releases sort
+above the corresponding base release and do not require `--pre`.
 
-For targeted selection:
+The `Build and Release tokenspeed-kernel` workflow also supports manual nightly
+builds from pull request branches. To publish manually, run it from `main` with
+both `nightly` and `publish_github` enabled. Same-day reruns preserve already
+published wheels.
+Historical nightlies are retained. Automatic cleanup is deferred.
 
-```python
-from tokenspeed_kernel.selection import select_kernel, kernel_override
+### Ascend source installation
+
+Select the NPU dependency set explicitly when installing from source:
+
+```bash
+TOKENSPEED_KERNEL_BACKEND=npu pip install --no-build-isolation ./python
 ```
 
-For platform checks:
-
-```python
-from tokenspeed_kernel.platform  import current_platform
-```
+This installs the Python registry and Ascend Triton provider and skips CUDA
+compilation. Install a compatible Torch/TorchNPU stack first. The
+`tokenspeed-kernel-npu` package and its native operator dependencies are separate
+installations.

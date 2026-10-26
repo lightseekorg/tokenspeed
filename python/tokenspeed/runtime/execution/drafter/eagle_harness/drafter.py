@@ -257,8 +257,9 @@ class EagleHarness(Eagle4):
     def _allocate_sampled(
         self, max_bs: int, topk: int, depth: int, num_nodes: int, pool_nodes: int
     ) -> None:
-        """Sampled trees' round buffers and the next round's q tables: one q
-        slot for the root and one per lane row of every later depth."""
+        """Sampled rounds' buffers (trees and chains) and the next round's q
+        tables: one q slot for the root and one per lane row of every later
+        depth."""
         device = self.device
         num_candidates = self.draft_model_runner.model.num_candidates
         num_slots = 1 + (depth - 1) * topk

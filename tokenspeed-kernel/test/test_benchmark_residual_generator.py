@@ -240,3 +240,75 @@ def test_hyperconnection_mix_generator_invokes_with_padded_storage(
         hc_count * hidden_size,
     )
     assert torch.count_nonzero(prepared_weight[projection_rows:]) == 0
+
+
+def _boundary_request(**updates: object) -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="residual",
+        mode="post_norm_residual_pre_norm",
+        parameters={
+            "model_profile": "muse_spark_tp8",
+            "tokens": 3,
+            "hidden_size": 256,
+            "post_weighted": True,
+            "pre_weighted": True,
+            "outputs": "bf16",
+            "post_eps": 1e-8,
+            "pre_eps": 1e-5,
+            "gate_eps": 1e-3,
+            "gate_temperature": 0.3,
+            "weight_offset": 1.0,
+            "dtype": "bfloat16",
+            **updates,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"outputs": "fp32"}, "outputs"),
+        ({"post_eps": 0.0}, "post_eps"),
+        ({"pre_weighted": 1}, "pre_weighted"),
+        ({"model_profile": "kimi_k3_tp8"}, "model_profile"),
+    ],
+)
+def test_post_norm_residual_pre_norm_rejects_invalid_parameters(updates, match) -> None:
+    with pytest.raises(BenchmarkCaseError, match=match):
+        residual_generator.prepare_post_norm_residual_pre_norm(
+            _boundary_request(**updates), None
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+@pytest.mark.parametrize(
+    ("updates", "outputs"),
+    [
+        ({"outputs": "bf16"}, (torch.float32, torch.bfloat16)),
+        (
+            {"outputs": "fp32_and_bf16", "post_weighted": False},
+            (torch.float32, torch.float32, torch.bfloat16),
+        ),
+        (
+            {"outputs": "fp32_and_bf16", "pre_weighted": False},
+            (torch.float32, None, None),
+        ),
+    ],
+)
+def test_post_norm_residual_pre_norm_returns_the_selected_entrys_outputs(
+    updates, outputs
+) -> None:
+    from tokenspeed_kernel.platform import current_platform
+
+    prepared = residual_generator.prepare_post_norm_residual_pre_norm(
+        _boundary_request(**updates), current_platform()
+    )
+    results = prepared.invocation.invoke()
+
+    assert prepared.registration.mode == "post_norm_residual_pre_norm"
+    assert tuple(None if r is None else r.dtype for r in results) == outputs
+    assert all(r is None or r.shape == (3, 256) for r in results)

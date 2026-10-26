@@ -524,6 +524,31 @@ def _iris_drain_subgroup_vmem():
     )
 
 
+@gluon.jit
+def _iris_subgroup_any(flags):
+    """Return whether any lane of this subgroup holds a nonzero int32 flag.
+
+    One v_cmp writes the subgroup's lane mask to scalar registers, so a loop
+    can branch on it without a cross-lane reduction or, in multi-subgroup
+    programs, a shared-memory exchange. The result is uniform per subgroup,
+    not per workgroup: subgroups looping on it iterate independently, so such
+    a loop must not contain a workgroup barrier. The memory clobber keeps the
+    compiler from hoisting polling loads out of the loop. The 64-bit result is
+    the whole lane mask only on wave64 (CDNA4) targets.
+
+    Args:
+        flags: Exactly one int32 per lane (the instruction takes one VGPR).
+    """
+    mask = gl.inline_asm(
+        "v_cmp_ne_u32_e64 $0, 0, $1",
+        "=s,v,~{memory}",
+        [flags],
+        gl.int64,
+        is_pure=False,
+    )
+    return mask != 0
+
+
 @triton.jit
 def iris_pull_oneshot_staged(
     input_ptr,
@@ -679,39 +704,64 @@ def _iris_wait_lamport_slots(
 ):
     """Wait for each peer's BF16 packs in its slot to replace the empty markers.
 
-    Peer p's packs start at slots + p * SLOT_ELEMENTS; offsets index packs.
+    Peer p's packs start at slots + p * SLOT_ELEMENTS. slots is 16-byte aligned,
+    as Iris allocations are; each row of offsets indexes one pack of consecutive
+    elements starting at a multiple of its width. Each subgroup polls the packs
+    as 32-bit words until all of its valid lanes have every peer's pack, then
+    returns them as BF16 in LAYOUT.
     """
-    values = ()
+    ROWS: gl.constexpr = offsets.shape[0]
+    WORDS: gl.constexpr = offsets.shape[1] // 2
+    gl.static_assert(offsets.shape[1] % 2 == 0 and SLOT_ELEMENTS % 8 == 0)
+    # Peers store whole words. Polling words keeps each one a single load at any
+    # pointer alignment; BF16 loads could split a word into a stale low half
+    # and an arrived high half.
+    words_ptr = gl.multiple_of(slots.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
+    first, _ = gl.split(gl.reshape(offsets, [ROWS, WORDS, 2]))
+    # Each thread's words stay as consecutive as its BF16 elements.
+    word_offsets = gl.max_contiguous(gl.multiple_of(first // 2, [1, WORDS]), [1, WORDS])
+    word_valid = gl.convert_layout(valid, gl.SliceLayout(1, word_offsets.type.layout))
+    loaded = ()
     for _ in gl.static_range(1, WORLD_SIZE):
-        values += (gl.full(offsets.shape, 0, gl.bfloat16, LAYOUT),)
-    active = valid
-    while gl.any(active, 0):
+        loaded += (gl.zeros_like(word_offsets).to(gl.uint32),)
+    waiting = _iris_subgroup_any(valid.to(gl.int32))
+    while waiting:
+        # Issue every peer's read before checking any; .cv bypasses stale
+        # cache lines. Arrived packs stay unchanged until this rank clears
+        # them, so all valid lanes simply reread them. The compiler regression
+        # tests check that these reads remain in the polling cycle.
         loaded = ()
-        # A lane reloads every peer until all seven packs are ready. Issue the
-        # independent reads before checking them; retired lanes keep their data.
-        # .cv controls hardware caches, not compiler volatility. The compiler
-        # regression test checks that these reads remain in the polling cycle.
         for delta in gl.static_range(1, WORLD_SIZE):
             peer = (RANK + delta) % WORLD_SIZE
             loaded += (
                 gl.amd.cdna4.buffer_load(
-                    slots + peer * SLOT_ELEMENTS,
-                    offsets,
-                    mask=active[:, None],
-                    other=values[delta - 1],
+                    words_ptr + peer * (SLOT_ELEMENTS // 2),
+                    word_offsets,
+                    mask=word_valid[:, None],
                     cache=".cv",
                 ),
             )
-        active = gl.full(valid.shape, False, gl.int1, gl.SliceLayout(1, LAYOUT))
+        # Payloads never hold negative zero, so a word is still empty exactly
+        # when its high half is 0x8000.
+        missing = gl.full(
+            word_valid.shape,
+            False,
+            gl.int1,
+            gl.SliceLayout(1, word_offsets.type.layout),
+        )
         for delta in gl.static_range(0, WORLD_SIZE - 1):
-            active |= valid & (
-                gl.max(
-                    (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000).to(gl.int32),
-                    1,
-                )
-                != 0
-            )
-        values = loaded
+            empty = (loaded[delta] >> 16) == 0x8000
+            missing |= word_valid & (gl.max(empty.to(gl.int32), 1) != 0)
+        waiting = _iris_subgroup_any(missing.to(gl.int32))
+    values = ()
+    for delta in gl.static_range(0, WORLD_SIZE - 1):
+        low = loaded[delta].to(gl.uint16).to(gl.bfloat16, bitcast=True)
+        high = (loaded[delta] >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+        values += (
+            gl.convert_layout(
+                gl.reshape(gl.join(low, high), [ROWS, 2 * WORDS]), LAYOUT
+            ),
+        )
     return values
 
 

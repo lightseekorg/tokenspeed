@@ -47,6 +47,7 @@ from tokenspeed_kernel.ops.moe import (
     FUSED_ROUTING_MAX_TOKENS,
     PreparedNvfp4Routing,
     bf16_moe_routes,
+    bf16_moe_routes_warmup,
     gather_moe_routes,
     moe_sigmoid_bias_topk_routing,
     moe_topk,
@@ -1178,11 +1179,12 @@ class MuseSparkMoE(nn.Module):
             # Each TP rank contributes only its intermediate-column slice.
             # RMSNorm must see the complete route before top-k weighting.
             if not owned_rows:
-                routes = routes.reshape(num_tokens * self.topk, width)
-                if iris is not None and iris.can_reduce_borrowed(routes):
-                    routes = iris.reduce_borrowed(routes)
-                else:
-                    (routes,) = _muse_all_reduce(iris, (routes,), self.tp_group)
+                # Routes already in the acquired producer views reduce without staging.
+                (routes,) = _muse_all_reduce(
+                    iris,
+                    (routes.reshape(num_tokens * self.topk, width),),
+                    self.tp_group,
+                )
             # Consume borrowed collective storage before the next projection.
             return routed_input_scale_rmsnorm_sum(
                 routes.reshape(num_tokens, self.topk, width),
@@ -1191,6 +1193,7 @@ class MuseSparkMoE(nn.Module):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                None,
             )
         if owned_rows:
             assert iris is not None and iris.can_use_owned_rows(num_tokens)
@@ -1207,6 +1210,22 @@ class MuseSparkMoE(nn.Module):
                 )
                 if reduced is not None:
                     return reduced
+        if route_map is not None and norm.weight is None:
+            raise ValueError("routed gathered reduction requires an affine norm")
+        # Write the sum straight into the prepared all-reduce input that the
+        # collective below acquires again, instead of copying it there.
+        output = (
+            _acquire_all_reduce_output(
+                (
+                    num_tokens,
+                    routes.shape[-1] if route_map is None else norm.weight.shape[0],
+                ),
+                routes,
+                self.ep_group,
+            )
+            if current_platform().is_cdna4 and (owned_rows or self.ep_size > 1)
+            else None
+        )
         if route_map is None:
             combined = routed_input_scale_rmsnorm_sum(
                 routes,
@@ -1215,17 +1234,9 @@ class MuseSparkMoE(nn.Module):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                output,
             )
         else:
-            if norm.weight is None:
-                raise ValueError("routed gathered reduction requires an affine norm")
-            output = (
-                _acquire_all_reduce_output(
-                    (num_tokens, norm.weight.shape[0]), routes, self.ep_group
-                )
-                if current_platform().is_cdna4 and (owned_rows or self.ep_size > 1)
-                else None
-            )
             if (
                 not owned_rows
                 and iris is not None
@@ -1295,17 +1306,17 @@ class MuseSparkMoE(nn.Module):
         iris = self.iris_state
         deferred_out = None
         if (
-            owned_rows
-            and self.tp_size > 1
+            self.tp_size > 1
             and self.ep_size == 1
             and iris is not None
-            and iris.owned_route_max_rows
             and norm_weight is not None
             and norm_weight.shape == (4096,)
             and self.experts.deferred_output_is_token_order
             and self.experts.supports_deferred_out
         ):
-            deferred_out = iris.acquire_owned_route_input(topk_ids.shape[0])
+            deferred_out = self._acquire_route_destination(
+                topk_ids.shape[0], owned_rows
+            )
         gemm2_out, _, expanded_idx = self.experts(
             hidden_states=compressed,
             topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
@@ -1332,6 +1343,8 @@ class MuseSparkMoE(nn.Module):
             # no map gather before the TP reduction.
             gemm2_out = gemm2_out.view(*topk_ids.shape, norm_weight.shape[0])
             expanded_idx = None
+        # A supplied destination is canonical; gathering it would read itself.
+        assert deferred_out is None or expanded_idx is None
         # Other deferred outputs retain their map and any hidden-width padding.
         return self._reduce_expert_routes(
             routes=gemm2_out,
@@ -1339,6 +1352,23 @@ class MuseSparkMoE(nn.Module):
             num_tokens=topk_ids.shape[0],
             route_weights=topk_weights,
             owned_rows=owned_rows,
+        )
+
+    def _acquire_route_destination(
+        self, num_tokens: int, owned_rows: bool
+    ) -> torch.Tensor | None:
+        """Borrow the TP route reduction's input as ``[tokens * topk, width]``."""
+        iris = self.iris_state
+        norm_weight = self.post_expert_norm.weight
+        assert iris is not None and norm_weight is not None
+        if owned_rows:
+            return (
+                iris.acquire_owned_route_input(num_tokens)
+                if iris.owned_route_max_rows
+                else None
+            )
+        return _acquire_all_reduce_output(
+            (num_tokens * self.topk, norm_weight.shape[0]), norm_weight, self.tp_group
         )
 
     def _prepare_routing(
@@ -1519,6 +1549,15 @@ class MuseSparkMoE(nn.Module):
                 self.experts.w2_weight,
                 topk_ids.contiguous(),
                 self.expert_start,
+                output=(
+                    self._acquire_route_destination(
+                        compressed.shape[0], owned_global_rows is not None
+                    )
+                    if self.tp_size > 1 and self.iris_state is not None
+                    else None
+                ),
+                batch_invariant=global_server_args_dict["numerics"]
+                in BITWISE_ENVELOPES,
             )
             combined = self._reduce_expert_routes(
                 routes=routes,
@@ -2549,15 +2588,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             if self._loaded_audio != audio_parameters:
                 missing = sorted(audio_parameters - self._loaded_audio)
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
-        if global_server_args_dict["disable_autotune"]:
-            return
-        experts_to_warm = [
-            layer.mlp.experts
-            for layer in self.model.layers
-            if layer.mlp.quantized_experts
-            and layer.mlp.experts.plan.get("warmup") is not None
+        bf16_mlps = [
+            layer.mlp for layer in self.model.layers if not layer.mlp.quantized_experts
         ]
-        if not experts_to_warm:
+        experts_to_warm = (
+            []
+            if global_server_args_dict["disable_autotune"]
+            else [
+                layer.mlp.experts
+                for layer in self.model.layers
+                if layer.mlp.quantized_experts
+                and layer.mlp.experts.plan.get("warmup") is not None
+            ]
+        )
+        if not bf16_mlps and not experts_to_warm:
             return
         # Match the global routing span reserved by execution/device.py.
         chunk = int(global_server_args_dict["chunked_prefill_size"])
@@ -2574,6 +2618,18 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if global_server_args_dict["speculative_algorithm"]:
             decode_rows *= int(global_server_args_dict["speculative_num_draft_tokens"])
         max_tokens = max(max_tokens, decode_rows)
+        # BF16 expert layers compile their route kernels before graph capture.
+        # This is JIT warmup, not tuning, so disable_autotune does not skip it.
+        for mlp in bf16_mlps:
+            bf16_moe_routes_warmup(
+                mlp.experts.w13_weight,
+                mlp.experts.w2_weight,
+                mlp.topk,
+                mlp.expert_start,
+                max_num_tokens=max_tokens,
+                batch_invariant=global_server_args_dict["numerics"]
+                in BITWISE_ENVELOPES,
+            )
         for experts in experts_to_warm:
             if not experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")

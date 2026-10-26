@@ -299,6 +299,9 @@ class Envs:
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
+    # Seconds a blocking node of rank >= 1 gives its schedulers to exit on
+    # SIGTERM before it kills them, when it is stopped.
+    TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT = EnvFloat(10.0)
     # The ts-host binary each engine rank runs; by default the one installed
     # with the tokenspeed-engine wheel (``tokenspeed_engine.host_binary()``).
     TOKENSPEED_HOST_BINARY = EnvStr(None)

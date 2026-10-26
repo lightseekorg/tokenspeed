@@ -528,7 +528,6 @@ def _select_radix_pass(
         "topk",
         "take",
     ),
-    do_not_specialize_on_alignment=("row_limits_stride",),
 )
 def gluon_dsv41_index_topk_select_gfx950(
     logits,  # [Q, width] fp32, -inf = unscored
