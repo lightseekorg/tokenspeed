@@ -417,7 +417,8 @@ External INT32 or INT64 routes remain accepted through input staging.
 ### Large Kimi-K3 router
 
 On SM103, the optional FlashInfer source bundle supplies biased-sigmoid top-16
-routing for contiguous FP32 logits and bias, 896 experts, and 3072-8192 tokens.
+routing for contiguous FP32 logits and bias, 896 experts, and 3072-16384 tokens.
+Above 8192 rows, independent row tiles respect the native launch limit.
 It requires normalized weights with scale 1, FP32 output weights, and INT32 ids.
 The dispatcher preserves the existing implementations for other contracts or
 when the source bundle is absent. Explicit kernel selections still apply.

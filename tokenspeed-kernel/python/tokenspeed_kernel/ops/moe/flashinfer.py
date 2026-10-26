@@ -4350,7 +4350,7 @@ if platform.is_nvidia and platform.arch_version == ArchVersion(10, 3):
             priority=Priority.SPECIALIZED,
             traits={
                 "tokens_min": frozenset({3072}),
-                "tokens_max": frozenset({8192}),
+                "tokens_max": frozenset({16384}),
                 "experts": frozenset({896}),
                 "topk": frozenset({16}),
                 "bias_dtype": frozenset({torch.float32}),

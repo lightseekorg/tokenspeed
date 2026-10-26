@@ -52,7 +52,7 @@ def check_routes(actual, expected):
 
 
 @native
-@pytest.mark.parametrize("rows", [3072, 4097, 8192])
+@pytest.mark.parametrize("rows", [3072, 4097, 8192, 8193, 10240, 12288, 16384])
 @pytest.mark.parametrize("pattern", ["random", "ties", "saturated"])
 def test_fused_router_buffers_and_graph(rows, pattern):
     torch.manual_seed(rows)
@@ -106,7 +106,7 @@ def test_fused_router_buffers_and_graph(rows, pattern):
     ],
 )
 def test_other_contracts_keep_existing_router(case):
-    rows = 16 if case == "small" else 8193 if case == "large" else 3072
+    rows = 16 if case == "small" else 16385 if case == "large" else 3072
     experts = 128 if case == "experts" else 896
     topk = 8 if case == "topk" else 16
     logits = torch.randn(

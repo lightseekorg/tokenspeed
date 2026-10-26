@@ -107,7 +107,26 @@ def fused_router(
         prepare_kimi_k3_fused_router,
     )
 
-    plan = allocate_kimi_k3_route_plan(logits.shape[0], 8, logits.device)
+    rows = logits.shape[0]
+    if rows > 8192:
+        if out is None:
+            out = (
+                logits.new_empty((rows, 16)),
+                torch.empty((rows, 16), device=logits.device, dtype=torch.int32),
+            )
+        # Balanced tiles reuse the warmed large-row kernel instead of tiny tails.
+        tiles = (rows + 8191) // 8192
+        for tile in range(tiles):
+            start = rows * tile // tiles
+            end = rows * (tile + 1) // tiles
+            fused_router(
+                logits[start:end],
+                correction_bias,
+                out=(out[0][start:end], out[1][start:end]),
+            )
+        return out
+
+    plan = allocate_kimi_k3_route_plan(rows, 8, logits.device)
     if out is not None:
         plan = plan._replace(topk_weights=out[0], topk_ids=out[1])
     prepare_kimi_k3_fused_router(
