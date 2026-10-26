@@ -209,6 +209,17 @@ impl PendingFrontend {
 /// One output of one request: its chunk, or why its stream ended early.
 type Delivery = (String, Result<OutputChunk, StreamError>);
 
+/// The gateway's load snapshot view, in native LCM allocator blocks.
+#[pyclass(frozen, get_all, module = "tokenspeed_engine._native")]
+struct LoadSnapshot {
+    dp_rank: i64,
+    num_running_reqs: i64,
+    num_waiting_reqs: i64,
+    num_used_pages: i64,
+    num_active_pages: i64,
+    max_total_pages: i64,
+}
+
 /// The connected engines.
 #[pyclass(frozen, module = "tokenspeed_engine._native")]
 struct Frontend {
@@ -248,6 +259,23 @@ impl Frontend {
                     load.kv_active_pages,
                     load.kv_total_pages,
                 )
+            })
+            .collect()
+    }
+
+    /// Current native reports for every rank, or no snapshots while any
+    /// rank lacks capacity or has missed three one-second load heartbeats.
+    fn fresh_snapshots(&self) -> Vec<LoadSnapshot> {
+        self.client
+            .fresh_loads(Duration::from_secs(3))
+            .into_iter()
+            .map(|(dp_rank, load)| LoadSnapshot {
+                dp_rank,
+                num_running_reqs: load.num_running,
+                num_waiting_reqs: load.num_waiting,
+                num_used_pages: load.kv_used_pages,
+                num_active_pages: load.kv_active_pages,
+                max_total_pages: load.kv_total_pages,
             })
             .collect()
     }

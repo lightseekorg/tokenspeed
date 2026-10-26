@@ -297,20 +297,15 @@ class SchedulerControlClient:
         return [res.updated for res in responses]
 
     async def get_load(self: AsyncLLM) -> list[GetLoadReqOutput]:
-        """Each engine's latest load, as it reported it with its outputs."""
+        """The complete set of fresh native scheduler load reports."""
         self.auto_create_handle_loop()
         return [
             GetLoadReqOutput(
-                dp_rank=dp_rank,
-                num_reqs=num_running + num_waiting,
-                num_waiting_reqs=num_waiting,
-                num_pages=kv_active_pages,
-                num_total_pages=kv_total_pages,
+                dp_rank=snapshot.dp_rank,
+                num_reqs=snapshot.num_running_reqs + snapshot.num_waiting_reqs,
+                num_waiting_reqs=snapshot.num_waiting_reqs,
+                num_pages=snapshot.num_used_pages,
+                num_total_pages=snapshot.max_total_pages,
             )
-            for dp_rank, (
-                num_running,
-                num_waiting,
-                kv_active_pages,
-                kv_total_pages,
-            ) in enumerate(self.frontend.loads())
+            for snapshot in self.frontend.fresh_snapshots()
         ]

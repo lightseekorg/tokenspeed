@@ -102,6 +102,7 @@ fn tokens(chunks: &[OutputChunk]) -> Vec<i32> {
 async fn streams_tokens_until_finished() {
     let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
     assert_eq!(client.engines()[0].ready.max_model_len, 4096);
+    assert!(client.fresh_loads(Duration::from_secs(3)).is_empty());
 
     let chunks = collect(client.generate(request("r1", Some(3))).await.unwrap()).await;
     assert_eq!(tokens(&chunks), [1, 2, 3]);
@@ -111,6 +112,12 @@ async fn streams_tokens_until_finished() {
     assert!(chunks[..2].iter().all(|c| c.finish_reason.is_none()));
     assert_eq!(client.in_flight(), [0]);
     assert_eq!(client.loads()[0].kv_total_pages, 100);
+    let snapshots = client.fresh_loads(Duration::from_secs(3));
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].0, 0);
+    assert_eq!(snapshots[0].1.kv_used_pages, 7);
+    assert_eq!(snapshots[0].1.kv_active_pages, 0);
+    assert!(client.fresh_loads(Duration::ZERO).is_empty());
 }
 
 #[tokio::test]
@@ -123,6 +130,7 @@ async fn pinned_requests_go_to_their_rank() {
         };
         let chunks = collect(client.generate(pinned).await.unwrap()).await;
         assert_eq!(tokens(&chunks), [1001]);
+        assert!(client.fresh_loads(Duration::from_secs(3)).is_empty());
     }
     let out_of_range = TokenizedGenerateReqInput {
         data_parallel_rank: Some(2),

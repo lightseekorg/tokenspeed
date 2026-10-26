@@ -218,6 +218,7 @@ pub fn output_batch(
         num_waiting: load.num_waiting,
         kv_active_pages: load.kv_active_pages,
         kv_total_pages: load.kv_total_pages,
+        kv_used_pages: load.kv_used_pages,
         finish_reason_details: Vec::with_capacity(n),
         spec_verify_ct: Vec::new(),
         accept_draft_tokens: Vec::new(),

@@ -131,6 +131,9 @@ class AsyncLLM(SchedulerControlClient, EngineClient):
         self.logger = logger
 
         self.frontend = frontend
+        # SMG reads the native reports directly; there is no Python replica
+        # or separate scheduler channel for load snapshots.
+        self.load_snapshot_store = frontend
         self._encode_sender = encode_sender
         self._wire_encoder = MsgpackEncoder()
         # The prefill role's KV bootstrap server, which the launcher starts;

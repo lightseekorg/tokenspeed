@@ -264,6 +264,7 @@ fn step(
         num_waiting: 0,
         kv_active_pages: 0,
         kv_total_pages: 100,
+        kv_used_pages: 7,
         finish_reason_details: vec![None],
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],

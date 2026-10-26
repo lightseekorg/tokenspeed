@@ -3005,7 +3005,6 @@ def finish_selection(
 
 @triton.jit(
     do_not_specialize=["selected_stride", "candidate_stride", "K", "C"],
-    do_not_specialize_on_alignment=["selected_stride", "candidate_stride", "K", "C"],
 )
 def _write_selection(
     Selected,
