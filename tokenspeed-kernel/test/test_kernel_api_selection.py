@@ -7025,18 +7025,18 @@ _CASES = [
             "cdna5",
             "moe",
             "topk",
-            "triton_sqrt_softplus_topk",
+            "gluon_sqrt_softplus_topk_gfx1250",
             partial(_moe_topk_bias, tokens=tokens),
             id_suffix=f"bias-tokens{tokens}",
         )
-        for tokens in (1, 2, 17)
+        for tokens in (1, 2, 17, 8192)
     ],
     _case(
         _is_cdna5,
         "cdna5",
         "moe",
         "topk",
-        "triton_sqrt_softplus_topk",
+        "gluon_sqrt_softplus_topk_gfx1250",
         _moe_topk_hash,
         id_suffix="hash",
     ),
