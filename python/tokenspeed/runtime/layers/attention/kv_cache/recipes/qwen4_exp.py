@@ -314,6 +314,15 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
             if spec.group_id == FULL_ATTENTION
             for field in fields
         }
+        # A parent belongs to one cache group at a time, so a side group can
+        # use a whole plane, and every plane holds at least its largest decoder
+        # field. A recurrent state is many FP8 K pages wide.
+        plane_capacity: dict[str, int] = {}
+        for _, fields in decoder_groups:
+            for field in fields:
+                plane_capacity[field.plane_id] = max(
+                    plane_capacity.get(field.plane_id, 0), field.payload_bytes
+                )
         shared_extras = []
         for spec, fields in extras:
             plane_bytes: dict[str, int] = {}
@@ -336,7 +345,7 @@ class Qwen4ExpRecipe(QwenGDNRecipe):
                     compatible = len(ratios) == 1
                 else:
                     compatible = all(
-                        size <= attention_plane_bytes[plane]
+                        size <= plane_capacity[plane]
                         for plane, size in plane_bytes.items()
                     )
             if not compatible:
