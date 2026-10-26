@@ -922,3 +922,41 @@ class TestL3StorageBackend:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+@pytest.mark.parametrize("minimum", [None, 1, 8, 256])
+def test_mla_min_kv_split_cli(minimum):
+    argv = ["--model", "x", "--attention-backend", "tokenspeed_mla"]
+    if minimum is not None:
+        argv += ["--min-kv-split", str(minimum)]
+    args = prepare_server_args(argv)
+    assert args.min_kv_split == minimum
+
+
+@pytest.mark.parametrize("minimum", [0, -1, 257])
+def test_mla_min_kv_split_rejects_invalid_minimum(minimum):
+    with pytest.raises(ValueError, match="min_kv_split"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--attention-backend",
+                "tokenspeed_mla",
+                "--min-kv-split",
+                str(minimum),
+            ]
+        )
+
+
+def test_mla_min_kv_split_rejects_unsupported_backend():
+    with pytest.raises(ValueError, match="requires tokenspeed_mla"):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--attention-backend",
+                "mla",
+                "--min-kv-split",
+                "8",
+            ]
+        )

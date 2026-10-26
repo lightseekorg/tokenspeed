@@ -423,3 +423,16 @@ covers every split in their launches.
     stages. Overall geometric means weight all 16 workloads equally; Q4 and Q8
     means each cover eight workloads. See the linked article for the full
     benchmark context.
+
+### Serving split minimum
+
+TokenSpeed exposes the kernel's `min_split_kv` through `--min-kv-split`.
+It requires `--attention-backend tokenspeed_mla` and applies to target and
+draft attention, including BF16 drafts. Omission preserves automatic selection;
+`--min-kv-split 8` sets a lower bound while allowing the existing heuristic to
+choose more splits. Short histories may use fewer nonempty partitions.
+
+The setting is fixed for the server lifetime. The runtime reserves workspace
+for the maximum decode batch and query width before CUDA graph capture; eager
+and captured execution pass the same minimum to the kernel. Larger minima
+trade extra workspace and short-context overhead for long-context parallelism.

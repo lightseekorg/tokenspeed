@@ -89,7 +89,7 @@ launch_server() {
     "${SRUN[@]}" --nodes="${#NODES[@]}" --ntasks="${#NODES[@]}" --nodelist="$SERVER_NODES" --ntasks-per-node=1 \
         --cpus-per-task=64 --gpus-per-node=4 --mpi=pmix --kill-on-bad-exit=1 \
         --job-name="$SERVER_STEP" "${SRUN_ARGS[@]}" \
-        bash -x "$SCRIPT_DIR/configs/${CONFIG}.sh" > "$RUN_DIR/server.log" 2>&1 &
+        bash -x "$SCRIPT_DIR/configs/${CONFIG}.sh" --min-kv-split 8 > "$RUN_DIR/server.log" 2>&1 &
     SERVER_PID=$!
 }
 

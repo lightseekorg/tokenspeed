@@ -87,7 +87,8 @@ Server settings live in `configs/attn_tp8_moe_{tp8,ep8}.sh`. They use EAGLE3
 with synthetic acceptance length 3.7, text-only serving, and ports 8000 (API)
 and 8010 (metrics). Both configs explicitly capture every decode batch size from
 1 through 64 with graph padding disabled. Synthetic output is for performance
-measurement.
+measurement. The AgentX launcher adds `--min-kv-split 8` to improve
+long-context decode parallelism for both target and draft attention.
 
 InferenceX replays recorded assistant responses. Concurrency counts root lanes;
 child agents can add concurrent HTTP requests. The server stays alive across
