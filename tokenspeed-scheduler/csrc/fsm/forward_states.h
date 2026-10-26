@@ -55,6 +55,10 @@ struct CacheProgress {
     // (CacheCoordinator::AdmissionResult::resumed_tail_hash). The finish that
     // publishes the end state marks it superseded.
     std::optional<std::string> resumed_tail_hash;
+    // Where a local first admission resumed (its prefix hit), zero without
+    // one: the request read that boundary's entries then, which its final
+    // publication refreshes on Host.
+    std::int32_t resume_tokens{0};
     // The in-forward State checkpoint a scheduled forward writes
     // (SchedulerConfig::state_checkpoint_in_forward): the page boundary it
     // sits at and, per cache group, the block it is written to (null for

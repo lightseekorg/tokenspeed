@@ -811,11 +811,12 @@ pin. Nothing else needs to know the copy is in flight, so the runtime copies
 on its own stream and no forward waits. A cached block is never written again
 by its owner (prefix reuse already depends on that), so the pin alone makes
 the copy race-free. Both guards share one ticket (`StartPendingStores(guard,
-cause)` drains the publication queue; `StartRetractionStores` builds the
-image's L2 leg from the victim's tables; `StartEvictionStores` drains what the
-plan's admissions and restores evicted), and the op carries `source_pinned` to
-the runtime, which branches on the guard and never on the cause. Whatever its
-guard or cause, the op is a `WriteBackOperation`, batched in the plan's
+cause, tables, num_tokens)` drains the publication queue, a finish's boundary
+from its tables first; `StartRetractionStores` builds the image's L2 leg from
+the victim's tables; `StartEvictionStores` drains what the plan's admissions
+and restores evicted), and the op carries `source_pinned` to the runtime,
+which branches on the guard and never on the cause. Whatever its guard or
+cause, the op is a `WriteBackOperation`, batched in the plan's
 `WriteBackBatch` (`WriteBackOp` in Python) and acknowledged by
 `CompleteWriteBack`: "write back" in these names means any copy from the
 Device to Host L2, under either Host write policy, not only under
@@ -1226,7 +1227,8 @@ have to test; a state the phases do not know is the one way to hold pages and
 be invisible at once.
 
 **Finish or abort while suspended** drops the state: from `Retracted`, the
-pinned Host entries become ordinary evictable entries at once and the pool
+pinned Host entries become ordinary evictable entries at once, dated as the
+retraction left them (`cache-concepts.md`, two tiers), and the pool
 blocks return when the copies still writing them land (the tickets hold the
 refs); from `Restoring`, the rebuilt tables are freed and the restore's ACK
 only drops its pins — it republishes nothing, because the token descriptors

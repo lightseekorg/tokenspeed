@@ -143,12 +143,35 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
     }
-    // Every published entry of the request streams: its pages, its tail and
-    // the state checkpoint published with the frontier.
+    // Every published entry under the request's pages streams. The scan
+    // queues them by key, so a page its tables hold only as a private copy
+    // (a restore's copy that was not republished) is stored from its Device
+    // entry; StartPendingStores stores the boundary from the tables first and
+    // skips the queued keys it already took.
     coordinator_.QueueCachedBlocksForStore(store_hashes);
+    // Only what the request used refreshes its Host copies: the boundary it
+    // resumed from and the one it leaves at the frontier -- the pages its
+    // forwards read to the end and the state it ends with.
+    refreshResumeBoundary(request, progress);
+    // A request that computed nothing leaves no boundary.
+    const std::span<const BlockTable> tables =
+        num_computed_tokens > 0 ? std::span<const BlockTable>(request.BlockTablesRef()) : std::span<const BlockTable>{};
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
-    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
+    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish, tables,
+                                              num_computed_tokens);
+}
+
+void Scheduler::refreshResumeBoundary(const Request& request, const fsm::CacheProgress& cache_progress) {
+    const std::int32_t resumed = cache_progress.resume_tokens;
+    if (resumed == 0) {
+        return;
+    }
+    const auto pages = static_cast<std::size_t>(resumed / coordinator_.PrefixGranularity());
+    _assert(pages <= cache_progress.prefix_hashes.size(), "the resume point lies inside the hashed prefix");
+    const std::span<const std::string> hashes(cache_progress.prefix_hashes.data(), pages);
+    coordinator_.RefreshHostBoundary(hashes, request.TailPublicationAt(resumed, pages == 0 ? "" : hashes.back()),
+                                     cache_progress.access_epoch);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {

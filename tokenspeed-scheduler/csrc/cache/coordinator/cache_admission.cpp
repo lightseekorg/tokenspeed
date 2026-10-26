@@ -1251,8 +1251,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             _assert(!input, "a State group matches one checkpoint");
             input = std::move(acquired_prefix.state_at_prompt_end[i]);
         }
-        if (const std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool_, input);
-            key && tails_.Contains(key->content_hash)) {
+        if (const CacheKey* key = groups_[i].Index().KeyOf(pool_, input);
+            key != nullptr && tails_.Contains(key->content_hash)) {
             result.resumed_tail_hash = key->content_hash;
         }
         groups_[i].Allocator().ShapeStateTable(*demands[i].table, std::move(input));

@@ -12497,8 +12497,8 @@ TEST_F(WriteBackTransactionTest, APublicationStoreCopiesWhatAnEvictionWriteBackC
     ASSERT_EQ(x_op->transfers.size(), 8u);
     PublishFinal(tables, MakeTokens(18));
     coordinator_.QueueCachedBlocksForStore(hashes_);
-    const std::optional<WriteBackOperation> store =
-        transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication);
+    const std::optional<WriteBackOperation> store = transfers_.StartPendingStores(
+        StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication, /*tables=*/{}, /*num_tokens=*/0);
     ASSERT_TRUE(store.has_value());
     EXPECT_EQ(store->transfers.size(), 4u) << "X's four pages";
     EXPECT_EQ(transfers_.WriteBackStatsFor(HostStoreCause::kPublication).in_flight, 0u);
@@ -13365,6 +13365,76 @@ TEST(RestoreWriteBackTest, ARestoreDropsASupersededInputRatherThanWritingItBack)
     }
 }
 
+// A retraction stores a State input -- slot 0, outside the boundary it
+// leaves -- at its Device entry's date (CacheCoordinator::StoreEpoch). A later
+// turn's finish can mark that input superseded while the victim still holds
+// it, dating it below every issued epoch: the image's Host copy keeps that
+// date, so once the image lets go it is the next Host victim, ahead of an
+// idle entry stored after it.
+TEST(RetractionImageTest, AnImageStoresASupersededInputAtItsDate) {
+    const std::vector<CacheGroupSpec> specs{
+        CacheGroupSpec{.attn_kind = AttnKind::kFull, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
+        CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0},
+    };
+    BlockPool pool(8, {1, 1});
+    BlockPool host_pool(2, {1, 1});
+    BlockPool snapshot_pool(8, {1, 1});
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, &host_pool, &snapshot_pool,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
+    // Outlives the transfer manager, whose snapshot store holds a slot.
+    SnapshotSlotAllocator blob_slots(1);
+    TierTransferManager transfers(coordinator);
+    // A one-token prompt end: its tail and the checkpoint there, marked
+    // superseded as a later turn's finish marks it.
+    std::vector<BlockTable> tables(2);
+    ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/1));
+    const TailPublication tail{.tail_tokens = 1, .hash = HashPrefixPage(token_span(MakeTokens(1)), std::string{})};
+    const std::uint64_t epoch = CacheCoordinatorTestAccess::NextAccessEpoch(coordinator);
+    coordinator.CacheCompletedBlocks(
+        tables,
+        RequestProgress{
+            .completed_pages =
+                CompletedPages{.tail = tail, .publish_state = true, .boundary_kind = CacheBoundaryKind::kEndpoint},
+            .num_computed_tokens = 1},
+        epoch);
+    const CacheBlockRef checkpoint = tables[1].Blocks()[1];
+    coordinator.Free(tables);
+    coordinator.MarkSupersededStateInput(tail.hash, epoch);
+
+    // The victim holds the checkpoint as its input and computed a private page.
+    std::vector<BlockTable> victim{
+        BlockTable::FromBlocks({pool.AcquireBlock(0)}, /*available_tokens=*/0),
+        BlockTable::FromBlocks({checkpoint, pool.AcquireBlock(1)}, /*available_tokens=*/0),
+    };
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(victim, 2);
+    TierTransferManager::RetractionImageSplit split =
+        transfers.SplitRetractionImage(victim, /*num_tokens=*/2, coordinator.PublishedDataSlots(victim, 2));
+    ASSERT_EQ(split.slots.size(), 1u) << "the input is the one published slot";
+    ASSERT_FALSE(split.shortfall.has_value());
+    std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
+        "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), victim,
+        /*num_tokens=*/2, std::move(split), std::move(epochs));
+    ASSERT_TRUE(stores.has_value());
+    ASSERT_TRUE(stores->host_store.has_value());
+    EXPECT_EQ(transfers.CompleteWriteBack(stores->host_store->op_id).size(), 1u);
+    transfers.CompleteSnapshotStore(stores->snapshot_store.op_id);
+    stores.reset();  // the request is gone: the image lets go
+    coordinator.Free(victim);
+    ASSERT_TRUE(coordinator.ContainsHostCachedBlock(Key(tail.hash, 1)));
+    {
+        CacheBlockRef idle = host_pool.AcquireBlock(0);
+        ASSERT_TRUE(idle);
+        coordinator.CacheHostBlock(idle, Key("idle", 0), std::nullopt);
+    }
+
+    CacheBlockRef replacement = coordinator.AcquireHostBlock(0, /*bucket=*/0);
+
+    ASSERT_TRUE(replacement);
+    EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(tail.hash, 1))) << "the superseded input left first";
+    EXPECT_TRUE(coordinator.ContainsHostCachedBlock(Key("idle", 0)));
+}
+
 // A restore whose only victim is a superseded tail adds a record that stays
 // empty, and erases it before it returns. An admission later in the same
 // plan then records the one segment the drain takes, dated by its newest
@@ -13730,6 +13800,7 @@ TEST(RetractionImageSplitTest, AnImageFitsOnlyWhereTheAllocatorWouldPlaceIt) {
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/true);
 
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2);
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
         ASSERT_EQ(split.boundaries.size(), 1u);
@@ -13742,7 +13813,7 @@ TEST(RetractionImageSplitTest, AnImageFitsOnlyWhereTheAllocatorWouldPlaceIt) {
             ASSERT_FALSE(split.shortfall.has_value());
             std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
                 "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-                /*num_tokens=*/2, std::move(split));
+                /*num_tokens=*/2, std::move(split), std::move(epochs));
             ASSERT_TRUE(stores.has_value());
             EXPECT_EQ(transfers.WriteBackStatsFor(HostStoreCause::kRetraction).snapshot_fallback, 2u);
         }
@@ -13791,6 +13862,7 @@ TEST(RetractionImageSplitTest, ACheckpointVictimFreesItsStateSiblingInThePlan) {
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2);
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
     ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 1, 2}));
@@ -13798,7 +13870,7 @@ TEST(RetractionImageSplitTest, ACheckpointVictimFreesItsStateSiblingInThePlan) {
     ASSERT_FALSE(split.shortfall.has_value());
     std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-        /*num_tokens=*/2, std::move(split));
+        /*num_tokens=*/2, std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[0]));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[1]));
@@ -13846,6 +13918,7 @@ TEST(RetractionImageSplitTest, ARowsChildVictimKeepsItsParentFromGoingWhole) {
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 4);
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/4, coordinator.PublishedDataSlots(tables, 4));
     ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 0, 1}));
@@ -13853,7 +13926,7 @@ TEST(RetractionImageSplitTest, ARowsChildVictimKeepsItsParentFromGoingWhole) {
     ASSERT_FALSE(split.shortfall.has_value());
     std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-        /*num_tokens=*/4, std::move(split));
+        /*num_tokens=*/4, std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[0]));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(host_keys[1]));
@@ -14013,6 +14086,7 @@ TEST(RetractionImageSplitTest, OneFullHostBucketDecidesTheSplitBeforeAnyEviction
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/false);
 
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 8);
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/8, coordinator.PublishedDataSlots(tables, 8));
         EXPECT_EQ(split.buckets, (std::vector<std::int32_t>{0, 1, 0, 1}));
@@ -14026,7 +14100,7 @@ TEST(RetractionImageSplitTest, OneFullHostBucketDecidesTheSplitBeforeAnyEviction
         ASSERT_FALSE(split.shortfall.has_value());
         std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
             "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-            /*num_tokens=*/8, std::move(split));
+            /*num_tokens=*/8, std::move(split), std::move(epochs));
         ASSERT_TRUE(stores.has_value());
         ASSERT_TRUE(stores->host_store.has_value());
         const std::vector<CacheTransfer>& copies = stores->host_store->transfers;
@@ -14146,6 +14220,7 @@ TEST(RetractionImageSplitTest, BoundariesGoShallowestFirstWhateverTheGroupOrder)
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/true);
 
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 6);
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/6, coordinator.PublishedDataSlots(tables, 6));
         ASSERT_EQ(split.boundaries.size(), 3u);
@@ -14157,7 +14232,7 @@ TEST(RetractionImageSplitTest, BoundariesGoShallowestFirstWhateverTheGroupOrder)
         ASSERT_FALSE(split.shortfall.has_value());
         std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
             "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-            /*num_tokens=*/6, std::move(split));
+            /*num_tokens=*/6, std::move(split), std::move(epochs));
         ASSERT_TRUE(stores.has_value());
         ASSERT_TRUE(stores->host_store.has_value());
         ASSERT_EQ(stores->host_store->transfers.size(), 1u);
@@ -14286,6 +14361,7 @@ TEST(RetractionImageSplitTest, ProbeAndCommitAgreeOnEveryImage) {
                 };
                 const std::vector<std::optional<CacheBlockLocation>> before = host_locations();
 
+                CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2 * num_pages);
                 TierTransferManager::RetractionImageSplit split =
                     transfers.SplitRetractionImage(tables, 2 * num_pages, published);
                 EXPECT_EQ(host_locations(), before) << "the split mutates nothing";
@@ -14319,7 +14395,7 @@ TEST(RetractionImageSplitTest, ProbeAndCommitAgreeOnEveryImage) {
                 const std::size_t num_pool_rows = split.slots.size() - num_host_rows;
                 std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
                     "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()),
-                    tables, 2 * num_pages, std::move(split));
+                    tables, 2 * num_pages, std::move(split), std::move(epochs));
                 ASSERT_TRUE(stores.has_value());
                 std::vector<CacheTransfer> copies;
                 if (stores->host_store) {
@@ -14400,6 +14476,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegTakesAHostLeafNotAMiddlePage)
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, kP);
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, kP, coordinator_.PublishedDataSlots(image, kP));
     ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0}));
@@ -14407,7 +14484,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegTakesAHostLeafNotAMiddlePage)
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image, kP,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     coordinator_.Free(image);
 
@@ -14453,13 +14530,14 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegDoesNotCutAboveAnInFlightSegm
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, kP);
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, kP, coordinator_.PublishedDataSlots(image, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image, kP,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     coordinator_.Free(image);
     EXPECT_EQ(HostEntries(b), 2) << "s0 and s1";
@@ -14500,13 +14578,14 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegFallsBackToSingleBlocksAboveA
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, kP);
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, kP, coordinator_.PublishedDataSlots(image, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
     ASSERT_FALSE(split.shortfall.has_value());
     std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image, kP,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     coordinator_.Free(image);
     EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(Key(b_hashes_[1], 0))) << "s1";
@@ -14541,12 +14620,13 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegLeavesAnotherImagesEntries) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(first, kP);
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(first, kP, coordinator_.PublishedDataSlots(first, kP));
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> first_image = transfers_.StartRetractionStores(
         "first", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), first, kP,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(first_image.has_value());
     ASSERT_TRUE(first_image->host_store.has_value());
     transfers_.CompleteWriteBack(first_image->host_store->op_id);
@@ -14572,12 +14652,13 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegLeavesAnotherImagesEntries) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    epochs = transfers_.TakeRetractionEpochs(second, kP);
     split = transfers_.SplitRetractionImage(second, kP, coordinator_.PublishedDataSlots(second, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> second_image = transfers_.StartRetractionStores(
         "second", /*request_pool_index=*/2, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), second, kP,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(second_image.has_value());
     ASSERT_TRUE(second_image->host_store.has_value());
     transfers_.CompleteWriteBack(second_image->host_store->op_id);
@@ -14606,12 +14687,13 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegLeavesAnotherImagesEntries) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    epochs = transfers_.TakeRetractionEpochs(third, kP);
     split = transfers_.SplitRetractionImage(third, kP, coordinator_.PublishedDataSlots(third, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> third_image = transfers_.StartRetractionStores(
         "third", /*request_pool_index=*/3, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), third, kP,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(third_image.has_value());
     coordinator_.Free(third);
     for (const CacheKey& key : z) {
@@ -14632,13 +14714,14 @@ TEST_F(ImageWriteBackTransactionTest, AnEvictionDrainBorrowsAnImagesTicket) {
     std::vector<BlockTable> image(4);
     const TailPublication tail = *PublishFinal(image, MakeTokens(18));
     const std::vector<CacheKey> keys = KeysOf(hashes_, tail);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, 18);
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
     ASSERT_EQ(split.slots.size(), 8u) << "four pages, the tail block and its checkpoints";
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image, 18,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     ASSERT_TRUE(stores->host_store.has_value());
     ASSERT_EQ(stores->host_store->transfers.size(), 8u);
@@ -14676,6 +14759,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageDoesNotBorrowAnEvictionWriteBacksTi
     std::vector<BlockTable> image(4);
     const TailPublication tail = *PublishFinal(image, tokens);
     const std::vector<CacheKey> keys = KeysOf(pages, tail);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, 18);
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
     EXPECT_TRUE(split.pending_store_ops.empty()) << "nothing borrowed";
@@ -14684,7 +14768,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageDoesNotBorrowAnEvictionWriteBacksTi
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image, 18,
-        std::move(split));
+        std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     ASSERT_TRUE(stores->host_store.has_value());
     EXPECT_EQ(stores->host_store->transfers.size(), 8u);
@@ -14748,6 +14832,7 @@ TEST_P(ImageHostPrefixTest, TheSegmentStepPlacesTheBoundariesTheHostCanTake) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/6, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 6);
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/6, coordinator.PublishedDataSlots(tables, 6));
     ASSERT_EQ(split.boundaries.size(), 3u);
@@ -14755,7 +14840,7 @@ TEST_P(ImageHostPrefixTest, TheSegmentStepPlacesTheBoundariesTheHostCanTake) {
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-        /*num_tokens=*/6, std::move(split));
+        /*num_tokens=*/6, std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     std::vector<std::string> copied;
     if (stores->host_store) {
@@ -14817,13 +14902,14 @@ TEST(ImageSegmentsThenBlocksTest, TheFallbackPlansOnTheHostTheSegmentsLeave) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/6, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 6);
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/6, coordinator.PublishedDataSlots(tables, 6));
     ASSERT_EQ(split.num_host_boundaries, 3u);
     ASSERT_FALSE(split.shortfall.has_value());
     const std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
         "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-        /*num_tokens=*/6, std::move(split));
+        /*num_tokens=*/6, std::move(split), std::move(epochs));
     ASSERT_TRUE(stores.has_value());
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(y[0], 0)));
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(Key(y[1], 0)));
@@ -14890,6 +14976,7 @@ TEST(ImageSegmentsThenBlocksTest, TheBlockByBlockPlanStandsWhereTheStepsPlaceFew
                                     CacheBoundaryKind::kEndpoint,
                                     /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 8);
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/8, coordinator.PublishedDataSlots(tables, 8));
         ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 0, 0, 0, 1, 2}));
@@ -14897,7 +14984,7 @@ TEST(ImageSegmentsThenBlocksTest, TheBlockByBlockPlanStandsWhereTheStepsPlaceFew
         ASSERT_FALSE(split.shortfall.has_value());
         const std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
             "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-            /*num_tokens=*/8, std::move(split));
+            /*num_tokens=*/8, std::move(split), std::move(epochs));
         ASSERT_TRUE(stores.has_value());
         ASSERT_TRUE(stores->host_store.has_value());
         EXPECT_EQ(stores->host_store->transfers.size(), 6u);
@@ -14963,6 +15050,7 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesABoundaryTheBlockByBlockPl
             /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2, CacheBoundaryKind::kEndpoint,
             /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2);
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
         if (!write_back_evictions) {
@@ -14976,7 +15064,7 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesABoundaryTheBlockByBlockPl
         ASSERT_FALSE(split.shortfall.has_value());
         const std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
             "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-            /*num_tokens=*/2, std::move(split));
+            /*num_tokens=*/2, std::move(split), std::move(epochs));
         ASSERT_TRUE(stores.has_value());
         ASSERT_TRUE(stores->host_store.has_value());
         EXPECT_EQ(stores->host_store->transfers.size(), 3u);
@@ -15042,6 +15130,7 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesMoreBoundariesThanTheBlock
                                     CacheBoundaryKind::kEndpoint,
                                     /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 4);
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/4, coordinator.PublishedDataSlots(tables, 4));
         if (!write_back_evictions) {
@@ -15055,7 +15144,7 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesMoreBoundariesThanTheBlock
         ASSERT_FALSE(split.shortfall.has_value());
         const std::optional<TierTransferManager::RetractionStores> stores = transfers.StartRetractionStores(
             "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots.Allocate()), tables,
-            /*num_tokens=*/4, std::move(split));
+            /*num_tokens=*/4, std::move(split), std::move(epochs));
         ASSERT_TRUE(stores.has_value());
         ASSERT_TRUE(stores->host_store.has_value());
         EXPECT_EQ(stores->host_store->transfers.size(), 4u);
@@ -15121,6 +15210,7 @@ TEST_P(ShardedImageWriteBackTest, AnImagesHostBlocksKeepTheirDeviceBlocksBuckets
                                     /*first_new_prefix_page=*/0, /*num_computed_tokens=*/shards * kP,
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/false);
+        CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, shards * kP);
         TierTransferManager::RetractionImageSplit split =
             transfers_.SplitRetractionImage(image, shards * kP, coordinator_.PublishedDataSlots(image, shards * kP));
         std::vector<std::int32_t> image_buckets;
@@ -15135,7 +15225,7 @@ TEST_P(ShardedImageWriteBackTest, AnImagesHostBlocksKeepTheirDeviceBlocksBuckets
         ASSERT_FALSE(split.shortfall.has_value());
         const std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
             "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image,
-            shards * kP, std::move(split));
+            shards * kP, std::move(split), std::move(epochs));
         ASSERT_TRUE(stores.has_value());
         ASSERT_TRUE(stores->host_store.has_value());
         const std::vector<CacheTransfer>& copies = stores->host_store->transfers;
@@ -15215,6 +15305,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageBetweenASegmentsTwoAcksCopiesItsKey
 
         std::vector<BlockTable> image(4);
         PublishFinal(image, y_tokens);
+        CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, 18);
         TierTransferManager::RetractionImageSplit split =
             transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
         EXPECT_TRUE(split.pending_store_ops.empty()) << "nothing borrowed";
@@ -15222,7 +15313,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageBetweenASegmentsTwoAcksCopiesItsKey
         ASSERT_FALSE(split.shortfall.has_value());
         std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
             "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image, 18,
-            std::move(split));
+            std::move(split), std::move(epochs));
         ASSERT_TRUE(stores.has_value());
         ASSERT_TRUE(stores->host_store.has_value());
         coordinator_.Free(image);

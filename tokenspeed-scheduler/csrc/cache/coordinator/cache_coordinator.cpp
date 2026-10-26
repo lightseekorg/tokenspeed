@@ -435,7 +435,7 @@ CoordinatorMatch CacheCoordinator::acquireTierWithKeys(std::span<const std::vect
         }
         if (GroupIsState(i)) {
             for (const CacheBlockRef& block : out.per_group[i].blocks) {
-                if (const std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool, block)) {
+                if (const CacheKey* key = groups_[i].Index().KeyOf(pool, block)) {
                     if (BoundaryTree::Node* node = boundary_tree_.Find(key->content_hash)) {
                         node->latest_state_access_epoch = std::max(node->latest_state_access_epoch, access_epoch);
                     }
@@ -2702,13 +2702,13 @@ std::vector<std::vector<ImageSlot>> CacheCoordinator::PublishedDataSlots(std::sp
         const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
         for (std::int32_t slot = 0; slot < span.blocks; ++slot) {
             const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
-            if (std::optional<CacheKey> key = groups_[i].Index().KeyOf(pool_, block)) {
+            if (const CacheKey* key = groups_[i].Index().KeyOf(pool_, block)) {
                 const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
                     groups_[i].Index().MetadataFor(pool_, block->Location());
                 _assert(metadata.has_value(), "a published slot has an index entry");
                 published[i].push_back(ImageSlot{.slot_index = slot,
                                                  .block = block,
-                                                 .key = std::move(*key),
+                                                 .key = *key,
                                                  .logical_block_index = metadata->logical_block_index,
                                                  .boundary_kind = metadata->boundary_kind});
             }
@@ -2864,6 +2864,78 @@ bool CacheCoordinator::ContainsHostCachedBlock(const CacheKey& key) const {
     return groups_[key.group_id].Index().Contains(*host_pool_, key);
 }
 
+CacheCoordinator::StoreEpochs CacheCoordinator::TakeStoreEpochs(std::span<const BlockTable> tables,
+                                                                std::int32_t num_tokens) {
+    _assert(tables.empty() || (tables.size() == groups_.size() && num_tokens > 0),
+            "a final publication names every group's table and its frontier");
+    // Pages [0, pages): the last is the one num_tokens ends in.
+    const std::int32_t pages = tables.empty() ? 0 : (num_tokens - 1) / prefix_granularity_ + 1;
+    StoreEpochs epochs{.base = ++next_access_epoch_, .final_publication = !tables.empty()};
+    next_access_epoch_ += static_cast<std::uint64_t>(pages);
+    const auto refresh = [&](std::size_t group_index, const CacheBlockRef& block, std::int32_t page) {
+        PrefixCacheIndex& index = groups_[group_index].Index();
+        const CacheKey* key = index.KeyOf(pool_, block);
+        if (key == nullptr) {
+            return;
+        }
+        const std::uint64_t epoch = epochs.base + static_cast<std::uint64_t>(pages - page);
+        if (host_pool_ == nullptr || !index.Touch(*host_pool_, *key, epoch)) {
+            epochs.uncached.push_back(StoreEpochs::Uncached{.key = *key, .device_block = block, .access_epoch = epoch});
+        }
+    };
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
+        if (GroupIsState(i)) {
+            if (blocks.size() > 1 && blocks[1]) {
+                refresh(i, blocks[1], pages - 1);
+            }
+            continue;
+        }
+        // Back to front, so every refresh is its index's newest access; the
+        // blocks to store are listed front to back, as Host allocates them.
+        const std::size_t first_uncached = epochs.uncached.size();
+        const std::int32_t blocks_per_page = BlocksPerBoundary(static_cast<std::int32_t>(i));
+        for (std::int32_t slot = dataSpan(tables[i], geometry_[i], num_tokens).blocks - 1; slot >= 0; --slot) {
+            if (const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)]) {
+                refresh(i, block, slot / blocks_per_page);
+            }
+        }
+        std::reverse(epochs.uncached.begin() + static_cast<std::ptrdiff_t>(first_uncached), epochs.uncached.end());
+    }
+    return epochs;
+}
+
+std::uint64_t CacheCoordinator::StoreEpoch(const StoreEpochs& epochs, std::uint32_t group_id,
+                                           CacheBlockLocation device_location) const {
+    if (!epochs.final_publication) {
+        return epochs.base;
+    }
+    const std::optional<PrefixCacheIndex::CachedBlockMetadata> metadata =
+        groups_[group_id].Index().MetadataFor(pool_, device_location);
+    return metadata ? std::min(epochs.base, metadata->last_access_epoch) : epochs.base;
+}
+
+void CacheCoordinator::RefreshHostBoundary(std::span<const std::string> prefix_hashes,
+                                           const std::optional<TailPublication>& tail, std::uint64_t access_epoch) {
+    if (host_pool_ == nullptr || (prefix_hashes.empty() && !tail)) {
+        return;
+    }
+    const auto pages = static_cast<std::int32_t>(prefix_hashes.size());
+    const CompletedPages boundary{
+        .prefix_hashes = prefix_hashes,
+        .first_new_prefix_page = tail ? pages : pages - 1,
+        .tail = tail,
+        .publish_state = true,
+    };
+    for (std::size_t i = 0; i < groups_.size(); ++i) {
+        for (const PublishedRange& range : completedBlockRanges(i, boundary)) {
+            for (const CacheKey& key : range.keys) {
+                groups_[i].Index().Touch(*host_pool_, key, access_epoch);
+            }
+        }
+    }
+}
+
 bool CacheCoordinator::IsHostCachedBlock(CacheBlockLocation location) const {
     if (host_pool_ == nullptr) {
         return false;
@@ -2932,6 +3004,16 @@ void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& 
         node.latest_state_access_epoch =
             std::max({node.latest_state_access_epoch, metadata.last_access_epoch, metadata.max_access_epoch});
     }
+}
+
+void CacheCoordinator::CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key, std::uint64_t access_epoch) {
+    // kSupersededAccessEpoch included: a copy outside a final publication's
+    // boundary keeps its Device entry's date (StoreEpoch), and a superseded
+    // input's is that one.
+    _assert(access_epoch <= next_access_epoch_, "a Host entry is dated by an issued epoch");
+    // As an inherited date: an entry already canonical for the key (an L3
+    // read landed first) is never dated back.
+    CacheHostBlock(block_ref, key, PrefixCacheIndex::CachedBlockMetadata{.last_access_epoch = access_epoch});
 }
 
 void CacheCoordinator::CacheHostTail(const ContentHash& prior, const TailPublication& tail) {

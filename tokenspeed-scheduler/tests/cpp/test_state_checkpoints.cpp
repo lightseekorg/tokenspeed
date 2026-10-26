@@ -1627,6 +1627,169 @@ TEST_F(StateRestoreClaimSuite, ARetractionAtAPageBoundaryRestoresUnderWriteBack)
     EXPECT_TRUE(scheduler_->CanClearCache());
 }
 
+// One KV and one State group over a small Host cache.
+class StateHostDatesSuite : public StateCheckpointSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
+        cfg.disable_l2_cache = false;
+        std::erase_if(cfg.cache_groups, [](const CacheGroupConfig& group) {
+            return group.group_id == "state1" || group.group_id == "state2";
+        });
+        return cfg;
+    }
+
+    // A Host cache of `entries` blocks; a nonzero interval forces retractions.
+    void ResetHost(std::int32_t entries, std::int32_t retraction_interval) {
+        config_ = MakeConfig();
+        config_.host_allocator.total_pages = entries + 1;
+        config_.debug_force_retraction_interval = retraction_interval;
+        scheduler_ = std::make_unique<Scheduler>(WithHostPackingFromDevice(config_));
+    }
+
+    // Prefills `tokens` chunk by chunk, finishes with the first sampled token
+    // and acknowledges every store on the way.
+    void FinishAfterPrefill(const std::string& id, std::vector<std::int32_t> tokens) {
+        const auto prompt_tokens = static_cast<std::int32_t>(tokens.size());
+        Submit(RequestSpec{.request_id = id, .tokens = std::move(tokens), .max_new_tokens = 1});
+        for (bool prompt_done = false; !prompt_done;) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_NE(batch, nullptr);
+            const auto row =
+                static_cast<std::size_t>(std::ranges::find(batch->request_ids, id) - batch->request_ids.begin());
+            ASSERT_LT(row, batch->request_ids.size());
+            prompt_done = batch->extend_prefix_lens.at(row) + batch->input_lengths.at(row) == prompt_tokens;
+            SendForwardDone(id, prompt_done ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        }
+        SendFinish(id);
+        AckWriteBacks(PlanOnce());
+    }
+};
+
+// A finish refreshes the Host copies of what its request used -- the
+// checkpoint it resumed from, at its admission, the pages it read and the
+// state it ends with -- and of no other checkpoint under its pages. b
+// resumes from the checkpoint at 4 and refreshes it; c resumes from the one at
+// 8 and leaves the one at 4 at b's admission, so it is the next Host victim,
+// ahead of a prompt stored after b's finish that nobody read.
+TEST_F(StateHostDatesSuite, AFinishDoesNotRefreshACheckpointItDidNotRead) {
+    ResetHost(/*entries=*/9, /*retraction_interval=*/0);
+    FinishAfterPrefill("a", MakeTokens(4));  // the page [1, 4] and the checkpoint at 4
+    FinishAfterPrefill("b", MakeTokens(8));  // resumes at 4: the page [5, 8] and the checkpoint at 8
+    FinishAfterPrefill("idle", MakeTokens(4, 200));
+    FinishAfterPrefill("c", MakeTokens(12));  // resumes at 8: the page [9, 12] and the checkpoint at 12
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
+    FinishAfterPrefill("e", MakeTokens(4, 300));  // two entries, one free block
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_EQ(Probe("at-4", {1, 2, 3, 4, 77, 78}).prefix_tokens, 0) << "the checkpoint at 4 left";
+    EXPECT_EQ(Probe("idle-again", {200, 201, 202, 203, 77}).prefix_tokens, 4) << "the idle prompt stayed";
+    EXPECT_EQ(Probe("at-12", {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 77}).prefix_tokens, 12) << "so did what c left";
+}
+
+// Every user of a shared system prompt resumes from its checkpoint on the
+// Device -- at an unaligned prompt end, from its tail as well -- and holds
+// neither at its finish. Each finish still refreshes their Host copies, so the
+// system prompt stays resumable from Host while the users' turns age out.
+TEST_F(StateHostDatesSuite, AFinishRefreshesTheBoundaryItResumedFrom) {
+    for (const std::int32_t system_tokens : {4, 6}) {
+        SCOPED_TRACE(system_tokens);
+        // The system prompt leaves two entries, or three with its tail; so
+        // does every user, and the third user's store evicts the first's.
+        ResetHost(/*entries=*/system_tokens == 4 ? 6 : 9, /*retraction_interval=*/0);
+        FinishAfterPrefill("system", MakeTokens(system_tokens));
+        for (const std::int32_t user : {1, 2, 3}) {
+            std::vector<std::int32_t> tokens = MakeTokens(system_tokens);
+            for (std::int32_t i = 0; i < 4; ++i) {
+                tokens.push_back(1000 * user + i);
+            }
+            FinishAfterPrefill("user" + std::to_string(user), std::move(tokens));
+        }
+
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        std::vector<std::int32_t> next_user = MakeTokens(system_tokens);
+        next_user.insert(next_user.end(), {77, 78});
+        EXPECT_EQ(Probe("next-user", std::move(next_user)).prefix_tokens, system_tokens);
+    }
+}
+
+// A conversation's next turn resumes from the checkpoint the last one left
+// and leaves a newer one. The boundary it resumed from is dated at its
+// admission, behind everything its finish publishes, so the newest
+// checkpoint outlives the one it superseded.
+TEST_F(StateHostDatesSuite, ANewTurnsCheckpointOutlivesTheOneItResumedFrom) {
+    ResetHost(/*entries=*/7, /*retraction_interval=*/0);
+    FinishAfterPrefill("turn1", MakeTokens(6));  // the page [1, 4], the tail and the checkpoint at 6
+    FinishAfterPrefill("turn2", {1, 2, 3, 4, 5, 6, 101, 102, 103, 104});  // resumes at 6; leaves 10
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    FinishAfterPrefill("other", MakeTokens(8, 500));  // three entries, one free block
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_EQ(Probe("turn3", {1, 2, 3, 4, 5, 6, 101, 102, 103, 104, 99}).prefix_tokens, 10);
+}
+
+// A finish refreshes the checkpoint at its frontier when Host already holds
+// it: a repeated prompt (which first cuts a junction at 4) keeps its tail and
+// checkpoint at 6 ahead of an idle prompt.
+TEST_F(StateHostDatesSuite, ARepeatedPromptRefreshesItsCheckpointOnHost) {
+    ResetHost(/*entries=*/7, /*retraction_interval=*/0);
+    FinishAfterPrefill("first", MakeTokens(6));  // the page [1, 4], the tail and the checkpoint at 6
+    FinishAfterPrefill("idle", MakeTokens(4, 200));
+    FinishAfterPrefill("again", MakeTokens(6));  // adds the checkpoint at 4, republishes the rest
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 6);
+    FinishAfterPrefill("e", MakeTokens(4, 300));  // two entries, one free block
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_EQ(Probe("again-hit", {1, 2, 3, 4, 5, 6, 77}).prefix_tokens, 6);
+}
+
+// A retraction refreshes the Host copies of what it publishes like a finish,
+// and only those: the image's pins drop when the request finishes while
+// Retracted, and the dates stay. r = [1..6] streams its prompt end at plan 2
+// (the page [1, 4], the tail at 6 and the checkpoint at 6, which rotates into
+// slot 0), an idle prompt is stored at plan 3, and plan 4 retracts r at 7: the
+// image pins the page and the checkpoint at 6 -- on Host, or still carried by
+// the prompt end's store -- and stores the tail and the checkpoint at 7. Once
+// r is gone, a store of three blocks evicts two entries: the tail and the
+// checkpoint at 6, not the page the retraction refreshed nor the idle prompt.
+TEST_F(StateHostDatesSuite, AFinishWhileRetractedKeepsTheRetractionsDates) {
+    for (const bool prompt_end_in_flight : {false, true}) {
+        SCOPED_TRACE(prompt_end_in_flight);
+        ResetHost(/*entries=*/8, /*retraction_interval=*/4);
+        Submit(RequestWithTokens("r", MakeTokens(6)));
+        AckWriteBacks(PlanOnce());
+        SendForwardDone("r", {101});
+        const ExecutionPlan prompt_end = PlanOnce();
+        if (!prompt_end_in_flight) {
+            AckWriteBacks(prompt_end);
+        }
+        SendForwardDone("r", {102});
+        Submit(RequestSpec{.request_id = "idle", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
+        PlanOnce();
+        SendForwardDone("idle", {900});
+        SendFinish("idle");
+        const ExecutionPlan retraction = PlanOnce();
+        ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+        if (prompt_end_in_flight) {
+            AckWriteBacks(prompt_end);
+        }
+        AckImageStores(retraction);
+        SendFinish("r");
+        ASSERT_EQ(scheduler_->RetractedSize(), 0u);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 7);
+        FinishAfterPrefill("e", MakeTokens(8, 300));
+
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        EXPECT_EQ(Probe("at-7", {1, 2, 3, 4, 5, 6, 101, 77}).prefix_tokens, 7)
+            << "what the retraction published stayed";
+        EXPECT_EQ(Probe("idle-again", {200, 201, 202, 203, 77}).prefix_tokens, 4) << "so did the idle prompt";
+        EXPECT_EQ(Probe("at-6", {1, 2, 3, 4, 5, 6, 88}).prefix_tokens, 0)
+            << "the checkpoint at 6 kept its date and left";
+    }
+}
+
 // Retraction after the forward that wrote the in-forward checkpoint, before
 // the request's next publication point: the retraction is that point, and the
 // Retracted request holds no Device block (fsm::Retracted). Its image carries
@@ -2613,9 +2776,11 @@ TEST_F(StateCheckpointPrefillHostSuite, AFailedTransferMarksNothing) {
 // without one, the same holds: f1 evicts h's tail and its checkpoints at 27
 // while g's input is unmarked, and the checkpoint at 22 as well, as g's
 // reclaim, once g finished -- the same prompt as g then loads it back from
-// the Host, or without one starts over.
+// the Host, or without one starts over. The Host holds every store, so no
+// Host eviction decides what is left to load.
 TEST_P(StateCheckpointPrefillHostShardSuite, AnEarlierFinishLeavesALaterHittersInputUnmarked) {
     device_pages_ = 15;
+    host_pages_ = 15;
     for (const auto& [policy, host_cache] : {std::pair{SchedulerConfig::HostWritePolicy::kWriteBack, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, true},
                                              std::pair{SchedulerConfig::HostWritePolicy::kWriteThrough, false}}) {

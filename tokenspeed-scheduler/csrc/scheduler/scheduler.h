@@ -280,6 +280,11 @@ private:
     // decode's result -- paused or not, plan or no plan.
     void settleFinishedRequests();
     std::optional<WriteBackOperation> publishCompletedPages(Request& request);
+    // A final publication (finish, retraction) also refreshes the Host copies
+    // of the boundary the request resumed from, which it read at its first
+    // admission and may no longer hold, dated at that admission so a later
+    // checkpoint of its own stays newer.
+    void refreshResumeBoundary(const Request& request, const fsm::CacheProgress& cache_progress);
 
     std::size_t groupIndex(const std::string& group_id) const;
     Request* findRequest(const std::string& request_id);

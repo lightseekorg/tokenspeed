@@ -1062,8 +1062,30 @@ Its responsibilities:
   accessed child, so a cold sibling cannot cause newer data to be discarded.
   Equal epochs prefer
   evicting one child; group and physical location break remaining ties. A
-  prefix hit refreshes its access epoch, and earlier reuse grants no
-  additional protection. Pinned entries, partially pinned foreign parents,
+  prefix hit refreshes its access epoch; earlier reuse grants no additional
+  protection. A request's final publication — a finish, or a retraction,
+  whose image only pins its entries — also refreshes the Host copies of what
+  the request used, raising epochs and never lowering them. The boundary it
+  leaves (`CacheCoordinator::TakeStoreEpochs`: every History block it holds
+  below its frontier, the pages its forwards read to the end, Device hits
+  included, and each State group's checkpoint at the frontier) takes one
+  epoch per prefix page, the first page newest, so a prefix leaves Host from
+  its end and every group's blocks of a page share a date. The boundary it
+  resumed from, read at its first admission (`RefreshHostBoundary`: each
+  State group's checkpoint there and the blocks of it the request no longer
+  holds, such as an unaligned hit's tail or a sliding window's lookback), is
+  dated at that admission, behind everything the publication leaves, so a
+  new turn's checkpoint outlives the one it resumed from. Other checkpoints
+  under its pages keep their epochs. A store batch takes its epochs when it
+  starts: a boundary copy already on Host is refreshed at once, before the
+  batch picks its victims (a retraction's before its image's split plans the
+  Host leg); one an earlier store still carries is published at the newer
+  epoch at that store's ACK (an eviction write-back's segment publishes its
+  members as their Device entries were), and no ACK dates back an entry the
+  index already holds (an L3 read that landed first). The batch dates what
+  else it stores `base`, older than its boundary, except that a final
+  publication's copy of an entry its tables do not hold keeps that Device
+  entry's date. Pinned entries, partially pinned foreign parents,
   and blocks allocated earlier in the same batch remain protected. Parent
   candidates are snapshots; selection skips parents that are now empty or
   bound to another group. Parent aggregation reuses coordinator-owned scratch
@@ -1075,18 +1097,26 @@ Its responsibilities:
   victim, so it places in the room such a cascade freed.
   No group has an eviction preference or a fixed share of the pool; capacity follows the access
   pattern, without guaranteeing that KV and every required state checkpoint
-  remain resident together. During prefill, each chunk end queues the
+  remain resident together. Entries sharing an epoch (a page of a final
+  publication's boundary, a live request's store batch) fall to the
+  tie-breaks above: one child before a whole parent, then group id and
+  location. During prefill, each chunk end queues the
   full-attention pages it published; the prompt end (the first decode's
   admission, or a junction cut) queues its tail and state checkpoint too;
   the candidates are merged into a batched writeback. Ordinary decode
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the
   request published (pages, tail, state slot 1) is queued before request
-  ownership is released. Under write-through, ordinary sliding-window
-  entries stream whenever published. The queue is drained by
-  `TierTransferManager::StartPendingStores(guard, cause)`, and every store it
-  issues pins its Device sources until the ACK. A retraction does not use the
-  queue: the scheduler publishes the victim's computed prefix the same way,
+  ownership is released. The store takes the boundary from the request's
+  tables first; the queue supplies what they do not hold as published
+  entries: a State group's earlier checkpoints, a sliding window's earlier
+  pages, a page a restore rebuilt as a private copy.
+  Under write-through, ordinary sliding-window entries stream whenever
+  published. The queue is drained by
+  `TierTransferManager::StartPendingStores(guard, cause, tables, num_tokens)`,
+  and every store it issues pins its Device sources until the ACK. A
+  retraction does not use the queue: the scheduler publishes the victim's
+  computed prefix the same way,
   `CacheCoordinator::PublishedDataSlots` names the data slots that are
   published entries (with the key, logical index, and boundary kind each was
   published under), `TierTransferManager::SplitRetractionImage` plans their
