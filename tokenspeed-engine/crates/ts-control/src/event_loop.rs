@@ -413,7 +413,7 @@ pub struct LoopConfig {
     /// waits for the embeddings before it is scheduled. Its first stage
     /// receives them ([`Subsystems::embeddings`]); a later stage follows the
     /// first's decisions.
-    pub epd_prefill: bool,
+    pub epd_receive_enabled: bool,
     /// The data plane fills grammar bitmasks before a forward from the
     /// matchers' state, which only a commit advances: a grammar batch
     /// cannot overlap a pending forward (`uses_eager_grammar`).
@@ -1122,7 +1122,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         };
         let (staged, submissions): (Vec<_>, Vec<_>) = submissions
             .into_iter()
-            .partition(|submission| self.config.epd_prefill && !submission.embeddings.is_empty());
+            .partition(|submission| self.config.epd_receive_enabled && !submission.embeddings.is_empty());
         if !staged.is_empty() {
             // Its transfer registers only once it reaches the scheduler: a
             // transfer event for a request the scheduler does not know is a
