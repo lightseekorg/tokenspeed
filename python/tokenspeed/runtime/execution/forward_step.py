@@ -23,7 +23,7 @@ from __future__ import annotations
 import bisect
 import gc
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -1179,11 +1179,13 @@ class ForwardStepRunner:
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
-                graph.update(
-                    cpu_update_input=[
-                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                    ]
-                )
+                # Update callbacks write the inference tensors created at capture.
+                with torch.inference_mode():
+                    graph.update(
+                        cpu_update_input=[
+                            {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                        ]
+                    )
             if self._expert_load_rows is not None:
                 # Every rank replays the same padded batch; the live rows are
                 # the DP-gathered live counts (this rank's own without DP).
@@ -1196,7 +1198,9 @@ class ForwardStepRunner:
                         else [ctx.input_num_tokens] * self.world_size
                     ),
                 )
-            with nvtx_range("graph_replay", color="red"):
+            with (
+                torch.inference_mode() if self.device == "npu" else nullcontext()
+            ), nvtx_range("graph_replay", color="red"):
                 if self.drafter is not None:
                     self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
                 else:

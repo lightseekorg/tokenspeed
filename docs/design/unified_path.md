@@ -78,6 +78,10 @@ FlashInfer receives host CSR metadata derived from those mirrors, with fresh
 pinned sources for asynchronous uploads. Planning does not download device
 lengths or indptrs; mixed batches apply the same rule to their extend rows.
 
+NPU graph task updates and replay run in inference mode because they write the
+output tensors allocated during capture. This applies to active and idle DP
+ranks; callers need not establish an inference context.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
