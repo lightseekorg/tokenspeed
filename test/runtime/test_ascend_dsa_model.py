@@ -20,11 +20,14 @@
 
 """Native DSA rejects old projection contracts before any device operation."""
 
+from dataclasses import dataclass
+
 import pytest
 import torch
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed import Mapping
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAAttention
 
 
@@ -78,10 +81,15 @@ def test_rejects_old_projection_layout():
         make_attention(nope=True, separate=False, independent=True)
 
 
-def test_uninitialized_native_forward_never_uses_standard_projections():
+def test_unprepared_weights_fail_before_device_execution():
     attention = make_attention(nope=True, separate=True, independent=True)
-    with pytest.raises(RuntimeError, match="native DSA resources"):
-        attention(None, torch.zeros((64, 4096)), None, None)
+
+    @dataclass
+    class Context:
+        forward_mode: ForwardMode = ForwardMode.DECODE
+
+    with pytest.raises(RuntimeError, match="Prepare DSA weights"):
+        attention(None, torch.zeros((64, 4096)), Context(), None)
 
 
 def test_rejects_shared_cross_layer_selection():

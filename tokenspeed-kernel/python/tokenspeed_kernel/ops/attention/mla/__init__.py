@@ -43,6 +43,32 @@ from tokenspeed_kernel.signature import (
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 
+def prepare_mla_prolog(layer, *, group):
+    """Resolve MLA prolog and apply its registered weight preparation once."""
+    from tokenspeed_kernel.registry import KernelRegistry
+    from tokenspeed_kernel.selection import select_kernel
+
+    kernel = select_kernel(
+        "attention",
+        "mla_fused_prolog",
+        format_signature(x=dense_tensor_format(layer.q_b_proj.weight.dtype)),
+    )
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None or spec.weight_preprocessor is None:
+        raise RuntimeError("MLA prolog has no registered weight preprocessor")
+    merge = select_kernel(
+        "attention",
+        "mla_fused_merge",
+        format_signature(output=dense_tensor_format(torch.float32)),
+    )
+    attention = select_kernel(
+        "attention",
+        "mla_fused_attention",
+        format_signature(query=dense_tensor_format(torch.bfloat16)),
+    )
+    return kernel, spec.weight_preprocessor(layer, group=group), attention, merge
+
+
 def mla_prolog_available() -> bool:
     """Whether the optional Ascend Lite MLA prolog is available."""
     if not current_platform().is_npu:
@@ -1418,6 +1444,7 @@ if current_platform().is_npu:
 
 
 __all__ = [
+    "prepare_mla_prolog",
     "mla_project_value_prefers_contiguous_weight",
     "mla_project_value",
     "mla_normalize_project_query",

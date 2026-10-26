@@ -360,19 +360,21 @@ optional independent MLA/indexer RoPE and BF16 cache writes;
 the existing paged backend owns sparse selection and attention. Unsupported
 execution shapes fail instead of selecting another projection path.
 
-The paged backend also accepts the ordinary MLA/indexer projections. A model
-adapter can use them for prefill or capture buckets outside the native shape
-contract while retaining fused decode for supported rows. Both use the same
-causal metadata and cache placement; only the projection and collective provider
-differs.
+`AscendDSAAttention` also owns the ordinary MLA/indexer projections used by
+Prefill and decode buckets outside the prepared native projection shape.
+Both paths share causal metadata, cache placement and the existing paged backend.
+Prefill gathers complete projection weights once after loading; Decode keeps
+its original head-sharded weights. No model extension supplies another forward.
 
-When a model already owns a SHMEM runtime, attach a separate DSA window to that
-owner before capture instead of initializing another runtime. The model keeps
-the attached window and registered attention outputs alive until its graphs are
-released, closes imported IPC mappings before freeing their exports, then releases
-the DSA window before the owning communication runtime.
-The model adapter supplies these prepared resources through the installed
-provider; the common runtime does not create a second resource manager.
+`AscendDSARuntime` prepares the existing HCCL window views before capture and
+binds them to replacement cache backends. `AscendMLARuntime` owns the analogous
+MLA prologue, FP32 FIA partials and direct LSE merge. Models construct these
+owners from their local attention layers through the existing startup hook and
+close them only after forwards drain and all referencing graphs are destroyed.
+The operators validate actual HCCL window capacity during preparation. No extra
+SHMEM arena, Python IPC registration or per-forward capacity query is added.
+Kernel registration and weight preparation belong to the `attention` family in
+`tokenspeed-kernel`; neither owner imports an external model extension.
 
 Device projection format conversion stays behind the kernel-package adapter.
 Preparing a weight allocates fresh NZ29 storage without changing coefficients
@@ -401,8 +403,11 @@ consumer event from the preceding layer. Cache rebind and shutdown drain and
 close the owned communicator.
 
 Each rank reads the complete visible sequence and expands only its local heads.
-One dense MLA attention call per request uses bottom-right causal alignment,
-then the original O shard and CommManager output reduction. There is no
-additional KV chunking or LSE merge and no full-head projection-weight copy.
-The model adapter currently covers ungated BF16 NoPE Q-LoRA; native Decode
-projections, cache reads and merge retain their existing contracts.
+`AscendMLAAttention` expands only bounded history blocks for ungated BF16 NoPE
+Q-LoRA. History blocks are unmasked because they precede every current query;
+the final current block uses bottom-right causal alignment. Partial outputs and
+LSE merge in FP32 before rounding back to the query dtype. Short histories stay
+in one attention call. The original O shard and CommManager output reduction
+remain unchanged; no full-head projection-weight copy is retained.
+The NPU kernel package owns FIA graph-length updates and the capture-local FP32
+scratch for BF16 destinations. Models do not replace that handler.
