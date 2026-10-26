@@ -2237,9 +2237,9 @@ def _fp8_kv_qwen4_exp_cache_setup(*, with_ple: bool):
     """A Qwen4-Exp cache plan whose PLE state outgrows one FP8 K page.
 
     The recurrent state (8 x 32 x 32 fp32, 32 KiB) is far wider than an FP8 K
-    page (64 tokens x 1 head x 32 dims, 2 KiB), and the PLE state (512 x 9
-    bf16 plus its context, about 9 KiB) falls between them, as on the real
-    model with FP8 KV.
+    page (the recipe's 128-token grain x 1 head x 32 dims, 4 KiB), and the PLE
+    state (512 x 9 bf16 plus its context, about 9 KiB) falls between them, as
+    on the real model with FP8 KV.
     """
     text_config = SimpleNamespace(
         model_type="qwen4_exp_text",
