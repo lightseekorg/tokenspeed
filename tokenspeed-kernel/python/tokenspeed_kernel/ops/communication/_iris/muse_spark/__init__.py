@@ -609,6 +609,30 @@ class MuseIrisState:
         )
         return output
 
+    def all_gather_owned_stream_bf16(
+        self, stream: torch.Tensor, rows: int
+    ) -> torch.Tensor:
+        """Round each rank's FP32 residual rows to BF16 and gather full rows.
+
+        The rounded rows are written straight into pull scratch, so the
+        gather skips the staging copy it makes for a separate BF16 tensor.
+        ``stream`` must not alias pull scratch. Returns independent
+        ``[rows, 8192]`` BF16 storage.
+        """
+        assert self.can_use_owned_rows(rows)
+        local_rows = triton.cdiv(rows, self.world_size)
+        assert stream.shape == (local_rows, _MUSE_BOUNDARY_WIDTH)
+        assert stream.dtype == torch.float32 and stream.is_contiguous()
+        assert stream.device == self.all_reduce.device
+        staging = self.all_reduce.producer_pull.scratch[: stream.numel()]
+        begin, size = staging.data_ptr(), staging.numel() * staging.element_size()
+        assert (
+            stream.data_ptr() + stream.numel() * stream.element_size() <= begin
+            or begin + size <= stream.data_ptr()
+        ), "the FP32 stream must not alias its BF16 staging"
+        staging = staging.view(local_rows, _MUSE_BOUNDARY_WIDTH).copy_(stream)
+        return self.all_gather_owned_rows(staging, rows, False)
+
     def gather_owned_moe_inputs(
         self,
         inputs: torch.Tensor | tuple[torch.Tensor, torch.Tensor],

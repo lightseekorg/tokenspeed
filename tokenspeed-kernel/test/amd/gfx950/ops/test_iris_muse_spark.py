@@ -2506,6 +2506,81 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _muse_owned_stream_tap_worker(rank, world_size, device):
+    """Gather BF16-rounded owned FP32 residual rows between other collectives
+    that use pull scratch."""
+    torch.set_grad_enabled(False)
+    state = _muse_state(rank, device, 8192, False)
+
+    def make_inputs(rows):
+        local_rows = (rows + world_size - 1) // world_size
+        stream = torch.empty((local_rows, 8192), device=device, dtype=torch.float32)
+        branch = torch.empty((rows, 8192), device=device, dtype=torch.bfloat16)
+        return rows, stream, branch
+
+    def update(item, step):
+        rows, stream, branch = item
+        local_rows = stream.shape[0]
+        # Every rank derives every owner's rows; random FP32 exercises rounding.
+        generator = torch.Generator(device=device).manual_seed(rows * 31 + step)
+        full = torch.randn(
+            (world_size * local_rows, 8192),
+            device=device,
+            dtype=torch.float32,
+            generator=generator,
+        )
+        full[rows:] = float("nan")
+        stream.copy_(full[rank * local_rows : (rank + 1) * local_rows])
+        branch.fill_((rank + 1) * (step + 1))
+        return full[:rows].bfloat16()
+
+    def one(item):
+        rows, stream, branch = item
+        # A reduce-scatter result occupies pull scratch first, as attention
+        # output does.
+        reduced = state.reduce_scatter_owned_rows(branch)
+        retained = state.all_gather_owned_rows(reduced, rows, True)
+        if rank == rows % world_size:
+            torch.cuda._sleep(20000)
+        tap = state.all_gather_owned_stream_bf16(stream, rows)
+        # Staging different data right away fails the check below if a peer
+        # is still reading the gathered rows.
+        staged = state.all_gather_owned_rows((-stream).bfloat16(), rows, False)
+        return retained, tap, staged
+
+    inputs = [make_inputs(rows) for rows in (192, 193, 8191)]
+    for item in inputs:
+        update(item, 0)
+        one(item)
+    state.row_gather_flags.fill_(2**32 - 2)
+    state.row_scatter_flags.fill_(2**32 - 2)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = [one(item) for item in inputs]
+    for step in range(4):
+        expected = [update(item, step) for item in inputs]
+        graph.replay()
+        for (retained, tap, staged), full in zip(outputs, expected):
+            torch.testing.assert_close(
+                tap.view(torch.int16), full.view(torch.int16), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                staged.view(torch.int16), (-full).view(torch.int16), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                retained,
+                torch.full_like(
+                    retained, (world_size * (world_size + 1) // 2) * (step + 1)
+                ),
+                atol=0,
+                rtol=0,
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 @pytest.mark.parametrize(
     "check,backend",
     [
@@ -2528,6 +2603,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
+        pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
         pytest.param(
             partial(_muse_tp_owned_forward_worker, quantized=False),
