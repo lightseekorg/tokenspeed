@@ -1131,6 +1131,8 @@ The launch policy and its thresholds live in `mha/prefill.py`.
 QK and PV accumulate in FP32. The denominator uses probabilities before rounding
 them to the input dtype for PV. Dot products must be finite in FP32. Online
 softmax subtracts the maximum before scaling, preserving large finite scores.
+Sink-derived initial references are capped at the FP32 maximum to prevent
+positive overflow when converting to unscaled score units.
 The fixed-shift schedule changes probability rounding, so its results are
 numerically equivalent within tolerance, rather than bitwise identical.
 

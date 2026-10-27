@@ -574,7 +574,9 @@ class AttentionProgram:
                 dtype=gl.float32,
                 layout=gl.SliceLayout(1, cfg.pv_layout),
             )
-            m_i += sink_log2 / cfg.SM_SCALE
+            # The reference shift may be smaller than the sink. Cap its
+            # conversion to unscaled units so finite sinks cannot seed +inf.
+            m_i += gl.minimum(sink_log2 / cfg.SM_SCALE, 3.4028234663852886e38)
         else:
             # LSE excludes sinks, so preserve a maximum from the key logits.
             # Packed tail rows can be fully masked. A finite seed keeps their

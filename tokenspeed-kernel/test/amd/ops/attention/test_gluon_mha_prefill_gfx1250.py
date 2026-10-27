@@ -951,7 +951,7 @@ def test_mha_prefill_partial_packed_tiles_replay_without_recompile(
         (128, 4, 4096, 2),
         (128, 64, 95, 4),
         (128, 96, 95, 4),
-        # Sinks/LSE must route the wide-transfer shape to a compatible schedule.
+        # Sinks/LSE must route the wide-transport shape to a compatible schedule.
         (128, 8, 1024, 1),
     ],
 )
@@ -981,7 +981,11 @@ def test_mha_prefill_sink_lse_replay(
             q, k, v, cu, cu_cpu, maximum, sinks=sinks, return_lse=return_lse
         )
     output, lse = result if return_lse else (result, None)
-    for pattern in ("normal", "sharp", "late_large", "normal"):
+    patterns = ["normal", "sharp", "late_large"]
+    if sinks is not None and dtype == torch.bfloat16:
+        patterns.append("large_sink")
+    patterns.append("normal")
+    for pattern in patterns:
         for tensor, original in zip((q, k, v), saved):
             tensor.copy_(original)
         if sinks is not None:
@@ -996,6 +1000,10 @@ def test_mha_prefill_sink_lse_replay(
                 k[start + min(256, seqlen // 2) : end].fill_(16)
             if sinks is not None:
                 sinks.add_(96)
+        elif pattern == "large_sink":
+            # Finite sink logits can overflow conversion to unscaled QK units.
+            # Keep other heads unchanged to check both normalization regimes.
+            sinks[::2] = 2.0**125
         output.fill_(float("nan"))
         if lse is not None:
             lse.fill_(float("nan"))
