@@ -40,10 +40,7 @@ from tokenspeed_kernel.numerics.tolerance import get_family_tolerance
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ProfilingConfig, profiling
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
-from tokenspeed_kernel.selection import (
-    ref_compatible_with_spec,
-    spec_matches_shape_traits,
-)
+from tokenspeed_kernel.selection import select_reference, spec_matches_shape_traits
 
 # isort: split
 import tokenspeed_kernel.numerics.gemm  # noqa: F401
@@ -229,42 +226,16 @@ class BenchmarkRunner:
         dtype_role: str | Iterable[str],
         generator: Any,
     ) -> tuple[bool | None, float | None, float | None]:
-        if spec.solution == "torch":
-            return None, None, None
-
-        registry = KernelRegistry.get()
         signature = spec.format_signature_for_storage_dtype(dtype, dtype_role)
         if signature is None:
             return None, None, None
-
-        ref_specs = registry.get_for_operator(
-            spec.family,
-            spec.mode,
-            format_signature=signature,
-            solution="torch",
-        )
-        if not ref_specs:
-            return None, None, None
-
-        ref_spec = None
-        for ref in ref_specs:
-            if ref.name == spec.name:
-                continue
-            if ref_compatible_with_spec(ref, spec):
-                ref_spec = ref
-                break
-        if ref_spec is None:
-            return None, None, None
-        if not spec_matches_shape_traits(ref_spec, shape_traits(shape)):
-            return None, None, None
-
-        ref_kernel = registry.get_impl(ref_spec.name)
-        if ref_kernel is None:
+        reference = select_reference(spec, signature, traits=shape_traits(shape))
+        if reference is None:
             return None, None, None
 
         verify_inputs = generator.generate(**shape)
         with torch.no_grad():
-            expected = ref_kernel(**verify_inputs)
+            expected = reference(**verify_inputs)
             actual = kernel(**verify_inputs)
 
         if not isinstance(actual, torch.Tensor) or not isinstance(

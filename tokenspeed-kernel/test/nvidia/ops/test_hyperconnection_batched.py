@@ -25,10 +25,11 @@ from unittest import mock
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.residual import torch_hyperconnection_mix
 from tokenspeed_kernel.ops.residual import cute_fused, gated_residual_mix
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.profiling import ShapeCapture
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -64,9 +65,26 @@ def inputs(rows, dtype, has_inject):
     )
 
 
+def _hyperconnection_reference(normalized, projection, up):
+    """``residual.hyperconnection_mix``'s reference solution for these inputs."""
+    signature = format_signature(
+        normalized=dense_tensor_format(normalized.dtype),
+        projection_weight=dense_tensor_format(projection.dtype),
+        up_weight=dense_tensor_format(up.dtype),
+    )
+    return select_kernel(
+        "residual",
+        "hyperconnection_mix",
+        signature,
+        traits=None,
+        solution="reference",
+    )
+
+
 def reference(values, scale):
     x, w, u = (value.cpu() for value in values)
-    return torch_hyperconnection_mix(x, w, u, 4, 2560, 320, w.shape[0], scale, True)
+    reference = _hyperconnection_reference(x, w, u)
+    return reference(x, w, u, 4, 2560, 320, w.shape[0], scale, True)
 
 
 def check(result, expected, dtype):

@@ -11,8 +11,9 @@ from tokenspeed_kernel.ops.activation.triton import (
     attnres_partial,
     attnres_partial_dual,
 )
-from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
 from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -30,7 +31,17 @@ def disable_pdl():
 
 def _reference(prefix, blocks, wp, eps, out_w):
     """Direct softmax over the KB+1 candidate logits, fp32."""
-    return torch_attn_res_fwd(
+    reference = select_kernel(
+        "residual",
+        "attn_res_fwd",
+        format_signature(
+            layer_residual=dense_tensor_format(torch.bfloat16),
+            block_residual=dense_tensor_format(torch.bfloat16),
+        ),
+        traits=None,
+        solution="reference",
+    )
+    return reference(
         layer_residual=prefix.clone(),
         block_residual=blocks,
         res_weight=wp,

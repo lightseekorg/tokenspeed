@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.transform import torch_hadamard_transform
 from tokenspeed_kernel.ops.transform import hadamard_transform
 from tokenspeed_kernel.selection import select_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
@@ -40,7 +39,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.transform.hadamard import (  # noqa: E402
 
 def _assert_matches(x: torch.Tensor, scale: float, *, atol: float, rtol: float) -> None:
     out = hadamard_transform(x, scale=scale)
-    expected = torch_hadamard_transform(x.float(), scale=scale)
+    expected = hadamard_transform(x.float(), scale=scale, solution="reference")
     assert out.shape == x.shape
     assert out.dtype == x.dtype
     torch.testing.assert_close(out.float(), expected, atol=atol, rtol=rtol)
@@ -89,7 +88,7 @@ def test_gfx1250_hadamard_row_count_shares_one_binary() -> None:
     def run(rows: int) -> None:
         x = torch.randn(rows, 128, device="cuda", dtype=torch.bfloat16)
         out = hadamard_transform(x, scale=scale)
-        expected = torch_hadamard_transform(x.float(), scale=scale)
+        expected = hadamard_transform(x.float(), scale=scale, solution="reference")
         torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)
 
     kernel = gluon_hadamard_transform_128_gfx1250
@@ -105,5 +104,5 @@ def test_solution_triton_stays_on_the_portable_kernel() -> None:
     x = torch.randn(300, 128, device="cuda", dtype=torch.bfloat16)
     scale = 0.125
     out = hadamard_transform(x, scale=scale, solution="triton")
-    expected = torch_hadamard_transform(x.float(), scale=scale)
+    expected = hadamard_transform(x.float(), scale=scale, solution="reference")
     torch.testing.assert_close(out.float(), expected, atol=2e-2, rtol=2e-2)

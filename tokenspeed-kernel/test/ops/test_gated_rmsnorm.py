@@ -24,10 +24,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.layernorm import torch_gated_rmsnorm
+from tokenspeed_kernel.numerics.reference import reference_kernel
 from tokenspeed_kernel.ops.layernorm import gated_rmsnorm
 from tokenspeed_kernel.ops.layernorm.triton import GATED_RMSNORM_ROWS_PER_PROGRAM
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
 
@@ -64,7 +65,14 @@ def test_gated_rmsnorm_matches_reference(
         fp8_scale=None,
         weights_independent=True,
     )
-    expected = torch_gated_rmsnorm(
+    reference = reference_kernel(
+        "layernorm",
+        "gated_rmsnorm",
+        format_signature(x=dense_tensor_format(x.dtype)),
+        traits={"group_size": group_size, "fp8_out": False},
+        kernel=None,
+    )
+    expected = reference(
         x, weight, z, 1e-6, group_size, norm_before_gate, sigmoid_gate, None, True
     )
     # Two bf16 ulps: the reference rounds once, the kernel may differ in the last bit.

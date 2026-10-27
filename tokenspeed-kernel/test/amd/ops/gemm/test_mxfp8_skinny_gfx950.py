@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
+from tokenspeed_kernel.ops.gemm import mm
 from utils import (
     assert_no_triton_compile,
     int_specialization_class,
@@ -54,8 +54,15 @@ def _inputs(m: int, n: int, k: int, seed: int = 0):
 
 
 def _reference(a, b, a_scales, b_scales) -> torch.Tensor:
-    return torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, torch.float32, block_size=[1, 32]
+    return mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=torch.float32,
+        block_size=[1, 32],
+        quant="mxfp8",
+        solution="reference",
     )
 
 

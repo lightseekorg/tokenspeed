@@ -22,15 +22,31 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
+from tokenspeed_kernel.numerics.reference import reference_kernel
 from tokenspeed_kernel.ops.residual import mhc_init
 from tokenspeed_kernel.ops.residual.triton import (
     _mhc_init_kernel,
     triton_mhc_pre,
 )
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+
+
+def _mhc_pre_reference(kernel: str, *args):
+    """``residual.mhc_pre``'s reference for ``kernel``, run on ``args``."""
+    residual, fn, hc_scale, hc_base = args[:4]
+    signature = format_signature(
+        residual=dense_tensor_format(residual.dtype),
+        fn=dense_tensor_format(fn.dtype),
+        hc_scale=dense_tensor_format(hc_scale.dtype),
+        hc_base=dense_tensor_format(hc_base.dtype),
+    )
+    reference = reference_kernel(
+        "residual", "mhc_pre", signature, traits=None, kernel=kernel
+    )
+    return reference(*args, None, None)
 
 
 def test_tiled_hc4_prefill_matches_reference() -> None:
@@ -44,7 +60,7 @@ def test_tiled_hc4_prefill_matches_reference() -> None:
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-5, 3)
 
     actual = triton_mhc_pre(*args, norm_weight=None, norm_eps=None)
-    expected = torch_mhc_pre(*args, None, None)
+    expected = _mhc_pre_reference("triton_mhc_pre", *args)
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(

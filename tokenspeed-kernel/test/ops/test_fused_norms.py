@@ -25,15 +25,7 @@ import itertools
 import pytest
 import torch
 from fused_boundary_helpers import boundary_case
-from tokenspeed_kernel.numerics.torch.layernorm import (
-    torch_affine_rmsnorm,
-    torch_weightless_qk_rmsnorm,
-    torch_weightless_rmsnorm,
-    torch_weightless_rmsnorm_gated_sigmoid,
-)
-from tokenspeed_kernel.numerics.torch.residual import (
-    torch_post_norm_residual_pre_norm,
-)
+from tokenspeed_kernel.numerics.reference import reference_kernel
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
     weightless_qk_rmsnorm,
@@ -61,11 +53,22 @@ from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
     triton_post_norm_residual_pre_norm as triton_boundary,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.signature import (
+    dense_format_signature,
+    dense_tensor_format,
+    format_signature,
+)
 
 pytestmark = pytest.mark.skipif(
     not (current_platform().is_amd or current_platform().is_nvidia),
     reason="Fused normalization tests require an AMD or NVIDIA GPU.",
 )
+
+
+def _reference(mode: str, roles: tuple[str, ...], *tensors: torch.Tensor):
+    """The ``"reference"`` solution of ``layernorm.<mode>`` for these inputs."""
+    signature = dense_format_signature(roles, tuple(t.dtype for t in tensors))
+    return reference_kernel("layernorm", mode, signature, traits=None, kernel=None)
 
 
 def test_head_norms_match_reference(device: str) -> None:
@@ -78,12 +81,14 @@ def test_head_norms_match_reference(device: str) -> None:
     q, k, _ = packed.split((q_width, kv_width, kv_width), dim=-1)
     eps, q_scale = 1e-5, 43.7840518911 / head_dim**0.5
     q_out, k_out = weightless_qk_rmsnorm(q, k, head_dim, eps, q_scale, True)
-    q_ref, k_ref = torch_weightless_qk_rmsnorm(q, k, head_dim, eps, q_scale, True)
+    q_ref, k_ref = _reference("weightless_qk_rmsnorm", ("q", "k"), q, k)(
+        q, k, head_dim, eps, q_scale, True
+    )
     torch.testing.assert_close(q_out, q_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(k_out, k_ref, atol=2e-2, rtol=2e-2)
     x, gate = q.contiguous(), torch.randn_like(q)
     output = weightless_rmsnorm_gated_sigmoid(x, gate, query_heads, head_dim, eps, True)
-    reference = torch_weightless_rmsnorm_gated_sigmoid(
+    reference = _reference("weightless_rmsnorm_gated_sigmoid", ("x", "gate"), x, gate)(
         x, gate, query_heads, head_dim, eps, True
     )
     torch.testing.assert_close(output, reference, atol=2e-2, rtol=2e-2)
@@ -99,13 +104,15 @@ def test_rmsnorm_variants_match_reference(device: str) -> None:
     affine = affine_rmsnorm(x, weight, eps, 1.0, x.dtype)
     fp32_affine = affine_rmsnorm(x.float(), weight, eps, 1.0, torch.float32)
 
-    plain_ref = torch_weightless_rmsnorm(x, eps, x.dtype)
-    affine_ref = torch_affine_rmsnorm(x, weight, eps, 1.0, x.dtype)
+    plain_ref = _reference("weightless_rmsnorm", ("x",), x)(x, eps, x.dtype)
+    affine_ref = _reference("affine_rmsnorm", ("x",), x)(x, weight, eps, 1.0, x.dtype)
     torch.testing.assert_close(plain, plain_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(affine, affine_ref, atol=2e-2, rtol=2e-2)
     torch.testing.assert_close(
         fp32_affine,
-        torch_affine_rmsnorm(x.float(), weight, eps, 1.0, torch.float32),
+        _reference("affine_rmsnorm", ("x",), x.float())(
+            x.float(), weight, eps, 1.0, torch.float32
+        ),
         atol=1e-5,
         rtol=1e-5,
     )
@@ -309,6 +316,22 @@ def test_portable_kernels_capture_and_replay_with_fresh_inputs(device: str) -> N
         assert torch.equal(actual, reference)
 
 
+def _post_norm_reference(kernel: str, args):
+    """``residual.post_norm_residual_pre_norm``'s reference for ``kernel``."""
+    stream, branch = args[:2]
+    signature = format_signature(
+        stream=dense_tensor_format(stream.dtype),
+        branch=dense_tensor_format(branch.dtype),
+    )
+    return reference_kernel(
+        "residual",
+        "post_norm_residual_pre_norm",
+        signature,
+        traits=None,
+        kernel=kernel,
+    )
+
+
 @pytest.mark.parametrize("device", ["cuda"])
 @pytest.mark.parametrize("enable_pdl", [False, True])
 @pytest.mark.parametrize("boundary", ["attention", "ffn", "ffn_linked"])
@@ -325,7 +348,8 @@ def test_fused_boundary_keeps_the_post_norm_in_fp32(
     ):
         assert (got is None and plain is None) or torch.equal(got, plain)
     new_stream, pre_fp32, pre_bf16 = outputs
-    stream_ref, pre_ref, _ = torch_post_norm_residual_pre_norm(*args, False, None, 1)
+    reference = _post_norm_reference("triton_post_norm_residual_pre_norm", args)
+    stream_ref, pre_ref, _ = reference(*args, False, None, 1)
     ulps = 2.0**-20
     torch.testing.assert_close(new_stream.double(), stream_ref, atol=1e-6, rtol=ulps)
     if pre_ref is None:

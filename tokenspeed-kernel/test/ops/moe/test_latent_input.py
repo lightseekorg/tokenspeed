@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.moe import torch_latent_input
 from tokenspeed_kernel.ops.moe import (
     latent_moe_input_projections,
     packed_projection_weight_view,
@@ -58,13 +57,14 @@ def _concatenated_weights(
 
 
 def _reference(hidden, views):
-    return torch_latent_input(
-        hidden_states=hidden,
-        router_weight=views[0],
-        routed_weight=views[1],
-        shared_gate_up_weight=views[2],
+    return latent_moe_input_projections(
+        hidden,
+        views[0],
+        views[1],
+        views[2],
         gate_clamp=GATE_CLAMP,
         up_clamp=UP_CLAMP,
+        solution="reference",
     )
 
 

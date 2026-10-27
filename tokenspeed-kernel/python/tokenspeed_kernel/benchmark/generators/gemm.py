@@ -42,8 +42,8 @@ from tokenspeed_kernel.registry import KernelRegistry, KernelSpec, load_builtin_
 from tokenspeed_kernel.selection import (
     NoKernelFoundError,
     SelectedKernel,
-    ref_compatible_with_spec,
     select_kernel,
+    select_reference,
     spec_matches_shape_traits,
     spec_matches_traits,
 )
@@ -254,24 +254,9 @@ def _select_reference_registration(
     traits: dict[str, object],
     platform: PlatformInfo,
 ) -> tuple[KernelSpec, SelectedKernel]:
-    registry = KernelRegistry.get()
-    references = registry.get_for_operator(
-        spec.family,
-        spec.mode,
-        platform=platform,
-        format_signature=signature,
-        solution="torch",
-    )
-    for reference in references:
-        if (
-            reference.name == spec.name
-            or not ref_compatible_with_spec(reference, spec)
-            or not spec_matches_shape_traits(reference, traits)
-        ):
-            continue
-        implementation = registry.get_impl(reference.name)
-        if implementation is not None:
-            return reference, SelectedKernel(reference.name, implementation)
+    reference = select_reference(spec, signature, traits=traits, platform=platform)
+    if reference is not None:
+        return KernelRegistry.get().get_by_name(reference.name), reference
 
     raise BenchmarkCaseError(
         BenchmarkStatus.REGISTRATION_MISSING,

@@ -64,15 +64,19 @@ def _make_inputs(num_tokens: int, seed: int = 0):
 
 
 def _reference_apply_attn_res(prefix_sum, block_residual, proj, norm):
-    """The checkpoint's modeling_kimi.py::_apply_attn_res, over block-major
-    candidates [N, T, H] = blocks then the current stream."""
-    return torch_attn_res_fwd(
-        layer_residual=prefix_sum.clone(),
-        block_residual=block_residual,
-        res_weight=proj.weight.squeeze(0),
-        rms_weight=norm.weight,
-        eps=norm.variance_epsilon,
-    )
+    """Verbatim math from the checkpoint's modeling_kimi.py::_apply_attn_res,
+    over block-major candidates [N, T, H] = blocks then the current stream.
+
+    Kept independent of ``torch_attn_res_fwd``, which the tests check against it.
+    """
+    v = torch.cat((block_residual, prefix_sum.unsqueeze(0)), dim=0)
+    v_float = v.float()
+    variance = v_float.pow(2).mean(-1, keepdim=True)
+    k = v_float * torch.rsqrt(variance + norm.variance_epsilon)
+    score_weight = norm.weight.float() * proj.weight.squeeze(0).float()
+    scores = (k * score_weight).sum(-1)  # [N, T]
+    probs = scores.softmax(0)
+    return (probs.unsqueeze(-1) * v_float).sum(0).to(v.dtype)
 
 
 class TestAttnResTests:

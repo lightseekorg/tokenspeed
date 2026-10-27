@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.residual.torch import torch_attn_res_fwd
+from tokenspeed_kernel.selection import select_kernel
+from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 from utils import is_cdna4, is_cdna5
 
 if not (is_cdna4() or is_cdna5()):
@@ -61,7 +62,17 @@ def _attn_res_reference(
     output_eps: float,
 ) -> torch.Tensor:
     # ``history`` is token-major ``[T, blocks, H]``.
-    return torch_attn_res_fwd(
+    reference = select_kernel(
+        "residual",
+        "attn_res_fwd",
+        format_signature(
+            layer_residual=dense_tensor_format(torch.bfloat16),
+            block_residual=dense_tensor_format(torch.bfloat16),
+        ),
+        traits=None,
+        solution="reference",
+    )
+    return reference(
         layer_residual=layer.clone(),
         block_residual=history.transpose(0, 1),
         res_weight=res_weight,

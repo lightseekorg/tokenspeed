@@ -155,7 +155,10 @@ folder.
   `ops/` family (`attention/<variant>.py` for attention), registered with
   `solution="torch"`; never auto-selects over a real backend but always
   available as ground truth. Kernel tests compare against these references
-  instead of writing their own.
+  instead of writing their own. Correctness checks select their ground truth
+  with the meta solution `solution="reference"`, which resolves to `torch`
+  and, for an operation without a matching torch kernel, to `triton`; tests
+  get it for an operator's kernel with `numerics.reference.reference_kernel`.
 
 TokenSpeed-kernel carefully curates external dependencies and actively
 re-evaluates their inclusion to maintain minimal dependencies and enable

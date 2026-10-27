@@ -23,7 +23,6 @@ from __future__ import annotations
 import pytest
 import torch
 import torch.nn.functional as F
-from tokenspeed_kernel.numerics.torch.residual import torch_mhc_pre
 from tokenspeed_kernel.ops.residual import mhc_pre as kernel_mhc_pre
 from utils import assert_no_triton_compile, is_cdna4
 
@@ -63,7 +62,9 @@ def test_gluon_mhc_pre_multitoken_matches_reference(
     args = (residual, fn, hc_scale, hc_base, 1e-6, 1e-6, 20)
 
     actual = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
-    expected = torch_mhc_pre(*args, None, None)
+    expected = kernel_mhc_pre(
+        *args, solution="reference", norm_weight=None, norm_eps=None
+    )
 
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(
@@ -104,7 +105,9 @@ def test_glm5_next_mhc_pre_graph_shape_replays_changed_input() -> None:
         graph_output = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
 
     residual.copy_(torch.randn(residual.shape, device="cuda", dtype=residual.dtype))
-    expected = torch_mhc_pre(*args, None, None)
+    expected = kernel_mhc_pre(
+        *args, solution="reference", norm_weight=None, norm_eps=None
+    )
     graph.replay()
     torch.cuda.synchronize()
 
@@ -152,7 +155,9 @@ def test_gluon_mhc_large_prefill_matches_reference(
 ) -> None:
     args = _prefill_args(num_tokens, hidden_size)
     actual = kernel_mhc_pre(*args, norm_weight=None, norm_eps=None)
-    expected = torch_mhc_pre(*args, None, None)
+    expected = kernel_mhc_pre(
+        *args, solution="reference", norm_weight=None, norm_eps=None
+    )
     for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
         torch.testing.assert_close(
             actual_tensor.float(), expected_tensor.float(), rtol=2e-2, atol=2e-2
@@ -233,7 +238,9 @@ def test_gluon_mhc_prefill_output_normalization(
         norm_weight=norm_weight,
         norm_eps=1e-5,
     )
-    layer, post, comb = torch_mhc_pre(*args, None, None)
+    layer, post, comb = kernel_mhc_pre(
+        *args, solution="reference", norm_weight=None, norm_eps=None
+    )
     layer = F.rms_norm(layer, (hidden_size,), norm_weight, 1e-5)
     for result, expected in zip(actual, (layer, post, comb), strict=True):
         torch.testing.assert_close(
@@ -259,7 +266,9 @@ def test_gluon_mhc_prefill_graph_changes_all_inputs(normalize) -> None:
     bias.add_(0.1)
     if normalize:
         norm_weight.mul_(0.8)
-    expected = list(torch_mhc_pre(*args, None, None))
+    expected = list(
+        kernel_mhc_pre(*args, solution="reference", norm_weight=None, norm_eps=None)
+    )
     if normalize:
         expected[0] = F.rms_norm(expected[0], (7168,), norm_weight, norm_eps)
     graph.replay()

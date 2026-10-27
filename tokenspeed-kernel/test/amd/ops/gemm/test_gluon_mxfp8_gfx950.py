@@ -24,7 +24,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
 from utils import assert_no_triton_compile, is_cdna4
 
 if not is_cdna4():
@@ -79,8 +78,15 @@ def test_mxfp8_gemm_matches_dequantized_reference(k: int) -> None:
         block_size=[1, 32],
         out=out,
     )
-    expected = torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    expected = kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=actual.dtype,
+        block_size=[1, 32],
+        quant="mxfp8",
+        solution="reference",
     )
 
     assert actual is out
@@ -115,8 +121,15 @@ def test_mxfp8_gemm_ragged_shapes_match_dequantized_reference(
         block_size=[1, 32],
         out=None,
     )
-    expected = torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    expected = kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=actual.dtype,
+        block_size=[1, 32],
+        quant="mxfp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -180,8 +193,15 @@ def test_mxfp8_gemm_accepts_row_padded_operands_and_strided_scales(k: int) -> No
         block_size=[1, 32],
         out=None,
     )
-    expected = torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    expected = kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=actual.dtype,
+        block_size=[1, 32],
+        quant="mxfp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
@@ -210,8 +230,15 @@ def test_mxfp8_gemm_async_scales_accept_row_padding() -> None:
         block_size=[1, 32],
         out=None,
     )
-    expected = torch_mm_fp8_blockscale(
-        a, b, a_scales, b_scales, actual.dtype, block_size=[1, 32]
+    expected = kernel_mm(
+        a,
+        b,
+        A_scales=a_scales,
+        B_scales=b_scales,
+        out_dtype=actual.dtype,
+        block_size=[1, 32],
+        quant="mxfp8",
+        solution="reference",
     )
 
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)

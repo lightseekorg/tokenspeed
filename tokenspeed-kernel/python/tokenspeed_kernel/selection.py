@@ -49,10 +49,19 @@ __all__ = [
     "kernel_override",
     "explain_selection",
     "spec_matches_traits",
-    "ref_compatible_with_spec",
     "spec_matches_shape_traits",
+    "REFERENCE_SOLUTION",
+    "REFERENCE_SOLUTIONS",
+    "select_reference",
     "warmup_selection",
 ]
+
+
+# The meta solution correctness checks select their ground truth with: the
+# first of ``REFERENCE_SOLUTIONS`` with a kernel matching the request, so the
+# PyTorch references when one exists and the portable Triton kernels otherwise.
+REFERENCE_SOLUTION = "reference"
+REFERENCE_SOLUTIONS = ("torch", "triton")
 
 
 class NoKernelFoundError(RuntimeError):
@@ -463,23 +472,6 @@ def spec_matches_traits(
     return True
 
 
-def ref_compatible_with_spec(ref: KernelSpec, spec: KernelSpec) -> bool:
-    """Return whether a reference kernel can handle the same inputs as a test kernel.
-
-    For each trait the reference declares, the spec must declare that same trait
-    with values that fully cover the reference's required values.  Traits the
-    reference does not declare are unconstrained (the reference is general with
-    respect to those traits).
-    """
-    for trait_name, ref_values in ref.traits.items():
-        spec_values = spec.traits.get(trait_name)
-        if spec_values is None:
-            return False
-        if not ref_values.issubset(spec_values):
-            return False
-    return True
-
-
 # GEMM problem-shape dimensions. Their exact value sets are enforced here as
 # well as by ``spec_matches_traits`` so that shape-only callers (numerics,
 # benchmarks) see the full envelope, and a spec that constrains one of them
@@ -562,6 +554,56 @@ def _filter_by_traits(
     ]
 
 
+def _concrete_solutions(solution: str | None) -> tuple[str | None, ...]:
+    """The solutions a requested solution tries, in order."""
+    if solution == REFERENCE_SOLUTION:
+        return REFERENCE_SOLUTIONS
+    return (solution,)
+
+
+def _match_candidates(
+    registry: KernelRegistry,
+    family: str,
+    mode: str,
+    format_signature: FormatSignature,
+    *,
+    features: frozenset[str] | None,
+    platform: PlatformInfo,
+    traits: dict[str, Any] | None,
+    solution: str | None,
+    ignore_layout: bool,
+    exclude: str | None,
+) -> tuple[list[KernelSpec], list[KernelSpec], str | None]:
+    """Kernels matching a request, before and after trait filtering.
+
+    The ``"reference"`` meta solution takes the first of
+    ``REFERENCE_SOLUTIONS`` with a kernel passing every filter. The kernel
+    named ``exclude`` never matches.
+
+    Returns:
+        ``(matched, eligible, resolved)``: the kernels matching platform,
+        features, format signature and solution; those also matching
+        ``traits``; and the concrete solution they were drawn from (for the
+        meta solution, the last one tried when none matches).
+    """
+    matched: list[KernelSpec] = []
+    for resolved in _concrete_solutions(solution):
+        matched = registry.get_for_operator(
+            family,
+            mode,
+            features=features,
+            platform=platform,
+            format_signature=format_signature,
+            solution=resolved,
+            ignore_layout=ignore_layout,
+        )
+        matched = [spec for spec in matched if spec.name != exclude]
+        eligible = _filter_by_traits(matched, traits) if traits else matched
+        if eligible:
+            return matched, eligible, resolved
+    return matched, [], resolved
+
+
 def _resolve_override(
     registry: KernelRegistry,
     family: str,
@@ -581,7 +623,11 @@ def _resolve_override(
     """
     spec = registry.get_by_name(override)
     if spec is None:
-        candidates = registry.get_for_operator(family, mode, solution=override)
+        candidates: list[KernelSpec] = []
+        for solution in _concrete_solutions(override):
+            candidates = registry.get_for_operator(family, mode, solution=solution)
+            if candidates:
+                break
         if not candidates:
             raise NoKernelFoundError(
                 f"Override '{override}' not found for {family}.{mode} "
@@ -702,10 +748,12 @@ def select_kernel(
         traits: Op-specific trait values that affect kernel applicability
                (e.g., {"head_dim": 128, "num_kv_heads": 8})
         solution: Restrict selection to a registered solution while preserving
-            normal platform, format signature, and trait filtering.
-        override: Force a specific kernel name or solution string, skipping
-            platform, format-signature and trait matching but still refusing
-            a kernel that lacks a required feature.
+            normal platform, format signature, and trait filtering. The meta
+            solution ``"reference"`` takes the first of ``"torch"`` and
+            ``"triton"`` with a matching kernel.
+        override: Force a specific kernel name or solution string (including
+            ``"reference"``), skipping platform, format-signature and trait
+            matching but still refusing a kernel that lacks a required feature.
         ignore_layout: Ignore only storage layouts when choosing preprocessing
             at initialization. Execution uses the default layout-aware matching.
 
@@ -747,27 +795,56 @@ def select_kernel(
         )
         return selected
 
-    # Get candidates (same filtering for both strategies)
-    candidates = registry.get_for_operator(
+    result = _select_ranked(
+        registry,
         family,
         mode,
+        format_signature,
         features=features,
         platform=platform,
-        format_signature=format_signature,
+        traits=traits,
         solution=solution,
         ignore_layout=ignore_layout,
+        exclude=None,
+    )
+    registry.cache_put(cache_key, result)
+    return result
+
+
+def _select_ranked(
+    registry: KernelRegistry,
+    family: str,
+    mode: str,
+    format_signature: FormatSignature,
+    *,
+    features: frozenset[str] | None,
+    platform: PlatformInfo,
+    traits: dict[str, Any] | None,
+    solution: str | None,
+    ignore_layout: bool,
+    exclude: str | None,
+) -> SelectedKernel:
+    """The best-ranked kernel matching a request, other than the one named
+    ``exclude``; overrides do not apply."""
+    matched, candidates, _ = _match_candidates(
+        registry,
+        family,
+        mode,
+        format_signature,
+        features=features,
+        platform=platform,
+        traits=traits,
+        solution=solution,
+        ignore_layout=ignore_layout,
+        exclude=exclude,
     )
 
     solution_clause = f" with solution {solution!r}" if solution else ""
-    if not candidates:
+    if not matched:
         raise NoKernelFoundError(
             f"No kernel found for {family}.{mode} ({format_signature})"
             f"{solution_clause} on {platform.device_name}"
         )
-
-    if traits:
-        candidates = _filter_by_traits(candidates, traits)
-
     if not candidates:
         raise NoKernelFoundError(
             f"No kernel found for {family}.{mode} ({format_signature})"
@@ -793,10 +870,53 @@ def select_kernel(
 
     _log_selection(family, mode, format_signature, winner, scored, platform)
 
-    impl = registry.get_impl(winner.name)
-    result = SelectedKernel(name=winner.name, impl=impl)
-    registry.cache_put(cache_key, result)
-    return result
+    return SelectedKernel(name=winner.name, impl=registry.get_impl(winner.name))
+
+
+def select_reference(
+    spec: KernelSpec,
+    format_signature: FormatSignature,
+    *,
+    traits: dict[str, Any] | None,
+    platform: PlatformInfo | None = None,
+) -> SelectedKernel | None:
+    """Select the ground truth to check ``spec`` against.
+
+    Runs :func:`select_kernel`'s ranking with the ``"reference"`` meta
+    solution for ``spec``'s operator and ``format_signature``, requiring every
+    trait ``spec`` declares, so the reference accepts any input ``spec``
+    does, plus the call's ``traits`` (such as problem-shape traits).
+    The kernel under test is never a candidate, so when it would rank first
+    the next-best reference is taken. Overrides do not apply: an override
+    naming the kernel under test would make it its own reference.
+
+    Args:
+        spec: The kernel under test.
+        format_signature: The format signature it is called with.
+        traits: Extra traits of the call, or None.
+        platform: Hardware to match (auto-detected if None).
+
+    Returns:
+        The selected reference, or None when no kernel other than ``spec``
+        matches.
+    """
+    registry = KernelRegistry.get()
+    try:
+        selected = _select_ranked(
+            registry,
+            spec.family,
+            spec.mode,
+            format_signature,
+            features=None,
+            platform=platform or current_platform(),
+            traits={**spec.traits, **(traits or {})},
+            solution=REFERENCE_SOLUTION,
+            ignore_layout=False,
+            exclude=spec.name,
+        )
+    except NoKernelFoundError:
+        return None
+    return selected
 
 
 def _autotune_select(
@@ -900,17 +1020,18 @@ def explain_selection(
             override_error = str(exc)
 
     all_specs = registry.list_kernels(family=family, mode=mode)
-    candidates = registry.get_for_operator(
+    _, candidates, resolved = _match_candidates(
+        registry,
         family,
         mode,
+        format_signature,
         features=features,
         platform=platform,
-        format_signature=format_signature,
+        traits=traits,
         solution=solution,
+        ignore_layout=False,
+        exclude=None,
     )
-
-    if traits:
-        candidates = _filter_by_traits(candidates, traits)
 
     scored = _rank(candidates, platform, traits)
 
@@ -920,7 +1041,11 @@ def explain_selection(
     lines = [
         f"Op: {family}.{mode} ({format_signature})",
         f"Platform: {platform.device_name} ({platform.arch})",
-        f"Solution: {solution or 'any'}",
+        (
+            f"Solution: {solution} (resolves to {resolved!r})"
+            if solution == REFERENCE_SOLUTION
+            else f"Solution: {solution or 'any'}"
+        ),
         (
             f"Override: {active_override} ({_override_origin(family, mode)})"
             if active_override
@@ -977,7 +1102,7 @@ def explain_selection(
                     f"format signature mismatch (supports "
                     f"{', '.join(str(d) for d in spec.format_signatures)})"
                 )
-            if solution and spec.solution != solution:
+            if solution and spec.solution != resolved:
                 reasons.append(f"solution mismatch (is {spec.solution!r})")
             reason_str = "; ".join(reasons) if reasons else "unknown"
             lines.append(f"  - {spec.name}: {reason_str}")

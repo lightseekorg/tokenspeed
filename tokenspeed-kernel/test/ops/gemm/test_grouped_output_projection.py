@@ -24,9 +24,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from tokenspeed_kernel.numerics.torch.gemm import (
-    torch_dsv4_grouped_output_projection,
-)
 from tokenspeed_kernel.ops.gemm import (
     dsv4_grouped_output_projection,
     dsv4_grouped_output_projection_plan,
@@ -124,18 +121,16 @@ def test_grouped_output_projection_preparation_and_graph_replay(
         )
 
     def check(actual: torch.Tensor) -> None:
-        expected = torch_dsv4_grouped_output_projection(
-            attention=attention,
-            positions=positions,
-            cos_sin_cache=cos_sin,
-            weight=checkpoint_weight,
-            weight_scale=checkpoint_scale,
-            num_groups=groups,
-            heads_per_group=heads_per_group,
-            output_dim=output_dim,
-            nope_dim=nope_dim,
-            rope_dim=rope_dim,
-            block_size=block_size,
+        # The reference takes the checkpoint (canonical) weight layout.
+        expected = dsv4_grouped_output_projection(
+            plan,
+            attention,
+            positions,
+            cos_sin,
+            checkpoint_weight,
+            checkpoint_scale,
+            allow_unknown_layout=True,
+            solution="reference",
         )
         assert actual.dtype == torch.bfloat16
         torch.testing.assert_close(actual.float(), expected, atol=1e-3, rtol=5e-3)
