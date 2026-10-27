@@ -2027,6 +2027,9 @@ class MuseSparkModel(BaseTransformerModel):
             and self.config.moe_hidden_size == 4096
             and self.config.num_local_experts == 256
             and self.config.num_experts_per_tok == 8
+            # The owned-row path gathers its rows, including the hidden states
+            # captured for a draft, in BF16.
+            and self.embed_tokens.weight.dtype == torch.bfloat16
         ):
             return False
         for index, layer in enumerate(self.layers):
@@ -2144,15 +2147,17 @@ class MuseSparkModel(BaseTransformerModel):
         each rank holds only its owned rows, only the captured layers gather
         full rows; the other layers keep the owned-row layout.
         """
-        tap = hidden_states.to(self.embed_tokens.weight.dtype)
         if owned_global_rows is None:
+            tap = hidden_states.to(self.embed_tokens.weight.dtype)
             # The final capture (index num_layers + 1) gathers like the last layer's.
             layer = self.layers[min(layer_index, len(self.layers) - 1)]
             tap = layer.comm_manager.gather_residual(tap, ctx)
         else:
             iris = self.iris_state
             assert iris is not None
-            tap = iris.all_gather_owned_rows(tap, owned_global_rows, False)
+            # Round FP32 to BF16 directly into the gather's pull scratch,
+            # saving the copy a separate BF16 tensor would need.
+            tap = iris.all_gather_owned_stream_bf16(hidden_states, owned_global_rows)
         aux_hidden_states.append(tap)
         if ctx.target_capture_sink is not None:
             notify_target_capture(
