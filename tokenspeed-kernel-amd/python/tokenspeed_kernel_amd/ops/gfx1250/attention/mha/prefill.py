@@ -48,6 +48,7 @@ from tokenspeed_kernel_amd.ops.gfx1250.attention._common import (
 cdna5 = gl.amd.cdna5
 
 _GFX1250_NUM_CUS = 256
+_FP32_MAX = gl.constexpr(3.4028234663852886e38)
 
 
 @gluon.aggregate
@@ -552,7 +553,29 @@ class AttentionProgram:
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
+        if (
+            self.cfg.HAS_SINK
+            and self.cfg.HAS_LSE
+            and self.q_ptr.dtype.element_ty == gl.bfloat16
+        ):
+            v = (v.to(gl.float32) * self.value_scale()).to(v.dtype)
         return cdna5.wmma(p, v, acc)
+
+    @gluon.jit
+    def value_scale(self):
+        if (
+            self.cfg.HAS_SINK
+            and self.cfg.HAS_LSE
+            and self.q_ptr.dtype.element_ty == gl.bfloat16
+        ):
+            # Key-only LSE requires a reference independent of the sink. Bound
+            # the online PV sum by V's range before the sink can rescale it.
+            # Scale V, preserving small probabilities that can multiply large V.
+            # A power of two preserves normal BF16 value significands.
+            length = gl.maximum(self.seq_len, 1).to(gl.float32)
+            return gl.exp2(-gl.ceil(gl.log2(length)))
+        else:
+            return 1.0
 
     @gluon.jit
     def init_attention_state(self):
@@ -576,13 +599,13 @@ class AttentionProgram:
             )
             # The reference shift may be smaller than the sink. Cap its
             # conversion to unscaled units so finite sinks cannot seed +inf.
-            m_i += gl.minimum(sink_log2 / cfg.SM_SCALE, 3.4028234663852886e38)
+            m_i += gl.minimum(sink_log2 / cfg.SM_SCALE, _FP32_MAX)
         else:
             # LSE excludes sinks, so preserve a maximum from the key logits.
             # Packed tail rows can be fully masked. A finite seed keeps their
             # max-difference arithmetic defined while exp2 still underflows to zero.
             initial_max: gl.constexpr = (
-                -3.4028234663852886e38
+                -_FP32_MAX
                 if cfg.DEEP_PIPELINE and cfg.GUARDED_QUERY_ROWS
                 else -float("inf")
             )
@@ -695,7 +718,9 @@ class AttentionProgram:
                 l_i = l_i * alpha + gl.exp2(sink_delta - shift)
             else:
                 l_i += gl.exp2(sink_delta)
-        return l_i, acc
+        # LSE was stored from the unscaled key sum. Match the PV scale only
+        # for output normalization, after incorporating the sink.
+        return l_i * self.value_scale(), acc
 
     @gluon.jit
     def store_lse(self, l_i, m_i):
@@ -830,7 +855,7 @@ def process_single_attention_tile(
         and not cfg.HAS_LSE
     ):
         # Finite seed gives masked rows zero probability. No previous tile exists.
-        m_i = maximum(max(qk, 1), -3.4028234663852886e38)
+        m_i = maximum(max(qk, 1), -_FP32_MAX)
         p = gl.exp2((qk - m_i[:, None]) * cfg.SM_SCALE)
         l_i = gl.sum(p, 1)
         p = gl.convert_layout(p.to(program.q_ptr.dtype.element_ty), cfg.p_layout)
@@ -2402,137 +2427,233 @@ def _count_live_workgroups(
     )
 
 
+class PrefillGeometry(NamedTuple):
+    block_m: int
+    block_n: int
+    num_warps: int
+    packed_gqa: bool
+    use_tdm_q: bool
+
+
+def _short_prefill_candidate(
+    config: LaunchConfig,
+    *,
+    group: int,
+    can_pack: bool,
+    uniform: bool,
+    candidate: int,
+    grid: int,
+) -> bool:
+    """Allow less occupancy for measured short packed-query layouts."""
+    length = config.max_seqlen
+    short_packed = (
+        config.head_dim == 128 and 64 < length <= 128 and can_pack and uniform
+    )
+    partial_short = (
+        short_packed
+        and candidate == 256
+        and length < 128
+        and 2 <= group <= 8
+        and (group > 2 or grid <= _GFX1250_NUM_CUS)
+        and (length * group) % 128 != 0
+        and config.batch_size * config.n_kv_heads * triton_cdiv(length * group, 128)
+        > _GFX1250_NUM_CUS
+    )
+    short_narrow = (
+        short_packed
+        and candidate == 128
+        and group >= 8
+        and (group < 32 or length < 128 or grid >= 3 * _GFX1250_NUM_CUS // 4)
+    )
+    min_workgroups = (
+        _GFX1250_NUM_CUS // 2 if partial_short or short_narrow else _GFX1250_NUM_CUS
+    )
+    effective_group = group if can_pack else 1
+    return (
+        candidate <= min(length, 128) * effective_group or partial_short
+    ) and grid >= min_workgroups
+
+
+def _short_prefill_layout(
+    config: LaunchConfig,
+    *,
+    group: int,
+    can_pack: bool,
+    uniform: bool,
+    block_m: int,
+) -> PrefillGeometry:
+    """Choose waves and key width after sizing the short query tile."""
+    length = config.max_seqlen
+    warps = (16 if length <= 64 else 8) if block_m == 256 else 4
+    short_packed = (
+        config.head_dim == 128 and 64 < length <= 128 and can_pack and uniform
+    )
+    multiple_rounds = (
+        config.batch_size * config.n_kv_heads * triton_cdiv(length * group, 128)
+        > _GFX1250_NUM_CUS
+    )
+    # Full 128-row tiles and partial ratio-16/32 tiles benefit from extra waves.
+    if (
+        short_packed
+        and multiple_rounds
+        and (
+            (block_m == 128 and group > 1 and (length * group) % 128 == 0)
+            or (group >= 16 and length < 128 and (length * group) % 128 != 0)
+        )
+    ):
+        block_m, warps = 128, 8
+    block_n = 64 if length <= 64 or (group > 1 and can_pack and block_m >= 128) else 128
+    if short_packed and group == 2 and block_m == 256 and warps == 8 and length < 128:
+        block_n = 128
+    return PrefillGeometry(block_m, block_n, warps, can_pack, True)
+
+
+def _select_short_prefill_geometry(
+    config: LaunchConfig,
+    seqlens: list[int],
+    *,
+    group: int,
+    can_pack: bool,
+) -> PrefillGeometry:
+    length = config.max_seqlen
+    uniform = len(set(seqlens)) == 1
+    effective_group = group if can_pack else 1
+    heads = config.n_kv_heads if can_pack else config.n_heads
+    block_m = 64
+    for candidate in (128, 256):
+        grid = (
+            config.batch_size * heads * triton_cdiv(length * effective_group, candidate)
+        )
+        if _short_prefill_candidate(
+            config,
+            group=group,
+            can_pack=can_pack,
+            uniform=uniform,
+            candidate=candidate,
+            grid=grid,
+        ):
+            block_m = candidate
+    if (
+        length <= 128
+        and config.batch_size == 1
+        and config.n_heads >= 16
+        and (config.head_dim != 128 or length <= 64 or (length * effective_group) % 64)
+    ):
+        block_m = 32
+    return _short_prefill_layout(
+        config,
+        group=group,
+        can_pack=can_pack,
+        uniform=uniform,
+        block_m=block_m,
+    )
+
+
+def _select_d64_prefill_geometry(
+    config: LaunchConfig,
+    *,
+    rows: int,
+    can_pack: bool,
+) -> PrefillGeometry:
+    length = config.max_seqlen
+    block_m = 64 if rows < 32768 else (128 if rows <= 65536 else 256)
+    block_n = 128 if (rows <= 65536 and length >= 512) or length >= 16384 else 64
+    return PrefillGeometry(block_m, block_n, 4, can_pack, length <= 2048)
+
+
+def _select_medium_prefill_geometry(
+    config: LaunchConfig,
+    seqlens: list[int],
+    *,
+    rows: int,
+    group: int,
+    can_pack: bool,
+) -> PrefillGeometry:
+    """D128 batches through 8192 tokens use smaller tiles at low occupancy."""
+    length = config.max_seqlen
+    uniform = len(set(seqlens)) == 1
+    partial_packed = (
+        group > 1
+        and can_pack
+        and uniform
+        and (
+            0 < (length * group) % 128 <= 32
+            or (length <= 768 and (length * group) % 128 != 0)
+        )
+    )
+    if (
+        length <= 2048
+        and 16384 <= rows <= 32768
+        and (length <= 512 or (group == 1 and not uniform) or partial_packed)
+    ):
+        return PrefillGeometry(64, 64, 4, can_pack, True)
+    block_m = 64 if length <= 2048 and rows < 16384 else (128 if rows <= 98304 else 256)
+    if length >= 4096 and rows >= 98304:
+        block_m = 256
+    block_n = 128 if block_m == 64 or (length >= 4096 and rows <= 32768) else 64
+    warps = 8 if block_m == 256 and length <= 768 else 4
+    return PrefillGeometry(block_m, block_n, warps, can_pack, length <= 2048)
+
+
 def _select_prefill_geometry(
     config: LaunchConfig, seqlens: list[int]
-) -> tuple[int, int, int, bool, bool] | None:
+) -> PrefillGeometry | None:
     """Choose tiles, wave count, GQA packing, and Q loads from finite buckets."""
     group = config.n_heads // config.n_kv_heads
     can_pack = group <= 32 and group & (group - 1) == 0
-    length = config.max_seqlen
+    if config.max_seqlen <= 256:
+        return _select_short_prefill_geometry(
+            config, seqlens, group=group, can_pack=can_pack
+        )
     rows = config.n_heads * sum(seqlens)
-    if length <= 256:
-        effective_group = group if can_pack else 1
-        heads = config.n_kv_heads if can_pack else config.n_heads
-        block_m = 64
-        for candidate in (128, 256):
-            grid = (
-                config.batch_size
-                * heads
-                * triton_cdiv(length * effective_group, candidate)
-            )
-            partial_short = (
-                config.head_dim == 128
-                and candidate == 256
-                and 64 < length < 128
-                and can_pack
-                and 2 <= group <= 8
-                and (group > 2 or grid <= _GFX1250_NUM_CUS)
-                and len(set(seqlens)) == 1
-                and (length * group) % 128 != 0
-                and config.batch_size * heads * triton_cdiv(length * group, 128)
-                > _GFX1250_NUM_CUS
-            )
-            short_narrow = (
-                config.head_dim == 128
-                and candidate == 128
-                and 64 < length <= 128
-                and can_pack
-                and group >= 8
-                and (group < 32 or length < 128 or grid >= 3 * _GFX1250_NUM_CUS // 4)
-                and len(set(seqlens)) == 1
-            )
-            min_workgroups = (
-                _GFX1250_NUM_CUS // 2
-                if partial_short or short_narrow
-                else _GFX1250_NUM_CUS
-            )
-            if (
-                candidate <= min(length, 128) * effective_group or partial_short
-            ) and grid >= min_workgroups:
-                block_m = candidate
-        if (
-            length <= 128
-            and config.batch_size == 1
-            and config.n_heads >= 16
-            and (
-                config.head_dim != 128
-                or length <= 64
-                or (length * effective_group) % 64
-            )
-        ):
-            block_m = 32
-        warps = (16 if length <= 64 else 8) if block_m == 256 else 4
-        # More than one CU-wide round benefits from the extra resident waves.
-        if (
-            config.head_dim == 128
-            and block_m == 128
-            and 64 < length <= 128
-            and can_pack
-            and group > 1
-            and len(set(seqlens)) == 1
-            and (length * group) % block_m == 0
-            and config.batch_size * heads * triton_cdiv(length * group, block_m)
-            > _GFX1250_NUM_CUS
-        ):
-            warps = 8
-        if (
-            config.head_dim == 128
-            and 64 < length < 128
-            and can_pack
-            and group >= 16
-            and len(set(seqlens)) == 1
-            and (length * group) % 128 != 0
-            and config.batch_size * heads * triton_cdiv(length * group, 128)
-            > _GFX1250_NUM_CUS
-        ):
-            block_m = 128
-            warps = 8
-        block_n = (
-            64 if length <= 64 or (group > 1 and can_pack and block_m >= 128) else 128
-        )
-        if (
-            config.head_dim == 128
-            and group == 2
-            and block_m == 256
-            and warps == 8
-            and 64 < length < 128
-            and len(set(seqlens)) == 1
-        ):
-            block_n = 128
-        return block_m, block_n, warps, can_pack, True
-    if (
-        config.head_dim == 128
-        and 256 < length <= 2048
-        and 16384 <= rows <= 32768
-        and (
-            length <= 512
-            or (group == 1 and len(set(seqlens)) > 1)
-            or (
-                group > 1
-                and can_pack
-                and len(set(seqlens)) == 1
-                and (
-                    0 < (length * group) % 128 <= 32
-                    or (length <= 768 and (length * group) % 128 != 0)
-                )
-            )
-        )
-    ):
-        return 64, 64, 4, can_pack, True
     if config.head_dim == 64:
-        block_m = 64 if rows < 32768 else (128 if rows <= 65536 else 256)
-        block_n = 128 if (rows <= 65536 and length >= 512) or length >= 16384 else 64
-        return block_m, block_n, 4, can_pack, length <= 2048
-    if length <= 8192:
-        block_m = (
-            64 if length <= 2048 and rows < 16384 else (128 if rows <= 98304 else 256)
+        return _select_d64_prefill_geometry(config, rows=rows, can_pack=can_pack)
+    if config.max_seqlen <= 8192:
+        return _select_medium_prefill_geometry(
+            config, seqlens, rows=rows, group=group, can_pack=can_pack
         )
-        if length >= 4096 and rows >= 98304:
-            block_m = 256
-        block_n = 128 if block_m == 64 or (length >= 4096 and rows <= 32768) else 64
-        warps = 8 if block_m == 256 and length <= 768 else 4
-        return block_m, block_n, warps, can_pack, length <= 2048
     return None
+
+
+def _apply_prefill_geometry(
+    config: LaunchConfig,
+    seqlens: list[int],
+    geometry: PrefillGeometry,
+    *,
+    uniform: bool,
+) -> tuple[LaunchConfig, bool, bool, bool]:
+    """Build the grid and derive compact, deep, and guarded-row execution flags."""
+    group = config.n_heads // config.n_kv_heads if geometry.packed_gqa else 1
+    q_span = geometry.block_m // group
+    compact_ragged = (
+        geometry.packed_gqa
+        and not uniform
+        and config.batch_size * config.max_seqlen > 2 * sum(seqlens)
+    )
+    query_blocks = triton_cdiv(config.max_seqlen, q_span)
+    if compact_ragged:
+        live_tiles = sum(
+            triton_cdiv(seqlen * group, geometry.block_m) for seqlen in seqlens
+        )
+        query_blocks = triton_cdiv(live_tiles, config.batch_size)
+    config = config._replace(
+        block_m=geometry.block_m,
+        block_n=geometry.block_n,
+        num_warps=geometry.num_warps,
+        num_buffers=1 if config.max_seqlen <= geometry.block_n else 2,
+        waves_per_eu=1,
+        packed_gqa=geometry.packed_gqa,
+        grid=(
+            config.batch_size,
+            config.n_kv_heads if geometry.packed_gqa else config.n_heads,
+            query_blocks,
+        ),
+    )
+    deep_pipeline = config.max_seqlen >= 3 * config.block_n
+    guarded_query_rows = not (uniform and config.max_seqlen % q_span == 0)
+    if deep_pipeline and not config.packed_gqa and config.block_m < 3 * config.block_n:
+        guarded_query_rows = True
+    return config, compact_ragged, deep_pipeline, guarded_query_rows
 
 
 def launch_gluon_mha_prefill_gfx1250(
@@ -2820,43 +2941,13 @@ def launch_gluon_mha_prefill_gfx1250(
     ):
         geometry = _select_prefill_geometry(config, seqlens)
     if geometry is not None:
-        block_m, block_n, warps, packed, use_tdm_q = geometry
-        group = config.n_heads // config.n_kv_heads if packed else 1
-        q_span = block_m // group
+        config, compact_ragged, deep_pipeline, guarded_query_rows = (
+            _apply_prefill_geometry(config, seqlens, geometry, uniform=uniform)
+        )
+        use_tdm_q = geometry.use_tdm_q
         uniform_scalar = uniform and cu_seqlens_cpu[0] == 0
-        config = config._replace(
-            block_m=block_m,
-            block_n=block_n,
-            num_warps=warps,
-            num_buffers=1 if config.max_seqlen <= block_n else 2,
-            waves_per_eu=1,
-            packed_gqa=packed,
-            grid=(
-                config.batch_size,
-                config.n_kv_heads if packed else config.n_heads,
-                triton_cdiv(config.max_seqlen, q_span),
-            ),
-        )
         wide_transport = False
-        compact_ragged = (
-            packed
-            and not uniform
-            and config.batch_size * config.max_seqlen > 2 * sum(seqlens)
-        )
-        if compact_ragged:
-            live_tiles = sum(triton_cdiv(seqlen * group, block_m) for seqlen in seqlens)
-            config = config._replace(
-                grid=(
-                    config.batch_size,
-                    config.n_kv_heads,
-                    triton_cdiv(live_tiles, config.batch_size),
-                )
-            )
-        deep_pipeline = config.max_seqlen >= 3 * block_n
-        guarded_query_rows = not (uniform and config.max_seqlen % q_span == 0)
-        if deep_pipeline and not packed and block_m < 3 * block_n:
-            guarded_query_rows = True
-        reverse_q_blocks = config.max_seqlen > block_m
+        reverse_q_blocks = config.max_seqlen > config.block_m
         tdm_warp_hint = False
         llvm_fn_attrs = "amdgpu-sched-strategy=coexec"
         qk_valu_group_size = 0

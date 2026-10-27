@@ -1320,6 +1320,8 @@ positive overflow when converting to unscaled score units.
 The fixed-shift schedule changes probability rounding, so its results are
 numerically equivalent within tolerance, rather than bitwise identical.
 
+The normalization modes have these prerequisites and numerical bounds:
+
 | Mode | Eligibility | Numerical contract |
 | --- | --- | --- |
 | Online softmax | General path, including FP8 and windows | Keep the maximum in unscaled score units; update it and rescale FP32 state for each key tile. |
@@ -1334,9 +1336,11 @@ every graph replay; high-range inputs can pay for both passes.
 
 LSE describes key logits and excludes sinks. When both are requested, the kernel
 writes key-only LSE before adding sinks to output normalization with stable
-rescaling. Tests cover this contract with independent FP64 attention, changing
-graph inputs, storage offsets, ragged boundaries, and bounded JIT
-specialization.
+rescaling. For BF16, values and the final denominator share a power-of-two
+downscale based on sequence length, bounding the online value sum before sink
+rescaling without changing probability rounding or key-only LSE. Tests cover
+this contract with independent FP64 attention, changing graph inputs, storage
+offsets, ragged boundaries, and bounded JIT specialization.
 
 ### gfx1250 MLA prefill
 

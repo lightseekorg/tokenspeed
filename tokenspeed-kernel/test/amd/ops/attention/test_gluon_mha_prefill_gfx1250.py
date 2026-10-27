@@ -146,6 +146,48 @@ def test_mha_prefill_wide_transport(dtype):
     _check_sampled_fp64(out, q, k, v, cu_cpu)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("fused_tdm", [False, True], ids=["separate", "fused"])
+def test_mha_prefill_wide_transport_small(dtype, fused_tdm):
+    """Direct launch covers both transfer variants within the simulator budget."""
+    torch.manual_seed(75)
+    # Five BN64 tiles cover the prologue, loop, and odd/even transfer tails.
+    q, k, v, cu, cu_cpu, maximum = _inputs([320], 2, 1, 128, "cuda", dtype)
+    out = torch.full_like(q, float("nan"))
+    prefill.gluon_mha_prefill_gfx1250_wide_transport[(1, 1, 5)](
+        q,
+        k,
+        v,
+        cu,
+        out,
+        Q_STRIDE_T=q.stride(0),
+        Q_STRIDE_H=q.stride(1),
+        Q_STRIDE_D=q.stride(2),
+        K_STRIDE_T=k.stride(0),
+        K_STRIDE_H=k.stride(1),
+        K_STRIDE_D=k.stride(2),
+        V_STRIDE_T=v.stride(0),
+        V_STRIDE_H=v.stride(1),
+        V_STRIDE_D=v.stride(2),
+        N_HEADS=2,
+        N_KV_HEADS=1,
+        HEAD_DIM=128,
+        SM_SCALE=128**-0.5 * prefill._INV_LN2_VALUE,
+        NUM_WARPS=4,
+        NUM_BUFFERS=2,
+        FUSED_TDM=fused_tdm,
+        num_warps=4,
+        waves_per_eu=1,
+        llvm_fn_attrs="amdgpu-sched-strategy=coexec",
+        enable_fp_fusion=True,
+        **prefill.sched_compile_options(),
+    )
+    expected = _reference(q.double(), k.double(), v.double(), cu_cpu, 2, 1, 128)
+    tolerance = 2e-2 if dtype == torch.bfloat16 else 3e-3
+    torch.testing.assert_close(out.double(), expected, atol=tolerance, rtol=tolerance)
+    _check_sampled_fp64(out, q, k, v, cu_cpu)
+
+
 def test_mha_prefill_addresses_past_four_gib():
     """Sequence and head bases must not wrap through 32-bit buffer offsets."""
     device, dtype = "cuda", torch.bfloat16
@@ -982,6 +1024,8 @@ def test_mha_prefill_sink_lse_replay(
         )
     output, lse = result if return_lse else (result, None)
     patterns = ["normal", "sharp", "late_large"]
+    if feature == "both" and dtype == torch.bfloat16:
+        patterns.extend(["large_value", "small_probability"])
     # 2**125 is finite in BF16; FP16 would store infinity.
     if sinks is not None and dtype == torch.bfloat16:
         patterns.append("large_sink")
@@ -1005,6 +1049,24 @@ def test_mha_prefill_sink_lse_replay(
             # Finite sink logits can overflow conversion to unscaled QK units.
             # Keep other heads unchanged to check both normalization regimes.
             sinks[::2] = 2.0**125
+        elif pattern == "large_value":
+            # Finite BF16 values can overflow the unnormalized FP32 PV sum
+            # before the sink makes the final attention output much smaller.
+            q.zero_()
+            k.zero_()
+            v.fill_(2.0**120)
+            v[..., 1::2].neg_()
+            sinks.fill_(64)
+        elif pattern == "small_probability":
+            # Scaling P instead of V would underflow small probabilities whose
+            # product with a large value still contributes to the output.
+            q.fill_(1)
+            k.zero_()
+            v.zero_()
+            sinks.zero_()
+            for start, end in zip(cu_cpu[:-1], cu_cpu[1:]):
+                k[end - 1].fill_(-80 / math.sqrt(head_dim))
+                v[end - 1].fill_(2.0**120)
         output.fill_(float("nan"))
         if lse is not None:
             lse.fill_(float("nan"))
