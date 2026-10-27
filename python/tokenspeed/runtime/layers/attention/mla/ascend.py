@@ -26,8 +26,11 @@ import weakref
 
 import torch
 import torch.distributed as dist
-from tokenspeed_kernel.ops.attention.dsa import prepare_dsa_resources
-from tokenspeed_kernel.ops.attention.mla import mla_prefill, prepare_mla_prolog
+from tokenspeed_kernel.ops.attention.mla import (
+    mla_prefill,
+    prepare_mla_prolog,
+    prepare_mla_resources,
+)
 
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
@@ -233,17 +236,25 @@ class FusedMLADecode:
         device = layer.q_b_proj.weight.device
         self.outputs = {
             rows: (
-                torch.empty((rows, 64, 576), dtype=torch.bfloat16, device=device),
-                torch.empty((rows, 1536), dtype=torch.bfloat16, device=device),
+                torch.empty(
+                    (rows, layer.num_heads, 576), dtype=torch.bfloat16, device=device
+                ),
+                torch.empty(
+                    (rows, layer.q_lora_rank), dtype=torch.bfloat16, device=device
+                ),
                 torch.empty((rows, 576), dtype=torch.bfloat16, device=device),
                 torch.zeros(rows, dtype=torch.int64, device=device),
             )
-            for rows in (64, 128, 256, 512)
+            for rows in owner.outputs
         }
         self.attention_outputs = {
             rows: (
-                torch.empty((rows, 1, 64 * 512), dtype=torch.float32, device=device),
-                torch.empty((rows, 64, 1), dtype=torch.float32, device=device),
+                torch.empty(
+                    (rows, 1, layer.num_heads * 512), dtype=torch.float32, device=device
+                ),
+                torch.empty(
+                    (rows, layer.num_heads, 1), dtype=torch.float32, device=device
+                ),
             )
             for rows in self.outputs
         }
@@ -350,8 +361,11 @@ class AscendMLARuntime:
 
         self.layers = tuple(layers)
         self.ranks = tuple(mapping.attn.tp_group)
-        if len(self.ranks) != 8 or mapping.attn.kvp_size != 8 or not self.layers:
+        if not self.layers or len(self.ranks) != 8 or mapping.attn.kvp_size != 8:
             raise ValueError("Fused MLA requires TP8/DCP8 and nonempty MLA layers")
+        self.heads = self.layers[0].num_heads
+        if any(layer.num_heads != self.heads for layer in self.layers):
+            raise ValueError("Fused MLA resources require uniform head geometry")
         self.closed = False
         rank = self.ranks.index(dist.get_rank())
         group = pg.get_dedicated_device_group(self.ranks, "ascend_mla")
@@ -362,7 +376,9 @@ class AscendMLARuntime:
         self.group = group._get_backend(probe.device).get_hccl_comm_name(
             dist.get_rank()
         )
-        self.resources = prepare_dsa_resources(group=self.group, rank=rank)
+        self.resources = prepare_mla_resources(
+            group=self.group, rank=rank, heads=self.heads, rank_size=len(self.ranks)
+        )
         self.window = self.resources.window
         self.outputs = self.resources.outputs
         self.tables = self.resources.tables

@@ -122,7 +122,10 @@ fail before a context-parallel kernel is launched. The backend takes its CP
 degree and ranks from the host topology and passes that degree to every fused
 collective. The installed operators' Meta implementations validate topology
 and head layout before execution or graph capture; the framework carries no
-CP degree whitelist. The current native fusion remains specialized for DCP8.
+CP degree whitelist. DSA native fusion remains specialized for DCP8; prepared Ascend MLA also
+admits the H32 geometry on TP8/DCP8. Its head count, Q latent
+width and borrowed producer views follow the model, with the same projection,
+owner-store and FP32 LSE merge path.
 Bindings must supply Meta implementations for this startup check; a missing
 Meta kernel reports a binding upgrade, separately from unsupported topology.
 

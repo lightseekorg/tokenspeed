@@ -43,6 +43,15 @@ from tokenspeed_kernel.signature import (
 AttentionResult = torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]
 
 
+def prepare_mla_resources(*, group, rank, heads, rank_size):
+    """Prepare selected fused MLA communication storage before capture."""
+    from tokenspeed_kernel.selection import select_kernel
+
+    return select_kernel("attention", "mla_prepare_resources", format_signature())(
+        group=group, rank=rank, heads=heads, rank_size=rank_size
+    )
+
+
 def prepare_mla_prolog(layer, *, group):
     """Resolve MLA prolog and apply its registered weight preparation once."""
     from tokenspeed_kernel.registry import KernelRegistry
@@ -1445,6 +1454,7 @@ if current_platform().is_npu:
 
 __all__ = [
     "prepare_mla_prolog",
+    "prepare_mla_resources",
     "mla_project_value_prefers_contiguous_weight",
     "mla_project_value",
     "mla_normalize_project_query",
