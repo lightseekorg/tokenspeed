@@ -48,6 +48,7 @@ SUPPORTED_TRIGGERS = {
 # requests and on pushes to main; `post-submit` tasks run only on pushes.
 SCAN_TRIGGER_TASK_TRIGGERS = {"post-submit": {"per-commit", "post-submit"}}
 WORKFLOW_STAGE_TYPES = {
+    "import-check": {"ut"},
     "unit-test": {"ut", "server_smoke"},
     "kernel-benchmark": {"perf"},
     "model-test": {"eval", "perf"},

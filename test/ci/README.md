@@ -33,6 +33,8 @@ Currently configured task directories:
 
 Every task declares one `workflow_stage`:
 
+- `import-check` for AMD adapter import and dispatch checks when only the other
+  architecture's implementation changed
 - `unit-test` for kernel and runtime tests
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
@@ -275,6 +277,12 @@ its GPU matrix jobs when nothing requires that runner group. The first
 matching rule decides (`ci_path_filter.py` holds the full lists):
 
 - Markdown files require no runner group.
+- AMD sources under `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/`
+  select MI350; `ops/gfx1250/` selects MI450. Tests under
+  `tokenspeed-kernel/test/amd/gfx950/` or `amd/gfx1250/`, and
+  benchmark suites under `tokenspeed-kernel/benchmarks/amd/gfx950/` or
+  `gfx1250/` (including the corresponding `.json` files), select that family.
+  MI450 simulator scripts select only MI450.
 - Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
   `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
   and CI scripts) require only that vendor's runner groups.
@@ -289,6 +297,21 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
 - Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
 
+Shared AMD adapters, helpers, dependencies, packaging, and unrecognized AMD
+paths still select both families. Mixed changes take the union. Architecture
+rules use both the current and previous filenames supplied by the workflows,
+so moves between architectures retain coverage on both.
+
+AMD adapters import implementations for both architectures. A change confined
+to one architecture's Python sources therefore runs the other family's
+`import-check` tasks in place of its full unit/model suites and benchmarks.
+These reuse the existing API selection tests, which import the real adapters
+and intercept kernel execution. Test-only and benchmark-only changes need no
+cross-architecture import check. Full suites already exercise these imports.
+The MI450 tasks use the existing CPU functional simulator; they do not measure
+GPU performance. Manual runs keep full coverage, and potentially truncated
+changed-path lists (300+ files) conservatively select full coverage.
+
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,
 touch kernel benchmark suites under `tokenspeed-kernel/benchmarks/` additionally
@@ -299,7 +322,13 @@ retain their existing task selection.
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under
-`tokenspeed-kernel/test/amd/`. Tests that require CUDA, CuTe DSL, FlashInfer,
+`tokenspeed-kernel/test/amd/`. Tests for one AMD architecture live under its
+`gfx950/` or `gfx1250/` subdirectory; shared AMD tests stay outside those
+directories. Keep fixtures and helpers with their tests so directory-based
+coverage also applies to them. Benchmark infrastructure tests live under
+`test/benchmark/`; vendor- or architecture-specific benchmark tests keep a
+`benchmark/` directory under their corresponding vendor or architecture.
+Tests that require CUDA, CuTe DSL, FlashInfer,
 DeepEP, DeepGEMM, TRT-LLM, FlashAttention 3/4, FlashMLA, Marlin, MNNVL, or
 `tokenspeed-mla` live under `tokenspeed-kernel/test/nvidia/`. Everything else
 (portable Triton kernels, registry and selection logic, tests that

@@ -1,6 +1,9 @@
+import json
 import os
+import re
 import shlex
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -44,6 +47,128 @@ def test_pr_workflow_can_classify_pull_request_files(name: str):
         "contents": "read",
         "pull-requests": "read",
     }
+
+
+@pytest.mark.parametrize("group", ["amd-mi350", "amd-mi450"])
+@pytest.mark.parametrize(
+    ("paths", "full_groups", "import_groups"),
+    [
+        (
+            {
+                "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx1250/attention/mha/prefill.py"
+            },
+            {"amd-mi450"},
+            {"amd-mi350"},
+        ),
+        (
+            {"tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/mhc.py"},
+            {"amd-mi350"},
+            {"amd-mi450"},
+        ),
+        (
+            {"tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py"},
+            {"amd-mi350", "amd-mi450"},
+            set(),
+        ),
+        (
+            {
+                "tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py"
+            },
+            {"amd-mi450"},
+            set(),
+        ),
+        (
+            {"test/ci/ut/import-tokenspeed-kernel-mi350.yaml"},
+            set(),
+            {"amd-mi350"},
+        ),
+    ],
+)
+def test_amd_workflow_builds_architecture_matrices(
+    tmp_path, group, paths, full_groups, import_groups
+):
+    workflow = load_yaml(REPO_ROOT / f".github/workflows/{group}-tests.yml")
+    step = next(
+        step for step in workflow["jobs"]["scan"]["steps"] if step.get("id") == "scan"
+    )
+    changed = tmp_path / "tokenspeed-changed-files.txt"
+    changed.write_text("\n".join(sorted(paths)))
+    classified = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "test/ci_system/ci_path_filter.py"),
+            "--runner-group",
+            group,
+            "--event-name",
+            "pull_request",
+            "--repo-root",
+            str(REPO_ROOT),
+            str(changed),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    flags = dict(line.split("=", 1) for line in classified.stdout.splitlines())
+    full = flags["should_run"] == "true"
+    imports = flags["should_run_import_check"] == "true"
+    assert full == (group in full_groups)
+    assert imports == (group in import_groups)
+    script = (
+        step["run"]
+        .replace("${{ steps.changes.outputs.should_run }}", str(full).lower())
+        .replace(
+            "${{ steps.changes.outputs.should_run_import_check }}", str(imports).lower()
+        )
+    )
+    script = re.sub(r"\$\{\{ github.event_name.*?\}\}", "per-commit", script)
+    output = tmp_path / "outputs"
+    env = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_OUTPUT": str(output),
+        "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS": "",
+    }
+    result = subprocess.run(
+        ["bash", "-c", script], cwd=REPO_ROOT, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    matrices = {
+        stage: json.loads(values[f"{stage}_matrix"])["include"]
+        for stage in ("unit", "model", "import")
+    }
+    assert bool(matrices["unit"]) == full
+    if not full:
+        assert matrices["model"] == []
+    assert bool(matrices["import"]) == imports
+    assert all(entry["workflow_stage"] == "unit-test" for entry in matrices["unit"])
+    assert all(entry["workflow_stage"] == "model-test" for entry in matrices["model"])
+    if imports:
+        suffix = "mi350" if group == "amd-mi350" else "mi450-sim"
+        assert [entry["config"] for entry in matrices["import"]] == [
+            f"test/ci/ut/import-tokenspeed-kernel-{suffix}.yaml"
+        ]
+
+
+@pytest.mark.parametrize("name", ["amd-mi350-tests.yml", "amd-mi450-tests.yml"])
+@pytest.mark.parametrize("failed", [None, "SCAN_RESULT", "IMPORT_CHECK_RESULT"])
+def test_amd_finish_rejects_scan_and_import_failures(tmp_path, name, failed):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows" / name)
+    step = workflow["jobs"]["finish"]["steps"][0]
+    env = {**os.environ, **{key: "skipped" for key in step["env"]}}
+    env["SCAN_RESULT"] = "success"
+    if failed is not None:
+        env[failed] = "failure"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) == (failed is None), result.stdout
 
 
 def run_slurm_dispatch_script(

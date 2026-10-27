@@ -7,6 +7,7 @@ from ci_path_filter import (
     kernel_solution_vendor,
     path_vendor,
     should_run,
+    should_run_import_check,
 )
 from pipeline import load_yaml
 
@@ -55,6 +56,8 @@ def test_gb300_slurm_path_filter_ignores_other_vendor_workflows():
         "tokenspeed-kernel/test/conftest.py",
         "tokenspeed-kernel/test/utils.py",
         "tokenspeed-kernel/test/ops/test_attention.py",
+        "tokenspeed-kernel/test/ops/test_attention_gfx1250.py",
+        "tokenspeed-kernel/test/benchmark/test_benchmark_harness.py",
         "tokenspeed-kernel/test/ops/attention/test_kda_mtp_verify.py",
         f"{KERNEL}/registry.py",
         f"{KERNEL}/ops/attention/mha/__init__.py",
@@ -75,10 +78,11 @@ def test_shared_paths_require_every_group(path):
     "path",
     [
         "tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py",
-        "tokenspeed-kernel/test/amd/test_kpool_gluon_integration.py",
-        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/mhc.py",
+        "tokenspeed-kernel/test/amd/test_scheduling.py",
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py",
+        "tokenspeed-kernel-amd/pyproject.toml",
         "tokenspeed-kernel/python/requirements/rocm.txt",
-        "tokenspeed-kernel/benchmarks/amd/gfx950.json",
+        "tokenspeed-kernel/benchmarks/amd/unknown.json",
         "test/ci_system/install_deps_rocm.sh",
         f"{KERNEL}/ops/attention/mha/gluon.py",
         f"{KERNEL}/ops/attention/dsv41/_gluon/indexer.py",
@@ -89,6 +93,134 @@ def test_shared_paths_require_every_group(path):
 def test_amd_owned_paths_require_only_amd(path):
     assert path_vendor(path, REPO_ROOT) == "amd"
     assert required_groups(path) == {"amd-mi350", "amd-mi450"}
+
+
+@pytest.mark.parametrize(
+    ("arch", "group"), [("gfx950", "amd-mi350"), ("gfx1250", "amd-mi450")]
+)
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/{arch}/attention/mha/prefill.py",
+        "tokenspeed-kernel/test/amd/{arch}/ops/attention/test_prefill.py",
+        "tokenspeed-kernel/test/amd/{arch}/fixtures/input.json",
+        "tokenspeed-kernel/benchmarks/amd/{arch}/attention.json",
+        "tokenspeed-kernel/benchmarks/amd/{arch}.json",
+    ],
+)
+def test_architecture_paths_select_one_full_suite(arch, group, path):
+    assert required_groups(path.format(arch=arch)) == {group}
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx1201/mhc.py",
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx12500/mhc.py",
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950_helpers.py",
+        "tokenspeed-kernel/test/amd/test_gluon_gfx1250_helpers.py",
+        "tokenspeed-kernel/test/amd/ops/attention/test_prefill_gfx1250.py",
+        "tokenspeed-kernel/test/amd/gfx12500/test_prefill.py",
+        "tokenspeed-kernel/test/amd/gfx1201/test_prefill.py",
+    ],
+)
+def test_unclassified_amd_paths_keep_both_full_suites(path):
+    assert required_groups(path) == {"amd-mi350", "amd-mi450"}
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "setup_mi450_sim.sh",
+        "run_mi450_rocjitsu.sh",
+        "run_mi450_rocjitsu_parallel.sh",
+        "mi450_rocjitsu_worker_python.sh",
+        "mi450_sim_report_digest.py",
+    ],
+)
+def test_simulator_scripts_select_only_mi450(name):
+    assert required_groups(f"test/ci_system/{name}") == {"amd-mi450"}
+
+
+@pytest.mark.parametrize(
+    ("arch", "other"), [("gfx950", "amd-mi450"), ("gfx1250", "amd-mi350")]
+)
+def test_architecture_source_changes_keep_other_family_imports(arch, other, tmp_path):
+    # Path ownership also applies to deleted files, without reading the source.
+    paths = {f"tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/{arch}/mha.py"}
+    for group in RUNNER_GROUPS:
+        assert should_run_import_check(paths, group, "pull_request", tmp_path) == (
+            group == other
+        )
+
+
+@pytest.mark.parametrize(
+    "paths",
+    [
+        {"tokenspeed-kernel/test/amd/gfx1250/test_prefill.py"},
+        {"tokenspeed-kernel/benchmarks/amd/gfx950/attention.json"},
+        {"test/ci_system/setup_mi450_sim.sh"},
+        {"tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx1250/README.md"},
+        {"tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py"},
+    ],
+)
+def test_non_source_or_shared_changes_need_no_separate_import_check(paths):
+    assert not any(
+        should_run_import_check(paths, group, "pull_request", REPO_ROOT)
+        for group in RUNNER_GROUPS
+    )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/mha.py",
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py",
+        f"{KERNEL}/ops/attention/mha/gluon.py",
+    ],
+)
+def test_mixed_and_cross_architecture_renames_keep_full_amd_coverage(extra):
+    paths = {
+        "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx1250/mha.py",
+        extra,
+    }
+    for group in ("amd-mi350", "amd-mi450"):
+        assert should_run(paths, group, "pull_request", REPO_ROOT)
+        assert not should_run_import_check(paths, group, "pull_request", REPO_ROOT)
+
+
+@pytest.mark.parametrize("event", ["workflow_dispatch", "schedule"])
+def test_explicit_full_runs_bypass_architecture_filtering(event):
+    paths = {"tokenspeed-kernel/test/amd/gfx1250/test_prefill.py"}
+    for group in RUNNER_GROUPS:
+        assert should_run(paths, group, event, REPO_ROOT)
+        assert should_run_import_check(paths, group, event, REPO_ROOT) == (
+            group in {"amd-mi350", "amd-mi450"}
+        )
+
+
+def test_potentially_truncated_diff_keeps_full_coverage():
+    paths = {f"tokenspeed-kernel/test/amd/gfx1250/test_{i}.py" for i in range(300)}
+    for group in RUNNER_GROUPS:
+        assert should_run(paths, group, "push", REPO_ROOT)
+
+
+@pytest.mark.parametrize(
+    ("config", "owner"),
+    [("mi350", "amd-mi350"), ("mi450-sim", "amd-mi450")],
+)
+def test_import_task_changes_run_the_declared_check_even_with_shared_changes(
+    config, owner
+):
+    paths = {f"test/ci/ut/import-tokenspeed-kernel-{config}.yaml"}
+    assert required_groups(next(iter(paths))) == set()
+    for group in RUNNER_GROUPS:
+        assert should_run_import_check(paths, group, "pull_request", REPO_ROOT) == (
+            group == owner
+        )
+    paths.add(f"{KERNEL}/registry.py")
+    assert should_run(paths, owner, "pull_request", REPO_ROOT)
+    assert should_run_import_check(paths, owner, "pull_request", REPO_ROOT)
 
 
 @pytest.mark.parametrize(
@@ -253,7 +385,7 @@ def test_vendor_subtree_prefix_does_not_leak_onto_sibling_paths():
 
 def test_mixed_vendor_changes_require_both_vendors():
     paths = {
-        "tokenspeed-kernel/test/amd/ops/test_mhc_gfx950.py",
+        "tokenspeed-kernel/test/amd/ops/test_mhc.py",
         f"{KERNEL}/ops/attention/mha/flashinfer.py",
     }
     for group in RUNNER_GROUPS:
@@ -262,7 +394,7 @@ def test_mixed_vendor_changes_require_both_vendors():
 
 def test_workflow_dispatch_runs_vendor_groups_for_foreign_paths():
     assert should_run(
-        {"tokenspeed-kernel/test/amd/ops/test_mhc_gfx950.py"},
+        {"tokenspeed-kernel/test/amd/gfx950/ops/test_mhc_gfx950.py"},
         "nvidia-x86",
         "workflow_dispatch",
         REPO_ROOT,

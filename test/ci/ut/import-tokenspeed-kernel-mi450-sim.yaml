@@ -1,0 +1,30 @@
+api_version: ci.tokenspeed.io/v1
+name: import-tokenspeed-kernel-mi450-sim
+type: ut
+workflow_stage: import-check
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi45x-cpu-test
+env:
+  BUILD_AND_DOWNLOAD_PARALLEL: "4"
+  CI: "true"
+  GFX_ARCH: gfx1250
+  # Use the same software stack as ut-tokenspeed-kernel-mi450-sim.
+  ROCM_NIGHTLY_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
+  ROCM_SDK_VERSION: 10.2.0a20261010
+  ROCM_SYSTEMS_REF: d5c528019d0fcfbbc32d96b53ac2c61df6d0e67d
+  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.2.0a20261010
+  TORCH_INDEX_URL: https://nightly.repo.amd.com/rocm/whl-next/
+  TORCH_VERSION: 2.14.0+rocm10.2.0a20261010
+  TORCHVISION_VERSION: 0.29.0+rocm10.2.0a20261010
+install:
+  - bash test/ci_system/setup_mi450_sim.sh
+  - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
+ut:
+  commands:
+    - timeout -k 30 300 bash test/ci_system/run_mi450_rocjitsu.sh python3 -m pytest tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection -k 'cdna4 or cdna5' -v
+report:
+  github_step_summary: true
