@@ -1,6 +1,9 @@
+import json
 from pathlib import Path
 
+import pipeline
 import pytest
+import yaml
 from ci_path_filter import (
     RUNNER_GROUPS,
     VENDOR_WORKFLOWS,
@@ -16,6 +19,24 @@ NVIDIA_GROUPS = tuple(
     group for group in RUNNER_GROUPS if group not in ("amd-mi350", "amd-mi450")
 )
 KERNEL = "tokenspeed-kernel/python/tokenspeed_kernel"
+
+
+def write_task(repo_root: Path, path: str, labels: list[str], stage: str) -> Path:
+    target = repo_root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        yaml.safe_dump(
+            {
+                "api_version": "ci.tokenspeed.io/v1",
+                "name": target.stem,
+                "type": "ut",
+                "workflow_stage": stage,
+                "triggers": ["per-commit"],
+                "runner": {"labels": labels},
+            }
+        )
+    )
+    return target
 
 
 def required_groups(path: str, repo_root: Path = REPO_ROOT) -> set[str]:
@@ -224,6 +245,62 @@ def test_import_task_changes_run_the_declared_check_even_with_shared_changes(
 
 
 @pytest.mark.parametrize(
+    ("label", "group"),
+    [("amd-mi355-1gpu", "amd-mi350"), ("amd-mi45x-cpu-test", "amd-mi450")],
+)
+@pytest.mark.parametrize("renamed", [False, True])
+@pytest.mark.parametrize("shared_change", [False, True])
+def test_added_and_renamed_import_tasks_reach_the_matrix(
+    tmp_path, capsys, label, group, renamed, shared_change
+):
+    path = "test/ci/ut/adapter-compatibility.yaml"
+    previous = "test/ci/ut/previous-compatibility.yaml"
+    task = write_task(tmp_path, previous if renamed else path, [label], "import-check")
+    paths = {path}
+    if renamed:
+        task.rename(tmp_path / path)
+        paths.add(previous)
+    unchanged = "test/ci/ut/unchanged-compatibility.yaml"
+    write_task(tmp_path, unchanged, [label], "import-check")
+    if shared_change:
+        paths.add(f"{KERNEL}/registry.py")
+
+    assert required_groups(path, tmp_path) == set()
+    assert should_run_import_check(paths, group, "pull_request", tmp_path)
+    assert should_run(paths, group, "pull_request", tmp_path) == (
+        renamed or shared_change
+    )
+    if not renamed:
+        other = "amd-mi450" if group == "amd-mi350" else "amd-mi350"
+        assert not should_run_import_check(paths, other, "pull_request", tmp_path)
+
+    changed = tmp_path / "changed.txt"
+    changed.write_text("\n".join(sorted(paths)))
+    assert (
+        pipeline.main(
+            [
+                "scan",
+                "--repo-root",
+                str(tmp_path),
+                "--changed-files",
+                str(changed),
+                "--trigger",
+                "per-commit",
+                "--runner-group",
+                group,
+                "--workflow-stage",
+                "import-check",
+            ]
+        )
+        == 0
+    )
+    matrix = json.loads(capsys.readouterr().out)
+    assert {entry["config"] for entry in matrix["include"]} == (
+        {path, unchanged} if shared_change else {path}
+    )
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "tokenspeed-kernel/test/nvidia/ops/test_tokenspeed_mla.py",
@@ -318,11 +395,7 @@ def test_deleted_kernel_solution_file_keeps_its_vendor(tmp_path):
 )
 def test_task_yaml_requires_groups_of_its_runner_labels(tmp_path, labels, expected):
     path = "test/ci/eval/task.yaml"
-    (tmp_path / path).parent.mkdir(parents=True)
-    (tmp_path / path).write_text(
-        "name: task\nrunner:\n  labels:\n"
-        + "".join(f"    - {label}\n" for label in labels)
-    )
+    write_task(tmp_path, path, labels, "unit-test")
 
     assert required_groups(path, tmp_path) == expected
 
@@ -335,7 +408,12 @@ def test_existing_task_yaml_requires_only_its_runner_groups():
 
 @pytest.mark.parametrize(
     "text",
-    [None, "runner: {}\n", "runner:\n  labels: [\n"],
+    [
+        None,
+        "runner: {}\n",
+        "runner:\n  labels: [\n",
+        "workflow_stage: import-check\nrunner:\n  labels: [amd-mi355-1gpu]\n",
+    ],
 )
 def test_unreadable_task_yaml_requires_every_group(tmp_path, text):
     path = "test/ci/eval/task.yaml"
@@ -344,6 +422,19 @@ def test_unreadable_task_yaml_requires_every_group(tmp_path, text):
         (tmp_path / path).write_text(text)
 
     assert required_groups(path, tmp_path) == set(RUNNER_GROUPS)
+    for group in ("amd-mi350", "amd-mi450"):
+        assert should_run_import_check({path}, group, "pull_request", tmp_path)
+    if text is not None:
+        with pytest.raises((ValueError, yaml.YAMLError)):
+            pipeline.build_matrix(tmp_path / "test/ci", tmp_path, "per-commit")
+
+
+@pytest.mark.parametrize("directory", ["test/ci/npu", "test/ci/deepswe"])
+def test_deleted_tasks_keep_their_directory_exclusions(tmp_path, directory):
+    paths = {f"{directory}/deleted.yaml"}
+    for group in ("amd-mi350", "amd-mi450"):
+        assert not should_run(paths, group, "pull_request", tmp_path)
+        assert not should_run_import_check(paths, group, "pull_request", tmp_path)
 
 
 @pytest.mark.parametrize(

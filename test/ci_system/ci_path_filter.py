@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from pipeline import is_amd_runner, is_npu_runner, is_nvidia_arm_runner, load_yaml
+from pipeline import is_amd_runner, is_npu_runner, is_nvidia_arm_runner, normalize_task
 
 RUNNER_GROUPS = (
     "amd-mi350",
@@ -32,12 +32,6 @@ AMD_ARCH_RUNNER_GROUPS = {"gfx950": "amd-mi350", "gfx1250": "amd-mi450"}
 AMD_KERNEL_OPS = "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops"
 AMD_KERNEL_TESTS = "tokenspeed-kernel/test/amd"
 AMD_BENCHMARKS = "tokenspeed-kernel/benchmarks/amd"
-AMD_IMPORT_CHECK_TASKS = frozenset(
-    {
-        "test/ci/ut/import-tokenspeed-kernel-mi350.yaml",
-        "test/ci/ut/import-tokenspeed-kernel-mi450-sim.yaml",
-    }
-)
 
 SHARED_DIRECTORIES = (
     "python",
@@ -288,33 +282,22 @@ def runner_label_in_group(label: str, runner_group: str) -> bool:
     raise ValueError(f"unsupported runner group: {runner_group!r}")
 
 
-def task_runner_labels(path: str, repo_root: Path) -> list[str] | None:
-    """Return the runner labels of a checked-out CI task YAML.
+def task_config(path: str, repo_root: Path) -> dict | None:
+    """Read a task using the same validation as matrix construction.
 
-    Returns ``None`` for anything that is not a readable task declaration,
-    including deleted files, so the caller falls back to the shared rule.
+    Missing or invalid definitions keep conservative coverage. Matrix
+    construction reports any invalid definitions still in the checkout.
     """
     if not is_in_directory(path, TASK_DIRECTORY) or not path.endswith(".yaml"):
         return None
     try:
-        data = load_yaml(repo_root / path)
-    except (FileNotFoundError, IsADirectoryError, ValueError, yaml.YAMLError):
+        return normalize_task(repo_root / path, repo_root)
+    except (OSError, ValueError, yaml.YAMLError):
         return None
-    runner = data.get("runner")
-    labels = runner.get("labels") if isinstance(runner, dict) else None
-    if (
-        not isinstance(labels, list)
-        or not labels
-        or not all(isinstance(label, str) and label for label in labels)
-    ):
-        return None
-    return labels
 
 
 def path_requires_group(path: str, runner_group: str, repo_root: Path) -> bool:
     if path.endswith(DOCUMENTATION_SUFFIXES):
-        return False
-    if path in AMD_IMPORT_CHECK_TASKS:
         return False
     arch_group = amd_arch_runner_group(path)
     if arch_group is not None:
@@ -325,9 +308,14 @@ def path_requires_group(path: str, runner_group: str, repo_root: Path) -> bool:
     for group_path, runner_groups in RUNNER_GROUP_PATHS.items():
         if is_in_directory(path, group_path):
             return runner_group in runner_groups
-    labels = task_runner_labels(path, repo_root)
-    if labels is not None:
-        return any(runner_label_in_group(label, runner_group) for label in labels)
+    task = task_config(path, repo_root)
+    if task is not None:
+        if task.get("workflow_stage") == "import-check":
+            return False
+        return any(
+            runner_label_in_group(label, runner_group)
+            for label in task["runner"]["labels"]
+        )
     if path in SHARED_FILES:
         return True
     if any(is_in_directory(path, directory) for directory in SHARED_DIRECTORIES):
@@ -353,10 +341,18 @@ def should_run_import_check(
         return False
     if event_name in {"workflow_dispatch", "schedule"}:
         return True
-    for path in paths & AMD_IMPORT_CHECK_TASKS:
-        labels = task_runner_labels(path, repo_root)
-        if labels is None or any(
-            runner_label_in_group(label, runner_group) for label in labels
+    for path in paths:
+        if not is_in_directory(path, TASK_DIRECTORY) or not path.endswith(".yaml"):
+            continue
+        task = task_config(path, repo_root)
+        # A deleted or unreadable task might have been an import check.
+        if task is None:
+            if path_requires_group(path, runner_group, repo_root):
+                return True
+            continue
+        if task.get("workflow_stage") == "import-check" and any(
+            runner_label_in_group(label, runner_group)
+            for label in task["runner"]["labels"]
         ):
             return True
     if should_run(paths, runner_group, event_name, repo_root):

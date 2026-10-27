@@ -33,8 +33,8 @@ Currently configured task directories:
 
 Every task declares one `workflow_stage`:
 
-- `import-check` for AMD adapter import and dispatch checks when only the other
-  architecture's implementation changed
+- `import-check` for MI350 adapter import and dispatch checks after gfx1250
+  implementation changes, and MI450 checks after gfx950 implementation changes
 - `unit-test` for kernel and runtime tests
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
@@ -281,7 +281,8 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
   select MI350; `ops/gfx1250/` selects MI450. Tests under
   `tokenspeed-kernel/test/amd/gfx950/` or `amd/gfx1250/`, and
   benchmark suites under `tokenspeed-kernel/benchmarks/amd/gfx950/` or
-  `gfx1250/` (including the corresponding `.json` files), select that family.
+  `gfx1250/` (including the corresponding `.json` files), each select their
+  matching family: MI350 for gfx950 and MI450 for gfx1250.
   MI450 simulator scripts select only MI450.
 - Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
   `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
@@ -291,7 +292,10 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
   `gluon` is AMD. A vendor-named file whose content mentions another vendor
   stays shared.
 - `test/ci` task YAMLs require only the runner groups matching their
-  `runner.labels`.
+  `runner.labels`. Their `workflow_stage` selects full coverage or import
+  checks; adding or renaming an import-check task needs no filename registry.
+  Missing or invalid task definitions retain conservative coverage, and
+  invalid definitions in the checkout fail matrix validation.
 - Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
   `tokenspeed-scheduler/` require every runner group.
 - Each workflow's own YAML requires only its runner group; `workflow_dispatch`

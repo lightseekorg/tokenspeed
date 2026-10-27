@@ -1400,6 +1400,29 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "ROCM_NIGHTLY_INDEX",
+        "ROCM_SDK_VERSION",
+        "ROCM_SYSTEMS_REF",
+        "TORCH_DEVICE_PACKAGE",
+        "TORCH_INDEX_URL",
+        "TORCH_VERSION",
+        "TORCHVISION_VERSION",
+    ],
+)
+def test_mi450_import_checks_use_the_numerical_suites_software_stack(key):
+    numerical = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")
+    imports = load_yaml(
+        REPO_ROOT / "test/ci/ut/import-tokenspeed-kernel-mi450-sim.yaml"
+    )
+
+    # Compatibility checks must exercise the same ROCm, simulator and PyTorch
+    # versions as the numerical suite they protect.
+    assert imports["env"][key] == numerical["env"][key]
+
+
 def test_mi450_sim_pins_one_rocm_nightly():
     env = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")["env"]
     setup_script = (REPO_ROOT / "test/ci_system/setup_mi450_sim.sh").read_text()
