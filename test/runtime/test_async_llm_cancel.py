@@ -182,5 +182,82 @@ class TestAbortTasks:
         assert not mgr._abort_tasks
 
 
+class _StubBatchAsyncLLM(_StubAsyncLLM):
+    """Stub whose per-request send registers a live ``ReqState`` instead of
+    tokenizing and talking to the scheduler."""
+
+    async def _tokenize_one_request(self, obj: Any) -> None:
+        return None
+
+    def _send_one_request(self, obj: Any, tokenized_obj: Any, created_time) -> None:
+        self.rid_to_state[obj.rid] = _fresh_state(obj)
+
+
+class _StubBatchReqObj:
+    """A batch of ``batch_size`` streaming requests, indexable like
+    ``GenerateReqInput``."""
+
+    def __init__(self, batch_size: int) -> None:
+        self.batch_size = batch_size
+        self.parallel_sample_num = 1
+        self.stream = True
+
+    def __getitem__(self, index: int) -> _StubReqObj:
+        return _StubReqObj(rid=f"r{index}", stream=True)
+
+
+class TestBatchStreamCancellation:
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_cancelled_batch_stream_aborts_every_request(self) -> None:
+        """Cancel a streaming batch while it waits for its first outputs.
+        Expect: every sub-request is dropped from ``rid_to_state`` and gets
+        an ``AbortReq``, as for a single request."""
+        mgr = _StubBatchAsyncLLM()
+        gen = mgr._handle_batch_request(_StubBatchReqObj(batch_size=2))
+
+        task = asyncio.create_task(gen.__anext__())
+        # Let the batch send its requests and block waiting for outputs.
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert set(mgr.rid_to_state) == {"r0", "r1"}
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert mgr.rid_to_state == {}
+        aborts = mgr.engine_core_client.send_to_scheduler.aborts
+        assert sorted(abort.rid for abort in aborts) == ["r0", "r1"]
+
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_closed_batch_stream_aborts_every_request(self) -> None:
+        """The consumer stops iterating after the first chunk (for example a
+        client disconnect closes the generator): the other sub-requests must
+        be aborted too."""
+        mgr = _StubBatchAsyncLLM()
+        gen = mgr._handle_batch_request(_StubBatchReqObj(batch_size=2))
+
+        task = asyncio.create_task(gen.__anext__())
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+        # Request r0 produces its first (non-final) chunk.
+        state = mgr.rid_to_state["r0"]
+        state.collector.put(
+            {"text": "a", "output_ids": [1], "meta_info": {"id": "r0"}},
+            stream=True,
+            cumulative=False,
+        )
+        state.event.set()
+        chunk = await task
+        assert chunk["index"] == 0
+
+        await gen.aclose()
+
+        assert mgr.rid_to_state == {}
+        aborts = mgr.engine_core_client.send_to_scheduler.aborts
+        assert sorted(abort.rid for abort in aborts) == ["r0", "r1"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", *sys.argv[1:]]))
