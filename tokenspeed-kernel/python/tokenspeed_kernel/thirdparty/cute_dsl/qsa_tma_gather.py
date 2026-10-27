@@ -38,9 +38,17 @@ from tokenspeed_kernel.thirdparty.cute_dsl._qsa_tma_gather.kernel import (
 
 
 @lru_cache(maxsize=None)
-def _prepare(device: torch.device, page_size: int, split_kv: int, enable_pdl: bool):
+def _prepare(
+    device: torch.device,
+    page_size: int,
+    split_kv: int,
+    enable_pdl: bool,
+    query_group_size: int,
+):
     # Only model-static geometry and the explicit tactic key compilation.
-    kernel = TmaGatherSparseAttentionKernel(page_size=page_size, split_kv=split_kv)
+    kernel = TmaGatherSparseAttentionKernel(
+        page_size=page_size, split_kv=split_kv, query_group_size=query_group_size
+    )
     with torch.cuda.device(device):
         core = kernel.compile(enable_pdl=enable_pdl)
         combine = (
@@ -61,12 +69,22 @@ class TmaGatherSparseAttention:
     Args:
         page_size: Positive physical page size, divisible by four.
         split_kv: Explicit split tactic: 1, 4, 8 or 16.
+        query_group_size: One for independent selection rows, or two for pairs
+            of consecutive queries with identical selected-block lists. The
+            paired tactic requires an even query length; it does not check
+            device list equality. Each query retains its own causal tail.
         enable_pdl: Whether both launches use programmatic dependency ordering.
         device: CUDA device whose primary context owns the compiled kernels.
     """
 
     def __init__(
-        self, *, page_size: int, split_kv: int, enable_pdl: bool, device: torch.device
+        self,
+        *,
+        page_size: int,
+        split_kv: int,
+        enable_pdl: bool,
+        device: torch.device,
+        query_group_size: int,
     ):
         device = torch.device(device)
         if device.type != "cuda":
@@ -83,7 +101,10 @@ class TmaGatherSparseAttention:
         self.page_size = page_size
         self.split_kv = split_kv
         self.enable_pdl = enable_pdl
-        self._core, self._combine = _prepare(device, page_size, split_kv, enable_pdl)
+        self.query_group_size = query_group_size
+        self._core, self._combine = _prepare(
+            device, page_size, split_kv, enable_pdl, query_group_size
+        )
 
     def workspace_bytes(
         self, *, batch_size: int, query_length: int, num_query_heads: int
@@ -118,6 +139,8 @@ class TmaGatherSparseAttention:
             block_ids: Contiguous int32 ``[B,S,512]`` logical four-token blocks.
                 Each row uses min(512, floor((position+1)/4)) entries; negative
                 entries are absent. IDs must be distinct and exclude the open tail.
+                With query_group_size=2, both rows of a pair must contain the
+                same list, including entries used only by the later query.
             seq_kv_lens: Contiguous int32 ``[B]`` live lengths. Query j is at
                 position length-S+j; its incomplete tail is appended by the kernel.
             block_table: Int32 ``[B,max_pages]`` with contiguous columns. Its
@@ -134,6 +157,8 @@ class TmaGatherSparseAttention:
         if q.ndim != 4 or q.shape[-1] != 256 or not 1 <= q.shape[1] <= 4:
             raise ValueError("q must have shape [B, S in 1..4, Hq, 256]")
         b, sq, h, _ = q.shape
+        if sq % self.query_group_size:
+            raise ValueError("query_length must be divisible by query_group_size")
         if b >= 65536:
             raise ValueError("Batch exceeds the CLC work-item encoding")
         if (

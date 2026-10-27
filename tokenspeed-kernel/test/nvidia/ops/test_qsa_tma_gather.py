@@ -31,13 +31,17 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _plan(page, split, pdl):
+def _plan(page, split, pdl, *, query_group_size):
     from tokenspeed_kernel.thirdparty.cute_dsl.qsa_tma_gather import (
         TmaGatherSparseAttention,
     )
 
     return TmaGatherSparseAttention(
-        page_size=page, split_kv=split, enable_pdl=pdl, device=torch.device("cuda")
+        page_size=page,
+        split_kv=split,
+        enable_pdl=pdl,
+        device=torch.device("cuda"),
+        query_group_size=query_group_size,
     )
 
 
@@ -81,7 +85,7 @@ def _case(batch, queries, length, page, *, strided):
     )
 
 
-def _reference(case, page):
+def _reference(case, page, *, probability_dtype):
     q, k, v, ids, lengths, table = (x.cpu() for x in case)
     result = torch.zeros(q.shape, dtype=torch.float64)
     batch, queries, heads, _ = q.shape
@@ -109,7 +113,16 @@ def _reference(case, page):
                 continue
             for h in range(heads):
                 scores = (k[slots, h // 12].double() @ q[b, j, h].double()) / 16
-                result[b, j, h] = scores.softmax(0) @ v[slots, h // 12].double()
+                if probability_dtype is None:
+                    result[b, j, h] = scores.softmax(0) @ v[slots, h // 12].double()
+                else:
+                    # Only for one-KV-tile cases: preserve the kernel's BF16 P
+                    # boundary while retaining the unrounded denominator.
+                    weights = (scores - scores.max()).exp()
+                    result[b, j, h] = (
+                        weights.to(probability_dtype).double()
+                        @ v[slots, h // 12].double()
+                    ) / weights.sum()
     return result
 
 
@@ -136,11 +149,14 @@ def test_sm107_sparse_matches_reference(
     split, pdl, batch, queries, length, page, strided
 ):
     case = _case(batch, queries, length, page, strided=strided)
-    plan = _plan(page, split, pdl)
+    plan = _plan(page, split, pdl, query_group_size=1)
     output, workspace = _buffers(plan, case[0])
     _run(plan, case, output, workspace)
     torch.testing.assert_close(
-        output.cpu().double(), _reference(case, page), atol=2e-3, rtol=2e-2
+        output.cpu().double(),
+        _reference(case, page, probability_dtype=None),
+        atol=2e-3,
+        rtol=2e-2,
     )
 
 
@@ -149,7 +165,7 @@ def test_prepared_tactics_can_coexist(pdl):
     prepared = []
     for page, split in ((4, 1), (64, 4), (4, 8), (64, 16)):
         case = _case(2, 4, 131, page, strided=True)
-        plan = _plan(page, split, pdl)
+        plan = _plan(page, split, pdl, query_group_size=1)
         output, workspace = _buffers(plan, case[0])
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
@@ -172,7 +188,10 @@ def test_prepared_tactics_can_coexist(pdl):
         _run(plan, case, output, workspace)
         torch.testing.assert_close(output, captured, atol=0, rtol=0)
         torch.testing.assert_close(
-            output.cpu().double(), _reference(case, page), atol=2e-3, rtol=2e-2
+            output.cpu().double(),
+            _reference(case, page, probability_dtype=None),
+            atol=2e-3,
+            rtol=2e-2,
         )
 
 
@@ -196,7 +215,7 @@ def test_sm107_missing_pages_have_no_softmax_weight(split, pdl, length, invalid_
         torch.tensor([length], device="cuda", dtype=torch.int32),
         torch.tensor([[2, invalid_page]], device="cuda", dtype=torch.int32),
     )
-    plan = _plan(4, split, pdl)
+    plan = _plan(4, split, pdl, query_group_size=1)
     output, workspace = _buffers(plan, q)
     _run(plan, case, output, workspace)
     # Four valid values equal one. Invalid selected blocks or the implicit tail
@@ -208,7 +227,7 @@ def test_sm107_missing_pages_have_no_softmax_weight(split, pdl, length, invalid_
 @pytest.mark.parametrize("pdl", [False, True])
 def test_sm107_graph_refresh_and_poisoned_padding(split, pdl):
     case = list(_case(2, 4, 131, 4, strided=True))
-    plan = _plan(4, split, pdl)
+    plan = _plan(4, split, pdl, query_group_size=1)
     output, workspace = _buffers(plan, case[0])
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -234,7 +253,10 @@ def test_sm107_graph_refresh_and_poisoned_padding(split, pdl):
     torch.testing.assert_close(output, captured, atol=0, rtol=0)
     torch.testing.assert_close(output[1], torch.zeros_like(output[1]), atol=0, rtol=0)
     torch.testing.assert_close(
-        output.cpu().double(), _reference(case, 4), atol=2e-3, rtol=2e-2
+        output.cpu().double(),
+        _reference(case, 4, probability_dtype=None),
+        atol=2e-3,
+        rtol=2e-2,
     )
     case[4].zero_()
     case[0].fill_(float("nan"))
@@ -276,7 +298,7 @@ def test_sm107_pipeline_wraps_across_work_items(pdl):
     expected = (values + mean_token[:, None, None]).repeat_interleave(12, dim=1)
     expected = expected[:, None].to(q.dtype)
 
-    plan = _plan(64, 1, pdl)
+    plan = _plan(64, 1, pdl, query_group_size=1)
     output, workspace = _buffers(plan, q)
     _run(plan, case, output, workspace)
     torch.testing.assert_close(output, expected, atol=0, rtol=0)
@@ -291,26 +313,95 @@ def test_sm107_pipeline_wraps_across_work_items(pdl):
 
 
 def test_sm107_prepared_kernel_reuses_runtime_shapes():
-    plan = _plan(64, 4, False)
+    plan = _plan(64, 4, False, query_group_size=1)
     for b, s, length in [(1, 1, 129), (2, 4, 259), (3, 1, 1027)]:
         case = _case(b, s, length, 64, strided=True)
         out, ws = _buffers(plan, case[0])
         _run(plan, case, out, ws)
         torch.testing.assert_close(
-            out.cpu().double(), _reference(case, 64), atol=2e-3, rtol=2e-2
+            out.cpu().double(),
+            _reference(case, 64, probability_dtype=None),
+            atol=2e-3,
+            rtol=2e-2,
         )
 
 
 def test_sm107_rejects_unsupported_inputs():
     with pytest.raises(ValueError, match="page_size"):
-        _plan(3, 1, False)
+        _plan(3, 1, False, query_group_size=1)
     with pytest.raises(ValueError, match="split_kv"):
-        _plan(4, 2, False)
+        _plan(4, 2, False, query_group_size=1)
     case = list(_case(1, 1, 129, 4, strided=False))
-    plan = _plan(4, 4, False)
+    plan = _plan(4, 4, False, query_group_size=1)
     out, ws = _buffers(plan, case[0])
     with pytest.raises(ValueError, match="workspace"):
         _run(plan, case, out, ws[:16])
     case[1] = case[1].to(torch.float16)
     with pytest.raises(ValueError, match="BF16"):
         _run(plan, case, out, ws)
+
+
+@pytest.mark.parametrize("split", [1, 4, 8, 16])
+@pytest.mark.parametrize("pdl", [False, True])
+@pytest.mark.parametrize("length", [7, 8, 9, 10])
+def test_paired_queries_keep_independent_causal_tails(split, pdl, length):
+    # Cover every alignment of a pair against four-token block boundaries.
+    case = list(_case(2, 2, length, 4, strided=True))
+    case[0].mul_(0.25)
+    case[3].copy_(torch.arange(512, dtype=torch.int32, device="cuda"))
+    case[5][1, 0] = 0
+    plan = _plan(4, split, pdl, query_group_size=2)
+    output, workspace = _buffers(plan, case[0])
+    _run(plan, case, output, workspace)
+    torch.testing.assert_close(
+        output.cpu().double(),
+        _reference(case, 4, probability_dtype=torch.bfloat16),
+        atol=2e-3,
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.parametrize("split", [1, 4, 8, 16])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_paired_queries_wrap_and_refresh_graph(split, pdl):
+    batch = torch.cuda.get_device_properties("cuda").multi_processor_count
+    case = list(_case(batch, 4, 1027, 64, strided=True))
+    q, k, v, ids, lengths, table = case
+    q.zero_()
+    k.zero_()
+    ids.copy_(torch.arange(512, dtype=torch.int32, device="cuda"))
+    lengths.copy_(
+        torch.tensor([7, 8, 129, 1027], device="cuda").repeat(math.ceil(batch / 4))[
+            :batch
+        ]
+    )
+    v.fill_(0.5)
+    v[:64].fill_(float("nan"))
+    table[1::4].zero_()
+    expected = torch.full_like(q, 0.5)
+    expected[1::4].zero_()
+    plan = _plan(64, split, pdl, query_group_size=2)
+    output, workspace = _buffers(plan, q)
+    _run(plan, case, output, workspace)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(plan, case, output, workspace)
+    for _ in range(2):
+        v.neg_()
+        expected.neg_()
+        graph.replay()
+        torch.testing.assert_close(output, expected, atol=0, rtol=0)
+    lengths.zero_()
+    q.fill_(float("nan"))
+    graph.replay()
+    torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
+
+
+def test_paired_plan_requires_even_query_length():
+    plan = _plan(64, 1, False, query_group_size=2)
+    for queries in (1, 3):
+        case = _case(1, queries, 129, 64, strided=False)
+        output, workspace = _buffers(plan, case[0])
+        with pytest.raises(ValueError, match="divisible"):
+            _run(plan, case, output, workspace)

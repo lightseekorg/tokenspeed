@@ -37,10 +37,10 @@ optimized without importing the frontend's multi-purpose split combiner.
 ### Operand and lifetime contract
 
 Construct the prepared kernel outside CUDA graph capture, explicitly selecting
-`page_size`, `split_kv`, `enable_pdl` and `device`. The supported split tactics
+`page_size`, `split_kv`, `query_group_size`, `enable_pdl` and `device`. The supported split tactics
 are 1, 4, 8 and 16. A normally imported `TmaGatherSparseAttentionKernel` owns
 each tactic's static geometry and CuTe entry points. Compiled callables are
-cached by device, page size, split count and PDL; distinct prepared tactics
+cached by device, page size, split count, query group size and PDL; distinct prepared tactics
 can coexist without module-global configuration. The entry takes:
 
 - BF16 Q/O in `[B,S,Hq,256]`, with `S` from 1 to 4 and non-overlapping BSHD
@@ -68,12 +68,23 @@ replay; there is no separate replay metadata implementation.
 
 ### Computation and synchronization
 
-Each work item handles one query and one KV head. Its twelve query heads occupy
-a sixteen-column MMA tile. Two four-warp softmax groups share eight gather
-warps, with separate MMA, Q/list-load and CLC scheduler warps. Three K/V slots,
-two Q/list slots and two score/probability slots retain the upstream barrier
-ownership and phase transitions. All CTA-wide synchronization precedes the
-spare warp's exit.
+`query_group_size=1` handles one query and one KV head per work item, with twelve
+heads in a sixteen-column MMA tile. The experimental `query_group_size=2` tactic
+uses a 32-column tile, with sixteen padded columns per query. It requires S=2 or
+4 and identical 512-entry selection lists within each consecutive pair; this
+device-data precondition is the caller's responsibility. Independent lists use
+group size one. The selected prefix and the union of open tails are loaded once;
+each query masks its own selected count and causal tail. A tail that becomes a
+completed block at the next position must not receive duplicate softmax weight.
+
+Both tactics use two four-warp softmax groups and eight gather warps, with
+separate MMA, Q/list-load and CLC scheduler warps. In the paired tactic each
+softmax group owns one query. The K/V ring has three slots for one query and two
+for a pair; two Q/list slots and two score/probability slots keep the same
+producer/last-reader ownership. For paired queries, Q/P/KV operand storage is
+32/16/128 KiB, excluding list, reduction and synchronization storage; TMEM uses
+128 columns. No extra K/V consumer or barrier arrival is added: each wider MMA
+consumes both queries. All CTA-wide synchronization precedes the spare warp's exit.
 
 Ring indices and phase bits use CUTLASS `pipeline.PipelineState`, advanced in
 place and carried across persistent work items. Empty-buffer waits start at

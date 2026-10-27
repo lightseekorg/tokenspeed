@@ -22,11 +22,12 @@
 
 """SM107 sparse attention with TMA gather4 and a persistent CLC scheduler.
 
-Each work item is one query and one KV head, packing 12 query heads into the
-16-column MMA tile. Two four-warp softmax groups share eight gather warps;
-MMA, Q/list loads and scheduling each have one warp. Three K/V slots, two
-Q/list slots and two score/probability slots retain the upstream barrier
-ownership and phase transitions. No CTA-wide barrier follows initialization.
+Each work item is one or two consecutive queries and one KV head, with twelve
+heads in sixteen padded columns per query. Two four-warp softmax groups share
+eight gather warps; MMA, Q/list loads and scheduling each have one warp. Paired
+queries share a selected-block list, with independent causal masks. Two K/V
+slots in the paired tactic leave room for wider Q/P operands; the single-query
+tactic uses three. No CTA-wide barrier follows initialization.
 
 QK/PV accumulate in FP32 and probabilities round to BF16 before PV. The
 softmax masks missing pages as well as logical/causal bounds. Split outputs
@@ -130,11 +131,14 @@ class TmaGatherSparseAttentionKernel:
     and lengths remain runtime arguments to its compiled callable.
     """
 
-    def __init__(self, *, page_size: int, split_kv: int):
+    def __init__(self, *, page_size: int, split_kv: int, query_group_size: int):
         if page_size <= 0 or page_size % 4:
             raise ValueError("page_size must be a positive multiple of four")
         if split_kv not in (1, 4, 8, 16):
             raise ValueError("split_kv must be one of 1, 4, 8, 16")
+        if query_group_size not in (1, 2):
+            raise ValueError("query_group_size must be one or two")
+        self.query_group_size = query_group_size
         self.page_size = page_size
         self.split_kv = split_kv
 
@@ -142,7 +146,8 @@ class TmaGatherSparseAttentionKernel:
         self.tile_n = 128
         self.tile_k = 256
         self.tile_o = self.tile_k
-        self.n_q = 16
+        self.query_head_tile = 16
+        self.n_q = self.query_head_tile * query_group_size
         self.qh_per_kh = 12
         self.bpe = 2
         self.block_size = 4
@@ -152,7 +157,8 @@ class TmaGatherSparseAttentionKernel:
         self.include_open_block = 1
 
         # Pipeline depths and warp roles retain the validated producer/consumer layout.
-        self.stages_kv = 3
+        # The wider Q/P operands leave room for two K/V slots in the paired tactic.
+        self.stages_kv = 3 if query_group_size == 1 else 2
         self.stages_s = 2
         self.stages_q = 2
         self.stages_ids = 2
@@ -180,7 +186,7 @@ class TmaGatherSparseAttentionKernel:
         self.q_swz_bytes = 128
         self.k_swz_bytes = 128
         self.v_swz_bytes = 128
-        self.p_swz_bytes = 32
+        self.p_swz_bytes = self.n_q * self.bpe
         self.blocks_per_warp = self.blocks_per_tile // self.gather_warps
         self.gather_boxes = self.tile_k * self.bpe // self.k_swz_bytes
         self.gather_box_elems = self.k_swz_bytes // self.bpe
@@ -189,7 +195,7 @@ class TmaGatherSparseAttentionKernel:
         )
         self.q_box_tokens = 1
         self.q_box_rows = self.qh_per_kh * self.q_box_tokens
-        self.q_tx_bytes = self.q_box_rows * self.tile_k * self.bpe
+        self.q_tx_bytes = self.q_box_rows * self.tile_k * self.bpe * query_group_size
         self.ids_tx_bytes = self.block_topk * 4
         self.ids_slot_bytes = self.ids_tx_bytes + 64
         self.qk_granu_elems = self.gather_box_elems
@@ -309,7 +315,12 @@ class TmaGatherSparseAttentionKernel:
         seqlen_kv,
         split,
     ):
-        """Compute causal bounds, selected entries, open tail and split tile range."""
+        """Compute the item's union of selected blocks and open tails.
+
+        Adjacent queries have at most one distinct open block. Its extra list
+        entry is masked independently by each softmax group, even when it has
+        become a completed selected block for the later query.
+        """
         eff_seqlen_kv = cutlass.Int32(
             cutlass.make_array_view(seq_kv_lens_tensor)[batch]
         )
@@ -318,8 +329,11 @@ class TmaGatherSparseAttentionKernel:
         bs = cutlass.Int32(self.block_size)
         pos = tok + (eff_seqlen_kv - eff_seqlen_q)
         n_vis = cute.math.max(cute.math.min(pos + one, eff_seqlen_kv), zero)
+        first_n_vis = n_vis
+        pos = pos + cutlass.Int32(self.query_group_size - 1)
+        n_vis = cute.math.max(cute.math.min(pos + one, eff_seqlen_kv), zero)
         anchor = pos
-        n_anchor = n_vis
+        n_anchor = first_n_vis
         n_sel_default = cute.math.min(
             cutlass.Int32(self.block_topk), cute.math.max(anchor + one, zero) // bs
         )
@@ -330,7 +344,9 @@ class TmaGatherSparseAttentionKernel:
         tail_lo = n_anchor // bs
         n_tail = zero
         if cutlass.const_expr(self.include_open_block == 1):
-            n_tail = _select_i32((n_vis % bs) != zero, 1, 0)
+            n_tail = _select_i32(
+                ((n_vis % bs) != zero) | ((first_n_vis % bs) != zero), 1, 0
+            )
         n_listed = count + n_tail
         dead = (
             (pos < zero)
@@ -376,10 +392,12 @@ class TmaGatherSparseAttentionKernel:
         """Decode the initial grid item or a subsequent CLC payload for every role."""
         split = cutlass.Int32(0)
         x = cute.arch.make_warp_uniform(t0)
+        groups = seqlen_q // cutlass.Int32(self.query_group_size)
         tok = x
         if cutlass.const_expr(self.split_kv > 1):
-            split = cute.arch.make_warp_uniform(x // seqlen_q)
-            tok = x - split * seqlen_q
+            split = cute.arch.make_warp_uniform(x // groups)
+            tok = x - split * groups
+        tok = tok * cutlass.Int32(self.query_group_size)
         head = cute.arch.make_warp_uniform(t1 & cutlass.Int32(0xFFFF))
         batch = cute.arch.make_warp_uniform(
             (t1 >> cutlass.Int32(16)) & cutlass.Int32(0xFFFF)
@@ -435,17 +453,20 @@ class TmaGatherSparseAttentionKernel:
         bars.mb_q_full[q_state.index].arrive(
             n_bytes=self.q_tx_bytes, pred=prims.elect_sync()
         )
-        load_q(
-            sQ[q_state.index].base,
-            tma_q,
-            bars.mb_q_full[q_state.index].smem_ptr,
-            head * cutlass.Int32(self.qh_per_kh),
-            out_tok,
-            out_batch,
-            boxes=self.qk_iters,
-            box_elems=self.qk_granu_elems,
-            rows=self.n_q,
-        )
+        for query in cutlass.range_constexpr(self.query_group_size):
+            load_q(
+                sQ[q_state.index].base.subview(
+                    query * self.query_head_tile * self.qk_granu_elems
+                ),
+                tma_q,
+                bars.mb_q_full[q_state.index].smem_ptr,
+                head * cutlass.Int32(self.qh_per_kh),
+                out_tok + cutlass.Int32(query),
+                out_batch,
+                boxes=self.qk_iters,
+                box_elems=self.qk_granu_elems,
+                rows=self.n_q,
+            )
         q_state.advance()
         qe_state.advance()
         i_state.advance()
@@ -1213,6 +1234,20 @@ class TmaGatherSparseAttentionKernel:
                     split,
                 )
             )
+            query_tok = out_tok
+            query_col0 = col0
+            if cutlass.const_expr(self.query_group_size == 2):
+                # One four-warp group owns each query's sixteen padded head columns.
+                query_tok = out_tok + grp
+                query_col0 = cutlass.Int32(0)
+                pos = query_tok + eff_seqlen_kv - eff_seqlen_q
+            query_vis = cute.math.max(
+                cute.math.min(pos + cutlass.Int32(1), eff_seqlen_kv), cutlass.Int32(0)
+            )
+            query_count = cute.math.min(
+                cutlass.Int32(self.block_topk),
+                query_vis // cutlass.Int32(self.block_size),
+            )
             slot_base = ids_state.index * cutlass.Int32(self.ids_slot_words)
             bars.mb_ids_full[ids_state.index].wait(ids_state.phase)
 
@@ -1242,7 +1277,7 @@ class TmaGatherSparseAttentionKernel:
                 prims.tcgen05_fence(prims.Tcgen05Fence.BEFORE_THREAD_SYNC)
                 bars.mb_s_empty[par].arrive()
 
-                # Per-thread validity (header: the in-block mask depends on the key index alone -- all 16 columns share pos).
+                # Each group shares a position; paired groups mask independently.
                 # Lane l of tile i holds key 4 blk + l % 4 with blk = the list entry 32 (tile0 + i) + l // 4 (tail / -1 by the SELECT).
                 t_abs = i
                 if cutlass.const_expr(self.split_kv > 1):
@@ -1261,6 +1296,16 @@ class TmaGatherSparseAttentionKernel:
                     & (key_abs <= pos)
                     & (key_abs < eff_seqlen_kv)
                 )
+                if cutlass.const_expr(self.query_group_size == 2):
+                    # A completed block may be selected for only the later query;
+                    # the appended tail belongs only to queries with an open block.
+                    valid = valid & (
+                        (idx < query_count)
+                        | (
+                            (idx == count)
+                            & ((query_vis % cutlass.Int32(self.block_size)) != 0)
+                        )
+                    )
                 page = self._physical_page(
                     blk,
                     cutlass.make_array_view(block_table_tensor),
@@ -1356,7 +1401,7 @@ class TmaGatherSparseAttentionKernel:
                     self.p_buffer_words
                 ) + lane * cutlass.Int32(self.p_row_words)
                 if cutlass.const_expr(self.softmax_groups > 1):
-                    # group g writes word offset 4 g of the lane's 32-B row = the chunk c = g of the one-group loop, under the same swizzle
+                    # Each group writes disjoint columns of the same swizzled row.
                     p_row_base = p_row_base + grp * cutlass.Int32(self.p_group_words)
                 for c in cutlass.range_constexpr(self.p_chunks):
                     chunk = cutlass.Vector.from_elements(
@@ -1460,20 +1505,18 @@ class TmaGatherSparseAttentionKernel:
                 inv_cols.append(inv_j)
                 dead_cols.append(row_dead)
 
-            # Stores: column j = query head (head * G + j) of the item's token at its output coordinate (out_tok, out_batch) --
-            # the dense (tok, batch) or the packed (tok_packed, 0) of _decode_item; the zero tail columns j >= G are never stored,
-            # and a padded Q row (the Q ROW past the sequence's Q length) stores nothing.  SPLIT_KV > 1: the tensors are the fp32
-            # partial slabs and the batch coordinate is split-major, b + s x B (the combine's convention).
+            # Paired groups store to separate query rows. Padded head columns
+            # never store; split partials retain the existing split-major layout.
             live_row = (
-                tok < eff_seqlen_q
+                query_tok < eff_seqlen_q
             )  # the row's liveness is the Q row's, not its key-space position's
             part_batch = out_batch
             if cutlass.const_expr(self.split_kv > 1):
                 part_batch = out_batch + split * n_batch
             head_base = head * cutlass.Int32(self.qh_per_kh)
-            # Two groups: column j of group g is head col0 + j; the columns at or past G (the zero tail) are never stored.
+            # query_col0 is relative to the group's query, not the full MMA tile.
             n_live_cols = (
-                (cutlass.Int32(self.q_box_rows) - col0)
+                (cutlass.Int32(self.q_box_rows) - query_col0)
                 if cutlass.const_expr(self.softmax_groups > 1)
                 else cutlass.Int32(self.q_box_rows)
             )
@@ -1498,7 +1541,11 @@ class TmaGatherSparseAttentionKernel:
                             else ((lane == col) & live_row)
                         )
                         if ok:
-                            lse_arr[part_batch, head_base + col, out_tok] = lse_cols[j]
+                            lse_arr[
+                                part_batch,
+                                head_base + query_col0 + cutlass.Int32(j),
+                                query_tok,
+                            ] = lse_cols[j]
 
             # O[q, d] = O^T[d, q] / l[q]: the thread index is d (and d + 128).
             oo = cutlass.make_array_view(o_tensor)
@@ -1531,16 +1578,18 @@ class TmaGatherSparseAttentionKernel:
                                     ):  # the group's columns at or past G are the zero tail: never stored
                                         oo[
                                             cutlass.Int64(part_batch),
-                                            cutlass.Int64(out_tok),
+                                            cutlass.Int64(query_tok),
                                             cutlass.Int64(
-                                                head_base + col0 + cutlass.Int32(j)
+                                                head_base
+                                                + query_col0
+                                                + cutlass.Int32(j)
                                             ),
                                             cutlass.Int64(d_idx),
                                         ] = val.to(o_tensor.element_type)
                                 else:
                                     oo[
                                         cutlass.Int64(part_batch),
-                                        cutlass.Int64(out_tok),
+                                        cutlass.Int64(query_tok),
                                         cutlass.Int64(head_base + cutlass.Int32(j)),
                                         cutlass.Int64(d_idx),
                                     ] = val.to(o_tensor.element_type)
@@ -1724,8 +1773,9 @@ class TmaGatherSparseAttentionKernel:
                     )
 
         if cutlass.const_expr(self.q_box_rows < self.n_q):
-            # Zero the Q^T tail rows the TMA box never covers (rows G..15 of BOTH slots) once per CTA, so their never-stored
-            # columns stay finite; the generic stores are published to the async proxy before any MMA reads the slots.
+            # Zero from the first query's padding to the end of each subtile.
+            # Paired Q loads overwrite the second query's real rows before MMA;
+            # both queries' padded rows remain zero across persistent items.
             if warp_idx < self.softmax_warps:
                 zero4 = cutlass.Vector.from_elements(
                     tuple(cutlass.Int32(0) for _ in range(4)), cutlass.Int32
@@ -1961,7 +2011,7 @@ class TmaGatherSparseAttentionKernel:
         tma_k_desc = _gather_desc(k_ptr, k_strides, k_rows_per_page)
         tma_v_desc = _gather_desc(v_ptr, v_strides, v_rows_per_page)
 
-        grid_shape = (SQ * self.split_kv, KH, B)
+        grid_shape = (SQ // self.query_group_size * self.split_kv, KH, B)
         self._kernel(
             tma_q_desc,
             tma_k_desc,
