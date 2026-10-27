@@ -13,11 +13,10 @@ runs on the shared model path: vendor-neutral Triton kernels
 with capability-gated NVIDIA fast paths that keep the same numerics. The
 checkpoint must expose the model type `muse_spark` and the architecture
 `MuseSparkForConditionalGeneration`; the runtime reads the sliding-attention
-and no-RoPE schedule from that configuration. Expert parallelism spans the
-attention TP ranks with MoE TP1. The gateway loads the checkpoint's
-`chat_template.jinja`; pass `--chat-template` only to override it. The
-residual stream, the layer boundaries, and the final norm run in FP32; the
-attention and MoE branch outputs and the final-norm output are BF16.
+and no-RoPE schedule from that configuration. The gateway loads the
+checkpoint's `chat_template.jinja`; pass `--chat-template` only to override
+it. The residual stream, the layer boundaries, and the final norm run in FP32;
+the attention and MoE branch outputs and the final-norm output are BF16.
 
 `ts serve` selects the `muse` reasoning and tool parsers: the `self` channel
 becomes `reasoning_content`, `user` and `commentary` stay visible, `<|eom|>`
@@ -42,26 +41,34 @@ the checkpoint's vision tower. Audio uses the `<audio>` anchor: one `<|audio|>`
 token per 1,920 samples of mono 24 kHz, encoded by the checkpoint's audio
 tower. SMG performs the preprocessing and anchor expansion.
 
-### MI350X BF16
+### MI355X MXFP4, MoE TP8
 
-The BF16 model and vision tower run on eight GPUs with attention TP8, vision
-TP8, and expert parallelism over all eight ranks:
+The
+[AMD Quark MXFP4](https://huggingface.co/amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4)
+checkpoint quantizes the routed-expert weights and activations of all but the
+first and last layers to MXFP4 and keeps everything else in BF16. On eight
+MI355X GPUs (gfx950), MoE TP8 with EP1 shards every expert over its
+intermediate dimension, so each GPU holds all 256 experts and no tokens are
+dispatched between GPUs:
 
 ```bash
 ts serve \
-    --model meta-models/Muse-Spark-Open-816B-A42B \
+    --model amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
     --served-model-name muse-spark \
     --tp 8 \
-    --ep-size 8 \
+    --moe-tp-size 8 \
+    --ep-size 1 \
     --dtype bfloat16 \
-    --max-model-len 65536 \
-    --max-num-seqs 16 \
-    --max-total-tokens 524288 \
-    --gpu-memory-utilization 0.92 \
-    --cudagraph-capture-sizes 1 2 4 8 16 \
-    --max-cudagraph-capture-size 16 \
+    --quantization mxfp4 \
+    --moe-backend gluon \
+    --max-model-len 1048576 \
+    --max-num-seqs 64 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64 \
+    --max-cudagraph-capture-size 64 \
     --disable-prefill-graph \
-    --disable-overlap-schedule \
+    --gpu-memory-utilization 0.92 \
     --sampling-backend triton \
     --disable-kvstore \
     --kvstore-ratio 0.0 \
@@ -69,7 +76,11 @@ ts serve \
     --port 8000
 ```
 
-Prefill stays eager and overlap scheduling is off.
+`--max-model-len 1048576` keeps the checkpoint's native context, which agentic
+workloads with long cached prefixes need; prefix caching is on by default.
+Compared with `--ep-size 8 --moe-tp-size 1` on the same checkpoint, this
+layout decodes faster at low concurrency but has a higher time-to-first-token;
+prefer EP8 for prefill-heavy traffic.
 
 ### Blackwell NVFP4
 
