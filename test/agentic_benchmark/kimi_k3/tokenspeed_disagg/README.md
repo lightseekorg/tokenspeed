@@ -6,7 +6,7 @@ benchmark with KV transfer.
 | Script | Workload | Nodes (4 GPUs each) |
 | --- | --- | --- |
 | `agentic_bench.slurm` | 1P1D, both ADP16/EP16 | 8 |
-| `p_bench.slurm` | Prefill simulation, ADP16/EP16 | 4 |
+| `p_bench.slurm` | Prefill simulation, TP8 KVP8 then ADP16/EP16 | 4 |
 | `d_bench.slurm` | Decode simulation, TP8/TP8 then ADP16/EP16 and ADP32/EP32 | 8 |
 
 ## Running
@@ -56,8 +56,11 @@ responses and decode request-rate normalization. Both simulations use
 sticky conversation IDs for prefix reuse.
 
 - **Prefill:** warm up with 16 conversations, then replay 1,024 conversations
-  at concurrency 512. Each turn generates one token; the client appends
-  500 synthetic assistant tokens before the next user turn.
+  at concurrency 512 for ADP16, or 128 at concurrency 64 for TP8 KVP8. Each
+  turn generates one token; the client appends 500 synthetic assistant tokens
+  before the next user turn. `attn_tp8_kvp8_moe_tp8` shards the MLA KV cache
+  over the eight attention ranks (`--kv-parallel-size 8`, with decode context
+  parallelism of the same size) and uses the first two nodes.
 - **Decode:** sweep concurrency 1/2/4/8/16/32 for TP8, 16/32/64/128/256/384/512
   for ADP16, and 32/64/128/256/384/512/768/1024 for ADP32. TP8 runs
   4/8/8/16/32/64 conversations respectively; ADP runs one conversation per
@@ -86,5 +89,6 @@ python3 collect_outputs.py outputs/p_<timestamp> outputs/d_<timestamp>
 The collector excludes warmup and reports cache-hit rates without filtering.
 `Requests/s @ target OSL` is the measured P request rate or D output tokens/s
 divided by 500. For matching configs, it estimates `n_P = mu_D / mu_P` with
-one D instance. This fractional ratio excludes transfer costs. The collector
+one D instance; TP8 KVP8 matches the `attn_tp8_moe_tp8` decode. This
+fractional ratio excludes transfer costs. The collector
 handles the simulations only; use EvalScope reports for the 1P1D benchmark.

@@ -1,6 +1,7 @@
 #!/usr/bin/bash
 # Prefill-node simulation as a Slurm sweep: dataset prep, the server and
-# pd_client run as job steps (DP16 uses the first 4 nodes, 4 GPUs each).
+# pd_client run as job steps (4 GPUs per node): TP8 KVP8 uses the first 2
+# nodes, DP16 the first 4.
 #
 #   sbatch -N 4 --gres=gpu:4 --time=12:00:00 [-A <account> -p <partition>] \
 #       --export=ALL,CONTAINER_IMAGE=<sqsh-or-ref> \
@@ -11,6 +12,7 @@
 set -euo pipefail
 
 CONFIGS=(
+    attn_tp8_kvp8_moe_tp8
     attn_dp16_moe_ep16
 )
 
@@ -81,6 +83,7 @@ launch_server() {
     local config=$1
     local node_count
     case "$config" in
+        attn_tp8_kvp8_moe_tp8) node_count=2 ;;
         attn_dp16_moe_ep16) node_count=4 ;;
         attn_dp32_moe_ep32) node_count=8 ;;
         *) echo "Unsupported config: $config" >&2; return 1 ;;
@@ -174,6 +177,13 @@ SWEEP_DIR="${SCRIPT_DIR}/outputs/p_${SWEEP_TS}"
 echo "P-sim sweep outputs: ${SWEEP_DIR}"
 
 for CONFIG in "${CONFIGS[@]}"; do
+    # Measured replay as parallel / number: TP8 is one 8-GPU instance, so it
+    # replays 128 conversations at 64 instead of DP16's 1024 at 512.
+    case "$CONFIG" in
+        attn_tp8_kvp8_moe_tp8) MEASURE=(64 128) ;;
+        *) MEASURE=(512 1024) ;;
+    esac
+
     echo "=== Running $CONFIG ==="
     launch_server "$CONFIG"
 
@@ -187,7 +197,7 @@ for CONFIG in "${CONFIGS[@]}"; do
         --name "${CONFIG}_warmup" --outputs-dir "$SWEEP_DIR"
 
     echo "--- P conversation replay ---"
-    client --phase p-measure --parallel 512 --number 1024 --offset 0 --max-tokens 1 \
+    client --phase p-measure --parallel "${MEASURE[0]}" --number "${MEASURE[1]}" --offset 0 --max-tokens 1 \
         --name "${CONFIG}_p_measure" --outputs-dir "$SWEEP_DIR"
 
     stop_server
