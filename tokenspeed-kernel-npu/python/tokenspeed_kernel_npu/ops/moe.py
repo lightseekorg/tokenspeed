@@ -149,12 +149,13 @@ def _ascend_bf16_expert_gmm(
         group_type=0,
         group_list_type=1,
     )[0]
-    hidden = torch_npu.mlp_split_swiglu(
-        hidden,
-        expert_counts.to(torch.int32),
-        local_exp_start=0,
-        local_exp_end=int(w.num_local_experts),
-    )
+    # torch_npu 2.10 已移除 mlp_split_swiglu（旧名漂移），等价融合算子为 npu_swiglu。
+    # 语义对照：mlp_split_swiglu(hidden, counts, local_start, local_end) 对按 expert
+    # 分组的 [gate,up] 末维拼接做 SwiGLU，仅处理 [local_start, local_end) 的本地 expert。
+    # 当前调用链 w13_weight 为本地 expert 权重，hidden 仅含本地 expert 行（行数 ==
+    # sum(expert_counts)，无 padding），且 SwiGLU 为逐行元素运算、与 expert 分组无关，
+    # 故 npu_swiglu(hidden, dim=-1)（沿末维切半做 silu(gate)*up，作用于全部行）语义等价。
+    hidden = torch_npu.npu_swiglu(hidden, dim=-1)
     return torch_npu.npu_grouped_matmul(
         [hidden],
         [w.w2_weight],
