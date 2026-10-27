@@ -65,14 +65,15 @@ public:
     // kPinnedUntilAck; a retraction's stream-ordered L2 leg does not use the
     // queue -- StartRetractionStores builds it from the victim's tables.
     // `cause` (kPublication or kFinish) only picks the counters. A finish
-    // passes its tables and computed frontier, empty for a live request's
+    // passes its final publication, nullopt for a live request's
     // publications and a finish that computed nothing: the boundary it
     // leaves is stored ahead of the queued candidates, and its Host copies
     // -- already cached, carried by a store in flight that publishes them at
     // its ACK, or stored now -- are dated by the batch's epochs
     // (CacheCoordinator::TakeStoreEpochs); no other Host entry is refreshed.
-    std::optional<WriteBackOperation> StartPendingStores(StoreSourceGuard guard, HostStoreCause cause,
-                                                         std::span<const BlockTable> tables, std::int32_t num_tokens);
+    std::optional<WriteBackOperation> StartPendingStores(
+        StoreSourceGuard guard, HostStoreCause cause,
+        const std::optional<CacheCoordinator::FinalPublication>& publication);
     // Drains the segments this plan's admissions and restores recorded under
     // the write-back policy (CacheCoordinator::TakeEvictedSegments) into one
     // stream-ordered write-back op: their Device pages may be granted away
@@ -138,14 +139,13 @@ public:
     RetractionImageSplit SplitRetractionImage(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                               std::vector<std::vector<ImageSlot>> published) const;
     // The epochs a retraction's L2 leg dates its Host copies with: those of
-    // the victim's tables at its computed frontier num_tokens
-    // (CacheCoordinator::TakeStoreEpochs), taken before its image is split,
-    // so the boundary's Host copies are refreshed before the plan picks Host
-    // victims, and the boundary keys an earlier store still carries are
-    // re-dated, so that store's ACK publishes them at these epochs. The
-    // refresh stands when the split then refuses the image. Nothing is dated
-    // without a Host pool.
-    CacheCoordinator::StoreEpochs TakeRetractionEpochs(std::span<const BlockTable> tables, std::int32_t num_tokens);
+    // the victim's final publication (CacheCoordinator::TakeStoreEpochs),
+    // taken before its image is split, so the boundary's Host copies are
+    // refreshed before the plan picks Host victims, and the boundary keys an
+    // earlier store still carries are re-dated, so that store's ACK
+    // publishes them at these epochs. The refresh stands when the split then
+    // refuses the image. Nothing is dated without a Host pool.
+    CacheCoordinator::StoreEpochs TakeRetractionEpochs(const CacheCoordinator::FinalPublication& publication);
     // Takes the image of a quiescent victim's tables ([0, num_tokens) are its
     // computed tokens) as `split` planned it -- with no shortfall and nothing
     // changed since -- and starts both store legs: the Host takes the rows of

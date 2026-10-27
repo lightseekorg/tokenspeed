@@ -534,9 +534,9 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // Boundary publications of live requests: their owners hold the pages,
         // and the ticket pins them until the ACK, so the copy stays off the
         // forward's critical path.
-        if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck,
-                                                            HostStoreCause::kPublication, /*tables=*/{},
-                                                            /*num_tokens=*/0)) {
+        if (auto store =
+                tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication,
+                                                   /*publication=*/std::nullopt)) {
             write_back_operations.push_back(std::move(*store));
         }
     }

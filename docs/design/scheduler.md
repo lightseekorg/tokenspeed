@@ -322,7 +322,11 @@ boundary, and so does one whose admission cannot also hold the extra block (a
 cache with no spare block): the next chunk's admission publishes its live slot
 there, at the cost of one more round. Multi-turn traffic whose next turn
 re-renders the end of the previous prompt then reuses the common prefix
-immediately.
+immediately. The next turn reads that checkpoint, so the request keeps its
+boundary (`CacheProgress::published_state_checkpoint_tokens`) once the block
+is published, and its final publication refreshes the checkpoint's Host copy
+as part of the boundary it leaves, dated with its page (`cache-concepts.md`,
+two tiers).
 
 An active request retains one such aligned input checkpoint and its cached,
 non-replayable sliding windows across both tiers. Its full-history tables
@@ -811,11 +815,11 @@ pin. Nothing else needs to know the copy is in flight, so the runtime copies
 on its own stream and no forward waits. A cached block is never written again
 by its owner (prefix reuse already depends on that), so the pin alone makes
 the copy race-free. Both guards share one ticket (`StartPendingStores(guard,
-cause, tables, num_tokens)` drains the publication queue, a finish's boundary
-from its tables first; `StartRetractionStores` builds the image's L2 leg from
-the victim's tables; `StartEvictionStores` drains what the plan's admissions
-and restores evicted), and the op carries `source_pinned` to the runtime,
-which branches on the guard and never on the cause. Whatever its guard or
+cause, publication)` drains the publication queue, a finish's boundary first;
+`StartRetractionStores` builds the image's L2 leg from the victim's tables;
+`StartEvictionStores` drains what the plan's admissions and restores
+evicted), and the op carries `source_pinned` to the runtime, which branches
+on the guard and never on the cause. Whatever its guard or
 cause, the op is a `WriteBackOperation`, batched in the plan's
 `WriteBackBatch` (`WriteBackOp` in Python) and acknowledged by
 `CompleteWriteBack`: "write back" in these names means any copy from the

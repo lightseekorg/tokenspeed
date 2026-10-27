@@ -671,17 +671,30 @@ public:
     // Collection/pinning follows host-tier presence, so the slide credit flips count_uncached on this.
     bool StreamsDeviceCacheToHost() const { return stream_device_cache_to_host_; }
     bool ContainsHostCachedBlock(const CacheKey& key) const;
+    // A request's final publication (finish, retraction), as the store batch
+    // that dates it sees it: the request's tables and computed frontier
+    // num_tokens, the hashes of its completed prefix pages
+    // (CacheProgress::prefix_hashes), and the in-forward State checkpoint it
+    // published, at the boundary prefix_hashes[state_checkpoint_pages - 1]
+    // (zero pages: none).
+    struct FinalPublication {
+        std::span<const BlockTable> tables;
+        std::int32_t num_tokens{0};
+        std::span<const std::string> prefix_hashes;
+        std::int32_t state_checkpoint_pages{0};
+    };
     // The access epochs a store batch dates Host entries with. A request's
-    // final publication (finish, retraction) at num_tokens refreshes the
-    // boundary it leaves: every published History block of `tables` below
-    // num_tokens -- the pages its forwards read to the end -- and each State
-    // group's live slot, the checkpoint at num_tokens (slot 0 holds an
-    // earlier one and is not part of it). The boundary takes one epoch per
-    // prefix page, the first page newest so a prefix leaves Host from its end
-    // and every group's blocks of a page share a date (the checkpoint takes
-    // the page num_tokens ends in); `base`, older than all of them, dates
-    // everything else the batch stores. A live request's publications pass no
-    // tables.
+    // final publication refreshes the boundary it leaves: every published
+    // History block of its tables below num_tokens -- the pages its forwards
+    // read to the end -- each State group's live slot, the checkpoint at
+    // num_tokens (slot 0 holds an earlier one and is not part of it), and the
+    // in-forward State checkpoint it published with a sliding window's blocks
+    // behind it (the tables no longer hold them). The boundary takes one
+    // epoch per prefix page, the first page newest so a prefix leaves Host
+    // from its end and every group's blocks of a page share a date (a
+    // checkpoint takes the page its token count ends in); `base`, older than
+    // all of them, dates everything else the batch stores. A live request's
+    // publications have no final publication.
     struct StoreEpochs {
         std::uint64_t base{0};
         bool final_publication{false};
@@ -698,11 +711,11 @@ public:
     };
     // Takes a store batch's epochs and refreshes the boundary's Host entries
     // already cached, before the batch picks its Host victims.
-    StoreEpochs TakeStoreEpochs(std::span<const BlockTable> tables, std::int32_t num_tokens);
+    StoreEpochs TakeStoreEpochs(const std::optional<FinalPublication>& publication);
     // The epoch a batch's copy of an entry outside its boundary is published
     // at: `base` -- for a final publication no later than the entry's Device
-    // block (at device_location) was last used, since the request's tables
-    // do not hold that block.
+    // block (at device_location) was last used, since it is not part of what
+    // the request leaves.
     std::uint64_t StoreEpoch(const StoreEpochs& epochs, std::uint32_t group_id,
                              CacheBlockLocation device_location) const;
     // Raises the Host copies of a boundary's own entries -- what a

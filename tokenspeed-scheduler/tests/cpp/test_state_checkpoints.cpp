@@ -1790,6 +1790,166 @@ TEST_F(StateHostDatesSuite, AFinishWhileRetractedKeepsTheRetractionsDates) {
     }
 }
 
+// StateHostDatesSuite with the in-forward State checkpoint: turn1 = [1..22]
+// runs the chunks [0, 8), [8, 16) and [16, 22), the last writing S(20), where
+// turn2 -- turn1 re-rendered without its last token, then new tokens --
+// resumes. Neither turn1's tables nor its frontier hold S(20) when it leaves,
+// yet its final publication refreshes the Host copy with the boundary it
+// leaves, dated with its page.
+class StateCheckpointInForwardHostDatesSuite : public StateHostDatesSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateHostDatesSuite::MakeConfig();
+        cfg.state_checkpoint_in_forward = true;
+        return cfg;
+    }
+
+    // Plans turn1's prefill chunks (plans 1-3) and its prompt end (plan 4),
+    // which stores the page [17, 20], the tail [21, 22], the state at 22 and
+    // S(20); then an idle prompt nobody reads again prefills alone (plan 5)
+    // and finishes, its store riding plan 6 with turn1's second decode.
+    // Returns the prompt end's plan, its store left in flight on request.
+    ExecutionPlan PrefillTurn1BesideAnIdlePrompt(bool prompt_end_in_flight) {
+        Submit(RequestWithTokens("turn1", MakeTokens(22)));
+        for (const std::int32_t checkpoint_len : {0, 0, 4}) {
+            const ExecutionPlan plan = PlanOnce();
+            AckWriteBacks(plan);
+            const ForwardBatch* batch = FindForwardBatch(plan);
+            ASSERT_TRUE_OR_RETURN(batch != nullptr, plan);
+            EXPECT_EQ(batch->extend_state_checkpoint_lens.at(0), checkpoint_len);
+            SendForwardDone("turn1", checkpoint_len > 0 ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+        }
+        ExecutionPlan prompt_end = PlanOnce();
+        if (!prompt_end_in_flight) {
+            AckWriteBacks(prompt_end);
+            EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
+        }
+        SendForwardDone("turn1", {901});
+        Submit(RequestSpec{.request_id = "idle", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
+        const ExecutionPlan idle_prefill = PlanOnce();
+        AckWriteBacks(idle_prefill);
+        const ForwardBatch* batch = FindForwardBatch(idle_prefill);
+        ASSERT_TRUE_OR_RETURN(batch != nullptr, prompt_end);
+        EXPECT_EQ(batch->request_ids, std::vector<std::string>{"idle"});
+        SendForwardDone("idle", {900});
+        SendFinish("idle");
+        AckWriteBacks(PlanOnce());
+        SendForwardDone("turn1", {902});
+        return prompt_end;
+    }
+
+    static std::vector<std::int32_t> Turn2() {
+        std::vector<std::int32_t> tokens = MakeTokens(21);
+        tokens.insert(tokens.end(), {500, 501, 502, 503});
+        return tokens;
+    }
+};
+
+// turn1 finishes at 25 -- the page [21, 22, 900, 901], the tail [902] and its
+// state join Host, 13 entries -- with the prompt end's store landed or still
+// in flight, which the finish then re-dates. A 20-token prompt storing seven
+// entries evicts the tail [21, 22] and the state at 22, which turn1 left
+// behind its frontier, the idle prompt, and the end of what turn1 left (the
+// tail [902], the state at 25 and the page [21, 22, 900, 901]), but not
+// S(20), which shares the date of the page [17, 20] before them.
+TEST_F(StateCheckpointInForwardHostDatesSuite, AFinishRefreshesTheInForwardCheckpointItPublished) {
+    for (const bool prompt_end_in_flight : {false, true}) {
+        SCOPED_TRACE(prompt_end_in_flight);
+        ResetHost(/*entries=*/13, /*retraction_interval=*/0);
+        const ExecutionPlan prompt_end = PrefillTurn1BesideAnIdlePrompt(prompt_end_in_flight);
+        AckWriteBacks(PlanOnce());
+        SendForwardDone("turn1", {903});
+        SendFinish("turn1");
+        const ExecutionPlan finish = PlanOnce();
+        if (prompt_end_in_flight) {
+            AckWriteBacks(prompt_end);
+        }
+        AckWriteBacks(finish);
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 13);
+        FinishAfterPrefill("e", MakeTokens(20, 300));
+
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        EXPECT_EQ(Probe("turn2", Turn2()).prefix_tokens, 20) << "S(20) stayed on Host";
+        EXPECT_EQ(Probe("idle-again", {200, 201, 202, 203, 77}).prefix_tokens, 0) << "the idle prompt left";
+    }
+}
+
+// The same at a retraction: plan 7 retracts turn1 at 24, storing the page
+// [21, 22, 900, 901] and the state at 24, and turn1 finishes while
+// Retracted, 12 entries on Host. S(20) keeps the retraction's date.
+TEST_F(StateCheckpointInForwardHostDatesSuite, AFinishWhileRetractedKeepsTheInForwardCheckpointsRetractionDate) {
+    ResetHost(/*entries=*/12, /*retraction_interval=*/7);
+    PrefillTurn1BesideAnIdlePrompt(/*prompt_end_in_flight=*/false);
+    const ExecutionPlan retraction = PlanOnce();
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+    AckImageStores(retraction);
+    SendFinish("turn1");
+    ASSERT_EQ(scheduler_->RetractedSize(), 0u);
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 12);
+    FinishAfterPrefill("e", MakeTokens(6, 300));
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_EQ(Probe("turn2", Turn2()).prefix_tokens, 20) << "S(20) stayed on Host";
+    EXPECT_EQ(Probe("idle-again", {200, 201, 202, 203, 77}).prefix_tokens, 0) << "the idle prompt left";
+}
+
+// turn1 finishes right after its prefill, so its finish publishes S(20)
+// itself and stores it with the page [17, 20], the tail [21, 22] and the
+// state at 22, filling Host with 8 entries. S(20) shares its page's date, so
+// a store of two entries evicts the tail and the state at 22, the end of what
+// turn1 left: turn2 still resumes at 20, and so does a longer resend.
+TEST_F(StateCheckpointInForwardHostDatesSuite, AFinishDatesTheInForwardCheckpointItPublishesWithItsPage) {
+    ResetHost(/*entries=*/8, /*retraction_interval=*/0);
+    FinishAfterPrefill("turn1", MakeTokens(22));
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
+    FinishAfterPrefill("e", MakeTokens(4, 300));
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_EQ(Probe("turn2", Turn2()).prefix_tokens, 20);
+    std::vector<std::int32_t> resend = MakeTokens(22);
+    resend.insert(resend.end(), {600, 601});
+    EXPECT_EQ(Probe("resend", std::move(resend)).prefix_tokens, 20) << "the prompt end's tail and state left";
+}
+
+// A 26-token prompt's boundary 24 is a chunk end (chunks 8, 8, 8 and 2): the
+// last chunk's admission (plan 4) publishes S(24) from the live slot, and the
+// prompt end (plan 5) the tail [25, 26] and the state at 26. turn1 finishes
+// at 29 beside the idle prompt, 14 entries on Host; the store of three
+// entries evicts the tail, the state at 26 and an idle entry, not S(24).
+TEST_F(StateCheckpointInForwardHostDatesSuite, AFinishRefreshesTheCheckpointAChunkEndPublishedAtTheBoundary) {
+    ResetHost(/*entries=*/14, /*retraction_interval=*/0);
+    Submit(RequestWithTokens("turn1", MakeTokens(26)));
+    for (const std::int32_t chunk_end : {8, 16, 24, 26}) {
+        const ExecutionPlan plan = PlanOnce();
+        AckWriteBacks(plan);
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_NE(batch, nullptr);
+        EXPECT_EQ(batch->extend_prefix_lens.at(0) + batch->input_lengths.at(0), chunk_end);
+        EXPECT_EQ(batch->extend_state_checkpoint_lens.at(0), 0);
+        SendForwardDone("turn1", chunk_end == 26 ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+    }
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("turn1", {901});
+    Submit(RequestSpec{.request_id = "idle", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("idle", {900});
+    SendFinish("idle");
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("turn1", {902});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("turn1", {903});
+    SendFinish("turn1");
+    AckWriteBacks(PlanOnce());
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 14);
+    FinishAfterPrefill("e", MakeTokens(6, 300));
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    std::vector<std::int32_t> turn2 = MakeTokens(25);
+    turn2.insert(turn2.end(), {500, 501, 502, 503});
+    EXPECT_EQ(Probe("turn2", std::move(turn2)).prefix_tokens, 24) << "S(24) stayed on Host";
+    EXPECT_EQ(Probe("idle-again", {200, 201, 202, 203, 77}).prefix_tokens, 0) << "the idle prompt left";
+}
+
 // Retraction after the forward that wrote the in-forward checkpoint, before
 // the request's next publication point: the retraction is that point, and the
 // Retracted request holds no Device block (fsm::Retracted). Its image carries

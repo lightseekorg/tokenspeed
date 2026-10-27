@@ -2864,30 +2864,42 @@ bool CacheCoordinator::ContainsHostCachedBlock(const CacheKey& key) const {
     return groups_[key.group_id].Index().Contains(*host_pool_, key);
 }
 
-CacheCoordinator::StoreEpochs CacheCoordinator::TakeStoreEpochs(std::span<const BlockTable> tables,
-                                                                std::int32_t num_tokens) {
-    _assert(tables.empty() || (tables.size() == groups_.size() && num_tokens > 0),
+CacheCoordinator::StoreEpochs CacheCoordinator::TakeStoreEpochs(const std::optional<FinalPublication>& publication) {
+    StoreEpochs epochs{.base = ++next_access_epoch_, .final_publication = publication.has_value()};
+    if (!publication) {
+        return epochs;
+    }
+    const std::span<const BlockTable> tables = publication->tables;
+    const std::int32_t num_tokens = publication->num_tokens;
+    const std::span<const std::string> prefix_hashes = publication->prefix_hashes;
+    const std::int32_t checkpoint_pages = publication->state_checkpoint_pages;
+    _assert(tables.size() == groups_.size() && num_tokens > 0,
             "a final publication names every group's table and its frontier");
+    _assert(checkpoint_pages >= 0 && checkpoint_pages <= static_cast<std::int32_t>(prefix_hashes.size()) &&
+                checkpoint_pages * prefix_granularity_ <= num_tokens,
+            "an in-forward State checkpoint lies inside the hashed prefix, behind the frontier");
     // Pages [0, pages): the last is the one num_tokens ends in.
-    const std::int32_t pages = tables.empty() ? 0 : (num_tokens - 1) / prefix_granularity_ + 1;
-    StoreEpochs epochs{.base = ++next_access_epoch_, .final_publication = !tables.empty()};
+    const std::int32_t pages = (num_tokens - 1) / prefix_granularity_ + 1;
     next_access_epoch_ += static_cast<std::uint64_t>(pages);
-    const auto refresh = [&](std::size_t group_index, const CacheBlockRef& block, std::int32_t page) {
-        PrefixCacheIndex& index = groups_[group_index].Index();
-        const CacheKey* key = index.KeyOf(pool_, block);
-        if (key == nullptr) {
+    // Raises key's Host copy to the epoch of `page`, or lists the key for the
+    // batch to store from device_block.
+    const auto refresh = [&](std::size_t group_index, const CacheKey& key, CacheBlockRef device_block,
+                             std::int32_t page) {
+        const std::uint64_t epoch = epochs.base + static_cast<std::uint64_t>(pages - page);
+        if (host_pool_ != nullptr && groups_[group_index].Index().Touch(*host_pool_, key, epoch)) {
             return;
         }
-        const std::uint64_t epoch = epochs.base + static_cast<std::uint64_t>(pages - page);
-        if (host_pool_ == nullptr || !index.Touch(*host_pool_, *key, epoch)) {
-            epochs.uncached.push_back(StoreEpochs::Uncached{.key = *key, .device_block = block, .access_epoch = epoch});
+        if (device_block) {
+            epochs.uncached.push_back(
+                StoreEpochs::Uncached{.key = key, .device_block = std::move(device_block), .access_epoch = epoch});
         }
     };
     for (std::size_t i = 0; i < tables.size(); ++i) {
+        PrefixCacheIndex& index = groups_[i].Index();
         const std::span<const CacheBlockRef> blocks = tables[i].Blocks();
         if (GroupIsState(i)) {
-            if (blocks.size() > 1 && blocks[1]) {
-                refresh(i, blocks[1], pages - 1);
+            if (const CacheKey* key = blocks.size() > 1 ? index.KeyOf(pool_, blocks[1]) : nullptr) {
+                refresh(i, *key, blocks[1], pages - 1);
             }
             continue;
         }
@@ -2896,11 +2908,37 @@ CacheCoordinator::StoreEpochs CacheCoordinator::TakeStoreEpochs(std::span<const 
         const std::size_t first_uncached = epochs.uncached.size();
         const std::int32_t blocks_per_page = BlocksPerBoundary(static_cast<std::int32_t>(i));
         for (std::int32_t slot = dataSpan(tables[i], geometry_[i], num_tokens).blocks - 1; slot >= 0; --slot) {
-            if (const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)]) {
-                refresh(i, block, slot / blocks_per_page);
+            const CacheBlockRef& block = blocks[static_cast<std::size_t>(slot)];
+            if (const CacheKey* key = index.KeyOf(pool_, block)) {
+                refresh(i, *key, block, slot / blocks_per_page);
             }
         }
         std::reverse(epochs.uncached.begin() + static_cast<std::ptrdiff_t>(first_uncached), epochs.uncached.end());
+    }
+    // The in-forward State checkpoint the request published and a sliding
+    // window's blocks behind it -- where a next turn that re-renders the end
+    // of the prompt resumes -- which the tables no longer hold; the full
+    // pages before it are the tables'.
+    if (checkpoint_pages > 0) {
+        const CompletedPages checkpoint{
+            .prefix_hashes = prefix_hashes.first(static_cast<std::size_t>(checkpoint_pages)),
+            .first_new_prefix_page = checkpoint_pages - 1,
+            .publish_state = true,
+        };
+        for (std::size_t i = 0; i < groups_.size(); ++i) {
+            if (groups_[i].Matcher().IsPrefixClosed()) {
+                continue;
+            }
+            const std::int32_t blocks_per_page = BlocksPerBoundary(static_cast<std::int32_t>(i));
+            for (const PublishedRange& range : completedBlockRanges(i, checkpoint)) {
+                for (std::size_t k = 0; k < range.keys.size(); ++k) {
+                    const std::int32_t page =
+                        GroupIsState(i) ? checkpoint_pages - 1
+                                        : (range.first_cache_block + static_cast<std::int32_t>(k)) / blocks_per_page;
+                    refresh(i, range.keys[k], groups_[i].Index().Find(pool_, range.keys[k]), page);
+                }
+            }
+        }
     }
     return epochs;
 }

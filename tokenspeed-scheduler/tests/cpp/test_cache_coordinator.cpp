@@ -12498,7 +12498,7 @@ TEST_F(WriteBackTransactionTest, APublicationStoreCopiesWhatAnEvictionWriteBackC
     PublishFinal(tables, MakeTokens(18));
     coordinator_.QueueCachedBlocksForStore(hashes_);
     const std::optional<WriteBackOperation> store = transfers_.StartPendingStores(
-        StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication, /*tables=*/{}, /*num_tokens=*/0);
+        StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication, /*publication=*/std::nullopt);
     ASSERT_TRUE(store.has_value());
     EXPECT_EQ(store->transfers.size(), 4u) << "X's four pages";
     EXPECT_EQ(transfers_.WriteBackStatsFor(HostStoreCause::kPublication).in_flight, 0u);
@@ -13407,7 +13407,7 @@ TEST(RetractionImageTest, AnImageStoresASupersededInputAtItsDate) {
         BlockTable::FromBlocks({pool.AcquireBlock(0)}, /*available_tokens=*/0),
         BlockTable::FromBlocks({checkpoint, pool.AcquireBlock(1)}, /*available_tokens=*/0),
     };
-    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(victim, 2);
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = victim, .num_tokens = 2});
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(victim, /*num_tokens=*/2, coordinator.PublishedDataSlots(victim, 2));
     ASSERT_EQ(split.slots.size(), 1u) << "the input is the one published slot";
@@ -13800,7 +13800,7 @@ TEST(RetractionImageSplitTest, AnImageFitsOnlyWhereTheAllocatorWouldPlaceIt) {
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/true);
 
-        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2);
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 2});
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
         ASSERT_EQ(split.boundaries.size(), 1u);
@@ -13862,7 +13862,7 @@ TEST(RetractionImageSplitTest, ACheckpointVictimFreesItsStateSiblingInThePlan) {
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
-    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2);
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 2});
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
     ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 1, 2}));
@@ -13918,7 +13918,7 @@ TEST(RetractionImageSplitTest, ARowsChildVictimKeepsItsParentFromGoingWhole) {
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/4, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
-    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 4);
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 4});
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/4, coordinator.PublishedDataSlots(tables, 4));
     ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 0, 1}));
@@ -14086,7 +14086,7 @@ TEST(RetractionImageSplitTest, OneFullHostBucketDecidesTheSplitBeforeAnyEviction
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/false);
 
-        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 8);
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 8});
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/8, coordinator.PublishedDataSlots(tables, 8));
         EXPECT_EQ(split.buckets, (std::vector<std::int32_t>{0, 1, 0, 1}));
@@ -14220,7 +14220,7 @@ TEST(RetractionImageSplitTest, BoundariesGoShallowestFirstWhateverTheGroupOrder)
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/true);
 
-        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 6);
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 6});
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/6, coordinator.PublishedDataSlots(tables, 6));
         ASSERT_EQ(split.boundaries.size(), 3u);
@@ -14361,7 +14361,8 @@ TEST(RetractionImageSplitTest, ProbeAndCommitAgreeOnEveryImage) {
                 };
                 const std::vector<std::optional<CacheBlockLocation>> before = host_locations();
 
-                CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2 * num_pages);
+                CacheCoordinator::StoreEpochs epochs =
+                    transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 2 * num_pages});
                 TierTransferManager::RetractionImageSplit split =
                     transfers.SplitRetractionImage(tables, 2 * num_pages, published);
                 EXPECT_EQ(host_locations(), before) << "the split mutates nothing";
@@ -14476,7 +14477,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegTakesAHostLeafNotAMiddlePage)
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, kP);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs({.tables = image, .num_tokens = kP});
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, kP, coordinator_.PublishedDataSlots(image, kP));
     ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0}));
@@ -14530,7 +14531,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegDoesNotCutAboveAnInFlightSegm
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, kP);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs({.tables = image, .num_tokens = kP});
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, kP, coordinator_.PublishedDataSlots(image, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
@@ -14578,7 +14579,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegFallsBackToSingleBlocksAboveA
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, kP);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs({.tables = image, .num_tokens = kP});
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, kP, coordinator_.PublishedDataSlots(image, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
@@ -14620,7 +14621,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegLeavesAnotherImagesEntries) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(first, kP);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs({.tables = first, .num_tokens = kP});
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(first, kP, coordinator_.PublishedDataSlots(first, kP));
     ASSERT_FALSE(split.shortfall.has_value());
@@ -14652,7 +14653,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegLeavesAnotherImagesEntries) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    epochs = transfers_.TakeRetractionEpochs(second, kP);
+    epochs = transfers_.TakeRetractionEpochs({.tables = second, .num_tokens = kP});
     split = transfers_.SplitRetractionImage(second, kP, coordinator_.PublishedDataSlots(second, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
     ASSERT_FALSE(split.shortfall.has_value());
@@ -14687,7 +14688,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImagesL2LegLeavesAnotherImagesEntries) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator_),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/kP, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    epochs = transfers_.TakeRetractionEpochs(third, kP);
+    epochs = transfers_.TakeRetractionEpochs({.tables = third, .num_tokens = kP});
     split = transfers_.SplitRetractionImage(third, kP, coordinator_.PublishedDataSlots(third, kP));
     ASSERT_EQ(split.num_host_boundaries, 1u);
     ASSERT_FALSE(split.shortfall.has_value());
@@ -14714,7 +14715,7 @@ TEST_F(ImageWriteBackTransactionTest, AnEvictionDrainBorrowsAnImagesTicket) {
     std::vector<BlockTable> image(4);
     const TailPublication tail = *PublishFinal(image, MakeTokens(18));
     const std::vector<CacheKey> keys = KeysOf(hashes_, tail);
-    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, 18);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs({.tables = image, .num_tokens = 18});
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
     ASSERT_EQ(split.slots.size(), 8u) << "four pages, the tail block and its checkpoints";
@@ -14759,7 +14760,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageDoesNotBorrowAnEvictionWriteBacksTi
     std::vector<BlockTable> image(4);
     const TailPublication tail = *PublishFinal(image, tokens);
     const std::vector<CacheKey> keys = KeysOf(pages, tail);
-    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, 18);
+    CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs({.tables = image, .num_tokens = 18});
     TierTransferManager::RetractionImageSplit split =
         transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
     EXPECT_TRUE(split.pending_store_ops.empty()) << "nothing borrowed";
@@ -14832,7 +14833,7 @@ TEST_P(ImageHostPrefixTest, TheSegmentStepPlacesTheBoundariesTheHostCanTake) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/6, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 6);
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 6});
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/6, coordinator.PublishedDataSlots(tables, 6));
     ASSERT_EQ(split.boundaries.size(), 3u);
@@ -14902,7 +14903,7 @@ TEST(ImageSegmentsThenBlocksTest, TheFallbackPlansOnTheHostTheSegmentsLeave) {
                                 CacheCoordinatorTestAccess::NextAccessEpoch(coordinator),
                                 /*first_new_prefix_page=*/0, /*num_computed_tokens=*/6, CacheBoundaryKind::kEndpoint,
                                 /*stream_completed_to_host=*/false, /*publish_state=*/false);
-    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 6);
+    CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 6});
     TierTransferManager::RetractionImageSplit split =
         transfers.SplitRetractionImage(tables, /*num_tokens=*/6, coordinator.PublishedDataSlots(tables, 6));
     ASSERT_EQ(split.num_host_boundaries, 3u);
@@ -14976,7 +14977,7 @@ TEST(ImageSegmentsThenBlocksTest, TheBlockByBlockPlanStandsWhereTheStepsPlaceFew
                                     CacheBoundaryKind::kEndpoint,
                                     /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
-        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 8);
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 8});
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/8, coordinator.PublishedDataSlots(tables, 8));
         ASSERT_EQ(split.group_ids, (std::vector<std::uint32_t>{0, 0, 0, 0, 1, 2}));
@@ -15050,7 +15051,7 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesABoundaryTheBlockByBlockPl
             /*first_new_prefix_page=*/0, /*num_computed_tokens=*/2, CacheBoundaryKind::kEndpoint,
             /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
-        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 2);
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 2});
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/2, coordinator.PublishedDataSlots(tables, 2));
         if (!write_back_evictions) {
@@ -15130,7 +15131,7 @@ TEST(ImageSegmentsThenBlocksTest, TheSegmentStepPlacesMoreBoundariesThanTheBlock
                                     CacheBoundaryKind::kEndpoint,
                                     /*stream_completed_to_host=*/false, /*publish_state=*/true);
 
-        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs(tables, 4);
+        CacheCoordinator::StoreEpochs epochs = transfers.TakeRetractionEpochs({.tables = tables, .num_tokens = 4});
         TierTransferManager::RetractionImageSplit split =
             transfers.SplitRetractionImage(tables, /*num_tokens=*/4, coordinator.PublishedDataSlots(tables, 4));
         if (!write_back_evictions) {
@@ -15210,7 +15211,8 @@ TEST_P(ShardedImageWriteBackTest, AnImagesHostBlocksKeepTheirDeviceBlocksBuckets
                                     /*first_new_prefix_page=*/0, /*num_computed_tokens=*/shards * kP,
                                     CacheBoundaryKind::kEndpoint, /*stream_completed_to_host=*/false,
                                     /*publish_state=*/false);
-        CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, shards * kP);
+        CacheCoordinator::StoreEpochs epochs =
+            transfers_.TakeRetractionEpochs({.tables = image, .num_tokens = shards * kP});
         TierTransferManager::RetractionImageSplit split =
             transfers_.SplitRetractionImage(image, shards * kP, coordinator_.PublishedDataSlots(image, shards * kP));
         std::vector<std::int32_t> image_buckets;
@@ -15305,7 +15307,7 @@ TEST_F(ImageWriteBackTransactionTest, AnImageBetweenASegmentsTwoAcksCopiesItsKey
 
         std::vector<BlockTable> image(4);
         PublishFinal(image, y_tokens);
-        CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs(image, 18);
+        CacheCoordinator::StoreEpochs epochs = transfers_.TakeRetractionEpochs({.tables = image, .num_tokens = 18});
         TierTransferManager::RetractionImageSplit split =
             transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
         EXPECT_TRUE(split.pending_store_ops.empty()) << "nothing borrowed";

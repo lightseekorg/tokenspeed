@@ -41,19 +41,19 @@ TierTransferManager::TierTransferManager(CacheCoordinator& coordinator) : coordi
     restore_load_stats_.blocks.resize(num_groups);
 }
 
-std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(StoreSourceGuard guard, HostStoreCause cause,
-                                                                          std::span<const BlockTable> tables,
-                                                                          std::int32_t num_tokens) {
+std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(
+    StoreSourceGuard guard, HostStoreCause cause,
+    const std::optional<CacheCoordinator::FinalPublication>& publication) {
     _assert(cause == HostStoreCause::kPublication || cause == HostStoreCause::kFinish,
             "only publication and finish drain the pending-store queue");
     WriteBackStats& stats = write_back_stats_[static_cast<std::size_t>(cause)];
     std::vector<CacheCoordinator::StoreCandidate> candidates = coordinator_.TakePendingStores();
-    if (candidates.empty() && tables.empty()) {
+    if (candidates.empty() && !publication) {
         return std::nullopt;
     }
     // The boundary's Host copies are refreshed first, so the allocation below
     // does not take them as victims.
-    CacheCoordinator::StoreEpochs epochs = coordinator_.TakeStoreEpochs(tables, num_tokens);
+    CacheCoordinator::StoreEpochs epochs = coordinator_.TakeStoreEpochs(publication);
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
     std::vector<std::uint32_t> group_ids;
@@ -427,15 +427,15 @@ void TierTransferManager::redateInFlight(const BoundaryEpochs& boundary) {
     }
 }
 
-CacheCoordinator::StoreEpochs TierTransferManager::TakeRetractionEpochs(std::span<const BlockTable> tables,
-                                                                        std::int32_t num_tokens) {
+CacheCoordinator::StoreEpochs TierTransferManager::TakeRetractionEpochs(
+    const CacheCoordinator::FinalPublication& publication) {
     if (!coordinator_.HasHostPool()) {
         return {};
     }
     // The image pins its entries until the request is restored or gone; what
     // the retraction publishes is refreshed like a finish's boundary, so it
     // is as recent as the retraction once the image lets go.
-    CacheCoordinator::StoreEpochs epochs = coordinator_.TakeStoreEpochs(tables, num_tokens);
+    CacheCoordinator::StoreEpochs epochs = coordinator_.TakeStoreEpochs(publication);
     BoundaryEpochs boundary;
     for (const CacheCoordinator::StoreEpochs::Uncached& block : epochs.uncached) {
         boundary.emplace(block.key, block.access_epoch);
