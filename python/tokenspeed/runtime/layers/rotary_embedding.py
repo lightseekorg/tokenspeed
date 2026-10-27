@@ -1385,7 +1385,13 @@ def get_rope(
                 cache_position_limit,
             ),
             scaling,
-            _YarnDevices(yarn_ramp_mask_device, yarn_frequency_device),
+            # NPU torch is built without CUDA and the trainer builds the
+            # deepseek_yarn inv_freq table on the host: force CPU ramp and
+            # frequency tables, then the cache moves to the NPU device.
+            _YarnDevices(
+                "cpu" if current_platform().is_npu else yarn_ramp_mask_device,
+                "cpu" if current_platform().is_npu else yarn_frequency_device,
+            ),
         )
     _ROPE_DICT[key] = rotary_emb
     return rotary_emb
