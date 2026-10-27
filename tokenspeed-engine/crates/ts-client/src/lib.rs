@@ -25,7 +25,9 @@
 //! tokenized requests to engines and streams each request's outputs back.
 //! It does not tokenize or detokenize: the frontend owns both, and so also
 //! matches stop strings itself. The engine refuses requests that carry stop
-//! strings on this wire; send stop token ids.
+//! strings on this wire; send stop token ids. An EPD encode server's first
+//! rank connects the same way and takes encode requests only
+//! ([`EngineClient::encode`]).
 //!
 //! ```no_run
 //! # async fn run() -> ts_client::Result<()> {

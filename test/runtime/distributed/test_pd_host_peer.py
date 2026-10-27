@@ -60,6 +60,7 @@ from tokenspeed.runtime.pd.host_peer import (  # noqa: E402
     HostPrefillPeer,
     PeerSettings,
     _prefill_settings,
+    kv_bootstrap_address,
 )
 from tokenspeed.runtime.pd.topology import PDParallelTopology  # noqa: E402
 
@@ -133,6 +134,7 @@ def _settings() -> PeerSettings:
     return PeerSettings(
         library="libtokenspeed_transfer_engine.so",
         local_ip="127.0.0.1",
+        protocol="rdma",
         ib_device="",
         engine_rank=0,
         regions=((_SOURCE, 512),),
@@ -145,6 +147,26 @@ def _server_args(bootstrap_port: int) -> SimpleNamespace:
         dist_init_addr="127.0.0.1:5000",
         disaggregation_bootstrap_port=bootstrap_port,
     )
+
+
+def test_the_kv_bootstrap_server_is_on_the_first_node():
+    # Where the prefill ranks register, and where a frontend sends decode.
+    assert kv_bootstrap_address(_server_args(8998)) == ("127.0.0.1", 8998)
+
+
+@pytest.mark.parametrize(
+    ("vendor", "protocol"),
+    [("nvidia", "rdma"), ("amd", "rdma"), ("ascend", "ascend_direct")],
+)
+def test_mooncake_protocol_uses_the_device_transport(monkeypatch, vendor, protocol):
+    from tokenspeed_kernel.platform import current_platform
+
+    from tokenspeed.runtime.pd import host_peer
+
+    # Hardware discovery is unavailable on the host running this test.
+    platform = replace(current_platform(), vendor=vendor)
+    monkeypatch.setattr(host_peer, "current_platform", lambda: platform)
+    assert host_peer.mooncake_protocol() == protocol
 
 
 def _http(url: str, *, body: dict | None = None) -> tuple[int, str]:

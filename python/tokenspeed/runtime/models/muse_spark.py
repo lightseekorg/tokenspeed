@@ -37,6 +37,8 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
     mv,
+    mv_weightless_rmsnorm_gated_sigmoid,
+    mv_weightless_rmsnorm_gated_sigmoid_supported,
 )
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
@@ -226,6 +228,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         self.rank = tp_rank
         self.group = tp_group
         self.gather_column_view = replicated and replicate_for_owned_rows
+        # Every rank holds the whole weight, so a rank can project any columns.
+        self.replicated = replicated
         self.workspace = None
         self.multicast = None
         if tp_size > 1 and (not replicated or self.gather_column_view):
@@ -805,21 +809,17 @@ class MuseSparkAttention(nn.Module):
         )
         self.iris_state: MuseIrisState | None = None
 
-    def _project_output(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project ``x`` and defer the TP reduction to the consuming operation."""
+    def _acquire_projection_output(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Borrow the all-reduce producer buffer for the projection, if compatible."""
         linear = self.o_proj
-        if linear.tp_size == 1:
-            return RowParallelLinear.forward(linear, x)[0]
-        output = (
+        return (
             _acquire_all_reduce_output(
                 (x.shape[0], linear.output_size),
                 x,
                 linear.tp_group,
             )
-            if type(linear.quant_method) is UnquantizedLinearMethod
+            if linear.tp_size > 1
+            and type(linear.quant_method) is UnquantizedLinearMethod
             and linear.bias is None
             and linear.input_is_parallel
             and not linear.reduce_results
@@ -827,6 +827,14 @@ class MuseSparkAttention(nn.Module):
             and not _gemm_dispatch_required()
             else None
         )
+
+    def _project_output(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project ``x`` and defer the TP reduction to the consuming operation."""
+        linear = self.o_proj
+        output = self._acquire_projection_output(x)
         return (
             RowParallelLinear.forward(linear, x)[0]
             if output is None
@@ -880,8 +888,28 @@ class MuseSparkAttention(nn.Module):
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
             )
             output = self.attn(q, k, v, positions, ctx)
+        output = output.contiguous()
+        # One row normalizes and gates inside the output projection's GEMV.
+        projection_out = (
+            self._acquire_projection_output(output)
+            if output.shape[0] == 1
+            and mv_weightless_rmsnorm_gated_sigmoid_supported(
+                output, output_gate, self.o_proj.weight, self.num_heads, self.head_dim
+            )
+            else None
+        )
+        if projection_out is not None:
+            projected = mv_weightless_rmsnorm_gated_sigmoid(
+                output,
+                output_gate,
+                self.o_proj.weight,
+                self.num_heads,
+                self.rms_norm_eps,
+                projection_out,
+            )
+            return projected, None, 1
         output = weightless_rmsnorm_gated_sigmoid(
-            output.contiguous(),
+            output,
             output_gate,
             self.num_heads,
             self.head_dim,
@@ -1435,12 +1463,16 @@ class MuseSparkMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         owned_global_rows: int | None,
+        project: bool,
     ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
 
         The returned projection may defer its gather to the residual boundary.
+        Without ``project`` the combined expert rows are returned unprojected
+        for a boundary that applies ``post_expert_proj`` itself.
         """
-        # The graph phase warms the fork serially, so capture never first-touches it.
+        # Without an auxiliary stream (gfx950) the branch runs inline. Otherwise
+        # the graph phase warms the fork serially, so capture never first-touches it.
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
@@ -1566,6 +1598,9 @@ class MuseSparkMoE(nn.Module):
                 route_weights=topk_weights,
                 owned_rows=owned_global_rows is not None,
             )
+        if not project:
+            assert owned_global_rows is None
+            return combined, None
         if owned_global_rows is not None:
             output = iris.acquire_owned_post_expert_output(
                 owned_global_rows, self.post_expert_proj.output_size
@@ -1800,13 +1835,60 @@ class MuseSparkDecoderLayer(nn.Module):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
+        post_norm = self.post_feedforward_layernorm
+        alpha, beta = self.post_feedforward_residual_gate._gate_coefficients()
+        next_weight, next_eps, next_weight_offset = (
+            (None, 0.0, 0.0)
+            if next_input_layernorm is None
+            else (
+                next_input_layernorm.weight,
+                next_input_layernorm.eps,
+                next_input_layernorm.weight_offset,
+            )
+        )
+        projection = self.mlp.post_expert_proj
+        # A few decode rows project only this rank's post-expert columns; the
+        # boundary gathers them, which beats streaming the replicated weight.
+        project_in_boundary = (
+            owned_global_rows is None
+            and self.iris_state is not None
+            and projection.replicated
+            and not projection.gather_column_view
+            and not _gemm_dispatch_required()
+            and resolve_kernel_override("residual", "post_norm_residual_pre_norm", None)
+            is None
+            and self.iris_state.can_gemv_all_gather_boundary(
+                mlp_input.shape[0],
+                projection.weight,
+                hidden_states,
+                post_norm.weight,
+                alpha,
+                beta,
+                next_weight,
+            )
+        )
         mlp_output, sentinel = self.mlp(
             mlp_input,
             router_input,
             num_global_tokens,
             max_num_tokens_per_gpu,
             owned_global_rows,
+            project=not project_in_boundary,
         )
+        if project_in_boundary:
+            return self.iris_state.gemv_all_gather_boundary(
+                mlp_output,
+                projection.weight,
+                hidden_states,
+                post_norm.weight,
+                alpha,
+                beta,
+                next_weight,
+                post_norm.eps,
+                post_norm.weight_offset,
+                next_eps,
+                next_weight_offset,
+            )
         boundary = (
             post_norm_residual_pre_norm_bf16
             if current_platform().is_cdna4
@@ -1815,17 +1897,14 @@ class MuseSparkDecoderLayer(nn.Module):
         boundary_outputs = boundary(
             hidden_states,
             mlp_output,
-            self.post_feedforward_layernorm.weight,
-            self.post_feedforward_layernorm.eps,
-            self.post_feedforward_layernorm.weight_offset,
-            *self.post_feedforward_residual_gate._gate_coefficients(),
-            next_input_layernorm.weight if next_input_layernorm is not None else None,
-            next_input_layernorm.eps if next_input_layernorm is not None else 0.0,
-            (
-                next_input_layernorm.weight_offset
-                if next_input_layernorm is not None
-                else 0.0
-            ),
+            post_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            alpha,
+            beta,
+            next_weight,
+            next_eps,
+            next_weight_offset,
             pdl_enabled(),
             None if owned_global_rows is not None else sentinel,
             1,
@@ -1892,8 +1971,14 @@ class MuseSparkModel(BaseTransformerModel):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.ModuleList:
-        """Build the decoder layers around one shared auxiliary stream."""
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        """Build decoder layers, sharing an auxiliary stream where enabled."""
+        # On gfx950 a CUDA-graph fork/join idles the GPU for longer than the
+        # router work it would hide, so the router runs in the main stream there.
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available() and not current_platform().is_cdna4
+            else None
+        )
         return make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: self.layer_cls(

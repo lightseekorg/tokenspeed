@@ -54,6 +54,12 @@ local hits. Retraction remains an exact image restore, never an L3 re-prefill.
 The D role probes Device history and receives missing data from its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
+A first admission with no free request-pool row skips prefix hashing and
+matching. This is a slot constraint, not a KV capacity failure: it does not
+trigger retraction. Asynchronous L3 preparation runs before forward scheduling
+and can still fetch Host data while rows are full, because it owns no row.
+Resident prefill chunks and restore admissions keep their existing paths.
+
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
 tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see
@@ -404,6 +410,11 @@ alone; the landed tail is what the first decode steps read, with no
 regeneration anywhere.
 
 ### 1.4 What bounds a single request
+
+The runtime's usable request length is the minimum of the model context and
+`MaxSingleRequestTokens`. Input admission leaves room for the first decode/verify
+window. The generation budget is capped at `usable_length - prompt_length`;
+that input reserve is not subtracted again from the remaining output budget.
 
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
 `CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):

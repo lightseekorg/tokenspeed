@@ -2366,7 +2366,6 @@ class ModelExecutor:
                         sampling_info=sampling_info,
                         bs=bs,
                         is_spec_decode=self.drafter is not None and num_extends < bs,
-                        spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
                         input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
@@ -2622,9 +2621,8 @@ class ModelExecutor:
                 # Defensive clamp into the valid vocab range (kept from the
                 # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
                 # value surfaced by the intermittent spec-decode decode-state race
-                # -- would otherwise reach the detokenizer, whose HF
-                # tokenizer.decode raises a fatal OverflowError on ids outside
-                # [0, vocab) and tears down the whole server process tree.
+                # -- would otherwise reach the frontend's detokenizer as a
+                # token outside the vocabulary.
                 # It must run on-GPU *before* the non_blocking D2H: clamping the
                 # CPU result afterwards would race the in-flight copy. In-place
                 # (clamp_) so output_tokens keeps aliasing _output_pack_buf and

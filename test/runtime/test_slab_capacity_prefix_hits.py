@@ -4,7 +4,8 @@ The slab layout shares one K/V slab between one layer from each attention
 group, doubling the page pool in tokens at the same byte budget. This test
 boots the SAME commit twice (slab: natural; legacy: predicate nulled via an
 env-injected sitecustomize) and asserts the gain twice over: directly, via
-``scheduler_info["max_total_num_tokens"]`` doubling, and behaviorally, via
+the cache capacity the engine registers with (``kv_cache_size_tokens``)
+doubling, and behaviorally, via
 the round-2 prefix-hit-rate contrast (slab keeps the working set cached;
 the legacy arm's halved pool recycles it before reuse).
 
@@ -15,6 +16,7 @@ Usage:
     python3 -m pytest test_slab_capacity_prefix_hits.py -v
 """
 
+import functools
 import math
 import os
 import shutil
@@ -37,7 +39,10 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=900, suite="runtime-prefix-cache-e2e")
 
-from tokenspeed.runtime.entrypoints.engine import Engine  # noqa: E402
+from tokenspeed.runtime.entrypoints.wire_driver import (  # noqa: E402
+    WireDriver,
+    generate_request,
+)
 
 _MODEL = "openai/gpt-oss-20b"
 # 130 numbered sentences tokenize to ~2074 tokens with the gpt-oss tokenizer;
@@ -157,39 +162,59 @@ def _build_prompt(i: int) -> str:
     return " ".join(parts)
 
 
-def _make_engine() -> Engine:
-    return Engine(
-        disable_autotune=True,
-        model=_MODEL,
-        dtype=get_dtype_str(torch.bfloat16),
-        seed=42,
-        enable_prefix_caching=True,
-        # resolve_cache would auto-enable kvstore, tripping the slab guard
-        # (per-layer L2 host copies would alias shared slabs).
-        disable_kvstore=True,
-        max_model_len=8192,
-        max_num_seqs=2,
-        # Shared byte budget; the profiled pool also depends on free GPU
-        # memory at boot, hence K is sized from the measured capacity.
-        gpu_memory_utilization=0.165,
-        moe_backend="auto",  # our tree lacks upstream flashinfer_mxfp4
-        disable_prefill_graph=True,
+def _make_engine() -> WireDriver:
+    return WireDriver(
+        [
+            "--disable-autotune",
+            "--model",
+            _MODEL,
+            "--dtype",
+            get_dtype_str(torch.bfloat16),
+            "--seed",
+            "42",
+            "--enable-prefix-caching",
+            # resolve_cache would auto-enable kvstore, tripping the slab guard
+            # (per-layer L2 host copies would alias shared slabs).
+            "--disable-kvstore",
+            "--max-model-len",
+            "8192",
+            "--max-num-seqs",
+            "2",
+            # Shared byte budget; the profiled pool also depends on free GPU
+            # memory at boot, hence K is sized from the measured capacity.
+            "--gpu-memory-utilization",
+            "0.165",
+            "--moe-backend",
+            "auto",  # our tree lacks upstream flashinfer_mxfp4
+            "--disable-prefill-graph",
+        ],
+        num_engines=1,
+        routing="round_robin",
+        startup_timeout_s=3600,
     )
 
 
-def _run_round(engine: Engine, prompts: list) -> tuple:
+@functools.cache
+def _tokenizer():
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(_MODEL)
+
+
+def _capacity(engine: WireDriver) -> int:
+    """The tokens the engine's cache holds."""
+    return int(engine.engines()[0]["kv_cache_size_tokens"])
+
+
+def _run_round(engine: WireDriver, prompts: list) -> tuple:
     """Generate every prompt once; return (cached_tokens, prompt_tokens) sums."""
     total_cached = 0
     total_prompt = 0
     for prompt in prompts:
-        resp = engine.generate(
-            prompt=prompt,
-            sampling_params=_SAMPLING,
-            return_logprob=False,
-            stream=False,
+        [completion] = engine.generate(
+            [generate_request(_tokenizer().encode(prompt), _SAMPLING)]
         )
-        meta = resp["meta_info"]
-        prompt_tokens = int(meta["prompt_tokens"])
+        prompt_tokens = completion.prompt_tokens
         if not _PROMPT_TOKENS_MIN <= prompt_tokens <= _PROMPT_TOKENS_MAX:
             # Not a bare assert: must survive python -O.
             raise AssertionError(
@@ -197,12 +222,12 @@ def _run_round(engine: Engine, prompts: list) -> tuple:
                 f"proven regime [{_PROMPT_TOKENS_MIN}, {_PROMPT_TOKENS_MAX}];"
                 " retune _SENTENCES_PER_PROMPT"
             )
-        total_cached += int(meta.get("cached_tokens", 0))
+        total_cached += completion.cached_tokens
         total_prompt += prompt_tokens
     return total_cached, total_prompt
 
 
-def _measure_arm(engine: Engine, num_prompts: int, tag: str) -> tuple:
+def _measure_arm(engine: WireDriver, num_prompts: int, tag: str) -> tuple:
     """Two sequential rounds over the same prompts; return (r1_ratio, r2_ratio)."""
     prompts = [_build_prompt(i) for i in range(num_prompts)]
     cached1, prompt1 = _run_round(engine, prompts)
@@ -235,7 +260,7 @@ class TestSlabCapacityPrefixHits:
         # --- Arm 1: natural slab layout ---
         engine = _make_engine()
         try:
-            slab_capacity = int(engine.scheduler_info["max_total_num_tokens"])
+            slab_capacity = _capacity(engine)
             num_prompts = math.ceil(
                 _TARGET_POOL_FILL * slab_capacity / _APPROX_CACHED_TOKENS
             )
@@ -279,7 +304,7 @@ class TestSlabCapacityPrefixHits:
             os.environ["TOKENSPEED_FORCE_LEGACY_KV_LAYOUT"] = "1"
             engine = _make_engine()
             try:
-                legacy_capacity = int(engine.scheduler_info["max_total_num_tokens"])
+                legacy_capacity = _capacity(engine)
                 print(f"[legacy layout] max_total_num_tokens={legacy_capacity}")
                 cap_ratio = slab_capacity / legacy_capacity
                 # gpt-oss pairs 12 sliding with 12 full layers -> exactly 2x;

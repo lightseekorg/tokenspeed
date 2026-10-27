@@ -39,8 +39,8 @@ fn spans_and_page_grids_land_on_the_peer() {
         eprintln!("TS_MOONCAKE_LIBRARY is not set; skipping");
         return;
     };
-    let sender = Engine::start(library.clone(), "127.0.0.1", "").unwrap();
-    let receiver = Engine::start(library, "127.0.0.1", "").unwrap();
+    let sender = Engine::start(library.clone(), "127.0.0.1", "rdma", "").unwrap();
+    let receiver = Engine::start(library, "127.0.0.1", "rdma", "").unwrap();
     assert_ne!(sender.session_id(), receiver.session_id());
 
     const PAGE: usize = 64;

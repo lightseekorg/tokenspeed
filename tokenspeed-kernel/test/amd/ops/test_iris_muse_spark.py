@@ -970,8 +970,12 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
     dist.barrier()
 
 
-def _compile_gfx950(fn, types, constexprs, num_warps):
-    """Compile a Gluon kernel for gfx950 without launching it."""
+def _compile_gfx950(fn, types, constexprs, num_warps, unspecialized=()):
+    """Compile a Gluon kernel for gfx950 without launching it.
+
+    Arguments named in unspecialized get no 16-byte divisibility, as when a
+    caller passes them in do_not_specialize or compiles ahead of time.
+    """
     from tokenspeed_kernel._triton import gluon, triton
 
     attrs = {}
@@ -983,7 +987,7 @@ def _compile_gfx950(fn, types, constexprs, num_warps):
                     for peer in range(len(types[name]))
                 }
             )
-        elif name in types:
+        elif name in types and name not in unspecialized:
             attrs[(index,)] = [["tt.divisibility", 16]]
     source = gluon._runtime.GluonASTSource(
         fn,
@@ -1167,6 +1171,90 @@ def test_gather_lamport_polling_codegen():
         cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 8)
     ]
     assert polls, "all remote system-cache reads must issue together on a retry"
+    assert all(
+        votes_with_subgroup_mask(cycle) for cycle in polls
+    ), "a retry must branch on one subgroup lane mask"
+    assert re.search(r"\.amdhsa_private_segment_fixed_size\s+0\b", assembly)
+
+
+@pytest.mark.parametrize("block_m", [1, 8])
+def test_moetail_lamport_codegen(block_m):
+    """The fused tail pushes without waiting and its reducer votes per subgroup.
+
+    Each sender's eight 8-byte packets per row (seven peers and its own slot)
+    must issue back to back, one store instruction per peer for all rows; a
+    wait after each would expose seven remote write latencies. The reducer
+    rereads its 16-byte mailbox words on every retry and branches on the
+    subgroup's lane mask. The mailbox pointer is compiled without alignment
+    specialization: no 32-bit word may be split into 16-bit accesses.
+    """
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import iris_cache_policy
+    from tokenspeed_kernel.ops.communication._iris.muse_spark.moetail import (
+        iris_fused_gemv_lamport_allgather_muse_moetail as fn,
+    )
+
+    types = {
+        "x_ptr": "*bf16",
+        "weight_ptr": "*bf16",
+        "region": "*bf16",
+        "epochs": "*i32",
+        "regions": ("i64",) * 8,
+        "stream_ptr": "*fp32",
+        "post_weight_ptr": "*bf16",
+        "alpha_ptr": "*fp32",
+        "beta_ptr": "*fp32",
+        "pre_weight_ptr": "*bf16",
+        "out_stream_ptr": "*fp32",
+        "pre_bf16_ptr": "*bf16",
+        "M": "i32",
+    }
+    kernel = _compile_gfx950(
+        fn,
+        types,
+        {
+            "RANK": 5,
+            "WORLD_SIZE": 8,
+            "K": 4096,
+            "LOCAL_WIDTH": 1024,
+            "MAX_ELEMENTS": 43 * 4096,
+            "BLOCK_M": block_m,
+            "BLOCK_K": 512,
+            "WAVES_PER_OUTPUT": 4,
+            "POST_EPS": 1e-5,
+            "POST_WEIGHT_OFFSET": 1.0,
+            "PRE_EPS": 1e-5,
+            "PRE_WEIGHT_OFFSET": 1.0,
+            "HAS_PRE": True,
+            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+                ArchVersion(9, 5)
+            ).peer_signal_store,
+        },
+        num_warps=16,
+        unspecialized=("region", "M"),
+    )
+    assembly = kernel.asm["amdgcn"]
+    lines = assembly.splitlines()
+    pushes = [
+        index
+        for index, line in enumerate(lines)
+        if "buffer_store_dwordx2" in line and "sc0 sc1" in line
+    ]
+    # Seven peer orders of seven pushes each, plus the own slot.
+    assert len(pushes) == 7 * 7 + 1
+    for order in range(7):
+        first, last = pushes[7 * order], pushes[7 * order + 6]
+        assert not any("s_waitcnt vmcnt" in line for line in lines[first:last])
+    # The reducer restores its polled words with one 16-byte write-through store.
+    # (Duplicate pusher lanes are dropped by an out-of-range buffer offset, not
+    # an exec mask, so this test does not pin that pattern.)
+    clears = [
+        line for line in lines if "buffer_store_dwordx4" in line and "sc0 sc1" in line
+    ]
+    assert len(clears) == 1, clears
+    polls = [
+        cycle for cycle in polling_cycles(assembly) if _batched_peer_reads(cycle, 1)
+    ]
+    assert polls, "the reducer must reread its mailbox words on every retry"
     assert all(
         votes_with_subgroup_mask(cycle) for cycle in polls
     ), "a retry must branch on one subgroup lane mask"
@@ -1446,14 +1534,165 @@ def _muse_routed_lamport_worker(rank, world_size, device):
         dist.barrier()
 
 
+def _muse_moetail_reference(x, weight, stream, post, alpha, beta, pre):
+    from tokenspeed_kernel.ops.residual._triton.gated_boundary import (
+        _launch_post_norm_residual_pre_norm,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.gemm.fp16.decode_gemv import (
+        gluon_rowcta_bf16_gemv_gfx950,
+    )
+
+    # The replicated single-row projection of each row, then the unfused boundary.
+    branch = x.new_empty((x.shape[0], weight.shape[0]))
+    for row in range(x.shape[0]):
+        gluon_rowcta_bf16_gemv_gfx950(x[row : row + 1], weight, branch[row : row + 1])
+    out_stream, _, pre_bf16 = _launch_post_norm_residual_pre_norm(
+        stream,
+        branch,
+        post,
+        1e-5,
+        1.0,
+        alpha,
+        beta,
+        pre,
+        1e-6,
+        1.0,
+        False,
+        None,
+        1,
+        return_pre_fp32=False,
+    )
+    return out_stream, pre_bf16
+
+
+def _muse_moetail_worker(rank, world_size, device):
+    """The fused tail matches per-row replicated single-row GEMVs plus the boundary.
+
+    Row counts cover every power-of-two bucket at TP8 and odd counts inside
+    them (TP4 takes one row). Two layers alternate weights and next norms, one
+    rank lags, row counts interleave in one graph, and the stage counters start
+    at the last stage so eager calls and replays wrap them.
+    """
+    state = _muse_state(rank, device, 1, True)
+    reduction = state.reduction
+    reduction.lamport_epochs.fill_(2)
+    generator = torch.Generator(device=device).manual_seed(2610)
+    weights = [
+        torch.randn(8192, 4096, device=device, generator=generator).bfloat16() / 64
+        for _ in range(2)
+    ]
+    # A zero row yields an exact zero, which travels as data, not as empty.
+    weights[0][5] = 0
+    post = (torch.randn(8192, device=device, generator=generator) * 0.1).bfloat16()
+    pres = [
+        (torch.randn(8192, device=device, generator=generator) * 0.1).bfloat16(),
+        None,
+    ]
+    beta = torch.sigmoid(torch.randn(8192, device=device, generator=generator))
+    alpha = torch.sqrt(1 - beta.square())
+    counts = (1, 2, 3, 4, 5, 8) if world_size == 8 else (1,)
+    xs = {
+        rows: [
+            torch.empty(rows, 4096, dtype=torch.bfloat16, device=device)
+            for _ in range(2)
+        ]
+        for rows in counts
+    }
+    streams = {
+        rows: [torch.empty(rows, 8192, device=device) for _ in range(2)]
+        for rows in counts
+    }
+
+    def update(phase):
+        g = torch.Generator(device=device).manual_seed(2700 + phase)
+        for rows in counts:
+            for x, stream in zip(xs[rows], streams[rows]):
+                # Negative inputs make the zero row's products negative zeros.
+                x.copy_(-torch.rand(rows, 4096, device=device, generator=g).bfloat16())
+                stream.copy_(torch.randn(rows, 8192, device=device, generator=g))
+
+    def step(rows):
+        outputs = []
+        for layer in range(2):
+            assert state.can_gemv_all_gather_boundary(
+                rows,
+                weights[layer],
+                streams[rows][layer],
+                post,
+                alpha,
+                beta,
+                pres[layer],
+            )
+            if rank == layer:
+                torch.cuda._sleep(20000)
+            outputs.append(
+                state.gemv_all_gather_boundary(
+                    xs[rows][layer],
+                    weights[layer],
+                    streams[rows][layer],
+                    post,
+                    alpha,
+                    beta,
+                    pres[layer],
+                    1e-5,
+                    1.0,
+                    1e-6,
+                    1.0,
+                )
+            )
+        return outputs
+
+    def check(rows, outputs):
+        for layer, (out_stream, pre_bf16) in enumerate(outputs):
+            expected = _muse_moetail_reference(
+                xs[rows][layer],
+                weights[layer],
+                streams[rows][layer],
+                post,
+                alpha,
+                beta,
+                pres[layer],
+            )
+            assert torch.equal(out_stream, expected[0])
+            assert (pre_bf16 is None) == (expected[1] is None)
+            if pre_bf16 is not None:
+                assert torch.equal(pre_bf16, expected[1])
+
+    tiles = torch.arange(reduction.lamport_epochs.numel(), device=device)
+    for phase in range(4):
+        update(phase)
+        for rows in counts:
+            advanced = (tiles < rows * 8192 // world_size // 512).int() * 2
+            before = reduction.lamport_epochs.clone()
+            check(rows, step(rows))
+            torch.cuda.synchronize()
+            assert torch.equal(reduction.lamport_epochs, (before + advanced) % 3)
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = {rows: step(rows) for rows in counts}
+    for phase in range(4, 8):
+        update(phase)
+        graph.replay()
+        for rows in counts:
+            check(rows, outputs[rows])
+    torch.cuda.synchronize()
+    dist.barrier()
+    assert bool((reduction.lamport_region.view(torch.int32) == -(2**31)).all())
+    epochs = [torch.empty_like(reduction.lamport_epochs) for _ in range(world_size)]
+    dist.all_gather(epochs, reduction.lamport_epochs)
+    assert all(torch.equal(e, reduction.lamport_epochs) for e in epochs)
+
+
 def _muse_decode_step_lamport_worker(rank, world_size, device):
     """Interleave every Lamport user of one decode layer under graph replay.
 
-    The routed-normalization, gather-norm-MXFP4 and generic one-shot BF16
-    reductions share one sentinel mailbox and its per-512-element stage
-    counters while covering different tile prefixes, so the counters diverge
-    per tile. TP8's generic two-shot (route payloads from two tokens) and the
-    attention tail keep their own mailboxes but run in the same step.
+    The routed-normalization, gather-norm-MXFP4, post-expert tail and
+    generic one-shot BF16 reductions share one sentinel mailbox and its
+    per-512-element stage counters while covering different tile prefixes, so
+    the counters diverge per tile. TP8's generic two-shot (route payloads from
+    two tokens) and the attention tail keep their own mailboxes but run in the
+    same step.
     """
     from tokenspeed_kernel.ops.communication._iris.muse_spark.routed_moe import (
         iris_fused_pull_oneshot_allreduce_routed_rmsnorm_sum,
@@ -1468,6 +1707,9 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
     alpha = torch.sqrt(1 - beta.square())
     gather_weight = (torch.randn(width, device=device) * 0.1).bfloat16()
     norm = (torch.randn(width, device=device) * 0.1).bfloat16()
+    # The post-expert tail projects the routed rows and gathers 8192 columns.
+    tail_weight = (torch.randn(8192, width, device=device) / 64).bfloat16()
+    tail_post = (torch.randn(8192, device=device) * 0.1).bfloat16()
     # Start every tile at the last stage so the first replays wrap the counters.
     reduction = state.reduction
     reduction.lamport_epochs.fill_(2)
@@ -1485,7 +1727,11 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
         )
         return count // two_shot_tile if selected else 0
 
-    for rows in (1, 3, 5):
+    # Eight rows (the post-expert tail's largest bucket) are out of reach here:
+    # the routed one-shot Lamport that feeds the tail would need 8 * 8 * 4096
+    # elements per slot, beyond lamport_max_numel (43 * 4096). The moetail
+    # worker covers eight rows on its own.
+    for rows in (1, 3, 4, 5):
         assert rows * 8 * width <= state.reduction.lamport_max_numel
         torch.manual_seed(1800 + rows)
         attn_base = torch.randn(rows, 8192, device=device)
@@ -1569,7 +1815,24 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
                     branch = state.all_reduce.acquire_outputs((tuple(value.shape),))[0]
                     branch.copy_(value)
                     raw.append(state.reduce_outputs((branch,))[0].clone())
-                outputs.append((boundary, packed, scales, routed, raw))
+                tail = None
+                if state.can_gemv_all_gather_boundary(
+                    rows, tail_weight, boundary[0], tail_post, alpha, beta, pre
+                ):
+                    tail = state.gemv_all_gather_boundary(
+                        routed,
+                        tail_weight,
+                        boundary[0],
+                        tail_post,
+                        alpha,
+                        beta,
+                        pre,
+                        1e-5,
+                        1.0,
+                        1e-6,
+                        1.0,
+                    )
+                outputs.append((boundary, packed, scales, routed, raw, tail))
             return outputs
 
         update(0)
@@ -1583,6 +1846,10 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
         # and each generic reduction on whichever protocol it selects.
         tiles = torch.arange(reduction.lamport_epochs.numel(), device=device)
         advanced = (tiles < rows * local_width // 512).int() + (tiles < rows * 8).int()
+        if state.can_gemv_all_gather_boundary(
+            rows, tail_weight, attn_streams[0], tail_post, alpha, beta, pre
+        ):
+            advanced += (tiles < rows * 8192 // world_size // 512).int()
         two_shot_advanced = None
         if reduction.lamport_two_shot_epochs is not None:
             programs = torch.arange(
@@ -1641,7 +1908,9 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
                 num_warps=8,
             )
             routed_expected = state.gather.output[: rows * width].view(rows, width)
-            for layer, (boundary, packed, scales, routed, raw) in enumerate(outputs):
+            for layer, (boundary, packed, scales, routed, raw, tail) in enumerate(
+                outputs
+            ):
                 reduced = contribution(layer, 0, phase).float()
                 for peer in range(1, world_size):
                     reduced.add_(contribution(layer, peer, phase).float())
@@ -1679,6 +1948,12 @@ def _muse_decode_step_lamport_worker(rank, world_size, device):
                     )
                     reference[0] = 0.0
                     torch.testing.assert_close(output, reference, atol=0, rtol=0)
+                if tail is not None:
+                    expected = _muse_moetail_reference(
+                        routed, tail_weight, boundary[0], tail_post, alpha, beta, pre
+                    )
+                    assert torch.equal(tail[0], expected[0])
+                    assert torch.equal(tail[1], expected[1])
             dist.barrier()
     torch.cuda.synchronize()
     dist.barrier()
@@ -2033,9 +2308,9 @@ def _muse_tp_owned_forward_worker(rank, world_size, device, *, quantized: bool):
             full = torch.randn(rows, 8192, device=device)
             local = torch.zeros(local_rows, 8192, device=device)
             local[:valid].copy_(full[first : first + valid])
-            expected, _ = moe(full, full.float(), rows, rows, None)
+            expected, _ = moe(full, full.float(), rows, rows, None, project=True)
             expected = expected[first : first + valid].clone()
-            actual, _ = moe(local, local.float(), rows, rows, rows)
+            actual, _ = moe(local, local.float(), rows, rows, rows, project=True)
             actual = actual.clone()
             # Post projection borrows the generic producer; retain it before reuse.
             state.all_reduce.producer.data.fill_(torch.nan)
@@ -2250,6 +2525,7 @@ def _muse_owned_routed_wt_worker(rank, world_size, device):
         pytest.param(
             _muse_decode_step_lamport_worker, "nccl", id="decode_step_lamport"
         ),
+        pytest.param(_muse_moetail_worker, "nccl", id="moetail"),
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),

@@ -23,16 +23,23 @@
 from __future__ import annotations
 
 import math
+import weakref
 from typing import Any
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.ops.attention.dsa import prepare_dsa_resources
 from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_kernels
+from tokenspeed_kernel.ops.attention.prologue import mla_prologue
 from torch import nn
+from torch.nn import functional as F
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.distributed import Mapping
+from tokenspeed.runtime.distributed.process_group_manager import process_group_manager
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_dsa import (
+    AscendDSABackend,
+    ascend_dsa_prefill_backend,
     prepare_ascend_dsa_cp_metadata,
 )
 from tokenspeed.runtime.layers.layernorm import RMSNorm
@@ -330,6 +337,7 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         *,
         lora_norm_eps: float,
         independent_selection: bool,
+        native_prefill: bool,
         separate_mla_projections: bool,
     ) -> None:
         if not independent_selection:
@@ -409,6 +417,8 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         )
         self._scales_prepared = False
         self._fused_decode_runtime = None
+        self._prefill_weights = None
+        self.native_prefill = native_prefill
 
     def configure_fused_decode(self, runtime) -> None:
         """Attach prepared weights and communication state outside forward."""
@@ -429,7 +439,31 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
                 self.kv_b_proj.weight, self
             )
 
-    def forward(self, positions, hidden_states, ctx, comm_manager):
+        if self.native_prefill and self._prefill_weights is None:
+            group = self.mapping.attn.head_tp_group
+            pg = (
+                process_group_manager.get_device_process_group(group)
+                if len(group) > 1
+                else None
+            )
+
+            def gather(value, dim):
+                if len(group) == 1:
+                    return value.contiguous()
+                pieces = [torch.empty_like(value) for _ in group]
+                dist.all_gather(pieces, value.contiguous(), group=pg)
+                return torch.cat(pieces, dim=dim).contiguous()
+
+            # Token-local Prefill computes all heads and the complete O row.
+            # Decode continues to use the original sharded weights.
+            self._prefill_weights = (
+                gather(self.q_b_proj.weight, 0),
+                gather(self.w_kc, 0),
+                gather(self.w_vc, 0),
+                gather(self.o_proj.weight, 1),
+            )
+
+    def _forward_fused_decode(self, positions, hidden_states, ctx, comm_manager):
         if hidden_states.shape[0] == 0:
             return hidden_states
         if self._fused_decode_runtime is None:
@@ -470,9 +504,317 @@ class AscendDSAAttention(DeepseekV3AttentionMLA):
         )
         return self._fused_decode_runtime.output_projection(out)
 
+    def _rotate_indexer(self, positions, index_query, index_key):
+        if self.indexer.rotary_emb is not None:
+            # The Indexer rotary module describes only the first 64 dimensions,
+            # not the full 128-dimensional head. Preserve the NoPE half.
+            rotary_dim = self.indexer.rotary_emb.rotary_dim
+            query_rope, key_rope = self.indexer.rotary_emb(
+                positions,
+                index_query[..., :rotary_dim].contiguous().flatten(1),
+                index_key[..., :rotary_dim].contiguous().flatten(1),
+            )
+            index_query = torch.cat(
+                (
+                    query_rope.view(*index_query.shape[:-1], rotary_dim),
+                    index_query[..., rotary_dim:],
+                ),
+                dim=-1,
+            )
+            index_key = torch.cat(
+                (
+                    key_rope.view(*index_key.shape[:-1], rotary_dim),
+                    index_key[..., rotary_dim:],
+                ),
+                dim=-1,
+            )
+        return index_query, index_key
+
+    def _forward_prefill(self, positions, hidden, ctx):
+        if self._prefill_weights is None:
+            raise RuntimeError("Prepare token-local DSA Prefill weights before forward")
+        backend = ascend_dsa_prefill_backend(ctx.attn_backend)
+        plan = backend._prefill_plan
+        if plan is None or hidden.shape[0] != plan.row_end - plan.row_start:
+            raise ValueError(
+                "DSA Prefill hidden rows must follow the CP query partition"
+            )
+        positions = positions[plan.row_start : plan.row_end]
+        qb, kc, vc, wo = self._prefill_weights
+        indexer = self.indexer
+        if hidden.shape[0]:
+            q_lora = self.q_a_layernorm(self.q_a_proj(hidden)[0])
+            iq = indexer.wq_b(q_lora)[0].view(
+                -1, indexer.index_n_heads, indexer.index_head_dim
+            )
+            ik = indexer.k_norm(indexer.wk(hidden)[0]).unsqueeze(1)
+            iq, ik = self._rotate_indexer(positions, iq, ik)
+        else:
+            iq = hidden.new_empty((0, indexer.index_n_heads, indexer.index_head_dim))
+            ik = hidden.new_empty((0, 1, indexer.index_head_dim))
+        backend.start_prefill_index(self.layer_id, ik.contiguous())
+        if hidden.shape[0]:
+            # Index-K communication runs while the MLA query/latent are formed.
+            weights = indexer.weights_proj(hidden.float())[0]
+            kv = self.kv_a_proj_with_mqa(hidden)[0]
+            q = F.linear(q_lora, qb).view(
+                -1, kc.shape[0], self.qk_nope_head_dim + self.qk_rope_head_dim
+            )
+            latent = self.kv_a_layernorm(kv[:, : self.kv_lora_rank].contiguous())
+            query = torch.cat(
+                (
+                    torch.bmm(
+                        q[..., : self.qk_nope_head_dim].transpose(0, 1), kc
+                    ).transpose(0, 1),
+                    q[..., self.qk_nope_head_dim :],
+                ),
+                dim=-1,
+            )
+            latent = torch.cat((latent, kv[:, self.kv_lora_rank :]), dim=-1)
+            prologue = mla_prologue(
+                query,
+                query[..., self.kv_lora_rank :],
+                latent,
+                expanded=None,
+                rotary=(
+                    None
+                    if self.rotary_emb is None
+                    else self.rotary_emb.as_rotary(positions)
+                ),
+                cache=None,
+                solution=None,
+                override=None,
+            )
+            query, latent = prologue.query, prologue.latent
+            if ctx.token_to_kv_pool.latent_write_sanitizes:
+                latent = torch.nan_to_num(latent)
+        else:
+            weights = torch.empty(
+                (0, indexer.index_n_heads), dtype=torch.float32, device=hidden.device
+            )
+            query = hidden.new_empty(
+                (0, kc.shape[0], self.kv_lora_rank + self.qk_rope_head_dim)
+            )
+            latent = hidden.new_empty((0, self.kv_lora_rank + self.qk_rope_head_dim))
+        output = ctx.attn_backend.forward(
+            query,
+            None,
+            None,
+            self.attn_mqa,
+            ctx.token_to_kv_pool,
+            ctx.forward_mode,
+            ctx.bs,
+            fused=False,
+            save_kv_cache=False,
+            index_query=iq,
+            prefill_latent=latent.contiguous(),
+            index_weights=weights,
+            index_init_tokens=self.index_init_tokens,
+            index_local_tokens=self.index_local_tokens,
+            head_major_output=True,
+        )
+        if hidden.shape[0] == 0:
+            return hidden
+        projected = torch.bmm(output, vc).transpose(0, 1).contiguous()
+        return F.linear(projected.flatten(1), wo)
+
+    def forward(self, positions, hidden_states, ctx, comm_manager):
+        if (
+            ctx.forward_mode.is_extend_or_mixed()
+            and ascend_dsa_prefill_backend(ctx.attn_backend).native_prefill_enabled
+        ):
+            if not self.native_prefill:
+                raise RuntimeError(
+                    "Native DSA cache requires model opt-in before loading weights"
+                )
+            return self._forward_prefill(positions, hidden_states, ctx)
+        if hidden_states.shape[0] == 0:
+            return hidden_states
+        if (
+            self._fused_decode_runtime is not None
+            and hidden_states.ndim == 2
+            and hidden_states.shape[0] in (64, 128, 256, 512)
+            and hidden_states.shape[1] == 4096
+            and ctx.forward_mode.is_decode()
+            and ctx.num_extends == 0
+            and ctx.bs == hidden_states.shape[0] // 8
+        ):
+            return self._forward_fused_decode(
+                positions, hidden_states, ctx, comm_manager
+            )
+        if self.w_kc is None:
+            raise RuntimeError("Prepare DSA weights before forward/capture")
+        # CommManager has already gathered this attention group's input rows.
+        q_lora = self.q_a_layernorm(self.q_a_proj(hidden_states)[0])
+        kv = self.kv_a_proj_with_mqa(hidden_states)[0]
+        q = self.q_b_proj(q_lora)[0].view(
+            -1, self.num_local_heads, self.qk_nope_head_dim + self.qk_rope_head_dim
+        )
+        latent = self.kv_a_layernorm(kv[:, : self.kv_lora_rank].contiguous())
+        query = torch.cat(
+            (
+                torch.bmm(
+                    q[..., : self.qk_nope_head_dim].transpose(0, 1), self.w_kc
+                ).transpose(0, 1),
+                q[..., self.qk_nope_head_dim :],
+            ),
+            dim=-1,
+        )
+        latent_cache = torch.cat((latent, kv[:, self.kv_lora_rank :]), dim=-1)
+        slots = ctx.attn_backend.padded_write_locations(
+            self.attn_mqa, ctx.forward_mode, query.shape[0]
+        )
+        query = self.attn_mqa.latent_prologue(
+            query,
+            query[..., self.kv_lora_rank :],
+            latent_cache,
+            positions,
+            ctx,
+            slots=slots,
+            expanded=None,
+            key_rows=None,
+        ).query
+        indexer = self.indexer
+        index_query = indexer.wq_b(q_lora)[0].view(
+            -1, indexer.index_n_heads, indexer.index_head_dim
+        )
+        index_key = indexer.k_norm(indexer.wk(hidden_states)[0]).unsqueeze(1)
+        index_query, index_key = self._rotate_indexer(positions, index_query, index_key)
+        index_weights = indexer.weights_proj(hidden_states.float())[0].to(
+            index_key.dtype
+        )
+        output = ctx.attn_backend.forward(
+            query,
+            None,
+            None,
+            self.attn_mqa,
+            ctx.token_to_kv_pool,
+            ctx.forward_mode,
+            ctx.bs,
+            fused=False,
+            save_kv_cache=False,
+            index_query=index_query,
+            index_key=index_key,
+            prefill_latent=None,
+            index_weights=index_weights,
+            index_init_tokens=self.index_init_tokens,
+            index_local_tokens=self.index_local_tokens,
+            head_major_output=True,
+        )
+        projected = torch.bmm(output, self.w_vc).transpose(0, 1).contiguous()
+        return self.o_proj(projected.flatten(1))[0]
+
+
+class _RuntimeDSADecode(FusedDSADecode):
+    """Bind shared HCCL views around the unchanged host DSA computation."""
+
+    def __init__(self, layer, *, rank, group, eps_q, eps_kv, owner):
+        super().__init__(layer, rank=rank, group=group, eps_q=eps_q, eps_kv=eps_kv)
+        self.owner = owner
+
+    def prolog(self, hidden, positions, ctx):
+        self.owner.bind_backend(ctx.attn_backend)
+        stream = torch.npu.current_stream()
+        hidden.record_stream(stream)
+        if positions is not None and positions.dtype in (torch.int32, torch.int64):
+            positions = positions.to(dtype=torch.int64).contiguous()
+            positions.record_stream(stream)
+        return super().prolog(hidden, positions, ctx)
+
+
+class AscendDSARuntime:
+    """Prepare native DSA once before profiling; retain it across cache rebinds."""
+
+    def __init__(self, layers, mapping):
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager as pg,
+        )
+
+        self.layers = tuple(layers)
+        self.ranks = tuple(mapping.attn.tp_group)
+        if len(self.ranks) != 8 or not self.layers:
+            raise ValueError(
+                "Native DSA requires a complete eight-rank attention group"
+            )
+        rank = self.ranks.index(dist.get_rank())
+        group = pg.get_dedicated_device_group(self.ranks, "ascend_dsa")
+        pg.init_process_group(self.ranks, backend="gloo")
+        cpu_group = pg.get_process_group("gloo", self.ranks)
+        probe = torch.ones(1, device=self.layers[0].q_a_proj.weight.device)
+        dist.all_reduce(probe, group=group)
+        name = group._get_backend(probe.device).get_hccl_comm_name(dist.get_rank())
+        self.group = name
+        self.resources = prepare_dsa_resources(group=name, rank=rank)
+        self.window = self.resources.window
+        self.outputs = self.resources.outputs
+        self.tables = self.resources.tables
+        self.backends = weakref.WeakSet()
+        self.runtimes = []
+        self.closed = False
+        try:
+            torch.npu.synchronize()
+            dist.barrier(group=cpu_group)
+            for layer in self.layers:
+                runtime = _RuntimeDSADecode(
+                    layer,
+                    rank=rank,
+                    group=pg.get_device_process_group(self.ranks),
+                    eps_q=layer.q_a_layernorm.variance_epsilon,
+                    eps_kv=layer.kv_a_layernorm.variance_epsilon,
+                    owner=self,
+                )
+                runtime.window = self.window
+                layer.configure_fused_decode(runtime)
+                self.runtimes.append(runtime)
+        except BaseException:
+            self.close()
+            raise
+
+    def bind_backend(self, backend):
+        if self.closed:
+            raise RuntimeError("DSA runtime is closed")
+        if backend in self.backends:
+            return
+        pending = [backend]
+        found = False
+        while pending:
+            node = pending.pop()
+            if isinstance(node, AscendDSABackend):
+                if tuple(node._dcp.ranks) != self.ranks:
+                    raise ValueError("DSA model and cache backend groups differ")
+                node.configure_fused_decode(
+                    group=self.group,
+                    attention_outputs=self.outputs,
+                    peer_inputs=self.tables,
+                )
+                found = True
+            pending.extend(node.child_backends())
+        if not found:
+            raise ValueError("Native DSA requires an Ascend DSA cache backend")
+        self.backends.add(backend)
+
+    def close(self):
+        """The caller has drained forwards and destroyed every referencing graph."""
+        if self.closed:
+            return
+        torch.npu.synchronize()
+        for layer in self.layers:
+            layer.configure_fused_decode(None)
+        for runtime in self.runtimes:
+            runtime.window = None
+        self.resources.release(self.window)
+        self.resources = None
+        self.window = None
+        self.outputs.clear()
+        self.tables.clear()
+        self.runtimes.clear()
+        self.backends.clear()
+        self.closed = True
+
 
 __all__ = [
     "AscendDSAAttention",
+    "AscendDSARuntime",
     "AscendDSAIndexer",
     "FusedDSADecode",
     "pack_qb_panels",

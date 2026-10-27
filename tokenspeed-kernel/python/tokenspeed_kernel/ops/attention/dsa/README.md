@@ -281,3 +281,15 @@ For non-cluster PDL grids with no more rows than SMs, the launcher selects a
 one-block register budget to reduce packing of waiting CTAs. Larger grids keep
 the two-block budget. Launch bounds guide register allocation; they are not a
 hard limit on resident CTAs. Both variants use the same radix algorithm.
+
+### FlashMLA query padding lifetime
+
+Sparse FlashMLA pads small query head counts to the kernel's supported width.
+Prefill and decode padding tensors are call-local: PyTorch's CUDA allocator
+reuses released storage with stream ordering, and allocations made during graph
+capture belong to the graph's private pool. Do not cache these writable tensors
+by shape: variable prefill lengths retain every allocation, and concurrent calls
+or independent graphs can overwrite each other's queries. Cross-stream users
+must still follow PyTorch's normal tensor synchronization/lifetime rules.
+Padding remains an exact copy of the original heads plus zero-filled extra
+heads; this changes neither arithmetic nor the supported numerics envelopes.

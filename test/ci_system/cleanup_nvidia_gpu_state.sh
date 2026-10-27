@@ -8,7 +8,7 @@ set +e
 
 WAIT_AFTER_TERM_SECS=${TOKENSPEED_NVIDIA_GPU_WAIT_AFTER_TERM:-3}
 WAIT_AFTER_KILL_SECS=${TOKENSPEED_NVIDIA_GPU_WAIT_AFTER_KILL:-5}
-STALE_CMD_RE='tokenspeed::|ts serve|python.*-m[[:space:]]+smg|smg::|smg_grpc_servicer'
+STALE_CMD_RE='tokenspeed::|ts serve|python.*-m[[:space:]]+smg|smg::|tokenspeed\.runtime\.entrypoints\.engine'
 
 _section() {
     echo ""

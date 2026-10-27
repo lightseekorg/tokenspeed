@@ -50,7 +50,7 @@ def test_stale_process_patterns_match_smg_router_proctitle():
     survive between runs and the next run hits port-bind conflicts."""
     sample_cmdlines = [
         "smg::router",
-        "smg::router --worker-urls grpc://127.0.0.1:1234",
+        "smg::router --worker-urls ipc:///tmp/smg-zmq/ts0.ipc",
     ]
     for cmdline in sample_cmdlines:
         assert any(
@@ -61,8 +61,8 @@ def test_stale_process_patterns_match_smg_router_proctitle():
 def test_stale_process_patterns_match_existing_targets():
     cmdlines = [
         "/usr/bin/python /usr/local/bin/ts serve --model foo",
-        "/usr/bin/python -m smg launch --worker-urls grpc://127.0.0.1:1234",
-        "/usr/bin/python -m smg_grpc_servicer.tokenspeed --host 127.0.0.1",
+        "/usr/bin/python -m smg launch --worker-urls ipc:///tmp/smg-zmq/ts-serve-1234",
+        "/usr/bin/python -m tokenspeed.runtime.entrypoints.engine --host 127.0.0.1",
         "/usr/bin/python /repo/test/runtime/run_ci_suite.py --device cuda",
     ]
     for cmdline in cmdlines:

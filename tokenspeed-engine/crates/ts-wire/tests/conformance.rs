@@ -437,6 +437,7 @@ fn output_slim() {
         num_waiting: 2,
         kv_active_pages: 1000,
         kv_total_pages: 4096,
+        kv_used_pages: 1500,
         ..no_tail()
     };
     let frames = fixture("output_slim");
@@ -507,6 +508,7 @@ fn no_tail() -> BatchTokenIDOutSlim {
         kv_active_pages: 0,
         kv_total_pages: 0,
         finish_reason_details: vec![],
+        kv_used_pages: 0,
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],
         input_token_logprobs_val: vec![],
@@ -612,6 +614,7 @@ fn handshake_hello() {
             local: Some(true),
             headless: Some(false),
             parallel_config_hash: Some(s("abc")),
+            engine_count: Some(2),
         },
     );
 }
@@ -666,6 +669,20 @@ fn handshake_ready_response() {
                 ("publisher".into(), "zmq".into()),
                 ("topic".into(), "".into()),
             ])),
+            request_types: vec![s("add"), s("abort"), s("control")],
+            positional_layouts: Dict(vec![(
+                s("ControlReplySlim"),
+                vec![s("call_id"), s("success")],
+            )]),
+            disaggregation_mode: Some(s("prefill")),
+            bootstrap_host: Some(s("10.0.0.7")),
+            bootstrap_port: Some(8998),
+            model_type: Some(s("qwen3_5")),
+            architectures: vec![s("Qwen3_5ForConditionalGeneration")],
+            mrope_positions: Some(true),
+            spatial_merge_size: Some(2),
+            image_token_id: Some(248056),
+            video_token_id: Some(248057),
         },
     );
 }

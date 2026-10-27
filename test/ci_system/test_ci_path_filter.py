@@ -124,6 +124,9 @@ def test_nvidia_owned_paths_require_only_nvidia_groups(path):
     [
         f"{KERNEL}/ops/layernorm/ascend.py",
         "test/ci_system/install_triton_ascend.sh",
+        "test/ci_system/npu/changes.py",
+        "test/ci/npu/manifest.json",
+        "test/ci/npu/tests/scatter-test.py",
     ],
 )
 def test_npu_owned_paths_require_no_gpu_group(path):

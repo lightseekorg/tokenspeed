@@ -20,9 +20,8 @@
 
 """The headless launcher: KV bootstrap hosting and scheduler supervision.
 
-Without an in-process frontend there is no ``AsyncLLM`` to start a prefill
-engine's KV bootstrap server, so the launcher does; and with nothing above it
-to clean up, the launcher must not wait forever on a scheduler that ignores
+The launcher starts a prefill engine's KV bootstrap server; and with nothing
+above it to clean up, it must not wait forever on a scheduler that ignores
 its termination.
 """
 
@@ -88,6 +87,18 @@ def test_other_launchers_start_none(mode, node_rank):
         _start_kv_bootstrap_server(_server_args(mode, get_free_port(), node_rank))
         is None
     )
+
+
+def test_a_headless_encode_server_hosts_its_own_bootstrap_server():
+    # Its first encode rank dials the frontend and hosts the EPD bootstrap
+    # server; the launcher starts none.
+    server_args = ServerArgs(
+        model="x",
+        disaggregation_mode="encode",
+        data_parallel_address="10.0.0.2",
+        data_parallel_rpc_port=31000,
+    )
+    assert _start_kv_bootstrap_server(server_args) is None
 
 
 def _exit_with(code: int) -> None:

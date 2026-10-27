@@ -59,7 +59,9 @@ Where it departs from ``docs/design/tree-speculation.md``:
   ``j // 64``), and its deepest lanes can write past the reserved next verify
   window, costing draft acceptance only. Its depth update writes the lane
   masks in place of ``draft_tree_expand``.
-* Sampled trees (``--enable-speculative-sampling``) draw each node's children
-  from the draft q (``RuntimeStates.future_draft_q``), which the verifier
-  accepts by recursive rejection sampling (``TreeRejectionSampler``).
+* Sampled trees and chains (``--enable-speculative-sampling``) draw each
+  node's children from the draft q (``RuntimeStates.future_draft_q``), which
+  the verifier accepts by recursive rejection sampling
+  (``TreeRejectionSampler``). A sampled round stops at a depth planned before
+  its draws, so where it stops never depends on them.
 """

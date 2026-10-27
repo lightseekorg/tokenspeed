@@ -366,6 +366,35 @@ def prepare_all_reduce_lane(
     return backend.prepare_all_reduce_lane(group, hidden_dim)
 
 
+def prepare_shard_exchange(
+    group: Group,
+    channels: int,
+    max_rows: int,
+    dtype: torch.dtype,
+    backend: CommBackend | None = None,
+) -> bool:
+    """Prepare a backend-owned exchange for even ``all_to_all_transpose`` /
+    ``all_to_all_head_scatter`` calls before graph capture.
+
+    Collective: every rank of ``group`` calls in the same order with the same
+    arguments (layers do it at build time, like ``prepare_all_reduce_lane``).
+
+    Args:
+        group: Global ranks of the exchange.
+        channels: The full feature width ``W * F_local`` of the exchanged rows.
+        max_rows: Rows per rank the prepared exchange serves; larger calls
+            and uneven row counts take the generic all-to-all.
+        dtype: Element type of the exchanged rows.
+        backend: Backend to prepare, or ``None`` for the global backend.
+
+    Returns:
+        Whether the backend prepared a dedicated exchange.
+    """
+    if backend is None:
+        backend = get_global_backend()
+    return backend.prepare_shard_exchange(group, channels, max_rows, dtype)
+
+
 def prepare_all_reduce_buffers(
     group: Group,
     *,
@@ -576,6 +605,12 @@ def all_to_all_transpose(
         # Nothing to move for the whole group (every rank reads the same
         # counts, so every rank skips the collective together).
         return x.new_empty(0, world_size * width)
+    if backend is None:
+        backend = get_global_backend()
+    if all(count == rows for count in input_split_sizes):
+        exchanged = backend.try_shard_exchange(x, group, inverse=True)
+        if exchanged is not None:
+            return exchanged
     received = x.new_empty(world_size * rows, width)
     all_to_all_single(
         received,
@@ -632,6 +667,14 @@ def all_to_all_head_scatter(
     if rows_full == 0:
         # Nothing to move for the whole group; every rank skips together.
         return x.new_empty(0, heads_local, dim)
+    if backend is None:
+        backend = get_global_backend()
+    if all(count == rows_own for count in output_split_sizes):
+        exchanged = backend.try_shard_exchange(
+            x.reshape(rows_own, heads * dim), group, inverse=False
+        )
+        if exchanged is not None:
+            return exchanged.view(rows_full, heads_local, dim)
     # Head block i (destined for rank i) becomes send chunk i.
     sent = (
         x.view(rows_own, world_size, heads_local * dim)

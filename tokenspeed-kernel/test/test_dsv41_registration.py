@@ -51,7 +51,8 @@ def log(phase):
         pass
 
 # Capture the child stack before the parent's 60-second timeout kills it.
-# Keep the watchdog armed through interpreter shutdown as well as imports.
+# The watchdog covers the import and check phases; a successful child skips
+# interpreter teardown through the os._exit below.
 faulthandler.enable()
 faulthandler.dump_traceback_later(45)
 
@@ -123,6 +124,11 @@ for round_index in range(2):
         assert implementation.__module__ == family + "." + module
     log(f"round {round_index + 1}: checks done")
 log("registration checks complete")
+# The registration contract is fully verified above, so skip interpreter
+# teardown: finalizing the imported native stacks has been seen to hang in
+# CI with the main thread outside Python, and teardown is not what this
+# subprocess verifies. os._exit keeps the exit status meaningful.
+os._exit(0)
 """
     try:
         result = subprocess.run(

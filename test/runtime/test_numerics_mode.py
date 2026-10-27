@@ -84,6 +84,16 @@ class TestNumericsMode:
         args = ServerArgs(model="x", numerics="rl-bitwise", world_size=1)
         assert not (args.enable_allreduce_fusion)
 
+    def test_batch_invariant_collectives_vetoes_the_fused_all_reduce_norm(self):
+        args = ServerArgs(model="x", enable_allreduce_fusion=True)
+        assert args.enable_allreduce_fusion and args.comm_fusion_max_num_tokens > 0
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
+        args = ServerArgs(
+            model="x", batch_invariant_collectives=True, enable_allreduce_fusion=True
+        )
+        assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
+
     def test_unknown_mode_is_rejected(self):
         with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="bitwise")
@@ -118,11 +128,12 @@ class TestNumericsMode:
         assert (ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm) == (
             "unfused"
         )
-        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
         args = ServerArgs(
             model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
         )
         assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
         with pytest.raises((ValueError), match=("--layer-boundary-norm")):
             ServerArgs(model="x", layer_boundary_norm="half")
 
@@ -164,24 +175,47 @@ class TestNumericsMode:
 
     def test_slot_combine_is_validated_against_the_launch_at_startup(self):
         # The slot fold runs over the EP group inside the leaf: a K-split down
-        # projection would need a second fold, and DeepEP owns the exchange.
+        # projection would need a second fold.
         ServerArgs(model="x", moe_combine_order="slot", world_size=2, ep_size=2)
         # MoE TP defaults to the stage world over EP, so world_size=2 alone
         # is MoE TP 2.
         with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", moe_combine_order="slot", world_size=2)
-        with pytest.raises((ValueError), match=("--all2all-backend deepep")):
-            ServerArgs(
-                model="x",
-                moe_combine_order="slot",
-                world_size=2,
-                ep_size=2,
-                all2all_backend="deepep",
-            )
+        # Under DeepEP the leaf owns the exchange; whether one declares both
+        # traits is the MoE plan's question, not the launch's.
+        args = ServerArgs(
+            model="x",
+            moe_combine_order="slot",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="auto",
+        )
+        assert not args.enforce_eager
         # The envelope inherits both refusals: rl-bitwise needs MoE TP 1.
         with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", numerics="rl-bitwise", world_size=2)
         ServerArgs(model="x", numerics="rl-bitwise", world_size=2, ep_size=2)
+
+    def test_deepep_normal_mode_runs_eager(self):
+        # The normal dispatch reads its receive counts on the host, so no
+        # decode graph can capture it; the low-latency legs keep the graphs.
+        normal = ServerArgs(
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="normal",
+        )
+        assert normal.enforce_eager
+        low_latency = ServerArgs(
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="low_latency",
+        )
+        assert not low_latency.enforce_eager
 
     def test_rl_bitwise_is_the_one_bitwise_envelope(self):
         from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES

@@ -807,6 +807,9 @@ if current_platform().is_nvidia:
     def trtllm_workspace_allreduce(
         input_tensor: torch.Tensor,
         group: dist.ProcessGroup,
+        *,
+        fp32_acc: bool,
+        out: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
         """Plain SUM all-reduce through the group's armed fusion workspace.
 
@@ -820,9 +823,16 @@ if current_platform().is_nvidia:
                 is treated as the hidden lane. A non-contiguous tensor is
                 served through a contiguous copy and is never mutated.
             group: process group to reduce over.
+            fp32_acc: Sum 16-bit partials in fp32. Every strategy then adds
+                ranks 0..n-1 left to right from rank 0's value and rounds
+                once (lamport sends -0.0 as +0.0), the rank-ordered fold;
+                these calls take mnnvl where it serves, and the IPC
+                two-shot, which keeps -0.0 sums, never.
+            out: Contiguous destination of the input's shape and dtype;
+                None allocates one.
 
         Returns:
-            The reduced tensor (new allocation, same shape), or ``None`` when
+            The reduced tensor (``out`` or a new allocation), or ``None`` when
             no workspace is armed for *group* or the shape is not served --
             the caller keeps its own (NCCL) fallback.
         """
@@ -863,27 +873,52 @@ if current_platform().is_nvidia:
             resolved_oneshot = manager.mnnvl_workspace.resolve_use_oneshot(
                 token_num, None, hidden_dim
             )
-        workspace = _ar_fusion_workspace(
-            manager,
-            token_num,
-            hidden_dim,
-            tensor_2d.dtype,
-            AllReduceFusionPattern.kAllReduce,
-            resolved_oneshot,
-            ipc_oneshot=requested_oneshot,
-        )
+        mnnvl = manager.mnnvl_workspace
+        if (
+            fp32_acc
+            and mnnvl is not None
+            and mnnvl.supports(
+                token_num,
+                hidden_dim,
+                tensor_2d.dtype,
+                world_size,
+                AllReduceFusionPattern.kAllReduce,
+                use_oneshot=resolved_oneshot,
+            )
+        ):
+            # The IPC two-shot keeps -0.0 sums, so the fold stays on mnnvl.
+            workspace = _mark_captured(manager, mnnvl)
+        else:
+            workspace = _ar_fusion_workspace(
+                manager,
+                token_num,
+                hidden_dim,
+                tensor_2d.dtype,
+                AllReduceFusionPattern.kAllReduce,
+                resolved_oneshot,
+                ipc_oneshot=requested_oneshot,
+            )
         if workspace is None:
             return None
         # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
         if workspace is not manager.mnnvl_workspace:
             resolved_oneshot = requested_oneshot
-            # The IPC two-shot kernel asserts token_num > world_size.
-            if not resolved_oneshot and token_num <= world_size:
+            # IPC two-shot needs token_num > world_size and keeps -0.0 sums.
+            if not resolved_oneshot and (token_num <= world_size or fp32_acc):
                 return None
         if not tensor_2d.is_contiguous():
             tensor_2d = tensor_2d.contiguous()
 
-        allreduce_out = torch.empty_like(tensor_2d)
+        if out is None:
+            allreduce_out = torch.empty_like(tensor_2d)
+        elif (
+            out.shape != input_tensor.shape
+            or out.dtype != input_tensor.dtype
+            or not out.is_contiguous()
+        ):
+            raise ValueError("out must be contiguous with the input's shape and dtype")
+        else:
+            allreduce_out = out.view(tensor_2d.shape)
         trtllm_allreduce_fusion(
             allreduce_in=tensor_2d,
             world_size=world_size,
@@ -893,7 +928,7 @@ if current_platform().is_nvidia:
             workspace_ptrs=workspace,
             use_oneshot=resolved_oneshot,
             trigger_completion_at_end=True,
-            fp32_acc=False,
+            fp32_acc=fp32_acc,
             pattern_code=AllReduceFusionPattern.kAllReduce,
             allreduce_out=allreduce_out,
         )

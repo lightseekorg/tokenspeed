@@ -80,6 +80,7 @@ import tokenspeed_kernel.ops.attention.triton as _attention_triton_merge_state
 import tokenspeed_kernel.ops.gemm as _gemm_pkg
 import tokenspeed_kernel.ops.gemm.cuda as _gemm_cuda
 import tokenspeed_kernel.ops.gemm.cute_dsl as _gemm_cute_dsl
+import tokenspeed_kernel.ops.gemm.deepgemm as _gemm_deepgemm
 import tokenspeed_kernel.ops.gemm.flashinfer as _gemm_flashinfer
 import tokenspeed_kernel.ops.gemm.gluon as _gemm_gluon
 import tokenspeed_kernel.ops.gemm.triton as _gemm_triton
@@ -189,6 +190,7 @@ _RELOAD_MODULES = [
     _gemm_reference,
     _gemm_cuda,
     _gemm_cute_dsl,
+    _gemm_deepgemm,
     _gemm_flashinfer,
     _gemm_gluon,
     _gemm_triton,
@@ -545,6 +547,375 @@ def _mm_mxfp8(m: int) -> torch.Tensor:
         block_size=[128, 128],
         quant="mxfp8",
     )
+
+
+@pytest.mark.parametrize("platform_fixture", ["b200_platform", "b300_platform"])
+@pytest.mark.parametrize(
+    ("m", "layout", "out_dtype", "solution", "expected"),
+    [
+        (16, "contiguous", torch.bfloat16, None, "flashinfer_mm_fp8_blockscale"),
+        (
+            17,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            31,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            32,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            33,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (
+            512,
+            "contiguous",
+            torch.bfloat16,
+            None,
+            "trtllm_cutedsl_mm_fp8_blockscale_large_m",
+        ),
+        (33, "contiguous", torch.float16, None, "flashinfer_mm_fp8_blockscale"),
+        (17, "contiguous", torch.float16, None, "triton_mm_fp8_blockscale"),
+        (16, "a_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (17, "a_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (17, "b_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (33, "a_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (33, "b_rows", torch.bfloat16, None, "torch_mm_fp8_blockscale"),
+        (17, "out_rows", torch.bfloat16, None, "triton_mm_fp8_blockscale"),
+        (33, "out_rows", torch.bfloat16, None, "flashinfer_mm_fp8_blockscale"),
+        (
+            16,
+            "contiguous",
+            torch.bfloat16,
+            "trtllm_cutedsl",
+            "trtllm_cutedsl_mm_fp8_blockscale",
+        ),
+        (
+            33,
+            "contiguous",
+            torch.bfloat16,
+            "flashinfer",
+            "flashinfer_mm_fp8_blockscale",
+        ),
+        (33, "contiguous", torch.bfloat16, "triton", "triton_mm_fp8_blockscale"),
+    ],
+)
+def test_blackwell_block_fp8_auto_boundary(
+    platform_fixture,
+    m,
+    layout,
+    out_dtype,
+    solution,
+    expected,
+    request,
+    selected_kernel_spy,
+):
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected_spec = registry.get_by_name(expected)
+    if expected_spec is None:
+        assert not _is_blackwell_plus(
+            host_platform
+        ), f"{expected!r} is not registered on {host_platform.device_name}"
+        pytest.skip(f"{expected!r} is not registered (optional backend missing)")
+    assert expected_spec.capability.satisfied_by(platform)
+    a = torch.empty((m * (2 if layout == "a_rows" else 1), 256), dtype=_fp8_dtype())
+    b = torch.empty((128 * (2 if layout == "b_rows" else 1), 256), dtype=_fp8_dtype())
+    out = torch.empty((m * (2 if layout == "out_rows" else 1), 128), dtype=out_dtype)
+    if layout == "a_rows":
+        a = a[::2]
+    if layout == "b_rows":
+        b = b[::2]
+    if layout == "out_rows":
+        out = out[::2]
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_blackwell_plus,
+        "blackwell-plus",
+        "gemm",
+        "mm",
+        expected,
+        lambda: None,
+    )
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        kernel_mm(
+            a,
+            b,
+            A_scales=torch.empty((m, 2), dtype=torch.float32),
+            B_scales=torch.empty((1, 2), dtype=torch.float32),
+            out_dtype=out_dtype,
+            out=out,
+            quant="mxfp8",
+            block_size=[128, 128],
+            solution=solution,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize(
+    ("operand", "large_m_fallback"),
+    [
+        ("a", "triton_mm_fp8_blockscale"),
+        ("b", "triton_mm_fp8_blockscale"),
+        ("a_scales", "flashinfer_mm_fp8_blockscale"),
+        ("b_scales", "flashinfer_mm_fp8_blockscale"),
+        ("out", "flashinfer_mm_fp8_blockscale"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("m", "solution"),
+    [(17, None), (33, None), (16, "trtllm_cutedsl"), (33, "trtllm_cutedsl")],
+)
+def test_block_fp8_unaligned_tensor_selection(
+    operand, large_m_fallback, m, solution, b200_platform, selected_kernel_spy
+):
+    """Offset views must not reach CuTe with unsupported pointer alignment."""
+    registry = KernelRegistry.get()
+    host_platform = Platform.get()
+    fallback = "triton_mm_fp8_blockscale" if m == 17 else large_m_fallback
+    if fallback is not None and registry.get_by_name(fallback) is None:
+        assert not _is_blackwell_plus(host_platform)
+        pytest.skip(f"{fallback!r} is not registered (optional backend missing)")
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_blackwell_plus, "blackwell-plus", "gemm", "mm", fallback, lambda: None
+    )
+    # K=128 makes both scale-layout normalizations no-ops, preserving offsets.
+    shapes = {
+        "a": (m, 128),
+        "b": (256, 128),
+        "a_scales": (m, 1),
+        "b_scales": (2, 1),
+        "out": (m, 256),
+    }
+    try:
+        Platform.override(b200_platform)
+        registry.clear_cache()
+        for offset in (16, 1):
+            tensors = {}
+            for name, shape in shapes.items():
+                dtype = _fp8_dtype() if name in ("a", "b") else torch.float32
+                if name == "out":
+                    dtype = torch.bfloat16
+                start = offset if name == operand else 0
+                storage = torch.empty(shape[0] * shape[1] + start, dtype=dtype)
+                tensors[name] = storage[start:].view(shape)
+            assert tensors[operand].is_contiguous()
+            assert (tensors[operand].data_ptr() % 16 == 0) == (offset == 16)
+            kwargs = dict(
+                A_scales=tensors["a_scales"],
+                B_scales=tensors["b_scales"],
+                out=tensors["out"],
+                out_dtype=torch.bfloat16,
+                quant="mxfp8",
+                block_size=[128, 128],
+                solution=solution,
+            )
+            if offset == 1 and solution is not None:
+                with pytest.raises(kernel_NoKernelFoundError):
+                    kernel_mm(tensors["a"], tensors["b"], **kwargs)
+            else:
+                kernel_mm(tensors["a"], tensors["b"], **kwargs)
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    aligned = (
+        "trtllm_cutedsl_mm_fp8_blockscale"
+        if m == 16
+        else "trtllm_cutedsl_mm_fp8_blockscale_large_m"
+    )
+    assert calls == ([aligned, fallback] if solution is None else [aligned])
+
+
+@pytest.mark.parametrize(
+    ("platform_fixture", "solution", "layout"),
+    [
+        ("b200_platform", "flashinfer", "a_rows"),
+        ("b200_platform", "flashinfer", "b_rows"),
+        ("b200_platform", "triton", "a_rows"),
+        ("b200_platform", "triton", "b_rows"),
+        ("h100_platform", "deepgemm", "a_rows"),
+        ("h100_platform", "deepgemm", "b_rows"),
+        ("h100_platform", "deepgemm", "out_rows"),
+        ("h100_platform", "deepgemm", "b_scales_rows"),
+    ],
+)
+def test_block_fp8_layout_rejected_before_launch(
+    platform_fixture,
+    solution,
+    layout,
+    request,
+    monkeypatch,
+):
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    spec = registry.get_by_name(f"{solution}_mm_fp8_blockscale")
+    if spec is None:
+        native = {
+            "flashinfer": host_platform.is_blackwell,
+            "triton": host_platform.is_nvidia or host_platform.is_amd,
+            "deepgemm": host_platform.is_hopper,
+        }[solution]
+        assert not native
+        pytest.skip(f"{solution!r} is not registered (optional backend missing)")
+
+    def reject_launch(*args, **kwargs):
+        pytest.fail("Layout-incompatible kernel reached execution")
+
+    monkeypatch.setattr(SelectedKernel, "__call__", reject_launch)
+    a = torch.empty((66 if layout == "a_rows" else 33, 256), dtype=_fp8_dtype())
+    b = torch.empty((512 if layout == "b_rows" else 256, 256), dtype=_fp8_dtype())
+    out = torch.empty((66 if layout == "out_rows" else 33, 256), dtype=torch.bfloat16)
+    sb = torch.empty((4 if layout == "b_scales_rows" else 2, 2), dtype=torch.float32)
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        with pytest.raises(kernel_NoKernelFoundError):
+            kernel_mm(
+                a[::2] if layout == "a_rows" else a,
+                b[::2] if layout == "b_rows" else b,
+                A_scales=torch.empty((33, 2), dtype=torch.float32),
+                B_scales=sb[::2] if layout == "b_scales_rows" else sb,
+                out=out[::2] if layout == "out_rows" else out,
+                out_dtype=torch.bfloat16,
+                quant="mxfp8",
+                block_size=[128, 128],
+                solution=solution,
+            )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+
+
+def test_block_fp8_deepgemm_contiguous_layout(
+    h100_platform,
+    selected_kernel_spy,
+):
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    expected = "deepgemm_mm_fp8_blockscale"
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_hopper,
+        "hopper",
+        "gemm",
+        "mm",
+        expected,
+        lambda: None,
+    )
+    try:
+        Platform.override(h100_platform)
+        registry.clear_cache()
+        kernel_mm(
+            torch.empty((33, 256), dtype=_fp8_dtype()),
+            torch.empty((128, 256), dtype=_fp8_dtype()),
+            A_scales=torch.empty((33, 2), dtype=torch.float32),
+            B_scales=torch.empty((1, 2), dtype=torch.float32),
+            out=torch.empty((33, 128), dtype=torch.bfloat16),
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=[128, 128],
+            solution="deepgemm",
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    assert calls == [expected]
+
+
+@pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["a_rows", "a_cols", "a_offset"])
+@pytest.mark.parametrize(
+    ("platform_fixture", "solution", "expected"),
+    [
+        ("b200_platform", "flashinfer", "flashinfer_mm_fp8_blockscale"),
+        ("b200_platform", "triton", "triton_mm_fp8_blockscale"),
+        ("b200_platform", "trtllm_cutedsl", "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+        ("h100_platform", "deepgemm", "deepgemm_mm_fp8_blockscale"),
+    ],
+)
+def test_block_fp8_online_quantization_layout(
+    input_dtype,
+    layout,
+    platform_fixture,
+    solution,
+    expected,
+    request,
+    monkeypatch,
+    selected_kernel_spy,
+):
+    platform = request.getfixturevalue(platform_fixture)
+    host_platform = Platform.get()
+    registry = KernelRegistry.get()
+    if registry.get_by_name(expected) is None:
+        assert not _is_blackwell_plus(host_platform)
+        pytest.skip(f"{expected!r} is not registered (optional backend missing)")
+    if layout == "a_offset":
+        a = torch.empty(33 * 256 + 1, dtype=input_dtype)[1:].view(33, 256)
+    else:
+        a = torch.empty(
+            (66, 256) if layout == "a_rows" else (33, 512), dtype=input_dtype
+        )
+        a = a[::2] if layout == "a_rows" else a[:, ::2]
+    quantized = []
+
+    def fake_quantize(x, block_size, scale_encoding, *, enable_pdl, kernel_name):
+        assert x.data_ptr() % 16 != 0 if layout == "a_offset" else not x.is_contiguous()
+        assert block_size == [128, 128] and scale_encoding == "float32"
+        quantized.append(x)
+        return torch.empty(x.shape, dtype=_fp8_dtype()), torch.empty(
+            (33, 2), dtype=torch.float32
+        )
+
+    monkeypatch.setattr(_gemm_pkg, "_online_quantize_mxfp8", fake_quantize)
+    active_case, calls = selected_kernel_spy
+    active_case["case"] = _case(
+        _is_hopper if solution == "deepgemm" else _is_blackwell_plus,
+        "hopper" if solution == "deepgemm" else "blackwell-plus",
+        "gemm",
+        "mm",
+        expected,
+        lambda: None,
+    )
+    try:
+        Platform.override(platform)
+        registry.clear_cache()
+        kernel_mm(
+            a,
+            torch.empty((128, 256), dtype=_fp8_dtype()),
+            B_scales=torch.empty((1, 2), dtype=torch.float32),
+            out_dtype=torch.bfloat16,
+            quant="mxfp8",
+            block_size=[128, 128],
+            solution=solution,
+        )
+    finally:
+        Platform.override(host_platform)
+        registry.clear_cache()
+    assert calls == [expected]
+    assert len(quantized) == 1 and quantized[0] is a
 
 
 def _mm_mxfp8_ue8m0(m: int, n: int, k: int) -> torch.Tensor:
@@ -5405,19 +5776,22 @@ _CASES = [
     ),
     *[
         _case(
-            _is_blackwell_sm100,
-            "blackwell-sm100",
+            _is_blackwell_plus,
+            "blackwell-plus",
             "gemm",
             "mm",
-            (
-                "triton_mm_fp8_blockscale"
-                if 17 <= m <= 32
-                else "flashinfer_mm_fp8_blockscale"
-            ),
+            expected,
             partial(_mm_mxfp8, m),
             id_suffix=f"fp8-rows-{m}",
         )
-        for m in (16, 17, 24, 32, 33)
+        for m, expected in (
+            (16, "flashinfer_mm_fp8_blockscale"),
+            (17, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (24, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (31, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (32, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+            (33, "trtllm_cutedsl_mm_fp8_blockscale_large_m"),
+        )
     ],
     # Attention API x architecture golden cases.
     _case(

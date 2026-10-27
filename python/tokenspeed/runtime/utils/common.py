@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import functools
 import io
@@ -664,57 +663,13 @@ def nullable_str(val: str):
     return val
 
 
-def launch_dummy_health_check_server(host, port, enable_metrics):
-
-    import uvicorn
-    from fastapi import FastAPI, Response
-
-    app = FastAPI()
-
-    @app.get("/health")
-    async def health():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    @app.get("/health_generate")
-    async def health_generate():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    # Add prometheus middleware
-    if enable_metrics:
-        add_prometheus_middleware(app)
-
-    config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        timeout_keep_alive=5,
-        loop="auto",
-        log_config=None,
-        log_level="warning",
-    )
-    server = uvicorn.Server(config=config)
-
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
-        )
-        loop.create_task(server.serve())
-
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
-        server.run()
-
-
 def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
     """Serve the engine's Prometheus /metrics endpoint on a daemon thread.
 
     With --enable-metrics every engine process on this node writes to the
     shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
-    engine's main process, which otherwise has no HTTP surface (the gRPC
-    servicer speaks gRPC only). The daemon thread keeps the synchronous
+    engine's main process, which otherwise has no HTTP surface (its frontend
+    speaks the msgpack wire only). The daemon thread keeps the synchronous
     launch path free of event-loop assumptions. The socket is bound eagerly
     on the calling thread, so a bind failure degrades to an error log and
     None — metrics must never take down serving — and the

@@ -25,18 +25,59 @@ from __future__ import annotations
 from dataclasses import replace
 
 import torch
-from tokenspeed_kernel.ops.attention.mla.ascend import ascend_mla_dcp_kernels
+from tokenspeed_kernel.ops.attention.mla.ascend import (
+    ascend_mla_dcp_kernels,
+    prepare_ascend_mla_prefill,
+)
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.configs.model_config import AttentionArch
-from tokenspeed.runtime.layers.attention.backends.paged.mla import MLAAttnBackend
-from tokenspeed.runtime.layers.attention.dcp.ascend import AscendDCPContext
+from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+    MLAAttnBackend,
+    MLAPrefillMetadata,
+)
+from tokenspeed.runtime.layers.attention.dcp.ascend import (
+    AscendDCPContext,
+    AscendPrefillCache,
+    AscendPrefillPlan,
+)
 from tokenspeed.runtime.layers.attention.dcp.metadata import (
     CompactDCPLayout,
     refresh_dcp_page_table_metadata,
 )
 from tokenspeed.runtime.layers.attention.dcp.placement import CachePlacement
 from tokenspeed.runtime.layers.attention.registry import register_backend
+
+
+def ascend_mla_prefill_backend(backend):
+    """Find the MLA leaf without adding prefetch hooks to shared routers."""
+    pending = [backend]
+    leaves = []
+    while pending:
+        node = pending.pop()
+        if isinstance(node, AscendMLABackend):
+            leaves.append(node)
+        else:
+            pending.extend(node.child_backends())
+    if len(leaves) != 1:
+        raise ValueError("MLA Prefill needs exactly one MLA cache leaf")
+    return leaves[0]
+
+
+def mla_prefill_spans(extends, prefixes, *, first, rows):
+    """Return local query slices and their causal starting KV positions."""
+    if len(extends) != len(prefixes) or min([first, rows, *extends, *prefixes]) < 0:
+        raise ValueError("MLA Prefill lengths and query partition are invalid")
+    if first + rows > sum(extends):
+        raise ValueError("MLA Prefill query partition exceeds the extend rows")
+    offset = 0
+    spans = []
+    for extent, prefix in zip(extends, prefixes, strict=True):
+        begin, end = max(first, offset), min(first + rows, offset + extent)
+        if begin < end:
+            spans.append((begin - first, end - first, prefix + begin - offset))
+        offset += extent
+    return tuple(spans)
 
 
 class AscendMLABackend(MLAAttnBackend):
@@ -80,13 +121,148 @@ class AscendMLABackend(MLAAttnBackend):
         self._local_views = {}
         self._page_metadata = {}
         self._current_local = None
+        self._prefill_runtime = None
+        self._prefill_plan: AscendPrefillPlan | None = None
+        self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
+        self._prefill_pages: torch.Tensor | None = None
+        self._prefill_options = None
+
+    @property
+    def native_prefill_enabled(self):
+        return self._prefill_options is not None
 
     def _publish_cache_pool(self, cache_pool):
+        self.close_prefill()
         super()._publish_cache_pool(cache_pool)
+        self._prefill_options = (
+            cache_pool.prefill_options
+            if isinstance(cache_pool, AscendPrefillCache)
+            else None
+        )
         self._page_metadata.clear()
         self._local_views.clear()
         self._current_local = None
         self._placement = None
+        self._prefill_plan = None
+        self._prefill_pages = None
+        self._prefill_spans = ()
+        self.prepare_prefill_workspace()
+
+    def prepare_prefill_workspace(self):
+        if not self.native_prefill_enabled:
+            return 0
+        if self._prefill_runtime is not None:
+            return self._prefill_runtime.workspace_bytes
+        if self.cache_pool is None:
+            raise RuntimeError("Bind the MLA cache before preparing Prefill")
+        from tokenspeed.runtime.distributed.process_group_manager import (
+            process_group_manager,
+        )
+
+        layer_id = min(self.cache_pool.history_group_by_layer())
+        kv = self.cache_pool.get_key_buffer(layer_id)
+        self._prefill_options.check_workspace(
+            local_rows=kv.numel() // 576, degree=self._dcp.degree, index_width=0
+        )
+        self._prefill_runtime = prepare_ascend_mla_prefill(
+            kv,
+            ranks=self._dcp.ranks,
+            bootstrap_group=process_group_manager.get_process_group(
+                "gloo", self._dcp.ranks
+            ),
+            max_current_rows=self._prefill_options.max_current_rows,
+        )
+        return self._prefill_runtime.workspace_bytes
+
+    def _init_prefill_metadata(self, **kwargs):
+        if not self.native_prefill_enabled:
+            return super()._init_prefill_metadata(**kwargs)
+        extends = kwargs["extend_seq_lens_cpu"].tolist()
+        prefixes = kwargs["extend_prefix_lens_cpu"].tolist()
+        cumulative = torch.zeros(
+            len(extends) + 1, dtype=torch.int32, device=kwargs["seq_lens"].device
+        )
+        torch.cumsum(kwargs["extend_seq_lens"], 0, out=cumulative[1:])
+        metadata = MLAPrefillMetadata(
+            **kwargs,
+            cum_extend_seq_lens=cumulative,
+            cum_seq_lens_kv=None,
+            max_extend_seq_len=max(extends, default=0),
+            max_extend_prefix_len=max(prefixes, default=0),
+            use_absorbed_cached_extend=False,
+            chunked_loop_num=0,
+            chunk_kv_indices_list=[],
+            chunked_seq_len=kwargs["seq_lens"][:0],
+            cu_chunked_seq_len=cumulative[:0],
+            max_chunk_len_per_loop=[],
+        )
+        if self._prefill_runtime is None or self._placement is None:
+            raise RuntimeError("Prepare MLA Prefill cache and geometry before metadata")
+        plan = AscendPrefillPlan.build(
+            metadata,
+            self._placement,
+            degree=self._dcp.degree,
+            rank=self._dcp.rank,
+            page_size=self.kernel_page_size,
+            topk=1,
+            local_cache_pages=self._prefill_runtime.local_rows // self.kernel_page_size,
+            query_partition=(0, sum(extends)),
+        )
+        self._prefill_plan = plan
+        self._prefill_pages = plan.page_table.long()
+        self._prefill_spans = mla_prefill_spans(
+            extends, prefixes, first=plan.row_start, rows=plan.row_end - plan.row_start
+        )
+        self.forward_prefill_metadata = metadata
+        self.chunked_prefill_metadata = metadata
+
+    def prefetch_prefill_layer(self, layer_id):
+        if self._prefill_runtime is None or self._prefill_plan is None:
+            raise RuntimeError("Prepare MLA Prefill workspace and metadata first")
+        self._prefill_runtime.prefetch(
+            layer_id,
+            self.cache_pool.get_key_buffer(layer_id),
+            None,
+            has_history=not self._prefill_plan.cold,
+        )
+
+    def start_prefill_kv(self, layer_id, latent):
+        if self._prefill_runtime is None or self._prefill_plan is None:
+            raise RuntimeError("Prepare MLA Prefill before producing current KV")
+        self._prefill_runtime.gather_current(
+            layer_id, latent, width=576, total_rows=sum(self._prefill_plan.row_counts)
+        )
+
+    def consume_prefill_kv(self, layer_id, slots):
+        if self._prefill_runtime is None or self._prefill_plan is None:
+            raise RuntimeError("Prepare MLA Prefill before consuming KV")
+        self._prefill_runtime.patch(
+            layer_id,
+            slots,
+            self._prefill_plan.current_direct,
+            width=576,
+            block_rows=self._placement.block_granularity,
+            virtual_blocks=self._placement.virtual_block_count,
+        )
+
+    def read_prefill_rows(self, sequence, begin, end):
+        """Read a bounded logical span; the mapped table is prepared on device."""
+        pages = self._prefill_pages[
+            sequence, begin // self.kernel_page_size : -(-end // self.kernel_page_size)
+        ]
+        cache = self._prefill_runtime.kv.view(-1, self.kernel_page_size, 576)
+        rows = cache.index_select(0, pages).flatten(0, 1)
+        return rows[
+            begin % self.kernel_page_size : begin % self.kernel_page_size + end - begin
+        ]
+
+    def finish_prefill_layer(self, layer_id):
+        self._prefill_runtime.finish(layer_id)
+
+    def close_prefill(self):
+        if self._prefill_runtime is not None:
+            self._prefill_runtime.close()
+            self._prefill_runtime = None
 
     def configure_runtime(
         self, *, block_granularity, virtual_block_count, shard_count, **kwargs
@@ -109,8 +285,30 @@ class AscendMLABackend(MLAAttnBackend):
         return False
 
     def _should_use_absorbed_cached_extend(self, **kwargs):
-        # The generic model's gathered-prefix path handles sharded history.
+        # Expanded prefill reads sharded history through read_prefix_history.
         return False
+
+    def read_prefix_history(self, pool, layer, chunk_kv_indices_list, *, dst_dtype):
+        if not chunk_kv_indices_list:
+            return iter(())
+        if self._dcp.degree == 1:
+            return super().read_prefix_history(
+                pool, layer, chunk_kv_indices_list, dst_dtype=dst_dtype
+            )
+        placement = self.cache_placement(layer)
+        rows = self._dcp.gather_cache_rows(
+            pool.get_key_buffer(layer.layer_id),
+            chunk_kv_indices_list,
+            block_granularity=placement.block_granularity,
+            virtual_block_count=placement.virtual_block_count,
+        )
+        return (
+            (
+                kv[..., : self.kv_lora_rank].to(dst_dtype).contiguous(),
+                kv[..., self.kv_lora_rank :].to(dst_dtype).contiguous(),
+            )
+            for kv in rows
+        )
 
     def refresh_decode_metadata(
         self,

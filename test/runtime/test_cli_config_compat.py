@@ -272,7 +272,6 @@ class TestCLIConfigCompat:
                 "deepseek_v4",
                 "--hf-overrides",
                 '{"rope_scaling": null}',
-                "--no-enable-log-requests",
                 "--no-trust-remote-code",
                 "--disable-prefix-caching",
                 "--quantization",
@@ -302,7 +301,6 @@ class TestCLIConfigCompat:
             "sampling_backend": "triton_full",
             "tokenizer_mode": "deepseek_v4",
             "hf_overrides": '{"rope_scaling": null}',
-            "enable_log_requests": False,
             "trust_remote_code": False,
             "enable_prefix_caching": False,
             "quantization": "mxfp4",
@@ -375,11 +373,6 @@ class TestCLIConfigCompat:
         sa = self._from_cli_args_no_init(args)
         sa.resolve_basic_defaults()
         assert (sa.kv_cache_dtype) == ("fp8_e4m3")
-
-    def test_log_requests_default_on(self):
-        args = self._parse_args(["--model", "test/model"])
-        assert args.enable_log_requests
-        assert (args.log_requests_level) == (0)
 
     def test_kv_events_config_arg(self):
         config = (
