@@ -94,6 +94,7 @@ RUNNER_GROUP_PATHS = {
         f"test/ci_system/{name}": frozenset({"amd-mi450"})
         for name in (
             "mi450_rocjitsu_worker_python.sh",
+            "mi450_sim_env.sh",
             "mi450_sim_report_digest.py",
             "run_mi450_rocjitsu.sh",
             "run_mi450_rocjitsu_parallel.sh",
@@ -340,6 +341,9 @@ def should_run_import_check(
     if runner_group not in AMD_ARCH_RUNNER_GROUPS.values():
         return False
     if event_name in {"workflow_dispatch", "schedule"}:
+        return True
+    # Both MI450 tasks consume the shared stack independently.
+    if runner_group == "amd-mi450" and "test/ci_system/mi450_sim_env.sh" in paths:
         return True
     for path in paths:
         if not is_in_directory(path, TASK_DIRECTORY) or not path.endswith(".yaml"):

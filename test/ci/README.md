@@ -316,6 +316,12 @@ The MI450 tasks use the existing CPU functional simulator; they do not measure
 GPU performance. Manual runs keep full coverage, and potentially truncated
 changed-path lists (300+ files) conservatively select full coverage.
 
+MI450 simulator tasks share their ROCm and PyTorch pins through
+`test/ci_system/mi450_sim_env.sh`. Each task sources it before running the
+simulator and dependency installers in the same shell; standalone simulator
+setup loads it as well. Update that file to change the stack: its pins override
+inherited environment values. Changes to it select both MI450 tasks.
+
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,
 touch kernel benchmark suites under `tokenspeed-kernel/benchmarks/` additionally

@@ -279,19 +279,12 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_wide_tile_preserves_strided_out
     tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_reuses_kernels_across_row_counts
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-False-64-gluon_mm_fp8_blockscale_gfx1250]
-  ROCM_NIGHTLY_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
-  # The PyTorch nightly requires this exact ROCm SDK build.
-  ROCM_SDK_VERSION: 10.2.0a20261010
-  # The rocm-systems revision that this ROCm SDK nightly was built from, as
-  # recorded in its share/therock/therock_manifest.json.
-  ROCM_SYSTEMS_REF: d5c528019d0fcfbbc32d96b53ac2c61df6d0e67d
-  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.2.0a20261010
-  TORCH_INDEX_URL: https://nightly.repo.amd.com/rocm/whl-next/
-  TORCH_VERSION: 2.14.0+rocm10.2.0a20261010
-  TORCHVISION_VERSION: 0.29.0+rocm10.2.0a20261010
 install:
-  - bash test/ci_system/setup_mi450_sim.sh
-  - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
+  - |
+    set -eu
+    . test/ci_system/mi450_sim_env.sh
+    bash test/ci_system/setup_mi450_sim.sh
+    WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
 ut:
   commands:
     - >-

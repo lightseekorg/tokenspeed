@@ -153,6 +153,7 @@ def test_unclassified_amd_paths_keep_both_full_suites(path):
     "name",
     [
         "setup_mi450_sim.sh",
+        "mi450_sim_env.sh",
         "run_mi450_rocjitsu.sh",
         "run_mi450_rocjitsu_parallel.sh",
         "mi450_rocjitsu_worker_python.sh",
