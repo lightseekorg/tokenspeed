@@ -32,7 +32,8 @@ if TYPE_CHECKING:
 
 def allreduce_residual_attnres_max_tokens(world_size: int) -> int:
     """Return K3's measured fused AttnRes window for this group size."""
-    return 16 if current_platform().is_cdna4 and world_size == 8 else 0
+    platform = current_platform()
+    return 16 if (platform.is_cdna4 or platform.is_cdna5) and world_size == 8 else 0
 
 
 class K3IrisState:

@@ -190,7 +190,7 @@ class K3AttnComm:
         from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
 
         if (
-            not current_platform().is_cdna4
+            not (current_platform().is_cdna4 or current_platform().is_cdna5)
             or like.ndim != 2
             or not _IRIS_ATTN_PRODUCER_DIRECT_MIN_TOKENS
             <= like.shape[0]
@@ -250,7 +250,7 @@ class K3AttnComm:
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Mix a prepared projection, retaining the MoE's local residual rows."""
         if (
-            not current_platform().is_cdna4
+            not (current_platform().is_cdna4 or current_platform().is_cdna5)
             or partial.ndim != 2
             or not _IRIS_ATTN_SHARDED_PREFIX_MIN_TOKENS
             <= partial.shape[0]

@@ -283,8 +283,17 @@ def _make_amd_moe(fork, *, routed, shared, projection, norm, mapping):
 @pytest.mark.parametrize(
     "graph_phase,capture_mode", [(False, False), (True, False), (True, True)]
 )
+@pytest.mark.parametrize(
+    "platform",
+    (
+        SimpleNamespace(is_cdna4=True, is_cdna5=False),
+        SimpleNamespace(is_cdna4=False, is_cdna5=True),
+    ),
+    ids=("cdna4", "cdna5"),
+)
 def test_row_sharded_moe_tail_selection_and_fallback(
     monkeypatch,
+    platform,
     rows,
     producer_direct,
     tp,
@@ -350,7 +359,7 @@ def test_row_sharded_moe_tail_selection_and_fallback(
         all_reduce=SimpleNamespace(owns_outputs=lambda tensors: producer_direct),
         reduce_moe=lambda tensors: joined(tensors, group),
     )
-    monkeypatch.setattr(mod, "current_platform", lambda: SimpleNamespace(is_cdna4=True))
+    monkeypatch.setattr(mod, "current_platform", lambda: platform)
     monkeypatch.setattr(mod, "all_reduce", joined)
     monkeypatch.setattr(mod, "get_is_cuda_graph_phase", lambda: graph_phase)
     monkeypatch.setattr(mod, "get_is_capture_mode", lambda: capture_mode)
@@ -416,7 +425,9 @@ def test_row_sharded_moe_tail_skips_iris_import_on_other_platform(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        mod, "current_platform", lambda: SimpleNamespace(is_cdna4=False)
+        mod,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=False, is_cdna5=False),
     )
     monkeypatch.setitem(
         sys.modules, "tokenspeed_kernel.ops.communication.iris", SimpleNamespace()

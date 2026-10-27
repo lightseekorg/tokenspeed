@@ -36,9 +36,18 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=2, suite="runtime-1gpu")
 
-# The iris cases drive the CDNA4 branch, which imports an AMD-only package.
+# The iris cases drive the CDNA4 and CDNA5 branches, which import an AMD-only
+# package.
 needs_iris = pytest.mark.skipif(
     find_spec("iris") is None, reason="iris is packaged for ROCm only"
+)
+cdna_platforms = pytest.mark.parametrize(
+    "platform",
+    (
+        SimpleNamespace(is_cdna4=True, is_cdna5=False),
+        SimpleNamespace(is_cdna4=False, is_cdna5=True),
+    ),
+    ids=("cdna4", "cdna5"),
 )
 
 from tokenspeed.runtime.models.kimi_k3_comm import (  # noqa: E402
@@ -88,16 +97,15 @@ def _capture_iris_preparation(monkeypatch):
 
 
 @needs_iris
-def test_nextn_reuses_target_iris_state(monkeypatch):
+@cdna_platforms
+def test_nextn_reuses_target_iris_state(monkeypatch, platform):
     from tokenspeed.runtime.distributed.mapping import Mapping
     from tokenspeed.runtime.models import kimi_k3
     from tokenspeed.runtime.models.kimi_k3_comm import K3AttnComm
     from tokenspeed.runtime.models.kimi_k3_nextn import KimiK3NextNForCausalLM
 
     prepare = _capture_iris_preparation(monkeypatch)
-    monkeypatch.setattr(
-        kimi_k3, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
-    )
+    monkeypatch.setattr(kimi_k3, "current_platform", lambda: platform)
     monkeypatch.setattr(K3AttnComm, "iris_states", {})
     mapping = Mapping(rank=0, world_size=8, attn_tp_size=8, moe_tp_size=8)
     config = SimpleNamespace(hidden_size=7168, routed_expert_hidden_size=3584)
@@ -155,9 +163,12 @@ def test_nextn_reuses_target_iris_state(monkeypatch):
     "max_rows,tail_rows",
     [(39, 0), (40, 40), (47, 40), (511, 504), (8192, 8192), (16384, 8192)],
 )
+@cdna_platforms
 def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
-    monkeypatch, pp_size, max_rows, tail_rows
+    monkeypatch, pp_size, max_rows, tail_rows, platform
 ):
+    from tokenspeed_kernel.ops.communication._iris import kimi_k3 as iris_k3
+
     from tokenspeed.runtime.models import kimi_k3
 
     group = tuple(range(8))
@@ -167,11 +178,8 @@ def test_iris_preparation_caps_attnres_for_equal_tp8_groups(
         moe=SimpleNamespace(tp_size=8, ep_size=1, tp_ep_size=8, tp_ep_group=group),
     )
     prepare = _capture_iris_preparation(monkeypatch)
-    monkeypatch.setattr(
-        kimi_k3,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
+    monkeypatch.setattr(kimi_k3, "current_platform", lambda: platform)
+    monkeypatch.setattr(iris_k3, "current_platform", lambda: platform)
 
     assert kimi_k3.prepare_k3_all_reduce_buffers(
         mapping=mapping,
@@ -532,7 +540,8 @@ def test_arming_declines_unsupported_collectives(monkeypatch, multicast, shape_o
         (8193, False),
     ],
 )
-def test_attention_producer_window(monkeypatch, rows, eligible):
+@cdna_platforms
+def test_attention_producer_window(monkeypatch, rows, eligible, platform):
     from tokenspeed.runtime.layers.dense import UnquantizedLinearMethod
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
@@ -556,9 +565,7 @@ def test_attention_producer_window(monkeypatch, rows, eligible):
     destination = Mock()
     acquire = Mock(return_value=(destination,))
     capability = Mock(return_value=True)
-    monkeypatch.setattr(
-        module, "current_platform", lambda: SimpleNamespace(is_cdna4=True)
-    )
+    monkeypatch.setattr(module, "current_platform", lambda: platform)
     monkeypatch.setattr(module, "can_acquire_all_reduce_outputs", capability)
     monkeypatch.setattr(module, "acquire_all_reduce_outputs", acquire)
     out = comm.acquire_projection_output(like, projection)
@@ -573,17 +580,20 @@ def test_attention_producer_window(monkeypatch, rows, eligible):
 
 
 @pytest.mark.parametrize(
-    "rows,is_cdna4,eligible",
+    "rows,is_cdna4,is_cdna5,eligible",
     [
-        (48, True, False),
-        (56, True, True),
-        (57, True, False),
-        (8192, True, True),
-        (8200, True, False),
-        (512, False, False),
+        (48, True, False, False),
+        (56, True, False, True),
+        (57, True, False, False),
+        (8192, True, False, True),
+        (8200, True, False, False),
+        (56, False, True, True),
+        (8192, False, True, True),
+        (8200, False, True, False),
+        (512, False, False, False),
     ],
 )
-def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
+def test_attention_mix_window(monkeypatch, rows, is_cdna4, is_cdna5, eligible):
     from tokenspeed.runtime.models import kimi_k3_comm as module
 
     group = tuple(range(8))
@@ -597,7 +607,9 @@ def test_attention_mix_window(monkeypatch, rows, is_cdna4, eligible):
     operation = Mock(return_value=expected)
     comm.iris_state = SimpleNamespace(attention_mix=operation)
     monkeypatch.setattr(
-        module, "current_platform", lambda: SimpleNamespace(is_cdna4=is_cdna4)
+        module,
+        "current_platform",
+        lambda: SimpleNamespace(is_cdna4=is_cdna4, is_cdna5=is_cdna5),
     )
     result = comm.mix_for_moe(
         partial,
