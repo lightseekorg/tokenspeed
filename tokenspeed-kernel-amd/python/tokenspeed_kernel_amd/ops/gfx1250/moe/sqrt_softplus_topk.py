@@ -83,6 +83,18 @@ def gluon_sqrt_softplus_topk_gfx1250(
     SPLIT: gl.constexpr,
     NUM_WARPS: gl.constexpr,
 ):
+    """Route one token: sqrt-softplus scores, then TOPK experts and weights.
+
+    Program ``token`` reads its E logits, summing SPLIT FP32 split-K partials
+    in order when SPLIT > 1, and scores them as sqrt(softplus). With
+    HASH_ROUTING the experts come from the hash table row of its input id.
+    Otherwise TOPK rounds each take the highest score, plus the bias when
+    HAS_BIAS, with ties to the lowest id and NaN ranked first, so every id
+    stays in range. Weights are
+    the unbiased scores, renormalized when RENORMALIZE and multiplied by
+    SCALE. EP and TKP are E and TOPK padded to the lane layouts, and
+    NEED_SCORES also writes every expert's score.
+    """
     token = gl.program_id(0)
     expert_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])
     topk_layout: gl.constexpr = gl.BlockedLayout([1], [32], [NUM_WARPS], [0])

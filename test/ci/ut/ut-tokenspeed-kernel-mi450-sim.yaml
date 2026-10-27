@@ -220,8 +220,10 @@ env:
     tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_public_entry_point_selects_and_captures
     tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_token_count_does_not_recompile
     # DeepSeek V4.1 router: the fused GEMV and sqrt-softplus top-k against the
-    # logits path, and top-k selection for biased and hash routing.
+    # logits path, one binary across token counts, and top-k selection for
+    # biased and hash routing.
     tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_fused_router_matches_logits_path[17-256]
+    tokenspeed-kernel/test/ops/moe/test_triton_dsv4_router.py::test_gfx1250_fused_router_reuses_compilation_across_token_counts
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/gluon_sqrt_softplus_topk_gfx1250/bias-tokens17@mi450]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.topk/gluon_sqrt_softplus_topk_gfx1250/hash@mi450]
     # Length-128 Hadamard: BF16 and FP32 against the Sylvester matrix, one

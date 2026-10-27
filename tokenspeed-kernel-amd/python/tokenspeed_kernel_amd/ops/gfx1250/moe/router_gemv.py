@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd._triton import gl, gluon
 
 __all__ = ["launch_gluon_router_sqrt_softplus_topk_gemv_gfx1250"]
 
@@ -60,8 +60,14 @@ def gluon_router_sqrt_softplus_topk_gemv_gfx1250(
     stride_pm,
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    M_TILES: gl.constexpr,
 ):
+    """Store one K split of ``x @ w.T`` for a BLOCK_N-expert tile, in FP32.
+
+    Program ``(n, k)`` loads its ``[BLOCK_K, BLOCK_N]`` weight tile once and
+    walks every 16-row tile of the M rows of ``x`` against it, writing
+    ``partials[k, :M, n * BLOCK_N:(n + 1) * BLOCK_N]``. The row-tile loop is
+    bounded at runtime, so one binary serves every batch size.
+    """
     pid_n = gl.program_id(0)
     pid_k = gl.program_id(1)
     wmma: gl.constexpr = gl.amd.AMDWMMALayout(
@@ -87,7 +93,7 @@ def gluon_router_sqrt_softplus_topk_gemv_gfx1250(
     cn = (
         pid_n * BLOCK_N + gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, wmma))[None, :]
     )
-    for t in gl.static_range(M_TILES):
+    for t in range(gl.cdiv(M, 16)):
         rows = t * 16 + am
         a = cdna5.buffer_load(
             x,
@@ -113,6 +119,11 @@ def launch_gluon_router_sqrt_softplus_topk_gemv_gfx1250(
     """Return FP32 split-K partials ``[K // block_k, M, N]`` of ``x @ weight.T``.
 
     Summing the partials over dim 0 in order yields the router logits.
+
+    Args:
+        x: BF16 activations ``[M, K]`` with unit stride along K.
+        weight: Contiguous BF16 router weight ``[N, K]``, N a multiple of 16.
+        block_k: Width of each K split; K must be a multiple of it.
     """
     tokens, hidden = x.shape
     experts = weight.shape[0]
@@ -140,7 +151,6 @@ def launch_gluon_router_sqrt_softplus_topk_gemv_gfx1250(
         partials.stride(1),
         BLOCK_N=block_n,
         BLOCK_K=block_k,
-        M_TILES=triton.cdiv(tokens, 16),
         num_warps=1,
     )
     return partials
