@@ -110,7 +110,10 @@ class BlockwiseGemmRunner(TunableRunner):
             )
         ]
 
-    def forward(self, inputs, tactic):
+    def forward(self, inputs, tactic=-1, do_preparation: bool = False):
+        if do_preparation:
+            # FlashInfer runs this phase only when a cache miss needs profiling.
+            _prepare(inputs[0].device, self.get_valid_tactics(inputs, None))
         return _run(*inputs, tactic)
 
 
@@ -158,10 +161,7 @@ def run(a, b, a_scales, b_scales, out):
         tuner.is_tuning_mode
         and "trtllm_cutedsl_fp8_blockscale" not in tuner._effective_skip_ops
     ):
-        # Cache hits skip profiling, so prepare variants explicitly on restart.
-        # All M/N/K remain dynamic; this work is done once per configuration/GPU.
         with torch.cuda.device(a.device):
-            _prepare(a.device, _runner.get_valid_tactics(inputs, None))
             runner, tactic = tuner.choose_one(
                 "trtllm_cutedsl_fp8_blockscale",
                 [_runner],

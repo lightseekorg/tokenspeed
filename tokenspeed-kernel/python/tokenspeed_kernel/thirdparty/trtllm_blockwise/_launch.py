@@ -139,6 +139,8 @@ def _run(a, b, a_scales, b_scales, out, tactic):
         tactic = (tile == 256, (tile, 128), (2 if tile == 256 else 1, 1))
     key = (a.device.index, tactic)
     if key not in _compiled:
+        # One eager launch also warms fixed tiles needed by later graph buckets.
+        prepare(a.device)
         with torch.cuda.device(a.device), _compile_lock:
             if key not in _compiled:
                 if torch.cuda.is_current_stream_capturing():

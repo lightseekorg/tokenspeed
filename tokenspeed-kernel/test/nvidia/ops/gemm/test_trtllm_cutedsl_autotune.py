@@ -92,7 +92,7 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
     for key in entries:
         m = ast.literal_eval(key)[2][0][0]
         configs[key][1] = (
-            [False, [64, 128], [1, 1]] if m == 32 else [True, [256, 128], [2, 1]]
+            [False, [64, 128], [1, 1]] if m == 32 else [True, [128, 128], [2, 1]]
         )
     Path(path).write_text(json.dumps(configs))
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
@@ -101,6 +101,20 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
     tuner.clear_cache()
     monkeypatch.setattr(launcher, "_compiled", {})
     assert load_autotune_cache(path, None, 0)
+
+    original_compile = launcher._compile
+    needed_tactics = {
+        (False, (64, 128), (1, 1)),
+        (False, (128, 128), (1, 1)),
+        (True, (256, 128), (2, 1)),
+        (True, (128, 128), (2, 1)),
+    }
+
+    def compile_loaded_tactic(*args):
+        assert args[-1] in needed_tactics, "Cache hit compiled an unused candidate"
+        return original_compile(*args)
+
+    monkeypatch.setattr(launcher, "_compile", compile_loaded_tactic)
 
     def unexpected_profile(*args, **kwargs):
         pytest.fail("Reloaded FP8 tactics must not be profiled again")
@@ -126,7 +140,7 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
         tensors = _inputs(m, 384, 256)
         _mm(tensors)
         assert selected[-1] == (
-            (False, (64, 128), (1, 1)) if m < 64 else (True, (256, 128), (2, 1))
+            (False, (64, 128), (1, 1)) if m < 64 else (True, (128, 128), (2, 1))
         )
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
@@ -159,6 +173,10 @@ def test_fp8_all_tactics_preserve_values_and_graph(monkeypatch):
     for m, n, k in ((1, 384, 256), (17, 384, 256), (129, 512, 512), (257, 640, 256)):
         inputs = _inputs(m, n, k)
         expected = _reference(inputs)
+        torch.testing.assert_close(
+            runner(inputs, do_preparation=True), expected, atol=1e-4, rtol=1e-2
+        )
+        torch.testing.assert_close(runner(inputs), expected, atol=1e-4, rtol=1e-2)
         tactics = runner.get_valid_tactics(inputs, None)
         assert (False, (64, 128), (1, 1)) in tactics
         assert (True, (128, 128), (2, 2)) in tactics
@@ -178,15 +196,14 @@ def test_fp8_all_tactics_preserve_values_and_graph(monkeypatch):
 
 
 @torch.inference_mode()
-def test_prepare_after_one_shape_warms_all_fallbacks(monkeypatch):
-    """An eager small-M call must not make prepare skip the larger graph tiles."""
+def test_eager_warmup_covers_all_fallback_tiles(monkeypatch):
+    """One eager fallback must prepare all fixed tiles before graph capture."""
     from tokenspeed_kernel.thirdparty import trtllm_blockwise as adapter
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
 
     AutoTuner.get().clear_cache()
     monkeypatch.setattr(launcher, "_compiled", {})
     adapter.blockwise_gemm(*_inputs(1, 256, 128))
-    adapter.prepare(torch.device("cuda", 0))
     inputs = _inputs(129, 256, 128)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):

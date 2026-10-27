@@ -29,15 +29,18 @@ adapter, including scale-layout copies, with CUDA graphs and a cold L2 cache.
 M uses powers-of-two buckets rounded down; N/K and the scale contract remain
 in the cache key. Activation scales and output rows follow each M bucket.
 The normal startup cache save/load path persists the selected configurations.
-Startup prepares valid dynamic-shape variants before tuning or using cached
-choices, so later M buckets do not require compilation during serving.
+FlashInfer's preparation phase compiles the valid dynamic-shape variants only
+when a tuning-cache miss needs profiling. Cache hits skip that phase and
+prepare the fixed fallback tiles and encountered winners during eager warmup.
 
 Outside the tuning context, calls use the cached choice. Without a matching
 entry, the previous rule applies: M <= 64 uses tile 64x128, M <= 128 uses
 128x128, and larger M uses 256x128 with 2-CTA instructions. `--disable-autotune`
-skips new searches; an existing loaded cache can still be used. Eager warmup
-must precede CUDA graph capture. `prepare(device)` prepares the three fallback
-configurations for callers that do not run startup tuning.
+skips new searches; an existing loaded cache can still be used. The first eager
+launch prepares all three fallback configurations. Loaded non-default winners
+must be warmed eagerly for their capture buckets; TokenSpeed's graph capture
+already runs each batch eagerly before capturing it. `prepare(device)` also
+prepares the three fallback configurations explicitly.
 The adapter passes the current PyTorch stream on every launch, so the same
 call path works in eager execution, auxiliary streams, and CUDA graphs.
 Input pointers and stream handles are never cached.
