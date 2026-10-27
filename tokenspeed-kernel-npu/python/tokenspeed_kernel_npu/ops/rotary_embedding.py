@@ -1,23 +1,3 @@
-# Copyright (c) 2026 LightSeek Foundation
-#
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in
-# all copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
-
 """Ascend rotary embedding operator."""
 
 from __future__ import annotations
@@ -37,12 +17,26 @@ def apply_rope(
     q_rope_out: torch.Tensor | None = None,
     k_rope_out: torch.Tensor | None = None,
 ) -> None:
-    """Apply RoPE to Q and K, writing into outputs or the inputs in place."""
+    """Apply RoPE to Q and K, writing into outputs or the inputs in place.
+
+    ``torch_npu.npu_mrope`` requires 2D ``queryIn``/``keyIn`` shaped
+    ``(numTokens, numHeads * headSize)`` (verified against the op-plugin
+    signature: "queryIn、keyIn、cosSinCache只支持2维shape输入"). The dense
+    prologue hands the RoPE channels as ``[numTokens, numHeads, headSize]``
+    (MLA passes the per-head RoPE slice), so heads are flattened into the
+    last dimension before the call and the outputs are reshaped back to the
+    input shapes for the in-place write. 2D inputs pass through unchanged.
+    """
     if not positions.numel():
         return
     key_only = not q.numel()
+    q_shape, k_shape = q.shape, k.shape
+    # npu_mrope requires 2D inputs; flatten per-head slices of a 3D prologue
+    # and reshape the outputs back. Empty queries (key-only RoPE) stay as-is.
+    q_in = q.reshape(q_shape[0], -1) if q.dim() > 2 and q.numel() else q
+    k_in = k.reshape(k_shape[0], -1) if k.dim() > 2 else k
     # aclnnRopeWithSinCosCache requires a nonempty query even for K-only RoPE.
-    native_q = k.new_zeros((positions.numel(), head_size)) if key_only else q
+    native_q = k_in.new_zeros(k_in.shape) if key_only else q_in
     native_positions = positions
     cache = cos_sin_cache
     if cache.dtype != native_q.dtype:
@@ -56,15 +50,15 @@ def apply_rope(
     q_out, k_out = torch_npu.npu_mrope(
         native_positions,
         native_q,
-        k,
+        k_in,
         cache,
         head_size,
         mrope_section=[0, 0, 0],
         rotary_mode="half" if is_neox else "interleave",
     )
     if not key_only:
-        (q if q_rope_out is None else q_rope_out).copy_(q_out)
-    (k if k_rope_out is None else k_rope_out).copy_(k_out)
+        (q if q_rope_out is None else q_rope_out).copy_(q_out.reshape(q_shape))
+    (k if k_rope_out is None else k_rope_out).copy_(k_out.reshape(k_shape))
 
 
 __all__ = ["apply_rope"]
