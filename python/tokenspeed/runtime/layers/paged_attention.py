@@ -495,7 +495,9 @@ class PagedAttention(nn.Module):
         ``extra_rows`` (``[local_rows, width]``, the latent's dtype) are
         concatenated after the rotated latent columns and all-gathered in the
         same collective as the shard's latent rows; they come back in span
-        order. The latent is rotated and stored exactly as
+        order. ``width`` must keep the latent half of the payload 16-byte
+        aligned (a multiple of 8 fp16/bf16 elements), which the latent store
+        slices require. The latent is rotated and stored exactly as
         :meth:`latent_prologue` does -- only the wiring differs, so the store
         writes the same bytes. Returns the prologue output and the gathered
         extra rows (``[total_rows, width]``).
@@ -520,6 +522,12 @@ class PagedAttention(nn.Module):
                 "extra rows must be a [local_rows, width] tensor of the latent's "
                 f"dtype: got {tuple(extra_rows.shape)} {extra_rows.dtype} for "
                 f"{plan.local_rows} rows of {latent_cache.dtype}"
+            )
+        if extra_rows.shape[1] * extra_rows.element_size() % 16:
+            raise ValueError(
+                "extra rows must keep the gathered latent half 16-byte aligned: "
+                f"got {extra_rows.shape[1]} elements of "
+                f"{extra_rows.element_size()} bytes, which is not a multiple of 16"
             )
         rotary = (
             None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions)
