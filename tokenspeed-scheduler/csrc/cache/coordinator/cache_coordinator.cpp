@@ -1426,10 +1426,13 @@ CacheBlockRef CacheCoordinator::AcquireDeviceCachedBlock(const CacheKey& key) co
     return groups_[key.group_id].Index().Find(pool_, key);
 }
 
-CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
-                                                                          std::span<const std::int32_t> buckets) {
+CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(
+    std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
+    std::span<const std::uint64_t> access_epochs) {
     _assert(host_pool_ != nullptr, "AcquireHostBlocks requires a host pool");
     _assert(group_ids.size() == buckets.size(), "Host allocation needs one bucket per requested block");
+    _assert(access_epochs.empty() || access_epochs.size() == group_ids.size(),
+            "Host allocation dates every requested block or none");
     HostAllocationBatch batch;
     batch.blocks.resize(group_ids.size());
     batch.stats.requested = group_ids.size();
@@ -1444,12 +1447,19 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         return refs.empty() ? CacheBlockRef{} : std::move(refs.front());
     };
 
+    // Candidate order, or newest first for dated blocks: a newer copy is
+    // placed before an older one competes for the same room.
+    std::vector<std::size_t> order(group_ids.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    if (!access_epochs.empty()) {
+        std::ranges::stable_sort(order, std::ranges::greater{}, [&](std::size_t i) { return access_epochs[i]; });
+    }
     std::vector<bool> needs_replacement(groups_.size(), false);
-    for (std::size_t i = 0; i < group_ids.size(); ++i) {
+    for (const std::size_t i : order) {
         _assert(group_ids[i] < groups_.size(), "Host block group id out of range");
         _assert(buckets[i] >= 0 && buckets[i] < groups_[group_ids[i]].Allocator().ShardCount(),
                 "Host block bucket is outside the group's shard count");
-        // Free capacity first, in candidate order.
+        // Free capacity first, in placement order.
         batch.blocks[i] = acquire_in_bucket(group_ids[i], buckets[i]);
         if (!batch.blocks[i]) {
             needs_replacement[group_ids[i]] = true;
@@ -1566,7 +1576,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         std::ranges::pop_heap(victim_parents, std::greater{});
         victim_parents.pop_back();
     };
-    for (std::size_t i = 0; i < group_ids.size(); ++i) {
+    for (const std::size_t i : order) {
         if (batch.blocks[i]) {
             continue;
         }
@@ -1604,8 +1614,16 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
             // Compare feasible reclamations across all groups. A foreign
             // parent costs every occupied child, so its newest child sets
             // the epoch. Equal epochs prefer evicting just one child.
-            if (has_child && (!has_parent || candidates.entries[candidates.next].metadata.last_access_epoch <=
-                                                 std::get<0>(victim_parents.front().first))) {
+            const bool evict_child =
+                has_child && (!has_parent || candidates.entries[candidates.next].metadata.last_access_epoch <=
+                                                 std::get<0>(victim_parents.front().first));
+            const std::uint64_t victim_epoch = evict_child
+                                                   ? candidates.entries[candidates.next].metadata.last_access_epoch
+                                                   : std::get<0>(victim_parents.front().first);
+            if (!access_epochs.empty() && victim_epoch >= access_epochs[i]) {
+                continue;  // every entry it could replace is at least as recent as its own
+            }
+            if (evict_child) {
                 // The retry above found no compatible hole. Releasing one
                 // Host child creates the only placement for its refill; its
                 // State cascade takes only other groups' entries.
@@ -1649,7 +1667,7 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
 CacheBlockRef CacheCoordinator::AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket) {
     const std::array groups{group_id};
     const std::array buckets{bucket};
-    HostAllocationBatch batch = AcquireHostBlocks(groups, buckets);
+    HostAllocationBatch batch = AcquireHostBlocks(groups, buckets, /*access_epochs=*/{});
     return batch.blocks.empty() ? CacheBlockRef{} : std::move(batch.blocks.front());
 }
 
@@ -3310,7 +3328,7 @@ CacheCoordinator::StorageReservation CacheCoordinator::ReserveStoragePrefix(cons
         }
         if (result.keys.empty()) return {};
         if (result.keys.size() + warm_blocks.size() <= max_blocks) {
-            auto allocation = AcquireHostBlocks(groups, buckets);
+            auto allocation = AcquireHostBlocks(groups, buckets, /*access_epochs=*/{});
             if (allocation.stats.allocated == groups.size()) {
                 result.blocks = std::move(allocation.blocks);
                 return result;

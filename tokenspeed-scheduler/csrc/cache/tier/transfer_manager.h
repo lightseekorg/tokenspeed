@@ -71,6 +71,8 @@ public:
     // -- already cached, carried by a store in flight that publishes them at
     // its ACK, or stored now -- are dated by the batch's epochs
     // (CacheCoordinator::TakeStoreEpochs); no other Host entry is refreshed.
+    // Its copies are placed newest first, each only in free capacity or in
+    // place of an older entry.
     std::optional<WriteBackOperation> StartPendingStores(
         StoreSourceGuard guard, HostStoreCause cause,
         const std::optional<CacheCoordinator::FinalPublication>& publication);

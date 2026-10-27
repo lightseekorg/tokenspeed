@@ -52,7 +52,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(
         return std::nullopt;
     }
     // The boundary's Host copies are refreshed first, so the allocation below
-    // does not take them as victims.
+    // evicts one only for a newer copy.
     CacheCoordinator::StoreEpochs epochs = coordinator_.TakeStoreEpochs(publication);
     std::vector<CacheKey> keys;
     std::vector<CacheBlockRef> device_block_refs;
@@ -124,7 +124,15 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(
         return std::nullopt;
     }
 
-    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(group_ids, buckets);
+    // A final publication's copies carry different dates -- one per page of
+    // its boundary, while an entry outside it keeps its Device date -- so they
+    // are placed newest first and each evicts only older entries: the batch
+    // never trades an entry for an older copy, which would be the next victim.
+    // A live batch dates every copy `base`, newer than any entry, and
+    // allocates in candidate order.
+    CacheCoordinator::HostAllocationBatch host_allocation = coordinator_.AcquireHostBlocks(
+        group_ids, buckets,
+        epochs.final_publication ? std::span<const std::uint64_t>(access_epochs) : std::span<const std::uint64_t>{});
     _assert(host_allocation.blocks.size() == keys.size(), "Host allocation result must stay aligned");
     stats.no_placement += host_allocation.stats.unallocated;
 

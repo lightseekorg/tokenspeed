@@ -593,13 +593,20 @@ public:
     // shortfall leaves an empty reference. Evicting a State checkpoint takes
     // the other State groups' at its hash along; every block retries free
     // capacity before it picks a victim, so it places in the room such a
-    // cascade freed before another victim goes. Block by block: it serves
+    // cascade freed before another victim goes. access_epochs, unless empty,
+    // are the epochs the blocks' entries will be published at: the blocks are
+    // placed newest first, and each evicts only entries older than its own
+    // (a parent: when its newest child is), so a copy never displaces a newer
+    // entry; a block that finds no such entry and no free capacity is a
+    // shortfall. Empty: any entry may be evicted. Block by block: it serves
     // publication and finish stores and L3 prefetches. A retraction image's
     // Host blocks come from AcquireHostBoundaries, whose per-block plan ranks
-    // victims as this does (change the two together), and the Host blocks of
-    // what an eviction writes back from AcquireHostSegments.
+    // victims as this does without access_epochs (change the two together),
+    // and the Host blocks of what an eviction writes back from
+    // AcquireHostSegments.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
-                                          std::span<const std::int32_t> buckets);
+                                          std::span<const std::int32_t> buckets,
+                                          std::span<const std::uint64_t> access_epochs);
     // One segment of an AcquireHostSegments batch, or one boundary of a
     // retraction image's (NumHostBoundariesThatFit): rows [first_row,
     // past_end_row) of its group_ids and buckets.
@@ -977,7 +984,8 @@ private:
     // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
     // carries out; by whole segments first with place_by_segments (the
     // write-back policy), else block by block alone. Its per-block victim
-    // ranking is AcquireHostBlocks'; change the two together.
+    // ranking is AcquireHostBlocks' without access_epochs; change the two
+    // together.
     HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
