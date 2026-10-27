@@ -13194,6 +13194,254 @@ TEST_P(ShardedImageWriteBackTest, AnImagesHostBlocksKeepTheirDeviceBlocksBuckets
     }
 }
 
+// ---------------------------------------------------------------------------
+// The eviction write-back across plans. A plan builds -- its admissions and
+// restores evict and record segments -- then drains the records into one op
+// (StartEvictionStores) and collects the dead entries (CollectDeadEntries),
+// as Scheduler::NextExecutionPlan does; the runtime acknowledges each op any
+// number of plans later. Until its last ACK, a segment's stores hold its tree
+// nodes (pending_host_stores); a later drain borrows the block of a key a
+// store still carries instead of copying it again; and the settlement at the
+// last ACK publishes the members, or cancels those no probe could resume
+// from any more.
+// ---------------------------------------------------------------------------
+
+// ASegmentPublishesOnlyAtItsLastAck's two ops: Y's segment borrows X's four
+// pages from X's op and copies its tail and checkpoints in an op of its own,
+// so it waits for both, in either ACK order. Between the two ACKs a request
+// over Y's prompt is retracted. Y's own keys are then landed but unpublished,
+// or on Y's op still out; an image borrows only from a store whose ACK
+// publishes, so it copies them once more, and X's pages too while X's op is
+// out. The segment publishes at its last ACK; the image's ACK merges each
+// copy into the entry the segment published (the index redirects the
+// publication), and the image follows it. One Host entry per key; once the
+// image is let go nothing is pinned or in flight, and the extra copies' Host
+// blocks are free again.
+TEST_F(ImageWriteBackTransactionTest, AnImageBetweenASegmentsTwoAcksCopiesItsKeysAgain) {
+    for (const bool own_op_first : {true, false}) {
+        SCOPED_TRACE(own_op_first);
+        std::vector<BlockTable> tables(4);
+        const TailPublication x_tail = *PublishFinal(tables, MakeTokens(18));
+        const std::vector<CacheKey> x = KeysOf(hashes_, x_tail);
+        coordinator_.Free(tables);
+        const std::optional<WriteBackOperation> x_op = EvictOldestAndDrain();
+        ASSERT_TRUE(x_op.has_value());
+        std::vector<std::int32_t> y_tokens = MakeTokens(18);
+        y_tokens[16] = 9000;
+        const TailPublication y_tail = *PublishFinal(tables, y_tokens);
+        coordinator_.Free(tables);
+        const std::vector<CacheKey> y_own = KeysOf({}, y_tail);
+        const std::optional<WriteBackOperation> y_op = EvictOldestAndDrain();
+        ASSERT_TRUE(y_op.has_value());
+        ASSERT_EQ(y_op->transfers.size(), 4u);
+        EXPECT_EQ(transfers_.CompleteWriteBack(own_op_first ? y_op->op_id : x_op->op_id).size(),
+                  own_op_first ? 0u : 8u);
+        EXPECT_EQ(HostEntries(y_own), 0);
+        const std::int32_t empty_parents = host_pool_.NumEmptyLcmBlocks();
+        const std::int32_t free_kv_slots = host_pool_.NumFreeSlots(0);
+
+        std::vector<BlockTable> image(4);
+        PublishFinal(image, y_tokens);
+        TierTransferManager::RetractionImageSplit split =
+            transfers_.SplitRetractionImage(image, 18, coordinator_.PublishedDataSlots(image, 18));
+        EXPECT_TRUE(split.pending_store_ops.empty()) << "nothing borrowed";
+        ASSERT_EQ(split.slots.size(), own_op_first ? 8u : 4u);
+        ASSERT_FALSE(split.shortfall.has_value());
+        std::optional<TierTransferManager::RetractionStores> stores = transfers_.StartRetractionStores(
+            "image", /*request_pool_index=*/1, std::make_shared<SnapshotSlotIndex>(blob_slots_.Allocate()), image, 18,
+            std::move(split));
+        ASSERT_TRUE(stores.has_value());
+        ASSERT_TRUE(stores->host_store.has_value());
+        coordinator_.Free(image);
+
+        EXPECT_EQ(transfers_.CompleteWriteBack(own_op_first ? x_op->op_id : y_op->op_id).size(),
+                  own_op_first ? 8u + 8u : 8u);
+        EXPECT_EQ(HostEntries(x), 8);
+        EXPECT_EQ(HostEntries(y_own), 4);
+        EXPECT_EQ(stores->host_store->transfers.size(), own_op_first ? 8u : 4u);
+        stores->image.FollowPublished(transfers_.CompleteWriteBack(stores->host_store->op_id));
+        for (const ImageTable& table : stores->image.tables) {
+            for (const ImageSlot& slot : table.slots) {
+                if (slot.InHostCache()) {
+                    EXPECT_EQ(slot.block, coordinator_.FindHostCachedBlock(slot.key));
+                }
+            }
+        }
+        transfers_.CompleteSnapshotStore(stores->snapshot_store.op_id);
+        stores.reset();
+        EXPECT_EQ(coordinator_.NumPinnedHostCachedBlocks(), 0);
+        EXPECT_FALSE(transfers_.HasAnyInFlight());
+        EXPECT_EQ(host_pool_.NumEmptyLcmBlocks(), empty_parents);
+        EXPECT_EQ(host_pool_.NumFreeSlots(0), free_kv_slots);
+        EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 8 + 4);
+        EXPECT_EQ(transfers_.WriteBackStatsFor(HostStoreCause::kEviction).cancelled, 0u);
+        ASSERT_TRUE(coordinator_.ClearCache());
+    }
+}
+
+// AnEvictionDrainBorrowsAnImagesTicket with an earlier eviction write-back's
+// ticket. The same prompt is published on the Device again while its
+// write-back is still out -- neither tier indexes it, so a later request
+// computed it again -- and a later plan evicts it again. That plan's drain
+// borrows every member from the op still out and issues no store of its own:
+// the second segment waits for the first one's op, and the two hold the tree
+// nodes together (pending_host_stores). The one ACK publishes both, in drain
+// order, onto the same Host entries: each key crossed once, and nothing stays
+// pinned or in flight.
+TEST_F(WriteBackTransactionTest, ADrainBorrowingAnEarlierWriteBackIssuesNoStore) {
+    const std::vector<std::int32_t> tokens = MakeTokens(18);
+    std::vector<BlockTable> tables(4);
+    const TailPublication tail = *PublishFinal(tables, tokens);
+    const std::vector<std::string> pages = hashes_;
+    const std::vector<CacheKey> keys = KeysOf(pages, tail);
+    coordinator_.Free(tables);
+    const std::optional<WriteBackOperation> op = EvictOldestAndDrain();
+    ASSERT_TRUE(op.has_value());
+    ASSERT_EQ(op->transfers.size(), 8u);
+    PublishFinal(tables, tokens);
+    coordinator_.Free(tables);
+
+    EXPECT_FALSE(EvictOldestAndDrain().has_value()) << "every member borrowed";
+    const TierTransferManager::WriteBackStats& stats = transfers_.WriteBackStatsFor(HostStoreCause::kEviction);
+    EXPECT_EQ(stats.ops, 1u);
+    EXPECT_EQ(stats.in_flight, 8u);
+    EXPECT_EQ(stats.blocks, (std::vector<std::uint64_t>{5, 1, 1, 1}));
+    for (const std::string& page : pages) {
+        EXPECT_EQ(NodeOf(page).pending_host_stores, 2) << "a hold per segment";
+    }
+    EXPECT_EQ(NodeOf(tail.hash).pending_host_stores, 2 * 4) << "the tail block and its checkpoints, twice";
+    EXPECT_EQ(HostEntries(keys), 0);
+
+    EXPECT_EQ(transfers_.CompleteWriteBack(op->op_id).size(), 8u + 8u) << "the first segment, then the second";
+    EXPECT_TRUE(transfers_.CompleteWriteBack(op->op_id).empty());
+    EXPECT_EQ(HostEntries(keys), 8);
+    EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 8);
+    EXPECT_EQ(host_pool_.NumEmptyLcmBlocks(), 32 - 5) << "two KV parents and three checkpoint parents";
+    EXPECT_EQ(stats.cancelled, 0u);
+    for (const std::string& hash : {pages[0], pages[1], pages[2], pages[3], tail.hash}) {
+        EXPECT_EQ(NodeOf(hash).pending_host_stores, 0);
+    }
+    EXPECT_EQ(coordinator_.NumPinnedHostCachedBlocks(), 0);
+    EXPECT_FALSE(transfers_.HasAnyInFlight());
+}
+
+// ASegmentPublishesOnlyAtItsLastAck's two ops, Y's own landing first. Eight
+// tails without a checkpoint then arrive under the last page, and the
+// per-prior cap drops X's tail and Y's while both segments are out. Each
+// segment is judged at its last ACK, as the Host then stands: the settlement
+// cancels a member no probe could resume from. X's settles first: its tail
+// and checkpoints are cancelled, and its pages publish, Y's checkpoints still
+// on their way under them. Y's then cancels all eight of its members: its
+// own copies, landed as they were, and the pages it borrowed, which X's
+// settlement just published. Once the next collection has run, nothing is
+// left of either session or of the eight tails, and nothing stays pinned or
+// in flight.
+TEST_F(WriteBackTransactionTest, TheCapCancelsASegmentBetweenItsTwoAcks) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(18));
+    const std::vector<std::string> pages = hashes_;
+    coordinator_.Free(tables);
+    const std::optional<WriteBackOperation> x_op = EvictOldestAndDrain();
+    ASSERT_TRUE(x_op.has_value());
+    std::vector<std::int32_t> y_tokens = MakeTokens(18);
+    y_tokens[16] = 9000;
+    PublishFinal(tables, y_tokens);
+    coordinator_.Free(tables);
+    const std::optional<WriteBackOperation> y_op = EvictOldestAndDrain();
+    ASSERT_TRUE(y_op.has_value());
+    ASSERT_EQ(y_op->transfers.size(), 4u);
+    EXPECT_TRUE(transfers_.CompleteWriteBack(y_op->op_id).empty()) << "Y waits for X's op";
+
+    PublishEightTailsWithoutCheckpoints(pages);
+    ASSERT_EQ(coordinator_.TailCapEvictions(), 2);
+    transfers_.CompleteWriteBack(x_op->op_id);
+    EXPECT_EQ(transfers_.WriteBackStatsFor(HostStoreCause::kEviction).cancelled, 4u + 8u);
+    coordinator_.CollectDeadEntries();
+    EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 0);
+    EXPECT_EQ(host_pool_.NumEmptyLcmBlocks(), 32);
+    EXPECT_EQ(Tree().Size(), 0u);
+    EXPECT_EQ(coordinator_.NumPinnedHostCachedBlocks(), 0);
+    EXPECT_FALSE(transfers_.HasAnyInFlight());
+}
+
+// Restore-only plans: a plan's one piece of work is a restore, which takes no
+// forward, so nothing in the plan waits for its write-back, and the ACK may
+// come any number of plans later. Five retracted requests' images, in the
+// snapshot pool, are restored in five plans; each restore finds three Device
+// parents spare and evicts the oldest of five finished sessions for the rest,
+// recording it as one segment; every plan drains and collects as the scheduler
+// does, and each op's ACK arrives one to five plans after its drain, out of
+// order, while later plans run. Until its ACK a session's stores alone hold
+// its tree nodes (pending_host_stores): neither tier holds it, and the
+// collection leaves it. Each ACK publishes its segment once, whole; a repeated
+// one publishes nothing. Once every ACK is in, the Host holds the five
+// sessions, no entry is pinned, nothing is in flight, and the cache clears.
+TEST_F(ImageWriteBackTransactionTest, RestoreOnlyPlansPublishEachSegmentOnceAtItsLateAck) {
+    std::vector<RetractionImage> images;
+    for (std::int32_t request = 0; request < 5; ++request) {
+        std::vector<BlockTable> tables(4);
+        ASSERT_TRUE(AdmitForTest(coordinator_, tables, kP));
+        std::optional<CacheCoordinator::ImageTaken> image = coordinator_.TakeImage(tables, kP, NoHostSlots(4));
+        ASSERT_TRUE(image.has_value());
+        image->store_pairs.clear();
+        coordinator_.Free(tables);
+        images.push_back(std::move(image->image));
+    }
+    std::vector<std::vector<CacheKey>> sessions;
+    for (std::int32_t session = 0; session < 5; ++session) {
+        std::vector<BlockTable> tables(4);
+        const TailPublication tail = *PublishFinal(tables, MakeTokens(18, 100 * (session + 1)));
+        sessions.push_back(KeysOf(hashes_, tail));
+        coordinator_.Free(tables);
+    }
+    // Before which plan each restore's write-back is acknowledged: one to five
+    // plans after the restore's own.
+    const std::array<std::int32_t, 5> ack_plan{0 + 3, 1 + 1, 2 + 5, 3 + 2, 4 + 4};
+    std::vector<WriteBackOperation> ops;
+    for (std::int32_t plan = 0; plan <= 8; ++plan) {
+        SCOPED_TRACE(plan);
+        std::vector<BlockTable> restored(4);
+        for (std::size_t session = 0; session < ops.size(); ++session) {
+            if (ack_plan[session] == plan) {
+                EXPECT_EQ(transfers_.CompleteWriteBack(ops[session].op_id).size(), 8u) << "session " << session;
+                EXPECT_TRUE(transfers_.CompleteWriteBack(ops[session].op_id).empty()) << "session " << session;
+            }
+        }
+        if (plan < 5) {
+            HoldFreeCapacity(pool_, /*spare_parents=*/3);
+            ASSERT_TRUE(RestoreDemands(coordinator_, images[static_cast<std::size_t>(plan)], restored,
+                                       {GroupDemand{.extent = DenseGrowth{0}, .reserve_tokens = 1},
+                                        GroupDemand{.extent = StateStep{StateStep::Kind::kKeep}},
+                                        GroupDemand{.extent = StateStep{StateStep::Kind::kKeep}},
+                                        GroupDemand{.extent = StateStep{StateStep::Kind::kKeep}}},
+                                       /*access_epoch=*/1));
+        }
+        std::optional<WriteBackOperation> op = transfers_.StartEvictionStores();
+        ASSERT_EQ(op.has_value(), plan < 5);
+        if (op) {
+            EXPECT_EQ(op->transfers.size(), 8u);
+            ops.push_back(std::move(*op));
+        }
+        coordinator_.CollectDeadEntries();
+        for (std::size_t session = 0; session < ops.size(); ++session) {
+            const bool landed = ack_plan[session] <= plan;
+            for (const CacheKey& key : sessions[session]) {
+                const Node* node = Tree().Find(key.content_hash);
+                ASSERT_NE(node, nullptr) << "session " << session;
+                EXPECT_EQ(node->pending_host_stores > 0, !landed) << "session " << session;
+                EXPECT_FALSE(node->on_device) << "session " << session;
+                EXPECT_EQ(coordinator_.ContainsHostCachedBlock(key), landed) << "session " << session;
+            }
+        }
+        coordinator_.Free(restored);
+    }
+    EXPECT_EQ(coordinator_.DeviceEvictions().restore.blocks, 5u * 8u);
+    EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 5 * 8);
+    EXPECT_EQ(coordinator_.NumPinnedHostCachedBlocks(), 0);
+    EXPECT_FALSE(transfers_.HasAnyInFlight());
+    EXPECT_TRUE(coordinator_.ClearCache());
+}
+
 // Random K3 sessions -- forked from earlier ones at random pages, resumed on
 // what either tier holds, with a checkpoint at a chunk end now and then --
 // published and evicted under pressure on a Device of 64 Full blocks, written
