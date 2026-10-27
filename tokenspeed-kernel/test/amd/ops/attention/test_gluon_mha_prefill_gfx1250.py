@@ -982,6 +982,7 @@ def test_mha_prefill_sink_lse_replay(
         )
     output, lse = result if return_lse else (result, None)
     patterns = ["normal", "sharp", "late_large"]
+    # 2**125 is finite in BF16; FP16 would store infinity.
     if sinks is not None and dtype == torch.bfloat16:
         patterns.append("large_sink")
     patterns.append("normal")
