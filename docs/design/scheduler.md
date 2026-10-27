@@ -151,6 +151,8 @@ capacity model (§1.4) states the same split.
 
 `holdsHeadOfLine` breaks the candidate loop after scheduling a chunk of a
 prefill that is still incomplete. Nothing behind it is scheduled that round.
+A resident chunk that fails admission ends the prefill phases too: admitting
+anything behind it would strand it.
 
 The reason is that per-chunk admission gives an in-progress prefill **no claim
 on the capacity it still needs**. Let a newcomer take pages while a prompt is
@@ -544,12 +546,17 @@ edges of the loop:
   next page is the preferred victim). It comes back through the restore
   phase, so the grant is redirected: to the next request whose admission
   failed for capacity this round (`AdmissionFeedback::capacity_blocked`, in
-  phase order), else to the first waiting prompt — granting the pages straight
-  back to the victim's own readmission is the loop the grant exists to break.
-  With nobody to redirect to, the victim is **not** retracted (except in the
-  empty-round retraction below, when a decode is left to take its pages): the
-  retraction would cost its image's copies and its restore and serve no one,
-  so it waits for a completion instead.
+  phase order), else to the first waiting prompt, else to a resident prefill
+  the head-of-line rule (§1.1) kept from trying this round — granting the
+  pages straight back to the victim's own readmission is the loop the grant
+  exists to break. The held-back prefill is who the victim's wait would
+  starve: behind a prefill blocked on its next chunk no other prefill runs,
+  so two prompts mid-prefill holding every page, with a waiting readmission
+  sealing new prompts and no decode left, would wait for a completion
+  nothing can bring. With nobody to redirect to, the victim is **not**
+  retracted (except in the empty-round retraction below, when a decode is
+  left to take its pages): the retraction would cost its image's copies and
+  its restore and serve no one, so it waits for a completion instead.
 - **A grant that cannot legally join its round's batch** (a fused prefill
   beside decodes outside mixed mode) still retracts one victim, and the next
   round's phase order (§3) tries the blocker before any other claim.
@@ -771,8 +778,8 @@ pages before the blocker: a generated token survives any later retraction, so
 each empty-round retraction that lets a decode run is progress no
 retract/restore cycle can undo. Granted to a prompt instead, the pages can go
 to one that blocks the same way on its next chunk and becomes the next
-victim; granted to nobody (the victim was the blocker and nobody else is
-blocked or waiting), the victim can be restored ahead of the decodes and take
+victim; granted to nobody (the victim was the blocker and no other request
+wants its pages), the victim can be restored ahead of the decodes and take
 the same pages back, round after round. A victim that is the blocker, with
 nobody to redirect to, is therefore retracted here whenever the round has a
 decode left to offer its pages to — there is no completion to wait for — and

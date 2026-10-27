@@ -204,7 +204,8 @@ private:
         Request* capacity_blocker{nullptr};
         // Every candidate whose admission failed for capacity this round, in
         // phase order (the blocker first). When the victim turns out to be
-        // the blocker itself, the next of these is who its pages serve.
+        // the blocker itself, the next of these, if any, is who its pages
+        // serve first (maybeRetractForCapacity lists the rest).
         std::vector<Request*> capacity_blocked;
 
         void NoteCapacityBlocked(Request* request) {

@@ -3543,6 +3543,209 @@ TEST_F(PrefillHeadOfLineSuite, BlockedLaterChunkDoesNotStartSubmittedRequest) {
     EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "the completed request keeps its pages";
 }
 
+// Two prompts mid-prefill hold every Device page while a retracted request
+// waits to restore: 13 physical pages -> 12 usable, one full-attention group
+// of 2-token pages, 8-token chunks, and the knob retracting the oldest decode
+// every sixth plan, under each Host write policy.
+class PrefillsHoldingTheDeviceSuite : public SchedulerTestSuite,
+                                      public ::testing::WithParamInterface<SchedulerConfig::HostWritePolicy> {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 13;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.host_write_policy = GetParam();
+        cfg.max_scheduled_tokens = 8;
+        cfg.debug_force_retraction_interval = 6;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// Validate refuses write-back on the fused role.
+INSTANTIATE_TEST_SUITE_P(HostWritePolicies, PrefillsHoldingTheDeviceSuite,
+                         ::testing::Values(SchedulerConfig::HostWritePolicy::kWriteThrough));
+
+// h, the head of line, blocks on its own next chunk and, as the largest
+// incomplete prefill, is the victim. Its admission is the only one that
+// failed: the head-of-line rule kept x from trying, and r's waiting restore
+// seals new prompts. No decode, no chunk and no copy is left to run, so a
+// completion never comes: h gives way to x.
+TEST_P(PrefillsHoldingTheDeviceSuite, ABlockedPrefillGivesWayToThePrefillItHoldsBack) {
+    // r decodes on 4 pages: its 3-page prompt and the decode page. Every
+    // Host store is acknowledged in the plan after its own: a pinned one in
+    // flight would hold off any retraction.
+    Submit(MakeRequestSpec("r", /*num_pages=*/3));
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("r", {7});
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("r", {7});
+
+    // h, a 10-page prompt, runs two chunks beside r; x, 9 pages, arrives.
+    Submit(MakeRequestSpec("h", /*num_pages=*/10, /*start=*/1001));
+    const ExecutionPlan h_first = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(h_first)->request_ids, std::vector<std::string>{"h"});
+    SendForwardDone("h");
+    AckWriteBacks(h_first);
+    Submit(MakeRequestSpec("x", /*num_pages=*/9, /*start=*/2001));
+    const ExecutionPlan h_second = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(h_second)->request_ids, std::vector<std::string>{"h"});
+    SendForwardDone("h");
+    AckWriteBacks(h_second);
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+    // h's last chunk does not fit beside r: h gives way to x, whose grant
+    // waits for the next prefill round (r's decode runs alone outside mixed
+    // mode).
+    const ExecutionPlan h_retracted = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(h_retracted), nullptr);
+    ASSERT_EQ(FindSnapshotStore(h_retracted)->request_ids, std::vector<std::string>{"h"});
+    ASSERT_EQ(FindForwardBatch(h_retracted)->request_ids, std::vector<std::string>{"r"});
+    SendForwardDone("r", {7});
+    AckImageStores(h_retracted);
+
+    // The knob retracts r; h restores onto its pages still cached; x runs
+    // its first chunk.
+    const ExecutionPlan h_restored = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(h_restored), nullptr);
+    ASSERT_EQ(FindSnapshotStore(h_restored)->request_ids, std::vector<std::string>{"r"});
+    ASSERT_NE(FindRestore(h_restored), nullptr);
+    ASSERT_EQ(FindRestore(h_restored)->request_ids, std::vector<std::string>{"h"});
+    ASSERT_EQ(FindForwardBatch(h_restored)->request_ids, std::vector<std::string>{"x"});
+    SendForwardDone("x");
+    AckImageStores(h_restored);
+    AckRestores(h_restored);
+    ASSERT_EQ(scheduler_->PrefillSize(), 2u) << "h and x mid-prefill";
+    ASSERT_EQ(scheduler_->RetractedSize(), 1u) << "r waits to restore";
+    ASSERT_EQ(scheduler_->AvailableLcmBlocks(), 0);
+
+    const ExecutionPlan gave_way = PlanOnce();
+    ASSERT_NE(FindSnapshotStore(gave_way), nullptr);
+    EXPECT_EQ(FindSnapshotStore(gave_way)->request_ids, std::vector<std::string>{"h"});
+    ASSERT_NE(FindForwardBatch(gave_way), nullptr);
+    ASSERT_EQ(FindForwardBatch(gave_way)->request_ids, std::vector<std::string>{"x"});
+    SendForwardDone("x");
+    AckImageStores(gave_way);
+
+    // From here every request finishes at the token its prompt ends with (r
+    // at its next decode), each copy acknowledged in the plan after its own.
+    for (std::int32_t round = 0;
+         round < 32 && (scheduler_->RequestTokenSize("h") != -1 || scheduler_->RequestTokenSize("x") != -1 ||
+                        scheduler_->RequestTokenSize("r") != -1);
+         ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        if (const ForwardBatch* batch = FindForwardBatch(plan)) {
+            for (std::size_t row = 0; row < batch->request_ids.size(); ++row) {
+                const std::string& id = batch->request_ids[row];
+                if (row < batch->NumExtends() &&
+                    batch->extend_prefix_lens[row] + batch->input_lengths[row] < batch->prefill_lengths[row]) {
+                    SendForwardDone(id);
+                    continue;
+                }
+                SendForwardDone(id, {7});
+                SendFinish(id);
+            }
+        }
+        AckImageStores(plan);
+        AckRestores(plan);
+    }
+    EXPECT_EQ(scheduler_->RequestTokenSize("h"), -1);
+    EXPECT_EQ(scheduler_->RequestTokenSize("x"), -1);
+    EXPECT_EQ(scheduler_->RequestTokenSize("r"), -1);
+}
+
+// Four decodes with declared budgets fill an 8-token budget at 2 tokens a
+// step beside d1, which declares none and so is the only request the victim
+// policy may take, and p, a 16-token prompt mid-prefill: 41 physical pages
+// -> 40 usable, one full-attention group of 2-token pages, mixed batches,
+// under each Host write policy.
+class DecodesFillingTheBatchSuite : public SchedulerTestSuite,
+                                    public ::testing::WithParamInterface<SchedulerConfig::HostWritePolicy> {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 41;
+        cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;
+        cfg.host_write_policy = GetParam();
+        cfg.max_scheduled_tokens = 8;
+        cfg.decode_input_tokens = 2;
+        cfg.enable_mixed_prefill_decode = true;
+        SetTestSnapshotPool(cfg);
+        return cfg;
+    }
+};
+
+// Validate refuses write-back on the fused role.
+INSTANTIATE_TEST_SUITE_P(HostWritePolicies, DecodesFillingTheBatchSuite,
+                         ::testing::Values(SchedulerConfig::HostWritePolicy::kWriteThrough));
+
+// d1 blocks on its next page while e1-e4 fill the batch, so the prefill
+// phases never run: the full batch, not the head-of-line rule, leaves p out,
+// and p could not run this round anyway. Nobody else's admission failed and
+// no prompt waits, so d1 waits for a completion instead of giving way to p.
+TEST_P(DecodesFillingTheBatchSuite, ABlockedDecodeDoesNotGiveWayToAPrefillTheFullBatchLeftOut) {
+    const std::map<std::string, std::int32_t> limits = {{"d1", 8},  {"e1", 12}, {"e2", 12},
+                                                        {"e3", 12}, {"e4", 12}, {"p", 2}};
+    Submit(RequestSpec{.request_id = "d1", .tokens = MakeTokens(2)});
+    for (std::int32_t i = 1; i <= 4; ++i) {
+        const std::string id = "e" + std::to_string(i);
+        Submit(
+            RequestSpec{.request_id = id, .tokens = MakeTokens(1, 1001 + 1000 * i), .max_new_tokens = limits.at(id)});
+    }
+    Submit(RequestSpec{.request_id = "p", .tokens = MakeTokens(16, 1001), .max_new_tokens = limits.at("p")});
+
+    // Lands every row of the plan; a request finishes at its limit (d1 at
+    // one it never declared).
+    std::map<std::string, std::int32_t> generated;
+    const auto land = [&](const ExecutionPlan& plan) {
+        if (const ForwardBatch* batch = FindForwardBatch(plan)) {
+            for (std::size_t row = 0; row < batch->request_ids.size(); ++row) {
+                const std::string& id = batch->request_ids[row];
+                if (row < batch->NumExtends() &&
+                    batch->extend_prefix_lens[row] + batch->input_lengths[row] < batch->prefill_lengths[row]) {
+                    SendForwardDone(id);
+                    continue;
+                }
+                SendForwardDone(id, {7});
+                if (++generated[id] == limits.at(id)) {
+                    SendFinish(id);
+                }
+            }
+        }
+        AckImageStores(plan);
+        AckRestores(plan);
+    };
+
+    // Every prompt prefills, p by its first chunk; then d1 and e1-e3 decode
+    // three times, e4 and p left out of the full batch.
+    for (std::int32_t round = 0; round < 4; ++round) {
+        const ExecutionPlan plan = PlanOnce();
+        ASSERT_EQ(FindSnapshotStore(plan), nullptr);
+        land(plan);
+    }
+
+    const ExecutionPlan blocked = PlanOnce();
+    ASSERT_EQ(FindForwardBatch(blocked)->request_ids, (std::vector<std::string>{"e1", "e2", "e3", "e4"}))
+        << "d1 blocks on its next page";
+    ASSERT_EQ(scheduler_->PrefillSize(), 1u) << "p mid-prefill";
+    EXPECT_EQ(FindSnapshotStore(blocked), nullptr) << "d1 gave way to p, which the full batch keeps out of the round";
+    EXPECT_TRUE(blocked.aborts.empty());
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    land(blocked);
+
+    // Then every request runs to its limit.
+    for (std::int32_t round = 0;
+         round < 32 &&
+         std::ranges::any_of(limits,
+                             [this](const auto& limit) { return scheduler_->RequestTokenSize(limit.first) != -1; });
+         ++round) {
+        land(PlanOnce());
+    }
+    for (const auto& [id, limit] : limits) {
+        EXPECT_EQ(scheduler_->RequestTokenSize(id), -1) << id;
+    }
+}
+
 // Exact-fit re-admission after a retract: the whole freed budget (pages AND any
 // stale decode reserve) must be spendable by the next request.
 class RetractExactFitSuite : public RetractSuite {

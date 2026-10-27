@@ -1071,13 +1071,14 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // The victim blocked on its own next page; it comes back through
             // the readmission phase. Its freed capacity goes to the next
             // request whose admission failed this round, else to the first
-            // waiting prompt -- granting it back to the victim's own
-            // readmission is the loop the grant exists to break. With nobody
-            // to serve, retracting it would only cost the image's copies and
-            // its restore: it waits for a completion instead. An empty round
-            // has no completion to wait for, and its decodes take the freed
-            // pages first (below): there the victim is retracted whenever a
-            // decode is left to serve.
+            // waiting prompt, else to a resident prefill the head-of-line
+            // rule kept from trying this round -- granting it back to the
+            // victim's own readmission is the loop the grant exists to break.
+            // With nobody to serve, retracting it would only cost the image's
+            // copies and its restore: it waits for a completion instead. An
+            // empty round has no completion to wait for, and its decodes take
+            // the freed pages first (below): there the victim is retracted
+            // whenever a decode is left to serve.
             const auto blocked = std::ranges::find_if(feedback.capacity_blocked, [victim](Request* request) {
                 // An earlier iteration may have retracted one of them.
                 return request != victim &&
@@ -1085,6 +1086,14 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             });
             const auto waiting = std::ranges::find_if(
                 candidates, [victim](Request* request) { return request != victim && request->Is<fsm::Submitted>(); });
+            // When the victim is a prefill, its chunk failed admission and the
+            // head-of-line rule kept every resident prefill behind it from
+            // trying this round (a forced victim sitting the round out is
+            // marked scheduled and stays out).
+            const auto held_back = std::ranges::find_if(candidates, [&build, victim](Request* request) {
+                return victim->Is<fsm::Prefilling>() && request != victim && request->Is<fsm::Prefilling>() &&
+                       !build.Scheduled(*request);
+            });
             const bool decode_left = std::ranges::any_of(candidates, [victim](Request* request) {
                 return request != victim && request->IsAnyOf<fsm::PrefillDone, fsm::Decoding>();
             });
@@ -1092,6 +1101,8 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
                 blocker = *blocked;
             } else if (waiting != candidates.end()) {
                 blocker = *waiting;
+            } else if (held_back != candidates.end()) {
+                blocker = *held_back;
             } else if (!empty_round || !decode_left) {
                 return;
             }
