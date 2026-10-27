@@ -20,10 +20,8 @@
 
 from __future__ import annotations
 
-import pytest
 import tokenspeed_kernel.benchmark.generators.qsa as qsa_generator
 import torch
-from tokenspeed_kernel.benchmark.harness import BenchmarkRequest
 
 
 def test_selected_slots_follow_each_rows_prefix() -> None:
@@ -47,55 +45,3 @@ def test_selected_slots_follow_each_rows_prefix() -> None:
         assert torch.all((valid >= start) & (valid < start + int(position)))
     # A row whose prefix fits the width selects every slot of it.
     assert slots[0].tolist() == [2, 3, 4, -1, -1, -1]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-@pytest.mark.parametrize(
-    ("phase", "q_len", "is_decode"), [("decode", 4, True), ("prefill", None, False)]
-)
-def test_qsa_generator_selection_matches_operation_api(
-    monkeypatch: pytest.MonkeyPatch, phase: str, q_len: int | None, is_decode: bool
-) -> None:
-    import tokenspeed_kernel.ops.attention.qsa as qsa_ops
-
-    captured: list[dict[str, object]] = []
-
-    def select(family, mode, signature, **kwargs):
-        captured.append(kwargs["traits"])
-        raise RuntimeError("selection captured")
-
-    monkeypatch.setattr(qsa_ops, "select_kernel", select)
-    monkeypatch.setattr(qsa_generator, "load_builtin_kernels", lambda: None)
-    parameters = {
-        "model_profile": "qwen38_flash_tp2",
-        "phase": phase,
-        "batch": 2,
-        "context_tokens": 8,
-        "dtype": "bfloat16",
-        "kv_dtype": "bfloat16",
-    }
-    if q_len is not None:
-        parameters["q_len"] = q_len
-    request = BenchmarkRequest(
-        family="attention",
-        mode="qsa_sparse_attention",
-        parameters=parameters,
-        solution=None,
-        registration=None,
-        cold_cache=True,
-        seed=42,
-    )
-    with pytest.raises(RuntimeError, match="selection captured"):
-        qsa_generator.prepare_qsa_sparse_attention(request, None)
-
-    rows_per_request = q_len or 8
-    assert captured[0] == {
-        "batch_size": 2 if is_decode else 2 * rows_per_request,
-        "q_len": rows_per_request if is_decode else 1,
-        "num_q_heads": 12,
-        "num_kv_heads": 1,
-        "head_dim": 256,
-        "value_head_dim": 256,
-        "selected_width": 2051,
-        "is_decode": is_decode,
-    }

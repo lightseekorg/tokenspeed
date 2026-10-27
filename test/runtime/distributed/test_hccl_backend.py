@@ -41,6 +41,55 @@ def test_hccl_all_reduce_uses_hccl_process_group(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("shape", [(), (1,), (7,), (3, 5), (512,)])
+@pytest.mark.parametrize("ranks", [2, 3, 8])
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_small_int64_max_preserves_every_bit_and_output_buffer(
+    monkeypatch, shape, ranks, contiguous
+):
+    count = torch.empty(shape).numel()
+    generator = torch.Generator().manual_seed(43)
+    values = torch.randint(
+        -(1 << 63), (1 << 63) - 1, (ranks, count), generator=generator
+    )
+    # Signed extremes and equal high words exercise unsigned low-word order.
+    values[:, 0] = -(1 << 63)
+    if count > 1:
+        values[:, 1] = (-3 << 32) | torch.linspace(
+            0, (1 << 32) - 1, ranks, dtype=torch.float64
+        ).to(torch.int64)
+    if count > 2:
+        values[0, 2] = (1 << 63) - 1
+    if contiguous:
+        tensor = values[ranks // 2].reshape(shape).clone()
+    elif len(shape) == 2:
+        tensor = values[ranks // 2].reshape(shape).t().contiguous().t()
+    else:
+        tensor = torch.empty((*shape, 2), dtype=torch.int64)[..., 0]
+        tensor.copy_(values[ranks // 2].reshape(shape))
+    original = values[ranks // 2].reshape(shape).clone()
+    backend = HcclBackend()
+    group = tuple(range(ranks))
+
+    def all_gather_single(output, input, actual_group):
+        assert actual_group == group
+        # The wire type must be AIV-compatible without converting the key.
+        assert input.dtype == output.dtype == torch.int32
+        torch.testing.assert_close(
+            input, original.view(-1).view(torch.int32), rtol=0, atol=0
+        )
+        output.view(torch.int64).copy_(values.view(-1))
+
+    monkeypatch.setattr(backend, "all_gather_single", all_gather_single)
+    result = backend.all_reduce(tensor, group, op=torch.distributed.ReduceOp.MAX)
+
+    assert result is tensor
+    assert result.shape == shape
+    torch.testing.assert_close(
+        result, values.amax(dim=0).reshape(shape), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("counts", [[8] * 8, [0] * 8, [8], [2, 1, 3], [0, 2, 1]])
 def test_token_all_gather_preserves_rank_order_without_repacking_equal_shards(
     monkeypatch, counts

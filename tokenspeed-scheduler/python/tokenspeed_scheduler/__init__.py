@@ -35,6 +35,11 @@ from tokenspeed_scheduler.tokenspeed_scheduler_ext import (
     SchedulerConfig,
 )
 
+StorageStats = _ext.StorageStats
+StorageConfig = _ext.StorageConfig
+StoragePressure = _ext.StoragePressure
+StorageKind = _ext.StorageKind
+
 PD = _ext.PD
 Cache = _ext.Cache
 Forward = _ext.Forward
@@ -62,6 +67,10 @@ Forward.Batch.__repr__ = _forward_batch_repr
 __all__ = [
     "Scheduler",
     "SchedulerConfig",
+    "StorageConfig",
+    "StoragePressure",
+    "StorageStats",
+    "StorageKind",
     "RequestSpec",
     "AttnKind",
     "CacheGroupConfig",

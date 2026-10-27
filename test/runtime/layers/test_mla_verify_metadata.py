@@ -80,6 +80,7 @@ def _run_mla_decode(
     backend.kv_cache_dim = 4
     backend.data_type = data_type
     backend.kernel_solution = None
+    backend.decode_kernel_plan = None
     backend._query_block_decode = {}
 
     layer = SimpleNamespace(

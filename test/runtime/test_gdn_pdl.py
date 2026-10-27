@@ -52,7 +52,12 @@ sys.path.insert(0, _TEST_DIR)
 sys.path.insert(0, os.path.dirname(_TEST_DIR))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=180, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=180,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="PDL requires NVIDIA SM90+",
+)
 
 pytestmark = pytest.mark.skipif(
     not current_platform().is_hopper_plus, reason="PDL requires NVIDIA SM90+"

@@ -249,6 +249,45 @@ Notes:
   0.9704 without speculative decoding (paired disagreement 10 versus 8, McNemar
   p ~ 0.81 -- within run-to-run noise), so the draft does not move accuracy.
 
+## MiniMax M3.1 {#minimax-m3-1}
+
+For checkpoints that declare `quant_method: mxfp8` with
+`moe_quant_algo: NVFP4`, TokenSpeed automatically selects `mxfp8_nvfp4`:
+projections use MXFP8 and routed experts use NVFP4. This quantization requires
+Blackwell.
+
+Download the target and bundled DSpark draft together. The draft is in the
+`dspark/` subdirectory and declares `DSparkMiniMaxDraftModel`. This example uses
+seven draft queries and an eight-token verify window; match those widths to
+the draft checkpoint's configuration.
+
+```bash
+model_dir=$(hf download MiniMaxAI/MiniMax-M3.1-Flash --quiet)
+
+tokenspeed serve "$model_dir" \
+    --tensor-parallel-size 4 \
+    --max-model-len 1048576 \
+    --gpu-memory-utilization 0.95 \
+    --attention-backend trtllm \
+    --kv-cache-dtype fp8 \
+    --moe-backend flashinfer_trtllm \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path "$model_dir/dspark" \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --prefix-granularity 128 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+Set `--speculative-num-steps` to the DSpark checkpoint's `block_size` and
+`--speculative-num-draft-tokens` to `block_size + 1`. See
+[Speculative decoding](../configuration/server.md#speculative-decoding) for
+the width conventions. To serve the target alone, drop the `--speculative-*`
+options.
+
 ## Kimi K2.5 / K2.6
 
 Kimi-style MoE launches usually need remote code, long context, reasoning and
@@ -345,8 +384,11 @@ Notes:
 - K3 uses the cache-group scheduler and KDA state groups.
 - On Blackwell, `--dense-gemm-backend trtllm_cutedsl` opts the
   block-FP8 attention projections into TRT-LLM CuTe-DSL: KDA fused QKV/gates and output,
-  and MLA fused QKV-a/gate, Q-b, and output. Omit it (or use `auto`) to keep
-  the existing backend selection. This shared option applies across models
+  and MLA fused QKV-a/gate, Q-b, and output. With `auto`, compatible GEMMs prefer
+  CuTe-DSL at M > 16 rows and FlashInfer at M <= 16. Unsupported CuTe-DSL inputs
+  retain compatible fallback selection. M is the actual GEMM row count,
+  not necessarily request concurrency. Explicit `trtllm_cutedsl` also selects
+  CuTe-DSL for smaller M. This shared option applies across models
   to standard 128x128 block-FP8 dense linears. BF16/NVFP4 linears, MXFP8,
   per-tensor FP8, specialized grouped projections, and routed experts are
   unchanged. It does not change tensor-parallel mapping.
@@ -1365,14 +1407,22 @@ tokenspeed serve nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 \
 Beam (`model_type=beam`, `BeamForCausalLM`) is a mixture-of-experts model
 with 52 decoder layers: 9 full-attention layers and 43 sliding-window layers
 with a 512-token window. Its BF16, FP8, and NVFP4 checkpoints run with the same
-command: the checkpoint's own quantization config selects the path, with no
-flag. Use these supported Hub revisions:
+NVIDIA command below: the checkpoint's own quantization config selects the
+path, with no flag. Use these supported Hub revisions:
 
 | Checkpoint | Revision |
 | --- | --- |
 | BF16 | `f40a3a29` |
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
+
+For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
+per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or
+dense gate/up projection. This reuses the BF16-rounded norm output and its
+existing quantizer contract. The consumer accepts at most 64 rows; other
+shapes and checkpoint formats retain their existing path. No extra flag is
+required. If the fused collective declines, the second norm fills the same
+buffers before the projection consumes them.
 
 The command below runs one TP8 replica over two 4-GPU nodes, as in the
 recipe's GB200 measurements. Run it on both nodes, changing only
@@ -1415,8 +1465,9 @@ Notes:
   `TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` unset. With the drafter the
   default batch limit is 80 requests, not 160.
 - Name no `--reasoning-parser` or `--tool-call-parser`. The bundled
-  `tokenspeed-smg==1.13.0.post20261016` that TokenSpeed pins reads the output
-  through the checkpoint's `response_template`.
+  `tokenspeed-smg` version pinned in
+  [python/pyproject.toml](https://github.com/lightseekorg/tokenspeed/blob/main/python/pyproject.toml)
+  reads the output through the checkpoint's `response_template`.
 
 The first start on a fresh machine tunes kernels for 30 to 45 minutes; pass
 `--engine-startup-timeout 5400`. Later starts reuse the caches.
@@ -1434,6 +1485,43 @@ and graph flags. For 512 requests, use `--max-num-seqs 512`,
 `--max-cudagraph-capture-size 512`, and
 `--cudagraph-capture-sizes 1 8 32 64 128 160 256 384 512`. Setting only the
 first one or two leaves larger decode batches outside the captured graph list.
+
+### AMD gfx950
+
+Beam supports BF16 and compressed-tensors dynamic W8A8 FP8 checkpoints on
+gfx950. The following configuration runs an eight-GPU FP8 target with a BF16
+DFlash2 drafter, mixed prefill/decode batching, and graph replay:
+
+```bash
+ts serve --model <beam-fp8-checkpoint-dir> \
+  --tensor-parallel-size 8 --ep-size 1 \
+  --dtype bfloat16 --kv-cache-dtype bfloat16 \
+  --attention-backend mha --moe-backend gluon --all2all-backend none \
+  --sampling-backend triton_full --grammar-backend xgrammar \
+  --disable-tf32 --layer-boundary-norm unfused \
+  --max-model-len 262144 --max-num-seqs 16 --chunked-prefill-size 8192 \
+  --prefill-graph-max-tokens 8192 \
+  --max-cudagraph-capture-size 16 --cudagraph-capture-sizes 1 2 4 8 16 \
+  --gpu-memory-utilization 0.85 --disable-kvstore --disable-prefix-caching \
+  --enable-mixed-batch --speculative-algorithm DFLASH \
+  --speculative-draft-model-path <beam-dflash2-checkpoint-dir> \
+  --speculative-draft-model-quantization unquant \
+  --drafter-attention-backend mha \
+  --speculative-num-steps 15 --speculative-num-draft-tokens 16 \
+  --host 127.0.0.1 --port 8000
+```
+
+For a BF16 target, use its checkpoint and `--moe-backend triton` with the
+same attention, dtype and unfused-boundary settings. Omit the speculative
+arguments for target-only decoding. The context and memory fraction above
+are starting budgets, not a capacity guarantee; check the startup allocation
+for the chosen checkpoint and request lengths.
+
+This recipe covers BF16 and FP8 checkpoints, not other quantization formats.
+
+Use the gateway dependencies pinned by this checkout and the original
+checkpoint chat template. Check raw generation, parsed chat/tool APIs,
+numerical parity and performance independently before deployment.
 
 ## Tuning order
 

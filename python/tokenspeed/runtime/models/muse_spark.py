@@ -37,6 +37,8 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
     mv,
+    mv_weightless_rmsnorm_gated_sigmoid,
+    mv_weightless_rmsnorm_gated_sigmoid_supported,
 )
 from tokenspeed_kernel.ops.layernorm import (
     affine_rmsnorm,
@@ -47,6 +49,8 @@ from tokenspeed_kernel.ops.moe import (
     FUSED_ROUTING_MAX_TOKENS,
     PreparedNvfp4Routing,
     bf16_moe_routes,
+    bf16_moe_routes_warmup,
+    gather_moe_routes,
     moe_sigmoid_bias_topk_routing,
     moe_topk,
     moe_warmup,
@@ -156,7 +160,7 @@ def _muse_all_reduce(
             tensor.dtype == torch.bfloat16
             and tensor.device == iris.all_reduce.device
             and tensor.is_contiguous()
-            and 0 < tensor.numel() <= iris.all_reduce.producer_direct_max_numel
+            and tensor.numel() > 0
             and tensor.numel() % (iris.world_size * 8) == 0
         ):
             results.append(iris.reduce(tensor))
@@ -224,6 +228,8 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         self.rank = tp_rank
         self.group = tp_group
         self.gather_column_view = replicated and replicate_for_owned_rows
+        # Every rank holds the whole weight, so a rank can project any columns.
+        self.replicated = replicated
         self.workspace = None
         self.multicast = None
         if tp_size > 1 and (not replicated or self.gather_column_view):
@@ -256,13 +262,19 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Apply an unbiased projection, writing into ``out`` when supplied."""
-        if x.shape[0] == 1 and (
-            (
-                current_platform().is_cdna4
-                and x.dtype == weight.dtype
-                and not _gemm_dispatch_required()
+        if (
+            current_platform().is_cdna4
+            and x.dtype == weight.dtype
+            and not _gemm_dispatch_required()
+            # Rows gemm.mm would route to gemm.mv go there directly, writing a
+            # contiguous ``out`` in place.
+            and (
+                x.shape[0] == 1
+                or ((out is None or out.is_contiguous()) and _use_mv(x, weight))
             )
-            or (
+        ) or (
+            x.shape[0] == 1
+            and (
                 not current_platform().is_cdna4
                 and resolve_kernel_override("gemm", "mm", None) is None
                 and _use_mv(x, weight)
@@ -710,10 +722,10 @@ class MuseSparkAttention(nn.Module):
                 layer_id > 0
                 and current_platform().is_cdna4
                 and mapping.pp_size == 1
-                and mapping.attn.tp_size == mapping.moe.ep_size
+                and mapping.attn.tp_size == mapping.moe.tp_ep_size
                 and mapping.attn.tp_size in (4, 8)
-                and mapping.moe.tp_size == 1
-                and mapping.attn.tp_group == mapping.moe.ep_group
+                and (mapping.moe.tp_size == 1 or mapping.moe.ep_size == 1)
+                and mapping.attn.tp_group == mapping.moe.tp_ep_group
                 and config.hidden_size == 8192
                 and config.num_attention_heads == 128
                 and config.num_key_value_heads == 16
@@ -798,21 +810,17 @@ class MuseSparkAttention(nn.Module):
         )
         self.iris_state: MuseIrisState | None = None
 
-    def _project_output(
-        self,
-        x: torch.Tensor,
-    ) -> torch.Tensor:
-        """Project ``x`` and defer the TP reduction to the consuming operation."""
+    def _acquire_projection_output(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Borrow the all-reduce producer buffer for the projection, if compatible."""
         linear = self.o_proj
-        if linear.tp_size == 1:
-            return RowParallelLinear.forward(linear, x)[0]
-        output = (
+        return (
             _acquire_all_reduce_output(
                 (x.shape[0], linear.output_size),
                 x,
                 linear.tp_group,
             )
-            if type(linear.quant_method) is UnquantizedLinearMethod
+            if linear.tp_size > 1
+            and type(linear.quant_method) is UnquantizedLinearMethod
             and linear.bias is None
             and linear.input_is_parallel
             and not linear.reduce_results
@@ -820,6 +828,14 @@ class MuseSparkAttention(nn.Module):
             and not _gemm_dispatch_required()
             else None
         )
+
+    def _project_output(
+        self,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project ``x`` and defer the TP reduction to the consuming operation."""
+        linear = self.o_proj
+        output = self._acquire_projection_output(x)
         return (
             RowParallelLinear.forward(linear, x)[0]
             if output is None
@@ -873,8 +889,28 @@ class MuseSparkAttention(nn.Module):
                 (self.q_size, self.kv_size, self.kv_size, self.q_size), dim=-1
             )
             output = self.attn(q, k, v, positions, ctx)
+        output = output.contiguous()
+        # One row normalizes and gates inside the output projection's GEMV.
+        projection_out = (
+            self._acquire_projection_output(output)
+            if output.shape[0] == 1
+            and mv_weightless_rmsnorm_gated_sigmoid_supported(
+                output, output_gate, self.o_proj.weight, self.num_heads, self.head_dim
+            )
+            else None
+        )
+        if projection_out is not None:
+            projected = mv_weightless_rmsnorm_gated_sigmoid(
+                output,
+                output_gate,
+                self.o_proj.weight,
+                self.num_heads,
+                self.rms_norm_eps,
+                projection_out,
+            )
+            return projected, None, 1
         output = weightless_rmsnorm_gated_sigmoid(
-            output.contiguous(),
+            output,
             output_gate,
             self.num_heads,
             self.head_dim,
@@ -936,6 +972,7 @@ class PreparedFP32RouterGEMV(nn.Module):
             output_size=output_size,
             dtype=torch.float32,
             solution=solution,
+            batch_invariant=global_server_args_dict["numerics"] in BITWISE_ENVELOPES,
         )
         self.register_buffer("prepared_weight", None, persistent=False)
 
@@ -981,7 +1018,7 @@ class MuseSparkRouter(PreparedFP32RouterGEMV):
 
 
 class MuseSparkMoE(nn.Module):
-    """Expert-parallel SwiGLU with per-route post normalization.
+    """Sharded SwiGLU experts with per-route post normalization.
 
     The experts run as raw BF16 weights through the portable Triton route
     kernel, or as FP4 weights through ``MoELayer``'s planned kernel when the
@@ -1003,14 +1040,18 @@ class MuseSparkMoE(nn.Module):
         self.stream_fork = StreamFork(alt_stream)
         if torch.get_default_dtype() != torch.bfloat16:
             raise ValueError("Muse Spark requires --dtype bfloat16")
-        if mapping.moe.tp_size != 1:
-            raise ValueError("Muse Spark MoE requires moe_tp_size=1")
-        if mapping.attn.tp_group != mapping.moe.ep_group:
+        if mapping.moe.tp_size > 1 and mapping.moe.ep_size > 1:
             raise ValueError(
-                "Muse Spark requires the attention TP and expert groups to match"
+                "Muse Spark MoE requires pure tensor or expert parallelism"
+            )
+        if mapping.attn.tp_group != mapping.moe.tp_ep_group:
+            raise ValueError(
+                "Muse Spark requires the attention TP and MoE groups to match"
             )
         if config.num_local_experts % mapping.moe.ep_size:
             raise ValueError("the expert count must divide evenly across EP ranks")
+        if config.moe_intermediate_size % mapping.moe.tp_size:
+            raise ValueError("the expert intermediate size must divide across TP ranks")
         self.num_experts = config.num_local_experts
         self.topk = config.num_experts_per_tok
         self.route_scale = config.routed_scaling_factor
@@ -1019,8 +1060,11 @@ class MuseSparkMoE(nn.Module):
         self.experts_per_rank = config.num_local_experts // self.ep_size
         self.expert_start = self.ep_rank * self.experts_per_rank
         self.ep_group = mapping.moe.ep_group
+        self.tp_rank = mapping.moe.tp_rank
+        self.tp_size = mapping.moe.tp_size
+        self.tp_group = mapping.moe.tp_group
         compressed_size = config.moe_hidden_size
-        intermediate_size = config.moe_intermediate_size
+        intermediate_size = config.moe_intermediate_size // self.tp_size
 
         self.gate = MuseSparkRouter(
             hidden_size=config.hidden_size,
@@ -1058,10 +1102,12 @@ class MuseSparkMoE(nn.Module):
                 top_k=self.topk,
                 num_experts=self.num_experts,
                 hidden_size=compressed_size,
-                intermediate_size=intermediate_size,
+                intermediate_size=config.moe_intermediate_size,
                 quant_config=quant_config,
                 layer_index=layer_id,
                 prefix=experts_prefix,
+                tp_rank=self.tp_rank,
+                tp_size=self.tp_size,
                 ep_rank=self.ep_rank,
                 ep_size=self.ep_size,
                 # "swiglu" would force one shared gate/up scale; this model is plain silu(gate) * up.
@@ -1126,9 +1172,57 @@ class MuseSparkMoE(nn.Module):
         *,
         owned_rows: bool,
     ) -> torch.Tensor:
-        """Normalize each route before weighting, then complete the EP sum."""
+        """Complete TP routes before normalization, or sum normalized EP routes."""
         norm = self.post_expert_norm
         iris = self.iris_state
+        if self.tp_size > 1:
+            assert norm.weight is not None
+            width = norm.weight.shape[0]
+            if owned_rows:
+                assert iris is not None
+                routes = iris.reduce_scatter_owned_routes(routes, route_map, num_tokens)
+                num_tokens = routes.shape[0]
+                first = iris.all_reduce.rank_in_group * num_tokens
+                route_weights = route_weights[first : first + num_tokens]
+                if route_weights.shape[0] < num_tokens:
+                    route_weights = torch.nn.functional.pad(
+                        route_weights, (0, 0, 0, num_tokens - route_weights.shape[0])
+                    )
+            elif route_map is not None:
+                output = _acquire_all_reduce_output(
+                    (num_tokens * self.topk, width), routes, self.tp_group
+                )
+                routes = gather_moe_routes(
+                    routes,
+                    route_map,
+                    num_tokens,
+                    self.topk,
+                    width,
+                    output=(
+                        output.reshape(num_tokens, self.topk, width)
+                        if output is not None
+                        else None
+                    ),
+                )
+            # Each TP rank contributes only its intermediate-column slice.
+            # RMSNorm must see the complete route before top-k weighting.
+            if not owned_rows:
+                # Routes already in the acquired producer views reduce without staging.
+                (routes,) = _muse_all_reduce(
+                    iris,
+                    (routes.reshape(num_tokens * self.topk, width),),
+                    self.tp_group,
+                )
+            # Consume borrowed collective storage before the next projection.
+            return routed_input_scale_rmsnorm_sum(
+                routes.reshape(num_tokens, self.topk, width),
+                route_weights,
+                norm.weight,
+                norm.eps,
+                norm.weight_offset,
+                pdl_enabled(),
+                None,
+            )
         if owned_rows:
             assert iris is not None and iris.can_use_owned_rows(num_tokens)
             if route_map is not None and norm.weight is not None:
@@ -1144,6 +1238,22 @@ class MuseSparkMoE(nn.Module):
                 )
                 if reduced is not None:
                     return reduced
+        if route_map is not None and norm.weight is None:
+            raise ValueError("routed gathered reduction requires an affine norm")
+        # Write the sum straight into the prepared all-reduce input that the
+        # collective below acquires again, instead of copying it there.
+        output = (
+            _acquire_all_reduce_output(
+                (
+                    num_tokens,
+                    routes.shape[-1] if route_map is None else norm.weight.shape[0],
+                ),
+                routes,
+                self.ep_group,
+            )
+            if current_platform().is_cdna4 and (owned_rows or self.ep_size > 1)
+            else None
+        )
         if route_map is None:
             combined = routed_input_scale_rmsnorm_sum(
                 routes,
@@ -1152,17 +1262,9 @@ class MuseSparkMoE(nn.Module):
                 norm.eps,
                 norm.weight_offset,
                 pdl_enabled(),
+                output,
             )
         else:
-            if norm.weight is None:
-                raise ValueError("routed gathered reduction requires an affine norm")
-            output = (
-                _acquire_all_reduce_output(
-                    (num_tokens, norm.weight.shape[0]), routes, self.ep_group
-                )
-                if current_platform().is_cdna4 and (owned_rows or self.ep_size > 1)
-                else None
-            )
             if (
                 not owned_rows
                 and iris is not None
@@ -1227,7 +1329,22 @@ class MuseSparkMoE(nn.Module):
         prepared: PreparedNvfp4Routing | None,
         owned_rows: bool,
     ) -> torch.Tensor:
-        """Run FP4 experts and normalize routes before their weighted EP sum."""
+        """Run FP4 experts and complete sharded routes before normalization."""
+        norm_weight = self.post_expert_norm.weight
+        iris = self.iris_state
+        deferred_out = None
+        if (
+            self.tp_size > 1
+            and self.ep_size == 1
+            and iris is not None
+            and norm_weight is not None
+            and norm_weight.shape == (4096,)
+            and self.experts.deferred_output_is_token_order
+            and self.experts.supports_deferred_out
+        ):
+            deferred_out = self._acquire_route_destination(
+                topk_ids.shape[0], owned_rows
+            )
         gemm2_out, _, expanded_idx = self.experts(
             hidden_states=compressed,
             topk_output=StandardTopKOutput(topk_weights, topk_ids, router_logits),
@@ -1236,17 +1353,50 @@ class MuseSparkMoE(nn.Module):
             do_finalize=False,
             x_quantized=compressed_quantized,
             routing_prepared=prepared,
+            deferred_out=deferred_out,
         )
+        if deferred_out is not None:
+            assert gemm2_out.data_ptr() == deferred_out.data_ptr()
         if prepared is None:
             self._prepare_routing(compressed_quantized, topk_ids, topk_weights)
-        # The permute map marks routes this rank does not own with -1; the
-        # kernel pads gemm2_out's hidden dimension.
+        if (
+            self.tp_size > 1
+            and self.ep_size == 1
+            and self.experts.deferred_output_is_token_order
+            and norm_weight is not None
+            and gemm2_out.shape == (topk_ids.numel(), norm_weight.shape[0])
+            and gemm2_out.is_contiguous()
+        ):
+            # EP1 owns every valid Muse route. Canonical, unpadded rows need
+            # no map gather before the TP reduction.
+            gemm2_out = gemm2_out.view(*topk_ids.shape, norm_weight.shape[0])
+            expanded_idx = None
+        # A supplied destination is canonical; gathering it would read itself.
+        assert deferred_out is None or expanded_idx is None
+        # Other deferred outputs retain their map and any hidden-width padding.
         return self._reduce_expert_routes(
             routes=gemm2_out,
             route_map=expanded_idx,
             num_tokens=topk_ids.shape[0],
             route_weights=topk_weights,
             owned_rows=owned_rows,
+        )
+
+    def _acquire_route_destination(
+        self, num_tokens: int, owned_rows: bool
+    ) -> torch.Tensor | None:
+        """Borrow the TP route reduction's input as ``[tokens * topk, width]``."""
+        iris = self.iris_state
+        norm_weight = self.post_expert_norm.weight
+        assert iris is not None and norm_weight is not None
+        if owned_rows:
+            return (
+                iris.acquire_owned_route_input(num_tokens)
+                if iris.owned_route_max_rows
+                else None
+            )
+        return _acquire_all_reduce_output(
+            (num_tokens * self.topk, norm_weight.shape[0]), norm_weight, self.tp_group
         )
 
     def _prepare_routing(
@@ -1313,12 +1463,16 @@ class MuseSparkMoE(nn.Module):
         num_global_tokens: int,
         max_num_tokens_per_gpu: int,
         owned_global_rows: int | None,
+        project: bool,
     ) -> tuple[torch.Tensor, int | None]:
         """Route BF16 ``hidden_states`` (router reads the FP32 ``router_input``) through the experts.
 
         The returned projection may defer its gather to the residual boundary.
+        Without ``project`` the combined expert rows are returned unprojected
+        for a boundary that applies ``post_expert_proj`` itself.
         """
-        # The graph phase warms the fork serially, so capture never first-touches it.
+        # Without an auxiliary stream (gfx950) the branch runs inline. Otherwise
+        # the graph phase warms the fork serially, so capture never first-touches it.
         with self.stream_fork.scope(
             enable=get_is_cuda_graph_phase(), overlap=get_is_capture_mode()
         ) as fork:
@@ -1331,7 +1485,10 @@ class MuseSparkMoE(nn.Module):
                 compressed = self.pre_expert_proj.forward_owned_rows(
                     hidden_states, output
                 )
-                if self.expert_quant_kind == "mxfp4":
+                if (
+                    self.expert_quant_kind == "mxfp4"
+                    and self.experts.supports_prequantized_input
+                ):
                     compressed_quantized = rmsnorm_mxfp4_quant(
                         compressed,
                         norm_weight,
@@ -1391,7 +1548,13 @@ class MuseSparkMoE(nn.Module):
                 topk_ids,
                 topk_weights,
                 owned_global_rows,
-                min(local_rows, max(0, owned_global_rows - self.ep_rank * local_rows)),
+                min(
+                    local_rows,
+                    max(
+                        0,
+                        owned_global_rows - iris.all_reduce.rank_in_group * local_rows,
+                    ),
+                ),
             )
             compressed_quantized = None
             router_logits = None
@@ -1418,6 +1581,15 @@ class MuseSparkMoE(nn.Module):
                 self.experts.w2_weight,
                 topk_ids.contiguous(),
                 self.expert_start,
+                output=(
+                    self._acquire_route_destination(
+                        compressed.shape[0], owned_global_rows is not None
+                    )
+                    if self.tp_size > 1 and self.iris_state is not None
+                    else None
+                ),
+                batch_invariant=global_server_args_dict["numerics"]
+                in BITWISE_ENVELOPES,
             )
             combined = self._reduce_expert_routes(
                 routes=routes,
@@ -1426,6 +1598,9 @@ class MuseSparkMoE(nn.Module):
                 route_weights=topk_weights,
                 owned_rows=owned_global_rows is not None,
             )
+        if not project:
+            assert owned_global_rows is None
+            return combined, None
         if owned_global_rows is not None:
             output = iris.acquire_owned_post_expert_output(
                 owned_global_rows, self.post_expert_proj.output_size
@@ -1660,13 +1835,60 @@ class MuseSparkDecoderLayer(nn.Module):
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
         )
+        post_norm = self.post_feedforward_layernorm
+        alpha, beta = self.post_feedforward_residual_gate._gate_coefficients()
+        next_weight, next_eps, next_weight_offset = (
+            (None, 0.0, 0.0)
+            if next_input_layernorm is None
+            else (
+                next_input_layernorm.weight,
+                next_input_layernorm.eps,
+                next_input_layernorm.weight_offset,
+            )
+        )
+        projection = self.mlp.post_expert_proj
+        # A few decode rows project only this rank's post-expert columns; the
+        # boundary gathers them, which beats streaming the replicated weight.
+        project_in_boundary = (
+            owned_global_rows is None
+            and self.iris_state is not None
+            and projection.replicated
+            and not projection.gather_column_view
+            and not _gemm_dispatch_required()
+            and resolve_kernel_override("residual", "post_norm_residual_pre_norm", None)
+            is None
+            and self.iris_state.can_gemv_all_gather_boundary(
+                mlp_input.shape[0],
+                projection.weight,
+                hidden_states,
+                post_norm.weight,
+                alpha,
+                beta,
+                next_weight,
+            )
+        )
         mlp_output, sentinel = self.mlp(
             mlp_input,
             router_input,
             num_global_tokens,
             max_num_tokens_per_gpu,
             owned_global_rows,
+            project=not project_in_boundary,
         )
+        if project_in_boundary:
+            return self.iris_state.gemv_all_gather_boundary(
+                mlp_output,
+                projection.weight,
+                hidden_states,
+                post_norm.weight,
+                alpha,
+                beta,
+                next_weight,
+                post_norm.eps,
+                post_norm.weight_offset,
+                next_eps,
+                next_weight_offset,
+            )
         boundary = (
             post_norm_residual_pre_norm_bf16
             if current_platform().is_cdna4
@@ -1675,17 +1897,14 @@ class MuseSparkDecoderLayer(nn.Module):
         boundary_outputs = boundary(
             hidden_states,
             mlp_output,
-            self.post_feedforward_layernorm.weight,
-            self.post_feedforward_layernorm.eps,
-            self.post_feedforward_layernorm.weight_offset,
-            *self.post_feedforward_residual_gate._gate_coefficients(),
-            next_input_layernorm.weight if next_input_layernorm is not None else None,
-            next_input_layernorm.eps if next_input_layernorm is not None else 0.0,
-            (
-                next_input_layernorm.weight_offset
-                if next_input_layernorm is not None
-                else 0.0
-            ),
+            post_norm.weight,
+            post_norm.eps,
+            post_norm.weight_offset,
+            alpha,
+            beta,
+            next_weight,
+            next_eps,
+            next_weight_offset,
             pdl_enabled(),
             None if owned_global_rows is not None else sentinel,
             1,
@@ -1752,8 +1971,14 @@ class MuseSparkModel(BaseTransformerModel):
         quant_config: QuantizationConfig | None,
         prefix: str,
     ) -> nn.ModuleList:
-        """Build the decoder layers around one shared auxiliary stream."""
-        self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
+        """Build decoder layers, sharing an auxiliary stream where enabled."""
+        # On gfx950 a CUDA-graph fork/join idles the GPU for longer than the
+        # router work it would hide, so the router runs in the main stream there.
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if torch.cuda.is_available() and not current_platform().is_cdna4
+            else None
+        )
         return make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: self.layer_cls(
@@ -1793,10 +2018,10 @@ class MuseSparkModel(BaseTransformerModel):
             and not ctx.forward_mode.is_idle()
             and not ctx.forward_mode.is_mixed()
             and mapping.pp_size == 1
-            and mapping.attn.tp_size == mapping.moe.ep_size
+            and mapping.attn.tp_size == mapping.moe.tp_ep_size
             and mapping.attn.tp_size in (4, 8)
-            and mapping.moe.tp_size == 1
-            and mapping.attn.tp_group == mapping.moe.ep_group
+            and (mapping.moe.tp_size == 1 or mapping.moe.ep_size == 1)
+            and mapping.attn.tp_group == mapping.moe.tp_ep_group
             and self.config.hidden_size == 8192
             and self.config.moe_hidden_size == 4096
             and self.config.num_local_experts == 256
@@ -1824,7 +2049,11 @@ class MuseSparkModel(BaseTransformerModel):
             ):
                 return False
         iris = self.iris_state
-        return iris is not None and iris.can_use_owned_rows(rows)
+        return (
+            iris is not None
+            and iris.can_use_owned_rows(rows)
+            and (mapping.moe.tp_size == 1 or rows <= iris.owned_route_max_rows)
+        )
 
     def forward(
         self,
@@ -2081,6 +2310,50 @@ def load_expert_input_scale(
     parameter.data.copy_(scales[expert_start : expert_start + local])
 
 
+def shard_expert_projection(
+    loaded_weight: torch.Tensor,
+    target: torch.Tensor,
+    tp_rank: int,
+    tp_size: int,
+    *,
+    gate_up: bool,
+    fused_gate_up: bool,
+) -> torch.Tensor:
+    """Select one TP slice in the checkpoint's packed-weight or scale units.
+
+    Gate and up own matching intermediate rows; the down projection owns the
+    corresponding input columns. Fused gate/up tensors need a slice from each
+    half, rather than one contiguous slice of their concatenation.
+
+    Args:
+        loaded_weight: Full expert projection or its block scales, after EP slicing.
+        target: Local parameter view, including only the selected gate/up half
+            for a separately stored projection.
+        tp_rank: Rank within the expert tensor-parallel group.
+        tp_size: Number of expert tensor-parallel ranks.
+        gate_up: Select output rows when true, or down-projection input columns.
+        fused_gate_up: Whether the loaded tensor concatenates both gate and up.
+
+    Returns:
+        The checkpoint shard corresponding to ``target``.
+    """
+    if tp_size == 1:
+        return loaded_weight
+    dim = -2 if gate_up else -1
+    width = target.shape[dim]
+    if fused_gate_up:
+        width //= 2
+        gate, up = loaded_weight.chunk(2, dim=dim)
+        return torch.cat(
+            (
+                gate.narrow(dim, tp_rank * width, width),
+                up.narrow(dim, tp_rank * width, width),
+            ),
+            dim=dim,
+        )
+    return loaded_weight.narrow(dim, tp_rank * width, width)
+
+
 class MuseSparkForConditionalGeneration(BaseCausalLM):
     """Muse Spark conditional generation model with shared vision and audio towers."""
 
@@ -2106,6 +2379,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         )
 
         capacity = min(max_num_tokens, 8192) * self.config.hidden_size
+        owned_route_max_rows = (
+            min(max_num_tokens, 8192)
+            if mapping.moe.tp_size > 1
+            and mapping.moe.ep_size == 1
+            and self.config.moe_hidden_size == 4096
+            and self.config.num_experts_per_tok == 8
+            else 0
+        )
         state = self.model.iris_state
         if state is None:
             state = prepare_muse_communication(
@@ -2114,13 +2395,17 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 staged_max_numel=min(capacity, (512 << 10) // torch.bfloat16.itemsize),
                 producer_direct_max_numel=capacity,
                 enable_lamport=True,
+                owned_route_max_rows=owned_route_max_rows,
                 all_reduce=backend.iris.state(group, torch.bfloat16),
                 device=torch.device(f"cuda:{torch.cuda.current_device()}"),
             )
             backend.iris.install(group, state.all_reduce)
             backend.iris.install_all_gather(group, state.gather)
             backend.iris.install_broadcast(group, state.broadcast)
-        elif state.all_reduce.producer_direct_max_numel < capacity:
+        elif (
+            state.all_reduce.producer_direct_max_numel < capacity
+            or state.owned_route_max_rows < owned_route_max_rows
+        ):
             raise RuntimeError(
                 "Muse communication was prepared below the requested capacity"
             )
@@ -2321,6 +2606,14 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 if half is not None:
                     rows = target.shape[0] // 2
                     target = target.narrow(0, half * rows, rows)
+                loaded_weight = shard_expert_projection(
+                    loaded_weight,
+                    target,
+                    moe.tp_rank,
+                    moe.tp_size,
+                    gate_up=half is not None,
+                    fused_gate_up=False,
+                )
                 if target.shape != loaded_weight.shape:
                     raise ValueError(
                         f"checkpoint tensor '{name}' has shape "
@@ -2345,10 +2638,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
                 if parameter_name.endswith("_input_scale"):
                     load_expert_input_scale(parameter, loaded_weight, moe.expert_start)
                     continue
-                default_weight_loader(
-                    parameter,
-                    loaded_weight.narrow(0, moe.expert_start, moe.experts_per_rank),
+                loaded_weight = loaded_weight.narrow(
+                    0, moe.expert_start, moe.experts_per_rank
                 )
+                if parameter_name.endswith(("_weight", "_weight_scale")):
+                    gate_up = ".w13_" in parameter_name
+                    loaded_weight = shard_expert_projection(
+                        loaded_weight,
+                        parameter,
+                        moe.tp_rank,
+                        moe.tp_size,
+                        gate_up=gate_up,
+                        fused_gate_up=gate_up,
+                    )
+                default_weight_loader(parameter, loaded_weight)
                 continue
             if parameter_name.endswith(".mlp.gate.weight"):
                 loaded_weight = loaded_weight.T.contiguous()
@@ -2370,15 +2673,20 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             if self._loaded_audio != audio_parameters:
                 missing = sorted(audio_parameters - self._loaded_audio)
                 raise ValueError(f"checkpoint is missing audio tensors: {missing[:5]}")
-        if global_server_args_dict["disable_autotune"]:
-            return
-        experts_to_warm = [
-            layer.mlp.experts
-            for layer in self.model.layers
-            if layer.mlp.quantized_experts
-            and layer.mlp.experts.plan.get("warmup") is not None
+        bf16_mlps = [
+            layer.mlp for layer in self.model.layers if not layer.mlp.quantized_experts
         ]
-        if not experts_to_warm:
+        experts_to_warm = (
+            []
+            if global_server_args_dict["disable_autotune"]
+            else [
+                layer.mlp.experts
+                for layer in self.model.layers
+                if layer.mlp.quantized_experts
+                and layer.mlp.experts.plan.get("warmup") is not None
+            ]
+        )
+        if not bf16_mlps and not experts_to_warm:
             return
         # Match the global routing span reserved by execution/device.py.
         chunk = int(global_server_args_dict["chunked_prefill_size"])
@@ -2395,6 +2703,18 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
         if global_server_args_dict["speculative_algorithm"]:
             decode_rows *= int(global_server_args_dict["speculative_num_draft_tokens"])
         max_tokens = max(max_tokens, decode_rows)
+        # BF16 expert layers compile their route kernels before graph capture.
+        # This is JIT warmup, not tuning, so disable_autotune does not skip it.
+        for mlp in bf16_mlps:
+            bf16_moe_routes_warmup(
+                mlp.experts.w13_weight,
+                mlp.experts.w2_weight,
+                mlp.topk,
+                mlp.expert_start,
+                max_num_tokens=max_tokens,
+                batch_invariant=global_server_args_dict["numerics"]
+                in BITWISE_ENVELOPES,
+            )
         for experts in experts_to_warm:
             if not experts._weights_processed:
                 raise RuntimeError("MoE weights must be processed before warmup")

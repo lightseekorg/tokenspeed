@@ -245,15 +245,20 @@ def test_moe_topk_row_count():
 
 
 def test_iris_allreduce_sizes():
-    pytest.importorskip("iris")
+    pytest.importorskip("tokenspeed_kernel.ops.communication._iris")
     from tokenspeed_kernel._triton import gl
     from tokenspeed_kernel.ops.communication._iris import all_reduce as comm
 
     buf = torch.empty(1 << 22, device=DEVICE, dtype=torch.bfloat16)
     flags = torch.zeros(1024, device=DEVICE, dtype=torch.int32)
     heaps = [1 << 40] * 8
-    common = dict(RANK=0, WORLD_SIZE=8, SUBGROUP_SIZE=64, WORDS_PER_LANE=2)
-    common.update(ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
+    policy = comm.iris_cache_policy()
+    common = dict(RANK=0, WORLD_SIZE=8)
+    common.update(WORDS_PER_LANE=2, ELEMENT_DTYPE=gl.bfloat16, ELEMENTS_PER_WORD=4)
+    common.update(
+        PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+        PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
+    )
 
     # Compile only: the allreduce itself needs the symmetric heap of every rank.
     def two_stage(words):
@@ -319,29 +324,35 @@ def test_kda_fused_replay_batch_size():
     def compile_for(batch):
         pages = torch.zeros(2, batch, dtype=torch.int32, device=DEVICE)
         accepted = torch.zeros(batch, dtype=torch.int32, device=DEVICE)
+        metadata = torch.zeros(batch, 3, dtype=torch.int64, device=DEVICE)
+        stamps = torch.zeros(layers, batch, 4, 2, dtype=torch.int64, device=DEVICE)
+        activation_ref = torch.empty(0, dtype=torch.bfloat16, device=DEVICE)
         decode.gluon_kda_fused_replay_gfx950.warmup(
             descriptors,
             groups,
             pages,
             pages,
             accepted,
+            metadata,
+            stamps,
+            activation_ref,
+            activation_ref,
+            BATCH=batch,
+            qkv_stride=4608,
+            conv_stride=13824,
+            state_stride=196608,
+            u_stride=1536,
+            kg_stride=3072,
+            record_slots=batch,
+            stamp_layer_stride=stamps.stride(0),
+            lower_bound=-5.0,
             H=12,
             D=128,
-            TOKENS_PER_SEQUENCE=4,
-            MIXED_ROW_STRIDE=4608,
-            CONV_WEIGHT_ROW_STRIDE=4,
-            CONV_WEIGHT_COL_STRIDE=1,
-            CONV_POOL_PAGE_STRIDE=13824,
-            CONV_POOL_CHANNEL_STRIDE=3,
-            CONV_POOL_HISTORY_STRIDE=1,
-            GATE_ROW_STRIDE=1536,
-            BETA_ROW_STRIDE=12,
-            STATE_POOL_PAGE_STRIDE=196608,
-            HAS_LOWER_BOUND=True,
-            LOWER_BOUND=-5.0,
-            BATCH_SIZE=batch,
+            T=4,
+            CAPACITY=4,
+            BOUNDED=True,
             num_warps=4,
-            num_stages=2,
+            debug=True,
             grid=(1,),
         )
 

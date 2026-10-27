@@ -592,10 +592,10 @@ def scaled_mm_kernel(
     for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
         masks_k = offsets_k < K
         masks_a = masks_am[:, None] & masks_k[None, :]
-        a = tl.load(a_ptrs, mask=masks_a)
+        a = tl.load(a_ptrs, mask=masks_a, other=0.0)
 
         masks_b = masks_k[:, None] & masks_bn[None, :]
-        b = tl.load(b_ptrs, mask=masks_b)
+        b = tl.load(b_ptrs, mask=masks_b, other=0.0)
 
         accumulator = tl.dot(a, b, accumulator, out_dtype=accumulator_dtype)
 
@@ -654,7 +654,7 @@ def triton_scaled_mm(
     M, K = input.shape
     N = weight.shape[1]
 
-    assert N > 0 and K > 0 and M > 0
+    assert N > 0 and K > 0 and M >= 0
     assert weight.shape[0] == K
     assert input.dtype == weight.dtype
 
@@ -683,6 +683,9 @@ def triton_scaled_mm(
         raise ValueError(
             f"triton_scaled_mm out expects dtype {out_dtype}, got {result.dtype}"
         )
+
+    if M == 0:
+        return result
 
     def has_scalar(x):
         return x.shape[0] == 1 and x.shape[1] == 1

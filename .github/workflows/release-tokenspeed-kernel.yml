@@ -66,7 +66,7 @@ concurrency:
 jobs:
   metadata:
     name: Resolve release metadata
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.metadata.outputs.version }}
       version_date: ${{ steps.metadata.outputs.version_date }}
@@ -183,11 +183,11 @@ jobs:
       matrix:
         arch:
           - name: x64
-            runner: ubuntu-24.04-32core-x64
+            runner: ubuntu-latest
             manylinux_arch: x86_64
             cuda_repo_arch: x86_64
           - name: arm64
-            runner: ubuntu-24.04-32core-arm64
+            runner: ubuntu-24.04-arm
             manylinux_arch: aarch64
             cuda_repo_arch: sbsa
         python:
@@ -318,7 +318,7 @@ jobs:
   build-sdist:
     name: Build source distribution
     needs: metadata
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -354,7 +354,7 @@ jobs:
       group: wheelhouse-publication
       cancel-in-progress: false
     needs: [metadata, build-wheel, build-sdist]
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -510,7 +510,7 @@ jobs:
     name: Publish ${{ inputs.pypi_cuda_variant }} to PyPI
     if: inputs.publish_pypi
     needs: [metadata, build-wheel, build-sdist]
-    runs-on: ubuntu-24.04-32core-x64
+    runs-on: ubuntu-latest
     environment: pypi
     permissions:
       id-token: write

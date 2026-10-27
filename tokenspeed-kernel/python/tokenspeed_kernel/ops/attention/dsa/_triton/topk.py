@@ -304,7 +304,6 @@ def local_topk_to_global_slots(
 
 @triton.jit(
     do_not_specialize=["total"],
-    do_not_specialize_on_alignment=["total"],
 )
 def _workspace_topk_to_global_slots_kernel(
     out_ptr,

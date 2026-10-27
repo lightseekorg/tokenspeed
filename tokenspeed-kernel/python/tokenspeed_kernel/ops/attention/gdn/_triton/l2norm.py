@@ -56,7 +56,6 @@ def l2norm_fwd_kernel1(
 
 @triton.jit(
     do_not_specialize=["T"],
-    do_not_specialize_on_alignment=["T"],
 )
 def l2norm_fwd_kernel(
     x,

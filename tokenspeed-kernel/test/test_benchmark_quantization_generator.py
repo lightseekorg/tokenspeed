@@ -58,6 +58,10 @@ def test_fp8_with_scale_selection_matches_operation_api(
     def capture(source: str):
         def select(family, mode, signature, **kwargs):
             kwargs.pop("platform", None)
+            if kwargs.get("features") is None:
+                # An omitted features argument and features=None both leave
+                # selection unconstrained; compare only real constraints.
+                kwargs.pop("features", None)
             captured[source] = (family, mode, signature, kwargs)
             raise RuntimeError("selection captured")
 

@@ -38,6 +38,7 @@ from tokenspeed.runtime.execution.breakable_cuda_graph import (
     active_forward,
 )
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     Qwen4ExpBackend,
 )
@@ -49,6 +50,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     qwen4_exp_ple_conv_field,
 )
 from tokenspeed.runtime.layers.attention.qsa.indexer import QSAIndexer
+from tokenspeed.runtime.layers.attention.qsa.metadata import QSASelection
 from tokenspeed.runtime.layers.qwen4_exp_ple import Qwen4ExpPLELayer
 
 
@@ -203,8 +205,10 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
         return token_k
 
     indexer._write_and_compress = write_and_compress
-    indexer._select_slots = lambda q, logical, *args, **kwargs: torch.stack(
-        (logical.to(torch.int32), q[:, 0].to(torch.int32)), dim=-1
+    indexer._select = lambda q, logical, *args, **kwargs: QSASelection(
+        torch.stack((logical.to(torch.int32), q[:, 0].to(torch.int32)), dim=-1),
+        (logical // indexer.compress_ratio).unsqueeze(-1),
+        indexer.compress_ratio,
     )
     pool = SimpleNamespace(
         cache=torch.zeros((6, 8), device="cuda"),
@@ -214,9 +218,7 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
     )
     backend = Qwen4ExpBackend.__new__(Qwen4ExpBackend)
     backend.indexer_backend = SimpleNamespace(spec_num_tokens=1, is_draft=False)
-    backend.attention_backend = SimpleNamespace(
-        sparse_topk=SimpleNamespace(decode=None)
-    )
+    backend.attention_backend = SimpleNamespace(sparse_topk=SparseTopKShare())
 
     def make_ctx(lengths, write_page):
         count = sum(lengths)
@@ -238,6 +240,7 @@ def test_qsa_break_replays_live_rows_positions_and_cache_writes(monkeypatch) -> 
                 qsa_locs=logical,
                 recent_locs=logical,
                 complete_blocks=torch.ones(count, device="cuda", dtype=torch.int32),
+                queries_per_request=(lengths[0] if len(set(lengths)) == 1 else None),
                 qsa_page_table=pool.compressed,
                 full_page_table=pool.compressed,
                 full_kernel_page_size=64,

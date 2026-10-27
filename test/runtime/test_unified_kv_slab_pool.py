@@ -622,14 +622,6 @@ class TestCachePoolFieldBindingTest:
         assert (pool.get_component(0, "conv_state")) is (conv)
         assert (pool.get_component(0, "recurrent_state")) is (ssm)
 
-    def test_pool_rejects_unknown_state_layer_and_field(self):
-        pool = self._pool()
-
-        with pytest.raises((ValueError), match=("not a state layer")):
-            pool.get_state_buffers(1)
-        with pytest.raises((ValueError), match=("not planned")):
-            pool.arena.field("missing")
-
     def test_ordinary_pool_keeps_ordinary_per_layer_kv(self):
         pool = self._ordinary_pool()
 

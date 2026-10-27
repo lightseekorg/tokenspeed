@@ -1,0 +1,105 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+name: Ascend NPU Tests
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: pr-test-npu-arm-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  select:
+    name: Check Ascend NPU ARM changes
+    if: |
+      (github.repository == 'lightseekorg/tokenspeed' ||
+       github.repository == vars.TOKENSPEED_NPU_CI_REPOSITORY) &&
+      github.event.deleted != true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      should_run: ${{ steps.changes.outputs.should_run }}
+      reason: ${{ steps.changes.outputs.reason }}
+      matrix: ${{ steps.scan.outputs.matrix || '{"include":[]}' }}
+    steps:
+      - name: Check out event commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Select operator tests
+        id: changes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 -B -m unittest discover -s test/ci_system/npu -p test_changes.py
+          python3 -B test/ci_system/npu/changes.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --manifest test/ci/npu/manifest.json \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-path "$GITHUB_EVENT_PATH" \
+            --repository "$GITHUB_REPOSITORY" \
+            --github-output "$GITHUB_OUTPUT" \
+            | tee "$RUNNER_TEMP/npu-change-selection.json"
+
+      - name: Scan shared CI tasks
+        id: scan
+        if: steps.changes.outputs.should_run == 'true'
+        run: |
+          python3 -m pip install PyYAML==6.0.3
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) trigger=per-commit ;;
+            push) trigger=post-submit ;;
+            workflow_dispatch) trigger=manual ;;
+            *) exit 1 ;;
+          esac
+          matrix=$(python3 -B test/ci_system/pipeline.py scan \
+            --repo-root "$GITHUB_WORKSPACE" --runner-group npu \
+            --workflow-stage unit-test --trigger "$trigger")
+          echo "$matrix" | jq -e '.include | length > 0' >/dev/null
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  npu:
+    name: Ascend NPU ARM operator tests
+    needs: select
+    if: |
+      vars.TOKENSPEED_NPU_ARM_CI_ENABLED == 'true' &&
+      needs.select.outputs.should_run == 'true' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.draft == false)
+    uses: ./.github/workflows/run-ci-task-matrix.yml
+    with:
+      matrix: ${{ needs.select.outputs.matrix }}
+      install_tokenspeed_mla_from_source: ${{ 'false' }}
+      checkout_ref: ${{ github.sha }}
+      timeout_minutes: 60

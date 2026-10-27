@@ -214,6 +214,7 @@ def _make_plan(profile: _BenchmarkProfile) -> dict:
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
         deepep_mode=None,
         deepep_low_latency_max_num_tokens_per_gpu=None,
         solution="gluon",

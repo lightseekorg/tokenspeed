@@ -146,11 +146,12 @@ class CacheArena:
         )
         if self.storage_plan != expected_storage:
             raise ValueError("cache physical binding does not match its memory plan")
-        if enable_memory_saver and not self.storage_plan.monolithic:
-            raise ValueError("mixed host/device cache does not support sleep/wake")
         self.offload_config = self.storage_plan.offload
         self.offload: SparseKVOffload | None = None
         self.regions: dict[str, torch.Tensor] = {}
+        # Only device regions live in the memory saver's pool; pinned Host
+        # regions (sparse offload history) are ordinary Host allocations and
+        # stay mapped across sleep. Wake zeroes both (clear()).
         with self.memory_saver_adapter.region(tag="kv_cache", enable_cpu_backup=False):
             for region in self.storage_plan.regions:
                 host = region.placement == "host"
@@ -573,12 +574,23 @@ class CacheArena:
             )
         return self.buffer
 
+    def synchronize(self) -> None:
+        """Wait for the arena's own copy streams (sparse KV offload).
+
+        A sleep release calls this before the device regions are unmapped, so
+        no prefetch or writeback still reads or writes them.
+        """
+        if self.offload is not None:
+            self.offload.synchronize()
+
     @torch.no_grad()
     def clear(self) -> None:
         """Zero the arena after sleep/wake remaps its storage.
 
         Exactly one owner, so callers may fan this out over every compute
-        view without double-clearing or needing a "views skip" rule.
+        view without double-clearing or needing a "views skip" rule. The
+        sparse offload's hot-pool tags and replacement state are reset with
+        it, and its Host history is zeroed like any other region.
         """
         if self.offload is not None:
             self.offload.synchronize()

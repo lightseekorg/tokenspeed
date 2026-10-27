@@ -324,6 +324,7 @@ class HostTransferWorkspace:
 
     def __init__(self) -> None:
         self._address_key: tuple[int, ...] | None = None
+        self._address_host: torch.Tensor | None = None
         self._address_table: torch.Tensor | None = None
         self._block_host: torch.Tensor | None = None
         self._block_device: torch.Tensor | None = None
@@ -431,9 +432,15 @@ class HostTransferWorkspace:
         if self._address_table is None or self._address_key != key:
             addresses = [int(buffer.data_ptr()) for buffer in device_buffers]
             addresses.append(host_ptr)
-            self._address_table = torch.tensor(
-                addresses, dtype=torch.uint64, device=device
+            # A rebind must not overwrite a pinned source whose previous
+            # asynchronous upload may still be in flight. The pinned allocator
+            # tracks that copy's completion before recycling the old source.
+            address_host = _pinned_host_int64((len(addresses),)).view(torch.uint64)
+            address_host.copy_(
+                torch.tensor(addresses, dtype=torch.uint64, device="cpu")
             )
+            self._address_table = address_host.to(device, non_blocking=True)
+            self._address_host = address_host
             self._address_key = key
         return self._address_table
 

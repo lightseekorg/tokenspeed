@@ -55,8 +55,7 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 }
 
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
-                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
-                                std::int32_t state_checkpoint_tokens) {
+                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     // The re-fed window of a hit rides in the same forward, so it comes out of
     // the budget before any new token; with nothing left the request waits.
@@ -66,10 +65,8 @@ std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_
     }
     const std::int32_t plain = std::min(budget, unscheduled);
     std::int32_t prefill_tokens = plain;
-    for (const std::int32_t checkpoint : {junction_tokens, state_checkpoint_tokens}) {
-        if (checkpoint > first_pos) {
-            prefill_tokens = std::min(prefill_tokens, checkpoint - first_pos);
-        }
+    if (junction_tokens > first_pos) {
+        prefill_tokens = std::min(prefill_tokens, junction_tokens - first_pos);
     }
     const std::int32_t window = coordinator.ReplayWindowTokens();
     const std::int32_t kept = ChunkKeepingFinalWindow(prefill_tokens, unscheduled, window);

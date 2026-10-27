@@ -135,6 +135,7 @@ def _runtime_states(*, draft_probs: bool, trees: bool, history: bool) -> Runtime
         states.init_draft_probs(spec_num_tokens=SPEC_TOKENS, reject_threshold=2.0)
     if trees:
         states.init_draft_trees(SPEC_TOKENS)
+        states.init_draft_tree_q(SPEC_TOKENS, num_slots=2, num_candidates=4)
     if history:
         states.init_ngram_state(3)
         states.init_request_token_history(16)

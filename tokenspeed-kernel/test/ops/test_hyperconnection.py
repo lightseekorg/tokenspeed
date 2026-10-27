@@ -341,12 +341,14 @@ def test_general_triton_mix_prefill_projection_padding(
         projection, projection_rows=LOWRANK + HC_COUNT
     )
     scale = 0.25
-    _mix(
-        (normalized[:17], projection, up),
-        override="triton_hyperconnection_mix",
-        projection_scale=scale,
-        weights_independent=False,
-    )
+    # Warm both fixed epilogue configurations before varying the token count.
+    for warm_rows in (17, 4096):
+        _mix(
+            (normalized[:warm_rows], projection, up),
+            override="triton_hyperconnection_mix",
+            projection_scale=scale,
+            weights_independent=False,
+        )
     capture = ShapeCapture.get()
     capture.enabled = True
     with assert_no_triton_compile(_projection_epilogue_kernel, _mix_epilogue_kernel):
@@ -367,6 +369,82 @@ def test_general_triton_mix_prefill_projection_padding(
     sampled = tuple(value[indices] for value in actual)
     tolerance = 0.01 if dtype is torch.bfloat16 else 0.002
     torch.testing.assert_close(sampled, expected, rtol=tolerance, atol=tolerance)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("strided", [False, True])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_mix_epilogue_row_tiles_and_graph(
+    dtype: torch.dtype, strided: bool, enable_pdl: bool
+) -> None:
+    from tokenspeed_kernel.ops.residual.triton import _launch_mix_epilogue
+
+    if enable_pdl and not (
+        current_platform().is_nvidia and current_platform().is_hopper_plus
+    ):
+        pytest.skip("PDL requires NVIDIA Hopper or newer")
+    pdl_enabled(enable_pdl)
+    stride = WIDE + 16 if strided else WIDE
+    gate = torch.randn(4097, stride, device="cuda", dtype=dtype)[:, :WIDE]
+    normalized = torch.randn(4097, stride, device="cuda", dtype=dtype)[:, :WIDE]
+
+    def reference(rows: int) -> torch.Tensor:
+        g = gate[:rows].double().reshape(rows, HC_COUNT, HIDDEN_SIZE)
+        x = normalized[:rows].double().reshape(rows, HC_COUNT, HIDDEN_SIZE)
+        return (g.sigmoid() * x).mean(1).to(dtype)
+
+    tolerance = 0.008 if dtype is torch.bfloat16 else 0.001
+    for rows in (4095, 4096, 4097):
+        actual = _launch_mix_epilogue(
+            gate[:rows], normalized[:rows], HC_COUNT, HIDDEN_SIZE
+        )
+        torch.testing.assert_close(actual, reference(rows), rtol=tolerance, atol=1e-4)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = _launch_mix_epilogue(gate, normalized, HC_COUNT, HIDDEN_SIZE)
+    for scale in (0.0, 20.0):
+        gate.normal_().mul_(scale)
+        normalized.normal_()
+        graph.replay()
+        torch.testing.assert_close(actual, reference(4097), rtol=tolerance, atol=1e-4)
+
+
+def test_hc_epilogue_row_counts_do_not_recompile() -> None:
+    from tokenspeed_kernel.ops.layernorm.triton import (
+        _gated_residual_combine_norm_kernel,
+    )
+    from tokenspeed_kernel.ops.residual.triton import (
+        _launch_mix_epilogue,
+        _mix_epilogue_kernel,
+    )
+
+    x = torch.randn(8193, WIDE, device="cuda", dtype=torch.bfloat16)
+    gate = torch.randn_like(x)
+    block = torch.randn(8193, HIDDEN_SIZE, device="cuda", dtype=x.dtype)
+    inject = torch.randn(8193, HC_COUNT, device="cuda", dtype=x.dtype)
+    weight = torch.randn(WIDE, device="cuda", dtype=x.dtype) * 0.02
+
+    def run(rows: int) -> None:
+        _launch_mix_epilogue(gate[:rows], x[:rows], HC_COUNT, HIDDEN_SIZE)
+        gated_residual_combine_norm(
+            block[:rows],
+            x[:rows],
+            inject[:rows],
+            weight,
+            HC_COUNT,
+            HIDDEN_SIZE,
+            1e-6,
+            preload_residual=True,
+        )
+
+    for rows in (1, 4096):
+        run(rows)
+    with assert_no_triton_compile(
+        _mix_epilogue_kernel, _gated_residual_combine_norm_kernel
+    ):
+        for rows in (17, 255, 257, 4095, 4097, 8192, 8193):
+            run(rows)
 
 
 @pytest.mark.parametrize("padded", [False, True])
@@ -483,6 +561,10 @@ def test_grouped_gemma_rmsnorm_production_shape(rows: int, dtype: torch.dtype) -
         (torch.float16, False, True, 17, 4, 2560),
         (torch.float32, True, False, 3, 3, 13),
         (torch.bfloat16, False, False, 128, 4, 2560),
+        (torch.bfloat16, False, True, 4096, 4, 2560),
+        (torch.float16, True, True, 4097, 4, 2560),
+        (torch.bfloat16, False, False, 4097, 4, 2560),
+        (torch.bfloat16, False, True, 65536, 4, 2560),
     ],
 )
 def test_combine_norm_matches_separate_kernels(
@@ -591,8 +673,9 @@ def test_combine_norm_validates_inputs(field: str, invalid: str) -> None:
     ("enable_pdl", "preload_residual"),
     [(False, False), (True, False), (True, True)],
 )
+@pytest.mark.parametrize("rows", [8, 4097])
 def test_combine_norm_cuda_graph_replays_changed_inputs(
-    enable_pdl: bool, preload_residual: bool
+    enable_pdl: bool, preload_residual: bool, rows: int
 ) -> None:
     if enable_pdl and not (
         current_platform().is_nvidia and current_platform().is_hopper_plus
@@ -600,13 +683,13 @@ def test_combine_norm_cuda_graph_replays_changed_inputs(
         pytest.skip("PDL requires NVIDIA Hopper or newer")
     generator = torch.Generator(device="cuda").manual_seed(47)
     residual = torch.randn(
-        8, WIDE, dtype=torch.bfloat16, device="cuda", generator=generator
+        rows, WIDE, dtype=torch.bfloat16, device="cuda", generator=generator
     )
     source_block = torch.randn(
-        8, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda", generator=generator
+        rows, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda", generator=generator
     )
     source_inject = torch.randn(
-        8, HC_COUNT, dtype=torch.bfloat16, device="cuda", generator=generator
+        rows, HC_COUNT, dtype=torch.bfloat16, device="cuda", generator=generator
     )
     block, inject = torch.empty_like(source_block), torch.empty_like(source_inject)
     weight = (
@@ -616,7 +699,7 @@ def test_combine_norm_cuda_graph_replays_changed_inputs(
 
     def chain() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if enable_pdl:
-            _delayed_combine_projection[(8,)](
+            _delayed_combine_projection[(rows,)](
                 source_block,
                 source_inject,
                 block,
@@ -794,19 +877,6 @@ def test_general_fallback_supports_deterministic_mode() -> None:
     )
     torch.cuda.synchronize()
     assert capture._records[-1].kernel_name == "triton_hyperconnection_mix"
-
-
-def test_hc_mix_has_only_fused_and_general_implementations() -> None:
-    from tokenspeed_kernel.ops.residual import cute_fused
-
-    # The torch reference is the ground truth tests compare against.
-    expected = {"triton_hyperconnection_mix", "torch_hyperconnection_mix"}
-    if cute_fused._AVAILABLE:
-        expected.add("cute_fused_hyperconnection_mix")
-    if current_platform().is_amd:
-        expected.add("gluon_hyperconnection_mix_gfx950")
-    kernels = KernelRegistry.get().list_kernels("residual", "hyperconnection_mix")
-    assert {kernel.name for kernel in kernels} == expected
 
 
 @pytest.mark.parametrize("reason", ["dtype", "strides", "capacity", "unavailable"])

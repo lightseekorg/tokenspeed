@@ -20,7 +20,6 @@
 
 """Dense-workspace DeepSeek V4 selected-attention prefill for GFX1250.
 
-Wave32 WMMA-v3 port of the generic H=16 GFX950 ``dsv4_prefill`` path.
 Prefill gathers SWA/global rows into a BF16 workspace first; this kernel
 only runs selected attention over that dense buffer.
 """
@@ -28,15 +27,154 @@ only runs selected attention over that dense buffer.
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 
 __all__ = ["launch_gluon_dsv4_prefill_gfx1250"]
 
+_LOG2E = 1.4426950408889634
+_BLOCK_H = 16
+_NUM_WARPS = 4
+# Each wave owns 32 rows of a step: one K step of its PV WMMA.
+_WAVE_ROWS = 32
+_NUM_XCDS = 8
+
+
+def _prefill_launch_metadata(grid, kernel, args):
+    """Report selected-attention capacity without reading device-resident lengths."""
+    q = args["q"]
+    tokens, heads = q.shape[0], q.shape[1]
+    width = args["SELECTED_WIDTH"]
+    head_dim = args["HEAD_DIM"]
+    return {
+        "name": kernel.name,
+        # QK^T and PV over every selected slot.
+        "flops16": 4 * tokens * heads * width * head_dim,
+        # Each workgroup gathers its token's selected rows (and indices) once
+        # for 16 heads, and reads q / writes out once.
+        "bytes": tokens * grid[1] * width * (head_dim * 2 + 4)
+        + 2 * q.numel() * q.element_size(),
+    }
+
+
+@gluon.constexpr_function
+def _warp_split_row_layout(rows, num_warps, warp_size):
+    """Rows split into contiguous per-wave blocks, replicated across lanes."""
+    rows_per_warp = rows // num_warps
+    return gl.DistributedLinearLayout(
+        reg_bases=[[1 << i] for i in range(rows_per_warp.bit_length() - 1)],
+        lane_bases=[[0]] * (warp_size.bit_length() - 1),
+        warp_bases=[[rows_per_warp << i] for i in range(num_warps.bit_length() - 1)],
+        block_bases=[],
+        shape=[rows],
+    )
+
 
 @gluon.jit
+def _load_rows(
+    indices, index_row, positions, SELECTED_WIDTH: gl.constexpr, STEP_ROWS: gl.constexpr
+):
+    """Load one step's raw selected-row indices."""
+    # A per-element mask would split the load into one load-and-wait per row.
+    if SELECTED_WIDTH % STEP_ROWS == 0:
+        return gl.amd.cdna5.buffer_load(indices + index_row, positions)
+    else:
+        return gl.amd.cdna5.buffer_load(
+            indices + index_row, positions, mask=positions < SELECTED_WIDTH, other=-1
+        )
+
+
+@gluon.jit
+def _gather_step(kv_desc, kv_tile, rows, positions, length, num_kv_rows):
+    """Gather one step's rows; unusable ones read the zero-filled OOB row."""
+    # Branch-free clamp: TDM takes the rows in SGPRs, and a lane-mask select
+    # per row would cost a VALU->SALU dependency each.
+    past_length = ~((positions - length) >> 31)
+    rows = gl.minimum((rows | past_length).to(gl.uint32), num_kv_rows.to(gl.uint32))
+    gl.amd.cdna5.tdm.async_gather(kv_desc, rows.to(gl.int32), kv_tile)
+
+
+@gluon.jit
+def _step_valid(indices, index_row, positions, length, num_kv_rows):
+    """Return whether each selected position holds a usable row."""
+    in_range = positions < length
+    rows = gl.amd.cdna5.buffer_load(
+        indices + index_row, positions, mask=in_range, other=-1
+    )
+    return in_range & (rows >= 0) & (rows < num_kv_rows)
+
+
+@gluon.jit
+def _q_chunk(
+    q_shared, start: gl.constexpr, b_layout: gl.constexpr, NUM_WARPS: gl.constexpr
+):
+    """One 128-dim Q^T chunk, shared by every wave."""
+    q_t = (
+        q_shared.slice(start, 128, dim=1)
+        .permute([1, 0])
+        .load(gl.SliceLayout(0, b_layout))
+    )
+    return q_t[None, :, :].broadcast_to(NUM_WARPS, 128, q_t.shape[1])
+
+
+@gluon.jit
+def _chunk_scores(
+    kv_waves,
+    q_shared,
+    start: gl.constexpr,
+    a_layout: gl.constexpr,
+    b_layout: gl.constexpr,
+    zeros,
+):
+    """S^T partial over one 128-dim chunk for each wave's rows."""
+    k = kv_waves.slice(start, 128, dim=2).load(a_layout)
+    return gl.amd.cdna5.wmma(
+        k, _q_chunk(q_shared, start, b_layout, zeros.shape[0]), zeros
+    )
+
+
+@gluon.jit
+def _chunk_pv(kv_waves, start: gl.constexpr, p_t, acc, alpha, a_layout: gl.constexpr):
+    """O^T[start:start + 128] = alpha O^T + V^T P^T for each wave."""
+    v_t = kv_waves.slice(start, 128, dim=2).permute([0, 2, 1]).load(a_layout)
+    return gl.amd.cdna5.wmma(v_t, p_t, acc * alpha[:, None, :])
+
+
+@gluon.jit
+def _store_chunk(
+    out,
+    partials,
+    weight,
+    token_idx,
+    num_heads,
+    head_offset,
+    start: gl.constexpr,
+    sum_layout: gl.constexpr,
+):
+    """Merge one 128-dim chunk of the per-wave O^T partials and store it."""
+    chunk = gl.sum(
+        partials.slice(start, 128, dim=1).load(sum_layout) * weight[:, None, :], axis=0
+    )
+    out_layout: gl.constexpr = gl.SliceLayout(0, sum_layout)
+    dims = gl.arange(0, 128, layout=gl.SliceLayout(1, out_layout))
+    heads = head_offset + gl.arange(
+        0, weight.shape[1], layout=gl.SliceLayout(0, out_layout)
+    )
+    gl.store(
+        out
+        + (token_idx.to(tl.int64) * num_heads + heads[None, :]) * 512
+        + start
+        + dims[:, None],
+        chunk.to(out.dtype.element_ty),
+        mask=(heads < num_heads)[None, :],
+    )
+
+
+@gluon.jit(
+    launch_metadata=_prefill_launch_metadata,
+    do_not_specialize=("num_heads", "num_kv_rows"),
+)
 def gluon_dsv4_prefill_gfx1250(
     q,
     kv,
@@ -44,185 +182,230 @@ def gluon_dsv4_prefill_gfx1250(
     lens,
     attn_sink,
     out,
-    stride_q_t: tl.int64,
-    stride_q_h: tl.int64,
-    stride_kv_row: tl.int64,
-    stride_indices_t: tl.int64,
-    stride_o_t: tl.int64,
-    stride_o_h: tl.int64,
-    softmax_scale: tl.float32,
-    num_heads: tl.int32,
-    num_kv_rows: tl.int64,
+    qk_scale_log2: tl.float32,
+    num_heads,
+    num_kv_rows,
     SELECTED_WIDTH: gl.constexpr,
     BLOCK_H: gl.constexpr,
-    TILE_K: gl.constexpr,
+    WAVE_ROWS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
 ):
-    WARP_SIZE: gl.constexpr = 32
+    # One workgroup per (token, 16-head group). Each wave runs its own online
+    # softmax over a private WAVE_ROWS slice of every step in the transposed
+    # form S^T = K Q^T, O^T += V^T P^T, which keeps the softmax and P inside
+    # the wave; the per-wave softmaxes are merged once at the end.
     NUM_WARPS: gl.constexpr = gl.num_warps()
-    K_WIDTH: gl.constexpr = 8
-    qk_layout: gl.constexpr = gl.amd.AMDWMMALayout(
+    STEP_ROWS: gl.constexpr = WAVE_ROWS * NUM_WARPS
+    wmma: gl.constexpr = gl.amd.AMDWMMALayout(
         version=3,
         transposed=True,
-        warp_bases=[[1, 0], [2, 0]],
+        warp_bases=[[1, 0, 0], [2, 0, 0]],
         reg_bases=[],
         instr_shape=[16, 16, 32],
+        rank=3,
     )
-    pv_layout: gl.constexpr = gl.amd.AMDWMMALayout(
-        version=3,
-        transposed=True,
-        warp_bases=[[0, 1], [0, 2]],
-        reg_bases=[],
-        instr_shape=[16, 16, 32],
+    a_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=wmma, k_width=8
     )
+    b_layout: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=wmma, k_width=8
+    )
+    score_layout: gl.constexpr = gl.SliceLayout(2, wmma)
+    stat_layout: gl.constexpr = gl.SliceLayout(1, wmma)
+    row_layout: gl.constexpr = _warp_split_row_layout(STEP_ROWS, NUM_WARPS, 32)
     q_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 16],
-        [1, WARP_SIZE],
-        [NUM_WARPS, 1],
-        [1, 0],
+        [1, 8], [1, 32], [NUM_WARPS, 1], [1, 0]
     )
-    kv_load_layout: gl.constexpr = gl.BlockedLayout(
-        [16, 1],
-        [WARP_SIZE, 1],
-        [1, NUM_WARPS],
-        [0, 1],
-    )
-    q_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[HEAD_DIM, K_WIDTH]],
-        [BLOCK_H, HEAD_DIM],
-        [1, 0],
+    # A thread merges all waves' copies of 8 contiguous dims of one head.
+    sum_layout: gl.constexpr = gl.BlockedLayout(
+        [NUM_WARPS, 8, 1], [1, 16, 2], [1, 1, NUM_WARPS], [1, 2, 0]
     )
     kv_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[HEAD_DIM, K_WIDTH]],
-        [HEAD_DIM, TILE_K],
-        [0, 1],
+        [[512, 16]], [STEP_ROWS, HEAD_DIM], [1, 0]
     )
-    q_dot_layout: gl.constexpr = gl.DotOperandLayout(0, qk_layout, K_WIDTH)
-    k_dot_layout: gl.constexpr = gl.DotOperandLayout(1, qk_layout, K_WIDTH)
-    p_dot_layout: gl.constexpr = gl.DotOperandLayout(0, pv_layout, K_WIDTH)
-    v_dot_layout: gl.constexpr = gl.DotOperandLayout(1, pv_layout, K_WIDTH)
+    # Aliasing the KV tile requires its byte padding pattern (32 B per 1 KiB).
+    partial_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 8]], [NUM_WARPS, HEAD_DIM, BLOCK_H], [1, 2, 0]
+    )
+    stat_shared_layout: gl.constexpr = gl.SwizzledSharedLayout(
+        vec=1, per_phase=1, max_phase=1, order=[1, 0]
+    )
 
-    token_idx = gl.program_id(axis=0)
-    head_group_idx = gl.program_id(axis=1)
-    head_offset = head_group_idx * BLOCK_H
-    valid_len = gl.load(lens + token_idx).to(tl.int32)
+    # Workgroups are dispatched round-robin over the XCDs; give each XCD a
+    # contiguous token range so neighbouring tokens' shared KV rows (sliding
+    # window, overlapping top-k) hit in that XCD's L2.
+    pid = gl.program_id(axis=0)
+    num_tokens = gl.num_programs(axis=0)
+    xcd = pid % NUM_XCDS
+    token_idx = (
+        xcd * (num_tokens // NUM_XCDS)
+        + gl.minimum(xcd, num_tokens % NUM_XCDS)
+        + pid // NUM_XCDS
+    )
+    head_offset = gl.program_id(axis=1) * BLOCK_H
+    valid_len = gl.load(lens + token_idx)
     effective_len = gl.minimum(gl.maximum(valid_len, 0), SELECTED_WIDTH)
-    num_tiles = gl.maximum(gl.cdiv(effective_len, TILE_K), 1)
+    num_steps = gl.cdiv(effective_len, STEP_ROWS)
+    last_step = gl.maximum(num_steps - 1, 0)
+    index_row = token_idx.to(tl.int64) * SELECTED_WIDTH
 
-    q_heads = head_offset + gl.arange(
-        0, BLOCK_H, layout=gl.SliceLayout(1, q_load_layout)
-    )
-    q_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
-    q_offsets = (
-        token_idx.to(tl.int64) * stride_q_t
-        + q_heads[:, None].to(tl.int64) * stride_q_h
-        + q_dims[None, :].to(tl.int64)
-    )
-    q_shared = gl.allocate_shared_memory(
-        q.dtype.element_ty,
-        [BLOCK_H, HEAD_DIM],
-        layout=q_shared_layout,
-    )
-    q_shared.store(
-        gl.load(q + q_offsets, mask=(q_heads < num_heads)[:, None], other=0.0)
-    )
-    kv_shared = gl.allocate_shared_memory(
-        q.dtype.element_ty,
-        [HEAD_DIM, TILE_K],
+    # One KV step in LDS, wave w's rows at [w * WAVE_ROWS, (w + 1) * WAVE_ROWS).
+    # A second buffer would halve the workgroups per CU.
+    kv_desc = gl.amd.cdna5.tdm.make_tensor_descriptor(
+        base=kv,
+        shape=[num_kv_rows, HEAD_DIM],
+        strides=[HEAD_DIM, 1],
+        block_shape=[STEP_ROWS, HEAD_DIM],
         layout=kv_shared_layout,
     )
-    q_dot = q_shared.load(q_dot_layout)
-
-    score_heads = head_offset + gl.arange(
-        0, BLOCK_H, layout=gl.SliceLayout(1, qk_layout)
+    kv_tile = gl.allocate_shared_memory(
+        gl.bfloat16, [STEP_ROWS, HEAD_DIM], layout=kv_shared_layout
     )
-    valid_heads = score_heads < num_heads
-    max_value = gl.load(attn_sink + score_heads, mask=valid_heads, other=0.0).to(
-        gl.float32
+    kv_waves = kv_tile.reshape([NUM_WARPS, WAVE_ROWS, HEAD_DIM])
+    gather_positions = gl.arange(0, STEP_ROWS, layout=row_layout)
+    score_positions = (
+        gl.arange(0, NUM_WARPS, layout=gl.SliceLayout(1, score_layout))[:, None]
+        * WAVE_ROWS
+        + gl.arange(0, WAVE_ROWS, layout=gl.SliceLayout(0, score_layout))[None, :]
     )
-    denominator = gl.full(
-        [BLOCK_H],
-        1.0,
-        dtype=gl.float32,
-        layout=gl.SliceLayout(1, qk_layout),
-    )
-    accumulator = gl.zeros([BLOCK_H, HEAD_DIM], dtype=gl.float32, layout=pv_layout)
 
-    local_k_load = gl.arange(0, TILE_K, layout=gl.SliceLayout(0, kv_load_layout))
-    kv_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(1, kv_load_layout))
-    indices_base = token_idx.to(tl.int64) * stride_indices_t
-
-    for tile_idx in range(num_tiles):
-        positions = tile_idx * TILE_K + local_k_load
-        rows_load = gl.load(
-            indices + indices_base + positions.to(tl.int64),
-            mask=positions < SELECTED_WIDTH,
-            other=-1,
-        )
-        valid_load = (
-            (positions < effective_len)
-            & (rows_load >= 0)
-            & (rows_load.to(tl.int64) < num_kv_rows)
-        )
-        safe_rows = gl.where(valid_load, rows_load, 0).to(tl.int64)
-        kv_values = gl.load(
-            kv + safe_rows[None, :] * stride_kv_row + kv_dims[:, None].to(tl.int64),
-            mask=valid_load[None, :],
-            other=0.0,
-        )
-        valid_col = gl.convert_layout(valid_load, gl.SliceLayout(0, qk_layout))
-        kv_shared.store(kv_values)
-
-        k_dot = kv_shared.load(k_dot_layout)
-        v_dot = kv_shared.permute([1, 0]).load(v_dot_layout)
-        scores = (
-            gl.amd.cdna5.wmma(
-                q_dot,
-                k_dot,
-                gl.zeros([BLOCK_H, TILE_K], dtype=gl.float32, layout=qk_layout),
-            )
-            * softmax_scale
-        )
-        scores = gl.where(
-            valid_heads[:, None] & valid_col[None, :],
-            scores,
-            -float("inf"),
-        )
-
-        tile_max = gl.max(scores, axis=1)
-        next_max = gl.maximum(max_value, tile_max)
-        safe_next_max = gl.where(next_max > -float("inf"), next_max, 0.0)
-        previous_scale = gl.exp(max_value - safe_next_max)
-        probabilities = gl.exp(scores - safe_next_max[:, None])
-        denominator = previous_scale * denominator + gl.sum(probabilities, axis=1)
-        accumulator *= gl.convert_layout(previous_scale[:, None], pv_layout)
-        p_dot = gl.convert_layout(probabilities.to(q.dtype.element_ty), p_dot_layout)
-        accumulator = gl.amd.cdna5.wmma(p_dot, v_dot, accumulator)
-        max_value = next_max
-
-    denominator_value = gl.convert_layout(denominator, gl.SliceLayout(1, pv_layout))
-    safe_denominator = gl.where(denominator_value > 0.0, denominator_value, 1.0)
-    accumulator /= safe_denominator[:, None]
-    accumulator = gl.where(denominator_value[:, None] > 0.0, accumulator, 0.0)
-
-    out_heads = head_offset + gl.arange(
+    # The first gather overlaps the q load. Each step's indices are loaded a
+    # step ahead of their gather.
+    rows = _load_rows(indices, index_row, gather_positions, SELECTED_WIDTH, STEP_ROWS)
+    q_rows = head_offset + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(1, q_load_layout)
     )
-    out_dims = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
-    out_offsets = (
-        token_idx.to(tl.int64) * stride_o_t
-        + out_heads[:, None].to(tl.int64) * stride_o_h
-        + out_dims[None, :].to(tl.int64)
+    q_cols = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, q_load_layout))
+    q_tile = gl.load(
+        q
+        + (token_idx.to(tl.int64) * num_heads + q_rows[:, None]) * HEAD_DIM
+        + q_cols[None, :],
+        mask=(q_rows < num_heads)[:, None],
+        other=0.0,
     )
-    output = gl.convert_layout(accumulator.to(out.dtype.element_ty), q_load_layout)
-    gl.store(out + out_offsets, output, mask=(out_heads < num_heads)[:, None])
+    if num_steps > 0:
+        _gather_step(
+            kv_desc, kv_tile, rows, gather_positions, effective_len, num_kv_rows
+        )
+    rows = _load_rows(
+        indices,
+        index_row,
+        gl.minimum(1, last_step) * STEP_ROWS + gather_positions,
+        SELECTED_WIDTH,
+        STEP_ROWS,
+    )
+    # Q^T stays in LDS: holding it in registers costs the second workgroup
+    # per CU.
+    q_shared = gl.allocate_shared_memory(
+        gl.bfloat16,
+        [BLOCK_H, HEAD_DIM],
+        layout=gl.PaddedSharedLayout.with_identity_for(
+            [[512, 16]], [BLOCK_H, HEAD_DIM], [1, 0]
+        ),
+        value=q_tile,
+    )
 
+    max_value = gl.full([NUM_WARPS, BLOCK_H], -float("inf"), gl.float32, stat_layout)
+    denominator = gl.zeros([NUM_WARPS, BLOCK_H], gl.float32, stat_layout)
+    acc_0 = gl.zeros([NUM_WARPS, 128, BLOCK_H], gl.float32, wmma)
+    acc_1 = gl.zeros([NUM_WARPS, 128, BLOCK_H], gl.float32, wmma)
+    acc_2 = gl.zeros([NUM_WARPS, 128, BLOCK_H], gl.float32, wmma)
+    acc_3 = gl.zeros([NUM_WARPS, 128, BLOCK_H], gl.float32, wmma)
+    zeros = gl.zeros([NUM_WARPS, WAVE_ROWS, BLOCK_H], gl.float32, wmma)
+    for step in range(num_steps):
+        score_valid = _step_valid(
+            indices,
+            index_row,
+            step * STEP_ROWS + score_positions,
+            effective_len,
+            num_kv_rows,
+        )
+        gl.amd.cdna5.tdm.async_wait(0)
+        # Four independent WMMA chains over the head dims.
+        scores = (
+            _chunk_scores(kv_waves, q_shared, 0, a_layout, b_layout, zeros)
+            + _chunk_scores(kv_waves, q_shared, 128, a_layout, b_layout, zeros)
+        ) + (
+            _chunk_scores(kv_waves, q_shared, 256, a_layout, b_layout, zeros)
+            + _chunk_scores(kv_waves, q_shared, 384, a_layout, b_layout, zeros)
+        )
+        scores = gl.where(
+            score_valid[:, :, None], scores * qk_scale_log2, -float("inf")
+        )
+        next_max = gl.maximum(max_value, gl.max(scores, axis=1))
+        safe_max = gl.where(next_max > -float("inf"), next_max, 0.0)
+        alpha = gl.exp2(max_value - safe_max)
+        max_value = next_max
+        probabilities = gl.exp2(scores - safe_max[:, None, :])
+        denominator = denominator * alpha + gl.sum(probabilities, axis=1)
+        p_t = gl.convert_layout(probabilities.to(gl.bfloat16), b_layout)
+        acc_0 = _chunk_pv(kv_waves, 0, p_t, acc_0, alpha, a_layout)
+        acc_1 = _chunk_pv(kv_waves, 128, p_t, acc_1, alpha, a_layout)
+        acc_2 = _chunk_pv(kv_waves, 256, p_t, acc_2, alpha, a_layout)
+        acc_3 = _chunk_pv(kv_waves, 384, p_t, acc_3, alpha, a_layout)
+        if step + 1 < num_steps:
+            _gather_step(
+                kv_desc,
+                kv_tile,
+                rows,
+                (step + 1) * STEP_ROWS + gather_positions,
+                effective_len,
+                num_kv_rows,
+            )
+            rows = _load_rows(
+                indices,
+                index_row,
+                gl.minimum(step + 2, last_step) * STEP_ROWS + gather_positions,
+                SELECTED_WIDTH,
+                STEP_ROWS,
+            )
 
-def _tile_k() -> int:
-    value = int(os.environ.get("TOKENSPEED_DSV4_PREFILL_TILE_K", "32"))
-    if value not in (32, 64):
-        raise ValueError("TOKENSPEED_DSV4_PREFILL_TILE_K must be 32 or 64 on gfx1250")
-    return value
+    # Merge the per-wave softmaxes behind a single barrier: each wave parks
+    # its unnormalized O^T partial (in the dead KV tile) and its statistics
+    # in LDS, and each thread merges all waves' copies of its outputs.
+    partials = kv_tile.reinterpret(
+        gl.float32, [NUM_WARPS, HEAD_DIM, BLOCK_H], partial_shared_layout
+    )
+    partials.slice(0, 128, dim=1).store(acc_0)
+    partials.slice(128, 128, dim=1).store(acc_1)
+    partials.slice(256, 128, dim=1).store(acc_2)
+    partials.slice(384, 128, dim=1).store(acc_3)
+    max_shared = gl.allocate_shared_memory(
+        gl.float32, [NUM_WARPS, BLOCK_H], layout=stat_shared_layout, value=max_value
+    )
+    sum_shared = gl.allocate_shared_memory(
+        gl.float32, [NUM_WARPS, BLOCK_H], layout=stat_shared_layout, value=denominator
+    )
+    wave_stat_layout: gl.constexpr = gl.SliceLayout(1, sum_layout)
+    wave_max = max_shared.load(wave_stat_layout)
+    wave_sum = sum_shared.load(wave_stat_layout)
+    heads = head_offset + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(0, wave_stat_layout)
+    )
+    # The sink joins the softmax with a unit weight and no value.
+    sink = (
+        gl.load(attn_sink + heads, mask=heads < num_heads, other=0.0).to(gl.float32)
+        * 1.4426950408889634  # log2(e): the sink joins the base-2 softmax.
+    )
+    total_max = gl.maximum(gl.max(wave_max, axis=0), sink)
+    # No usable row and a -inf sink leave an all-zero output.
+    total_max = gl.where(total_max > -float("inf"), total_max, 0.0)
+    weight = gl.exp2(wave_max - total_max[None, :])
+    total = gl.sum(wave_sum * weight, axis=0) + gl.exp2(sink - total_max)
+    weight = weight * gl.where(total > 0.0, 1.0 / total, 0.0)[None, :]
+    _store_chunk(
+        out, partials, weight, token_idx, num_heads, head_offset, 0, sum_layout
+    )
+    _store_chunk(
+        out, partials, weight, token_idx, num_heads, head_offset, 128, sum_layout
+    )
+    _store_chunk(
+        out, partials, weight, token_idx, num_heads, head_offset, 256, sum_layout
+    )
+    _store_chunk(
+        out, partials, weight, token_idx, num_heads, head_offset, 384, sum_layout
+    )
 
 
 def _check_tensor(name: str, tensor: object) -> torch.Tensor:
@@ -356,28 +539,22 @@ def launch_gluon_dsv4_prefill_gfx1250(
         return output
 
     kv_rows = kv.reshape(-1, 512)
-    sink_values = attn_sink.reshape(-1)
-    grid = (q.shape[0], triton.cdiv(q.shape[1], 16))
+    grid = (q.shape[0], triton.cdiv(q.shape[1], _BLOCK_H))
     gluon_dsv4_prefill_gfx1250[grid](
         q,
         kv_rows,
         indices,
         lens,
-        sink_values,
+        attn_sink.reshape(-1),
         output,
-        q.stride(0),
-        q.stride(1),
-        kv_rows.stride(0),
-        indices.stride(0),
-        output.stride(0),
-        output.stride(1),
-        scale,
+        scale * _LOG2E,
         q.shape[1],
         kv_rows.shape[0],
         SELECTED_WIDTH=indices.shape[1],
-        BLOCK_H=16,
-        TILE_K=_tile_k(),
+        BLOCK_H=_BLOCK_H,
+        WAVE_ROWS=_WAVE_ROWS,
         HEAD_DIM=512,
-        num_warps=4,
+        NUM_XCDS=_NUM_XCDS,
+        num_warps=_NUM_WARPS,
     )
     return output

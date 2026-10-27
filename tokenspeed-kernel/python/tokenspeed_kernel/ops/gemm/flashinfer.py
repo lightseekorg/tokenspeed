@@ -147,9 +147,12 @@ if gemm_fp8_nt_groupwise is not error_fn:
             "n_align": frozenset({128}),
             "k_align": frozenset({128}),
             "mnk_problem_filter": frozenset({_supports_flashinfer_fp8_blockscale}),
+            "a_contiguous": frozenset({True}),
+            "b_contiguous": frozenset({True}),
             "block_scale_layout": frozenset({"canonical", "canonical_blackwell"}),
+            "operands_aligned_16": frozenset({True}),
         },
-        priority=Priority.SPECIALIZED + 3,
+        priority=Priority.SPECIALIZED + 2,
     )
     def flashinfer_mm_fp8_blockscale(
         A: torch.Tensor,
@@ -188,6 +191,7 @@ if gemm_fp8_nt_groupwise is not error_fn:
             out is not None
             and out.is_contiguous()
             and out.shape == (orig_m, B.shape[0])
+            and out.data_ptr() % 16 == 0
         )
         output = gemm_fp8_nt_groupwise(
             A,
@@ -771,16 +775,19 @@ if has_flashinfer_cute_dsl_nvfp4_a16():
 
 
 # ===-----------------------------------------------------------------------===#
-# BF16 low-latency GEMM: FlashInfer TGV and CuTe DSL (NVIDIA SM100, SM103)
+# BF16 low-latency GEMM: FlashInfer TGV and CuTe DSL (NVIDIA SM100/103/107)
 # ===-----------------------------------------------------------------------===#
 
 
 _mm_bf16 = error_fn
 _fi_gemm = None
 # Automatic dispatch scope, not a TGV capability limit.
-BF16_GEMM_MAX_M = 32
+BF16_GEMM_MAX_M = 4 if platform.arch_version == ArchVersion(10, 7) else 32
 
-if platform.is_nvidia and platform.arch_version in _CUTE_DSL_SM100_ARCHS:
+if platform.is_nvidia and platform.arch_version in (
+    *_CUTE_DSL_SM100_ARCHS,
+    ArchVersion(10, 7),
+):
     from flashinfer import mm_bf16 as _mm_bf16
     from flashinfer.gemm import gemm_base as _fi_gemm
 
@@ -809,7 +816,7 @@ def has_flashinfer_cute_dsl_bf16() -> bool:
     """Whether the flashinfer cute-dsl BF16 low-latency GEMM is usable here.
 
     Returns:
-        True when running on an SM100 or SM103 GPU with a flashinfer build
+        True when running on an SM100, SM103, or SM107 GPU with a flashinfer build
         whose ``mm_bf16`` declares the backend.
     """
     return _mm_bf16 is not error_fn and _declares_cute_dsl_backend(_mm_bf16)
@@ -833,7 +840,7 @@ def flashinfer_joint_bf16_supported(
 ) -> bool:
     """Check the common contract and whether at least one backend is eligible.
 
-    Discovery may use large M; execution enforces the separate M <= 32 scope.
+    Discovery may use large M; execution enforces the separate small-M bound.
     """
     return (
         _fi_gemm is not None
@@ -841,6 +848,11 @@ def flashinfer_joint_bf16_supported(
         and x.is_cuda
         and x.device == weight.device
         and x.ndim == weight.ndim == 2
+        # Limit SM107 dispatch to the measured attention output projection.
+        # Other dense projections keep their existing implementation.
+        and (
+            platform.arch_version != ArchVersion(10, 7) or weight.shape == (2560, 6144)
+        )
         and x.dtype == weight.dtype == torch.bfloat16
         and x.shape[0] > 0
         and weight.shape[0] > 0
@@ -877,7 +889,8 @@ def flashinfer_bf16_gemm(
     """Compute BF16 x[M,K] @ weight[N,K].T using FI's joint runner/tactic search.
 
     The caller checks the contract and warms the actual shape before capture.
-    Only M <= 32 enters this search. Larger calls keep the original GEMM.
+    Only rows within the platform's small-M bound enter this search. Larger
+    calls keep the original GEMM.
     No TokenSpeed backend choice or second cache is maintained.
     """
     if (
@@ -890,7 +903,8 @@ def flashinfer_bf16_gemm(
     workspace = _fi_gemm._get_cache_buf(
         "mm_bf16_workspace", _fi_gemm.DEFAULT_WORKSPACE_SIZE, x.device
     )
-    # WAR: the public auto heuristic excludes cute-dsl. Reuse the existing FI
+    # WAR: the public auto heuristic excludes cute-dsl, and its SM100a check
+    # rejects SM107 even though the native runners support it. Reuse the FI
     # dispatcher so eligible families enter one choose_one, including cache
     # lookup. A backend that cannot handle K must not exclude the other one.
     # Contiguous singleton rows can retain a sliced tensor's larger row stride;
@@ -911,8 +925,9 @@ def autotune_bf16_gemm(x: torch.Tensor, weight: torch.Tensor) -> None:
     """Expose native small-M profiles from any encountered projection's N/K.
 
     FI skips cached profiles. Scratch inputs/output never alias the model output;
-    this function does nothing outside the startup autotune window. M=32
-    exposes FI native profiles 1/2/4/8/16/32 without a large-M fallback profile.
+    this function does nothing outside the startup autotune window. The scratch
+    row count exposes native profiles up to the dispatch bound: 1/2/4 on
+    SM107, and 1/2/4/8/16/32 on SM100/103.
     """
     if is_autotuning() and flashinfer_joint_bf16_supported(x, weight, None):
         with torch.no_grad():

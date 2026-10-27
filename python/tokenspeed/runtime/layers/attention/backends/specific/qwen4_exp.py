@@ -146,6 +146,13 @@ class Qwen4ExpBackend(AttentionBackend):
             *(backend.cache_consumer_attn_kinds for backend in self.child_backends())
         )
 
+    @property
+    def stores_in_forward_state_checkpoints(self) -> bool:
+        return all(
+            backend.stores_in_forward_state_checkpoints
+            for backend in self.child_backends()
+        )
+
     def preallocate_verify_workspace(self, max_bs: int, draft_token_num: int) -> int:
         """Preallocate target verify consumers and return their total byte count."""
         if self.is_draft or self.spec_num_tokens <= 1:
@@ -264,14 +271,14 @@ class Qwen4ExpBackend(AttentionBackend):
         if self.indexer_backend is not None:
             self.indexer_backend.fill_block_decode_seq_lens(bs, block_seq_lens)
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_acceptance(
         self,
         accepted_lengths: torch.Tensor,
         *,
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        self.attention_backend.commit_speculative_state_after_verify(
+        self.attention_backend.commit_state_after_acceptance(
             accepted_lengths, num_extends=num_extends, accepted_path=accepted_path
         )
         if num_extends == 0 and self.ple_backend is not None:

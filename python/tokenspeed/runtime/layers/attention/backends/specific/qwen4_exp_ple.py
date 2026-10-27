@@ -45,7 +45,9 @@ from tokenspeed.runtime.layers.attention.backends.base import (
     reject_query_shard,
 )
 from tokenspeed.runtime.layers.attention.backends.state.checkpoint import (
+    InForwardStateCheckpoints,
     compute_state_block_indices,
+    in_forward_state_checkpoints,
 )
 from tokenspeed.runtime.layers.attention.backends.state.utils import row_stride_i32
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
@@ -76,12 +78,18 @@ class PLEForwardMetadata:
     output_blocks: torch.Tensor
     query_lengths: list[int]
     verify_width: int | None
+    # The in-forward State checkpoints this extend forward writes (the PLE
+    # context and short-conv windows at each), or None.
+    state_checkpoints: InForwardStateCheckpoints | None = None
 
 
 class Qwen4ExpPLEBackend(AttentionBackend):
     """Bind PLE cache fields and own their metadata and verify workspace."""
 
     cache_consumer_attn_kinds = frozenset({"state"})
+    # The PLE layer stores its context and short-conv window at every
+    # in-forward State checkpoint (Qwen4ExpPLELayer._write_checkpoints).
+    stores_in_forward_state_checkpoints = True
     # The PLE layer's break runs request-shaped state updates eagerly, using
     # live query lengths to exclude padded rows from state writes.
     cuda_graph_support = CudaGraphSupport(prefill_graph=True)
@@ -211,6 +219,7 @@ class Qwen4ExpPLEBackend(AttentionBackend):
         extend_prompt_lens_cpu: torch.Tensor,
         extend_with_prefix: bool,
         query_shard: QueryShardPlan | None,
+        extend_state_checkpoint_lens_cpu: torch.Tensor | None = None,
         **kwargs,
     ) -> None:
         reject_query_shard(query_shard, "Qwen4ExpPLEBackend")
@@ -257,6 +266,13 @@ class Qwen4ExpPLEBackend(AttentionBackend):
             + [self.spec_num_tokens] * (bs - num_extends),
             # Mixed rounds keep their existing direct final-state writes.
             verify_width=None,
+            state_checkpoints=in_forward_state_checkpoints(
+                extend_state_checkpoint_lens_cpu,
+                extend_seq_lens_cpu,
+                num_extends,
+                block_tables,
+                (QWEN4_EXP_PLE_CACHE_GROUP,),
+            ),
         )
 
     def refresh_decode_metadata(

@@ -90,6 +90,12 @@ def _config(device):
         num_kv_heads=1,
         head_dim=512,
         attn_tp_size=1,
+        attention_query_swa_min_tokens=4096,
+        attention_query_min_tokens=1024,
+        attention_query_rank=0,
+        attention_query_group=(0,),
+        indexer_query_rank=0,
+        indexer_query_group=(0,),
         cache_layer_types=("sliding_attention",) * 40,
         sliding_window_tokens=128,
         compress_ratios=RATIOS,
@@ -322,6 +328,7 @@ def test_packed_refresh_positions_padding_and_token_count(
             torch.tensor([129 + verify_width, 3 + verify_width]),
             ForwardMode.DECODE,
             use_graph=for_graph_replay,
+            settle=lambda: None,
             block_tables=tables,
         )
         assert backend.query_metadata(ForwardMode.DECODE) is meta
@@ -747,7 +754,13 @@ def _decode_compute(backend, inputs, bs):
             order = torch.arange(bs - 1, -1, -2, device=backend.device)
             outputs.extend(
                 backend.select_global(
-                    21, None, None, pos[order], req[order], mode, None
+                    21,
+                    None,
+                    None,
+                    pos[order],
+                    req[order],
+                    mode,
+                    None,
                 )
             )
     return outputs
@@ -968,6 +981,10 @@ def test_packed_config_and_recipe_capacity(verify_width, overlap_depth):
         model="x",
         device="cpu",
         attn_tp_size=1,
+        deepseek_v41_attention_query_swa_min_tokens=4096,
+        deepseek_v41_attention_query_min_tokens=1024,
+        deepseek_v41_attention_query_parallel_size=1,
+        deepseek_v41_indexer_query_parallel_size=1,
         data_parallel_size=2,
         prefix_granularity=128,
         max_num_seqs=4,
@@ -1111,7 +1128,7 @@ def test_dspark_windows_join_the_swa_group():
     )
 
     contract, _ = build_arena_cache_transfer_contract(_pool(recipe, "cpu").arena)
-    assert {f.field_id for f in contract.fields_for_group(SWA)} >= {
+    assert _group_fields(contract, SWA) >= {
         f"layer.39.dspark_kv{stage}" for stage in range(3)
     }
     recipe.server_args.speculative_algorithm = None
@@ -1123,16 +1140,20 @@ def test_dspark_windows_join_the_swa_group():
         recipe.groups()
 
 
-@pytest.mark.parametrize("dspark", [False, True])
-def test_pd_contract_plan_and_manifest(dspark):
-    import numpy as np
+def _group_fields(contract, group_id: str) -> set[str]:
+    return {
+        field.field_id for field in contract.plan.fields if field.group_id == group_id
+    }
 
+
+@pytest.mark.parametrize("dspark", [False, True])
+def test_pd_contract_describes_every_group_and_field(dspark):
+    """The contract a V4.1 rank publishes: the engine host plans its routes,
+    manifests and copies (``ts-pd``, whose planning fixtures include this
+    contract's)."""
     from tokenspeed.runtime.pd.cache_protocol import (
         build_arena_cache_transfer_contract,
-        build_cache_block_manifest,
-        validate_cache_peer_layout,
     )
-    from tokenspeed.runtime.pd.transfer_plan import CacheTransferPlanner
 
     recipe = _dspark_recipe("cpu") if dspark else _recipe("cpu")
     recipe.attn_config = replace(recipe.attn_config, pd_disaggregation_enabled=True)
@@ -1140,7 +1161,6 @@ def test_pd_contract_plan_and_manifest(dspark):
     assert pool.arena.supports_disaggregation is True
     contract, base_addr = build_arena_cache_transfer_contract(pool.arena)
     assert base_addr == pool.arena.buffer.data_ptr()
-    validate_cache_peer_layout(contract, contract)
     assert [spec.group_id for spec in contract.group_specs] == [SWA, R2, R1, TAIL]
     # The replayable groups keep their declaration under PD (a peer that
     # cached them would disagree on what a hit means) and travel as ordinary
@@ -1150,79 +1170,16 @@ def test_pd_contract_plan_and_manifest(dspark):
     for gid in (SWA, TAIL):
         assert specs_by_id[gid].replayable
     assert all(spec.transfer_policy == "full_suffix" for spec in contract.group_specs)
-    cached_peer = replace(
-        contract,
-        group_specs=tuple(
-            replace(spec, replayable=False) if spec.group_id == SWA else spec
-            for spec in contract.group_specs
-        ),
-    )
-    with pytest.raises(Exception, match="semantics"):
-        validate_cache_peer_layout(contract, cached_peer)
     swa_fields = {f"layer.{i}.swa" for i in range(40)}
     if dspark:
         swa_fields.update(f"layer.39.dspark_kv{stage}" for stage in range(3))
-    assert {f.field_id for f in contract.fields_for_group(SWA)} == swa_fields
-    assert {f.field_id for f in contract.fields_for_group(R2)} == {
+    assert _group_fields(contract, SWA) == swa_fields
+    assert _group_fields(contract, R2) == {
         f"layer.{o}.{name}" for o in (2, 8, 14) for name in ("global_kv", "index_k")
     }
-    assert {f.field_id for f in contract.fields_for_group(TAIL)} == {
+    assert _group_fields(contract, TAIL) == {
         f"layer.{o}.compressor_tail" for o in (2, 8, 14)
     }
-    # No V4.1 field is head-sharded, so unequal TP copies whole fields from
-    # one replicated source rank per decode rank.
-    planner = CacheTransferPlanner(
-        prefill_tp_size=4,
-        decode_tp_size=2,
-        prefill_layout=contract,
-        decode_layout=contract,
-        # A single-stage prefill owns every field.
-        prefill_field_ids=None,
-    )
-    for decode_rank, source in ((0, 0), (1, 2)):
-        plan = planner.plan_for_decode_rank(decode_rank)
-        assert plan.target_prefill_ranks == (source,)
-        fragments = plan.fragments_by_prefill_rank[source]
-        assert len(fragments) == len(contract.plan.fields)
-        by_field = {f.field_id: f for f in contract.plan.fields}
-        assert all(
-            fragment.rows_per_page == 1
-            and fragment.bytes_per_row == by_field[fragment.field_id].payload_bytes
-            for fragment in fragments
-        )
-
-    # An odd prompt leaves an unfinished ratio-2 pair: its input lives in the
-    # compressor tail, so the tail and the last global_r2 page must both ship.
-    prompt_len, prefix_len = 4097, 3840
-    tables = {}
-    for spec in contract.group_specs:
-        columns = prompt_len // spec.block_granularity + 2
-        capacity = contract.plan.group(spec.group_id).page_count
-        # Any non-null page ID inside the group's capacity is a valid block.
-        tables[spec.group_id] = (
-            1 + np.arange(2 * columns).reshape(2, columns) % (capacity - 1)
-        ).astype(np.int32)
-    manifest = build_cache_block_manifest(
-        SimpleNamespace(block_tables_arrays=lambda: tables),
-        layout=contract,
-        request_row=1,
-        prefix_len=prefix_len,
-        prompt_len=prompt_len,
-        state_prefix_cached=False,
-    )
-    blocks = {group.group_id: group.block_ids for group in manifest.groups}
-    specs = {spec.group_id: spec for spec in contract.group_specs}
-
-    def logical(gid, begin, end):
-        return tuple(int(tables[gid][1, slot]) for slot in range(begin, end))
-
-    assert blocks[R2] == logical(R2, prefix_len // 128, (prompt_len + 127) // 128)
-    assert blocks[R1] == logical(R1, prefix_len // 64, (prompt_len + 63) // 64)
-    swa_begin = (prompt_len - specs[SWA].sliding_window_tokens + 1) // 64
-    assert blocks[SWA] == logical(SWA, swa_begin, (prompt_len + 63) // 64)
-    tail_begin = (prompt_len - specs[TAIL].sliding_window_tokens + 1) // 2
-    assert blocks[TAIL] == logical(TAIL, tail_begin, (prompt_len + 1) // 2)
-    assert (prompt_len - 1) // 2 in range(tail_begin, (prompt_len + 1) // 2)
 
 
 @pytest.mark.parametrize("cache_format", ["v41", "v4"])
@@ -1488,6 +1445,7 @@ def test_target_runner_refresh_omits_num_extends_after_mixed_metadata():
             seq_lens,
             ForwardMode.DECODE,
             use_graph=False,
+            settle=lambda: None,
             block_tables=tables,
         )
         meta = backend.query_metadata(ForwardMode.DECODE)
@@ -1681,7 +1639,13 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
     pick = torch.tensor([18, 16, 4], device="cuda")
     positions, requests = meta.positions[pick], meta.request_indices[pick]
     reuse, _ = backend.select_global(
-        21, None, None, positions, requests, ForwardMode.EXTEND, None
+        21,
+        None,
+        None,
+        positions,
+        requests,
+        ForwardMode.EXTEND,
+        None,
     )
     want = backend.global_read_slots(
         20, record.logical_rows[pick], positions, requests, ForwardMode.EXTEND
@@ -1689,7 +1653,13 @@ def test_gpu_quantized_joint_attention_and_reindex_reuse():
     torch.testing.assert_close(reuse, want)
     for layer in (24, 28):
         slots, lengths = backend.select_global(
-            layer, iq[pick], iw[pick], positions, requests, ForwardMode.EXTEND, None
+            layer,
+            iq[pick],
+            iw[pick],
+            positions,
+            requests,
+            ForwardMode.EXTEND,
+            None,
         )
         assert backend.sparse_topk.prefill.candidates is candidates
         assert (lengths > 0).all() and (slots[:, 0] >= 0).all()
@@ -2031,7 +2001,8 @@ def test_native_decode_receives_compact_window_and_real_lengths(monkeypatch, pos
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     captured = []
 
-    def selected(*args):
+    def selected(*args, lse):
+        assert lse is None
         captured.append(args)
         return torch.zeros_like(args[0])
 
@@ -2912,3 +2883,99 @@ def test_index_geometry_scope_preserves_all_indexer_selections_in_graph(monkeypa
         graph.replay()
         for got, want in zip(captured, expected, strict=True):
             torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "mode,layer,total,history,head_group,expected",
+    [
+        (ForwardMode.EXTEND, 2, 8192, 65536, None, True),
+        (ForwardMode.EXTEND, 8, 8192, 65536, None, True),
+        (ForwardMode.EXTEND, 14, 8192, 65536, None, True),
+        (ForwardMode.EXTEND, 2, 4095, 65536, None, False),
+        (ForwardMode.EXTEND, 2, 8192, 4096, None, False),
+        (ForwardMode.EXTEND, 3, 8192, 65536, None, False),
+        (ForwardMode.EXTEND, 20, 8192, 65536, None, False),
+        (ForwardMode.EXTEND, 24, 8192, 65536, None, False),
+        (ForwardMode.DECODE, 2, 8192, 65536, None, False),
+        (ForwardMode.MIXED, 2, 8192, 65536, None, False),
+        (ForwardMode.EXTEND, 2, 8192, 65536, object(), False),
+    ],
+)
+def test_indexer_projection_plan_preserves_execution_boundaries(
+    mode, layer, total, history, head_group, expected
+):
+    backend = _backend("cpu", 2)
+    backend.spec = replace(
+        backend.spec, indexer_query_rank=3, indexer_query_group=tuple(range(8))
+    )
+    # The planner uses host metadata only; no CUDA runtime is needed here.
+    positions = SimpleNamespace(is_cuda=True, numel=lambda: total)
+    spans = (SimpleNamespace(prefix=history * 2 - total, count=total),)
+    with patch.object(backend, "_window", return_value=(None, spans)):
+        plan = backend.plan_indexer_queries(layer, positions, None, mode, head_group)
+    assert (plan is not None) == expected
+    if expected:
+        assert plan.local_rows == 1024
+        assert plan.local_slice == slice(3, total, 8)
+
+
+@pytest.mark.parametrize("projected", [False, True])
+@pytest.mark.parametrize("deferred", [False, True])
+def test_projected_indexer_queries_are_not_sliced_twice(projected, deferred):
+    from tokenspeed.runtime.layers.attention.query_partition import InterleavedQueryPlan
+
+    backend = _backend("cpu", 2)
+    _extend(backend, _tables("cpu"), [5, 4], [20, 20], [0, 0], [25, 24])
+    meta = backend.query_metadata(ForwardMode.EXTEND)
+    plan = InterleavedQueryPlan(total_rows=9, rank=1, size=2)
+    backend.spec = replace(
+        backend.spec, indexer_query_rank=1, indexer_query_group=(0, 1)
+    )
+    q = torch.arange(9, dtype=torch.bfloat16).reshape(9, 1, 1).expand(9, 2, 128)
+    weights = torch.ones(9, 2, dtype=torch.bfloat16)
+    seen = []
+
+    if deferred:
+        q = dsv41.IndexQueryInput(
+            q, meta.positions, torch.zeros(25, 64), weight_scale=0.25
+        )
+
+    def score(*args):
+        query = args[0]
+        values = query.values if deferred else query
+        seen.extend(values[:, 0, 0].tolist())
+        if deferred:
+            expected_positions = meta.positions[values[:, 0, 0].long()]
+            torch.testing.assert_close(query.positions, expected_positions)
+            assert query.weight_scale == 0.25
+        rows, lengths, _, _ = args[12]
+        rows.fill_(0)
+        lengths.fill_(1)
+
+    def gather(self, rows, lengths, group):
+        assert self == plan and group == (0, 1)
+        assert rows.shape[0] == 4 and lengths.tolist() == [1] * 4
+        return torch.zeros(9, rows.shape[1], dtype=torch.int32), torch.ones(
+            9, dtype=torch.int32
+        )
+
+    with (
+        patch.object(backend, "plan_indexer_queries", return_value=plan),
+        patch("tokenspeed_kernel.ops.attention.dsv41.index_topk", side_effect=score),
+        patch.object(InterleavedQueryPlan, "gather_selection", new=gather),
+    ):
+        slots, lengths = backend.prepare_global_selection(
+            2,
+            q[plan.local_slice] if projected else q,
+            weights[plan.local_slice] if projected else weights,
+            meta.positions,
+            meta.request_indices,
+            ForwardMode.EXTEND,
+            None,
+            projected_partition=plan if projected else None,
+        )
+    assert seen == [1, 3, 5, 7]
+    assert slots.shape[0] == 9 and lengths.shape == (9,)
+    record = backend.sparse_topk.prefill
+    assert record.positions is meta.positions
+    assert record.request_indices is meta.request_indices

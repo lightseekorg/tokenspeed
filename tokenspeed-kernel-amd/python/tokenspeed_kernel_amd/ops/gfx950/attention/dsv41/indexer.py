@@ -250,10 +250,12 @@ def gluon_dsv41_index_topk_gfx950(
 ):
     token = gl.program_id(0)
     split = gl.program_id(1)
+    # Raw lengths may be int64 and exceed int32. Clamp before narrowing so
+    # an oversized length cannot wrap negative and hide valid cache rows.
     vis = gl.minimum(
-        gl.maximum(gl.load(visible + token).to(gl.int32), 0),
+        gl.maximum(gl.load(visible + token).to(gl.int64), 0),
         table_width * PAGE_SIZE,
-    )
+    ).to(gl.int32)
     if CANDIDATES >= 0:
         width = gl.where(vis > 0, CANDIDATES * 8, 0)
     else:
@@ -521,6 +523,7 @@ def _select_radix_pass(
         "logits_stride",
         "cand_stride",
         "out_stride",
+        "row_limits_stride",
         "width",
         "topk",
         "take",
@@ -535,6 +538,7 @@ def gluon_dsv41_index_topk_select_gfx950(
     logits_stride,
     cand_stride,
     out_stride,
+    row_limits_stride,
     width,
     topk,  # row_out width
     take,  # min(topk, width)
@@ -563,7 +567,10 @@ def gluon_dsv41_index_topk_select_gfx950(
     row = logits + q * logits_stride
     if HAS_LIMITS:
         # Columns at or past the row's live width are -inf: skip them.
-        width = gl.minimum(width, gl.maximum(gl.load(row_limits + q).to(gl.int32), 0))
+        width = gl.minimum(
+            width,
+            gl.maximum(gl.load(row_limits + q * row_limits_stride).to(gl.int64), 0),
+        ).to(gl.int32)
     hist_smem = gl.allocate_shared_memory(gl.int32, [BINS], SL)
     ones = gl.full([BLOCK], 1, gl.int32, layout=L)
     d = gl.arange(0, BINS, layout=LBIN)
@@ -705,8 +712,8 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         candidates: None, or int32/int64 [Q, blocks] block ids whose 8-row
             blocks map logits column c to logical row
             ``candidates[q, c // 8] * 8 + c % 8``.
-        live_widths: None, or int32/int64 [Q] counts of leading columns that
-            may be finite; row q's columns at or past ``live_widths[q]`` must be
+        live_widths: None, or strided int32/int64 [Q] counts of leading columns
+            that may be finite; row q's columns at or past ``live_widths[q]`` must be
             -inf and are not read. Full selection passes the visible lengths, so
             a page-table-capacity row costs its context, not its capacity.
         topk: Selection capacity in [1, 1024]; V4.1 uses 512.
@@ -743,10 +750,9 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         raise ValueError(f"candidates must be [{queries}, >= {-(-width // 8)}]")
     if live_widths is not None and (
         live_widths.shape != (queries,)
-        or live_widths.stride(0) != 1
         or live_widths.dtype not in (torch.int32, torch.int64)
     ):
-        raise ValueError(f"live_widths must be contiguous int32/int64 [{queries}]")
+        raise ValueError(f"live_widths must be int32/int64 [{queries}]")
     cand = logits if candidates is None else candidates
     gluon_dsv41_index_topk_select_gfx950[(queries,)](
         logits,
@@ -757,6 +763,7 @@ def launch_gluon_dsv41_index_topk_select_gfx950(
         logits.stride(0),
         0 if candidates is None else candidates.stride(0),
         row_out.stride(0),
+        0 if live_widths is None else live_widths.stride(0),
         width,
         topk,
         min(topk, width),

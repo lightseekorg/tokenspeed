@@ -32,7 +32,12 @@ from tokenspeed_kernel.benchmark.harness import (
 )
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
-from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.signature import (
+    ScaleFormat,
+    dense_tensor_format,
+    format_signature,
+    tensor_format,
+)
 from utils import FakeTimer
 
 
@@ -54,7 +59,7 @@ def _mxfp8_parameters(**updates):
     [
         (_mxfp8_parameters(extra=1), "Unknown"),
         (_mxfp8_parameters(quant="fp8"), "quant"),
-        (_mxfp8_parameters(block_size=[128, 128]), "block_size"),
+        (_mxfp8_parameters(block_size=[64, 128]), "block_size"),
         (_mxfp8_parameters(out_dtype="float16"), "dtype"),
     ],
 )
@@ -86,6 +91,86 @@ def _gemm_mm_request(parameters, *, registration=None) -> BenchmarkRequest:
         registration=registration,
         cold_cache=True,
         seed=42,
+    )
+
+
+@pytest.mark.parametrize(
+    "block_size,scale_dtype", [([1, 32], torch.uint8), ([128, 128], torch.float32)]
+)
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_scaled_mm_harness_validates_canonical_scale_formats(
+    mi350_platform, fresh_registry, monkeypatch, block_size, scale_dtype, corrupt
+):
+    from tokenspeed_kernel.numerics.torch.gemm import torch_mm_fp8_blockscale
+
+    scale = ScaleFormat(
+        storage_dtype=scale_dtype,
+        granularity="block",
+        block_shape=tuple(block_size),
+    )
+    signature = format_signature(
+        a=tensor_format("mxfp8", torch.float8_e4m3fn, scale=scale),
+        b=tensor_format("mxfp8", torch.float8_e4m3fn, scale=scale),
+    )
+    candidate_spec = KernelSpec(
+        name="unit_scaled_mm",
+        family="gemm",
+        mode="mm",
+        solution="unit",
+        format_signatures=frozenset({signature}),
+        traits={"out_inner_stride_one": frozenset({True})},
+    )
+    reference_spec = KernelSpec(
+        name="unit_scaled_mm_reference",
+        family="gemm",
+        mode="mm",
+        solution="torch",
+        format_signatures=frozenset({signature}),
+    )
+
+    def candidate(**inputs):
+        assert inputs["A_scales"].dtype == scale_dtype
+        assert inputs["B_scales"].dtype == scale_dtype
+        assert inputs["A_scales"].shape == (3, 256 // block_size[1])
+        assert inputs["B_scales"].shape == (
+            (130 + block_size[0] - 1) // block_size[0],
+            256 // block_size[1],
+        )
+        output = torch_mm_fp8_blockscale(**inputs)
+        if corrupt:
+            output.add_(1)
+        return output
+
+    KernelRegistry.get().register(candidate_spec, candidate)
+    KernelRegistry.get().register(reference_spec, torch_mm_fp8_blockscale)
+    get_generator = gemm_generator.get_input_generator
+
+    def cpu_generator(*args, **kwargs):
+        # Only the unavailable GPU allocation boundary is replaced.
+        return get_generator(*args, **dict(kwargs, device="cpu"))
+
+    monkeypatch.setattr(gemm_generator, "get_input_generator", cpu_generator)
+    monkeypatch.setattr(gemm_generator, "load_builtin_kernels", lambda: None)
+    timer = FakeTimer()
+    result = KernelBenchmarkHarness(
+        timer, platform_provider=lambda: mi350_platform
+    ).run(
+        _gemm_mm_request(
+            _mxfp8_parameters(
+                M=3, N=130, K=256, block_size=block_size, validation={"runs": 2}
+            ),
+            registration=candidate_spec.name,
+        ),
+        measurement_blocks=3,
+    )
+    assert result.correctness is not None, result.to_dict()
+    assert result.correctness["passed"] is not corrupt
+    assert result.status is (
+        BenchmarkStatus.CORRECTNESS_FAILURE if corrupt else BenchmarkStatus.SUCCESS
+    ), result.to_dict()
+    assert timer.calls == (0 if corrupt else 1)
+    assert result.parameters["scale_dtype"] == (
+        "uint8" if scale_dtype == torch.uint8 else "float32"
     )
 
 
@@ -707,3 +792,65 @@ def test_grouped_bf16_projection_times_strided_view_without_out(
     assert weight.is_contiguous()
     assert out is None
     assert prepared.parameters["x_token_stride"] == 64
+
+
+def _router_request(**updates) -> BenchmarkRequest:
+    return BenchmarkRequest(
+        family="gemm",
+        mode="prepared_fp32_router_gemv",
+        parameters={
+            "M": 4,
+            "N": 256,
+            "K": 1024,
+            "multiplier": 2.0,
+            "dtype": "float32",
+            **updates,
+        },
+        solution=None,
+        registration=None,
+        cold_cache=True,
+        seed=42,
+    )
+
+
+@pytest.mark.parametrize(
+    ("updates", "match"),
+    [
+        ({"dtype": "bfloat16"}, "float32"),
+        ({"multiplier": 2}, "multiplier"),
+        ({"extra": 1}, "Unknown"),
+    ],
+)
+def test_prepared_router_gemv_rejects_invalid_parameters(updates, match):
+    with pytest.raises(BenchmarkCaseError, match=match):
+        gemm_generator.prepare_prepared_fp32_router_gemv(
+            _router_request(**updates), None
+        )
+
+
+def test_prepared_router_gemv_refuses_exact_registration():
+    request = BenchmarkRequest(
+        family="gemm",
+        mode="prepared_fp32_router_gemv",
+        parameters=_router_request().parameters,
+        solution=None,
+        registration="triton_prepared_fp32_router_gemv",
+        cold_cache=True,
+        seed=42,
+    )
+    with pytest.raises(BenchmarkCaseError, match="solution instead"):
+        gemm_generator.prepare_prepared_fp32_router_gemv(request, None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU is required")
+def test_prepared_router_gemv_runs_through_harness():
+    result = KernelBenchmarkHarness(
+        GraphTimer(
+            GraphBenchmarkConfig(eager_warmup_iterations=1, replay_warmup_iterations=1)
+        ),
+        platform_provider=current_platform,
+    ).run(_router_request(), measurement_blocks=3)
+
+    assert result.status is BenchmarkStatus.SUCCESS, result.to_dict()
+    spec = KernelRegistry.get().get_by_name(result.registration_name)
+    assert (spec.family, spec.mode) == ("gemm", "prepared_fp32_router_gemv")

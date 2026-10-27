@@ -298,6 +298,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -323,6 +324,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -366,6 +368,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -384,6 +387,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=False,
                 use_marlin=True,
@@ -407,6 +411,7 @@ class TestKimiK3RegistrationTests:
         built = self._build_moe_block(
             kimi_k3.Kimi3MoEExecutionPlan(
                 use_mega_moe=False,
+                owns_ep_communication=False,
                 use_native=False,
                 use_trtllm=True,
                 overlap_shared_experts=False,
@@ -826,7 +831,7 @@ class TestKimiK3RegistrationTests:
             gate.untyped_storage().data_ptr()
         )
 
-    def test_kda_compacts_prefill_qkv_before_backend_break(self, subtests):
+    def test_kda_hands_the_backend_projection_rows_without_a_copy(self, subtests):
         from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         from tokenspeed.runtime.models.kimi_k3 import KimiLinearKDA
 
@@ -852,27 +857,19 @@ class TestKimiK3RegistrationTests:
         layer = KimiLinearKDA(
             config, mapping, layer_id=0, qkv_parallel=None, output_parallel=None
         )
-        rows, projection_width = 4, 64
-        packed = torch.randn(rows, 288, dtype=torch.bfloat16)
-        projection_outputs = (
-            packed[:, : 3 * projection_width],
-            packed[:, 3 * projection_width : 4 * projection_width],
-            packed[:, 4 * projection_width : 4 * projection_width + 16],
-            packed[:, 4 * projection_width + 16 : 4 * projection_width + 20],
-        )
+        torch.nn.init.normal_(layer.qkvgb_proj.weight)
+        rows = 4
+        hidden_states = torch.randn(rows, 64, dtype=torch.bfloat16)
 
         class BackendCalled(Exception):
             pass
 
-        for mode, expect_contiguous in (
-            (ForwardMode.EXTEND, True),
-            (ForwardMode.DECODE, False),
-        ):
+        for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
             with subtests.test(mode=mode):
                 captured = []
 
                 def capture_backend(**kwargs):
-                    captured.append(kwargs["mixed_qkv"])
+                    captured.append(kwargs)
                     raise BackendCalled
 
                 ctx = SimpleNamespace(
@@ -881,19 +878,34 @@ class TestKimiK3RegistrationTests:
                     attn_backend=SimpleNamespace(forward=capture_backend),
                     token_to_kv_pool=None,
                 )
-                with mock.patch.object(
-                    layer, "_project_qkvfab", return_value=projection_outputs
-                ):
-                    with pytest.raises((BackendCalled)):
-                        layer(
-                            positions=torch.empty(rows, dtype=torch.int64),
-                            hidden_states=torch.empty(rows, 64, dtype=torch.bfloat16),
-                            ctx=ctx,
-                            comm_manager=None,
-                            projection_out=None,
-                        )
+                with pytest.raises(BackendCalled):
+                    layer(
+                        positions=torch.empty(rows, dtype=torch.int64),
+                        hidden_states=hidden_states,
+                        ctx=ctx,
+                        comm_manager=None,
+                        projection_out=None,
+                    )
 
-                assert (captured[0].is_contiguous()) == (expect_contiguous)
+                # Prefill and decode both get the leading q|k|v columns of the
+                # merged projection rows [q|k|v|g|f_a|b] themselves, not a
+                # compact copy: one storage with the f_a and beta columns
+                # handed over beside them, at their row offsets.
+                (kwargs,) = captured
+                mixed_qkv, f_a, beta = (
+                    kwargs[name] for name in ("mixed_qkv", "f_a_out", "beta_raw")
+                )
+                storage = mixed_qkv.untyped_storage().data_ptr()
+                assert f_a.untyped_storage().data_ptr() == storage
+                assert beta.untyped_storage().data_ptr() == storage
+                item = mixed_qkv.element_size()
+                assert mixed_qkv.data_ptr() == storage
+                assert f_a.data_ptr() == storage + 4 * 64 * item
+                assert beta.data_ptr() == storage + (4 * 64 + 16) * item
+                row = (layer.qkvgb_proj.weight.shape[0], 1)
+                assert mixed_qkv.stride() == f_a.stride() == beta.stride() == row
+                assert mixed_qkv.dtype == torch.bfloat16
+                assert mixed_qkv.shape == (rows, 3 * 64)
 
     @_NVIDIA_ONLY
     def test_native_kimi_moe_uses_direct_ep_and_collective_tp_paths(self):
@@ -988,6 +1000,7 @@ class TestKimiK3RegistrationTests:
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
                     use_mega_moe=False,
+                    owns_ep_communication=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1077,6 +1090,7 @@ class TestKimiK3RegistrationTests:
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
                     use_mega_moe=False,
+                    owns_ep_communication=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,
@@ -1118,6 +1132,7 @@ class TestKimiK3RegistrationTests:
                 "build",
                 return_value=kimi_k3.Kimi3MoEExecutionPlan(
                     use_mega_moe=False,
+                    owns_ep_communication=False,
                     use_native=True,
                     use_trtllm=False,
                     overlap_shared_experts=False,

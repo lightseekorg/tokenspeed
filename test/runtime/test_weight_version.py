@@ -123,6 +123,25 @@ class TestWeightVersionHTTP:
         assert (response.status_code) == (400)
         assert (llm.server_args.weight_version) == ("v8")
 
+    def test_sglang_disk_update_passes_flush_cache_and_weight_version(self):
+        llm = FakeLLM()
+        client = TestClient(build_sglang_compat_app(llm))
+
+        response = client.post(
+            "/update_weights_from_disk",
+            json={"model_path": "/tmp/model", "flush_cache": False},
+        )
+        assert (response.status_code) == (200)
+        assert (llm.updates[-1].flush_cache) is (False)
+        assert (llm.updates[-1].weight_version) is (None)
+
+        client.post(
+            "/update_weights_from_disk",
+            json={"model_path": "/tmp/model", "weight_version": "v2"},
+        )
+        assert (llm.updates[-1].flush_cache) is (True)
+        assert (llm.updates[-1].weight_version) == ("v2")
+
     def test_sglang_scheduler_memory_and_load_endpoints(self):
         llm = FakeLLM()
         client = TestClient(build_sglang_compat_app(llm))

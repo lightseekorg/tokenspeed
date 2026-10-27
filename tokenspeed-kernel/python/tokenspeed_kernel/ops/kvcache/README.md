@@ -57,3 +57,35 @@ The residency path uses only CuTe DSL. The former resident/selection sorting,
 binary-search lookup, and adjacent-entry miss deduplication have been removed.
 Hash ownership merges duplicate loads while preserving all attention references;
 upstream top-k ordering remains part of the attention numerical contract.
+
+## Ascend KVP page compaction
+
+Compact KVP tables retain owned physical pages in their original virtual
+position order. Ascend uses an inclusive owner scan and a device scatter:
+owned column i writes to prefix[i]-1; an unowned column writes zero to
+total_owned+i-prefix[i]. These destinations partition the whole output row,
+so every entry is written exactly once, including padding. No general sort
+or host read of the owned-page count is needed.
+
+With a page-prefix buffer, allocated draft reserve pages are retained and
+causal token counts still exclude rows beyond the current endpoint. Without
+it, only pages intersecting the endpoint are packed. Both paths refresh the
+caller's persistent buffers and support changed tables/lengths in NPU graph
+replay. This device-op implementation avoids the synchronous lock setup in
+the current Ascend Triton scan launcher during capture. It uses AIV scan and
+scatter tasks, rather than the int64 sort that dispatches to AICPU.
+
+
+### Large Ascend clear grids
+
+`zero_page_fields` caps the flattened Ascend launch grid at 65535 programs
+and strides over remaining page/field ranges. The logical page count remains
+a runtime argument. The tile dimension is at most 1024 for every nonempty
+range list, so dividing the launch limit by it always leaves at least one
+range program. Only selected fields are cleared; surrounding arena bytes
+must remain unchanged. A small-grid device test exercises both the range
+stride and payload-tile stride, including partial tiles and unselected pages.
+
+`copy_state_rows` uses the same conservative 65535-program cap. Large state copies
+split along logical rows while retaining global layer indices and physical row
+strides. CUDA keeps one launch. The start row is a runtime argument.

@@ -50,6 +50,7 @@ from test.runtime.test_gdn_state_paging import (
 
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
+    GdnChainVerifyForm,
     gdn_decode_mtp,
     gdn_replay_commit_supported,
     gdn_tree_verify_needs_node_states,
@@ -446,11 +447,12 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
     )
 
 
-@pytest.mark.parametrize("chunked", [False, True])
+@pytest.mark.parametrize("form", [GdnChainVerifyForm.STEP, GdnChainVerifyForm.TREE])
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
-def test_qwen_replay_chain_verifies_chunked_where_faster(state_dtype, chunked):
+def test_qwen_replay_chain_verifies_chunked_where_faster(state_dtype, form):
     """A ReplaySSM chain hands the GDN verify its ancestor masks exactly where the
     chunked form is faster, and matches the per-position scratch verify."""
+    chunked = form is GdnChainVerifyForm.TREE
     draft_tokens = GDN_TREE_VERIFY_CHUNKED_MAX_NODES
     conv, recurrent = _initial_pools(state_dtype=state_dtype)
     replay_backend, replay_pool = _make_backend(
@@ -463,14 +465,15 @@ def test_qwen_replay_chain_verifies_chunked_where_faster(state_dtype, chunked):
 
     module = MambaAttnBackend.__module__
     with (
-        patch(
-            f"{module}.gdn_chain_verify_is_chunked", return_value=chunked
-        ) as is_chunked,
+        patch(f"{module}.gdn_chain_verify_form", return_value=form) as pick_form,
         patch(f"{module}.gdn_decode_mtp", wraps=gdn_decode_mtp) as verify,
     ):
         replay_out = _prepare_verify(replay_backend, replay_pool, inputs)
     scratch_out = _prepare_verify(scratch_backend, scratch_pool, inputs)
-    is_chunked.assert_called_with(draft_tokens, BATCH * NUM_V_HEADS)
+    # This backend's scan does not run the chain form (nor would its K != V heads).
+    pick_form.assert_called_with(
+        draft_tokens, BATCH * NUM_V_HEADS, state_dtype, chain_form=False
+    )
     assert (verify.call_args.kwargs["tree_ancestors"] is not None) == chunked
     # The chunked verify and the step-by-step one round differently.
     tol = dict(atol=1e-4, rtol=2**-7) if chunked else dict(atol=0.0, rtol=0.0)

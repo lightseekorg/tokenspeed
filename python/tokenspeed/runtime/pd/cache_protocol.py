@@ -18,33 +18,25 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Cache transfer contract and per-request PD protocol.
+"""The cache transfer contract a PD rank publishes.
 
 The cache recipe owns semantic group specs and the transfer schema, while the
 memory planner owns physical geometry. PD transports those objects directly
-instead of maintaining a second physical layout schema. This module owns the
-wire contract, request block manifests, producer-step projection, and peer
-validation.
+instead of maintaining a second physical layout schema: this module binds
+them into the wire contract, and the producer schedule layerwise streaming
+follows. Everything a transfer reads off the contract -- routes, block
+manifests, copies -- is planned by the engine host (``ts-pd``).
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from functools import cached_property
 
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
-    virtual_block_count as sharded_virtual_block_count,
-)
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
-    CacheFieldLayout,
-    CacheGroupLayout,
     CacheMemoryPlan,
-    CachePlaneLayout,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
-    STATE_LIVE_SLOT,
     CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
@@ -55,11 +47,10 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (
 )
 
 MAX_CACHE_CONTRACT_WIRE_BYTES = 256 << 10
-MAX_CACHE_MANIFEST_WIRE_BYTES = 2 << 20
 
 
 class CacheContractError(ValueError):
-    """A cache pool, peer, or scheduler violated the runtime cache contract."""
+    """A cache pool or its plan violated the runtime cache contract."""
 
 
 def _dump_wire_json(value: object, *, name: str, maximum: int) -> bytes:
@@ -75,20 +66,6 @@ def _dump_wire_json(value: object, *, name: str, maximum: int) -> bytes:
     return result
 
 
-def _load_wire_json(raw: bytes, *, name: str, maximum: int) -> dict:
-    if not raw or len(raw) > maximum:
-        raise CacheContractError(f"{name} payload must be 1..{maximum} bytes")
-    try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise CacheContractError(f"invalid {name} JSON") from exc
-    if not isinstance(value, dict):
-        raise CacheContractError(f"{name} payload must be a JSON object")
-    return value
-
-
-# No ``slots``: like ``CacheMemoryPlan``, the frozen contract caches its
-# lookup index in ``__dict__``; dataclass fields alone define the wire form.
 @dataclass(frozen=True)
 class CacheTransferContract:
     """Thin PD wire envelope around the cache-owned plan and group specs."""
@@ -120,134 +97,12 @@ class CacheTransferContract:
             ):
                 raise CacheContractError("field addresses must be nonzero uint64")
 
-    def field_address(self, base: int, field_id: str) -> int:
-        if self.field_addresses is not None:
-            return self.field_addresses[field_id]
-        return base + self.plan.field_page_byte_offset(field_id, 0)
-
-    def shard_count(self, group_id: str) -> int:
-        """Return the cache group's cyclic owner count; one means replicated."""
-        return self.group_spec(group_id).shard_count
-
-    def fields_for_group(self, group_id: str) -> tuple[CacheFieldLayout, ...]:
-        return tuple(
-            sorted(
-                (field for field in self.plan.fields if field.group_id == group_id),
-                key=lambda field: field.field_id,
-            )
-        )
-
-    # Resolved per manifest group on the transfer paths; index the immutable
-    # spec tuple once instead of scanning it per call.
-    @cached_property
-    def _specs_by_id(self) -> dict[str, CacheGroupSpec]:
-        return {spec.group_id: spec for spec in self.group_specs}
-
-    def group_spec(self, group_id: str) -> CacheGroupSpec:
-        return self._specs_by_id[group_id]
-
-    def virtual_block_count(self, group_id: str) -> int:
-        """Exclusive bound of the scheduler block IDs a manifest may carry.
-
-        Block manifests are read from the scheduler's tables, so a sharded
-        group's IDs run over ``shard_count`` times its physical page count;
-        the physical count bounds local arena addressing only.
-        """
-        return sharded_virtual_block_count(
-            self.plan.group(group_id).page_count,
-            self.group_spec(group_id).shard_count,
-        )
-
-    def field_dtype(self, field_id: str) -> str:
-        return self.plan.field(field_id).dtype
-
     def to_wire_bytes(self) -> bytes:
         return _dump_wire_json(
             self,
             name="cache transfer contract",
             maximum=MAX_CACHE_CONTRACT_WIRE_BYTES,
         )
-
-    @classmethod
-    def from_wire_bytes(cls, raw: bytes) -> "CacheTransferContract":
-        payload = _load_wire_json(
-            raw,
-            name="cache transfer contract",
-            maximum=MAX_CACHE_CONTRACT_WIRE_BYTES,
-        )
-        try:
-            plan_payload = payload["plan"]
-            plan = CacheMemoryPlan(
-                prefix_granularity=plan_payload["prefix_granularity"],
-                lcm_block_bytes=plan_payload["lcm_block_bytes"],
-                num_lcm_blocks=plan_payload["num_lcm_blocks"],
-                groups=tuple(
-                    CacheGroupLayout(**group) for group in plan_payload["groups"]
-                ),
-                planes=tuple(
-                    CachePlaneLayout(**plane) for plane in plan_payload["planes"]
-                ),
-                fields=tuple(
-                    CacheFieldLayout(
-                        **{
-                            **field,
-                            "shape": tuple(field["shape"]),
-                        }
-                    )
-                    for field in plan_payload["fields"]
-                ),
-                resident_block_bytes=plan_payload.get("resident_block_bytes"),
-            )
-            schema_payload = payload["transfer_schema"]
-            return cls(
-                plan=plan,
-                field_addresses=payload.get("field_addresses"),
-                group_specs=tuple(
-                    CacheGroupSpec(**spec) for spec in payload["group_specs"]
-                ),
-                transfer_schema=CacheTransferSchema(
-                    tuple(
-                        CacheFieldTransferSpec(
-                            field_id=field["field_id"],
-                            partition=CacheFieldPartition(
-                                axis=field["partition"]["axis"],
-                                global_extent=field["partition"]["global_extent"],
-                                global_parts=tuple(field["partition"]["global_parts"]),
-                            ),
-                        )
-                        for field in schema_payload["fields"]
-                    )
-                ),
-            )
-        except (KeyError, TypeError, ValueError) as exc:
-            raise CacheContractError("invalid cache transfer contract") from exc
-
-
-def build_cache_transfer_contract(
-    *,
-    plan: CacheMemoryPlan,
-    buffer: object,
-    group_specs: Sequence[CacheGroupSpec],
-    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
-) -> tuple[CacheTransferContract, int]:
-    """Bind one cache memory plan to its semantics and raw slab."""
-    specs = tuple(group_specs)
-    contract = CacheTransferContract(
-        plan=plan,
-        group_specs=specs,
-        transfer_schema=transfer_schema,
-    )
-    if (
-        str(buffer.dtype) != "torch.uint8"
-        or not buffer.is_contiguous()
-        or buffer.storage_offset() != 0
-        or buffer.data_ptr() != buffer.untyped_storage().data_ptr()
-        or int(buffer.nbytes) != plan.arena_bytes
-    ):
-        raise CacheContractError(
-            "cache transfer buffer must be the contiguous uint8 arena owner"
-        )
-    return contract, buffer.data_ptr()
 
 
 def build_arena_cache_transfer_contract(
@@ -327,364 +182,14 @@ def build_cache_fields_by_producer_step(
     return schedule
 
 
-@dataclass(frozen=True, slots=True)
-class CachePDGroupBlocks:
-    group_id: str
-    block_ids: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDBlockManifest:
-    """One request's transferable blocks per group, in logical slot order.
-
-    Block IDs are the publishing side's scheduler IDs -- virtual IDs for a
-    KVP-sharded group. The sender translates its own IDs to local pages when
-    it copies; the destination's IDs are addressed as the destination's
-    contract says.
-    """
-
-    groups: tuple[CachePDGroupBlocks, ...]
-    prefix_len: int
-    prompt_len: int
-    # The Decode found every state group's prompt-end checkpoint in its own
-    # cache: no ``latest_snapshot`` group transfers (their block lists are
-    # empty on both sides); the KV groups are still trimmed by ``prefix_len``.
-    state_prefix_cached: bool
-
-    def to_wire_bytes(self) -> bytes:
-        return _dump_wire_json(
-            self,
-            name="Cache block manifest",
-            maximum=MAX_CACHE_MANIFEST_WIRE_BYTES,
-        )
-
-    @classmethod
-    def from_wire_bytes(cls, raw: bytes) -> "CachePDBlockManifest":
-        payload = _load_wire_json(
-            raw, name="Cache block manifest", maximum=MAX_CACHE_MANIFEST_WIRE_BYTES
-        )
-        return cls(
-            groups=tuple(
-                CachePDGroupBlocks(group["group_id"], tuple(group["block_ids"]))
-                for group in payload["groups"]
-            ),
-            prefix_len=payload["prefix_len"],
-            prompt_len=payload["prompt_len"],
-            state_prefix_cached=bool(payload["state_prefix_cached"]),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDLayerwiseGroupSelection:
-    """Source blocks for one group and their positions in Decode's manifest."""
-
-    source_block_ids: tuple[int, ...]
-    destination_positions: tuple[int, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class CachePDLayerwiseBlockSelection:
-    """One prompt chunk's group-aware source-to-destination block selection.
-
-    This object stays process-local on Prefill. Decode publishes the full
-    request manifest once; each queued layerwise chunk references positions in
-    that immutable destination manifest instead of inventing a partial wire
-    manifest with ambiguous state-group semantics.
-    """
-
-    groups: tuple[CachePDLayerwiseGroupSelection, ...]
-
-
-def _logical_slots(
-    spec: CacheGroupSpec,
-    prefix_len: int,
-    prompt_len: int,
-    *,
-    state_prefix_cached: bool,
-) -> tuple[int, ...]:
-    """The block-table slots one group transfers for a prompt.
-
-    ``full_suffix`` (history) sends every retained block from the one holding
-    ``prefix_len`` -- the Prefill's private, fully valid copy when the prefix
-    hit ended inside it -- through the final partial block. ``latest_snapshot``
-    (state) sends the live slot: the exact prompt-end state, which the Decode
-    lands in its own live slot and evolves in place; nothing when the Decode
-    already holds that checkpoint (``state_prefix_cached``).
-    """
-    if spec.transfer_policy == "full_suffix":
-        block_granularity = spec.block_granularity
-        begin = prefix_len // block_granularity
-        if spec.attn_kind == "sliding_window":
-            # The next decode token can attend the preceding window - 1 raw
-            # tokens. Include every group block intersecting that retained tail.
-            retained_begin = max(0, prompt_len - spec.sliding_window_tokens + 1)
-            begin = max(begin, retained_begin // block_granularity)
-        end = (prompt_len + block_granularity - 1) // block_granularity
-        return tuple(range(begin, end))
-    return () if state_prefix_cached else (STATE_LIVE_SLOT,)
-
-
-def validate_cache_peer_layout(
-    layout: CacheTransferContract, peer_layout: CacheTransferContract
-) -> None:
-    if layout.plan.prefix_granularity != peer_layout.plan.prefix_granularity:
-        raise CacheContractError("Cache P/D contract mismatch: prefix_granularity")
-    local_group_ids = tuple(spec.group_id for spec in layout.group_specs)
-    peer_group_ids = tuple(spec.group_id for spec in peer_layout.group_specs)
-    if local_group_ids != peer_group_ids:
-        raise CacheContractError("Cache P/D contract mismatch: group order")
-    for local_spec, peer_spec in zip(
-        layout.group_specs, peer_layout.group_specs, strict=True
-    ):
-        # shard_count is deliberately not compared: Prefill and Decode shard
-        # a group independently (either, both or neither). Which rank sets
-        # exchange which pages is the transfer planner's decision, not a
-        # contract mismatch.
-        if (
-            local_spec.attn_kind != peer_spec.attn_kind
-            or local_spec.rows_per_page != peer_spec.rows_per_page
-            or local_spec.entry_stride_tokens != peer_spec.entry_stride_tokens
-            or local_spec.sliding_window_tokens != peer_spec.sliding_window_tokens
-            or local_spec.replayable != peer_spec.replayable
-            or local_spec.transfer_policy != peer_spec.transfer_policy
-        ):
-            raise CacheContractError(
-                f"Cache P/D contract mismatch: group {local_spec.group_id!r} "
-                "semantics"
-            )
-        local_fields = layout.fields_for_group(local_spec.group_id)
-        peer_fields = peer_layout.fields_for_group(peer_spec.group_id)
-        local_field_ids = tuple(field.field_id for field in local_fields)
-        peer_field_ids = tuple(field.field_id for field in peer_fields)
-        if local_field_ids != peer_field_ids:
-            raise CacheContractError(
-                f"Cache P/D contract mismatch: group "
-                f"{local_spec.group_id!r} transfer field order"
-            )
-        for local_field, peer_field in zip(local_fields, peer_fields, strict=True):
-            local_global_shape = list(local_field.shape)
-            peer_global_shape = list(peer_field.shape)
-            local_partition = layout.transfer_schema.partition_for(local_field.field_id)
-            peer_partition = peer_layout.transfer_schema.partition_for(
-                peer_field.field_id
-            )
-            if local_partition is not None:
-                local_global_shape[local_partition.axis] = local_partition.global_extent
-            if peer_partition is not None:
-                peer_global_shape[peer_partition.axis] = peer_partition.global_extent
-            if (
-                # element_size derives from dtype, so one comparison covers both.
-                local_field.dtype != peer_field.dtype
-                or local_partition != peer_partition
-                or tuple(local_global_shape) != tuple(peer_global_shape)
-            ):
-                raise CacheContractError(
-                    f"Cache P/D contract mismatch: field "
-                    f"{local_field.field_id!r} semantics"
-                )
-
-
-def validate_cache_manifest(
-    manifest: CachePDBlockManifest,
-    *,
-    layout: CacheTransferContract,
-    peer: str,
-) -> None:
-    if not 0 <= manifest.prefix_len < manifest.prompt_len:
-        raise CacheContractError(
-            f"{peer} manifest requires 0 <= prefix_len < prompt_len, got "
-            f"prefix_len={manifest.prefix_len} prompt_len={manifest.prompt_len}"
-        )
-    expected = tuple(spec.group_id for spec in layout.group_specs)
-    actual = tuple(group.group_id for group in manifest.groups)
-    if actual != expected:
-        raise CacheContractError(f"{peer} manifest group order disagrees with layout")
-    for group, spec in zip(manifest.groups, layout.group_specs, strict=True):
-        required = _logical_slots(
-            spec,
-            manifest.prefix_len,
-            manifest.prompt_len,
-            state_prefix_cached=manifest.state_prefix_cached,
-        )
-        if len(group.block_ids) != len(required):
-            raise CacheContractError(
-                f"{peer} manifest group {group.group_id!r} block count disagrees "
-                "with its transfer policy"
-            )
-        group_capacity = layout.virtual_block_count(spec.group_id)
-        if any(block <= 0 or block >= group_capacity for block in group.block_ids):
-            raise CacheContractError(
-                f"{peer} manifest group {group.group_id!r} has an out-of-bounds block"
-            )
-
-
-def build_cache_block_manifest(
-    forward_op: object,
-    *,
-    layout: CacheTransferContract,
-    request_row: int,
-    prefix_len: int,
-    prompt_len: int,
-    state_prefix_cached: bool,
-) -> CachePDBlockManifest:
-    """Select each group's blocks according to its explicit transfer policy."""
-    if prefix_len >= prompt_len:
-        raise CacheContractError("Cache-transfer PD requires prefix_len < prompt_len")
-    mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
-    expected_ids = {group.group_id for group in layout.group_specs}
-    if set(mapping) != expected_ids:
-        raise CacheContractError(
-            "scheduler group IDs disagree with the cache-transfer layout: "
-            f"missing={sorted(expected_ids - set(mapping))}, "
-            f"extra={sorted(set(mapping) - expected_ids)}"
-        )
-
-    groups: list[CachePDGroupBlocks] = []
-    for spec in layout.group_specs:
-        table = mapping[spec.group_id]
-        logical_slots = _logical_slots(
-            spec, prefix_len, prompt_len, state_prefix_cached=state_prefix_cached
-        )
-        if logical_slots and logical_slots[-1] >= table.shape[1]:
-            raise CacheContractError(
-                f"table {spec.group_id!r} misses logical slot {logical_slots[-1]}"
-            )
-        block_ids = tuple(
-            int(table[request_row, logical_slot]) for logical_slot in logical_slots
-        )
-        group_capacity = layout.virtual_block_count(spec.group_id)
-        for logical_slot, block_id in zip(logical_slots, block_ids, strict=True):
-            if block_id <= 0 or block_id >= group_capacity:
-                raise CacheContractError(
-                    f"table {spec.group_id!r} logical slot {logical_slot} "
-                    f"has invalid block ID {block_id}"
-                )
-        groups.append(
-            CachePDGroupBlocks(
-                spec.group_id,
-                block_ids,
-            )
-        )
-    return CachePDBlockManifest(
-        groups=tuple(groups),
-        prefix_len=prefix_len,
-        prompt_len=prompt_len,
-        state_prefix_cached=state_prefix_cached,
-    )
-
-
-def build_cache_layerwise_block_selection(
-    forward_op: object,
-    *,
-    layout: CacheTransferContract,
-    request_row: int,
-    prefix_len: int,
-    prompt_len: int,
-    chunk_start: int,
-    chunk_end: int,
-    state_prefix_cached: bool,
-) -> CachePDLayerwiseBlockSelection:
-    """Select blocks that became transferable during one Prefill chunk.
-
-    Full-suffix groups publish newly completed retained blocks (plus the final
-    partial block). Latest-snapshot groups publish only the prompt's final
-    state, once the final chunk has written it. The returned destination
-    positions refer to Decode's immutable full manifest.
-    """
-    if prefix_len >= prompt_len:
-        raise CacheContractError("layerwise selection requires prefix_len < prompt_len")
-    if chunk_start >= chunk_end:
-        raise CacheContractError("layerwise selection requires chunk_start < chunk_end")
-    if chunk_end > prompt_len:
-        raise CacheContractError("layerwise selection requires chunk_end <= prompt_len")
-    is_final = chunk_end == prompt_len
-
-    mapping = forward_op.block_tables_arrays()  # type: ignore[attr-defined]
-    expected_ids = {group.group_id for group in layout.group_specs}
-    if set(mapping) != expected_ids:
-        raise CacheContractError(
-            "scheduler group IDs disagree with the cache-transfer layout: "
-            f"missing={sorted(expected_ids - set(mapping))}, "
-            f"extra={sorted(set(mapping) - expected_ids)}"
-        )
-
-    selections = []
-    for spec in layout.group_specs:
-        table = mapping[spec.group_id]
-        final_slots = _logical_slots(
-            spec, prefix_len, prompt_len, state_prefix_cached=state_prefix_cached
-        )
-        if spec.transfer_policy == "full_suffix":
-            block_granularity = spec.block_granularity
-            group_start_position = (
-                max(
-                    0,
-                    min(
-                        len(final_slots),
-                        chunk_start // block_granularity - final_slots[0],
-                    ),
-                )
-                if final_slots
-                else 0
-            )
-            ready_end = (
-                (chunk_end + block_granularity - 1) // block_granularity
-                if is_final
-                else chunk_end // block_granularity
-            )
-            ready_count = (
-                max(0, min(len(final_slots), ready_end - final_slots[0]))
-                if final_slots
-                else 0
-            )
-            destination_positions = tuple(range(group_start_position, ready_count))
-            logical_slots = tuple(
-                final_slots[position] for position in destination_positions
-            )
-        elif spec.transfer_policy == "latest_snapshot":
-            destination_positions = (0,) if is_final and final_slots else ()
-            logical_slots = final_slots if is_final else ()
-        if logical_slots and logical_slots[-1] >= table.shape[1]:
-            raise CacheContractError(
-                f"table {spec.group_id!r} misses logical slot {logical_slots[-1]}"
-            )
-        source_block_ids = tuple(
-            int(table[request_row, logical_slot]) for logical_slot in logical_slots
-        )
-        group_capacity = layout.virtual_block_count(spec.group_id)
-        for logical_slot, block_id in zip(logical_slots, source_block_ids, strict=True):
-            if block_id <= 0 or block_id >= group_capacity:
-                raise CacheContractError(
-                    f"table {spec.group_id!r} logical slot {logical_slot} "
-                    f"has invalid block ID {block_id}"
-                )
-        selections.append(
-            CachePDLayerwiseGroupSelection(
-                source_block_ids=source_block_ids,
-                destination_positions=destination_positions,
-            )
-        )
-
-    return CachePDLayerwiseBlockSelection(groups=tuple(selections))
-
-
 __all__ = [
     "CacheContractError",
     "CacheFieldPartition",
     "CacheFieldTransferSpec",
-    "CachePDBlockManifest",
-    "CachePDGroupBlocks",
-    "CachePDLayerwiseGroupSelection",
-    "CachePDLayerwiseBlockSelection",
     "CacheProducerSchedule",
     "CacheTransferContract",
     "CacheTransferSchema",
     "build_cache_fields_by_producer_step",
-    "build_cache_block_manifest",
-    "build_cache_layerwise_block_selection",
     "build_cache_transfer_schema",
-    "build_cache_transfer_contract",
     "build_arena_cache_transfer_contract",
-    "validate_cache_manifest",
-    "validate_cache_peer_layout",
 ]

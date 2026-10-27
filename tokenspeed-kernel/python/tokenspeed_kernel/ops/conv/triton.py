@@ -34,6 +34,8 @@ both are registered leaves of the ``conv`` family's
 kernels are re-exported for the conv package entry points.
 """
 
+import functools
+
 import torch
 from tokenspeed_kernel._triton import triton
 from tokenspeed_kernel.ops.attention.gdn.triton import (
@@ -47,6 +49,7 @@ from tokenspeed_kernel.ops.conv._triton.causal_conv1d import (
 )
 from tokenspeed_kernel.ops.conv._triton.grouped import dflash2_grouped_conv
 from tokenspeed_kernel.ops.conv._triton.sconv import (
+    _inkling_ring_commit_kernel,
     _inkling_ring_sconv_decode_kernel,
     _inkling_ring_sconv_prefill_kernel,
     select_prefill_config,
@@ -57,6 +60,7 @@ from tokenspeed_kernel.signature import format_signatures
 
 __all__ = [
     "PAD_SLOT_ID",
+    "_inkling_ring_commit_kernel",
     "_inkling_ring_sconv_decode_kernel",
     "_inkling_ring_sconv_prefill_kernel",
     "dflash2_grouped_conv",
@@ -66,6 +70,15 @@ __all__ = [
 ]
 
 _CONV_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
+# Channels per program of the sequential update, one per thread.
+_UPDATE_BLOCK_CHANNELS = 128
+
+
+@functools.cache
+def _update_num_warps() -> int:
+    """Warps holding one channel per thread (32- or 64-lane warps)."""
+    warp_size = triton.runtime.driver.active.get_current_target().warp_size
+    return max(_UPDATE_BLOCK_CHANNELS // warp_size, 1)
 
 
 @register_kernel(
@@ -264,6 +277,8 @@ def triton_causal_conv1d_update(
     validate_data=False,
     *,
     parent_indices: torch.Tensor | None,
+    out: torch.Tensor | None = None,
+    replay_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ):
     """
     x: (batch, dim) or (batch, dim, seqlen)
@@ -291,7 +306,9 @@ def triton_causal_conv1d_update(
         conv_state_indices and int32 output_state_indices. Draft trees: token t's
         window ends at token parent_indices[b, t] (the initial window when
         negative) instead of token t - 1.
-    out: (batch, dim) or (batch, dim, seqlen)
+    out: destination shaped and typed like x, not overlapping it; None writes over x.
+    replay_payload: (payload, a, b) to fill, or None; row i * seqlen + t: [k/v channels | a | b].
+    returns: the output, (batch, dim) or (batch, dim, seqlen)
     """
     enable_pdl = pdl_enabled()
     if parent_indices is not None:
@@ -329,6 +346,8 @@ def triton_causal_conv1d_update(
     elif activation is not None:
         assert activation in ["silu", "swish"]
     if parent_indices is not None:
+        if out is not None or replay_payload is not None:
+            raise ValueError("the tree conv writes its own output, without payload")
         return _causal_conv1d_tree_update(
             x,
             conv_state,
@@ -363,7 +382,14 @@ def triton_causal_conv1d_update(
         assert weight.stride(1) == 1
         assert cache_seqlens is None
 
-    out = x
+    if out is None:
+        out = x
+    elif out.dim() == 2:
+        out = out.unsqueeze(-1)
+    if out.shape != x.shape or out.dtype != x.dtype:
+        raise ValueError(
+            f"out {out.dtype} {tuple(out.shape)} must match x {x.dtype} {x.shape}"
+        )
     stride_w_dim, stride_w_width = weight.stride()
 
     stride_x_seq, stride_x_dim, stride_x_token = x.stride()  # X (batch, dim, seqlen)
@@ -401,6 +427,36 @@ def triton_causal_conv1d_update(
         )
     else:
         stride_output_state_indices_seq = stride_output_state_indices_step = 0
+    # One channel per thread for multi-token windows, two for single-token decode (faster each).
+    block_n, num_warps = (
+        (_UPDATE_BLOCK_CHANNELS, _update_num_warps()) if seqlen > 1 else (256, 4)
+    )
+    if replay_payload is not None:
+        payload, replay_a, replay_b = replay_payload
+        gate_heads = replay_a.shape[-1]
+        rows = batch * seqlen
+        # The payload saves the channels from this one on.
+        replay_first_channel = dim + 2 * gate_heads - payload.shape[-1]
+        if (
+            payload.shape[0] != rows
+            or payload.stride(-1) != 1
+            or replay_a.shape != (rows, gate_heads)
+            or replay_b.shape != (rows, gate_heads)
+            or replay_a.stride(-1) != 1
+            or replay_b.stride(-1) != 1
+            or not 0 <= replay_first_channel < dim
+            or any(t.dtype != x.dtype for t in replay_payload)
+        ):
+            raise ValueError(
+                "replay_payload needs a [batch * seqlen, width] payload saving "
+                "1 to dim channels plus two [batch * seqlen, heads] gates, all of "
+                "x's dtype with unit inner strides"
+            )
+        replay_strides = (payload.stride(0), replay_a.stride(0), replay_b.stride(0))
+    else:
+        payload = replay_a = replay_b = out
+        gate_heads = replay_first_channel = 0
+        replay_strides = (0, 0, 0)
 
     _causal_conv1d_update_kernel[grid](
         x,
@@ -413,6 +469,9 @@ def triton_causal_conv1d_update(
         intermediate_conv_window if intermediate_conv_window is not None else x,
         output_state_indices if output_state_indices is not None else x,
         out,
+        payload,
+        replay_a,
+        replay_b,
         batch,
         dim,
         seqlen,
@@ -436,6 +495,7 @@ def triton_causal_conv1d_update(
         stride_o_seq,
         stride_o_dim,
         stride_o_token,
+        *replay_strides,
         pad_slot_id,
         HAS_BIAS=bias is not None,
         KERNEL_WIDTH=width,
@@ -444,9 +504,15 @@ def triton_causal_conv1d_update(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         NP2_STATELEN=np2_statelen,
         USE_PAD_SLOT=pad_slot_id is not None,
-        BLOCK_N=256,
+        BLOCK_N=block_n,
+        num_warps=num_warps,
         SAVE_INTERMEDIATE=intermediate_conv_window is not None,
         HAS_OUTPUT_STATE_INDICES=output_state_indices is not None,
+        HAS_REPLAY_PAYLOAD=replay_payload is not None,
+        REPLAY_FIRST_CHANNEL=replay_first_channel,
+        GATE_HEADS=gate_heads,
+        GATE_BLOCK=triton.next_power_of_2(max(gate_heads, 1)),
+        NP2_SEQLEN=triton.next_power_of_2(seqlen),
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )

@@ -76,6 +76,14 @@ def _load_trtllm_comm_module():
     return tvm_ffi.load_module(str(so_path))
 
 
+@functools.cache
+def _load_trtllm_mhc_module():
+    import tvm_ffi
+
+    path = Path(__file__).resolve().parent / "objs/trtllm_mhc/trtllm_mhc.so"
+    return tvm_ffi.load_module(str(path))
+
+
 # ---------------------------------------------------------------------------
 # Pattern enums (pure Python, identical to flashinfer)
 # ---------------------------------------------------------------------------
@@ -125,6 +133,10 @@ class AllReduceFusionPattern:
     # trtllm_mnnvl_sandwich_norm_allreduce (its own binding); the generic
     # trtllm_allreduce_fusion dispatchers refuse it.
     kARSandwichResidualRMSNorm = 11
+    # The same boundary with its norm output also (or only) written as
+    # per-token FP8 E4M3 codes and FP32 scales; launched by
+    # trtllm_mnnvl_sandwich_norm_allreduce with token_fp8_out.
+    kARSandwichResidualRMSNormTokenFP8 = 12
 
 
 class AllGatherFusionPattern:
@@ -280,14 +292,7 @@ def _mnnvl_should_use_oneshot(
 # kernel header. Workspace slot layout: [A: token][rank][hidden] + [B: token][hidden].
 MNNVL_TWOSHOT_MAX_TOKEN = 2048
 
-# Above this payload the IPC lamport workspace beats the mnnvl one on a single
-# node: multicast/scatter wins while cost tracks the number of stores, but past
-# ~10 MiB bandwidth dominates and IPC's direct peer writes come out ahead.
-# Measured at world 4, hidden 7168, bf16, with the scatter phase A: mnnvl leads
-# through 768 tokens (10.5 MiB, 60.0 vs 63.4 us) and trails from 1024 (14 MiB,
-# 86.1 vs 75.4). Expressed in input-tensor bytes so it holds across hidden sizes
-# and dtypes. Only reachable single-node -- cross-node there is no IPC
-# workspace, and there mnnvl beats NCCL across the whole supported range.
+# Single-node calls this large stay on IPC only when its one-shot serves them; mnnvl beats its two-shot.
 MNNVL_PREFER_IPC_BYTES = int(
     os.environ.get("TOKENSPEED_MNNVL_PREFER_IPC_BYTES", 12 * 1024 * 1024)
 )
@@ -599,7 +604,7 @@ def trtllm_mnnvl_sandwich_norm_allreduce(
     residual_in: torch.Tensor,
     post_norm_gamma: torch.Tensor,
     rms_gamma: torch.Tensor,
-    norm_out: torch.Tensor,
+    norm_out: Optional[torch.Tensor],
     residual_out: torch.Tensor,
     *,
     world_rank: int,
@@ -609,6 +614,7 @@ def trtllm_mnnvl_sandwich_norm_allreduce(
     residual_scale: float,
     trigger_completion_at_end: bool = True,
     launch_with_pdl: Optional[bool] = None,
+    token_fp8_out: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> None:
     """Launch the pre/post norm boundary (kARSandwichResidualRMSNorm) on ``workspace``.
 
@@ -619,6 +625,14 @@ def trtllm_mnnvl_sandwich_norm_allreduce(
     rms_gamma)``, both norms with ``rms_eps``. All tensors are contiguous
     BF16; ``use_oneshot`` is the strategy ``workspace.resolve_use_oneshot``
     gave for this call.
+
+    ``token_fp8_out=(codes, scales)`` (kARSandwichResidualRMSNormTokenFP8)
+    also writes ``norm_out`` quantized per token, as
+    ``ops/quantization/triton.py``'s ``fp8_quantize_per_token`` quantizes the
+    BF16 ``norm_out``: contiguous FP8 E4M3 ``[T, H]`` codes and FP32 ``[T]``
+    (or ``[T, 1]``) scales. ``norm_out`` may then be None: only the codes and
+    scales are written. Without ``token_fp8_out`` the launch is the BF16
+    pattern's and ``norm_out`` is required.
 
     Raises:
         RuntimeError: the workspace does not serve this shape and strategy.
@@ -639,6 +653,35 @@ def trtllm_mnnvl_sandwich_norm_allreduce(
             f"dtype={allreduce_in.dtype}, use_oneshot={use_oneshot})"
         )
     launch_with_pdl = pdl_enabled() if launch_with_pdl is None else launch_with_pdl
+    if token_fp8_out is not None:
+        codes, scales = token_fp8_out
+        _load_trtllm_comm_module().trtllm_mnnvl_sandwich_norm_allreduce_token_fp8(
+            allreduce_in,
+            residual_in,
+            post_norm_gamma,
+            rms_gamma,
+            norm_out,
+            residual_out,
+            codes,
+            scales,
+            world_size,
+            world_rank,
+            token_num,
+            hidden_dim,
+            workspace.multicast_ptr,
+            workspace.local_ptr,
+            workspace.peer_ptrs,
+            workspace.buffer_flags,
+            launch_with_pdl,
+            use_oneshot,
+            trigger_completion_at_end,
+            float(rms_eps),
+            float(x_scale),
+            float(residual_scale),
+        )
+        return
+    if norm_out is None:
+        raise ValueError("norm_out is required without token_fp8_out")
     _load_trtllm_comm_module().trtllm_mnnvl_sandwich_norm_allreduce(
         allreduce_in,
         residual_in,

@@ -34,6 +34,7 @@ from tokenspeed_kernel.platform import ArchVersion, current_platform
 from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_profile import ModelProfile
+from tokenspeed.runtime.configs.numerics import BITWISE_ENVELOPES
 from tokenspeed.runtime.layers.attention.kernel_page_sizes import (
     DEEPSEEK_V4_PAGE_SIZE,
     TRTLLM_MHA_PAGE_SIZE,
@@ -466,12 +467,18 @@ def beam_default_moe_backend(
 
 
 def _apply_beam_moe_default(model_config, server_args: ServerArgs) -> None:
-    """Fill ``--moe-backend`` for a Beam model the launch left ``auto`` (an
-    explicit backend is never asked; another model's launch is not read)."""
+    """Apply Beam's performance default to eligible ``auto`` launches.
+
+    Bitwise launches leave selection to the capability-constrained MoE planner.
+    """
     architectures = _model_architectures(
         model_config.hf_config, model_config.hf_text_config
     )
-    if "BeamForCausalLM" not in architectures or server_args.moe_backend != "auto":
+    if (
+        "BeamForCausalLM" not in architectures
+        or server_args.moe_backend != "auto"
+        or server_args.numerics in BITWISE_ENVELOPES
+    ):
         return
     fmt = _beam_checkpoint_format(model_config)
     backend = beam_default_moe_backend(

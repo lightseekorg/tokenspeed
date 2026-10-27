@@ -128,7 +128,7 @@ def test_decode_replays_in_a_graph() -> None:
 
 # 2000 is not a multiple of the 256-row tile, so it exercises the clamped
 # descriptor and the masked store that a whole number of tiles never reaches.
-@pytest.mark.parametrize("tokens", [1536, 2000, 8192])
+@pytest.mark.parametrize("tokens", [1025, 2000, 8192])
 def test_prefill_matches_reference(tokens: int) -> None:
     _packed, views = _weights()
     hidden = torch.randn(tokens, HIDDEN, dtype=torch.bfloat16, device="cuda")
@@ -143,6 +143,7 @@ def test_prefill_matches_reference(tokens: int) -> None:
     [
         (1, "gluon_latent_input_decode_gfx1250"),
         (64, "gluon_latent_input_decode_gfx1250"),
+        (1025, "gluon_latent_input_largem_gfx1250"),
         (8192, "gluon_latent_input_largem_gfx1250"),
     ],
 )

@@ -45,6 +45,28 @@ class HcclBackend(CommBackend):
         if not isinstance(tensor, torch.Tensor):
             return super().all_reduce(tensor, group, op=op)
         if len(group) > 1:
+            if (
+                tensor.dtype == torch.int64
+                and op == dist.ReduceOp.MAX
+                and 0 < tensor.numel() * tensor.element_size() <= 4096
+            ):
+                # CANN's AIV AllReduce does not support INT64. Gather the
+                # unchanged bits as INT32, then select the exact local maximum.
+                # Bound the gather to small payloads such as packed argmax keys.
+                flat = tensor.reshape(-1)
+                if flat.stride(0) != 1:
+                    # contiguous() can retain a single-element view's stride.
+                    flat = flat.clone(memory_format=torch.contiguous_format)
+                gathered = tensor.new_empty((len(group), flat.numel()))
+                self.all_gather_single(
+                    gathered.view(torch.int32).view(-1),
+                    flat.view(torch.int32),
+                    group,
+                )
+                torch.amax(gathered, dim=0, out=flat)
+                if flat.data_ptr() != tensor.data_ptr():
+                    tensor.copy_(flat.view_as(tensor))
+                return tensor
             dist.all_reduce(
                 tensor,
                 op=dist.ReduceOp.SUM if op is None else op,

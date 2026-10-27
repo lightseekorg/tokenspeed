@@ -74,6 +74,8 @@ _STANDARD_PREFILL_WAVES_PER_EU = 1
 _KPOOL_SCORE_BLOCK_N = 128
 _KPOOL_SCORE_NUM_WARPS = 4
 _KPOOL_SCORE_WAVES_PER_EU = 4
+_KPOOL_PLAN_PAIR_ROWS = True
+_KPOOL_PLAN_PAIR_WAVES_PER_EU = 3
 # Prefill and KPool scorers split each row's columns over enough programs to
 # give every compute unit this many, so short batches still fill the GPU.
 _SCORE_SPLIT_PROGRAMS_PER_CU = 4
@@ -1282,8 +1284,8 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         window_cols: Output columns in the local scoring window.
         softmax_scale: Scale applied after weighted per-head ReLU reduction.
         ordered_head_fold: Whether the caller requires heads folded in
-            logical order. GFX1250 always folds heads in logical order, its
-            fastest reduction, so both values return identical scores.
+            logical order. Otherwise heads are folded with a balanced
+            in-register reduction.
         out: Optional contiguous FP32 scoring workspace.
         row_ends_out: Optional contiguous int32 local exclusive bounds.
 
@@ -1387,6 +1389,7 @@ def gluon_dsa_kpool_prefill_logits_gfx1250(
         NUM_WARPS=num_warps,
         USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
         USE_BUFFER_STORE=out.nbytes < 2**31,
+        ORDERED_HEAD_FOLD=ordered_head_fold,
         num_warps=num_warps,
         waves_per_eu=_KPOOL_SCORE_WAVES_PER_EU,
     )
@@ -1425,8 +1428,8 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         window_cols: Output columns in the local scoring window.
         softmax_scale: Scale applied after weighted per-head ReLU reduction.
         ordered_head_fold: Whether the caller requires heads folded in
-            logical order. GFX1250 always folds heads in logical order, its
-            fastest reduction, so both values return identical scores.
+            logical order. Otherwise heads are folded with a balanced
+            in-register reduction.
         out: Optional contiguous FP32 scoring workspace.
         row_ends_out: Optional contiguous int32 local exclusive bounds.
 
@@ -1484,9 +1487,13 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         raise ValueError("a nonempty prefill plan requires pooled cache pages")
 
     num_warps = _KPOOL_SCORE_NUM_WARPS
-    split_cols = _score_split_cols(tokens, window_cols, _KPOOL_SCORE_BLOCK_N, q.device)
+    pair_rows = _KPOOL_PLAN_PAIR_ROWS
+    program_rows = triton.cdiv(tokens, 2) if pair_rows else tokens
+    split_cols = _score_split_cols(
+        program_rows, window_cols, _KPOOL_SCORE_BLOCK_N, q.device
+    )
     gluon_kpool_prefill_topk_fp8_plan_gfx1250[
-        (tokens, triton.cdiv(window_cols, split_cols))
+        (program_rows, triton.cdiv(window_cols, split_cols))
     ](
         q,
         weights,
@@ -1510,6 +1517,7 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         int(pool_workspace_slots.numel()),
         pool_offset,
         split_cols,
+        tokens,
         PAGE_SIZE=page_size,
         PAGE_STRIDE_BYTES=cache_page_stride_bytes,
         POOL_SIZE=pool_size,
@@ -1520,8 +1528,12 @@ def gluon_dsa_kpool_prefill_plan_logits_gfx1250(
         NUM_WARPS=num_warps,
         USE_BUFFER_LOAD=pooled_k_cache.untyped_storage().nbytes() < 2**31,
         USE_BUFFER_STORE=out.nbytes < 2**31,
+        ORDERED_HEAD_FOLD=ordered_head_fold,
+        PAIR_ROWS=pair_rows,
         num_warps=num_warps,
-        waves_per_eu=_KPOOL_SCORE_WAVES_PER_EU,
+        waves_per_eu=(
+            _KPOOL_PLAN_PAIR_WAVES_PER_EU if pair_rows else _KPOOL_SCORE_WAVES_PER_EU
+        ),
     )
     return out, row_ends_out
 

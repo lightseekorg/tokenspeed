@@ -35,7 +35,7 @@ atomics). One kernel:
   * ``gl.gather`` of the per-expert block offset + scatter each slot to
     ``block_off[e]*block_m + rank``.
 
-Sync-free: outputs sized at the bound ``EM_MAX = (M*topk)*block_m``;
+Sync-free: outputs sized at the bound of bucketed routes * block_m;
 ``num_valid`` (real EM) is on-device and the GEMM stages early-out on the padded
 tail. Decode-only (EM_MAX + the O(G^2) rank tile grow with M*topk).
 """
@@ -50,22 +50,22 @@ def _next_pow2(x: int) -> int:
     return 1 << max(0, (x - 1)).bit_length()
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=("G", "sentinel"))
 def _fused_align_kernel(
     ids_ptr,  # [G] int32  flat topk_ids
     wts_ptr,  # [G] fp32   flat topk_weights
-    sti_ptr,  # [em_max] int32  out (packed slot<<24|token)
-    sw_ptr,  # [em_max] fp32   out (routed weight)
-    sei_ptr,  # [nb_max] int32  out (expert per block, -1 pad)
+    sti_ptr,  # [EM_MAX] int32  out (packed slot<<24|token)
+    sw_ptr,  # [EM_MAX] fp32   out (routed weight)
+    sei_ptr,  # [NB_MAX] int32  out (expert per block, -1 pad)
     nv_ptr,  # [1] int32       out (EM)
     G,
     num_experts,
     block_m,
     sentinel,
-    nb_max,  # == G (max blocks) == sei length
-    em_max,  # == nb_max * block_m
+    nb_max,
+    em_max,
     TOPK: gl.constexpr,
-    GP: gl.constexpr,  # next_pow2(G)  (>= nb_max == G)
+    GP: gl.constexpr,  # next_pow2(G) == nb_max
     EP: gl.constexpr,  # next_pow2(num_experts)
     EXPERT_START: gl.constexpr,
     INIT_TILE: gl.constexpr,
@@ -166,7 +166,8 @@ def moe_align_block_size_fused(
     sentinel = M
     assert M <= block_m, f"fused small-M align needs M ({M}) <= block_m ({block_m})"
 
-    NB_MAX = G
+    # Bucket static bounds so changing live token counts reuses compiled code.
+    NB_MAX = _next_pow2(max(1, G))
     EM_MAX = NB_MAX * block_m
     GP = _next_pow2(G)
     EP = _next_pow2(num_experts)
@@ -195,8 +196,6 @@ def moe_align_block_size_fused(
         GP=GP,
         EP=EP,
         EXPERT_START=expert_start,
-        # The batch-derived output bounds stay runtime arguments; only the
-        # power-of-two route bucket GP and a fixed init tile specialize.
         INIT_TILE=1024,
         num_warps=4,
     )

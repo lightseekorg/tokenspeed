@@ -189,10 +189,13 @@ straight there, bypassing load balancing — overload spill is the router's
 job. An invalid pin fails that request. The engine keeps serving. Engines
 without attention DP drop the pin.
 
-Disaggregation engines ignore the pin: the `bootstrap_room` residue
-(`room % dp_size`) governs prefill placement (and decode placement under
-`round_robin`), so steer placement by minting the room instead. The engine
-logs and ignores a conflicting pin rather than rejecting it.
+Prefill engines ignore the pin: the decode side finds a request's prefill
+rank from its `bootstrap_room` residue (`room % dp_size`), so steer prefill
+placement by minting the room instead. The engine logs and ignores a
+conflicting pin rather than rejecting it. Decode engines honor the pin,
+since any decode rank finds the prefill rank from the room; without one, or
+with one out of range (logged and ignored), the room residue places the
+request.
 
 With the bundled gateway, pass `--policy cache_aware --dp-aware` to
 `ts serve` to enable per-rank affinity routing. This requires bundled smg
@@ -528,7 +531,7 @@ replicas live on other ranks.
      (`--ep-dispatch-algorithm static*`; the `dynamic*` variants draw at
      random per route). The runtime computes the map only on this path.
    - Under replicated-input EP (every rank routes every token, such as the
-     rl-bitwise aok path) exactly one rank must compute each route, so the
+     rl-bitwise slot-combine path) exactly one rank must compute each route, so the
      replica is a pure function of the token:
      `replicas[logical, (token row + route rank) mod replicas]`, identical
      on every rank. TokenSpeed refuses random replica choice on this path.
@@ -660,8 +663,9 @@ sharded-history prefill with DCP decode, without a PD transfer or QCP. On PD,
 a prefill engine (with or without a query shard) and a decode engine (with
 `--decode-context-parallel-size`) each shard their cache independently; a
 transfer edge copies the pages its prefill rank and decode rank both own.
-Works with the Host KVStore and the retraction snapshot pool; not yet with
-L3 storage.
+Works with the Host KVStore, the retraction snapshot pool and L3 storage.
+L3 reuse requires the same CP layout; see
+[Host L2 and Mooncake Store L3](../configuration/server.md#host-l2-and-mooncake-store-l3).
 
 For non-PD MLA serving, use a DCP-capable backend, for example:
 
@@ -707,7 +711,7 @@ movement, so a row's bits do not depend on which rank computes it
 
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
-Host KVStore and the retraction snapshot pool but not L3 storage, as every
+Host KVStore, the retraction snapshot pool and L3 storage, as every
 KVP engine does), `N == --attn-tp-size`, attention DP 1, no
 `--enable-mixed-batch`, GPU DSA attention with a bf16 KV cache (checked where
 the attention config is built), and `--dense-tp-size` and the MoE TP×EP group
@@ -853,6 +857,19 @@ Rules:
 Apply the same NCCL transport and channel settings on every node as well. In
 particular, do not mix IB and Socket selection or different
 `NCCL_MIN_NCHANNELS` / `NCCL_MAX_NCHANNELS` values across ranks.
+
+### Stopping
+
+Stop every node. A node that stops does not stop the others: they find out
+at their next collective with it, which fails or can hang.
+
+A node of rank 1 or higher that receives SIGTERM or SIGINT, or whose
+scheduler fails, sends SIGTERM to the engine rank processes it started and
+gives them `TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT` seconds (default 10)
+to exit. It then kills whatever is left of them and of the processes they
+started, and exits by the signal it received. On Linux the rank processes
+are also killed when the node process itself is killed, for example with
+SIGKILL at the end of a grace period.
 
 ## Emulating rank 0 on one GPU
 

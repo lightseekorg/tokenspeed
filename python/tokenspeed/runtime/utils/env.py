@@ -28,6 +28,7 @@ from tokenspeed_kernel.platform import pdl_enabled
 from tokenspeed.runtime.utils.server_args import ServerArgs
 
 global_server_args_dict: dict = {
+    "disaggregation_mode": ServerArgs.disaggregation_mode,
     "attention_backend": ServerArgs.attention_backend,
     "sampling_backend": ServerArgs.sampling_backend,
     "attention_use_fp4_indexer_cache": ServerArgs.attention_use_fp4_indexer_cache,
@@ -87,6 +88,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
     pdl_enabled(not server_args.disable_pdl)
     global_server_args_dict.update(
         {
+            "disaggregation_mode": server_args.disaggregation_mode,
             "attention_backend": server_args.attention_backend,
             "sampling_backend": server_args.sampling_backend,
             "attention_use_fp4_indexer_cache": server_args.attention_use_fp4_indexer_cache,
@@ -268,6 +270,8 @@ class Envs:
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
     TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
+    # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
+    TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
     TOKENSPEED_PROFILER_DIR = EnvStr("/tmp")
     # torch.cuda sync-debug mode armed once serving starts (after capture and
     # tuning, which synchronize legitimately): "warn" reports every host
@@ -294,6 +298,20 @@ class Envs:
 
     # Scheduler
     TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
+    # Seconds a blocking node of rank >= 1 gives its schedulers to exit on
+    # SIGTERM before it kills them, when it is stopped.
+    TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT = EnvFloat(10.0)
+    # The ts-host binary each engine rank runs; by default the one installed
+    # with the tokenspeed-engine wheel (``tokenspeed_engine.host_binary()``).
+    TOKENSPEED_HOST_BINARY = EnvStr(None)
+    # The Mooncake library the Rust host's PD peer loads
+    # (libtokenspeed_transfer_engine.so); by default the one installed with
+    # the tokenspeed-mooncake wheel.
+    TOKENSPEED_MOONCAKE_LIBRARY = EnvStr(None)
+    # The Mooncake store library the Rust host's L3 executor loads
+    # (libmooncake_store.so); by default the one installed with the
+    # tokenspeed-mooncake wheel.
+    TOKENSPEED_MOONCAKE_STORE_LIBRARY = EnvStr(None)
 
     # Mooncake
     TOKENSPEED_KVSTORE_MOONCAKE_CONFIG_PATH = EnvStr(None)

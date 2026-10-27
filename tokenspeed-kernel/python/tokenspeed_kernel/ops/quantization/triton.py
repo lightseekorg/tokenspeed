@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -99,7 +100,7 @@ def _flatten_to_2d(x: torch.Tensor):
         if x.stride(d) != expected:
             raise ValueError(
                 f"cannot flatten dim {d}: stride={x.stride(d)} but expected "
-                f"shape[{d+1}]*stride[{d+1}]={expected}. "
+                f"shape[{d + 1}]*stride[{d + 1}]={expected}. "
                 f"Tensor shape={tuple(x.shape)}, stride={tuple(x.stride())}."
             )
     return M, N, row_stride
@@ -238,7 +239,7 @@ def fp8_token_multiplier(amax):
 def fp8_quantize_by_multiplier(x, multiplier):
     """FP8 E4M3 codes of FP32 ``x`` times its quantization ``multiplier``."""
     q = tl.clamp(x * multiplier, -_FP8_E4M3_MAX, _FP8_E4M3_MAX)
-    return q.to(tl.float8e4nv)
+    return q.to(tl.float8e4nv, fp_downcast_rounding="rtne")
 
 
 @triton.jit
@@ -343,33 +344,65 @@ def fp8_quantize_per_token(
     return codes, scales
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["groups"])
 def _fp8_token_group_quantize_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
+    groups,
     group_size,
     eps,
     bit8_min,
     bit8_max,
     BLOCK: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
+    USE_RECIPROCAL: tl.constexpr,
 ):
-    group_id = tl.program_id(0)
+    # Each program quantizes GROUPS_PER_PROGRAM consecutive groups, one per
+    # tile row; every group's arithmetic is independent of the tiling.
+    group_ids = tl.program_id(0).to(tl.int64) * GROUPS_PER_PROGRAM + tl.arange(
+        0, GROUPS_PER_PROGRAM
+    )
     cols = tl.arange(0, BLOCK)
-    mask = cols < group_size
-    offsets = group_id.to(tl.int64) * group_size + cols
+    mask = (cols < group_size)[None, :]
+    # Only a multi-group tile can run past the last group.
+    group_mask = None
+    if GROUPS_PER_PROGRAM > 1:
+        group_mask = group_ids < groups
+        mask = mask & group_mask[:, None]
+    offsets = group_ids[:, None] * group_size + cols[None, :]
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(x), axis=0), eps) / bit8_max
-    out = tl.clamp(x / scale, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=1), eps) / bit8_max
+    if USE_RECIPROCAL:
+        inverse_scale = 1.0 / scale
+        normalized = x * inverse_scale[:, None]
+    else:
+        normalized = x / scale[:, None]
+    out = tl.clamp(normalized, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
 
     tl.store(out_ptr + offsets, out, mask=mask)
-    tl.store(scale_ptr + group_id, scale)
+    tl.store(scale_ptr + group_ids, scale, mask=group_mask)
+
+
+def _fp8_token_group_groups_per_cta(
+    x: torch.Tensor, group_size: int, groups: int
+) -> int | None:
+    # The grouped launch was measured on gfx950 with 256 compute units. Its
+    # crossover keeps at least two workgroups per compute unit on that device.
+    if group_size != 128 or x.device.type != "cuda" or torch.version.hip is None:
+        return None
+    device_properties = torch.cuda.get_device_properties(x.device)
+    if (
+        not current_platform().is_cdna4
+        or device_properties.multi_processor_count != 256
+    ):
+        return None
+    return 16 if groups >= 32 * device_properties.multi_processor_count else 1
 
 
 def _fp8_token_group_quantize(
-    x: torch.Tensor,
-    group_size: int,
+    x: torch.Tensor, group_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[-1] % group_size != 0:
         raise ValueError(
@@ -388,21 +421,63 @@ def _fp8_token_group_quantize(
     )
 
     groups = x.numel() // group_size
+    groups_per_cta = _fp8_token_group_groups_per_cta(x, group_size, groups)
     block = triton.next_power_of_2(group_size)
-    num_warps = min(max(block // 256, 1), 8)
+    # Tile by input size, measured on GB300: one group per program below
+    # 16 Ki padded elements, then tiles of consecutive groups, 1024 elements
+    # below 1.75 Mi (7 << 18) padded elements and 8192 from there. Groups of
+    # 1024 or more stay one per program. A program gets a warp per 256 tile
+    # elements, up to 8. The group count is a runtime argument; of the input
+    # size, only the tile is a compile-time choice.
+    padded_elements = groups * block
+    if padded_elements < 1 << 14 or block >= 1024:
+        groups_per_program = 1
+    elif padded_elements < 7 << 18:
+        groups_per_program = 1024 // block
+    else:
+        groups_per_program = 8192 // block
+    if groups_per_cta == 16:
+        groups_per_program = groups_per_cta
     fp8_finfo = torch.finfo(out_dtype)
-
-    _fp8_token_group_quantize_kernel[(groups,)](
-        x,
-        out,
-        scales,
-        group_size,
-        1e-10,
-        bit8_min=fp8_finfo.min,
-        bit8_max=fp8_finfo.max,
-        BLOCK=block,
-        num_warps=num_warps,
-        num_stages=1,
+    args = (x, out, scales, groups, group_size, 1e-10)
+    options = {
+        "bit8_min": fp8_finfo.min,
+        "bit8_max": fp8_finfo.max,
+        "BLOCK": block,
+        "num_stages": 1,
+    }
+    # Startup compiles every tile for this call's signature, so that a later
+    # input of another size and the same signature compiles nothing while
+    # serving.
+    if not is_serving() and block < 1024:
+        tiles = (
+            (1, 8, 16)
+            if groups_per_cta is not None
+            else (1, 1024 // block, 8192 // block)
+        )
+        for tile in tiles:
+            _fp8_token_group_quantize_kernel.warmup(
+                *args,
+                **options,
+                GROUPS_PER_PROGRAM=tile,
+                USE_RECIPROCAL=groups_per_cta is not None and tile == 16,
+                num_warps=(
+                    1
+                    if groups_per_cta is not None and tile == 16
+                    else min(max(tile * block // 256, 1), 8)
+                ),
+                grid=(1,),
+            )
+    _fp8_token_group_quantize_kernel[(triton.cdiv(groups, groups_per_program),)](
+        *args,
+        **options,
+        GROUPS_PER_PROGRAM=groups_per_program,
+        USE_RECIPROCAL=groups_per_cta == 16,
+        num_warps=(
+            1
+            if groups_per_cta == 16
+            else min(max(groups_per_program * block // 256, 1), 8)
+        ),
     )
     return out, scales
 
@@ -650,6 +725,7 @@ _FP8_PER_TOKEN_MAX_M = 64
     "fp8_with_scale",
     name="triton_quantize_fp8_per_token",
     solution="triton",
+    features={"token_fp8_min_scaling"},
     # SM100 and newer, where the per-token FP8 GEMMs that take its output run.
     capability=CapabilityRequirement(
         min_arch_version=ArchVersion(10, 0),
@@ -692,6 +768,63 @@ def triton_quantize_fp8_per_token(
             f"scale_encoding={scale_encoding!r}"
         )
     return fp8_quantize_per_token(x, enable_pdl=enable_pdl)
+
+
+@register_kernel(
+    "quantization",
+    "fp8_with_scale",
+    name="triton_quantize_fp8_per_token_portable",
+    solution="triton",
+    features={"token_fp8_min_scaling"},
+    capability=CapabilityRequirement(
+        vendors=frozenset({"amd"}),
+        min_arch_version=ArchVersion(9, 5),
+        max_arch_version=ArchVersion(9, 5),
+    ),
+    signatures=format_signatures("x", "dense", {torch.bfloat16, torch.float16}),
+    traits={
+        "granularity": frozenset({"token"}),
+        "scale_encoding": frozenset({"float32"}),
+    },
+    priority=Priority.PORTABLE + 1,
+)
+def triton_quantize_fp8_per_token_portable(
+    x: torch.Tensor,
+    *,
+    granularity: str,
+    group_size: int | None,
+    scale_encoding: str,
+    enable_pdl: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Portable per-token E4M3 quantization with a minimum scale, for any row count.
+
+    Args:
+        x: BF16 or FP16 activations; the last dimension is one token.
+        granularity: Must be ``"token"``.
+        group_size: Must be None.
+        scale_encoding: Must be ``"float32"``.
+        enable_pdl: Launch with Programmatic Dependent Launch on Hopper+.
+
+    Returns:
+        FP8 E4M3 codes with the input shape and FP32 scales with a singleton
+        last dimension. The scale
+        floor and independently rounded reciprocal match the shared token
+        quantizer, including zero and tiny rows.
+    """
+    if enable_pdl and not current_platform().is_hopper_plus:
+        raise ValueError("this platform does not support enable_pdl")
+    shape = x.shape
+    rows = x.reshape(-1, shape[-1])
+    if rows.stride(-1) != 1:
+        rows = rows.contiguous()
+    values, scales = triton_quantize_fp8_per_token(
+        rows,
+        granularity=granularity,
+        group_size=group_size,
+        scale_encoding=scale_encoding,
+        enable_pdl=enable_pdl,
+    )
+    return values.reshape(shape), scales.reshape(*shape[:-1], 1)
 
 
 # The widest SwiGLU half (intermediate size) one program holds: a row per
@@ -1648,7 +1781,6 @@ def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
 
 @triton.jit(
     do_not_specialize=["M", "X0"],
-    do_not_specialize_on_alignment=["M", "X0"],
 )
 def _fp8_group32_ue8m0_quantize_swizzled(
     X,

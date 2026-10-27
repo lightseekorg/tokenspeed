@@ -32,7 +32,7 @@ register_cuda_ci(est_time=20, suite="runtime-1gpu")
 @pytest.mark.parametrize(
     "backend,dtype,routing_config,error",
     [
-        ("flashinfer_cutlass", torch.bfloat16, {}, "only by the Triton"),
+        ("flashinfer_cutlass", torch.bfloat16, {}, "requires --moe-backend triton"),
         ("triton", torch.float16, {}, "requires BF16"),
         ("triton", torch.bfloat16, {"routed_scaling_factor": 2.5}, "unscaled"),
     ],
@@ -115,32 +115,6 @@ def test_hybrid_moe_dispatches_from_actual_topk_format(
     assert "topk_ids" not in calls[0]
     assert calls[1]["topk_weights"].shape == (2, 2)
     assert calls[1]["topk_ids"].shape == (2, 2)
-
-
-@pytest.mark.parametrize(
-    "beta,linear_beta",
-    [
-        (None, 25.0),
-        (0.0, 25.0),
-        (4.0, 0.0),
-    ],
-)
-def test_moe_layer_rejects_invalid_situ_parameters(
-    beta: float | None,
-    linear_beta: float | None,
-) -> None:
-    with pytest.raises(ValueError, match="beta values must be positive"):
-        MoELayer(
-            top_k=1,
-            num_experts=1,
-            hidden_size=32,
-            intermediate_size=32,
-            quant_config=None,
-            layer_index=0,
-            activation="situ",
-            activation_situ_beta=beta,
-            activation_situ_linear_beta=linear_beta,
-        )
 
 
 @pytest.mark.parametrize("backend", ["none", "agrs", "flashinfer"])

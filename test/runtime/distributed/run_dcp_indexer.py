@@ -262,6 +262,8 @@ def main() -> None:
     backend = object.__new__(DSABackend)
     backend.kernel_page_size = 64
     backend.kernel_solution = "triton"
+    backend.prefill_kernel_plan = None
+    backend.decode_kernel_plan = None
     backend.data_type = torch.bfloat16
     backend.kv_lora_rank = 128
     backend.qk_nope_head_dim = 128

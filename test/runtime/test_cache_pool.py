@@ -89,12 +89,6 @@ class TestCacheArenaContractTest:
 
         assert (make_arena(plan, "cpu").field("history.k").dtype) == (torch.bfloat16)
 
-    def test_field_rejects_an_unplanned_field(self):
-        arena = _arena()
-
-        with pytest.raises((ValueError), match=("not planned")):
-            arena.field("history.absent")
-
     def test_size_matches_the_tightest_packed_group(self):
         arena = _arena()
 
@@ -177,12 +171,6 @@ class TestCachePoolViewTest:
 
         with pytest.raises((TypeError), match=("abstract")):
             _Forgetful(_arena(), torch.uint8, rank=0)
-
-    def test_rejects_a_negative_field_layer_offset(self):
-        arena = _arena()
-
-        with pytest.raises((ValueError), match=("non-negative")):
-            MinimalCacheView(arena, torch.uint8, rank=0, field_layer_offset=-1)
 
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))

@@ -36,6 +36,9 @@ The contract, which every caller must hold to:
   kernels in order on one stream, so an earlier op is done with its scratch
   before a later op's kernels run. Work on a side stream runs concurrently and
   must bring its own buffer.
+  One hand-off: a pending draft round resumes on the drafter's stream
+  (``docs/design/event-loop.md``), which owns the block until the main stream
+  joins it.
 
 * **The block must reach its peak before the first CUDA-graph capture.** A
   graph records the raw address of any view captured into it, so the executor

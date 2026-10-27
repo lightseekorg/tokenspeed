@@ -64,6 +64,7 @@ class _FakeLLM:
             weight_version="default",
             model="model-x",
             kvstore_storage_backend=storage_backend,
+            rl_control_api_key=None,
         )
         self.updates: list = []
         self.succeed = True
@@ -180,13 +181,14 @@ def _executor(*, draft_policy, with_draft: bool):
     runner.model = target
     runner.server_args = SimpleNamespace(model_update_draft_weights=draft_policy)
     runner.update_weights_from_mooncake.return_value = (True, "applied")
-    forward_thread = mock.MagicMock()
-    forward_thread.run.side_effect = lambda callback: callback()
     return SimpleNamespace(
         model_runner=runner,
         draft_model_runner=SimpleNamespace(model=draft) if with_draft else None,
         drafter=mock.MagicMock(spec=BaseDrafter) if with_draft else None,
-        forward_thread=forward_thread,
+        device="cpu",
+        # The weight update is a data-plane task: it finishes a pending draft
+        # round first; none is pending here.
+        complete_pending_drafting=lambda: None,
     )
 
 

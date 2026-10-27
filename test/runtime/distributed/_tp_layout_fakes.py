@@ -47,11 +47,14 @@ def init_gloo(rank: int, rendezvous: str, mapping: Mapping) -> None:
     """One gloo world; every group the layouts use is registered under the
     device-backend key as well, so the NCCL-named backend path runs on CPU."""
     del rank  # Unused.
+    from tokenspeed.runtime.distributed.comm_backend.nccl import NcclBackend
+    from tokenspeed.runtime.distributed.comm_backend.registry import set_global_backend
     from tokenspeed.runtime.distributed.process_group_manager import (
         process_group_manager as pg_manager,
     )
     from tokenspeed.runtime.utils.env import global_server_args_dict
 
+    set_global_backend(NcclBackend())
     pg_manager.init_distributed(
         mapping,
         distributed_init_method=rendezvous,

@@ -151,8 +151,14 @@ class LlamaMLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.gateup_unquanted = quant_config is None
 
-    def forward(self, x, block_scale=None):
-
+    def forward(
+        self,
+        x: torch.Tensor,
+        block_scale: torch.Tensor | None,
+        ctx: ForwardContext,
+    ) -> torch.Tensor:
+        """This rank's partial MLP output; ``block_scale`` and ``ctx`` are
+        unused (an EAGLE-4 draft's MoE takes the same arguments)."""
         if x.shape[0] == 0:
             return x
         gate_up, _ = self.gate_up_proj(x)
@@ -230,6 +236,13 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             prefix=f"{prefix}.mlp",
         )
 
+    def _fuse_input(
+        self, hidden_states: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The attention input and residual from ``[norm(embeds) || norm(hidden)]``
+        and the incoming hidden; an EAGLE-4 draft may merge them first."""
+        return hidden_states, residual
+
     def _maybe_narrow_residual(
         self,
         residual: torch.Tensor,
@@ -281,6 +294,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                     output_kv_a=fused_norm_out[..., h:],
                 )
             hidden_states = fused_norm_out
+        hidden_states, residual = self._fuse_input(hidden_states, residual)
 
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
         hidden_states = self.self_attn(
@@ -302,7 +316,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
             )
         )
 
-        hidden_states = self.mlp(hidden_states, block_scale)
+        hidden_states = self.mlp(hidden_states, block_scale, ctx)
 
         # Fused final allreduce + norm (uses dense tp group)
         hidden_states, residual, *_ = final_norm.forward_with_allreduce_fusion(
@@ -358,6 +372,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
                 output_kv_a=fused_norm_out[..., h:],
             )
         hidden_states = fused_norm_out
+        hidden_states, residual = self._fuse_input(hidden_states, residual)
 
         hidden_states = self.comm_manager.pre_attn_comm(hidden_states, ctx)
         hidden_states = self.self_attn(
@@ -373,7 +388,7 @@ class Eagle3DecoderLayer(BaseDecoderLayer):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
 
         hidden_states = self.comm_manager.pre_mlp_comm(hidden_states, ctx)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states, None, ctx)
         hidden_states, residual = self.comm_manager.post_mlp_comm(
             hidden_states, residual, ctx
         )

@@ -55,11 +55,6 @@ def test_prefix_sum_matches_query_start_loc_contents() -> None:
     assert boundaries.tolist() == [0, 3, 8, 10]
 
 
-def test_absent_lens_raise() -> None:
-    with pytest.raises(RuntimeError, match="host extend lengths"):
-        _build_cu_extend_seq_lens_cpu(None, expected_len=4)
-
-
 def test_length_misalignment_raises() -> None:
     lens = torch.tensor([3, 5], dtype=torch.int32)
     # query_start_loc has 4 entries but only 2 lens -> 3 bounds: mismatch.

@@ -20,6 +20,7 @@
 
 """TRT-LLM blockwise FP8 adapter. All scales retain their original FP32 values."""
 
+import ctypes
 import threading
 
 import torch
@@ -28,7 +29,7 @@ _compiled = {}
 _compile_lock = threading.Lock()
 
 
-def _arguments(a, b, sa, sb, out):
+def _compile_arguments(a, b, sa, sb, out):
     import cutlass
     import cutlass.cute as cute
     from cutlass.cute.runtime import from_dlpack, make_ptr
@@ -49,6 +50,28 @@ def _arguments(a, b, sa, sb, out):
     return (m, n, k, m, n // 128, k // 128, 1, *pointers, c)
 
 
+def _arguments(a, b, sa, sb, out):
+    """Pass live storage directly through TVM-FFI after the types are compiled."""
+    m, k = a.shape
+    n = b.shape[0]
+    addresses = (a.data_ptr(), b.data_ptr(), sa.data_ptr(), sb.data_ptr())
+    if any(address % 16 for address in addresses) or out.data_ptr() % 16:
+        raise ValueError("TRT-LLM CuTe-DSL tensor pointers must be 16-byte aligned")
+    # Compile-time CuTe descriptors establish dtype/layout/alignment. At runtime
+    # TVM-FFI accepts opaque pointers and a Torch tensor without rebuilding them.
+    return (
+        m,
+        n,
+        k,
+        m,
+        n // 128,
+        k // 128,
+        1,
+        *(ctypes.c_void_p(address) for address in addresses),
+        out.as_strided((m, n, 1), (n, 1, m * n)),
+    )
+
+
 def _compile(a, b, sa, sb, out, tile_m):
     import cutlass
     import cutlass.cute as cute
@@ -64,7 +87,7 @@ def _compile(a, b, sa, sb, out, tile_m):
     active = utils.HardwareInfo().get_max_active_clusters(cluster[0] * cluster[1])
     return cute.compile(
         kernel.wrapper,
-        *_arguments(a, b, sa, sb, out),
+        *_compile_arguments(a, b, sa, sb, out),
         active,
         make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--opt-level 2 --enable-tvm-ffi",
@@ -105,9 +128,10 @@ def blockwise_gemm(a, b, a_scales, b_scales, out):
     from cuda.bindings.driver import CUstream
 
     # Query the stream at every launch, including capture on an auxiliary
-    # stream. Never bind the stream or pointers used during compilation.
+    # stream. Read the raw handle without constructing a temporary Torch Stream.
+    # Never bind the stream or pointers used during compilation.
     _compiled[key](
         *_arguments(a, b, sa, sb, out),
-        CUstream(torch.cuda.current_stream(a.device).cuda_stream),
+        CUstream(torch._C._cuda_getCurrentRawStream(a.device.index)),
     )
     return out

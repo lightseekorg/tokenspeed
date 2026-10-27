@@ -48,17 +48,25 @@ class TestNumericsMode:
         assert args.disable_pdl
         assert not (args.enable_allreduce_fusion)
         assert (args.comm_fusion_max_num_tokens) == (-1)
-        assert (args.moe_backend) == ("aok")
+        assert args.moe_backend == "auto"
         assert args.batch_invariant_collectives
 
-    def test_rl_bitwise_refuses_non_invariant_backends(self):
-        with pytest.raises((ValueError), match=("--moe-backend triton")):
-            ServerArgs(model="x", numerics="rl-bitwise", moe_backend="triton")
-        with pytest.raises((ValueError), match=("--draft-moe-backend triton")):
-            ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="triton")
-        # An explicit auto is a select-for-me request, folded like the target's.
+    def test_rl_bitwise_leaves_provider_validation_to_expert_planning(self):
+        assert (
+            ServerArgs(
+                model="x", numerics="rl-bitwise", moe_backend="triton"
+            ).moe_backend
+            == "triton"
+        )
+        assert (
+            ServerArgs(
+                model="x", numerics="rl-bitwise", draft_moe_backend="triton"
+            ).draft_moe_backend
+            == "triton"
+        )
+        # Auto asks the registry for a provider with the required capabilities.
         args = ServerArgs(model="x", numerics="rl-bitwise", draft_moe_backend="auto")
-        assert (args.draft_moe_backend) == ("aok")
+        assert args.draft_moe_backend == "auto"
         with pytest.raises((ValueError), match=("--sampling-backend triton")):
             ServerArgs(model="x", numerics="rl-bitwise", sampling_backend="triton")
         args = ServerArgs(
@@ -75,6 +83,16 @@ class TestNumericsMode:
         # topologies; the envelope must win regardless.
         args = ServerArgs(model="x", numerics="rl-bitwise", world_size=1)
         assert not (args.enable_allreduce_fusion)
+
+    def test_batch_invariant_collectives_vetoes_the_fused_all_reduce_norm(self):
+        args = ServerArgs(model="x", enable_allreduce_fusion=True)
+        assert args.enable_allreduce_fusion and args.comm_fusion_max_num_tokens > 0
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
+        args = ServerArgs(
+            model="x", batch_invariant_collectives=True, enable_allreduce_fusion=True
+        )
+        assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
 
     def test_unknown_mode_is_rejected(self):
         with pytest.raises((ValueError), match=("rl-bitwise")):
@@ -110,11 +128,12 @@ class TestNumericsMode:
         assert (ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm) == (
             "unfused"
         )
-        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
         args = ServerArgs(
             model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
         )
         assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
         with pytest.raises((ValueError), match=("--layer-boundary-norm")):
             ServerArgs(model="x", layer_boundary_norm="half")
 

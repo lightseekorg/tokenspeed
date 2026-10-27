@@ -94,6 +94,19 @@ class CommBackend(ABC):
         """Run fused DP column-linear, or leave out untouched and return False."""
         return False
 
+    def try_fused_dp_row_linear(
+        self,
+        tensor: torch.Tensor,
+        input_scales: torch.Tensor | None,
+        weight: torch.Tensor,
+        weight_scales: torch.Tensor | None,
+        owner_rows: tuple[int, ...],
+        out: torch.Tensor,
+        workspace: "ProjectionWorkspace",
+    ) -> bool:
+        """Run fused DP row-linear, or leave out untouched and return False."""
+        return False
+
     def projection_all_gather(
         self,
         tensor: torch.Tensor,
@@ -116,6 +129,8 @@ class CommBackend(ABC):
         quantize: bool,
         out: torch.Tensor | None,
         workspace: "ProjectionWorkspace",
+        *,
+        input_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Exchange token/channel axes using prepared layout and fusion resources."""
         from tokenspeed.runtime.distributed.comm_backend.projection import (
@@ -123,7 +138,14 @@ class CommBackend(ABC):
         )
 
         return projection_all_to_all(
-            tensor, rows, inverse, quantize, out, workspace, self
+            tensor,
+            rows,
+            inverse,
+            quantize,
+            out,
+            workspace,
+            self,
+            input_scales=input_scales,
         )
 
     def acquire_projection_output(
@@ -160,6 +182,20 @@ class CommBackend(ABC):
         if len(tensors) == 0:
             raise ValueError("all-reduce requires at least one tensor")
         return tuple(self.all_reduce(value, group, op=op) for value in tensors)
+
+    def supports_all_reduce_mhc_norm(
+        self, x: torch.Tensor, norm_weight: torch.Tensor, group: Group
+    ) -> bool:
+        """Whether the prepared group can fuse the anticipated output spec of x."""
+        return False
+
+    def all_reduce_mhc_norm(
+        self, x, residual, post, comb, pre, weight, eps, group: Group
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Execute admitted fusion; return residual/norm outputs or raise."""
+        raise NotImplementedError(
+            "This backend does not support mHC communication fusion"
+        )
 
     def prepare_all_reduce_lane(self, group: Group, hidden_dim: int) -> bool:
         """Prepare an implementation-specific one-shot lane when supported."""

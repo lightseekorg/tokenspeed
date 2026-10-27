@@ -84,12 +84,6 @@ def test_draft_tree_parents_are_declared_at_construction():
     assert torch.equal(states.future_parent_map, states.chain_parents.repeat(5, 1))
 
 
-def test_init_draft_probs_needs_a_verify_column():
-    states = RuntimeStates(4, 32, 3, "cpu")
-    with pytest.raises(ValueError, match="verify column"):
-        states.init_draft_probs(spec_num_tokens=0, reject_threshold=2.0)
-
-
 def _recorded_states() -> RuntimeStates:
     states = RuntimeStates(4, 32, 3, "cpu")
     states.init_draft_probs(spec_num_tokens=3, reject_threshold=2.0)

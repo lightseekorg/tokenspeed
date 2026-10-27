@@ -36,8 +36,6 @@ from prometheus_client import CollectorRegistry
 from tokenspeed.runtime.engine.request_types import (
     ABORT_CODE,
     FINISH_ABORT,
-    FINISH_LENGTH,
-    FINISH_MATCHED_TOKEN,
 )
 from tokenspeed.runtime.metrics.collector import (
     _ABORT_REASON_LABELS,
@@ -147,8 +145,8 @@ def test_finish_reason_label_maps_the_bounded_vocabulary():
     assert finish_reason_label({"type": "abort", "err_type": 999}) == "abort"
     assert finish_reason_label({"type": "some_future_reason"}) == "unknown"
     # The object form (BaseFinishReason before to_json()) maps the same way.
-    assert finish_reason_label(FINISH_MATCHED_TOKEN(matched=5)) == "stop"
-    assert finish_reason_label(FINISH_LENGTH(length=16)) == "length"
+    assert finish_reason_label({"type": "stop", "matched": 5}) == "stop"
+    assert finish_reason_label({"type": "length", "length": 16}) == "length"
     assert finish_reason_label(FINISH_ABORT()) == "abort:unknown_error"
     assert (
         finish_reason_label(FINISH_ABORT(err_type=ABORT_CODE.NumericalError))

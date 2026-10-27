@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -150,6 +149,9 @@ public:
         std::span<const std::string> prefix_hashes;
         std::span<const std::int32_t> tokens;
         std::int32_t max_tokens{0};
+        // An additional known candidate at max_tokens, used by storage before
+        // any local publication. It is a hint, never proof of cached data.
+        std::optional<TailPublication> tail;
     };
 
     struct PrefixProbe {
@@ -165,8 +167,7 @@ public:
             std::vector<GroupPrefixProbe> per_group;
         };
         struct Tier {
-            // Device/Host: the resume boundary T. Storage: the aligned fetch
-            // coverage, which is not eligible for admission until it lands.
+            // The boundary T this tier resumes at, in tokens.
             std::int32_t num_common_tokens{0};
             // The full pages below it: num_common_tokens less the tail.
             std::int32_t full_page_tokens{0};
@@ -191,11 +192,6 @@ public:
         // Entries the Host tier holds beyond the Device hit. Admission loads
         // these; nothing an admission touches can miss.
         Tier host;
-        // L3 only: token-spanned fetch coverage beyond the Host hit, over
-        // Host-cached or registered keys. Hits also carry available State
-        // checkpoints and their windows. PlanPrefetch fills Host; the ordinary
-        // Host candidate phase then chooses a resume boundary. Empty without L3.
-        Tier storage;
     };
     struct AdmissionResult {
         std::int32_t device_prefix_tokens{0};
@@ -225,6 +221,11 @@ public:
         // block at a publication point it keeps writing past. Both ends share
         // a bucket; the destination sits in the request's table.
         std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>> pages_to_copy;
+        // Aligned by group_id: the fresh block each State group's
+        // StateStep::checkpoint acquired outside the table (also listed in
+        // new_page_ids), null elsewhere. The caller holds it until the
+        // request's next publication point publishes it.
+        std::vector<CacheBlockRef> state_checkpoint_blocks;
     };
 
     // ProbePrefix is read-only. Cache state must not change before its
@@ -237,32 +238,6 @@ public:
     // Full pages only: a probe that enumerates no tails.
     PrefixProbe ProbePrefix(std::span<const std::string> content_hashes) const;
 
-    // One L3 object to fetch into a Host block, in prefix order. page_index
-    // is the prompt's prefix page the row belongs to, so the runtime can turn
-    // the rows that landed into a landed prefix-page count.
-    struct PrefetchRow {
-        std::uint32_t group_id{0};
-        CacheKey key{};
-        CacheBlockRef host_block;
-        std::int32_t page_index{0};
-    };
-    // The Host fill an L3-extended probe calls for: rows in prefix-page order
-    // (every group's rows of a page before the next page's), so a landed
-    // prefix length maps to a row prefix; page_row_ends[i] is the row count
-    // covering the first i + 1 prefetched pages.
-    struct PrefetchPlan {
-        std::vector<PrefetchRow> rows;
-        std::vector<std::size_t> page_row_ends;
-        std::int32_t first_page{0};  // prefix page index the fill starts at (the Host hit's end)
-    };
-    // Acquires a Host block for every storage-tier hit of `probe` beyond its
-    // Host hit, page by page, stopping at the first page a block cannot be
-    // had for (the pages before it stay); nullopt -- holding nothing -- when
-    // fewer than min_pages whole pages could be planned, so the request
-    // admits normally and computes them. Keys already Host-cached need no
-    // row. Mutates nothing but the Host allocation (which may evict unpinned
-    // entries).
-    std::optional<PrefetchPlan> PlanPrefetch(const PrefixProbe& probe, std::int32_t min_pages);
     // Decode-side PD reuses local history pages; the KV boundary trims the
     // peer's transfer and the partial block of a tail hit is left a hole for
     // the transfer to fill whole. A State group's checkpoint counts only at
@@ -400,8 +375,10 @@ public:
         std::size_t requested{0};
         std::size_t allocated{0};
         std::size_t unallocated{0};
-        std::size_t same_group_scans{0};
-        std::size_t cross_group_scans{0};
+        // Prefix-index enumerations, including groups that can donate capacity.
+        std::size_t group_scans{0};
+        // Distinct touched parents checked for whole-parent reclamation.
+        std::size_t parent_candidates{0};
     };
     struct HostAllocationBatch {
         std::vector<CacheBlockRef> blocks;
@@ -416,9 +393,10 @@ public:
     // One Host block per (group, bucket) entry, in the bucket of the Device
     // block it will mirror -- under page-cyclic sharding the owner of a Host
     // page must be the owner of its Device page, so a copy's two ends select
-    // the same rows on every rank. Free capacity first, then the group's own
-    // least valuable entries in the needed buckets, then whole parents of
-    // any group; a shortfall leaves an empty reference.
+    // the same rows on every rank. Free capacity first, then global LRU over
+    // compatible children and fully evictable parents of any group. A parent
+    // is ranked by its newest child; equal epochs prefer one child. A
+    // shortfall leaves an empty reference.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     CacheBlockRef AcquireHostBlock(std::uint32_t group_id, std::int32_t bucket);
@@ -430,6 +408,22 @@ public:
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;
     void CacheHostBlock(CacheBlockRef& block_ref, const CacheKey& key);
+    void CacheHostTail(const ContentHash& prior, const TailPublication& tail);
+    CacheBlockRef AcquireHostCachedBlock(const CacheKey& key);
+    struct StorageReservation {
+        std::vector<CacheKey> keys;
+        std::vector<CacheBlockRef> blocks;
+        ContentHash tail_prior;
+        std::optional<TailPublication> tail;
+    };
+    struct StorageQuery {
+        std::vector<CacheKey> keys;
+        std::int32_t max_tokens{0};
+    };
+    StorageQuery MissingStorageKeys(const PromptPrefix& prompt, std::size_t max_keys) const;
+    StorageReservation ReserveStoragePrefix(const PromptPrefix& prompt, std::span<const CacheKey> hits,
+                                            std::size_t max_blocks);
+
     // Publishes a Device block a restore filled from Host L2
     // (CompleteSnapshotRestore): the entry comes back with the logical block
     // index and boundary kind it was published under before the retraction,
@@ -437,21 +431,8 @@ public:
     void CacheDeviceBlock(CacheBlockRef& block_ref, const CacheKey& key, std::int32_t logical_block_index,
                           CacheBoundaryKind boundary_kind);
 
-    // L3 storage sits below Host: a bounded shadow of keys known to exist in
-    // the remote store, with no local Host block. ProbePrefix reports them as
-    // the storage tier beyond the Host hit, which PlanPrefetch turns into a
-    // pre-admission Host fill. Capacity tracks Host pages so the set cannot
-    // grow with every historical writeback. A single registration keeps the
-    // earliest contiguous prefix keys so prefix-closed matchers still hit,
-    // even when sequential write-backs already filled the shadow with this
-    // prompt's suffix. Later unrelated keys LRU-evict older prompts;
-    // submit-time registration re-inserts keys that were dropped.
     bool EnablesL3Storage() const { return enable_l3_storage_; }
-    void RegisterStorageKeys(std::span<const CacheKey> keys);
-    void UnregisterStorageKeys(std::span<const CacheKey> keys);
-    bool ContainsStorageKey(const CacheKey& key) const { return storage_keys_.contains(key); }
     std::vector<CacheKey> ExpandPrefixKeys(std::span<const std::string> content_hashes) const;
-    std::int32_t NumStorageKeys() const { return static_cast<std::int32_t>(storage_keys_.size()); }
 
     // Reports real device-cache entry insertions and removals. The scheduler
     // folds the per-group mutations into one externally visible prefix event.
@@ -484,12 +465,17 @@ public:
     };
     BlockRange SlidingWindowBlocks(std::int32_t i, std::int32_t boundary_tokens) const;
     // The first of a tail's blocks (page offset) group i needs: 0 for a
-    // History group that keeps every row; for a sliding group the block
-    // holding the window's first row when that lies inside the tail's page,
-    // below which the tail's blocks stay holes.
+    // History group that keeps every row and for a State group's one tail
+    // block; for a sliding group the block holding the window's first row
+    // when that lies inside the tail's page, below which the tail's blocks
+    // stay holes.
     std::int32_t FirstTailBlockNeeded(std::int32_t i, std::int32_t tail_tokens) const {
-        return tokenspeed::FirstTailBlockNeeded(groups_[static_cast<std::size_t>(i)].Spec(),
-                                                geometry_[static_cast<std::size_t>(i)].BlockGranularity(), tail_tokens);
+        const auto index = static_cast<std::size_t>(i);
+        if (GroupIsState(index)) {
+            return 0;
+        }
+        return tokenspeed::FirstTailBlockNeeded(groups_[index].Spec(), geometry_[index].BlockGranularity(),
+                                                tail_tokens);
     }
 
 private:
@@ -513,28 +499,26 @@ private:
     std::optional<SnapshotPoolPlan> planSnapshotPool(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                                      std::span<const std::vector<ImageSlot>> host_served_slots) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
-    void rememberStorageKey(const CacheKey& key);
-    void evictStorageKeysToLimit();
-    void compactStorageKeyOrder();
-    bool evictOldestUnprotectedKey(const std::unordered_set<CacheKey, CacheKeyHash>& protected_keys);
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>
     BlockPool& tierPool();
     template <CacheTier Tier>
     const BlockPool& tierPool() const;
     // Aligned matching over token-spanned groups; no State checkpoint hits.
-    // with_storage_keys also counts registered L3 keys (the Host tier only).
+    // extra_hits counts additional assumed hits beside the tier's entries.
     template <CacheTier Tier>
     PrefixProbe::Tier probeTierWithKeys(std::span<const std::vector<CacheKey>> group_keys,
                                         std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
-                                        std::int32_t floor_tokens, bool with_storage_keys) const;
+                                        std::int32_t floor_tokens,
+                                        const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
     // Whether group i can resume at the boundary full_tokens + tail_tokens on
     // this tier; on success fills tail_hits over tail_keys and, when asked,
     // page_hits over the group's full-page keys above the floor.
     template <CacheTier Tier>
     bool groupAcceptsBoundary(std::size_t i, std::span<const std::string> prefix_hashes, std::int32_t floor_tokens,
                               std::int32_t full_tokens, std::int32_t tail_tokens, std::span<const CacheKey> tail_keys,
-                              GroupPrefixProbe& tail_hits, GroupPrefixProbe* page_hits) const;
+                              GroupPrefixProbe& tail_hits, GroupPrefixProbe* page_hits,
+                              const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
     // Visits the published boundaries in (floor_tokens, from_tokens], longest
     // first, as (page_tokens, tail_tokens, published hash); the visitor
     // returns false to stop.
@@ -546,13 +530,13 @@ private:
     // tail a hole in the hits.
     template <CacheTier Tier>
     PrefixProbe::Tier probeTier(const PromptPrefix& prompt, std::span<const std::vector<CacheKey>> group_keys,
-                                std::span<const std::size_t> match_order, std::int32_t floor_tokens,
-                                bool claim_partial) const;
-    // Extends aligned fetch hits with State checkpoints and their windows;
-    // unlike probeTier, does not choose an admissible resume boundary.
-    PrefixProbe::Tier probeStorageForPrefetch(std::span<const std::vector<CacheKey>> group_keys,
-                                              std::span<const std::size_t> match_order, std::int32_t num_prefix_pages,
-                                              std::int32_t floor_tokens) const;
+                                std::span<const std::size_t> match_order, std::int32_t floor_tokens, bool claim_partial,
+                                const std::unordered_set<CacheKey, CacheKeyHash>* extra_hits) const;
+    // The complete dependency set selected by a matcher, with each key's
+    // absolute logical block index (including holes before an SWA window).
+    template <typename Visit>
+    void forEachStorageDependency(const PrefixProbe::Tier& probe, std::span<const std::vector<CacheKey>> group_keys,
+                                  std::int32_t floor_tokens, const Visit& visit) const;
     std::vector<CacheKey> tailKeysForGroup(std::size_t i, const ContentHash& hash, std::int32_t tail_tokens) const;
     PrefixProbe probePrefixWithOrder(const PromptPrefix& prompt, std::span<const std::size_t> match_order,
                                      bool claim_partial) const;
@@ -564,6 +548,13 @@ private:
     void cacheFullBlocksForGroup(std::size_t group_index, BlockTable& table, std::span<const CacheKey> keys,
                                  std::int32_t first_cache_block, std::uint64_t access_epoch,
                                  CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
+    // Registers blocks[j] under keys[j] (logical block first_logical_block + j)
+    // and reports and streams what was newly cached; cacheFullBlocksForGroup
+    // passes a table window, an in-forward State checkpoint its own block.
+    template <CacheTier Tier>
+    void cacheBlocksForGroup(std::size_t group_index, std::span<CacheBlockRef> blocks, std::span<const CacheKey> keys,
+                             std::int32_t first_logical_block, std::uint64_t access_epoch,
+                             CacheBoundaryKind boundary_kind, bool stream_completed_to_host);
     // One run of table slots a publication registers in a group, the key of
     // each (keys[j] is slot first_cache_block + j), and the boundary kind it
     // registers them under.
@@ -590,6 +581,7 @@ private:
     // Records a published tail in the tail table and evicts the tail the
     // per-prior cap dropped.
     void recordPublishedTail(const CompletedPages& completed);
+    void recordTail(const ContentHash& prior, const TailPublication& tail);
     // Evicts every group's Device entries under a tail hash: a tail's blocks
     // are usable only together, so they leave together.
     void evictTailEntries(const ContentHash& hash, std::int32_t tail_tokens);
@@ -627,11 +619,17 @@ private:
     std::int32_t prefix_granularity_{0};
     std::int32_t replay_window_tokens_{0};
     std::uint64_t next_access_epoch_{0};
+    struct HostParentCandidate {
+        std::uint64_t newest_access_epoch{0};
+        std::int32_t evictable_children{0};
+        bool allocated{false};
+    };
+    // Reuse the direct-indexed scratch buffer; reset only the parents touched
+    // by the previous replacement batch, never the whole Host arena per call.
+    std::vector<HostParentCandidate> host_parent_candidates_;
+    std::vector<std::int32_t> host_touched_parents_;
     TailTable tails_;
     std::vector<StoreCandidate> pending_stores_;
-    std::unordered_set<CacheKey, CacheKeyHash> storage_keys_;
-    std::deque<CacheKey> storage_key_order_;
-    std::size_t storage_key_limit_{0};
     CacheMutationSink cache_mutation_sink_;
 };
 

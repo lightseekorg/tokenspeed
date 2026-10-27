@@ -81,7 +81,10 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_id_repeats=False,
         fast_math=True,
         combine_order="rank",
+        features=frozenset(),
     )
+    plan["precision_policy"] = "default"
+    plan["output_scale"] = 1.0
     kernel_moe_process_weights(plan, weights)
     actual = kernel_moe_apply(
         plan,
@@ -119,11 +122,8 @@ def test_triton_mxfp4_moe_matches_torch(
         expert_output = F.linear(intermediate_dequant, w2_dequant[expert_id]).to(
             torch.bfloat16
         )
-        expected.index_add_(
-            0,
-            token_ids,
-            expert_output.float() * topk_weights[token_ids, slots, None],
-        )
+        weighted = expert_output.float() * topk_weights[token_ids, slots, None]
+        expected.index_add_(0, token_ids, weighted)
 
     torch.testing.assert_close(actual.float(), expected, rtol=0.02, atol=0.02)
 
@@ -184,6 +184,7 @@ def test_triton_mxfp4_moe_defers_local_ep_routes() -> None:
         persistent_max_num_tokens_per_gpu=None,
         fast_math=False,
         combine_order="rank",
+        features=frozenset(),
         solution="triton",
     )
     assert plan["supports_deferred_finalize"] is True

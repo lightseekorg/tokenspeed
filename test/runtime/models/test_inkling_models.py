@@ -74,8 +74,8 @@ class TestInklingConfigRegistry:
         assert (text.global_attention_layer_ids) == ([5])
 
     def test_scheduler_blindness(self):
-        """The engine enables mamba scheduling off attribute presence alone
-        (event_loop.py); the Inkling config must never grow these attributes."""
+        """The engine enables mamba scheduling off attribute presence alone;
+        the Inkling config must never grow these attributes."""
         config = load_inkling_config()
         text = config.get_text_config()
         for obj in (config, text):

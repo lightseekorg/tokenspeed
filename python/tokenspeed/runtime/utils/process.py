@@ -22,31 +22,59 @@
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import logging
 import multiprocessing as mp
 import os
 import signal
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from multiprocessing import connection
 from multiprocessing.connection import Connection
+from multiprocessing.process import BaseProcess
 from typing import Any
 
 import psutil
 
 logger = logging.getLogger(__name__)
 
+_process_shutdown_started = False
 
-def register_usr_signal():
-    parent_process = psutil.Process().parent()
+_PR_SET_PDEATHSIG = 1
+
+if sys.platform.startswith("linux"):
+    # Bound once so a post-fork child (a ``preexec_fn``) only calls prctl.
+    _libc = ctypes.CDLL(None, use_errno=True)
+
+
+def begin_process_shutdown() -> bool:
+    """Latch owner cleanup, returning whether this is the first shutdown request.
+
+    Failure and termination callbacks share this latch so a second worker's
+    notification cannot interrupt cleanup already unwinding the process.
+    """
+    global _process_shutdown_started
+    if _process_shutdown_started:
+        return False
+    _process_shutdown_started = True
+    return True
+
+
+def register_child_failure_signals():
+    """Unwind once to the launcher that owns cleanup after a child failure."""
+    global _process_shutdown_started
+    _process_shutdown_started = False
 
     def signal_handler(sig, frame):
-        logger.error("recv usr signal, kill usr signal to parent")
-        parent_process.send_signal(signal.SIGUSR1)
+        if begin_process_shutdown():
+            raise SystemExit(1)
 
     signal.signal(signal.SIGUSR1, signal_handler)
+    signal.signal(signal.SIGQUIT, signal_handler)
 
 
 def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
@@ -84,6 +112,67 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             pass
 
 
+def set_parent_death_signal(parent_pid: int) -> None:
+    """Ask the kernel to SIGKILL this process when ``parent_pid`` dies.
+
+    The kernel sends SIGKILL even when the parent itself was SIGKILLed.
+    Linux only; elsewhere this does nothing. The signal follows the parent
+    *thread* this process was started from, so start the process from a
+    thread that lives as long as the parent needs it.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    if _libc.prctl(_PR_SET_PDEATHSIG, int(signal.SIGKILL), 0, 0, 0) != 0:
+        errno = ctypes.get_errno()
+        raise OSError(errno, os.strerror(errno))
+    # The parent may have died before the signal was set up.
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+def run_with_parent_death_signal(parent_pid: int, target: Callable, *args):
+    """Run ``target(*args)`` in a process that is killed when its parent dies.
+
+    Meant as a ``multiprocessing.Process`` target, with ``parent_pid`` the
+    parent's ``os.getpid()``; see ``set_parent_death_signal``. Elsewhere
+    than Linux ``target`` just runs.
+    """
+    set_parent_death_signal(parent_pid)
+    return target(*args)
+
+
+def stop_processes(processes: Sequence[BaseProcess], timeout: float) -> None:
+    """Stop child ``processes`` and everything they started.
+
+    Each live one gets SIGTERM, and together they get ``timeout`` seconds to
+    exit. Then the ones still running, and every process that was below any
+    of them when this was called, get SIGKILL, and the killed ones get
+    ``timeout`` seconds more to be gone. Listing descendants first matters:
+    one whose parent exits in the meantime is no longer found below it.
+    """
+    processes = [process for process in processes if process.is_alive()]
+    descendants = []
+    for process in processes:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            descendants += psutil.Process(process.pid).children(recursive=True)
+        process.terminate()
+
+    def join(waiting):
+        deadline = time.monotonic() + timeout
+        for process in waiting:
+            process.join(max(0.0, deadline - time.monotonic()))
+
+    join(processes)
+    stuck = [process for process in processes if process.exitcode is None]
+    for process in stuck:
+        logger.warning(f"Process {process.pid!s} still running after {timeout!s} s")
+        process.kill()
+    for descendant in descendants:
+        with contextlib.suppress(psutil.NoSuchProcess):
+            descendant.kill()
+    join(stuck)
+
+
 def start_process_with_ready_pipe(
     target: Callable[..., None],
     args: tuple,
@@ -115,12 +204,15 @@ def start_process_with_ready_pipe(
 def receive_ready_messages(
     readers: Sequence[Connection], procs: Sequence[mp.Process]
 ) -> list[Any]:
-    """Receive one message per reader, failing as soon as any child dies.
+    """Receive one message per reader, failing when any child exits or closes its pipe.
 
     ``readers[i]`` is the ready pipe of ``procs[i]``. Waiting on every pipe
     and every process at once matters with several ranks: when one rank is
     killed, the others can block in a collective and never report, so
     waiting on their pipes alone would hang.
+
+    Detection never waits for cleanup or terminates workers. The launcher
+    owns shutdown of the process tree.
 
     Args:
         readers: The read ends from ``start_process_with_ready_pipe``.
@@ -131,20 +223,27 @@ def receive_ready_messages(
 
     Raises:
         RuntimeError: A process exited before every reader got its message,
-            including one that had already reported: its peers may be
-            waiting on it.
+            including one that had already reported, or closed its pipe
+            while cleanup still runs: its peers may be waiting on it.
     """
     messages: list[Any] = [None] * len(readers)
-    pending = {reader: index for index, reader in enumerate(readers)}
+    reader_indices = {reader: index for index, reader in enumerate(readers)}
+    pending = set(readers)
     sentinels = {proc.sentinel: index for index, proc in enumerate(procs)}
     while pending:
-        ready = connection.wait([*pending, *sentinels])
-        for reader in [obj for obj in ready if obj in pending]:
-            index = pending.pop(reader)
+        ready = connection.wait([*reader_indices, *sentinels])
+        for reader in [obj for obj in ready if obj in reader_indices]:
+            index = reader_indices[reader]
             try:
-                messages[index] = reader.recv()
+                message = reader.recv()
             except EOFError:
                 _raise_process_died(procs, index)
+            if reader not in pending:
+                raise RuntimeError(
+                    f"Scheduler process {index} reported readiness twice"
+                )
+            messages[index] = message
+            pending.remove(reader)
         for index in [sentinels[obj] for obj in ready if obj in sentinels]:
             _raise_process_died(procs, index)
     return messages
@@ -152,9 +251,8 @@ def receive_ready_messages(
 
 def _raise_process_died(procs: Sequence[mp.Process], index: int) -> None:
     proc = procs[index]
-    proc.join()
     raise RuntimeError(
-        f"Scheduler process {index} (pid {proc.pid}) exited with code "
-        f"{proc.exitcode} before startup finished. Please check if there are "
-        "relevant logs."
+        f"Scheduler process {index} (pid {proc.pid}) exited or closed its "
+        f"ready pipe before startup finished (exit code {proc.exitcode}). "
+        "Please check if there are relevant logs."
     )

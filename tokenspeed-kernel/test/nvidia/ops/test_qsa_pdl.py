@@ -22,6 +22,8 @@
 
 from __future__ import annotations
 
+import ctypes
+
 import pytest
 import torch
 from tokenspeed_kernel._triton import tl, triton
@@ -109,6 +111,44 @@ def restore_pdl():
     pdl_enabled(previous)
 
 
+def _graph_edges(graph):
+    """Read edge data into owned buffers before inspecting graph nodes."""
+    from cuda.bindings import driver as cu
+
+    class EdgeData(ctypes.Structure):
+        _fields_ = [
+            ("from_port", ctypes.c_ubyte),
+            ("to_port", ctypes.c_ubyte),
+            ("type", ctypes.c_ubyte),
+            ("reserved", ctypes.c_ubyte * 5),
+        ]
+
+    # cuda-python's returned edge structs can reference released array storage.
+    # Keep the CUDA driver's output arrays alive until their values are copied.
+    driver = ctypes.CDLL("libcuda.so.1")
+    get_edges = driver.cuGraphGetEdges_v2
+    get_edges.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(EdgeData),
+        ctypes.POINTER(ctypes.c_size_t),
+    ]
+    get_edges.restype = ctypes.c_int
+    raw = ctypes.c_void_p(graph.raw_cuda_graph())
+    count = ctypes.c_size_t()
+    assert get_edges(raw, None, None, None, ctypes.byref(count)) == 0
+    sources = (ctypes.c_void_p * count.value)()
+    targets = (ctypes.c_void_p * count.value)()
+    edges = (EdgeData * count.value)()
+    assert get_edges(raw, sources, targets, edges, ctypes.byref(count)) == 0
+    return (
+        [cu.CUgraphNode(node) for node in sources[: count.value]],
+        [cu.CUgraphNode(node) for node in targets[: count.value]],
+        [int(edge.type) for edge in edges[: count.value]],
+    )
+
+
 def _check_graph_edges(graph, enabled):
     from cuda.bindings import driver as cu
 
@@ -116,21 +156,21 @@ def _check_graph_edges(graph, enabled):
         assert result[0] == cu.CUresult.CUDA_SUCCESS, result
         return result[1:]
 
-    raw = cu.CUgraph(graph.raw_cuda_graph())
-    _, _, _, count = checked(cu.cuGraphGetEdges(raw, 0))
-    _, targets, edges, _ = checked(cu.cuGraphGetEdges(raw, count))
+    _, targets, edge_types = _graph_edges(graph)
     tested = 0
-    for target, edge in zip(targets, edges):
+    for target, edge_type in zip(targets, edge_types):
         (kind,) = checked(cu.cuGraphNodeGetType(target))
         if kind == cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
             (params,) = checked(cu.cuGraphKernelNodeGetParams(target))
             (name,) = checked(cu.cuFuncGetName(params.func))
-            assert int(edge.type) == int(enabled), (name, edge.type, enabled)
+            assert edge_type == int(enabled), (name, edge_type, enabled)
             tested += 1
     assert tested > 0
 
 
-def _check_replays(forward, sources, targets, enabled, *, unordered_outputs):
+def _check_replays(
+    forward, sources, targets, enabled, *, unordered_outputs, compare_outputs=None
+):
     # Explicit kernel arguments must take precedence over the global setting.
     pdl_enabled(not enabled)
     forward(enabled)
@@ -149,11 +189,57 @@ def _check_replays(forward, sources, targets, enabled, *, unordered_outputs):
             target.fill_(float("nan") if target.is_floating_point() else 0)
         pdl_enabled(not enabled)
         graph.replay()
-        for result, reference in zip(actual, expected):
-            if unordered_outputs:
-                result = result.sort(dim=-1).values
-                reference = reference.sort(dim=-1).values
-            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        if compare_outputs is None:
+            for result, reference in zip(actual, expected):
+                if unordered_outputs:
+                    result = result.sort(dim=-1).values
+                    reference = reference.sort(dim=-1).values
+                torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        else:
+            compare_outputs(actual, expected)
+
+
+@pytest.mark.skipif(
+    not current_platform().is_blackwell, reason="CuTe QSA requires Blackwell"
+)
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("uniform", [False, True])
+@pytest.mark.parametrize("pages", [9, 64, 129])
+def test_cute_grouped_topk_waits_for_query_and_ownership(
+    enabled, uniform, pages, restore_pdl
+):
+    """Grouping and scoring must wait for an early-releasing input producer."""
+    torch.manual_seed(337)
+    lengths = [65, 65] if uniform else [64, 66]
+    rows = sum(lengths)
+    capacity = pages * 64
+    query = torch.randn(rows, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn((pages + 1) * 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    table = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32).repeat(2, 1)
+    requests = torch.arange(2, device="cuda", dtype=torch.int64).repeat_interleave(
+        torch.tensor(lengths, device="cuda")
+    )
+    complete = torch.linspace(0, capacity, rows, device="cuda").to(torch.int32)
+    sources = query, cache, table, requests, complete
+    targets = tuple(torch.empty_like(source) for source in sources)
+
+    def forward(enable_pdl):
+        _publish(sources, targets)
+        selected = qwen4_exp_qsa_block_topk(
+            *targets,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=lengths[0] if uniform else None,
+            max_partial_bytes=0,
+            max_logits_bytes=256 << 20,
+            path="stream",
+            enable_pdl=enable_pdl,
+            solution="cute_dsl",
+            override=None,
+        )
+        return (selected,)
+
+    _check_replays(forward, sources, targets, enabled, unordered_outputs=True)
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -208,7 +294,10 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
             block_topk=topk,
             queries_per_request=queries_per_request,
             max_partial_bytes=32 * 1024 * 1024,
-            algorithm=algorithm,
+            path=algorithm,
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             enable_pdl=enable_pdl,
         )
         slots = qwen4_exp_qsa_selected_slots(
@@ -225,6 +314,113 @@ def test_qsa_selection_waits_for_query_cache_and_metadata(
         return selected, slots
 
     _check_replays(forward, sources, targets, enabled, unordered_outputs=True)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="CuTe DSL QSA stream top-k requires NVIDIA Blackwell",
+)
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize(
+    ("rows", "width", "pages"),
+    [
+        (16, 8, 65),
+        (1, 1, 128),
+        (2, 1, 1024),
+        (8, 8, 1024),
+        (256, 256, 32),
+        (256, 256, 64),
+        (256, 256, 128),
+        (9, 9, 1024),
+        (153, 17, 32),
+        (171, 19, 64),
+        (207, 23, 128),
+    ],
+)
+def test_cute_dsl_qsa_stream_waits_before_query_copy_and_frontiers(
+    enabled,
+    restore_pdl,
+    rows,
+    width,
+    pages,
+):
+    torch.manual_seed(317)
+    query = torch.randn(rows, 4, 128, device="cuda", dtype=torch.bfloat16)
+    cache = torch.randn((pages + 1) * 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    table = torch.arange(1, pages + 1, device="cuda", dtype=torch.int32).repeat(
+        rows // width, 1
+    )
+    requests = torch.arange(
+        rows // width, device="cuda", dtype=torch.int32
+    ).repeat_interleave(width)
+    capacity = pages * 64
+    counts = [0, 1, 511, 512, 513, capacity // 2, capacity - 1, capacity]
+    if rows < 8:
+        counts = [capacity, 513][:rows]
+    else:
+        counts = (counts * ((rows + 7) // 8))[:rows]
+    complete = torch.tensor(
+        counts,
+        device="cuda",
+        dtype=torch.int32,
+    )
+    sources = query, cache, table, requests, complete
+    targets = tuple(torch.empty_like(t) for t in sources)
+
+    def forward(enable_pdl):
+        _publish(sources, targets)
+        selected = qwen4_exp_qsa_block_topk(
+            *targets,
+            page_size=64,
+            block_topk=512,
+            queries_per_request=width,
+            max_partial_bytes=32 * 1024 * 1024,
+            path="stream",
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
+            enable_pdl=enable_pdl,
+        )
+        return (selected,)
+
+    def compare_selected(actual, expected):
+        query, cache, table, requests, complete = targets
+
+        def selected_scores(selected):
+            counts = complete.clamp(0, 512).long()
+            torch.testing.assert_close((selected >= 0).sum(1), counts)
+            assert bool(((selected < complete[:, None]) | (selected == -1)).all())
+            ordered = selected.sort(dim=1).values
+            assert bool(
+                ((ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)).all()
+            )
+            ids = selected.clamp_min(0).long()
+            slots = table[requests.long()[:, None], ids // 64].long() * 64 + ids % 64
+            scores = torch.einsum(
+                "rhd,rnd->rhn", query.float(), cache[slots, 0].float()
+            )
+            scores = (
+                scores.clamp_min_(0).sum(1).masked_fill_(selected < 0, -float("inf"))
+            )
+            return scores.sort(dim=1).values
+
+        # Atomic candidate compaction leaves output order and boundary tie
+        # ids unspecified. Compare FP32 selected scores, counts and uniqueness.
+        torch.testing.assert_close(
+            selected_scores(actual[0]),
+            selected_scores(expected[0]),
+            rtol=1e-5,
+            atol=1e-4,
+        )
+
+    _check_replays(
+        forward,
+        sources,
+        targets,
+        enabled,
+        unordered_outputs=False,
+        compare_outputs=compare_selected,
+    )
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -336,6 +532,7 @@ def test_qsa_attention_waits_for_slots_and_kv(
             v_scale=1.0,
             override=None,
             solution=solution,
+            sparse_metadata=None,
         )
         return (output,)
 
@@ -371,7 +568,10 @@ def test_qsa_selection_refreshes_block_frontiers(enabled, topk, restore_pdl):
             block_topk=topk,
             queries_per_request=width,
             max_partial_bytes=32 * 1024 * 1024,
-            algorithm="logits",
+            path="logits",
+            max_logits_bytes=256 << 20,
+            solution=None,
+            override=None,
             enable_pdl=enable_pdl,
         )
 
@@ -508,13 +708,9 @@ def test_qsa_cuda_selection_orders_strided_score_copies(
         selected = forward()
     _check_native_topk_edge(graph, enabled, rows, columns, topk)
     if column_stride != 1:
-        raw = cu.CUgraph(graph.raw_cuda_graph())
-        status, _, _, _, count = cu.cuGraphGetEdges(raw, 0)
-        assert status == cu.CUresult.CUDA_SUCCESS
-        status, _, _, edges, _ = cu.cuGraphGetEdges(raw, count)
-        assert status == cu.CUresult.CUDA_SUCCESS
+        _, _, edge_types = _graph_edges(graph)
         # The ordinary copy must wait for the producer's full completion.
-        assert any(int(edge.type) == 0 for edge in edges)
+        assert 0 in edge_types
 
     offsets = torch.arange(columns, device="cuda")
     for frontiers in ((0, topk - 1, columns), (1, topk, columns - 1), (0, 7, topk + 1)):
@@ -564,13 +760,9 @@ def _check_native_topk_edge(graph, enabled, rows, columns, topk):
     assert error == cu.CUresult.CUDA_SUCCESS
     expected_function = int(reference_params.func)
 
-    raw = cu.CUgraph(graph.raw_cuda_graph())
-    error, _, _, _, count = cu.cuGraphGetEdges(raw, 0)
-    assert error == cu.CUresult.CUDA_SUCCESS
-    error, _, targets, edges, _ = cu.cuGraphGetEdges(raw, count)
-    assert error == cu.CUresult.CUDA_SUCCESS
+    _, targets, edge_types = _graph_edges(graph)
     checked = 0
-    for target, edge in zip(targets, edges):
+    for target, edge_type in zip(targets, edge_types):
         error, kind = cu.cuGraphNodeGetType(target)
         assert error == cu.CUresult.CUDA_SUCCESS
         if kind != cu.CUgraphNodeType.CU_GRAPH_NODE_TYPE_KERNEL:
@@ -578,7 +770,7 @@ def _check_native_topk_edge(graph, enabled, rows, columns, topk):
         error, params = cu.cuGraphKernelNodeGetParams(target)
         assert error == cu.CUresult.CUDA_SUCCESS
         if int(params.func) == expected_function:
-            assert int(edge.type) == int(enabled)
+            assert edge_type == int(enabled)
             checked += 1
     assert checked == 1
 
@@ -680,12 +872,7 @@ def test_persistent_topk_pdl_register_budget(enabled, large_grid, columns, resto
     with torch.cuda.graph(graph):
         forward()
     _check_graph_edges(graph, enabled)
-    error, _, _, _, count = cu.cuGraphGetEdges(cu.CUgraph(graph.raw_cuda_graph()), 0)
-    assert error == cu.CUresult.CUDA_SUCCESS
-    error, _, nodes, _, _ = cu.cuGraphGetEdges(
-        cu.CUgraph(graph.raw_cuda_graph()), count
-    )
-    assert error == cu.CUresult.CUDA_SUCCESS
+    _, nodes, _ = _graph_edges(graph)
     assert len(nodes) == 1
     error, params = cu.cuGraphKernelNodeGetParams(nodes[0])
     assert error == cu.CUresult.CUDA_SUCCESS

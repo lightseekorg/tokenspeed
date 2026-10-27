@@ -81,6 +81,8 @@ _LDS_BYTES = 160 * 1024
 # MFMA tile: weight rows per tile are a multiple of the 16-wide instruction.
 _MFMA_BLOCK_M = 16
 _MFMA_MIN_BLOCK_N = 16
+_MFMA_LONG_K = 8192
+_MFMA_LONG_K_WARPS = 8
 
 
 def _gemv_launch_metadata(grid, kernel, args):
@@ -466,9 +468,9 @@ def gluon_gemv_a16w16_gfx950(
         )
 
 
-def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int]:
-    """``(rows, BLOCK_M, BLOCK_N, BLOCK_K, STAGES)`` of a GEMV with ``n``
-    outputs on ``cus`` CUs."""
+def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int, int]:
+    """``(rows, BLOCK_M, BLOCK_N, BLOCK_K, STAGES, num_warps)`` of a GEMV
+    with ``n`` outputs on ``cus`` CUs."""
     rows = triton.cdiv(n, cus)
     if m == 1:
         block_n = max(triton.next_power_of_2(rows), NUM_WARPS)
@@ -488,11 +490,13 @@ def _config(m: int, n: int, k: int, cus: int) -> tuple[int, int, int, int, int]:
         if staged and stages >= _STAGED_MIN_STAGES:
             # Stream the share through an LDS ring of `stages` chunks; this
             # also beats one register chunk that covers all of K.
-            return rows, 1, block_n, _FMA_MIN_CHUNK, stages
-        return rows, 1, block_n, chunk, 0
-    block_k = 128 if k >= 128 * NUM_WARPS else 64
+            return rows, 1, block_n, _FMA_MIN_CHUNK, stages, NUM_WARPS
+        return rows, 1, block_n, chunk, 0, NUM_WARPS
+    # Long K splits over eight waves, doubling the weight bytes in flight per CU.
+    num_warps = _MFMA_LONG_K_WARPS if k >= _MFMA_LONG_K else NUM_WARPS
+    block_k = 128 if k >= 128 * num_warps else 64
     block_n = max(triton.next_power_of_2(rows), _MFMA_MIN_BLOCK_N)
-    return rows, _MFMA_BLOCK_M, block_n, block_k, 0
+    return rows, _MFMA_BLOCK_M, block_n, block_k, 0, num_warps
 
 
 def supports_gluon_gemv_a16w16_gfx950(m: int, n: int, k: int) -> bool:
@@ -529,6 +533,8 @@ _PREFERRED_BUCKETS: dict[tuple[int, int], frozenset[int]] = {
     (4096, 2048): frozenset({16}),
     # DeepSeek V4.1 Flash TP4.
     (32, 5120): frozenset({1, 4, 16}),
+    # Attention QKV with the output gate, 8192-wide hidden.
+    (2304, 8192): frozenset({4, 16}),
 }
 
 
@@ -568,7 +574,7 @@ def launch_gluon_gemv_a16w16_gfx950(
     if not supports_gluon_gemv_a16w16_gfx950(m, n, k):
         raise ValueError(f"decode GEMV does not support M={m}, N={n}, K={k}")
     cus = torch.cuda.get_device_properties(x.device).multi_processor_count
-    rows, block_m, block_n, block_k, stages = _config(m, n, k, cus)
+    rows, block_m, block_n, block_k, stages, num_warps = _config(m, n, k, cus)
     gluon_gemv_a16w16_gfx950[(triton.cdiv(n, rows),)](
         x,
         weight,
@@ -583,6 +589,6 @@ def launch_gluon_gemv_a16w16_gfx950(
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         STAGES=stages,
-        num_warps=NUM_WARPS,
+        num_warps=num_warps,
     )
     return out

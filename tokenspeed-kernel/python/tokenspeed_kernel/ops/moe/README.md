@@ -9,6 +9,11 @@ execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
 
+`gather_moe_routes` restores token/route order from a deferred output map and
+zeros absent routes. A kernel declaring `deferred_output_is_token_order` writes
+each route it owns to row `token * topk + slot`; with EP > 1 the other rows are
+stale, so `gather_moe_routes` still zeros them.
+
 The solution modules register these operations. Shared Triton helpers live in
 `_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
 the same registry and public dispatchers as the other MoE operations.
@@ -39,6 +44,70 @@ compile-time parameter rule: token count, top-k, and table width are runtime
 arguments or bucketed, never `constexpr`.
 
 ## FlashInfer adapters (`flashinfer.py`)
+
+### Opt-in SM90 block-FP8 grouped MoE
+
+`prepare_sm90_fp8_moe(mode=...)` prepares a callable before warmup and graph
+capture. Choose `default` for upstream FlashInfer, `expected_m` for the per-call
+hint backport, or `optimized` to also enable expert-tile prefix sums and direct
+tile-to-expert lookup. Both private modes accept independent pipeline stage
+caps for FC1 and FC2.
+Existing `moe_plan` selection stays unchanged.
+
+```python
+from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
+
+expert_apply = prepare_sm90_fp8_moe(
+    mode="optimized", max_num_stages_fc1=4, max_num_stages_fc2=-1
+)
+# Each omitted stage bound defaults to -1 and keeps upstream selection.
+# Pass the usual FlashInfer CUTLASS MoE arguments plus:
+# expert_apply(..., expected_m=expected_tokens_per_expert)
+```
+
+Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
+0.7.2 and compile isolated modules, operators, and tuning caches. They require
+matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
+12.8 or newer. Initialization reports unsupported sources or build settings.
+Private cold JIT compilations bind their include path to that versioned source
+tree. FlashInfer can share mutable include-directory storage across native
+modules, so a module loaded later must not redirect private kernel compilation.
+The installed FlashInfer package is unchanged. To switch settings, prepare a
+new callable, warm it up, and recapture graphs.
+
+`expected_m` is a positive uint32 hint for both expert GEMMs in one call;
+omitting it preserves the native estimate. For complete local expert groups,
+use `max(1, ceil(local_rows * top_k / local_experts))`; replicated-input EP
+must account for remote routes using the global expert count. Routing,
+workspace bounds, and the runner's stored estimate are unchanged.
+
+`max_num_stages_fc1` and `max_num_stages_fc2` independently bound the two
+expert GEMMs. Each defaults to `-1`, preserving upstream stage selection for
+that GEMM. A positive value only excludes candidates above its limit, in
+both regular and SwapAB layouts. Tile selection, stage candidates, and
+shared-memory checks follow upstream logic. Bounds must be at least four,
+the backend's minimum candidate depth; zero is invalid. Different bound
+pairs use isolated module, operator, tuning, and kernel caches.
+
+Prefix/lookup scheduling supports SM90 DeepSeek block-FP8 SwapAB grouped GEMMs.
+The prefix scan handles expert counts independent of block and warp size and
+refreshes metadata on every replay. A bounded lookup covers the first tiles,
+then falls back to prefix binary search. Configurations whose scheduler
+metadata would exceed the shared-memory budget retain the upstream scheduler.
+Regression tests compare eager and graph outputs with upstream at
+`atol=rtol=0`. Performance depends on shape and routing; the mean hint alone
+can regress on concentrated routes, so benchmark the intended settings.
+
+Both private modes also change how the SwapAB grouped GEMM moves data, without
+changing its accumulation order. When a weight-scale row is a multiple of 16
+bytes, the TMA thread prefetches each tile's weight scales with the tile's first
+pipeline stage, so the math warps no longer load scales and synchronize at every
+tile boundary. Weight loads carry an L2 evict-first hint: weights are read once
+per call, and evicting them first keeps the GEMM from evicting, and writing
+back, data that earlier kernels left in L2, which would otherwise fill the
+pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
+reads the expert offsets once into shared memory while its barriers are set up,
+and fills the lookup table per expert instead of searching per tile.
 
 ### NVFP4 routing-map padding
 
@@ -160,6 +229,17 @@ be wrong here. The kernel test checks non-unit input scales against a
 dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
 experts and top-22.
 
+### Packed FP8 expert intermediate
+
+The matrix-based routed-expert path converts the clamped gate/up result into
+E4M3 inputs for the down projection, with one FP32 scale per 128 activations.
+It preserves BF16 intermediate rounding and clipping before conversion.
+Unsplit projections
+fuse conversion into the activation producer; split projections combine their
+partial results before the nonlinear activation and conversion. Only FP8 values
+and scales are materialized. The first BF16 input conversion still uses the
+shared quantizer rather than an upstream model operation.
+
 ### Unquantized CUTLASS MoE workspace
 
 `flashinfer_cutlass_unquant_moe_apply` hands `cutlass_fused_moe` one
@@ -199,6 +279,13 @@ The kernel takes precomputed routes only as BF16 weights packed with the
 expert ids. With FP32 route weights the routed kernel stops before its
 finalize and `moe_finalize_fuse_shared` combines the per-route outputs with the
 FP32 weights, accumulating in FP32 and rounding once to BF16.
+
+## FP8 per-channel experts
+
+Per-channel FP8 experts store weights in FP8 E4M3 with FP32 scales per output
+channel and quantize activations per token. FP32 routing weights remain FP32
+during combination. Native FP8 matrix arithmetic uses FP32 accumulators but
+need not match sequential FP32 arithmetic.
 
 ## Shared MoE precision policies
 

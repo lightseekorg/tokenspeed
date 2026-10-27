@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "common_parameters": {
+    "quant": "mxfp8",
+    "block_size": [[128, 128]],
+    "out_dtype": "bfloat16",
+    "validation": {"runs": 5}
+  },
+  "cases": [
+    {
+      "id": "glm53_flash.gemm.mm/tp4-shared-gate-up-fp8-fp32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [1, 2, 4, 8, 16, 24, 25, 64, 65, 128, 129, 848, 896, 1616, 1664, 1744, 1792, 3536, 7120, 8144, 8192],
+          "N": 1024,
+          "K": 4096
+        },
+        "cold_cache": true,
+        "seed": 4201
+      },
+      "policy": {"max_regression_relative": 0.05, "max_regression_absolute_us": 1.0}
+    },
+    {
+      "id": "glm53_flash.gemm.mm/tp4-shared-down-fp8-fp32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [1, 2, 4, 8, 16, 17, 24, 25, 32, 33, 64, 65, 128, 129, 848, 896, 1616, 1664, 1744, 1792, 3536, 7120, 8144, 8192],
+          "N": 4096,
+          "K": 512
+        },
+        "cold_cache": true,
+        "seed": 4202
+      },
+      "policy": {"max_regression_relative": 0.05, "max_regression_absolute_us": 1.0}
+    },
+    {
+      "id": "glm53_flash.gemm.mm/tp4-dense-gate-up-fp8-fp32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [1, 2, 4, 8, 16, 64, 848, 896, 1616, 1664, 1744, 1792, 3536, 7120, 8144, 8192],
+          "N": 6144,
+          "K": 4096
+        },
+        "cold_cache": true,
+        "seed": 4203
+      },
+      "policy": {"max_regression_relative": 0.05, "max_regression_absolute_us": 1.0}
+    },
+    {
+      "id": "glm53_flash.gemm.mm/tp4-dense-down-fp8-fp32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [1, 2, 4, 8, 16, 64, 848, 896, 1616, 1664, 1744, 1792, 3536, 7120, 8144, 8192],
+          "N": 4096,
+          "K": 3072
+        },
+        "cold_cache": true,
+        "seed": 4204
+      },
+      "policy": {"max_regression_relative": 0.05, "max_regression_absolute_us": 1.0}
+    },
+    {
+      "id": "glm53_flash.gemm.mm/tp4-attention-fused-input-fp8-fp32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [1, 2, 4, 8, 16, 64, 848, 896, 1616, 1664, 1744, 1792, 3536, 7120, 8144, 8192],
+          "N": 2048,
+          "K": 4096
+        },
+        "cold_cache": true,
+        "seed": 4205
+      },
+      "policy": {"max_regression_relative": 0.05, "max_regression_absolute_us": 1.0}
+    },
+    {
+      "id": "glm53_flash.gemm.mm/tp4-attention-query-expansion-fp8-fp32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [1, 2, 4, 8, 16, 64, 848, 896, 1616, 1664, 1744, 1792, 3536, 7120, 8144, 8192],
+          "N": 4096,
+          "K": 1536
+        },
+        "cold_cache": true,
+        "seed": 4206
+      },
+      "policy": {"max_regression_relative": 0.05, "max_regression_absolute_us": 1.0}
+    },
+    {
+      "id": "glm53_flash.gemm.mm/tp4-attention-output-fp8-fp32",
+      "comparison_epoch": 1,
+      "definition": {
+        "family": "gemm",
+        "mode": "mm",
+        "parameters": {
+          "M": [1, 2, 4, 8, 16, 64, 848, 896, 1616, 1664, 1744, 1792, 3536, 7120, 8144, 8192],
+          "N": 4096,
+          "K": 4096
+        },
+        "cold_cache": true,
+        "seed": 4207
+      },
+      "policy": {"max_regression_relative": 0.05, "max_regression_absolute_us": 1.0}
+    }
+  ]
+}

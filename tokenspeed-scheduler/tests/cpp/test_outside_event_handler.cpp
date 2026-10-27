@@ -1064,6 +1064,39 @@ TEST_F(PdSparseDecodeAdmissionTestSuite, AnExactPromptEndStateHitSkipsTheStateTr
         << "the block containing token 9 is a fresh page";
 }
 
+TEST_F(PdSparseDecodeAdmissionTestSuite, ExactStateHitCanFinishWithoutADecodeForward) {
+    // Seed a prompt-end checkpoint, then repeatedly finish on the bootstrap
+    // token. No decode forward can initialize the new live state in this case.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const std::string id = "one_token_" + std::to_string(attempt);
+        RequestSpec spec = MakeRequestSpec(id, /*num_pages=*/4, /*start=*/1);
+        spec.max_new_tokens = 1;
+        Submit({spec});
+        SendBootstrapped(id);
+        const ExecutionPlan plan = PlanOnce();
+        const ForwardBatch* destination = FindRemoteAdmission(plan);
+        ASSERT_NE(destination, nullptr);
+        ASSERT_EQ(destination->state_prefix_cached, std::vector<bool>{attempt > 0});
+        const auto& state = destination->block_tables.at("state").at(0);
+        ASSERT_EQ(state.size(), 2u);
+        if (attempt > 0) {
+            ASSERT_GT(state[0], 0);
+            ASSERT_NE(state[0], state[1]);
+            EXPECT_EQ(plan.pages_to_copy.at("state"),
+                      (std::vector<std::pair<std::int32_t, std::int32_t>>{{state[0], state[1]}}));
+            EXPECT_EQ(std::ranges::count(plan.pages_to_zero.at("state"), state[1]), 0);
+        }
+        SendRemotePrefillDone(id, /*bootstrap_token=*/42);
+        ExecutionEvent succeeded;
+        succeeded.With(pd::SucceededEvent{id});
+        scheduler_->Advance(succeeded);
+        const ExecutionPlan finish = PlanOnce();
+        const ForwardBatch* forward = FindForwardBatch(finish.Operations());
+        EXPECT_TRUE(forward == nullptr || forward->request_ids.empty());
+        PlanOnce();
+    }
+}
+
 TEST_F(PdSparseDecodeAdmissionTestSuite, ReusesHistoryPrefixAndClaimsAPageAlignedPromptEndState) {
     Submit({MakeRequestSpec("r0", /*num_pages=*/4, /*start=*/1)});
     SendBootstrapped("r0");

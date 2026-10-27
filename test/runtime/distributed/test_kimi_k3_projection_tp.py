@@ -200,7 +200,7 @@ def test_checkpoint_shards():
 
 
 @torch.no_grad()
-def _model_worker(rank, size, rendezvous):
+def _model_worker(rank, size, rendezvous, fp8_output):
 
     from tokenspeed.runtime.configs.kimi_k3_config import KimiLinearConfig
     from tokenspeed.runtime.distributed.comm_backend.auto import AutoBackend
@@ -268,8 +268,11 @@ def _model_worker(rank, size, rendezvous):
     # deterministic local attention consumes restored rows on each owner; all
     # projection GEMMs and collectives below are the production implementations.
     def local_kda(**kwargs):
-        value = kwargs["mixed_qkv"][:, 2 * proj : 3 * proj].contiguous()
-        return value
+        # A real attention kernel finishes QKV before the gated consumer's PDL
+        # launch. Even one row needs that boundary; contiguous() can be a no-op.
+        return kwargs["mixed_qkv"][:, 2 * proj : 3 * proj].clone(
+            memory_format=torch.contiguous_format
+        )
 
     comm = SimpleNamespace(pre_attn_comm=lambda value, ctx: value)
     for kind, gated in (("kda", True), ("mla", True), ("mla", False)):
@@ -281,23 +284,30 @@ def _model_worker(rank, size, rendezvous):
             (None, parallel),
             (parallel, parallel),
         )
-        if kind == "mla" and not gated:
-            # Ungated MLA supports O-only TP, including empty token owners.
+        if fp8_output or (kind == "mla" and not gated):
+            # Isolate FP8 O integration; ungated MLA also supports only O TP.
             projection_mappings = ((None, None), (None, parallel))
         for qkv_tp, output_tp in projection_mappings:
-            # Exercise the resolved BF16 method under an FP8 config. Re-resolving
-            # get_quant_method would bypass LinearBase's ignored-layer handling.
-            quant_config = (
-                Fp8Config(
+            if fp8_output:
+                # Only O uses FP8 weights; keep the existing QKV/attention setup.
+                quant_config = Fp8Config(
+                    is_checkpoint_fp8_serialized=True,
+                    activation_scheme="dynamic",
+                    ignored_layers=[r"re:self_attn\.(?!o_proj$).*"],
+                    weight_block_size=[128, 128],
+                    scale_fmt=None,
+                )
+            elif qkv_tp is None and output_tp is not None:
+                # Check that the resolved method respects ignored layers.
+                quant_config = Fp8Config(
                     is_checkpoint_fp8_serialized=True,
                     activation_scheme="dynamic",
                     ignored_layers=[r"re:self_attn\..*"],
                     weight_block_size=[128, 128],
                     scale_fmt=None,
                 )
-                if qkv_tp is None and output_tp is not None
-                else None
-            )
+            else:
+                quant_config = None
             with torch.device(device):
                 if kind == "kda":
                     module = KimiLinearKDA(
@@ -353,9 +363,21 @@ def _model_worker(rank, size, rendezvous):
         for shard in range(size):
             weight[index, index % (proj // size) + shard * (proj // size)] = 0.25
         for module in modules:
-            module.o_proj.weight.weight_loader(module.o_proj.weight, weight)
+            module.o_proj.weight.weight_loader(
+                module.o_proj.weight, weight.to(module.o_proj.weight.dtype)
+            )
+            if fp8_output:
+                module.o_proj.weight_scale_inv.weight_loader(
+                    module.o_proj.weight_scale_inv,
+                    torch.ones(
+                        (hidden // 128, proj // 128),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                )
         model = torch.nn.ModuleList(modules)
-        prepare_dp_linear_communication(model, 256, torch.bfloat16, AutoBackend())
+        capacity = 32 if fp8_output else 256
+        prepare_dp_linear_communication(model, capacity, torch.bfloat16, AutoBackend())
 
         def forward(module, x, ctx):
             # MLA core attention is replaced only at its local computation
@@ -388,13 +410,22 @@ def _model_worker(rank, size, rendezvous):
                 projection_out=None,
             )
 
-        for counts, mode in (
+        cases = (
             ([32] * size, ForwardMode.DECODE),
             ([0, 64, 32, 1][:size], ForwardMode.DECODE),
             ([128] * size, ForwardMode.DECODE),
             ([0] * size, ForwardMode.DECODE),
             ([256] * size, ForwardMode.EXTEND),
-        ):
+        )
+        if fp8_output:
+            # Exercise the model's real empty-owner branches below fusion's
+            # minimum, including ungated MLA whose activations must stay BF16.
+            cases = (
+                ([0, 32, 17, 1][:size], ForwardMode.DECODE),
+                ([32, 0, 1, 17][:size], ForwardMode.DECODE),
+                ([0] * size, ForwardMode.DECODE),
+            )
+        for counts, mode in cases:
             rows = counts[rank]
             x = (
                 (
@@ -437,7 +468,16 @@ def _model_worker(rank, size, rendezvous):
                 x.mul_(0.5).add_(0.125)
                 refreshed = forward(module, x, ctx)
                 graph.replay()
-                torch.testing.assert_close(captured, refreshed, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    captured,
+                    refreshed,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda detail: (
+                        f"{kind=}, {gated=}, {fp8_output=}, {counts=}, "
+                        f"projection={index}: {detail}"
+                    ),
+                )
                 torch.cuda.synchronize()
                 x.copy_(original)
                 del graph, captured
@@ -449,13 +489,17 @@ def _model_worker(rank, size, rendezvous):
     dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("size", [2, 4], ids=["tp2", "tp4"])
-def test_model_projection_paths(size, tmp_path):
+@pytest.mark.parametrize(
+    ("size", "fp8_output"),
+    [(2, False), (4, False), (2, True), (4, True)],
+    ids=["tp2", "tp4", "tp2-fp8", "tp4-fp8"],
+)
+def test_model_projection_paths(size, fp8_output, tmp_path):
     if torch.cuda.device_count() < size:
         pytest.skip(f"requires {size} CUDA GPUs")
     mp.spawn(
         _model_worker,
-        args=(size, f"file://{tmp_path / 'rendezvous'}"),
+        args=(size, f"file://{tmp_path / 'rendezvous'}", fp8_output),
         nprocs=size,
         join=True,
     )

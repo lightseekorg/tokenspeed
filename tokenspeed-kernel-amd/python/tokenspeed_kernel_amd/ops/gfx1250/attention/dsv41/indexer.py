@@ -227,10 +227,11 @@ def gluon_dsv41_index_topk_gfx1250(
 ):
     token = gl.program_id(0)
     split = gl.program_id(1)
+    # Clamp before narrowing so large int64 lengths cannot wrap negative.
     vis = gl.minimum(
-        gl.maximum(gl.load(visible + token).to(gl.int32), 0),
+        gl.maximum(gl.load(visible + token).to(gl.int64), 0),
         table_width * PAGE_SIZE,
-    )
+    ).to(gl.int32)
     if CANDIDATES >= 0:
         width = gl.where(vis > 0, CANDIDATES * 8, 0)
     else:

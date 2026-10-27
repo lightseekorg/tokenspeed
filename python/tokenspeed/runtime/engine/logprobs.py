@@ -81,6 +81,121 @@ def resolve_logprob_start_len(logprob_start_len: int | None, input_len: int) -> 
     return logprob_start_len
 
 
+# Most alternatives a top-k logprob request may ask for per position (the
+# OpenAI chat API's bound; legacy completions ask for at most 5).
+MAX_TOP_LOGPROBS = 20
+
+
+@dataclass(frozen=True)
+class LogprobServability:
+    """Which logprobs an engine can return, as its ingress checks a request.
+
+    Attributes:
+        enable_output_logprobs: ``--enable-output-logprobs``: the sampler
+            gathers the sampled tokens' logprobs.
+        supports_prompt_logprobs: The engine's startup verdict
+            (``DeviceSpecs.supports_prompt_logprobs``): its model keeps every
+            prompt row's activations.
+        logprob_order: ``--logprob-order``; the top-k alternatives need
+            ``torch``.
+        pipeline_parallel: The engine runs pipeline stages.
+        disaggregated: The engine is one role of a disaggregated deployment.
+        vocab_size: The model's vocabulary size.
+    """
+
+    enable_output_logprobs: bool
+    supports_prompt_logprobs: bool
+    logprob_order: str
+    pipeline_parallel: bool
+    disaggregated: bool
+    vocab_size: int
+
+    @classmethod
+    def of(
+        cls, server_args, *, supports_prompt_logprobs: bool, vocab_size: int
+    ) -> LogprobServability:
+        """The servability of an engine started with ``server_args``."""
+        return cls(
+            enable_output_logprobs=server_args.enable_output_logprobs,
+            supports_prompt_logprobs=supports_prompt_logprobs,
+            logprob_order=server_args.logprob_order,
+            pipeline_parallel=(
+                server_args.mapping is not None and server_args.mapping.has_pp
+            ),
+            disaggregated=server_args.disaggregation_mode != "null",
+            vocab_size=vocab_size,
+        )
+
+    def prompt_logprobs_refusal(
+        self, input_ids: list[int], has_multimodal_inputs: bool
+    ) -> str | None:
+        """Why this engine cannot compute a prompt's logprobs, or None.
+
+        A model that narrows its prefill rows has no activations for the
+        prompt positions; a multimodal prompt's media positions carry
+        content-hash ids, not tokens, so they have no logprob; and a token id
+        outside the vocabulary has no logprob column.
+        """
+        if not self.supports_prompt_logprobs:
+            return (
+                "logprob_start_len >= 0 (prompt logprobs) is not supported by this "
+                "engine: the model narrows its prefill rows, so it cannot score "
+                "every prompt position. Use logprob_start_len=-1."
+            )
+        if has_multimodal_inputs:
+            return (
+                "logprob_start_len >= 0 (prompt logprobs) is not supported for "
+                "multimodal prompts; use logprob_start_len=-1."
+            )
+        if min(input_ids) < 0 or max(input_ids) >= self.vocab_size:
+            return (
+                "prompt logprobs need every prompt token id inside the vocabulary "
+                f"[0, {self.vocab_size}); input_ids contains one outside it."
+            )
+        return None
+
+    def top_logprobs_refusal(
+        self, top_logprobs_num: int, max_new_tokens: int | None
+    ) -> str | None:
+        """Why this engine cannot return ``top_logprobs_num`` alternatives,
+        or None.
+
+        The top-k alternatives are computed where a forward runs eagerly: at
+        the prompt rows (``logprob_start_len``) and at the token a prefill
+        samples. A request whose every token is sampled in its prefill
+        (``max_new_tokens`` 0 or 1, as a teacher-forcing ``echo`` asks) is
+        served; a later token is sampled by a captured decode step, which
+        computes no alternatives, so a longer generation is refused rather
+        than answered with positions missing. The alternatives are torch's
+        log-softmax (the sampled token's logprob order), computed on the one
+        stage that holds logits, of a request this node completes.
+        """
+        if not 0 < top_logprobs_num <= MAX_TOP_LOGPROBS:
+            return (
+                f"top_logprobs_num must be between 1 and {MAX_TOP_LOGPROBS}, "
+                f"got {top_logprobs_num}."
+            )
+        if (max_new_tokens or 0) > 1:
+            return (
+                "top_logprobs_num > 0 needs max_new_tokens <= 1: top-k logprobs "
+                "are computed for the prompt and the token a prefill samples, "
+                "not for decode steps."
+            )
+        if self.logprob_order != "torch":
+            return (
+                "top_logprobs_num > 0 needs --logprob-order torch, not "
+                f"{self.logprob_order}."
+            )
+        if self.pipeline_parallel:
+            return "top_logprobs_num > 0 is not supported with pipeline parallelism."
+        if self.disaggregated:
+            return (
+                "top_logprobs_num > 0 is not supported with disaggregated "
+                "prefill and decode."
+            )
+        return None
+
+
 @dataclass
 class Logprob:
     """Per-output-token logprob entry (vLLM-style).

@@ -322,12 +322,15 @@ def _route_outputs(
     situ_linear_beta: float | None,
     expert_start: int,
     round_intermediates: bool,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     num_tokens, hidden_size = x.shape
     num_experts, twice_intermediate_size, _ = w13.shape
     intermediate_size = twice_intermediate_size // 2
     top_k = topk_ids.shape[1]
     if num_tokens == 0:
+        if output is not None:
+            return output.view(0, top_k, hidden_size)
         return torch.empty((0, top_k, hidden_size), dtype=x.dtype, device=x.device)
 
     expert_route_ids, expert_counts = _routing(topk_ids, num_experts, expert_start)
@@ -336,9 +339,13 @@ def _route_outputs(
         (route_count, intermediate_size), device=x.device, dtype=x.dtype
     )
     # Invalid expert ids are absent from routing; zero their canonical rows.
-    route_output = torch.zeros(
-        (route_count, hidden_size), device=x.device, dtype=x.dtype
-    )
+    if output is None:
+        route_output = torch.zeros(
+            (route_count, hidden_size), device=x.device, dtype=x.dtype
+        )
+    else:
+        route_output = output.view(route_count, hidden_size)
+        route_output.zero_()
     if intermediate_size % 128 == 0 and _deep_pipeline(x.device, 16):
         # Cold B300: deep 16-row tiles win up to 32 routes (counted over every
         # rank) per local expert.
@@ -438,5 +445,13 @@ def _moe(
         round_intermediates,
     )
     output = torch.empty_like(x)
-    _combine(route_output, topk_weights, output, round_intermediates, output_scale)
+    _combine(
+        route_output,
+        topk_weights,
+        output,
+        None,
+        0,
+        round_weighted_routes=round_intermediates,
+        output_scale=output_scale,
+    )
     return output

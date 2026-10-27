@@ -20,6 +20,7 @@
 
 """Iris all-reduce protocols and the synchronization used by its fusions."""
 
+import dataclasses
 import math
 
 import torch
@@ -33,12 +34,62 @@ from tokenspeed_kernel.ops.communication.iris import (
     _use_two_stage_producer_direct,
     producer_direct_all_reduce_can_run,
 )
-from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.platform import ArchVersion, current_platform
 
-_SUBGROUP_SIZE = 64
+hip_utils = triton.language.extra.hip.utils
+
 _PULL_MAX_PROGRAMS = 84
 _PULL_WORDS_PER_LANE = 2
 _TWO_SHOT_NUM_SUBGROUPS = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class IrisCachePolicy:
+    """Cache modifiers for Iris accesses whose policy differs by architecture.
+
+    Flag polls (".cv"), stores publishing into the local heap (".wt"), and
+    system-scope atomics are the same on every architecture and stay literal.
+    Kernels built only for gfx950 may keep literals for these roles too.
+
+    Attributes:
+        peer_payload_load: Streaming load of data a peer published, issued
+            after its readiness is observed; empty selects the default.
+        peer_signal_store: Store into a peer's memory that the peer polls,
+            such as a barrier epoch or a Lamport mailbox; empty selects the
+            default.
+    """
+
+    peer_payload_load: str
+    peer_signal_store: str
+
+
+_IRIS_CACHE_POLICIES = {
+    ArchVersion(9, 5): IrisCachePolicy(
+        peer_payload_load=".cg",
+        peer_signal_store=".wt",
+    ),
+    # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
+    # partially read sector over the fabric, and ".wt" peer stores are an order
+    # of magnitude slower than plain ones.
+    ArchVersion(12, 5): IrisCachePolicy(
+        peer_payload_load="",
+        peer_signal_store="",
+    ),
+}
+
+
+def iris_cache_policy(arch: ArchVersion | None = None) -> IrisCachePolicy:
+    """Return the Iris cache policy for ``arch``, or for the current device.
+
+    Raises:
+        ValueError: ``arch`` has no Iris cache policy.
+    """
+    if arch is None:
+        arch = current_platform().arch_version
+    policy = _IRIS_CACHE_POLICIES.get(arch)
+    if policy is None:
+        raise ValueError(f"Iris has no cache policy for {arch}")
+    return policy
 
 
 def _pull_scratch_numel(max_numel: int, world_size: int) -> int:
@@ -146,6 +197,7 @@ class StagedPullOneShot:
             BLOCK_SIZE=self.block_size,
             SLOT_STRIDE=self.slots.shape[1],
             NUM_SLOTS=self.slots.shape[0],
+            PEER_PAYLOAD_LOAD_CACHE=iris_cache_policy().peer_payload_load,
             num_warps=self.num_subgroups,
         )
 
@@ -160,12 +212,14 @@ def _launch_pull_twoshot(
     exit_barrier: bool,
     hc_post: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
 ) -> None:
+    policy = iris_cache_policy()
     elements_per_word = _PACKED_WORD_BYTES // inputs.element_size()
     numel = out.numel() if hc_post is None else out.numel() // 4
     partition_words = numel // peers.world_size // elements_per_word
+    subgroup_size = triton.runtime.driver.active.get_current_target().warp_size
     block_words = (
         _TWO_SHOT_NUM_SUBGROUPS
-        * _SUBGROUP_SIZE
+        * subgroup_size
         * _PULL_WORDS_PER_LANE
         // peers.world_size
     )
@@ -184,11 +238,12 @@ def _launch_pull_twoshot(
         NUM_PROGRAMS=num_programs,
         NUM_TILES=num_tiles,
         NUM_WARPS=_TWO_SHOT_NUM_SUBGROUPS,
-        SUBGROUP_SIZE=_SUBGROUP_SIZE,
         WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
         ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
         ELEMENTS_PER_WORD=elements_per_word,
         EXIT_BARRIER=exit_barrier,
+        PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+        PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
         **_hc_post_args(hc_post, elements_per_word),
         num_warps=_TWO_SHOT_NUM_SUBGROUPS,
     )
@@ -323,6 +378,7 @@ class ProducerPull:
                 hc_post=hc_post,
             )
             return
+        policy = iris_cache_policy()
         num_tiles = triton.cdiv(numel, self.BLOCK_SIZE)
         num_programs = min(num_tiles, _PULL_MAX_PROGRAMS)
         iris_pull_oneshot[(num_programs,)](
@@ -337,11 +393,12 @@ class ProducerPull:
             NUM_PROGRAMS=num_programs,
             NUM_TILES=num_tiles,
             NUM_WARPS=self.NUM_SUBGROUPS,
-            SUBGROUP_SIZE=_SUBGROUP_SIZE,
             WORDS_PER_LANE=_PULL_WORDS_PER_LANE,
             PUBLISH_READY=False,
             ELEMENT_DTYPE=_PRODUCER_DIRECT_GL_DTYPES[inputs.dtype],
             ELEMENTS_PER_WORD=_PACKED_WORD_BYTES // inputs.element_size(),
+            PEER_PAYLOAD_LOAD_CACHE=policy.peer_payload_load,
+            PEER_SIGNAL_STORE_CACHE=policy.peer_signal_store,
             **_hc_post_args(hc_post, _PACKED_WORD_BYTES // inputs.element_size()),
             num_warps=self.NUM_SUBGROUPS,
         )
@@ -411,6 +468,7 @@ class ProducerLamport:
             TOTAL_ELEMENTS=out.numel(),
             MAX_ELEMENTS=self.max_numel,
             NUM_STAGES=self.NUM_STAGES,
+            PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
             num_warps=self.NUM_SUBGROUPS,
         )
 
@@ -466,6 +524,31 @@ def _iris_drain_subgroup_vmem():
     )
 
 
+@gluon.jit
+def _iris_subgroup_any(flags):
+    """Return whether any lane of this subgroup holds a nonzero int32 flag.
+
+    One v_cmp writes the subgroup's lane mask to scalar registers, so a loop
+    can branch on it without a cross-lane reduction or, in multi-subgroup
+    programs, a shared-memory exchange. The result is uniform per subgroup,
+    not per workgroup: subgroups looping on it iterate independently, so such
+    a loop must not contain a workgroup barrier. The memory clobber keeps the
+    compiler from hoisting polling loads out of the loop. The 64-bit result is
+    the whole lane mask only on wave64 (CDNA4) targets.
+
+    Args:
+        flags: Exactly one int32 per lane (the instruction takes one VGPR).
+    """
+    mask = gl.inline_asm(
+        "v_cmp_ne_u32_e64 $0, 0, $1",
+        "=s,v,~{memory}",
+        [flags],
+        gl.int64,
+        is_pure=False,
+    )
+    return mask != 0
+
+
 @triton.jit
 def iris_pull_oneshot_staged(
     input_ptr,
@@ -479,6 +562,7 @@ def iris_pull_oneshot_staged(
     BLOCK_SIZE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
     NUM_SLOTS: tl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: tl.constexpr,
 ):
     """One-shot all-reduce over rotating staging slots.
 
@@ -551,7 +635,7 @@ def iris_pull_oneshot_staged(
                 heap_bases,
                 mask=mask,
                 other=0.0,
-                cache_modifier=".cg",
+                cache_modifier=PEER_PAYLOAD_LOAD_CACHE,
                 hint=BLOCK_SIZE,
             ).to(tl.float32)
     tl.store(output_ptr + offsets, acc.to(output_ptr.type.element_ty), mask=mask)
@@ -562,6 +646,123 @@ def _iris_sanitize_lamport_bf16(values):
     """Replace negative zero with zero so BF16 data cannot match an empty marker."""
     bits = values.to(gl.uint16, bitcast=True)
     return gl.where(bits == 0x8000, 0, bits).to(gl.bfloat16, bitcast=True)
+
+
+@gluon.jit
+def _iris_sanitize_lamport_bf16x2(words):
+    """Replace BF16 negative-zero halves so no payload word matches the empty marker."""
+    words = gl.where((words & 0xFFFF) == 0x8000, words & 0xFFFF0000, words)
+    return gl.where((words >> 16) == 0x8000, words & 0xFFFF, words)
+
+
+@gluon.jit
+def _iris_lamport_push(
+    values,
+    regions,
+    offset,
+    offsets,
+    mask,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Store values[delta - 1] at offset in peer (RANK + delta)'s region.
+
+    Each program starts at a different peer so that concurrent stores spread
+    across all links instead of all targeting RANK + 1 first. One uniform
+    branch selects the order, so peer bases stay scalar constants.
+    """
+    rotation = gl.program_id(0) % (WORLD_SIZE - 1)
+    for first in gl.static_range(WORLD_SIZE - 1):
+        if rotation == first:
+            for step in gl.static_range(WORLD_SIZE - 1):
+                # Preserve 16-byte stores after casting integer addresses.
+                destination = gl.multiple_of(
+                    regions[
+                        (RANK + 1 + (first + step) % (WORLD_SIZE - 1)) % WORLD_SIZE
+                    ].to(gl.pointer_type(gl.bfloat16)),
+                    16,
+                )
+                gl.amd.cdna4.buffer_store(
+                    values[(first + step) % (WORLD_SIZE - 1)],
+                    destination + offset,
+                    offsets,
+                    mask=mask,
+                    cache=PEER_SIGNAL_STORE_CACHE,
+                )
+
+
+@gluon.jit
+def _iris_wait_lamport_slots(
+    slots,
+    offsets,
+    valid,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    SLOT_ELEMENTS: gl.constexpr,
+    LAYOUT: gl.constexpr,
+):
+    """Wait for each peer's BF16 packs in its slot to replace the empty markers.
+
+    Peer p's packs start at slots + p * SLOT_ELEMENTS. slots is 16-byte aligned,
+    as Iris allocations are; each row of offsets indexes one pack of consecutive
+    elements starting at a multiple of its width. Each subgroup polls the packs
+    as 32-bit words until all of its valid lanes have every peer's pack, then
+    returns them as BF16 in LAYOUT.
+    """
+    ROWS: gl.constexpr = offsets.shape[0]
+    WORDS: gl.constexpr = offsets.shape[1] // 2
+    gl.static_assert(offsets.shape[1] % 2 == 0 and SLOT_ELEMENTS % 8 == 0)
+    # Peers store whole words. Polling words keeps each one a single load at any
+    # pointer alignment; BF16 loads could split a word into a stale low half
+    # and an arrived high half.
+    words_ptr = gl.multiple_of(slots.to(gl.pointer_type(gl.uint32), bitcast=True), 16)
+    first, _ = gl.split(gl.reshape(offsets, [ROWS, WORDS, 2]))
+    # Each thread's words stay as consecutive as its BF16 elements.
+    word_offsets = gl.max_contiguous(gl.multiple_of(first // 2, [1, WORDS]), [1, WORDS])
+    word_valid = gl.convert_layout(valid, gl.SliceLayout(1, word_offsets.type.layout))
+    loaded = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        loaded += (gl.zeros_like(word_offsets).to(gl.uint32),)
+    waiting = _iris_subgroup_any(valid.to(gl.int32))
+    while waiting:
+        # Issue every peer's read before checking any; .cv bypasses stale
+        # cache lines. Arrived packs stay unchanged until this rank clears
+        # them, so all valid lanes simply reread them. The compiler regression
+        # tests check that these reads remain in the polling cycle.
+        loaded = ()
+        for delta in gl.static_range(1, WORLD_SIZE):
+            peer = (RANK + delta) % WORLD_SIZE
+            loaded += (
+                gl.amd.cdna4.buffer_load(
+                    words_ptr + peer * (SLOT_ELEMENTS // 2),
+                    word_offsets,
+                    mask=word_valid[:, None],
+                    cache=".cv",
+                ),
+            )
+        # Payloads never hold negative zero, so a word is still empty exactly
+        # when its high half is 0x8000.
+        missing = gl.full(
+            word_valid.shape,
+            False,
+            gl.int1,
+            gl.SliceLayout(1, word_offsets.type.layout),
+        )
+        for delta in gl.static_range(0, WORLD_SIZE - 1):
+            empty = (loaded[delta] >> 16) == 0x8000
+            missing |= word_valid & (gl.max(empty.to(gl.int32), 1) != 0)
+        waiting = _iris_subgroup_any(missing.to(gl.int32))
+    values = ()
+    for delta in gl.static_range(0, WORLD_SIZE - 1):
+        low = loaded[delta].to(gl.uint16).to(gl.bfloat16, bitcast=True)
+        high = (loaded[delta] >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+        values += (
+            gl.convert_layout(
+                gl.reshape(gl.join(low, high), [ROWS, 2 * WORDS]), LAYOUT
+            ),
+        )
+    return values
 
 
 @gluon.jit
@@ -576,41 +777,15 @@ def _iris_wait_lamport_peers(
     LAYOUT: gl.constexpr,
 ):
     """Wait for peer BF16 tiles to replace the empty mailbox markers."""
-    values = ()
-    for _ in gl.static_range(1, WORLD_SIZE):
-        values += (gl.full([64, 8], 0, gl.bfloat16, LAYOUT),)
-    active = valid
-    while gl.any(active, 0):
-        loaded = ()
-        # A lane reloads every peer until all seven packs are ready. Issue the
-        # independent reads before checking them; retired lanes keep their data.
-        # .cv controls hardware caches, not compiler volatility. The compiler
-        # regression test checks that these reads remain in the polling cycle.
-        for delta in gl.static_range(1, WORLD_SIZE):
-            peer = (RANK + delta) % WORLD_SIZE
-            pointer = (
-                region + generation * WORLD_SIZE * MAX_ELEMENTS + peer * MAX_ELEMENTS
-            )
-            loaded += (
-                gl.amd.cdna4.buffer_load(
-                    pointer,
-                    offsets,
-                    mask=active[:, None],
-                    other=values[delta - 1],
-                    cache=".cv",
-                ),
-            )
-        active = gl.full([64], False, gl.int1, gl.SliceLayout(1, LAYOUT))
-        for delta in gl.static_range(0, WORLD_SIZE - 1):
-            active |= valid & (
-                gl.max(
-                    (loaded[delta].to(gl.uint16, bitcast=True) == 0x8000).to(gl.int32),
-                    1,
-                )
-                != 0
-            )
-        values = loaded
-    return values
+    return _iris_wait_lamport_slots(
+        region + generation * WORLD_SIZE * MAX_ELEMENTS,
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_ELEMENTS,
+        LAYOUT,
+    )
 
 
 @gluon.jit
@@ -632,6 +807,7 @@ def iris_lamport_allreduce(
     TOTAL_ELEMENTS: gl.constexpr,
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """All-reduce BF16 tiles across eight ranks using data as the ready signal.
 
@@ -655,23 +831,29 @@ def iris_lamport_allreduce(
     stride: gl.constexpr = WORLD_SIZE * MAX_ELEMENTS
     local = gl.amd.cdna4.buffer_load(input_sym_ptr, offsets, mask=mask, other=0.0)
     local = _iris_sanitize_lamport_bf16(local)
-    for delta in gl.static_range(1, WORLD_SIZE):
-        peer = (RANK + delta) % WORLD_SIZE
-        destination = _iris_heap_base(
-            peer,
-            region_0,
-            region_1,
-            region_2,
-            region_3,
-            region_4,
-            region_5,
-            region_6,
-            region_7,
-        )
-        # Preserve 16-byte publication stores after casting integer addresses.
-        destination = gl.multiple_of(destination.to(gl.pointer_type(gl.bfloat16)), 16)
-        destination += generation * stride + RANK * MAX_ELEMENTS
-        gl.amd.cdna4.buffer_store(local, destination, offsets, mask=mask, cache=".wt")
+    regions = (
+        region_0,
+        region_1,
+        region_2,
+        region_3,
+        region_4,
+        region_5,
+        region_6,
+        region_7,
+    )
+    published = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        published += (local,)
+    _iris_lamport_push(
+        published,
+        regions,
+        generation * stride + RANK * MAX_ELEMENTS,
+        offsets,
+        mask,
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
+    )
 
     peers = _iris_wait_lamport_peers(
         region_sym_ptr,
@@ -835,6 +1017,7 @@ def _iris_sync_rank_epoch(
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
     PUBLISH: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """Wait until each peer's workgroup counter reaches the requested epoch.
 
@@ -865,7 +1048,7 @@ def _iris_sync_rank_epoch(
             remote_flags,
             epoch,
             mask=peer_mask,
-            cache_modifier=".wt",
+            cache_modifier=PEER_SIGNAL_STORE_CACHE,
         )
         wait_flags = ready_flags + block_id * WORLD_SIZE + peer_ids
     else:
@@ -1028,11 +1211,12 @@ def iris_pull_oneshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     PUBLISH_READY: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     residual=None,
     post=None,
     comb=None,
@@ -1049,6 +1233,7 @@ def iris_pull_oneshot(
     and completion. All peer reads finish before the next producer can reuse
     the symmetric input; PUBLISH_READY selects how those counters are exchanged.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -1081,6 +1266,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -1123,7 +1309,7 @@ def iris_pull_oneshot(
                     packed_offset.to(gl.int32),
                     mask=mask,
                     other=0,
-                    cache=".cg",
+                    cache=PEER_PAYLOAD_LOAD_CACHE,
                 )
                 peer_0, peer_1, peer_2, peer_3 = _unpack_word(
                     peer_packed, ELEMENT_DTYPE, ELEMENTS_PER_WORD
@@ -1186,6 +1372,7 @@ def iris_pull_oneshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=PUBLISH_READY,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
 
@@ -1212,11 +1399,12 @@ def iris_pull_twoshot(
     NUM_PROGRAMS,
     NUM_TILES,
     NUM_WARPS: gl.constexpr,
-    SUBGROUP_SIZE: gl.constexpr,
     WORDS_PER_LANE: gl.constexpr,
     ELEMENT_DTYPE: gl.constexpr,
     ELEMENTS_PER_WORD: gl.constexpr,
     EXIT_BARRIER: gl.constexpr,
+    PEER_PAYLOAD_LOAD_CACHE: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
     residual=None,
     post=None,
     comb=None,
@@ -1234,6 +1422,7 @@ def iris_pull_twoshot(
     EXIT_BARRIER adds a final peer wait for callers that stage inputs before
     launch. Both communication phases run in this one kernel.
     """
+    SUBGROUP_SIZE: gl.constexpr = hip_utils.num_threads() // NUM_WARPS
     block_id = gl.program_id(0)
     local_heap = _iris_heap_base(
         RANK,
@@ -1266,6 +1455,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
     input_heap_offset = tl.cast(input_sym_ptr, gl.uint64) - local_heap
@@ -1322,7 +1512,7 @@ def iris_pull_twoshot(
             peer_inputs + gl.expand_dims(input_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_PAYLOAD_LOAD_CACHE,
         )
         peer_values.store(values)
 
@@ -1366,6 +1556,7 @@ def iris_pull_twoshot(
         NUM_WARPS,
         SUBGROUP_SIZE,
         PUBLISH=True,
+        PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
     )
 
     # Gather one reduced partition from every rank into the local output.
@@ -1377,7 +1568,7 @@ def iris_pull_twoshot(
             peer_scratch + gl.expand_dims(partition_offset.to(gl.int32), 0),
             mask=gl.expand_dims(mask, 0),
             other=0,
-            cache_modifier=".cg",
+            cache_modifier=PEER_PAYLOAD_LOAD_CACHE,
         )
         output_offset = gl.expand_dims(peer_ids * PARTITION_WORDS, 1) + gl.expand_dims(
             partition_offset, 0
@@ -1432,6 +1623,7 @@ def iris_pull_twoshot(
             NUM_WARPS,
             SUBGROUP_SIZE,
             PUBLISH=True,
+            PEER_SIGNAL_STORE_CACHE=PEER_SIGNAL_STORE_CACHE,
         )
 
 
@@ -1578,13 +1770,44 @@ def iris_pull_oneshot_rmsnorm_persistent(
 class ProducerAllReduce:
     """Prepared BF16 TP4/TP8 Lamport, push and pull variants over producer storage.
 
-    The owner selects this measured payload policy. Pull scratch is shared with
-    the generic producer reduction; all uses and consumers must be stream ordered.
-    ``run`` can return the push state's borrowed output instead of ``output``.
+    ``run`` selects the protocol from the payload and can return the push
+    state's borrowed output instead of ``output``. Fusions may share the Lamport
+    one-shot mailbox and its per-512-element stage counters; the two-shot owns
+    its own. A use covers whole tiles from the start of each slot and every rank
+    makes the same sequence of uses. Within a use, each push to a tile reads that
+    tile's stage first, and the receiver restores the markers of everything it
+    consumed and advances each tile's stage once; the next use of a tile, a
+    later launch, observes both. Pull scratch is shared with the generic
+    producer reduction; all uses and consumers must be stream ordered.
     """
 
     LAMPORT_MAX_ELEMENTS = 43 * 4096
+    # The one-shot sends every peer the whole payload; from this size the
+    # two-shot was faster in 8-rank MI355X graph replay. TP4 keeps push.
+    LAMPORT_TWO_SHOT_MIN_ELEMENTS = 48 * 1024
+    LAMPORT_TWO_SHOT_MAX_ELEMENTS = 128 * 8192
+    # iris_lamport_twoshot_bf16_allreduce reduces one 128-element tile of every
+    # shard per program.
+    LAMPORT_TWO_SHOT_TILE = 128
     PUSH_MAX_ELEMENTS = 128 * 8192
+
+    @staticmethod
+    def _lamport_two_shot_capacity(
+        max_numel: int, *, world_size: int, enable_lamport: bool
+    ) -> int:
+        """Return the TP8 Lamport two-shot capacity in elements, or 0."""
+        alignment = world_size * ProducerAllReduce.LAMPORT_TWO_SHOT_TILE
+        capacity = min(
+            max_numel // alignment * alignment,
+            ProducerAllReduce.LAMPORT_TWO_SHOT_MAX_ELEMENTS,
+        )
+        return (
+            capacity
+            if enable_lamport
+            and world_size == 8
+            and capacity >= ProducerAllReduce.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            else 0
+        )
 
     @staticmethod
     def heap_bytes(max_numel: int, *, world_size: int, enable_lamport: bool) -> int:
@@ -1592,6 +1815,9 @@ class ProducerAllReduce:
             min(max_numel // 512 * 512, ProducerAllReduce.LAMPORT_MAX_ELEMENTS)
             if enable_lamport
             else 0
+        )
+        two_shot = ProducerAllReduce._lamport_two_shot_capacity(
+            max_numel, world_size=world_size, enable_lamport=enable_lamport
         )
         alignment = world_size * 8
         push = min(
@@ -1603,6 +1829,13 @@ class ProducerAllReduce:
             + (
                 allocation_bytes((3, world_size, lamport), torch.bfloat16)
                 if lamport
+                else 0
+            )
+            + (
+                allocation_bytes(
+                    (3, 2, world_size, two_shot // world_size), torch.bfloat16
+                )
+                if two_shot
                 else 0
             )
         )
@@ -1659,13 +1892,66 @@ class ProducerAllReduce:
             self.lamport_peer_addresses = tuple(
                 base + offset for base in peers.addresses
             )
+        self.lamport_two_shot_max_numel = self._lamport_two_shot_capacity(
+            max_numel, world_size=self.world_size, enable_lamport=enable_lamport
+        )
+        two_shot_shard = self.lamport_two_shot_max_numel // self.world_size
+        # [stage][reduce-scatter, all-gather][source rank][shard] mailboxes and
+        # one stage counter per two-shot program.
+        self.lamport_two_shot_region = (
+            peers.ctx.empty(
+                (3, 2, self.world_size, two_shot_shard), dtype=torch.bfloat16
+            )
+            if two_shot_shard
+            else None
+        )
+        self.lamport_two_shot_epochs = (
+            torch.zeros(
+                two_shot_shard // self.LAMPORT_TWO_SHOT_TILE,
+                dtype=torch.int32,
+                device=peers.device,
+            )
+            if two_shot_shard
+            else None
+        )
+        self.lamport_two_shot_peer_addresses = None
+        if self.lamport_two_shot_region is not None:
+            self.lamport_two_shot_region.view(torch.int32).fill_(-2147483648)
+            offset = (
+                self.lamport_two_shot_region.data_ptr() - peers.addresses[peers.rank]
+            )
+            self.lamport_two_shot_peer_addresses = tuple(
+                base + offset for base in peers.addresses
+            )
 
     def run(
         self, input: torch.Tensor, output: torch.Tensor, numel: int
     ) -> torch.Tensor:
-        """Select packed Lamport, bounded push, or the large pull protocol."""
+        """Select Lamport one-shot or two-shot, bounded push, or large pull."""
         assert 0 < numel <= self.pull.producer.data.numel()
         assert numel % (self.world_size * 8) == 0
+        two_shot_tile = self.world_size * self.LAMPORT_TWO_SHOT_TILE
+        if (
+            self.LAMPORT_TWO_SHOT_MIN_ELEMENTS
+            <= numel
+            <= self.lamport_two_shot_max_numel
+            and numel % two_shot_tile == 0
+        ):
+            iris_lamport_twoshot_bf16_allreduce[(numel // two_shot_tile,)](
+                input,
+                self.lamport_two_shot_region,
+                output,
+                self.lamport_two_shot_epochs,
+                self.lamport_two_shot_peer_addresses[: self.world_size],
+                RANK=self.pull.producer.peers.rank,
+                WORLD_SIZE=self.world_size,
+                total_elements=numel,
+                MAX_SHARD_ELEMENTS=self.lamport_two_shot_max_numel // self.world_size,
+                NUM_STAGES=3,
+                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+                num_warps=1,
+            )
+            return output
         if numel <= self.lamport_max_numel and numel % 512 == 0:
             iris_lamport_bf16_allreduce[(numel // 512,)](
                 input,
@@ -1678,6 +1964,7 @@ class ProducerAllReduce:
                 total_elements=numel,
                 MAX_ELEMENTS=self.lamport_max_numel,
                 NUM_STAGES=3,
+                PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
                 num_warps=1,
             )
             return output
@@ -1796,6 +2083,7 @@ def iris_lamport_bf16_allreduce(
     total_elements,
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
 ):
     """All-reduce BF16 tiles across the group using rotating sentinel mailboxes.
 
@@ -1819,13 +2107,19 @@ def iris_lamport_bf16_allreduce(
     stride: gl.constexpr = WORLD_SIZE * MAX_ELEMENTS
     local = gl.amd.cdna4.buffer_load(input_sym_ptr, offsets, mask=mask, other=0.0)
     local = _iris_sanitize_lamport_bf16(local)
-    for delta in gl.static_range(1, WORLD_SIZE):
-        peer = (RANK + delta) % WORLD_SIZE
-        destination = _iris_group_heap_base(peer, regions)
-        # Preserve 16-byte publication stores after casting integer addresses.
-        destination = gl.multiple_of(destination.to(gl.pointer_type(gl.bfloat16)), 16)
-        destination += generation * stride + RANK * MAX_ELEMENTS
-        gl.amd.cdna4.buffer_store(local, destination, offsets, mask=mask, cache=".wt")
+    published = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        published += (local,)
+    _iris_lamport_push(
+        published,
+        regions,
+        generation * stride + RANK * MAX_ELEMENTS,
+        offsets,
+        mask,
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
+    )
 
     peers = _iris_wait_lamport_peers(
         region_sym_ptr,
@@ -1866,6 +2160,135 @@ def iris_lamport_bf16_allreduce(
         )
     gl.barrier()
     gl.store(epochs + gl.program_id(0), ((generation + 1) % NUM_STAGES).to(gl.int32))
+
+
+@gluon.jit(do_not_specialize=["total_elements"])
+def iris_lamport_twoshot_bf16_allreduce(
+    input_ptr,
+    region_sym_ptr,
+    output_ptr,
+    epochs,
+    regions,
+    RANK: gl.constexpr,
+    WORLD_SIZE: gl.constexpr,
+    total_elements,
+    MAX_SHARD_ELEMENTS: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Reduce-scatter then all-gather BF16 through sentinel mailboxes.
+
+    Each rank owns one contiguous 1/WORLD_SIZE shard of input_ptr. Program t
+    pushes tile t of every peer's shard to that peer, sums its own shard tile in
+    FP32 rank order, rounds once to BF16, and pushes the result to every peer.
+    regions are the peers' region_sym_ptr addresses. A region holds
+    [stage][reduce-scatter, all-gather][source rank][MAX_SHARD_ELEMENTS]
+    mailboxes, indexed by program, so epochs[t] belongs to program t for every
+    payload size. Negative zero becomes zero in inputs and in reduced values,
+    which every rank receives from the shard owner.
+    """
+    gl.static_assert(WORLD_SIZE == 8)
+    # One subgroup of 4-byte packs per program spreads pushes over more CUs.
+    VECTOR: gl.constexpr = 2
+    TILE: gl.constexpr = 64 * VECTOR
+    gl.static_assert(MAX_SHARD_ELEMENTS % TILE == 0)
+    gl.static_assert(NUM_STAGES >= 3)
+    layout: gl.constexpr = gl.BlockedLayout([1, VECTOR], [64, 1], [1, 1], [0, 1])
+    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
+    element = gl.arange(0, VECTOR, layout=gl.SliceLayout(0, layout))
+    offsets = pack[:, None] * VECTOR + element[None, :]
+    total_elements = gl.multiple_of(total_elements, WORLD_SIZE * TILE)
+    shard = gl.multiple_of(total_elements // WORLD_SIZE, TILE)
+    stage = gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
+    PHASE: gl.constexpr = WORLD_SIZE * MAX_SHARD_ELEMENTS
+    slots = stage * (2 * PHASE)
+    # chunks[delta] is this rank's tile of shard (RANK + delta) % WORLD_SIZE.
+    chunks = ()
+    for delta in gl.static_range(WORLD_SIZE):
+        owner = (RANK + delta) % WORLD_SIZE
+        chunks += (
+            _iris_sanitize_lamport_bf16(
+                gl.amd.cdna4.buffer_load(input_ptr + owner * shard, offsets)
+            ),
+        )
+    _iris_lamport_push(
+        chunks[1:],
+        regions,
+        slots + RANK * MAX_SHARD_ELEMENTS,
+        offsets,
+        None,
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
+    )
+    valid = gl.full([64], True, gl.int1, gl.SliceLayout(1, layout))
+    scattered = _iris_wait_lamport_slots(
+        region_sym_ptr + slots,
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        layout,
+    )
+    # Match the one-shot result: FP32 sum in rank order, one BF16 rounding.
+    for source in gl.static_range(0, WORLD_SIZE):
+        if source == RANK:
+            term = chunks[0]
+        else:
+            term = scattered[(source - RANK + WORLD_SIZE) % WORLD_SIZE - 1]
+        if source == 0:
+            accumulator = term.to(gl.float32)
+        else:
+            accumulator += term.to(gl.float32)
+    reduced = _iris_sanitize_lamport_bf16(accumulator.to(gl.bfloat16))
+    published = ()
+    for _ in gl.static_range(1, WORLD_SIZE):
+        published += (reduced,)
+    _iris_lamport_push(
+        published,
+        regions,
+        slots + PHASE + RANK * MAX_SHARD_ELEMENTS,
+        offsets,
+        None,
+        RANK,
+        WORLD_SIZE,
+        PEER_SIGNAL_STORE_CACHE,
+    )
+    gl.amd.cdna4.buffer_store(reduced, output_ptr + RANK * shard, offsets)
+    gathered = _iris_wait_lamport_slots(
+        region_sym_ptr + slots + PHASE,
+        offsets,
+        valid,
+        RANK,
+        WORLD_SIZE,
+        MAX_SHARD_ELEMENTS,
+        layout,
+    )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        owner = (RANK + delta) % WORLD_SIZE
+        gl.amd.cdna4.buffer_store(
+            gathered[delta - 1], output_ptr + owner * shard, offsets
+        )
+
+    # Clear this program's consumed mailboxes before advancing its stage.
+    sentinel = (
+        gl.where(offsets % 2 == 0, 0, 0x8000)
+        .to(gl.uint16)
+        .to(gl.bfloat16, bitcast=True)
+    )
+    for phase in gl.static_range(2):
+        for delta in gl.static_range(1, WORLD_SIZE):
+            source = (RANK + delta) % WORLD_SIZE
+            gl.amd.cdna4.buffer_store(
+                sentinel,
+                region_sym_ptr + slots + phase * PHASE + source * MAX_SHARD_ELEMENTS,
+                offsets,
+                cache=".wt",
+            )
+    # Order the sentinel restores before this program's stage advance.
+    gl.barrier()
+    gl.store(epochs + gl.program_id(0), ((stage + 1) % NUM_STAGES).to(gl.int32))
 
 
 @gluon.jit(do_not_specialize=["numel"])
