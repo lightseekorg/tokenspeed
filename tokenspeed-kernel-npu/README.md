@@ -45,20 +45,15 @@ limits, and a request example, see the
 ## Serving dependencies in a source checkout
 
 When running TokenSpeed directly from a checkout through `PYTHONPATH`, install
-the SMG serving packages explicitly. Run these commands from the repository
-root with the same Python interpreter used to launch TokenSpeed:
+the SMG gateway explicitly, at the version `python/pyproject.toml` pins. Run
+these commands from the repository root with the same Python interpreter used
+to launch TokenSpeed:
 
 ```bash
 source /usr/local/Ascend/cann-9.0.0/set_env.sh
 
 python -m pip install \
-    "tokenspeed-smg==1.11.0.post20261007" \
-    "tokenspeed-smg-grpc-proto==0.4.22.post20261007" \
-    "tokenspeed-smg-grpc-servicer==0.13.0.post20261007" \
-    "grpcio==1.81.1" \
-    "grpcio-health-checking==1.81.1" \
-    "grpcio-reflection==1.81.1" \
-    "protobuf>=5.26.0,<7" \
+    "tokenspeed-smg==1.13.0.post20261019" \
     "viztracer"
 ```
 
@@ -73,9 +68,10 @@ export http_proxy="${PROXY_URL}"
 export https_proxy="${PROXY_URL}"
 ```
 
-Verify the gRPC servicer and the source paths together:
+Verify the gateway, then the engine from the source paths:
 
 ```bash
+python -m smg launch --help
 PYTHONPATH="${PWD}/python:${PWD}/tokenspeed-kernel/python:${PWD}/tokenspeed-kernel-npu/python:${PYTHONPATH:-}" \
-    python -m smg_grpc_servicer.tokenspeed --help
+    python -m tokenspeed.runtime.entrypoints.engine --help
 ```

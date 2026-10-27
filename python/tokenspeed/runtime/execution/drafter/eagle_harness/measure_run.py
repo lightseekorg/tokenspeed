@@ -233,6 +233,8 @@ def _full_attention_layers(config) -> int:
 
 def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) -> bool:
     """Measure one batch size; whether its averages converged."""
+    from tokenspeed.runtime.entrypoints.wire_driver import generate_request
+
     ci = args.compute_intensity
     # The verify window: the widest swept verify width.
     verify_num = max(verify_widths(batch_size, ci))
@@ -241,8 +243,12 @@ def measure_batch(args, engine, input_ids, batch_size, target_cfg, draft_cfg) ->
     with open(os.path.join(config_dir, "measure_config.json"), "w") as f:
         json.dump({"batch_size": batch_size}, f)
     engine.generate(
-        input_ids=[input_ids] * batch_size,
-        sampling_params={"temperature": 0.0, "max_new_tokens": _MAX_NEW_TOKENS},
+        [
+            generate_request(
+                input_ids, {"temperature": 0.0, "max_new_tokens": _MAX_NEW_TOKENS}
+            )
+            for _ in range(batch_size)
+        ]
     )
     test = os.path.join(args.run_dir, "test", f"bs_{batch_size}")
     cost = os.path.join(args.run_dir, "cost", f"bs_{batch_size}")
@@ -351,7 +357,7 @@ def main(argv: list[str] | None = None) -> None:
     from transformers import AutoConfig, AutoTokenizer
 
     from tokenspeed.runtime.configs.model_config import get_hf_text_config
-    from tokenspeed.runtime.entrypoints.engine import Engine
+    from tokenspeed.runtime.entrypoints.wire_driver import WireDriver
     from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 
     # Read as serving does: a multimodal checkpoint's config class may not load without remote code.
@@ -359,17 +365,28 @@ def main(argv: list[str] | None = None) -> None:
     draft_cfg = AutoConfig.from_pretrained(args.draft_model, trust_remote_code=True)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     input_ids = list(tokenizer(_PROMPT, add_special_tokens=False)["input_ids"])
-    engine = Engine(
-        model=args.model, attn_tp_size=args.tp_size, dtype="bfloat16",
-        max_model_len=max(4096, len(input_ids) + _MAX_NEW_TOKENS + 2 * args.num_draft_tokens),
-        max_num_seqs=args.max_bs, attention_backend="trtllm", sampling_backend="greedy",
-        disable_kvstore=True, speculative_algorithm="EAGLE4",
-        speculative_draft_model_path=args.draft_model, speculative_eagle_topk=args.topk,
-        speculative_num_steps=args.num_steps, speculative_num_draft_tokens=args.num_draft_tokens,
-        speculative_exec_mode=2, speculative_data_path=args.run_dir,
-        speculative_compute_intensity=args.compute_intensity, log_level="warning",
-        mamba_ssm_dtype=args.mamba_ssm_dtype,
-        gpu_memory_utilization=args.gpu_memory_utilization,
+    max_model_len = max(
+        4096, len(input_ids) + _MAX_NEW_TOKENS + 2 * args.num_draft_tokens
+    )
+    engine = WireDriver(
+        [
+            "--model", args.model, "--attn-tp-size", str(args.tp_size),
+            "--dtype", "bfloat16", "--max-model-len", str(max_model_len),
+            "--max-num-seqs", str(args.max_bs), "--attention-backend", "trtllm",
+            "--sampling-backend", "greedy", "--disable-kvstore",
+            "--speculative-algorithm", "EAGLE4",
+            "--speculative-draft-model-path", args.draft_model,
+            "--speculative-eagle-topk", str(args.topk),
+            "--speculative-num-steps", str(args.num_steps),
+            "--speculative-num-draft-tokens", str(args.num_draft_tokens),
+            "--speculative-exec-mode", "2", "--speculative-data-path", args.run_dir,
+            "--speculative-compute-intensity", args.compute_intensity,
+            "--log-level", "warning", "--mamba-ssm-dtype", args.mamba_ssm_dtype,
+            "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        ],
+        num_engines=1,
+        routing="round_robin",
+        startup_timeout_s=3600,
     )  # fmt: skip
     try:
         for batch_size in COST_BATCH_SIZES:

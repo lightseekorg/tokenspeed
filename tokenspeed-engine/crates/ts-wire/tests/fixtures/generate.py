@@ -73,6 +73,7 @@ class WireReadyMessage(msgspec.Struct):
     local: bool | None = None
     headless: bool | None = None
     parallel_config_hash: str | None = None
+    engine_count: int | None = None
 
 
 class WireHandshakeAddresses(msgspec.Struct):
@@ -384,7 +385,11 @@ def _handshake_hello() -> list[bytes]:
     return [
         zmq_wire.encode(
             WireReadyMessage(
-                status="HELLO", local=True, headless=False, parallel_config_hash="abc"
+                status="HELLO",
+                local=True,
+                headless=False,
+                parallel_config_hash="abc",
+                engine_count=2,
             )
         )
     ]
@@ -430,6 +435,17 @@ def _handshake_ready_response() -> list[bytes]:
                 kv_cache_size_tokens=790080,
                 kv_cache_max_concurrency=24.1,
                 kv_events_config={"publisher": "zmq", "topic": ""},
+                request_types=["add", "abort", "control"],
+                positional_layouts={"ControlReplySlim": ["call_id", "success"]},
+                disaggregation_mode="prefill",
+                bootstrap_host="10.0.0.7",
+                bootstrap_port=8998,
+                model_type="qwen3_5",
+                architectures=["Qwen3_5ForConditionalGeneration"],
+                mrope_positions=True,
+                spatial_merge_size=2,
+                image_token_id=248056,
+                video_token_id=248057,
             )
         )
     ]

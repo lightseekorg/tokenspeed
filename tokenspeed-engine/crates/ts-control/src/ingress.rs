@@ -32,6 +32,7 @@ use ts_scheduler::RequestSpec;
 use ts_wire::{SamplingParams, StrOrList, TokenizedGenerateReqInput};
 
 use crate::{
+    grammar::ReasoningGrammar,
     request::{LogprobRequest, RequestState, MAX_STOP_TOKEN_IDS},
     sampling,
 };
@@ -56,6 +57,9 @@ pub struct IngressLimits {
     pub multimodal: bool,
     /// Grammar-constrained decoding is on (`--grammar-backend xgrammar`).
     pub grammar: bool,
+    /// How a JSON schema waits for the reasoning block; `None` without a
+    /// grammar, a reasoning parser, or xgrammar's template for it.
+    pub reasoning: Option<ReasoningGrammar>,
     /// Which logprobs beyond the sampled tokens' the engine returns.
     pub logprobs: LogprobServability,
 }
@@ -224,6 +228,12 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
     });
     let mut params = request.sampling_params;
     sampling::resolve(&mut params, &rid);
+    if let Some(reasoning) = &limits.reasoning {
+        reasoning.defer_schema(
+            &mut params,
+            request.input_ids.as_deref().unwrap_or_default(),
+        );
+    }
     // Checked as the client sent them: the context clamp below is the
     // engine's, so `min_new_tokens` is bounded by the budget asked for, not
     // the one the context leaves (the request then finishes at its length).
@@ -554,6 +564,7 @@ mod tests {
             requires_bootstrap: false,
             multimodal: false,
             grammar: false,
+            reasoning: None,
             logprobs: LogprobServability {
                 supports_prompt_logprobs: true,
                 logprob_order: "torch".to_owned(),
@@ -723,6 +734,82 @@ mod tests {
         assert!(
             message.contains("21 stop token ids") && message.contains("at most 15"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn a_json_schema_waits_for_the_reasoning_block() {
+        let reasoning = ReasoningGrammar {
+            continues: r#"{"continues":SLOT}"#.to_owned(),
+            may_open: r#"{"may_open":SLOT}"#.to_owned(),
+            schema_slot: "SLOT".to_owned(),
+            markers: Some((7, 8)),
+        };
+        let admitted = |limits: &IngressLimits, prompt: Vec<i32>, schema: &str| {
+            let params = SamplingParams {
+                json_schema: Some(schema.to_owned()),
+                ..Default::default()
+            };
+            let Some(Admitted::Run(admission)) = admit(request("r", prompt, params), limits) else {
+                panic!("expected admission");
+            };
+            admission
+        };
+        let limits = IngressLimits {
+            grammar: true,
+            reasoning: Some(reasoning.clone()),
+            ..limits()
+        };
+        let schema = r#"{"type":"object"}"#;
+
+        // The prompt ends inside the block: the reply continues it.
+        let opened = admitted(&limits, vec![1, 7, 3], schema);
+        assert_eq!(opened.sampling_params.json_schema, None);
+        assert_eq!(
+            opened.sampling_params.structural_tag.as_deref(),
+            Some(r#"{"continues":{"type":"object"}}"#)
+        );
+        assert_eq!(opened.grammar.map(|key| key.kind), Some("structural_tag"));
+        // A block the prompt closed, or never opened: the reply may open one.
+        for prompt in [vec![1, 7, 8, 3], vec![1, 2]] {
+            assert_eq!(
+                admitted(&limits, prompt, schema)
+                    .sampling_params
+                    .structural_tag
+                    .as_deref(),
+                Some(r#"{"may_open":{"type":"object"}}"#)
+            );
+        }
+        // Without single-token markers every prompt counts as opening it.
+        let unmarked = IngressLimits {
+            reasoning: Some(ReasoningGrammar {
+                markers: None,
+                ..reasoning
+            }),
+            ..limits.clone()
+        };
+        assert_eq!(
+            admitted(&unmarked, vec![1, 2], schema)
+                .sampling_params
+                .structural_tag
+                .as_deref(),
+            Some(r#"{"continues":{"type":"object"}}"#)
+        );
+        // A schema that is not JSON stays, for the compiler to refuse.
+        let any = admitted(&limits, vec![1, 7], "$$ANY$$");
+        assert_eq!(any.sampling_params.json_schema.as_deref(), Some("$$ANY$$"));
+        assert_eq!(any.sampling_params.structural_tag, None);
+        // Without a reasoning parser the schema constrains the whole reply.
+        let plain = IngressLimits {
+            reasoning: None,
+            ..limits.clone()
+        };
+        assert_eq!(
+            admitted(&plain, vec![1, 7], schema)
+                .sampling_params
+                .json_schema
+                .as_deref(),
+            Some(schema)
         );
     }
 

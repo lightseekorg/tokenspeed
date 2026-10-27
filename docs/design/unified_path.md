@@ -933,10 +933,6 @@ Pipeline parallelism is the one prefill configuration that forces eager:
 each stage threads its boundary state through an eager stage forward
 (`ModelExecutor._run_target_forward`), so `ServerArgs.resolve_disaggregation`
 sets `enforce_eager` for `--pipeline-parallel-size > 1`, not for the role.
-The DeepSeek-V4.1 Flash PD gate
-(`test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh`) runs the prefill
-role with its graphs and passes `--disable-prefill-graph` to the decode role
-only.
 
 ### Sampling has no greedy branch
 

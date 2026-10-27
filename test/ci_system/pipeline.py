@@ -82,7 +82,9 @@ STALE_PROCESS_PATTERNS = [
     # setproctitle, so the python pattern above stops matching once
     # the router is fully up.
     r"smg::",
-    r"smg_grpc_servicer\.tokenspeed",
+    # ts serve's engine: the headless launcher, whose ranks run as
+    # ``tokenspeed::`` processes.
+    r"tokenspeed\.runtime\.entrypoints\.engine",
     r"run_ci_suite",
 ]
 JIT_CACHE_ENV_SUBDIRS = {

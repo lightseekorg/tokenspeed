@@ -62,6 +62,52 @@ pub struct GrammarConfig {
     pub max_retries: u32,
 }
 
+/// How a request's JSON schema waits for the model's reasoning block
+/// (`--reasoning-parser`): xgrammar structural tags whose answer is
+/// `schema_slot`, which the request's schema replaces. A bare schema would
+/// lock the grammar onto `{` at the first token, so the model could not
+/// reason first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReasoningGrammar {
+    /// The tag for a reply that continues a reasoning block the prompt
+    /// opened.
+    pub continues: String,
+    /// The tag for a reply that may open the block itself or answer
+    /// directly.
+    pub may_open: String,
+    /// The JSON text in both tags that the schema replaces.
+    pub schema_slot: String,
+    /// The block's opener and closer token ids; `None` when they are not
+    /// single tokens, and every prompt counts as having opened the block.
+    pub markers: Option<(i32, i32)>,
+}
+
+impl ReasoningGrammar {
+    /// Constrain only the answer after the reasoning block to the request's
+    /// JSON schema, with the tag for how `prompt` leaves the block. A schema
+    /// that is not JSON stays as it is, for the compiler to refuse.
+    pub fn defer_schema(&self, params: &mut SamplingParams, prompt: &[i32]) {
+        let Some(schema) = params.json_schema.take() else {
+            return;
+        };
+        if serde_json::from_str::<serde_json::Value>(&schema).is_err() {
+            params.json_schema = Some(schema);
+            return;
+        }
+        // The prompt opened the block when the last marker in it is the
+        // opener.
+        let opened = self.markers.is_none_or(|(open, close)| {
+            prompt.iter().rev().find(|&&id| id == open || id == close) == Some(&open)
+        });
+        let tag = if opened {
+            &self.continues
+        } else {
+            &self.may_open
+        };
+        params.structural_tag = Some(tag.replacen(&self.schema_slot, &schema, 1));
+    }
+}
+
 /// What a request constrains its output to: the kind and its source.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GrammarKey {

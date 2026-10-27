@@ -12,7 +12,6 @@ TokenSpeed-specific behavior explicitly.
 | `--model` | Equivalent to positional `model`. |
 | `--tokenizer` | Tokenizer path. |
 | `--tokenizer-mode` | Tokenizer implementation mode. |
-| `--skip-tokenizer-init` | Skip tokenizer initialization. |
 | `--load-format` | Weight loading format. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--dtype` | Weight and activation dtype. |

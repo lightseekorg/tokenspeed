@@ -20,12 +20,12 @@
 
 """Stopping a non-zero-rank node of a multi-node deployment (CPU-only).
 
-Each test runs ``_launch_subprocesses`` as node rank 1 in a subprocess, with
-a stand-in ``ts-host`` binary in place of the real one, signals the node and
-checks that none of its schedulers is left running. Only ``host_binary`` is
-substituted: the ranks start through the real ``start_rust_host``, so the
-parent-death signal they report is the one the launcher asked the kernel
-for.
+Each test runs ``launch_scheduler_headless`` as node rank 1 in a subprocess,
+with a stand-in ``ts-host`` binary in place of the real one, signals the node
+and checks that none of its schedulers is left running. Only ``host_binary``
+and the node's service setup are substituted: the ranks start through the
+real ``start_rust_host``, so the parent-death signal they report is the one
+the launcher asked the kernel for.
 """
 
 from __future__ import annotations
@@ -54,10 +54,9 @@ pytestmark = pytest.mark.skipif(
 )
 
 # Node rank 1 with two stand-in schedulers: the FAKE_HOST binary, started by
-# the real start_rust_host. With IN_EVENT_LOOP=1 the node launches inside
-# asyncio.run, as the gRPC server does under `tokenspeed serve`.
+# the real start_rust_host. The node reports once it supervises them.
 NODE = """
-import asyncio, json, os, signal, sys
+import functools, json, os, sys
 from types import SimpleNamespace as NS
 
 
@@ -71,7 +70,23 @@ if __name__ == "__main__":
     engine.configure_logger = engine._set_envs_and_config = lambda args: None
     engine.prepare_model_and_tokenizer = lambda *names: names
     engine.host_binary = lambda: os.environ["FAKE_HOST"]
-    engine.launch_dummy_health_check_server = lambda *args: emit(waiting=True)
+    engine.launch_metrics_server = lambda args: None
+    engine.rust_host_refusals = lambda args: []
+    engine._start_kv_bootstrap_server = lambda args: None
+    engine.metrics_service = NS(
+        prepare=lambda args: None,
+        start=lambda args, port_args: None,
+        close=lambda timeout: None,
+    )
+    engine.PortArgs = NS(init_new=lambda args: NS(metrics_producer_configs=None))
+    engine._SCHEDULER_EXIT_GRACE_S = float(os.environ.get("EXIT_GRACE_S", "30"))
+    supervise = engine._supervise_schedulers
+
+    def supervise_and_report(*args, **kwargs):
+        emit(waiting=True)
+        return supervise(*args, **kwargs)
+
+    engine._supervise_schedulers = supervise_and_report
     mapping = NS(
         attn=NS(has_dp=False, tp_rank=0, has_kvp=False),
         moe=NS(has_ep=False),
@@ -84,26 +99,15 @@ if __name__ == "__main__":
         node_rank=1,
         model="",
         tokenizer="",
-        host="",
-        port=0,
         disaggregation_mode="null",
         kv_events_config=None,
         dist_init_addr="127.0.0.1:25000",
-        data_parallel_rpc_port=25001,
+        # The ranks get the args pickled: a builtin's partial survives that.
+        zmq_handshake_endpoint=functools.partial(str, "tcp://127.0.0.1:25001"),
     )
     args.enable_memory_saver = args.enable_metrics = False
     args.emulate_rank_zero = False
-    port_args = NS(metrics_producer_configs=None)
-    if os.environ.get("IN_EVENT_LOOP") == "1":
-
-        async def launch():
-            engine._launch_subprocesses(args, port_args)
-
-        asyncio.run(launch())
-    else:
-        engine._launch_subprocesses(args, port_args)
-    sigterm_default = signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
-    emit(returned=True, sigterm_default=sigterm_default)
+    engine.launch_scheduler_headless(args)
 """
 
 # A stand-in `ts-host`: takes the host command line, reports its parent-death
@@ -185,25 +189,15 @@ def left_running(procs, timeout):
     return [p for p in alive if p.status() != psutil.STATUS_ZOMBIE]
 
 
-@pytest.mark.parametrize(
-    "name, env",
-    [
-        ("SIGTERM", {}),
-        ("SIGINT", {}),
-        ("SIGINT", {"IN_EVENT_LOOP": "1"}),
-        ("SIGUSR1", {}),
-    ],
-    ids=["SIGTERM", "SIGINT", "SIGINT-in-event-loop", "SIGUSR1"],
-)
-def test_signal_stops_schedulers_then_node(tmp_path, name, env):
+@pytest.mark.parametrize("name", ["SIGTERM", "SIGINT", "SIGUSR1"])
+def test_signal_stops_schedulers_then_node(tmp_path, name):
     signum = signal.Signals[name]
-    with node_rank_1(tmp_path, "cooperative", **env) as started:
+    with node_rank_1(tmp_path, "cooperative") as started:
         node, schedulers, report, tree = started
         assert report == {"waiting": True}
-        # SIGUSR1 is what a failing scheduler sends its node.
+        # SIGUSR1 is what a failing scheduler sends its node: it fails.
         node.send_signal(signum)
-        # The node still ends by the signal it received.
-        assert node.wait(timeout=60) == -signum
+        assert node.wait(timeout=60) == (1 if signum == signal.SIGUSR1 else 0)
         assert left_running(tree, timeout=10) == []
         # Schedulers were asked to stop (SIGTERM) before anything was killed.
         assert sorted(p.name for p in tmp_path.iterdir() if p.name.isdigit()) == (
@@ -211,13 +205,12 @@ def test_signal_stops_schedulers_then_node(tmp_path, name, env):
         )
 
 
-def test_stuck_scheduler_is_killed_after_timeout(tmp_path):
-    env = {"TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT": "2"}
-    with node_rank_1(tmp_path, "stuck", **env) as (node, _, report, tree):
+def test_stuck_scheduler_is_killed_after_the_grace_period(tmp_path):
+    with node_rank_1(tmp_path, "stuck", EXIT_GRACE_S="2") as (node, _, report, tree):
         assert report == {"waiting": True}
         start = time.monotonic()
         node.send_signal(signal.SIGTERM)
-        assert node.wait(timeout=60) == -signal.SIGTERM
+        assert node.wait(timeout=60) == 1
         assert 2 <= time.monotonic() - start < 30
         assert left_running(tree, timeout=10) == []
 
@@ -229,14 +222,6 @@ def test_schedulers_die_with_killed_node(tmp_path):
         node.kill()
         node.wait(timeout=60)
         assert left_running(procs, timeout=10) == []
-
-
-def test_non_blocking_node_is_unchanged(tmp_path):
-    # As used through the Python ``Engine`` API: the caller owns the schedulers.
-    env = {"TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN": "0"}
-    with node_rank_1(tmp_path, "stuck", **env) as (_, schedulers, report, _):
-        assert report == {"returned": True, "sigterm_default": True}
-        assert [s["pdeathsig"] for s in schedulers] == [0, 0]
 
 
 def test_parent_death_signal_when_parent_is_already_gone():

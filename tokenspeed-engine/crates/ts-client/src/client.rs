@@ -38,9 +38,10 @@ use tokio::{
 };
 use tracing::{debug, warn};
 use ts_wire::{
+    frames::{REQUEST_ADD, REQUEST_CONTROL, REQUEST_ENCODE},
     output::{FinishDetails, PromptTopLogprobs, TopLogprobs},
-    BatchTokenIDOutSlim, ControlOutput, ControlRequest, EngineOutput, EngineRequest, RequestOutput,
-    StrOrList, TokenizedGenerateReqInput,
+    BatchTokenIDOutSlim, ControlOutput, ControlRequest, EncodeRequest, EngineOutput, EngineRequest,
+    RequestOutput, StrOrList, TokenizedGenerateReqInput,
 };
 use zeromq::{PullSocket, RouterRecvHalf, RouterSendHalf, SocketRecv, SocketSend, ZmqMessage};
 
@@ -167,6 +168,21 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Shared {
     fn closed(&self) -> Option<StreamError> {
         lock(&self.closed).clone()
+    }
+
+    /// Every engine takes requests of type `kind`.
+    fn require(&self, kind: &str) -> Result<()> {
+        match self
+            .engines
+            .iter()
+            .find(|engine| !engine.info.ready.takes(kind))
+        {
+            Some(engine) => Err(Error::InvalidRequest(format!(
+                "engine {} takes {:?} requests, not {kind:?}",
+                engine.info.index, engine.info.ready.request_types
+            ))),
+            None => Ok(()),
+        }
     }
 
     fn route(&self, request: &TokenizedGenerateReqInput) -> Result<usize> {
@@ -436,6 +452,7 @@ impl EngineClient {
         if let Some(reason) = self.shared.closed() {
             return Err(Error::Unavailable(reason));
         }
+        self.shared.require(REQUEST_ADD)?;
         let engine = self.shared.route(&request)?;
         let (tx, rx) = mpsc::unbounded_channel();
         {
@@ -466,8 +483,11 @@ impl EngineClient {
     /// Run a control operation on every engine and return their replies,
     /// one per engine, in arrival order. Operations of one kind run one at
     /// a time; some (a `wait` pause, a weight load) answer only when done,
-    /// so callers bound the wait themselves.
+    /// so callers bound the wait themselves. An engine that takes no control
+    /// operations (an EPD encode server) refuses the call before it is sent:
+    /// it would answer none.
     pub async fn control(&self, request: ControlRequest) -> Result<Vec<ControlOutput>> {
+        self.shared.require(REQUEST_CONTROL)?;
         let tag = request.reply_tag();
         let turn = lock(&self.shared.control_turns)
             .entry(tag)
@@ -495,6 +515,20 @@ impl EngineClient {
         replies.await.map_err(|_| {
             Error::Unavailable(self.shared.closed().unwrap_or(StreamError::ClientClosed))
         })
+    }
+
+    /// Send an EPD encode server an item to embed. Nothing answers: the
+    /// embedding reaches the prefill ranks waiting under the request's room
+    /// over the transfer engine. Requests go to the engines in turn.
+    pub async fn encode(&self, request: EncodeRequest) -> Result<()> {
+        if let Some(reason) = self.shared.closed() {
+            return Err(Error::Unavailable(reason));
+        }
+        self.shared.require(REQUEST_ENCODE)?;
+        let engine =
+            self.shared.round_robin.fetch_add(1, Ordering::Relaxed) % self.shared.engines.len();
+        let frames = EngineRequest::Encode(Box::new(request)).to_frames();
+        self.shared.send(engine, frames).await
     }
 
     /// Ask the engine to abort a request. Its stream then ends with an
@@ -582,6 +616,13 @@ async fn receive_outputs(shared: Arc<Shared>, mut output: PullSocket) {
         match EngineOutput::from_frames(&message.into_vec()) {
             Ok(EngineOutput::Batch(batch)) => shared.dispatch(&batch),
             Ok(EngineOutput::Control(output)) => shared.dispatch_control(*output),
+            // This client sends no control calls.
+            Ok(EngineOutput::ControlReply(reply)) => {
+                warn!(
+                    call_id = reply.call_id,
+                    "dropping a reply to a call this client never made"
+                )
+            }
             Ok(EngineOutput::Dead) => {
                 warn!("an engine shut down");
                 shared.close(StreamError::EngineDead);

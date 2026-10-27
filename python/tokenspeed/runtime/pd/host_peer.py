@@ -344,14 +344,23 @@ def build_host_peer(
     )
 
 
+def kv_bootstrap_address(server_args) -> tuple[str, int]:
+    """Where a prefill deployment's KV bootstrap server listens: on its first
+    node (``--dist-init-addr``'s host, else this host) at
+    ``--disaggregation-bootstrap-port``. Its ranks register there, and a
+    frontend sends the decode side there with each request."""
+    if server_args.dist_init_addr:
+        host = socket.gethostbyname(server_args.dist_init_addr.split(":")[0])
+    else:
+        host = get_ip()
+    return host, server_args.disaggregation_bootstrap_port
+
+
 def _prefill_settings(
     server_args, kv_args: KVArgs, topology: PDParallelTopology, local_ip: str
 ) -> PrefillSettings:
     """A Prefill rank's settings and bootstrap registration."""
-    if server_args.dist_init_addr:
-        bootstrap_ip = socket.gethostbyname(server_args.dist_init_addr.split(":")[0])
-    else:
-        bootstrap_ip = get_ip()
+    bootstrap_ip, bootstrap_port = kv_bootstrap_address(server_args)
     wire_layout = kv_args.wire_layout.to_wire_bytes()
     payload = {
         "role": "Prefill",
@@ -370,10 +379,7 @@ def _prefill_settings(
     schedule = kv_args.cache_producer_schedule
     return PrefillSettings(
         status_rank=status_rank,
-        bootstrap_url=(
-            f"http://{join_host_port(bootstrap_ip, server_args.disaggregation_bootstrap_port)}"
-            "/route"
-        ),
+        bootstrap_url=f"http://{join_host_port(bootstrap_ip, bootstrap_port)}/route",
         bootstrap_payload=json.dumps(payload),
         bootstrap_timeout_s=float(
             envs.TOKENSPEED_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()

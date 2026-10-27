@@ -96,8 +96,6 @@ PACKAGE_LIST = [
     "tokenspeed-quack",
     "tokenspeed-scheduler",
     "tokenspeed-smg",
-    "tokenspeed-smg-grpc-proto",
-    "tokenspeed-smg-grpc-servicer",
     "tokenspeed-triton",
     "tokenspeed-trtllm-kernel",
     "torch",
@@ -109,7 +107,6 @@ PACKAGE_LIST = [
     "triton-ascend",
     "uv",
     "uvicorn",
-    "uvloop",
     "viztracer",
     "xgrammar",
 ]

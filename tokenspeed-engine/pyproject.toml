@@ -12,7 +12,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tokenspeed-engine"
 version = "0.1.0"
-description = "TokenSpeed's engine control plane: the ts-host rank binary and the Python frontend's connection to the ranks"
+description = "TokenSpeed's engine control plane: the ts-host rank binary and the Python binding of its frontend client"
 requires-python = ">=3.10"
 license = "MIT"
 

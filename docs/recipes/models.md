@@ -1349,12 +1349,13 @@ select its YAML in **Slurm Dispatch**, choose cluster `gb300`, and optionally
 provide a pull request number.
 
 The launcher uses `PD_SLURM=1` to assign one role per node and clears Slurm
-topology discovery only inside each worker process. Share the launcher's
-job-and-step-scoped artifact directory between nodes. It publishes role
-readiness atomically and verifies cross-node gRPC health before starting the
-gateway.
-Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
-When you need an explicit RDMA device selection, set
+topology discovery only inside each worker process. Node 0 starts the gateway
+with the prefill worker on a same-host socket and the decode worker on
+`tcp://<node 0>:DECODE_HANDSHAKE_PORT` (18348), then publishes its address in
+the launcher's job-and-step-scoped artifact directory, which both nodes share;
+node 1's decode engine dials it there. The gateway is ready once both engines
+registered. Worker logs remain separate as `prefill.log`, `decode.log`, and
+`lb.log`. When you need an explicit RDMA device selection, set
 `DISAGGREGATION_IB_DEVICE`. The GB300 task selects
 `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the InfiniBand fabric.
 Automatic discovery also includes Ethernet RNICs, which can

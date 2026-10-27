@@ -612,6 +612,7 @@ fn handshake_hello() {
             local: Some(true),
             headless: Some(false),
             parallel_config_hash: Some(s("abc")),
+            engine_count: Some(2),
         },
     );
 }
@@ -666,6 +667,20 @@ fn handshake_ready_response() {
                 ("publisher".into(), "zmq".into()),
                 ("topic".into(), "".into()),
             ])),
+            request_types: vec![s("add"), s("abort"), s("control")],
+            positional_layouts: Dict(vec![(
+                s("ControlReplySlim"),
+                vec![s("call_id"), s("success")],
+            )]),
+            disaggregation_mode: Some(s("prefill")),
+            bootstrap_host: Some(s("10.0.0.7")),
+            bootstrap_port: Some(8998),
+            model_type: Some(s("qwen3_5")),
+            architectures: vec![s("Qwen3_5ForConditionalGeneration")],
+            mrope_positions: Some(true),
+            spatial_merge_size: Some(2),
+            image_token_id: Some(248056),
+            video_token_id: Some(248057),
         },
     );
 }
