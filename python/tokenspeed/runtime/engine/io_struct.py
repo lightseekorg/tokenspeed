@@ -305,7 +305,10 @@ class GenerateReqInput:
             if self.rid is None:
                 self.rid = [uuid.uuid4().hex for _ in range(num)]
             else:
-                _require(isinstance(self.rid, list), "The rid should be a list.")
+                _require(
+                    isinstance(self.rid, list) and len(self.rid) == num,
+                    "The rid should be a list with one id per sample.",
+                )
             if self.user_rid is None:
                 self.user_rid = list(self.rid)
             elif isinstance(self.user_rid, str):

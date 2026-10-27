@@ -56,7 +56,7 @@ def _replica_seeds(sampling_params: dict, n: int) -> tuple[int, list[int]]:
     tokenized = _tokenize(parent)
     seeds = [
         prepare_parallel_sampling_replica(
-            parent, tokenized, replica_index
+            parent, tokenized, replica_index, f"replica-{replica_index}"
         ).sampling_params.seed
         for replica_index in range(n)
     ]
@@ -82,7 +82,7 @@ class TestReplicaSeeds:
         parent.regenerate_rid()
         tokenized = _tokenize(parent)
         parent_seed = tokenized.sampling_params.seed
-        replica = prepare_parallel_sampling_replica(parent, tokenized, 3)
+        replica = prepare_parallel_sampling_replica(parent, tokenized, 3, "replica-3")
         assert (replica.sampling_params) is not (tokenized.sampling_params)
         assert (tokenized.sampling_params.seed) == (parent_seed)
 
@@ -127,6 +127,34 @@ class TestBatchFanOut:
         assert (len(replicas)) == (4)
         assert (len({r.rid for r in replicas})) == (4)
         assert (len({r.sampling_params.seed for r in replicas})) == (4)
+
+    async def test_replicas_keep_the_callers_rids(self) -> None:
+        # A frontend names each choice (e.g. "req-n0") and aborts by those ids;
+        # replica k of prompt i must run under rid[i * n + k].
+        mgr = _StubAsyncLLM()
+        obj = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6]],
+            sampling_params={"temperature": 1.0, "n": 2},
+        )
+        obj.rid = ["a-n0", "a-n1", "b-n0", "b-n1"]
+        obj.normalize_batch_and_arguments()
+
+        async for _ in mgr._handle_batch_request(obj):
+            pass
+
+        replicas = [r for r in mgr.sent if r.sampling_params.max_new_tokens != 0]
+        assert [r.rid for r in replicas] == ["a-n0", "a-n1", "b-n0", "b-n1"]
+        assert [r.input_ids for r in replicas] == [[1, 2, 3]] * 2 + [[4, 5, 6]] * 2
+
+
+class TestRidValidation:
+    def test_a_rid_list_must_name_every_sample(self) -> None:
+        obj = GenerateReqInput(
+            input_ids=[1, 2, 3], sampling_params={"temperature": 1.0, "n": 4}
+        )
+        obj.rid = ["only-one"]
+        with pytest.raises(ValueError, match="one id per sample"):
+            obj.normalize_batch_and_arguments()
 
 
 if __name__ == "__main__":
