@@ -40,7 +40,12 @@ import torch.multiprocessing as mp
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=120, suite="runtime-2gpu")
+register_cuda_ci(
+    est_time=120,
+    suite="runtime-2gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="the prepared shard exchange is an NVIDIA NVLink path",
+)
 
 _HEADS_LOCAL = 3
 _DIM = 64
