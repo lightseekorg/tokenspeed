@@ -168,7 +168,15 @@ def test_unprepared_group_keeps_default_producer_dispatch_limit(monkeypatch):
     )
 
 
-def test_prepared_group_uses_its_producer_capacity(monkeypatch):
+@pytest.mark.parametrize(
+    "platform",
+    (
+        SimpleNamespace(is_cdna4=True, is_cdna5=False),
+        SimpleNamespace(is_cdna4=False, is_cdna5=True),
+    ),
+    ids=("cdna4", "cdna5"),
+)
+def test_prepared_group_uses_its_producer_capacity(monkeypatch, platform):
     backend = IrisBackend(Mock(), producer_direct_max_bytes=1024)
     group = (0, 1)
     max_tokens = 8192
@@ -177,11 +185,7 @@ def test_prepared_group_uses_its_producer_capacity(monkeypatch):
         producer_direct_max_numel=max_tokens * (3584 + 7168), dtype=torch.bfloat16
     )
     backend._instances[group, torch.bfloat16] = state
-    monkeypatch.setattr(
-        iris_module,
-        "current_platform",
-        lambda: SimpleNamespace(is_cdna4=True),
-    )
+    monkeypatch.setattr(iris_module, "current_platform", lambda: platform)
     like = SimpleNamespace(is_cuda=True, dtype=torch.bfloat16)
 
     assert backend.can_acquire_outputs(shapes, like, group)
@@ -200,7 +204,7 @@ def test_iris_output_acquisition_does_not_initialize_iris_off_cdna4(monkeypatch)
     monkeypatch.setattr(
         iris_module,
         "current_platform",
-        lambda: SimpleNamespace(is_cdna4=False),
+        lambda: SimpleNamespace(is_cdna4=False, is_cdna5=False),
     )
 
     outputs = backend.acquire_all_reduce_outputs(((2, 4),), torch.empty(2, 4), (0, 1))

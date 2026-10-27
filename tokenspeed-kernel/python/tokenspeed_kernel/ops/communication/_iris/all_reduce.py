@@ -346,7 +346,10 @@ class ProducerPull:
 
     def can_run(self, shapes: tuple[tuple[int, ...], ...]) -> bool:
         data = self.producer.data
-        return current_platform().is_cdna4 and producer_direct_all_reduce_can_run(
+        platform = current_platform()
+        return (
+            platform.is_cdna4 or platform.is_cdna5
+        ) and producer_direct_all_reduce_can_run(
             self.producer.peers.world_size,
             sum(math.prod(shape) for shape in shapes),
             data.dtype,
@@ -405,9 +408,12 @@ class ProducerPull:
 
 
 class ProducerLamport:
-    """Own a TP8 BF16 Lamport mailbox for the shapes selected during preparation."""
+    """Own a BF16 Lamport mailbox into which every rank pushes its local tiles."""
 
     WORLD_SIZE = 8
+    ALL_REDUCE_WORLD_SIZES = (2, 4, 8)
+    # The mailbox holds NUM_STAGES * world_size copies of the largest payload.
+    ALL_REDUCE_MAX_NUMEL = 128 * 10752
     BLOCK_ELEMENTS = 512
     NUM_STAGES = 3
     NUM_SUBGROUPS = 1
@@ -415,6 +421,7 @@ class ProducerLamport:
 
     @staticmethod
     def supported(world_size: int, dtype: torch.dtype) -> bool:
+        """Whether K3's TP8 MoE window can use Lamport."""
         return (
             current_platform().is_cdna4
             and world_size == ProducerLamport.WORLD_SIZE
@@ -422,23 +429,39 @@ class ProducerLamport:
         )
 
     @staticmethod
-    def heap_bytes(max_numel: int) -> int:
+    def all_reduce_numel(
+        staged_max_numel: int,
+        producer_max_numel: int,
+        world_size: int,
+        dtype: torch.dtype,
+    ) -> int:
+        """Return the mailbox capacity generic all-reduces use, or 0 for none.
+
+        On CDNA5 (gfx1250), Lamport outruns every flag-synchronized protocol
+        at the measured TP2, TP4 and TP8 sizes, staged or producer-direct. A
+        tray holds four GPUs, so TP8 spans two trays in one fabric domain.
+        """
+        if not (
+            current_platform().is_cdna5
+            and world_size in ProducerLamport.ALL_REDUCE_WORLD_SIZES
+            and dtype == torch.bfloat16
+        ):
+            return 0
+        numel = min(
+            max(staged_max_numel, producer_max_numel),
+            ProducerLamport.ALL_REDUCE_MAX_NUMEL,
+        )
+        return numel // ProducerLamport.BLOCK_ELEMENTS * ProducerLamport.BLOCK_ELEMENTS
+
+    @staticmethod
+    def heap_bytes(max_numel: int, world_size: int) -> int:
         return allocation_bytes(
-            (ProducerLamport.NUM_STAGES, ProducerLamport.WORLD_SIZE, max_numel),
-            torch.bfloat16,
+            (ProducerLamport.NUM_STAGES, world_size, max_numel), torch.bfloat16
         )
 
-    def __init__(
-        self,
-        producer: ProducerBuffer,
-        *,
-        max_numel: int,
-    ):
-        self.producer = producer
-        peers = producer.peers
-        assert self.supported(peers.world_size, producer.data.dtype)
-        assert 0 < max_numel <= producer.data.numel()
-        assert max_numel % self.BLOCK_ELEMENTS == 0
+    def __init__(self, peers: IrisGroup, *, max_numel: int):
+        assert 0 < max_numel and max_numel % self.BLOCK_ELEMENTS == 0
+        self.peers = peers
         self.max_numel = max_numel
         self.mailbox = peers.ctx.zeros(
             (self.NUM_STAGES, peers.world_size, self.max_numel), dtype=torch.bfloat16
@@ -456,19 +479,31 @@ class ProducerLamport:
             address % self.TRANSACTION_BYTES == 0 for address in self.peer_mailboxes
         )
 
-    def run(self, out: torch.Tensor) -> None:
+    def can_run(self, numel: int) -> bool:
+        # Depends on the payload size alone, so every rank picks the same protocol.
+        return 0 < numel <= self.max_numel and numel % self.BLOCK_ELEMENTS == 0
+
+    def run(self, inputs: torch.Tensor, out: torch.Tensor) -> None:
+        """Reduce the first ``out.numel()`` elements of ``inputs`` into ``out``.
+
+        ``inputs`` is read only locally and may be ``out`` itself. Both must be
+        contiguous and 16-byte aligned.
+        """
+        assert inputs.data_ptr() % self.TRANSACTION_BYTES == 0
+        assert out.data_ptr() % self.TRANSACTION_BYTES == 0
         iris_lamport_allreduce[(out.numel() // self.BLOCK_ELEMENTS,)](
-            self.producer.data,
+            inputs,
             self.mailbox,
             out,
             self.epochs,
             *self.peer_mailboxes,
-            RANK=self.producer.peers.rank,
-            WORLD_SIZE=self.producer.peers.world_size,
+            RANK=self.peers.rank,
+            WORLD_SIZE=self.peers.world_size,
             TOTAL_ELEMENTS=out.numel(),
             MAX_ELEMENTS=self.max_numel,
             NUM_STAGES=self.NUM_STAGES,
             PEER_SIGNAL_STORE_CACHE=iris_cache_policy().peer_signal_store,
+            SUBGROUP_SIZE=triton.runtime.driver.active.get_current_target().warp_size,
             num_warps=self.NUM_SUBGROUPS,
         )
 
@@ -508,6 +543,11 @@ def all_reduce_heap_bytes(
             size += StagedPullOneShot.heap_bytes(numel, world_size, dtype, block_size)
         if StagedPullTwoShot.supported(world_size, dtype):
             size += StagedPullTwoShot.heap_bytes(staged_max_numel, world_size, dtype)
+    lamport_numel = ProducerLamport.all_reduce_numel(
+        staged_max_numel, producer_max_numel, world_size, dtype
+    )
+    if lamport_numel:
+        size += ProducerLamport.heap_bytes(lamport_numel, world_size)
     return size
 
 
@@ -525,7 +565,7 @@ def _iris_drain_subgroup_vmem():
 
 
 @gluon.jit
-def _iris_subgroup_any(flags):
+def _iris_subgroup_any(flags, SUBGROUP_SIZE: gl.constexpr = 64):
     """Return whether any lane of this subgroup holds a nonzero int32 flag.
 
     One v_cmp writes the subgroup's lane mask to scalar registers, so a loop
@@ -533,19 +573,30 @@ def _iris_subgroup_any(flags):
     programs, a shared-memory exchange. The result is uniform per subgroup,
     not per workgroup: subgroups looping on it iterate independently, so such
     a loop must not contain a workgroup barrier. The memory clobber keeps the
-    compiler from hoisting polling loads out of the loop. The 64-bit result is
-    the whole lane mask only on wave64 (CDNA4) targets.
+    compiler from hoisting polling loads out of the loop. A wave32 lane mask
+    is a single scalar register, so wave32 targets read it as int32.
 
     Args:
         flags: Exactly one int32 per lane (the instruction takes one VGPR).
+        SUBGROUP_SIZE: Lanes per subgroup, 64 on CDNA4 and 32 on gfx1250.
     """
-    mask = gl.inline_asm(
-        "v_cmp_ne_u32_e64 $0, 0, $1",
-        "=s,v,~{memory}",
-        [flags],
-        gl.int64,
-        is_pure=False,
-    )
+    gl.static_assert(SUBGROUP_SIZE == 32 or SUBGROUP_SIZE == 64)
+    if SUBGROUP_SIZE == 32:
+        mask = gl.inline_asm(
+            "v_cmp_ne_u32_e64 $0, 0, $1",
+            "=s,v,~{memory}",
+            [flags],
+            gl.int32,
+            is_pure=False,
+        )
+    else:
+        mask = gl.inline_asm(
+            "v_cmp_ne_u32_e64 $0, 0, $1",
+            "=s,v,~{memory}",
+            [flags],
+            gl.int64,
+            is_pure=False,
+        )
     return mask != 0
 
 
@@ -701,6 +752,7 @@ def _iris_wait_lamport_slots(
     WORLD_SIZE: gl.constexpr,
     SLOT_ELEMENTS: gl.constexpr,
     LAYOUT: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr = 64,
 ):
     """Wait for each peer's BF16 packs in its slot to replace the empty markers.
 
@@ -724,7 +776,7 @@ def _iris_wait_lamport_slots(
     loaded = ()
     for _ in gl.static_range(1, WORLD_SIZE):
         loaded += (gl.zeros_like(word_offsets).to(gl.uint32),)
-    waiting = _iris_subgroup_any(valid.to(gl.int32))
+    waiting = _iris_subgroup_any(valid.to(gl.int32), SUBGROUP_SIZE)
     while waiting:
         # Issue every peer's read before checking any; .cv bypasses stale
         # cache lines. Arrived packs stay unchanged until this rank clears
@@ -752,7 +804,7 @@ def _iris_wait_lamport_slots(
         for delta in gl.static_range(0, WORLD_SIZE - 1):
             empty = (loaded[delta] >> 16) == 0x8000
             missing |= word_valid & (gl.max(empty.to(gl.int32), 1) != 0)
-        waiting = _iris_subgroup_any(missing.to(gl.int32))
+        waiting = _iris_subgroup_any(missing.to(gl.int32), SUBGROUP_SIZE)
     values = ()
     for delta in gl.static_range(0, WORLD_SIZE - 1):
         low = loaded[delta].to(gl.uint16).to(gl.bfloat16, bitcast=True)
@@ -775,6 +827,7 @@ def _iris_wait_lamport_peers(
     WORLD_SIZE: gl.constexpr,
     MAX_ELEMENTS: gl.constexpr,
     LAYOUT: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr = 64,
 ):
     """Wait for peer BF16 tiles to replace the empty mailbox markers."""
     return _iris_wait_lamport_slots(
@@ -785,6 +838,7 @@ def _iris_wait_lamport_peers(
         WORLD_SIZE,
         MAX_ELEMENTS,
         LAYOUT,
+        SUBGROUP_SIZE,
     )
 
 
@@ -808,22 +862,31 @@ def iris_lamport_allreduce(
     MAX_ELEMENTS: gl.constexpr,
     NUM_STAGES: gl.constexpr,
     PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+    SUBGROUP_SIZE: gl.constexpr,
 ):
-    """All-reduce BF16 tiles across eight ranks using data as the ready signal.
+    """All-reduce BF16 tiles across two, four, or eight ranks using data as
+    the ready signal.
 
     Push input_sym_ptr into each peer's rotating mailbox and wait until the
     local mailbox contains every peer's contribution. Sum in FP32 rank order
     and write BF16 output_ptr. Clear consumed mailboxes and advance the tile's
     counter; negative zero is replaced with zero to preserve the empty marker.
     """
-    gl.static_assert(WORLD_SIZE == 8)
+    gl.static_assert(WORLD_SIZE == 2 or WORLD_SIZE == 4 or WORLD_SIZE == 8)
     gl.static_assert(TOTAL_ELEMENTS % 512 == 0)
     gl.static_assert(TOTAL_ELEMENTS <= MAX_ELEMENTS)
     gl.static_assert(NUM_STAGES >= 3)
-    layout: gl.constexpr = gl.BlockedLayout([1, 8], [64, 1], [1, 1], [0, 1])
-    pack = gl.program_id(0) * 64 + gl.arange(0, 64, layout=gl.SliceLayout(1, layout))
-    element = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
-    offsets = pack[:, None] * 8 + element[None, :]
+    # One subgroup owns a 512-element tile, one row of consecutive 16-byte
+    # packs per lane, so the polling mask holds exactly one flag per lane.
+    ROW_ELEMENTS: gl.constexpr = 512 // SUBGROUP_SIZE
+    layout: gl.constexpr = gl.BlockedLayout(
+        [1, ROW_ELEMENTS], [SUBGROUP_SIZE, 1], [1, 1], [1, 0]
+    )
+    row = gl.program_id(0) * SUBGROUP_SIZE + gl.arange(
+        0, SUBGROUP_SIZE, layout=gl.SliceLayout(1, layout)
+    )
+    element = gl.arange(0, ROW_ELEMENTS, layout=gl.SliceLayout(0, layout))
+    offsets = row[:, None] * ROW_ELEMENTS + element[None, :]
     mask = offsets < TOTAL_ELEMENTS
     generation = (
         gl.load(epochs + gl.program_id(0)).to(gl.uint32).to(gl.uint64) % NUM_STAGES
@@ -859,11 +922,12 @@ def iris_lamport_allreduce(
         region_sym_ptr,
         generation,
         offsets,
-        pack * 8 < TOTAL_ELEMENTS,
+        row * ROW_ELEMENTS < TOTAL_ELEMENTS,
         RANK,
         WORLD_SIZE,
         MAX_ELEMENTS,
         layout,
+        SUBGROUP_SIZE,
     )
     # All ranks use the same FP32 addition order, then round once to BF16.
     for peer in gl.static_range(0, WORLD_SIZE):

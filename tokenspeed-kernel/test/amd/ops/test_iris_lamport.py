@@ -70,6 +70,7 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
             "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
+            "SUBGROUP_SIZE": 64,
         },
         attrs={(index,): [["tt.divisibility", 16]] for index in range(12)},
     )

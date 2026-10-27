@@ -41,6 +41,11 @@ _DEFAULT_PRODUCER_DIRECT_MAX_BYTES = 1024 * 1024
 _DEFAULT_ALL_REDUCE_MAX_BYTES = 512 * 1024
 
 
+def _producer_direct_platform() -> bool:
+    platform = current_platform()
+    return platform.is_cdna4 or platform.is_cdna5
+
+
 class IrisBackend(CommBackend):
     """Keep direct handles to the Iris states prepared for each group/dtype."""
 
@@ -233,7 +238,7 @@ class IrisBackend(CommBackend):
         op=None,
     ) -> bool:
         """Check producer eligibility without initializing Iris or its heap."""
-        if not current_platform().is_cdna4 or not like.is_cuda:
+        if not _producer_direct_platform() or not like.is_cuda:
             return False
         numels = tuple(math.prod(shape) for shape in shapes)
         if (
@@ -288,7 +293,7 @@ class IrisBackend(CommBackend):
     ) -> bool:
         """Recognize producer views by ownership, without searching states."""
         if (
-            not current_platform().is_cdna4
+            not _producer_direct_platform()
             or op not in (None, torch.distributed.ReduceOp.SUM)
             or not tensors
         ):

@@ -202,6 +202,9 @@ def _ar_worker_main(
     try:
         # Importing inside the worker avoids pulling iris into the parent
         # process (which has no distributed context).
+        from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+            ProducerLamport,
+        )
         from tokenspeed_kernel.ops.communication.iris import (
             configure_iris,
             create_iris_state,
@@ -235,6 +238,11 @@ def _ar_worker_main(
                 state.tuned_staged.ready_flags.data_ptr()
                 != state.staged.ready_flags.data_ptr()
             )
+        if (
+            current_platform().is_cdna5
+            and world_size in ProducerLamport.ALL_REDUCE_WORLD_SIZES
+        ):
+            _check_lamport_dispatch(state, rank, world_size, device)
         k3 = None
         if attnres_max_numel:
             from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
@@ -372,6 +380,42 @@ def _ar_worker_main(
         dist.destroy_process_group()
 
 
+def _check_lamport_dispatch(state, rank: int, world_size: int, device) -> None:
+    """CDNA5 reduces staged and producer payloads of whole tiles with Lamport."""
+    from tokenspeed_kernel.ops.communication.iris import (
+        iris_acquire_outputs,
+        iris_all_reduce,
+        iris_all_reduce_symmetric,
+    )
+
+    lamport = state.lamport
+    assert lamport is not None
+    expected = world_size * (world_size + 1) // 2
+
+    def reduce_and_check_epochs(reduce, numel):
+        before = lamport.epochs.clone()
+        results = reduce()
+        tiles = numel // lamport.BLOCK_ELEMENTS
+        advanced = before.clone()
+        advanced[:tiles] = (advanced[:tiles] + 1) % lamport.NUM_STAGES
+        torch.testing.assert_close(lamport.epochs, advanced, atol=0, rtol=0)
+        for result in results:
+            torch.testing.assert_close(
+                result, torch.full_like(result, expected), atol=0, rtol=0
+            )
+
+    local = torch.full((16, 7168), rank + 1, dtype=torch.bfloat16, device=device)
+    reduce_and_check_epochs(
+        lambda: (iris_all_reduce(state, local, safe=False),), local.numel()
+    )
+    outputs = iris_acquire_outputs(state, ((4, 7168), (4, 3584)))
+    for output in outputs:
+        output.fill_(rank + 1)
+    reduce_and_check_epochs(
+        lambda: iris_all_reduce_symmetric(state, outputs), 4 * (7168 + 3584)
+    )
+
+
 def _check_all_reduce(state, rank: int, world_size: int, shape, device) -> None:
     from tokenspeed_kernel.ops.communication.iris import iris_all_reduce
 
@@ -503,7 +547,7 @@ def _check_all_reduce_symmetric_outputs(
     shapes,
     device,
 ) -> None:
-    if not current_platform().is_cdna4:
+    if not (current_platform().is_cdna4 or current_platform().is_cdna5):
         return
 
     from tokenspeed_kernel.ops.communication.iris import (

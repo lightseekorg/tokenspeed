@@ -156,6 +156,7 @@ class IrisAllReduce:
     ):
         from tokenspeed_kernel.ops.communication._iris.all_reduce import (
             ProducerBuffer,
+            ProducerLamport,
             ProducerPull,
             StagedPullOneShot,
             StagedPullTwoShot,
@@ -204,6 +205,12 @@ class IrisAllReduce:
             if staged_max_numel and StagedPullTwoShot.supported(peers.world_size, dtype)
             else None
         )
+        lamport_numel = ProducerLamport.all_reduce_numel(
+            staged_max_numel, producer_direct_max_numel, peers.world_size, dtype
+        )
+        self.lamport = (
+            ProducerLamport(peers, max_numel=lamport_numel) if lamport_numel else None
+        )
 
     def all_reduce(
         self, tensor: torch.Tensor, op=None, safe: bool = True, async_op: bool = False
@@ -215,7 +222,16 @@ class IrisAllReduce:
         assert not async_op, "Iris all-reduce does not support async_op"
         assert tensor.dtype == self.dtype
         assert 0 < tensor.numel() <= self.staged_max_numel
-        if (
+        if self.lamport is not None and self.lamport.can_run(tensor.numel()):
+            # Vector accesses need an aligned tensor; ranks keep the same
+            # collective when a caller supplies an element-aligned view.
+            if tensor.data_ptr() % self.lamport.TRANSACTION_BYTES:
+                aligned = tensor.clone()
+                self.lamport.run(aligned, aligned)
+                tensor.copy_(aligned)
+            else:
+                self.lamport.run(tensor, tensor)
+        elif (
             self.tuned_staged is not None
             and tensor.numel() == self.tuned_staged.slots.shape[1]
         ):
@@ -246,16 +262,17 @@ class IrisAllReduce:
         assert self.owns_outputs(tensors)
         assert self.producer_pull is not None
         shapes = tuple(tuple(tensor.shape) for tensor in tensors)
-        if not self.producer_pull.can_run(shapes):
+        numel = sum(tensor.numel() for tensor in tensors)
+        use_lamport = self.lamport is not None and self.lamport.can_run(numel)
+        if not use_lamport and not self.producer_pull.can_run(shapes):
             raise RuntimeError(
                 "Prepared Iris producer reduction does not support these outputs"
             )
-        output = torch.empty(
-            sum(tensor.numel() for tensor in tensors),
-            dtype=self.dtype,
-            device=self.device,
-        )
-        self.producer_pull.run(output)
+        output = torch.empty(numel, dtype=self.dtype, device=self.device)
+        if use_lamport:
+            self.lamport.run(self.producer.data, output)
+        else:
+            self.producer_pull.run(output)
         return self.producer.views(output, shapes)
 
     def can_reduce_mhc_post(
