@@ -1318,6 +1318,41 @@ including when source and destination alias. History retains its bound pool
 dtype; original QKV is converted on commit.
 
 
+### KDA retained history (gfx950 / gfx1250)
+
+The direct retained verify and commit APIs use a page-owned history with FP32
+correction U, normalized K, multiplicative decay, and an INT32 accepted length
+L. Each page represents its V-major dense base followed by L accepted updates.
+The caller provides all storage, including a private live page for each active
+request. Shared source pages are immutable; a live page must not alias another
+active request's source or live page.
+
+Before verify, a source-to-live transition or L + T greater than capacity C
+consolidates the accepted endpoint into the live dense base. T is the actual
+packed request length. A separate, ordered kernel resets the live length after
+all state tiles finish. L + T equal to C still fits. Empty requests and padding
+pages leave page storage unchanged.
+
+Verify reconstructs the accepted endpoint from the live base and history, then
+writes candidate U, K and decay at L + token offset. It preserves L and the
+dense base. Convolution still reads the original source page, because recurrent
+consolidation does not copy convolution history. The existing fused convolution,
+activation-dtype rounding, gate projection and state-panel scheduling remain
+shared with records-based verify.
+
+Retained commit clamps the accepted count to the actual window and configured
+bound, updates convolution from the caller's original QKV, then publishes the
+new length. It does not replay dense state or copy retained records. Zero
+acceptance still copies source convolution history to a distinct live page.
+When stamps are supplied, invalid accepted records prevent both convolution
+writes and length publication. Stamps validate the current candidate window;
+accepted history is independent of stamp-ring reuse.
+
+The adapter accepts `KdaRetainedHistory`; the AMD package receives its tensors
+explicitly and has no dependency on `tokenspeed-kernel`. These direct APIs do
+not enable retained history in serving or change the batched descriptor ABI.
+
+
 ## Transform
 
 ### gfx950 Hadamard query transform

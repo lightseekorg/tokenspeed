@@ -23,7 +23,11 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult, KdaReplayRecords
+from tokenspeed_kernel.ops.attention.kda import (
+    KdaPrefillResult,
+    KdaReplayRecords,
+    KdaRetainedHistory,
+)
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -45,6 +49,12 @@ if current_platform().is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
         launch_gluon_kda_fused_replay_gfx950 as _kda_fused_replay_impl,
     )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        launch_gluon_kda_retained_commit_gfx950 as _retained_commit_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.attention.kda.decode import (
+        launch_gluon_kda_retained_verify_gfx950 as _retained_verify_gfx950,
+    )
     from tokenspeed_kernel_amd.ops.gfx950.attention.kda.prefill import (
         launch_gluon_kda_paged_prefill_gfx950 as _kda_prefill_impl,
     )
@@ -59,6 +69,12 @@ if current_platform().is_amd:
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
         launch_gluon_kda_fused_replay_gfx1250 as _kda_fused_replay_gfx1250_impl,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
+        launch_gluon_kda_retained_commit_gfx1250 as _retained_commit_gfx1250,
+    )
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.decode import (
+        launch_gluon_kda_retained_verify_gfx1250 as _retained_verify_gfx1250,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.attention.kda.prefill import (
         launch_gluon_kda_paged_prefill_gfx1250 as _kda_prefill_gfx1250_impl,
@@ -555,3 +571,346 @@ if current_platform().is_amd:
             record_metadata=record_metadata,
             record_stamps=record_stamps,
         )
+
+
+def _validate_retained_request(
+    history, reads, starts, metadata, stamps, *, heads, dim, window, pages, device
+):
+    """Check current request geometry; immutable storage was checked at construction."""
+    batch = reads.numel()
+    if (
+        history.correction.shape[:2] != (pages, heads)
+        or history.correction.shape[-1] != dim
+        or history.key.shape[-1] != dim
+    ):
+        raise ValueError("retained history must match checkpoint page/head geometry")
+    if (
+        history.live_state_indices.shape != (batch,)
+        or reads.shape != (batch,)
+        or starts.shape != (batch + 1,)
+    ):
+        raise ValueError("retained history indices must match request/query boundaries")
+    if any(x.dtype not in (torch.int32, torch.int64) for x in (reads, starts)):
+        raise ValueError("retained KDA request indices must be integer tensors")
+    if window <= 0 or window > history.correction.shape[2]:
+        raise ValueError("retained KDA candidate window exceeds history capacity")
+    if any(x.device != device for x in (history.correction, reads, starts)):
+        raise ValueError("retained history and requests must use the checkpoint device")
+    if (metadata is None) != (stamps is None):
+        raise ValueError("retained KDA metadata and stamps must be supplied together")
+    if metadata is not None:
+        if (
+            metadata.shape != (batch, 3)
+            or stamps.ndim != 3
+            or stamps.shape[0] < batch
+            or (stamps.shape[1] < window or stamps.shape[2] != 2)
+            or any(
+                x.dtype != torch.int64 or not x.is_contiguous() or x.device != device
+                for x in (metadata, stamps)
+            )
+        ):
+            raise ValueError("retained KDA metadata must match requests and capacity")
+
+
+def gluon_kda_retained_verify_gfx950(
+    *,
+    mixed_qkv: torch.Tensor,
+    original_qkv: torch.Tensor | None,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    raw_g: torch.Tensor | None,
+    f_a_out: torch.Tensor | None,
+    f_b_weight: torch.Tensor | None,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    retained_history: KdaRetainedHistory,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+) -> torch.Tensor:
+    """Verify packed pre-convolution QKV using page-owned accepted history.
+
+    conv_states and state_pool contain source checkpoints. retained_history
+    selects private live pages and FP32 U/normalized-K/decay storage. Verify
+    writes candidates after the accepted prefix, without publishing length.
+    original_qkv optionally retains input rows for commit. raw_g excludes
+    f_a_out/f_b_weight; otherwise both projection inputs are required.
+    record_metadata and record_stamps are both tensors or both None.
+    num_heads/head_dim describe the checkpoint; draft_token_num bounds each
+    packed interval in query_start_loc. lower_bound selects the decay formula.
+    Return attention output with shape [1, tokens, heads, dim].
+    """
+    if (
+        state_pool.ndim != 4
+        or state_pool.shape[1:] != (num_heads, head_dim, head_dim)
+        or state_pool.dtype != torch.float32
+    ):
+        raise ValueError("retained KDA checkpoint must be FP32 [page, head, V, K]")
+    _validate_retained_request(
+        retained_history,
+        read_indices,
+        query_start_loc,
+        record_metadata,
+        record_stamps,
+        heads=num_heads,
+        dim=head_dim,
+        window=draft_token_num,
+        pages=state_pool.shape[0],
+        device=state_pool.device,
+    )
+    return _retained_verify_gfx950(
+        mixed_qkv=mixed_qkv,
+        original_qkv=original_qkv,
+        conv_weights=conv_weights,
+        conv_pool=conv_states,
+        raw_g=raw_g,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        query_start_loc=query_start_loc,
+        correction=retained_history.correction,
+        retained_key=retained_history.key,
+        retained_decay=retained_history.decay,
+        retained_length=retained_history.length,
+        live_indices=retained_history.live_state_indices,
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
+
+
+def gluon_kda_retained_commit_gfx950(
+    *,
+    original_qkv: torch.Tensor,
+    conv_states: torch.Tensor,
+    read_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    accepted_length: torch.Tensor,
+    retained_history: KdaRetainedHistory,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+) -> None:
+    """Commit accepted packed original_qkv rows to live convolution pages.
+
+    conv_states contains source taps. read_indices and query_start_loc map
+    request rows; accepted_length is clamped to each row's actual token count.
+    retained_history identifies private live pages and the length to publish.
+    Metadata/stamps must be supplied together; stale accepted records suppress
+    both convolution updates and length publication. num_heads, head_dim and
+    draft_token_num specify fixed geometry. Return None.
+    """
+    _validate_retained_request(
+        retained_history,
+        read_indices,
+        query_start_loc,
+        record_metadata,
+        record_stamps,
+        heads=num_heads,
+        dim=head_dim,
+        window=draft_token_num,
+        pages=conv_states.shape[0],
+        device=conv_states.device,
+    )
+    batch = read_indices.numel()
+    if (
+        accepted_length.shape != (batch,)
+        or accepted_length.dtype not in (torch.int32, torch.int64)
+        or accepted_length.device != conv_states.device
+    ):
+        raise ValueError("retained KDA accepted lengths must match the requests")
+    if (
+        head_dim != 128
+        or conv_states.shape[1:] != (3 * num_heads * head_dim, 3)
+        or original_qkv.ndim != 2
+        or original_qkv.shape[1] != 3 * num_heads * head_dim
+        or original_qkv.shape[0] > batch * draft_token_num
+        or original_qkv.stride(-1) != 1
+        or original_qkv.device != conv_states.device
+    ):
+        raise ValueError(
+            "retained KDA commit needs packed pre-convolution QKV and matching taps"
+        )
+    _retained_commit_gfx950(
+        original_qkv=original_qkv,
+        conv_pool=conv_states,
+        read_indices=read_indices,
+        live_indices=retained_history.live_state_indices,
+        query_start_loc=query_start_loc,
+        accepted_length=accepted_length,
+        retained_length=retained_history.length,
+        history_capacity=retained_history.correction.shape[2],
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+    )
+
+
+def gluon_kda_retained_verify_gfx1250(
+    *,
+    mixed_qkv: torch.Tensor,
+    original_qkv: torch.Tensor | None,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    raw_g: torch.Tensor | None,
+    f_a_out: torch.Tensor | None,
+    f_b_weight: torch.Tensor | None,
+    beta_logits: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_pool: torch.Tensor,
+    read_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    retained_history: KdaRetainedHistory,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    lower_bound: float | None,
+) -> torch.Tensor:
+    """Verify packed pre-convolution QKV using page-owned accepted history.
+
+    conv_states and state_pool contain source checkpoints. retained_history
+    selects private live pages and FP32 U/normalized-K/decay storage. Verify
+    writes candidates after the accepted prefix, without publishing length.
+    original_qkv optionally retains input rows for commit. raw_g excludes
+    f_a_out/f_b_weight; otherwise both projection inputs are required.
+    record_metadata and record_stamps are both tensors or both None.
+    num_heads/head_dim describe the checkpoint; draft_token_num bounds each
+    packed interval in query_start_loc. lower_bound selects the decay formula.
+    Return attention output with shape [1, tokens, heads, dim].
+    """
+    if (
+        state_pool.ndim != 4
+        or state_pool.shape[1:] != (num_heads, head_dim, head_dim)
+        or state_pool.dtype != torch.float32
+    ):
+        raise ValueError("retained KDA checkpoint must be FP32 [page, head, V, K]")
+    _validate_retained_request(
+        retained_history,
+        read_indices,
+        query_start_loc,
+        record_metadata,
+        record_stamps,
+        heads=num_heads,
+        dim=head_dim,
+        window=draft_token_num,
+        pages=state_pool.shape[0],
+        device=state_pool.device,
+    )
+    return _retained_verify_gfx1250(
+        mixed_qkv=mixed_qkv,
+        original_qkv=original_qkv,
+        conv_weights=conv_weights,
+        conv_pool=conv_states,
+        raw_g=raw_g,
+        f_a_out=f_a_out,
+        f_b_weight=f_b_weight,
+        beta_logits=beta_logits,
+        A_log=A_log,
+        dt_bias=dt_bias,
+        state_pool=state_pool,
+        read_indices=read_indices,
+        query_start_loc=query_start_loc,
+        correction=retained_history.correction,
+        retained_key=retained_history.key,
+        retained_decay=retained_history.decay,
+        retained_length=retained_history.length,
+        live_indices=retained_history.live_state_indices,
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+        lower_bound=lower_bound,
+    )
+
+
+def gluon_kda_retained_commit_gfx1250(
+    *,
+    original_qkv: torch.Tensor,
+    conv_states: torch.Tensor,
+    read_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    accepted_length: torch.Tensor,
+    retained_history: KdaRetainedHistory,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+) -> None:
+    """Commit accepted packed original_qkv rows to live convolution pages.
+
+    conv_states contains source taps. read_indices and query_start_loc map
+    request rows; accepted_length is clamped to each row's actual token count.
+    retained_history identifies private live pages and the length to publish.
+    Metadata/stamps must be supplied together; stale accepted records suppress
+    both convolution updates and length publication. num_heads, head_dim and
+    draft_token_num specify fixed geometry. Return None.
+    """
+    _validate_retained_request(
+        retained_history,
+        read_indices,
+        query_start_loc,
+        record_metadata,
+        record_stamps,
+        heads=num_heads,
+        dim=head_dim,
+        window=draft_token_num,
+        pages=conv_states.shape[0],
+        device=conv_states.device,
+    )
+    batch = read_indices.numel()
+    if (
+        accepted_length.shape != (batch,)
+        or accepted_length.dtype not in (torch.int32, torch.int64)
+        or accepted_length.device != conv_states.device
+    ):
+        raise ValueError("retained KDA accepted lengths must match the requests")
+    if (
+        head_dim != 128
+        or conv_states.shape[1:] != (3 * num_heads * head_dim, 3)
+        or original_qkv.ndim != 2
+        or original_qkv.shape[1] != 3 * num_heads * head_dim
+        or original_qkv.shape[0] > batch * draft_token_num
+        or original_qkv.stride(-1) != 1
+        or original_qkv.device != conv_states.device
+    ):
+        raise ValueError(
+            "retained KDA commit needs packed pre-convolution QKV and matching taps"
+        )
+    _retained_commit_gfx1250(
+        original_qkv=original_qkv,
+        conv_pool=conv_states,
+        read_indices=read_indices,
+        live_indices=retained_history.live_state_indices,
+        query_start_loc=query_start_loc,
+        accepted_length=accepted_length,
+        retained_length=retained_history.length,
+        history_capacity=retained_history.correction.shape[2],
+        record_metadata=record_metadata,
+        record_stamps=record_stamps,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
+    )
