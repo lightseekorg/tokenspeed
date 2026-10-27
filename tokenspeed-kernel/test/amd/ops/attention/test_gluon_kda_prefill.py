@@ -67,12 +67,18 @@ def _reference_sequence(
     )
 
 
-@pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize(
+    ("time_split", "lower_bound"),
+    [(False, -5.0), (False, None), (True, -5.0)],
+    ids=["chunk_edges", "chunk_edges_unbounded", "time_split"],
+)
 def test_kda_prefill_matches_packed_recurrent_reference(
-    lower_bound: float | None,
+    time_split: bool, lower_bound: float | None
 ) -> None:
+    # Few long sequences are split in time. Their gates decay slowly so that
+    # the state handed between time groups stays visible in the output.
     torch.manual_seed(31)
-    lengths = [0, 1, 15, 16, 17, 63, 64, 65]
+    lengths = [1700, 1600] if time_split else [0, 1, 15, 16, 17, 63, 64, 65]
     total_tokens = sum(lengths)
     heads = 2
     dim = 128
@@ -84,11 +90,17 @@ def test_kda_prefill_matches_packed_recurrent_reference(
     initial_state = torch.randn(
         len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
     )
-    a_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0
-    dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+    if time_split:
+        a_log = torch.full((heads,), 0.5, device="cuda", dtype=torch.float32)
+        dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+        dt_bias = dt_bias * 2.0 - 7.0
+    else:
+        a_log = torch.randn(heads, device="cuda", dtype=torch.float32) * 0.1 - 2.0
+        dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
     cu_seqlens = torch.tensor(
         [0, *accumulate(lengths)], device="cuda", dtype=torch.int32
     )
+    cu_seqlens_cpu = cu_seqlens.cpu().long() if time_split else None
 
     expected_outputs = []
     expected_states = []
@@ -120,6 +132,7 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
         lower_bound=lower_bound,
+        cu_seqlens_cpu=cu_seqlens_cpu,
     )
 
     torch.testing.assert_close(
@@ -128,10 +141,11 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         atol=2e-3,
         rtol=2e-2,
     )
+    # A slowly decaying state grows larger, and so does its bf16 rounding.
     torch.testing.assert_close(
         actual_state,
         torch.stack(expected_states),
-        atol=4e-3,
+        atol=1.5e-2 if time_split else 4e-3,
         rtol=2e-2,
     )
     assert actual_state.dtype == torch.float32
