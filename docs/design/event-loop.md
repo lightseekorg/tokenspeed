@@ -254,14 +254,18 @@ Consequences:
   through tensor indexing can stage a CPU tensor and introduce a hidden
   synchronous H2D copy, blocking further forward launches.
 
-An EPD prefill node's first stage receives each multimodal item's embedding
+An external-encoder receiver's first stage receives each multimodal item's embedding
 through the host's embedding receiver (`ts-pd`'s `epd::receiver`): it looks
 up and registers with the encode ranks, leases each item a slot of the
 receive pools and tells the encode rank where to write, and every round
 reports each staged request's state, which the replica MIN-reduces, so a
 request is admitted, or failed, on every rank in the same round. Later
 pipeline stages hold no receiver and agree with whatever the first decides;
-decode builds none. The data plane keeps the device half. It allocates the
+decode builds none. Aggregated serving opts into the same receive admission with
+--enable-external-encoder: it owns a standalone Mooncake transport and remains
+a Plain execution role, with no P/D KV peer. A PD Prefill receiver shares its
+KV peer transport. The receive pool budget uses the same capability gate as
+allocation. The data plane keeps the device half. It allocates the
 pools (one device buffer, after the cache is sized; the host registers it
 once). `epd_publish` copies the landed rows out of their slots onto the
 items before any forward of the request and, with row sharding, rebuilds
