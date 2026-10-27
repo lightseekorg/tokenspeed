@@ -102,7 +102,9 @@ def trim_matched_stop(
         return output
 
     matched = finished_reason.get("matched", None)
-    if not matched:
+    # A stop token id of 0 is valid, so only an absent or empty match skips
+    # trimming (an empty stop string would otherwise cut the whole output).
+    if matched is None or (isinstance(matched, (str, list)) and not matched):
         return output
 
     # Trim stop str.
