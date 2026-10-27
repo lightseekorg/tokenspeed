@@ -85,12 +85,13 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(
     }
     std::unordered_set<CacheKey, CacheKeyHash> storing;
     // The boundary's blocks Host lacks go first, front to back; one an earlier
-    // store still carries is published at this batch's epoch by that store.
-    // The first candidate queued for a block stored here lands where it does.
+    // store still carries is published no older than this batch's epoch by
+    // that store. The first candidate queued for a block stored here lands
+    // where it does.
     std::unordered_set<CacheKey, CacheKeyHash> boundary_rows;
     for (CacheCoordinator::StoreEpochs::Uncached& block : epochs.uncached) {
         if (const auto it = in_flight.find(block.key); it != in_flight.end()) {
-            it->second->access_epoch = block.access_epoch;
+            it->second->access_epoch = std::max(it->second->access_epoch, block.access_epoch);
         } else if (storing.insert(block.key).second) {
             boundary_rows.insert(block.key);
             add(std::move(block.key), std::move(block.device_block), block.access_epoch);
@@ -421,10 +422,19 @@ void TierTransferManager::redateInFlight(const BoundaryEpochs& boundary) {
         }
         for (StoreTicket& ticket : write_back.tickets) {
             if (const auto it = boundary.find(ticket.key); it != boundary.end()) {
-                ticket.access_epoch = it->second;
+                ticket.access_epoch = std::max(ticket.access_epoch, it->second);
             }
         }
     }
+}
+
+void TierTransferManager::RefreshHostBoundary(std::span<const std::string> prefix_hashes,
+                                              const std::optional<TailPublication>& tail, std::uint64_t access_epoch) {
+    BoundaryEpochs off_host;
+    for (CacheKey& key : coordinator_.RefreshHostBoundary(prefix_hashes, tail, access_epoch)) {
+        off_host.emplace(std::move(key), access_epoch);
+    }
+    redateInFlight(off_host);
 }
 
 CacheCoordinator::StoreEpochs TierTransferManager::TakeRetractionEpochs(

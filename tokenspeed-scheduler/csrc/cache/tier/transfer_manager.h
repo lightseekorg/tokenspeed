@@ -163,6 +163,12 @@ public:
                                                           std::span<const BlockTable> tables, std::int32_t num_tokens,
                                                           RetractionImageSplit split,
                                                           CacheCoordinator::StoreEpochs epochs);
+    // Refreshes the Host copies of the boundary a request resumed from
+    // (CacheCoordinator::RefreshHostBoundary) and re-dates the ones an
+    // earlier store still carries, so its ACK publishes them no older than
+    // access_epoch.
+    void RefreshHostBoundary(std::span<const std::string> prefix_hashes, const std::optional<TailPublication>& tail,
+                             std::uint64_t access_epoch);
     // One restore op for both legs: load_pairs are the Host L2 rows (keyed),
     // snapshot_pairs the snapshot-pool rows. Both ends of every pair, the blob
     // slot (shared) and the request-pool row the blob is imported into
@@ -321,11 +327,12 @@ private:
     };
     using InFlightHostBlocks = std::unordered_map<CacheKey, InFlightHostBlock, CacheKeyHash>;
     InFlightHostBlocks inFlightHostBlocks() const;
-    // A retraction's boundary keys Host does not hold, with their epochs.
+    // A boundary's keys Host does not hold, with their epochs.
     using BoundaryEpochs = std::unordered_map<CacheKey, std::uint64_t, CacheKeyHash>;
-    // Re-dates the boundary keys an earlier store still carries: its ACK
-    // publishes them at this batch's epochs. An eviction write-back's
-    // tickets publish nothing at the ACK and are left as they are.
+    // Re-dates the boundary keys an earlier store still carries, never back:
+    // its ACK publishes them no older than these epochs. An eviction
+    // write-back's tickets publish nothing at the ACK and are left as they
+    // are.
     void redateInFlight(const BoundaryEpochs& boundary);
 
     CacheCoordinator& coordinator_;

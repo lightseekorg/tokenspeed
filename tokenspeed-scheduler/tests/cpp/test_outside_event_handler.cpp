@@ -288,7 +288,8 @@ protected:
 // published before the retraction stays the page's entry. r's pages never
 // reached Host -- an earlier store held every Host block when r streamed its
 // prompt and when it was retracted -- so its finish stores them from those
-// entries.
+// entries, dated as the prefix it leaves: one more Host entry evicts its
+// tail [44], not a page.
 TEST_F(FinishAfterRetractionTestSuite, AFinishStoresThePagesItsRestoreCopied) {
     Reset(/*host_entries=*/4, /*retraction_interval=*/4);
     Submit(RequestSpec{.request_id = "held", .tokens = MakeTokens(8, 200), .max_new_tokens = 1});
@@ -323,8 +324,10 @@ TEST_F(FinishAfterRetractionTestSuite, AFinishStoresThePagesItsRestoreCopied) {
     const auto& finish_write_back = std::get<WriteBackBatch>(finish_stores.front());
     EXPECT_EQ(finish_write_back.src_pages.at(0).size(), 4u) << "the three pages and the tail [44]";
     SendWriteBackDone(finish_write_back.op_ids.front());
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 4);
+    AckWriteBacks(FinishAfterPrefill("e", {300, 301}));
     ASSERT_TRUE(scheduler_->ClearL1Cache());
-    EXPECT_EQ(HostHitTokens("probe", {1, 2, 3, 4, 42, 43, 44, 77}), 7);
+    EXPECT_EQ(HostHitTokens("probe", {1, 2, 3, 4, 42, 43, 44, 77}), 6);
 }
 
 // A request refreshes the Host copy of the boundary it resumed from at its
@@ -371,6 +374,53 @@ TEST_F(FinishAfterRetractionTestSuite, ARetractedRequestRefreshesTheBoundaryItRe
             AckWriteBacks(PlanOnce());
         }
         ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), restored ? 6 : 5);
+
+        AckWriteBacks(FinishAfterPrefill("e", {300, 301}));  // one entry evicts one
+        ASSERT_TRUE(scheduler_->ClearL1Cache());
+        EXPECT_EQ(HostHitTokens("next", {1, 2, 3, 99}), 3) << "the tail r resumed from stayed";
+    }
+}
+
+// The boundary a request resumed from may still be on its way to Host when
+// the request leaves, in the store of the request that published it; the
+// refresh re-dates the copy in flight, so that store's ACK publishes it no
+// older than the request's admission. r resumes from the system prompt's
+// tail [3] on the Device and finishes -- right after its prefill, or while
+// Retracted -- before the system prompt's store lands: the idle prompt
+// stored before r arrived is still the next Host victim.
+TEST_F(FinishAfterRetractionTestSuite, ARequestRedatesTheBoundaryItResumedFromInFlight) {
+    for (const bool retracted : {false, true}) {
+        SCOPED_TRACE(retracted);
+        // r leaves the page [3 5], and retracted the page [42 43] too.
+        Reset(/*host_entries=*/retracted ? 5 : 4, /*retraction_interval=*/retracted ? 6 : 0);
+        Submit(RequestSpec{.request_id = "system", .tokens = {1, 2, 3}, .max_new_tokens = 1});
+        PlanOnce();
+        SendForwardDone("system", {900});
+        SendFinish("system");  // the page [1 2] and the tail [3]
+        Submit(RequestSpec{.request_id = "idle", .tokens = {100, 101}, .max_new_tokens = 1});
+        const ExecutionPlan system_store = PlanOnce();
+        SendForwardDone("idle", {900});
+        SendFinish("idle");  // the page [100 101]
+        Submit(RequestSpec{.request_id = "r", .tokens = {1, 2, 3, 5}});
+        AckWriteBacks(PlanOnce());  // plan 3: r resumes at 3
+        SendForwardDone("r", {42});
+        if (retracted) {
+            AckWriteBacks(PlanOnce());  // r's prompt end stores the page [3 5]
+            SendForwardDone("r", {43});
+            PlanOnce();
+            SendForwardDone("r", {44});
+            const ExecutionPlan retraction = PlanOnce();  // plan 6 retracts r, storing the page [42 43]
+            ASSERT_EQ(scheduler_->RetractedSize(), 1u);
+            AckImageStores(retraction);
+            SendFinish("r");
+            AckWriteBacks(system_store);
+        } else {
+            SendFinish("r");
+            const ExecutionPlan r_store = PlanOnce();  // the page [3 5]
+            AckWriteBacks(system_store);
+            AckWriteBacks(r_store);
+        }
+        ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), retracted ? 5 : 4);
 
         AckWriteBacks(FinishAfterPrefill("e", {300, 301}));  // one entry evicts one
         ASSERT_TRUE(scheduler_->ClearL1Cache());

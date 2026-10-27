@@ -686,15 +686,16 @@ public:
     // The access epochs a store batch dates Host entries with. A request's
     // final publication refreshes the boundary it leaves: every published
     // History block of its tables below num_tokens -- the pages its forwards
-    // read to the end -- each State group's live slot, the checkpoint at
-    // num_tokens (slot 0 holds an earlier one and is not part of it), and the
-    // in-forward State checkpoint it published with a sliding window's blocks
-    // behind it (the tables no longer hold them). The boundary takes one
-    // epoch per prefix page, the first page newest so a prefix leaves Host
-    // from its end and every group's blocks of a page share a date (a
-    // checkpoint takes the page its token count ends in); `base`, older than
-    // all of them, dates everything else the batch stores. A live request's
-    // publications have no final publication.
+    // read to the end; a page the tables hold as a private copy (a restore's)
+    // through the page's Device entry -- each State group's live slot, the
+    // checkpoint at num_tokens (slot 0 holds an earlier one and is not part
+    // of it), and the in-forward State checkpoint it published with a
+    // sliding window's blocks behind it (the tables no longer hold them). The
+    // boundary takes one epoch per prefix page, the first page newest so a
+    // prefix leaves Host from its end and every group's blocks of a page
+    // share a date (a checkpoint takes the page its token count ends in);
+    // `base`, older than all of them, dates everything else the batch stores.
+    // A live request's publications have no final publication.
     struct StoreEpochs {
         std::uint64_t base{0};
         bool final_publication{false};
@@ -722,10 +723,12 @@ public:
     // publication there registers beyond the full pages before it: each State
     // group's checkpoint, the tail of an unaligned boundary (the page ending
     // at an aligned one), a sliding window's lookback -- to access_epoch,
-    // never dating them back. prefix_hashes are the boundary's full pages,
-    // tail its partial page.
-    void RefreshHostBoundary(std::span<const std::string> prefix_hashes, const std::optional<TailPublication>& tail,
-                             std::uint64_t access_epoch);
+    // never dating them back, and returns the keys of those Host does not
+    // hold, which a store in flight may still carry (none without a Host
+    // tier). prefix_hashes are the boundary's full pages, tail its partial
+    // page.
+    std::vector<CacheKey> RefreshHostBoundary(std::span<const std::string> prefix_hashes,
+                                              const std::optional<TailPublication>& tail, std::uint64_t access_epoch);
     bool IsHostCachedBlock(CacheBlockLocation location) const;
     std::int32_t NumHostCachedBlocks() const;
     std::int32_t NumPinnedHostCachedBlocks() const;

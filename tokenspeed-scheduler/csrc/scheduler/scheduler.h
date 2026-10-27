@@ -288,7 +288,7 @@ private:
     // A final publication also refreshes the Host copies of the boundary the
     // request resumed from, which it read at its first admission and may no
     // longer hold, dated at that admission so a later checkpoint of its own
-    // stays newer.
+    // stays newer -- copies a store still carries included.
     void refreshResumeBoundary(const Request& request, const fsm::CacheProgress& cache_progress);
 
     std::size_t groupIndex(const std::string& group_id) const;
