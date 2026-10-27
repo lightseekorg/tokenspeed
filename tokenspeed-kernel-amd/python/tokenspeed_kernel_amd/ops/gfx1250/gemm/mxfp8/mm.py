@@ -31,7 +31,6 @@ XCD order.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel_amd._scheduling import sched_compile_options
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx1250.gemm.fp16.mm import (
     _NUM_CUS,
@@ -52,7 +51,7 @@ _BK256_MIN_M = 512
 
 
 @gluon.constexpr_function
-def _bk512_layouts(tile, cluster, fp32_scales=False):
+def _bk512_layouts(tile, cluster, fp32_scales):
     """LDS and WMMA layouts of a ``cluster x cluster`` group of square tiles."""
     block = tile * cluster
     # CTA-id bits walk M first, then N; the same bases as
@@ -285,10 +284,11 @@ def _bk512_launch_metadata(grid, kernel, args):
 
 def _bk512_repr(specialization):
     constants = specialization.constants
-    scales = "fp32" if constants.get("FP32_SCALES") else "ue8m0"
+    scales = "_fp32" if constants.get("FP32_SCALES") else ""
+    walk = "_k1" if constants.get("SINGLE_K_TILE") else ""
     return (
-        f"gluon_mm_mxfp8_{scales}_largem_bk512_gfx1250_t{constants.get('TILE')}_"
-        f"c{constants.get('CLUSTER')}_sk{constants.get('SPLIT_K')}"
+        f"gluon_mm_mxfp8_ue8m0_largem_bk512_gfx1250{scales}_t{constants.get('TILE')}_"
+        f"c{constants.get('CLUSTER')}_sk{constants.get('SPLIT_K')}{walk}"
     )
 
 
@@ -1406,7 +1406,7 @@ def _bk512_split_k(m: int, n: int, k: int) -> int:
 
 
 def _cluster_mm_config(
-    m: int, n: int, k: int, fp32_scales: bool = False
+    m: int, n: int, k: int, *, fp32_scales: bool
 ) -> tuple[int, int, int]:
     """Return the clustered kernel's ``(tile, cluster, split_k)`` for a shape.
 
@@ -1445,7 +1445,7 @@ def _launch_cluster_mm(
     tile: int,
     cluster: int,
     split_k: int,
-    fp32_scales: bool = False,
+    fp32_scales: bool,
 ) -> None:
     """Run the clustered kernel ``_cluster_mm_config`` chose into ``out``."""
     m, k = A.shape
@@ -1494,7 +1494,6 @@ def _launch_cluster_mm(
             num_warps=8,
             num_ctas=cluster * cluster,
             waves_per_eu=2,
-            **sched_compile_options(),
         )
         if split_k > 1:
             _mxfp8_split_reduce_gfx1250[(m * triton.cdiv(n, _REDUCE_BLOCK_N),)](
@@ -1614,9 +1613,17 @@ def launch_gluon_mm_mxfp8_ue8m0_largem_gfx1250(
             f"out must be row-major GPU {out_dtype} ({m}, {n}) colocated with A"
         )
 
-    tile, cluster, split_k = _cluster_mm_config(m, n, k)
+    tile, cluster, split_k = _cluster_mm_config(m, n, k, fp32_scales=False)
     _launch_cluster_mm(
-        A, B, A_scales, B_scales, out, tile=tile, cluster=cluster, split_k=split_k
+        A,
+        B,
+        A_scales,
+        B_scales,
+        out,
+        tile=tile,
+        cluster=cluster,
+        split_k=split_k,
+        fp32_scales=False,
     )
     return out
 

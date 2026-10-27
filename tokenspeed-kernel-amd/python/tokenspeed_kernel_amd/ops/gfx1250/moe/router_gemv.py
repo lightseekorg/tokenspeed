@@ -30,7 +30,25 @@ __all__ = ["launch_gluon_router_sqrt_softplus_topk_gemv_gfx1250"]
 cdna5 = gl.amd.cdna5
 
 
-@gluon.jit(do_not_specialize=["M"])
+def _gemv_launch_metadata(grid, kernel, args):
+    """Report useful FLOPs and modeled traffic to Proton.
+
+    The weight is read once, the activation once per expert tile, and each
+    K split writes FP32 partials.
+    """
+    m = args["M"]
+    n = grid[0] * args["BLOCK_N"]
+    k = grid[1] * args["BLOCK_K"]
+    return {
+        "name": kernel.name,
+        "flops16": 2 * m * n * k,
+        "bytes": n * k * args["w"].element_size()
+        + grid[0] * m * k * args["x"].element_size()
+        + grid[1] * m * n * args["partials"].element_size(),
+    }
+
+
+@gluon.jit(launch_metadata=_gemv_launch_metadata, do_not_specialize=["M"])
 def gluon_router_sqrt_softplus_topk_gemv_gfx1250(
     x,
     w,

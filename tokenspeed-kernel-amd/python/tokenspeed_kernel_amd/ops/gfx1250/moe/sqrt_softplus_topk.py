@@ -30,7 +30,27 @@ __all__ = ["launch_gluon_sqrt_softplus_topk_gfx1250"]
 cdna5 = gl.amd.cdna5
 
 
-@gluon.jit
+def _topk_launch_metadata(grid, kernel, args):
+    """Report the logit, bias and hash-table reads plus the output writes."""
+    tokens = grid[0]
+    experts = args["E"]
+    topk = args["TOPK"]
+    reads = args["SPLIT"] * tokens * experts * args["router_logits"].element_size()
+    if args["HASH_ROUTING"]:
+        reads += tokens * (
+            args["input_ids"].element_size()
+            + topk * args["hash_indices_table"].element_size()
+        )
+    elif args["HAS_BIAS"]:
+        reads += experts * args["correction_bias"].element_size()
+    route_bytes = args["topk_weights"].element_size() + args["topk_ids"].element_size()
+    writes = tokens * topk * route_bytes
+    if args["NEED_SCORES"]:
+        writes += tokens * experts * args["output_scores"].element_size()
+    return {"name": kernel.name, "bytes": reads + writes}
+
+
+@gluon.jit(launch_metadata=_topk_launch_metadata)
 def gluon_sqrt_softplus_topk_gfx1250(
     router_logits,
     correction_bias,
