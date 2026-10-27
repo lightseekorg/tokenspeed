@@ -36,7 +36,7 @@ use ts_wire::{
     BatchTokenIDOutSlim, ControlOutput, ControlRequest, Dict, EncodeRequest,
     EngineCoreReadyResponse, EngineOutput, EngineRequest, HandshakeAddresses, HandshakeInitMessage,
     Modality, MultimodalDataItem, MultimodalInputs, ReadyMessage, SamplingParams, SessionParams,
-    ShmTensorHandle, StrOrList, Tensor, TokenizedGenerateReqInput, Value, Wire,
+    ShmTensorHandle, StrOrList, Tensor, TokenizedGenerateReqInput, Value, Wire, WireCapabilities,
 };
 
 /// A fixture's ZMQ frames: one hex-encoded frame per line.
@@ -666,6 +666,13 @@ fn handshake_ready_response() {
                 ("publisher".into(), "zmq".into()),
                 ("topic".into(), "".into()),
             ])),
+            capabilities: Some(WireCapabilities {
+                wire_revision: 1,
+                request_types: vec![s("add"), s("abort"), s("control")],
+                output_columns: vec![s("rids"), s("output_ids"), s("finished_reasons")],
+                finish_detail_keys: vec![s("type"), s("matched"), s("length")],
+                max_top_logprobs: 20,
+            }),
         },
     );
 }

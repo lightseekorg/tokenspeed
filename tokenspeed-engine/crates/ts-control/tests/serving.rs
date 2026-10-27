@@ -1542,6 +1542,13 @@ fn tokens(chunks: &[OutputChunk]) -> Vec<i32> {
 async fn a_request_generates_its_budget() {
     for depth in [0, 1] {
         let engine = start_engine(depth).await;
+        // The registration declares the wire the ranks speak.
+        assert_eq!(
+            engine.client.engines()[0].ready.capabilities,
+            Some(ts_wire::WireCapabilities::declared(
+                ts_control::ingress::MAX_TOP_LOGPROBS
+            ))
+        );
         let chunks = run(&engine.client, request("r1", 5, budget(3))).await;
         assert_eq!(tokens(&chunks), [1000, 1001, 1002], "depth {depth}");
         let last = chunks.last().unwrap();

@@ -46,6 +46,9 @@ pub const REQ_TYPE_ADD: u8 = 0x00;
 pub const REQ_TYPE_ABORT: u8 = 0x01;
 /// Type byte of a CONTROL message.
 pub const REQ_TYPE_CONTROL: u8 = 0x02;
+/// The input message types by name, in type-byte order; what an engine
+/// declares in its READY capabilities.
+pub const REQUEST_TYPES: &[&str] = &["add", "abort", "control"];
 /// The frame an engine sends on its output socket when it shuts down; the
 /// frontend then treats the engine as dead.
 pub const ENGINE_CORE_DEAD: &[u8] = b"ENGINE_CORE_DEAD";

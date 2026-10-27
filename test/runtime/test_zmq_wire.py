@@ -213,3 +213,34 @@ def test_ready_response_is_map_encoded():
     raw_engine_ready = msgspec.msgpack.decode(zmq_wire.encode(engine_ready))
     assert raw_engine_ready["dtype"] == "float16"
     assert raw_engine_ready["multimodal_encoder_dtype"] == "bfloat16"
+
+
+def test_ready_response_declares_capabilities_as_a_nested_map():
+    """The Python side builds the response without a declaration (the Rust
+    transport fills it when it registers); when present, it is a named map
+    under ``capabilities``."""
+    undeclared = msgspec.msgpack.decode(
+        zmq_wire.encode(zmq_wire.WireEngineCoreReadyResponse())
+    )
+    assert undeclared["capabilities"] is None
+    declared = zmq_wire.WireEngineCoreReadyResponse(
+        capabilities=zmq_wire.WireCapabilities(
+            wire_revision=1,
+            request_types=["add", "abort", "control"],
+            output_columns=["rids", "output_ids"],
+            finish_detail_keys=["type"],
+            max_top_logprobs=20,
+        )
+    )
+    raw = msgspec.msgpack.decode(zmq_wire.encode(declared))
+    assert raw["capabilities"] == {
+        "wire_revision": 1,
+        "request_types": ["add", "abort", "control"],
+        "output_columns": ["rids", "output_ids"],
+        "finish_detail_keys": ["type"],
+        "max_top_logprobs": 20,
+    }
+    decoded = msgspec.msgpack.Decoder(zmq_wire.WireEngineCoreReadyResponse).decode(
+        zmq_wire.encode(declared)
+    )
+    assert decoded == declared

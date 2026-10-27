@@ -51,6 +51,7 @@ pub use error::{Error, Result};
 pub use frames::{engine_identity, EngineOutput, EngineRequest, ENGINE_CORE_DEAD};
 pub use handshake::{
     EngineCoreReadyResponse, HandshakeAddresses, HandshakeInitMessage, ReadyMessage,
+    WireCapabilities, WIRE_REVISION,
 };
 pub use multimodal::{
     EncodeRequest, Modality, MultimodalDataItem, MultimodalInputs, ShmTensorHandle,

@@ -33,7 +33,7 @@ use ts_wire::{
     decode_frames, encode_frames,
     handshake::{STATUS_HELLO, STATUS_READY},
     BatchTokenIDOutSlim, ControlOutput, EngineCoreReadyResponse, EngineOutput, EngineRequest,
-    HandshakeInitMessage, ReadyMessage,
+    HandshakeInitMessage, ReadyMessage, WireCapabilities,
 };
 use zeromq::{
     util::PeerIdentity, DealerSocket, PushSocket, Socket, SocketOptions, SocketRecv, SocketSend,
@@ -63,6 +63,10 @@ pub enum TransportError {
     /// The I/O runtime could not start.
     #[error("starting the transport runtime: {0}")]
     Runtime(#[from] std::io::Error),
+    /// The caller filled the ready response's `capabilities`; the transport
+    /// declares them from the schema it was built with.
+    #[error("the ready response already carries capabilities; the transport declares them")]
+    CapabilitiesSupplied,
 }
 
 fn options(identity: [u8; 2]) -> SocketOptions {
@@ -88,13 +92,19 @@ pub struct EngineTransport {
 
 impl EngineTransport {
     /// Connect as engine `engine_index` to the frontend's handshake socket
-    /// and register with `ready`.
+    /// and register with `ready`, declaring the wire this crate speaks in
+    /// its `capabilities`. The caller leaves `capabilities` empty: the
+    /// declaration is the schema this crate was built with, not an input.
     pub fn connect(
         handshake_address: &str,
         engine_index: u16,
-        ready: EngineCoreReadyResponse,
+        mut ready: EngineCoreReadyResponse,
         init_timeout: Duration,
     ) -> Result<Self, TransportError> {
+        if ready.capabilities.is_some() {
+            return Err(TransportError::CapabilitiesSupplied);
+        }
+        ready.capabilities = Some(WireCapabilities::declared(crate::ingress::MAX_TOP_LOGPROBS));
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("ts-transport")
@@ -339,6 +349,17 @@ impl Drop for EngineTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caller_filled_declaration_is_refused_before_any_socket_opens() {
+        let ready = EngineCoreReadyResponse {
+            capabilities: Some(WireCapabilities::default()),
+            ..Default::default()
+        };
+        // No frontend listens here; the refusal comes first.
+        let refused = EngineTransport::connect("tcp://127.0.0.1:1", 0, ready, Duration::ZERO);
+        assert!(matches!(refused, Err(TransportError::CapabilitiesSupplied)));
+    }
 
     #[test]
     fn a_closed_input_is_noticed_after_its_last_messages() {

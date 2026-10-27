@@ -430,6 +430,13 @@ def _handshake_ready_response() -> list[bytes]:
                 kv_cache_size_tokens=790080,
                 kv_cache_max_concurrency=24.1,
                 kv_events_config={"publisher": "zmq", "topic": ""},
+                capabilities=zmq_wire.WireCapabilities(
+                    wire_revision=1,
+                    request_types=["add", "abort", "control"],
+                    output_columns=["rids", "output_ids", "finished_reasons"],
+                    finish_detail_keys=["type", "matched", "length"],
+                    max_top_logprobs=20,
+                ),
             )
         )
     ]

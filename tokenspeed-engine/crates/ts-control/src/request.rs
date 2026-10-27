@@ -593,4 +593,45 @@ mod tests {
         // Non-streaming requests: the first token, then every 50.
         assert!(due(false, None, 1) && !due(false, None, 2) && due(false, None, 50));
     }
+
+    /// One reason of every kind, every optional key present. The match and
+    /// the struct literals keep it complete: a new kind, or a new field on
+    /// one, does not compile until it is added here.
+    fn one_of_every_kind() -> Vec<FinishReason> {
+        let reasons = vec![
+            FinishReason::Length(3),
+            FinishReason::MatchedToken(5),
+            FinishReason::Abort {
+                message: "refused".to_owned(),
+                err_type: AbortCode::UnknownError,
+                status_code: Some(400),
+            },
+        ];
+        for reason in &reasons {
+            match reason {
+                FinishReason::Length(_)
+                | FinishReason::MatchedToken(_)
+                | FinishReason::Abort { .. } => {}
+            }
+        }
+        reasons
+    }
+
+    #[test]
+    fn the_declared_finish_detail_keys_are_exactly_the_keys_written() {
+        let mut written = std::collections::BTreeSet::new();
+        for reason in one_of_every_kind() {
+            let details = reason.details();
+            assert_eq!(
+                details.get("type"),
+                Some(&Value::Str(reason.wire_type().to_owned()))
+            );
+            written.extend(details.0.into_iter().map(|(key, _)| key));
+        }
+        let declared: std::collections::BTreeSet<String> = ts_wire::output::FINISH_DETAIL_KEYS
+            .iter()
+            .map(|key| (*key).to_owned())
+            .collect();
+        assert_eq!(written, declared);
+    }
 }

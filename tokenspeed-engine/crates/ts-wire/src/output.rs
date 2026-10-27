@@ -96,6 +96,18 @@ wire_struct! {
 /// `"length"` or `"message"`/`"err_type"`/`"status_code"`).
 pub type FinishDetails = Dict<String, Value>;
 
+/// Every key a [`FinishDetails`] map may carry: `type` always; `length` for
+/// a length finish; `matched` (the token id) for a stop; `message`,
+/// `err_type` and, when the refusal has one, `status_code` for an abort.
+pub const FINISH_DETAIL_KEYS: &[&str] = &[
+    "type",
+    "length",
+    "matched",
+    "message",
+    "err_type",
+    "status_code",
+];
+
 /// Top-k alternatives per token: their logprobs and token ids, most likely
 /// first.
 pub type TopLogprobs = (Vec<Vec<f64>>, Vec<Vec<i32>>);

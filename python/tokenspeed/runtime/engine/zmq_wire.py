@@ -134,6 +134,29 @@ CONTROL_OUTPUTS = (
 # ----------------------------------------------------------------------------
 
 
+class WireCapabilities(msgspec.Struct):
+    """What an engine's wire speaks, declared once in its registration.
+
+    The Rust transport fills it from the schema it was built with
+    (``ts_wire::WireCapabilities::declared``) when it registers; this struct
+    declares the shape so the fixtures and the Python decoders see it. A
+    frontend reads the declaration at start, for the whole connection, instead
+    of inferring a revision from the frames it later sees. A registration
+    without it comes from an engine that predates the declaration.
+    """
+
+    #: The wire's revision (``ts_wire::WIRE_REVISION``); 0 is undeclared.
+    wire_revision: int = 0
+    #: The input message types the engine takes: ``add``, ``abort``, ``control``.
+    request_types: list[str] = []
+    #: The slim output's columns in wire order.
+    output_columns: list[str] = []
+    #: The keys a finish-details map may carry.
+    finish_detail_keys: list[str] = []
+    #: Most top-k alternatives a request may ask for per position; 0 serves none.
+    max_top_logprobs: int = 0
+
+
 class WireEngineCoreReadyResponse(msgspec.Struct):
     """Engine -> frontend post-init config, sent on the input-socket
     registration once the HELLO/INIT/READY handshake completes.
@@ -162,6 +185,8 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_events_config: dict | None = None
+    # Filled by the Rust transport when it registers (see WireCapabilities).
+    capabilities: WireCapabilities | None = None
 
 
 _ENC = msgspec.msgpack.Encoder()

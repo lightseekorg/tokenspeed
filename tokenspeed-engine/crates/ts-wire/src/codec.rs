@@ -308,7 +308,9 @@ impl<'d, 'f> ArrayFields<'d, 'f> {
 ///
 /// The layout is `array` (optionally with a tag) or `map`. Writing
 /// `+ Default` after the layout also derives `Default` from the field
-/// defaults, which then must be given for every field.
+/// defaults, which then must be given for every field. An array-layout
+/// struct also gets `FIELDS`, its field names in wire order, so a peer can
+/// declare the columns it sends.
 macro_rules! wire_struct {
     (
         $(#[$meta:meta])*
@@ -343,6 +345,12 @@ macro_rules! wire_struct {
         wire_struct!(@$layout $name $(($tag))? { $( $field: $fty $(= $fdefault)? ),* });
     };
     (@array $name:ident $(($tag:expr))? { $( $field:ident: $fty:ty $(= $fdefault:expr)? ),* }) => {
+        impl $name {
+            /// The field names in wire order: the array's columns after
+            /// the tag, if any.
+            pub const FIELDS: &'static [&'static str] = &[$( stringify!($field) ),*];
+        }
+
         impl $crate::codec::Wire for $name {
             fn encode(&self, encoder: &mut $crate::msgpack::Encoder) {
                 let tag_len: usize = 0 $( + { let _ = $tag; 1 } )?;
@@ -517,6 +525,11 @@ mod tests {
 
         let encoded = encode_frames(&Named::default());
         assert_eq!(&encoded[0][..], b"\x82\xa1x\x01\xa1y\xc0");
+    }
+
+    #[test]
+    fn array_structs_name_their_fields_in_wire_order() {
+        assert_eq!(Tagged::FIELDS, ["name", "count"]);
     }
 
     #[test]
