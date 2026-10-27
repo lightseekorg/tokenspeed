@@ -1004,7 +1004,7 @@ def test_gemm_mxfp8_online_activation_signature_uses_quantized_storage() -> None
         ("fp32", False, 64, "gluon_mm_fp8_blockscale_gfx1250"),
         ("fp32", False, 65, "gluon_mm_fp8_blockscale_largem_gfx1250"),
         ("fp32", True, 4096, "gluon_mm_fp8_blockscale_largem_gfx1250"),
-        ("fp32", False, 4097, "triton_mm_fp8_blockscale"),
+        ("fp32", False, 8192, "gluon_mm_fp8_blockscale_largem_gfx1250"),
     ],
 )
 def test_public_mm_selects_gfx1250_decode_kernel(

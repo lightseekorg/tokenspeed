@@ -646,8 +646,7 @@ shared-expert, and attention projections.
 - Scales are FP32 `[M, K/128]` and `[N/128, K/128]` with unit inner stride
   and an explicit `[128, 128]` block. Output is BF16; `alpha` is not
   supported.
-- Automatic selection requires `M >= 65`. When `K` is a single 512-wide step,
-  it also requires `M <= 4096`; larger batches keep the Triton GEMM.
+- Automatic selection requires `M >= 65`.
 
 #### Algorithm
 

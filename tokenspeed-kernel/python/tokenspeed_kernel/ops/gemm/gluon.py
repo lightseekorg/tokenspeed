@@ -1089,11 +1089,6 @@ if platform.is_cdna5:
             out=out,
         )
 
-    def _gfx1250_fp32_largem_beats_triton(m: int, n: int, k: int) -> bool:
-        # A single 512-wide K tile leaves too little work per output tile to
-        # beat Triton above 4096 rows.
-        return k > 512 or m <= 4096
-
     @register_kernel(
         "gemm",
         "mm",
@@ -1125,7 +1120,6 @@ if platform.is_cdna5:
             "m_min": frozenset({65}),
             "n_align": frozenset({128}),
             "k_align": frozenset({512}),
-            "mnk_problem_filter": frozenset({_gfx1250_fp32_largem_beats_triton}),
             **_GFX1250_MXFP8_COMMON_TRAITS,
         },
     )

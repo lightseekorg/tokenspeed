@@ -1412,13 +1412,14 @@ def _cluster_mm_config(
 
     A 256 tile is the BK256 kernel, which needs UE8M0 scales and N divisible
     by 256; it takes batches from 512 rows whose 256 x 256 tiles exceed half
-    the CUs. The BK512 kernel takes the rest. It uses 64-row tiles while those fit one
-    wave of CUs, then 128-row tiles. Both run unclustered up to 128 rows,
-    where the cluster barriers cost more than the shared loads save. 128-row
-    tiles also run unclustered for two K tiles, too few to hide the
-    cluster's first multicast. A single row of 64-row tiles over at least
-    eight K tiles splits K into the most partitions of two or more tiles
-    that still fit one wave of CUs, and an FP32 reduction writes the output.
+    the CUs. The BK512 kernel takes the rest. It uses 64-row tiles while
+    those fit one wave of CUs, then 128-row tiles. Both run unclustered up to
+    128 rows, where the cluster barriers cost more than the shared loads
+    save. 128-row tiles also run unclustered for two K tiles, too few to hide
+    the cluster's first multicast; a single K tile clusters, which measured
+    faster from 512 rows. A single row of 64-row tiles over at least eight K
+    tiles splits K into the most partitions of two or more tiles that still
+    fit one wave of CUs, and an FP32 reduction writes the output.
     """
     if (
         not fp32_scales
@@ -1431,7 +1432,7 @@ def _cluster_mm_config(
         if m > 128:
             return 64, 2, 1
         return 64, 1, _bk512_split_k(m, n, k)
-    return 128, 1 if m <= 128 or k <= 2 * _BK512 else 2, 1
+    return 128, 1 if m <= 128 or _BK512 < k <= 2 * _BK512 else 2, 1
 
 
 def _launch_cluster_mm(
