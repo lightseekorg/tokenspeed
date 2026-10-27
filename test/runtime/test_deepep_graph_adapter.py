@@ -23,9 +23,11 @@
 from __future__ import annotations
 
 import pytest
-from tokenspeed_kernel.ops.communication.deep_ep import DeepEPBuffer
 
 from tokenspeed.runtime.execution.forward_step import DeepEPCudaGraphRunnerAdapter
+
+deep_ep = pytest.importorskip("tokenspeed_kernel.ops.communication.deep_ep")
+DeepEPBuffer = deep_ep.DeepEPBuffer
 
 
 class _Buffer:
