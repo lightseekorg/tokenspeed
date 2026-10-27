@@ -250,13 +250,14 @@ pub fn admit(mut request: TokenizedGenerateReqInput, limits: &IngressLimits) -> 
         let own = params.stop_token_ids.iter().flatten().map(|&id| id as i32);
         own.chain(limits.eos_token_ids.iter().copied()).collect()
     };
-    // Clamp the budget to the context (the admitted length limit is one
-    // under the model's).
-    let max_req_len = limits.max_model_len - 1;
+    // Clamp the budget to the usable request length. Input admission
+    // already reserves the first decode/verify window behind the prompt,
+    // so that reserve is not subtracted again here.
+    let max_req_len = limits.max_model_len;
     let max_new_tokens = params
         .max_new_tokens
         .unwrap_or(1 << 30)
-        .min(max_req_len - prompt_len - 1);
+        .min(max_req_len - prompt_len);
     params.max_new_tokens = Some(max_new_tokens);
     let mut state = RequestState::new(
         request.input_ids.clone().unwrap_or_default(),
@@ -626,19 +627,36 @@ mod tests {
 
     #[test]
     fn the_budget_is_clamped_to_the_context() {
-        let Some(Admitted::Run(admission)) = admit(
-            request("r1", vec![0; 50], SamplingParams::default()),
-            &limits(),
-        ) else {
-            panic!("expected admission");
+        let limits = IngressLimits {
+            max_req_input_len: 99,
+            ..limits()
         };
-        // max_model_len - 1 - prompt - 1
-        assert_eq!(admission.spec.max_new_tokens, 48);
+        for (prompt_len, requested, expected) in [
+            (50, None, 50),
+            (99, Some(1), 1),
+            (99, None, 1),
+            (99, Some(0), 0),
+        ] {
+            let params = SamplingParams {
+                max_new_tokens: requested,
+                ..Default::default()
+            };
+            let Some(Admitted::Run(admission)) =
+                admit(request("r1", vec![0; prompt_len], params), &limits)
+            else {
+                panic!("expected admission");
+            };
+            assert_eq!(admission.spec.max_new_tokens, expected);
+            assert_eq!(
+                admission.sampling_params.max_new_tokens,
+                Some(i64::from(expected))
+            );
+        }
     }
 
     #[test]
     fn min_new_tokens_is_checked_against_the_budget_asked_for() {
-        // The context leaves 8 tokens of the 50 asked for: the request runs
+        // The context leaves 10 tokens of the 50 asked for: the request runs
         // to its length rather than being refused over a budget the client
         // never sent.
         let params = SamplingParams {
@@ -650,8 +668,8 @@ mod tests {
         else {
             panic!("expected admission");
         };
-        assert_eq!(admission.spec.max_new_tokens, 8);
-        assert_eq!(admission.sampling_params.max_new_tokens, Some(8));
+        assert_eq!(admission.spec.max_new_tokens, 10);
+        assert_eq!(admission.sampling_params.max_new_tokens, Some(10));
 
         let params = SamplingParams {
             max_new_tokens: Some(10),

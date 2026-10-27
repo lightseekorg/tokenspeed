@@ -206,6 +206,8 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx: list[list] = []
     output_top_logprobs_val: list[list] = []
     output_top_logprobs_idx: list[list] = []
+    # Resident LCM blocks, including reclaimable prefix-cache entries.
+    kv_used_pages: int = 0
 
 
 class FlushCacheReqInput(BaseReq, kw_only=True):

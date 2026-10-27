@@ -188,11 +188,12 @@ request to one rank: the frontend dispatches it straight there, bypassing load
 balancing — overload spill is the router's job. A pin that names no rank fails
 that request. The engine keeps serving.
 
-A frontend places a prefill request on its `bootstrap_room` residue
-(`room % dp_size`), since the decode side finds the request's prefill rank
-from it: steer prefill placement by minting the room. A decode request may be
-pinned, since any decode rank finds the prefill rank from the room; without a
-pin the room residue places it.
+Disaggregated prefill and decode requests each honor their own rank pin,
+since any decode rank finds the prefill rank from the room. The
+`bootstrap_room` still identifies the prefill KV source: `room % dp_size`
+must match the rank a prefill pin selects, so a frontend pins the prefill
+rank and mints the room from one decision. Without a pin, a PD request
+follows the room residue (`room % dp_size`).
 
 Under `ts serve`, the engine's attention-DP ranks register with the bundled
 gateway as one grouped worker, which places each unpinned request on its
