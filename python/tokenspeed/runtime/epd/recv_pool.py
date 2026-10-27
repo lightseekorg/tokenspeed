@@ -33,10 +33,16 @@ if TYPE_CHECKING:
 _SLOT_ALIGN = 256
 
 
-def is_epd_prefill_node(server_args: ServerArgs, is_multimodal_active: bool) -> bool:
+def is_epd_receive_node(server_args: ServerArgs, is_multimodal_active: bool) -> bool:
     """Only the embedding stage receives encoder payloads and owns their pool."""
     return (
-        server_args.disaggregation_mode == "prefill"
+        (
+            server_args.disaggregation_mode == "prefill"
+            or (
+                server_args.disaggregation_mode == "null"
+                and server_args.enable_external_encoder
+            )
+        )
         and is_multimodal_active
         and server_args.mapping.is_first_pp_rank
     )
@@ -65,7 +71,7 @@ def recv_pool_bytes(server_args: ServerArgs, is_multimodal_active: bool) -> int:
     The prefill receive allocates the pool after the KV cache is sized, so the
     cache budget leaves these bytes out.
     """
-    if not is_epd_prefill_node(server_args, is_multimodal_active):
+    if not is_epd_receive_node(server_args, is_multimodal_active):
         return 0
     n_slots, slot_mb = recv_pool_geometry()
     return n_slots * (slot_mb << 20)

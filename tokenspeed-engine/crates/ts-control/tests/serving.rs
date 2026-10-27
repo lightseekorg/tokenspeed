@@ -1050,7 +1050,7 @@ struct Setup {
     /// The expert rebalance's settings per (ranks, rank).
     eplb: Option<fn(usize, usize) -> EplbConfig>,
     /// An EPD prefill node.
-    epd_prefill: bool,
+    epd_receive_enabled: bool,
     /// Grammar-constrained decoding over the toy vocabulary.
     grammar: bool,
     /// Grammar (`Setup::grammar`): the compile timeouts each rank recorded
@@ -1090,7 +1090,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             max_req_input_len: 4000,
             enable_output_logprobs: setup.logprobs,
             requires_bootstrap: pd.is_some(),
-            multimodal: setup.epd_prefill,
+            multimodal: setup.epd_receive_enabled,
             grammar: setup.grammar,
             reasoning: None,
             logprobs: LogprobServability {
@@ -1121,7 +1121,7 @@ fn loop_config(in_flight_depth: usize, pipeline: bool, setup: &Setup) -> LoopCon
             log_spec_accept_lengths: false,
         },
         kv_events: false,
-        epd_prefill: setup.epd_prefill,
+        epd_receive_enabled: setup.epd_receive_enabled,
         // The fake device fills bitmasks from the committed matcher state,
         // as the eager path does.
         eager_grammar: setup.grammar,
@@ -1170,7 +1170,7 @@ fn run_rank<F: Frontend>(
         eplb,
         grammar,
         grammar_timeouts,
-        epd_prefill,
+        epd_receive_enabled,
         ..
     } = setup;
     let role = pd.as_ref().map_or(Role::Plain, |pd| pd.role);
@@ -1213,7 +1213,7 @@ fn run_rank<F: Frontend>(
         ranks,
         Subsystems {
             transfer,
-            embeddings: epd_prefill.then(|| {
+            embeddings: epd_receive_enabled.then(|| {
                 Box::new(FakeReceiver {
                     rank,
                     staged: Vec::new(),
@@ -2091,7 +2091,7 @@ async fn epd_requests_wait_for_their_embeddings_on_every_rank() {
         0,
         Tiers::DeviceOnly,
         Setup {
-            epd_prefill: true,
+            epd_receive_enabled: true,
             ..Setup::default()
         },
     )
@@ -2802,7 +2802,7 @@ async fn a_drain_cancels_the_requests_still_receiving_their_embeddings() {
             1,
             Tiers::DeviceOnly,
             Setup {
-                epd_prefill: true,
+                epd_receive_enabled: true,
                 ..Setup::default()
             },
         )

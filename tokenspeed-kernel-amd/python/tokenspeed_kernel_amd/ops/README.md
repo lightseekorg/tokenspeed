@@ -108,24 +108,38 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
-### gfx950 single-row BF16 GEMV
+### gfx950 single- and few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
-`x @ w.T` for one BF16 row with one program per output: program `n` streams
-weight row `n` (`.cg`) against `x` in `BLOCK_K` chunks, keeps per-lane FP32
-partial sums and reduces them once. `N` programs per launch keep many
-independent weight streams in flight per CU, which suits cold weights.
+`x @ w.T` for one or a few BF16 input rows with cold weights.
 
-- `x` is a contiguous `[1, K]` row, `w` a contiguous `[N, K]` matrix and `out`
-  a contiguous `[1, N]` destination, all BF16. `K` is a compile-time constant.
-- `BLOCK_K` and the wave count follow `K` (one wave of 16-byte loads for
-  `K <= 1536`, wider programs above), except for the `(N, K)` shapes in
-  `_CONFIGS`, whose geometry measured faster in cold-cache sweeps.
-- `gemm.mv` takes it for any single row with `N, K >= 128`. `gemm.mm` hands a
-  single row to this GEMV only for the `(N, K)` shapes in
-  `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or
-  hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
-  measured shapes route single rows to `mv` separately.
+#### Contract
+
+- `x` is a contiguous `[M, K]` matrix, `w` a contiguous `[N, K]` matrix and
+  `out` a contiguous `[M, N]` destination, all BF16. `K` is a compile-time
+  constant.
+- `gemm.mv` takes any single row with `N, K >= 128`. `gemm.mm` hands a single
+  row to this GEMV only for the `(N, K)` shapes in `_PREFERRED_SHAPES`.
+  The dense decode GEMV routes its own measured single-row shapes to `mv`.
+- Multiple input rows require an `(N, K)` bucket in `_ROWS_CONFIGS`. Each row
+  is bitwise the single-row GEMV of that row; `M` is a runtime argument and
+  each power-of-two bucket uses one binary.
+- `gluon_gated_rowcta_bf16_gemv_gfx950` fuses per-head weightless RMSNorm and
+  sigmoid gating into a single-row projection. It matches the separate
+  Triton gated norm and GEMV bitwise. `gemm.mv_weightless_rmsnorm_gated_sigmoid`
+  takes it for measured `_GATED_SHAPES` when the separate gated-norm and GEMV
+  providers match.
+
+#### Algorithm
+
+A single-row program streams one weight row in `BLOCK_K` chunks and reduces
+its FP32 partial sums once. `BLOCK_K` and the subgroup count follow `K`,
+except for the measured `(N, K)` entries in `_CONFIGS`.
+
+A few-row program streams a tile of weight rows, reusing each load across
+its input rows. Each (input row, output) keeps the single-row reduction;
+FMA throughput limits this path to a few rows. The gated projection
+recomputes its normalized, gated input in every program.
 
 ### gfx950 FP32 router GEMV
 
@@ -630,7 +644,8 @@ KPool launchers return the scores for the caller's selection.
 
 - Each score is `softmax_scale * sum_h w[h] * relu(q[h] . k)` over the index
   heads, with `q` and `k` dequantized and NaN propagated. Heads are added in
-  FP32 in logical order, so scores are deterministic.
+  FP32, in logical order for DSA and for KPool with `ordered_head_fold`, and
+  in a fixed balanced order otherwise, so scores are deterministic.
 - Each cache page holds `page_size` rows of 128 FP8 E4M3 key bytes followed by
   their `page_size` FP32 scales. Page strides and the storage offset are
   4-byte aligned; pages may be padded.
@@ -647,34 +662,41 @@ KPool launchers return the scores for the caller's selection.
   sees the physical slots `[row_starts, row_ends)` of `pool_workspace_slots`.
   Output column `c` holds visible pool `pool_offset + c` for `window_cols`
   columns, `row_ends_out` holds each row's valid column count, and later
-  columns are not written. `ordered_head_fold` selects nothing on gfx1250.
+  columns are not written.
 
 #### Algorithm
 
-A program owns one query row and a span of its candidate columns. It loads
-the row's queries once, per 32-head group, in the WMMA A-operand layout, with
-the weights already multiplied by the query scales. It then walks the span in
-column tiles: 256 columns on eight waves for DSA prefill, 128 on four waves
-for KPool, and two 32-column tiles on one wave per 64-column decode program.
-DSA prefill waves split the 32 heads before the columns; KPool waves split
-only the columns, so each wave holds all heads of its columns.
+A program owns one query row and a span of its candidate columns. A planned
+KPool program owns two adjacent rows when they share a workspace start, so
+both rows score each key tile it loads; otherwise it scores the rows one
+after the other. A program loads each row's queries once, per 32-head group,
+in the WMMA A-operand layout, with the weights already multiplied by the
+query scales. It then walks the span in column tiles: 256 columns on eight
+waves for DSA prefill, 128 on four waves for KPool, and two 32-column tiles
+on one wave per 64-column decode program. DSA prefill waves split the 32
+heads before the columns; KPool waves split only the columns, so each wave
+holds all heads of its columns.
 
 For each tile, the program looks up the candidates' cache slots, from the
 workspace or plan slots or through the block table, and loads their keys.
-DSA prefill loads eight adjacent key bytes per lane and KPool sixteen, then
-converts the tile through LDS to the WMMA B-operand layout; decode loads the
-operand layout directly. FP8 queries use FP8 WMMA; BF16 queries upcast the
-keys to BF16. Each head group's WMMA result goes through ReLU and the head
-weights, then one layout conversion gives each lane all 32 heads of one
-column. The lane adds them in head order with register adds; a second head
-group continues the same sum. The column's key scale and `softmax_scale`
-apply last.
+Columns past the span read slot 0 and are not stored, so storages above
+2 GiB, which need 64-bit global loads, load without masks. DSA prefill loads
+eight adjacent key bytes per lane and KPool sixteen, then converts the tile
+through LDS to the WMMA B-operand layout; decode loads the operand layout
+directly. FP8 queries use FP8 WMMA; BF16 queries upcast the keys to BF16.
+Each head group's WMMA result goes through ReLU and the head weights. For the
+logical order, one layout conversion gives each lane all 32 heads of one
+column, and the lane adds them in head order with register adds; a second
+head group continues the same sum. The balanced KPool fold keeps eight heads
+of a column per lane and reduces them in the WMMA layout without LDS. The
+column's key scale and `softmax_scale` apply last.
 
 Prefill and KPool launches split each row's columns over a second grid
 dimension so that the grid has about four programs per compute unit; with
-enough rows, each row stays in one program. The span is a multiple of the
-tile and a runtime argument, so batch-size changes do not recompile the
-scorer. Only the first program of a KPool row writes its `row_ends_out`.
+enough rows, each row stays in one program; paired KPool programs count as
+one row. The span is a multiple of the tile and a runtime argument, so
+batch-size changes do not recompile the scorer. Only the first program of a
+KPool row writes its `row_ends_out`.
 
 ### gfx950 selected-slot sparse attention
 
@@ -699,11 +721,10 @@ the selected-index and single-buffer KV handoffs.
 
 ### DeepSeek V4 attention
 
-The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
-provides dense-workspace selected prefill, while both architectures provide
-page-planar selected decode. Decode reads a sliding-window (SWA) cache and an
-optional compressed cache; both segments share one softmax, with the attention
-sink applied once.
+The gfx950 and gfx1250 packages provide MXFP4 index selection,
+dense-workspace selected prefill and page-planar selected decode. Decode reads
+a sliding-window (SWA) cache and an optional compressed cache; both segments
+share one softmax, with the attention sink applied once.
 
 #### Contract
 
@@ -771,6 +792,14 @@ one-page-ahead software pipeline overlap these transfers with WMMA scoring
 while keeping the transfer geometry aligned and the number of nearby TDM
 operations bounded.
 
+Gfx1250 selected prefill also gives each (token, 16-head group) one four-wave
+workgroup, but each wave owns 32 rows of every 128-row step and runs its own
+online softmax in the transposed form `S^T = K Q^T`, `O^T += V^T P^T`, so the
+softmax and P stay inside the wave. Rows arrive by TDM gather, with each
+step's indices loaded a step ahead and clamped to a zero-filled row past the
+end. The four partial softmaxes merge once, behind a single barrier, through
+the dead KV tile. Q^T stays in LDS so two workgroups fit on a CU.
+
 On gfx1250, decode fuses page-planar dequantization, BF16 wave32 WMMA attention,
 FP32 online softmax, and output reduction. A workgroup covers 32 or 64 query
 heads and 32 selected KV rows with four or eight waves. Shape-based KV
@@ -796,13 +825,15 @@ CSA2 picks, for each query, the KV rows its sparse attention reads. The
 preparation, validation and tiling, and runs two steps per query tile: a
 scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
-gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
-`gluon_dsv41_index_topk_select_gfx950`), and gfx1250 does the same
-(`gluon_dsv41_index_topk_gfx1250`, then
-`gluon_dsv41_index_topk_select_gfx1250`). Both select candidate blocks with
-the portable Triton radix select (`tokenspeed_kernel` `index_block_select`),
-and both scorers take queries packed as MXFP4 values with one E8M0 scale per
-32 values.
+gfx950 runs both steps in Gluon (`gluon_dsv41_index_qtile_gfx950` when all
+queries of a tile share one page-table row, otherwise
+`gluon_dsv41_index_topk_gfx950`, then `gluon_dsv41_index_topk_select_gfx950`),
+and gfx1250 does the same (`gluon_dsv41_index_topk_gfx1250`, then
+`gluon_dsv41_index_topk_select_gfx1250`). gfx950 selects candidate blocks with
+`gluon_dsv41_index_block_max_gfx950` followed by its row selector; gfx1250
+uses the portable Triton radix select (`tokenspeed_kernel`
+`index_block_select`). Both scorers take queries packed as MXFP4 values with
+one E8M0 scale per 32 values; the adapter packs a call's queries once.
 
 #### Contract
 
@@ -810,8 +841,12 @@ Visible lengths are bounded by the block table's row capacity in each consumer,
 before narrowing int64 inputs to int32. The adapter passes dense raw lengths
 without a separate clamp launch. Candidate-block selection uses the same table
 bound, including when compact candidate logits have a smaller width, so forcing
-the newest visible block preserves its logical position. Logit and histogram
-scratch initialization remains necessary for unscored columns and atomic sums.
+the newest visible block preserves its logical position. The gfx950 scorers
+write every column the selections read, -inf where no row is scored: each
+query's columns through the end of its last visible 8-row block (block
+selection reads whole blocks), and every candidate column. Their logits are
+therefore not pre-filled; the gfx1250 launcher fills its logits with -inf.
+Histogram scratch is zeroed before its atomic sums.
 The gfx950 and gfx1250 row selectors read live-width strides directly, including
 broadcast limits and strided single-row tail tiles. Such tails retain their stride
 after PyTorch `contiguous()`, so selection cannot require a unit limit stride.
@@ -840,7 +875,11 @@ model-fixed selection capacities retain the existing launch policy.
   reading device lengths on the host. The query tile shrinks with that width
   to keep FP32 logits within 32 MiB (at most 256 queries at 32K rows, 64 at
   128K, and 8 at 1M). Score CTAs honor the caller's row-chunk bound up to the
-  256-row tuned maximum.
+  256-row tuned maximum. The gfx950 per-query scorer uses at most 64 columns
+  per chunk (64 or fewer queries) or 128; in Full mode the chunk is a
+  multiple of 32 or a divisor of 64, so a chunk never straddles a 64-row
+  page. Its grid is bounded, and each CTA strides over the chunks of a
+  capacity-wide row.
 - Full selection writes finite logits only for each query's visible rows, so
   row selection reads just that prefix of the capacity-wide row (the
   per-query visible length, read on device).
@@ -852,33 +891,52 @@ model-fixed selection capacities retain the existing launch policy.
 
 #### Algorithm
 
-The gfx950 scorer runs one program per query and chunk of up to 256 columns.
-The 32 padded heads form two 16-head MFMA groups. For each 32-column tile it
-maps columns to pages through the candidate ids and page table, loads the
-MXFP4 key rows, and scores them with E2M1 scaled MFMA against the E8M0
-scales, then applies ReLU and the weighted head sum. A chunk bound that is
-not a multiple of 32 masks its last tile. The gfx1250 scorer follows the
+The gfx950 scorers score 32-column key tiles: the 32 padded heads form two
+16-head MFMA groups that share one loaded tile of MXFP4 key rows and scales,
+scored with E2M1 scaled MFMA, then ReLU and the weighted head sum. Both are
+compiled without FP contraction, so they produce the same bits.
+
+- The shared-table scorer runs one program per four queries and chunk of up
+  to 256 columns. A 32-row tile never crosses a 64-row page, so each tile
+  needs one scalar page lookup, and the next tile loads before the current
+  tile's MFMAs.
+- The per-query scorer runs one program per query and grid split. In Full
+  mode each tile also takes one scalar page lookup; with candidates it maps
+  columns to pages through the candidate ids and page table. Two tiles are in
+  flight. A chunk bound that is not a multiple of 32 masks its last tile.
+
+The gfx1250 scorer follows the
 same steps with E2M1 scaled wave32 WMMA: all 32 heads form one WMMA tile, and
 its four warps split each 64-column key tile, so no warp loads another's keys.
 
-The gfx950 selector runs one workgroup per query in a single launch,
-replacing `torch.topk`, a sort and about ten elementwise kernels. A
-three-pass MSD radix select (11+11+10 key bits, LDS-atomic histograms) finds
-the order key of the K-th largest logit. One column-order compaction pass,
-with a single packed scan per chunk, keeps every larger key plus the first
-ties and maps candidate columns to logical rows. The picks are already
-ascending without candidates and with ascending candidate lists; otherwise an
-all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
-lanes regardless of conflicts, so the radix passes dominate on wide rows.
+The gfx950 selector runs one 16-warp workgroup per query in a single launch
+and reads the row twice:
+
+1. A histogram of the top 11 key bits finds the pivot digit of the K-th
+   largest logit.
+2. Each warp scans its own contiguous columns and appends, in column order,
+   every key at or above the pivot digit to its LDS region.
+
+The regions in warp order are in column order, so the exact threshold (one or
+two more digits, from LDS), the lowest-column boundary ties, and the output
+order follow without another row read or a sort. If a region overflows, each
+warp's exact count gives contiguous column-ordered offsets and a third pass
+rewrites the keys; if the pivot digit alone is too large, a second histogram
+pass first refines it to 22 bits. Only when the 22-bit boundary bin still
+does not fit does the selector fall back to a three-pass MSD radix select and
+a column-order compaction. Candidate columns map to logical rows; their picks
+are ranked when the candidate list is not ascending.
 
 The gfx1250 selector runs the same passes on sixteen 32-lane waves, so each
 workgroup keeps 512 lanes and the 2048-bin histograms.
 
 Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
-The portable Triton block select runs one program per query: it reads only
-the visible blocks, runs a four-pass MSD radix select (8 key bits per pass),
-and emits the picks in block order, so no sort is needed.
+On gfx950 one kernel writes the visible block maxima and the gfx950 row
+selector picks up to 2048 blocks. The portable Triton block select runs one
+program per query: it reads only the visible blocks, runs a four-pass MSD
+radix select (8 key bits per pass), and emits the picks in block order, so no
+sort is needed.
 
 ### gfx950 DeepSeek V4.1 selected attention
 
@@ -928,9 +986,32 @@ over many CUs.
 gfx950 contract, split and zero-query shortcut above. QK and PV use 16x16x32
 BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
 scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
-BF16 power of two, the E4M3 global scale as BF16. Rows are not prefetched,
-and V is read from LDS only after QK: the registers this saves buy more
-workgroups per CU than the overlap would.
+BF16 power of two, the E4M3 global scale as BF16. V is read from LDS only
+after QK, so the K and V operands are never live together.
+
+A workgroup stages its slots in LDS, resolving each position's gather row (-1
+when unusable) in one pass, since TDM takes row indices in SGPRs. Its tiles
+then run through a two-deep LDS ring: while one tile is dequantized, a TDM
+gather fetches the next tile's value rows and an async copy its scales.
+Prefetching rows into registers instead was slower: it doubled the live rows.
+The gathers view a cache as rows of a page's value bytes (512 SWA, 256
+global) with int32 row indices, so page strides must be whole such rows, as
+the arena plan aligns them, and a cache spans at most 2^31 rows. Invalid rows
+gather as zero values while their scale copies read row 0, so a cache needs at
+least one page; the dequant reads NaN scale bytes as tiny or zero, so those
+rows stay zero even over unwritten memory.
+
+Tiles dequantize from the ring straight into the QK operand layout, which
+reads 16 value rows at once, so the ring pads every 256 bytes of a row by 8
+to keep them off shared banks; the BF16 tile in LDS only feeds the
+transposed PV read.
+SWA and global tiles share the ring, so a workgroup takes 146 KiB of LDS, two
+fit on a CU and rows split until the grid reaches 512 workgroups. The
+zero-query check, the staged slot rows and the reduce's splits load clamped
+rather than masked, since a row mask becomes a branch and a full wait around
+each load. Outputs and partials store straight from the WMMA layout. The
+reduce loads all splits at once; its width depends only on the slot widths,
+so batch size never recompiles it.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks

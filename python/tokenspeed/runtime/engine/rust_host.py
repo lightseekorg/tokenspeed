@@ -444,7 +444,7 @@ class HostConfig:
         attn_tp_rank: This rank's attention-TP rank, an L3 metrics label.
         engine_role: ``--disaggregation-mode``, an L3 metrics label.
         eplb: With ``--enable-eplb``, the rebalance's settings; else None.
-        epd_prefill: An EPD prefill node: requests whose images an encode
+        epd_receive_enabled: An EPD prefill node: requests whose images an encode
             node embeds wait for the embeddings before they are scheduled;
             its first stage receives them (``HostBootstrap.epd_receive``).
         grammar: Grammar-constrained decoding's settings; None with
@@ -498,7 +498,7 @@ class HostConfig:
     attn_tp_rank: int
     engine_role: str
     eplb: EplbSettings | None
-    epd_prefill: bool
+    epd_receive_enabled: bool
     grammar: GrammarSettings | None
     eager_grammar: bool
 
@@ -1264,8 +1264,11 @@ class HostBootstrap:
                     and kv_events_config.publisher in (None, "zmq")
                     else None
                 ),
-                epd_prefill=(
-                    server_args.disaggregation_mode == "prefill"
+                epd_receive_enabled=(
+                    (
+                        server_args.disaggregation_mode == "prefill"
+                        or server_args.enable_external_encoder
+                    )
                     and model_config.is_multimodal_active
                 ),
                 grammar=(

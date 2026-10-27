@@ -367,12 +367,9 @@ def test_kpool_plan_logits_match_ragged_physical_slots_and_padded_stride(
         assert actual[row, end:].isnan().all()
 
 
-# GFX1250 folds heads in logical order regardless of the flag.
-@pytest.mark.parametrize("ordered_head_fold", (True, False) if is_cdna5() else (True,))
 @pytest.mark.parametrize("planned", (False, True))
 def test_kpool_ordered_head_fold_matches_sequential_signed_reference(
     planned: bool,
-    ordered_head_fold: bool,
 ) -> None:
     q = torch.zeros((1, _HEADS, _HEAD_DIM), device=_DEVICE, dtype=torch.bfloat16)
     q[:, :, 0] = 1.0
@@ -416,7 +413,7 @@ def test_kpool_ordered_head_fold_matches_sequential_signed_reference(
         pool_offset=0,
         window_cols=_PAGE_SIZE,
         softmax_scale=1.0,
-        ordered_head_fold=ordered_head_fold,
+        ordered_head_fold=True,
     )
     expected = torch.zeros((_PAGE_SIZE,), device=_DEVICE, dtype=torch.float32)
     for head in range(_HEADS):
@@ -500,9 +497,9 @@ def test_kpool_prefill_logits_preserve_nonfinite_visible_scores(
         assert torch.isposinf(actual).all()
 
 
-# The flag selects a different head reduction only on GFX950. The top-level op
-# captures only the planned scorer; the page-table path is eager-only.
-@pytest.mark.parametrize("ordered_head_fold", (False, True) if is_cdna4() else (True,))
+# The top-level op captures only the planned scorer; the page-table path is
+# eager-only.
+@pytest.mark.parametrize("ordered_head_fold", (False, True))
 def test_kpool_plan_graph_replay_reads_refreshed_inputs(
     ordered_head_fold: bool,
 ) -> None:

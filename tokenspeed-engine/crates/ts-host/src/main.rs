@@ -182,7 +182,7 @@ struct HostConfig {
     eplb: Option<Eplb>,
     /// An EPD prefill node: it receives image embeddings from encode
     /// workers.
-    epd_prefill: bool,
+    epd_receive_enabled: bool,
     /// Grammar-constrained decoding's settings, if it is on.
     grammar: Option<GrammarConfig>,
     /// The data plane fills bitmasks from the matchers' committed state.
@@ -390,7 +390,7 @@ impl HostConfig {
             },
             l3,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
-            epd_prefill: config.getattr("epd_prefill")?.extract()?,
+            epd_receive_enabled: config.getattr("epd_receive_enabled")?.extract()?,
             grammar: {
                 let grammar = config.getattr("grammar")?;
                 if grammar.is_none() {
@@ -617,7 +617,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         controls: config.controls.clone(),
         batch_log: config.batch_log.clone(),
         kv_events: config.kv_events,
-        epd_prefill: config.epd_prefill,
+        epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
     };
     tracing::info!(

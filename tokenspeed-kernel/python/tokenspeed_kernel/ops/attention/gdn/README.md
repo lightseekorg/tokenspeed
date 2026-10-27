@@ -24,10 +24,35 @@ for decode, MTP, BF16 state, and prefill.
 
 ## Chain verification
 
-ReplaySSM chains use chunked verification on Blackwell for 13–16 tokens and
-at least 24 (request, value-head) states. Other shapes and platforms retain
-step-by-step verification. `test/runtime/test_gdn_verify_policy.py` checks this
-selection and its boundaries without launching device kernels.
+A ReplaySSM chain verify reads the committed state and writes none, so it may
+run in any of three forms (`gdn_chain_verify_form`), all on Blackwell only:
+
+- the chain form, `gdn_chain_verify` (`_triton/chain_verify.py`), for 2 to 16
+  tokens of bf16 state (the dtype it was measured for) with equal power-of-two
+  key and value head dims;
+- else the tree form, `gdn_decode_mtp` with a one-path ancestor mask, for 13–16
+  tokens and at least 24 states;
+- else step by step, as on other shapes and platforms.
+
+The chain form computes a request's whole window from the committed state in
+one program per (value tile, request, value head), without materializing a
+state: the chain case of the tree-chunked kernel. With
+`D[t, s] = exp(g_{s+1} + ... + g_t)`, the updates solve
+`(I + b D_strict k k^T) U = b (v - exp(G) k h0)` and row t's output is
+`exp(G_t) q_t h0 + sum_{s<=t} D[t, s] (q_t . k_s) U_s`. Its rows come in a
+power-of-two bucket of the chain's length (at least 4); the products with the
+state and the key/query Gram matrices run on tensor cores in the state dtype,
+with the normalized key's rounding residual folded back in; the window algebra
+stays fp32 (dots from 8 rows, outer products below) and decays sum each
+segment's gates directly. Outputs round differently from the step kernels; the
+pool is never written. The row count and the gates' layout (alignment, row
+stride) are not specialized, and the launch (value tile, key splits, warps,
+pipeline stages) follows three measured tiers of request-heads per row bucket
+(`_CHAIN_VERIFY_LAUNCH_TIERS`), so the kernel compiles once per bucket and
+tier; the GDN backend runs it once per tier its batch sizes reach when it
+preallocates its verify workspace, before serving.
+`test/runtime/test_gdn_verify_policy.py` checks the selection and its
+boundaries without launching device kernels.
 
 ## Variable prefill lengths
 

@@ -707,6 +707,7 @@ class ServerArgs:
     mm_encoder_tp_mode: Literal["weights", "data"] = "weights"
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
+    enable_external_encoder: bool = False
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
@@ -1935,6 +1936,13 @@ class ServerArgs:
         elif self.pp_layer_partition is not None:
             raise ValueError(
                 "--pp-layer-partition requires --pipeline-parallel-size > 1"
+            )
+        if self.enable_external_encoder and self.disaggregation_mode not in (
+            "null",
+            "prefill",
+        ):
+            raise ValueError(
+                "--enable-external-encoder requires aggregated or prefill serving"
             )
         # PD disaggregation. The prefill role keeps the ordinary graph flags:
         # it never runs a decode step, so the decode graph has nothing to
@@ -3929,6 +3937,11 @@ class ServerArgs:
             ),
         )
         # Disaggregation
+        parser.add_argument(
+            "--enable-external-encoder",
+            action="store_true",
+            help="Receive external encoder embeddings in aggregated or prefill serving.",
+        )
         parser.add_argument(
             "--disaggregation-mode",
             type=str,
