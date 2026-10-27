@@ -1034,7 +1034,7 @@ class Qwen4ExpPLELayer(nn.Module):
         if plan is None:
             return hidden_states
         (hidden_states,) = slice_to_real_tokens(plan.num_real_tokens, hidden_states)
-        req, col, _, _, _, total, _ = plan.index
+        req, col, _, starts, _, total, _ = plan.index
         lengths = plan.lengths
         flat_ids = plan.flat_ids
         initial_context = plan.initial_context
