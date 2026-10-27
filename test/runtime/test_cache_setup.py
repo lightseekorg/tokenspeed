@@ -908,6 +908,73 @@ def test_ordinary_recipe_uses_the_draft_attention_family(
     assert not torch.count_nonzero(target_pool.get_key_buffer(1))
 
 
+def test_per_layer_target_windows_cover_a_block_drafter() -> None:
+    """A target with one window per layer, followed by appended draft layers.
+
+    The target's windows cover only its own layers; the block drafter's layers
+    have no window and share the target's full-history cache group.
+    """
+    target = AttnConfig(
+        components=(
+            replace(
+                _mha_config().component(MHAConfig),
+                cache_layer_types=(
+                    "sliding_attention",
+                    "full_attention",
+                    "sliding_attention",
+                ),
+                sliding_window_tokens=(128, None, 128),
+            ),
+        ),
+        **_model_wide_kwargs(),
+    )
+    draft = AttnConfig(
+        components=(
+            replace(
+                _mha_config().component(MHAConfig),
+                cache_layer_types=("full_attention", "full_attention"),
+                sliding_window_tokens=None,
+            ),
+        ),
+        **_model_wide_kwargs(),
+    )
+
+    setup = prepare_cache_setup(
+        family="mha",
+        server_args=SimpleNamespace(kv_offload_config=None, max_total_tokens=None),
+        model_config=SimpleNamespace(
+            num_attention_layers=3, hf_config=SimpleNamespace()
+        ),
+        attn_config=target,
+        draft_model_config=SimpleNamespace(
+            num_attention_layers=2, hf_config=SimpleNamespace()
+        ),
+        draft_attn_config=draft,
+        cache_budget_bytes=65_536,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+
+    plan = setup.spec.memory_plan
+    groups = {
+        layer: {
+            field.group_id
+            for field in plan.fields
+            if field.field_id.startswith(f"layer.{layer}.")
+        }
+        for layer in range(5)
+    }
+    assert groups[0] == groups[2] != groups[1]
+    assert groups[3] == groups[4] == groups[1]
+    windows = {
+        spec.group_id: spec.sliding_window_tokens
+        for spec in setup.spec.cache_group_specs
+    }
+    assert {windows[group] for group in groups[0]} == {128}
+    assert {windows[group] for group in groups[1]} == {None}
+
+
 def test_heterogeneous_draft_guards_fail_fast() -> None:
     from tokenspeed.runtime.layers.attention.registry import (
         _create_draft_components,
