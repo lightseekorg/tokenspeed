@@ -541,9 +541,7 @@ class PagedAttention(nn.Module):
             )
         width = extra_rows.shape[1]
         payload = torch.cat((extra_rows, out.latent), dim=1).contiguous()
-        gathered = token_all_gather_rows(
-            payload, key_rows.group, list(plan.row_counts)
-        )
+        gathered = token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
         latent_store(
             gathered[:, width:],
             kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],

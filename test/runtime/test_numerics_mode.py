@@ -201,12 +201,18 @@ class TestNumericsMode:
         # The normal dispatch reads its receive counts on the host, so no
         # decode graph can capture it; the low-latency legs keep the graphs.
         normal = ServerArgs(
-            model="x", world_size=2, ep_size=2, all2all_backend="deepep",
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
             deepep_mode="normal",
         )
         assert normal.enforce_eager
         low_latency = ServerArgs(
-            model="x", world_size=2, ep_size=2, all2all_backend="deepep",
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
             deepep_mode="low_latency",
         )
         assert not low_latency.enforce_eager
