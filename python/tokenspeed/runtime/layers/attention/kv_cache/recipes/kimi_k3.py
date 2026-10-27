@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_recurrent_state_dtype,
     kda_replay_supported,
     kda_verify_workspace_bytes,
 )
@@ -228,15 +229,7 @@ class KimiK3Recipe(CacheRecipe):
 
     @cached_property
     def _recurrent_dtype(self) -> torch.dtype:
-        """KDA recurrent-state dtype selected by ``--mamba-ssm-dtype``.
-
-        The scans accumulate in FP32 either way; BF16 only narrows what is
-        stored between steps, halving the state pages.
-        """
-        return {
-            "float32": torch.float32,
-            "bfloat16": torch.bfloat16,
-        }[self.server_args.mamba_ssm_dtype]
+        return kda_recurrent_state_dtype(self.server_args)
 
     @override
     def fields_for_layer(
