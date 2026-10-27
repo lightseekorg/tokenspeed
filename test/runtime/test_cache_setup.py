@@ -1492,16 +1492,18 @@ def _receive_pool_env(monkeypatch, slots, slot_mb):
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("probe", [False, True])
 @pytest.mark.parametrize(
-    "mode, active, pool",
+    "mode, active, external, pool",
     [
-        ("prefill", True, 4 << 30),
-        ("prefill", False, 0),
-        ("decode", True, 0),
-        ("null", True, 0),
+        ("prefill", True, False, 4 << 30),
+        ("prefill", False, False, 0),
+        ("decode", True, False, 0),
+        ("null", True, False, 0),
+        ("null", True, True, 4 << 30),
+        ("null", False, True, 0),
     ],
 )
 def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
-    monkeypatch, rank, probe, mode, active, pool
+    monkeypatch, rank, probe, mode, active, external, pool
 ) -> None:
     from tokenspeed.runtime.execution import device, factory
 
@@ -1516,6 +1518,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_external_encoder=external,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -1623,6 +1626,7 @@ def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
     _receive_pool_env(monkeypatch, slots, slot_mb)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_external_encoder=False,
         mapping=SimpleNamespace(is_first_pp_rank=True),
     )
     facts = SimpleNamespace(

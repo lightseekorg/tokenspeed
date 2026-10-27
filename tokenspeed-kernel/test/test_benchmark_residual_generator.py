@@ -66,7 +66,12 @@ def test_mhc_post_generator_selects_with_operation_traits(
     assert captured == {
         "family": "residual",
         "mode": "mhc_post",
-        "traits": {"num_tokens": 192, "hc_mult": 4, "hidden_size": 5120},
+        "traits": {
+            "num_tokens": 192,
+            "buffer_offsets_fit_int32": True,
+            "hc_mult": 4,
+            "hidden_size": 5120,
+        },
     }
 
 

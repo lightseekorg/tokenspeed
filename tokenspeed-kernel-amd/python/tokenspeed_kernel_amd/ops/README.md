@@ -108,24 +108,38 @@ eight outputs per lane store C through a row-contiguous layout, 16 bytes per
 lane. An optional XCD remap keeps the M tiles that share a weight tile on one
 XCD's L2.
 
-### gfx950 single-row BF16 GEMV
+### gfx950 single- and few-row BF16 GEMV
 
 `gluon_rowcta_bf16_gemv_gfx950` (`gemm/fp16/decode_gemv.py`) computes
-`x @ w.T` for one BF16 row with one program per output: program `n` streams
-weight row `n` (`.cg`) against `x` in `BLOCK_K` chunks, keeps per-lane FP32
-partial sums and reduces them once. `N` programs per launch keep many
-independent weight streams in flight per CU, which suits cold weights.
+`x @ w.T` for one or a few BF16 input rows with cold weights.
 
-- `x` is a contiguous `[1, K]` row, `w` a contiguous `[N, K]` matrix and `out`
-  a contiguous `[1, N]` destination, all BF16. `K` is a compile-time constant.
-- `BLOCK_K` and the wave count follow `K` (one wave of 16-byte loads for
-  `K <= 1536`, wider programs above), except for the `(N, K)` shapes in
-  `_CONFIGS`, whose geometry measured faster in cold-cache sweeps.
-- `gemm.mv` takes it for any single row with `N, K >= 128`. `gemm.mm` hands a
-  single row to this GEMV only for the `(N, K)` shapes in
-  `_PREFERRED_SHAPES`, where it beat mm's own path (Torch's skinny GEMM or
-  hipBLASLt) in cold-cache standalone sweeps. The dense decode GEMV's own
-  measured shapes route single rows to `mv` separately.
+#### Contract
+
+- `x` is a contiguous `[M, K]` matrix, `w` a contiguous `[N, K]` matrix and
+  `out` a contiguous `[M, N]` destination, all BF16. `K` is a compile-time
+  constant.
+- `gemm.mv` takes any single row with `N, K >= 128`. `gemm.mm` hands a single
+  row to this GEMV only for the `(N, K)` shapes in `_PREFERRED_SHAPES`.
+  The dense decode GEMV routes its own measured single-row shapes to `mv`.
+- Multiple input rows require an `(N, K)` bucket in `_ROWS_CONFIGS`. Each row
+  is bitwise the single-row GEMV of that row; `M` is a runtime argument and
+  each power-of-two bucket uses one binary.
+- `gluon_gated_rowcta_bf16_gemv_gfx950` fuses per-head weightless RMSNorm and
+  sigmoid gating into a single-row projection. It matches the separate
+  Triton gated norm and GEMV bitwise. `gemm.mv_weightless_rmsnorm_gated_sigmoid`
+  takes it for measured `_GATED_SHAPES` when the separate gated-norm and GEMV
+  providers match.
+
+#### Algorithm
+
+A single-row program streams one weight row in `BLOCK_K` chunks and reduces
+its FP32 partial sums once. `BLOCK_K` and the subgroup count follow `K`,
+except for the measured `(N, K)` entries in `_CONFIGS`.
+
+A few-row program streams a tile of weight rows, reusing each load across
+its input rows. Each (input row, output) keeps the single-row reduction;
+FMA throughput limits this path to a few rows. The gated projection
+recomputes its normalized, gated input in every program.
 
 ### gfx950 FP32 router GEMV
 
@@ -630,7 +644,8 @@ KPool launchers return the scores for the caller's selection.
 
 - Each score is `softmax_scale * sum_h w[h] * relu(q[h] . k)` over the index
   heads, with `q` and `k` dequantized and NaN propagated. Heads are added in
-  FP32 in logical order, so scores are deterministic.
+  FP32, in logical order for DSA and for KPool with `ordered_head_fold`, and
+  in a fixed balanced order otherwise, so scores are deterministic.
 - Each cache page holds `page_size` rows of 128 FP8 E4M3 key bytes followed by
   their `page_size` FP32 scales. Page strides and the storage offset are
   4-byte aligned; pages may be padded.
@@ -647,34 +662,41 @@ KPool launchers return the scores for the caller's selection.
   sees the physical slots `[row_starts, row_ends)` of `pool_workspace_slots`.
   Output column `c` holds visible pool `pool_offset + c` for `window_cols`
   columns, `row_ends_out` holds each row's valid column count, and later
-  columns are not written. `ordered_head_fold` selects nothing on gfx1250.
+  columns are not written.
 
 #### Algorithm
 
-A program owns one query row and a span of its candidate columns. It loads
-the row's queries once, per 32-head group, in the WMMA A-operand layout, with
-the weights already multiplied by the query scales. It then walks the span in
-column tiles: 256 columns on eight waves for DSA prefill, 128 on four waves
-for KPool, and two 32-column tiles on one wave per 64-column decode program.
-DSA prefill waves split the 32 heads before the columns; KPool waves split
-only the columns, so each wave holds all heads of its columns.
+A program owns one query row and a span of its candidate columns. A planned
+KPool program owns two adjacent rows when they share a workspace start, so
+both rows score each key tile it loads; otherwise it scores the rows one
+after the other. A program loads each row's queries once, per 32-head group,
+in the WMMA A-operand layout, with the weights already multiplied by the
+query scales. It then walks the span in column tiles: 256 columns on eight
+waves for DSA prefill, 128 on four waves for KPool, and two 32-column tiles
+on one wave per 64-column decode program. DSA prefill waves split the 32
+heads before the columns; KPool waves split only the columns, so each wave
+holds all heads of its columns.
 
 For each tile, the program looks up the candidates' cache slots, from the
 workspace or plan slots or through the block table, and loads their keys.
-DSA prefill loads eight adjacent key bytes per lane and KPool sixteen, then
-converts the tile through LDS to the WMMA B-operand layout; decode loads the
-operand layout directly. FP8 queries use FP8 WMMA; BF16 queries upcast the
-keys to BF16. Each head group's WMMA result goes through ReLU and the head
-weights, then one layout conversion gives each lane all 32 heads of one
-column. The lane adds them in head order with register adds; a second head
-group continues the same sum. The column's key scale and `softmax_scale`
-apply last.
+Columns past the span read slot 0 and are not stored, so storages above
+2 GiB, which need 64-bit global loads, load without masks. DSA prefill loads
+eight adjacent key bytes per lane and KPool sixteen, then converts the tile
+through LDS to the WMMA B-operand layout; decode loads the operand layout
+directly. FP8 queries use FP8 WMMA; BF16 queries upcast the keys to BF16.
+Each head group's WMMA result goes through ReLU and the head weights. For the
+logical order, one layout conversion gives each lane all 32 heads of one
+column, and the lane adds them in head order with register adds; a second
+head group continues the same sum. The balanced KPool fold keeps eight heads
+of a column per lane and reduces them in the WMMA layout without LDS. The
+column's key scale and `softmax_scale` apply last.
 
 Prefill and KPool launches split each row's columns over a second grid
 dimension so that the grid has about four programs per compute unit; with
-enough rows, each row stays in one program. The span is a multiple of the
-tile and a runtime argument, so batch-size changes do not recompile the
-scorer. Only the first program of a KPool row writes its `row_ends_out`.
+enough rows, each row stays in one program; paired KPool programs count as
+one row. The span is a multiple of the tile and a runtime argument, so
+batch-size changes do not recompile the scorer. Only the first program of a
+KPool row writes its `row_ends_out`.
 
 ### gfx950 selected-slot sparse attention
 
@@ -699,11 +721,10 @@ the selected-index and single-buffer KV handoffs.
 
 ### DeepSeek V4 attention
 
-The gfx950 and gfx1250 packages provide MXFP4 index selection. Gfx950 also
-provides dense-workspace selected prefill, while both architectures provide
-page-planar selected decode. Decode reads a sliding-window (SWA) cache and an
-optional compressed cache; both segments share one softmax, with the attention
-sink applied once.
+The gfx950 and gfx1250 packages provide MXFP4 index selection,
+dense-workspace selected prefill and page-planar selected decode. Decode reads
+a sliding-window (SWA) cache and an optional compressed cache; both segments
+share one softmax, with the attention sink applied once.
 
 #### Contract
 
@@ -770,6 +791,14 @@ and scales through native TDM into padded LDS. Double buffering and a
 one-page-ahead software pipeline overlap these transfers with WMMA scoring
 while keeping the transfer geometry aligned and the number of nearby TDM
 operations bounded.
+
+Gfx1250 selected prefill also gives each (token, 16-head group) one four-wave
+workgroup, but each wave owns 32 rows of every 128-row step and runs its own
+online softmax in the transposed form `S^T = K Q^T`, `O^T += V^T P^T`, so the
+softmax and P stay inside the wave. Rows arrive by TDM gather, with each
+step's indices loaded a step ahead and clamped to a zero-filled row past the
+end. The four partial softmaxes merge once, behind a single barrier, through
+the dead KV tile. Q^T stays in LDS so two workgroups fit on a CU.
 
 On gfx1250, decode fuses page-planar dequantization, BF16 wave32 WMMA attention,
 FP32 online softmax, and output reduction. A workgroup covers 32 or 64 query
@@ -928,9 +957,32 @@ over many CUs.
 gfx950 contract, split and zero-query shortcut above. QK and PV use 16x16x32
 BF16 WMMA. Rows are dequantized with the CDNA5 `scaled_upcast` at a unit
 scale and then multiplied by the block scale: the E8M0 SWA scale as an exact
-BF16 power of two, the E4M3 global scale as BF16. Rows are not prefetched,
-and V is read from LDS only after QK: the registers this saves buy more
-workgroups per CU than the overlap would.
+BF16 power of two, the E4M3 global scale as BF16. V is read from LDS only
+after QK, so the K and V operands are never live together.
+
+A workgroup stages its slots in LDS, resolving each position's gather row (-1
+when unusable) in one pass, since TDM takes row indices in SGPRs. Its tiles
+then run through a two-deep LDS ring: while one tile is dequantized, a TDM
+gather fetches the next tile's value rows and an async copy its scales.
+Prefetching rows into registers instead was slower: it doubled the live rows.
+The gathers view a cache as rows of a page's value bytes (512 SWA, 256
+global) with int32 row indices, so page strides must be whole such rows, as
+the arena plan aligns them, and a cache spans at most 2^31 rows. Invalid rows
+gather as zero values while their scale copies read row 0, so a cache needs at
+least one page; the dequant reads NaN scale bytes as tiny or zero, so those
+rows stay zero even over unwritten memory.
+
+Tiles dequantize from the ring straight into the QK operand layout, which
+reads 16 value rows at once, so the ring pads every 256 bytes of a row by 8
+to keep them off shared banks; the BF16 tile in LDS only feeds the
+transposed PV read.
+SWA and global tiles share the ring, so a workgroup takes 146 KiB of LDS, two
+fit on a CU and rows split until the grid reaches 512 workgroups. The
+zero-query check, the staged slot rows and the reduce's splits load clamped
+rather than masked, since a row mask becomes a branch and a full wait around
+each load. Outputs and partials store straight from the WMMA layout. The
+reduce loads all splits at once; its width depends only on the slot widths,
+so batch size never recompiles it.
 
 The launch differs from gfx950 in two ways. Small batches give each
 workgroup one or two 16-head groups instead of four while rows x head blocks

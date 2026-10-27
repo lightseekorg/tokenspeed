@@ -149,11 +149,15 @@ class InputProcessor:
         - non-integer pins (bool/float/str) are a caller error and raise on
           EVERY engine shape — checked first, before the mode branches below.
         - engines without attention DP: the pin is meaningless; drop it.
-        - disaggregation engines: the bootstrap_room residue is the
-          authoritative rank carrier on BOTH the prefill and decode sides
-          (pd/mooncake must re-derive the same rank from the room), so the
-          pin is dropped; a conflicting pin is logged, never rejected —
-          rejecting would turn gateway/room version skew into a 400 storm.
+        - prefill engines: the bootstrap_room residue is the authoritative
+          rank carrier (the decode side's pd/mooncake re-derives the prefill
+          rank from the room), so the pin is dropped; a conflicting pin is
+          logged, never rejected — rejecting would turn gateway/room version
+          skew into a 400 storm.
+        - decode engines: an in-range pin is kept and places the request
+          (ts-client's routing), since any decode rank finds the prefill
+          rank from the room; an out-of-range pin is logged and dropped,
+          never rejected, leaving the room residue to place the request.
         - colocated attention-DP engines: an out-of-range pin is a caller
           error and raises (surfacing as a request-level failure).
         """
@@ -176,6 +180,19 @@ class InputProcessor:
             obj.data_parallel_rank = None
             return
         dp_size = mapping.attn.dp_size
+
+        if server_args.disaggregation_mode == "decode":
+            kept = [
+                rank if rank is None or 0 <= rank < dp_size else None
+                for rank in rank_list
+            ]
+            if kept != rank_list:
+                self.engine.logger.warning(
+                    f"data_parallel_rank={ranks!s} is outside [0, {dp_size:d}) on a "
+                    "decode engine; the bootstrap_room places the request — pin ignored.",
+                )
+            obj.data_parallel_rank = kept if isinstance(ranks, list) else kept[0]
+            return
 
         if server_args.disaggregation_mode != "null":
             rooms = obj.bootstrap_room

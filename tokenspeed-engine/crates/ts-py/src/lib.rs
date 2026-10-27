@@ -93,7 +93,8 @@ impl FrontendListener {
     ///     num_engines: Engines to wait for, one per attention-DP rank.
     ///     routing: `"round_robin"`, `"least_in_flight"` or
     ///         `"minimum_cache_usage"` for aggregated serving, or
-    ///         `"bootstrap_room"` for disaggregated serving.
+    ///         `"bootstrap_room"` for disaggregated serving (a pinned
+    ///         decode request goes to its `data_parallel_rank`).
     ///     handshake_timeout_s: How long `accept` waits for every engine.
     ///     send_timeout_s: How long one message may wait for an engine's
     ///         socket.
