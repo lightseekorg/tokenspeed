@@ -38,6 +38,8 @@ from tokenspeed_kernel.signature import (
 )
 
 __all__ = [
+    "combine_quant_fp8",
+    "prepare_sm90_fp8_moe_routes",
     "bf16_moe_routes",
     "bf16_moe_routes_warmup",
     "gather_moe_routes",
@@ -161,6 +163,36 @@ def prepare_sm90_fp8_moe(
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
     return make_cutlass_fused_moe(
+        mode=mode,
+        max_num_stages_fc1=max_num_stages_fc1,
+        max_num_stages_fc2=max_num_stages_fc2,
+    )
+
+
+def prepare_sm90_fp8_moe_routes(
+    *,
+    mode: Literal["expected_m", "optimized"],
+    max_num_stages_fc1: int,
+    max_num_stages_fc2: int,
+) -> Callable:
+    """Prepare native SM90 MoE with unweighted, caller-owned expert outputs.
+
+    Args:
+        mode: Explicit private native scheduling mode.
+        max_num_stages_fc1: FC1 stage bound, or -1 to preserve native selection.
+        max_num_stages_fc2: Independent FC2 stage bound with the same meaning.
+
+    Returns:
+        A callable returning DeferredMoERoutes for BF16 inputs, block-FP8
+        experts, and 1..32 routes per token. Hidden and intermediate sizes
+        are inferred from the tensors and must be positive multiples of 128.
+        The callable requires explicit EP size/rank, expected_m and enable_pdl.
+        Optional out supplies (BF16 partial, flat int32 map, int64 offsets).
+        Prepare and warm before graph capture. Native GEMMs are not exposed.
+    """
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_moe_routes
+
+    return make_cutlass_moe_routes(
         mode=mode,
         max_num_stages_fc1=max_num_stages_fc1,
         max_num_stages_fc2=max_num_stages_fc2,
@@ -994,6 +1026,7 @@ from tokenspeed_kernel.ops.moe._triton.bf16 import (  # noqa: E402
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
     MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,
 )
+from tokenspeed_kernel.ops.moe.combine_quant import combine_quant_fp8  # noqa: E402
 from tokenspeed_kernel.ops.moe.flashinfer import (  # noqa: E402
     PreparedNvfp4Routing,
     prepare_nvfp4_routing,

@@ -25,6 +25,27 @@ from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
+
+@register_kernel(
+    "moe",
+    "combine_quant_fp8",
+    name="cute_dsl_combine_quant_fp8",
+    solution="cute_dsl",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(9, 0),
+        max_arch_version=ArchVersion(9, 0),
+    ),
+    signatures=format_signatures("partial", "dense", {torch.bfloat16}),
+    priority=Priority.SPECIALIZED,
+)
+def cute_dsl_combine_quant_fp8(partial, inverse, weights, valid_rows, out):
+    """Run the ordered route reduction and projection quantizer on Hopper."""
+    from tokenspeed_kernel.ops.moe._cute_dsl.combine_quant import run_combine_quant
+
+    return run_combine_quant(partial, inverse, weights, valid_rows, out)
+
+
 # ===-----------------------------------------------------------------------===#
 # NVFP4 MegaMoE: TRT-LLM (NVIDIA SM100)
 # ===-----------------------------------------------------------------------===#
