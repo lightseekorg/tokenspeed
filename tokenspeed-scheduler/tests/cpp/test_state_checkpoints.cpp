@@ -1639,6 +1639,19 @@ protected:
         return cfg;
     }
 
+    // A sliding-window group whose window is one page: resuming at a boundary
+    // also reads the window block before it, which a request computing past
+    // the window lets go.
+    static void AddOnePageWindow(SchedulerConfig& cfg) {
+        cfg.cache_groups.push_back(CacheGroupConfig{
+            .group_id = "swa",
+            .block_granularity = kP,
+            .total_pages = cfg.device_allocator.total_pages,
+            .attn_kind = AttnKind::kSlidingWindow,
+            .sliding_window_tokens = kP,
+        });
+    }
+
     // A Host cache of `entries` blocks; a nonzero interval forces retractions.
     void ResetHost(std::int32_t entries, std::int32_t retraction_interval) {
         config_ = MakeConfig();
@@ -1790,6 +1803,39 @@ TEST_F(StateHostDatesSuite, AFinishWhileRetractedKeepsTheRetractionsDates) {
     }
 }
 
+class StateWindowHostDatesSuite : public StateHostDatesSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateHostDatesSuite::MakeConfig();
+        AddOnePageWindow(cfg);
+        return cfg;
+    }
+};
+
+// AFinishRefreshesTheBoundaryItResumedFrom with a one-page window: every user
+// of an 8-token system prompt resumes from it on the Device and computes 20
+// more tokens, so its window table lets go of the block [5, 8] the resume
+// read. Each finish still refreshes that block's Host copy with the
+// checkpoint at 8, so the system prompt stays resumable from Host while the
+// users' turns age out.
+TEST_F(StateWindowHostDatesSuite, AFinishRefreshesTheWindowBehindTheBoundaryItResumedFrom) {
+    ResetHost(/*entries=*/30, /*retraction_interval=*/0);
+    FinishAfterPrefill("system", MakeTokens(8));
+    for (const std::int32_t user : {1, 2, 3}) {
+        std::vector<std::int32_t> tokens = MakeTokens(8);
+        for (std::int32_t i = 0; i < 20; ++i) {
+            tokens.push_back(1000 * user + i);
+        }
+        FinishAfterPrefill("user" + std::to_string(user), std::move(tokens));
+    }
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 30);
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    std::vector<std::int32_t> next_user = MakeTokens(8);
+    next_user.insert(next_user.end(), {77, 78});
+    EXPECT_EQ(Probe("next-user", std::move(next_user)).prefix_tokens, 8);
+}
+
 // StateHostDatesSuite with the in-forward State checkpoint: turn1 = [1..22]
 // runs the chunks [0, 8), [8, 16) and [16, 22), the last writing S(20), where
 // turn2 -- turn1 re-rendered without its last token, then new tokens --
@@ -1822,7 +1868,7 @@ protected:
         ExecutionPlan prompt_end = PlanOnce();
         if (!prompt_end_in_flight) {
             AckWriteBacks(prompt_end);
-            EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), 8);
+            EXPECT_EQ(scheduler_->HostPoolCachedBlocks(), PromptEndEntries());
         }
         SendForwardDone("turn1", {901});
         Submit(RequestSpec{.request_id = "idle", .tokens = MakeTokens(4, 200), .max_new_tokens = 1});
@@ -1837,6 +1883,9 @@ protected:
         SendForwardDone("turn1", {902});
         return prompt_end;
     }
+
+    // The Host entries turn1's prompt end stores.
+    virtual std::int32_t PromptEndEntries() const { return 8; }
 
     static std::vector<std::int32_t> Turn2() {
         std::vector<std::int32_t> tokens = MakeTokens(21);
@@ -1947,6 +1996,37 @@ TEST_F(StateCheckpointInForwardHostDatesSuite, AFinishRefreshesTheCheckpointAChu
     std::vector<std::int32_t> turn2 = MakeTokens(25);
     turn2.insert(turn2.end(), {500, 501, 502, 503});
     EXPECT_EQ(Probe("turn2", std::move(turn2)).prefix_tokens, 24) << "S(24) stayed on Host";
+    EXPECT_EQ(Probe("idle-again", {200, 201, 202, 203, 77}).prefix_tokens, 0) << "the idle prompt left";
+}
+
+class StateCheckpointInForwardWindowHostDatesSuite : public StateCheckpointInForwardHostDatesSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = StateCheckpointInForwardHostDatesSuite::MakeConfig();
+        AddOnePageWindow(cfg);
+        return cfg;
+    }
+
+    std::int32_t PromptEndEntries() const override { return 12; }  // and four window blocks
+};
+
+// With a one-page window, resuming at S(20) also needs the window block
+// [17, 20], which the prompt end stores with S(20) and turn1's window table
+// lets go during its decodes. turn1's finish at 25 refreshes that block with
+// S(20) and the page [17, 20], so a 12-token prompt's store evicts the idle
+// prompt and what turn1 left behind its frontier, not them.
+TEST_F(StateCheckpointInForwardWindowHostDatesSuite, AFinishRefreshesTheWindowBehindTheInForwardCheckpoint) {
+    ResetHost(/*entries=*/20, /*retraction_interval=*/0);
+    PrefillTurn1BesideAnIdlePrompt(/*prompt_end_in_flight=*/false);
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("turn1", {903});
+    SendFinish("turn1");
+    AckWriteBacks(PlanOnce());
+    ASSERT_EQ(scheduler_->HostPoolCachedBlocks(), 20);
+    FinishAfterPrefill("e", MakeTokens(12, 300));
+
+    ASSERT_TRUE(scheduler_->ClearL1Cache());
+    EXPECT_EQ(Probe("turn2", Turn2()).prefix_tokens, 20) << "S(20) and the window behind it stayed on Host";
     EXPECT_EQ(Probe("idle-again", {200, 201, 202, 203, 77}).prefix_tokens, 0) << "the idle prompt left";
 }
 
