@@ -430,6 +430,26 @@ def test_unreadable_task_yaml_requires_every_group(tmp_path, text):
             pipeline.build_matrix(tmp_path / "test/ci", tmp_path, "per-commit")
 
 
+@pytest.mark.parametrize(
+    "labels",
+    [
+        ["b200-1gpu"],
+        ["gb200-4gpu"],
+        ["tokenspeed-npu-arm64"],
+        ["amd-mi355-1gpu", "b200-1gpu"],
+        ["amd-mi45x-cpu-test", "tokenspeed-npu-arm64"],
+    ],
+)
+def test_unsupported_import_runners_fail_matrix_validation(tmp_path, labels):
+    path = "test/ci/ut/adapter-compatibility.yaml"
+    write_task(tmp_path, path, labels, "import-check")
+
+    # Invalid tasks must reach the scanner and fail, rather than select no jobs.
+    assert required_groups(path, tmp_path) == set(RUNNER_GROUPS)
+    with pytest.raises(ValueError, match="import-check.*AMD runner labels"):
+        pipeline.build_matrix(tmp_path / "test/ci", tmp_path, "per-commit")
+
+
 @pytest.mark.parametrize("directory", ["test/ci/npu", "test/ci/deepswe"])
 def test_deleted_tasks_keep_their_directory_exclusions(tmp_path, directory):
     paths = {f"{directory}/deleted.yaml"}

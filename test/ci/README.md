@@ -39,6 +39,9 @@ Every task declares one `workflow_stage`:
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
 
+Only AMD workflows run the `import-check` stage, so its tasks must use AMD
+runner labels. Validation rejects other runner labels for that stage.
+
 The NVIDIA B200 Tests and AMD Tests workflows run unit tests before model
 tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
 concurrently with unit tests. Matrix entries within
@@ -336,8 +339,8 @@ module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `gfx950/` or `gfx1250/` subdirectory; shared AMD tests stay outside those
 directories. Keep fixtures and helpers with their tests so directory-based
 coverage also applies to them. Benchmark infrastructure tests live under
-`test/benchmark/`; vendor- or architecture-specific benchmark tests keep a
-`benchmark/` directory under their corresponding vendor or architecture.
+`tokenspeed-kernel/test/benchmark/`; benchmark tests specific to a vendor or
+architecture keep a `benchmark/` directory under that vendor or architecture.
 Tests that require CUDA, CuTe DSL, FlashInfer,
 DeepEP, DeepGEMM, TRT-LLM, FlashAttention 3/4, FlashMLA, Marlin, MNNVL, or
 `tokenspeed-mla` live under `tokenspeed-kernel/test/nvidia/`. Everything else

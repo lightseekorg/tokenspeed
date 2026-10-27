@@ -227,6 +227,12 @@ def validate_task(data: Dict[str, Any], path: Path) -> None:
         or not all(isinstance(label, str) and label for label in labels)
     ):
         raise ValueError(f"{path}: runner.labels must be a non-empty string list")
+    if workflow_stage == "import-check" and not all(
+        is_amd_runner(label) for label in labels
+    ):
+        raise ValueError(
+            f"{path}: workflow_stage 'import-check' requires AMD runner labels"
+        )
     runner_env = runner.get("env", {})
     if runner_env:
         if not isinstance(runner_env, dict):
