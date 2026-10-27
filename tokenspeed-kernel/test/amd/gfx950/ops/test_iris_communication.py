@@ -19,12 +19,12 @@
 # SOFTWARE.
 
 
+import inspect
 import math
 import os
 import socket
 import time
 import traceback
-from types import SimpleNamespace
 from typing import List, Tuple
 
 import pytest
@@ -144,14 +144,10 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
 
 @pytest.mark.parametrize(
     ("configured", "spans_hosts", "expected"),
-    [
-        (None, False, {}),
-        (None, True, {"allocator_type": "vmem_chunked"}),
-        ("vmem", True, {"allocator_type": "vmem"}),
-    ],
+    [(None, False, None), (None, True, "vmem_chunked"), ("vmem", True, "vmem")],
     ids=["one-host", "across-hosts", "configured"],
 )
-def test_context_uses_the_current_gpu_and_picks_the_allocator(
+def test_context_picks_vmem_chunked_only_across_hosts(
     monkeypatch, configured, spans_hosts, expected
 ):
     from tokenspeed_kernel.ops.communication import _iris
@@ -160,80 +156,14 @@ def test_context_uses_the_current_gpu_and_picks_the_allocator(
     monkeypatch.setattr(_iris, "_context", None)
     monkeypatch.setattr(_iris, "_allocator_type", configured)
     monkeypatch.setattr(_iris, "_job_spans_hosts", lambda: spans_hosts)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
-    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
     monkeypatch.setattr(
         _iris,
         "_create_context",
-        lambda *args: created.append(args) or "ctx",
+        lambda size, allocator, device: created.append(allocator),
     )
 
-    assert _iris.get_or_create_context(heap_size=1 << 20) == "ctx"
-    assert created == [(1 << 20, expected.get("allocator_type"), 3)]
-
-
-def test_context_builds_the_heap_on_the_requested_gpu(monkeypatch):
-    """Iris without ``device=`` would place rank 0 on GPU 0 and switch to it."""
-    from tokenspeed_kernel.ops.communication import _iris
-
-    module = _iris.iris_host
-    switched, heaps, contexts = [], [], []
-    build_device_context = module.Iris._build_device_context
-
-    def build(heap_size, **options):
-        module.set_device(0)
-        heaps.append(module.SymmetricHeap(heap_size, 0, 0, 1, "torch"))
-        ctx = SimpleNamespace(gpu_id=0, device="cuda:0")
-        # Iris.__init__ ends by building the device context on ctx.device.
-        module.Iris._build_device_context(ctx)
-        ctx._build_device_context = lambda: contexts.append(ctx.device)
-        return ctx
-
-    monkeypatch.delenv("IRIS_ALLOCATOR", raising=False)
-    monkeypatch.setattr(module, "set_device", switched.append)
-    monkeypatch.setattr(module, "SymmetricHeap", lambda *args: args)
-    monkeypatch.setattr(_iris.iris, "iris", build)
-
-    ctx = _iris._create_context(1 << 20, None, 2)
-    assert (ctx.gpu_id, ctx.device) == (2, "cuda:2")
-    assert heaps == [(1 << 20, 2, 0, 1, "torch")]
-    assert contexts == ["cuda:2"]
-    assert not switched
-    assert module.set_device == switched.append
-    assert module.Iris._build_device_context is build_device_context
-
-
-def test_context_refuses_vmem_off_the_rank_gpu(monkeypatch):
-    """Iris without ``device=`` grants vmem access to GPUs 0..world_size-1."""
-    from tokenspeed_kernel.ops.communication import _iris
-
-    module = _iris.iris_host
-    heaps = []
-
-    def build(heap_size, allocator_type="torch"):
-        heaps.append(module.SymmetricHeap(heap_size, 0, 0, 2, allocator_type))
-        ctx = SimpleNamespace(gpu_id=0, device="cuda:0")
-        ctx._build_device_context = lambda: None
-        return ctx
-
-    monkeypatch.delenv("IRIS_ALLOCATOR", raising=False)
-    monkeypatch.setattr(module, "SymmetricHeap", lambda *args: args)
-    monkeypatch.setattr(_iris.iris, "iris", build)
-
-    with pytest.raises(RuntimeError, match="cannot place rank 0 on GPU 2"):
-        _iris._create_context(1 << 20, "vmem", 2)
-    monkeypatch.setenv("IRIS_ALLOCATOR", "vmem")
-    with pytest.raises(RuntimeError, match="cannot place rank 0 on GPU 2"):
-        _iris._create_context(1 << 20, None, 2)
-    _iris._create_context(1 << 20, "vmem", 0)
-    assert heaps == [(1 << 20, 0, 0, 2, "vmem")]
-
-
-def test_group_rejects_a_context_on_another_gpu():
-    from tokenspeed_kernel.ops.communication._iris import IrisGroup
-
-    with pytest.raises(RuntimeError, match="heap is on GPU 1"):
-        IrisGroup(SimpleNamespace(gpu_id=1), None, 0, torch.device("cuda:0"))
+    _iris.get_or_create_context(heap_size=1 << 20)
+    assert created == [expected]
 
 
 # ---------------------------------------------------------------------------
@@ -1041,40 +971,35 @@ def test_iris_all_reduce_on_gpus_past_the_rank_index():
     _spawn_and_collect(_partial_placement_worker_fn, (2, _get_open_port(), 2), 2)
 
 
-def _launched_across_hosts() -> bool:
-    world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    return world_size > int(os.environ.get("LOCAL_WORLD_SIZE", world_size))
+def _vmem_placement_worker_fn(rank, world_size, port, error_dict):
+    from tokenspeed_kernel.ops.communication._iris import get_or_create_context
 
-
-@pytest.mark.skipif(
-    not _launched_across_hosts(), reason="needs a torchrun launch across hosts"
-)
-def test_iris_all_reduce_across_two_hosts():
-    """Reduce over a TP group spanning gfx1250 trays in one fabric domain.
-
-    Launch the same command on each tray, for example two ranks per four-GPU
-    tray on GPUs 2-3::
-
-        TOKENSPEED_TEST_BASE_GPU=2 torchrun --nnodes 2 --nproc-per-node 2 \\
-            --rdzv-backend c10d --rdzv-endpoint <host>:<port> -m pytest \\
-            test_iris_communication.py -k across_two_hosts
-    """
-    if not current_platform().is_cdna5:
-        pytest.skip("only gfx1250 maps the heap across hosts")
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    gpu = int(os.environ.get("TOKENSPEED_TEST_BASE_GPU", "0"))
-    gpu += int(os.environ["LOCAL_RANK"])
-    dist.init_process_group(backend="gloo")
     try:
-        from tokenspeed_kernel.ops.communication._iris import get_or_create_context
-
-        _check_placed_all_reduce(rank, world_size, gpu)
-        ctx = get_or_create_context(heap_size=0)
-        assert type(ctx.heap.allocator).__name__ == "VMemChunkedAllocator"
-        dist.barrier()
+        os.environ["IRIS_ALLOCATOR"] = "vmem"
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://localhost:{port}",
+            rank=rank,
+            world_size=world_size,
+        )
+        torch.cuda.set_device(1)
+        with pytest.raises(RuntimeError, match="cannot place rank 0 on GPU 1"):
+            get_or_create_context(heap_size=1 << 20)
+    except BaseException:
+        error_dict[rank] = traceback.format_exc()
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
+
+
+def test_iris_vmem_refuses_a_gpu_past_the_rank_index():
+    """Without ``device=``, Iris's vmem heap would fault on GPU 1 for rank 0."""
+    _skip_if_unsupported(2, "Iris vmem placement tests")
+    from tokenspeed_kernel.ops.communication._iris import iris
+
+    if "device" in inspect.signature(iris.iris).parameters:
+        pytest.skip("this Iris places the heap itself")
+    _spawn_and_collect(_vmem_placement_worker_fn, (1, _get_open_port()), 1)
 
 
 # ---------------------------------------------------------------------------

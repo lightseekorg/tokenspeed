@@ -37,7 +37,6 @@ class TestAutoBackendTopology:
         backend._nccl = Mock()
         backend._rsag = Mock()
         backend._iris = Mock()
-        backend._iris.maps_across_hosts.return_value = False
         backend._trtllm_ar = Mock()
         backend._trtllm_ar.has_trtllm_ar.return_value = False
         backend._trtllm_ar.lamport_all_gather.return_value = None
@@ -262,32 +261,25 @@ class TestAutoBackendTopology:
         assert backend.all_reduce(tensor, tuple(range(8))) == "nccl-result"
         backend._iris.can_run.assert_not_called()
 
-    def test_a_heap_mapped_across_hosts_keeps_a_host_spread_all_reduce_on_iris(
-        self, backend, monkeypatch
+    @pytest.mark.parametrize(("cdna5", "expected"), [(True, "iris"), (False, "nccl")])
+    def test_cross_node_all_reduce_routing_by_arch(
+        self, backend, monkeypatch, cdna5, expected
     ):
-        backend._iris.maps_across_hosts.return_value = True
-        monkeypatch.setattr(backend, "route", lambda *args: None)
-        backend._iris.can_reduce_outputs.return_value = False
-        backend._iris.can_run.return_value = True
-        backend._iris.all_reduce.return_value = "iris-result"
-        tensor = torch.empty(1)
-
-        assert backend._all_reduce_one(tensor, tuple(range(8)), None) == "iris-result"
-        backend._nccl.all_reduce.assert_not_called()
-
-    def test_a_heap_mapped_across_hosts_prepares_a_host_spread_group(
-        self, backend, monkeypatch
-    ):
-        """Iris then builds the heap or fails startup; nothing falls back to NCCL."""
         import tokenspeed.runtime.distributed.comm_backend.auto as auto
 
         monkeypatch.setattr(
-            auto, "current_platform", lambda: SimpleNamespace(is_amd=True)
+            auto,
+            "current_platform",
+            lambda: SimpleNamespace(is_amd=True, is_cdna5=cdna5),
         )
+        backend._iris.can_reduce_outputs.return_value = False
+        backend._iris.can_run.return_value = True
+        backend._iris.all_reduce.return_value = "iris"
+        backend._nccl.all_reduce.return_value = "nccl"
         group = tuple(range(8))
-        assert not backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
-        backend._iris.maps_across_hosts.return_value = True
-        assert backend.can_prepare_all_reduce_buffers(group, torch.bfloat16)
+
+        assert backend.can_prepare_all_reduce_buffers(group, torch.bfloat16) is cdna5
+        assert backend.all_reduce(torch.empty(1), group) == expected
 
 
 def test_fabric_map_gathers_world_once_and_serves_groups_locally(monkeypatch):

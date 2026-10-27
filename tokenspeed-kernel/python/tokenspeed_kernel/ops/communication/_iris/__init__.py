@@ -77,7 +77,7 @@ def _job_spans_hosts() -> bool:
 
 
 @contextmanager
-def _heap_on(device: int):
+def _build_heap_on(device: int):
     """Build the heap on ``device``; Iris without ``device=`` uses rank % GPUs.
 
     The device context is left for the caller to build once ``ctx.device`` is
@@ -114,7 +114,7 @@ def _create_context(size: int, allocator_type: str | None, device: int):
     options = {} if allocator_type is None else {"allocator_type": allocator_type}
     if "device" in inspect.signature(iris.iris).parameters:
         return iris.iris(heap_size=size, device=device, **options)
-    with _heap_on(device):
+    with _build_heap_on(device):
         ctx = iris.iris(heap_size=size, **options)
     ctx.gpu_id, ctx.device = device, f"cuda:{device}"
     ctx._build_device_context()

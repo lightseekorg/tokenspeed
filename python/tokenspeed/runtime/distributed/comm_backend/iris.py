@@ -63,16 +63,6 @@ class IrisBackend(CommBackend):
     def producer_direct_max_bytes(self) -> int:
         return self._producer_direct_max_bytes
 
-    @staticmethod
-    def maps_across_hosts() -> bool:
-        """Whether the heap reaches peers on other hosts.
-
-        On gfx1250 Iris maps peers in one fabric domain over xGMI, and it refuses
-        to build a heap that cannot reach every world rank. A job it cannot map
-        therefore stops at preparation rather than running elsewhere.
-        """
-        return current_platform().is_cdna5
-
     def state(self, group: Group, dtype: torch.dtype) -> "IrisAllReduce | None":
         """Return this group's prepared all-reduce state without allocating."""
         return self._instances.get((group, dtype))
