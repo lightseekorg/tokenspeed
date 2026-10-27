@@ -95,7 +95,8 @@ struct CacheGroupSpec {
     // Cyclic owners of the virtual blocks; must divide cache_blocks_per_lcm_block.
     std::int32_t shard_count{1};
     // State checkpoints may only be reused/published at multiples of this
-    // token count. 1 preserves arbitrary natural checkpoints. No row span.
+    // token count and must be produced by prefill. 1 preserves arbitrary
+    // natural checkpoints, including decode endpoints. No row span.
     std::int32_t checkpoint_granularity{1};
 };
 

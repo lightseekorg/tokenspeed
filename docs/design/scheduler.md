@@ -238,6 +238,19 @@ state block is never written again: rotation moves it to slot 0, where it is
 read only, and the next step releases the request's reference while the
 cache keeps the block.
 
+For State groups with `checkpoint_granularity > 1`, only prefill-produced
+states may become reusable checkpoints. Publication remains in the ordinary
+scheduling path: a later admission publishes any retained in-forward
+checkpoint before rotating or reclaiming the owner's blocks. The first fused
+decode admission may deliver the preceding prefill's prompt-end and interior
+checkpoints; it does not publish a decode-produced state. Later decode states
+stay private at finish and retraction even when their positions are aligned.
+A prefill finish may still publish its endpoint, and retraction still saves
+the private live state for that request's own restore. The D role does not
+publish its transferred prompt state in this restricted mode. Unrestricted
+State groups keep the policy above. Forward result events carry no checkpoint
+data and do not trigger publication.
+
 **In-forward checkpoint (opt-in).** By default a prompt that diverges inside
 the last page of an earlier long prompt, or resends it, resumes from an
 earlier checkpoint: the prompt-end state cannot serve a hit that must replay
@@ -354,7 +367,8 @@ segment, `(prompt_tokens - 1) / grain * grain`, including when the whole
 prompt fits one round. Thus 8192 tokens run in one forward while saving the
 state at 4096. Prefix reuse stays strictly below the prompt length, so a full
 8192 match resumes at most at 4096. Only that extra entrance is retained;
-ordinary aligned natural endpoints remain reusable. The grain constrains
+aligned prefill endpoints remain reusable through the same admission path.
+A decode step reaching an aligned position creates no checkpoint. The grain constrains
 each request's logical position, independently of its packed batch offset.
 Unrestricted groups preserve their original scheduling and publication.
 

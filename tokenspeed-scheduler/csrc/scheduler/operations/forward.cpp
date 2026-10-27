@@ -160,7 +160,8 @@ bool canConsumeReservedTokensInPlace(const CacheCoordinator& coordinator, std::s
 
 RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgress& cache_progress,
                                        std::int32_t num_computed_tokens, std::int32_t prefix_granularity,
-                                       bool stream_completed_to_host, PublicationPoint point) {
+                                       bool stream_completed_to_host, PublicationPoint point,
+                                       bool allow_state_checkpoint) {
     const std::int32_t first_new_prefix_page = static_cast<std::int32_t>(cache_progress.prefix_hashes.size());
     const std::int32_t filled_prefix_pages = num_computed_tokens / prefix_granularity;
     if (filled_prefix_pages > first_new_prefix_page) {
@@ -176,7 +177,10 @@ RequestProgress AdvanceRequestProgress(const Request& request, fsm::CacheProgres
     // A final point publishes the frontier's state even when its pages were
     // all published by an earlier step (a D request leaving at a page-aligned
     // frontier): the checkpoint is keyed by the last page's chain hash.
-    const bool publish_state = point != PublicationPoint::kChunk;
+    // A retained in-forward checkpoint below is always eligible. Publishing
+    // the live slot additionally requires a prefill-produced frontier (or an
+    // unrestricted State group); an aligned decode state is not a checkpoint.
+    const bool publish_state = allow_state_checkpoint && point != PublicationPoint::kChunk;
     const bool state_only = publish_state && !tail && !cache_progress.prefix_hashes.empty() &&
                             num_computed_tokens == filled_prefix_pages * prefix_granularity;
     // The in-forward State checkpoint a scheduled forward wrote is published
@@ -591,7 +595,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     const RequestProgress progress = AdvanceRequestProgress(
         *request, cache_progress, request->NumComputedTokens(), coordinator_.PrefixGranularity(),
         config_.StreamsDeviceCacheToHost(),
-        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
+        ends_at_junction || ends_at_state_checkpoint ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
+        /*allow_state_checkpoint=*/true);
 
     std::vector<BlockTable>& tables = request->BlockTablesRef();
     // A chunk reads the state its predecessor wrote (slot 1 -> slot 0) and
@@ -680,7 +685,10 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     // blocks (the state by rotation: the first decode reads slot 0 and writes
     // the fresh slot 1). The P and D roles publish at finish only -- the P
     // never writes again, the D's prompt-end state arrived by transfer or was
-    // claimed. Every later decode writes slot 1 in place and lets slot 0 go.
+    // claimed. This delivers the preceding prefill's checkpoints; decode
+    // never creates an in-forward checkpoint. Every later decode writes slot
+    // 1 in place and lets slot 0 go. Restricted groups cannot publish that
+    // decode-produced live state at finish or retraction either.
     const bool first_decode = request->Is<fsm::PrefillDone>();
     const bool prompt_end = first_decode && config_.role == Role::kFused && !config_.disable_prefix_cache;
     const StateStep state_step{prompt_end                                 ? StateStep::Kind::kRotate
@@ -689,7 +697,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     const RequestProgress progress =
         AdvanceRequestProgress(*request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
                                config_.StreamsDeviceCacheToHost() && first_decode,
-                               prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk);
+                               prompt_end ? PublicationPoint::kOwnerContinues : PublicationPoint::kChunk,
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 || prompt_end);
 
     if (!progress.completed_pages && state_step.kind != StateStep::Kind::kRotate &&
         canConsumeReservedTokensInPlace(coordinator_, tables, reserve_tokens, num_computed_tokens)) {
@@ -854,7 +863,9 @@ void Scheduler::publishCompletedPrefix(Request& victim) {
     const std::int32_t num_computed_tokens = victim.NumComputedTokens();
     RequestProgress progress =
         AdvanceRequestProgress(victim, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
+                                   (config_.role != Role::kD && num_computed_tokens <= victim.PrefillSize()));
     if (progress.completed_pages) {
         // A publication is a KV-event mutation: the newly hashed pages (decode
         // pages no admission has registered yet) and the tail need their token
@@ -896,7 +907,9 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     const RequestProgress progress =
         AdvanceRequestProgress(request, cache_progress, num_computed_tokens, coordinator_.PrefixGranularity(),
-                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal);
+                               /*stream_completed_to_host=*/false, PublicationPoint::kFinal,
+                               /*allow_state_checkpoint=*/coordinator_.CheckpointGranularity() == 1 ||
+                                   (config_.role != Role::kD && num_computed_tokens <= request.PrefillSize()));
     return tier_transfers_
         .SplitRetractionImage(
             request.BlockTablesRef(), num_computed_tokens,

@@ -251,7 +251,11 @@ prompt-end checkpoint it still holds in slot 0 is the canonical block.
 
 State groups may additionally restrict reusable checkpoints with
 `checkpoint_granularity`: intermediate prefill forwards end on its multiples,
-and only states at these positions are published or matched. A forward may
+and only prefill-produced states at these positions are published or matched.
+The existing admission publishes retained checkpoints in stream order. A first
+decode admission can deliver the preceding prefill's checkpoint; decode-produced
+live states remain private, including at finish and retraction. Retraction
+still preserves the private state for the same request's restore. A forward may
 span several segments; the existing in-forward checkpoint mechanism saves the
 last segment entrance independently of the live endpoint.
 This is a numerical continuation constraint, not a block's token span. The

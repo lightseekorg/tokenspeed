@@ -87,8 +87,9 @@ class CacheGroupSpec:
     # Number of cyclic owners of this group's virtual blocks. One keeps the
     # same block IDs on every rank; local field geometry is independent of it.
     shard_count: int = 1
-    # Optional restriction on reusable State checkpoints, in logical tokens.
-    # None permits every natural checkpoint; this is not row geometry.
+    # Optional prefill-only State checkpoint restriction, in logical tokens.
+    # None permits every natural checkpoint, including decode endpoints;
+    # this is not row geometry.
     checkpoint_granularity: int | None = None
 
     def __post_init__(self) -> None:
