@@ -310,6 +310,7 @@ if current_platform().is_amd:
         lower_bound: float | None,
         record_metadata: torch.Tensor | None,
         record_stamps: torch.Tensor | None,
+        state_dtype: torch.dtype,
     ) -> None:
         """Recover accepted prefixes from FP32 U and activation-dtype K/raw-g records."""
         _kda_fused_replay_impl(
@@ -332,6 +333,7 @@ if current_platform().is_amd:
             lower_bound=lower_bound,
             record_metadata=record_metadata,
             record_stamps=record_stamps,
+            state_dtype=state_dtype,
         )
 
     @register_kernel(
@@ -532,6 +534,7 @@ if current_platform().is_amd:
         lower_bound: float | None,
         record_metadata: torch.Tensor | None,
         record_stamps: torch.Tensor | None,
+        state_dtype: torch.dtype,
     ) -> None:
         """Recover accepted prefixes from FP32 U and activation-dtype K/raw-g records."""
         _kda_fused_replay_gfx1250_impl(
@@ -554,4 +557,5 @@ if current_platform().is_amd:
             lower_bound=lower_bound,
             record_metadata=record_metadata,
             record_stamps=record_stamps,
+            state_dtype=state_dtype,
         )

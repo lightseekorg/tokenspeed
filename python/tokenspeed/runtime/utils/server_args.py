@@ -2679,7 +2679,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.mamba_ssm_dtype,
             choices=["float32", "bfloat16"],
-            help="It is used to tune mamba ssm dtype",
+            help="Dtype of the stored linear-attention recurrent state (GDN "
+            "and KDA SSM state). Scans accumulate in float32 either way; "
+            "bfloat16 halves the state memory.",
         )
         parser.add_argument(
             "--max-prefill-tokens",

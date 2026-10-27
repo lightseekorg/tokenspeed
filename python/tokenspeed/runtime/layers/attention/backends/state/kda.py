@@ -622,6 +622,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                         conv_width=conv_width,
                         lower_bound=next(iter(lower_bounds)),
                         **record_args,
+                        state_dtype=first_state.dtype,
                     )
 
                 self._batched_replay_launch = launch
@@ -1093,6 +1094,7 @@ class KdaAttnBackend(CapacityPrefillBackend):
                 conv_state_dtype=conv.dtype,
                 record_metadata=self._replay_record_metadata[:bs],
                 record_stamps=self._replay_record_stamps[row : row + 1],
+                state_dtype=state.dtype,
             )
         self._verify_commit_ctx = None
         return

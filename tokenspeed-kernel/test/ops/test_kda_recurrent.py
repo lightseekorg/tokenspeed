@@ -766,6 +766,7 @@ def test_batched_replay_call_contract() -> None:
             if "record_metadata" in parameters
             else {"gate_stride": 1, "beta_stride": 1}
         ),
+        state_dtype=torch.float32,
     )
 
 
@@ -894,6 +895,53 @@ def test_nvidia_kda_pool_matches_the_reference_recurrence() -> None:
     for row, (expected_out, expected_state) in enumerate(expected):
         torch.testing.assert_close(out[0, row : row + 1], expected_out)
         torch.testing.assert_close(pool[writes[row]], expected_state)
+
+
+def test_kda_paged_decode_bf16_state_rounds_the_fp32_scan_once() -> None:
+    """A BF16 pool is read into FP32, scanned, and rounded once on store.
+
+    Compared against the same kernel on an FP32 pool holding the same values.
+    The load dtype can change the kernel's reduction order, so results agree
+    to within one BF16 ulp, plus FP32 rounding noise for values near zero,
+    rather than bit for bit.
+    """
+    if current_platform().is_nvidia:
+        # NVIDIA single-token decode is reached through the FLA adapter module.
+        pytest.importorskip("fla")
+    torch.manual_seed(31)
+    tokens, heads, dim, pages = 3, 12, 128, 6
+    q, k, v, raw_g = (
+        torch.randn(1, tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+        for _ in range(4)
+    )
+    beta = torch.randn(1, tokens, heads, device="cuda", dtype=torch.bfloat16)
+    a_log = torch.randn(heads, device="cuda", dtype=torch.float32)
+    dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
+    bf16_pool = torch.randn(pages, heads, dim, dim, device="cuda", dtype=torch.bfloat16)
+    fp32_pool = bf16_pool.float()
+    reads = torch.tensor([0, 1, 1], device="cuda", dtype=torch.int32)
+    writes = torch.tensor([2, 3, 4], device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.arange(tokens + 1, device="cuda", dtype=torch.int32)
+
+    def run(pool: torch.Tensor) -> torch.Tensor:
+        return kda_paged_decode(
+            q,
+            k,
+            v,
+            raw_g,
+            beta,
+            a_log,
+            dt_bias,
+            state_pool=pool,
+            read_indices=reads,
+            write_indices=writes,
+            cu_seqlens=cu_seqlens,
+            lower_bound=LOWER_BOUND,
+        )
+
+    one_ulp = {"atol": 1e-6, "rtol": 2**-7}
+    torch.testing.assert_close(run(bf16_pool), run(fp32_pool), **one_ulp)
+    torch.testing.assert_close(bf16_pool, fp32_pool.to(torch.bfloat16), **one_ulp)
 
 
 def test_k3_safe_gate_reference_matches_sigmoid_contract() -> None:
@@ -1164,6 +1212,9 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
 # Local KDA heads: Kimi K3 at TP8 (12) across batch shapes, and GLM-5.3 at TP8
 # (8) and TP4 (16) at one full and one padded batch.
 @pytest.mark.parametrize(
+    "state_dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"]
+)
+@pytest.mark.parametrize(
     ("batch", "active", "heads"),
     [
         (1, 1, 12),
@@ -1180,7 +1231,7 @@ def test_kda_paged_decode_graph_padding_and_page_stride() -> None:
     ],
 )
 def test_kda_fused_paged_decode_matches_reference(
-    batch: int, active: int, heads: int
+    batch: int, active: int, heads: int, state_dtype: torch.dtype
 ) -> None:
     """Convolution/gate/recurrent fusion returns raw output and updates paged state."""
     if not (
@@ -1237,9 +1288,9 @@ def test_kda_fused_paged_decode_matches_reference(
         head_dim,
         device="cuda",
         dtype=torch.float32,
-    )
-    initial_state_pool = state_pool.clone()
-    expected_state_pool = state_pool.clone()
+    ).to(state_dtype)
+    initial_state_pool = state_pool.float().clone()
+    expected_state_pool = state_pool.float().clone()
     read_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
     write_indices = torch.full((batch,), -1, device="cuda", dtype=torch.int32)
     read_indices[:active] = torch.arange(active, device="cuda", dtype=torch.int32)
@@ -1316,7 +1367,11 @@ def test_kda_fused_paged_decode_matches_reference(
     torch.testing.assert_close(
         result[0, :active].float(), expected_out[:active].float(), atol=2e-4, rtol=2e-2
     )
-    torch.testing.assert_close(state_pool, expected_state_pool, atol=2e-4, rtol=2e-4)
+    # A BF16 pool adds one rounding of the stored state: half a BF16 ulp.
+    rtol = 2e-4 if state_dtype == torch.float32 else 2e-4 + 2**-9
+    torch.testing.assert_close(
+        state_pool.float(), expected_state_pool, atol=2e-4, rtol=rtol
+    )
     torch.testing.assert_close(conv_states, expected_conv_states)
 
 
@@ -1556,6 +1611,7 @@ def test_kda_fused_verify_and_replay_match_sequential_reference(
         record_stamps=stamps.unsqueeze(0),
         conv_width=4,
         lower_bound=LOWER_BOUND,
+        state_dtype=state_pool.dtype,
     )
     torch.testing.assert_close(conv_pool, expected_conv, atol=0, rtol=0)
     torch.testing.assert_close(state_pool, expected_state, atol=5e-4, rtol=5e-4)

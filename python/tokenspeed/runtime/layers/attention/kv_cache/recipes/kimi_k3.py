@@ -226,6 +226,18 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError("Kimi-K3 cache requires a linear-attention component")
         return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
 
+    @cached_property
+    def _recurrent_dtype(self) -> torch.dtype:
+        """KDA recurrent-state dtype selected by ``--mamba-ssm-dtype``.
+
+        The scans accumulate in FP32 either way; BF16 only narrows what is
+        stored between steps, halving the state pages.
+        """
+        return {
+            "float32": torch.float32,
+            "bfloat16": torch.bfloat16,
+        }[self.server_args.mamba_ssm_dtype]
+
     @override
     def fields_for_layer(
         self, layer_id: int, group_id: str, occurrence: int
@@ -260,7 +272,7 @@ class KimiK3Recipe(CacheRecipe):
                 f"layer.{layer_id}.recurrent_state",
                 plane_id,
                 recurrent_shape,
-                cache_dtype_name(torch.float32),
+                cache_dtype_name(self._recurrent_dtype),
                 exact_page_stride=False,
             ),
         )

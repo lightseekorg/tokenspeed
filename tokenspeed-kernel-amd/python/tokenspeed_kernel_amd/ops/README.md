@@ -1410,8 +1410,8 @@ speculative decode follow verify, acceptance, and commit. Verify retains
 the Gluon fused convolution, LDS vectors and batched value-split selection.
 GFX950 uses 32-row state panels for one-token windows with a bounded gate
 and no value split. Other cases use 16-row panels. Verify preserves committed
-FP32 state. It saves correction U in FP32, and unnormalized K and raw gate in
-the activation dtype.
+FP32 or BF16 state and widens it to FP32. It saves correction U in FP32,
+and unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
 the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
@@ -1439,9 +1439,9 @@ instrumentation. Interval and generation guards remain active; invalid
 records are skipped without device assertions.
 
 Batched descriptors use the shared ten-column table: original QKV (0), conv
-history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
-The remaining columns are reserved. Recovery retains one program per head,
-request and layer. It stages accepted
+history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 or BF16
+state (8). The remaining columns are reserved. Recovery retains one program
+per head, request and layer. It stages accepted
 U, K and raw gate once in LDS, then applies the same updates per value panel.
 It commits each head's convolution history after loading all old taps,
 including when source and destination alias. History retains its bound pool
