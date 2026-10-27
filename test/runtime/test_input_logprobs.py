@@ -597,5 +597,26 @@ def test_prompt_rows_and_sampled_rows_take_the_same_top_k_of_the_same_logits():
     assert torch.equal(out.input_top_logprobs_idx, out.sampled_top_logprobs_idx)
 
 
+def test_logprob_text_preserves_every_position():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel({"hello": 0, "world": 1, "!": 2}))
+    )
+    processor = LogprobsProcessor(SimpleNamespace(tokenizer=tokenizer))
+    values = [None, -0.25, -0.5]
+    assert processor.detokenize_logprob_tokens(values, [0, 1, 2], True) == [
+        (None, 0, "hello"),
+        (-0.25, 1, "world"),
+        (-0.5, 2, "!"),
+    ]
+    assert processor.detokenize_logprob_tokens([], [], True) == []
+    assert processor.detokenize_top_logprobs_tokens(
+        [[-0.25, -0.5]], [[1, 2]], True
+    ) == [[(-0.25, 1, "world"), (-0.5, 2, "!")]]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

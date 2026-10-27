@@ -374,7 +374,9 @@ class LogprobsProcessor:
             ]
         if self.engine.tokenizer is None:
             raise RuntimeError("Tokenizer is required to decode logprob tokens.")
-        token_texts = self.engine.tokenizer.batch_decode(token_logprobs_idx)
+        token_texts = self.engine.tokenizer.batch_decode(
+            [[token_id] for token_id in token_logprobs_idx]
+        )
         return list(zip(token_logprobs_val, token_logprobs_idx, token_texts))
 
     def detokenize_top_logprobs_tokens(
