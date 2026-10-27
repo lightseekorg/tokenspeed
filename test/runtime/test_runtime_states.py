@@ -137,6 +137,24 @@ def test_remote_landing_relies_on_the_receive_time_reset():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_remote_spec_candidates_upload_does_not_synchronize_cuda():
+    states = RuntimeStates(4, 32, 5, "cuda")
+    states.future_input_map.fill_(11)
+    torch.cuda.synchronize()
+    previous_mode = torch.cuda.get_sync_debug_mode()
+    try:
+        torch.cuda.set_sync_debug_mode("error")
+        states.write_remote_spec_candidate_ids(2, [5, 6, 7, 8, 9])
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_mode)
+    torch.cuda.synchronize()
+    assert states.future_input_map.tolist() == [
+        [5, 6, 7, 8, 9] if slot == 2 else [11] * 5 for slot in range(5)
+    ]
+    assert states.spec_candidates_ready.tolist() == [False, False, True, False, False]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_reset_states_does_not_synchronize_cuda():
     states = RuntimeStates(4, 32, 2, "cuda")
     indices = torch.tensor([1, 3], dtype=torch.int64, device="cuda")

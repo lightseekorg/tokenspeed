@@ -173,7 +173,8 @@ Consequences:
   but each is a low-rate path whose caller cannot proceed without the result
   (the landing's failure must surface BEFORE the scheduler advances the
   request into decode). A new blocking method on the per-round path is a bug.
-* Keep per-forward state resets asynchronous on the execution stream too.
+* Keep per-forward state resets and remote-prefill readiness updates
+  asynchronous on the execution stream too.
   Use device-side scalar fills for indexed flags: assigning a Python scalar
   through tensor indexing can stage a CPU tensor and introduce a hidden
   synchronous H2D copy, blocking further forward launches.
