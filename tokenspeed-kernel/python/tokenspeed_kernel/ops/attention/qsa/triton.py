@@ -1430,6 +1430,419 @@ def _qwen4_exp_qsa_pad_keys_to_topk(
 
 
 @triton.jit
+def _qsa_stream_threshold(bits, valid, rank, N: tl.constexpr):
+    """Select an exact unsigned threshold; equal keys share the boundary."""
+    active = valid
+    cutoff = tl.full((), 0, tl.uint32)
+    bins = tl.arange(0, 256)
+    remaining = rank
+    # The most significant byte has very few distinct values for positive
+    # scores. Reductions avoid contending on one shared histogram counter.
+    digits = bits >> 24
+    digit = tl.max(tl.where(active, digits, 0), 0)
+    count = tl.sum((active & (digits == digit)).to(tl.int32), 0)
+    while count < remaining:
+        remaining -= count
+        active &= digits < digit
+        digit = tl.max(tl.where(active, digits, 0), 0)
+        count = tl.sum((active & (digits == digit)).to(tl.int32), 0)
+    cutoff = digit.to(tl.uint32) << 24
+    active &= digits == digit
+    for shift in tl.static_range(16, -1, -8):
+        total = tl.sum(active.to(tl.int32), 0)
+        if remaining == 1:
+            cutoff = tl.max(tl.where(active, bits, 0), 0)
+            return cutoff
+        if remaining == total:
+            cutoff = tl.min(tl.where(active, bits, 0xFFFFFFFF), 0)
+            return cutoff
+        digits = (bits >> shift) & 255
+        hist = tl.histogram(digits.to(tl.int32), 256, mask=active)
+        inclusive = tl.cumsum(hist)
+        higher = total - inclusive
+        digit = tl.max(
+            tl.where((higher < remaining) & (higher + hist >= remaining), bins, 0), 0
+        )
+        remaining -= tl.sum(tl.where(bins > digit, hist, 0), 0)
+        cutoff |= digit.to(tl.uint32) << shift
+        active &= digits == digit
+    return cutoff
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tiles",
+        "num_blocks",
+        "stride_q_n",
+        "stride_q_h",
+        "stride_pt_b",
+    ]
+)
+def _qsa_stream_score_candidates_kernel(
+    query,
+    key_cache,
+    page_table,
+    request_indices,
+    complete_blocks,
+    candidates,
+    discarded,
+    merge_frontiers,
+    num_heads,
+    head_dim,
+    num_blocks,
+    page_size,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_k_n,
+    stride_k_d,
+    stride_pt_b,
+    num_tiles,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    KEEP: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    count = tl.minimum(tl.maximum(tl.load(complete_blocks + row), 0), num_blocks)
+    if tile == 0:
+        tl.store(merge_frontiers + row, tl.where(count > 8192, count, 0))
+    if count <= BLOCK_TOPK:
+        return
+    if tile * 64 >= count:
+        if count > 8192:
+            padding = tl.arange(0, KEEP)
+            tl.store(candidates + row * num_tiles * KEEP + tile * KEEP + padding, 0)
+            tl.store(discarded + row * num_tiles + tile, 0)
+        return
+    effective_keep = tl.where(count <= 4096, 32, KEEP)
+    offsets = tl.arange(0, 64)
+    ids = tile * 64 + offsets
+    packed = tl.zeros((1, 64), tl.uint64)
+    if count > BLOCK_TOPK and tile * 64 < count:
+        request = tl.load(request_indices + row).to(tl.int64)
+        pages = tl.load(
+            page_table + request * stride_pt_b + ids // page_size, ids < count, 0
+        ).to(tl.int64)
+        slots = pages * page_size + ids % page_size
+        heads = tl.arange(0, BLOCK_H)
+        dims = tl.arange(0, BLOCK_D)
+        q = tl.load(
+            query
+            + row * stride_q_n
+            + heads[:, None] * stride_q_h
+            + dims[None, :] * stride_q_d,
+            (heads[:, None] < num_heads) & (dims[None, :] < head_dim),
+            0,
+        )
+        k = tl.load(
+            key_cache + slots[None, :] * stride_k_n + dims[:, None] * stride_k_d,
+            (ids[None, :] < count) & (dims[:, None] < head_dim),
+            0,
+        )
+        acc = tl.dot(q, k, out_dtype=tl.float32, input_precision="ieee")
+        scores = tl.sum(tl.where(heads[:, None] < num_heads, tl.maximum(acc, 0), 0), 0)
+        packed = (
+            ((scores.to(tl.uint32, bitcast=True).to(tl.uint64) + 1) << 32)
+            | ids.to(tl.uint64)
+        )[None, :]
+        packed = tl.where(ids[None, :] < count, packed, 0)
+    packed = _qwen4_exp_qsa_sort_keys(packed, 1, 64, FULL_SORT=True, DESCENDING=True)
+    kept = tl.gather(packed, tl.arange(0, 32)[None, :], 1)
+    upper = tl.sum(tl.where(offsets[None, :] == effective_keep, packed >> 32, 0), 1)
+    retained = tl.arange(0, 32)
+    tl.store(
+        candidates + row * num_tiles * KEEP + tile * effective_keep + retained,
+        tl.reshape(kept, (32,)),
+        retained < effective_keep,
+    )
+    tl.store(discarded + row * num_tiles + tile, tl.reshape(upper, ()))
+
+
+@triton.jit
+def _qsa_stream_merge_candidates_impl(
+    candidates,
+    discarded,
+    complete_blocks,
+    selected,
+    num_tiles,
+    num_blocks,
+    TILE_SIZE: tl.constexpr,
+    N: tl.constexpr,
+    NT: tl.constexpr,
+    KEEP: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    SHORT_FRONTIER: tl.constexpr,
+):
+    row = tl.program_id(0)
+    count = tl.minimum(tl.maximum(tl.load(complete_blocks + row), 0), num_blocks)
+    if SHORT_FRONTIER:
+        actual_tiles = tl.cdiv(count, TILE_SIZE)
+        effective_keep = tl.where(count <= 4096, TILE_SIZE // 2, KEEP)
+        candidate_limit = tl.multiple_of(actual_tiles * effective_keep, KEEP)
+    else:
+        actual_tiles = num_tiles
+        candidate_limit = num_tiles * KEEP
+    # The launcher owns this contiguous CUDA allocation, including its alignment.
+    candidates = tl.multiple_of(candidates, 16)
+    oi = tl.arange(0, BLOCK_TOPK)
+    needs_refine = tl.full((), False, tl.int1)
+    if count <= BLOCK_TOPK:
+        tl.store(selected + row * BLOCK_TOPK + oi, tl.where(oi < count, oi, -1))
+    else:
+        offsets = tl.arange(0, N)
+        packed = tl.load(
+            candidates + row * num_tiles * KEEP + offsets, offsets < candidate_limit, 0
+        )
+        valid = packed != 0
+        if tl.sum(valid.to(tl.int32), 0) >= BLOCK_TOPK:
+            bits = (packed >> 32).to(tl.uint32)
+            cutoff = _qsa_stream_threshold(bits, valid, BLOCK_TOPK, N)
+            greater = valid & (bits > cutoff)
+            equal = valid & (bits == cutoff)
+            total_greater = tl.sum(greater.to(tl.int32), 0)
+            dest = tl.where(
+                greater,
+                tl.cumsum(greater.to(tl.int32)) - 1,
+                total_greater + tl.cumsum(equal.to(tl.int32)) - 1,
+            )
+            tl.store(
+                selected + row * BLOCK_TOPK + dest,
+                (packed & 0xFFFFFFFF).to(tl.int32),
+                (greater | equal) & (dest < BLOCK_TOPK),
+            )
+            tiles = tl.arange(0, NT)
+            upper = tl.load(
+                discarded + row * num_tiles + tiles, tiles < actual_tiles, 0
+            )
+            # Equal boundary scores are interchangeable under the public
+            # unordered top-k contract. Strictly larger discarded scores
+            # require the original complete selection.
+            needs_refine = tl.max(upper, 0) > cutoff
+        else:
+            needs_refine = tl.full((), True, tl.int1)
+    return needs_refine
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tiles",
+        "num_blocks",
+        "stride_q_n",
+        "stride_q_h",
+        "stride_pt_b",
+    ]
+)
+def _qsa_stream_merge_short_candidates_kernel(
+    candidates,
+    discarded,
+    complete_blocks,
+    selected,
+    refine,
+    num_tiles,
+    num_blocks,
+    query,
+    key_cache,
+    page_table,
+    request_indices,
+    num_heads,
+    head_dim,
+    page_size,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_k_n,
+    stride_k_d,
+    stride_pt_b,
+    BLOCK_H: tl.constexpr,
+    TILE_SIZE: tl.constexpr,
+    N: tl.constexpr,
+    NT: tl.constexpr,
+    KEEP: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    count = tl.minimum(tl.maximum(tl.load(complete_blocks + row), 0), num_blocks)
+    if count > 8192:
+        return
+    if N > 2048 and count <= 4096:
+        needs_refine = _qsa_stream_merge_candidates_impl(
+            candidates,
+            discarded,
+            complete_blocks,
+            selected,
+            num_tiles,
+            num_blocks,
+            TILE_SIZE=TILE_SIZE,
+            KEEP=KEEP,
+            BLOCK_TOPK=BLOCK_TOPK,
+            SHORT_FRONTIER=True,
+            N=2048,
+            NT=min(NT, 4096 // TILE_SIZE),
+        )
+    else:
+        needs_refine = _qsa_stream_merge_candidates_impl(
+            candidates,
+            discarded,
+            complete_blocks,
+            selected,
+            num_tiles,
+            num_blocks,
+            TILE_SIZE=TILE_SIZE,
+            KEEP=KEEP,
+            BLOCK_TOPK=BLOCK_TOPK,
+            SHORT_FRONTIER=True,
+            N=N,
+            NT=NT,
+        )
+    if needs_refine:
+        _qwen4_exp_qsa_stream_block_topk_kernel(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            selected,
+            refine,
+            num_heads,
+            head_dim,
+            num_blocks,
+            page_size,
+            stride_q_n,
+            stride_q_h,
+            stride_q_d,
+            stride_k_n,
+            stride_k_d,
+            stride_pt_b,
+            BLOCK_TOPK,
+            BLOCK_TOPK=BLOCK_TOPK,
+            BLOCK_N=min(512, BLOCK_TOPK),
+            BLOCK_H=BLOCK_H,
+            BLOCK_D=32,
+            QUERY_GROUP_SIZE=1,
+            ENABLE_PDL=False,
+            CHECK_REFINE=False,
+        )
+    tl.store(refine + row, needs_refine.to(tl.int32))
+
+
+@triton.jit(
+    do_not_specialize=[
+        "num_tiles",
+        "num_blocks",
+        "stride_q_n",
+        "stride_q_h",
+        "stride_pt_b",
+    ]
+)
+def _qsa_stream_merge_candidates_kernel(
+    candidates,
+    discarded,
+    complete_blocks,
+    selected,
+    refine,
+    num_tiles,
+    num_blocks,
+    query,
+    key_cache,
+    page_table,
+    request_indices,
+    num_heads,
+    head_dim,
+    page_size,
+    stride_q_n,
+    stride_q_h,
+    stride_q_d,
+    stride_k_n,
+    stride_k_d,
+    stride_pt_b,
+    BLOCK_H: tl.constexpr,
+    N: tl.constexpr,
+    NT: tl.constexpr,
+    KEEP: tl.constexpr,
+    BLOCK_TOPK: tl.constexpr,
+    ENABLE_PDL: tl.constexpr,
+):
+    if ENABLE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+    row = tl.program_id(0)
+    count = tl.minimum(tl.maximum(tl.load(complete_blocks + row), 0), num_blocks)
+    oi = tl.arange(0, BLOCK_TOPK)
+    needs_refine = tl.full((), False, tl.int1)
+    if count <= BLOCK_TOPK:
+        tl.store(selected + row * BLOCK_TOPK + oi, tl.where(oi < count, oi, -1))
+    else:
+        offsets = tl.arange(0, N)
+        packed = tl.load(
+            candidates + row * num_tiles * KEEP + offsets, offsets < num_tiles * KEEP, 0
+        )
+        valid = packed != 0
+        if tl.sum(valid.to(tl.int32), 0) >= BLOCK_TOPK:
+            bits = (packed >> 32).to(tl.uint32)
+            cutoff = _qsa_stream_threshold(bits, valid, BLOCK_TOPK, N)
+            greater = valid & (bits > cutoff)
+            equal = valid & (bits == cutoff)
+            total_greater = tl.sum(greater.to(tl.int32), 0)
+            dest = tl.where(
+                greater,
+                tl.cumsum(greater.to(tl.int32)) - 1,
+                total_greater + tl.cumsum(equal.to(tl.int32)) - 1,
+            )
+            tl.store(
+                selected + row * BLOCK_TOPK + dest,
+                (packed & 0xFFFFFFFF).to(tl.int32),
+                (greater | equal) & (dest < BLOCK_TOPK),
+            )
+            tiles = tl.arange(0, NT)
+            upper = tl.load(discarded + row * num_tiles + tiles, tiles < num_tiles, 0)
+            # Equal boundary scores are interchangeable under the public
+            # unordered top-k contract. Strictly larger discarded scores
+            # require the original complete selection.
+            needs_refine = tl.max(upper, 0) > cutoff
+        else:
+            needs_refine = tl.full((), True, tl.int1)
+    if needs_refine:
+        _qwen4_exp_qsa_stream_block_topk_kernel(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            selected,
+            refine,
+            num_heads,
+            head_dim,
+            num_blocks,
+            page_size,
+            stride_q_n,
+            stride_q_h,
+            stride_q_d,
+            stride_k_n,
+            stride_k_d,
+            stride_pt_b,
+            BLOCK_TOPK,
+            BLOCK_TOPK=BLOCK_TOPK,
+            BLOCK_N=min(512, BLOCK_TOPK),
+            BLOCK_H=BLOCK_H,
+            BLOCK_D=32,
+            QUERY_GROUP_SIZE=1,
+            ENABLE_PDL=False,
+            CHECK_REFINE=False,
+        )
+    tl.store(refine + row, needs_refine.to(tl.int32))
+
+
+@triton.jit(do_not_specialize=["num_blocks", "stride_q_n", "stride_q_h", "stride_pt_b"])
 def _qwen4_exp_qsa_stream_block_topk_kernel(
     query,
     key_cache,
@@ -1437,6 +1850,7 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
     request_indices,
     complete_blocks,
     selected_blocks,
+    needs_refine,
     num_heads,
     head_dim,
     num_blocks,
@@ -1454,11 +1868,17 @@ def _qwen4_exp_qsa_stream_block_topk_kernel(
     BLOCK_D: tl.constexpr,
     QUERY_GROUP_SIZE: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
+    CHECK_REFINE: tl.constexpr,
 ):
     if ENABLE_PDL:
         tl.extra.cuda.gdc_wait()
     row = tl.program_id(0) * QUERY_GROUP_SIZE
     query_offsets = tl.arange(0, QUERY_GROUP_SIZE)
+    if CHECK_REFINE:
+        if tl.max(tl.load(needs_refine + row + query_offsets), 0) == 0:
+            if ENABLE_PDL:
+                tl.extra.cuda.gdc_launch_dependents()
+            return
     complete = tl.maximum(
         0, tl.minimum(num_blocks, tl.load(complete_blocks + row + query_offsets))
     )
@@ -1671,7 +2091,9 @@ def triton_qsa_block_topk_stream(
     the expanded slot matrix nor the full score matrix is materialized.
     One program shares K across a group within an explicit uniform request
     run, retains each row's frontier, and writes final ids directly.
-    Only the output is allocated; the running set stays inside the program.
+    Small query grids may use bounded tile candidates and an exact merge.
+    A discarded-score upper bound triggers full selection when necessary.
+    A zero scratch budget keeps the running set inside each program.
 
     Args:
         query: Queries shaped ``[rows, heads, head_dim]``.
@@ -1683,9 +2105,9 @@ def triton_qsa_block_topk_stream(
         block_topk: Power-of-two selection width, at least 64.
         queries_per_request: Uniform request-run width or ``None``. The
             portable kernel groups a divisor of this width to share K.
-            Ragged runs use one row per program.
-        max_partial_bytes: Non-negative global scratch budget. This
-            implementation needs no scratch, including with a zero budget.
+            Native NVIDIA groups also resolve ragged ownership on device.
+        max_partial_bytes: Non-negative global scratch budget for tile
+            candidates. Zero disables that workspace.
         enable_pdl: Explicit programmatic dependent launch ordering.
 
     Returns:
@@ -1705,6 +2127,31 @@ def triton_qsa_block_topk_stream(
             (rows, block_topk), -1, dtype=torch.int32, device=query.device
         )
     selected = torch.empty((rows, block_topk), dtype=torch.int32, device=query.device)
+    if (
+        _is_nvidia
+        and query.dtype == torch.bfloat16
+        and (query.shape[1:] == (4, 128))
+        and (block_topk == 512)
+        and (rows > 128)
+        and (key_cache.stride(2) == 1)
+        and (key_cache.stride(0) % 8 == 0)
+        and (key_cache.data_ptr() % 16 == 0)
+    ):
+        from tokenspeed_kernel.ops.attention.qsa._triton.nvidia_gluon import (
+            launch_qsa_block_topk_stream,
+        )
+
+        return launch_qsa_block_topk_stream(
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            selected,
+            page_size=page_size,
+            queries_per_request=queries_per_request,
+            enable_pdl=enable_pdl,
+        )
     # Four-row groups reuse K while keeping selection registers bounded.
     query_group = math.gcd(queries_per_request or 1, 4)
     block_n = min(512, block_topk)
@@ -1713,6 +2160,223 @@ def triton_qsa_block_topk_stream(
     # accessing the preceding kernel's results.
     use_pdl = _is_nvidia and enable_pdl
     pdl_kwargs = {"launch_pdl": True} if use_pdl else {}
+    # Small query grids cannot cover the device with one program per group.
+    # Keep bounded candidates per independently scored tile, and validate the
+    # discarded upper bound before using them. The final launch only refines
+    # rows for which candidate compression could not prove an exact top-k.
+    native = (
+        current_platform().is_blackwell
+        and query.dtype == torch.bfloat16
+        and query.shape[1:] == (4, 128)
+        and key_cache.stride(2) == 1
+        and key_cache.stride(0) % 8 == 0
+        and key_cache.data_ptr() % 16 == 0
+    )
+    tile_size = 128 if native else 64
+    num_tiles = triton.cdiv(num_blocks, tile_size)
+    keep = (
+        (32 if num_blocks >= 8192 else 64)
+        if native
+        else (16 if num_blocks >= 8192 else 32)
+    )
+    scratch_bytes = rows * (num_tiles * (keep * 8 + 4) + 4)
+    tiled = rows <= 128 and num_blocks >= 2048 and scratch_bytes <= max_partial_bytes
+    refine = selected
+    if tiled:
+        candidates = torch.empty(
+            (rows, num_tiles, keep), dtype=torch.uint64, device=query.device
+        )
+        discarded = torch.empty(
+            (rows, num_tiles), dtype=torch.uint32, device=query.device
+        )
+        refine = torch.empty(rows, dtype=torch.int32, device=query.device)
+        score_kernel = _qsa_stream_score_candidates_kernel
+        paired_native = native and page_size == 64 and rows >= 8
+        native_kwargs = {}
+        if native:
+            from tokenspeed_kernel.ops.attention.qsa._triton.nvidia_gluon import (
+                _qsa_native_score_candidates_kernel,
+            )
+
+            score_kernel = _qsa_native_score_candidates_kernel
+            cache_offset = (key_cache.shape[0] - 1) * key_cache.stride(
+                0
+            ) + 127 * key_cache.stride(2)
+            table_offset = (
+                (page_table.shape[0] - 1) * page_table.stride(0)
+                + page_table.shape[1]
+                - 1
+            )
+            native_kwargs = {
+                "USE_INT32_OFFSETS": max(cache_offset, table_offset) < 2**31
+            }
+            if paired_native:
+                from tokenspeed_kernel.ops.attention.qsa._triton.nvidia_gluon import (
+                    _qsa_native_pair_score_candidates_kernel,
+                )
+
+                score_kernel = _qsa_native_pair_score_candidates_kernel
+                native_kwargs["num_rows"] = rows
+        score_kernel[(triton.cdiv(rows, 2) if paired_native else rows, num_tiles)](
+            query,
+            key_cache,
+            page_table,
+            request_indices,
+            complete_blocks,
+            candidates,
+            discarded,
+            refine,
+            query.shape[1],
+            query.shape[2],
+            num_blocks,
+            page_size,
+            *query.stride(),
+            key_cache.stride(0),
+            key_cache.stride(2),
+            page_table.stride(0),
+            num_tiles,
+            BLOCK_H=triton.next_power_of_2(query.shape[1]),
+            BLOCK_D=triton.next_power_of_2(query.shape[2]),
+            BLOCK_TOPK=block_topk,
+            KEEP=keep,
+            ENABLE_PDL=use_pdl,
+            num_warps=4,
+            num_stages=1,
+            **pdl_kwargs,
+            **native_kwargs,
+        )
+        if native and block_topk == 512:
+            from tokenspeed_kernel.ops.attention.qsa._triton.nvidia_gluon import (
+                _qsa_coarse_merge_candidates_kernel,
+                _qsa_partial_merge_candidates_kernel,
+            )
+
+            num_parts = triton.cdiv(num_tiles * keep, 4096)
+            partial_bytes = rows * num_parts * 512 * 8
+            use_partial = (
+                num_tiles * keep >= 32768
+                and scratch_bytes + partial_bytes <= max_partial_bytes
+            )
+            partials = candidates
+            merge_bound = triton.next_power_of_2(num_tiles * keep)
+            if use_partial:
+                partials = torch.empty(
+                    (rows, num_parts, 512), dtype=torch.uint64, device=query.device
+                )
+                _qsa_partial_merge_candidates_kernel[(rows, num_parts)](
+                    candidates,
+                    discarded,
+                    complete_blocks,
+                    partials,
+                    num_tiles,
+                    num_parts,
+                    num_blocks,
+                    KEEP=keep,
+                    NW=8,
+                    ENABLE_PDL=use_pdl,
+                    num_warps=8,
+                    maxnreg=128,
+                    **pdl_kwargs,
+                )
+                merge_bound = max(triton.next_power_of_2(num_parts * 512), 4096)
+            merge_warps = (
+                32 if merge_bound > 16384 else (16 if merge_bound >= 8192 else 8)
+            )
+            _qsa_coarse_merge_candidates_kernel[(rows,)](
+                candidates,
+                discarded,
+                complete_blocks,
+                selected,
+                refine,
+                num_tiles,
+                num_blocks,
+                partials,
+                num_parts,
+                query,
+                key_cache,
+                page_table,
+                request_indices,
+                rows,
+                page_size,
+                *query.stride(),
+                key_cache.stride(0),
+                key_cache.stride(2),
+                page_table.stride(0),
+                TILE_SIZE=tile_size,
+                KEEP=keep,
+                N=merge_bound,
+                NT=triton.next_power_of_2(num_tiles),
+                NW=merge_warps,
+                ENABLE_PDL=use_pdl,
+                ADAPTIVE=True,
+                USE_PARTIAL=use_partial,
+                num_warps=merge_warps,
+                maxnreg=(
+                    64 if merge_warps == 32 else (128 if merge_warps == 16 else 255)
+                ),
+                **pdl_kwargs,
+            )
+            return selected
+        else:
+            if num_blocks > 8192:
+                _qsa_stream_merge_candidates_kernel[(rows,)](
+                    candidates,
+                    discarded,
+                    refine,
+                    selected,
+                    refine,
+                    num_tiles,
+                    num_blocks,
+                    query,
+                    key_cache,
+                    page_table,
+                    request_indices,
+                    query.shape[1],
+                    query.shape[2],
+                    page_size,
+                    *query.stride(),
+                    key_cache.stride(0),
+                    key_cache.stride(2),
+                    page_table.stride(0),
+                    BLOCK_H=triton.next_power_of_2(query.shape[1]),
+                    KEEP=keep,
+                    BLOCK_TOPK=block_topk,
+                    ENABLE_PDL=use_pdl,
+                    N=triton.next_power_of_2(num_tiles * keep),
+                    NT=triton.next_power_of_2(num_tiles),
+                    num_warps=8 if num_tiles * keep <= 4096 else 16,
+                    **pdl_kwargs,
+                )
+            _qsa_stream_merge_short_candidates_kernel[(rows,)](
+                candidates,
+                discarded,
+                complete_blocks,
+                selected,
+                refine,
+                num_tiles,
+                num_blocks,
+                query,
+                key_cache,
+                page_table,
+                request_indices,
+                query.shape[1],
+                query.shape[2],
+                page_size,
+                *query.stride(),
+                key_cache.stride(0),
+                key_cache.stride(2),
+                page_table.stride(0),
+                BLOCK_H=triton.next_power_of_2(query.shape[1]),
+                KEEP=keep,
+                BLOCK_TOPK=block_topk,
+                ENABLE_PDL=use_pdl,
+                TILE_SIZE=tile_size,
+                N=min(triton.next_power_of_2(num_tiles * keep), 4096),
+                NT=min(triton.next_power_of_2(num_tiles), 8192 // tile_size),
+                num_warps=8,
+                **pdl_kwargs,
+            )
+            return selected
     # Strided query reads keep the GEMM-view input copy-free.
     _qwen4_exp_qsa_stream_block_topk_kernel[(rows // query_group,)](
         query,
@@ -1721,6 +2385,7 @@ def triton_qsa_block_topk_stream(
         request_indices,
         complete_blocks,
         selected,
+        refine,
         query.shape[1],
         query.shape[2],
         num_blocks,
@@ -1738,6 +2403,7 @@ def triton_qsa_block_topk_stream(
         BLOCK_D=32,
         QUERY_GROUP_SIZE=query_group,
         ENABLE_PDL=use_pdl,
+        CHECK_REFINE=tiled,
         num_warps=num_warps,
         num_stages=1,
         **pdl_kwargs,
