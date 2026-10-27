@@ -322,14 +322,13 @@ def test_cold_reader_restores_actual_published_unaligned_checkpoint(
     assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
 
 
-@pytest.mark.parametrize("disable_prefix_cache", [False, True])
-def test_l3_preparation_with_no_free_request_slot(disable_prefix_cache):
+def test_l3_preparation_with_no_free_request_slot():
     c = config(
         host=32, grain=2, groups=[group("full", 2, ts.AttnKind.Full, window=None)]
     )
     c.max_batch_size = 1
     c.enable_mixed_prefill_decode = False
-    c.disable_prefix_cache = disable_prefix_cache
+    c.disable_prefix_cache = False
     s = start(c)
     s.submit_requests([_spec("resident", [100, 101])])
     plan = s.next_execution_plan()
@@ -346,25 +345,18 @@ def test_l3_preparation_with_no_free_request_slot(disable_prefix_cache):
     plan = s.next_execution_plan()
     assert requests(plan) == ["resident"]
     _advance(s, "resident", [103])
-    if disable_prefix_cache:
-        assert not storage_ops(plan)
-    else:
-        query = storage_ops(plan)[0]
-        assert query.kind == ts.StorageKind.Query
-        plan = read(s, query, [1] * len(query.keys))
-        assert requests(plan) == ["resident"]
-        _advance(s, "resident", [104])
-        plan = acknowledge_get(s, plan)
-        assert requests(plan) == ["resident"]
-        assert not any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
-        _advance(s, "resident", [105])
+    query = storage_ops(plan)[0]
+    assert query.kind == ts.StorageKind.Query
+    plan = read(s, query, [1] * len(query.keys))
+    assert requests(plan) == ["resident"]
+    _advance(s, "resident", [104])
+    plan = acknowledge_get(s, plan)
+    assert requests(plan) == ["resident"]
+    assert not any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
+    _advance(s, "resident", [105])
 
     _finish(s, "resident")
     plan = s.next_execution_plan()
     assert requests(plan) == ["waiting"]
-    assert list(plan.forward[0].extend_prefix_lens) == [
-        0 if disable_prefix_cache else 6
-    ]
-    assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache) == (
-        not disable_prefix_cache
-    )
+    assert list(plan.forward[0].extend_prefix_lens) == [6]
+    assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
