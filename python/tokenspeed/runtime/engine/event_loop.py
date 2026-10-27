@@ -350,6 +350,9 @@ class EventLoop:
         self.dp_rank = dp_rank
         self.dp_size = mapping.attn.dp_size
         self.has_dp = mapping.has_attn_dp
+        self.requires_dp_sync = specs.requires_forward_coordination
+        if self.has_dp and not self.requires_dp_sync:
+            logger.info("Local execution groups: DP workers advance independently")
         if self.has_dp:
             self.world_cpu_group = pg_manager.get_process_group(
                 "gloo", mapping.world_group
@@ -1295,7 +1298,7 @@ class EventLoop:
                     # it must not suppress the rest of the scheduler plan.
                     dp_metadata = None
                     need_idle_forward = False
-                    if self.has_dp:
+                    if self.requires_dp_sync:
                         dp_metadata = self._dp_sync_and_check(forward_op)
                         if dp_metadata.need_idle_forward:
                             request_changes.extend(self._drain_in_flight(in_flight))
@@ -1512,7 +1515,10 @@ class EventLoop:
                 close_transfer()
         finally:
             try:
-                self._device.shutdown_cache()
+                try:
+                    self._device.shutdown_cache()
+                finally:
+                    self._device.shutdown_model()
             finally:
                 if self._l3 is not None:
                     self._l3.close(timeout_s=5.0)

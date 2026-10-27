@@ -129,6 +129,7 @@ class _FakeLoop:
         self.scheduler = _Scheduler()
         self._l3_hooks = SimpleNamespace(cancel_request=lambda rid: False)
         self.has_dp = False
+        self.requires_dp_sync = False
         self.kv_transfer = None
 
     def _submit_scheduler_requests(self, specs: list) -> None:

@@ -492,11 +492,11 @@ class PauseHooks:
 
     def paused_idle_step(self) -> None:
         """Run one iteration under ``PAUSED_ALL`` (keep mode): no new forward
-        work, but keep DP ranks in lockstep and yield the CPU so the freeze
-        does not busy-spin a core. The drain check runs at the event loop's
+        work, coordinating ranks only when execution requires it. Yield the
+        CPU so the freeze does not busy-spin a core. The drain check runs at the event loop's
         tail (after the round's results advance the scheduler), not here."""
         loop = self._loop
-        if loop.has_dp:
+        if loop.requires_dp_sync:
             dp_metadata = loop._dp_sync_and_check(None)
             # While memory is released the weights region is unmapped; an idle
             # forward runs the model and would read freed memory. All DP ranks

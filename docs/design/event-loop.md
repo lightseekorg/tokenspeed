@@ -678,3 +678,13 @@ termination and constructor-error cleanup share one process-local shutdown
 latch: once cleanup starts, later worker notifications cannot interrupt it.
 Signal callbacks do not log or enumerate processes; cleanup runs outside the
 callback.
+
+## Independent execution with shared weights
+
+The device build exports `requires_forward_coordination` as an immutable
+capability derived from execution groups. Fully local workers omit the per-round
+DP metadata exchange and peer-induced idle forwards while retaining their DP
+routing identities. Sharing immutable expert weights alone does not require
+forward coordination. Weight-copy streams and readiness/release events remain
+behind the model on the data plane; see
+[distributed immutable weights](distributed-weights.md).

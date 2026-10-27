@@ -235,6 +235,7 @@ class DeviceSpecs:
     spec_num_tokens: int
     uses_eager_grammar: bool
     supports_disaggregation: bool
+    requires_forward_coordination: bool
     supports_pd_layerwise_finalization: bool
     supports_prompt_logprobs: bool
     cache_state_group_ids: tuple[str, ...]
@@ -652,6 +653,14 @@ class DeviceHandle:
             "no completion events and would hang their cache-gated requests",
         )
         return l2.poll_results()
+
+    def shutdown_model(self) -> None:
+        """Drain local readers, then release shared model weights collectively."""
+        from tokenspeed.runtime.layers.moe.peer_weights import PeerWeightOwner
+
+        model = self._executor.model_runner.model
+        if isinstance(model, PeerWeightOwner):
+            self._thread.run(model.close_peer_weights)
 
     def shutdown_cache(self) -> None:
         """Join queued device submissions, then drain the Host copy streams.
@@ -1593,6 +1602,7 @@ def build_device_side(
         spec_num_tokens=spec_num_tokens,
         uses_eager_grammar=executor.eager_grammar_buffers is not None,
         supports_disaggregation=views.token_to_kv_pool.arena.supports_disaggregation,
+        requires_forward_coordination=server_args.mapping.requires_forward_coordination,
         supports_pd_layerwise_finalization=_supports_pd_layerwise_finalization(
             executor, server_args.mapping
         ),
