@@ -249,6 +249,21 @@ the stop token under every schedule ([Scheduler
 dispatched as a rotating first decode publishes at the prompt end, where the
 prompt-end checkpoint it still holds in slot 0 is the canonical block.
 
+State groups may additionally restrict reusable checkpoints with
+`checkpoint_granularity`: intermediate prefill forwards end on its multiples,
+and only states at these positions are published or matched. A forward may
+span several segments; the existing in-forward checkpoint mechanism saves the
+last segment entrance independently of the live endpoint.
+This is a numerical continuation constraint, not a block's token span. The
+grain is also part of the persistent cache identity and the P/D semantic
+contract, so a scan-final state cannot be loaded as an aligned entrance H.
+Unrestricted persistent namespaces remain unchanged. Live State
+blocks retain the same two-slot ownership; an interior checkpoint uses the
+existing separately allocated output block. Checkpoint keys always name the
+actual computed frontier; an unfinished tail is never relabeled as an earlier
+aligned H. Unrestricted State groups preserve the natural-checkpoint policy
+below.
+
 A **natural checkpoint** is a state block that exists because a forward ended
 there -- the prompt end (the block rotated out of slot 1 as the first decode
 runs), the finish (slot 1 in place), the chunk the junction cut ended, or the

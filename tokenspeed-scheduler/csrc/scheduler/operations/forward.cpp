@@ -99,7 +99,8 @@ void appendCompletedPrefixHashes(std::vector<std::string>& prefix_hashes,
 // computes no prompt, and without prefix caching nothing could reuse it.
 std::int32_t inForwardStateCheckpoint(const SchedulerConfig& config, const CacheCoordinator& coordinator,
                                       std::int32_t prompt_tokens) {
-    if (!config.state_checkpoint_in_forward || config.disable_prefix_cache || config.role == Role::kD) {
+    if ((!config.state_checkpoint_in_forward && coordinator.CheckpointGranularity() == 1) ||
+        config.disable_prefix_cache || config.role == Role::kD) {
         return 0;
     }
     return PrefillStateCheckpointTokens(coordinator, prompt_tokens, config.max_scheduled_tokens,

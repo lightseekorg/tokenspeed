@@ -311,12 +311,11 @@ KV with a Host checkpoint resumes, loading the checkpoint alone. When the KV
 groups reach further than the state (`kv_tokens >
 num_common_tokens`), the difference is the junction: the first chunk ends
 there and publishes the checkpoint the cache lacked, so the next prompt that
-shares the prefix resumes at the KV boundary in every group. No alignment is
-ever imposed on a chunk for the state's sake, and apart from the opt-in
+shares the prefix resumes at the KV boundary in every group. For unrestricted
+State groups no alignment is imposed on a chunk, and apart from the opt-in
 in-forward checkpoint above no checkpoint is produced inside a forward: a
 chunk's state output is its own natural checkpoint.
-`CacheProgress::junction_tokens` is the only progress a State group adds to
-the request; the backend contract for the two slots is in
+The backend contract for the two slots is in
 [Cache concepts](cache-concepts.md#recurrent-state-two-slots-natural-checkpoints).
 
 **A superseded input leaves first.** A prompt that resumes at a tail
@@ -345,6 +344,19 @@ resume at -- is never marked. On the fused role a turn also publishes its
 prompt end, at its first decode and at the same epoch: that one and the end
 state still rank level, since which of them the next turn resumes at depends
 on whether the client sends the reply back as it was generated.
+
+**Aligned state checkpoints.** A State group can declare
+`checkpoint_granularity`, a multiple of the prefix-hash grain. Its published
+and matched states must end on that boundary. Intermediate prefill forwards
+end on whole segments; a remaining prompt fitting the budget runs once. The
+existing in-forward checkpoint mechanism saves the entrance of its last
+segment, `(prompt_tokens - 1) / grain * grain`, including when the whole
+prompt fits one round. Thus 8192 tokens run in one forward while saving the
+state at 4096. Prefix reuse stays strictly below the prompt length, so a full
+8192 match resumes at most at 4096. Only that extra entrance is retained;
+ordinary aligned natural endpoints remain reusable. The grain constrains
+each request's logical position, independently of its packed batch offset.
+Unrestricted groups preserve their original scheduling and publication.
 
 **Capacity.** A State group holds at most two blocks per live request on
 every role — the pair, never a page per token — so `ReservePrefillDemands`

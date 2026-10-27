@@ -78,6 +78,9 @@ struct CacheGroupConfig {
     // Cyclic owners of this group's virtual blocks; the pool balances new
     // children across them by request load. 1 keeps the group replicated.
     std::int32_t shard_count{1};
+    // State checkpoints may only be reused/published at multiples of this
+    // token count. 1 preserves arbitrary natural checkpoints. No row span.
+    std::int32_t checkpoint_granularity{1};
 
     void Validate() const;
     // Validate() without the total_pages check: every field the capacity

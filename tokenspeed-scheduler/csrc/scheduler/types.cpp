@@ -34,6 +34,12 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
     if (group.attn_kind != AttnKind::kState && config.prefix_granularity % group.block_granularity != 0) {
         throw std::invalid_argument(where + "block_granularity must divide the scheduler prefix_granularity");
     }
+    if (group.checkpoint_granularity > 1 && (group.checkpoint_granularity % config.prefix_granularity != 0 ||
+                                             config.max_scheduled_tokens < group.checkpoint_granularity)) {
+        throw std::invalid_argument(where +
+                                    "checkpoint_granularity must be a multiple of prefix_granularity "
+                                    "and fit max_scheduled_tokens");
+    }
     if (config.role == Role::kFused) {
         return;
     }
@@ -159,11 +165,21 @@ void SchedulerConfig::ValidateCapacityInputs() const {
         throw std::invalid_argument("Scheduler: overlapped decode requires decode_input_tokens > 0");
     }
     std::int32_t replay_window_tokens = 0;
+    std::int32_t checkpoint_granularity = 1;
     for (const CacheGroupConfig& group : cache_groups) {
         validateGroupCapacityInputs(*this, group);
+        if (group.checkpoint_granularity > 1) {
+            if (checkpoint_granularity != 1 && checkpoint_granularity != group.checkpoint_granularity) {
+                throw std::invalid_argument("restricted State groups must use the same checkpoint_granularity");
+            }
+            checkpoint_granularity = group.checkpoint_granularity;
+        }
         if (group.replayable) {
             replay_window_tokens = std::max(replay_window_tokens, *group.sliding_window_tokens);
         }
+    }
+    if (replay_window_tokens > 0 && checkpoint_granularity > 1) {
+        throw std::invalid_argument("aligned State checkpoints do not support bounded replay groups");
     }
     if (replay_window_tokens > 0) {
         // A prefix hit re-feeds up to one replay window and must still carry

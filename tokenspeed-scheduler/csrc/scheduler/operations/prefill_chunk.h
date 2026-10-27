@@ -43,6 +43,8 @@ namespace tokenspeed {
 // one chunk budget (a later prompt re-prefills it cheaply) and for a model
 // without State groups. The forward that spans the boundary writes the
 // state there (SchedulerConfig::state_checkpoint_in_forward); no chunk is cut.
+// Restricted State groups instead save the last aligned segment entrance,
+// including prompts that fit one chunk budget.
 std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
                                           std::int32_t chunk_budget, std::int32_t prefix_replay_tokens);
 
@@ -64,6 +66,8 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 // token. A junction inside the prompt's final replay window yields to the
 // window rule: the chunk passes the junction rather than waiting for a chunk
 // end that satisfies both. Returns 0 when no chunk fits this round's budget.
+// For restricted State groups, nonterminal chunks contain whole checkpoint
+// segments; a terminal remainder is carried whole whenever it fits.
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
                                 std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens);
 

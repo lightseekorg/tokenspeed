@@ -107,6 +107,7 @@ def cache_group_config(
         attn_kind=attn_kind,
         cache_blocks_per_lcm_block=int(cache_blocks_per_lcm_block),
         shard_count=spec.shard_count,
+        checkpoint_granularity=spec.checkpoint_granularity or 1,
     )
     if spec.transfer_policy is not None:
         mapped_policy = _TRANSFER_POLICY_MAP.get(spec.transfer_policy)
