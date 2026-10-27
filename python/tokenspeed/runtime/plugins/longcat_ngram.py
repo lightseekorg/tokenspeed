@@ -28,6 +28,21 @@ served by :class:`NgramEmbedding`, whose forward mirrors the checkpoint
 reference implementation (base word embedding + per-neighbor polynomial-hash
 embedder/projection contributions, normalized by ``1 + k * (n - 1)``).
 
+**Host-resident n-gram tables (W18 scheme 2).** The embedder tables are
+huge — 12 tables of ``~10.24M x 256`` bf16 each, ~63 GB in total for the
+LongCat-Flash-Lite checkpoint — so they live on the host (CPU RAM) and are
+gathered on demand: every forward only moves the current batch's hashed ids
+to the CPU, looks up the rows there, and moves the (small) per-slot rows
+back to the NPU.  The device keeps only the post projections (~18 MB).
+The tables are created with an explicit ``device='cpu'`` (the runtime builds
+the model inside a ``torch.device(target)`` context, which would otherwise
+allocate the 63 GB on the accelerator) and a ``_apply`` override keeps them
+on the CPU even when the rest of the module is moved (``.to('npu')`` and
+friends).  The ``nn.ModuleList`` is preserved so the checkpoint's 24
+``model.ngram_embeddings.*`` keys keep resolving through
+``named_parameters()`` (embedder weights land in the CPU tables, post
+projection weights land in the NPU linears).
+
 The module is an in-tree runtime plugin: importing it runs ``register()``,
 which calls :func:`tokenspeed.runtime.plugins.registry.register_model`. The
 model registry's ``import_model_classes`` imports the in-tree plugin modules
@@ -42,6 +57,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from tokenspeed.runtime.models.longcat_flash import (
     LongcatFlashForCausalLM,
@@ -65,6 +81,30 @@ def _ensure_ngram_config(config) -> None:
     return config
 
 
+class _HostEmbedding(nn.Embedding):
+    """Host-resident n-gram table with a cheap deterministic initialization.
+
+    The standard ``nn.Embedding`` reset fills the whole table with
+    ``normal_`` — for the LongCat-Flash-Lite tables that is ~63 GB of random
+    numbers, on the order of twenty minutes of pure CPU fill that is thrown
+    away the moment ``load_weights`` streams the real checkpoint values in
+    (the 24 ``model.ngram_embeddings.*`` keys are always loaded before any
+    forward).  This subclass keeps the exact ``nn.Embedding`` semantics
+    (``weight`` parameter, ``padding_idx``, state-dict keys) but replaces
+    the reset with a fast row-index fill: deterministic, finite, and each
+    row differs, so even an unloaded table is a well-defined embedding.
+    """
+
+    def reset_parameters(self) -> None:
+        with torch.no_grad():
+            row = torch.arange(
+                self.num_embeddings,
+                dtype=torch.float32,
+                device="cpu",
+            ) % 1000
+            self.weight.data.copy_(row.unsqueeze(1))
+
+
 class NgramEmbedding(nn.Module):
     """N-gram enriched word embeddings (LongCat-Flash checkpoint layout).
 
@@ -74,6 +114,13 @@ class NgramEmbedding(nn.Module):
     looked up in a per-slot embedding table and projected back to the hidden
     size, then normalized by ``1 + k * (n - 1)``. Uses only plain ``torch``
     ops so it runs unchanged on NPU.
+
+    The per-slot embedder tables are host-resident (``_host_embedders``,
+    ~63 GB total for the LongCat-Flash-Lite checkpoint): they are created
+    on the CPU and a ``_apply`` override keeps them there under any module
+    device move, while the forward gathers only the current batch's rows on
+    demand.  The post projections (small, ~18 MB) stay on the module's
+    device.
 
     Args:
         config: The checkpoint config; needs ``ngram_vocab_size_ratio``,
@@ -97,7 +144,18 @@ class NgramEmbedding(nn.Module):
         self._vocab_mods_cache = None
 
     def _init_ngram_embeddings(self) -> None:
-        """Initialize the per-slot embedder/projection pairs."""
+        """Initialize the per-slot embedder/projection pairs.
+
+        The embedder tables are host-resident (see the module docstring):
+        they are created with an explicit ``device='cpu'`` so the runtime's
+        ``torch.device(target)`` construction context cannot allocate the
+        ~63 GB tables on the accelerator, and the ``_apply`` override below
+        keeps them on the CPU for any later device move.  The
+        ``nn.ModuleList`` registration is kept (not replaced by a plain
+        list) because the checkpoint loader resolves the 24
+        ``model.ngram_embeddings.embedders.*.weight`` /
+        ``...post_projs.*.weight`` keys through ``named_parameters()``.
+        """
         num_embedders = self.k * (self.n - 1)
         emb_dim = self.config.hidden_size // num_embedders
 
@@ -105,13 +163,47 @@ class NgramEmbedding(nn.Module):
         post_projs = []
         for i in range(num_embedders):
             vocab_size = int(self.m + i * 2 + 1)
-            emb = nn.Embedding(vocab_size, emb_dim, padding_idx=self.config.pad_token_id)
+            emb = _HostEmbedding(
+                vocab_size,
+                emb_dim,
+                padding_idx=self.config.pad_token_id,
+                device="cpu",
+            )
             proj = nn.Linear(emb_dim, self.config.hidden_size, bias=False)
             embedders.append(emb)
             post_projs.append(proj)
 
         self.embedders = nn.ModuleList(embedders)
         self.post_projs = nn.ModuleList(post_projs)
+
+    @property
+    def _host_embedders(self) -> list[torch.Tensor]:
+        """CPU-resident n-gram table weights (one ``[vocab_i, emb_dim]`` per slot).
+
+        The weights are the same tensors the ``nn.Embedding`` modules hold
+        (shared storage, so ``load_weights`` writes are visible here); they
+        are simply never moved off the CPU.
+        """
+        return [emb.weight for emb in self.embedders]
+
+    def _apply(self, fn, recurse=True):
+        """Module-wide device/dtype moves must never take the host tables off CPU.
+
+        The n-gram embedder tables are deliberately host-resident (~63 GB);
+        a ``.to('npu')`` (or any other ``_apply``) on the whole module would
+        otherwise move them onto the accelerator and OOM the device.  The
+        embedders are temporarily unregistered so ``super()._apply`` recurses
+        past them, then restored (the registration is what keeps the 24-key
+        ``named_parameters()`` loading contract intact).  Everything else —
+        the base word embedding, the post projections — follows the module's
+        device as usual.
+        """
+        embedders = self._modules.pop("embedders", None)
+        try:
+            return super()._apply(fn, recurse=recurse)
+        finally:
+            if embedders is not None:
+                self._modules["embedders"] = embedders
 
     def _shift_right_ignore_eos(self, tensor: torch.Tensor, n: int) -> torch.Tensor:
         """Shift right by ``n``, resetting at EOS boundaries (vectorized).
@@ -219,9 +311,19 @@ class NgramEmbedding(nn.Module):
                 )
                 new_ids = (ngram_ids % emb_vocab_dim)[..., -seq_len:]
 
-                embedder = self.embedders[index]
-                new_ids = new_ids.to(embedder.weight.device)
-                x_ngram = embedder(new_ids)
+                # Host-resident lookup (W18 scheme 2): the ids were hashed on
+                # the NPU; move only this batch's rows to the CPU, gather the
+                # embedder rows there, and bring the small result back to the
+                # device for the (NPU-resident) post projection.  Numerically
+                # identical to an on-device ``embedder(new_ids)`` — same ids,
+                # same weights — and leaves the ~63 GB tables off the device.
+                host_weight = self._host_embedders[index]
+                new_ids_cpu = new_ids.to("cpu")
+                x_ngram = F.embedding(
+                    new_ids_cpu,
+                    host_weight,
+                    padding_idx=self.config.pad_token_id,
+                ).to(x.device)
                 x_proj = self.post_projs[index](x_ngram)
                 x = x + x_proj.to(x.device)
 
