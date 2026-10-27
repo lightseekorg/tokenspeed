@@ -111,9 +111,12 @@ enum Tiers {
     ForcedRetraction,
     /// A Host L2 tier that published prefixes are written back to.
     HostL2,
-    /// A Host L2 tier that what the prefill role's admissions evict is
-    /// written back to.
+    /// A Host L2 tier that what the Device evicts is written back to.
     HostL2WriteBack,
+    /// `HostL2WriteBack` beside `ForcedRetraction`'s snapshot pool and
+    /// retractions, on 64 usable Full blocks, few enough that restores evict
+    /// cache.
+    HostL2WriteBackForcedRetraction,
     /// A Host L2 tier backed by an L3 store, which holds every prefix page
     /// a query asks for.
     L3,
@@ -121,8 +124,9 @@ enum Tiers {
 
 /// The scheduler over `tiers` for `role`, its KV cache split over
 /// `kv_shard_count` shards: an LCM block then packs one Full block per
-/// shard, so the Device keeps 512 usable Full blocks and a tier with Host
-/// pages 1024, the counts the tests' numbers rely on.
+/// shard, so the Device keeps 512 usable Full blocks (64 on
+/// `HostL2WriteBackForcedRetraction`) and a tier with Host pages 1024, the
+/// counts the tests' numbers rely on.
 fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize) -> Scheduler {
     interpreter();
     let role = match role {
@@ -146,6 +150,15 @@ fn new_scheduler(tiers: Tiers, role: Role, kv_shard_count: usize) -> Scheduler {
             "cfg.disable_l2_cache = False\n\
              cfg.num_host_pages = 1025\n\
              cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack"
+        }
+        Tiers::HostL2WriteBackForcedRetraction => {
+            "cfg.num_device_pages = 64 // cfg.cache_groups[0].shard_count + 1\n\
+             cfg.disable_l2_cache = False\n\
+             cfg.num_host_pages = 1025\n\
+             cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack\n\
+             cfg.num_snapshot_pages = 65\n\
+             cfg.max_retracted_requests = 8\n\
+             cfg.debug_force_retraction_interval = 3"
         }
         Tiers::L3 => {
             "cfg.disable_l2_cache = False\n\
@@ -1970,19 +1983,107 @@ async fn token_histories_are_seeded_where_the_row_lost_them() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retracted_requests_resume_where_they_stopped() {
-    for depth in [0, 1] {
-        let engine = start_engine_with(depth, Tiers::ForcedRetraction).await;
-        let requests = (0..4)
-            .map(|i| request(&format!("r{i}"), 20 + i, budget(12 + i as i64)))
-            .collect();
-        let results = run_all(&engine.client, requests).await;
-        for (i, chunks) in results.iter().enumerate() {
-            let expected: Vec<i32> = (1000..1012 + i as i32).collect();
-            assert_eq!(tokens(chunks), expected, "r{i} at depth {depth}");
+    // Also on mirrored ranks, the second of which acknowledges every cache
+    // op three polls after the first, and with a Host tier written back to.
+    for tiers in [
+        Tiers::ForcedRetraction,
+        Tiers::HostL2WriteBackForcedRetraction,
+    ] {
+        let write_back = matches!(tiers, Tiers::HostL2WriteBackForcedRetraction);
+        for layout in [Layout::Single, Layout::Tp(2), Layout::TpKvp(2, 2)] {
+            for depth in [0, 1] {
+                let engine = start_ranks_with(
+                    layout,
+                    depth,
+                    tiers,
+                    Setup {
+                        cache_ack_polls: Some(|rank| 3 * rank),
+                        ..Setup::default()
+                    },
+                )
+                .await;
+                let case = format!("{layout:?} at depth {depth}, write-back {write_back}");
+                // Under write-back, finished prompts of 2 full pages and a
+                // tail each first fill the Device's 64 blocks with cache (the
+                // last one evicts the first), so the restores below evict
+                // some of it.
+                let warm_prompts = if write_back { 22 } else { 0 };
+                let warm: Vec<_> = (1..=warm_prompts)
+                    .map(|k| TokenizedGenerateReqInput {
+                        input_ids: Some((1000 * k + 1..=1000 * k + 40).collect()),
+                        ..request(&format!("w{k}"), 1, budget(1))
+                    })
+                    .collect();
+                for prompt in &warm {
+                    let chunks = run(&engine.client, prompt.clone()).await;
+                    assert_eq!(tokens(&chunks), [1000], "{case}");
+                }
+                let requests = (0..4)
+                    .map(|i| request(&format!("r{i}"), 20 + i, budget(12 + i as i64)))
+                    .collect();
+                let results = run_all(&engine.client, requests).await;
+                for (i, chunks) in results.iter().enumerate() {
+                    let expected: Vec<i32> = (1000..1012 + i as i32).collect();
+                    assert_eq!(tokens(chunks), expected, "r{i} on {case}");
+                }
+                let stores = engine.cache_ops(CacheOpKind::SnapshotStore);
+                assert!(stores > 0, "nothing was retracted on {case}");
+                assert_eq!(
+                    engine.cache_ops(CacheOpKind::SnapshotRestore),
+                    stores,
+                    "{case}"
+                );
+                if !write_back {
+                    continue;
+                }
+                engine.settle().await;
+                // Under write-back a plan's WriteBack ops are one per image it
+                // stores to the Host and at most one for the cache it evicts:
+                // more of them than SnapshotStore ops write back evicted
+                // cache. Some plan restores and writes back what it evicted,
+                // on every rank.
+                for (rank, member) in engine.ranks.iter().enumerate() {
+                    let plans = member.plans.lock().unwrap();
+                    assert!(
+                        plans.iter().any(|(_, _, ops)| {
+                            let count = |kind| ops.iter().filter(|op| op.kind == kind).count();
+                            count(CacheOpKind::SnapshotRestore) > 0
+                                && count(CacheOpKind::WriteBack) > count(CacheOpKind::SnapshotStore)
+                        }),
+                        "rank {rank}, {case}: no restore wrote back what it evicted"
+                    );
+                }
+                // What the restores evicted is on the Host: every warm prompt
+                // sent again hits its 2 full pages, on the Device or loaded
+                // back. Each one waits for the acknowledgments of the cache
+                // ops before it, so nothing it hits is still in flight.
+                let mut cached = Vec::new();
+                for prompt in warm {
+                    let dispatched = engine.ranks[0]
+                        .plans
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(_, _, ops)| ops.len())
+                        .sum::<usize>();
+                    for _ in 0..500 {
+                        if engine
+                            .ranks
+                            .iter()
+                            .all(|rank| rank.acknowledged.lock().unwrap().len() == dispatched)
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    let chunks = run(&engine.client, prompt).await;
+                    assert_eq!(tokens(&chunks), [1000], "{case}");
+                    cached.push(chunks.last().unwrap().cached_tokens);
+                }
+                assert!(cached.iter().all(|&hit| hit == 32), "{case}: {cached:?}");
+                assert!(engine.cache_ops(CacheOpKind::LoadBack) >= 1, "{case}");
+            }
         }
-        let stores = engine.cache_ops(CacheOpKind::SnapshotStore);
-        assert!(stores > 0, "nothing was retracted at depth {depth}");
-        assert_eq!(engine.cache_ops(CacheOpKind::SnapshotRestore), stores);
     }
 }
 
@@ -2012,6 +2113,305 @@ async fn written_back_prefixes_are_acknowledged() {
             assert_eq!(tokens(&chunks), [1000, 1001, 1002, 1003], "{layout:?}");
         }
         assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0, "{layout:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fused_engine_writes_back_what_it_evicts_and_loads_it_back() {
+    // The prefill engine's case on a fused engine, which decodes its prompts:
+    // publishing a prompt's end at its first decode, a decode page once full
+    // and the rest at the finish stores nothing to the Host; what an
+    // admission evicts is written back in the round that evicts it. Also on
+    // mirrored ranks, acknowledging at the next poll or the odd ones three
+    // polls late.
+    let odd_ranks_three_polls_late: fn(usize) -> usize = |rank| 3 * (rank % 2);
+    for (layout, cache_ack_polls) in [
+        (Layout::Single, None),
+        (Layout::Tp(2), None),
+        (Layout::Tp(2), Some(odd_ranks_three_polls_late)),
+        (Layout::TpKvp(2, 2), None),
+        (Layout::TpKvp(2, 2), Some(odd_ranks_three_polls_late)),
+    ] {
+        for depth in [0, 1] {
+            let engine = start_ranks_with(
+                layout,
+                depth,
+                Tiers::HostL2WriteBack,
+                Setup {
+                    cache_ack_polls,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            let case = format!(
+                "{layout:?} at depth {depth}, delayed {}",
+                cache_ack_polls.is_some()
+            );
+            // Three 3000-token prompts, 187 full pages and an 8-token tail
+            // each, on 512 Device pages; each decodes 24 tokens, filling
+            // its tail's page. The third one's admission evicts the first
+            // one's last pages. Then the first one is sent again.
+            let mut cached = Vec::new();
+            for (rid, first) in [("a", 0), ("b", 10_000), ("c", 20_000), ("a-again", 0)] {
+                if rid == "c" {
+                    // Caching the first two stored nothing to the Host.
+                    assert_eq!(engine.cache_ops(CacheOpKind::WriteBack), 0, "{case}");
+                }
+                let chunks = run(
+                    &engine.client,
+                    TokenizedGenerateReqInput {
+                        input_ids: Some((first + 1..=first + 3000).collect()),
+                        ..request(rid, 1, budget(24))
+                    },
+                )
+                .await;
+                assert_eq!(
+                    tokens(&chunks),
+                    (1000..1024).collect::<Vec<i32>>(),
+                    "{rid} on {case}"
+                );
+                cached.push(chunks.last().unwrap().cached_tokens);
+            }
+            engine.settle().await;
+            // Every rank ran the same plans and acknowledged each of their
+            // cache ops once.
+            let plans = engine.ranks[0].plans.lock().unwrap().clone();
+            let mut dispatched: Vec<u32> = plans
+                .iter()
+                .flat_map(|(_, _, ops)| ops)
+                .map(|op| op.op_id)
+                .collect();
+            dispatched.sort_unstable();
+            for _ in 0..500 {
+                if engine
+                    .ranks
+                    .iter()
+                    .all(|rank| rank.acknowledged.lock().unwrap().len() == dispatched.len())
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            for (rank, member) in engine.ranks.iter().enumerate() {
+                assert_eq!(*member.plans.lock().unwrap(), plans, "rank {rank}, {case}");
+                let mut op_ids: Vec<u32> = member
+                    .acknowledged
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|&(_, _, op_id)| op_id)
+                    .collect();
+                op_ids.sort_unstable();
+                assert_eq!(op_ids, dispatched, "rank {rank}, {case}");
+            }
+            // The eviction's write-backs were acknowledged: the first
+            // prompt hits all its full pages again, loading the
+            // written-back ones from the Host.
+            assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0, "{case}");
+            assert_eq!(engine.cache_ops(CacheOpKind::LoadBack), 1, "{case}");
+            assert_eq!(cached, [0, 0, 0, 187 * 16], "{case}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_abort_while_a_write_back_or_restore_is_in_flight_ends_cleanly() {
+    // The devices acknowledge nothing until the test opens their gates; then
+    // the odd ranks of a mirrored replica acknowledge three polls late.
+    let held = Setup {
+        cache_ack_polls: Some(|rank| 3 * (rank % 2)),
+        held_cache_acks: true,
+        ..Setup::default()
+    };
+    for layout in [Layout::Single, Layout::Tp(2), Layout::TpKvp(2, 2)] {
+        // A prompt aborted while the write-back of what its admission evicted
+        // is in flight: the write-back still lands, and the evicted prompt
+        // sent again loads it back.
+        let engine = start_ranks_with(layout, 1, Tiers::HostL2WriteBack, held.clone()).await;
+        let prompt = |rid: &str, first: i32, max_new_tokens: i64| TokenizedGenerateReqInput {
+            input_ids: Some((first + 1..=first + 3000).collect()),
+            ..request(rid, 1, budget(max_new_tokens))
+        };
+        for (rid, first) in [("a", 0), ("b", 10_000)] {
+            let chunks = run(&engine.client, prompt(rid, first, 8)).await;
+            assert_eq!(
+                tokens(&chunks),
+                (1000..1008).collect::<Vec<i32>>(),
+                "{rid} on {layout:?}"
+            );
+        }
+        // The third prompt's admission evicts the first one's last pages; it
+        // decodes long enough to be aborted while it runs.
+        let doomed = engine
+            .client
+            .generate(prompt("c", 20_000, 1000))
+            .await
+            .unwrap();
+        for _ in 0..5000 {
+            if engine.cache_ops(CacheOpKind::WriteBack) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0, "{layout:?}");
+        // The engine streams nothing more for a client's own abort. Every
+        // rank releases the prompt before its budget runs out, with its
+        // write-back still unacknowledged.
+        assert!(engine.client.abort("c").await.unwrap());
+        drop(doomed);
+        for _ in 0..500 {
+            if (0..engine.ranks.len()).all(|rank| engine.released_on(rank).len() == 3) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for (rank, member) in engine.ranks.iter().enumerate() {
+            let released = engine.released_on(rank);
+            assert_eq!(released.len(), 3, "rank {rank} on {layout:?}");
+            let (rid, generated) = &released[2];
+            assert_eq!(rid, "c", "rank {rank} on {layout:?}");
+            assert!(
+                *generated < 1000,
+                "rank {rank} on {layout:?}: generated {generated} tokens after the abort"
+            );
+            assert!(member.acknowledged.lock().unwrap().is_empty(), "{layout:?}");
+            member.ack_gate.open();
+        }
+        let written_back = engine.cache_ops(CacheOpKind::WriteBack);
+        for _ in 0..500 {
+            if engine
+                .ranks
+                .iter()
+                .all(|rank| rank.acknowledged.lock().unwrap().len() == written_back)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let chunks = run(&engine.client, prompt("a-again", 0, 8)).await;
+        assert_eq!(
+            tokens(&chunks),
+            (1000..1008).collect::<Vec<i32>>(),
+            "{layout:?}"
+        );
+        assert!(engine.cache_ops(CacheOpKind::LoadBack) >= 1, "{layout:?}");
+        assert_eq!(chunks.last().unwrap().cached_tokens, 187 * 16, "{layout:?}");
+        engine.settle().await;
+        assert_eq!(engine.released_on(0).len(), 4, "{layout:?}");
+        for rank in 1..engine.ranks.len() {
+            assert_eq!(
+                engine.released_on(rank),
+                engine.released_on(0),
+                "{layout:?}"
+            );
+        }
+        drop(engine);
+
+        // A request retracted while its image is in flight, so its restore
+        // cannot have run, is aborted. The engine ends a client's abort at the
+        // request's next forward: once its image lands it is restored, ends
+        // short of its budget and is released once, on every rank, and the
+        // requests after it run to the end.
+        let engine = start_ranks_with(
+            layout,
+            1,
+            Tiers::HostL2WriteBackForcedRetraction,
+            held.clone(),
+        )
+        .await;
+        let doomed = engine
+            .client
+            .generate(request("r0", 20, budget(40)))
+            .await
+            .unwrap();
+        for _ in 0..5000 {
+            if engine.cache_ops(CacheOpKind::SnapshotStore) > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            engine.cache_ops(CacheOpKind::SnapshotStore) > 0,
+            "{layout:?}"
+        );
+        assert!(engine.client.abort("r0").await.unwrap());
+        drop(doomed);
+        // A control request acts after the messages that arrived before it:
+        // its reply means the engine took the abort.
+        let paused = ControlRequest::IsSchedulerPaused(IsSchedulerPausedReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        });
+        assert_eq!(
+            control(&engine, paused).await,
+            [("IsSchedulerPausedReqOutput", false)],
+            "{layout:?}"
+        );
+        for rank in &engine.ranks {
+            assert!(rank.acknowledged.lock().unwrap().is_empty(), "{layout:?}");
+            rank.ack_gate.open();
+        }
+        let requests = (1..3)
+            .map(|i| request(&format!("r{i}"), 20 + i, budget(12)))
+            .collect();
+        for (i, chunks) in run_all(&engine.client, requests).await.iter().enumerate() {
+            assert_eq!(
+                tokens(chunks),
+                (1000..1012).collect::<Vec<i32>>(),
+                "r{} on {layout:?}",
+                i + 1
+            );
+        }
+        engine.settle().await;
+        // Every rank ran the same plans and acknowledged each of their cache
+        // ops once, the aborted request's image included.
+        let plans = engine.ranks[0].plans.lock().unwrap().clone();
+        let mut dispatched: Vec<u32> = plans
+            .iter()
+            .flat_map(|(_, _, ops)| ops)
+            .map(|op| op.op_id)
+            .collect();
+        dispatched.sort_unstable();
+        for _ in 0..500 {
+            if engine
+                .ranks
+                .iter()
+                .all(|rank| rank.acknowledged.lock().unwrap().len() == dispatched.len())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        for (rank, member) in engine.ranks.iter().enumerate() {
+            assert_eq!(
+                *member.plans.lock().unwrap(),
+                plans,
+                "rank {rank} on {layout:?}"
+            );
+            let mut op_ids: Vec<u32> = member
+                .acknowledged
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|&(_, _, op_id)| op_id)
+                .collect();
+            op_ids.sort_unstable();
+            assert_eq!(op_ids, dispatched, "rank {rank} on {layout:?}");
+            let released = engine.released_on(rank);
+            assert_eq!(
+                released
+                    .iter()
+                    .map(|(rid, _)| rid.as_str())
+                    .collect::<Vec<_>>(),
+                ["r0", "r1", "r2"],
+                "rank {rank} on {layout:?}"
+            );
+            let (_, generated) = &released[0];
+            assert!(
+                *generated < 40,
+                "rank {rank} on {layout:?}: generated {generated} tokens after the abort"
+            );
+        }
     }
 }
 
@@ -2094,104 +2494,121 @@ async fn an_abort_while_storage_prepares_finishes_the_request() {
 async fn tensor_parallel_ranks_mirror_one_scheduler() {
     // The follower acknowledges each cache op three polls after the first
     // member, so for a while the members hold different acknowledgments.
-    for depth in [0, 1] {
-        let engine = start_ranks_with(
-            Layout::Tp(2),
-            depth,
+    // Also with the KV cache sharded over the members, and with a Host tier
+    // the images are also written back to.
+    for layout in [Layout::Tp(2), Layout::TpKvp(2, 2)] {
+        for tiers in [
             Tiers::ForcedRetraction,
-            Setup {
-                cache_ack_polls: Some(|rank| 3 * rank),
-                ..Setup::default()
-            },
-        )
-        .await;
-        let requests = (0..4)
-            .map(|i| request(&format!("r{i}"), 20 + i, budget(8 + i as i64)))
-            .collect();
-        let results = run_all(&engine.client, requests).await;
-        for (i, chunks) in results.iter().enumerate() {
-            let expected: Vec<i32> = (1000..1008 + i as i32).collect();
-            assert_eq!(tokens(chunks), expected, "r{i} at depth {depth}");
-        }
-        // The follower admitted, scheduled and released the same requests,
-        // and agreed on every cache acknowledgment with the first member.
-        engine.settle().await;
-        assert_eq!(engine.released_on(1), engine.released_on(0));
-        assert_eq!(engine.released_on(0).len(), 4);
-        assert!(engine.cache_ops(CacheOpKind::SnapshotStore) > 0);
-        let plans = engine.ranks[0].plans.lock().unwrap().clone();
-        assert_eq!(
-            *engine.ranks[1].plans.lock().unwrap(),
-            plans,
-            "depth {depth}"
-        );
-        // Each member acknowledged every op once, the follower at least
-        // three polls after the first member.
-        let mut dispatched: Vec<u32> = plans
-            .iter()
-            .flat_map(|(_, _, ops)| ops)
-            .map(|op| op.op_id)
-            .collect();
-        dispatched.sort_unstable();
-        let [first, follower] = [0, 1].map(|rank| {
-            let mut acknowledged = engine.ranks[rank].acknowledged.lock().unwrap().clone();
-            acknowledged.sort_by_key(|&(_, _, op_id)| op_id);
-            acknowledged
-        });
-        let op_ids: Vec<u32> = first.iter().map(|&(_, _, op_id)| op_id).collect();
-        assert_eq!(op_ids, dispatched, "depth {depth}");
-        assert_eq!(follower.len(), first.len(), "depth {depth}");
-        for (&(early, kind, op_id), &(late, follower_kind, follower_op_id)) in
-            first.iter().zip(&follower)
-        {
-            assert_eq!((follower_kind, follower_op_id), (kind, op_id));
-            assert!(
-                late >= early + 3,
-                "op {op_id} at depth {depth}: polls {early} and {late}"
-            );
-        }
-        // A restored request forwards again only from the poll that brought
-        // the follower a restore's acknowledgment: in order, the k-th
-        // request to resume does so no earlier than the k-th such poll. A
-        // forced retraction can take a restored request back before it
-        // forwards, so fewer requests may resume than were restored; at
-        // depth 1 that happens often, and the check is looser there. A
-        // prefill runs alone outside mixed mode, so a decoding request also
-        // sits out the plan that prefills a later prompt: it resumes only
-        // where a plan decoded others since its last forward. Every prompt
-        // here prefills in one forward, so a plan that forwards a request
-        // again decodes.
-        let mut restored: Vec<usize> = follower
-            .iter()
-            .filter(|(_, kind, _)| *kind == CacheEventKind::RestoreDone)
-            .map(|&(poll, _, _)| poll)
-            .collect();
-        restored.sort_unstable();
-        let mut last_forward: HashMap<&str, usize> = HashMap::new();
-        let mut decoded = Vec::with_capacity(plans.len());
-        let mut resumed = Vec::new();
-        for (index, (polls, rids, _)) in plans.iter().enumerate() {
-            decoded.push(
-                rids.iter()
-                    .any(|rid| last_forward.contains_key(rid.as_str())),
-            );
-            for rid in rids {
-                // A plan decoded others since the request's last forward.
-                let returned = last_forward
-                    .insert(rid, index)
-                    .is_some_and(|last| decoded[last + 1..index].contains(&true));
-                if returned {
-                    resumed.push(*polls);
+            Tiers::HostL2WriteBackForcedRetraction,
+        ] {
+            for depth in [0, 1] {
+                let engine = start_ranks_with(
+                    layout,
+                    depth,
+                    tiers,
+                    Setup {
+                        cache_ack_polls: Some(|rank| 3 * rank),
+                        ..Setup::default()
+                    },
+                )
+                .await;
+                let case = format!(
+                    "{layout:?} at depth {depth}, write-back {}",
+                    matches!(tiers, Tiers::HostL2WriteBackForcedRetraction)
+                );
+                let requests = (0..4)
+                    .map(|i| request(&format!("r{i}"), 20 + i, budget(8 + i as i64)))
+                    .collect();
+                let results = run_all(&engine.client, requests).await;
+                for (i, chunks) in results.iter().enumerate() {
+                    let expected: Vec<i32> = (1000..1008 + i as i32).collect();
+                    assert_eq!(tokens(chunks), expected, "r{i} on {case}");
+                }
+                // The follower admitted, scheduled and released the same
+                // requests, and agreed on every cache acknowledgment with the
+                // first member.
+                engine.settle().await;
+                assert_eq!(engine.released_on(1), engine.released_on(0), "{case}");
+                assert_eq!(engine.released_on(0).len(), 4, "{case}");
+                let stores = engine.cache_ops(CacheOpKind::SnapshotStore);
+                assert!(stores > 0, "{case}");
+                assert_eq!(
+                    engine.cache_ops(CacheOpKind::SnapshotRestore),
+                    stores,
+                    "{case}"
+                );
+                let plans = engine.ranks[0].plans.lock().unwrap().clone();
+                assert_eq!(*engine.ranks[1].plans.lock().unwrap(), plans, "{case}");
+                // Each member acknowledged every op once, the follower at
+                // least three polls after the first member.
+                let mut dispatched: Vec<u32> = plans
+                    .iter()
+                    .flat_map(|(_, _, ops)| ops)
+                    .map(|op| op.op_id)
+                    .collect();
+                dispatched.sort_unstable();
+                let [first, follower] = [0, 1].map(|rank| {
+                    let mut acknowledged = engine.ranks[rank].acknowledged.lock().unwrap().clone();
+                    acknowledged.sort_by_key(|&(_, _, op_id)| op_id);
+                    acknowledged
+                });
+                let op_ids: Vec<u32> = first.iter().map(|&(_, _, op_id)| op_id).collect();
+                assert_eq!(op_ids, dispatched, "{case}");
+                assert_eq!(follower.len(), first.len(), "{case}");
+                for (&(early, kind, op_id), &(late, follower_kind, follower_op_id)) in
+                    first.iter().zip(&follower)
+                {
+                    assert_eq!((follower_kind, follower_op_id), (kind, op_id), "{case}");
+                    assert!(
+                        late >= early + 3,
+                        "op {op_id} on {case}: polls {early} and {late}"
+                    );
+                }
+                // A restored request forwards again only from the poll that
+                // brought the follower a restore's acknowledgment: in order,
+                // the k-th request to resume does so no earlier than the k-th
+                // such poll. A forced retraction can take a restored request
+                // back before it forwards, so fewer requests may resume than
+                // were restored; at depth 1 that happens often, and the check
+                // is looser there. A prefill runs alone outside mixed mode, so
+                // a decoding request also sits out the plan that prefills a
+                // later prompt: it resumes only where a plan decoded others
+                // since its last forward. Every prompt here prefills in one
+                // forward, so a plan that forwards a request again decodes.
+                let mut restored: Vec<usize> = follower
+                    .iter()
+                    .filter(|(_, kind, _)| *kind == CacheEventKind::RestoreDone)
+                    .map(|&(poll, _, _)| poll)
+                    .collect();
+                restored.sort_unstable();
+                let mut last_forward: HashMap<&str, usize> = HashMap::new();
+                let mut decoded = Vec::with_capacity(plans.len());
+                let mut resumed = Vec::new();
+                for (index, (polls, rids, _)) in plans.iter().enumerate() {
+                    decoded.push(
+                        rids.iter()
+                            .any(|rid| last_forward.contains_key(rid.as_str())),
+                    );
+                    for rid in rids {
+                        // A plan decoded others since the request's last
+                        // forward.
+                        let returned = last_forward
+                            .insert(rid, index)
+                            .is_some_and(|last| decoded[last + 1..index].contains(&true));
+                        if returned {
+                            resumed.push(*polls);
+                        }
+                    }
+                }
+                assert!(!resumed.is_empty(), "{case}");
+                assert!(resumed.len() <= restored.len(), "{case}");
+                for (resumed, restored) in resumed.iter().zip(&restored) {
+                    assert!(
+                        resumed >= restored,
+                        "{case}: resumed at poll {resumed}, restored at poll {restored}"
+                    );
                 }
             }
-        }
-        assert!(!resumed.is_empty(), "depth {depth}");
-        assert!(resumed.len() <= restored.len(), "depth {depth}");
-        for (resumed, restored) in resumed.iter().zip(&restored) {
-            assert!(
-                resumed >= restored,
-                "depth {depth}: resumed at poll {resumed}, restored at poll {restored}"
-            );
         }
     }
 }
@@ -3442,67 +3859,122 @@ async fn memory_is_released_after_the_drain_and_resumed_in_reverse_order() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn memory_release_waits_for_the_host_stores_in_flight() {
-    // The device holds every cache acknowledgment. A finished request's
-    // prefix is stored to the Host, so the KV cache cannot be cleared, nor
+    // The devices hold every cache acknowledgment until the test opens their
+    // gates; then the odd ranks of a mirrored replica acknowledge three polls
+    // late. Under write-through a finished request's prefix is stored to the
+    // Host; under write-back, what the third of three 3000-token prompts
+    // evicts of the first one. Either way the KV cache cannot be cleared, nor
     // released, until the stores land.
-    let engine = start_ranks_with(
-        Layout::Single,
-        1,
-        Tiers::HostL2,
-        Setup {
-            held_cache_acks: true,
-            ..Setup::default()
-        },
-    )
-    .await;
-    let chunks = run(&engine.client, request("r1", 65, budget(2))).await;
-    assert_eq!(tokens(&chunks), [1000, 1001]);
-    for _ in 0..500 {
-        if engine.cache_ops(CacheOpKind::WriteBack) > 0 {
-            break;
+    for layout in [Layout::Single, Layout::Tp(2), Layout::TpKvp(2, 2)] {
+        for (tiers, prompts) in [
+            (Tiers::HostL2, &[("r1", 0, 65)][..]),
+            (
+                Tiers::HostL2WriteBack,
+                &[("a", 0, 3000), ("b", 10_000, 3000), ("c", 20_000, 3000)][..],
+            ),
+        ] {
+            let write_back = matches!(tiers, Tiers::HostL2WriteBack);
+            let case = format!("{layout:?}, write-back {write_back}");
+            let engine = start_ranks_with(
+                layout,
+                1,
+                tiers,
+                Setup {
+                    cache_ack_polls: Some(|rank| 3 * (rank % 2)),
+                    held_cache_acks: true,
+                    ..Setup::default()
+                },
+            )
+            .await;
+            for &(rid, first, len) in prompts {
+                let chunks = run(
+                    &engine.client,
+                    TokenizedGenerateReqInput {
+                        input_ids: Some((first + 1..=first + len).collect()),
+                        ..request(rid, 1, budget(2))
+                    },
+                )
+                .await;
+                assert_eq!(tokens(&chunks), [1000, 1001], "{rid} on {case}");
+            }
+            for _ in 0..500 {
+                if engine.cache_ops(CacheOpKind::WriteBack) > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0, "{case}");
+            for rank in &engine.ranks {
+                assert!(rank.acknowledged.lock().unwrap().is_empty(), "{case}");
+            }
+            let release =
+                ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
+                    rid: None,
+                    http_worker_ipc: None,
+                    tags: Some(vec!["kv_cache".to_owned()]),
+                });
+            let mut release = std::pin::pin!(engine.client.control(release));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(200), release.as_mut())
+                    .await
+                    .is_err(),
+                "released with Host stores in flight on {case}"
+            );
+            for rank in &engine.ranks {
+                assert!(rank.device_ops.lock().unwrap().is_empty(), "{case}");
+                rank.ack_gate.open();
+            }
+            let released = tokio::time::timeout(Duration::from_secs(10), release)
+                .await
+                .expect("no reply to the release once the stores landed")
+                .unwrap();
+            assert_eq!(
+                outcome(released),
+                [("ReleaseMemoryOccupationReqOutput", true)],
+                "{case}"
+            );
+            let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
+                rid: None,
+                http_worker_ipc: None,
+                tags: Some(vec!["kv_cache".to_owned()]),
+            });
+            assert_eq!(
+                control(&engine, wake).await,
+                [("ResumeMemoryOccupationReqOutput", true)],
+                "{case}"
+            );
+            // The first prompt is served exactly after the wake. Under
+            // write-through it hits its full pages on the Host. Under
+            // write-back the Host holds only the first prompt's last pages,
+            // which continued a prefix the cleared Device alone held: nothing
+            // reaches them, and nothing hits.
+            let (_, first, len) = prompts[0];
+            let chunks = run(
+                &engine.client,
+                TokenizedGenerateReqInput {
+                    input_ids: Some((first + 1..=first + len).collect()),
+                    ..request("again", 1, budget(2))
+                },
+            )
+            .await;
+            assert_eq!(tokens(&chunks), [1000, 1001], "{case}");
+            assert_eq!(
+                chunks.last().unwrap().cached_tokens,
+                if write_back { 0 } else { 64 },
+                "{case}"
+            );
+            // Each rank released and resumed the KV cache once; a follower may
+            // get there after the first member replied.
+            engine.settle().await;
+            for (rank, member) in engine.ranks.iter().enumerate() {
+                assert_eq!(
+                    *member.device_ops.lock().unwrap(),
+                    ["release kv_cache", "resume kv_cache"],
+                    "rank {rank}, {case}"
+                );
+            }
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(engine.cache_ops(CacheOpKind::WriteBack) > 0);
-    assert!(engine.ranks[0].acknowledged.lock().unwrap().is_empty());
-    let release = ControlRequest::ReleaseMemoryOccupation(ReleaseMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: Some(vec!["kv_cache".to_owned()]),
-    });
-    let mut release = std::pin::pin!(engine.client.control(release));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), release.as_mut())
-            .await
-            .is_err(),
-        "released with Host stores in flight"
-    );
-    assert!(engine.ranks[0].device_ops.lock().unwrap().is_empty());
-    engine.ranks[0].ack_gate.open();
-    let released = tokio::time::timeout(Duration::from_secs(10), release)
-        .await
-        .expect("no reply to the release once the stores landed")
-        .unwrap();
-    assert_eq!(
-        outcome(released),
-        [("ReleaseMemoryOccupationReqOutput", true)]
-    );
-    let wake = ControlRequest::ResumeMemoryOccupation(ResumeMemoryOccupationReqInput {
-        rid: None,
-        http_worker_ipc: None,
-        tags: Some(vec!["kv_cache".to_owned()]),
-    });
-    assert_eq!(
-        control(&engine, wake).await,
-        [("ResumeMemoryOccupationReqOutput", true)]
-    );
-    assert_eq!(
-        *engine.ranks[0].device_ops.lock().unwrap(),
-        ["release kv_cache", "resume kv_cache"]
-    );
-    // The same prompt is served exactly after the wake.
-    let chunks = run(&engine.client, request("r2", 65, budget(2))).await;
-    assert_eq!(tokens(&chunks), [1000, 1001]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
