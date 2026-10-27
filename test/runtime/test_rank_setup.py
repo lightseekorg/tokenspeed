@@ -241,6 +241,44 @@ def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
             ts.SchedulerConfig.HostWritePolicy.WriteBack,
             (1, 0),
         ),
+        (
+            ["--kvstore-write-policy", "write_back"],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
+        (
+            ["--kvstore-write-policy", "write_back", "--attn-tp-size", "2"],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
+        (
+            [
+                "--kvstore-write-policy",
+                "write_back",
+                "--attn-tp-size",
+                "8",
+                "--kv-parallel-size",
+                "8",
+                "--decode-context-parallel-size",
+                "8",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
+        (
+            [
+                "--kvstore-write-policy",
+                "write_back",
+                "--attn-tp-size",
+                "8",
+                "--kv-parallel-size",
+                "4",
+                "--decode-context-parallel-size",
+                "4",
+            ],
+            ts.SchedulerConfig.HostWritePolicy.WriteBack,
+            (5, 8),
+        ),
     ],
     ids=[
         "default",
@@ -248,6 +286,10 @@ def test_the_in_forward_state_checkpoint_is_refused_without_prefix_caching():
         "prefill_write_back_attention_tp",
         "prefill_write_back_kvp",
         "prefill_write_back_tp_wider_than_kvp",
+        "fused_write_back",
+        "fused_write_back_attention_tp",
+        "fused_write_back_dcp",
+        "fused_write_back_tp_wider_than_dcp",
     ],
 )
 def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
@@ -262,15 +304,26 @@ def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
 @pytest.mark.parametrize(
     "flags, refused",
     [
-        ([], "--disaggregation-mode null (prefill only)"),
+        (["--disaggregation-mode", "decode"], "--disaggregation-mode decode"),
         (
-            ["--disaggregation-mode", "decode"],
-            "--disaggregation-mode decode (prefill only)",
+            [
+                "--disaggregation-mode",
+                "decode",
+                "--attn-tp-size",
+                "8",
+                "--kv-parallel-size",
+                "8",
+                "--decode-context-parallel-size",
+                "8",
+            ],
+            "--disaggregation-mode decode",
         ),
         (
             ["--disaggregation-mode", "prefill", "--disable-kvstore"],
             "--disable-kvstore (no Host L2)",
         ),
+        # An encode engine runs without the KVStore.
+        (["--disaggregation-mode", "encode"], "--disable-kvstore (no Host L2)"),
         (
             ["--disaggregation-mode", "prefill", "--kvstore-storage-backend", "memory"],
             "--kvstore-storage-backend",
@@ -294,17 +347,76 @@ def test_the_host_write_policy_follows_the_flag(flags, policy, pool):
             ["--disaggregation-mode", "prefill", "--pipeline-parallel-size", "2"],
             "--pipeline-parallel-size > 1",
         ),
+        (["--pipeline-parallel-size", "2"], "--pipeline-parallel-size > 1"),
     ],
-    ids=["fused", "decode", "no_host", "l3", "qcp", "pp"],
+    ids=["decode", "decode_dcp", "no_host", "encode", "l3", "qcp", "pp", "fused_pp"],
 )
-def test_write_back_is_refused_without_its_prerequisites(flags, refused):
-    # The scheduler writes back on the prefill role alone; the runtime with
+def test_write_back_is_refused_without_its_prerequisites(flags, refused, monkeypatch):
+    # The scheduler writes back on every role but decode; the runtime with
     # Host L2 and no L3, on one pipeline stage, and not yet under a query
     # shard. Attention TP and KV parallelism are accepted (above). Each case
-    # breaks one prerequisite, which the write_back check names.
+    # breaks one prerequisite, which the write_back check names. The debug
+    # switch that runs a pipeline on the fused role does not let write_back
+    # through.
+    monkeypatch.setenv("TS_PP_DEBUG_ALLOW_NON_PREFILL", "1")
     with pytest.raises(
         ValueError, match=re.escape(f"write_back does not support {refused}")
     ):
+        prepare_server_args(
+            [
+                "--model",
+                "x",
+                "--max-num-seqs",
+                "8",
+                "--kvstore-write-policy",
+                "write_back",
+                *flags,
+            ]
+        )
+
+
+@pytest.mark.parametrize(
+    "flags, refused",
+    [
+        (
+            ["--attn-tp-size", "8", "--kv-parallel-size", "8"],
+            "--kv-parallel-size > 1 on --disaggregation-mode null requires "
+            "--decode-context-parallel-size 8",
+        ),
+        (
+            [
+                "--attn-tp-size",
+                "8",
+                "--kv-parallel-size",
+                "8",
+                "--decode-context-parallel-size",
+                "8",
+                "--enable-mixed-batch",
+            ],
+            "Aggregated DCP does not support --enable-mixed-batch",
+        ),
+        (
+            [
+                "--disaggregation-mode",
+                "prefill",
+                "--attn-tp-size",
+                "8",
+                "--kv-parallel-size",
+                "8",
+                "--decode-context-parallel-size",
+                "8",
+            ],
+            "--decode-context-parallel-size > 1 requires --disaggregation-mode "
+            "null or decode",
+        ),
+    ],
+    ids=["fused_kvp_without_dcp", "fused_dcp_mixed_batch", "prefill_dcp"],
+)
+def test_write_back_leaves_the_context_parallel_rules_as_they_are(flags, refused):
+    # A fused engine writes back over sharded pages only as the DCP engine
+    # the context-parallel rules make of it, and a prefill engine takes no
+    # DCP: write_back opens none of those layouts.
+    with pytest.raises(ValueError, match=re.escape(refused)):
         prepare_server_args(
             [
                 "--model",
@@ -368,18 +480,27 @@ def test_write_back_beside_a_sliding_window_group_is_refused_at_startup():
         ts.Scheduler(config("write_back"))
 
 
-def test_a_kv_parallel_prefill_engine_writes_back_its_sharded_group():
-    # A KV-parallel prefill engine shards its full-attention group over the
-    # KVP ranks, as the Kimi K3 recipe does; the scheduler built from it
-    # takes write-back as it takes write-through.
+@pytest.mark.parametrize(
+    "role_flags, pool",
+    [
+        (["--disaggregation-mode", "prefill"], (1, 0)),
+        (["--decode-context-parallel-size", "2"], (5, 8)),
+    ],
+    ids=["prefill", "fused"],
+)
+def test_a_kv_parallel_engine_writes_back_its_sharded_group(role_flags, pool):
+    # A KV-parallel prefill or fused engine (the fused one decoding the
+    # sharded pages with DCP and retracting into a snapshot pool) shards its
+    # full-attention group over the KVP ranks, as the Kimi K3 recipe does;
+    # the scheduler built from it takes write-back as it takes write-through.
     layer_types = ("full_attention",)
     (full,) = specs_for_layers(
         layer_types=layer_types,
         group_ids=make_layer_group_ids(layer_num=1, layer_types=layer_types),
         prefix_granularity=16,
-        pd_disaggregation_enabled=True,
+        pd_disaggregation_enabled="prefill" in role_flags,
     )
-    specs = _specs(num_host_pages=17, num_snapshot_pages=1, max_retracted=0)
+    specs = _specs(num_host_pages=17, num_snapshot_pages=pool[0], max_retracted=pool[1])
     specs.cache_groups = [
         cache_group_config(
             dataclasses.replace(full, shard_count=2),
@@ -398,8 +519,7 @@ def test_a_kv_parallel_prefill_engine_writes_back_its_sharded_group():
                 "x",
                 "--max-num-seqs",
                 "8",
-                "--disaggregation-mode",
-                "prefill",
+                *role_flags,
                 "--attn-tp-size",
                 "2",
                 "--kv-parallel-size",

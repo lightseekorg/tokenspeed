@@ -153,11 +153,11 @@ def make_config(
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
         host_write_policy: ``--kvstore-write-policy``: ``"write_through"``
             streams published entries to Host (at chunk ends, the prompt end
-            and finish); ``"write_back"`` writes back what an admission
-            evicts, in the same plan (``SchedulerConfig::Validate`` refuses it
-            where it cannot run). Required on every role; without a Host tier
-            write_through has no effect, and the decode role's Host tier holds
-            retraction images only.
+            and finish); ``"write_back"`` writes back what an admission or a
+            restore evicts, in the same plan (``SchedulerConfig::Validate``
+            refuses it where it cannot run). Required on every role; without a
+            Host tier write_through has no effect, and the decode role's Host
+            tier holds retraction images only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request

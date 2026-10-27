@@ -2035,23 +2035,21 @@ class ServerArgs:
             ("write_through", "write_back"),
         )
         if self.kvstore_write_policy == "write_back":
-            # The scheduler writes back on the prefill role alone, with Host
-            # L2 and no L3 (whose staging would split what it writes back);
-            # pipeline stages and query context parallelism have not run
-            # write-back. Attention TP and --kv-parallel-size need no refusal:
-            # a written-back segment publishes once every rank of the replica
-            # has acknowledged it (docs/design/scheduler.md section 3.1). A
-            # sliding-window cache group or more than 64 cache groups is
-            # refused by SchedulerConfig.Validate, once the model's cache
-            # groups exist.
+            # Decode's Host holds retraction images only, and L3 staging would
+            # split what is written back; pipeline stages and query context
+            # parallelism have not run write-back. Attention TP and
+            # --kv-parallel-size need no refusal: a written-back segment
+            # publishes once every rank of the replica has acknowledged it
+            # (docs/design/scheduler.md section 3.1). A sliding-window cache
+            # group or more than 64 cache groups is refused by
+            # SchedulerConfig.Validate, once the model's cache groups exist.
             unsupported = [
                 setting
                 for setting, refused in (
                     ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
                     (
-                        f"--disaggregation-mode {self.disaggregation_mode} "
-                        "(prefill only)",
-                        self.disaggregation_mode != "prefill",
+                        "--disaggregation-mode decode",
+                        self.disaggregation_mode == "decode",
                     ),
                     (
                         "--kvstore-storage-backend",
@@ -2665,8 +2663,8 @@ class ServerArgs:
             "'write_back' copies only the pages the GPU evicts, in the "
             "scheduling step that evicts them (that step's forward waits for "
             "the copy), so the two tiers hold mostly different pages. "
-            "write_back requires --disaggregation-mode prefill and is refused "
-            "with --disable-kvstore, --kvstore-storage-backend, "
+            "write_back is refused with --disaggregation-mode decode, "
+            "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
             "and at startup for a model with a sliding-window cache group or "
             "more than 64 cache groups; see docs/configuration/server.md.",

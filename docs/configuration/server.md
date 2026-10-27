@@ -1211,9 +1211,9 @@ prefix cache are copied to Host L2:
   the GPU caches is also copied to the Host, which keeps it after the GPU
   evicts the page. The decode role's Host L2 holds retraction images only.
 - `write_back`: nothing is copied when a page is cached. When the GPU
-  evicts cached pages to make room for a request, it copies them to the Host
-  in the same scheduling step, and they can be reused from there once the
-  copy completes.
+  evicts cached pages to make room for a request, or to resume a retracted
+  one, it copies them to the Host in the same scheduling step, and they can
+  be reused from there once the copy completes.
 
 `write_back` lets the two tiers cache more together: the GPU and the Host
 hold mostly different pages, up to about the sum of their capacities less
@@ -1224,7 +1224,8 @@ prompt resumes from both. The cost: a step that evicts must finish copying
 the evicted pages to the Host before its forward pass can write over them,
 so the copy adds to that step's time.
 
-`write_back` requires `--disaggregation-mode prefill` with Host L2,
+`write_back` runs on the fused and prefill roles, not with
+`--disaggregation-mode decode`. It requires Host L2,
 `--pipeline-parallel-size 1`, `--query-context-parallel-size 1` and no
 `--kvstore-storage-backend`, and a model whose KV cache has no sliding-window
 group (sliding-window attention layers make one) and at most 64 cache groups;
@@ -1234,12 +1235,16 @@ built.
 Under `write_back`:
 
 - Clearing only the GPU cache, as `POST /release_memory_occupation` does
-  when it releases `kv_cache`, loses what only the GPU holds. `/flush_cache`
-  clears both tiers under either policy.
+  when it releases `kv_cache`, loses what only the GPU holds, and with it the
+  Host pages that continue a prefix only the GPU held: nothing can reach them
+  any more, and the Host reclaims them. `/flush_cache` clears both tiers
+  under either policy.
 - Not everything the GPU evicts reaches the Host: what a request releases
   itself, what nothing can resume from any more, and pages evicted together
   that the Host cannot fit as a whole are dropped.
-- [KV cache events](#kv-cache-events) keep describing the GPU cache.
+- [KV cache events](#kv-cache-events) keep describing the GPU cache only,
+  so a router reading them does not see the Host's share of the reusable
+  cache, which `write_back` makes larger.
 - Under attention TP, every rank copies its own part of what the engine
   evicts to its own Host L2 (under `--kv-parallel-size`, the pages it owns),
   and an evicted page can be reused from the Host once every rank's copy has
@@ -1252,7 +1257,9 @@ whichever policy is set, not only the copies `write_back` makes. How the
 scheduler implements the two policies is in
 [cache concepts](../design/cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 and, for `write_back`,
-[scheduler §3.1](../design/scheduler.md#31-p--prefill-worker).
+[scheduler §3.1](../design/scheduler.md#31-p--prefill-worker) and, on the
+fused role,
+[§3.3](../design/scheduler.md#33-fused--one-engine-everything-local).
 
 **Sizing.** `--kvstore-size` (gigabytes per rank) wins over
 `--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).

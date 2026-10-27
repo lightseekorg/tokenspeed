@@ -24,8 +24,8 @@
 same owner filter zeroing uses, orders itself behind the execution stream and
 hands the arena whole-block copies; ``CacheArena.copy_blocks`` expands them
 over the group's field table byte for byte. Under Host write-back a copy's
-source or destination can be a page the same plan evicts and writes back;
-the store still reads it first.
+source or destination, or a restore's destination, can be a page the same
+plan evicts and writes back; the store still reads it first.
 """
 
 from __future__ import annotations
@@ -33,6 +33,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from unittest.mock import patch
 
 import numpy as np
 import pytest
@@ -327,8 +328,8 @@ class TestFinishTailHitCopyCudaTest:
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
 class TestWriteBackOfPagesThePlanReusesCudaTest:
-    """Under Host write-back an admission's evictions reach the Host in the
-    plan that re-grants their pages, end to end through
+    """Under Host write-back an admission's or a restore's evictions reach the
+    Host in the plan that re-grants their pages, end to end through
     ``DeviceHandle.execute``.
 
     On a full Device two finished prompts, A and E, each hold two full pages
@@ -342,11 +343,19 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
     through the scheduler's own load-backs: D resends A once B and C are
     done, and its plan evicts B's and C's tails and loads A's into B's page;
     F resends E once D is done, and its plan loads E's into C's former page.
+
+    At overlap depth 1 the loop hands a round over while the forward of the
+    round before may still be running on the execution stream. Two variants
+    stand that forward in, held back, as the last writer of both tails: the
+    store, not held back, still reads what it writes; held back longer than
+    that forward, the store still goes ahead of the round's copy and zeroing,
+    which that forward alone would have released.
     """
 
     PAGE = 16
 
-    def test_pages_a_plan_reuses_reach_the_host_as_the_prompts_left_them(self):
+    @pytest.mark.parametrize("held", ["store", "forward", "forward_and_store"])
+    def test_pages_a_plan_reuses_reach_the_host_as_the_prompts_left_them(self, held):
         ts = pytest.importorskip("tokenspeed_scheduler")
         from test.runtime.cache_pool_test_utils import (
             make_mha_memory_plan,
@@ -563,12 +572,39 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
             assert plan.pages_to_copy_arrays()[group].tolist() == [[tail_a, tail_e]]
             assert list(plan.pages_to_zero[group]) == [tail_a]
 
-            # The round, with the store's copy held back: the handle has
-            # submitted the copy and the zeroing behind it while it waits.
-            with torch.cuda.stream(executor.write_stream):
-                torch.cuda._sleep(200_000_000)
+            if held != "store":
+                # The round before's forward, held back, writes both tails
+                # last: they leave the Device as it leaves them.
+                written = torch.randint(
+                    0,
+                    256,
+                    (arena.buffer.numel(),),
+                    dtype=torch.uint8,
+                    generator=generator,
+                ).cuda()
+                for page in (tail_a, tail_e):
+                    for offset, size in segments(page):
+                        before[offset : offset + size] = written[offset : offset + size]
+                torch.cuda.synchronize()
+                with torch.cuda.stream(model_executor.execution_stream):
+                    torch.cuda._sleep(200_000_000)
+                    for page in (tail_a, tail_e):
+                        for offset, size in segments(page):
+                            arena.buffer[offset : offset + size].copy_(
+                                written[offset : offset + size]
+                            )
+            # The round, with the store's copy held back unless only the
+            # forward is: the handle has submitted the copy and the zeroing
+            # behind the store while it waits.
+            if held != "forward":
+                with torch.cuda.stream(executor.write_stream):
+                    torch.cuda._sleep(
+                        400_000_000 if held == "forward_and_store" else 200_000_000
+                    )
             execute(plan)
             assert not executor.write_stream.query()
+            if held != "store":
+                assert not model_executor.execution_stream.query()
             assert land() == list(store.op_ids)
             assert scheduler.host_pool_cached_blocks() == 2
             expected = before.clone()
@@ -620,6 +656,229 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                 segments(tail_e), segments(tail_a), strict=True
             ):
                 expected[dst_off : dst_off + size] = before[src_off : src_off + size]
+            torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
+        finally:
+            handle.shutdown_cache()
+
+    def test_a_restore_overwrites_a_page_after_its_plan_writes_the_page_back(self):
+        """A restore that evicts Device cache under Host write-back writes it
+        back in its own plan, and its rows can overwrite a page that store
+        reads. The handle submits the store first: with the store's copy held
+        back, the restore waits for it, the Host gets the bytes the page held
+        and the page ends with the restored ones.
+
+        A retracted request's image of page Z lies in the snapshot pool. One
+        plan writes page X back to Host block 1 and restores the image into
+        X; Host block 1 then comes back into page Y.
+        """
+        ts = pytest.importorskip("tokenspeed_scheduler")
+        from test.runtime.cache_pool_test_utils import (
+            make_mha_memory_plan,
+            make_pool,
+            specs_for_layers,
+        )
+
+        from tokenspeed.runtime.cache.l2.executor import HostCacheExecutor
+        from tokenspeed.runtime.cache.l2.sizing import RetractionPoolRequest
+        from tokenspeed.runtime.cache.transfer.ops import (
+            CacheTransfer,
+            HostTier,
+            RestoreOp,
+            SnapshotOp,
+        )
+        from tokenspeed.runtime.execution.device import DeviceHandle
+        from tokenspeed.runtime.execution.model_executor import ModelExecutor
+        from tokenspeed.runtime.layers.attention.kv_cache.hybrid_mha import (
+            HybridMHATokenToKVPool,
+        )
+
+        group = "full_attention"
+        layer_types = ("full_attention",) * 2
+        arena, pool = make_pool(
+            HybridMHATokenToKVPool,
+            make_mha_memory_plan(
+                size=6 * self.PAGE,
+                prefix_granularity=self.PAGE,
+                layer_num=2,
+                kv_heads=1,
+                head_dim=8,
+                dtype=torch.float16,
+            ),
+            device="cuda",
+            cache_group_specs=specs_for_layers(
+                layer_types=layer_types,
+                group_ids=(group,) * 2,
+                prefix_granularity=self.PAGE,
+            ),
+            dtype=torch.float16,
+            head_num=1,
+            head_dim=8,
+            layer_num=2,
+            rank=0,
+            layer_types=layer_types,
+        )
+        executor = HostCacheExecutor(
+            pool,
+            draft_pool=None,
+            l2_tier=True,
+            host_ratio=1.0,
+            host_size_gb=0,
+            # A pool as large as the Device; no slot state beside the pages.
+            snapshot_pool=RetractionPoolRequest(
+                host_gb=0.0,
+                ratio=1.0,
+                max_retracted_requests=1,
+                tail_lcm_blocks_per_request=0,
+            ),
+            slot_state_exporters=(),
+            io_backend="kernel",
+            attn_tp_rank=0,
+            kvp_rank=0,
+            nprocs_per_node=1,
+            world_cpu_group=None,
+        )
+        # A model executor without a model, as above; the plans here copy and
+        # zero no page.
+        model_executor = ModelExecutor.__new__(ModelExecutor)
+        model_executor.device = "cuda"
+        model_executor.device_module = torch.cuda
+        model_executor.default_stream = torch.cuda.default_stream()
+        model_executor.execution_stream = torch.cuda.Stream()
+        model_executor.token_to_kv_pool = pool
+        model_executor.draft_token_to_kv_pool = None
+        model_executor._cache_runtime_contract = arena.runtime_contract
+        model_executor._cache_kvp_rank = 0
+        model_executor.drafter = None
+        handle = DeviceHandle(model_executor, host_cache_executor=executor)
+        handle.bind_forward_thread()
+
+        class WriteBackOp:
+            # Cache.WriteBackOp has no Python constructor; stream-ordered.
+            def __init__(self, op_id, src_page, dst_page):
+                self.op_ids = [op_id]
+                self.group_ids = [[0]]
+                self.src_pages = [[src_page]]
+                self.dst_pages = [[dst_page]]
+                self.source_pinned = [False]
+
+        x, y, z = 1, 2, 3
+        x_segments, y_segments, z_segments = (
+            arena.block_byte_segments(group, [int(local)])
+            for local in local_pages_by_group(
+                {group: [x, y, z]}, contract=arena.runtime_contract, rank=0
+            )[group]
+        )
+        # Nothing to copy or zero: the rounds below are their cache ops.
+        plan = ts.ExecutionPlan()
+        try:
+            # Random bytes stand in for the KV the forwards wrote.
+            generator = torch.Generator(device="cpu").manual_seed(31)
+            arena.buffer.copy_(
+                torch.randint(
+                    0,
+                    256,
+                    (arena.buffer.numel(),),
+                    dtype=torch.uint8,
+                    generator=generator,
+                )
+            )
+            before = arena.buffer.clone()
+            with patch.object(ts.Cache, "WriteBackOp", WriteBackOp):
+                # Z's image into pool block 1, and a store and a restore on
+                # the lanes the round below takes, so that round loads no
+                # kernel and pins no staging memory: either would wait for the
+                # device, the held-back store included.
+                handle.execute(
+                    plan,
+                    None,
+                    cache_ops=[
+                        SnapshotOp(
+                            op_id=1,
+                            request_id="r",
+                            request_pool_index=1,
+                            snapshot_slot=1,
+                            transfers=(CacheTransfer(0, z, 1, "", 0),),
+                        ),
+                        WriteBackOp(2, z, 2),
+                    ],
+                )
+                torch.cuda.synchronize()
+                handle.execute(
+                    plan,
+                    None,
+                    cache_ops=[
+                        RestoreOp(
+                            op_id=3,
+                            request_id="r",
+                            request_pool_index=1,
+                            snapshot_slot=1,
+                            transfers=(CacheTransfer(0, 1, y, "", 0),),
+                            source_tier=(HostTier.SNAPSHOT_POOL,),
+                        )
+                    ],
+                )
+                torch.cuda.synchronize()
+                assert sorted(
+                    (type(ack).__name__, int(ack.op_id))
+                    for ack in handle.poll_cache_results()
+                ) == [
+                    ("RestoreDoneEvent", 3),
+                    ("SnapshotDoneEvent", 1),
+                    ("WriteBackDoneEvent", 2),
+                ]
+
+                # The round, with the store's copy held back: the restore
+                # waits behind it.
+                with torch.cuda.stream(executor.write_stream):
+                    torch.cuda._sleep(200_000_000)
+                handle.execute(
+                    plan,
+                    None,
+                    cache_ops=[
+                        WriteBackOp(4, x, 1),
+                        RestoreOp(
+                            op_id=5,
+                            request_id="r",
+                            request_pool_index=1,
+                            snapshot_slot=1,
+                            transfers=(CacheTransfer(0, 1, x, "", 0),),
+                            source_tier=(HostTier.SNAPSHOT_POOL,),
+                        ),
+                    ],
+                )
+                assert not executor.write_stream.query()
+                assert not executor.load_stream.query()
+                torch.cuda.synchronize()
+                assert sorted(
+                    (type(ack).__name__, int(ack.op_id))
+                    for ack in handle.poll_cache_results()
+                ) == [("RestoreDoneEvent", 5), ("WriteBackDoneEvent", 4)]
+
+                # Host block 1 back into Y, as a restore reads a retracted
+                # request's Host L2 leg.
+                handle.execute(
+                    plan,
+                    None,
+                    cache_ops=[
+                        RestoreOp(
+                            op_id=6,
+                            request_id="r",
+                            request_pool_index=1,
+                            snapshot_slot=1,
+                            transfers=(CacheTransfer(0, 1, y, "", 0),),
+                            source_tier=(HostTier.L2,),
+                        )
+                    ],
+                )
+                torch.cuda.synchronize()
+                assert [int(ack.op_id) for ack in handle.poll_cache_results()] == [6]
+            # X holds Z's restored bytes, and the Host got X's from before.
+            expected = before.clone()
+            for (x_off, size), (y_off, _), (z_off, _) in zip(
+                x_segments, y_segments, z_segments, strict=True
+            ):
+                expected[x_off : x_off + size] = before[z_off : z_off + size]
+                expected[y_off : y_off + size] = before[x_off : x_off + size]
             torch.testing.assert_close(arena.buffer, expected, rtol=0, atol=0)
         finally:
             handle.shutdown_cache()
