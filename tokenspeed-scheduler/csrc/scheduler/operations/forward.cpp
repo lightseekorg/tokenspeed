@@ -870,11 +870,14 @@ std::optional<ImageShortfall> Scheduler::imageShortfall(const Request& request) 
     // plans the L2 leg and counts against the pool what StartRetractionStores
     // will, unless the publication itself changes what that plan reads: a
     // tail it drops under the per-prior cap takes its Host entries along;
-    // and under KV parallelism a slot it re-points to the Device entry
-    // already holding its key rides the pool in that entry's bucket, not the
-    // one counted here. The split retractVictim makes after the publication
-    // can then refuse the image. Nothing is mutated: a candidate that does
-    // not fit is left as it was, and so is the Host.
+    // under the write-back policy the segment step ranks Host victims by
+    // what the Device holds, which the publication adds to
+    // (NumHostBoundariesThatFit); and under KV parallelism a slot it
+    // re-points to the Device entry already holding its key rides the pool
+    // in that entry's bucket, not the one counted here. The split
+    // retractVictim makes after the publication can then refuse the image.
+    // Nothing is mutated: a candidate that does not fit is left as it was,
+    // and so is the Host.
     fsm::CacheProgress cache_progress = request.CacheProgress();
     const std::int32_t num_computed_tokens = request.NumComputedTokens();
     const RequestProgress progress =

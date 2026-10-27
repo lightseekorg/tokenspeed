@@ -2784,10 +2784,15 @@ TEST_F(L2LegOfTheSecondCandidateFitsSuite, TheVictimRuleSkipsACandidateWhoseL2Le
     const ForwardBatch* granted = FindForwardBatch(round);
     ASSERT_NE(granted, nullptr);
     EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"});
-    const TierTransferManager::WriteBackStats retraction_stores = scheduler_->GetHostCacheStats().retraction_stores;
-    EXPECT_EQ(retraction_stores.blocks, (std::vector<std::uint64_t>{3, 3})) << "b's three pages in both groups";
-    EXPECT_EQ(retraction_stores.snapshot_fallback, 0u);
-    EXPECT_EQ(retraction_stores.image_refused, 0u);
+    const HostCacheStats stats = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(stats.retraction_stores.blocks, (std::vector<std::uint64_t>{3, 3})) << "b's three pages in both groups";
+    EXPECT_EQ(stats.retraction_stores.snapshot_fallback, 0u);
+    EXPECT_EQ(stats.retraction_stores.image_refused, 0u);
+    // Write-through places the leg block by block: a's prompt pages, still
+    // on the Device, leave the Host as lru, where segments would count them
+    // as duplicates.
+    EXPECT_EQ(stats.host_evictions.lru.blocks, 6u);
+    EXPECT_EQ(stats.host_evictions.duplicate.blocks, 0u);
 }
 
 // The knob's victim takes the same probe, which plans the L2 leg: a victim

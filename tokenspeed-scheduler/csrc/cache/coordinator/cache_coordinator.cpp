@@ -1444,9 +1444,10 @@ CacheBlockRef CacheCoordinator::AcquireHostBlock(std::uint32_t group_id, std::in
     return batch.blocks.empty() ? CacheBlockRef{} : std::move(batch.blocks.front());
 }
 
-CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
-    std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
-    std::span<const HostSegmentRows> boundaries) const {
+CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostBoundaries(std::span<const std::uint32_t> group_ids,
+                                                                         std::span<const std::int32_t> buckets,
+                                                                         std::span<const HostSegmentRows> boundaries,
+                                                                         bool place_by_segments) const {
     _assert(host_pool_ != nullptr, "Host placement requires a host pool");
     _assert(group_ids.size() == buckets.size(), "Host allocation needs one bucket per requested block");
     std::size_t next_row = 0;
@@ -1469,14 +1470,30 @@ CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
     }
     const std::vector<std::int64_t> no_dense_need(groups_.size(), 0);
     ShadowOccupancy shadow{*host_pool_, groups_};
-    HostBoundaryPlan plan;
+    HostPlacementPlan plan;
     // Every row fits the free capacity: no victim.
     if (shadow.Fits(need_by_bucket, no_dense_need)) {
-        plan.num_boundaries = boundaries.size();
+        plan.num_placed = boundaries.size();
         return plan;
     }
+    // By segments, every boundary is planned first as AcquireHostSegments
+    // plans an eviction write-back's segments; the per-block plan then places
+    // the ones the segment step dropped, against the Host less its victims.
+    // Where the two steps place fewer than the per-block plan alone, that
+    // plan stands: the image comes before the cache.
+    if (place_by_segments) {
+        plan = planHostSegments(group_ids, buckets, boundaries);
+        if (plan.num_placed == boundaries.size()) {
+            return plan;
+        }
+    }
+    // The demand restarts from the rows the segments place.
     for (std::vector<std::int64_t>& group_need : need_by_bucket) {
         std::ranges::fill(group_need, 0);
+    }
+    const std::size_t num_segment_rows = plan.num_placed == 0 ? 0 : boundaries[plan.num_placed - 1].past_end_row;
+    for (std::size_t row = 0; row < num_segment_rows; ++row) {
+        ++need_by_bucket[group_ids[row]][static_cast<std::size_t>(buckets[row])];
     }
 
     // AcquireHostBlocks' candidates, in its order: per group and bucket the
@@ -1528,13 +1545,22 @@ CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
     std::size_t next_parent = 0;
 
     std::unordered_set<CacheBlockLocation, CacheBlockLocationHash> taken;
+    // The segments' victims leave first.
+    for (const HostPlacementPlan::Victim& victim : plan.victims) {
+        shadow.Remove(victim.group_id, victim.location);
+        taken.insert(victim.location);
+        if (const auto parent = parents.find(victim.location.lcm_block_id); parent != parents.end()) {
+            --parent->second.untaken_occupants;
+        }
+    }
     const auto take_entry = [&](std::uint32_t group_id, CacheBlockLocation location) {
         shadow.Remove(group_id, location);
         taken.insert(location);
         if (const auto parent = parents.find(location.lcm_block_id); parent != parents.end()) {
             --parent->second.untaken_occupants;
         }
-        plan.victims.emplace_back(group_id, location);
+        plan.victims.push_back(
+            HostPlacementPlan::Victim{.group_id = group_id, .location = location, .reason = &HostEvictionStats::lru});
     };
     // As evictHostCachedBlock evicts: a checkpoint takes the other State
     // groups' at its hash along, those not pinned (Find's reference is the
@@ -1560,7 +1586,7 @@ CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
     // fit the capacity left go first, then each other row, in order, takes
     // victims until it fits. A boundary short of a victim returns those it
     // took and ends the plan.
-    for (const HostSegmentRows& boundary : boundaries) {
+    for (const HostSegmentRows& boundary : boundaries.subspan(plan.num_placed)) {
         const std::size_t num_victims_before = plan.victims.size();
         std::vector<std::size_t> short_rows;
         for (std::size_t row = boundary.first_row; row < boundary.past_end_row; ++row) {
@@ -1620,6 +1646,13 @@ CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
                 const bool has_parent = next_parent < victim_parents.size();
                 if (!has_child && !has_parent) {
                     plan.victims.resize(num_victims_before);
+                    if (place_by_segments) {
+                        HostPlacementPlan per_block =
+                            planHostBoundaries(group_ids, buckets, boundaries, /*place_by_segments=*/false);
+                        if (per_block.num_placed > plan.num_placed) {
+                            return per_block;
+                        }
+                    }
                     return plan;
                 }
                 // Equal epochs prefer one child, as in AcquireHostBlocks.
@@ -1640,7 +1673,7 @@ CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
                 }
             }
         }
-        ++plan.num_boundaries;
+        ++plan.num_placed;
     }
     return plan;
 }
@@ -1648,45 +1681,14 @@ CacheCoordinator::HostBoundaryPlan CacheCoordinator::planHostBoundaries(
 std::size_t CacheCoordinator::NumHostBoundariesThatFit(std::span<const std::uint32_t> group_ids,
                                                        std::span<const std::int32_t> buckets,
                                                        std::span<const HostSegmentRows> boundaries) const {
-    return planHostBoundaries(group_ids, buckets, boundaries).num_boundaries;
+    return planHostBoundaries(group_ids, buckets, boundaries, write_back_evictions_).num_placed;
 }
 
 CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBoundaries(
     std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
     std::span<const HostSegmentRows> boundaries) {
-    const HostBoundaryPlan plan = planHostBoundaries(group_ids, buckets, boundaries);
-    // Evict, then allocate, as AcquireHostSegments does: the planned rows fit
-    // jointly once the victims are gone.
-    for (const auto& [group_id, location] : plan.victims) {
-        // A checkpoint takes the other State groups' at its hash along.
-        if (groups_[group_id].Index().Contains(*host_pool_, location)) {
-            FatalCheck(evictHostCachedBlock(group_id, location, &HostEvictionStats::lru),
-                       "a planned Host victim became pinned");
-        }
-        FatalCheck(!host_pool_->IsOccupied(location), "a planned Host victim's block is still occupied");
-    }
-    HostAllocationBatch batch;
-    batch.blocks.resize(group_ids.size());
-    batch.stats.requested = group_ids.size();
-    const std::size_t num_placed_rows = plan.num_boundaries == 0 ? 0 : boundaries[plan.num_boundaries - 1].past_end_row;
-    for (std::uint32_t group_id = 0; group_id < groups_.size(); ++group_id) {
-        std::vector<std::size_t> rows;
-        std::vector<std::int32_t> group_buckets;
-        for (std::size_t row = 0; row < num_placed_rows; ++row) {
-            if (group_ids[row] == group_id) {
-                rows.push_back(row);
-                group_buckets.push_back(buckets[row]);
-            }
-        }
-        std::vector<CacheBlockRef> blocks = host_pool_->AcquireBlocksInBuckets(group_id, group_buckets);
-        FatalCheck(blocks.size() == rows.size(), "a planned Host placement did not fit");
-        for (std::size_t j = 0; j < rows.size(); ++j) {
-            batch.blocks[rows[j]] = std::move(blocks[j]);
-        }
-    }
-    batch.stats.allocated = num_placed_rows;
-    batch.stats.unallocated = batch.stats.requested - num_placed_rows;
-    return batch;
+    return acquireHostPlacement(planHostBoundaries(group_ids, buckets, boundaries, write_back_evictions_), group_ids,
+                                buckets, boundaries);
 }
 
 CacheBlockRef CacheCoordinator::FindHostCachedBlock(const CacheKey& key) const {

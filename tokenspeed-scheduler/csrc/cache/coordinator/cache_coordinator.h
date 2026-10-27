@@ -75,8 +75,9 @@ public:
     // whether ordinary Device prefix publication also feeds the Host tier;
     // write_back_evictions whether an admission or a restore evicts Device
     // cache by segments and records them for the plan's write-back drain
-    // (TakeEvictedSegments), and dead prefix entries are collected on both
-    // tiers (the Host write-back policy; it needs a Host pool and excludes
+    // (TakeEvictedSegments), dead prefix entries are collected on both tiers,
+    // and a retraction image's Host leg takes room by whole segments first
+    // (the Host write-back policy; it needs a Host pool and excludes
     // streaming). The snapshot pool holds retracted requests' private KV
     // images (Snapshot / Restore); nullptr means the engine never retracts.
     // enable_l3_storage, host_pool, snapshot_pool, stream_device_cache_to_host
@@ -495,8 +496,10 @@ public:
     // under the same reason.
     struct HostEvictionStats {
         // AcquireHostBlocks' global LRU took it, as one child or with a whole
-        // parent, whoever asked (a publication, finish or retraction store, an
-        // L3 prefetch), or a segment plan (AcquireHostSegments) took it as
+        // parent, whoever asked (a publication or finish store, an L3
+        // prefetch); a retraction image's leg took it block by block in that
+        // ranking (AcquireHostBoundaries); or a segment plan
+        // (AcquireHostSegments, or that leg's segment step) took it as
         // Host-only cache.
         HostEvictionCounts lru;
         // A segment plan took it as a duplicate of a boundary the Device
@@ -545,9 +548,9 @@ public:
     // capacity before it picks a victim, so it places in the room such a
     // cascade freed before another victim goes. Block by block: it serves
     // publication and finish stores and L3 prefetches. A retraction image's
-    // Host blocks come from AcquireHostBoundaries, whose plan ranks victims
-    // as this does (change the two together), and the Host blocks of what an
-    // eviction writes back from AcquireHostSegments.
+    // Host blocks come from AcquireHostBoundaries, whose per-block plan ranks
+    // victims as this does (change the two together), and the Host blocks of
+    // what an eviction writes back from AcquireHostSegments.
     HostAllocationBatch AcquireHostBlocks(std::span<const std::uint32_t> group_ids,
                                           std::span<const std::int32_t> buckets);
     // One segment of an AcquireHostSegments batch, or one boundary of a
@@ -582,7 +585,8 @@ public:
     // under the page above it, that page is a candidate too. The restore pass
     // then returns, newest first, each victim the placed segments can do
     // without and whose parent page stays. A dropped segment's rows hold empty
-    // references.
+    // references. A retraction image's leg under the write-back policy plans
+    // its boundaries this way first (NumHostBoundariesThatFit).
     HostAllocationBatch AcquireHostSegments(std::span<const std::uint32_t> group_ids,
                                             std::span<const std::int32_t> buckets,
                                             std::span<const HostSegmentRows> segments);
@@ -593,7 +597,9 @@ public:
     // It plans block by block with AcquireHostBlocks' victim ranking against
     // a shadow of the Host, which does not know which parent the pool gives
     // each row, so where several parents have room the victims can
-    // differ from those AcquireHostBlocks would take.
+    // differ from those AcquireHostBlocks would take. The write-back policy
+    // places by segments first and never places fewer boundaries than block
+    // by block (docs/design/scheduler.md §2).
     std::size_t NumHostBoundariesThatFit(std::span<const std::uint32_t> group_ids,
                                          std::span<const std::int32_t> buckets,
                                          std::span<const HostSegmentRows> boundaries) const;
@@ -799,16 +805,36 @@ private:
     };
     std::optional<SnapshotPoolPlan> planSnapshotPool(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                                      std::span<const std::vector<ImageSlot>> host_served_slots) const;
-    // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
-    // carries out: how many boundaries the Host places, and the victims they
-    // need, in eviction order (a checkpoint's State siblings after it). Its
-    // victim ranking is AcquireHostBlocks'; change the two together.
-    struct HostBoundaryPlan {
-        std::size_t num_boundaries{0};
-        std::vector<std::pair<std::uint32_t, CacheBlockLocation>> victims;
+    // A Host placement planned against a shadow before anything is evicted:
+    // how many of the leading segments or boundaries the Host places, and
+    // the entries to evict for them, in eviction order (a checkpoint's State
+    // siblings after it), each with the reason it counts under.
+    struct HostPlacementPlan {
+        struct Victim {
+            std::uint32_t group_id{0};
+            CacheBlockLocation location;
+            HostEvictionCounts HostEvictionStats::*reason{nullptr};
+        };
+        std::size_t num_placed{0};
+        std::vector<Victim> victims;
     };
-    HostBoundaryPlan planHostBoundaries(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
-                                        std::span<const HostSegmentRows> boundaries) const;
+    // The plan AcquireHostSegments carries out and planHostBoundaries'
+    // segment step reuses.
+    HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
+                                       std::span<const HostSegmentRows> segments) const;
+    // Carries out a plan of planHostSegments or planHostBoundaries: evicts its
+    // victims, then the rows of the segments it places take the room they
+    // leave. The rows of the later segments hold empty references.
+    HostAllocationBatch acquireHostPlacement(const HostPlacementPlan& plan, std::span<const std::uint32_t> group_ids,
+                                             std::span<const std::int32_t> buckets,
+                                             std::span<const HostSegmentRows> segments);
+    // The plan NumHostBoundariesThatFit counts and AcquireHostBoundaries
+    // carries out; by whole segments first with place_by_segments (the
+    // write-back policy), else block by block alone. Its per-block victim
+    // ranking is AcquireHostBlocks'; change the two together.
+    HostPlacementPlan planHostBoundaries(std::span<const std::uint32_t> group_ids,
+                                         std::span<const std::int32_t> buckets,
+                                         std::span<const HostSegmentRows> boundaries, bool place_by_segments) const;
     std::vector<CacheKey> keysForGroup(std::span<const std::string> content_hashes, std::uint32_t group_id) const;
     std::vector<std::vector<CacheKey>> buildGroupKeys(std::span<const std::string> content_hashes) const;
     template <CacheTier Tier>

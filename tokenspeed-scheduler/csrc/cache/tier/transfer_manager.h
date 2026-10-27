@@ -130,7 +130,7 @@ public:
     RetractionImageSplit SplitRetractionImage(std::span<const BlockTable> tables, std::int32_t num_tokens,
                                               std::vector<std::vector<ImageSlot>> published) const;
     // Takes the image of a quiescent victim's tables ([0, num_tokens) are its
-    // computed tokens) as `split` planned it -- with no shortfall, and nothing
+    // computed tokens) as `split` planned it -- with no shortfall and nothing
     // changed since -- and starts both store legs: the Host takes the rows of
     // the first split.num_host_boundaries boundaries, evicting the victims
     // the plan chose, and the later rows ride the snapshot pool. The image

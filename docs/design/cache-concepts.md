@@ -960,8 +960,9 @@ Its responsibilities:
   published entries (with the key, logical index, and boundary kind each was
   published under), `TierTransferManager::SplitRetractionImage` plans their
   Host blocks before anything is acquired or evicted for them — keys already
-  Host-cached, or carried by a store in flight, are pinned; of the rest, the
-  Host takes the leading boundaries that fit whole
+  Host-cached, or carried by a store in flight that publishes them at its
+  ACK, are pinned; of the rest, the Host takes the leading boundaries that
+  fit whole
   (`CacheCoordinator::NumHostBoundariesThatFit`) — and
   `StartRetractionStores` carries out that plan: the taken rows become one
   stream-ordered write-back whose Host entries the image pins, and
@@ -998,18 +999,19 @@ Its responsibilities:
   the reclaim of the request that superseded it.
   Write-through's publication and finish stores and L3 prefetches take Host
   blocks one by one (`AcquireHostBlocks`), a retraction image's leg by the
-  plan `SplitRetractionImage` made (`AcquireHostBoundaries`). What the
-  write-back policy writes back takes them per segment
-  (`AcquireHostSegments`), and a segment arrives whole: every segment's blocks
-  are fitted jointly before anything is evicted, a segment is placed whole or
-  not at all, and nothing is evicted for a dropped one. Each row's Host block
-  is fitted and placed in its Device block's bucket, so under KV parallelism
-  every rank copies only the rows it owns; a segment one bucket cannot fill is
-  dropped whole, even when another bucket has room. Host victims are whole as
-  well, never in use, and never take or sit right under a page an eviction
-  write-back is still bringing, which would otherwise arrive with nothing
-  under it; dead entries go first, Host-only cache last. `AcquireHostSegments`
-  documents the victim shapes, the ranking and the restore pass.
+  plan `SplitRetractionImage` made (`AcquireHostBoundaries`; under the
+  write-back policy whole segments first, `scheduler.md` §2), and what the
+  write-back policy writes back per segment (`AcquireHostSegments`), and a
+  segment arrives whole: every segment's blocks are fitted jointly before
+  anything is evicted, a segment is placed whole or not at all, and nothing is
+  evicted for a dropped one. Each row's Host block is fitted and placed in its
+  Device block's bucket, so under KV parallelism every rank copies only the
+  rows it owns; a segment one bucket cannot fill is dropped whole, even when
+  another bucket has room. Host victims are whole as well, never in use, and
+  never take or sit right under a page an eviction write-back is still
+  bringing, which would otherwise arrive with nothing under it; dead entries
+  go first, Host-only cache last. `AcquireHostSegments` documents the victim
+  shapes, the ranking and the restore pass.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at

@@ -565,21 +565,22 @@ the image as the split planned:
 - *The L2 leg.* A slot whose Device block is a published prefix entry becomes
   an ordinary Host L2 entry, acquired — like every Host copy — in the Device
   block's bucket (`cache-concepts.md`, placement). Keys already Host-cached, or
-  carried by a store still in flight, are pinned rather than copied again; the
-  rest ride one `WriteBackOperation` issued with
-  `StoreSourceGuard::kStreamOrdered`. The image holds a pinned `CacheBlockRef`
-  on each Host entry until the restore lands, so the planner cannot evict it
-  and `ClearCache` refuses, but the entries are published prefix cache like any
-  other and later prompts may hit them. The pin follows the publication, not
-  the ticket's block: when the store's ACK finds the key already canonical on
-  Host (an L3 prefetch of the same page by another prompt landed first),
-  `PrefixCacheIndex::Register` redirects the ticket to that entry, and
-  `CompleteWriteBack` hands the entries as published to every `Retracted`
-  request waiting for the op (`StoreLandedEvent`,
+  carried by a store still in flight that publishes them at its ACK (never an
+  eviction write-back's segment, which may publish late or not at all), are
+  pinned rather than copied again; the rest ride one `WriteBackOperation`
+  issued with `StoreSourceGuard::kStreamOrdered`. The image holds a pinned
+  `CacheBlockRef` on each Host entry until the restore lands, so the planner
+  cannot evict it and `ClearCache` refuses, but the entries are published
+  prefix cache like any other and later prompts may hit them. The pin follows
+  the publication, not the ticket's block: when the store's ACK finds the key
+  already canonical on Host (an L3 prefetch of the same page by another prompt
+  landed first), `PrefixCacheIndex::Register` redirects the ticket to that
+  entry, and `CompleteWriteBack` hands the entries as published to every
+  `Retracted` request waiting for the op (`StoreLandedEvent`,
   `RetractionImage::FollowPublished`), which re-points its slot to the
-  canonical block and lets its own unindexed block return to the pool. An
-  image therefore never pins a Host block the index does not know, and the
-  restore's L2 rows always come from published entries.
+  canonical block and lets its own unindexed block return to the pool. An image
+  therefore never pins a Host block the index does not know, and the restore's
+  L2 rows always come from published entries.
 - *The pool leg.* Every other slot — a State group's unpublished slot 0,
   replayable groups, any block the index did not take, the published slots
   the Host does not take (below), and with no Host cache the whole image —
@@ -598,7 +599,20 @@ fit whole (`CacheCoordinator::NumHostBoundariesThatFit`, planned in
 Host); the retraction (`AcquireHostBoundaries`) evicts exactly the planned
 victims and places exactly those rows. The first boundary the Host cannot take
 whole goes to the pool with every later one, even where the Host has room for
-some of their rows.
+some of their rows. Under the write-back policy the plan takes Host room for
+every boundary as an eviction write-back does, by whole segments first
+(`AcquireHostSegments`' plan: whole victims, none above a page an eviction
+write-back is still bringing, boundaries dropped from the deepest), then block
+by block, as above, for the boundaries the segment step dropped, against the
+Host less its victims. Where the two steps place fewer boundaries than block
+by block alone, the block-by-block plan stands, so the Host takes at least as
+many boundaries as the block-by-block plan would on the same Host, and
+sometimes more, since its victims differ. Placing block by block may take the
+Host page above an eviction write-back in flight. The write-back still
+publishes at its ACK — the settlement reads the tail hint and the checkpoint
+boundaries under its node, not the gap above — and the next dead-entry
+collection takes it as dead entries under the gap, and may widen the gap: a
+copy wasted, accepted because the image comes before the cache.
 
 An image **does not fit** when no blob slot is free (`SnapshotSlotAllocator`,
 `max_retracted_requests` slots) or when the pool cannot hold what the split
@@ -625,16 +639,18 @@ raise (`--retraction-snapshot-host-gb` / `--retraction-snapshot-ratio`,
 entries and whether copies are in flight). The same site aborts a chosen
 victim whose image its own publication left without room, which the probe does
 not foresee: a tail that publication drops under the per-prior cap takes its
-Host entries along; and under KV parallelism a slot the publication re-points
-to the Device entry already holding its key rides the snapshot pool in that
-entry's bucket, not the one the probe counted. The split made after the
-publication can then fall short. Waiting instead would deadlock once every
-resident needs a page; charging worst-case host room at admission would cost
-concurrency on every request to protect against a rare shortfall.
+Host entries along; under the write-back policy the segment step ranks Host
+victims by what the Device holds, which the publication adds to; and under KV
+parallelism a slot the publication re-points to the Device entry already
+holding its key rides the snapshot pool in that entry's bucket, not the one
+the probe counted. The split made after the publication can then fall short.
+Waiting instead would deadlock once every resident needs a page; charging
+worst-case host room at admission would cost concurrency on every request to
+protect against a rare shortfall.
 The debug knob (below) is not capacity pressure: it probes its victim with
 `imageShortfall` before `retractVictim` publishes anything; a victim that does
 not fit is refused, logged and left running. A victim refused only after the
-publication (either way above) is aborted at the same site, never left
+publication (any of the ways above) is aborted at the same site, never left
 running: the publication registered blocks it would write again (its partial
 page as a tail, and a State group's end state, which a decode step writes in
 place), and a published block is never written again by its owner (the prefix
