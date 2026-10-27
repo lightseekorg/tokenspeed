@@ -69,6 +69,10 @@ _PREPARE_WARPS = 4
 cdna4 = gl.amd.cdna4
 
 
+def _prefill_launch_metadata(grid, kernel, args):
+    return {"name": kernel.name}
+
+
 @gluon.jit
 def _band_index(n: gl.constexpr, axis: gl.constexpr, layout: gl.constexpr):
     """arange(n) along ``axis`` of a rank-3 tensor in ``layout``."""
@@ -110,7 +114,7 @@ def _shift_bands(
     return shifted
 
 
-@gluon.jit
+@gluon.jit(launch_metadata=_prefill_launch_metadata)
 def gluon_kda_paged_prefill_prepare_gfx950(
     q,
     k,
@@ -723,7 +727,7 @@ def _walk_group_chunks(num_chunks, num_groups, group):
     return lo, hi
 
 
-@gluon.jit
+@gluon.jit(launch_metadata=_prefill_launch_metadata, do_not_specialize=("num_groups",))
 def gluon_kda_paged_prefill_state_walk_gfx950(
     w,
     u,
@@ -796,7 +800,7 @@ def gluon_kda_paged_prefill_state_walk_gfx950(
         cdna4.buffer_store(state, final_state + plane, offsets, mask=mask)
 
 
-@gluon.jit
+@gluon.jit(launch_metadata=_prefill_launch_metadata, do_not_specialize=("num_groups",))
 def gluon_kda_paged_prefill_group_summary_gfx950(
     w,
     u,
@@ -881,7 +885,7 @@ def gluon_kda_paged_prefill_group_summary_gfx950(
         )
 
 
-@gluon.jit
+@gluon.jit(launch_metadata=_prefill_launch_metadata, do_not_specialize=("num_groups",))
 def gluon_kda_paged_prefill_chain_groups_gfx950(
     group_entry,
     group_b,
