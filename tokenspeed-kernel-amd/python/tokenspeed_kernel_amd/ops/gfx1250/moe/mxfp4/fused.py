@@ -1736,6 +1736,41 @@ def _fp8_quantize_kernel(
     tl.store(out_ptr + offsets, x.to(tl.float8e4nv), mask=mask)
 
 
+@gluon.jit
+def _quantize_fp8_rows_tile_gfx1250(
+    x_ptr,
+    stride_x,
+    q_ptr,
+    stride_q,
+    scale_ptr,
+    M,
+    tile,
+    K: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_K: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
+):
+    """Quantize tile ``tile`` of ``[M, K]`` rows to E4M3 as
+    ``_fp8_quantize_kernel`` does, ``BLOCK_M x BLOCK_K`` each."""
+    COL_TILES: gl.constexpr = (K + BLOCK_K - 1) // BLOCK_K
+    row_start = (tile // COL_TILES) * BLOCK_M
+    col_start = (tile % COL_TILES) * BLOCK_K
+    layout: gl.constexpr = gl.BlockedLayout([1, 8], [1, 32], [NUM_WARPS, 1], [1, 0])
+    rows = row_start + gl.arange(0, BLOCK_M, gl.SliceLayout(1, layout))
+    cols = col_start + gl.arange(0, BLOCK_K, gl.SliceLayout(0, layout))
+    mask = (rows < M)[:, None] & (cols < K)[None, :]
+    x = gl.load(
+        x_ptr + rows[:, None] * stride_x + cols[None, :], mask=mask, other=0.0
+    ).to(gl.float32)
+    if scale_ptr is not None:
+        x = x * (1.0 / gl.load(scale_ptr))
+    gl.store(
+        q_ptr + rows[:, None] * stride_q + cols[None, :],
+        x.to(gl.float8e4nv),
+        mask=mask,
+    )
+
+
 def _quantize_fp8_activation(
     x: torch.Tensor,
     scale: torch.Tensor | None,
@@ -1902,7 +1937,9 @@ def _small_route_launch_metadata(grid, kernel, args):
         programs -= triton.cdiv(args["M"], args["QUANT_BLOCK_M"]) * triton.cdiv(
             args["QUANT_K"], args["QUANT_BLOCK_K"]
         )
-        quant_bytes = values * args["x_ptr"].element_size() + values // 2 + values // 32
+        quant_bytes = values * args["x_ptr"].element_size() + (
+            values if args.get("QUANT_FP8") else values // 2 + values // 32
+        )
     return {
         "name": f"{kernel.name} [G={gates}, programs={programs}]",
         # Every routing program reads all ids; outputs are the slice
@@ -1953,6 +1990,8 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     QUANT_K: gl.constexpr = 0,
     QUANT_BLOCK_M: gl.constexpr = 8,
     QUANT_BLOCK_K: gl.constexpr = 512,
+    fp8_scale_ptr=None,
+    QUANT_FP8: gl.constexpr = False,
 ):
     """Stable counting sort of contiguous ``[M, TOPK]`` ids by expert.
 
@@ -1965,8 +2004,9 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     values; the power-of-two extents GP and MAX_BLOCKS_POW2 select a binary.
 
     With ``x_ptr``, programs past those quantize the ``[M, QUANT_K]`` MoE
-    input to MXFP4, one ``QUANT_BLOCK_M x QUANT_BLOCK_K`` tile each, on CUs
-    the routing programs leave idle.
+    input, one ``QUANT_BLOCK_M x QUANT_BLOCK_K`` tile each, on CUs the
+    routing programs leave idle: to MXFP4, or with ``QUANT_FP8`` to E4M3
+    divided by ``fp8_scale_ptr``.
     """
     # G is a multiple of TOPK, which keeps the masked id loads vectorized.
     G = M * TOPK
@@ -1975,20 +2015,35 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     if x_ptr is not None:
         quant_tile = pid - n_chunks - NB
         if quant_tile >= 0:
-            quantize_mxfp4_rows_tile_gfx1250(
-                x_ptr,
-                stride_x,
-                q_ptr,
-                stride_q,
-                q_scale_ptr,
-                stride_q_scale,
-                M,
-                quant_tile,
-                QUANT_K,
-                QUANT_BLOCK_M,
-                QUANT_BLOCK_K,
-                NUM_WARPS,
-            )
+            if QUANT_FP8:
+                _quantize_fp8_rows_tile_gfx1250(
+                    x_ptr,
+                    stride_x,
+                    q_ptr,
+                    stride_q,
+                    fp8_scale_ptr,
+                    M,
+                    quant_tile,
+                    QUANT_K,
+                    QUANT_BLOCK_M,
+                    QUANT_BLOCK_K,
+                    NUM_WARPS,
+                )
+            else:
+                quantize_mxfp4_rows_tile_gfx1250(
+                    x_ptr,
+                    stride_x,
+                    q_ptr,
+                    stride_q,
+                    q_scale_ptr,
+                    stride_q_scale,
+                    M,
+                    quant_tile,
+                    QUANT_K,
+                    QUANT_BLOCK_M,
+                    QUANT_BLOCK_K,
+                    NUM_WARPS,
+                )
             return
     start = pid * CH
     gate_layout: gl.constexpr = gl.BlockedLayout(
@@ -2117,12 +2172,23 @@ def _precomputed_topk_route_small_m_gfx1250(
     topk_ids: torch.Tensor,
     num_experts: int,
     quantize_into: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    fp8_quantize_into: (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None
+    ) = None,
 ) -> tuple[
     RaggedTensorMetadata,
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
 ]:
+    """Route ``[M, TOPK]`` ids in one launch.
+
+    ``quantize_into=(x, packed, scale)`` also quantizes ``x`` to MXFP4, and
+    ``fp8_quantize_into=(x, out, act_scale)`` to E4M3 as
+    ``_quantize_fp8_activation`` does, in extra programs of the same launch.
+    """
+    if quantize_into is not None and fp8_quantize_into is not None:
+        raise ValueError("the small-M route quantizes to one format")
     if (
         topk_ids.ndim != 2
         or topk_weights.shape != topk_ids.shape
@@ -2183,7 +2249,24 @@ def _precomputed_topk_route_small_m_gfx1250(
             QUANT_BLOCK_M=_SMALL_ROUTE_QUANT_BLOCK_M,
             QUANT_BLOCK_K=_SMALL_ROUTE_QUANT_BLOCK_K,
         )
-    if tokens == 1 and topk <= 16 and quantize_into is None:
+    elif fp8_quantize_into is not None:
+        x, out, act_scale = fp8_quantize_into
+        quant_k = int(x.shape[1])
+        quant_programs = triton.cdiv(tokens, _SMALL_ROUTE_QUANT_BLOCK_M) * triton.cdiv(
+            quant_k, _SMALL_ROUTE_QUANT_BLOCK_K
+        )
+        quant_args = dict(
+            x_ptr=x,
+            stride_x=x.stride(0),
+            q_ptr=out,
+            stride_q=out.stride(0),
+            QUANT_K=quant_k,
+            QUANT_BLOCK_M=_SMALL_ROUTE_QUANT_BLOCK_M,
+            QUANT_BLOCK_K=_SMALL_ROUTE_QUANT_BLOCK_K,
+            fp8_scale_ptr=act_scale,
+            QUANT_FP8=True,
+        )
+    if tokens == 1 and topk <= 16 and not quant_programs:
         num_warps = 8
         _precomputed_topk_route_m1_canonical_gfx1250_kernel[(1,)](
             topk_ids,
@@ -3148,7 +3231,23 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         ) = _precomputed_topk_route_mxfp4(
             topk_weights, topk_ids, num_experts, hidden_states
         )
+    elif (
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and hidden_states.stride(1) == 1
+        and _uses_small_route(topk_ids, num_experts)
+    ):
+        # The routing launch quantizes the input in programs of its own.
+        x_fp8 = torch.empty_like(hidden_states, dtype=torch.float8_e4m3fn)
+        ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
+            _precomputed_topk_route_small_m_gfx1250(
+                topk_weights,
+                topk_ids,
+                num_experts,
+                fp8_quantize_into=(hidden_states, x_fp8, w13_weight.act_scale),
+            )
+        )
     else:
+        x_fp8 = None
         ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
             _precomputed_topk_route(topk_weights, topk_ids, num_experts)
         )
@@ -3204,7 +3303,8 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             x_scale=intermediate_mx_scale, x_format="e2m1", x_global_scale=None
         )
     else:
-        x_fp8 = _quantize_fp8_activation(hidden_states, w13_weight.act_scale)
+        if x_fp8 is None:
+            x_fp8 = _quantize_fp8_activation(hidden_states, w13_weight.act_scale)
         # The second matmul wants its activation in FP8, so the first one
         # divides by that scale and casts in its epilogue. Quantizing
         # separately would re-read and rewrite the whole intermediate for no
