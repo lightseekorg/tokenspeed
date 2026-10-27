@@ -74,12 +74,20 @@ def _reference_sequence(
 
 
 @pytest.mark.parametrize(
-    ("time_split", "lower_bound"),
-    [(False, -5.0), (False, None), (True, -5.0)],
-    ids=["chunk_edges", "chunk_edges_unbounded", "time_split"],
+    ("time_split", "lower_bound", "dtype"),
+    [
+        (False, -5.0, torch.bfloat16),
+        (False, None, torch.bfloat16),
+        (False, -5.0, torch.float16),
+        (True, -5.0, torch.bfloat16),
+    ],
+    ids=["chunk_edges", "chunk_edges_unbounded", "chunk_edges_float16", "time_split"],
 )
 def test_kda_prefill_matches_packed_recurrent_reference(
-    time_split: bool, lower_bound: float | None
+    time_split: bool,
+    lower_bound: float | None,
+    dtype: torch.dtype,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Few long sequences are split in time. Their gates decay slowly so that
     # the state handed between time groups stays visible in the output.
@@ -88,11 +96,11 @@ def test_kda_prefill_matches_packed_recurrent_reference(
     total_tokens = sum(lengths)
     heads = 2
     dim = 128
-    q = torch.randn(1, total_tokens, heads, dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(1, total_tokens, heads, dim, device="cuda", dtype=dtype)
     k = torch.randn_like(q)
     v = torch.randn_like(q)
     raw_g = torch.randn_like(q)
-    beta = torch.randn(1, total_tokens, heads, device="cuda", dtype=torch.bfloat16)
+    beta = torch.randn(1, total_tokens, heads, device="cuda", dtype=dtype)
     initial_state = torch.randn(
         len(lengths), heads, dim, dim, device="cuda", dtype=torch.float32
     )
@@ -127,6 +135,14 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         expected_outputs.append(output)
         expected_states.append(state)
 
+    planned_groups = []
+    scan_groups = _prefill._scan_groups
+
+    def record_groups(*args: int) -> int:
+        planned_groups.append(scan_groups(*args))
+        return planned_groups[-1]
+
+    monkeypatch.setattr(_prefill, "_scan_groups", record_groups)
     actual_output, actual_state = launch_kda_prefill(
         q,
         k,
@@ -140,6 +156,7 @@ def test_kda_prefill_matches_packed_recurrent_reference(
         lower_bound=lower_bound,
         cu_seqlens_cpu=cu_seqlens_cpu,
     )
+    assert (planned_groups[-1] > 1) == time_split, planned_groups
 
     torch.testing.assert_close(
         actual_output[0].float(),

@@ -214,7 +214,7 @@ def gluon_kda_paged_prefill_prepare_gfx1250(
     g_smem = gl.allocate_shared_memory(raw_g.dtype.element_ty, [BT, D], tile_layout)
     q_smem = gl.allocate_shared_memory(q.dtype.element_ty, [BT, D], tile_layout)
     k_smem = gl.allocate_shared_memory(k.dtype.element_ty, [BT, D], tile_layout)
-    value_rhs = gl.allocate_shared_memory(gl.bfloat16, [BT, D], tile_layout)
+    value_rhs = gl.allocate_shared_memory(v.dtype.element_ty, [BT, D], tile_layout)
     cdna5.tdm.async_load(
         cdna5.tdm.make_tensor_descriptor(
             raw_g + head_base, (length, D), (H * D, 1), (BT, D), tile_layout
@@ -336,11 +336,11 @@ def gluon_kda_paged_prefill_prepare_gfx1250(
         mask=tile_mask,
     )
     # Q and K are in registers now, so their LDS holds the lifted columns and
-    # W's right-hand side.
-    lifted = k_smem
+    # W's right-hand side, as bf16 whatever the 16-bit input type.
+    lifted = k_smem.reinterpret(gl.bfloat16)
     lifted.store(gl.reshape(k_cols.to(gl.bfloat16), [BT, D]))
     k_rows = k_f * rise
-    key_rhs = q_smem
+    key_rhs = q_smem.reinterpret(gl.bfloat16)
     key_rhs.store(gl.reshape((k_rows * to_pivot).to(gl.bfloat16), [BT, D]))
     k_lhs = gl.convert_layout(k_rows.to(gl.bfloat16), a3)
 
@@ -463,9 +463,8 @@ def gluon_kda_paged_prefill_prepare_gfx1250(
             flat_offsets,
             mask=flat_mask,
         )
-        u_tile = cdna5.wmma(
-            inverse_a, value_rhs.slice(n * BN, BN, dim=1).load(b_op), zero_flat
-        )
+        value = value_rhs.slice(n * BN, BN, dim=1).load(b_op).to(gl.bfloat16)
+        u_tile = cdna5.wmma(inverse_a, value, zero_flat)
         cdna5.buffer_store(
             u_tile.to(u.dtype.element_ty),
             u + tile_base + n * BN,
