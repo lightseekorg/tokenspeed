@@ -2019,6 +2019,15 @@ if platform.is_amd:
                 "gfx1250 A8W4 SiTU MoE does not support shared projection fusion"
             )
 
+        return _gluon_mxfp4_a8w4_situ_gfx1250_apply(x, w, topk_weights, topk_ids)
+
+    def _gluon_mxfp4_a8w4_situ_gfx1250_apply(
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_start: int | None = None,
+    ) -> torch.Tensor:
         situ_beta = float(getattr(w, "activation_situ_beta", 1.0))
         situ_linear_beta = getattr(w, "activation_situ_linear_beta", None)
         if situ_linear_beta is None:
@@ -2054,6 +2063,66 @@ if platform.is_amd:
             situ_linear_beta=float(situ_linear_beta),
             decode=decode,
             out=getattr(w, "_situ_output_buffer", None),
+            expert_start=expert_start,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_mxfp4_a8w4_situ_ep_gfx1250_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_mxfp4_gfx1250_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(12, 5),
+            max_arch_version=ArchVersion(12, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            "weight_dtype": frozenset({"mxfp4"}),
+            "activation": frozenset({"situ"}),
+            "routing_mode": frozenset({"precomputed_topk"}),
+            "supports_deferred_finalize": frozenset({False}),
+            "supports_ep": frozenset({True}),
+            "supports_all_to_all_ep": frozenset({False}),
+            # K3 places 224 whole experts per rank at EP4 and 112 at EP8.
+            "ep_size": frozenset({4, 8}),
+            "ispp": frozenset({3072}),
+            "ispp_alignment": frozenset({128}),
+            "internal_activation_dtype": frozenset({"input"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_mxfp4_a8w4_situ_ep_gfx1250_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ):
+        """Apply this rank's experts to global top-k routes; other ranks' routes
+        contribute nothing, so the caller sums the ranks' outputs."""
+        del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
+        del enable_pdl
+        if not do_finalize:
+            raise ValueError("gfx1250 A8W4 SiTU EP MoE cannot defer finalization")
+        if topk_weights is None or topk_ids is None:
+            raise ValueError("gfx1250 A8W4 SiTU EP MoE requires precomputed top-k")
+        if x.shape[0] == 0:
+            output = getattr(w, "_situ_output_buffer", None)
+            return torch.empty_like(x) if output is None else output
+        num_local_experts = int(getattr(w, "num_local_experts"))
+        return _gluon_mxfp4_a8w4_situ_gfx1250_apply(
+            x,
+            w,
+            topk_weights,
+            topk_ids,
+            expert_start=int(getattr(w, "ep_rank", 0)) * num_local_experts,
         )
 
     @register_kernel(
