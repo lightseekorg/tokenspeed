@@ -3523,6 +3523,35 @@ if platform.is_nvidia:
         if _correction_bias is not None:
             _correction_bias = _correction_bias.to(_routing_logits_dtype)
 
+        from tokenspeed_kernel.ops.communication.peer_weights import (
+            ExpertWeightShard,
+            PreparedExpertWeights,
+        )
+
+        streamed = (
+            "gemm1_weights_fp4_shuffled",
+            "gemm1_scales_fp4_shuffled",
+            "gemm2_weights_fp4_shuffled",
+            "gemm2_scales_fp4_shuffled",
+        )
+        replicated = (
+            "g1_alphas",
+            "g2_alphas",
+            "g1_scale_c",
+            "gemm1_alpha",
+            "gemm1_beta",
+            "gemm1_clamp_limit",
+        )
+        parameters = dict(w.named_parameters(recurse=False))
+        return PreparedExpertWeights(
+            layout=f"flashinfer-trtllm-nvfp4-{activation}-v1",
+            shards=tuple(
+                ExpertWeightShard(name, parameters[name], name in replicated)
+                for name in (*streamed, *replicated)
+                if name in parameters
+            ),
+        )
+
     _FP4_TILES = (8, 16, 32, 64, 128)
 
     def _default_tile(num_tokens: int, top_k: int, num_local_experts: int) -> int:

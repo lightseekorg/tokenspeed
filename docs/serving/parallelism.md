@@ -963,3 +963,26 @@ Before benchmarking:
 - confirm GPU visibility and process placement
 - compare output correctness before tuning throughput
 - keep the full launch command with benchmark results
+
+### Distributed expert-weight storage
+
+`--moe-weight-sharing-size N` enables DWDP: each prefill worker stores one of
+`N` immutable expert shards and fetches remote weights while executing its own
+batch. Execution remains TP1/EP1; attention DP still identifies the serving
+workers. Omitting the option keeps resident expert weights.
+
+The initial K3 NVFP4 configuration requires `--attn-tp-size 1 --moe-tp-size 1
+--ep-size 1 --all2all-backend none`, `--disaggregation-mode prefill`,
+`--enforce-eager --prefill-graph-max-tokens 0`, and a fixed prefill token budget.
+The weight-sharing size must divide the instance size. Shared-expert and
+attention-projection TP overrides must also remain local. The additional
+staging memory is allocated before KV cache sizing. Live checkpoint replacement
+requires restarting these workers.
+
+See [distributed immutable weights](../design/distributed-weights.md) for
+storage ownership and stream-ordering invariants.
+
+DWDP supports local Device and Host L2 caches and auto/safetensors checkpoint
+loading. Memory-saver sleep/wake is unsupported. Shared L3 cache control and
+online expert rebalancing are currently unsupported: L3 flushes coordinate
+across DP ranks, and rebalancing changes immutable expert ownership.

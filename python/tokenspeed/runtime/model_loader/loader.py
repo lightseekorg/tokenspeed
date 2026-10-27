@@ -160,6 +160,13 @@ def _initialize_model(
         if replacements:
             quant_config.apply_checkpoint_name_replacements(replacements)
     mapping = model_config.mapping
+    if mapping.moe_weight_sharing_size is not None and not model_config.is_draft_worker:
+        from tokenspeed.runtime.layers.moe.peer_weights import PeerWeightOwner
+
+        if not issubclass(model_class, PeerWeightOwner):
+            raise ValueError(
+                "This model does not implement peer expert-weight ownership"
+            )
     # Only VLM wrappers accept these kwargs.
     extra_kwargs: dict = {}
     if model_config.is_multimodal:
