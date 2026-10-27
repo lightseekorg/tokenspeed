@@ -289,3 +289,84 @@ def test_full_decode_ragged_rows_match_reference(
     torch.cuda.synchronize()
     nonempty = cache_seqlens > 0
     torch.testing.assert_close(replayed[nonempty], actual[nonempty], atol=0, rtol=0)
+
+
+# One TP8 rank of Muse Spark's attention: 16 query heads over 2 KV heads.
+VERIFY_Q_HEADS = 16
+VERIFY_KV_HEADS = 2
+VERIFY_TOKENS = 8
+
+
+@pytest.mark.parametrize("window_left", [2047, -1], ids=["sliding", "full"])
+def test_verify_block_rows_are_causal_within_the_block(window_left: int) -> None:
+    """Speculative verify: each request's last ``VERIFY_TOKENS`` cached tokens
+    are queries, and query ``i`` sees the cache up to and including itself.
+
+    Lengths cover a block shorter than the window, one whose window starts
+    mid-page, and one that slides past many pages.
+    """
+    cache_lens = [VERIFY_TOKENS + 3, 2048 + VERIFY_TOKENS + 37, 300 * PAGE_SIZE + 5]
+    generator = torch.Generator(device="cuda").manual_seed(20261027)
+    pages = [-(-length // PAGE_SIZE) for length in cache_lens]
+    k_cache = torch.randn(
+        sum(pages),
+        PAGE_SIZE,
+        VERIFY_KV_HEADS,
+        HEAD_DIM,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    v_cache = torch.randn(
+        k_cache.shape, dtype=torch.bfloat16, device="cuda", generator=generator
+    )
+    page_table = torch.full(
+        (len(cache_lens), max(pages)), 1 << 30, dtype=torch.int32, device="cuda"
+    )
+    physical = torch.randperm(
+        sum(pages), generator=torch.Generator().manual_seed(11)
+    ).to(dtype=torch.int32, device="cuda")
+    start = 0
+    for row, count in enumerate(pages):
+        page_table[row, :count] = physical[start : start + count]
+        start += count
+    cache_seqlens = torch.tensor(cache_lens, dtype=torch.int32, device="cuda")
+    q = torch.randn(
+        len(cache_lens) * VERIFY_TOKENS,
+        VERIFY_Q_HEADS,
+        HEAD_DIM,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+
+    actual = gluon_mha_decode_gfx950(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=FULL_MAX_SEQLEN_K,
+        max_seqlen_q=VERIFY_TOKENS,
+        window_left=window_left,
+    )
+    torch.cuda.synchronize()
+    for row, length in enumerate(cache_lens):
+        row_pages = page_table[row, : pages[row]].long()
+        expected, _ = torch_dense_attention(
+            q[row * VERIFY_TOKENS : (row + 1) * VERIFY_TOKENS],
+            k_cache[row_pages].flatten(0, 1)[:length],
+            v_cache[row_pages].flatten(0, 1)[:length],
+            scale=HEAD_DIM**-0.5,
+            causal_offset=length - VERIFY_TOKENS,
+            window_left=None if window_left < 0 else window_left,
+            sinks=None,
+        )
+        # Short rows attend to few keys and reach |out| > 1, where one BF16
+        # rounding of the FP32 result is up to one BF16 ULP (2**-7) relative.
+        torch.testing.assert_close(
+            actual[row * VERIFY_TOKENS : (row + 1) * VERIFY_TOKENS].float(),
+            expected.float(),
+            atol=2e-3,
+            rtol=2**-7,
+        )
