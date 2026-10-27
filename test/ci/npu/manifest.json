@@ -1,0 +1,40 @@
+{
+  "schema_version": 3,
+  "watch_paths": [
+    "tokenspeed-kernel-npu/**",
+    "tokenspeed-kernel/python/**",
+    "python/pyproject.toml",
+    "test/ci/npu/**",
+    "test/ci_system/npu/**",
+    ".github/workflows/pr-test-ascendnpu-arm.yml",
+    ".github/workflows/run-ci-task-matrix.yml",
+    "test/ci_system/*ascend*",
+    "test/ci/ut/npu-operators.yaml",
+    "test/ci_system/pipeline.py"
+  ],
+  "expected_plans": "test/ci/npu/expected-plans.json",
+  "execution": {
+    "phases": [
+      "accuracy",
+      "performance"
+    ],
+    "fail_fast": true
+  },
+  "performance_policy": {
+    "mode": "record_only"
+  },
+  "operators": [
+    {
+      "name": "scatter",
+      "accuracy_cases": 5,
+      "performance_configs": 6,
+      "script": "test/ci/npu/tests/scatter-test.py"
+    },
+    {
+      "name": "virtual_slots_to_local",
+      "accuracy_cases": 48,
+      "performance_configs": 8,
+      "script": "test/ci/npu/tests/virtual_slots_to_local-test.py"
+    }
+  ]
+}

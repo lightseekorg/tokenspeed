@@ -1,0 +1,27 @@
+[package]
+name = "tokenspeed-l3"
+description = "The L3 storage tier's Host-only executor: bounded I/O queues, worker threads and the store backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[features]
+# Settings from the data plane's Python `L3Settings` (`Settings::from_python`).
+python = ["dep:pyo3"]
+
+[lib]
+name = "ts_l3"
+
+[dependencies]
+pyo3 = { version = "0.30", optional = true }
+sha2 = "0.10"
+thiserror.workspace = true
+tracing = "0.1"
+ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-metrics" }
+ts-mooncake = { package = "tokenspeed-mooncake", version = "0.1.0", path = "../ts-mooncake" }
+
+[lints]
+workspace = true

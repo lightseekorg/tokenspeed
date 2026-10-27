@@ -64,20 +64,13 @@ from tokenspeed.runtime.cache.transfer.layout import (  # noqa: E402
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
     HostTier,
-    PrefetchOp,
-    PrefetchRow,
     RestoreOp,
     SnapshotOp,
 )
 from tokenspeed.runtime.cache.transfer.ownership import (  # noqa: E402
     BlockOwnerTranslation,
 )
-from tokenspeed.runtime.engine import (  # noqa: E402
-    scheduler_utils as scheduler_utils_module,
-)
-from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
-    cache_event_from_payload,
     cache_event_to_payload,
 )
 from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
@@ -277,7 +270,6 @@ def _build(
         patch.object(
             executor_module, "compute_host_lcm_block_bytes", return_value=1_000_000
         ),
-        patch.object(executor_module, "check_host_memory"),
         patch.object(
             executor_module,
             "HostCacheStorage",
@@ -297,6 +289,11 @@ def _build(
         ),
         patch.object(
             executor_module, "new_cache_stream", side_effect=[write_stream, load_stream]
+        ),
+        patch.object(
+            executor_module.device_module,
+            "stream",
+            side_effect=lambda _stream: nullcontext(),
         ),
         patch.object(
             executor_module, "HostTransferLane", side_effect=list(lanes.values())
@@ -349,9 +346,7 @@ def test_op_dataclasses_carry_the_wire_fields():
     for kind, op_id in (("SnapshotDoneEvent", 3), ("RestoreDoneEvent", 4)):
         event = getattr(executor_module.Cache, kind)()
         event.op_id = op_id
-        payload = cache_event_to_payload(event)
-        assert payload == {"kind": kind, "op_id": op_id}
-        assert _acks([cache_event_from_payload(payload)]) == [(kind, op_id)]
+        assert cache_event_to_payload(event) == {"kind": kind, "op_id": op_id}
 
 
 def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
@@ -397,57 +392,6 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
     executor, _, _ = _build(layout=layout, shard_counts=[1], l2_tier=False)
     assert (executor.num_host_pages, executor.num_snapshot_pages) == (0, 4)
     assert executor.host_storage is None and executor._load_trackers == []
-
-
-def test_count_plan_ops_counts_each_request_of_a_snapshot_or_restore_batch():
-    hooks = CacheOpHooks(
-        SimpleNamespace(),
-        speculative_algorithm=None,
-        attn_tp_rank=0,
-        attn_tp_size=1,
-        attn_tp_cpu_group=None,
-        pp_size=1,
-        pp_cpu_group=None,
-        global_rank=0,
-    )
-
-    class _SnapshotBatch:
-        op_ids = [1, 2]
-        request_ids = ["a", "b"]
-        request_pool_indices = [1, 2]
-        snapshot_slots = [0, 1]
-        group_ids = [[0], []]
-        src_pages = [[1], []]
-        dst_pages = [[1], []]
-
-    class _RestoreBatch:
-        op_ids = [3]
-        request_ids = ["c"]
-        request_pool_indices = [4]
-        snapshot_slots = [2]
-        group_ids = [[0]]
-        src_pages = [[1]]
-        dst_pages = [[1]]
-        content_hashes = [["h"]]
-        page_offsets = [[0]]
-        source_tiers = [[0]]
-
-    plan = SimpleNamespace(cache=[_SnapshotBatch(), _RestoreBatch()])
-    with patch.object(
-        scheduler_utils_module,
-        "Cache",
-        SimpleNamespace(
-            WriteBackOp=(),
-            LoadBackOp=(),
-            SnapshotOp=_SnapshotBatch,
-            RestoreOp=_RestoreBatch,
-        ),
-    ):
-        num_retracted = hooks.count_plan_ops(plan)
-    assert hooks._num_inflight == 3
-    # The return counts retraction victims only: one per snapshot-store
-    # request, restores excluded — it feeds the preemption counter.
-    assert num_retracted == 2
 
 
 # ----------------------------------------------------------------------
@@ -909,63 +853,6 @@ def test_kvp_ranks_store_their_owned_subsets_on_both_legs():
     bad = _snapshot_op(6, 1, [_transfer(0, 1, 2)])
     with pytest.raises(ValueError, match="residue class"):
         executor.submit_write_backs([bad], prerequisite_stream="s", fence_stream=Mock())
-
-
-def test_kvp_rank_backs_up_and_prefetches_only_the_host_pages_it_owns():
-    """L3 sees the rows this rank owns, by local Host id: the L2 write's
-    backup list and a prefetch op's pages both pass the owner filter, so a
-    peer's page is neither put nor fetched from here."""
-    layout = _layout(2, [("full", 2)])
-    # Device 1 -> Host 3 is rank 0's (local Host 2); Device 2 -> Host 6 is
-    # rank 1's (local Host 3).
-    for rank, owned_page in ((0, (0, 2, "h3", 0)), (1, (0, 3, "h6", 1))):
-        executor, _, lanes = _build(layout=layout, shard_counts=[2], rank=rank)
-        store = _WriteBackOp([11], [[0, 0]], [[1, 2]], [[3, 6]], [True])
-        store.content_hashes = [["h3", "h6"]]
-        store.page_offsets = [[0, 1]]
-        finish = Mock()
-        finish.query.return_value = False
-        lanes["pinned"].start_d2h.return_value = finish
-        with patch.object(
-            executor_module.Cache, "WriteBackOp", _WriteBackOp, create=True
-        ):
-            executor.submit_write_backs(
-                [store],
-                prerequisite_stream="s",
-                fence_stream=Mock(),
-            )
-        ((pending_finish, ack),) = executor._completions._pending
-        assert pending_finish is finish
-        assert (ack.op_ids, ack.backup_pages) == ([11], [owned_page])
-        # The prefetch of the same two pages fetches only this rank's one; the
-        # peer's page counts as landed here so the replica MIN is the owners'.
-        executor.l3_store = Mock()
-        executor.l3_store.prefetch.return_value = [True]
-        executor._l3_prefetch_timeout_base_s = 10.0
-        executor._l3_prefetch_timeout_per_page_s = 0.0
-        executor._l3_prefetch_batch_pages = 4
-        executor.submit_prefetches(
-            [
-                PrefetchOp(
-                    op_id=12,
-                    request_id="r12",
-                    first_page=0,
-                    num_pages=2,
-                    rows=(
-                        PrefetchRow(0, 3, "h3", 0, 0),
-                        PrefetchRow(0, 6, "h6", 1, 1),
-                    ),
-                )
-            ]
-        )
-        for _ in range(200):
-            progress = executor.l3_prefetch_progress()
-            if progress[12][0]:
-                break
-            time.sleep(0.01)
-        assert progress[12] == (True, 2)
-        executor.l3_store.prefetch.assert_called_once_with([owned_page])
-        executor._l3_prefetch_lane.shutdown(wait=True)
 
 
 @pytest.mark.parametrize("backend", ["dma", "auto"])

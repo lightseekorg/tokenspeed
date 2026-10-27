@@ -1,8 +1,19 @@
 """Eager KDA replay commit versus the existing per-position scratch path."""
 
+import os
+import sys
+
 import numpy as np
 import pytest
 import torch
+
+# CI registration and absolute test imports use the same paths as the suite.
+_TEST_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _TEST_DIR)
+sys.path.insert(0, os.path.dirname(_TEST_DIR))
+from ci_system.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=120, suite="runtime-1gpu")
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
@@ -28,6 +39,10 @@ from tokenspeed.runtime.layers.attention.backends.state.mamba import (
     MambaAttnBackend,
     _packed_qkv_views,
 )
+from tokenspeed.runtime.layers.attention.configs.base import (
+    AttnConfig,
+    SoftmaxAttnConfig,
+)
 from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
 
 _LOWER_BOUND = -5.0
@@ -39,10 +54,13 @@ DEV = "cuda"
 
 
 class _Harness:
+    H = H
+
     def __init__(
         self,
         *,
         eager_replay: bool,
+        draft_tokens: int | None,
         seed: int = 0,
         max_bs: int = 8,
         usable_pages: int = 24,
@@ -50,21 +68,26 @@ class _Harness:
         torch.manual_seed(seed)
         self.pool = _make_kimi_pool(DEV, usable_pages=usable_pages)
         self.contract = self.pool.arena.runtime_contract
-        spec = SimpleNamespace(
-            num_attention_heads=H,
-            num_kv_heads=H,
+        self.key_dim = self.H * D
+        self.conv_dim = 3 * self.key_dim
+        self.width = max(int(draft_tokens or 1), 1)
+        spec = SoftmaxAttnConfig(
+            num_attention_heads=self.H,
+            num_kv_heads=self.H,
             attn_tp_size=1,
             head_dim=D,
         )
-        config = SimpleNamespace(
+        config = AttnConfig(
             device=DEV,
             dtype=torch.bfloat16,
+            kv_cache_dtype=torch.float8_e4m3fn,
+            kv_cache_quant_method=None,
+            prefix_granularity=128,
+            context_len=4096,
             is_draft=False,
-            speculative_num_draft_tokens=T,
+            speculative_num_draft_tokens=draft_tokens,
             max_bs=max_bs,
             components=(spec,),
-            # Stub component(): this backend construction never queries components.
-            component=lambda cls: None,
         )
         self.config = config
         self.backend = KdaAttnBackend(
@@ -79,16 +102,22 @@ class _Harness:
         if not eager_replay:
             self.backend._replay_active = False
             self.backend._verify_scratch = None
-            self.backend.preallocate_verify_workspace(config.max_bs, T)
+        self.backend.preallocate_verify_workspace(config.max_bs, self.width)
         self.layer_ids = list(self.backend._state_layer_ids())
         self.params = {
             layer_id: dict(
-                conv_weights=torch.randn(CONV_DIM, 4, device=DEV, dtype=torch.bfloat16)
+                conv_weights=torch.randn(
+                    self.conv_dim, 4, device=DEV, dtype=torch.bfloat16
+                )
                 * 0.1,
-                f_b_weight=torch.randn(KEY_DIM, D_FA, device=DEV, dtype=torch.bfloat16)
+                f_b_weight=torch.randn(
+                    self.key_dim, D_FA, device=DEV, dtype=torch.bfloat16
+                )
                 * 0.05,
-                A_log=torch.randn(H, device=DEV, dtype=torch.float32) * 0.1,
-                dt_bias=torch.randn(KEY_DIM, device=DEV, dtype=torch.float32) * 0.1,
+                A_log=torch.randn(self.H, device=DEV, dtype=torch.float32) * 0.1,
+                dt_bias=torch.randn(self.key_dim, device=DEV, dtype=torch.float32)
+                * 0.1,
+                lower_bound=_LOWER_BOUND,
             )
             for layer_id in self.layer_ids
         }
@@ -100,9 +129,9 @@ class _Harness:
             return torch.randn(*shape, generator=generator).to(DEV, torch.bfloat16)
 
         return {
-            "mixed_qkv": rnd(bs * T, CONV_DIM),
-            "f_a_out": rnd(bs * T, D_FA),
-            "beta_raw": rnd(bs * T, H),
+            "mixed_qkv": rnd(bs * self.width, self.conv_dim),
+            "f_a_out": rnd(bs * self.width, D_FA),
+            "beta_raw": rnd(bs * self.width, self.H),
         }
 
     def prepare_metadata(self, rpis, pages, seq_lens):
@@ -139,21 +168,21 @@ class _Harness:
                     mixed_qkv=inputs["mixed_qkv"].clone(),
                     f_a_out=inputs["f_a_out"],
                     beta_raw=inputs["beta_raw"],
-                    g_raw=None,
+                    g_raw=inputs.get("g_raw"),
                     conv_weights=params["conv_weights"],
-                    bias=None,
+                    bias=params.get("bias"),
                     activation="silu",
-                    key_dim=KEY_DIM,
-                    value_dim=KEY_DIM,
+                    key_dim=self.key_dim,
+                    value_dim=self.key_dim,
                     attention_tp_size=1,
                     head_k_dim=D,
                     head_v_dim=D,
                     A_log=params["A_log"],
                     dt_bias=params["dt_bias"],
                     f_b_weight=params["f_b_weight"],
-                    lower_bound=_LOWER_BOUND,
+                    lower_bound=params["lower_bound"],
                     layer_id=layer_id,
-                    seq_len=bs * T,
+                    seq_len=bs * self.width,
                     a=None,
                     b=None,
                 )
@@ -218,8 +247,8 @@ def test_packed_qkv_views_keep_projection_storage_and_stride():
 
 def test_direct_committed_read_matches_seeded_verify_and_commit_bitwise():
     """The fallback may skip only the recurrent-state seed copy."""
-    direct = _Harness(eager_replay=False, seed=73)
-    seeded = _Harness(eager_replay=False, seed=73)
+    direct = _Harness(draft_tokens=T, eager_replay=False, seed=73)
+    seeded = _Harness(draft_tokens=T, eager_replay=False, seed=73)
     for harness in (direct, seeded):
         harness.backend._verify = MethodType(MambaAttnBackend._verify, harness.backend)
     seeded.backend._verify_reads_committed_recurrent_state = False
@@ -315,12 +344,14 @@ def test_packed_qkv_views_match_materialized_split_across_commits():
     """Packed views preserve verifier outputs and committed state over rounds."""
     rpis = [0, 1]
     viewed = _Harness(
+        draft_tokens=T,
         eager_replay=False,
         seed=89,
         max_bs=len(rpis),
         usable_pages=8,
     )
     materialized = _Harness(
+        draft_tokens=T,
         eager_replay=False,
         seed=89,
         max_bs=len(rpis),
@@ -406,10 +437,133 @@ def test_packed_qkv_views_match_materialized_split_across_commits():
         ]
 
 
+def _reference_committed_states(harness, pages, inputs, accepted):
+    """Evaluate accepted recurrence independently from each path's producers."""
+    bs = len(accepted)
+    width = harness.width
+    raw = inputs["mixed_qkv"].float().view(bs, width, CONV_DIM)
+    beta = inputs["beta_raw"].float().sigmoid().view(bs, width, H)
+    expected = {}
+    for layer_id in harness.layer_ids:
+        params = harness.params[layer_id]
+        ids = pages[harness.pool.state_group_by_layer[layer_id]]
+        full_conv = harness.pool.get_component(layer_id, "conv_state")[ids].float()
+        full_state = harness.pool.get_component(layer_id, "recurrent_state")[
+            ids
+        ].clone()
+        conv = full_conv[:, :CONV_DIM]
+        state = full_state[:, :H]
+        weight = params["conv_weights"].float()
+        raw_gate = inputs.get("g_raw")
+        gate = (
+            raw_gate.float()
+            if raw_gate is not None
+            else (
+                inputs["f_a_out"].float()[:, None, :]
+                * params["f_b_weight"].float()[None, :, :]
+            ).sum(-1)
+        )
+        # Records verification uses activation-dtype convolution values,
+        # including AMD's fused producer. The decomposed scratch path
+        # does too; NVIDIA's fused scratch path retains FP32 intermediates.
+        materialized_producers = (harness.backend._replay_active) or (
+            not harness.backend._replay_active and torch.version.hip is not None
+        )
+        if materialized_producers:
+            from tokenspeed_kernel.ops.attention.kda import kda_verify_conv_update
+
+            if (
+                raw_gate is None
+                and harness.backend._replay_active
+                and torch.version.hip
+            ):
+                # AMD's fused verify projects the gate in FP32 and rounds it
+                # once to the activation dtype; a BLAS GEMM may round a few
+                # channels the other way.
+                gate = gate.to(inputs["f_a_out"].dtype).float()
+            elif raw_gate is None:
+                gate = torch.nn.functional.linear(
+                    inputs["f_a_out"], params["f_b_weight"]
+                ).float()
+            if harness.backend._replay_active:
+                produced_qkv = kda_verify_conv_update(
+                    inputs["mixed_qkv"],
+                    params["conv_weights"],
+                    harness.pool.get_component(layer_id, "conv_state"),
+                    torch.tensor(ids, device=DEV, dtype=torch.int32),
+                    num_heads=H,
+                    head_dim=D,
+                    draft_token_num=width,
+                    recurrent_layout="v_major",
+                    bias=params.get("bias"),
+                ).view(bs, width, CONV_DIM)
+            else:
+                from tokenspeed_kernel.ops.conv import causal_conv1d_update
+
+                # The scratch path uses the common convolution producer,
+                # whose intermediate rounding differs from the KDA producer.
+                produced_qkv = causal_conv1d_update(
+                    inputs["mixed_qkv"]
+                    .view(bs, width, CONV_DIM)
+                    .transpose(1, 2)
+                    .clone(),
+                    conv.to(inputs["mixed_qkv"].dtype).contiguous(),
+                    params["conv_weights"],
+                    bias=params.get("bias"),
+                    activation="silu",
+                    intermediate_conv_window=torch.empty(
+                        bs,
+                        width,
+                        CONV_DIM,
+                        3,
+                        dtype=inputs["mixed_qkv"].dtype,
+                        device=DEV,
+                    ),
+                    parent_indices=None,
+                ).transpose(1, 2)
+            produced_qkv = produced_qkv.float()
+        gate = gate.view(bs, width, H, D) + params["dt_bias"].view(H, D)
+        scale = params["A_log"].exp()[None, None, :, None]
+        lower_bound = params["lower_bound"]
+        log_decay = (
+            -scale * torch.nn.functional.softplus(gate)
+            if lower_bound is None
+            else lower_bound * torch.sigmoid(scale * gate)
+        )
+        decay = log_decay.exp()
+        states, windows = [], []
+        for token in range(width):
+            current = raw[:, token]
+            if materialized_producers:
+                qkv = produced_qkv[:, token]
+            else:
+                acc = current * weight[:, 3]
+                for tap in range(3):
+                    acc = torch.addcmul(acc, conv[:, :, tap], weight[:, tap])
+                qkv = torch.nn.functional.silu(acc)
+            _, key, value = (part.view(bs, H, D) for part in qkv.chunk(3, -1))
+            key = key * torch.rsqrt(key.square().sum(-1, keepdim=True) + 1e-6)
+            state = state * decay[:, token, :, None, :]
+            correction = value - (state * key[:, :, None, :]).sum(-1)
+            correction = correction * beta[:, token, :, None]
+            state = state + correction[..., None] * key[:, :, None, :]
+            conv = torch.cat((conv[:, :, 1:], current[..., None]), dim=-1)
+            states.append(state.clone())
+            windows.append(conv.clone())
+        full_state[:, :H] = torch.stack(
+            [states[max(1, count) - 1][i] for i, count in enumerate(accepted)]
+        )
+        full_conv[:, :CONV_DIM] = torch.stack(
+            [windows[max(1, count) - 1][i] for i, count in enumerate(accepted)]
+        )
+        expected[layer_id] = full_state, full_conv
+    return expected
+
+
 def test_eager_replay_matches_scratch_over_multiple_rounds_and_layers():
-    """Absolute oracle: independent scratch and replay arms evolve identically."""
-    replay = _Harness(eager_replay=True, seed=17)
-    scratch = _Harness(eager_replay=False, seed=17)
+    """Both paths commit their accepted prefix, with their producer precision."""
+    replay = _Harness(draft_tokens=T, eager_replay=True, seed=17)
+    scratch = _Harness(draft_tokens=T, eager_replay=False, seed=17)
     rpis = [0, 1, 2]
     pages = {
         group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
@@ -419,15 +573,30 @@ def test_eager_replay_matches_scratch_over_multiple_rounds_and_layers():
     accepts = ([0, 1, T], [T, 0, 2], [1, T, 0], [2, 1, T])
     for round_index, accepted in enumerate(accepts):
         for harness in (replay, scratch):
+            inputs = harness.inputs(len(rpis), 100 + round_index)
+            expected = _reference_committed_states(harness, pages, inputs, accepted)
             harness.round(rpis, pages, seq_lens, 100 + round_index, accepted)
-        _assert_committed_pages_equal(replay, scratch, pages)
-        seq_lens = [length + count for length, count in zip(seq_lens, accepted)]
+            for layer_id, (state, conv) in expected.items():
+                ids = pages[harness.pool.state_group_by_layer[layer_id]]
+                torch.testing.assert_close(
+                    harness.pool.get_component(layer_id, "recurrent_state")[ids],
+                    state,
+                    atol=2e-6,
+                    rtol=2e-5,
+                )
+                torch.testing.assert_close(
+                    harness.pool.get_component(layer_id, "conv_state")[ids].float(),
+                    conv,
+                    atol=0,
+                    rtol=0,
+                )
+        seq_lens = [length + max(1, count) for length, count in zip(seq_lens, accepted)]
 
 
 def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
     """The captured verify graph plus the existing post-forward hook follows eager."""
-    captured = _Harness(eager_replay=True, seed=29)
-    eager = _Harness(eager_replay=True, seed=29)
+    captured = _Harness(draft_tokens=T, eager_replay=True, seed=29)
+    eager = _Harness(draft_tokens=T, eager_replay=True, seed=29)
     rpis = [0, 1]
     pages = {
         group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
@@ -541,9 +710,34 @@ def test_graph_replay_then_post_forward_commit_matches_eager_over_rounds():
         _assert_committed_pages_equal(captured, eager, pages)
 
 
+@pytest.mark.parametrize("draft_tokens", [None, 1, 4])
+def test_standard_decode_replay_workspace_matches_recipe(draft_tokens):
+    """Decode and MTP reserve the bytes used by their real replay buffers."""
+    harness = _Harness(draft_tokens=draft_tokens, eager_replay=True)
+    recipe = _kimi_recipe(
+        max_bs=harness.backend.max_bs,
+        speculative_algorithm=None if harness.width == 1 else "EAGLE3",
+        speculative_num_draft_tokens=draft_tokens,
+    )
+    planned_bytes = recipe.setup().fixed_workspace_bytes
+    allocated_bytes = harness.backend.preallocate_verify_workspace(
+        harness.backend.max_bs, harness.width
+    )
+    assert planned_bytes == allocated_bytes
+    _prepare_fixed_workspaces(
+        server_args=recipe.server_args,
+        config=harness.config,
+        backend=harness.backend,
+        draft_backend=None,
+        uses_paged_state_verify=True,
+        is_inkling=False,
+        expected_bytes=planned_bytes,
+    )
+
+
 def test_replay_planning_matches_allocation_and_rejects_drift():
     """The cache recipe and startup allocator share one byte contract."""
-    harness = _Harness(eager_replay=True)
+    harness = _Harness(draft_tokens=T, eager_replay=True)
     recipe = _kimi_recipe(
         draft_layers=5,
         max_bs=8,
@@ -589,7 +783,7 @@ def test_replay_planning_matches_allocation_and_rejects_drift():
 
 
 def test_descriptor_binding_rejects_nonuniform_conv_width():
-    harness = _Harness(eager_replay=True)
+    harness = _Harness(draft_tokens=T, eager_replay=True)
     last = harness.layer_ids[-1]
     harness.prepare_metadata([0], {group: [2] for group in _STATE_GROUPS}, [8 + T])
     harness.forward(harness.inputs(1, 701), 1)
@@ -604,7 +798,7 @@ def test_descriptor_binding_rejects_nonuniform_conv_width():
 
 
 def test_equal_geometry_pool_replacement_rebinds_batched_replay():
-    harness = _Harness(eager_replay=True)
+    harness = _Harness(draft_tokens=T, eager_replay=True)
     pages = {group: [2] for group in _STATE_GROUPS}
     harness.prepare_metadata([0], pages, [8 + T])
     harness.forward(harness.inputs(1, 711), 1)
@@ -627,7 +821,7 @@ def test_equal_geometry_pool_replacement_rebinds_batched_replay():
 
 def test_uneven_state_groups_bind_batched_replay():
     """Replay uses each layer's cache group instead of equal-size partitions."""
-    harness = _Harness(eager_replay=True)
+    harness = _Harness(draft_tokens=T, eager_replay=True)
     first_group, second_group = _STATE_GROUPS[:2]
     moved_layer = next(
         layer_id
@@ -652,7 +846,7 @@ def test_uneven_state_groups_bind_batched_replay():
 
 def test_verify_scratch_cannot_grow_after_preallocation():
     """Scratch is allocated once; any later capacity overrun fails loudly."""
-    harness = _Harness(eager_replay=True)
+    harness = _Harness(draft_tokens=T, eager_replay=True)
     harness.backend.preallocate_verify_workspace(harness.backend.max_bs, T)
     capacity = next(iter(harness.backend._verify_scratch.values()))[0].shape[0]
     with pytest.raises(RuntimeError, match="preallocated scratch holds"):
@@ -663,8 +857,8 @@ def test_no_store_fused_verify_matches_decomposed_outputs():
     """Replay fusion agrees with the shared conv/gate/recurrent verify path."""
     from types import MethodType
 
-    fused = _Harness(eager_replay=True, seed=61)
-    decomposed = _Harness(eager_replay=False, seed=61)
+    fused = _Harness(draft_tokens=T, eager_replay=True, seed=61)
+    decomposed = _Harness(draft_tokens=T, eager_replay=False, seed=61)
     decomposed.backend._verify = MethodType(
         MambaAttnBackend._verify, decomposed.backend
     )
@@ -692,13 +886,8 @@ def test_no_store_fused_verify_matches_decomposed_outputs():
 
 
 def test_rebinding_the_pool_reissues_the_raw_gate_scratch(monkeypatch):
-    """Raw-gate scratch is issued against the bound pool; a rebind must not keep the old one."""
-    monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
-        lambda dtype, **kwargs: True,
-    )
-    harness = _Harness(eager_replay=True)
-    assert harness.backend._replay_uses_raw_gate
+    """Rebinding drops the previous records workspace and its references to the old pool."""
+    harness = _Harness(draft_tokens=T, eager_replay=True)
     harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
     old_pool = storages_of(
         *(
@@ -721,8 +910,8 @@ def test_rebinding_the_pool_reissues_the_raw_gate_scratch(monkeypatch):
 
 def test_rebinding_the_pool_commits_like_a_fresh_bind():
     """Verify/commit after a rebind lands in the new pool exactly as a fresh bind's does."""
-    rebound = _Harness(eager_replay=True)
-    fresh = _Harness(eager_replay=True)
+    rebound = _Harness(draft_tokens=T, eager_replay=True)
+    fresh = _Harness(draft_tokens=T, eager_replay=True)
     rpis = [0, 1]
     pages = {
         group_id: [2 + group * len(rpis) + i for i in range(len(rpis))]
@@ -734,6 +923,7 @@ def test_rebinding_the_pool_commits_like_a_fresh_bind():
     replacement = _make_kimi_pool(DEV, usable_pages=24)
     rebound.backend.set_kv_pool(replacement)
     rebound.backend.init_cuda_graph_state(rebound.config.max_bs)
+    rebound.backend.preallocate_verify_workspace(rebound.config.max_bs, rebound.width)
     rebound.pool = replacement
     rebound.contract = replacement.arena.runtime_contract
     for round_index, accepted in enumerate(([0, T], [T, 2])):
@@ -750,7 +940,7 @@ def test_rebinding_the_pool_commits_like_a_fresh_bind():
 
 def test_reordered_state_groups_are_the_same_geometry():
     """Group ids name the groups; the contract's enumeration order is not geometry."""
-    harness = _Harness(eager_replay=False)
+    harness = _Harness(draft_tokens=T, eager_replay=False)
     specs = harness.pool.arena.runtime_contract.group_specs
     reordered = SimpleNamespace(
         arena=SimpleNamespace(
@@ -771,7 +961,7 @@ def test_a_rejected_hybrid_rebind_moves_no_child():
         CacheGroupRouter,
     )
 
-    harness = _Harness(eager_replay=False)
+    harness = _Harness(draft_tokens=T, eager_replay=False)
     leaves = []
 
     def leaf_factory(group_id, granularity):
@@ -819,7 +1009,7 @@ def test_a_rejected_hybrid_rebind_moves_no_child():
 
 
 def test_a_rejected_hybrid_rebind_publishes_nothing():
-    harness = _Harness(eager_replay=False)
+    harness = _Harness(draft_tokens=T, eager_replay=False)
     full = SimpleNamespace(device=DEV, cache_pool=harness.pool)
     full.set_cache_pool = full._bind = lambda pool: setattr(full, "cache_pool", pool)
     full.validate_cache_pool = lambda pool: None
@@ -853,8 +1043,8 @@ def test_a_rejected_hybrid_rebind_publishes_nothing():
 
 def test_a_rebound_backend_matches_a_fresh_one_field_by_field():
     """After the documented re-initialisation, no attribute tells a rebind from a fresh bind."""
-    rebound = _Harness(eager_replay=True)
-    fresh = _Harness(eager_replay=True)
+    rebound = _Harness(draft_tokens=T, eager_replay=True)
+    fresh = _Harness(draft_tokens=T, eager_replay=True)
     pages = {group: [2] for group in _STATE_GROUPS}
     rebound.round([0], pages, [8 + T], 100, [1])
     old_slabs = storages_of(
@@ -870,26 +1060,33 @@ def test_a_rebound_backend_matches_a_fresh_one_field_by_field():
         harness.backend.init_cuda_graph_state(harness.config.max_bs)
         harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
 
-    assert binding_state(rebound.backend) == binding_state(fresh.backend)
+    rebound_state = binding_state(rebound.backend)
+    fresh_state = binding_state(fresh.backend)
+    # Tapes record raw device addresses, which differ between any two backends.
+    assert rebound.backend._replay_state_tapes.keys() == (
+        fresh.backend._replay_state_tapes.keys()
+    )
+    rebound_state.pop("_replay_state_tapes")
+    fresh_state.pop("_replay_state_tapes")
+    assert rebound_state == fresh_state
     assert_no_alias(rebound.backend, old_slabs)
 
 
 def test_a_pool_too_small_for_the_raw_gate_scratch_is_refused(monkeypatch):
-    """The raw-gate scratch is the pool's own conv slab, so a probe pool must hold max_bs rows."""
-    monkeypatch.setattr(
-        "tokenspeed.runtime.layers.attention.backends.state.kda.kda_batched_replay_uses_raw_gate",
-        lambda dtype, **kwargs: True,
-    )
-    harness = _Harness(eager_replay=True)
-    assert harness.backend._replay_uses_raw_gate
+    """Records workspace is independent of the small cache used during graph probing."""
+    harness = _Harness(draft_tokens=T, eager_replay=True)
     harness.backend.set_kv_pool(_make_kimi_pool(DEV, usable_pages=4))
 
-    with pytest.raises(RuntimeError, match="transient conv rows"):
-        harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    harness.backend.preallocate_verify_workspace(harness.config.max_bs, T)
+    for layer_id in harness.layer_ids:
+        conv = harness.backend._state_components(layer_id)[0]
+        scratch = harness.backend._verify_scratch[layer_id][0]
+        assert scratch.shape[0] >= harness.config.max_bs
+        assert scratch.untyped_storage().data_ptr() != conv.untyped_storage().data_ptr()
 
 
 def test_hybrid_rebinding_reaches_the_state_child():
-    harness = _Harness(eager_replay=False)
+    harness = _Harness(draft_tokens=T, eager_replay=False)
     full = SimpleNamespace(device=DEV, cache_pool=None)
     full.set_cache_pool = full._bind = lambda pool: setattr(full, "cache_pool", pool)
     full.validate_cache_pool = lambda pool: None
@@ -912,3 +1109,621 @@ def test_hybrid_rebinding_reaches_the_state_child():
     assert share.prefill is None and share.decode is None
     assert_no_alias(hybrid, old_slabs)
     assert_no_alias(harness.backend, old_slabs)
+
+
+def test_padded_graph_verify_keeps_live_rows_and_commits_isolated():
+    """Padding may have undefined outputs, but cannot change live state."""
+    captured = _Harness(draft_tokens=T, eager_replay=True, seed=982)
+    eager = _Harness(draft_tokens=T, eager_replay=True, seed=982)
+    bs, real_bs = 4, 2
+    rpis = [0, 1]
+    pages = {
+        group_id: [2 + group * real_bs + i for i in range(real_bs)]
+        for group, group_id in enumerate(_STATE_GROUPS)
+    }
+    seq_lens = [8 + T] * real_bs
+    captured.prepare_metadata(rpis, pages, seq_lens)
+    captured.forward(captured.inputs(real_bs, 901), real_bs)
+    capture_tables = {
+        group_id: torch.full((bs, 2), -1, dtype=torch.int32, device=DEV)
+        for group_id in _STATE_GROUPS
+    }
+    captured.backend.init_forward_metadata_capture_cuda_graph(
+        bs,
+        torch.arange(bs, dtype=torch.int32, device=DEV),
+        torch.full((bs,), 8 + T, dtype=torch.int32, device=DEV),
+        ForwardMode.DECODE,
+        block_tables=capture_tables,
+    )
+    stable_inputs = captured.inputs(bs, 902)
+    side_stream = torch.cuda.Stream()
+    side_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side_stream):
+        captured.forward(stable_inputs, bs)
+    torch.cuda.current_stream().wait_stream(side_stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_outputs = captured.forward(stable_inputs, bs)
+
+    for round_index, counts in enumerate(([0, T], [1, 2])):
+        tables = {
+            group_id: np.asarray(
+                [[0, page] for page in pages[group_id]], dtype=np.int32
+            )
+            for group_id in _STATE_GROUPS
+        }
+        captured.backend.refresh_decode_metadata(
+            bs,
+            real_bs,
+            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            torch.tensor(seq_lens, dtype=torch.int32, device=DEV),
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=_tables_for(captured.contract, tables, DEV),
+        )
+        inputs = captured.inputs(bs, 903 + round_index)
+        for name, value in inputs.items():
+            stable_inputs[name].copy_(value)
+        graph.replay()
+        accepted = torch.tensor(counts, dtype=torch.int32, device=DEV)
+        captured.backend.commit_verified_state(accepted, accepted_path=None)
+        eager.prepare_metadata(rpis, pages, seq_lens)
+        eager_outputs = eager.forward(
+            {name: value[: real_bs * T] for name, value in inputs.items()}, real_bs
+        )
+        eager.backend.commit_verified_state(accepted, accepted_path=None)
+        for actual, expected in zip(graph_outputs, eager_outputs, strict=True):
+            torch.testing.assert_close(
+                actual.reshape(-1, KEY_DIM)[: real_bs * T],
+                expected.reshape(-1, KEY_DIM),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        for layer_id in captured.layer_ids:
+            for component in ("conv_state", "recurrent_state"):
+                torch.testing.assert_close(
+                    captured.pool.get_component(layer_id, component),
+                    eager.pool.get_component(layer_id, component),
+                    atol=0 if component == "conv_state" else 1e-5,
+                    rtol=0 if component == "conv_state" else 1e-3,
+                )
+        seq_lens = [length + count for length, count in zip(seq_lens, counts)]
+
+
+def test_commit_plan_resolves_pages_when_packed_storage_moves():
+    """Resolve the new scheduler pages after replacing packed table storage."""
+    harness = _Harness(
+        draft_tokens=T, eager_replay=True, seed=173, max_bs=2, usable_pages=24
+    )
+    first_pages = {
+        group: [1 + 2 * index, 2 + 2 * index]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    next_pages = {
+        group: [7 + 2 * index, 8 + 2 * index]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    harness.prepare_metadata([0, 1], first_pages, [64 + T, 64 + T])
+    # Retain the previous views so the allocator cannot reuse their address.
+    _previous_tables = harness.backend._verify_commit_ctx[0]
+    harness.prepare_metadata([0, 1], next_pages, [64 + T, 64 + T])
+
+    accepted = torch.tensor([2, T], dtype=torch.int32, device=DEV)
+    pages, steps = harness.backend._resolve_verify_commit_pages(
+        accepted, harness.backend._replay_group_ids
+    )
+    expected = torch.tensor(
+        [next_pages[group] for group in harness.backend._replay_group_ids],
+        dtype=torch.int32,
+        device=DEV,
+    )
+    torch.testing.assert_close(pages, expected, atol=0, rtol=0)
+    torch.testing.assert_close(steps, accepted, atol=0, rtol=0)
+    torch.testing.assert_close(
+        harness.backend._replay_commit_reads[: expected.numel()].view_as(expected),
+        expected,
+        atol=0,
+        rtol=0,
+    )
+
+
+@pytest.mark.parametrize("batch", [2, 5])
+def test_commit_plan_queued_table_updates_keep_each_round_pages(batch):
+    """Queued descriptor uploads preserve each round's source and live pages."""
+    harness = _Harness(
+        draft_tokens=T, eager_replay=True, seed=174, max_bs=batch, usable_pages=24
+    )
+    group_ids = harness.backend._replay_group_ids
+    request_indices = torch.arange(batch, dtype=torch.int32, device=DEV)
+    seq_lens = torch.full((batch,), 64 + T, dtype=torch.int32, device=DEV)
+    accepted = torch.arange(batch, dtype=torch.int32, device=DEV) % (T + 2)
+    rounds = []
+    for iteration in range(12):
+        tables = {}
+        expected_reads, expected_pages = [], []
+        for group_index, group in enumerate(group_ids):
+            rows, sources, destinations = [], [], []
+            for row in range(batch):
+                live = 1 + (iteration * 3 + group_index + row) % 20
+                checkpoint = (
+                    1 + (iteration + group_index * 7 + row) % 20
+                    if (iteration + row) % 2
+                    else 0
+                )
+                if iteration % 3 == 0 and row == batch - 1:
+                    checkpoint = live = -1
+                rows.append(
+                    [checkpoint, live] + [-1] * (1 + (iteration + group_index) % 3)
+                )
+                sources.append(checkpoint if checkpoint > 0 else live)
+                destinations.append(live)
+            # Retain independently allocated, strided tables across rounds.
+            tables[group] = torch.tensor(rows, dtype=torch.int32, device=DEV)[:, :2]
+            expected_reads.append(sources)
+            expected_pages.append(destinations)
+        rounds.append((tables, expected_reads, expected_pages))
+
+    def plan(tables):
+        harness.backend.refresh_decode_metadata(
+            batch,
+            batch,
+            request_indices,
+            seq_lens,
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=True,
+            block_tables=tables,
+        )
+        return harness.backend._resolve_verify_commit_pages(accepted, group_ids)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        # Compile and warm the metadata kernels before queuing delayed updates.
+        for tables, _, _ in rounds:
+            plan(tables)
+    stream.synchronize()
+
+    snapshots = []
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(100_000_000)
+        for tables, _, _ in rounds:
+            pages, steps = plan(tables)
+            reads = harness.backend._replay_commit_reads[: len(group_ids) * batch]
+            snapshots.append(
+                (pages.clone(), reads.view_as(pages).clone(), steps.clone())
+            )
+    torch.cuda.current_stream().wait_stream(stream)
+    for (_, expected_reads, expected_pages), (pages, reads, steps) in zip(
+        rounds, snapshots, strict=True
+    ):
+        torch.testing.assert_close(
+            pages,
+            torch.tensor(expected_pages, dtype=torch.int32, device=DEV),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(
+            reads,
+            torch.tensor(expected_reads, dtype=torch.int32, device=DEV),
+            atol=0,
+            rtol=0,
+        )
+        torch.testing.assert_close(steps, accepted.clamp(1, T), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("draft_tokens", [None, 1, 4])
+@pytest.mark.parametrize("captured", [False, True])
+def test_decode_records_commit_after_acceptance(draft_tokens, captured):
+    """Verify preserves live state; acceptance commits only the selected prefixes."""
+    actual = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=431)
+    eager = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=431)
+    width = actual.width
+    recipe = _kimi_recipe(
+        max_bs=actual.backend.max_bs,
+        speculative_num_draft_tokens=draft_tokens,
+        speculative_algorithm=None if width == 1 else "EAGLE3",
+    )
+    planned_bytes = recipe.workspace_bytes()
+    _prepare_fixed_workspaces(
+        server_args=recipe.server_args,
+        config=actual.config,
+        backend=actual.backend,
+        draft_backend=None,
+        uses_paged_state_verify=True,
+        is_inkling=False,
+        expected_bytes=planned_bytes,
+    )
+
+    def workspace_tensors():
+        backend = actual.backend
+        return tuple(
+            tensor
+            for tensor in (
+                *backend._replay_payloads,
+                backend._replay_descriptors,
+                backend._replay_group_indices,
+                backend._replay_commit_tables,
+                backend._replay_commit_reads,
+                backend._replay_commit_pages,
+                backend._replay_commit_steps,
+                backend._replay_record_metadata,
+                backend._replay_record_stamps,
+                *(pair[0] for pair in backend._verify_scratch.values()),
+                *backend.query_start_loc_list,
+            )
+            if tensor is not None
+        )
+
+    # Retain the allocations so a replacement cannot reuse their addresses.
+    initial_workspace = workspace_tensors()
+    workspace_storage = [
+        (tensor.data_ptr(), tensor.nbytes) for tensor in initial_workspace
+    ]
+    batch_sizes = (4, 8, 3, 4)
+    live_counts = (2, 1, 3, 2)
+    max_live = max(live_counts)
+    all_pages = {
+        group: [2 + index * max_live + row for row in range(max_live)]
+        for index, group in enumerate(_STATE_GROUPS)
+    }
+    all_lengths = [8 + width] * max_live
+    stable_inputs = actual.inputs(actual.config.max_bs, 432)
+
+    def assert_live_state_unchanged(snapshots):
+        for (layer, component), snapshot in snapshots.items():
+            torch.testing.assert_close(
+                actual.pool.get_component(layer, component), snapshot, atol=0, rtol=0
+            )
+
+    before = {
+        (layer, component): actual.pool.get_component(layer, component).clone()
+        for layer in actual.layer_ids
+        for component in ("conv_state", "recurrent_state")
+    }
+    # Bind layer descriptors before capture, as serving warmup does.
+    actual.prepare_metadata(list(range(max_live)), all_pages, all_lengths)
+    actual.forward(actual.inputs(max_live, 433), max_live)
+    assert_live_state_unchanged(before)
+    graphs = {}
+    if captured:
+        stream = torch.cuda.Stream()
+        for batch in dict.fromkeys(batch_sizes):
+            actual.backend.init_forward_metadata_capture_cuda_graph(
+                batch,
+                torch.arange(batch, dtype=torch.int32, device=DEV),
+                torch.full((batch,), 8 + width, dtype=torch.int32, device=DEV),
+                ForwardMode.DECODE,
+            )
+            capture_inputs = {
+                name: value[: batch * width] for name, value in stable_inputs.items()
+            }
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                actual.forward(capture_inputs, batch)
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            assert_live_state_unchanged(before)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs = actual.forward(capture_inputs, batch)
+            graphs[batch] = graph, outputs
+            assert_live_state_unchanged(before)
+    assert [
+        (tensor.data_ptr(), tensor.nbytes) for tensor in workspace_tensors()
+    ] == workspace_storage
+
+    for round_index, (batch, live) in enumerate(
+        zip(batch_sizes, live_counts, strict=True)
+    ):
+        if round_index:
+            all_pages = {group: ids[::-1] for group, ids in all_pages.items()}
+            all_lengths.reverse()
+        pages = {group: ids[:live] for group, ids in all_pages.items()}
+        lengths = all_lengths[:live]
+        rpis = list(reversed(range(live)))
+        inputs = actual.inputs(batch, 440 + round_index)
+        live_inputs = {name: value[: live * width] for name, value in inputs.items()}
+        counts = [1 + (round_index + row) % width for row in range(live)]
+        expected = _reference_committed_states(eager, pages, live_inputs, counts)
+        tables = {
+            group: np.asarray([[0, page] for page in ids], dtype=np.int32)
+            for group, ids in pages.items()
+        }
+        actual.backend.refresh_decode_metadata(
+            batch,
+            live,
+            torch.tensor(rpis, dtype=torch.int32, device=DEV),
+            torch.tensor(lengths, dtype=torch.int32, device=DEV),
+            forward_mode=ForwardMode.DECODE,
+            for_graph_replay=captured,
+            block_tables=_tables_for(actual.contract, tables, DEV),
+        )
+        before = {
+            (layer, component): actual.pool.get_component(layer, component).clone()
+            for layer in actual.layer_ids
+            for component in ("conv_state", "recurrent_state")
+        }
+        for name, value in inputs.items():
+            stable_inputs[name][: batch * width].copy_(value)
+        first_outputs = None
+        for _ in range(2):
+            if captured:
+                graph, outputs = graphs[batch]
+                graph.replay()
+            else:
+                outputs = actual.forward(
+                    {
+                        name: value[: batch * width]
+                        for name, value in stable_inputs.items()
+                    },
+                    batch,
+                )
+            assert_live_state_unchanged(before)
+            live_outputs = [
+                output.reshape(-1, KEY_DIM)[: live * width] for output in outputs
+            ]
+            if first_outputs is None:
+                first_outputs = [output.clone() for output in live_outputs]
+            else:
+                for output, previous in zip(live_outputs, first_outputs, strict=True):
+                    torch.testing.assert_close(output, previous, atol=0, rtol=0)
+
+        eager.prepare_metadata(rpis, pages, lengths)
+        eager_outputs = eager.forward(live_inputs, live)
+        for output, reference in zip(outputs, eager_outputs, strict=True):
+            torch.testing.assert_close(
+                output.reshape(-1, KEY_DIM)[: live * width],
+                reference.reshape(-1, KEY_DIM),
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        accepted = torch.tensor(counts, dtype=torch.int32, device=DEV)
+        for harness in (actual, eager):
+            root = HybridLinearAttnBackend(
+                AttentionBackend(harness.config, harness.config.components[0]),
+                harness.backend,
+                [],
+            )
+            root.commit_state_after_acceptance(
+                accepted, num_extends=0, accepted_path=None
+            )
+        # State groups share physical planes, so a view includes the other
+        # groups' pages. Exclude all accepted destinations from the guard.
+        destination_pages = [
+            page for group_pages in pages.values() for page in group_pages
+        ]
+        for layer, (state, conv) in expected.items():
+            ids = pages[actual.pool.state_group_by_layer[layer]]
+            torch.testing.assert_close(
+                actual.pool.get_component(layer, "recurrent_state")[ids],
+                state,
+                atol=2e-6,
+                rtol=2e-5,
+            )
+            torch.testing.assert_close(
+                actual.pool.get_component(layer, "conv_state")[ids].float(),
+                conv,
+                atol=0,
+                rtol=0,
+            )
+            for component in ("conv_state", "recurrent_state"):
+                committed = actual.pool.get_component(layer, component)
+                untouched = torch.ones(committed.shape[0], device=DEV, dtype=torch.bool)
+                untouched[destination_pages] = False
+                torch.testing.assert_close(
+                    committed[untouched],
+                    before[layer, component][untouched],
+                    atol=0,
+                    rtol=0,
+                )
+                torch.testing.assert_close(
+                    committed,
+                    eager.pool.get_component(layer, component),
+                    atol=0,
+                    rtol=0,
+                )
+        assert [
+            (tensor.data_ptr(), tensor.nbytes) for tensor in workspace_tensors()
+        ] == workspace_storage
+        assert (
+            actual.backend.preallocate_verify_workspace(actual.config.max_bs, width)
+            == planned_bytes
+        )
+        all_lengths[:live] = [length + count for length, count in zip(lengths, counts)]
+
+
+@pytest.mark.parametrize("width", [1, 4])
+def test_verify_convolution_bias_matches_torch(width):
+    from tokenspeed_kernel.ops.attention.kda import kda_verify_conv_update
+
+    torch.manual_seed(871)
+    channels = CONV_DIM
+    raw = torch.randn(2 * width, channels, device=DEV, dtype=torch.bfloat16) * 0.1
+    state = torch.randn(3, channels, 3, device=DEV, dtype=torch.bfloat16) * 0.1
+    weight = torch.randn(channels, 4, device=DEV, dtype=torch.bfloat16) * 0.1
+    bias = torch.randn(channels, device=DEV, dtype=torch.bfloat16) * 0.1
+    pages = torch.tensor([2, -1], device=DEV, dtype=torch.int32)
+    history = torch.stack((state[2], torch.zeros_like(state[0]))).float()
+    sequence = torch.cat(
+        (history, raw.view(2, width, channels).transpose(1, 2).float()), dim=-1
+    )
+    expected = torch.nn.functional.conv1d(
+        sequence, weight.float().unsqueeze(1), bias.float(), groups=channels
+    )
+    expected = torch.nn.functional.silu(expected).transpose(1, 2).reshape_as(raw)
+    actual = kda_verify_conv_update(
+        raw,
+        weight,
+        state,
+        pages,
+        num_heads=H,
+        head_dim=D,
+        draft_token_num=width,
+        recurrent_layout="v_major",
+        bias=bias,
+    )
+    torch.testing.assert_close(actual.float(), expected, atol=1e-4, rtol=8e-3)
+
+
+@pytest.mark.parametrize("draft_tokens", [None, 4])
+@pytest.mark.parametrize("lower_bound", [None, _LOWER_BOUND])
+def test_record_decode_preserves_raw_gate_bias_and_layer_subset(
+    draft_tokens, lower_bound
+):
+    harness = _Harness(draft_tokens=draft_tokens, eager_replay=True, seed=901)
+    if not harness.backend._verify_split_producers:
+        pytest.skip("fused verify kernel does not support a conv bias")
+    harness.layer_ids = harness.layer_ids[:1]
+    for layer in harness.layer_ids:
+        harness.params[layer]["bias"] = (
+            torch.randn(CONV_DIM, device=DEV, dtype=torch.bfloat16) * 0.1
+        )
+        harness.params[layer]["f_b_weight"] = None
+        harness.params[layer]["lower_bound"] = lower_bound
+    pages = {group: [2 + i] for i, group in enumerate(_STATE_GROUPS)}
+    for round_index in range(3):
+        inputs = harness.inputs(1, 910 + round_index)
+        inputs["g_raw"] = (
+            torch.randn(harness.width, KEY_DIM, device=DEV, dtype=torch.bfloat16) * 0.1
+        )
+        count = max(1, harness.width - 1)
+        reference = _reference_committed_states(harness, pages, inputs, [count])
+        harness.prepare_metadata([0], pages, [8 + harness.width + round_index * count])
+        harness.forward(inputs, 1)
+        harness.backend.commit_state_after_acceptance(
+            torch.tensor([count], device=DEV, dtype=torch.int32),
+            num_extends=0,
+            accepted_path=None,
+        )
+        for layer, (state, conv) in reference.items():
+            ids = pages[harness.pool.state_group_by_layer[layer]]
+            torch.testing.assert_close(
+                harness.pool.get_component(layer, "recurrent_state")[ids],
+                state,
+                atol=2e-6,
+                rtol=2e-5,
+            )
+            torch.testing.assert_close(
+                harness.pool.get_component(layer, "conv_state")[ids].float(),
+                conv,
+                atol=0,
+                rtol=0,
+            )
+
+
+@pytest.mark.parametrize("draft_tokens", [None, 4])
+def test_mixed_decode_commit_matches_separate_forwards(draft_tokens):
+    # Prefill consumes the full cache field, including every per-rank head.
+    class _FullWidthHarness(_Harness):
+        H = 12
+
+    actual = _FullWidthHarness(draft_tokens=draft_tokens, eager_replay=True, seed=941)
+    reference = _FullWidthHarness(
+        draft_tokens=draft_tokens, eager_replay=True, seed=941
+    )
+    width, prompt = actual.width, 3
+    pages = {group: [2 + 2 * i, 3 + 2 * i] for i, group in enumerate(_STATE_GROUPS)}
+    inputs = {
+        name: value[: prompt + width]
+        for name, value in actual.inputs(prompt + width, 943).items()
+    }
+
+    def metadata(harness, *, mixed):
+        bs = 2 if mixed else 1
+        lengths = torch.tensor([prompt, 8 + width][:bs], device=DEV, dtype=torch.int32)
+        new_cpu = torch.tensor([prompt], dtype=torch.int32)
+        prefix_cpu = torch.zeros(1, dtype=torch.int32)
+        tables = {
+            group: np.asarray([[0, page] for page in ids[:bs]], dtype=np.int32)
+            for group, ids in pages.items()
+        }
+        harness.backend.init_forward_metadata(
+            bs,
+            1,
+            torch.arange(bs, device=DEV, dtype=torch.int32),
+            lengths,
+            ForwardMode.MIXED if mixed else ForwardMode.EXTEND,
+            block_tables=_tables_for(harness.contract, tables, DEV),
+            extend_seq_lens=new_cpu.to(DEV),
+            extend_seq_lens_cpu=new_cpu,
+            extend_prefix_lens=prefix_cpu.to(DEV),
+            extend_prefix_lens_cpu=prefix_cpu,
+            extend_replay_lens_cpu=prefix_cpu,
+            extend_prompt_lens_cpu=new_cpu,
+            extend_with_prefix=False,
+            query_shard=None,
+        )
+
+    def forward(harness, values, *, batch, mode):
+        outputs = []
+        for layer in harness.layer_ids:
+            params = harness.params[layer]
+            outputs.append(
+                harness.backend.forward_extend(
+                    None,
+                    None,
+                    None,
+                    layer=None,
+                    token_to_kv_pool=harness.pool,
+                    bs=batch,
+                    forward_mode=mode,
+                    mixed_qkv=values["mixed_qkv"].clone(),
+                    f_a_out=values["f_a_out"],
+                    beta_raw=values["beta_raw"],
+                    conv_weights=params["conv_weights"],
+                    bias=None,
+                    activation="silu",
+                    key_dim=harness.key_dim,
+                    value_dim=harness.key_dim,
+                    attention_tp_size=1,
+                    head_k_dim=D,
+                    head_v_dim=D,
+                    A_log=params["A_log"],
+                    dt_bias=params["dt_bias"],
+                    f_b_weight=params["f_b_weight"],
+                    lower_bound=params["lower_bound"],
+                    layer_id=layer,
+                    seq_len=values["mixed_qkv"].shape[0],
+                ).reshape(-1, harness.H, D)
+            )
+        return outputs
+
+    metadata(actual, mixed=True)
+    actual_outputs = forward(actual, inputs, batch=2, mode=ForwardMode.MIXED)
+    count = max(1, width - 1)
+    actual.backend.commit_state_after_acceptance(
+        torch.tensor([1, count], device=DEV, dtype=torch.int32),
+        num_extends=1,
+        accepted_path=None,
+    )
+    metadata(reference, mixed=False)
+    prompt_outputs = forward(
+        reference,
+        {name: value[:prompt] for name, value in inputs.items()},
+        batch=1,
+        mode=ForwardMode.EXTEND,
+    )
+    reference.prepare_metadata(
+        [1], {group: ids[1:] for group, ids in pages.items()}, [8 + width]
+    )
+    decode_outputs = reference.forward(
+        {name: value[prompt:] for name, value in inputs.items()}, 1
+    )
+    reference.backend.commit_state_after_acceptance(
+        torch.tensor([count], device=DEV, dtype=torch.int32),
+        num_extends=0,
+        accepted_path=None,
+    )
+    for layer, output, prefill, decode in zip(
+        actual.layer_ids, actual_outputs, prompt_outputs, decode_outputs, strict=True
+    ):
+        expected = torch.cat((prefill, decode.reshape(-1, actual.H, D)))
+        torch.testing.assert_close(output, expected, atol=2e-3, rtol=2e-3)
+        for component in ("conv_state", "recurrent_state"):
+            torch.testing.assert_close(
+                actual.pool.get_component(layer, component),
+                reference.pool.get_component(layer, component),
+                atol=0,
+                rtol=0,
+            )

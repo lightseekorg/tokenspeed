@@ -28,6 +28,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.moe import packed_projection_weight_view
+from tokenspeed_kernel.ops.quantization import quantize_fp8_with_scale
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -207,6 +208,9 @@ if platform.is_amd:
 
 if platform.is_amd:
     from tokenspeed_kernel_amd.ops.gfx950.moe import (
+        launch_gluon_router_sqrt_softplus_topk_gemv_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe import (
         launch_gluon_sqrt_softplus_topk_gfx950 as _topk_impl,
     )
 
@@ -256,6 +260,60 @@ if platform.is_amd:
             routed_scaling_factor,
         )
         return weights.to(weights_dtype), ids, scores
+
+    @register_kernel(
+        "moe",
+        "router_topk",
+        name="gluon_router_sqrt_softplus_topk_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+            vendors=frozenset({"amd"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    hidden_states=dense_tensor_format(torch.bfloat16),
+                    gate_weight=dense_tensor_format(torch.bfloat16),
+                )
+            }
+        ),
+        traits={
+            # Measured to beat the decode GEMM plus top-k up to 128 rows.
+            "tokens": frozenset(range(1, 129)),
+            "experts": frozenset({256, 384}),
+            "hidden_alignment": frozenset({512}),
+            "top_k": frozenset({6}),
+            "routing_kind": frozenset({"plain", "bias", "hash"}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_router_sqrt_softplus_topk_gfx950(
+        hidden_states: torch.Tensor,
+        gate_weight: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        correction_bias: torch.Tensor | None,
+        hash_indices_table: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+        routed_scaling_factor: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Split-K GEMV partials; the top-k kernel sums them in order.
+        partials = launch_gluon_router_sqrt_softplus_topk_gemv_gfx950(
+            hidden_states, gate_weight
+        )
+        weights, ids, _ = _topk_impl(
+            partials,
+            top_k,
+            renormalize,
+            correction_bias,
+            hash_indices_table,
+            input_ids,
+            False,
+            routed_scaling_factor,
+        )
+        return weights, ids
 
 
 # ===-----------------------------------------------------------------------===#
@@ -489,6 +547,75 @@ if platform.is_amd:
         )
 
 
+if platform.is_amd:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.routes_decode import (
+        MAX_TOKENS as _BF16_ROUTES_DECODE_MAX_TOKENS,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.routes_decode import (
+        launch_gluon_bf16_moe_routes_decode_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.routes_prefill import (
+        launch_gluon_bf16_moe_routes_prefill_gfx950,
+    )
+
+    @register_kernel(
+        "moe",
+        "routes",
+        name="gluon_bf16_moe_routes_gfx950",
+        solution="gluon",
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            # The kernels address buffers with 32-bit byte offsets. The
+            # zero kernel clears 512-column hidden blocks; the decode and
+            # prefill GEMMs tile the intermediate size by 256.
+            "buffer_offsets_fit_int32": frozenset({True}),
+            "hidden_alignment": frozenset({512}),
+            "ispp_alignment": frozenset({256}),
+            "topk": frozenset({1, 2, 4, 8, 16}),
+        },
+        priority=Priority.SPECIALIZED,
+    )
+    def gluon_bf16_moe_routes_gfx950(
+        x: torch.Tensor,
+        w13: torch.Tensor,
+        w2: torch.Tensor,
+        topk_ids: torch.Tensor,
+        expert_start: int,
+        output: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Gluon kernel of :func:`tokenspeed_kernel.ops.moe.bf16_moe_routes`.
+
+        Direct per-expert decode GEMMs through 16 tokens, block-aligned grouped
+        GEMMs above; both write zeros for non-local routes, so ``output`` needs
+        no clearing. The facade validates the tensors before selection.
+        """
+        num_tokens, top_k = topk_ids.shape
+        if output is None:
+            output = torch.empty(
+                (num_tokens * top_k, x.shape[1]), dtype=x.dtype, device=x.device
+            )
+        if num_tokens:
+            launch = (
+                launch_gluon_bf16_moe_routes_decode_gfx950
+                if num_tokens <= _BF16_ROUTES_DECODE_MAX_TOKENS
+                else launch_gluon_bf16_moe_routes_prefill_gfx950
+            )
+            launch(
+                x,
+                w13,
+                w2,
+                topk_ids.to(torch.int32).contiguous(),
+                expert_start,
+                output.view(num_tokens * top_k, x.shape[1]),
+            )
+        return output.view(num_tokens, top_k, x.shape[1])
+
+
 # ===-----------------------------------------------------------------------===#
 # FP8 block-scaled experts (AMD gfx950, gfx1250)
 # ===-----------------------------------------------------------------------===#
@@ -497,6 +624,16 @@ if platform.is_amd:
 _FP8_BLOCK = 128
 _DIRECT_DECODE_MAX_TOKENS = 32
 _EXACT_MFMA_MAX_TOKENS = 4096
+
+
+def _quantize_packed_activation(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize each activation row in groups of 128 values."""
+    return quantize_fp8_with_scale(
+        x,
+        granularity="token_group",
+        group_size=128,
+        solution="triton",
+    )
 
 
 def _validate_fp8_moe(
@@ -606,6 +743,10 @@ if platform.is_amd:
         gluon_fp8_block_dequantize,
         gluon_fp8_block_exact_mfma_moe,
         gluon_fp8_block_warp_decode_moe,
+        launch_gluon_fp8_packed_moe_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+        preprocess_gluon_fp8_packed_gfx950_moe_weights as gluon_fp8_packed_moe_weights,
     )
     from tokenspeed_kernel_amd.ops.gfx1250.moe.fp8 import (
         launch_gluon_fp8_block_experts_gfx1250,
@@ -707,6 +848,7 @@ if platform.is_amd:
                 swiglu_limit,
                 expert_start,
                 int(getattr(w, "ep_size", 1)) > 1,
+                packed_weights=False,
             )
         if x.shape[0] <= _EXACT_MFMA_MAX_TOKENS:
             num_local_experts = int(
@@ -844,6 +986,200 @@ if platform.is_amd:
         # Expert programs skip ids outside this rank and leave those rows unset.
         _combine(route_output, validated_weights, output, validated_ids, num_experts)
         return output
+
+    _PACKED_FP8_TRAITS = {
+        "weight_dtype": frozenset({"fp8"}),
+        "activation": frozenset({"swiglu"}),
+        "swiglu_form": frozenset({"standard"}),
+        "activation_clamped": frozenset({True}),
+        "routing_mode": frozenset({"precomputed_topk"}),
+        "supports_deferred_finalize": frozenset({False}),
+        "supports_ep": frozenset({False, True}),
+        "supports_all_to_all_ep": frozenset({False}),
+        "hidden": frozenset({4096}),
+        "internal_activation_dtype": frozenset({"input"}),
+        "fp8_scale_block_shape": frozenset({(_FP8_BLOCK, _FP8_BLOCK)}),
+        "supports_bias": frozenset({False}),
+        "expert_id_repeats": frozenset({False}),
+        "combine_order": frozenset({"rank"}),
+    }
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_fp8_packed_ep1_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_fp8_packed_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            **_PACKED_FP8_TRAITS,
+            "ep_size": frozenset({1}),
+            "ispp": frozenset({512}),
+        },
+        priority=Priority.SPECIALIZED + 1,
+    )
+    def gluon_fp8_packed_ep1_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply packed block-FP8 experts without expert parallelism.
+
+        Args:
+            plan: MoE execution plan selecting standard clamped SwiGLU.
+            x: Contiguous BF16 hidden states ``[tokens, 4096]``.
+            w: Module holding prepared packed E4M3 expert weights and FP32
+                inverse scales per 128-by-128 block.
+            router_logits: Accepted but unused; routing must be precomputed.
+            topk_weights: Required global route weights ``[tokens, 8]``.
+            topk_ids: Required global expert ids ``[tokens, 8]``.
+            num_tokens_global: Accepted but unused EP token count.
+            max_num_tokens_per_gpu: Accepted but unused token-capacity hint.
+            do_finalize: Must be true; deferred finalization is unsupported.
+            enable_pdl: Accepted but unused launch hint.
+
+        Returns:
+            Finalized BF16 expert contribution ``[tokens, 4096]``.
+        """
+        return _gluon_fp8_packed_precomputed_moe_apply(
+            plan,
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            num_tokens_global,
+            max_num_tokens_per_gpu,
+            do_finalize,
+            enable_pdl,
+        )
+
+    @register_kernel(
+        "moe",
+        "apply",
+        name="gluon_fp8_packed_ep4_precomputed_moe_apply",
+        solution="gluon",
+        weight_preprocessor=gluon_fp8_packed_moe_weights,
+        capability=CapabilityRequirement(
+            vendors=frozenset({"amd"}),
+            min_arch_version=ArchVersion(9, 5),
+            max_arch_version=ArchVersion(9, 5),
+        ),
+        signatures=format_signatures("x", "dense", {torch.bfloat16}),
+        traits={
+            **_PACKED_FP8_TRAITS,
+            "ep_size": frozenset({4}),
+            "ispp": frozenset({2048}),
+        },
+        priority=Priority.SPECIALIZED + 1,
+    )
+    def gluon_fp8_packed_ep4_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply packed block-FP8 experts with four expert-parallel ranks.
+
+        Args:
+            plan: MoE execution plan selecting standard clamped SwiGLU.
+            x: Contiguous BF16 hidden states ``[tokens, 4096]``.
+            w: Module holding this rank's prepared packed E4M3 expert weights
+                and FP32 inverse scales per 128-by-128 block.
+            router_logits: Accepted but unused; routing must be precomputed.
+            topk_weights: Required global route weights ``[tokens, 8]``.
+            topk_ids: Required global expert ids ``[tokens, 8]``.
+            num_tokens_global: Accepted but unused EP token count.
+            max_num_tokens_per_gpu: Accepted but unused token-capacity hint.
+            do_finalize: Must be true; deferred finalization is unsupported.
+            enable_pdl: Accepted but unused launch hint.
+
+        Returns:
+            Finalized BF16 local expert contribution ``[tokens, 4096]``;
+            the caller performs any cross-rank reduction.
+        """
+        return _gluon_fp8_packed_precomputed_moe_apply(
+            plan,
+            x,
+            w,
+            router_logits,
+            topk_weights,
+            topk_ids,
+            num_tokens_global,
+            max_num_tokens_per_gpu,
+            do_finalize,
+            enable_pdl,
+        )
+
+    def _gluon_fp8_packed_precomputed_moe_apply(
+        plan: dict,
+        x: torch.Tensor,
+        w: torch.nn.Module,
+        router_logits: torch.Tensor,
+        topk_weights: torch.Tensor | None = None,
+        topk_ids: torch.Tensor | None = None,
+        num_tokens_global: int | None = None,
+        max_num_tokens_per_gpu: int | None = None,
+        do_finalize: bool = True,
+        enable_pdl: bool = False,
+    ) -> torch.Tensor:
+        """Apply packed block-FP8 experts and return this rank's full partial.
+
+        Args:
+            plan: MoE execution plan selecting standard clamped SwiGLU.
+            x: Contiguous BF16 hidden states ``[tokens, 4096]``.
+            w: Module holding canonical packed FP8 expert parameters.
+            router_logits: Unused for precomputed routing.
+            topk_weights: Global route weights ``[tokens, top_k]``.
+            topk_ids: Global expert ids ``[tokens, top_k]``.
+            num_tokens_global: Unused EP token count.
+            max_num_tokens_per_gpu: Unused token-capacity hint.
+            do_finalize: Must be true.
+            enable_pdl: Unused launch hint.
+
+        Returns:
+            Finalized BF16 local expert contribution ``[tokens, 4096]``.
+        """
+        validated_weights, validated_ids, swiglu_limit = _validate_fp8_moe(
+            plan, x, w, topk_weights, topk_ids, do_finalize
+        )
+        if swiglu_limit is None or validated_ids.shape[1] != 8:
+            raise ValueError("packed FP8 MoE requires clamped SwiGLU and eight routes")
+        if x.shape[0] == 0:
+            return torch.empty_like(x)
+
+        num_local_experts = int(w.num_local_experts)
+        return launch_gluon_fp8_packed_moe_gfx950(
+            x,
+            w.w13_weight,
+            w.w2_weight,
+            w.w13_weight_scale_inv,
+            w.w2_weight_scale_inv,
+            validated_ids.to(dtype=torch.int32).contiguous(),
+            validated_weights.to(dtype=torch.float32).contiguous(),
+            float(swiglu_limit),
+            int(w.ep_rank) * num_local_experts,
+            num_experts_total=w.num_experts,
+            quantize_activation=_quantize_packed_activation,
+        )
 
 
 # ===-----------------------------------------------------------------------===#
@@ -1096,11 +1432,13 @@ if platform.is_amd:
             "activation": frozenset({"silu"}),
             "routing_mode": frozenset({"precomputed_topk"}),
             "supports_deferred_finalize": frozenset({True}),
+            "deferred_output_is_token_order": frozenset({True}),
+            "supports_deferred_out": frozenset({True}),
             "supports_prequantized_input": frozenset({True}),
             "supports_ep": frozenset({True}),
             "supports_all_to_all_ep": frozenset({False}),
-            "ep_size": frozenset({4, 8}),
-            "ispp": frozenset({4096}),
+            "ep_size": frozenset({1, 4, 8}),
+            "ispp": frozenset({512, 4096}),
             "internal_activation_dtype": frozenset({"mxfp4"}),
             "supports_bias": frozenset({False}),
         },
@@ -1118,8 +1456,9 @@ if platform.is_amd:
         do_finalize: bool = True,
         enable_pdl: bool = False,
         x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
+        deferred_out: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
-        """Run the gfx950 dynamic-A4W4 EP4/EP8 path with optional finalization.
+        """Run gfx950 dynamic-A4W4 experts with optional finalization.
 
         Args:
             plan: Kernel plan selected by the MoE registry.
@@ -1134,6 +1473,9 @@ if platform.is_amd:
             do_finalize: Whether to combine weighted routes into hidden states.
             enable_pdl: Unused launch hint.
             x_quantized: Optional packed E2M1 input and CDNA4 E8M0 scales.
+            deferred_out: Optional contiguous BF16 ``[tokens * top_k, hidden]``
+                destination for unweighted routes with ``do_finalize=False``.
+                It must not overlap inputs; the route map marks defined rows.
 
         Returns:
             Final hidden states when ``do_finalize`` is true; otherwise the
@@ -1142,6 +1484,8 @@ if platform.is_amd:
 
         del plan, router_logits, num_tokens_global, max_num_tokens_per_gpu
         del enable_pdl
+        if do_finalize and deferred_out is not None:
+            raise ValueError("deferred_out requires do_finalize=False")
         if topk_weights is None or topk_ids is None:
             raise ValueError("gfx950 dynamic A4W4 EP requires precomputed top-k")
         num_local_experts = int(getattr(w, "num_local_experts"))
@@ -1169,6 +1513,7 @@ if platform.is_amd:
             swiglu_limit=swiglu_limit,
             swiglu_beta=swiglu_beta,
             out=getattr(w, "_situ_output_buffer", None) if do_finalize else None,
+            deferred_out=deferred_out,
         )
 
     def _warmup_a4w4_ep_deferred(plan: dict, w: torch.nn.Module) -> None:
@@ -1184,7 +1529,6 @@ if platform.is_amd:
         if (
             w.hidden_size != 4096
             or w.intermediate_size != 4096
-            or w.num_local_experts not in (32, 64)
             or w.num_experts != 256
             or w.top_k != 8
             or _swiglu_args(w) != (1.0, 0.0, 0.0)
@@ -1196,6 +1540,13 @@ if platform.is_amd:
             _extract_gluon_raw_w(w.w2_weight_triton_tensor),
             _extract_gluon_raw_s(w.w2_precision_config.b_mx_scale),
         )
+        # The processed W13 bank holds the local intermediate shard.
+        if (w.num_local_experts, tensors[0].shape[-1] // 2) not in (
+            (32, 4096),
+            (64, 4096),
+            (256, 512),
+        ):
+            return
         device = tensors[0].device
         if device.type != "cuda":
             return
@@ -1262,8 +1613,8 @@ if platform.is_amd:
                 packed = torch.zeros((rows, 2048), device=device, dtype=torch.uint8)
                 scales = empty_swizzled_cdna4_mxfp4_scale(rows, 128, device=device)
                 scales.fill_(127)
-                # Global token routes are replicated. Each rank computes only
-                # the slots whose expert IDs belong to its local weights.
+                # Routes are replicated; EP filters by expert, TP computes
+                # each route's local intermediate shard.
                 ids = torch.arange(rows * 8, device=device, dtype=torch.int32)
                 ids = ids.remainder(256).view(rows, 8)
                 weights = torch.full(

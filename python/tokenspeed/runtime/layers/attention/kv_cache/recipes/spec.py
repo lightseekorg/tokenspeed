@@ -42,6 +42,9 @@ SlidingWindowTokens = int | Sequence[int | None] | None
 STATE_INPUT_SLOT = 0
 STATE_LIVE_SLOT = 1
 STATE_TABLE_SLOTS = 2
+# A prefill that writes an in-forward State checkpoint carries a third entry:
+# the block that receives the state at the checkpoint inside its chunk.
+STATE_CHECKPOINT_SLOT = 2
 
 
 @dataclass(frozen=True)
@@ -220,6 +223,37 @@ def validate_scheduler_config(
             f"{sorted(required_kinds)}, but backend "
             f"{type(attn_backend).__name__} is missing "
             f"{sorted(missing_kinds)}"
+        )
+
+
+def validate_state_checkpoint_in_forward(
+    *,
+    attn_backend: object,
+    kv_pool: object,
+) -> None:
+    """Refuse the flag when a State group's consumer cannot store the checkpoint.
+
+    The flag is ``--enable-state-checkpoint-in-forward``. The scheduler plans an in-forward checkpoint for every State group of a
+    long prompt and publishes the third block of its rows; a consumer that
+    never writes that block would publish a zeroed state as a checkpoint.
+
+    Args:
+        attn_backend: The (possibly composite) attention backend.
+        kv_pool: The KV pool whose ``runtime_contract`` names the groups.
+
+    Raises:
+        ValueError: When the contract has a State group and the backend does
+            not store in-forward checkpoints for every one it consumes.
+    """
+    contract = kv_pool.arena.runtime_contract
+    has_state = any(spec.attn_kind == "state" for spec in contract.group_specs)
+    if has_state and not attn_backend.stores_in_forward_state_checkpoints:
+        raise ValueError(
+            "--enable-state-checkpoint-in-forward: attention backend "
+            f"{type(attn_backend).__name__} cannot store in-forward State "
+            "checkpoints for every State group (supported: GDN with a "
+            "checkpointing prefill kernel and a prefix granularity it divides, "
+            "Qwen4-Exp PLE)"
         )
 
 
@@ -651,4 +685,5 @@ __all__ = [
     "layer_group_ids",
     "split_recurrent_state_groups",
     "validate_scheduler_config",
+    "validate_state_checkpoint_in_forward",
 ]

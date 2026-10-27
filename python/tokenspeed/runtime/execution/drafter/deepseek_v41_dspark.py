@@ -104,9 +104,6 @@ class DeepseekV41DSpark(BaseDrafter):
         self.next_tokens_buf = torch.empty(
             (max_bs, self.spec_num_tokens), dtype=torch.int32, device=self.device
         )
-        self.draft_tokens_buf = torch.empty(
-            (max_bs, self.block_size), dtype=torch.int32, device=self.device
-        )
         self.start_pos_buf = torch.empty(
             (max_bs,), dtype=torch.int64, device=self.device
         )
@@ -218,9 +215,8 @@ class DeepseekV41DSpark(BaseDrafter):
             self.tp_group,
             self.candidates,
             self.partials,
-            self.draft_tokens_buf[:num_decodes],
+            next_tokens[num_extends:, 1:],
         )
-        next_tokens[num_extends:, 1:].copy_(self.draft_tokens_buf[:num_decodes])
 
     @nvtx_range("drafter:dspark", color="purple")
     def run(

@@ -22,7 +22,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import dataclasses
 import functools
 import io
@@ -59,7 +58,6 @@ from starlette.routing import Mount
 from tokenspeed_kernel.platform import current_platform
 
 from tokenspeed.runtime.metrics.config import metrics_enabled
-from tokenspeed.runtime.metrics.func_timer import enable_func_timer
 from tokenspeed.runtime.utils.network import (  # noqa: F401
     get_free_port,
     is_valid_ipv6_address,
@@ -345,47 +343,6 @@ def set_weight_attrs(
         if hasattr(weight, key):
             raise ValueError(f"Overwriting existing tensor attribute: {key}")
         setattr(weight, key, value)
-
-
-class PipelinedPyobjBroadcaster:
-    """Overlap empty Python-object notifications with useful work."""
-
-    def __init__(
-        self,
-        rank: int,
-        dist_group: torch.distributed.ProcessGroup | None = None,
-        src: int = 0,
-    ) -> None:
-        self.rank = rank
-        self.dist_group = dist_group
-        self.src = src
-        self._data = None
-        self._ready = torch.zeros(1, dtype=torch.long)
-        self._work = None
-
-    @property
-    def in_flight(self) -> bool:
-        return self._work is not None
-
-    def start(self, data: list[Any] | None) -> None:
-        self._data = data
-        if self.rank == self.src:
-            self._ready[0] = bool(data)
-        self._work = dist.broadcast(
-            self._ready,
-            src=self.src,
-            group=self.dist_group,
-            async_op=True,
-        )
-
-    def finish(self) -> list[Any]:
-        self._work.wait()
-        data = self._data
-        self._data = None
-        self._work = None
-        if self._ready.item():
-            return broadcast_pyobj(data, self.rank, self.dist_group, src=self.src)
-        return data or []
 
 
 def broadcast_pyobj(
@@ -706,58 +663,13 @@ def nullable_str(val: str):
     return val
 
 
-def launch_dummy_health_check_server(host, port, enable_metrics):
-
-    import uvicorn
-    from fastapi import FastAPI, Response
-
-    app = FastAPI()
-
-    @app.get("/health")
-    async def health():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    @app.get("/health_generate")
-    async def health_generate():
-        """Check the health of the http server."""
-        return Response(status_code=200)
-
-    # Add prometheus middleware
-    if enable_metrics:
-        add_prometheus_middleware(app)
-        enable_func_timer()
-
-    config = uvicorn.Config(
-        app,
-        host=host,
-        port=port,
-        timeout_keep_alive=5,
-        loop="auto",
-        log_config=None,
-        log_level="warning",
-    )
-    server = uvicorn.Server(config=config)
-
-    try:
-        loop = asyncio.get_running_loop()
-        logger.info(
-            f"Dummy health check server scheduled on existing loop at {host!s}:{port!s}",
-        )
-        loop.create_task(server.serve())
-
-    except RuntimeError:
-        logger.info(f"Starting dummy health check server at {host!s}:{port!s}")
-        server.run()
-
-
 def launch_metrics_server(server_args: ServerArgs) -> uvicorn.Server | None:
     """Serve the engine's Prometheus /metrics endpoint on a daemon thread.
 
     With --enable-metrics every engine process on this node writes to the
     shared PROMETHEUS_MULTIPROC_DIR; this serves the aggregate from the
-    engine's main process, which otherwise has no HTTP surface (the gRPC
-    servicer speaks gRPC only). The daemon thread keeps the synchronous
+    engine's main process, which otherwise has no HTTP surface (its frontend
+    speaks the msgpack wire only). The daemon thread keeps the synchronous
     launch path free of event-loop assumptions. The socket is bound eagerly
     on the calling thread, so a bind failure degrades to an error log and
     None — metrics must never take down serving — and the

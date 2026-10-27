@@ -249,6 +249,45 @@ Notes:
   0.9704 without speculative decoding (paired disagreement 10 versus 8, McNemar
   p ~ 0.81 -- within run-to-run noise), so the draft does not move accuracy.
 
+## MiniMax M3.1 {#minimax-m3-1}
+
+For checkpoints that declare `quant_method: mxfp8` with
+`moe_quant_algo: NVFP4`, TokenSpeed automatically selects `mxfp8_nvfp4`:
+projections use MXFP8 and routed experts use NVFP4. This quantization requires
+Blackwell.
+
+Download the target and bundled DSpark draft together. The draft is in the
+`dspark/` subdirectory and declares `DSparkMiniMaxDraftModel`. This example uses
+seven draft queries and an eight-token verify window; match those widths to
+the draft checkpoint's configuration.
+
+```bash
+model_dir=$(hf download MiniMaxAI/MiniMax-M3.1-Flash --quiet)
+
+tokenspeed serve "$model_dir" \
+    --tensor-parallel-size 4 \
+    --max-model-len 1048576 \
+    --gpu-memory-utilization 0.95 \
+    --attention-backend trtllm \
+    --kv-cache-dtype fp8 \
+    --moe-backend flashinfer_trtllm \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path "$model_dir/dspark" \
+    --speculative-num-steps 7 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 8 \
+    --prefix-granularity 128 \
+    --trust-remote-code \
+    --host 0.0.0.0 \
+    --port 8000
+```
+
+Set `--speculative-num-steps` to the DSpark checkpoint's `block_size` and
+`--speculative-num-draft-tokens` to `block_size + 1`. See
+[Speculative decoding](../configuration/server.md#speculative-decoding) for
+the width conventions. To serve the target alone, drop the `--speculative-*`
+options.
+
 ## Kimi K2.5 / K2.6
 
 Kimi-style MoE launches usually need remote code, long context, reasoning and
@@ -345,8 +384,11 @@ Notes:
 - K3 uses the cache-group scheduler and KDA state groups.
 - On Blackwell, `--dense-gemm-backend trtllm_cutedsl` opts the
   block-FP8 attention projections into TRT-LLM CuTe-DSL: KDA fused QKV/gates and output,
-  and MLA fused QKV-a/gate, Q-b, and output. Omit it (or use `auto`) to keep
-  the existing backend selection. This shared option applies across models
+  and MLA fused QKV-a/gate, Q-b, and output. With `auto`, compatible GEMMs prefer
+  CuTe-DSL at M > 16 rows and FlashInfer at M <= 16. Unsupported CuTe-DSL inputs
+  retain compatible fallback selection. M is the actual GEMM row count,
+  not necessarily request concurrency. Explicit `trtllm_cutedsl` also selects
+  CuTe-DSL for smaller M. This shared option applies across models
   to standard 128x128 block-FP8 dense linears. BF16/NVFP4 linears, MXFP8,
   per-tensor FP8, specialized grouped projections, and routed experts are
   unchanged. It does not change tensor-parallel mapping.
@@ -1307,12 +1349,13 @@ select its YAML in **Slurm Dispatch**, choose cluster `gb300`, and optionally
 provide a pull request number.
 
 The launcher uses `PD_SLURM=1` to assign one role per node and clears Slurm
-topology discovery only inside each worker process. Share the launcher's
-job-and-step-scoped artifact directory between nodes. It publishes role
-readiness atomically and verifies cross-node gRPC health before starting the
-gateway.
-Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
-When you need an explicit RDMA device selection, set
+topology discovery only inside each worker process. Node 0 starts the gateway
+with the prefill worker on a same-host socket and the decode worker on
+`tcp://<node 0>:DECODE_HANDSHAKE_PORT` (18348), then publishes its address in
+the launcher's job-and-step-scoped artifact directory, which both nodes share;
+node 1's decode engine dials it there. The gateway is ready once both engines
+registered. Worker logs remain separate as `prefill.log`, `decode.log`, and
+`lb.log`. When you need an explicit RDMA device selection, set
 `DISAGGREGATION_IB_DEVICE`. The GB300 task selects
 `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the InfiniBand fabric.
 Automatic discovery also includes Ethernet RNICs, which can
@@ -1374,6 +1417,14 @@ path, with no flag. Use these supported Hub revisions:
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
 
+For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
+per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or
+dense gate/up projection. This reuses the BF16-rounded norm output and its
+existing quantizer contract. The consumer accepts at most 64 rows; other
+shapes and checkpoint formats retain their existing path. No extra flag is
+required. If the fused collective declines, the second norm fills the same
+buffers before the projection consumes them.
+
 The command below runs one TP8 replica over two 4-GPU nodes, as in the
 recipe's GB200 measurements. Run it on both nodes, changing only
 `--node-rank`, and point `--dist-init-addr` at node 0, the only rank that
@@ -1415,8 +1466,9 @@ Notes:
   `TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN` unset. With the drafter the
   default batch limit is 80 requests, not 160.
 - Name no `--reasoning-parser` or `--tool-call-parser`. The bundled
-  `tokenspeed-smg==1.13.0.post20261016` that TokenSpeed pins reads the output
-  through the checkpoint's `response_template`.
+  `tokenspeed-smg` version pinned in
+  [python/pyproject.toml](https://github.com/lightseekorg/tokenspeed/blob/main/python/pyproject.toml)
+  reads the output through the checkpoint's `response_template`.
 
 The first start on a fresh machine tunes kernels for 30 to 45 minutes; pass
 `--engine-startup-timeout 5400`. Later starts reuse the caches.

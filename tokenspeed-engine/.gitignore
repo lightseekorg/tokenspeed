@@ -1,0 +1,4 @@
+/target
+/build
+*.egg-info
+/python/tokenspeed_engine/bin

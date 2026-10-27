@@ -63,6 +63,7 @@ def test_verify_chain_target_sampled_prefix_compare(device: str) -> None:
         accept_length,
         candidates,
         target_sampled,
+        write_rejected_targets=False,
     )
 
     torch.testing.assert_close(

@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 import torch
 from cutlass import cute
@@ -52,6 +53,7 @@ _HEADS = 4
 _HEAD_DIM = 128
 _TOPK = 512
 _COMPILED = {}
+_WARMED = set()
 
 
 @dataclass(frozen=True)
@@ -62,6 +64,7 @@ class StreamConfig:
     compact_ids: bool
     linear_bins: bool
     partition_width: int
+    group_layout: Literal["aligned", "uniform", "ragged"]
 
 
 def _workspace_bytes(rows: int, config: StreamConfig) -> int:
@@ -86,13 +89,17 @@ def _configuration(
     grouped = (
         queries_per_request is not None
         and queries_per_request >= 8
-        and queries_per_request % 8 == 0
         and rows % queries_per_request == 0
+    )
+    group_layout = (
+        "aligned"
+        if grouped and queries_per_request % _QUERY_GROUP == 0
+        else "uniform" if queries_per_request else "ragged"
     )
     if rows <= 128:
         if grouped and capacity > 8192:
             splits = 1 << (((capacity + 4095) // 4096) - 1).bit_length()
-            config = StreamConfig("split", splits, 0, False, False, 64)
+            config = StreamConfig("split", splits, 0, False, False, 64, group_layout)
         else:
             splits = 1 << (((capacity + 63) // 64) - 1).bit_length()
             keep = 0
@@ -110,19 +117,23 @@ def _configuration(
                 keep = 8
                 compact_ids = True
             config = StreamConfig(
-                "small", splits, keep, compact_ids, linear_bins, partition_width
+                "small",
+                splits,
+                keep,
+                compact_ids,
+                linear_bins,
+                partition_width,
+                "aligned",  # Unused by the independent-row small-grid kernels.
             )
         if _workspace_bytes(rows, config) <= max_partial_bytes:
             return config
-    if not grouped:
-        return None
     if capacity <= 2048:
         algorithm = "prefill"
     elif capacity <= 4096:
         algorithm = "dense"
     else:
         algorithm = "overlap"
-    return StreamConfig(algorithm, 1, 0, False, False, 64)
+    return StreamConfig(algorithm, 1, 0, False, False, 64, group_layout)
 
 
 def _meta(tensor: torch.Tensor, leading_dim: int) -> cute.Tensor:
@@ -139,6 +150,7 @@ def _compile(
     complete_blocks,
     selected,
     scratch,
+    queries_per_request: int | None,
     config: StreamConfig,
     enable_pdl: bool,
 ):
@@ -190,15 +202,15 @@ def _compile(
         )
         return score, merge
     if config.algorithm == "split":
-        op = SplitPrefillTopK(enable_pdl, config.splits)
+        op = SplitPrefillTopK(enable_pdl, config.splits, config.group_layout)
         target = scratch[0]
     else:
         if config.algorithm == "prefill":
-            op = PrefillTopK(enable_pdl)
+            op = PrefillTopK(enable_pdl, config.group_layout)
         elif config.algorithm == "dense":
-            op = DensePrefillTopK(enable_pdl, 1)
+            op = DensePrefillTopK(enable_pdl, 1, config.group_layout)
         else:
-            op = OverlapPrefillTopK(enable_pdl)
+            op = OverlapPrefillTopK(enable_pdl, config.group_layout)
         target = selected
     score = cute.compile(
         op,
@@ -210,6 +222,7 @@ def _compile(
         _meta(target, 1),
         int(query.stride(0)),
         int(query.stride(1)),
+        int(queries_per_request or 0),
         64,
         stream,
         options=options,
@@ -226,6 +239,68 @@ def _compile(
         )
         return score, merge
     return (score,)
+
+
+def warmup(
+    query, keys, request_indices, *, max_capacity, max_partial_bytes, enable_pdl
+):
+    """Warm algorithm/capacity buckets without reading request-owned cache rows.
+
+    Args:
+        query: BF16 query prototype supplying the CUDA device.
+        keys: Existing compressed key cache, unchanged by warmup.
+        request_indices: Prototype supplying the request-index dtype.
+        max_capacity: Maximum compressed-block capacity; capped at 131072.
+        max_partial_bytes: Caller budget for selection scratch.
+        enable_pdl: Programmatic dependent launch setting to compile.
+
+    Returns:
+        None. Compiled configurations remain cached for subsequent calls.
+    """
+    max_capacity = min(max_capacity, 131072)
+    key = (
+        query.device.index,
+        request_indices.dtype,
+        max_capacity,
+        max_partial_bytes,
+        enable_pdl,
+    )
+    if key in _WARMED:
+        return
+    capacities = {max_capacity}
+    capacity = 64
+    while capacity <= max_capacity:
+        capacities.add(capacity)
+        capacity *= 2
+    configurations = {}
+    # Cover _configuration's row policies: singleton, both ends of 2..8,
+    # the first row above 8, and the small-grid limit 128. Above that limit,
+    # cover both aligned and partial query groups. Try ragged and
+    # whole-request ownership for each row count.
+    for capacity in sorted(capacities):
+        for rows in (1, 2, 8, 9, 128, 135, 136):
+            for width in (None, rows):
+                config = _configuration(rows, capacity, width, max_partial_bytes)
+                if config is not None:
+                    configurations.setdefault(config, (rows, capacity, width))
+    sample = query.new_zeros((136, _HEADS, _HEAD_DIM))
+    table = torch.zeros((1, max_capacity // 64), dtype=torch.int32, device=query.device)
+    requests = request_indices.new_zeros(136)
+    complete = requests.new_zeros(136, dtype=torch.int32)
+    for rows, capacity, width in configurations.values():
+        kernel(
+            sample[:rows],
+            keys,
+            table[:, : capacity // 64],
+            requests[:rows],
+            complete[:rows],
+            page_size=64,
+            block_topk=_TOPK,
+            queries_per_request=width,
+            max_partial_bytes=max_partial_bytes,
+            enable_pdl=enable_pdl,
+        )
+    _WARMED.add(key)
 
 
 def kernel(
@@ -256,7 +331,7 @@ def kernel(
         page_size: Compressed blocks per page; must be 64.
         block_topk: Selected blocks per row; must be 512.
         queries_per_request: Uniform consecutive query-run width, or ``None``
-            for ragged rows. Above 128 rows, runs must be divisible by eight.
+            for ragged rows. Groups stop at request boundaries and mask tails.
         max_partial_bytes: Budget for global scratch, excluding the output.
             Grouped streaming needs none; split scoring respects this budget.
         enable_pdl: Explicit programmatic dependent launch ordering.
@@ -364,6 +439,7 @@ def kernel(
             complete_blocks,
             selected,
             scratch,
+            queries_per_request,
             config,
             enable_pdl,
         )
@@ -378,6 +454,7 @@ def kernel(
         *target,
         int(query.stride(0)),
         int(query.stride(1)),
+        *([] if config.algorithm == "small" else [int(queries_per_request or 0)]),
     )
     if len(compiled) > 1:
         compiled[1](*scratch, complete_blocks, selected, int(capacity))

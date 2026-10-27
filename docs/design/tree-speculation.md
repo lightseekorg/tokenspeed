@@ -29,7 +29,7 @@ path. The TP-agreed path has one owner, the backend's packed verify output
 * `TreeSpec.compact_rows` moves the target hidden rows to the front of the
   window and the positions back from `vc + depth` to `vc + i`;
 * stateful backends receive it through
-  `commit_speculative_state_after_verify(accepted_path=...)` (`None` for a chain).
+  `commit_state_after_acceptance(accepted_path=...)` (`None` for a chain).
 
 Everything downstream sees a chain.
 
@@ -64,6 +64,12 @@ prefix tail it missed and its masked window) and merges both in one Triton
 kernel. Verify runs it with `R = W = N`. Draft lanes run it with `R = K`
 over the `(S - 1) * K`-key lane window (below). There is no size-dependent
 second path.
+
+Lanes that carry per-row tables (`TreeCascadeRows.row_page_table`) let a
+sliding-window draft layer see in every lane row the window frozen at the
+round's prefix end: each row decodes the prefix alone (`q_len = 1` at the
+prefix's last key) and the window kernel attends the tree window only
+(`causal_prefix=False`).
 
 An FP8 KV cache (E4M3, unscaled like every FP8 KV cache here) changes no
 structure: trtllm-gen takes the query cast to FP8 as it does for any decode,
@@ -155,6 +161,14 @@ refresh-only draft metadata contract of `unified_path.md`. It is graph-safe
 because the runtime binds the buffers once at fixed addresses and in-graph ops
 write them before the lane forward reads them.
 
+### A drafter may finish its round in the next forward
+
+A drafter may leave its round pending past the forward (`BaseDrafter.finish_round`)
+and write the next round's tree in the next forward's settle (`complete_round`,
+`event-loop.md`), which runs before that forward's draft refresh, so its lanes
+read the tables they started on. EAGLE-Harness does, and lists where it departs
+from this document in `drafter/eagle_harness/__init__.py`.
+
 ### The drafter scores, the tree selects
 
 `Eagle._score_candidates` is the one place a drafter decides how to score
@@ -186,18 +200,22 @@ keyed by `(seed, position)`. For a tree the key is the position predicted by the
 parameters and its offset advanced by its depth, so the token accepted at every
 position is the one plain decoding samples there. Acceptance is the greedy tree
 walk over those draws, accepting a child when it equals its parent's draw.
-Backends that cannot do this keep `supports_tree_verify = False` and the
+The flashinfer backend instead accepts every tree by recursive rejection
+sampling (`TreeRejectionSampler`), against the draft q that drew a sampled
+node's children (`RuntimeStates.future_draft_q`), exact in distribution rather
+than the plain-decoding draw.
+Backends that can do neither keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 
 ## Scope
 
 EAGLE3 and EAGLE-style MTP drafters (the `Eagle` drafter; the multi-depth `Mtp`
-drafter refuses trees at startup); `greedy` and `triton` sampling backends; the `trtllm`
+drafter refuses trees at startup) and EAGLE4; `greedy`, `triton` and `flashinfer` sampling backends; the `trtllm`
 attention backend, or `trtllm_mla` / `tokenspeed_mla` for MLA targets and drafts (no
 KV parallelism), with bf16 or FP8 E4M3 KV in full-history KV cache groups, alone or inside the
 hybrid linear-attention backend (GDN or Mamba2, ReplaySSM or staged); no structured output,
 no mixed batches, no pipeline parallelism, no prefill/decode disaggregation, no
-attention data parallelism, no sliding window or attention sinks in the target
+attention data parallelism, no sliding window in target layers (draft lanes take a frozen window), no attention sinks in the target
 or draft layers, no target or draft that reads request token history or
 n-gram (Engram) input history, and separate target and draft attention backends.
 
@@ -208,7 +226,8 @@ through `child_backends()` once at startup, before any bind, and reports every
 blocker together. Composites never forward the question, so a new composite
 cannot silently skip a child. Sliding window and attention sinks are the named
 exception: they are per layer and per call, so the `trtllm` and `tokenspeed_mla`
-forwards refuse them (`trtllm_mla` takes no sliding window at all).
+forwards refuse them (`trtllm_mla` takes no sliding window at all), except a
+sliding window in the `trtllm` draft lanes.
 
 ## Not scheduler or cache state
 

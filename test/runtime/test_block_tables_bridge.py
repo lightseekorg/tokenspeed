@@ -144,3 +144,38 @@ class TestBlockTablesBridgeTest:
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "cuda", "npu"])
+def test_packed_tables_keep_independent_host_staging(device_type):
+    import numpy as np
+    import torch
+
+    if device_type == "npu":
+        pytest.importorskip("torch_npu")
+    if device_type != "cpu" and not getattr(torch, device_type).is_available():
+        pytest.skip(f"{device_type} device unavailable")
+    from tokenspeed.runtime.engine.scheduler_utils import (
+        packed_block_tables_from_forward_op,
+    )
+
+    class ForwardTables:
+        def __init__(self, value):
+            self.arrays = {
+                "state": np.array([[value, -1], [0, value + 1]], dtype=np.int32)
+            }
+
+        def block_tables_arrays(self):
+            return self.arrays
+
+    first = packed_block_tables_from_forward_op(
+        ForwardTables(7), device_type, num_reqs=2
+    )
+    second = packed_block_tables_from_forward_op(
+        ForwardTables(19), device_type, num_reqs=2
+    )
+    for result, value in ((first, 7), (second, 19)):
+        assert result.tables_cpu["state"].is_pinned() == (device_type != "cpu")
+        assert result.tables["state"].cpu().tolist() == [[value, -1], [0, value + 1]]
+        assert result.tables_cpu["state"].tolist() == [[value, -1], [0, value + 1]]
+    assert first.tables_cpu["state"].data_ptr() != second.tables_cpu["state"].data_ptr()

@@ -14,8 +14,12 @@ from unittest import mock
 
 import pytest
 import torch
+from torch import nn
+from transformers import PretrainedConfig
 
 from tokenspeed.runtime.configs.model_config import _apply_block_spec_widths
+from tokenspeed.runtime.distributed.mapping import Mapping
+from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import (
     DFlash,
@@ -24,6 +28,8 @@ from tokenspeed.runtime.execution.drafter.dflash import (
 )
 from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
 from tokenspeed.runtime.execution.drafter.dspark import DSpark
+from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
+from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
     resolve_speculative_num_tokens,
@@ -33,7 +39,10 @@ from tokenspeed.runtime.layers.attention.configs.mla import (
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
-from tokenspeed.runtime.models.base.transformer_model import notify_target_capture
+from tokenspeed.runtime.models.base.transformer_model import (
+    BaseTransformerModel,
+    notify_target_capture,
+)
 from tokenspeed.runtime.models.dspark import _get_markov_params
 from tokenspeed.runtime.utils.hf_transformers_utils import get_config
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -367,10 +376,9 @@ def test_dspark_draft_keeps_the_window_transformers_would_null(
 
 
 def _draft_dtype(server_dtype: str, target_dtype: torch.dtype) -> object:
-    from tokenspeed.runtime.engine import event_loop as event_loop_module
+    from tokenspeed.runtime.engine import rank_setup
 
-    loop = event_loop_module.EventLoop.__new__(event_loop_module.EventLoop)
-    loop.server_args = SimpleNamespace(
+    server_args = SimpleNamespace(
         dtype=server_dtype,
         quantization=None,
         speculative_draft_model_quantization=None,
@@ -379,10 +387,10 @@ def _draft_dtype(server_dtype: str, target_dtype: torch.dtype) -> object:
         max_model_len=262144,
         hf_overrides="{}",
     )
-    loop.model_config = SimpleNamespace(dtype=target_dtype)
+    target = SimpleNamespace(dtype=target_dtype)
 
-    with mock.patch.object(event_loop_module, "ModelConfig") as model_config:
-        loop._load_model_config("draft", is_draft_worker=True)
+    with mock.patch.object(rank_setup, "ModelConfig") as model_config:
+        rank_setup.load_model_config(server_args, "draft", draft_of=target)
 
     return model_config.call_args.kwargs["dtype"]
 
@@ -521,6 +529,75 @@ def test_taps_shift_by_one_and_sort_for_positional_concat() -> None:
         58: 5,
     }
     assert causal_lm.capture_aux_hidden_states is True
+
+
+class _TapLayer(nn.Module):
+    """Taps the residual stream entering it, then adds ``layer_id + 1``."""
+
+    def __init__(self, config, layer_id, mapping, quant_config, prefix) -> None:
+        super().__init__()
+        self.increment = float(layer_id + 1)
+
+    def forward(self, positions, hidden_states, ctx, residual, aux_hidden_states):
+        stream = hidden_states if residual is None else hidden_states + residual
+        if aux_hidden_states is not None:
+            aux_hidden_states.append(stream.clone())
+        return torch.full_like(stream, self.increment), stream
+
+
+class _TapStack(BaseTransformerModel):
+    layer_cls = _TapLayer
+
+
+class _TapCausalLM:
+    """Stand-in causal LM around a real transformer stack."""
+
+    def __init__(self, model: BaseTransformerModel) -> None:
+        self.model = model
+        self.capture_aux_hidden_states = False
+
+    set_dflash_layers_to_capture = BaseCausalLM.set_dflash_layers_to_capture
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_the_last_layer_tap_is_the_final_norm_residual() -> None:
+    """The last layer's output enters no layer, so the stack captures it after
+    the final norm, as capture ``num_layers + 1``, and hands it to the sink
+    last."""
+    config = PretrainedConfig(
+        vocab_size=8, hidden_size=128, num_hidden_layers=3, rms_norm_eps=1e-6
+    )
+    model = _TapStack(config, Mapping(rank=0, world_size=1))
+    model.to(device="cuda", dtype=torch.bfloat16)
+    _TapCausalLM(model).set_dflash_layers_to_capture([2, 0])
+    sink = _RecordingSink()
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=2,
+        num_extends=0,
+        input_num_tokens=2,
+        forward_mode=ForwardMode.DECODE,
+        output_layout=ForwardOutputLayout(0, 0, 2, 1),
+        target_capture_sink=sink,
+    )
+    embeds = torch.ones(2, 128, device="cuda", dtype=torch.bfloat16)
+
+    _, aux_hidden_states = model(
+        torch.zeros(2, dtype=torch.long, device="cuda"),
+        torch.zeros(2, dtype=torch.long, device="cuda"),
+        ctx,
+        input_embeds=embeds,
+    )
+
+    assert model.layers_to_capture == [1, 4]
+    # Layer 1's input stream is 1 + 1; the final norm's residual adds the last
+    # layer's output to its input stream: (2 + 2) + 3.
+    expected = [torch.full_like(embeds, 2.0), torch.full_like(embeds, 7.0)]
+    assert [idx for idx, _ in sink.seen] == [0, 1]
+    for (_, seen), tap, want in zip(sink.seen, aux_hidden_states, expected):
+        torch.testing.assert_close(seen, want, atol=0, rtol=0)
+        torch.testing.assert_close(tap, want, atol=0, rtol=0)
 
 
 def test_each_capture_reaches_the_forward_sink_in_concat_order() -> None:

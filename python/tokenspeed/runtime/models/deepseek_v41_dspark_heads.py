@@ -97,7 +97,10 @@ def sample_dspark_block_greedy(
             ``dspark_greedy_workspace``.
         partials: This rank's candidate buffer from
             ``dspark_greedy_workspace``; None on a single rank.
-        output: ``[rows, block]`` int32 destination for the block tokens.
+        output: ``[rows, block]`` int32 destination with contiguous columns;
+            row strides may include a preceding anchor column. The sampler
+            writes only this view, so the drafter can produce proposals directly
+            into its final token table without touching the anchor.
 
     Returns:
         ``output``, filled in place.

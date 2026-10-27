@@ -18,13 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``/update_weights_from_disk`` from the scheduler request to parameter values.
+"""``/update_weights_from_disk`` on the data plane, down to parameter values.
 
-The route's existing coverage replaces the engine with a fake, so nothing
-below it was exercised. These tests drive the real
-``RequestHandler.process_requests`` and assert on parameter values loaded from
-a real safetensors checkpoint, including a round trip (load B, then A again),
-because a load that writes the wrong data also changes the model.
+These tests drive the device handle's weight update (what the control plane
+asks for once its gate admits the op) and assert on parameter values loaded
+from a real safetensors checkpoint, including a round trip (load B, then A
+again), because a load that writes the wrong data also changes the model.
 
 A refused reload must leave every parameter as it was, so those tests assert
 that ``load_weights`` saw nothing, not only that the request failed.
@@ -37,7 +36,6 @@ import json
 import os
 import sys
 import tempfile
-from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -55,9 +53,7 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed.runtime.distributed.mapping import Mapping  # noqa: E402
 from tokenspeed.runtime.engine.io_struct import (  # noqa: E402
     UpdateWeightFromDiskReqInput,
-    UpdateWeightFromDiskReqOutput,
 )
-from tokenspeed.runtime.engine.request_handler import RequestHandler  # noqa: E402
 from tokenspeed.runtime.execution.device import DeviceHandle  # noqa: E402
 from tokenspeed.runtime.execution.model_runner import ModelRunner  # noqa: E402
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod  # noqa: E402
@@ -123,120 +119,12 @@ def _runner(model: torch.nn.Module, booted_from: Path) -> ModelRunner:
 
 def _device_handle(runner, drafter=None) -> DeviceHandle:
     handle = DeviceHandle.__new__(DeviceHandle)
-    handle._executor = SimpleNamespace(model_runner=runner, drafter=drafter)
+    # No drafter round is pending for ``settle`` to finish.
+    handle._executor = SimpleNamespace(
+        model_runner=runner, drafter=drafter, complete_pending_drafting=lambda: None
+    )
     handle._l2 = None
-    # The real forward thread orders the call against forwards; here it only
-    # has to run it.
-    handle._thread = SimpleNamespace(run=lambda fn: fn())
     return handle
-
-
-def _handler(device) -> RequestHandler:
-    handler = RequestHandler.__new__(RequestHandler)
-    handler.memory_controller = None
-    handler.send_func = mock.Mock()
-    handler.server_args = mock.Mock(weight_version="v1", kvstore_storage_backend=None)
-    handler._device = device
-    handler._replica_tp_size = 1
-    handler._replica_tp_cpu_group = None
-    handler.attn_cp_size = 1
-    handler.attn_cp_cpu_group = None
-    handler.pp_size = 1
-    handler.pp_cpu_group = None
-    handler.attn_dp_size = 1
-    handler.attn_dp_cpu_group = None
-    handler._replica_decision_buf = torch.zeros(1, dtype=torch.int32)
-    handler._replica_flush_want_buf = torch.zeros(7, dtype=torch.int32)
-    handler._pending_weight_ops = deque()
-    handler._pending_internal_ops = deque()
-    handler._internal_op_completer = None
-    handler.can_clear_cache_fn = mock.Mock(return_value=True)
-    handler.clear_cache_fn = mock.Mock(return_value=True)
-    return handler
-
-
-def _mock_device(ok: bool = True, message: str = "loaded"):
-    device = mock.Mock()
-    device.update_weights = mock.Mock(return_value=(ok, message))
-    device.delete_l3_namespace.return_value = True
-    return device
-
-
-class TestSchedulerDispatch:
-    def test_disk_update_is_dispatched_and_answered(self):
-        # Without a branch the request reaches the NotImplementedError
-        # fallthrough and the scheduler process exits.
-        handler = _handler(_mock_device())
-        req = UpdateWeightFromDiskReqInput(model_path="/ckpt/step-42")
-
-        handler.process_requests([req])
-
-        handler._device.update_weights.assert_called_once_with(req)
-        output = handler.send_func.send_pyobj.call_args.args[0]
-        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
-        assert output.success
-        assert (output.message) == ("loaded")
-
-    def test_failed_disk_update_is_answered(self):
-        handler = _handler(_mock_device(ok=False, message="no such checkpoint"))
-
-        handler.process_requests([UpdateWeightFromDiskReqInput(model_path="/nope")])
-
-        output = handler.send_func.send_pyobj.call_args.args[0]
-        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
-        assert not (output.success)
-        assert (output.message) == ("no such checkpoint")
-
-    def test_prefix_cache_is_flushed_before_the_load(self):
-        # Cached KV was computed under the old weights; prefix caching is on by
-        # default, so reusing it would mix two sets of weights in one response.
-        order = []
-        device = _mock_device()
-        device.update_weights.side_effect = lambda req: order.append("load") or (
-            True,
-            "ok",
-        )
-        handler = _handler(device)
-        handler.clear_cache_fn = mock.Mock(
-            side_effect=lambda: order.append("flush") or True
-        )
-
-        handler.process_requests([UpdateWeightFromDiskReqInput(model_path="/ckpt")])
-
-        assert (order) == (["flush", "load"])
-
-    def test_failed_flush_skips_the_load(self):
-        handler = _handler(_mock_device())
-        handler.can_clear_cache_fn = mock.Mock(return_value=False)
-
-        handler.process_requests([UpdateWeightFromDiskReqInput(model_path="/ckpt")])
-
-        handler._device.update_weights.assert_not_called()
-        output = handler.send_func.send_pyobj.call_args.args[0]
-        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
-        assert not (output.success)
-        assert ("cache flush failed") in (output.message)
-
-    def test_weight_version_is_committed_after_a_successful_load(self):
-        handler = _handler(_mock_device())
-
-        handler.process_requests(
-            [UpdateWeightFromDiskReqInput(model_path="/ckpt", weight_version="v2")]
-        )
-
-        assert (handler.server_args.weight_version) == ("v2")
-        handler._device.set_l3_weight_version.assert_called_once_with("v2")
-
-    def test_l3_flush_without_weight_version_is_rejected_before_the_load(self):
-        handler = _handler(_mock_device())
-        handler.server_args.kvstore_storage_backend = "memory"
-
-        handler.process_requests([UpdateWeightFromDiskReqInput(model_path="/ckpt")])
-
-        handler._device.update_weights.assert_not_called()
-        output = handler.send_func.send_pyobj.call_args.args[0]
-        assert isinstance((output), (UpdateWeightFromDiskReqOutput))
-        assert not (output.success)
 
 
 class TestDeviceRouting:
@@ -392,27 +280,6 @@ class TestRealCheckpoint:
 
         assert not (ok)
         assert ("in-place reload") in (message)
-
-    def test_scheduler_request_reaches_the_parameters(self):
-        original = _write_checkpoint(self.root / "step-0", scale=1.0)
-        updated = _write_checkpoint(self.root / "step-1", scale=7.0)
-        model = _TinyModel()
-        handler = _handler(_device_handle(_runner(model, self.root / "step-0")))
-
-        for path, expected in (
-            (self.root / "step-1", updated),
-            (self.root / "step-0", original),
-        ):
-            handler.process_requests(
-                [UpdateWeightFromDiskReqInput(model_path=str(path))]
-            )
-            output = handler.send_func.send_pyobj.call_args.args[0]
-            assert isinstance((output), (UpdateWeightFromDiskReqOutput))
-            _pytest_expr_21 = output.success
-            _pytest_msg_22 = output.message
-            assert _pytest_expr_21, _pytest_msg_22
-            torch.testing.assert_close(model.w.data, expected["w"])
-        assert (handler.clear_cache_fn.call_count) == (2)
 
 
 def _bare(cls: type[torch.nn.Module]) -> torch.nn.Module:

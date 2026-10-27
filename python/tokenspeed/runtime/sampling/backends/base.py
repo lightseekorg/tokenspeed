@@ -56,13 +56,14 @@ SPECULATIVE_ACCEPT_THRESHOLD_ACC = 1.0
 
 @dataclass(frozen=True)
 class SpeculativeSamplingPools:
-    """The verifier's pool-indexed per-request scalars a chain drafter reads
+    """The verifier's pool-indexed per-request scalars a drafter reads
     to sample its proposals from the request's own distribution
     (``--enable-speculative-sampling``). Each is ``[max_req_pool_size + 1]``,
     indexed by ``req_pool_idx``; the backend scatters them on admission."""
 
     temperature: torch.Tensor  # fp32
     top_k: torch.Tensor  # int32; greedy requests carry 1
+    top_p: torch.Tensor  # fp32
     seed: torch.Tensor  # int64 Philox seed
 
 
@@ -134,7 +135,11 @@ class SamplingBackendConfig:
             logprob_order=server_args.logprob_order,
             enable_nan_detection=server_args.enable_nan_detection,
             enable_output_logprobs=server_args.enable_output_logprobs,
-            enable_speculative_sampling=server_args.enable_speculative_sampling,
+            # Trees verify against their draft q tables, not recorded draft probs.
+            enable_speculative_sampling=(
+                server_args.enable_speculative_sampling
+                and not server_args.speculative_draft_tree
+            ),
             spec_reject_draft_prob_threshold=(
                 server_args.spec_reject_draft_prob_threshold
             ),

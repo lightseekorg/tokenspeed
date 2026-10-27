@@ -29,8 +29,10 @@
 
 """Blackwell QSA attention with grouped query and KV operand reuse."""
 
+import cutlass
 import cutlass.cute as cute
 import torch
+from cutlass.cute.runtime import make_fake_tensor
 from tokenspeed_kernel.thirdparty.cute_dsl._qsa_sparse.common import (
     _CONVERT_WARPGROUPS,
     _HEAD_DIM,
@@ -53,6 +55,7 @@ from tokenspeed_kernel.thirdparty.cute_dsl._qsa_sparse.prefix import (
 )
 
 _COMPILED_KERNELS = {}
+_WARMED = set()
 
 
 def _query_group_size(
@@ -91,6 +94,101 @@ def _query_head_tile(heads_per_kv: int, head_tile: int, bf16_kv: bool) -> int:
     return _select_head_tile(heads_per_kv, bf16_kv, 1)
 
 
+def _configuration(rows, q_heads, kv_heads, max_seqlen_q, bf16_kv, sm_count, device):
+    heads_per_kv = q_heads // kv_heads
+    query_group = _query_group_size(
+        rows, kv_heads, heads_per_kv, max_seqlen_q, bf16_kv, sm_count
+    )
+    head_tile = _select_head_tile(heads_per_kv * query_group, bf16_kv, query_group)
+    head_tiles_per_row = kv_heads * cute.ceil_div(heads_per_kv, head_tile)
+    query_rows_per_cta, kv_splits, smem_slots, async_ready = _select_launch_config(
+        rows,
+        head_tiles_per_row,
+        bf16_kv,
+        sm_count,
+        (
+            _wide_cluster_capacity(device)
+            if rows * head_tiles_per_row <= _SMALL_MAX_CLUSTERS
+            else 0
+        ),
+    )
+    return (
+        head_tile,
+        query_group,
+        kv_splits,
+        query_rows_per_cta,
+        2 if head_tile in (48, 64, 72, 96) else smem_slots,
+        smem_slots,
+        async_ready,
+        heads_per_kv == 12 and kv_heads == 2 and query_group == 2 and rows > 128,
+    )
+
+
+def warmup(query, key_cache, value_cache, *, max_rows, enable_pdl):
+    """Warm every launch configuration for this model's cache and row budget.
+
+    Args:
+        query: BF16 query prototype supplying device and fixed head geometry.
+        key_cache: Model's BF16 or FP8 key cache; its layout stays fixed.
+        value_cache: Value cache matching the key cache.
+        max_rows: Largest row count whose execution configurations to warm.
+        enable_pdl: Programmatic dependent launch setting to compile.
+
+    Returns:
+        None. Compiled configurations remain cached for subsequent calls.
+    """
+    key = (
+        query.device.index,
+        query.shape[1],
+        key_cache.shape,
+        key_cache.dtype,
+        max_rows,
+        enable_pdl,
+    )
+    if key in _WARMED:
+        return
+    bf16_kv = key_cache.dtype is torch.bfloat16
+    sm_count = _sm_count(query.device.index)
+    configurations = {}
+    # These are the divisibility cases in _query_group_size: width 1 disables
+    # grouping, 2/4 select pairs/quads, 6 covers groups of three/six, and 8
+    # reaches the widest group. Row counts independently select launch policy.
+    for rows in range(1, max_rows + 1):
+        for width in (1, 2, 4, 6, 8):
+            if rows % width == 0:
+                config = _configuration(
+                    rows,
+                    query.shape[1],
+                    key_cache.shape[1],
+                    width,
+                    bf16_kv,
+                    sm_count,
+                    query.device.index,
+                )
+                configurations.setdefault(config, (rows, width))
+    warmup_rows = max(rows for rows, _ in configurations.values())
+    sample = query.new_zeros((warmup_rows, *query.shape[1:]))
+    selected = torch.full(
+        (warmup_rows, _SELECTED_WIDTH),
+        -1,
+        dtype=torch.int32,
+        device=query.device,
+    )
+    for rows, width in configurations.values():
+        kernel(
+            sample[:rows],
+            key_cache,
+            value_cache,
+            selected[:rows],
+            scale=1.0,
+            max_seqlen_q=width,
+            k_scale=None,
+            v_scale=None,
+            enable_pdl=enable_pdl,
+        )
+    _WARMED.add(key)
+
+
 def _compile_kernel(
     query: torch.Tensor,
     original_query: torch.Tensor,
@@ -113,7 +211,8 @@ def _compile_kernel(
     heads_per_kv = original_query.shape[1] // kv_heads
     query_head_tile = _query_head_tile(heads_per_kv, head_tile, bf16_kv)
     problem_shape = (
-        original_query.shape[0] // query_group,
+        # Tensor layouts carry rows; the remaining dimensions are model facts.
+        None,
         kv_heads * query_head_tile * query_group if query_group > 1 else query.shape[1],
         kv_heads,
         key_cache.shape[0],
@@ -183,16 +282,35 @@ def _compile_kernel(
         ),
         cached_bf16_lookahead=False,
         work_sync_threads=0,
+        prefix_in_cta=prefix_shared.numel() == 0,
+        large_query_grid=original_query.shape[0] > 128,
+    )
+
+    def dynamic_rows(tensor):
+        return _to_tvm_meta(tensor, 16).mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1, 2)
+        )
+
+    prefix_meta = make_fake_tensor(
+        cutlass.Int32,
+        (cute.sym_int64(),),
+        stride=(cute.sym_int64(),),
+        assumed_align=4,
     )
     return cute.compile(
         fmha,
-        _to_tvm_meta(query, 16),
-        _to_tvm_meta(original_query, 16),
+        dynamic_rows(query),
+        dynamic_rows(original_query),
         _to_tvm_meta(key_cache, 16),
         _to_tvm_meta(value_cache, 16),
-        _to_tvm_meta(selected_slots, 16),
-        _to_tvm_meta(prefix_shared, 4),
-        _to_tvm_meta(output, 16),
+        make_fake_tensor(
+            cutlass.Int32,
+            (cute.sym_int64(divisibility=query_group), _SELECTED_WIDTH),
+            stride=(cute.sym_int64(), cute.sym_int64()),
+            assumed_align=16,
+        ),
+        prefix_meta,
+        dynamic_rows(output),
         1.0,
         1.0,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -252,10 +370,25 @@ def kernel(
     bf16_kv = key_cache.dtype is torch.bfloat16
     heads_per_kv = num_q_heads // num_kv_heads
     sm_count = _sm_count(query.device.index)
-    query_group = _query_group_size(
-        query.shape[0], num_kv_heads, heads_per_kv, max_seqlen_q, bf16_kv, sm_count
+    config = _configuration(
+        query.shape[0],
+        num_q_heads,
+        num_kv_heads,
+        max_seqlen_q,
+        bf16_kv,
+        sm_count,
+        query.device.index,
     )
-    head_tile = _select_head_tile(heads_per_kv * query_group, bf16_kv, query_group)
+    (
+        head_tile,
+        query_group,
+        kv_splits,
+        query_rows_per_cta,
+        bf16_smem_slots,
+        distinct_bf16_smem_slots,
+        bf16_async_ready,
+        _,
+    ) = config
     query_head_tile = _query_head_tile(heads_per_kv, head_tile, bf16_kv)
     prepared_query = query
     prefix_shared = selected_slots[:, 0]
@@ -284,39 +417,13 @@ def kernel(
                 query_group,
                 enable_pdl,
             )
-    head_tiles_per_row = num_kv_heads * cute.ceil_div(heads_per_kv, head_tile)
-    num_clusters = query.shape[0] * head_tiles_per_row
-    query_rows_per_cta, kv_splits, bf16_smem_slots, bf16_async_ready = (
-        _select_launch_config(
-            query.shape[0],
-            head_tiles_per_row,
-            bf16_kv,
-            sm_count,
-            (
-                _wide_cluster_capacity(query.device.index)
-                if num_clusters <= _SMALL_MAX_CLUSTERS
-                else 0
-            ),
-        )
-    )
-    distinct_bf16_smem_slots = bf16_smem_slots
-    if head_tile in (48, 64, 72, 96):
-        bf16_smem_slots = 2
     cache_key = (
         query.device.index,
-        query.shape[0],
         num_q_heads,
         num_kv_heads,
         key_cache.shape[0],
         key_cache.dtype,
-        head_tile,
-        query_group,
-        kv_splits,
-        query_rows_per_cta,
-        bf16_smem_slots,
-        distinct_bf16_smem_slots,
-        bf16_async_ready,
-        tuple(selected_slots.stride()),
+        config,
         enable_pdl,
     )
     compiled = _COMPILED_KERNELS.get(cache_key)

@@ -24,6 +24,7 @@ rank-sync payload, and the retraction and prefetch fields of ``make_config``."""
 
 from __future__ import annotations
 
+from test.l3_test_utils import storage_ops, storage_scheduler
 from types import SimpleNamespace
 
 import pytest
@@ -33,19 +34,14 @@ ts = pytest.importorskip("tokenspeed_scheduler")
 from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
     CacheTransfer,
     HostTier,
-    PrefetchOp,
-    PrefetchRow,
     RestoreOp,
     SnapshotOp,
 )
 from tokenspeed.runtime.engine import scheduler_utils  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
-    cache_event_from_payload,
-    cache_event_key,
     cache_event_to_payload,
     cache_ops_from_plan,
     make_config,
-    pop_common_cache_event_payloads,
 )
 
 
@@ -65,10 +61,6 @@ class _RestoreBatch(SimpleNamespace):
     pass
 
 
-class _PrefetchBatch(SimpleNamespace):
-    pass
-
-
 @pytest.fixture()
 def wire(monkeypatch):
     # The op bindings have no Python constructor; dispatch on these fakes.
@@ -80,7 +72,10 @@ def wire(monkeypatch):
             LoadBackOp=_LoadBackOp,
             SnapshotOp=_SnapshotBatch,
             RestoreOp=_RestoreBatch,
-            PrefetchOp=_PrefetchBatch,
+            StorageQueryOp=ts.Cache.StorageQueryOp,
+            StorageGetOp=ts.Cache.StorageGetOp,
+            StoragePutOp=ts.Cache.StoragePutOp,
+            StorageCancelOp=ts.Cache.StorageCancelOp,
         ),
     )
 
@@ -116,22 +111,6 @@ def _restore_batch(**overrides):
     return _RestoreBatch(**fields)
 
 
-def _prefetch_batch(**overrides):
-    fields = dict(
-        op_ids=[8],
-        request_ids=["w"],
-        first_pages=[2],
-        num_pages=[3],
-        group_ids=[[0, 1, 0, 1]],
-        host_pages=[[5, 6, 7, 8]],
-        content_hashes=[["p2", "p2", "p4", "p4"]],
-        page_offsets=[[2, 2, 4, 4]],
-        page_indices=[[2, 2, 4, 4]],  # page 3 has no rows (a sliding group)
-    )
-    fields.update(overrides)
-    return _PrefetchBatch(**fields)
-
-
 def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
     write_back, load_back = _WriteBackOp(op_ids=[1]), _LoadBackOp(op_ids=[2, 3])
     plan = SimpleNamespace(
@@ -140,25 +119,12 @@ def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
             _snapshot_batch(),
             load_back,
             _restore_batch(),
-            _prefetch_batch(),
         ]
     )
 
-    ops = cache_ops_from_plan(plan)
+    ops = cache_ops_from_plan(plan).device
 
     assert ops[0] is write_back and ops[3] is load_back
-    assert ops[5] == PrefetchOp(
-        op_id=8,
-        request_id="w",
-        first_page=2,
-        num_pages=3,
-        rows=(
-            PrefetchRow(0, 5, "p2", 2, 2),
-            PrefetchRow(1, 6, "p2", 2, 2),
-            PrefetchRow(0, 7, "p4", 4, 4),
-            PrefetchRow(1, 8, "p4", 4, 4),
-        ),
-    )
     assert ops[1] == SnapshotOp(
         op_id=4,
         request_id="a",
@@ -185,7 +151,7 @@ def test_plan_adapter_passes_l2_batches_and_expands_snapshot_batches(wire):
         ),
         source_tier=(HostTier.L2, HostTier.SNAPSHOT_POOL, HostTier.SNAPSHOT_POOL),
     )
-    assert cache_ops_from_plan(SimpleNamespace(cache=[])) == []
+    assert cache_ops_from_plan(SimpleNamespace(cache=[])).device == ()
 
 
 def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
@@ -205,8 +171,6 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
         cache_ops_from_plan(
             SimpleNamespace(cache=[_restore_batch(source_tiers=[[0, 1, 7]])])
         )
-    with pytest.raises(ValueError, match="ragged cache operation 8"):
-        cache_ops_from_plan(SimpleNamespace(cache=[_prefetch_batch(host_pages=[[5]])]))
     with pytest.raises(TypeError, match="unsupported cache op kind: str"):
         cache_ops_from_plan(SimpleNamespace(cache=["op"]))
 
@@ -214,48 +178,16 @@ def test_plan_adapter_rejects_ragged_batches_and_unknown_kinds(wire):
 @pytest.mark.parametrize(
     "kind", ["WriteBackDoneEvent", "SnapshotDoneEvent", "RestoreDoneEvent"]
 )
-def test_cache_acks_round_trip_the_rank_sync_payload(kind):
+def test_cache_acks_become_the_payload_the_host_reads(kind):
     event = getattr(ts.Cache, kind)()
     event.op_id = 42
-    payload = cache_event_to_payload(event)
-    assert payload == {"kind": kind, "op_id": 42}
-    assert cache_event_key(payload) == (kind, 42)
-    rebuilt = cache_event_from_payload(payload)
-    assert type(rebuilt).__name__ == kind and rebuilt.op_id == 42
-    # The rebuilt event is what advance_scheduler hands the binding.
-    ts.ExecutionEvent().add_event(rebuilt)
+    assert cache_event_to_payload(event) == {"kind": kind, "op_id": 42}
 
 
-def test_load_back_and_prefetch_acks_round_trip():
+def test_load_back_acks_become_payloads():
     # A load-back lands or does not happen: no outcome on the ACK.
     payload = cache_event_to_payload(ts.Cache.LoadBackDoneEvent(7))
     assert payload == {"kind": "LoadBackDoneEvent", "op_id": 7}
-    assert cache_event_from_payload(payload).op_id == 7
-    # A prefetch's ACK carries the replica-converged landed prefix.
-    payload = cache_event_to_payload(ts.Cache.PrefetchDoneEvent(9, 4))
-    assert payload == {"kind": "PrefetchDoneEvent", "op_id": 9, "landed_pages": 4}
-    rebuilt = cache_event_from_payload(payload)
-    assert (rebuilt.op_id, rebuilt.landed_pages) == (9, 4)
-    with pytest.raises(ValueError, match="Unsupported cache event type"):
-        cache_event_from_payload({"kind": "RetractDoneEvent", "op_id": 1})
-
-
-def test_replica_intersection_is_per_kind_and_op_id():
-    snapshot = {"kind": "SnapshotDoneEvent", "op_id": 3}
-    restore = {"kind": "RestoreDoneEvent", "op_id": 3}
-    write = {"kind": "WriteBackDoneEvent", "op_id": 3}
-    assert pop_common_cache_event_payloads([[snapshot, restore], [restore, write]]) == [
-        restore
-    ]
-
-
-def test_no_retract_event_survives():
-    # A capacity retraction is the scheduler's suspend-with-image path and an
-    # L3 miss lands a shorter Host hit before admission: the runtime builds no
-    # retract event of any kind.
-    assert not hasattr(ts.ForwardEvent, "Retract")
-    assert not hasattr(scheduler_utils, "make_retract_event")
-    assert not hasattr(scheduler_utils, "make_recompute_retract_event")
 
 
 def _config(**overrides):
@@ -270,7 +202,7 @@ def _config(**overrides):
         role="fused",
         num_snapshot_pages=1,
         max_retracted_requests=0,
-        l3_prefetch_min_pages=0,
+        storage_config=None,
     )
     fields.update(overrides)
     return make_config(**fields)
@@ -299,15 +231,55 @@ def test_make_config_states_the_snapshot_pool_on_every_role():
         make_config(32, 64, 8, 2, 0, True, False, "fused")
 
 
-def test_make_config_ties_the_prefetch_threshold_to_l3():
-    with pytest.raises(ValueError, match="l3_prefetch_min_pages"):
-        _config(l3_prefetch_min_pages=2)
-    with pytest.raises(ValueError, match="l3_prefetch_min_pages"):
+def test_make_config_requires_storage_limits_exactly_with_l3():
+    from tokenspeed.runtime.cache.l3.config import StorageRuntimeConfig
+
+    limits = StorageRuntimeConfig.from_extra_config(
+        None, host_blocks=7, prefix_granularity=2
+    ).scheduler
+    with pytest.raises(ValueError, match="storage_config"):
+        _config(storage_config=limits)
+    with pytest.raises(ValueError, match="storage_config"):
         _config(num_host_pages=8, disable_l2_cache=False, enable_l3_storage=True)
     config = _config(
         num_host_pages=8,
         disable_l2_cache=False,
         enable_l3_storage=True,
-        l3_prefetch_min_pages=2,
+        storage_config=limits,
     )
-    assert config.l3_prefetch_min_pages == 2
+    config.cache_groups = [ts.CacheGroupConfig("full", 2, 32, ts.AttnKind.Full)]
+    scheduler = ts.Scheduler(config)
+    request = ts.RequestSpec()
+    request.request_id = "waiting"
+    request.tokens = [1, 2, 3, 4]
+    scheduler.submit_requests([request])
+    tick = ts.ExecutionEvent()
+    tick.add_event(ts.Cache.StorageTick(1, True, True, ts.StoragePressure(0, 0, 0)))
+    scheduler.advance(tick)
+    plan = scheduler.next_execution_plan()
+    assert all(not batch.request_ids for batch in plan.forward)
+    assert storage_ops(plan)[0].kind == ts.StorageKind.Query
+
+
+def test_cache_plan_keeps_storage_cancel_before_the_next_query():
+    scheduler = storage_scheduler()
+    first = cache_ops_from_plan(scheduler.next_execution_plan())
+    assert first.device == () and len(first.storage) == 1
+    original = first.storage[0]
+    assert isinstance(original, ts.Cache.StorageQueryOp)
+    changes = ts.ExecutionEvent()
+    changes.add_event(ts.Cache.StorageDetach("waiting"))
+    changes.add_event(ts.Cache.StorageTick(2, False, True, ts.StoragePressure(0, 0, 0)))
+    scheduler.advance(changes)
+    request = ts.RequestSpec()
+    request.request_id = "next"
+    request.tokens = [5, 6, 7, 8]
+    scheduler.submit_requests([request])
+    prepared = cache_ops_from_plan(scheduler.next_execution_plan())
+    assert prepared.device == ()
+    assert [op.kind for op in prepared.storage] == [
+        ts.StorageKind.Cancel,
+        ts.StorageKind.Query,
+    ]
+    assert prepared.storage[0].op_id == original.op_id
+    assert prepared.storage[1].op_id > original.op_id

@@ -59,6 +59,8 @@ add_library(tokenspeed_scheduler_core STATIC
     csrc/cache/core/cache_block_ref.cpp
     csrc/scheduler/operations/cache.cpp
     csrc/cache/tier/transfer_manager.cpp
+    csrc/cache/tier/storage_manager.cpp
+    csrc/scheduler/operations/storage.cpp
 )
 
 target_include_directories(tokenspeed_scheduler_core
@@ -117,6 +119,7 @@ if(TOKENSPEED_SCHEDULER_BUILD_TESTS)
         tests/cpp/test_swa_group.cpp
         tests/cpp/test_match_host_pages.cpp
         tests/cpp/test_cache_coordinator.cpp
+        tests/cpp/test_storage_query.cpp
         tests/cpp/test_state_checkpoints.cpp
         tests/cpp/test_joint_match_invariants.cpp
         tests/cpp/test_forward_cache_ops.cpp

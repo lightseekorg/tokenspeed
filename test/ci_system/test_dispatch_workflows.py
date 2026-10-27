@@ -18,7 +18,8 @@ SLURM_RUNNER_PREFIXES = (
     "slurm-gb300-",
 )
 PR_TEST_WORKFLOWS = (
-    "amd-tests.yml",
+    "amd-mi350-tests.yml",
+    "amd-mi450-tests.yml",
     "nvidia-b200-tests.yml",
     "pr-test-nvidia-arm.yml",
 )
@@ -351,7 +352,7 @@ def test_runtime_1gpu_tasks_run_every_partition_once_per_runner():
 def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     # AMD Tests keeps unit and model tests; the benchmark lives in a separate
     # workflow so it starts alongside unit tests and completes on its own.
-    tests = load_yaml(REPO_ROOT / ".github/workflows/amd-tests.yml")["jobs"]
+    tests = load_yaml(REPO_ROOT / ".github/workflows/amd-mi350-tests.yml")["jobs"]
     assert "kernel-benchmark" not in tests
     assert "kernel-benchmark" not in tests["finish"]["needs"]
     assert (
@@ -366,8 +367,6 @@ def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     workflow = load_yaml(REPO_ROOT / ".github/workflows/amd-kernel-benchmark.yml")
     assert workflow["name"] == "AMD Kernel Benchmark"
     triggers = workflow.get("on") or workflow.get(True)
-    # The `high priority` label only affects model tests; it must not restart
-    # the benchmark.
     assert "labeled" not in triggers["pull_request"]["types"]
     # tokenspeed-mla is NVIDIA-only, so its changes must not start the workflow.
     for event in ("push", "pull_request"):
@@ -804,13 +803,13 @@ def test_only_dedicated_tasks_declare_gb300():
     ]
 
 
-def test_kimi_k3_gb300_is_two_node_per_commit_tp8():
+def test_kimi_k3_gb300_is_two_node_nightly_tp8():
     task = load_yaml(
         REPO_ROOT / "test/ci/eval/"
         "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
     )
 
-    assert task["triggers"] == ["per-commit"]
+    assert task["triggers"] == ["nightly"]
     assert task["runner"]["labels"] == ["slurm-gb300-4gpu"]
     assert task["slurm"] == {"nodes": 2, "gpus_per_node": 4}
     assert "--tensor-parallel-size 8" in task["server"]["command"]
@@ -922,7 +921,7 @@ def test_gb300_slurm_nightly_workflow_is_scheduled_and_isolated():
     assert checkout["with"]["persist-credentials"] is False
 
 
-def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatch):
+def test_gb300_slurm_nightly_matrix_selects_all_nightly_kimi_k3_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -948,7 +947,17 @@ def test_gb300_slurm_nightly_matrix_selects_the_nightly_kimi_k3_tasks(monkeypatc
         ),
         (
             "test/ci/eval/"
+            "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+        (
+            "test/ci/eval/"
             "kimi-k3-nvfp4-dflash2-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
+            "slurm-gb300-4gpu",
+        ),
+        (
+            "test/ci/eval/"
+            "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml",
             "slurm-gb300-4gpu",
         ),
     }
@@ -1012,7 +1021,7 @@ def test_gb300_slurm_per_commit_workflow_is_isolated_and_automatic():
     assert "gb300-slurm-per-commit" in cancel_groups
 
 
-def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
+def test_gb300_slurm_per_commit_matrix_excludes_nightly_tp8_tasks(monkeypatch):
     monkeypatch.delenv("TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS", raising=False)
 
     matrix = build_matrix(
@@ -1038,18 +1047,6 @@ def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
             "workflow_stage": "model-test",
         },
         {
-            "name": "eval-kimi-k3-mxfp4-tp8-two-node-aime26-gb300-slurm",
-            "type": "eval",
-            "config": (
-                "test/ci/eval/"
-                "kimi-k3-mxfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
-            ),
-            "runner": "slurm-gb300-4gpu",
-            "priority": "normal",
-            "optional": False,
-            "workflow_stage": "model-test",
-        },
-        {
             "name": "eval-kimi-k3-nvfp4-dp16-four-node-aime26-gb300-slurm",
             "type": "eval",
             "config": (
@@ -1067,18 +1064,6 @@ def test_gb300_slurm_per_commit_matrix_selects_model_tasks(monkeypatch):
             "config": (
                 "test/ci/eval/"
                 "kimi-k3-nvfp4-dspark-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
-            ),
-            "runner": "slurm-gb300-4gpu",
-            "priority": "normal",
-            "optional": False,
-            "workflow_stage": "model-test",
-        },
-        {
-            "name": "eval-kimi-k3-nvfp4-tp8-two-node-aime26-gb300-slurm",
-            "type": "eval",
-            "config": (
-                "test/ci/eval/"
-                "kimi-k3-nvfp4-tp8-two-node-evalscope-aime26-gb300-slurm.yaml"
             ),
             "runner": "slurm-gb300-4gpu",
             "priority": "normal",

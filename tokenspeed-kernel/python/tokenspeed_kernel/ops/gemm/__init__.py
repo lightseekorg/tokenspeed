@@ -97,6 +97,8 @@ __all__ = [
     "grouped_bf16_projection_quantize_fp8",
     # MV: small-M dense projection
     "mv",
+    "mv_weightless_rmsnorm_gated_sigmoid",
+    "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
@@ -697,20 +699,52 @@ def mm(
     block_scale_layout = (
         "canonical_blackwell" if Platform.get().is_blackwell_plus else "canonical"
     )
+    # Supported online FP32/UE8M0 quantizers materialize contiguous FP8 operands.
+    # Describe the layout seen by GEMM, not the original dense activation view.
+    online_contiguous_a = (
+        quant == "mxfp8"
+        and A_scales is None
+        and A.dtype in (torch.bfloat16, torch.float16)
+        and B_scales is not None
+        and block_size is not None
+        and (
+            (B_scales.dtype == torch.float32 and block_size[1] in (32, 128))
+            or (
+                B_scales.dtype == torch.uint8
+                and block_size[1] == 32
+                and A.stride(-1) == 1
+            )
+        )
+    )
     traits: dict[str, object] = {
         "m": M,
         "n": N,
         "k": K,
         "b_layout": b_layout,
-        "a_inner_stride_one": A.stride(-1) == 1,
+        "a_contiguous": online_contiguous_a or A.is_contiguous(),
+        "a_inner_stride_one": online_contiguous_a or A.stride(-1) == 1,
         "a_scales_inner_stride_one": (A_scales is None or A_scales.stride(-1) == 1),
+        "b_contiguous": B.is_contiguous(),
         "b_inner_stride_one": B.stride(-1) == 1,
+        "b_scales_contiguous": B_scales is None or B_scales.is_contiguous(),
         "b_scales_inner_stride_one": (B_scales is None or B_scales.stride(-1) == 1),
         "block_scale_layout": block_scale_layout,
+        "has_alpha": alpha is not None,
+        "out_contiguous": out is None or out.is_contiguous(),
         "out_dtype": out_dtype,
         "out_inner_stride_one": out is None or out.stride(-1) == 1,
         "pdl_enabled": enable_pdl,
     }
+    if quant == "mxfp8" and block_size is not None and tuple(block_size) == (128, 128):
+        # Contiguous offset views can still violate a backend's pointer alignment.
+        # Online quantization allocates aligned activation values and scales.
+        traits["operands_aligned_16"] = (
+            online_contiguous_a or A.data_ptr() % 16 == 0
+        ) and B.data_ptr() % 16 == 0
+        traits["out_aligned_16"] = out is None or out.data_ptr() % 16 == 0
+        traits["scales_aligned_16"] = (
+            A_scales is None or A_scales.data_ptr() % 16 == 0
+        ) and (B_scales is None or B_scales.data_ptr() % 16 == 0)
 
     signature = _gemm_format_signature(
         A, B, A_scales, B_scales, out_dtype, quant, block_size
@@ -1910,6 +1944,124 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
+
+
+def _select_mv_weightless_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> SelectedKernel | None:
+    """Select the one-launch gated GEMV for this row, or None."""
+    if (
+        not x.is_cuda
+        or x.ndim != 2
+        or x.shape[1] != num_heads * head_dim
+        or not x.is_contiguous()
+        or gate.shape != x.shape
+        or gate.stride(1) != 1
+        or weight.ndim != 2
+        or weight.shape[1] != x.shape[1]
+        or not weight.is_contiguous()
+        or gate.device != x.device
+        or weight.device != x.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    m, (n, k) = x.shape[0], weight.shape
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "mv_weightless_rmsnorm_gated_sigmoid",
+            dense_format_signature(
+                ("x", "gate", "weight"), (x.dtype, gate.dtype, weight.dtype)
+            ),
+            traits={"m": m, "n": n, "k": k, "head_dim": head_dim},
+        )
+    except NoKernelFoundError:
+        return None
+    # The launch reproduces the gated norm and GEMV it replaces bit for bit, so
+    # it only stands in where those two calls select the kernels it copies.
+    norm = select_kernel(
+        "layernorm",
+        "weightless_rmsnorm_gated_sigmoid",
+        dense_format_signature(("x", "gate"), (x.dtype, gate.dtype)),
+    )
+    gemv = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+    if (
+        norm.name != "triton_weightless_rmsnorm_gated_sigmoid"
+        or gemv is not KernelRegistry.get().get_impl("gluon_rowcta_bf16_gemv_gfx950")
+    ):
+        return None
+    return kernel
+
+
+def mv_weightless_rmsnorm_gated_sigmoid_supported(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Return whether :func:`mv_weightless_rmsnorm_gated_sigmoid` serves this row.
+
+    A registered kernel must take the shape, and the separate gated norm and
+    ``mv`` must select the kernels it reproduces.
+
+    Args:
+        x: Attention row ``[1, num_heads * head_dim]``.
+        gate: Gate logits with ``x``'s shape.
+        weight: Output projection weight ``[N, num_heads * head_dim]``.
+        num_heads: Heads in ``x``.
+        head_dim: Width of each head.
+
+    Returns:
+        ``True`` when one launch can replace the gated norm followed by ``mv``.
+    """
+    return (
+        _select_mv_weightless_rmsnorm_gated_sigmoid(
+            x, gate, weight, num_heads, head_dim
+        )
+        is not None
+    )
+
+
+def mv_weightless_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize, gate and project one row in one launch.
+
+    Computes ``mv(weightless_rmsnorm_gated_sigmoid(x, gate, ...), weight,
+    out)`` where :func:`mv_weightless_rmsnorm_gated_sigmoid_supported` holds.
+
+    Args:
+        x: Contiguous BF16 row ``[1, num_heads * head_dim]``.
+        gate: Gate logits with ``x``'s shape and a unit inner stride.
+        weight: ``[N, K]`` weight.
+        num_heads: Heads in ``x``.
+        eps: Epsilon added to each per-head variance.
+        out: ``[1, N]`` destination.
+
+    Returns:
+        ``out``.
+    """
+    head_dim = x.shape[-1] // max(num_heads, 1)
+    kernel = _select_mv_weightless_rmsnorm_gated_sigmoid(
+        x, gate, weight, num_heads, head_dim
+    )
+    if kernel is None:
+        raise ValueError(
+            "mv_weightless_rmsnorm_gated_sigmoid needs a supported gated row "
+            f"(see mv_weightless_rmsnorm_gated_sigmoid_supported), got x "
+            f"{tuple(x.shape)}, weight {tuple(weight.shape)}, {num_heads} heads"
+        )
+    return kernel(x, gate, weight, out, num_heads, eps)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -3817,6 +3969,7 @@ def fp32_router_gemv_plan(
     output_size: int,
     dtype: torch.dtype,
     solution: str | None,
+    batch_invariant: bool,
 ) -> object:
     """Select an FP32 router GEMV and its persistent weight layout.
 
@@ -3825,6 +3978,8 @@ def fp32_router_gemv_plan(
         output_size: Number of router outputs.
         dtype: Input and canonical weight dtype, which must be FP32.
         solution: Optional implementation family override.
+        batch_invariant: Require a provider declaring the ``batch_invariant``
+            feature, as bitwise numerics envelopes do.
 
     Returns:
         An opaque plan accepted by the related process and execute APIs.
@@ -3838,6 +3993,7 @@ def fp32_router_gemv_plan(
         "gemm",
         "prepared_fp32_router_gemv",
         signature,
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
         solution=solution,
     )
     spec = KernelRegistry.get().get_by_name(kernel.name)

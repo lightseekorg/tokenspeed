@@ -26,6 +26,23 @@
 
 namespace tokenspeed {
 
+std::int32_t PrefillStateCheckpointTokens(const CacheCoordinator& coordinator, std::int32_t prompt_tokens,
+                                          std::int32_t chunk_budget, std::int32_t prefix_replay_tokens) {
+    _assert(prompt_tokens >= 0 && chunk_budget > 0 && prefix_replay_tokens >= 0,
+            "prefill checkpoint inputs must be non-negative with a positive budget");
+    const std::int32_t tail = std::max({1, coordinator.ReplayWindowTokens(), prefix_replay_tokens});
+    if (prompt_tokens <= chunk_budget || prompt_tokens <= tail) {
+        return 0;
+    }
+    for (std::int32_t group = 0; group < coordinator.NumGroups(); ++group) {
+        if (coordinator.GroupIsState(group)) {
+            const std::int32_t page = coordinator.PrefixGranularity();
+            return (prompt_tokens - tail) / page * page;
+        }
+    }
+    return 0;
+}
+
 std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t unscheduled,
                                      std::int32_t replay_window) {
     _assert(0 <= prefill_tokens && prefill_tokens <= unscheduled, "a chunk cannot exceed the unscheduled prompt");

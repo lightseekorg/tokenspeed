@@ -25,7 +25,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tokenspeed.runtime.cache.l2.storage import HostCacheStorage
+from tokenspeed.runtime.cache.host_storage import HostCacheStorage
 from tokenspeed.runtime.cache.transfer.layout import (
     CacheField,
     CacheGroupLayout,
@@ -113,3 +113,22 @@ def test_host_fields_are_packed_without_padding():
     assert storage.host_cache_block_bytes == (80, 1200)
     assert storage.host_field_offsets == ((0, 40), (0, 1000))
     assert storage.host_lcm_block_bytes == 1280
+
+
+def test_host_storage_does_not_retain_device_buffers():
+    import dataclasses
+    import gc
+    import weakref
+
+    class DeviceBuffer:
+        pass
+
+    buffer = DeviceBuffer()
+    reference = weakref.ref(buffer)
+    layout = dataclasses.replace(_layout(), buffers=(buffer,))
+    storage = HostCacheStorage(layout, num_host_lcm_blocks=2)
+    del layout, buffer
+    gc.collect()
+    assert reference() is None
+    assert storage.host_block_range(0, 1) == (0, 32)
+    assert len(storage.host_buffer) == 256

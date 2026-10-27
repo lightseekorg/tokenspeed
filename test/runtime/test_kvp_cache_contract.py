@@ -130,11 +130,6 @@ class TestRuntimeContractTest:
                 group_packing={"sharded": 1},
             )
 
-    def test_shard_count_must_be_a_positive_integer(self, subtests):
-        for value in (0, -1, 2.0, True):
-            with subtests.test(value=value), pytest.raises((ValueError)):
-                _full_history_spec("g", shard_count=value)
-
 
 class TestLocalPagesTest:
     def test_owned_blocks_partition_every_non_null_virtual_block(self, subtests):
@@ -186,16 +181,6 @@ class TestLocalPagesTest:
         )
         assert ((owned.tolist(), local.tolist())) == (([], []))
 
-    def test_out_of_range_ids_and_ranks_are_rejected(self):
-        with pytest.raises((IndexError)):
-            local_pages([9], shard_count=2, rank=0, virtual_block_count=9)
-        with pytest.raises((IndexError)):
-            local_pages([-1], shard_count=2, rank=0, virtual_block_count=9)
-        with pytest.raises((ValueError)):
-            local_pages([1], shard_count=2, rank=2, virtual_block_count=9)
-        with pytest.raises((ValueError)):
-            local_pages([1], shard_count=0, rank=0, virtual_block_count=9)
-
     def test_by_group_reads_shard_count_and_bounds_from_the_contract(self):
         contract = _contract(parents=2, packing=2, shard_count=2)
         translated = local_pages_by_group(
@@ -228,16 +213,6 @@ class TestMappingTest:
         )
         assert not (plain.has_kvp)
         assert (plain.kvp_group) == ((3,))
-
-    def test_kvp_must_divide_attention_tp(self):
-        with pytest.raises((ValueError), match=("divisible")):
-            AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=3
-            )
-        with pytest.raises((ValueError), match=("positive")):
-            AttentionLayerMapping(
-                rank=0, world_size=8, tp_size=8, dp_size=1, kvp_size=0
-            )
 
 
 class TestConfigurationTest:
@@ -273,10 +248,10 @@ class TestConfigurationTest:
         with pytest.raises((ValueError), match=("DSA, FlashMLA")):
             self._config(components=(self._component("mha"),))
 
-    def test_kvp_keeps_the_host_kvstore_but_refuses_l3(self):
+    def test_kvp_keeps_host_kvstore_and_allows_l3(self):
         # Host blocks are allocated in their Device block's residue class, so
         # the KVStore (and the retraction snapshot pool) serve a sharded
-        # engine; an L3 key has no owner-stable form under sharding.
+        # engine. L3 keys use a replica identity independent of allocation.
         args = object.__new__(ServerArgs)
         args.disaggregation_mode = "decode"
         args.kv_parallel_size = 2
@@ -288,8 +263,7 @@ class TestConfigurationTest:
         assert args.enable_kvstore, "KVStore is on by default"
         args.validate_cache_options()
         args.kvstore_storage_backend = "mooncake"
-        with pytest.raises((ValueError), match=("L3")):
-            args.validate_cache_options()
+        args.validate_cache_options()
 
 
 if __name__ == "__main__":

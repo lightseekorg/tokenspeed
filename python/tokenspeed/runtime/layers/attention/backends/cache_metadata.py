@@ -163,7 +163,9 @@ class CacheBatchMetadata:
             )
 
     def tables(self, *, active_forward_op: Any) -> Mapping[str, torch.Tensor]:
-        """Return all immutable table views after freshness validation."""
+        """Return every group's table view, in a read-only mapping, after
+        freshness validation. The views are this step's own upload: the
+        executor pads stopped requests' state rows in them in place."""
         self._validate_active_forward_op(active_forward_op)
         return self._group_tables
 

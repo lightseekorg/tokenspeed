@@ -49,12 +49,6 @@ from tokenspeed_kernel._triton import tl, triton
 
 @triton.jit(
     do_not_specialize=["total", "batch_size", "tail_block_rows", "uniform_length"],
-    do_not_specialize_on_alignment=[
-        "total",
-        "batch_size",
-        "tail_block_rows",
-        "uniform_length",
-    ],
 )
 def _ngram_ids_kernel(
     ids_ptr,

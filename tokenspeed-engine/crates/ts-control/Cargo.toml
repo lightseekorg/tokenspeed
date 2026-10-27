@@ -1,0 +1,37 @@
+[package]
+name = "tokenspeed-control"
+description = "The TokenSpeed engine's control plane: request state, the scheduling loop, outputs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+readme.workspace = true
+
+[lib]
+name = "ts_control"
+
+[dependencies]
+bytes.workspace = true
+serde_json = "1"
+crc32fast = "1"
+thiserror.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+ts-collective = { package = "tokenspeed-collective", version = "0.1.0", path = "../ts-collective" }
+ts-grammar = { package = "tokenspeed-grammar", version = "0.1.0", path = "../ts-grammar" }
+ts-l3 = { package = "tokenspeed-l3", version = "0.1.0", path = "../ts-l3" }
+ts-metrics = { package = "tokenspeed-metrics", version = "0.1.0", path = "../ts-metrics" }
+ts-pd = { package = "tokenspeed-pd", version = "0.1.0", path = "../ts-pd" }
+ts-scheduler = { package = "tokenspeed-scheduler", version = "0.1.0", path = "../ts-scheduler" }
+ts-wire = { package = "tokenspeed-wire", version = "0.1.0", path = "../ts-wire" }
+zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport", "ipc-transport"] }
+
+[dev-dependencies]
+pyo3 = "0.30"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+ts-client = { package = "tokenspeed-client", version = "0.1.0", path = "../ts-client" }
+
+[lints]
+workspace = true

@@ -52,16 +52,29 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   missing implementation fails at startup
 │                                   instead of silently falling back
 ├── collectives.deterministic       one association order per reduction
-│   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
-│   │                               kernels make no bitwise claim)
+│   ├── no fused AR+norm            enable_allreduce_fusion=False and
+│   │                               comm_fusion_max_num_tokens=-1, also set
+│   │                               by batch_invariant_collectives or
+│   │                               layer_boundary_norm=unfused alone (the
+│   │                               fused kernels make no bitwise claim)
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   ├── batch_invariant_collectives AutoBackend.route, one decision for every
-│   │                               collective: every reduction is NCCL data
+│   │                               collective: every reduction is data
 │   │                               movement plus a fixed-rank-order fp32
 │   │                               fold (all-reduce = all-gather + fold at
-│   │                               world_size x traffic, reduce-scatter =
-│   │                               all-to-all + fold at no extra traffic).
+│   │                               world_size x traffic, its gather on the
+│   │                               multicast kernels where they reach, or
+│   │                               trtllm workspace kernels with fp32
+│   │                               accumulation where a workspace is armed
+│   │                               (one call, or chunks of the rows it
+│   │                               holds; armed through a prefill chunk
+│   │                               up to 2048 rows): they fold ranks
+│   │                               0..W-1 the same way on one-shot and
+│   │                               two-shot, bit for bit, -0.0 sums
+│   │                               included as +0.0;
+│   │                               reduce-scatter = all-to-all + fold at no
+│   │                               extra traffic).
 │   │                               A ring reduction chunks by message size,
 │   │                               so its per-element order is run-stable
 │   │                               but not batch-size-invariant; the NVLS
@@ -73,7 +86,14 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               kernels. The route reads only static
 │   │                               properties of the call site, never the
 │   │                               row count, so a site cannot change route
-│   │                               with the batch
+│   │                               with the batch. Inside the all-reduce
+│   │                               fold the row count does pick the kernel
+│   │                               (workspace one-shot or two-shot, or the
+│   │                               gather where no armed workspace serves
+│   │                               the shape); all give the same bits,
+│   │                               except values below 1.2e-38, which the
+│   │                               workspace kernels (built with fast
+│   │                               math) flush to zero
 │   ├── data movement               all-gather, token all-gather, all-to-all
 │   │                               (even or uneven, the transposes of the
 │   │                               decode TP layouts) move bytes without

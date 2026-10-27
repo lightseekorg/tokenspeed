@@ -234,7 +234,6 @@ def _route_u32_bits_to_f32(bits, element_ty: gl.constexpr):
 
 @gluon.jit(
     do_not_specialize=("M",),
-    do_not_specialize_on_alignment=("M",),
 )
 def _sigmoid_bias_topk_route_gluon_kernel(
     logits_ptr,  # (M, E)

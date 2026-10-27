@@ -664,6 +664,38 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     }
 }
 
+TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching) {
+    // The checkpoint only pays off through a prefix hit on it; without prefix
+    // caching it would hold a State block for nothing.
+    SchedulerConfig config = MakeValidConfig();
+    config.state_checkpoint_in_forward = true;
+    EXPECT_NO_THROW(config.Validate());
+    config.disable_prefix_cache = true;
+    EXPECT_THROW(config.Validate(), std::invalid_argument);
+    config.state_checkpoint_in_forward = false;
+    EXPECT_NO_THROW(config.Validate());
+
+    // The D role computes no prompt, so it takes the flag without prefix
+    // caching (PD launchers share one argument list between the roles); the
+    // P role still refuses it.
+    for (const Role role : {Role::kP, Role::kD}) {
+        SchedulerConfig pd = MakeValidConfig();
+        pd.role = role;
+        for (CacheGroupConfig& group : pd.cache_groups) {
+            group.transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(pd);
+        pd.disable_prefix_cache = true;
+        EXPECT_NO_THROW(pd.Validate());
+        pd.state_checkpoint_in_forward = true;
+        if (role == Role::kD) {
+            EXPECT_NO_THROW(pd.Validate());
+        } else {
+            EXPECT_THROW(pd.Validate(), std::invalid_argument);
+        }
+    }
+}
+
 TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether) {
     // The pool is explicit on every role: 0 pages says nothing, the null page
     // alone says "never retract" (and takes no blob slots), anything above it
@@ -734,15 +766,15 @@ TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
     }
 }
 
-TEST(SchedulerConfigValidateTest, L3StorageRequiresReplicatedGroups) {
+TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     SchedulerConfig config = MakeValidConfig();
     config.host_allocator.total_pages = 32;
     config.enable_l3_storage = true;
-    config.l3_prefetch_min_pages = 1;
+    config.storage_config = StorageConfig{
+        8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
     config.cache_groups[0].cache_blocks_per_lcm_block = 2;
     config.cache_groups[0].shard_count = 2;
-    EXPECT_THROW(config.Validate(), std::invalid_argument)
-        << "an L3 prefetch allocates its Host page before any Device destination exists";
+    EXPECT_NO_THROW(config.Validate());
     config.cache_groups[0].shard_count = 1;
     EXPECT_NO_THROW(config.Validate());
 }

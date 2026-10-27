@@ -1,0 +1,513 @@
+# Copyright (c) 2026 LightSeek Foundation
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+"""The cache transfer contract a PD rank publishes (``pd/cache_protocol.py``):
+its construction checks, its wire form, the transfer schema the recipes
+derive, and the producer schedule layerwise streaming follows. The engine
+host plans everything a transfer reads off the contract (``ts-pd``)."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from dataclasses import replace
+from types import SimpleNamespace
+
+import pytest
+
+# CPU-only tests scheduled in runtime-1gpu because they import the full runtime.
+sys.path.insert(
+    0,
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+)
+from ci_system.ci_register import register_cuda_ci  # noqa: E402
+
+register_cuda_ci(est_time=10, suite="runtime-1gpu")
+
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (  # noqa: E402
+    CacheFieldLayout,
+    CacheGroupLayout,
+    CacheMemoryPlan,
+    CachePlaneLayout,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (  # noqa: E402
+    CacheGroupSpec,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.transfer import (  # noqa: E402
+    CacheFieldPartition,
+    CacheFieldTransferSpec,
+    CacheTransferSchema,
+    build_cache_transfer_schema,
+)
+from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
+    CacheContractError,
+    CacheTransferContract,
+    build_cache_fields_by_producer_step,
+)
+from tokenspeed.runtime.pd.cache_protocol import (  # noqa: E402
+    build_cache_transfer_schema as compatibility_build_cache_transfer_schema,
+)
+
+
+def _group_spec(
+    group_id: str,
+    attn_kind: str,
+    policy: str,
+    *,
+    prefix_granularity: int = 4,
+    sliding_window_tokens: int | None = None,
+    shard_count: int = 1,
+) -> CacheGroupSpec:
+    # A state group is one state per block; a history group is rows.
+    if attn_kind == "state":
+        return CacheGroupSpec(
+            group_id=group_id,
+            attn_kind=attn_kind,
+            transfer_policy=policy,
+            replayable=False,
+            shard_count=shard_count,
+        )
+    return CacheGroupSpec(
+        group_id=group_id,
+        attn_kind=attn_kind,
+        rows_per_page=prefix_granularity,
+        entry_stride_tokens=1,
+        sliding_window_tokens=sliding_window_tokens,
+        transfer_policy=policy,
+        replayable=False,
+        shard_count=shard_count,
+    )
+
+
+def _field(
+    group_id: str,
+    field_id: str,
+    *,
+    plane_id: str = "cache",
+    shape: tuple[int, ...] = (1,),
+    dtype: str = "uint8",
+    offset: int = 0,
+    stride: int = 128,
+) -> CacheFieldLayout:
+    return CacheFieldLayout(
+        group_id=group_id,
+        field_id=field_id,
+        plane_id=plane_id,
+        shape=shape,
+        dtype=dtype,
+        field_offset_bytes=offset,
+        page_stride_bytes=stride,
+    )
+
+
+def _contract(
+    specs: tuple[CacheGroupSpec, ...],
+    fields: tuple[CacheFieldLayout, ...],
+    *,
+    block_size: int = 4,
+    capacity: int = 64,
+    page_bytes: int = 128,
+    planes: tuple[CachePlaneLayout, ...] | None = None,
+    transfer_schema: CacheTransferSchema = CacheTransferSchema(),
+    packing: int = 1,
+) -> CacheTransferContract:
+    plan = CacheMemoryPlan(
+        prefix_granularity=block_size,
+        lcm_block_bytes=page_bytes,
+        num_lcm_blocks=capacity - 1,
+        groups=tuple(
+            CacheGroupLayout(
+                group_id=spec.group_id,
+                cache_blocks_per_lcm_block=packing,
+                page_count=(1 + (capacity - 1) * packing),
+            )
+            for spec in specs
+        ),
+        planes=planes
+        or (
+            CachePlaneLayout(
+                plane_id="cache",
+                bytes_per_lcm_block=page_bytes,
+                arena_offset_bytes=0,
+            ),
+        ),
+        fields=fields,
+    )
+    return CacheTransferContract(
+        plan=plan,
+        group_specs=specs,
+        transfer_schema=transfer_schema,
+    )
+
+
+def _layout(capacity: int = 64) -> CacheTransferContract:
+    specs = (
+        _group_spec("attention", "full_history", "full_suffix"),
+        _group_spec("linear-a", "state", "latest_snapshot"),
+        _group_spec("linear-b", "state", "latest_snapshot"),
+    )
+    fields = (
+        _field("attention", "attention.k", offset=0),
+        _field("linear-a", "linear-a.state", offset=1),
+        _field("linear-b", "linear-b.state", offset=2),
+    )
+    return _contract(specs, fields, capacity=capacity)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_transfer_contract_rejects_group_mismatch_with_field_addresses(missing):
+    contract = _layout()
+    specs = contract.group_specs
+    specs = specs[:-1] if missing else (*specs, replace(specs[0], group_id="extra"))
+    with pytest.raises(CacheContractError, match="group IDs disagree"):
+        replace(
+            contract,
+            group_specs=specs,
+            field_addresses={field.field_id: 1024 for field in contract.plan.fields},
+        )
+
+
+def test_recipe_layer_owns_transfer_schema_api() -> None:
+    schema = build_cache_transfer_schema(
+        _two_plane_lcm_plan(3),
+        model_config=SimpleNamespace(
+            num_attention_layers=1,
+            num_key_value_heads=8,
+            hf_text_config=SimpleNamespace(),
+        ),
+    )
+
+    assert schema == CacheTransferSchema(
+        tuple(
+            CacheFieldTransferSpec(
+                f"layer.0.{suffix}",
+                CacheFieldPartition(axis=1, global_extent=8),
+            )
+            for suffix in ("k", "v")
+        )
+    )
+
+
+def test_cache_protocol_compatibility_reexports_recipe_compiler() -> None:
+    assert compatibility_build_cache_transfer_schema is build_cache_transfer_schema
+
+
+def test_contract_serializes_recipe_specs_without_a_pd_group_projection() -> None:
+    contract = _layout()
+    assert contract.group_specs[1].transfer_policy == "latest_snapshot"
+    payload = json.loads(contract.to_wire_bytes())
+    assert "groups" not in payload
+    assert [spec["group_id"] for spec in payload["group_specs"]] == [
+        spec.group_id for spec in contract.group_specs
+    ]
+
+
+def test_contract_wire_form_has_no_version_field() -> None:
+    layout = _layout()
+    contract_payload = json.loads(layout.to_wire_bytes())
+    plan_payload = contract_payload["plan"]
+    assert plan_payload["num_lcm_blocks"] == layout.plan.num_lcm_blocks
+    assert plan_payload["lcm_block_bytes"] == layout.plan.lcm_block_bytes
+    assert [spec["group_id"] for spec in contract_payload["group_specs"]] == [
+        "attention",
+        "linear-a",
+        "linear-b",
+    ]
+    assert "version" not in contract_payload
+
+
+def _two_plane_lcm_plan(num_lcm_blocks: int) -> CacheMemoryPlan:
+    plane_bytes = 512
+    lcm_block_bytes = 1024
+    return CacheMemoryPlan(
+        prefix_granularity=4,
+        lcm_block_bytes=lcm_block_bytes,
+        num_lcm_blocks=num_lcm_blocks,
+        groups=(
+            CacheGroupLayout(
+                group_id="history",
+                cache_blocks_per_lcm_block=2,
+                page_count=1 + num_lcm_blocks * 2,
+            ),
+        ),
+        planes=(
+            CachePlaneLayout(
+                plane_id="k",
+                bytes_per_lcm_block=plane_bytes,
+                arena_offset_bytes=0,
+            ),
+            CachePlaneLayout(
+                plane_id="v",
+                bytes_per_lcm_block=plane_bytes,
+                arena_offset_bytes=(num_lcm_blocks + 1) * plane_bytes,
+            ),
+        ),
+        fields=(
+            CacheFieldLayout(
+                group_id="history",
+                field_id="layer.0.k",
+                plane_id="k",
+                shape=(4, 8),
+                dtype="bfloat16",
+                field_offset_bytes=0,
+                page_stride_bytes=256,
+            ),
+            CacheFieldLayout(
+                group_id="history",
+                field_id="layer.0.v",
+                plane_id="v",
+                shape=(4, 8),
+                dtype="bfloat16",
+                field_offset_bytes=0,
+                page_stride_bytes=256,
+            ),
+        ),
+    )
+
+
+def _recipe_contract(
+    groups,
+    *,
+    q=128,
+    transfer_schema=CacheTransferSchema(),
+    **solve,
+):
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import pack
+
+    specs = tuple(spec for spec, _ in groups)
+    plan = pack(
+        groups,
+        prefix_granularity=q,
+        max_padding_fraction=1.0,
+        **solve,
+    ).bind(3)
+    return CacheTransferContract(
+        plan=plan,
+        group_specs=specs,
+        transfer_schema=transfer_schema,
+    )
+
+
+@pytest.mark.parametrize("family", ("mha", "mla", "dsa"))
+def test_pd_derives_ordinary_transfer_metadata_from_physical_plan(
+    family: str,
+) -> None:
+    import torch
+
+    from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+    from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
+    from tokenspeed.runtime.layers.attention.configs.mla import MLAConfig
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
+        OrdinaryRecipe,
+    )
+
+    common = {
+        "backend_name": "test",
+        "num_attention_heads": 8,
+        "num_kv_heads": 4,
+        "head_dim": 8,
+        "attn_tp_size": 2,
+    }
+    classes = {"mha": MHAConfig, "mla": MLAConfig, "dsa": DSAConfig}
+    extras = {}
+    if family != "mha":
+        extras.update(
+            kv_lora_rank=6,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=2,
+            v_head_dim=4,
+            scaling=1.0,
+            kv_cache_dim=8,
+        )
+    if family == "dsa":
+        # fp8_scaled: the (16, 132) uint8 index plane asserted below.
+        extras.update(
+            index_topk=4,
+            index_head_dim=128,
+            index_n_heads=1,
+            index_k_format="fp8_scaled",
+        )
+    spec = classes[family](
+        **common,
+        **extras,
+        cache_layer_types=(),
+    )
+    config = AttnConfig(
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        prefix_granularity=16,
+        context_len=256,
+        max_bs=4,
+        kv_cache_quant_method="none",
+        pd_disaggregation_enabled=True,
+        components=(spec,),
+    )
+
+    recipe = OrdinaryRecipe(
+        family=family,
+        server_args=SimpleNamespace(max_total_tokens=None),
+        model_config=SimpleNamespace(num_attention_layers=2),
+        attn_config=config,
+        draft_model_config=None,
+        draft_attn_config=None,
+        cache_budget_bytes=1 << 24,
+        probe_batch_rows=None,
+        decode_input_tokens=1,
+        overlap_schedule_depth=0,
+    )
+    groups = recipe.groups()
+    layout = _recipe_contract(
+        groups,
+        q=config.prefix_granularity,
+        cache_blocks_per_lcm_block=recipe.packing(groups),
+        alignment=1,
+    )
+    model_config = SimpleNamespace(
+        num_attention_layers=2,
+        num_key_value_heads=4,
+        hf_text_config=SimpleNamespace(),
+    )
+    layout = replace(
+        layout,
+        transfer_schema=build_cache_transfer_schema(
+            layout.plan,
+            model_config=model_config,
+        ),
+    )
+
+    assert layout.plan.prefix_granularity == 16
+    assert len(layout.group_specs) == 1
+    group = layout.group_specs[0]
+    assert (group.group_id, group.attn_kind) == ("full_attention", "full_history")
+    # Packing lives on the plan, not on the group spec.
+    assert layout.plan.group("full_attention").cache_blocks_per_lcm_block == 1
+
+    fields_by_id = {
+        field.field_id: field
+        for field in layout.plan.fields
+        if field.group_id == group.group_id
+    }
+    suffixes = {
+        "mha": ("k", "v"),
+        "mla": ("latent_kv",),
+        "dsa": ("index_k", "latent_kv"),
+    }[family]
+    expected_field_ids = tuple(
+        f"layer.{layer_id}.{suffix}" for layer_id in range(2) for suffix in suffixes
+    )
+    assert tuple(sorted(fields_by_id)) == expected_field_ids
+    for field_id, field in fields_by_id.items():
+        is_index = field_id.endswith(".index_k")
+        expected_shape = (
+            (16, 132)
+            if family == "dsa" and is_index
+            else (16, 1, 8) if field_id.endswith(".latent_kv") else (16, 2, 8)
+        )
+        # The recipe put the dtype in the plan; the contract reads it back.
+        expected_dtype = "uint8" if family == "dsa" and is_index else "bfloat16"
+        assert field.dtype == expected_dtype
+        assert field.shape == expected_shape
+        assert field.element_size == (1 if expected_dtype == "uint8" else 2)
+        partition = layout.transfer_schema.partition_for(field_id)
+        if field_id.endswith((".k", ".v")):
+            assert partition is not None
+            assert partition.axis == 1
+            assert partition.global_extent == 4
+        else:
+            assert partition is None
+
+
+def test_producer_schedule_groups_draft_fields_in_the_final_step() -> None:
+    spec = _group_spec("history", "full_history", "full_suffix")
+    layout = _contract(
+        (spec,),
+        tuple(
+            _field("history", f"layer.{layer_id}.kv", offset=layer_id)
+            for layer_id in range(4)
+        ),
+    )
+
+    schedule = build_cache_fields_by_producer_step(
+        layout.plan,
+        producer_fields_by_step=(
+            ("layer.0.kv",),
+            ("layer.1.kv",),
+            ("layer.2.kv", "layer.3.kv"),
+        ),
+    )
+
+    assert schedule.fields_by_step == (
+        ("layer.0.kv",),
+        ("layer.1.kv",),
+        ("layer.2.kv", "layer.3.kv"),
+    )
+
+
+def test_cache_construction_resolves_draft_readiness_before_transfer():
+    from types import SimpleNamespace
+
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
+        cache_field_placement,
+        pipeline_cache_ownership,
+    )
+
+    plan = SimpleNamespace(
+        fields=[SimpleNamespace(field_id=f"layer.{i}.kv") for i in range(6)]
+    )
+    owners = pipeline_cache_ownership(4, 2, ((0, 2), (2, 4)))
+    resident, schedules = cache_field_placement(plan, owners)
+    assert resident == (
+        ("layer.0.kv", "layer.1.kv"),
+        ("layer.2.kv", "layer.3.kv", "layer.4.kv", "layer.5.kv"),
+    )
+    assert schedules == (
+        (("layer.0.kv",), ("layer.1.kv",)),
+        (("layer.2.kv",), ("layer.3.kv",), ("layer.4.kv", "layer.5.kv")),
+    )
+    for fields, steps in zip(resident, schedules):
+        physical_plan = SimpleNamespace(
+            fields=[SimpleNamespace(field_id=field) for field in fields]
+        )
+        schedule = build_cache_fields_by_producer_step(
+            physical_plan, producer_fields_by_step=steps
+        )
+        assert schedule.fields_in_range(0, schedule.step_count) == frozenset(fields)
+
+
+def test_cache_readiness_rejects_missing_resident_fields():
+    from types import SimpleNamespace
+
+    plan = SimpleNamespace(
+        fields=[
+            SimpleNamespace(field_id="layer.0.kv"),
+            SimpleNamespace(field_id="layer.1.kv"),
+        ]
+    )
+    with pytest.raises(ValueError, match="every resident field"):
+        build_cache_fields_by_producer_step(
+            plan, producer_fields_by_step=(("layer.0.kv",),)
+        )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -27,11 +27,14 @@ from tokenspeed_kernel.numerics.torch.moe import torch_moe_experts
 from tokenspeed_kernel.ops.moe.native import torch_softmax_topk
 from utils import assert_no_triton_compile, is_cdna4
 
-if not is_cdna4():
-    pytest.skip(
-        "AMD CDNA4 is required for BF16-weight Gluon MoE tests",
-        allow_module_level=True,
-    )
+pytest.importorskip(
+    "tokenspeed_kernel_amd.ops.gfx950.moe.fp16",
+    reason="tokenspeed-kernel-amd is required for Gluon BF16 MoE tests",
+)
+
+requires_cdna4 = pytest.mark.skipif(
+    not is_cdna4(), reason="AMD CDNA4 is required for BF16-weight Gluon MoE tests"
+)
 
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import gluon_bf16_moe  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp16.moe_align_device import (  # noqa: E402
@@ -103,6 +106,7 @@ def _build(num_tokens: int, seed: int = 0, i_r: int = I_R, hidden_size: int = D)
     return hidden, w1, w2, topk_ids, topk_weights
 
 
+@requires_cdna4
 def test_small_route_device_alignment_contract() -> None:
     """The two-launch route path preserves every packed route and block."""
     num_tokens, num_experts, top_k, block_m = 64, 4, 2, 16
@@ -115,31 +119,14 @@ def test_small_route_device_alignment_contract() -> None:
         num_tokens * top_k, device="cuda", dtype=torch.float32
     ).reshape(num_tokens, top_k)
 
-    sorted_ids, sorted_experts, sorted_weights, num_valid = moe_align_block_size_device(
-        topk_ids, topk_weights, num_experts, block_m
-    )
-    valid_rows = int(num_valid.item())
-    assert valid_rows == num_tokens * top_k
-    assert sorted_experts[: valid_rows // block_m].tolist() == [
-        0,
-        0,
-        1,
-        1,
-        2,
-        2,
-        3,
-        3,
-    ]
-
-    packed = sorted_ids[:valid_rows]
-    tokens = packed & 0xFFFFFF
-    slots = packed >> 24
-    experts = sorted_experts[: valid_rows // block_m].repeat_interleave(block_m)
-    assert torch.equal(topk_ids[tokens, slots], experts)
-    assert torch.equal(topk_weights[tokens, slots], sorted_weights[:valid_rows])
-    assert torch.equal(
-        torch.sort(tokens * top_k + slots).values,
-        torch.arange(num_tokens * top_k, device="cuda"),
+    outputs = moe_align_block_size_device(topk_ids, topk_weights, num_experts, block_m)
+    _assert_production_alignment_contract(
+        topk_ids,
+        topk_weights,
+        outputs,
+        num_experts=num_experts,
+        block_m=block_m,
+        expert_start=0,
     )
 
 
@@ -197,48 +184,12 @@ def _assert_production_alignment_contract(
     assert torch.all(sorted_weights[valid_rows:] == 0)
 
 
-@pytest.mark.parametrize("routing", ["concentrated", "distributed", "filtered"])
-def test_small_route_production_alignment_contract(routing: str) -> None:
-    """Production-sized concentrated, distributed, and EP routes stay exact."""
-    num_tokens, num_experts, top_k, block_m = 64, 288, 8, 16
-    flat_slots = torch.arange(num_tokens * top_k, device="cuda", dtype=torch.int32)
-    if routing == "concentrated":
-        expert_start = 0
-        topk_ids = torch.zeros_like(flat_slots)
-    elif routing == "distributed":
-        expert_start = 0
-        topk_ids = (flat_slots * 37).remainder(num_experts)
-    else:
-        expert_start = 100
-        route_pattern = torch.tensor(
-            [99, 100, 101, 200, 387, 388, 42, 999],
-            device="cuda",
-            dtype=torch.int32,
-        )
-        topk_ids = route_pattern.repeat(num_tokens)
-    topk_ids = topk_ids.reshape(num_tokens, top_k)
-    topk_weights = (flat_slots.float() + 0.25).reshape(num_tokens, top_k)
-    outputs = moe_align_block_size_device(
-        topk_ids,
-        topk_weights,
-        num_experts,
-        block_m,
-        expert_start=expert_start,
-    )
-    torch.cuda.synchronize()
-    _assert_production_alignment_contract(
-        topk_ids,
-        topk_weights,
-        outputs,
-        num_experts=num_experts,
-        block_m=block_m,
-        expert_start=expert_start,
-    )
-
-
-@pytest.mark.parametrize("case", ["no_local_routes", "maximum_small_route"])
+@requires_cdna4
+@pytest.mark.parametrize(
+    "case", ["no_local_routes", "maximum_small_route", "filtered_routes"]
+)
 def test_small_route_boundary_alignment_contract(case: str) -> None:
-    """The direct-fill bound handles empty routing and its 1,024-route edge."""
+    """The direct-fill bound handles empty, filtered, and 1,024-route inputs."""
     num_experts, top_k, block_m = 288, 8, 16
     if case == "no_local_routes":
         num_tokens = 1
@@ -249,6 +200,15 @@ def test_small_route_boundary_alignment_contract(case: str) -> None:
             dtype=torch.int32,
             device="cuda",
         )
+    elif case == "filtered_routes":
+        num_tokens = 64
+        expert_start = 100
+        route_pattern = torch.tensor(
+            [99, 100, 101, 200, 387, 388, 42, 999],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        topk_ids = route_pattern.repeat(num_tokens).reshape(num_tokens, top_k)
     else:
         num_tokens = 128
         expert_start = 0
@@ -261,6 +221,8 @@ def test_small_route_boundary_alignment_contract(case: str) -> None:
     topk_weights = torch.arange(
         num_tokens * top_k, dtype=torch.float32, device="cuda"
     ).reshape(num_tokens, top_k)
+    if case == "filtered_routes":
+        topk_weights = topk_weights + 0.25
 
     outputs = moe_align_block_size_device(
         topk_ids,
@@ -280,6 +242,7 @@ def test_small_route_boundary_alignment_contract(case: str) -> None:
     )
 
 
+@requires_cdna4
 def test_small_route_production_alignment_graph_replay() -> None:
     """Graph replay updates the live block prefix and padded suffix."""
     num_tokens, num_experts, top_k, block_m = 64, 288, 8, 16
@@ -347,7 +310,53 @@ def test_small_route_production_alignment_graph_replay() -> None:
     torch.testing.assert_close(outputs[1], first_experts, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 8, 32, 64, 256])
+@requires_cdna4
+def test_large_route_count_reset_and_graph_replay() -> None:
+    """The shared large sorter resets counts when local routes disappear."""
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp16 import moe_align_device
+
+    num_tokens, top_k, num_experts, block_m, expert_start = 130, 8, 4, 16, 12
+    ids = torch.full(
+        (num_tokens, top_k), expert_start, dtype=torch.int32, device="cuda"
+    )
+    weights = torch.ones((num_tokens, top_k), dtype=torch.float32, device="cuda")
+    kernels = (
+        moe_align_device._init_kernel,
+        moe_align_device._count_kernel,
+        moe_align_device._offsets_kernel,
+        moe_align_device._scatter_kernel,
+    )
+
+    # Both views have more than 1,024 routes and share the same capacity bucket.
+    moe_align_block_size_device(
+        ids[:129], weights[:129], num_experts, block_m, expert_start=expert_start
+    )
+    with assert_no_triton_compile(*kernels):
+        moe_align_block_size_device(
+            ids, weights, num_experts, block_m, expert_start=expert_start
+        )
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        outputs = moe_align_block_size_device(
+            ids, weights, num_experts, block_m, expert_start=expert_start
+        )
+    for route_id in (expert_start, 0, expert_start + 3):
+        ids.fill_(route_id)
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_production_alignment_contract(
+            ids,
+            weights,
+            outputs,
+            num_experts=num_experts,
+            block_m=block_m,
+            expert_start=expert_start,
+        )
+
+
+@requires_cdna4
+@pytest.mark.parametrize("num_tokens", [1, 8, 32, 64, 65, 256])
 def test_fp16_weight_moe_matches_fp32_reference(num_tokens):
     """End-to-end output matches the fp32 oracle (auto decode/prefill path)."""
     hidden, w1, w2, topk_ids, topk_weights = _build(num_tokens)
@@ -359,6 +368,7 @@ def test_fp16_weight_moe_matches_fp32_reference(num_tokens):
     assert max_abs <= REL_TOL * peak + 1e-2, f"max_abs={max_abs}, peak={peak}"
 
 
+@requires_cdna4
 @pytest.mark.parametrize("num_tokens", [1, 16, 64, 256])
 def test_fp16_weight_moe_64_aligned_intermediate_matches_fp32_reference(num_tokens):
     """An intermediate size that is a multiple of 64 but not 128 (a TP shard
@@ -372,6 +382,7 @@ def test_fp16_weight_moe_64_aligned_intermediate_matches_fp32_reference(num_toke
     assert max_abs <= REL_TOL * peak + 1e-2, f"max_abs={max_abs}, peak={peak}"
 
 
+@requires_cdna4
 @pytest.mark.parametrize("num_tokens", [1, 4, 8])
 def test_fp16_weight_moe_decode_hidden_with_odd_k_tiles(num_tokens):
     """A hidden size whose 128-wide K-tile count is not a multiple of the
@@ -388,6 +399,7 @@ def test_fp16_weight_moe_decode_hidden_with_odd_k_tiles(num_tokens):
     assert max_abs <= REL_TOL * peak + 1e-2, f"max_abs={max_abs}, peak={peak}"
 
 
+@requires_cdna4
 @pytest.mark.parametrize("num_tokens", [1, 4, 16])
 def test_fp16_weight_moe_splitk_consistency(num_tokens):
     """The decode split-K stage-1 path matches the single-launch path."""
@@ -404,6 +416,7 @@ def test_fp16_weight_moe_splitk_consistency(num_tokens):
     assert max_abs <= 1e-2 * peak + 1e-2, f"max_abs={max_abs}"
 
 
+@requires_cdna4
 @pytest.mark.parametrize("num_tokens", [1, 8])
 def test_fp16_weight_moe_warp_decode_matches_default(num_tokens):
     """The warp-reduce GEMV decode path matches the split-K/reduce path."""
@@ -416,6 +429,7 @@ def test_fp16_weight_moe_warp_decode_matches_default(num_tokens):
     assert max_abs <= 1e-2 * peak + 1e-2, f"max_abs={max_abs}"
 
 
+@requires_cdna4
 def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes() -> None:
     """The prefill aligner maps global EP routes to contiguous local weights."""
     generator = torch.Generator(device="cuda").manual_seed(29)
@@ -491,6 +505,7 @@ def test_fp16_weight_moe_prefill_ep_filters_nonlocal_routes() -> None:
     assert max_abs <= REL_TOL * peak + 1e-2, f"max_abs={max_abs}, peak={peak}"
 
 
+@requires_cdna4
 def test_decode_align_batch_size_does_not_recompile() -> None:
     """Token counts inside one power-of-two route bucket share a compile."""
     topk_ids = torch.randint(0, E, (32, TOPK), dtype=torch.int32, device="cuda")

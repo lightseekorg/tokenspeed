@@ -34,6 +34,7 @@ from tokenspeed_kernel.numerics.torch.attention.dsa import (
     torch_dsa_compact_index_pages,
 )
 from utils import (
+    assert_fp8_same_or_adjacent_at_midpoint,
     assert_no_triton_compile,
     int_specialization_class,
     warm_specialization_classes,
@@ -226,6 +227,71 @@ def test_mxfp4_mm_row_count():
             torch.testing.assert_close(run(rows), full[:rows], rtol=0, atol=0)
 
 
+def test_fp8_token_group_quantize_row_count(monkeypatch):
+    from tokenspeed_kernel import compile_monitor
+    from tokenspeed_kernel.ops.quantization import quantize_fp8
+    from tokenspeed_kernel.ops.quantization import triton as quantization
+
+    # Kimi K3's KDA projection quantizes 7168-wide tokens in groups of 128,
+    # whose general launch tile changes above 2 and above 255 tokens. The
+    # gfx950 specialization has its own 1/16-group boundary. One startup call
+    # compiles every tile for the selected policy.
+    x = torch.randn(4096, 7168, device=DEVICE, dtype=torch.bfloat16)
+    monkeypatch.setattr(compile_monitor, "_serving", False)
+    full_codes, full_scales = quantize_fp8(
+        x,
+        granularity="token_group",
+        group_size=128,
+        override="triton_quantize_fp8_with_scale",
+    )
+    full_reciprocal = (
+        quantization._fp8_token_group_groups_per_cta(x, 128, x.numel() // 128) == 16
+    )
+    compile_monitor.mark_serving()
+    with assert_no_triton_compile(quantization._fp8_token_group_quantize_kernel):
+        for rows, columns in (
+            (1, 128),
+            (1, 7168),
+            (2, 7168),
+            (3, 7168),
+            (4, 7168),
+            (255, 7168),
+            (256, 7168),
+            (4095, 7168),
+        ):
+            # Groups are independent: a smaller input is a slice of the full one.
+            codes, scales = quantize_fp8(
+                x[:rows, :columns],
+                granularity="token_group",
+                group_size=128,
+                override="triton_quantize_fp8_with_scale",
+            )
+            values = x[:rows, :columns]
+            reciprocal = (
+                quantization._fp8_token_group_groups_per_cta(
+                    values, 128, values.numel() // 128
+                )
+                == 16
+            )
+            expected_codes = full_codes[:rows, :columns]
+            if reciprocal == full_reciprocal:
+                torch.testing.assert_close(
+                    codes.view(torch.uint8),
+                    expected_codes.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
+            else:
+                # Crossing the AMD normalization boundary can move only an
+                # FP8 midpoint to its adjacent code; scales remain exact.
+                assert_fp8_same_or_adjacent_at_midpoint(
+                    values, codes, expected_codes, scales, 128
+                )
+            torch.testing.assert_close(
+                scales, full_scales[:rows, : columns // 128], rtol=0, atol=0
+            )
+
+
 def test_dsa_index_candidates_table_width():
     from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates as ic
 
@@ -254,7 +320,9 @@ def test_dsa_index_candidates_table_width():
         logits = torch.randn(requests.numel(), width, device=DEVICE)
         logits[0, 5] = float("nan")
         expected = logits.clone()
-        ic.mask_index_scores(logits, positions, lengths, causal, page, 3, 5)
+        ic.mask_index_scores(
+            logits, positions, lengths, causal, page, 3, 5, mask_tail=True
+        )
         col = torch.arange(width, device=DEVICE)
         valid = col[None] < lengths
         logical = positions.gather(
@@ -387,6 +455,96 @@ def test_dsv41_index_topk_table_width():
         for cols in (144, 131, 263, 1024):
             for got, want in zip(run(cols), expected, strict=True):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("with_candidates", [False, True])
+@pytest.mark.parametrize("sort_positions", [False, True])
+def test_dsv41_finish_selection_width(with_candidates, sort_positions):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    scores = torch.ones((2, 128), device=DEVICE)
+    scores[:, 3] = -torch.inf
+    lengths = torch.tensor([64, 128], dtype=torch.int32, device=DEVICE)
+    candidates = torch.arange(15, -1, -1, dtype=torch.int32, device=DEVICE)
+    candidates = candidates.repeat(2, 1)
+    candidates[:, 2] = -1
+
+    def run(k):
+        indices = torch.arange(k - 1, -1, -1, dtype=torch.int32, device=DEVICE)
+        indices = indices.repeat(2, 1)
+        valid = (indices < lengths[:, None]) & (indices != 3)
+        positions = indices
+        if with_candidates:
+            blocks = candidates.gather(1, (indices // 8).long())
+            positions = blocks * 8 + indices % 8
+            valid &= (blocks >= 0) & (positions < 121)
+        expected = torch.where(valid, positions, torch.iinfo(torch.int32).max)
+        if sort_positions:
+            expected = expected.sort(dim=1).values
+        expected = torch.where(expected == torch.iinfo(torch.int32).max, -1, expected)
+        actual = implementation.finish_selection(
+            indices,
+            scores,
+            lengths,
+            candidates if with_candidates else None,
+            121,
+            8,
+            sort_positions,
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    run(65)
+    with assert_no_triton_compile(implementation._finish_selection):
+        for k in (72, 80, 96, 104, 112, 127):
+            run(k)
+
+
+@pytest.mark.parametrize("with_candidates", [False, True])
+def test_dsv41_write_selection_width(with_candidates):
+    from tokenspeed_kernel.ops.attention.dsv41 import triton as implementation
+
+    def run(k, c):
+        selected = torch.arange(k, dtype=torch.int32, device=DEVICE).repeat(2, 1)
+        selected[0, ::2] = -1
+        selected[1, 1::3] = -1
+        candidates = None
+        if with_candidates:
+            candidates = torch.arange(c, dtype=torch.int32, device=DEVICE)
+            candidates = candidates.repeat(2, 1)
+            candidates[0, ::3] = -1
+            candidates[1, 1::4] = -1
+        rows = torch.full((2, k), -2, dtype=torch.int32, device=DEVICE)
+        lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        blocks = torch.full((2, c), -2, dtype=torch.int32, device=DEVICE)
+        block_lengths = torch.full((2,), -2, dtype=torch.int32, device=DEVICE)
+        implementation.write_selection(
+            selected, candidates, (rows, lengths, blocks, block_lengths)
+        )
+        torch.testing.assert_close(rows, selected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            lengths, (selected >= 0).sum(1).to(torch.int32), rtol=0, atol=0
+        )
+        if with_candidates:
+            sentinel = torch.iinfo(torch.int32).max
+            expected = torch.where(candidates >= 0, candidates, sentinel)
+            expected = expected.sort(dim=1).values
+            expected = torch.where(expected == sentinel, -1, expected)
+            torch.testing.assert_close(blocks, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                block_lengths,
+                (candidates >= 0).sum(1).to(torch.int32),
+                rtol=0,
+                atol=0,
+            )
+        else:
+            torch.testing.assert_close(
+                block_lengths, torch.zeros_like(block_lengths), rtol=0, atol=0
+            )
+
+    run(65, 65 if with_candidates else 0)
+    with assert_no_triton_compile(implementation._write_selection):
+        for k in (72, 80, 96, 104, 112, 127):
+            run(k, k if with_candidates else 0)
 
 
 def test_dsv41_page_table_geometry():

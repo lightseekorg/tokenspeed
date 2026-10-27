@@ -801,6 +801,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
         .access_epoch = access_epoch,
         .new_page_ids = std::vector<std::vector<std::int32_t>>(groups_.size()),
         .pages_to_copy = std::vector<std::vector<std::pair<std::int32_t, std::int32_t>>>(groups_.size()),
+        .state_checkpoint_blocks = std::vector<CacheBlockRef>(groups_.size()),
     };
     for (std::size_t i = 0; i < groups_.size(); ++i) {
         if (GroupIsState(i)) {
@@ -972,7 +973,23 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             }
             if (step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand) {
                 FatalCheck(allocator.AcquireStateLive(pool_, table), "admission plan no longer fits the block pool");
-                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(table.Blocks()[1]->Location()));
+                const std::int32_t live = allocator.ResolveCacheBlockId(table.Blocks()[1]->Location());
+                if (step.kind == StateStep::Kind::kLand && state_prefix_cached) {
+                    // The peer omits this state transfer. A bootstrap token
+                    // can finish the request before any decode writes live.
+                    _assert(static_cast<bool>(table.Blocks()[0]), "an exact state hit must have an input checkpoint");
+                    result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(table.Blocks()[0]->Location()),
+                                                         live);
+                } else {
+                    result.new_page_ids[i].push_back(live);
+                }
+            }
+            if (step.checkpoint) {
+                _assert(step.kind == StateStep::Kind::kRotate, "an in-forward checkpoint rides a prefill chunk");
+                CacheBlockRef checkpoint = allocator.AcquireStateCheckpoint(pool_, table);
+                FatalCheck(static_cast<bool>(checkpoint), "admission plan no longer fits the block pool");
+                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(checkpoint->Location()));
+                result.state_checkpoint_blocks[i] = std::move(checkpoint);
             }
             continue;
         }

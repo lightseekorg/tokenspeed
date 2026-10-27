@@ -38,6 +38,25 @@ from tokenspeed.runtime.utils.server_args import PortArgs, ServerArgs
 logger = get_colorful_logger(__name__)
 
 
+def workspace_token_capacity(
+    hidden_size: int, max_num_tokens: int, *, batch_invariant_collectives: bool
+) -> int:
+    """Rows the trtllm all-reduce workspace of a group is armed for.
+
+    The one-shot window (2 MiB of bf16 rows) by default; configure_group
+    widens cross-node groups. Under batch-invariant collectives every
+    all-reduce folds ranks in order, and a call the workspace cannot hold
+    falls back to all-gathering world_size copies of the partials, so the
+    workspace also holds a forward's rows through the two-shot range.
+    """
+    from tokenspeed_kernel.ops.communication.trtllm import MNNVL_TWOSHOT_MAX_TOKEN
+
+    oneshot_tokens = max(1, (2 * 1024 * 1024) // max(hidden_size * 2, 1))
+    if not batch_invariant_collectives:
+        return oneshot_tokens
+    return max(oneshot_tokens, min(max_num_tokens, MNNVL_TWOSHOT_MAX_TOKEN))
+
+
 @dataclass
 class DistributedConfig:
     """Lightweight configuration for distributed initialization.
@@ -75,6 +94,11 @@ class DistributedConfig:
     # Run this rank alone, with local stand-ins for its collectives
     # (--emulate-rank-zero).
     emulate_rank_zero: bool
+    # Full enabled fusion window; zero when fused reductions are disabled.
+    comm_fusion_token_capacity: int
+
+    # --batch-invariant-collectives: every all-reduce folds ranks in order.
+    batch_invariant_collectives: bool
 
     dist_init_addr: str | None = None
     distributed_timeout_seconds: int = 1800
@@ -118,6 +142,12 @@ class DistributedConfig:
             moe_ep_rank=mapping.moe.ep_rank,
             nccl_port=port_args.nccl_port,
             emulate_rank_zero=server_args.emulate_rank_zero,
+            comm_fusion_token_capacity=(
+                max(0, server_args.comm_fusion_max_num_tokens)
+                if server_args.enable_allreduce_fusion
+                else 0
+            ),
+            batch_invariant_collectives=server_args.batch_invariant_collectives,
             dist_init_addr=port_args.dist_init_addr,
             distributed_timeout_seconds=(
                 server_args.distributed_timeout_seconds
@@ -226,9 +256,18 @@ class DistributedInitializer:
             backend = get_global_backend()
             trtllm_ar = getattr(backend, "trtllm_ar", None)
             if trtllm_ar is not None:
-                # One-shot window; configure_group widens cross-node groups.
-                max_oneshot_tokens = max(
-                    1, (2 * 1024 * 1024) // max(config.hidden_size * 2, 1)
+                # Plain one-shot reductions and fused norms share this
+                # workspace. Prefill may never capture a decode graph, so
+                # arm the full fusion window here, before serving begins.
+                max_workspace_tokens = max(
+                    workspace_token_capacity(
+                        config.hidden_size,
+                        config.max_num_tokens,
+                        # The rsag override keeps the fold off the workspace.
+                        batch_invariant_collectives=config.batch_invariant_collectives
+                        and not config.force_deterministic_rsag,
+                    ),
+                    config.comm_fusion_token_capacity,
                 )
                 for group in {
                     config.mapping.attn.tp_group,
@@ -238,7 +277,7 @@ class DistributedInitializer:
                         ok = trtllm_ar.configure_group(
                             rank=group.index(config.mapping.rank),
                             group=group,
-                            max_token_num=max_oneshot_tokens,
+                            max_token_num=max_workspace_tokens,
                             hidden_dim=config.hidden_size,
                         )
                         logger.info(

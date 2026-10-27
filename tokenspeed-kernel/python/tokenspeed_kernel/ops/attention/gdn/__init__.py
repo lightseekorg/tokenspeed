@@ -119,6 +119,31 @@ class GdnChunkPrefillResult:
     h_layout: GdnCheckpointLayout = GdnCheckpointLayout.NONE
 
 
+@dataclass(frozen=True)
+class GdnStateCheckpoints:
+    """Recurrent states a chunk prefill stores from inside its scan.
+
+    Sequence ``i`` stores the state after each whole multiple of
+    ``every_n_tokens`` of its own tokens (counted from its ``cu_seqlens``
+    start): ``len_i // every_n_tokens`` states, the ``j``-th (0-based) the
+    state after ``(j + 1) * every_n_tokens`` tokens, at row
+    ``cu_starts[i] + j`` of ``states``.
+
+    Args:
+        every_n_tokens: Interval in tokens; a positive multiple of
+            ``GDN_STATE_CHECKPOINT_GRANULARITY``, the scan's chunk size.
+        states: Caller-allocated K-last float32 buffer ``[total, num_v_heads,
+            head_v_dim, head_dim]`` with ``total = sum(len_i //
+            every_n_tokens)``; the kernel overwrites it.
+        cu_starts: ``[num_seqs + 1]`` int32 cumulative per-sequence counts on
+            the device of ``states``.
+    """
+
+    every_n_tokens: int
+    states: torch.Tensor
+    cu_starts: torch.Tensor
+
+
 # Chunk-prefill kernels whose launch geometry depends only on the sequence count
 # and which read the sequence bounds on device.
 _DEVICE_BOUNDS_CHUNK_PREFILL = frozenset({"flashinfer_gdn_chunk_prefill"})
@@ -131,6 +156,7 @@ def _chunk_prefill_traits(
     num_v_heads: int,
     output_h: bool,
     qk_l2norm: bool,
+    state_checkpoints: bool,
 ) -> dict[str, int | bool]:
     return {
         "head_dim": head_dim,
@@ -138,6 +164,7 @@ def _chunk_prefill_traits(
         "num_v_gte_num_q": num_v_heads >= num_q_heads,
         "output_h": output_h,
         "qk_l2norm": qk_l2norm,
+        "state_checkpoints": state_checkpoints,
     }
 
 
@@ -174,12 +201,79 @@ def gdn_chunk_prefill_capturable(
             "gdn_chunk_prefill",
             _attention_format_signature(q=probe, k=probe, v=probe),
             traits=_chunk_prefill_traits(
-                head_dim, value_head_dim, num_q_heads, num_v_heads, False, qk_l2norm
+                head_dim,
+                value_head_dim,
+                num_q_heads,
+                num_v_heads,
+                False,
+                qk_l2norm,
+                False,
             ),
         )
     except NoKernelFoundError:
         return False
     return kernel.name in _DEVICE_BOUNDS_CHUNK_PREFILL
+
+
+# State checkpoints land on scan chunk boundaries: every interval is a
+# multiple of this many tokens.
+GDN_STATE_CHECKPOINT_GRANULARITY = 64
+
+
+def gdn_chunk_prefill_stores_state_checkpoints(
+    dtype: torch.dtype,
+    *,
+    head_dim: int,
+    value_head_dim: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    qk_l2norm: bool,
+    interval_granularity: int,
+) -> bool:
+    """Whether a ``gdn_chunk_prefill`` kernel stores checkpoints at these intervals.
+
+    That is, whether the kernel for this geometry takes ``state_checkpoints``
+    (stores states from inside its scan) at intervals that are multiples of
+    ``interval_granularity``.
+
+    Args:
+        dtype: Q/K/V dtype.
+        head_dim: Query/key head dimension.
+        value_head_dim: Value head dimension.
+        num_q_heads: Query (and key) head count.
+        num_v_heads: Value head count.
+        qk_l2norm: Whether the scan L2-normalizes Q/K.
+        interval_granularity: Every interval the caller asks for is a multiple
+            of it; the scan stores only at multiples of
+            ``GDN_STATE_CHECKPOINT_GRANULARITY``.
+
+    Returns:
+        ``True`` when kernel selection finds one and the intervals fit it.
+    """
+    if (
+        interval_granularity <= 0
+        or interval_granularity % GDN_STATE_CHECKPOINT_GRANULARITY
+    ):
+        return False
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    try:
+        select_kernel(
+            "attention",
+            "gdn_chunk_prefill",
+            _attention_format_signature(q=probe, k=probe, v=probe),
+            traits=_chunk_prefill_traits(
+                head_dim,
+                value_head_dim,
+                num_q_heads,
+                num_v_heads,
+                False,
+                qk_l2norm,
+                True,
+            ),
+        )
+    except NoKernelFoundError:
+        return False
+    return True
 
 
 def gdn_chunk_prefill(
@@ -195,6 +289,7 @@ def gdn_chunk_prefill(
     qk_l2norm: bool = False,
     output_final_state: bool = True,
     output_h: bool = False,
+    state_checkpoints: GdnStateCheckpoints | None = None,
     override: str | None = None,
     solution: str | None = None,
 ) -> GdnChunkPrefillResult:
@@ -216,6 +311,9 @@ def gdn_chunk_prefill(
         output_final_state: Whether to return the final recurrent state.
         output_h: Whether to return intermediate recurrent checkpoints in the
             selected backend's native layout.
+        state_checkpoints: Optional caller-owned buffer the scan stores
+            states into at a fixed interval (see ``GdnStateCheckpoints``);
+            exclusive with ``output_h``.
         override: Optional kernel override name.
         solution: Optional kernel solution to force through normal selection.
 
@@ -228,8 +326,18 @@ def gdn_chunk_prefill(
     value_head_dim = v.shape[-1]
     num_q_heads = q.shape[-2]
     num_v_heads = v.shape[-2]
+    if output_h and state_checkpoints is not None:
+        raise ValueError(
+            "gdn_chunk_prefill: output_h and state_checkpoints are exclusive"
+        )
     traits = _chunk_prefill_traits(
-        head_dim, value_head_dim, num_q_heads, num_v_heads, output_h, qk_l2norm
+        head_dim,
+        value_head_dim,
+        num_q_heads,
+        num_v_heads,
+        output_h,
+        qk_l2norm,
+        state_checkpoints is not None,
     )
     signature = _attention_format_signature(q=q, k=k, v=v)
     kernel = select_kernel(
@@ -276,6 +384,7 @@ def gdn_chunk_prefill(
             qk_l2norm=qk_l2norm,
             output_final_state=output_final_state,
             output_h=output_h,
+            state_checkpoints=state_checkpoints,
         )
 
 
@@ -405,22 +514,58 @@ def gdn_tree_verify_needs_node_states(num_nodes: int) -> bool:
     )
 
 
-# A ReplaySSM chain verifies faster in the chunked form from these sizes on, measured on Blackwell.
+class GdnChainVerifyForm(str, Enum):
+    """How a ReplaySSM chain verify runs (``gdn_chain_verify_form``)."""
+
+    # Step by step through ``gdn_decode_mtp``.
+    STEP = "step"
+    # Chunked as a one-path tree through ``gdn_decode_mtp``.
+    TREE = "tree"
+    # Chunked through ``gdn_chain_verify`` (16-bit state, tensor-core products).
+    CHAIN = "chain"
+
+
+# A ReplaySSM chain verifies faster in the tree form from these sizes on, measured on Blackwell.
 GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS = 13
 GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES = 24
 
+# State dtypes whose 2- to 16-token chains take the chain form (measured on Blackwell).
+GDN_CHAIN_VERIFY_CHAIN_STATE_DTYPES = frozenset({torch.bfloat16})
 
-def gdn_chain_verify_is_chunked(num_tokens: int, num_states: int) -> bool:
-    """Whether a ReplaySSM chain ``gdn_decode_mtp`` of ``num_tokens`` tokens over
-    ``num_states`` (request, value head) states verifies in the chunked form, as
-    a one-path tree, rather than step by step: only where that is faster."""
+
+def gdn_chain_verify_supported(
+    head_k_dim: int, head_v_dim: int, state_dtype: torch.dtype
+) -> bool:
+    """Whether ``gdn_chain_verify`` takes 16-bit state and equal power-of-two dims from 64."""
     return (
-        current_platform().is_blackwell
-        and GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
-        <= num_tokens
-        <= GDN_TREE_VERIFY_CHUNKED_MAX_NODES
-        and num_states >= GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES
+        state_dtype in (torch.bfloat16, torch.float16)
+        and head_k_dim == head_v_dim
+        and head_k_dim >= 64
+        and head_k_dim & (head_k_dim - 1) == 0
     )
+
+
+def gdn_chain_verify_form(
+    num_tokens: int, num_states: int, state_dtype: torch.dtype, *, chain_form: bool
+) -> GdnChainVerifyForm:
+    """The fastest form of a chain of ``num_tokens`` over ``num_states`` states."""
+    if (
+        not current_platform().is_blackwell
+        or num_tokens > GDN_TREE_VERIFY_CHUNKED_MAX_NODES
+    ):
+        return GdnChainVerifyForm.STEP
+    if (
+        chain_form
+        and num_tokens >= 2
+        and state_dtype in GDN_CHAIN_VERIFY_CHAIN_STATE_DTYPES
+    ):
+        return GdnChainVerifyForm.CHAIN
+    if (
+        num_tokens >= GDN_CHAIN_VERIFY_CHUNKED_MIN_TOKENS
+        and num_states >= GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES
+    ):
+        return GdnChainVerifyForm.TREE
+    return GdnChainVerifyForm.STEP
 
 
 def gdn_decode_mtp(
@@ -621,6 +766,78 @@ def gdn_decode_mtp(
             output_state=output_state,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+        )
+
+
+def gdn_chain_verify(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None,
+    use_qk_l2norm: bool,
+    override: str | None = None,
+    solution: str | None = None,
+) -> torch.Tensor:
+    """Read-only chain verify of whole windows from the committed states, in the chunked form.
+
+    Args:
+        q: Query ``[B, T, num_q_heads, head_dim]``, ``T <= 16``, request-major rows.
+        k: Key tensor shaped like ``q``.
+        v: Value tensor shaped ``[B, T, num_v_heads, head_v_dim]``, dense heads.
+        A_log: Log decay parameter shaped ``[num_v_heads]``.
+        a: Input-dependent decay shaped ``[B, T, num_v_heads]``, unit head stride.
+        dt_bias: Decay bias shaped ``[num_v_heads]``.
+        b: Update-gate (beta) input shaped like ``a``.
+        initial_state: K-last 16-bit pool ``[pages, num_v_heads, head_v_dim, head_dim]``.
+        initial_state_indices: Per-request page ``[B]``; negative marks padding (zero outputs).
+        scale: Attention scale; ``None`` uses ``head_dim ** -0.5``.
+        use_qk_l2norm: Whether to L2-normalize q and k in the kernel.
+        override: Optional kernel override name.
+        solution: Optional kernel solution to force through normal selection.
+
+    Returns:
+        Verify output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
+    """
+    head_dim = q.shape[-1]
+    signature = _attention_format_signature(q=q, k=k, v=v)
+    kernel = select_kernel(
+        "attention",
+        "gdn_chain_verify",
+        signature,
+        traits={"head_dim": head_dim},
+        solution=solution,
+        override=override,
+    )
+    with kernel_scope(
+        "attention",
+        "gdn_chain_verify",
+        q.dtype,
+        kernel_name=kernel.name,
+        batch_size=q.shape[0],
+        seq_len=q.shape[1],
+        num_v_heads=v.shape[-2],
+        head_dim=head_dim,
+        head_v_dim=v.shape[-1],
+    ):
+        return kernel(
+            q=q,
+            k=k,
+            v=v,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            scale=scale,
+            use_qk_l2norm=use_qk_l2norm,
         )
 
 
@@ -911,9 +1128,15 @@ __all__ = [
     "GDN_TREE_VERIFY_CHUNKED_MAX_NODES",
     "GdnCheckpointLayout",
     "GdnChunkPrefillResult",
-    "gdn_chain_verify_is_chunked",
+    "GDN_STATE_CHECKPOINT_GRANULARITY",
+    "GdnChainVerifyForm",
+    "GdnStateCheckpoints",
+    "gdn_chain_verify",
+    "gdn_chain_verify_form",
+    "gdn_chain_verify_supported",
     "gdn_chunk_prefill",
     "gdn_chunk_prefill_capturable",
+    "gdn_chunk_prefill_stores_state_checkpoints",
     "gdn_decode_step",
     "gdn_decode_mtp",
     "gdn_decode_supports",

@@ -6,10 +6,11 @@ import sys
 from pathlib import Path
 
 import yaml
-from pipeline import is_amd_runner, is_nvidia_arm_runner, load_yaml
+from pipeline import is_amd_runner, is_npu_runner, is_nvidia_arm_runner, load_yaml
 
 RUNNER_GROUPS = (
-    "amd",
+    "amd-mi350",
+    "amd-mi450",
     "nvidia-arm",
     "nvidia-gb200-slurm",
     "nvidia-gb300-slurm",
@@ -19,7 +20,8 @@ RUNNER_GROUPS = (
 # Every runner group belongs to one vendor; vendor-owned paths below are
 # expressed per vendor so a new NVIDIA runner group needs no new path list.
 RUNNER_GROUP_VENDORS = {
-    "amd": "amd",
+    "amd-mi350": "amd",
+    "amd-mi450": "amd",
     "nvidia-arm": "nvidia",
     "nvidia-gb200-slurm": "nvidia",
     "nvidia-gb300-slurm": "nvidia",
@@ -29,6 +31,7 @@ RUNNER_GROUP_VENDORS = {
 SHARED_DIRECTORIES = (
     "python",
     "test",
+    "tokenspeed-engine",
     "tokenspeed-kernel",
     "tokenspeed-scheduler",
 )
@@ -66,6 +69,8 @@ VENDOR_PATHS = {
         "tokenspeed-kernel/test/amd",
     ),
     "npu": (
+        "test/ci/npu",
+        "test/ci_system/npu",
         "test/ci_system/install_triton_ascend.sh",
         "test/ci_system/verify_triton_ascend.py",
     ),
@@ -147,10 +152,11 @@ VENDOR_CONTENT_MARKERS = {
     "nvidia": re.compile(r"\bis_nvidia\b|\bis_hopper\w*|\bis_blackwell\w*|\"nvidia\""),
 }
 VENDOR_WORKFLOWS = {
-    "amd": (
-        ".github/workflows/amd-tests.yml",
+    "amd-mi350": (
+        ".github/workflows/amd-mi350-tests.yml",
         ".github/workflows/amd-kernel-benchmark.yml",
     ),
+    "amd-mi450": (".github/workflows/amd-mi450-tests.yml",),
     "nvidia-arm": (".github/workflows/pr-test-nvidia-arm.yml",),
     "nvidia-gb200-slurm": (".github/workflows/nvidia-gb200-tests.yml",),
     "nvidia-gb300-slurm": (".github/workflows/nvidia-gb300-tests.yml",),
@@ -231,8 +237,14 @@ def runner_label_in_group(label: str, runner_group: str) -> bool:
     Mirrors the matrix filters in each workflow's scan job: the ARM workflow
     drops ``slurm-*`` labels, which only the Slurm workflows pick up.
     """
-    if runner_group == "amd":
-        return is_amd_runner(label)
+    if is_npu_runner(label):
+        return False
+    if runner_group == "amd-mi450":
+        return label.startswith(("amd-mi450-", "amd-mi45x-"))
+    if runner_group == "amd-mi350":
+        return is_amd_runner(label) and not label.startswith(
+            ("amd-mi450-", "amd-mi45x-")
+        )
     if is_amd_runner(label):
         return False
     if runner_group == "nvidia-x86":

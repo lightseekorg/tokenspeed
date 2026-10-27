@@ -718,8 +718,10 @@ def _mla_nope_quantize_fp8_kernel(
     kno_stride_h,
     kro_stride_t,
     kro_stride_h,
+    num_heads: tl.constexpr,
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
+    BLOCK_H: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_R: tl.constexpr,
     HAS_SCALE_Q_TENSOR: tl.constexpr,
@@ -727,8 +729,20 @@ def _mla_nope_quantize_fp8_kernel(
     BROADCAST_K: tl.constexpr,
     ENABLE_PDL: tl.constexpr,
 ):
+    # One program per token and block of BLOCK_H heads: each of the four parts
+    # is a [BLOCK_H, dim] tile, masked to the real heads and columns.
     token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64) * BLOCK_H + tl.arange(0, BLOCK_H)[:, None]
+    q_rows = head < num_heads
+    # A single-head K is stored once, by the row of head 0.
+    if BROADCAST_K:
+        k_rows = head == 0
+    else:
+        k_rows = q_rows
+    offs_n = tl.arange(0, BLOCK_N)[None, :]
+    mask_n = offs_n < nope_dim
+    offs_r = tl.arange(0, BLOCK_R)[None, :]
+    mask_r = offs_r < rope_dim
     # PDL: launched with launch_pdl; the q/k inputs may still be in flight from
     # the producer until griddepcontrol.wait orders them.
     if ENABLE_PDL:
@@ -738,59 +752,46 @@ def _mla_nope_quantize_fp8_kernel(
     if HAS_SCALE_KV_TENSOR:
         scale_kv = tl.load(scale_kv)
 
-    offs_n = tl.arange(0, BLOCK_N)
-    mask_n = offs_n < nope_dim
-    offs_r = tl.arange(0, BLOCK_R)
-    mask_r = offs_r < rope_dim
-
     qn = tl.load(
         q_nope + token * qn_stride_t + head * qn_stride_h + offs_n,
-        mask=mask_n,
+        mask=q_rows & mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    qr = tl.load(
+        q_rope + token * qr_stride_t + head * qr_stride_h + offs_r,
+        mask=q_rows & mask_r,
+        other=0.0,
+    ).to(tl.float32)
+    kn = tl.load(
+        k_nope + token * kn_stride_t + head * kn_stride_h + offs_n,
+        mask=k_rows & mask_n,
+        other=0.0,
+    ).to(tl.float32)
+    kr = tl.load(
+        k_rope + token * kr_stride_t + head * kr_stride_h + offs_r,
+        mask=k_rows & mask_r,
         other=0.0,
     ).to(tl.float32)
     tl.store(
         q_nope_out + token * qno_stride_t + head * qno_stride_h + offs_n,
         (qn * scale_q).to(tl.float8e4nv),
-        mask=mask_n,
+        mask=q_rows & mask_n,
     )
-    qr = tl.load(
-        q_rope + token * qr_stride_t + head * qr_stride_h + offs_r,
-        mask=mask_r,
-        other=0.0,
-    ).to(tl.float32)
     tl.store(
         q_rope_out + token * qro_stride_t + head * qro_stride_h + offs_r,
         (qr * scale_q).to(tl.float8e4nv),
-        mask=mask_r,
+        mask=q_rows & mask_r,
     )
-
-    if BROADCAST_K:
-        store_k = head == 0
-    else:
-        store_k = True
-
-    kn = tl.load(
-        k_nope + token * kn_stride_t + head * kn_stride_h + offs_n,
-        mask=mask_n,
-        other=0.0,
-    ).to(tl.float32)
-    if store_k:
-        tl.store(
-            k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
-            (kn * scale_kv).to(tl.float8e4nv),
-            mask=mask_n,
-        )
-    kr = tl.load(
-        k_rope + token * kr_stride_t + head * kr_stride_h + offs_r,
-        mask=mask_r,
-        other=0.0,
-    ).to(tl.float32)
-    if store_k:
-        tl.store(
-            k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
-            (kr * scale_kv).to(tl.float8e4nv),
-            mask=mask_r,
-        )
+    tl.store(
+        k_nope_out + token * kno_stride_t + head * kno_stride_h + offs_n,
+        (kn * scale_kv).to(tl.float8e4nv),
+        mask=k_rows & mask_n,
+    )
+    tl.store(
+        k_rope_out + token * kro_stride_t + head * kro_stride_h + offs_r,
+        (kr * scale_kv).to(tl.float8e4nv),
+        mask=k_rows & mask_r,
+    )
     if ENABLE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
@@ -811,7 +812,10 @@ def mla_nope_quantize_fp8_triton(
 ) -> None:
     """The no-RoPE tail of apply_rope_mla: quantize the four query/key parts
     straight into their FP8 output slices in one launch. ``k_rope`` may carry
-    a single head; it broadcasts across the output heads via a zero stride."""
+    a single head; it broadcasts across the output heads via a zero stride.
+
+    The outputs must not overlap any input; the order in which programs run
+    is unspecified."""
     num_tokens, num_heads, nope_dim = q_nope.shape
     rope_dim = q_rope.shape[-1]
     kv_heads = k_nope.shape[1]
@@ -861,8 +865,14 @@ def mla_nope_quantize_fp8_triton(
     if isinstance(quant_scale_kv, torch.Tensor):
         quant_scale_kv = quant_scale_kv.contiguous()
 
+    block_n = max(16, _next_power_of_2(nope_dim))
+    block_r = max(16, _next_power_of_2(rope_dim))
+    # Heads per program: about 2048 elements in the wider of the NoPE and RoPE
+    # tiles. Derived from the model's head count and dims only, so it never
+    # changes per batch.
+    block_h = min(_next_power_of_2(num_heads), max(1, 2048 // max(block_n, block_r)))
     extra_kwargs = {"launch_pdl": True} if enable_pdl else {}
-    _mla_nope_quantize_fp8_kernel[(num_tokens, num_heads)](
+    _mla_nope_quantize_fp8_kernel[(num_tokens, triton.cdiv(num_heads, block_h))](
         q_nope,
         q_rope,
         k_nope,
@@ -889,10 +899,12 @@ def mla_nope_quantize_fp8_triton(
         k_nope_out.stride(1),
         k_rope_out.stride(0),
         k_rope_out.stride(1),
+        num_heads=num_heads,
         nope_dim=nope_dim,
         rope_dim=rope_dim,
-        BLOCK_N=max(16, _next_power_of_2(nope_dim)),
-        BLOCK_R=max(16, _next_power_of_2(rope_dim)),
+        BLOCK_H=block_h,
+        BLOCK_N=block_n,
+        BLOCK_R=block_r,
         HAS_SCALE_Q_TENSOR=isinstance(quant_scale_q, torch.Tensor),
         HAS_SCALE_KV_TENSOR=isinstance(quant_scale_kv, torch.Tensor),
         BROADCAST_K=broadcast_k,
@@ -1099,12 +1111,18 @@ def triton_embedding_rope_mla(
     )
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["index_width", "index_stride_row", "index_stride_col"],
+)
 def _mxfp8_embedding_kernel(
     W,
     S,
     I,
     O,
+    index_width,
+    index_stride_row,
+    index_stride_col,
+    STRIDED_IDS: tl.constexpr,
     D: tl.constexpr,
     START: tl.constexpr,
     END: tl.constexpr,
@@ -1112,9 +1130,16 @@ def _mxfp8_embedding_kernel(
     SS: tl.constexpr,
     B: tl.constexpr,
 ):
-    row = tl.program_id(0)
     d = tl.arange(0, B)
-    index = tl.load(I + row)
+    if STRIDED_IDS:
+        index_col = tl.program_id(0).to(tl.int64)
+        index_row = tl.program_id(1).to(tl.int64)
+        row = index_row * index_width + index_col
+        index_offset = index_row * index_stride_row + index_col * index_stride_col
+    else:
+        row = tl.program_id(0).to(tl.int64)
+        index_offset = row
+    index = tl.load(I + index_offset).to(tl.int64)
     local = (index >= START) & (index < END)
     code = tl.load(W + (index - START) * WS + d, local & (d < D), 0.0).to(tl.float32)
     exponent = tl.load(S + (index - START) * SS + d // 32, local & (d < D), 127).to(
@@ -1212,11 +1237,24 @@ def mxfp8_embedding(weight, scales, indices, row_start, row_end):
         (*indices.shape, weight.shape[1]), dtype=torch.bfloat16, device=indices.device
     )
     if indices.numel():
-        _mxfp8_embedding_kernel[(indices.numel(),)](
+        strided = not indices.is_contiguous()
+        if strided and indices.shape[0] > 2048:
+            # Large prefills amortize the ID copy and favor the flat gather.
+            # This also keeps the second grid dimension within its limit.
+            indices = indices.contiguous()
+            strided = False
+        # A two-dimensional grid provides the ID coordinates without a
+        # per-workgroup runtime division for decode and short prefills.
+        grid = (indices.shape[1], indices.shape[0]) if strided else (indices.numel(),)
+        _mxfp8_embedding_kernel[grid](
             weight,
             scales,
             indices,
             out,
+            indices.shape[1] if strided else 1,
+            indices.stride(0) if strided else 1,
+            indices.stride(1) if strided else 1,
+            strided,
             weight.shape[1],
             row_start,
             row_end,

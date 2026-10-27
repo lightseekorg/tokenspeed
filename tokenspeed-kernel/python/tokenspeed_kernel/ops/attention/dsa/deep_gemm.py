@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import os
 
 import torch
@@ -10,6 +11,7 @@ from tokenspeed_kernel.ops.attention.dsa import (
     CANDIDATE_LENS_CPU_FEATURE,
     INDEX_K_WORKSPACE_ROWS_FEATURE,
 )
+from tokenspeed_kernel.ops.attention.dsa._triton import index_candidates
 from tokenspeed_kernel.ops.attention.dsa.cuda import (
     has_ragged_decode_topk,
     ragged_decode_topk,
@@ -39,6 +41,16 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
 
 platform = current_platform()
+
+
+_dcp_deep_select = None
+if platform.is_hopper:
+    try:
+        from tokenspeed_kernel.ops.attention.dsa._cute_dsl import (
+            deep_select as _dcp_deep_select,
+        )
+    except ImportError:
+        pass
 
 # Default the DSA decode top-k to the CuTe DSL cluster kernel; set
 # ``TS_DSA_DECODE_TOPK_CUTEDSL=0`` to fall back to the ragged/persistent path.
@@ -128,6 +140,93 @@ def _pad_index_heads(
     padded_q[:, :16].copy_(q)
     padded_weights[:, :16].copy_(weights)
     return padded_q, padded_weights
+
+
+@functools.cache
+def _warmup_dcp_topk(capacity: int, device: torch.device) -> None:
+    # Batch geometry can choose a different cluster during capture. Compile all
+    # variants of this capacity on the first eager call, as the V4.1 indexer does.
+    _dcp_deep_select.warmup((capacity,), device)
+
+
+def _dcp_topk_supports_lengths(scores: torch.Tensor, topk: int) -> bool:
+    """Whether the selector can safely ignore uninitialized logits padding."""
+    selector = _dcp_deep_select
+    if (
+        selector is None
+        or not 1 <= topk <= selector.MAX_TOPK
+        or scores.dtype != torch.float32
+        or not scores.is_cuda
+        or scores.ndim != 2
+    ):
+        return False
+
+    rows, width = scores.shape
+    alignment = selector.SCORE_ALIGNMENT
+    padded_width = (width + alignment - 1) // alignment * alignment
+    storage_end = scores.storage_offset() + (rows - 1) * scores.stride(0) + padded_width
+    if (
+        rows == 0
+        or width == 0
+        or scores.stride(1) != 1
+        or scores.stride(0) < padded_width
+        or scores.stride(0) % alignment
+        or scores.data_ptr() % (alignment * scores.element_size())
+        or storage_end * scores.element_size() > scores.untyped_storage().nbytes()
+    ):
+        return False
+
+    return True
+
+
+def _select_dcp_index_candidates(
+    scores: torch.Tensor,
+    positions: torch.Tensor,
+    lengths: torch.Tensor,
+    causal_lens: torch.Tensor,
+    *,
+    page_size: int,
+    topk: int,
+    initial_tokens: int,
+    local_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    length_aware = _dcp_topk_supports_lengths(scores, topk)
+    index_candidates.mask_index_scores(
+        scores,
+        positions,
+        lengths,
+        causal_lens,
+        page_size,
+        initial_tokens,
+        local_tokens,
+        mask_tail=not length_aware,
+    )
+    values = None
+    if length_aware:
+        selector = _dcp_deep_select
+        capacity = selector.capacity_for(topk)
+        _warmup_dcp_topk(capacity, scores.device)
+        cluster_size = selector.choose_cluster_size(
+            *scores.shape, capacity, platform.sm_count
+        )
+        offsets, values = selector.deepselect_topk(
+            scores,
+            lengths.reshape(-1),
+            topk,
+            capacity=capacity,
+            cluster_size=cluster_size,
+        )
+    else:
+        offsets = index_candidates.candidate_topk_offsets(scores, topk)
+
+    return index_candidates.gather_index_candidates(
+        offsets,
+        scores,
+        positions,
+        page_size,
+        lengths=lengths,
+        selected_scores=values,
+    )
 
 
 def _check_out(
@@ -640,14 +739,7 @@ if platform.is_hopper_plus:
         initial_tokens: int,
         local_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        from tokenspeed_kernel.ops.attention.dsa._triton.index_candidates import (
-            candidate_topk_offsets,
-            compact_index_pages,
-            gather_index_candidates,
-            mask_index_scores,
-        )
-
-        pages, positions, lengths = compact_index_pages(
+        pages, positions, lengths = index_candidates.compact_index_pages(
             local_page_table,
             query_requests,
             causal_lens,
@@ -681,14 +773,13 @@ if platform.is_hopper_plus:
             pages.shape[1] * page_size,
             clean_logits=False,
         )
-        mask_index_scores(
+        return _select_dcp_index_candidates(
             logits,
             positions,
             lengths,
             causal_lens,
-            page_size,
-            initial_tokens,
-            local_tokens,
+            page_size=page_size,
+            topk=topk,
+            initial_tokens=initial_tokens,
+            local_tokens=local_tokens,
         )
-        offsets = candidate_topk_offsets(logits, topk)
-        return gather_index_candidates(offsets, logits, positions, page_size)

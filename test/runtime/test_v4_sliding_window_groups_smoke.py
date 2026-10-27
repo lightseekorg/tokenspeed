@@ -116,9 +116,9 @@ class TestV4SlidingWindowGroupsSmoke:
                 ):
                     # One overlapped step protects one more verify window per
                     # live request: never fewer pages, never more than the
-                    # window's own page span. A dense history has one tail page
-                    # of slack per request, so the window costs a page only
-                    # past what that slack absorbs.
+                    # window's own page span. Speculative decode already
+                    # reserves a draft window; overlap adds another window
+                    # beyond that reservation and the unaligned history tail.
                     for group_id in ("full", "sliding"):
                         delta = overlapped[group_id] - baseline[group_id]
                         _pytest_a_12 = delta
@@ -131,8 +131,18 @@ class TestV4SlidingWindowGroupsSmoke:
                         )
                         _pytest_msg_17 = group_id
                         assert _pytest_a_15 <= _pytest_b_16, _pytest_msg_17
+                    draft_tokens = verify_width if verify_width > 1 else 0
                     assert (overlapped["full"] - baseline["full"]) == (
-                        max_live_requests * math.ceil((verify_width - 1) / raw_per_page)
+                        max_live_requests
+                        * (
+                            math.ceil(
+                                (raw_per_page - 1 + draft_tokens + verify_width)
+                                / raw_per_page
+                            )
+                            - math.ceil(
+                                (raw_per_page - 1 + draft_tokens) / raw_per_page
+                            )
+                        )
                     )
 
     def test_capture_table_width_is_parameterized_by_verify_width_and_depth(
