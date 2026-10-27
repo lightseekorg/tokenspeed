@@ -24,7 +24,7 @@ import torch
 import torch.distributed as dist
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
-from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.signature import format_signature, format_signatures
 
 
 def ascend_mla_dcp_kernels():
@@ -55,16 +55,17 @@ def pack_mla_panels(weight: torch.Tensor, *, width: int) -> torch.Tensor:
         raise ValueError("MLA panel packing requires CPU BF16 weights")
     if width <= 0 or width % 16:
         raise ValueError("MLA N tiles must be positive multiples of 16")
-    if weight.ndim != 2 or weight.shape[0] % width or weight.shape[1] % 512:
+    panel = 256 if weight.ndim == 2 and weight.shape[1] == 768 else 512
+    if weight.ndim != 2 or weight.shape[0] % width or weight.shape[1] % panel:
         raise ValueError(
-            "MLA weights must cover complete N tiles and 512-wide K panels"
+            "MLA weights must cover complete N tiles and complete K panels"
         )
     panels = []
     for col in range(0, weight.shape[0], width):
-        for start in range(0, weight.shape[1], 512):
-            tile = weight[col : col + width, start : start + 512]
+        for start in range(0, weight.shape[1], panel):
+            tile = weight[col : col + width, start : start + panel]
             panels.append(
-                tile.reshape(width // 16, 16, 32, 16)
+                tile.reshape(width // 16, 16, panel // 16, 16)
                 .permute(2, 0, 1, 3)
                 .contiguous()
                 .flatten()
@@ -76,18 +77,22 @@ def pack_mla_panels(weight: torch.Tensor, *, width: int) -> torch.Tensor:
 def _prepare_mla_prolog_weights(layer, *, group):
     """Pack fixed BF16 weights once, before any forward or graph capture."""
     if (
-        layer.num_local_heads != 8
-        or layer.num_heads != 64
+        (layer.num_heads, layer.num_local_heads, layer.q_lora_rank)
+        not in ((64, 8, 1536), (32, 4, 768))
         or layer.use_output_gate
         or layer.q_lora_scale is not None
         or layer.kv_lora_scale is not None
     ):
         raise ValueError(
-            "Fused MLA requires H64/TP8 without output gate/runtime LoRA scaling"
+            "Fused MLA requires H64/TP8 or H32/TP8 without output gate/runtime LoRA scaling"
         )
     down = layer.fused_qkv_a_proj_with_mqa.weight.detach()
     qb = layer.q_b_proj.weight.detach()
-    if down.shape != (2112, 4096) or qb.shape != (1536, 1536):
+    hidden = 4096 if layer.num_heads == 64 else 2048
+    if down.shape != (layer.q_lora_rank + 576, hidden) or qb.shape != (
+        layer.num_local_heads * 192,
+        layer.q_lora_rank,
+    ):
         raise ValueError("Unsupported MLA projection geometry")
     if down.dtype != torch.bfloat16 or qb.dtype != torch.bfloat16:
         raise ValueError("Fused MLA requires unquantized BF16 projections")
@@ -114,6 +119,7 @@ def _prepare_mla_prolog_weights(layer, *, group):
     else:
         cos_sin = torch.zeros((1, 64), dtype=torch.float32, device=down.device)
     return dict(
+        local_heads=layer.num_local_heads,
         down=nz(down, 96),
         qb=nz(qb, 128),
         uk=torch.cat(pieces, 0),
@@ -147,7 +153,7 @@ def ascend_mla_prolog(
         weights["cos_sin"],
         weights["eps_q"],
         weights["eps_kv"],
-        rank * 8,
+        rank * weights["local_heads"],
         weights["rotary_mode"],
     )
 
@@ -179,7 +185,44 @@ def ascend_mla_merge(output, *, maximum, total, peers, group):
     )
 
 
+def ascend_prepare_mla_resources(*, group, rank, heads, rank_size):
+    """Retain checked operator views of this MLA group's HCCL window."""
+    from tokenspeed_kernel.ops.attention.dsa import DSAResources
+    from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_kernels
+
+    ascend_dsa_kernels()
+    window = torch.ops.custom.mla_prepare_prolog_window(group, rank, heads, rank_size)
+    try:
+        prepared = {
+            rows: torch.ops.custom.mla_prepare_lse_buffers(
+                group, rows, rank, heads, rank_size
+            )
+            for rows in (
+                (32, 64, 128, 256, 512) if heads == 32 else (64, 128, 256, 512)
+            )
+        }
+    except BaseException:
+        torch.ops.custom.dsa_release_prolog_window(window)
+        raise
+    return DSAResources(
+        window,
+        {rows: values[:3] for rows, values in prepared.items()},
+        {rows: values[3] for rows, values in prepared.items()},
+        release=torch.ops.custom.dsa_release_prolog_window,
+    )
+
+
 if current_platform().is_npu:
+    register_kernel(
+        "attention",
+        "mla_prepare_resources",
+        name="ascend_prepare_mla_resources",
+        solution="native",
+        capability=CapabilityRequirement(vendors=frozenset({"ascend"})),
+        signatures=[format_signature()],
+        priority=Priority.PERFORMANT,
+    )(ascend_prepare_mla_resources)
+
     from tokenspeed_kernel_npu.ops.mla import (
         mla_decode_with_kvcache as _mla_decode_with_kvcache,
     )

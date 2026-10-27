@@ -418,13 +418,19 @@ def test_mla_projection_panels_preserve_coefficients():
     import torch
     from tokenspeed_kernel.ops.attention.mla.ascend import pack_mla_panels
 
-    for n, k, width in ((2112, 4096, 96), (1536, 1536, 128)):
+    for n, k, width in (
+        (2112, 4096, 96),
+        (1536, 1536, 128),
+        (1344, 2048, 96),
+        (768, 768, 128),
+    ):
         generator = torch.Generator().manual_seed(92001 + width)
         weight = torch.randn((n, k), generator=generator).bfloat16()
         original = weight.clone()
         carrier = pack_mla_panels(weight, width=width)
         raw = carrier.reshape(16, -1, 16).permute(1, 0, 2).contiguous()
-        restored = raw.reshape(n // width, k // 512, 32, width // 16, 16, 16)
+        panel = 256 if k == 768 else 512
+        restored = raw.reshape(n // width, k // panel, panel // 16, width // 16, 16, 16)
         restored = restored.permute(0, 3, 4, 1, 2, 5).contiguous().reshape(n, k)
         assert torch.equal(restored, original)
         assert torch.equal(weight, original)
@@ -438,7 +444,7 @@ def test_mla_projection_panels_reject_incomplete_tiles():
     for shape, width, dtype in (
         ((96, 512), 0, torch.bfloat16),
         ((100, 512), 96, torch.bfloat16),
-        ((96, 768), 96, torch.bfloat16),
+        ((96, 784), 96, torch.bfloat16),
         ((96, 512), 96, torch.float32),
     ):
         with pytest.raises(ValueError):
