@@ -325,3 +325,124 @@ def test_kimi_k3_tp_situ_is_cuda_graph_capturable_gfx1250() -> None:
     torch.cuda.synchronize()
 
     torch.testing.assert_close(captured, expected, atol=0.0, rtol=0.0)
+
+
+_EP_KERNEL_NAME = "gluon_mxfp4_a8w4_situ_ep_gfx1250_precomputed_moe_apply"
+
+
+def _make_ep_case(num_tokens: int, ep_rank: int, num_local_experts: int = 16):
+    """K3's full-width experts of one EP4 rank, routed by global top-16 ids."""
+    generator = torch.Generator(device="cuda").manual_seed(20261026 + num_tokens)
+    ep_size, hidden_size, top_k = 4, 3584, 16
+    num_experts = ep_size * num_local_experts
+    module, raw = _make_mxfp4_module(
+        num_experts=num_local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=3072,
+        top_k=top_k,
+        generator=generator,
+    )
+    module.num_experts = num_experts
+    module.num_local_experts = num_local_experts
+    module.ep_size = ep_size
+    module.ep_rank = ep_rank
+    hidden_states = 0.1 * torch.randn(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    topk_ids = torch.stack(
+        [
+            torch.randperm(num_experts, device="cuda", generator=generator)[:top_k]
+            for _ in range(num_tokens)
+        ]
+    ).to(torch.int32)
+    topk_weights = torch.rand(
+        num_tokens, top_k, device="cuda", generator=generator
+    ).softmax(dim=-1)
+    router_logits = torch.zeros(
+        (num_tokens, num_experts), dtype=torch.float32, device="cuda"
+    )
+    return module, raw, hidden_states, topk_weights, topk_ids, router_logits
+
+
+def _make_ep_plan() -> dict:
+    plan = kernel_moe_plan(
+        "mxfp4",
+        input_dtype=torch.bfloat16,
+        activation="situ",
+        routing_mode="precomputed_topk",
+        ep_size=4,
+        ispp=3072,
+        internal_activation_dtype="input",
+        solution="gluon",
+        hidden=None,
+        swiglu_form=None,
+        activation_clamped=False,
+        expert_id_repeats=False,
+        fast_math=True,
+        combine_order="rank",
+        features=frozenset(),
+    )
+    assert plan["apply_kernel_name"] == _EP_KERNEL_NAME
+    return plan
+
+
+@pytest.mark.parametrize("ep_rank", [0, 3])
+@pytest.mark.parametrize("num_tokens", [1, 4, 32, 128, 129, 2048])
+def test_kimi_k3_ep_situ_sums_local_routes_gfx1250(num_tokens: int, ep_rank: int):
+    """An EP rank's output is its experts' share; other ranks' routes add zero."""
+    module, raw, hidden_states, topk_weights, topk_ids, router_logits = _make_ep_case(
+        num_tokens, ep_rank
+    )
+    plan = _make_ep_plan()
+    kernel_moe_process_weights(plan, module)
+
+    actual = kernel_moe_apply(
+        plan,
+        hidden_states,
+        module,
+        router_logits,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+    )
+    local_ids = topk_ids - ep_rank * module.num_local_experts
+    is_local = (local_ids >= 0) & (local_ids < module.num_local_experts)
+    expected = mxfp4_situ_moe_experts(
+        hidden_states,
+        raw["w13_weight"],
+        raw["w13_scale"],
+        raw["w2_weight"],
+        raw["w2_scale"],
+        torch.where(is_local, local_ids, 0),
+        torch.where(is_local, topk_weights, 0.0),
+        activation_dtype=torch.float8_e4m3fn,
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+
+    torch.cuda.synchronize()
+    assert is_local.any() and not is_local.all()
+    # Outputs peak near 1e-2, so a fixed atol would accept the wrong experts.
+    scale = expected.abs().max().item()
+    assert scale > 0
+    torch.testing.assert_close(actual, expected, atol=5e-2 * scale, rtol=5e-2)
+
+
+def test_kimi_k3_ep_situ_returns_empty_output_for_empty_input_gfx1250():
+    module, _, hidden_states, topk_weights, topk_ids, router_logits = _make_ep_case(
+        1, 1
+    )
+    plan = _make_ep_plan()
+    kernel_moe_process_weights(plan, module)
+    output = kernel_moe_apply(
+        plan,
+        hidden_states[:0],
+        module,
+        router_logits[:0],
+        topk_weights=topk_weights[:0],
+        topk_ids=topk_ids[:0],
+    )
+    assert output.shape == (0, hidden_states.shape[1])

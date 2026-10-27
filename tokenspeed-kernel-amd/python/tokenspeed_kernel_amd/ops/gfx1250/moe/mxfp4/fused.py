@@ -1992,6 +1992,7 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     QUANT_BLOCK_K: gl.constexpr = 512,
     fp8_scale_ptr=None,
     QUANT_FP8: gl.constexpr = False,
+    EXPERT_START=0,
 ):
     """Stable counting sort of contiguous ``[M, TOPK]`` ids by expert.
 
@@ -2007,6 +2008,9 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     input, one ``QUANT_BLOCK_M x QUANT_BLOCK_K`` tile each, on CUs the
     routing programs leave idle: to MXFP4, or with ``QUANT_FP8`` to E4M3
     divided by ``fp8_scale_ptr``.
+
+    Ids are global; this rank owns experts ``[EXPERT_START, EXPERT_START + E)``
+    and sorts every other id into the invalid bin.
     """
     # G is a multiple of TOPK, which keeps the masked id loads vectorized.
     G = M * TOPK
@@ -2067,9 +2071,11 @@ def _precomputed_topk_route_small_m_gfx1250_kernel(
     gate = gl.arange(0, GP, layout=gate_layout)
     gate_mask = gate < G
     ids = gl.load(topk_ids_ptr + gate, mask=gate_mask, other=E)
+    ids = gl.where(gate_mask, ids - EXPERT_START, E)
     row = start + gl.arange(0, CH, layout=row_layout)
     row_mask = row < G
     row_ids = gl.load(topk_ids_ptr + row, mask=row_mask & is_chunk, other=E)
+    row_ids = gl.where(row_mask & is_chunk, row_ids - EXPERT_START, E)
     row_weights = gl.load(topk_weights_ptr + row, mask=row_mask & is_chunk, other=0.0)
 
     # Invalid ids count in bin E, after every expert; padding lanes go to the
@@ -2175,6 +2181,7 @@ def _precomputed_topk_route_small_m_gfx1250(
     fp8_quantize_into: (
         tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None
     ) = None,
+    expert_start: int | None = None,
 ) -> tuple[
     RaggedTensorMetadata,
     torch.Tensor,
@@ -2186,6 +2193,8 @@ def _precomputed_topk_route_small_m_gfx1250(
     ``quantize_into=(x, packed, scale)`` also quantizes ``x`` to MXFP4, and
     ``fp8_quantize_into=(x, out, act_scale)`` to E4M3 as
     ``_quantize_fp8_activation`` does, in extra programs of the same launch.
+    With ``expert_start`` the ids are global and this rank owns experts
+    ``[expert_start, expert_start + num_experts)``; other routes get no rows.
     """
     if quantize_into is not None and fp8_quantize_into is not None:
         raise ValueError("the small-M route quantizes to one format")
@@ -2266,7 +2275,8 @@ def _precomputed_topk_route_small_m_gfx1250(
             fp8_scale_ptr=act_scale,
             QUANT_FP8=True,
         )
-    if tokens == 1 and topk <= 16 and not quant_programs:
+    # The canonical M1 route assumes every id is a local expert.
+    if tokens == 1 and topk <= 16 and not quant_programs and expert_start is None:
         num_warps = 8
         _precomputed_topk_route_m1_canonical_gfx1250_kernel[(1,)](
             topk_ids,
@@ -2323,6 +2333,7 @@ def _precomputed_topk_route_small_m_gfx1250(
             NUM_WARPS=num_warps,
             stride_bo=block_offsets.stride(0),
             num_warps=num_warps,
+            EXPERT_START=expert_start or 0,
             **quant_args,
         )
     ragged_metadata = RaggedTensorMetadata(
@@ -2821,11 +2832,15 @@ def _topk_route_is_valid_gfx1250(
     stride_ik,
     E: gl.constexpr,
     HAS_TOPK_IDS: gl.constexpr,
+    EXPERT_START=0,
 ):
     if HAS_TOPK_IDS:
-        expert = gl.load(
-            topk_ids_ptr + pid_m.to(gl.int64) * stride_im + slot * stride_ik
-        ).to(gl.int32)
+        expert = (
+            gl.load(
+                topk_ids_ptr + pid_m.to(gl.int64) * stride_im + slot * stride_ik
+            ).to(gl.int32)
+            - EXPERT_START
+        )
         return (expert >= 0) & (expert < E)
     return pid_m >= 0
 
@@ -2850,6 +2865,7 @@ def _weighted_topk_reduce_gfx1250_kernel(
     HAS_TOPK_IDS: gl.constexpr,
     TOPK: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    EXPERT_START=0,
 ):
     pid = gl.program_id(0)
     num_pid_n = gl.cdiv(N, BLOCK_N)
@@ -2868,6 +2884,7 @@ def _weighted_topk_reduce_gfx1250_kernel(
             stride_ik,
             E,
             HAS_TOPK_IDS,
+            EXPERT_START,
         )
         weight = gl.load(
             weights_ptr + pid_m.to(gl.int64) * stride_wm + slot * stride_wk
@@ -2899,6 +2916,7 @@ def _weighted_topk_reduce_gfx1250(
     *,
     topk_ids: torch.Tensor | None = None,
     num_experts: int | None = None,
+    expert_start: int = 0,
     out: torch.Tensor | None,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -2966,6 +2984,7 @@ def _weighted_topk_reduce_gfx1250(
         HAS_TOPK_IDS=topk_ids is not None,
         TOPK=topk,
         BLOCK_N=block_n,
+        EXPERT_START=expert_start,
         num_warps=1,
     )
     return out
@@ -3160,6 +3179,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     block_m: int | None = None,
     out: torch.Tensor | None = None,
     partial_tdm: bool = False,
+    expert_start: int | None = None,
 ) -> torch.Tensor:
     """Dispatch + combine for gfx1250 MXFP4-weight MoE with precomputed top-k.
 
@@ -3191,6 +3211,10 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         out: Optional destination tensor for the finalized expert output.
         partial_tdm: Fuse each projection's operand loads into one TDM
             operation issued by half the warps.
+        expert_start: For expert parallelism, the first global expert id
+            this rank owns; ``topk_ids`` are then global, the weights hold
+            this rank's experts, and the output sums only their routes.
+            Requires FP8 activations and a batch the one-launch route serves.
 
     Returns:
         Tensor shaped ``(n_tokens, hidden_size)``.
@@ -3200,6 +3224,8 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
             "gfx1250 Gluon MXFP4 MoE supports activation_dtype 'fp8' or "
             f"'mxfp4', got {activation_dtype!r}"
         )
+    if expert_start is not None and activation_dtype != "fp8":
+        raise ValueError("gfx1250 expert-parallel MoE requires FP8 activations")
     if topk_ids.ndim != 2:
         raise ValueError(f"topk_ids must be rank-2, got {tuple(topk_ids.shape)}")
     if topk_weights.shape != topk_ids.shape:
@@ -3231,6 +3257,24 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         ) = _precomputed_topk_route_mxfp4(
             topk_weights, topk_ids, num_experts, hidden_states
         )
+    elif expert_start is not None and not (
+        hidden_states.dtype in (torch.bfloat16, torch.float16)
+        and hidden_states.stride(1) == 1
+        and _uses_small_route(topk_ids, num_experts)
+    ):
+        # The staged route drops ids outside [0, E); the torch fallback
+        # would file them under expert 0.
+        if not _uses_staged_route(topk_ids, num_experts):
+            raise ValueError(
+                "gfx1250 expert-parallel MoE supports at most 16 routes per "
+                "token and 1024 local experts"
+            )
+        x_fp8 = None
+        ragged_metadata, gather_indx, scatter_indx, _gate_scal = (
+            _precomputed_topk_route_large_m_gfx1250(
+                topk_weights, topk_ids - expert_start, num_experts
+            )
+        )
     elif (
         hidden_states.dtype in (torch.bfloat16, torch.float16)
         and hidden_states.stride(1) == 1
@@ -3244,6 +3288,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
                 topk_ids,
                 num_experts,
                 fp8_quantize_into=(hidden_states, x_fp8, w13_weight.act_scale),
+                expert_start=expert_start,
             )
         )
     else:
@@ -3345,6 +3390,10 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         # Serving top-k is valid by construction. Invalid-ID masking stays on
         # the public reduce helper; applying it to every prefill token made
         # C1/C16 prefill substantially slower than the last accepted gate.
+        # Expert parallelism leaves other ranks' routes without rows.
+        topk_ids=None if expert_start is None else topk_ids,
+        num_experts=None if expert_start is None else num_experts,
+        expert_start=expert_start or 0,
         out=out,
         out_dtype=out_dtype,
     )
