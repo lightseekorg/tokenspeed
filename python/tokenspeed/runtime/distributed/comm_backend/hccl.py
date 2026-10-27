@@ -105,7 +105,9 @@ class HcclBackend(CommBackend):
         if len(group) == 1:
             output.copy_(input)
             return
-        dist.all_gather_single(output, input, group=self._process_group(group))
+        # torch>=2.x renamed all_gather_single to all_gather_into_tensor; the
+        # shape contract is identical (output rows == len(group) * input rows).
+        dist.all_gather_into_tensor(output, input, group=self._process_group(group))
 
     def reduce_scatter(self, tensor: torch.Tensor, group: Group) -> torch.Tensor:
         if len(group) == 1:
@@ -115,7 +117,9 @@ class HcclBackend(CommBackend):
             dtype=tensor.dtype,
             device=tensor.device,
         )
-        dist.reduce_scatter_single(output, tensor, group=self._process_group(group))
+        # torch>=2.x renamed reduce_scatter_single to reduce_scatter_tensor; the
+        # shape contract is identical (input rows == len(group) * output rows).
+        dist.reduce_scatter_tensor(output, tensor, group=self._process_group(group))
         return output
 
     def all_to_all_single(
@@ -190,7 +194,7 @@ class HcclBackend(CommBackend):
         if len(group) == 1:
             output.copy_(padded)
         else:
-            dist.reduce_scatter_single(
+            dist.reduce_scatter_tensor(
                 output,
                 padded.contiguous(),
                 group=self._process_group(group),
