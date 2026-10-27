@@ -44,6 +44,14 @@ frontend is `tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under
 event loop. Their first rank binds the request channel its frontend pushes
 encode requests to; headless, that is the address an engine rank would dial.
 
+Scheduler load travels on the same output wire, including an empty batch at
+startup and at most once per second without token outputs. Reports carry
+running and waiting counts and resident, active, and total LCM blocks. The
+native frontend timestamps receipt and exposes a complete per-rank snapshot
+set to the gateway only while every report is less than three seconds old.
+The gateway converts these allocator counts to capacity ratios; it must not
+interpret an LCM block as a fixed-size token page.
+
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
 The event loop is the **control plane**. The forward thread is the **data

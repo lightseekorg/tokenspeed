@@ -437,6 +437,7 @@ fn output_slim() {
         num_waiting: 2,
         kv_active_pages: 1000,
         kv_total_pages: 4096,
+        kv_used_pages: 1500,
         ..no_tail()
     };
     let frames = fixture("output_slim");
@@ -507,6 +508,7 @@ fn no_tail() -> BatchTokenIDOutSlim {
         kv_active_pages: 0,
         kv_total_pages: 0,
         finish_reason_details: vec![],
+        kv_used_pages: 0,
         spec_verify_ct: vec![],
         accept_draft_tokens: vec![],
         input_token_logprobs_val: vec![],

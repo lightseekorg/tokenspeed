@@ -310,6 +310,8 @@ pub struct Load {
     pub kv_active_pages: i64,
     /// Usable cache pages.
     pub kv_total_pages: i64,
+    /// Resident cache blocks, including reclaimable prefix-cache entries.
+    pub kv_used_pages: i64,
 }
 
 /// The frontend: requests in, outputs out.
@@ -482,6 +484,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Without L3, the forward permission the scheduler last received; it
     /// starts allowed. With L3 every round's tick carries it.
     forward_allowed: bool,
+    /// Last load report on the output wire, including idle heartbeats.
+    last_load_report: Option<Instant>,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -534,6 +538,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             staged: Vec::new(),
             dp_idle: true,
             forward_allowed: true,
+            last_load_report: None,
         }
     }
 
@@ -659,15 +664,22 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
-        if !outputs.is_empty() && self.owns_frontend() {
+        if self.owns_frontend()
+            && (!outputs.is_empty()
+                || self
+                    .last_load_report
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)))
+        {
             let sizes = self.scheduler.sizes();
             let load = Load {
                 num_running: self.outputs.num_running() as i64,
                 num_waiting: sizes.waiting as i64,
                 kv_active_pages: i64::from(sizes.active_lcm_blocks),
                 kv_total_pages: self.config.kv_total_pages,
+                kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
             };
             self.frontend.send(outputs, load);
+            self.last_load_report = Some(Instant::now());
         }
         // A deferred pause or release resolves once the scheduler drained.
         self.finish_drain()?;

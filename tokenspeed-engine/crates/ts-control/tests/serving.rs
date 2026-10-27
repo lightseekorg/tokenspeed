@@ -1539,6 +1539,36 @@ fn tokens(chunks: &[OutputChunk]) -> Vec<i32> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn idle_load_reports_preserve_resident_cache_capacity() {
+    let engine = start_engine(0).await;
+    let snapshots = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshots = engine.client.fresh_loads(Duration::from_secs(3));
+            if !snapshots.is_empty() {
+                break snapshots;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].0, 0);
+    assert_eq!(snapshots[0].1.kv_total_pages, 512);
+    assert_eq!(snapshots[0].1.kv_used_pages, 0);
+
+    run(&engine.client, request("cached", 32, budget(1))).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let snapshots = engine.client.fresh_loads(Duration::from_millis(500));
+    assert_eq!(snapshots.len(), 1, "idle reports keep capacity fresh");
+    let load = snapshots[0].1;
+    assert_eq!((load.num_running, load.num_waiting), (0, 0));
+    assert_eq!(load.kv_active_pages, 0);
+    assert!(load.kv_used_pages > 0, "reclaimable prefixes stay resident");
+    assert_eq!(load.kv_total_pages, 512);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_request_generates_its_budget() {
     for depth in [0, 1] {
         let engine = start_engine(depth).await;

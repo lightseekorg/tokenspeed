@@ -405,6 +405,11 @@ regeneration anywhere.
 
 ### 1.4 What bounds a single request
 
+The runtime's usable request length is the minimum of the model context and
+`MaxSingleRequestTokens`. Input admission leaves room for the first decode/verify
+window. The generation budget is capped at `usable_length - prompt_length`;
+that input reserve is not subtracted again from the remaining output budget.
+
 `MaxSingleRequestTokens` is a **startup** bound computed by binary search over
 `CapacityModel::SingleRequestGroupPages` (`csrc/scheduler/capacity_model.h`):
 the largest prompt whose worst-case working set — dense or sliding history

@@ -89,6 +89,8 @@ wire_struct! {
         pub output_top_logprobs_val: Vec<Vec<Vec<f64>>> = Vec::new(),
         /// Their token ids.
         pub output_top_logprobs_idx: Vec<Vec<Vec<i32>>> = Vec::new(),
+        /// Resident LCM blocks, including reclaimable prefix-cache entries.
+        pub kv_used_pages: i64 = 0,
     }
 }
 

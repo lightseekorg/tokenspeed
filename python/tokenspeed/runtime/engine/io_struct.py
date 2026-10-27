@@ -178,8 +178,8 @@ class GenerateReqInput:
     bootstrap_port: list[int] | int | None = None
     bootstrap_room: list[int] | int | None = None
 
-    # Hard-pin to this attention-DP rank, bypassing load balancing. Ignored on
-    # disaggregation engines, where the bootstrap_room residue is authoritative.
+    # Hard-pin to this attention-DP rank, bypassing load balancing. A prefill
+    # pin must match the bootstrap_room residue; a decode pin may differ.
     data_parallel_rank: list[int] | int | None = None
 
     def normalize_batch_and_arguments(self):
@@ -775,6 +775,8 @@ class BatchTokenIDOutSlim(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx: list[list] = []
     output_top_logprobs_val: list[list] = []
     output_top_logprobs_idx: list[list] = []
+    # Resident LCM blocks, including reclaimable prefix-cache entries.
+    kv_used_pages: int = 0
 
 
 class BatchStrOut(BaseBatchReq, kw_only=True):

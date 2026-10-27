@@ -149,17 +149,8 @@ class InputProcessor:
         - non-integer pins (bool/float/str) are a caller error and raise on
           EVERY engine shape — checked first, before the mode branches below.
         - engines without attention DP: the pin is meaningless; drop it.
-        - prefill engines: the bootstrap_room residue is the authoritative
-          rank carrier (the decode side's pd/mooncake re-derives the prefill
-          rank from the room), so the pin is dropped; a conflicting pin is
-          logged, never rejected — rejecting would turn gateway/room version
-          skew into a 400 storm.
-        - decode engines: an in-range pin is kept and places the request
-          (ts-client's routing), since any decode rank finds the prefill
-          rank from the room; an out-of-range pin is logged and dropped,
-          never rejected, leaving the room residue to place the request.
-        - colocated attention-DP engines: an out-of-range pin is a caller
-          error and raises (surfacing as a request-level failure).
+        - attention-DP engines, including prefill and decode: an out-of-range
+          pin is a caller error and raises; a valid pin is preserved.
         """
         ranks = getattr(obj, "data_parallel_rank", None)
         if ranks is None:
@@ -180,54 +171,6 @@ class InputProcessor:
             obj.data_parallel_rank = None
             return
         dp_size = mapping.attn.dp_size
-
-        if server_args.disaggregation_mode == "decode":
-            kept = [
-                rank if rank is None or 0 <= rank < dp_size else None
-                for rank in rank_list
-            ]
-            if kept != rank_list:
-                self.engine.logger.warning(
-                    f"data_parallel_rank={ranks!s} is outside [0, {dp_size:d}) on a "
-                    "decode engine; the bootstrap_room places the request — pin ignored.",
-                )
-            obj.data_parallel_rank = kept if isinstance(ranks, list) else kept[0]
-            return
-
-        if server_args.disaggregation_mode != "null":
-            rooms = obj.bootstrap_room
-            room_list = rooms if isinstance(rooms, list) else [rooms]
-            # Broadcast whichever side is scalar so a scalar pin is checked
-            # against EVERY room residue (and vice versa), then pad the
-            # shorter side with None — zip truncation would silently skip
-            # conflicts past the shorter list, and a rank with no room to
-            # check against is itself a conflict signal.
-            width = max(len(rank_list), len(room_list), 1)
-            if len(rank_list) == 1:
-                rank_list = rank_list * width
-            if len(room_list) == 1:
-                room_list = room_list * width
-            rank_list = rank_list + [None] * (width - len(rank_list))
-            room_list = room_list + [None] * (width - len(room_list))
-            for rank, room in zip(rank_list, room_list):
-                if rank is None:
-                    continue
-                # A non-int room (gateway format bug) is unverifiable — take
-                # the warn+drop path, never raise: on disaggregation engines
-                # a pin must not turn room skew into request rejections.
-                if (
-                    not isinstance(room, int)
-                    or isinstance(room, bool)
-                    or room % dp_size != rank
-                ):
-                    self.engine.logger.warning(
-                        f"data_parallel_rank={rank!s} conflicts with bootstrap_room "
-                        f"residue (room={room!s}, dp_size={dp_size:d}); the room stays "
-                        "authoritative on disaggregation engines — pin ignored.",
-                    )
-                    break
-            obj.data_parallel_rank = None
-            return
 
         for rank in rank_list:
             if rank is not None and not 0 <= rank < dp_size:
@@ -448,6 +391,17 @@ class InputProcessor:
                 self._verify_prompt_logprobs_servable(input_ids, multimodal_inputs)
 
         if isinstance(obj, GenerateReqInput):
+            if (
+                obj.data_parallel_rank is not None
+                and self.engine.server_args.disaggregation_mode == "prefill"
+            ):
+                dp_size = self.engine.server_args.mapping.attn.dp_size
+                if obj.data_parallel_rank != obj.bootstrap_room % dp_size:
+                    raise ValueError(
+                        f"Prefill data_parallel_rank={obj.data_parallel_rank} must "
+                        f"match bootstrap_room % dp_size "
+                        f"({obj.bootstrap_room % dp_size})"
+                    )
             return TokenizedGenerateReqInput(
                 rid=obj.rid,
                 input_text=input_text,

@@ -26,7 +26,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -116,6 +116,9 @@ pub struct EngineLoad {
     pub kv_active_pages: i64,
     /// KV pages in total.
     pub kv_total_pages: i64,
+    /// Resident LCM blocks, including reclaimable prefix-cache entries.
+    pub kv_used_pages: i64,
+    received_at: Option<Instant>,
 }
 
 type StreamItem = std::result::Result<OutputChunk, StreamError>;
@@ -259,6 +262,8 @@ impl Shared {
                     num_waiting: batch.num_waiting,
                     kv_active_pages: batch.kv_active_pages,
                     kv_total_pages: batch.kv_total_pages,
+                    kv_used_pages: batch.kv_used_pages,
+                    received_at: Some(Instant::now()),
                 };
             }
             None => debug!(
@@ -408,6 +413,22 @@ impl EngineClient {
     /// Each engine's latest reported load, in index order.
     pub fn loads(&self) -> Vec<EngineLoad> {
         self.shared.engines.iter().map(|e| *lock(&e.load)).collect()
+    }
+
+    /// A complete set of reported loads, keyed by attention-DP rank.
+    /// Missing capacity or an expired report makes the whole set unavailable.
+    pub fn fresh_loads(&self, max_age: Duration) -> Vec<(i64, EngineLoad)> {
+        self.shared
+            .engines
+            .iter()
+            .map(|engine| {
+                let load = *lock(&engine.load);
+                (load.kv_total_pages > 0
+                    && load.received_at.is_some_and(|at| at.elapsed() < max_age))
+                .then_some((engine.info.ready.data_parallel_rank, load))
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default()
     }
 
     /// This client's unfinished requests per engine, in index order.
