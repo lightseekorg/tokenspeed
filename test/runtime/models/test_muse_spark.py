@@ -418,6 +418,12 @@ class _TwoRankGather:
     ) -> torch.Tensor:
         return torch.cat((rows, rows + 100))[:global_rows]
 
+    def all_gather_owned_stream_bf16(
+        self, stream: torch.Tensor, global_rows: int
+    ) -> torch.Tensor:
+        assert stream.dtype == torch.float32
+        return self.all_gather_owned_rows(stream.bfloat16(), global_rows, False)
+
 
 def test_owned_row_taps_gather_full_rows() -> None:
     model, sink, ctx = _tapping_model([0])
