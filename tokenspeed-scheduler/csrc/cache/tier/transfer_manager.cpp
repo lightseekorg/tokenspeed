@@ -92,7 +92,7 @@ std::optional<WriteBackOperation> TierTransferManager::StartPendingStores(
     for (CacheCoordinator::StoreEpochs::Uncached& block : epochs.uncached) {
         if (const auto it = in_flight.find(block.key); it != in_flight.end()) {
             it->second->access_epoch = std::max(it->second->access_epoch, block.access_epoch);
-        } else if (storing.insert(block.key).second) {
+        } else if (block.device_block && storing.insert(block.key).second) {
             boundary_rows.insert(block.key);
             add(std::move(block.key), std::move(block.device_block), block.access_epoch);
         }

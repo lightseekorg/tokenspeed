@@ -2882,17 +2882,16 @@ CacheCoordinator::StoreEpochs CacheCoordinator::TakeStoreEpochs(const std::optio
     const std::int32_t pages = (num_tokens - 1) / prefix_granularity_ + 1;
     next_access_epoch_ += static_cast<std::uint64_t>(pages);
     // Raises key's Host copy to the epoch of `page`, or lists the key for the
-    // batch to store from device_block.
+    // batch to store from device_block (empty once the Device no longer caches
+    // it) or to re-date in flight.
     const auto refresh = [&](std::size_t group_index, const CacheKey& key, CacheBlockRef device_block,
                              std::int32_t page) {
         const std::uint64_t epoch = epochs.base + static_cast<std::uint64_t>(pages - page);
         if (host_pool_ != nullptr && groups_[group_index].Index().Touch(*host_pool_, key, epoch)) {
             return;
         }
-        if (device_block) {
-            epochs.uncached.push_back(
-                StoreEpochs::Uncached{.key = key, .device_block = std::move(device_block), .access_epoch = epoch});
-        }
+        epochs.uncached.push_back(
+            StoreEpochs::Uncached{.key = key, .device_block = std::move(device_block), .access_epoch = epoch});
     };
     for (std::size_t i = 0; i < tables.size(); ++i) {
         if (GroupIsReplayable(static_cast<std::int32_t>(i))) {

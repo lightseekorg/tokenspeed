@@ -701,8 +701,9 @@ public:
         bool final_publication{false};
         // The boundary's blocks Host does not hold, each group's front to
         // back, with their epochs: the batch stores them, or re-dates the
-        // earlier store still carrying one. The rest were refreshed when the
-        // epochs were taken.
+        // earlier store still carrying one -- the only way to date one whose
+        // Device entry is gone (device_block empty). The rest were refreshed
+        // when the epochs were taken.
         struct Uncached {
             CacheKey key;
             CacheBlockRef device_block;
