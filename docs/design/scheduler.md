@@ -612,8 +612,14 @@ The same site handles a victim that passed the probe but whose L2 leg fell
 back to a pool that then could not take it. Waiting instead would deadlock
 once every resident needs a page; charging worst-case host room at admission
 would cost concurrency on every request to protect against a rare shortfall.
-The debug knob (§2, below) never aborts: a forced retraction whose image does
-not fit is refused and logged.
+The debug knob (below) is not capacity pressure: it probes its victim with
+`imageFits` before `retractVictim` publishes anything, and a victim that does
+not fit is refused, logged and left running. A victim refused only after the
+publication (that L2 fallback) is aborted at the same site, never left
+running: the publication registered blocks it would write again (its partial
+page as a tail, and a State group's end state, which a decode step writes in
+place), and a published block is never written again by its owner (the prefix
+cache depends on it).
 
 **The victim's pages are released — and grantable — immediately**, before
 either copy has run. Both legs are stream-ordered: their tickets pin only the
@@ -749,9 +755,10 @@ off) exercises the path without pressure: every `|interval|` plans the oldest
 `Decoding` (`> 0`) or `Prefilling` (`< 0`) request is *armed* — kept out of
 that round's batch so its outstanding forward lands — and retracted at the
 first plan where it is quiescent, bypassing the victim policy's exemption but
-not the image-fit refusal. It runs at the start of the D and fused grammars,
-before the restore phase, so the freed pages are granted by the ordinary
-phases.
+not the image-fit refusal (probed before the publication; a refusal after it
+aborts the victim, see "does not fit" above). It runs at the start of the D
+and fused grammars, before the restore phase, so the freed pages are granted
+by the ordinary phases.
 
 The P role never retracts: `buildPrefillWorkerPlan` does not call
 `maybeRetractForCapacity` (the only two call sites are the D and fused
@@ -1189,7 +1196,9 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   in-flight pinned store defers all retraction; stream-ordered stores and
   in-flight restores defer nothing. A victim that would serve nobody is not
   retracted. A victim whose image does not fit is aborted through
-  `onImageDoesNotFit` and nowhere else; the debug knob never aborts.
+  `onImageDoesNotFit` and nowhere else; the debug knob aborts only a victim
+  whose image is refused after its publication, and leaves one its probe
+  refuses running with nothing published.
 - Freed capacity is granted to the request it was freed for in the same plan
   build whenever the round's grammar admits the grant, except that the
   empty-round retraction offers it to the round's decodes first (2); the

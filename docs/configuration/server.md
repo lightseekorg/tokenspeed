@@ -986,7 +986,9 @@ nothing is recomputed) to free Device pages for a blocked admission. One
 increment per retraction victim, counted from the plan's snapshot-store ops;
 forced retractions from `--debug-force-retraction-interval` count too. A
 retraction whose victim cannot be imaged aborts it instead — those are
-`tokenspeed:num_capacity_aborted_requests`, never preemptions.
+`tokenspeed:num_capacity_aborted_requests`, never preemptions. A forced
+retraction's victim refused after its pages were published is aborted and
+counts there too.
 
 The cached/uncached token split (the billing split Baseten/Fireworks-style
 dashboards show) derives from existing counters; no dedicated metric is needed:
@@ -1168,8 +1170,10 @@ much work may be suspended at once, and exceeding them costs an abort of
 one request, never latency for everyone else. With no pool
 (`--retraction-snapshot-ratio 0`) nothing can be imaged, so a
 capacity-blocked round aborts the newest resident instead of imaging
-anyone. `--debug-force-retraction-interval` never aborts: a forced
-retraction whose image does not fit is refused and logged. The scheduler's
+anyone. A forced retraction (`--debug-force-retraction-interval`) whose
+image does not fit is refused and logged, and the request runs on; only a
+request whose image is refused after its pages were published (the Host L2
+leg fell back to a pool too small) is aborted as above. The scheduler's
 victim choice is in `docs/design/scheduler.md` section 2.
 
 The ops ride the round's `DeviceHandle.execute` with the L2 write-backs and

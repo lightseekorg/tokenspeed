@@ -2518,7 +2518,7 @@ TEST_F(SlotPinKnobSuite, AnAbortWhileRetractedKeepsTheBlobSlotUntilTheStoreAck) 
     const ExecutionPlan p5 = PlanOnce();
     EXPECT_EQ(scheduler_->RetractedSize(), 0u) << "no blob slot: the export into it has not been acknowledged";
     EXPECT_EQ(FindSnapshotStore(p5), nullptr);
-    EXPECT_TRUE(p5.aborts.empty()) << "the knob never aborts";
+    EXPECT_TRUE(p5.aborts.empty()) << "a forced retraction refused before its publication aborts nobody";
     ASSERT_EQ(FindForwardBatch(p5)->request_ids, std::vector<std::string>{"b"});
     SendForwardDone("b", {146});
 
@@ -2734,6 +2734,43 @@ TEST_F(L2LegFallbackSuite, AnL2LegThatFallsBackToATooSmallPoolAbortsTheChosenVic
     EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the attempt's Host block is released with it";
 }
 
+// The knob's victim takes the same probe: an L2 leg that falls back to a
+// too small pool refuses its image only after the retraction published its
+// pages, partial page included, so the victim cannot run on.
+class ForcedL2LegFallbackSuite : public L2LegFallbackSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        SchedulerConfig cfg = L2LegFallbackSuite::MakeConfig();
+        cfg.debug_force_retraction_interval = 3;
+        return cfg;
+    }
+};
+
+TEST_F(ForcedL2LegFallbackSuite, AForcedVictimRefusedAfterItsPublicationIsAborted) {
+    Submit(MakeRequestSpec("a", /*num_pages=*/2));
+    AckWriteBacks(PlanOnce());  // plan 1: prefill
+    SendForwardDone("a", {42});
+    AckWriteBacks(PlanOnce());  // plan 2: the first decode
+    SendForwardDone("a", {43});
+
+    // Plan 3 arms a = [1 2 3 4 42 43], quiescent: 5 computed tokens, the
+    // partial page [42]. a passes the probe (every slot is published, so
+    // the pool holds the blob alone), but of its six published blocks at
+    // most one gets a Host block and the rest fall back to a pool of one
+    // block. The page [42] is a tail on a's own block now: a is aborted.
+    const ExecutionPlan forced = PlanOnce();
+    ASSERT_EQ(forced.aborts.size(), 1u);
+    EXPECT_EQ(forced.aborts.front().request_id, "a");
+    EXPECT_EQ(forced.aborts.front().reason, AbortReason::kImageDoesNotFit);
+    EXPECT_NE(forced.aborts.front().detail.find("snapshot pool"), std::string::npos) << forced.aborts.front().detail;
+    EXPECT_EQ(scheduler_->TailEntries(), 1u) << "the publication stands";
+    EXPECT_EQ(scheduler_->RetractedSize(), 0u);
+    EXPECT_EQ(FindSnapshotStore(forced), nullptr);
+    EXPECT_TRUE(FindForwardBatch(forced)->request_ids.empty()) << "a never writes its published tail block";
+    EXPECT_EQ(scheduler_->HostPoolPinnedBlocks(), 0) << "the attempt's Host block is released with it";
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14) << "a's pages return in this round";
+}
+
 // The null page alone: the engine never images, and says so.
 class NoPoolSuite : public ImageDoesNotFitSuite {
 protected:
@@ -2759,18 +2796,36 @@ TEST_F(NoPoolSuite, WithoutAPoolACapacityBlockAbortsAndNamesThePoolKnobNotTheSlo
     EXPECT_EQ(granted->request_ids, std::vector<std::string>{"a"});
 }
 
-TEST_F(NoImageFitsSuite, TheDebugKnobNeverAborts) {
+TEST_F(NoImageFitsSuite, TheDebugKnobLeavesAVictimItCannotImageRunningWithNothingPublished) {
     // Forced retraction is not capacity pressure: a victim it cannot image
-    // keeps running.
-    config_.debug_force_retraction_interval = 1;
+    // keeps running. The knob probes the image before the retraction
+    // publishes anything: that publication would register a's partial page
+    // as a tail on the block a writes next, and the page's own publication
+    // would later find that block under the tail's key.
+    config_.debug_force_retraction_interval = 3;
     scheduler_ = std::make_unique<Scheduler>(config_);
     Submit(MakeRequestSpec("a", /*num_pages=*/2));
-    PlanOnce();
+    PlanOnce();  // plan 1: prefill
     SendForwardDone("a", {42});
-    const ExecutionPlan forced = PlanOnce();  // arms a at plan 2 and retracts it if it fits
+    PlanOnce();  // plan 2: the first decode
+    SendForwardDone("a", {43});
+
+    // Plan 3 arms a = [1 2 3 4 42 43], quiescent: 5 computed tokens, the
+    // partial page [42]. Its 3 pages x 2 groups do not fit one pool block.
+    const ExecutionPlan forced = PlanOnce();
     EXPECT_TRUE(forced.aborts.empty());
     EXPECT_EQ(scheduler_->RetractedSize(), 0u);
-    EXPECT_EQ(scheduler_->DecodingSize(), 1u) << "a keeps its pages and runs";
+    EXPECT_EQ(FindSnapshotStore(forced), nullptr);
+    EXPECT_EQ(scheduler_->TailEntries(), 0u) << "the partial page is not published";
+    ASSERT_EQ(FindForwardBatch(forced)->request_ids, std::vector<std::string>{"a"}) << "a keeps its pages and runs";
+    SendForwardDone("a", {44});
+
+    // Plan 4 publishes the page [42 43] a completed on its own block.
+    ASSERT_EQ(FindForwardBatch(PlanOnce())->request_ids, std::vector<std::string>{"a"});
+    SendForwardDone("a", {45});
+    SendFinish("a");
+    PlanOnce();
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), 14);
 }
 
 // Head-of-line among readmissions: a 60K-token image that does not fit must

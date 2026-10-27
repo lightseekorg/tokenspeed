@@ -491,7 +491,8 @@ impl EngineMetrics {
                 "tokenspeed:num_capacity_aborted_requests",
                 "Requests the scheduler aborted because a capacity retraction could not image its \
                  victim (retraction snapshot pool or image rows exhausted); clients may resubmit \
-                 them.",
+                 them. Forced retractions from --debug-force-retraction-interval aborted the same \
+                 way count too.",
                 names,
             ),
             num_preemptions: Metric::counter(

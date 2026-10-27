@@ -424,21 +424,23 @@ private:
     // page alone is configured, so nothing is ever imaged), no blob slot
     // free, or a pool too small for the image.
     enum class ImageShortfall { kNoPool, kBlobSlot, kSnapshotPool };
-    // Images the victim (Host L2 for its published pages, the snapshot pool
-    // for the rest), issues both store legs and suspends it. Returns the
-    // shortfall -- with nothing changed but Host entries evicted for the
-    // attempt -- when the image cannot be held or no blob slot is free.
+    // Images the victim and suspends it, or returns the shortfall; past the
+    // blob-slot check its completed pages stay published, and the Host
+    // entries evicted for the attempt stay evicted (see forward.cpp).
     std::optional<ImageShortfall> retractVictim(Request& victim, PlanBuild& build,
                                                 std::vector<WriteBackOperation>& write_back_operations);
     // The one site of the last-resort policy: a capacity retraction whose
     // victim cannot be imaged aborts that victim instead -- its pages and
     // slot return in this very round and the blocked grant proceeds as after
     // a retraction -- and records it on the plan for the runtime to fail the
-    // request toward its client.
+    // request toward its client. A forced victim refused after its
+    // publication is aborted here too.
     void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
     // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
-    // the batch until it is quiescent, then retracts it.
+    // the batch until it is quiescent, then retracts it. A victim whose image
+    // does not fit (imageFits) runs on with nothing published; one refused
+    // only after its publication is aborted.
     void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
                               std::vector<WriteBackOperation>& write_back_operations);
 

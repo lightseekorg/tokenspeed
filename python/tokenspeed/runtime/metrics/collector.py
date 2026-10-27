@@ -276,7 +276,9 @@ class EngineMetrics:
             documentation=(
                 "Requests the scheduler aborted because a capacity retraction "
                 "could not image its victim (retraction snapshot pool or image "
-                "rows exhausted); clients may resubmit them."
+                "rows exhausted); clients may resubmit them. Forced retractions "
+                "from --debug-force-retraction-interval aborted the same way "
+                "count too."
             ),
             labelnames=labelnames,
         )

@@ -885,7 +885,10 @@ bool Scheduler::imageFits(const Request& request) const {
 // this very round, because the runtime orders both copies on the forward
 // thread's stream ahead of the plan's page reuse. A victim whose image cannot
 // be held, or with no blob slot free, is not retracted: the shortfall is
-// returned, and the publication it did stands as its progress.
+// returned, and the publication it did stands as its progress. Both callers
+// then abort it rather than let it run on: the publication registered blocks
+// the victim would write again (a partial page as a tail, and a State group's
+// end state, which a decode step writes in place).
 std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     Request& victim, PlanBuild& build, std::vector<WriteBackOperation>& write_back_operations) {
     if (snapshot_slots_.AvailableSlots() == 0) {
@@ -901,7 +904,7 @@ std::optional<Scheduler::ImageShortfall> Scheduler::retractVictim(
     std::optional<TierTransferManager::RetractionStores> stores = tier_transfers_.StartRetractionStores(
         victim.Id(), victim.RequestPoolIndex(), blob_slot, victim.BlockTablesRef(), num_computed_tokens);
     if (!stores) {
-        return ImageShortfall::kSnapshotPool;  // the publication stands; the victim keeps running
+        return ImageShortfall::kSnapshotPool;  // the publication stands; the caller aborts the victim
     }
     victim.NoteRetracted();
     if (stores->host_store) {
@@ -937,7 +940,7 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
     }
     spdlog::warn(
         "[Scheduler] capacity abort: request {} ({} tokens) cannot be imaged -- {}; aborting it to free its "
-        "pages for the blocked admission",
+        "pages",
         victim.Id(), victim.TokenSize(), detail);
     build.plan.aborts.push_back(SchedulerAbort{
         .request_id = victim.Id(),
@@ -1166,10 +1169,15 @@ void Scheduler::maybeForceRetraction(PlanBuild& build, std::span<Request* const>
         return;
     }
     forced_victim_id_.clear();
-    // The knob is not capacity pressure: a victim it cannot image is left
-    // running, never aborted (onImageDoesNotFit is the retraction loop's).
-    if (retractVictim(*armed, build, write_back_operations)) {
+    // The knob is not capacity pressure: a victim the probe refuses runs on
+    // with nothing published; one retractVictim refuses after its
+    // publication is aborted (see retractVictim).
+    if (!imageFits(*armed)) {
         spdlog::info("[Scheduler] forced retraction of request {} refused: its image does not fit", armed->Id());
+        return;
+    }
+    if (const std::optional<ImageShortfall> shortfall = retractVictim(*armed, build, write_back_operations)) {
+        onImageDoesNotFit(*armed, *shortfall, build);
     }
 }
 
