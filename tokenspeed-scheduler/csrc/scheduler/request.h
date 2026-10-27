@@ -215,6 +215,8 @@ public:
                    state_);
     }
 
+    std::span<const std::string> AdmissionPrefixHashes();
+
     std::vector<std::span<const std::int32_t>> FullPrefixPages(bool except_last) const {
         return token_container_.FullPrefixPages(prefix_granularity_, except_last);
     }

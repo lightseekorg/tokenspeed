@@ -289,9 +289,7 @@ Scheduler::AdmissionMatch Scheduler::matchPrefixAtAdmission(Request* request) {
     const std::int32_t candidate_prefix_pages = config_.role == Role::kD
                                                     ? request->PrefillSize() / prefix_granularity
                                                     : std::max((request->PrefillSize() - 1) / prefix_granularity, 0);
-    std::vector<std::span<const std::int32_t>> prefix_pages = request->FullPrefixPages(false);
-    prefix_pages.resize(std::min(prefix_pages.size(), static_cast<std::size_t>(candidate_prefix_pages)));
-    std::vector<std::string> hashes = ComputePrefixHashes(prefix_pages, "");
+    const auto hashes = request->AdmissionPrefixHashes().first(static_cast<std::size_t>(candidate_prefix_pages));
 
     AdmissionMatch match;
     match.candidate_prefix_hashes = hashes;
@@ -362,16 +360,15 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens) {
-    AdmissionMatch match = matchPrefixAtAdmission(request);
     if (req_pool_allocator_.AvailableSlots() == 0) {
         return FirstChunkOutcome{};
     }
+    AdmissionMatch match = matchPrefixAtAdmission(request);
 
     // The D role's prompts are the peer's work; every other first chunk is local.
     const fsm::PrefillSource source =
         config_.role == Role::kD ? fsm::PrefillSource::kRemote : fsm::PrefillSource::kLocal;
     const std::int32_t prefix_granularity = coordinator_.PrefixGranularity();
-    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
 
     const std::int32_t hit_tokens = std::max(match.probe.device.num_common_tokens, match.probe.host.num_common_tokens);
     // KV coverage beyond the state checkpoint the hit resumes from is the
@@ -485,6 +482,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         feedback.admission_failed = true;
         return FirstChunkOutcome{};
     }
+    registerKvEventPrefixPages(*request, match.candidate_prefix_hashes, 0);
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
     // Every Host hit is an entry the admission acquired in the same step, so

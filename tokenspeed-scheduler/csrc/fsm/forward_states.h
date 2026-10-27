@@ -95,6 +95,7 @@ struct AdmissionResources {
     std::int32_t prefix_granularity;
     bool storage_prepared{false};
     std::optional<StorageReadyHold> storage_hold;
+    std::optional<std::vector<std::string>> prefix_hashes;
 };
 
 // Eligible for ordinary admission. A pending L3 dependency is Prefetching.

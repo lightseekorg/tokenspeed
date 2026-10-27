@@ -37,6 +37,15 @@ Request::Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role 
       state_{role == Role::kFused ? fsm::State{fsm::Submitted{&token_container_, prefix_granularity}}
                                   : fsm::State{fsm::Bootstrapping{&token_container_, prefix_granularity}}} {}
 
+std::span<const std::string> Request::AdmissionPrefixHashes() {
+    auto* admission = AdmissionResourcesPtr();
+    _assert(admission != nullptr, "prefix hashing requires a pre-admission request");
+    if (!admission->prefix_hashes) {
+        admission->prefix_hashes = ComputePrefixHashes(FullPrefixPages(false), "");
+    }
+    return *admission->prefix_hashes;
+}
+
 PrefillInfo Request::CurrentPrefillInfo() const {
     return std::visit(
         Overloaded{

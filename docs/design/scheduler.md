@@ -54,6 +54,13 @@ local hits. Retraction remains an exact image restore, never an L3 re-prefill.
 The D role probes Device history and receives missing data from its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
+Waiting requests retain their immutable prompt hash chain in `AdmissionResources`.
+Admission retries reuse the hashes but probe the current cache again, so cache
+publications and evictions remain visible. The hashes move with pre-admission
+state transitions and are released when the request is admitted or discarded.
+A full request pool skips hashing and matching; KV-event descriptors are
+registered only after admission succeeds.
+
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
 tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see
