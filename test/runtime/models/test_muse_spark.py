@@ -300,6 +300,7 @@ class _AddLayer(torch.nn.Module):
         super().__init__()
         self.value = value
         self.input_layernorm = f"norm{value}"
+        self.comm_manager = SimpleNamespace(gather_residual=lambda rows, ctx: rows)
 
     def forward(
         self,
@@ -323,6 +324,7 @@ def test_forward_threads_attention_input_rows_between_layers() -> None:
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
+    model.layers_to_capture = []
     ctx = SimpleNamespace(forward_mode=SimpleNamespace(is_idle=lambda: False))
     out, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
     assert aux is None
@@ -339,6 +341,98 @@ def test_forward_threads_attention_input_rows_between_layers() -> None:
         "norm3.0",
         None,
     ]
+
+
+class _CaptureSink:
+    def __init__(self) -> None:
+        self.captures: list[tuple[int, torch.Tensor]] = []
+
+    def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
+        self.captures.append((capture_idx, hidden))
+
+
+def _tapping_model(taps: list[int]):
+    """Three constant-adding layers and a draft capturing the layers in ``taps``."""
+    model = _stub(MuseSparkForConditionalGeneration.model_cls)
+    model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model._embed_hidden = lambda input_ids, input_embeds: input_embeds
+    model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
+    model.norm = lambda value, out_dtype: -value.to(out_dtype)
+    causal_lm = _stub(MuseSparkForConditionalGeneration)
+    causal_lm.model = model
+    causal_lm.set_dflash_layers_to_capture(taps)
+    sink = _CaptureSink()
+    ctx = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: False),
+        target_capture_sink=sink,
+    )
+    return model, sink, ctx
+
+
+def test_forward_taps_the_residual_stream_after_each_draft_target_layer() -> None:
+    # A draft names layer outputs; the last layer's output is the final stream.
+    model, sink, ctx = _tapping_model([2, 0])
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    out, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    after_layer_0 = (hidden + 1.0).to(torch.bfloat16)
+    final_stream = (hidden + 1.0 + 2.0 + 3.0).to(torch.bfloat16)
+    assert len(aux) == 2
+    torch.testing.assert_close(aux[0], after_layer_0, rtol=0, atol=0)
+    # The final capture is the stream before the output norm.
+    torch.testing.assert_close(aux[1], final_stream, rtol=0, atol=0)
+    torch.testing.assert_close(out, -final_stream)
+    # The sink receives each capture in draft order as soon as it is produced.
+    assert [index for index, _ in sink.captures] == [0, 1]
+    assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
+
+
+def test_idle_forward_taps_nothing() -> None:
+    model, sink, _ = _tapping_model([0, 2])
+    idle = SimpleNamespace(
+        forward_mode=SimpleNamespace(is_idle=lambda: True),
+        target_capture_sink=sink,
+    )
+    rows = torch.empty(0, 3)
+
+    _, aux = model.forward(torch.empty(0), torch.empty(0), idle, rows)
+
+    # Like the base model: an idle forward passes the draft no partial captures.
+    assert aux is None
+    assert sink.captures == []
+
+
+class _IdentityNorm:
+    weight = torch.empty(0, dtype=torch.bfloat16)
+
+    def __call__(self, values: torch.Tensor, out_dtype: torch.dtype) -> torch.Tensor:
+        return values.to(out_dtype)
+
+
+class _TwoRankGather:
+    """Rank 0 of two; the peer's owned rows are this rank's plus 100."""
+
+    def all_gather_owned_rows(
+        self, rows: torch.Tensor, global_rows: int, producer_writes_through: bool
+    ) -> torch.Tensor:
+        return torch.cat((rows, rows + 100))[:global_rows]
+
+
+def test_owned_row_taps_gather_full_rows() -> None:
+    model, sink, ctx = _tapping_model([0])
+    model.layers[0].input_layernorm = _IdentityNorm()
+    model.mapping = SimpleNamespace(attn=SimpleNamespace(tp_size=2, tp_rank=0))
+    model._can_use_owned_rows = lambda rows, ctx: True
+    model.iris_state = _TwoRankGather()
+    hidden = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+
+    _, aux = model.forward(torch.arange(4), torch.arange(4), ctx, hidden)
+
+    # Rank 0 owns rows 0-1; the capture holds every row, not just the owned ones.
+    owned = (hidden[:2] + 1.0).to(torch.bfloat16)
+    torch.testing.assert_close(aux[0], torch.cat((owned, owned + 100)), rtol=0, atol=0)
+    assert sink.captures[0][1] is aux[0]
 
 
 @requires_gpu
