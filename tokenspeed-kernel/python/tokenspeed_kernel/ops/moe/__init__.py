@@ -38,6 +38,7 @@ from tokenspeed_kernel.signature import (
 )
 
 __all__ = [
+    "route_quant_fp8",
     "bf16_moe_routes",
     "bf16_moe_routes_warmup",
     "gather_moe_routes",
@@ -154,7 +155,10 @@ def prepare_sm90_fp8_moe(
     Returns:
         A callable accepting FlashInfer's ``cutlass_fused_moe`` arguments and
         returning its output list. Private modes additionally accept a positive
-        uint32 ``expected_m`` or None. Callers compute that hint from their own
+        uint32 ``expected_m`` or None, and ``prepared_input`` from
+        ``route_quant_fp8``. Prepared input keeps both native expert GEMMs and
+        skips their input preparation; retain its storage through all consumers.
+        Callers compute the hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
         private modes require FlashInfer 0.7.2, Hopper, and a working JIT compiler.
     """
@@ -166,6 +170,8 @@ def prepare_sm90_fp8_moe(
         max_num_stages_fc2=max_num_stages_fc2,
     )
 
+
+from tokenspeed_kernel.ops.moe.route_quant import route_quant_fp8  # noqa: E402
 
 # ===-----------------------------------------------------------------------===#
 # Expert placement dispatch
