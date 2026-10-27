@@ -33,6 +33,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sync_peers,
     _iris_wait_lamport_peers,
 )
+from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 
 
 @gluon.jit
@@ -255,7 +256,7 @@ def iris_fused_lamport_allreduce_routed_rmsnorm_sum(
             sentinel, region, stage_base + peer * MAX_ELEMENTS + offsets, cache=".wt"
         )
     # Finish resetting the mailbox before advancing this tile's epoch.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
     gl.store(epochs + program, ((stage + 1) % 3).to(gl.int32))
 
 
@@ -301,5 +302,5 @@ def iris_routed_rmsnorm_weighted_sum_write_through(
         combined.to(gl.bfloat16), output, token * 4096 + columns, cache=".wt"
     )
     # Finish every subgroup's write-through stores before returning.
-    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
     gl.barrier()

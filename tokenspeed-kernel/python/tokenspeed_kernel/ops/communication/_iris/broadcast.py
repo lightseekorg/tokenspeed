@@ -27,6 +27,7 @@ from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_byte
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     iris_arch_policy,
 )
+from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 
 
 class IrisBroadcast:
@@ -184,7 +185,7 @@ def iris_lamport_broadcast(
                 pointers + BLOCK, (bits >> 16)[None, :], mask, cache_modifier=".wt"
             )
             # Every publishing subgroup must finish before the next tile/call.
-            WAIT_STORES(args=[], constraints="=r,~{memory}")
+            iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
             gl.barrier()
     else:
         layout: gl.constexpr = gl.BlockedLayout([1], [64], [SUBGROUPS], [0])
@@ -210,5 +211,5 @@ def iris_lamport_broadcast(
             gl.store(mailbox + offsets, sentinel, cache_modifier=".wt")
             gl.store(mailbox + BLOCK + offsets, sentinel, cache_modifier=".wt")
             # Finish clearing the full tile before a later receive can start.
-            WAIT_STORES(args=[], constraints="=r,~{memory}")
+            iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
             gl.barrier()

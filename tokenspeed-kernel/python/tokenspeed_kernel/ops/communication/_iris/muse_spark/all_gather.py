@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_peer_pointers,
     _iris_rendezvous,
 )
+from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 
 
 @gluon.jit
@@ -134,7 +135,7 @@ def iris_pull_allgather_moe_inputs(
         )
         + 1
     )
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     local_rows = gl.cdiv(rows, WORLD_SIZE)
@@ -174,7 +175,7 @@ def iris_pull_allgather_moe_inputs(
                 row * 32 + route_byte - 32,
                 valid & (route_byte >= 32) & (route_byte < 64),
             )
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,

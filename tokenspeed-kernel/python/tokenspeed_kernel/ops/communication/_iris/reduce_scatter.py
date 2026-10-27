@@ -26,6 +26,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_peer_pointers,
     _iris_rendezvous,
 )
+from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 
 
 @gluon.jit(do_not_specialize=["ROWS"])
@@ -92,7 +93,7 @@ def iris_pull_reduce_scatter(
             cache=".wt",
         )
     if EXIT_BARRIER:
-        WAIT_VMEM(args=[], constraints="=r,~{memory}")
+        iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
         gl.barrier()
         done = (
             gl.atomic_add(

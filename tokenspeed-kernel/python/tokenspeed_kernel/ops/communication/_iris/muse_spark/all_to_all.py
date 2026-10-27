@@ -31,6 +31,7 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_peer_pointers,
     _iris_rendezvous,
 )
+from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 
 
 @gluon.jit(do_not_specialize=["rows"])
@@ -83,7 +84,7 @@ def iris_a2a_transpose_qkvg(
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The output projection may immediately overwrite this buffer. Every reader
     # must finish before any rank returns to that producer on the main stream.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -207,7 +208,7 @@ def iris_fused_a2a_transpose_qkvg_norm_rope(
                 (copy_lanes >= KV_WIDTH) & (copy_lanes < (Q_WIDTH + KV_WIDTH)),
             )
     # All QKVG reads finish before the output projection reuses the producer buffer.
-    WAIT_VMEM(args=[], constraints="=r,~{memory}")
+    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
