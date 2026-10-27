@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.scheduler_bridge impor
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupDeclaration,
     CacheGroupSpec,
+    SlidingWindowTokens,
     group,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.storage import (
@@ -301,6 +302,16 @@ class CacheRecipe(ABC):
         )
 
     @property
+    def sliding_window_tokens(self) -> SlidingWindowTokens:
+        """Sliding-window sizes for :attr:`layer_types`: one value for every
+        sliding layer, or one entry per layer.
+
+        Returns the target config's windows, which the default per-layer
+        :meth:`groups` walk reads; recipes that append draft layers override it.
+        """
+        return self.attn_config.component(SoftmaxAttnConfig).sliding_window_tokens
+
+    @property
     def num_target_layers(self) -> int:
         """Leading layers that belong to the target model."""
         return self.model_config.num_attention_layers
@@ -375,9 +386,7 @@ class CacheRecipe(ABC):
         return group(
             layer_types=self.layer_types,
             group_ids=self.group_ids,
-            sliding_window_tokens=self.attn_config.component(
-                SoftmaxAttnConfig
-            ).sliding_window_tokens,
+            sliding_window_tokens=self.sliding_window_tokens,
             prefix_granularity=self.prefix_granularity,
             fields_for_layer=self.fields_for_layer,
             pd_disaggregation_enabled=self.pd_disaggregation_enabled,
