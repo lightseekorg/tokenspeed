@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Model-backend ReplaySSM dispatch, state ownership and accepted-path replay."""
+"""NVIDIA CuTe ReplaySSM dispatch, state ownership and accepted-path replay."""
 
 import json
 import sys
@@ -36,7 +36,12 @@ sys.path.insert(0, str(_TEST_DIR))
 sys.path.insert(0, str(_TEST_DIR.parent))
 from ci_system.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, suite="runtime-1gpu")
+register_cuda_ci(
+    est_time=45,
+    suite="runtime-1gpu",
+    disabled_on_runners=["amd-*"],
+    disabled_on_runners_reason="CuTe GDN requires NVIDIA SM90+",
+)
 
 if not torch.cuda.is_available() or not current_platform().is_hopper_plus:
     pytest.skip("CuTe GDN requires NVIDIA SM90+", allow_module_level=True)
