@@ -3562,9 +3562,9 @@ protected:
     }
 };
 
-// Validate refuses write-back on the fused role.
 INSTANTIATE_TEST_SUITE_P(HostWritePolicies, PrefillsHoldingTheDeviceSuite,
-                         ::testing::Values(SchedulerConfig::HostWritePolicy::kWriteThrough));
+                         ::testing::Values(SchedulerConfig::HostWritePolicy::kWriteThrough,
+                                           SchedulerConfig::HostWritePolicy::kWriteBack));
 
 // h, the head of line, blocks on its own next chunk and, as the largest
 // incomplete prefill, is the victim. Its admission is the only one that
@@ -3675,9 +3675,9 @@ protected:
     }
 };
 
-// Validate refuses write-back on the fused role.
 INSTANTIATE_TEST_SUITE_P(HostWritePolicies, DecodesFillingTheBatchSuite,
-                         ::testing::Values(SchedulerConfig::HostWritePolicy::kWriteThrough));
+                         ::testing::Values(SchedulerConfig::HostWritePolicy::kWriteThrough,
+                                           SchedulerConfig::HostWritePolicy::kWriteBack));
 
 // d1 blocks on its next page while e1-e4 fill the batch, so the prefill
 // phases never run: the full batch, not the head-of-line rule, leaves p out,

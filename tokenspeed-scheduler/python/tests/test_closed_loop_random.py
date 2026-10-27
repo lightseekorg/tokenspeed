@@ -30,9 +30,9 @@ scheduler must never raise. The D-role tail hit inside a prompt's last block
 of a sliding-window group was found this way.
 
 The fused and P roles also run with a Host L2: under the write-through
-policy, which stores what is published, and on the P role under the
-write-back policy, which copies what an admission evicts to the Host in the
-same plan (without the sliding-window group, which write-back refuses).
+policy, which stores what is published, and under the write-back policy,
+which copies what an admission or a restore evicts to the Host in the same
+plan (without the sliding-window group, which write-back refuses).
 The P role also runs with the history group's pages dealt over two and four
 KV-parallel shards under write-back, and over two under write-through. Every
 Host op is acknowledged zero to three plans late, out of order and now and
@@ -42,13 +42,16 @@ under either policy, once everything is acknowledged no Host entry is pinned
 and nothing is in flight. These rows declare the cache groups in a random
 order, as K3 declares a State group before its history group.
 
-The fused role under write-through also runs with a snapshot pool, retracting
-its oldest decode or prefill every third plan, each image's Host leg planned
-before anything is evicted for it. That pool is too small for some of the
-images the knob takes, so those are refused, and image_refused must stay 0
-after every plan: a refused image is refused by its plan, before the Host
-leg is taken. These rows exercise the planned Host placement, its ACKs and
-the restores under churn.
+The fused role also runs with a snapshot pool, retracting its oldest decode
+or prefill every third plan, each image's Host leg planned before anything is
+evicted for it. That pool is too small for some of the images the knob takes,
+so those are refused, and image_refused must stay 0 after every plan: a
+refused image is refused by its plan, before the Host leg is taken. These rows
+exercise the planned Host placement, its ACKs and the restores under churn.
+Under write-back they run with and without mixed batches, at one and two
+shards, and abort a live request now and then -- before its admission, while
+it runs, or while it waits to be restored -- from a second random stream, so
+the other rows draw as they always did.
 """
 
 from __future__ import annotations
@@ -76,6 +79,7 @@ def _config(
     num_snapshot_pages: int,
     max_retracted_requests: int,
     force_retraction_interval: int,
+    mixed: bool,
 ) -> "ts.SchedulerConfig":
     cfg = ts.SchedulerConfig()
     cfg.prefix_granularity = P
@@ -93,6 +97,7 @@ def _config(
     cfg.disable_prefix_cache = False
     cfg.decode_input_tokens = 1
     cfg.overlap_schedule_depth = 1
+    cfg.enable_mixed_prefill_decode = mixed
     cfg.role = role
     groups = [
         ts.CacheGroupConfig(
@@ -149,9 +154,16 @@ class _Loop:
         num_snapshot_pages: int,
         max_retracted_requests: int,
         force_retraction_interval: int,
+        mixed: bool,
+        inject_aborts: bool,
         shuffle_groups: bool,
     ):
         self.rng = random.Random(seed)
+        # Mid-run aborts draw from their own stream.
+        self.abort_rng: random.Random | None = (
+            random.Random(seed + 1) if inject_aborts else None
+        )
+        self.aborts = 0
         self.role = role
         self.kv_shards = kv_shards
         self.uses_write_back = policy == ts.SchedulerConfig.HostWritePolicy.WriteBack
@@ -169,6 +181,7 @@ class _Loop:
             num_snapshot_pages=num_snapshot_pages,
             max_retracted_requests=max_retracted_requests,
             force_retraction_interval=force_retraction_interval,
+            mixed=mixed,
         )
         if shuffle_groups:
             # The declaration order draws from its own stream, so a seed
@@ -374,6 +387,19 @@ class _Loop:
             self.pending.append(plan)
             if self.remote or self.prefill_only:
                 self.peer(plan)
+            if self.abort_rng is not None:
+                # One in twenty rounds, and from mid-run on until one is aborted.
+                abortable = sorted(r for r, s in self.live.items() if not s["finished"])
+                if abortable and (
+                    self.abort_rng.random() < 0.05
+                    or (self.aborts == 0 and self.round >= rounds // 2)
+                ):
+                    request_id = self.abort_rng.choice(abortable)
+                    events = ts.ExecutionEvent()
+                    events.add_event(_event("Abort", request_id))
+                    self.scheduler.advance(events)
+                    del self.live[request_id]
+                    self.aborts += 1
             if len(self.pending) > 1:
                 self.land(self.pending.pop(0))
             if self.rng.random() < 0.1:
@@ -405,26 +431,35 @@ def test_random_closed_loop_never_raises(role: str, seed: int) -> None:
         num_snapshot_pages=1,
         max_retracted_requests=0,
         force_retraction_interval=0,
+        mixed=False,
+        inject_aborts=False,
         shuffle_groups=False,
     ).run(ROUNDS)
 
 
-# Write-back runs on the P role alone; write-through on both roles that
-# compute prompts. The P role also shards its history group; the fused role
-# also retracts every third plan, a decode (3) or a prefill (-3), into a
-# snapshot pool too small for some of the images the knob takes.
+# Both write policies on both roles that compute prompts. The P role also
+# shards its history group; the fused role also retracts every third plan, a
+# decode (3) or a prefill (-3), into a snapshot pool too small for some of the
+# images the knob takes. Under write-back it does so with and without mixed
+# batches, at one and two shards, aborting now and then.
 @pytest.mark.parametrize(
     "policy, role, kv_shards, num_snapshot_pages, max_retracted_requests, "
-    "force_retraction_interval",
+    "force_retraction_interval, mixed, inject_aborts",
     [
-        ("WriteBack", "P", 1, 1, 0, 0),
-        ("WriteBack", "P", 2, 1, 0, 0),
-        ("WriteBack", "P", 4, 1, 0, 0),
-        ("WriteThrough", "P", 1, 1, 0, 0),
-        ("WriteThrough", "P", 2, 1, 0, 0),
-        ("WriteThrough", "Fused", 1, 1, 0, 0),
-        ("WriteThrough", "Fused", 1, 17, 2, 3),
-        ("WriteThrough", "Fused", 1, 17, 2, -3),
+        ("WriteBack", "P", 1, 1, 0, 0, False, False),
+        ("WriteBack", "P", 2, 1, 0, 0, False, False),
+        ("WriteBack", "P", 4, 1, 0, 0, False, False),
+        ("WriteThrough", "P", 1, 1, 0, 0, False, False),
+        ("WriteThrough", "P", 2, 1, 0, 0, False, False),
+        ("WriteThrough", "Fused", 1, 1, 0, 0, False, False),
+        ("WriteThrough", "Fused", 1, 17, 2, 3, False, False),
+        ("WriteThrough", "Fused", 1, 17, 2, -3, False, False),
+        *[
+            ("WriteBack", "Fused", kv_shards, 17, 2, interval, mixed, True)
+            for interval in (3, -3)
+            for mixed in (False, True)
+            for kv_shards in (1, 2)
+        ],
     ],
 )
 @pytest.mark.parametrize("host_pages", [9, 17, 33])
@@ -436,6 +471,8 @@ def test_random_host_acks_leave_nothing_in_flight(
     num_snapshot_pages: int,
     max_retracted_requests: int,
     force_retraction_interval: int,
+    mixed: bool,
+    inject_aborts: bool,
     host_pages: int,
     seed: int,
 ) -> None:
@@ -448,6 +485,8 @@ def test_random_host_acks_leave_nothing_in_flight(
         num_snapshot_pages=num_snapshot_pages,
         max_retracted_requests=max_retracted_requests,
         force_retraction_interval=force_retraction_interval,
+        mixed=mixed,
+        inject_aborts=inject_aborts,
         shuffle_groups=True,
     )
     loop.run(ROUNDS)
@@ -487,3 +526,9 @@ def test_random_host_acks_leave_nothing_in_flight(
     assert loop.scheduler.host_pool_pinned_blocks() == 0
     # No copy is in flight: a cache flush could go ahead.
     assert loop.scheduler.can_clear_cache()
+    if inject_aborts:
+        stats = loop.scheduler.host_cache_stats()
+        assert stats.eviction_stores.ops > 0
+        assert stats.retraction_stores.ops > 0
+        assert stats.restore_loads.ops > 0
+        assert loop.aborts > 0

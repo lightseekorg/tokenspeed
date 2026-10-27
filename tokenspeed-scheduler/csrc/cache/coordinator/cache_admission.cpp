@@ -270,10 +270,12 @@ public:
                 // Post-order: a node after the nodes under it, its own entries
                 // in NodeEntries order. It completes the climbed nodes in climb
                 // order. A child the Device does not hold has nothing on the
-                // Device under it when the model has a prefix-closed group (the
-                // Device's coverage is closed from the root), so the walk skips
-                // the Host's subtrees; without one, what such a child keeps
-                // under it on the Device needs none of these pages either.
+                // Device under it when the model has a prefix-closed group
+                // (eviction keeps the Device's coverage closed from the root),
+                // so the walk skips the Host's subtrees; without one, what such
+                // a child keeps under it on the Device needs none of these pages
+                // either. A page a restore republished below such a child stays
+                // and leaves later as a segment of its own.
                 struct Frame {
                     const BoundaryTree::Node* node;
                     const BoundaryTree::Node* next_child;

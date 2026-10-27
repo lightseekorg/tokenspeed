@@ -81,9 +81,8 @@ void SchedulerConfig::Validate() const {
     if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
         throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
     }
-    // Write-back is the P role's alone for now, with no L3 staging through
-    // the Host. It needs no KV-parallel check: each Host block takes its
-    // Device block's bucket (docs/design/scheduler.md §5).
+    // Write-back needs no KV-parallel check: each Host block takes its Device
+    // block's bucket (docs/design/scheduler.md §5).
     //
     // No sliding-window group yet. Such a group takes Device copies (a hit's
     // private copy of a tail block) as a full-attention group does, and the
@@ -95,8 +94,10 @@ void SchedulerConfig::Validate() const {
         if (!HasHostCache()) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
         }
-        if (role != Role::kP) {
-            throw std::invalid_argument("Scheduler: host_write_policy WriteBack is available on the P role only");
+        if (role == Role::kD) {
+            throw std::invalid_argument(
+                "Scheduler: host_write_policy WriteBack is not available on the D role: its Host holds retraction "
+                "images only and remote admission probes the Device alone");
         }
         if (enable_l3_storage) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");

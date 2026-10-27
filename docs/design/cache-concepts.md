@@ -915,10 +915,10 @@ Its responsibilities:
   tier and has no default to fall back on. Under `kWriteThrough`, Device
   prefix publication streams to the Host tier
   (`stream_device_cache_to_host_`) on the fused and P roles; the D role's
-  Host tier holds retraction images only. Under `kWriteBack` (the P role
-  only, no sliding-window group, at most 64 groups, no L3: `Validate`)
-  nothing streams at publication; what an admission evicts is written back
-  instead (below).
+  Host tier holds retraction images only. Under `kWriteBack` (not on the D
+  role, no sliding-window group, at most 64 groups, no L3: `Validate`)
+  nothing streams at publication; what an admission or a restore evicts is
+  written back instead (below).
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
   alongside Host-side acquire/contains/pin queries. Host L2 uses free
   capacity first, then global LRU across cache groups: a compatible child in
@@ -985,16 +985,16 @@ Its responsibilities:
   dropped, and so is a block no probe could resume from on the Host
   (`DeadEntriesNotWrittenBack`). A record holds its tree node, tail hint and
   Host presence until its segment settles, and a block the Host holds already
-  rides as that entry, never copied again. The invariants: the Device's
-  coverage stays closed from the root and a segment is never split; the plan
-  that evicts drains its segments right after the build
-  (`TierTransferManager::StartEvictionStores`), as one stream-ordered copy
-  the runtime orders ahead of the plan's reuse of those pages, and no record
-  outlives its plan; segments that depend on each other are placed together;
-  and a segment publishes whole, at the last ACK it waits for, with its
-  Device metadata, or not at all (`SettleEvictedSegment`, which also drops
-  what a cap or the loss of every checkpoint boundary under it made dead
-  meanwhile).
+  rides as that entry, never copied again. The invariants: eviction keeps the
+  Device's coverage closed from the root (a restore can open it, below) and a
+  segment is never split; the plan that evicts drains its segments right
+  after the build (`TierTransferManager::StartEvictionStores`), as one
+  stream-ordered copy the runtime orders ahead of the plan's reuse of those
+  pages, and no record outlives its plan; segments that depend on each other
+  are placed together; and a segment publishes whole, at the last ACK it
+  waits for, with its Device metadata, or not at all (`SettleEvictedSegment`,
+  which also drops what a cap or the loss of every checkpoint boundary under
+  it made dead meanwhile).
   A superseded input (above) an admission or a restore evicts is dropped, as
   the reclaim of the request that superseded it.
   Write-through's publication and finish stores and L3 prefetches take Host
@@ -1169,9 +1169,16 @@ L2: the segment plan (`AcquireHostSegments`) and the boundary plan
 
 A victim set is the candidate block alone unless the coordinator evicts by
 *segments* (`write_back_evictions`, the Host write-back policy). Then the set
-follows the `BoundaryTree`, so the Device's coverage stays closed from the
-root — no Device page outlives its parent — and what leaves is a checkpoint
-boundary with the pages only it depends on, which can be written back:
+follows the `BoundaryTree`, so eviction keeps the Device's coverage closed
+from the root — no Device page outlives its parent — and what leaves is a
+checkpoint boundary with the pages only it depends on, which can be written
+back. A restore can open that coverage: it republishes the slots it copies
+back from Host L2 entries, but a slot the image kept in the snapshot pool
+carries no key and stays the resumed request's own, so a page the image found
+on the Host already can return to the index below ancestors the pool kept.
+The walk skips what the Device does not hold, so such a page does not leave
+with the pages above it; it leaves later as a segment of its own, costing
+Device room and hits, never correctness. The victim sets:
 
 * a request's released slots take the other released slots at their hash
   (and, at a tail, the tail's other unpinned blocks); a sliding window's block,

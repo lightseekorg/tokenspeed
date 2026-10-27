@@ -278,3 +278,90 @@ def test_finish_while_retracted_releases_the_pins_at_the_acks() -> None:
     assert scheduler.host_pool_pinned_blocks() == 0
     assert scheduler.snapshot_pool_free_blocks() == 8
     assert scheduler.decoding_size() == 3
+
+
+def test_under_write_back_the_image_copies_every_published_slot() -> None:
+    """Under the write-back policy nothing streams at publication, so a's
+    image copies every published slot to the Host itself -- none is a Host
+    entry already. Its restore needs pages the finished requests left as
+    Device cache: the plan that restores a writes them back, the store
+    listed ahead of the restore."""
+    cfg = _make_config()
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteBack
+    scheduler = ts.Scheduler(cfg)
+    request_ids = ("a", "b", "c", "d")
+    scheduler.submit_requests(
+        [_spec("a", [1, 2, 3, 4, 5])]
+        + [
+            _spec(r, [100 * i + 1, 100 * i + 2])
+            for i, r in enumerate(request_ids[1:], 1)
+        ]
+    )
+    prefill_plan = scheduler.next_execution_plan()
+    host_rows: dict[str, int] = {}
+    assert not _ops(prefill_plan, ts.Cache.WriteBackOp)
+    for index, request_id in enumerate(request_ids):
+        _advance(scheduler, request_id, [1000 + index])
+
+    a_row: list[int] = []
+    next_token = 2000
+    for _ in range(16):
+        plan = scheduler.next_execution_plan()
+        op = _find_forward_op(plan)
+        scheduled = () if op is None else tuple(op.request_ids)
+        if _ops(plan, ts.Cache.SnapshotOp):
+            break
+        if "a" in scheduled:
+            a_row = list(dict(op.block_tables)["full"][scheduled.index("a")])
+        _ack_write_backs(scheduler, plan, host_rows)
+        for request_id in scheduled:
+            _advance(scheduler, request_id, [next_token])
+            next_token += 1
+    else:
+        pytest.fail("decode growth never retracted a request")
+
+    [snapshot] = _ops(plan, ts.Cache.SnapshotOp)
+    [write_back] = _ops(plan, ts.Cache.WriteBackOp)
+    assert list(write_back.source_pinned) == [False]
+    [stored_pages] = write_back.src_pages
+    assert sorted(stored_pages) == sorted(a_row)
+    stats = scheduler.host_cache_stats()
+    assert stats.retraction_stores.ops == 1
+    assert list(stats.retraction_stores.blocks) == [5]
+    assert stats.retraction_stores.host_cached == 0
+    assert stats.retraction_stores.in_flight == 0
+
+    for request_id in scheduled:
+        _advance(scheduler, request_id, [next_token])
+        next_token += 1
+    _ack_write_backs(scheduler, plan, host_rows)
+    done = ts.Cache.SnapshotDoneEvent()
+    done.op_id = int(snapshot.op_ids[0])
+    _ack(scheduler, done)
+    for request_id in ("b", "c", "d"):
+        _finish(scheduler, request_id)
+
+    for _ in range(4):
+        before = scheduler.host_cache_stats()
+        plan = scheduler.next_execution_plan()
+        if _ops(plan, ts.Cache.RestoreOp):
+            break
+        _ack_write_backs(scheduler, plan, host_rows)
+    else:
+        pytest.fail("a was never restored")
+    after = scheduler.host_cache_stats()
+    assert list(_ops(plan, ts.Cache.RestoreOp)[0].request_ids) == ["a"]
+    assert (
+        after.device_evictions.restore.blocks > before.device_evictions.restore.blocks
+    )
+    assert after.eviction_stores.ops == before.eviction_stores.ops + 1
+    kinds = [type(op) for op in plan.cache]
+    assert kinds.index(ts.Cache.WriteBackOp) < kinds.index(ts.Cache.RestoreOp)
+    _ack_write_backs(scheduler, plan, host_rows)
+    [restore] = _ops(plan, ts.Cache.RestoreOp)
+    restored = ts.Cache.RestoreDoneEvent()
+    restored.op_id = int(restore.op_ids[0])
+    _ack(scheduler, restored)
+    assert scheduler.retracted_size() == 0
+    assert scheduler.decoding_size() == 1
+    assert scheduler.host_pool_pinned_blocks() == 0

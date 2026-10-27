@@ -1019,7 +1019,8 @@ private:
     bool stream_device_cache_to_host_{false};
     // An admission or a restore evicts Device cache by segments: a checkpoint
     // boundary with the pages only it depends on and everything under them, so
-    // the Device's coverage stays closed from the root; records what its cache
+    // eviction keeps the Device's coverage closed from the root (a restore's
+    // republication can open it: cache-concepts.md); records what its cache
     // victims leave behind for this plan's write-back drain; and the dead
     // prefix entries either tier is left with are collected.
     bool write_back_evictions_{false};

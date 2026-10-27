@@ -67,8 +67,8 @@ struct SchedulerConfig {
     //   kWriteThrough  published entries stream to Host at chunk ends, the
     //                  prompt end and finish.
     //   kWriteBack     nothing streams at publication: what an admission
-    //                  evicts is written back to Host in the same plan, by
-    //                  whole segments.
+    //                  or a restore evicts is written back to Host in the
+    //                  same plan, by whole segments.
     enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
     HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
 

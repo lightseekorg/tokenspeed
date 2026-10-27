@@ -186,6 +186,8 @@ def test_host_write_policy_round_trips():
             block_granularity=16,
             total_pages=64,
             attn_kind=ts.AttnKind.Full,
+            # The D role below requires it.
+            transfer_policy=ts.CacheTransferPolicy.FullSuffix,
         )
     ]
     # Unset: what feeds Host L2 is a behavioural choice, not a default.
@@ -194,8 +196,13 @@ def test_host_write_policy_round_trips():
         ts.Scheduler(cfg)
     cfg.host_write_policy = policy.WriteBack
     assert cfg.host_write_policy == policy.WriteBack
-    with pytest.raises(ValueError, match="host_write_policy WriteBack"):
+    assert ts.Scheduler(cfg).host_pool_total_blocks() == 8
+    cfg.role = ts.SchedulerConfig.Role.D
+    with pytest.raises(
+        ValueError, match="host_write_policy WriteBack is not available on the D role"
+    ):
         ts.Scheduler(cfg)
+    cfg.role = ts.SchedulerConfig.Role.Fused
     cfg.host_write_policy = policy.WriteThrough
     assert cfg.host_write_policy == policy.WriteThrough
     assert ts.Scheduler(cfg).host_pool_total_blocks() == 8

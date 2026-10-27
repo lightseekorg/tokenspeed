@@ -806,11 +806,12 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
     }
 }
 
-// Write-back is the P role's alone for now (which parallel layouts run it is
-// the runtime's to decide): it needs a Host tier, takes a sharded group, and
-// refuses the other roles, L3, a sliding-window group and more groups than the
-// 64 bits that mark a hash's written-back groups.
-TEST(SchedulerConfigValidateTest, WriteBackOnlyOnThePrefillRole) {
+// Write-back runs on every role but D (which parallel layouts run it is the
+// runtime's to decide): it needs a Host tier, takes a sharded group and the
+// fused role's snapshot pool, and refuses the D role, L3, a sliding-window
+// group and more groups than the 64 bits that mark a hash's written-back
+// groups.
+TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     const auto prefill = [] {
         SchedulerConfig config = MakeValidConfig();
         config.role = Role::kP;
@@ -827,13 +828,16 @@ TEST(SchedulerConfigValidateTest, WriteBackOnlyOnThePrefillRole) {
     SchedulerConfig disabled_host = prefill();
     disabled_host.disable_l2_cache = true;
     ExpectRejectedNamingGroup(disabled_host, "requires a Host L2 cache");
-    for (const Role role : {Role::kFused, Role::kD}) {
-        SCOPED_TRACE(static_cast<int>(role));
-        SchedulerConfig other_role = prefill();
-        other_role.role = role;
-        SetTestSnapshotPool(other_role);
-        ExpectRejectedNamingGroup(other_role, "on the P role only");
-    }
+    SchedulerConfig fused = prefill();
+    fused.role = Role::kFused;
+    SetTestSnapshotPool(fused);
+    ASSERT_TRUE(fused.HasSnapshotPool());
+    EXPECT_NO_THROW(fused.Validate());
+    EXPECT_NO_THROW(Scheduler{fused});
+    SchedulerConfig decode = prefill();
+    decode.role = Role::kD;
+    SetTestSnapshotPool(decode);
+    ExpectRejectedNamingGroup(decode, "not available on the D role");
     SchedulerConfig l3 = prefill();
     l3.enable_l3_storage = true;
     l3.storage_config = StorageConfig{4, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};

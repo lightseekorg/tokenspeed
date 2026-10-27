@@ -849,22 +849,23 @@ state (§1.2) — and releases request ownership; cached entries remain subject
 to normal eviction.
 
 **Host L2: write-back.** With `host_write_policy` `kWriteBack`
-(`--kvstore-write-policy write_back`; this role only, no sliding-window group,
-no L3, and in the runtime one pipeline stage and no query shard) nothing
-streams to the Host at publication. Instead what an admission evicts for the
-cache leaves by whole segments and is written back in the same plan, by the
-drain right after the build (one stream-ordered op, §2); how a segment is
-recorded, placed, published or dropped is in [Cache
+(`--kvstore-write-policy write_back`; this role or the fused one (§3.3), no
+sliding-window group, no L3, and in the runtime one pipeline stage and no
+query shard) nothing streams to the Host at publication. Instead what an
+admission evicts for the cache leaves by whole segments and is written back in
+the same plan, by the drain right after the build (one stream-ordered op, §2);
+how a segment is recorded, placed, published or dropped is in [Cache
 concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator). Every
 attention-TP rank of the replica runs the same plan and copies the rows it
 owns, each Host block in its Device block's bucket (§5, "Every tier transfer
 pairs blocks of equal residue"), and each round's head hands the scheduler
 only the ACKs every rank holds (`CacheOps::acknowledged`, `event-loop.md`), a
 rank that owns none of an op's rows included. Nothing depends on an ACK
-arriving before the next plan is built. So the two tiers together hold
-distinct content up to about the sum of their capacities, less pinned and
-in-flight blocks, where write-through keeps on the Host a copy of what the
-Device holds.
+arriving before the next plan is built, so it can land several plans later: at
+overlap depth 1, or across a rank's idle rounds under attention DP. So the two
+tiers together hold distinct content up to about the sum of their capacities,
+less pinned and in-flight blocks, where write-through keeps on the Host a copy
+of what the Device holds.
 
 **Retraction: none.** A P node's pressure valve is the transfer itself — pages
 are pinned until the peer acknowledges, then released wholesale. Retracting a
@@ -976,6 +977,28 @@ travels as pinned L2 entries and only the unpublished slots go to the snapshot
 pool; without L2 the whole image goes to the pool.
 Either way the request resumes where it stopped, and never competes for
 admission as a newcomer.
+
+**Host L2: write-back.** With `host_write_policy` `kWriteBack` this role
+writes back as the P role does (§3.1): nothing streams to the Host at a
+publication — the prompt end at the first decode, each page a decode
+completes, the finish, a retraction — and what an admission or a restore
+evicts for the cache leaves by whole segments, copied to the Host in the plan
+that evicts it. A mixed batch's admissions and decode steps share the one
+drain after the build. A segment's ACK can also land after a plan that only
+restores (§4). A retraction image's L2 leg takes the published slots not on
+the Host already as §2 plans them (whole segments first), and the snapshot
+pool the rest. The fused role adds three shapes to what the P role sees:
+
+- A decoding request holds the KV pages under its prompt end, so when the
+  prompt ends on a page boundary that checkpoint boundary's segment can leave
+  the Device only after the request finishes.
+- A turn that decoded leaves two checkpoint boundaries, its prompt end and
+  its finish; the next turn continues from one of them, and the other, once
+  evicted, is written back like any other cache.
+- An eviction in a plan that only decodes is written back on that plan's
+  ordered stream ahead of its forward, unthrottled: the evicted pages are
+  not pinned, the forward reuses them, so the copy cannot wait for a later
+  plan.
 
 ## 4. Suspend and resume
 
