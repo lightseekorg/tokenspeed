@@ -39,8 +39,10 @@ Keep an explicit `gl.barrier()` only where the compiler cannot see the hazard:
   orders in a comment.
 
 Use `wait_vmem()` to wait for a subgroup's vector memory operations to
-complete. Keep workgroup barriers where all producer subgroups must finish
-before signaling completion, or all consumers must wait before reading data.
+complete, or `wait_stores()` for only its stores on targets that count them
+separately, such as gfx1250. Keep workgroup barriers where all producer
+subgroups must finish before signaling completion, or all consumers must wait
+before reading data.
 
 ## GEMM
 

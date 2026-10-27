@@ -40,3 +40,20 @@ def wait_vmem(args, constraints: gl.constexpr):
         is_pure=False,
         pack=1,
     )
+
+
+@gluon.jit
+def wait_stores(args, constraints: gl.constexpr):
+    """Wait for this subgroup's vector stores and non-returning atomics.
+
+    For targets that count stores separately (STOREcnt), such as gfx1250.
+    ``args`` and ``constraints`` specify the assembly's compiler dependencies.
+    """
+    gl.inline_asm_elementwise(
+        asm="s_wait_storecnt 0x0",
+        constraints=constraints,
+        args=args,
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )

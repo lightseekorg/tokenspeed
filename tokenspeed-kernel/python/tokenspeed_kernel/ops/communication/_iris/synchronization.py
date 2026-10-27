@@ -25,7 +25,7 @@
 ``args`` and ``constraints`` specify each wait's compiler dependencies. Callers
 handle workgroup synchronization, cache writeback/invalidation, and
 system-scope ordering. tokenspeed_kernel_amd._synchronization carries the same
-VMcnt wait for the AMD package's kernels; change both together.
+VMcnt and store waits for the AMD package's kernels; change both together.
 """
 
 from tokenspeed_kernel._triton import gl, gluon
