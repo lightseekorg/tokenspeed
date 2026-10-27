@@ -433,6 +433,7 @@ def triton_nvidia_kda_fused_paged_verify_split(
             A_log,
             dt_bias,
             checkpoint_state=state_pool[:, :num_heads],
+            retained_history=None,
             correction_cache=replay_records.correction,
             kg_cache=replay_records.key_gate,
             query_start_loc=replay_records.query_start_loc,

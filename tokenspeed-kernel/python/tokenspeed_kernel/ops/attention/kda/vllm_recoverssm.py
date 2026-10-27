@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.ops.attention.kda import KdaRetainedHistory
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -31,12 +32,70 @@ from tokenspeed_kernel.thirdparty.vllm_recoverssm.kda import (
     NULL_BLOCK_ID,
     _commit_kda_state_kernel,
     _prepare_commit_plan_kernel,
+    _publish_kda_history_kernel,
     kda_recoverssm_verify,
 )
 
 _DENSE_HALF_SIGNATURES = format_signatures(
     ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
 )
+
+
+def _validate_retained_request(
+    history: KdaRetainedHistory,
+    checkpoint_state: torch.Tensor,
+    state_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    spec_query_len: int,
+    record_metadata: torch.Tensor | None,
+    record_stamps: torch.Tensor | None,
+) -> None:
+    """Check request inputs against validated storage without reading GPU values."""
+    pages, heads, _, values = history.correction.shape
+    if (
+        checkpoint_state.shape != (pages, heads, values, history.key.shape[3])
+        or checkpoint_state.dtype != torch.float32
+    ):
+        raise ValueError("retained FP32 checkpoint must match the history geometry")
+    if history.live_state_indices.shape != state_indices.shape:
+        raise ValueError(
+            "retained source and live indices must have one entry per request"
+        )
+    if query_start_loc.shape != (state_indices.numel() + 1,):
+        raise ValueError("retained query offsets must contain one boundary per request")
+    if any(
+        x.dtype not in (torch.int32, torch.int64)
+        for x in (state_indices, query_start_loc)
+    ):
+        raise ValueError("retained indices and query offsets must use integer storage")
+    if any(
+        x.device != checkpoint_state.device
+        for x in (history.correction, state_indices, query_start_loc)
+    ):
+        raise ValueError("retained history must be on the checkpoint device")
+    if spec_query_len <= 0:
+        raise ValueError("retained speculative window must be positive")
+    if (record_metadata is None) != (record_stamps is None):
+        raise ValueError("record metadata and stamps must be supplied together")
+    if record_metadata is not None:
+        if (
+            record_metadata.shape != (state_indices.numel(), 3)
+            or record_stamps.ndim != 3
+            or record_stamps.shape[2] != 2
+            or record_stamps.shape[1] < spec_query_len
+        ):
+            raise ValueError(
+                "retained stamps need independent [slots, capacity, 2] storage covering the window"
+            )
+        if any(
+            x.dtype != torch.int64
+            or not x.is_contiguous()
+            or x.device != checkpoint_state.device
+            for x in (record_metadata, record_stamps)
+        ):
+            raise ValueError(
+                "record metadata must be contiguous INT64 on the checkpoint device"
+            )
 
 
 def _use_tensor_cores_for_commit(
@@ -75,8 +134,9 @@ def vllm_triton_kda_recoverssm_verify(
     dt_bias: torch.Tensor,
     *,
     checkpoint_state: torch.Tensor,
-    correction_cache: torch.Tensor,
-    kg_cache: torch.Tensor,
+    correction_cache: torch.Tensor | None,
+    kg_cache: torch.Tensor | None,
+    retained_history: KdaRetainedHistory | None,
     query_start_loc: torch.Tensor,
     state_indices: torch.Tensor,
     spec_query_len: int,
@@ -103,8 +163,27 @@ def vllm_triton_kda_recoverssm_verify(
     Records use position % capacity; verify stamps each written candidate.
     Both may be None only for standalone unstamped kernel diagnostics.
 
-    Return out after writing verify results. The checkpoint is unchanged.
+    retained_history selects page-owned FP32 U/normalized-K/decay records;
+    raw caches must then be None. Its live pages are private unique destinations
+    and cannot alias another active source. Source pages may be shared read-only.
+    A nonempty verify consolidates accepted history into the live dense base
+    when source differs from live or accepted length plus actual window exceeds
+    capacity. Verify appends candidates without publishing their length.
+
+    Return out after writing verify results and candidate records.
     """
+    if retained_history is not None:
+        if correction_cache is not None or kg_cache is not None:
+            raise ValueError("retained history does not accept raw recovery caches")
+        _validate_retained_request(
+            retained_history,
+            checkpoint_state,
+            state_indices,
+            query_start_loc,
+            spec_query_len,
+            record_metadata,
+            record_stamps,
+        )
     return kda_recoverssm_verify(
         q,
         k,
@@ -123,6 +202,7 @@ def vllm_triton_kda_recoverssm_verify(
         out=out,
         record_metadata=record_metadata,
         record_stamps=record_stamps,
+        retained_history=retained_history,
     )
 
 
@@ -146,22 +226,23 @@ def vllm_triton_kda_recoverssm_commit(
     v: torch.Tensor,
     *,
     checkpoint_state: torch.Tensor,
-    correction_cache: torch.Tensor,
-    kg_cache: torch.Tensor,
+    correction_cache: torch.Tensor | None,
+    kg_cache: torch.Tensor | None,
+    retained_history: KdaRetainedHistory | None,
     state_indices: torch.Tensor,
     query_start_loc: torch.Tensor,
     num_accepted_tokens: torch.Tensor,
-    commit_lens: torch.Tensor,
-    final_state_indices: torch.Tensor,
-    boundary_state_indices: torch.Tensor,
-    boundary_recovery_lens: torch.Tensor,
-    state_base_addrs: torch.Tensor,
-    correction_cache_base_addrs: torch.Tensor,
-    kg_cache_base_addrs: torch.Tensor,
+    commit_lens: torch.Tensor | None,
+    final_state_indices: torch.Tensor | None,
+    boundary_state_indices: torch.Tensor | None,
+    boundary_recovery_lens: torch.Tensor | None,
+    state_base_addrs: torch.Tensor | None,
+    correction_cache_base_addrs: torch.Tensor | None,
+    kg_cache_base_addrs: torch.Tensor | None,
     spec_query_len: int,
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
-    gate_parameters: tuple[torch.Tensor, torch.Tensor, float | None],
+    gate_parameters: tuple[torch.Tensor, torch.Tensor, float | None] | None,
 ) -> None:
     """Commit one layer's accepted FP32 U and activation-dtype K/raw-gate records.
 
@@ -190,10 +271,74 @@ def vllm_triton_kda_recoverssm_commit(
     caller-owned buffers.
     The configured window and head dimensions select CUDA-core or TF32x3
     Tensor Core recovery. Accepted lengths stay runtime GPU inputs.
-    Return None after updating checkpoint_state.
+    retained_history selects length-only publication after verify. Pass None
+    for raw caches, planner buffers, address tables, and gate_parameters in that
+    path. It validates accepted candidate stamps, then publishes L+A on the
+    live page, without copying records or changing the dense base.
+    Return None after updating checkpoint_state or publishing retained length.
     """
     del q, k, v
     batch = state_indices.shape[0]
+    if retained_history is not None:
+        if any(
+            x is not None
+            for x in (
+                correction_cache,
+                kg_cache,
+                commit_lens,
+                final_state_indices,
+                boundary_state_indices,
+                boundary_recovery_lens,
+                state_base_addrs,
+                correction_cache_base_addrs,
+                kg_cache_base_addrs,
+                gate_parameters,
+            )
+        ):
+            raise ValueError(
+                "retained publication does not accept raw caches, planner buffers, address tables, or gate parameters"
+            )
+        _validate_retained_request(
+            retained_history,
+            checkpoint_state,
+            state_indices,
+            query_start_loc,
+            spec_query_len,
+            record_metadata,
+            record_stamps,
+        )
+        if (
+            num_accepted_tokens.shape != (batch,)
+            or num_accepted_tokens.dtype not in (torch.int32, torch.int64)
+            or num_accepted_tokens.device != checkpoint_state.device
+        ):
+            raise ValueError(
+                "retained accepted counts must be an integer vector on the checkpoint device"
+            )
+        if batch:
+            _publish_kda_history_kernel[batch,](
+                retained_history.length,
+                state_indices,
+                retained_history.live_state_indices,
+                query_start_loc,
+                num_accepted_tokens,
+                record_metadata,
+                record_stamps,
+                retained_history.length.stride(0),
+                state_indices.stride(0),
+                retained_history.live_state_indices.stride(0),
+                query_start_loc.stride(0),
+                num_accepted_tokens.stride(0),
+                record_stamps.shape[0] if record_stamps is not None else 0,
+                STAMP_CAPACITY=(
+                    record_stamps.shape[1] if record_stamps is not None else 1
+                ),
+                CAPACITY=retained_history.correction.shape[2],
+                SPEC_QUERY_LEN=spec_query_len,
+                num_warps=1,
+                debug=True,
+            )
+        return
     if (record_metadata is None) != (record_stamps is None):
         raise ValueError("record metadata and stamps must be supplied together")
     if record_metadata is not None:

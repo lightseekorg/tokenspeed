@@ -108,6 +108,58 @@ class KdaPrefillResult:
 
 
 @dataclass(frozen=True)
+class KdaRetainedHistory:
+    """Page-owned accepted history and private verify destinations.
+
+    correction is FP32 [page, head, capacity, value]. key and decay are
+    FP32 [page, head, capacity, key], holding normalized K and multiplicative
+    decay. length is INT32 [page, 1] and publishes only accepted records.
+    live_state_indices maps request rows to unique private pages. Live pages
+    cannot alias another active row's source; immutable sources may be shared.
+    All fields may be strided arena views.
+
+    Construction validates storage metadata, which must stay fixed for the
+    object's lifetime. Tensor contents may be refreshed in place.
+    """
+
+    correction: torch.Tensor
+    key: torch.Tensor
+    decay: torch.Tensor
+    length: torch.Tensor
+    live_state_indices: torch.Tensor
+
+    def __post_init__(self) -> None:
+        if self.correction.ndim != 4:
+            raise ValueError(
+                "retained correction must be [page, head, capacity, value]"
+            )
+        pages, heads, capacity, _ = self.correction.shape
+        if (
+            capacity <= 0
+            or self.key.ndim != 4
+            or self.key.shape[:3] != (pages, heads, capacity)
+            or self.decay.shape != self.key.shape
+        ):
+            raise ValueError("retained records must share page/head/capacity geometry")
+        if any(
+            x.dtype != torch.float32 for x in (self.correction, self.key, self.decay)
+        ):
+            raise ValueError("retained correction, key, and decay must be FP32")
+        if self.length.shape != (pages, 1) or self.length.dtype != torch.int32:
+            raise ValueError("retained length must be INT32 [page, 1]")
+        if self.live_state_indices.ndim != 1 or self.live_state_indices.dtype not in (
+            torch.int32,
+            torch.int64,
+        ):
+            raise ValueError("retained live indices must be an integer vector")
+        if any(
+            x.device != self.correction.device
+            for x in (self.key, self.decay, self.length, self.live_state_indices)
+        ):
+            raise ValueError("retained history fields must be on the same device")
+
+
+@dataclass(frozen=True)
 class KdaReplayRecords:
     """Current-round recovery destinations and record metadata.
 
@@ -762,6 +814,7 @@ import tokenspeed_kernel.ops.attention.kda.gluon  # noqa: E402,F401
 
 __all__ = [
     "KdaPrefillResult",
+    "KdaRetainedHistory",
     "kda_replay_payload_specs",
     "kda_recurrent_layout",
     "kda_paged_prefill",
