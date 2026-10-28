@@ -94,11 +94,20 @@ enum RoundF64 : int { kRoundDraftCost = 0, kRoundModelCostRatio, kRoundThreshold
 constexpr int kWarp = 32;
 constexpr unsigned kFullMask = 0xffffffffu;
 
+#if defined(__HIP_PLATFORM_AMD__)
+// torch.cumsum's rocPRIM scan tile on gfx950 (no tuned config: the default, 256 threads x 16
+// items, warp scans); one tile holds every ranking, so no look-back enters the sum order.
+constexpr int kRankThreads = 256;
+constexpr int kRankItems = 16;
+constexpr int kRankTile = kRankThreads * kRankItems;
+constexpr int kRankTiles = 1;
+#else
 // torch.cumsum's CUB scan tiles (128 threads x 15 items); two tiles keep the look-back's sum order.
 constexpr int kRankThreads = 128;
 constexpr int kRankItems = 15;
 constexpr int kRankTile = kRankThreads * kRankItems;
 constexpr int kRankTiles = 2;
+#endif
 // The shapes whose torch.mean(dim=0) reduction order the ranking replicates.
 constexpr int kRankMaxRows = 32;
 constexpr int kRankMaxCols = 64;
@@ -619,9 +628,18 @@ __device__ float column_mean(const float* top, int stride, int rows, int cols, i
       const float second = l + width < rows ? __fadd_rn(0.0f, top[(l + width) * stride]) : 0.0f;
       lanes[l] = __fadd_rn(__fadd_rn(__fadd_rn(first, second), 0.0f), 0.0f);
     }
+#if defined(__HIP_PLATFORM_AMD__)
+    // ROCm's warp reduce shuffles down by increasing offsets; lane 0 sums adjacent pairs first.
+    for (int offset = 1; offset < width; offset *= 2) {
+      for (int l = 0; l + offset < width; l += 2 * offset) {
+        lanes[l] = __fadd_rn(lanes[l], lanes[l + offset]);
+      }
+    }
+#else
     for (int offset = width / 2; offset > 0; offset /= 2) {
       for (int l = 0; l < offset; ++l) lanes[l] = __fadd_rn(lanes[l], lanes[l + offset]);
     }
+#endif
     total = lanes[0];
   } else {
     float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};

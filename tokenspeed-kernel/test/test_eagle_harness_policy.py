@@ -29,9 +29,11 @@ from tokenspeed_kernel.thirdparty.cuda.eagle_harness_policy import (
     eagle_harness_policy_select_verify,
 )
 
+# The ROCm build hipifies the kernels for gfx950 (setup.py, HIP_KERNEL_GROUPS).
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_platform().is_nvidia,
-    reason="eagle_harness_policy CUDA kernel is NVIDIA-only",
+    not torch.cuda.is_available()
+    or not (current_platform().is_nvidia or current_platform().is_cdna4),
+    reason="eagle_harness_policy CUDA kernel is built for NVIDIA and gfx950 only",
 )
 
 _DEVICE = "cuda"

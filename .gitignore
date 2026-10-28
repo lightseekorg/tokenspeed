@@ -160,6 +160,8 @@ cython_debug/
 *.so.*
 # Local CUDA build identities contain host-specific toolchain paths.
 tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/objs/**/build-identity.*
+# The ROCm build's hipified sources.
+tokenspeed-kernel/python/tokenspeed_kernel/thirdparty/cuda/objs/*/hip/
 
 # Fortran module files
 *.mod
