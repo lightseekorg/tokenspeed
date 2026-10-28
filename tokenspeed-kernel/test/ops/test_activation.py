@@ -13,6 +13,7 @@ from tokenspeed_kernel.numerics.torch.activation import (
     torch_swiglu_oai,
 )
 from tokenspeed_kernel.ops.activation.triton import (
+    _moe_finalize_gate_add_kernel,
     _relu2_kernel,
     fused_gate_sigmoid_mul_add,
     moe_finalize_gate_add,
@@ -491,6 +492,47 @@ def test_moe_finalize_gate_add_rejects_bad_shapes(device: str) -> None:
         moe_finalize_gate_add(
             gemm2_out, permuted[:-1], weights, hidden, gate_weight, shared
         )
+
+
+def test_moe_finalize_gate_add_compiles_once_across_batch_sizes(device: str) -> None:
+    def run(num_tokens: int, spare_rows: int) -> None:
+        gemm2_out, *args = _moe_finalize_inputs(
+            num_tokens, 2560, 10, 0, torch.bfloat16, device
+        )
+        # The expert layout pads gemm2_out with rows that no route reads.
+        spare = gemm2_out.new_zeros(spare_rows, gemm2_out.shape[1])
+        moe_finalize_gate_add(torch.cat([gemm2_out, spare]), *args)
+
+    run(3, 0)
+    with assert_no_triton_compile(_moe_finalize_gate_add_kernel):
+        for num_tokens, spare_rows in ((1, 0), (1, 100), (16, 7), (37, 0), (300, 64)):
+            run(num_tokens, spare_rows)
+
+
+def test_moe_finalize_gate_add_reads_gemm2_rows_past_int32_offsets(
+    device: str,
+) -> None:
+    """Routes to gemm2_out rows past 2^31 elements finalize like the same rows
+    in a small pool."""
+    num_tokens, hidden_dim, top_k = 2, 2560, 10
+    near, permuted, weights, hidden, gate_weight, shared = _moe_finalize_inputs(
+        num_tokens, hidden_dim, top_k, 0, torch.bfloat16, device
+    )
+    first_far_row = 2**31 // hidden_dim + 1
+    assert first_far_row * hidden_dim > 2**31
+    # A 4 GiB pool; only the routed rows at its far end are written.
+    far = torch.empty(
+        first_far_row + near.shape[0], hidden_dim, device=device, dtype=near.dtype
+    )
+    far[first_far_row:] = near
+    far_permuted = torch.where(permuted >= 0, permuted + first_far_row, permuted)
+
+    expected = moe_finalize_gate_add(
+        near, permuted, weights, hidden, gate_weight, shared
+    )
+    out = moe_finalize_gate_add(far, far_permuted, weights, hidden, gate_weight, shared)
+
+    assert torch.equal(out, expected)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
