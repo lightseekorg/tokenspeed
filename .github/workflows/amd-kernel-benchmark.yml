@@ -19,16 +19,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-kernel-amd/**"
-      - "tokenspeed-engine/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/amd-kernel-benchmark.yml"
-      - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
 
 env:

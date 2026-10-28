@@ -20,18 +20,6 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
-    paths:
-      - "python/pyproject.toml"
-      - "python/tokenspeed/**"
-      - "tokenspeed-kernel/**"
-      - "tokenspeed-kernel-amd/**"
-      - "tokenspeed-mla/**"
-      - "tokenspeed-scheduler/**"
-      - "test/**"
-      - ".github/workflows/amd-mi450-tests.yml"
-      - ".github/workflows/nvidia-b200-tests.yml"
-      - ".github/workflows/pr-test-nvidia-arm.yml"
-      - ".github/workflows/run-ci-task-matrix.yml"
   workflow_dispatch:
     inputs:
       trigger:
