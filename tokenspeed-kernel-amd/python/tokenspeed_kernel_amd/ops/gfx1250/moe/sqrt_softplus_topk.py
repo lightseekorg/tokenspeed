@@ -230,6 +230,7 @@ def launch_gluon_sqrt_softplus_topk_gfx1250(
         input_ids: Token ids corresponding to rows of ``router_logits``.
         need_scores: Whether to materialize all FP32 sqrt-softplus scores.
         routed_scaling_factor: Multiplier applied to the final weights.
+        num_warps: Warp count of the per-token routing kernel launch.
 
     Returns:
         FP32 weights, INT32 expert ids, and FP32 scores. When ``need_scores`` is
