@@ -5,3 +5,4 @@ numpy
 torch
 tokenspeed-proton>=3.9.10.post20261028
 tokenspeed-triton>=3.9.10.post20261028
+apache-tvm-ffi>=0.1.13.post3

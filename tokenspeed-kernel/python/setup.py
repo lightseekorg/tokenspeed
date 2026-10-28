@@ -47,7 +47,9 @@ Kernel compilation
 ==================
 
 Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
-On systems without an NVIDIA CUDA build target, the build is skipped and the
+The ROCm backend compiles the HIP sources of ROCM_KERNEL_GROUPS (.hip files
+under thirdparty/hip/csrc) with hipcc the same way.
+On systems without a CUDA or ROCm build target, the build is skipped and the
 package installs as a pure-Python stub. Cached CUDA binaries carry a toolchain
 identity, so CUDA 12/13 and architecture changes invalidate them in either
 direction. The cu129 source recipe always rebuilds its in-tree CUDA kernels.
@@ -86,9 +88,15 @@ CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
 
 # JIT kernels source directory (no pre-compilation, just need sources available)
 
+HIP_CSRC_DIR = THIRDPARTY_DIR / "hip" / "csrc"
+HIP_OBJS_DIR = THIRDPARTY_DIR / "hip" / "objs"
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")
 CXX = os.environ.get("CXX", "g++")
+ROCM_HOME = os.environ.get("ROCM_HOME", os.environ.get("ROCM_PATH", "/opt/rocm"))
+HIPCC = os.environ.get("HIPCC", f"{ROCM_HOME}/bin/hipcc")
+# Supported AMD targets of the HIP kernels; TOKENSPEED_ROCM_ARCH overrides (comma-separated).
+DEFAULT_ROCM_ARCHS = ("gfx950",)
 
 
 def _version_date() -> str:
@@ -1027,24 +1035,154 @@ class CudaKernelBuilder:
                 temporary.replace(identity_path)
 
 
-class BuildKernels(build_ext):
-    """Compile CUDA kernels into .so files for the CUDA backend."""
+# HIP kernel groups (name, sources), built into thirdparty/hip/objs/<name>/<name>.so.
+# They match torch or Python bit for bit, so none uses fast math or FMA contraction.
+ROCM_KERNEL_GROUPS = [
+    ("eagle_harness_tree", [HIP_CSRC_DIR / "eagle_harness_tree.hip"]),
+    ("eagle_harness_policy", [HIP_CSRC_DIR / "eagle_harness_policy.hip"]),
+]
+
+
+class RocmKernelBuilder:
+    """Compiles ROCM_KERNEL_GROUPS with hipcc, one shared library per group."""
+
+    def __init__(self, kernel_groups, verbose: bool):
+        self.kernel_groups = kernel_groups
+        self.verbose = verbose
+
+    @staticmethod
+    def _archs():
+        override = os.environ.get("TOKENSPEED_ROCM_ARCH", "").strip()
+        if override:
+            return tuple(a.strip() for a in override.split(",") if a.strip())
+        return DEFAULT_ROCM_ARCHS
+
+    @staticmethod
+    def _hipcc_version():
+        try:
+            return subprocess.check_output(
+                [HIPCC, "--version"], stderr=subprocess.STDOUT, text=True
+            )
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    @staticmethod
+    def _include_dirs():
+        dirs = [str(HIP_CSRC_DIR)]
+        try:
+            tvm_ffi = importlib.import_module("tvm_ffi")
+            dirs.append(str(Path(tvm_ffi.__file__).parent / "include"))
+        except ImportError:
+            pass
+        return dirs
+
+    def compile_flags(self):
+        return [
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-fPIC",
+            "-ffp-contract=off",
+            *(f"--offload-arch={arch}" for arch in self._archs()),
+        ]
+
+    def _compile_one(self, src, obj, flags, include_dirs):
+        cmd = [HIPCC, *flags, *(f"-I{d}" for d in include_dirs)]
+        subprocess.check_call(cmd + ["-c", str(src), "-o", str(obj)])
+        return obj
 
     def run(self):
-        if _selected_backend() != "cuda":
+        if shutil.which(HIPCC) is None:
+            raise RuntimeError(
+                f"ROCm backend selected but hipcc was not found: {HIPCC}"
+            )
+        flags = self.compile_flags()
+        include_dirs = self._include_dirs()
+        version = self._hipcc_version()
+        identity = (
+            {
+                "format": 1,
+                "hipcc": str(Path(shutil.which(HIPCC)).resolve()),
+                "hipcc_version": version,
+                "compile_flags": flags,
+                "include_dirs": include_dirs,
+            }
+            if version is not None
+            else None
+        )
+        HIP_OBJS_DIR.mkdir(parents=True, exist_ok=True)
+        headers = sorted(HIP_CSRC_DIR.glob("*.h"))
+        stale = []
+        for name, sources in self.kernel_groups:
+            out_dir = HIP_OBJS_DIR / name
+            out_dir.mkdir(parents=True, exist_ok=True)
+            so_path = out_dir / f"{name}.so"
+            identity_path = out_dir / "build-identity.json"
+            if (
+                so_path.exists()
+                and CudaKernelBuilder._matches_build_identity(identity_path, identity)
+                and all(
+                    so_path.stat().st_mtime > src.stat().st_mtime
+                    for src in [*sources, *headers]
+                )
+            ):
+                continue
+            identity_path.unlink(missing_ok=True)
+            stale.append((name, sources, so_path))
+        print(f"Building {len(stale)}/{len(self.kernel_groups)} HIP kernel group(s)...")
+        if not stale:
+            return
+        max_jobs = int(os.environ.get("MAX_JOBS", min(os.cpu_count() or 1, 16)))
+        with ThreadPoolExecutor(max_workers=max_jobs) as executor:
+            futures = [
+                executor.submit(
+                    self._compile_one,
+                    src,
+                    so_path.parent / f"{src.stem}.o",
+                    flags,
+                    include_dirs,
+                )
+                for _, sources, so_path in stale
+                for src in sources
+            ]
+            for future in as_completed(futures):
+                future.result()
+        for name, sources, so_path in stale:
+            objects = [str(so_path.parent / f"{src.stem}.o") for src in sources]
+            arch_flags = [f for f in flags if f.startswith("--offload-arch=")]
+            subprocess.check_call(
+                [HIPCC, "-shared", *arch_flags, *objects, "-o", str(so_path)]
+            )
+            if identity is not None:
+                identity_path = so_path.parent / "build-identity.json"
+                temporary = identity_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(identity, sort_keys=True) + "\n")
+                temporary.replace(identity_path)
+
+
+class BuildKernels(build_ext):
+    """Compile the native kernels into .so files: KERNEL_GROUPS for the CUDA
+    backend, ROCM_KERNEL_GROUPS for the ROCm backend."""
+
+    def run(self):
+        backend = _selected_backend()
+        verbose = bool(getattr(self, "verbose", False))
+        if backend == "rocm":
+            RocmKernelBuilder(ROCM_KERNEL_GROUPS, verbose=verbose).run()
+            return
+        if backend != "cuda":
             print(
-                f"CUDA backend not selected; skipping CUDA kernel build. "
+                f"{backend} backend has no native kernels; skipping the kernel build. "
                 f"{self.distribution.get_name()}"
             )
             return
 
         _ensure_cuda_compiler()
-        verbose = bool(getattr(self, "verbose", False))
         CudaKernelBuilder(KERNEL_GROUPS, verbose=verbose).run()
 
 
 class BuildNative(Command):
-    description = "Build CUDA kernels"
+    description = "Build CUDA or HIP kernels"
     user_options = []
 
     def initialize_options(self):
@@ -1056,8 +1194,8 @@ class BuildNative(Command):
     def run(self):
         backend = _selected_backend()
         _install_backend_build_requirements(getattr(self, "verbose", False))
-        if backend != "cuda":
-            print("CUDA backend not selected; skipping CUDA kernel build")
+        if backend not in ("cuda", "rocm"):
+            print(f"{backend} backend has no native kernels; skipping the kernel build")
             return
 
         self.run_command("build_ext")
@@ -1104,6 +1242,7 @@ setup(
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
         ],
+        "tokenspeed_kernel.thirdparty.hip": ["objs/**/*.so"],
         # Optional JIT adapter for fused AllGather quantization.
         "tokenspeed_kernel.thirdparty.flashinfer": [
             "allgather_quant.cu",

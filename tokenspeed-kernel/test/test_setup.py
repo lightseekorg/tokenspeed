@@ -355,3 +355,50 @@ def test_cuda_compile_command_preserves_optional_launcher(
             "source.o",
         ]
     ]
+
+
+def test_rocm_build_compiles_each_hip_group_for_gfx950(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("TOKENSPEED_KERNEL_BACKEND", "rocm")
+    monkeypatch.delenv("TOKENSPEED_ROCM_ARCH", raising=False)
+    setup_kwargs = {}
+    monkeypatch.setattr(
+        setuptools, "setup", lambda **kwargs: setup_kwargs.update(kwargs)
+    )
+    setup_namespace = runpy.run_path(str(SETUP_PY))
+    builder = setup_namespace["RocmKernelBuilder"](
+        setup_namespace["ROCM_KERNEL_GROUPS"], verbose=False
+    )
+    # Build into a scratch tree with a stand-in hipcc that records its commands.
+    monkeypatch.setitem(builder.run.__globals__, "HIP_OBJS_DIR", tmp_path)
+    monkeypatch.setattr(shutil, "which", lambda command: command)
+
+    def no_version(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, "hipcc")
+
+    monkeypatch.setattr(subprocess, "check_output", no_version)
+    calls = []
+    monkeypatch.setattr(subprocess, "check_call", calls.append)
+
+    builder.run()
+
+    hipcc = setup_namespace["HIPCC"]
+    compiles = [call for call in calls if "-c" in call]
+    links = [call for call in calls if "-shared" in call]
+    assert sorted(Path(call[call.index("-c") + 1]).name for call in compiles) == [
+        "eagle_harness_policy.hip",
+        "eagle_harness_tree.hip",
+    ]
+    for call in compiles:
+        # Exact float math: the kernels match torch's results bit for bit.
+        assert call[0] == hipcc
+        assert {"--offload-arch=gfx950", "-ffp-contract=off"} <= set(call)
+    linked = sorted(Path(call[-1]).relative_to(tmp_path) for call in links)
+    assert [path.as_posix() for path in linked] == [
+        "eagle_harness_policy/eagle_harness_policy.so",
+        "eagle_harness_tree/eagle_harness_tree.so",
+    ]
+    package_data = setup_kwargs["package_data"]["tokenspeed_kernel.thirdparty.hip"]
+    assert all(
+        any((Path("objs") / path).match(glob) for glob in package_data)
+        for path in linked
+    )

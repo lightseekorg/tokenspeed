@@ -23,8 +23,7 @@
 import numpy as np
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
     eagle_harness_draft_depth_update,
     eagle_harness_publish_draft_q,
     eagle_harness_residual_sample,
@@ -34,10 +33,13 @@ from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
     eagle_harness_work_deltas,
     eagle_harness_write_verify_tree,
 )
+from tokenspeed_kernel.platform import current_platform
 
+# The CUDA build serves NVIDIA, the HIP build gfx950 (ops/sampling/eagle_harness).
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_platform().is_nvidia,
-    reason="eagle_harness CUDA kernels are NVIDIA-only",
+    not torch.cuda.is_available()
+    or not (current_platform().is_nvidia or current_platform().is_cdna4),
+    reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 _DEVICE = "cuda"

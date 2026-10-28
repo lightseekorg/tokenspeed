@@ -44,13 +44,17 @@ import pytest  # noqa: E402
 import tokenspeed_scheduler as ts  # noqa: E402
 import torch  # noqa: E402
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
+from tokenspeed_kernel.ops.sampling.eagle_harness import (  # noqa: E402
+    eagle_harness_device_chain_available,
+)
+from tokenspeed_kernel.platform import current_platform  # noqa: E402
 from transformers import LlamaConfig  # noqa: E402
 
 register_cuda_ci(
     est_time=10,
     suite="runtime-1gpu",
-    disabled_on_runners=["amd-*"],
-    disabled_on_runners_reason="the eagle_harness policy kernels are NVIDIA-only",
+    disabled_on_runners=["amd-mi45*"],
+    disabled_on_runners_reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 from test.runtime.scheduler_driver import advance_scheduler  # noqa: E402
@@ -100,7 +104,16 @@ from tokenspeed.runtime.models.llama_eagle4 import (  # noqa: E402
 from tokenspeed.runtime.sampling.sampling_params import SamplingParams  # noqa: E402
 from tokenspeed.runtime.utils.env import envs  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or not (current_platform().is_nvidia or current_platform().is_cdna4),
+    reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
+)
+# Device-chained rounds launch graphs from the GPU, which HIP cannot.
+needs_device_chain = pytest.mark.skipif(
+    not eagle_harness_device_chain_available(),
+    reason="needs device-side graph launch",
+)
 
 # Trees of K children per node, STEPS steps, NODES verified; POOL slots, MAX_BS a round.
 K, STEPS, NODES, POOL, MAX_BS = 8, 6, 32, 16, 8
@@ -587,6 +600,7 @@ def test_a_round_drafts_beside_the_next_forwards_staging(tmp_path, graphs) -> No
     )
 
 
+@needs_device_chain
 @torch.inference_mode()
 def test_a_device_chained_round_completes_without_the_host(tmp_path) -> None:
     """A round on captured graphs writes its verify tree on the GPU though
@@ -617,6 +631,7 @@ def test_a_device_chained_round_completes_without_the_host(tmp_path) -> None:
     assert len(depths) > 2
 
 
+@needs_device_chain
 @torch.inference_mode()
 def test_a_round_launched_behind_the_decode_graph_drafts_beside_the_forward(
     tmp_path,

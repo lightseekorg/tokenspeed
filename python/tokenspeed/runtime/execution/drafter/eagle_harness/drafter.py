@@ -43,8 +43,8 @@ import logging
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.sampling.triton import logprob_topk
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
+    eagle_harness_device_chain_available,
     eagle_harness_draft_depth_update,
     eagle_harness_publish_draft_q,
     eagle_harness_sample_children,
@@ -53,6 +53,7 @@ from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
     eagle_harness_work_deltas,
     eagle_harness_write_verify_tree,
 )
+from tokenspeed_kernel.ops.sampling.triton import logprob_topk
 from typing_extensions import override
 
 from tokenspeed.runtime.distributed.process_group_manager import (
@@ -176,8 +177,9 @@ class EagleHarness(Eagle4):
     per (padded batch, depth) serves every round; a padded batch captures the
     depths its rounds can reach.
 
-    With the device policy, a round on captured graphs is device-chained
-    (``DeviceChain``): the host launches depth 1's graph behind the decode
+    With the device policy, where the platform has device-side graph launch
+    (``eagle_harness_device_chain_available``), a round on captured graphs is
+    device-chained (``DeviceChain``): the host launches depth 1's graph behind the decode
     graph (``replay_decode_graph``), and each depth's graph launches the next
     one or the finalize on the GPU. Otherwise (eager rounds, exec mode 2)
     ``finish_round`` launches depth 1, the host each next depth once its
@@ -247,7 +249,12 @@ class EagleHarness(Eagle4):
         # Children come from draft_topk; the head's argmax would go unread.
         logits_processor.do_argmax = False
         self.policy = self._make_policy(config.num_nodes, topk, depth)
-        if isinstance(self.policy, DevicePolicy):
+        # Without device-side graph launch (HIP), the host launches each depth
+        # once its decision lands, as in an eager round.
+        if (
+            isinstance(self.policy, DevicePolicy)
+            and eagle_harness_device_chain_available()
+        ):
             self._chain = DeviceChain(max_bs, depth - 1, self.device)
         pool_nodes = max(1024, topk * topk * depth)
         self._allocate(max_bs, topk, depth, pool_nodes, max(64, topk * (depth + 1) + 1))

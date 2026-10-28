@@ -109,6 +109,8 @@ def test_shared_paths_require_every_group(path):
         f"{KERNEL}/ops/attention/dsv41/_gluon/indexer.py",
         f"{KERNEL}/ops/moe/gluon.py",
         f"{KERNEL}/ops/communication/iris.py",
+        f"{KERNEL}/ops/sampling/eagle_harness/hip.py",
+        f"{KERNEL}/thirdparty/hip/csrc/eagle_harness_tree.hip",
     ],
 )
 def test_amd_owned_paths_require_only_amd(path):
