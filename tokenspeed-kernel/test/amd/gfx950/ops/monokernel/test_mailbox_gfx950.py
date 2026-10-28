@@ -26,9 +26,20 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
 import torch
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage, launch_tag
 from utils import is_cdna4
+
+# The CPU-side helpers come from the AMD kernel package, which other vendors
+# do not install.
+pytest.importorskip("tokenspeed_kernel_amd")
+
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
+    LAYER_SLOTS,
+    Plan,
+    Stage,
+    launch_tag,
+)
 
 if is_cdna4():
     from tokenspeed_kernel_amd._triton import gl, gluon
@@ -100,7 +111,23 @@ if is_cdna4():
             torch.cuda.synchronize()
             assert bad[:consumers].tolist() == [0] * consumers
         # The pairs carry the last launch's tag.
-        assert int(scratch[0].item()) >> 32 == launch_tag(8, 3)
+        assert (int(scratch[0].item()) >> 32) & 0xFFFFFFFF == launch_tag(8, 3)
+
+    def test_a_tag_past_bit_31_still_matches():
+        # The int32 tag wraps negative after about 2**31 / LAYER_SLOTS steps.
+        # The pair holds its 32 bits, so the poll must still match it.
+        producers, per, consumers, grid = 64, 64, 128, 256
+        scratch = torch.zeros(producers * per, dtype=torch.int64, device="cuda")
+        bad = torch.full((grid,), -1, dtype=torch.int32, device="cuda")
+        value = (1 << 31) // LAYER_SLOTS
+        assert launch_tag(value, 3) >= 1 << 31
+        step = torch.full((1,), value, dtype=torch.int32, device="cuda")
+        _exchange_kernel[(grid,)](
+            scratch, step, bad, producers, per, consumers, num_warps=8
+        )
+        torch.cuda.synchronize()
+        assert bad[:consumers].tolist() == [0] * consumers
+        assert (int(scratch[0].item()) >> 32) & 0xFFFFFFFF == launch_tag(value, 3)
 
     # A poll whose pair never arrives, with a small retry bound so that the
     # test is quick. It runs in its own process: the trap ends the process's

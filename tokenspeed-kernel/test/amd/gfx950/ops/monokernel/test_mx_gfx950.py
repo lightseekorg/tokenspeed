@@ -24,8 +24,15 @@ from __future__ import annotations
 
 import pytest
 import torch
-from tokenspeed_kernel.ops.quantization import quantize_mxfp4 as kernel_quantize_mxfp4
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (
+
+# The CPU-side helpers come from the AMD kernel package, which other vendors
+# do not install.
+pytest.importorskip("tokenspeed_kernel_amd")
+
+from tokenspeed_kernel.ops.quantization import (  # noqa: E402
+    quantize_mxfp4 as kernel_quantize_mxfp4,
+)
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.weights import (  # noqa: E402
     dequantize_mxfp4,
     mxfp4_scales,
     mxfp4_tiles,

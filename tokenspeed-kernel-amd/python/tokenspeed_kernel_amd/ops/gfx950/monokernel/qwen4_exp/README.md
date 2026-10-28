@@ -235,7 +235,7 @@ dataclasses that the stages read (`DeltaLayerWeights`, `QsaLayerWeights`).
 
 ## Tests
 
-Tests are in `tokenspeed-kernel/test/amd/ops/monokernel/`:
+Tests are in `tokenspeed-kernel/test/amd/gfx950/ops/monokernel/`:
 
 | Test | Covers |
 |---|---|

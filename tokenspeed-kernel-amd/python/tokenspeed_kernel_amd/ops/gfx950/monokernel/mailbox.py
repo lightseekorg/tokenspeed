@@ -194,10 +194,13 @@ def _poll_n(scratch, offsets, tag, spin):
     ptrs = ()
     for k in gl.static_range(len(offsets)):
         ptrs += (scratch + offsets[k],)
+    # The pair's high dword holds the tag's 32 bits and the poll shifts it
+    # down zero-extended, so compare with the zero-extended tag. A
+    # sign-extended tag never matches once the tag wraps past bit 31.
     out = gl.inline_asm(
         _poll_asm,
         _poll_constraints(len(offsets)),
-        ptrs + (tag.to(gl.int64), spin),
+        ptrs + (tag.to(gl.int64) & 0xFFFFFFFF, spin),
         _poll_types(offsets.type, gl.num_warps()),
     )
     pairs = ()

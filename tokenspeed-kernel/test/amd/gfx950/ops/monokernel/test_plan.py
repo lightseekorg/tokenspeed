@@ -25,7 +25,16 @@ from __future__ import annotations
 import json
 
 import pytest
-from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage, placement
+
+# The CPU-side helpers come from the AMD kernel package, which other vendors
+# do not install.
+pytest.importorskip("tokenspeed_kernel_amd")
+
+from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import (  # noqa: E402
+    Plan,
+    Stage,
+    placement,
+)
 
 
 def test_plan_rejects_a_stage_reading_a_later_stage():

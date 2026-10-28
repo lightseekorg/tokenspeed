@@ -79,9 +79,12 @@ from tokenspeed_kernel.ops.monokernel import (
     qwen4_exp_qsa_layer_decode,
 )
 
-from tokenspeed.runtime.execution.context import ForwardContext
+from tokenspeed.runtime.execution.context import DraftNarrowing, ForwardContext
 from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (
     qwen4_exp_backend,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
+    QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
@@ -390,7 +393,8 @@ def forward_chain(rows: int, ctx: ForwardContext) -> int | None:
     The forward must be a decode step of at most ``MAX_ROWS`` token rows
     (padded graph rows included). It must have one token per request (a
     decode step or an MTP draft step), or ``k + 1``: a target verify (with
-    ReplaySSM, whose payload the kernels fill) or the draft's first step of
+    Gated DeltaNet layers and ReplaySSM, whose payload the kernels fill; a
+    view without them keeps the regular path) or the draft's first step of
     one request, which catches up on the verified rows (its launch narrows to
     the request's live row).
     """
@@ -406,7 +410,10 @@ def forward_chain(rows: int, ctx: ForwardContext) -> int | None:
         return chain
     if ctx.draft_narrowing is not None:
         return chain if ctx.bs == 1 else None
-    return chain if ctx.attn_backend.linear_attn_backend.replay_ssm else None
+    backend = ctx.attn_backend
+    if not backend.has_linear_attn:
+        return None
+    return chain if backend.linear_attn_backend.replay_ssm else None
 
 
 def _out_rows(rows: int, chain: int, ctx: ForwardContext) -> int:
@@ -488,6 +495,27 @@ class Qwen4ExpMonokernels:
         return None if chain is None else MonokernelStep(self, chain)
 
 
+class DraftVerifyLengths:
+    """The verified rows' lengths of a draft's first step, for every fused
+    layer of the forward.
+
+    The step publishes the accepted lengths into the same seq-lens buffer
+    that the rows' lengths come from. So the first fused layer copies the
+    lengths and then publishes, and every later layer reuses that copy.
+    """
+
+    def __init__(self) -> None:
+        self._lengths: torch.Tensor | None = None
+
+    def take(self, seq_lens: torch.Tensor, narrowing: DraftNarrowing) -> torch.Tensor:
+        """The lengths from before the publish. The first call copies
+        ``seq_lens`` and publishes through ``narrowing``."""
+        if self._lengths is None:
+            self._lengths = seq_lens.clone()
+            narrowing.publish_accepted_prefix()
+        return self._lengths
+
+
 class MonokernelStep:
     """One forward that the monokernels serve.
 
@@ -501,6 +529,7 @@ class MonokernelStep:
         self._monokernels = monokernels
         self._chain = chain
         self.lm_head_input: torch.Tensor | None = None
+        self._draft_lengths = DraftVerifyLengths()
 
     def layer(self, index: int) -> Callable | None:
         """The launch that replaces decoder layer ``index``, with the layer's
@@ -559,6 +588,7 @@ class MonokernelStep:
             residual,
             ctx,
             self.lm_head_input,
+            self._draft_lengths,
         )
         return out, None
 
@@ -651,6 +681,7 @@ def _qsa_decode(
     residual,
     ctx: ForwardContext,
     mixed_out: torch.Tensor | None,
+    draft_lengths: DraftVerifyLengths,
 ) -> torch.Tensor:
     """Run one QSA layer launch. Returns the output streams.
 
@@ -700,11 +731,10 @@ def _qsa_decode(
             # key (TokenSpeed's draft write mask). Only the live row runs the
             # rest of the layer (the draft narrowing). The step publishes the
             # accepted lengths as the draft's decode lengths, so the rows'
-            # lengths are a copy from before, and starts a new draft scratch
-            # round.
+            # lengths are a copy from before (one copy per forward), and
+            # starts a new draft scratch round.
             staging = None
-            seq_len = seq_len.clone()
-            ctx.draft_narrowing.publish_accepted_prefix()
+            seq_len = draft_lengths.take(seq_len, ctx.draft_narrowing)
             accepted = metadata.seq_lens[: ctx.bs]
             layer.indexer.reset_draft_tags(ctx.bs, torch.bfloat16, hidden_states.device)
         else:
@@ -734,8 +764,8 @@ def _qsa_decode(
         v_cache=v_cache,
         qsa_table=tables[1],
         recent_table=tables[2],
-        compressed=_paged(compressed, 64),
-        raw_key=_paged(raw_key, 4),
+        compressed=_paged(compressed, QWEN4_EXP_QSA_COMPRESSED_ROWS_PER_PAGE),
+        raw_key=_paged(raw_key, layer.indexer.compress_ratio),
         rope_position=rope_position,
         staging=staging,
         draft=draft,

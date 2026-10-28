@@ -10,7 +10,7 @@ Read these documents with this one:
   the invariants.
 - [`tokenspeed_kernel/ops/monokernel/README.md`](../../../../../../tokenspeed-kernel/python/tokenspeed_kernel/ops/monokernel/README.md):
   the steps to add a model, the tests and the performance workflow.
-- `tokenspeed-kernel/test/amd/ops/monokernel/test_monokernel_example_gfx950.py`:
+- `tokenspeed-kernel/test/amd/gfx950/ops/monokernel/test_monokernel_example_gfx950.py`:
   the smallest complete monokernel, of two stages. Copy its shape for a new
   model.
 
@@ -288,7 +288,7 @@ Read the kernel's AMDGCN from the Triton cache. Look for these items:
 
 ## Tests
 
-Tests are in `tokenspeed-kernel/test/amd/ops/monokernel/`:
+Tests are in `tokenspeed-kernel/test/amd/gfx950/ops/monokernel/`:
 
 | Test | Covers |
 |---|---|

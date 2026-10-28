@@ -41,7 +41,7 @@ step's rows in one launch instead of six.
 
 ## Adding a model
 
-Use `test/amd/ops/monokernel/test_monokernel_example_gfx950.py` as the
+Use `test/amd/gfx950/ops/monokernel/test_monokernel_example_gfx950.py` as the
 template.
 It is a complete monokernel of two stages, about 150 lines long, that uses
 the plan, the schedule, the mailbox, an operand bundle and the trace. The

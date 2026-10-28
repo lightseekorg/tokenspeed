@@ -42,10 +42,16 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa:
 from tokenspeed.runtime.execution.output_layout import (  # noqa: E402
     ForwardOutputLayout,
 )
+from tokenspeed.runtime.layers.attention.backends.specific.qwen4_exp import (  # noqa: E402
+    Qwen4ExpBackend,
+)
+from tokenspeed.runtime.layers.attention.configs.base import AttnConfig  # noqa: E402
+from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig  # noqa: E402
 from tokenspeed.runtime.models.qwen4_exp_monokernel import (  # noqa: E402
     ATTENTION_TP,
     EXPERT_PARALLEL,
     NOT_MXFP4,
+    DraftVerifyLengths,
     coverage,
     forward_chain,
     unserved_report,
@@ -95,6 +101,75 @@ def test_draft_steps_take_the_kernels() -> None:
     assert forward_chain(4, _decode_ctx(2, 4, two)) is None
     assert forward_chain(8, _decode_ctx(2, 8, two)) is None
     assert forward_chain(5, _decode_ctx(5, 5, None)) is None
+
+
+def test_a_target_verify_without_gated_deltanet_keeps_the_regular_path() -> None:
+    """A Qwen4-Exp view without Gated DeltaNet layers has no ReplaySSM
+    payload for the kernels to fill: its verify keeps the regular path
+    instead of failing on the missing recurrent backend."""
+    qsa = MHAConfig(
+        backend_name="qsa",
+        num_attention_heads=1,
+        num_kv_heads=1,
+        head_dim=2,
+        attn_tp_size=1,
+        cache_layer_types=("full_attention",),
+        sliding_window_tokens=None,
+    )
+    config = AttnConfig(
+        device="cuda",
+        dtype=torch.bfloat16,
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method="none",
+        kv_cache_mxfp8=False,
+        prefix_granularity=256,
+        kernel_page_size=64,
+        context_len=1024,
+        max_bs=2,
+        pd_disaggregation_enabled=False,
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+        is_draft=False,
+        draft_block_decode=False,
+        components=(qsa,),
+    )
+    # The full-attention child only, with no hybrid wrapper.
+    backend = Qwen4ExpBackend(config, _DraftBackend(), None, None)
+    assert not backend.has_linear_attn
+
+    def verify_ctx(rows: int) -> ForwardContext:
+        return ForwardContext(
+            attn_backend=backend,
+            token_to_kv_pool=None,
+            bs=1,
+            num_extends=0,
+            input_num_tokens=rows,
+            forward_mode=ForwardMode.DECODE,
+            output_layout=ForwardOutputLayout(0, 0, 1, 1),
+            draft_narrowing=None,
+        )
+
+    assert forward_chain(4, verify_ctx(4)) is None
+    # One row per request still takes the kernels.
+    assert forward_chain(1, verify_ctx(1)) == 1
+
+
+def test_every_fused_draft_layer_reads_the_lengths_from_before_the_publish() -> None:
+    """The draft's first step publishes the accepted lengths into the buffer
+    that holds the verified rows' lengths. A second fused layer of the same
+    forward must still see the lengths from before the publish."""
+    seq_lens = torch.tensor([12, 15])
+
+    class _PublishingBackend(_DraftBackend):
+        def advance_draft_forward_metadata(self, lengths: torch.Tensor) -> None:
+            seq_lens.copy_(lengths)
+
+    narrowing = AcceptedPrefixPublisher(_PublishingBackend(), torch.tensor([10, 11]))
+    lengths = DraftVerifyLengths()
+    first = lengths.take(seq_lens, narrowing)
+    assert seq_lens.tolist() == [10, 11]
+    second = lengths.take(seq_lens, narrowing)
+    assert first.tolist() == second.tolist() == [12, 15]
 
 
 def test_the_report_groups_layers_by_reason() -> None:
