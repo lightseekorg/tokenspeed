@@ -18,7 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""EAGLE-4 candidate head kernels: bit for bit the torch ops they replace."""
+"""EAGLE-4 candidate head kernels: bit for bit the torch ops they replace.
+On AMD the head runs those torch ops, whose top-k breaks ties in no fixed
+order there, so it is checked as a top-k: the same values, each id with its
+own value."""
 
 import pytest
 import torch
@@ -29,9 +32,28 @@ from tokenspeed_kernel.thirdparty.cuda.eagle4_candidate import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_platform().is_hopper_plus,
-    reason="needs an NVIDIA SM90+ GPU (thread-block clusters)",
+    not torch.cuda.is_available()
+    or not (current_platform().is_hopper_plus or current_platform().is_cdna4),
+    reason="needs an NVIDIA SM90+ GPU (thread-block clusters) or AMD CDNA4",
 )
+
+# torch-ROCm's top-k picks among tied values in no fixed order, call to call.
+_TIES_UNORDERED = current_platform().is_amd
+
+
+def _assert_pairs(ids, values, pool_ids, pool_values) -> None:
+    """Every ``(ids, values)`` entry of a row is one of its ``(pool_ids,
+    pool_values)`` entries."""
+    hits = (ids[:, :, None] == pool_ids[:, None, :]) & (
+        values[:, :, None] == pool_values[:, None, :]
+    )
+    assert bool(hits.any(-1).all())
+
+
+def _assert_same_values(values, expected) -> None:
+    torch.testing.assert_close(
+        values.sort(-1).values, expected.sort(-1).values, rtol=0, atol=0
+    )
 
 
 def _scores(rows: int, cols: int, levels: int, seed: int) -> torch.Tensor:
@@ -49,8 +71,13 @@ def test_shard_topk_matches_torch(cols: int, levels: int) -> None:
     scores = _scores(rows, cols, levels, rows * cols + levels)
     ids = torch.empty((rows, 128), dtype=torch.int64, device="cuda")
     eagle4_shard_topk(scores, 128, 1000, ids)
-    expected = torch.topk(scores, 128, dim=-1, sorted=False).indices
-    torch.testing.assert_close(ids, expected + 1000, rtol=0, atol=0)
+    expected = torch.topk(scores, 128, dim=-1, sorted=False)
+    if _TIES_UNORDERED:
+        picked = torch.gather(scores, -1, ids - 1000)
+        _assert_same_values(picked, expected.values)
+        assert bool((ids.sort(-1).values.diff(dim=-1) > 0).all())  # distinct ids
+        return
+    torch.testing.assert_close(ids, expected.indices + 1000, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("nc", [32, 128, 256])
@@ -79,6 +106,15 @@ def test_candidate_tail_matches_torch(
     # The rank-concatenated [M, R * NC] view the all-gather along the last dim makes.
     pool_logits = views[0].permute(1, 0, 2).reshape(rows, ranks * nc)
     pool_tokens = views[1].permute(1, 0, 2).reshape(rows, ranks * nc)
+    if ranks > 1 and _TIES_UNORDERED:
+        ref_logits = torch.topk(pool_logits, nc, dim=-1, sorted=False).values.float()
+        _assert_same_values(logits_out, ref_logits)
+        _assert_pairs(tokens_out, logits_out, pool_tokens, pool_logits.float())
+        if top_k:
+            probs_ref = torch.topk(torch.softmax(logits_out, -1), top_k, dim=-1)
+            torch.testing.assert_close(probs, probs_ref.values, rtol=0, atol=0)
+            _assert_pairs(top_tokens, probs, tokens_out, torch.softmax(logits_out, -1))
+        return
     if ranks > 1:
         ref_logits, picked = torch.topk(pool_logits, nc, dim=-1, sorted=False)
         ref_tokens = torch.gather(pool_tokens, -1, picked)

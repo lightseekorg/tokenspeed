@@ -21,12 +21,16 @@
 """EAGLE-4 low-rank candidate head kernels (SM90+, thread-block clusters); see
 ``csrc/eagle4_candidate.cu``. Both reproduce the torch ops they replace bit for
 bit; ``eagle4_candidate_supports`` says which heads they cover, and a launch
-outside it raises."""
+outside it raises. On AMD (no thread-block clusters) both run the torch ops
+their docstrings define; torch-ROCm's top-k picks among tied scores in no fixed
+order, which changes which tied candidates a draft keeps, never the target's
+output."""
 
 import functools
 from pathlib import Path
 
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 __all__ = ["eagle4_candidate_supports", "eagle4_candidate_tail", "eagle4_shard_topk"]
 
@@ -74,6 +78,10 @@ def eagle4_shard_topk(
     ``[M, N]`` bf16 scores, same set and order, offset by ``vocab_start`` into
     ``global_ids`` (``[M, k]`` int64, unit column stride). One cluster of 8
     CTAs per row; covers N up to 262144."""
+    if current_platform().is_amd:
+        ids = torch.topk(scores, k, dim=-1, sorted=False).indices
+        torch.add(ids, vocab_start, out=global_ids)
+        return
     _module().eagle4_shard_topk(scores, k, vocab_start, global_ids)
 
 
@@ -104,8 +112,46 @@ def eagle4_candidate_tail(
     top_k]``). Covers ``NC`` in 32, 64, 128, 256, ``R * NC <= 1024`` and
     ``top_k <= 32``.
     """
+    if current_platform().is_amd:
+        _candidate_tail_torch(
+            cand_logits,
+            cand_tokens,
+            top_k,
+            logits_out,
+            tokens_out,
+            topk_probs,
+            topk_tokens,
+        )
+        return
     if topk_probs is None:  # top_k == 0: the kernel does not touch them
         topk_probs, topk_tokens = logits_out, tokens_out
     _module().eagle4_candidate_tail(
         cand_logits, cand_tokens, top_k, logits_out, tokens_out, topk_probs, topk_tokens
     )
+
+
+def _candidate_tail_torch(
+    cand_logits: torch.Tensor,
+    cand_tokens: torch.Tensor,
+    top_k: int,
+    logits_out: torch.Tensor,
+    tokens_out: torch.Tensor,
+    topk_probs: torch.Tensor | None,
+    topk_tokens: torch.Tensor | None,
+) -> None:
+    """The torch ops of ``eagle4_candidate_tail``'s docstring."""
+    ranks, rows, nc = cand_logits.shape
+    if ranks > 1:
+        gathered = cand_logits.permute(1, 0, 2).reshape(rows, ranks * nc)
+        logits, pos = torch.topk(gathered, nc, dim=-1, sorted=False)
+        tokens = torch.gather(
+            cand_tokens.permute(1, 0, 2).reshape(rows, ranks * nc), -1, pos
+        )
+        tokens_out.copy_(tokens)
+    else:
+        logits, tokens = cand_logits[0], cand_tokens[0]
+    logits_out.copy_(logits)
+    if top_k:
+        top = torch.topk(torch.softmax(logits_out, -1), top_k, dim=-1)
+        topk_probs.copy_(top.values)
+        torch.gather(tokens, -1, top.indices, out=topk_tokens)
