@@ -171,7 +171,12 @@ def load_weight_tiles(
         NW: N waves (16 rows each).
         GROUP, GROUP_STRIDE: N waves come in groups of ``GROUP`` consecutive
             blocks, ``GROUP_STRIDE`` blocks apart.
-        SCALES: Scale layout, ``"k4"`` or ``"n32"`` (see :func:`_scale_bytes`).
+        SCALES: Scale layout, ``"k4"``, ``"n32"`` or ``"n32h"`` (see
+            :func:`_scale_bytes`). ``"n32h"`` selects a scale byte by the
+            parities of the k-iteration and the block. So it needs an even
+            ``kit0`` and ``nb0`` (runtime values: the caller's contract), an
+            even ``KITS // SPLIT`` and a ``GROUP_STRIDE`` of ``GROUP``'s
+            parity (checked here).
 
     Returns:
         ``(tiles, scales)``: one B tile and one B scale per chain step.
@@ -179,6 +184,12 @@ def load_weight_tiles(
     KI: gl.constexpr = K // 128
     KJ: gl.constexpr = _scale_extent(K, SCALES)
     gl.static_assert(KITS % SPLIT == 0 and KITS <= KI)
+    if SCALES == "n32h":
+        # Chain step i of wave s is k-iteration kit0 + s KITS / SPLIT + i, and
+        # N wave v reads block nb0 + (v // GROUP) GROUP_STRIDE + v % GROUP:
+        # their parities must be those of i and v (see _scale_operand).
+        gl.static_assert((KITS // SPLIT) % 2 == 0)
+        gl.static_assert((GROUP_STRIDE - GROUP) % 2 == 0)
     bl: gl.constexpr = b_layout(SPLIT, NW)
     s = gl.arange(0, SPLIT, gl.SliceLayout(1, gl.SliceLayout(2, bl)))
     k = gl.arange(0, 64, gl.SliceLayout(0, gl.SliceLayout(2, bl)))

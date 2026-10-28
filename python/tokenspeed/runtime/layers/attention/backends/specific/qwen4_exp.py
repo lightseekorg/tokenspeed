@@ -255,6 +255,11 @@ class Qwen4ExpBackend(AttentionBackend):
         return self.attention_backend
 
     @property
+    def has_linear_attn(self) -> bool:
+        """Whether this view has Gated DeltaNet layers (a hybrid child)."""
+        return isinstance(self.attention_backend, HybridLinearAttnBackend)
+
+    @property
     def linear_attn_backend(self) -> AttentionBackend:
         """The Gated DeltaNet layers' backend (the hybrid composite's child)."""
         if not isinstance(self.attention_backend, HybridLinearAttnBackend):
