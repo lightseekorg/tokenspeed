@@ -134,6 +134,7 @@ dependency wait and writes neither routing metadata nor weights; activation
 and activation-scale reads remain after the dependency wait.
 `enable_pdl=False` keeps all grouped launches ordered and disables this
 first-tile prefetch.
+
 Prepare and warm the callable before graph capture. Fusion and prefetch variants
 have distinct content-keyed kernel caches, and route metadata is refreshed on
 replay. Performance depends on routing; benchmark the intended workload.
