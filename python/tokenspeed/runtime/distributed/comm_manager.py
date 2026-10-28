@@ -45,9 +45,9 @@ def gather_sampled_rows(
 
     The last row of every request (``gather_ids``, the batch's full layout,
     sorted) lives on exactly one rank; each rank selects the ones inside its
-    shard (``QueryShardPlan.local_sampled_ids``) and one all-gather with the
-    plan's per-rank sampled-row counts concatenates them in rank order, which
-    is request order. The logits processor runs this in place of its
+    shard (``QueryShardPlan.local_sampled_ids``), one all-gather with the
+    plan's per-rank sampled-row counts concatenates them rank by rank, and
+    ``sampled_to_request`` puts them in request order. The logits processor runs this in place of its
     ``hidden_states[gather_ids]`` selection on a sharded forward, for the
     final hidden rows and for a LAST capture's aux hidden rows alike; the
     gather is byte-preserving (:func:`token_all_gather_rows`), so any row
@@ -70,7 +70,8 @@ def gather_sampled_rows(
             f"{hidden_states.shape[0]}"
         )
     local = hidden_states.index_select(0, plan.local_sampled_ids(gather_ids))
-    return token_all_gather_rows(local, group, list(plan.sampled_rows_per_rank))
+    gathered = token_all_gather_rows(local, group, list(plan.sampled_rows_per_rank))
+    return gathered.index_select(0, plan.sampled_to_request)
 
 
 def moe_input_row_segments(

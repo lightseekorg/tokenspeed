@@ -1126,7 +1126,7 @@ class ModelExecutor:
                     rows = (
                         slice(0, num_tokens)
                         if ctx.query_shard is None
-                        else ctx.query_shard.local_slice
+                        else ctx.query_shard.local_row_ids
                     )
                     positions = (
                         ib.mrope_positions_buf[:, rows]
@@ -1326,12 +1326,13 @@ class ModelExecutor:
     @nvtx_range("target_forward", color="red")
     def _run_target_forward(self, ctx: ForwardContext):
         # The model's rows: the whole packed span, or this rank's shard of it
-        # under query context parallelism. Every buffer below is the full span
-        # on every rank; the model sees the slice.
+        # under query context parallelism (its span rows, an index tensor).
+        # Every buffer below is the full span on every rank; the model sees
+        # its rows.
         rows = (
             slice(0, ctx.input_num_tokens)
             if ctx.query_shard is None
-            else ctx.query_shard.local_slice
+            else ctx.query_shard.local_row_ids
         )
         positions = self._active_positions_override
         if positions is None:
@@ -1349,7 +1350,11 @@ class ModelExecutor:
         # below can be active alongside PP.
         if self.config.pp_size > 1 and not self._pp_is_first_stage:
             # The boundary bundle carries the rows this stage computes.
-            pp_inbound = self._pp_recv_stage_state(rows.stop - rows.start)
+            pp_inbound = self._pp_recv_stage_state(
+                ctx.input_num_tokens
+                if ctx.query_shard is None
+                else ctx.query_shard.local_rows
+            )
             output = self.model_runner.forward(
                 ctx,
                 input_ids,
@@ -1395,15 +1400,16 @@ class ModelExecutor:
         )
 
     def _model_input_kwargs(
-        self, num_tokens: int, bs: int, rows: slice
+        self, num_tokens: int, bs: int, rows: slice | torch.Tensor
     ) -> dict[str, object]:
         """Model inputs beyond ids and positions, as views of persistent buffers.
 
         Every forward call site passes these, so eager, captured and replayed
-        forwards read the same storage. ``rows`` is the slice of the packed
-        span the model computes (the whole span, or a query shard): per-row
-        inputs are sliced by it, per-request inputs keep the whole batch with
-        the slice's start as their row offset.
+        forwards read the same storage. ``rows`` are the rows of the packed
+        span the model computes (the whole span as a slice, or a query
+        shard's span rows): per-row inputs are indexed by them, per-request
+        inputs keep the whole batch (a sharded model reads the shard from
+        ``ctx.query_shard``).
         """
         # The n-gram history views are per row: hand the model its rows.
         kwargs: dict[str, object] = {
@@ -1417,7 +1423,6 @@ class ModelExecutor:
                     req_pool_indices=ib.req_pool_indices_buf[:bs],
                     input_start_offsets=ib.input_start_offsets_buf[: bs + 1],
                     active_request_mask=ib.active_request_mask_buf[:bs],
-                    row_offset=rows.start,
                 )
             )
         return kwargs
@@ -2001,7 +2006,6 @@ class ModelExecutor:
                             input_start_offsets=ib.input_start_offsets_buf[:1],
                             active_request_mask=ib.active_request_mask_buf[:0],
                             committed_lengths=self.runtime_states.valid_cache_lengths,
-                            row_offset=0,
                         )
                     )
                 step_global_num_tokens = self.drafter.idle_forward_global_num_tokens(
@@ -2471,6 +2475,7 @@ class ModelExecutor:
                         input_lengths=forward_op.input_lengths[:bs],
                         size=self.config.query_shard_size,
                         rank=self.config.query_shard_rank,
+                        device=self.device,
                     )
                 ctx = ForwardContext(
                     attn_backend=self.attn_backend,
@@ -2725,10 +2730,10 @@ class ModelExecutor:
         slots (the shifted ids are the whole span on every rank; every rank
         scores every row once the planned activations are gathered, and the
         target audit flags the same requests everywhere) and keeps as its
-        ``rows`` the ones inside its shard, re-based to it: the plan's rows
-        are sorted batch-global rows, so each rank's are one contiguous run
-        and the per-rank counts are host arithmetic over the shard boundaries
-        (``QueryShardPlan.rows_per_rank``).
+        ``rows`` the ones inside its shard, as indices into it, with the
+        per-rank counts of their gather and the index that puts the gathered
+        rows back in plan order: host arithmetic over the shard's row tables
+        (``QueryShardPlan.split_rows``).
         """
         if plan is None:
             return None
@@ -2740,21 +2745,26 @@ class ModelExecutor:
             torch.cumsum(counts, dim=0) - counts
         )
         rows_cpu = torch.arange(plan.num_rows, dtype=torch.int64) + first_row[slots_cpu]
-        staged = torch.stack((rows_cpu, slots_cpu))
+        split = None
+        host = [rows_cpu, slots_cpu]
+        if query_shard is not None and query_shard.size > 1:
+            split = query_shard.split_rows(rows_cpu)
+            host += [split.local_ids, split.to_rows_order]
+        staged = torch.cat(host)
         if is_pin_memory_available():
             staged = staged.pin_memory()
-        rows, slots = staged.to(self.device, non_blocking=True)
+        staged = staged.to(self.device, non_blocking=True)
+        rows, slots, *shard_rows = torch.split(staged, [t.shape[0] for t in host])
         targets = self.input_buffers.shifted_prefill_ids_buf[rows].to(torch.int64)
         self.nan_guard.audit_input_logprob_targets(
             targets, slots, num_extends, self.runtime_states.vocab_size
         )
         targets.clamp_(0, self.runtime_states.vocab_size - 1)
-        rows_per_rank = None
+        rows_per_rank = gathered_to_rows = None
         num_input_rows = total_tokens
-        if query_shard is not None and query_shard.size > 1:
-            rows_per_rank = query_shard.rows_per_rank(rows_cpu)
-            local = query_shard.local_rows_run(rows_per_rank)
-            rows = rows[local] - query_shard.local_start
+        if split is not None:
+            rows, gathered_to_rows = shard_rows
+            rows_per_rank = split.rows_per_rank
             num_input_rows = query_shard.local_rows
         return InputLogprobRows(
             rows=rows,
@@ -2763,6 +2773,7 @@ class ModelExecutor:
             num_input_rows=num_input_rows,
             chunk_tokens=self.config.input_logprob_chunk_tokens,
             rows_per_rank=rows_per_rank,
+            gathered_to_rows=gathered_to_rows,
             top_k=plan.top_k,
         )
 

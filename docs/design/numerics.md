@@ -314,13 +314,17 @@ Within one deployment they keep the contract as follows.
 ## Layout invariance of query context parallelism
 
 Every collective query context parallelism adds (`docs/design/unified_path.md`)
-is data movement: row slicing, the all-gather of rotated latent rows, index-K
+is data movement: row selection, the all-gather of rotated latent rows, index-K
 rows, gathered history rows, sampled rows and the planned prompt-logprob rows'
-activations. The per-row kernels — sparse attention over the gathered history
+activations, and the permutations between gather order and span order. The
+zigzag split of every request over the ranks only decides which rank
+computes a row. The per-row kernels — sparse attention over the gathered history
 with every head and no LSE merge, the indexer's top-k over pre-gathered rows,
 RoPE, the GEMMs — see for each row exactly the operands a single GPU would,
-so a row's bits do not depend on which rank computes it or on the batch it
-shares: the layout preserves run and batch invariance by construction. The
+so the permutation itself is byte-preserving. Bitwise equivalence also
+requires the selected kernels and reductions to be batch-invariant; identical
+operands alone do not ensure identical rounding when row counts select
+different kernel tactics. The
 prompt logprobs in particular are the tensor-parallel path's bit for bit:
 once the planned rows are gathered, every rank runs the same chunk loop over
 the same rows against the same vocab-sharded head

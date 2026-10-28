@@ -30,7 +30,11 @@ import torch
 
 from tokenspeed.runtime.distributed.comm_manager import CommManager
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.query_shard import QueryShardPlan, scatter_count
+from tokenspeed.runtime.execution.query_shard import (
+    QueryShardPlan,
+    scatter_count,
+    zigzag_segment_lengths,
+)
 
 RUNTIME = (
     pathlib.Path(__file__).resolve().parents[3] / "python" / "tokenspeed" / "runtime"
@@ -50,10 +54,41 @@ def _gather_rows(lengths: list[int]) -> list[int]:
     return (torch.cumsum(torch.tensor(lengths), 0) - 1).tolist()
 
 
+def _zigzag_rows(lengths: list[int], size: int) -> list[list[int]]:
+    """Every rank's span rows, written out segment by segment."""
+    rows: list[list[int]] = [[] for _ in range(size)]
+    start = 0
+    for length in lengths:
+        bounds = []
+        for count in zigzag_segment_lengths(length, size):
+            bounds.append(list(range(start, start + count)))
+            start += count
+        for rank in range(size):
+            rows[rank] += bounds[rank] + bounds[2 * size - 1 - rank]
+    return rows
+
+
+def _owner(lengths: list[int], size: int) -> dict[int, int]:
+    return {
+        row: rank
+        for rank, rows in enumerate(_zigzag_rows(lengths, size))
+        for row in rows
+    }
+
+
 def test_scatter_count_matches_the_rsag_split():
     assert scatter_count(10, 4) == [3, 3, 2, 2]
     assert scatter_count(2, 4) == [1, 1, 0, 0]
     assert scatter_count(0, 3) == [0, 0, 0]
+
+
+def test_a_request_is_cut_into_two_segments_per_rank():
+    # The first segments take the remainder.
+    assert zigzag_segment_lengths(10, 2) == [3, 3, 2, 2]
+    assert zigzag_segment_lengths(3, 4) == [1, 1, 1, 0, 0, 0, 0, 0]
+    # Rank r computes segments r and 2N - 1 - r: an early and a late part.
+    plan = _plans(16, [16], 4)[1]
+    assert plan.local_row_ids.tolist() == [2, 3, 12, 13]
 
 
 @pytest.mark.parametrize(
@@ -64,102 +99,136 @@ def test_scatter_count_matches_the_rsag_split():
         ([16], 8),
         ([2, 2, 2, 2, 2, 2, 2, 2, 2], 3),
         ([9, 1, 1, 9], 2),
+        ([2048] * 8, 8),
+        ([], 2),
     ],
 )
-def test_shard_ranges_partition_the_span_and_count_the_sampled_rows(lengths, size):
+def test_the_shards_are_every_requests_zigzag_segments(lengths, size):
     total = sum(lengths)
     plans = _plans(total, lengths, size)
-    ranges = [(p.local_start, p.local_end) for p in plans]
-    assert ranges[0][0] == 0 and ranges[-1][1] == total
-    assert all(a[1] == b[0] for a, b in zip(ranges, ranges[1:]))
-    assert all(p.row_counts == tuple(scatter_count(total, size)) for p in plans)
-    assert all(p.local_rows == p.local_end - p.local_start for p in plans)
-    # The sampled rows of every request land in exactly one shard, and the
-    # plan counts them per shard in request order.
-    rows = _gather_rows(lengths)
-    expected = [sum(1 for row in rows if start <= row < end) for start, end in ranges]
-    assert list(plans[0].sampled_rows_per_rank) == expected
-    assert plans[0].sampled_rows_total == len(lengths)
-    # Rank order is request order: the local sampled rows are a contiguous
-    # run of gather_ids starting at local_sampled_first.
+    expected = _zigzag_rows(lengths, size)
     for plan in plans:
-        first = plan.local_sampled_first
-        local = rows[first : first + plan.local_sampled_rows]
-        assert all(plan.local_start <= row < plan.local_end for row in local)
-        assert [row - plan.local_start for row in local] == sorted(
-            row - plan.local_start for row in local
+        assert plan.local_row_ids.tolist() == expected[plan.rank]
+        assert plan.local_row_ids_cpu.tolist() == expected[plan.rank]
+        assert plan.row_counts == tuple(len(rows) for rows in expected)
+        assert plan.local_rows == len(expected[plan.rank])
+        # Gather order: every rank's rows, rank by rank.
+        assert plan.rank_major_rows.tolist() == sum(expected, [])
+        # A rank's rows are in request order, counted per request.
+        starts = [sum(lengths[:b]) for b in range(len(lengths))]
+        assert plan.local_rows_per_request == tuple(
+            sum(1 for row in expected[plan.rank] if s <= row < s + n)
+            for s, n in zip(starts, lengths)
         )
+        index = plan.local_index_of_row.tolist()
+        assert [index[row] for row in expected[plan.rank]] == list(
+            range(plan.local_rows)
+        )
+        assert sum(1 for i in index if i >= 0) == plan.local_rows
+    # The shards partition the span.
+    assert sorted(sum(expected, [])) == list(range(total))
+
+
+@pytest.mark.parametrize("lengths,size", [([5, 3, 7], 4), ([16], 8), ([2048] * 8, 8)])
+def test_span_and_gather_order_convert_both_ways(lengths, size):
+    """A row all-gather over the group concatenates the ranks' rows rank by
+    rank; ``to_span_order`` puts them back, ``to_gather_order`` is its
+    inverse (the layout a reduce-scatter of span rows takes)."""
+    total = sum(lengths)
+    plans = _plans(total, lengths, size)
+    span = torch.arange(total * 2, dtype=torch.float32).reshape(total, 2)
+    gathered = torch.cat([span[plan.local_row_ids] for plan in plans])
+    for plan in plans:
+        assert torch.equal(plan.to_span_order(gathered), span)
+        assert torch.equal(plan.to_gather_order(span), gathered)
+    with pytest.raises(ValueError, match="gathered rows"):
+        plans[0].to_span_order(gathered[1:])
+
+
+@pytest.mark.parametrize(
+    "lengths,size",
+    [([5, 3, 7], 4), ([1, 1, 1], 4), ([2], 4), ([16], 8), ([30, 2, 9], 2)],
+)
+def test_the_sampled_rows_gather_back_in_request_order(lengths, size):
+    total = sum(lengths)
+    plans = _plans(total, lengths, size)
+    sampled = _gather_rows(lengths)
+    owner = _owner(lengths, size)
+    counts = tuple(sum(1 for row in sampled if owner[row] == r) for r in range(size))
+    gathered = []
+    for plan in plans:
+        assert plan.sampled_rows_per_rank == counts
+        local = plan.local_sampled_ids(torch.tensor(sampled))
+        mine = plan.local_row_ids[local].tolist()
+        assert mine == [row for row in sampled if owner[row] == plan.rank]
+        gathered += mine
+    for plan in plans:
+        restored = torch.tensor(gathered).index_select(0, plan.sampled_to_request)
+        assert restored.tolist() == sampled
+    # A shard's rows must not be handed in as the full layout.
+    with pytest.raises(ValueError, match="full layout"):
+        plans[0].local_sampled_ids(torch.zeros(len(sampled) + 1, dtype=torch.int64))
 
 
 def test_zero_row_ranks_join_with_empty_shards():
     plans = _plans(2, [2], 4)
     assert [p.local_rows for p in plans] == [1, 1, 0, 0]
     assert plans[0].sampled_rows_per_rank == (0, 1, 0, 0)
-    assert plans[3].local_slice == slice(2, 2)
-    assert plans[1].local_sampled_first == 0 and plans[1].local_sampled_rows == 1
+    assert plans[3].local_row_ids.numel() == 0
+    assert plans[1].local_sampled_rows == 1
+    # The last row of a long request is in rank 0's late segment.
+    assert _plans(20, [20], 4)[0].sampled_rows_per_rank == (1, 0, 0, 0)
 
 
 @pytest.mark.parametrize(
     "lengths,size,rows",
     [
         ([5, 3, 7], 4, [0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13]),
-        ([5, 3, 7], 4, [14]),  # one row, on the last rank
+        ([5, 3, 7], 4, [14]),
         ([2], 4, [0]),  # zero-row ranks behind a short chunk
         ([16], 8, list(range(16))),
         ([16], 8, []),  # an empty row list splits into zeros
+        ([16], 8, [9, 2, 15]),  # any order of distinct rows
     ],
 )
-def test_rows_per_rank_splits_sorted_rows_by_shard(lengths, size, rows):
-    """The prompt-logprob rows of a plan (sorted batch-global rows): each
-    rank's share is the rows inside its shard, rank order is row order, so
-    the local run is contiguous and the shares sum to the whole plan."""
+def test_split_rows_names_every_rows_rank_and_restores_their_order(lengths, size, rows):
+    """The prompt-logprob rows of a plan: each rank contributes the rows it
+    holds, as indices into its shard; the gather concatenates them rank by
+    rank and ``to_rows_order`` restores the order they were given in."""
     total = sum(lengths)
     plans = _plans(total, lengths, size)
+    owner = _owner(lengths, size)
     rows_t = torch.tensor(rows, dtype=torch.int64)
-    counts = plans[0].rows_per_rank(rows_t)
-    assert all(p.rows_per_rank(rows_t) == counts for p in plans)
-    assert sum(counts) == len(rows)
+    gathered = []
     for plan in plans:
-        expected = [r for r in rows if plan.local_start <= r < plan.local_end]
-        assert counts[plan.rank] == len(expected)
-        run = plan.local_rows_run(counts)
-        assert rows[run] == expected
-        # Re-based to the shard, the local rows index the shard's activations.
-        local = rows_t[run] - plan.local_start
-        assert all(0 <= r < plan.local_rows for r in local.tolist())
-    # The concatenation of every rank's run is the plan in row order.
-    assert sum((rows[p.local_rows_run(counts)] for p in plans), []) == rows
+        split = plan.split_rows(rows_t)
+        assert split.rows_per_rank == tuple(
+            sum(1 for row in rows if owner[row] == r) for r in range(size)
+        )
+        assert split.local_ids.shape[0] == split.rows_per_rank[plan.rank]
+        gathered += plan.local_row_ids[split.local_ids].tolist()
+    restored = torch.tensor(gathered, dtype=torch.int64)
+    assert restored.index_select(0, split.to_rows_order).tolist() == rows
 
 
-def test_rows_per_rank_refuses_rows_past_the_span_unsorted_and_device_rows():
+def test_split_rows_refuses_rows_past_the_span_and_device_rows():
     plan = _plans(10, [4, 6], 4)[0]
     with pytest.raises(ValueError, match="exceed"):
-        plan.rows_per_rank(torch.tensor([3, 10]))
+        plan.split_rows(torch.tensor([3, 10]))
     with pytest.raises(ValueError, match="1-D host"):
-        plan.rows_per_rank(torch.tensor([[1, 2]]))
-    # The split counts rows below each shard boundary, so unsorted rows
-    # would be miscounted silently: refused loudly instead.
-    with pytest.raises(ValueError, match="sorted"):
-        plan.rows_per_rank(torch.tensor([5, 3]))
-    # Ties and a single row are sorted (shards [3, 3, 2, 2]).
-    assert plan.rows_per_rank(torch.tensor([3, 3, 9])) == (0, 2, 0, 1)
-    assert plan.rows_per_rank(torch.tensor([9])) == (0, 0, 0, 1)
+        plan.split_rows(torch.tensor([[1, 2]]))
 
 
-@pytest.mark.parametrize(
-    "lengths,size", [([5, 3, 7], 4), ([1, 1, 1], 4), ([2], 4), ([16], 8), ([], 2)]
-)
-def test_the_sampled_rows_take_the_same_split_as_any_sorted_rows(lengths, size):
-    """``sampled_rows_per_rank`` is ``rows_per_rank`` over the sampled rows:
-    one split, so the sampled-row gather and the prompt-row gather can never
+def test_the_sampled_rows_take_the_same_split_as_any_rows():
+    """``sampled_rows_per_rank`` is ``split_rows`` over the sampled rows: one
+    split, so the sampled-row gather and the prompt-row gather can never
     disagree on which rank a row belongs to."""
-    plan = _plans(sum(lengths), lengths, size)[0]
-    sampled_rows = torch.tensor(_gather_rows(lengths), dtype=torch.int64)
-    assert plan.sampled_rows_per_rank == plan.rows_per_rank(sampled_rows)
-    assert (
-        plan.local_sampled_first
-        == plan.local_rows_run(plan.sampled_rows_per_rank).start
-    )
+    lengths = [5, 3, 7]
+    plan = _plans(sum(lengths), lengths, 4)[2]
+    split = plan.split_rows(torch.tensor(_gather_rows(lengths)))
+    assert plan.sampled_rows_per_rank == split.rows_per_rank
+    assert torch.equal(plan.local_sampled_index, split.local_ids)
+    assert torch.equal(plan.sampled_to_request, split.to_rows_order)
 
 
 def test_rows_for_collective_names_the_shard_or_the_sampled_rows():
@@ -177,9 +246,7 @@ def test_plan_rejects_inconsistent_inputs():
             total_tokens=5, input_lengths=[2, 2], size=2, rank=0
         )
     with pytest.raises(ValueError, match="outside"):
-        QueryShardPlan(size=2, rank=2, row_counts=(1, 1), sampled_rows_per_rank=(1, 0))
-    with pytest.raises(ValueError, match="name every rank"):
-        QueryShardPlan(size=2, rank=0, row_counts=(2,), sampled_rows_per_rank=(1, 0))
+        QueryShardPlan.from_forward(total_tokens=2, input_lengths=[2], size=2, rank=2)
 
 
 def test_mapping_exposes_the_query_shard_group():
@@ -277,8 +344,8 @@ def test_the_model_exit_hands_the_processor_the_shard_and_its_plan():
 
 
 def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
-    """``_model_input_kwargs`` slices per-row inputs by the shard and gives
-    the per-request history view the shard's row offset."""
+    """``_model_input_kwargs`` indexes per-row inputs by the shard's rows and
+    hands per-request inputs (the history view) the whole batch."""
     from types import SimpleNamespace
 
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
@@ -296,21 +363,22 @@ def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
         has_request_token_history=True,
         request_token_history_view=lambda **kw: views.update(kw) or "view",
     )
-    kwargs = executor._model_input_kwargs(10, 3, slice(3, 6))
-    assert torch.equal(kwargs["engram_hash_ids"], history[3:6])
+    plan = QueryShardPlan.from_forward(
+        total_tokens=10, input_lengths=[4, 1, 5], size=2, rank=1
+    )
+    kwargs = executor._model_input_kwargs(10, 3, plan.local_row_ids)
+    assert torch.equal(kwargs["engram_hash_ids"], history[plan.local_row_ids])
     assert kwargs["request_token_history"] == "view"
-    assert views["row_offset"] == 3
     assert views["input_start_offsets"].tolist() == [0, 4, 5, 10]
     kwargs = executor._model_input_kwargs(10, 3, slice(0, 10))
     assert torch.equal(kwargs["engram_hash_ids"], history)
-    assert views["row_offset"] == 0
 
 
 def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     monkeypatch,
 ):
     """Eagle's step-0 extend under a shard: the shifted prefill ids are the
-    shard's slice (after the last-token patch over the whole span) while the
+    shard's rows (after the last-token patch over the whole span) while the
     draft's ``gather_ids`` stay the batch's full layout, exactly as on the
     target's context -- one convention, so the logits processor's
     ``gather_sampled_rows`` is the one place that cuts them to the shard."""
@@ -319,7 +387,9 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     from tokenspeed.runtime.distributed import comm_manager
     from tokenspeed.runtime.execution.drafter.eagle import Eagle
 
-    lengths = [4, 1, 5]  # sampled rows 3, 4, 9 over shards [3, 3, 2, 2]
+    # Sampled rows 3, 4, 9: row 3 is request 0's segment 3 (rank 3), row 4
+    # request 1's segment 0 (rank 0), row 9 request 2's segment 4 (rank 3).
+    lengths = [4, 1, 5]
     total = sum(lengths)
     rows = (torch.cumsum(torch.tensor(lengths), 0) - 1).tolist()
     shifted = torch.arange(100, 100 + total)
@@ -333,6 +403,17 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     sampled = torch.tensor([7, 8, 9])
     # The draft's final hidden rows on every rank: row r of the span is r.
     hidden = torch.arange(total, dtype=torch.float32).unsqueeze(1)
+    plans = [
+        QueryShardPlan.from_forward(
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+        )
+        for rank in range(4)
+    ]
+    # What the group's gather returns: every rank's sampled rows, rank by rank.
+    gathered = torch.cat(
+        [hidden[p.local_row_ids][p.local_sampled_index] for p in plans]
+    )
+    assert gathered.flatten().tolist() == [4, 3, 9]
     gathered_by_rank = {}
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
@@ -348,35 +429,30 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
         assert ids.shape[0] == plan.local_rows
         patched = shifted.clone()
         patched[torch.tensor(rows)] = sampled
-        assert torch.equal(ids, patched[plan.local_slice])
+        assert torch.equal(ids, patched[plan.local_row_ids])
         assert gather_ids.tolist() == rows  # full layout, not re-based
         # The exit selects this rank's sampled rows from its shard.
         local = plan.local_sampled_ids(gather_ids)
-        expected = [
-            r - plan.local_start for r in rows if plan.local_start <= r < plan.local_end
-        ]
-        assert local.tolist() == expected
-        assert len(expected) == plan.local_sampled_rows == [0, 2, 0, 1][rank]
+        owned = [r for r in rows if r in plan.local_row_ids.tolist()]
+        assert plan.local_row_ids[local].tolist() == owned
+        assert len(owned) == plan.local_sampled_rows == [1, 0, 0, 2][rank]
         monkeypatch.setattr(
             comm_manager,
             "token_all_gather_rows",
             lambda t, g, counts, r=rank: gathered_by_rank.setdefault(
                 r, (t.clone(), counts)
-            ),
+            )
+            and gathered,
         )
-        comm_manager.gather_sampled_rows(
-            hidden[plan.local_slice], plan, gather_ids, group=(0, 1, 2, 3)
+        out = comm_manager.gather_sampled_rows(
+            hidden[plan.local_row_ids], plan, gather_ids, group=(0, 1, 2, 3)
         )
         contributed, counts = gathered_by_rank[rank]
-        assert counts == [0, 2, 0, 1]
-        # Rank 1 contributes rows 3 and 4, rank 3 row 9; the others none.
-        assert contributed.flatten().tolist() == [
-            r for r in rows if plan.local_start <= r < plan.local_end
-        ]
-    # The concatenation in rank order is the batch's sampled rows in request order.
-    assert (
-        torch.cat([gathered_by_rank[r][0] for r in range(4)]).flatten().tolist() == rows
-    )
+        assert counts == [1, 0, 0, 2]
+        # Rank 0 contributes row 4, rank 3 rows 3 and 9; the others none.
+        assert contributed.flatten().tolist() == owned
+        # Put back in request order on every rank.
+        assert out.flatten().tolist() == rows
     # A shard's slice must not be handed in as the full layout.
     with pytest.raises(ValueError, match="full layout"):
         QueryShardPlan.from_forward(
@@ -386,7 +462,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
 
 def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
     """The multi-depth MTP drafter under a shard, every rank of a four-rank
-    group in turn: each depth's ids and positions are the shard's slice of
+    group in turn: each depth's ids and positions are the shard's rows of
     the whole-span depth ids, the draft context carries the plan and the
     full-layout ``gather_ids``, the chain hiddens are the shard's rows, and
     the cross-chunk stash of target hiddens -- summed from every rank's
@@ -442,7 +518,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
         return drafter
 
     def draft_input(plan):
-        shard = target_hidden[plan.local_slice] if plan is not None else target_hidden
+        shard = target_hidden[plan.local_row_ids] if plan is not None else target_hidden
         return mtp.MtpDraftInput(
             input_num_tokens=total,
             num_extends=bs,
@@ -481,9 +557,9 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
         assert torch.equal(next_tokens, reference_next)
         assert len(forwards) == steps
         for d, call in enumerate(forwards):
-            assert torch.equal(call["input_ids"], reference_ids[d][plan.local_slice])
+            assert torch.equal(call["input_ids"], reference_ids[d][plan.local_row_ids])
             assert torch.equal(
-                call["positions"], torch.arange(1000, 1000 + total)[plan.local_slice]
+                call["positions"], torch.arange(1000, 1000 + total)[plan.local_row_ids]
             )
             ctx = call["ctx"]
             assert ctx.query_shard is plan and ctx.gather_ids.tolist() == rows
@@ -491,7 +567,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
             assert call["captured_hidden_states"].shape[0] == plan.local_rows
             torch.testing.assert_close(
                 call["captured_hidden_states"],
-                target_hidden[plan.local_slice] + d,
+                target_hidden[plan.local_row_ids] + d,
                 rtol=0,
                 atol=0,
             )

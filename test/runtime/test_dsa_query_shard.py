@@ -60,7 +60,7 @@ KV_DIM = 8
 INDEX_HEAD_DIM = 128
 WORLD = 4
 # Three requests: prefix + chunk rows. The chunk rows (extend lengths) make a
-# 10-row span sharded [3, 3, 2, 2] over four ranks.
+# 10-row span sharded [3, 2, 2, 3] over four ranks.
 EXTEND = [4, 1, 5]
 PREFIX = [2, 4, 0]
 HISTORY = [p + e for p, e in zip(PREFIX, EXTEND)]  # [6, 5, 5]
@@ -165,13 +165,11 @@ def test_the_plan_groups_requests_and_slices_this_ranks_queries(rank):
     assert [g.requests for g in meta.groups] == [slice(0, 2), slice(2, 3)]
     assert [g.rows for g in meta.groups] == [11, 5]
     assert [g.row_base for g in meta.groups] == [0, 11]
-    # Query rows 0-4 belong to the first group, 5-9 to the second; each
-    # rank's slice is its shard intersected with the group's span.
-    start, end = plan.local_start, plan.local_end
+    # Query rows 0-4 belong to the first group, 5-9 to the second; a rank's
+    # rows are ascending, so each group's are one run of them.
+    local = plan.local_row_ids.tolist()
     for group, (lo, hi) in zip(meta.groups, ((0, 5), (5, 10))):
-        expected = slice(
-            min(max(lo, start), end) - start, min(max(hi, start), end) - start
-        )
+        expected = slice(sum(r < lo for r in local), sum(r < hi for r in local))
         assert group.local_query == expected
     # One owner (no KVP): the gather is local and holds every history row.
     for group in meta.groups:
@@ -254,7 +252,7 @@ def test_the_sharded_arm_attends_gathered_groups_with_full_heads(monkeypatch, ra
     # Workspace rows: history rows numbered request-major over all requests.
     topk = torch.full((local_rows, 4), -1, dtype=torch.int32)
     for j in range(local_rows):
-        topk[j, 0] = plan.local_start + j  # some absolute workspace row
+        topk[j, 0] = plan.local_row_ids[j]  # some absolute workspace row
     topk_lens = torch.ones(local_rows, dtype=torch.int32)
     kv_seq_lens = torch.full((local_rows,), 3, dtype=torch.int32)
 

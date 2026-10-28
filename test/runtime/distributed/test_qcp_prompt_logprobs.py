@@ -115,7 +115,7 @@ def _forward(
     )
     out = processor(
         input_ids=None,
-        hidden_states=hidden[shard.local_slice].clone(),
+        hidden_states=hidden[shard.local_row_ids].clone(),
         lm_head=SimpleNamespace(weight=local),
         logits_metadata=metadata,
     )
