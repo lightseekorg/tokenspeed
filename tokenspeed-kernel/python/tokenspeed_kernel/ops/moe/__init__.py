@@ -2245,6 +2245,7 @@ import tokenspeed_kernel.ops.moe.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_ep  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.flashinfer  # noqa: E402,F401
+import tokenspeed_kernel.ops.moe.flashinfer_megamoe  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.moe.native  # noqa: E402,F401
