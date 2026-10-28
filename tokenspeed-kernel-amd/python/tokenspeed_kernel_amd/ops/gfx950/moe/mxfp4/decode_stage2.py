@@ -31,6 +31,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
+    _direct_mxfp4_k_loop,
     _direct_mxfp4_load_tile,
     _direct_mxfp4_mfma,
     _direct_mxfp4_mfma_layouts,
@@ -501,6 +502,7 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
+    PIPELINE_K: gl.constexpr,
 ):
     """Read expert route tiles and return separate token/slot outputs."""
     gl.static_assert(
@@ -542,38 +544,37 @@ def gluon_mxfp4_moe_stage2_route_tiles_gfx950(
         ncols = n * BLOCK_N + bn
         nscols = n * BLOCK_N + bsn
         acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
-        for kt in range(K_PACKED // KP):
-            a, b, sa, sb = _direct_mxfp4_load_tile(
-                kt,
-                ak,
-                bk,
-                ask,
-                bsk,
-                am,
-                asm,
-                x,
-                xscale,
-                w,
-                wscale,
-                xoff,
-                woff,
-                wsoff,
-                ncols,
-                nscols,
-                scale_routes,
-                1,
-                XS0,
-                XS1,
-                SS0,
-                SS1,
-                OUTPUT,
-                INTERMEDIATE,
-                OUTPUT,
-                K_PACKED,
-                KP,
-                KS,
-            )
-            acc = _direct_mxfp4_mfma(acc, a, b, sa, sb)
+        acc = _direct_mxfp4_k_loop(
+            acc,
+            ak,
+            bk,
+            ask,
+            bsk,
+            am,
+            asm,
+            x,
+            xscale,
+            w,
+            wscale,
+            xoff,
+            woff,
+            wsoff,
+            ncols,
+            nscols,
+            scale_routes,
+            1,
+            XS0,
+            XS1,
+            SS0,
+            SS1,
+            OUTPUT,
+            INTERMEDIATE,
+            OUTPUT,
+            K_PACKED,
+            KP,
+            KS,
+            PIPELINE_K,
+        )
         sm = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, mfma))[:, None]
         sn = gl.arange(0, BLOCK_N, layout=gl.SliceLayout(0, mfma))[None, :]
         destinations = gl.load(sorted_routes + start + sm, sm < count, other=first)
