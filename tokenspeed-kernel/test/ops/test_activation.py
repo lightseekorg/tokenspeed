@@ -526,6 +526,8 @@ def test_moe_finalize_gate_add_reads_gemm2_rows_past_int32_offsets(
     )
     far[first_far_row:] = near
     far_permuted = torch.where(permuted >= 0, permuted + first_far_row, permuted)
+    # An int32 route map is what makes the in-kernel int64 cast matter.
+    assert far_permuted.dtype == torch.int32
 
     expected = moe_finalize_gate_add(
         near, permuted, weights, hidden, gate_weight, shared
