@@ -31,6 +31,8 @@ from tokenspeed_kernel_amd._triton import triton
 # third wave on the EP shapes. Stage 1 is fastest at 1000 and loses occupancy
 # again at 3000; stage 2 keeps it only up to 300.
 _PACKED_LARGE_STAGE1_LLVM_CL_OPTS = "slp-schedule-budget=1000"
+# Under the bound, iterative-ilp schedules stage 1 best.
+_PACKED_LARGE_STAGE1_LLVM_FN_ATTRS = (("amdgpu-sched-strategy", "iterative-ilp"),)
 _PACKED_LARGE_STAGE2_LLVM_CL_OPTS = "slp-schedule-budget=100"
 
 
@@ -233,6 +235,7 @@ def launch_gluon_fp8_packed_moe_gfx950(
                 "USE_NT": use_nt,
                 "num_stages": 1,
                 "llvm_cl_opts": _PACKED_LARGE_STAGE1_LLVM_CL_OPTS,
+                "llvm_fn_attrs": _PACKED_LARGE_STAGE1_LLVM_FN_ATTRS,
             }
         else:
             from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (
