@@ -52,7 +52,6 @@ _ORCH_FLAGS = {
     "--engine-startup-timeout",
     "--gateway-startup-timeout",
     "--drain-timeout",
-    "--control-port",
 }
 
 _FANOUT_FLAGS = {"--model", "--reasoning-parser"}
@@ -98,7 +97,6 @@ class OrchestratorOpts:
     engine_startup_timeout: int = 3600
     gateway_startup_timeout: int = 60
     drain_timeout: int = 30
-    control_port: int | None = None
 
 
 @dataclass

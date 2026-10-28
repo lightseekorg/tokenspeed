@@ -9,8 +9,8 @@ embeds CPython for the data plane. The design rules of the loop are in
 | Source crate | Published package | Role |
 | --- | --- | --- |
 | `ts-wire` | `tokenspeed-wire` | The engine IPC schema and its msgpack codec, byte-compatible with the Python structs in `python/tokenspeed/runtime/engine/io_struct.py` and `zmq_wire.py`. |
-| `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts and control operations. |
-| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for the Python frontend (`AsyncLLM`, under the `Engine` API and the gRPC servicer), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
+| `ts-client` | `tokenspeed-client` | A frontend's connection to the engines: the startup handshake, request routing across attention-DP ranks, output streams, aborts, control operations and an EPD encode server's encode requests. |
+| `ts-py` | `tokenspeed-py` | `tokenspeed_engine._native`: `ts-client` for Python tests and tools (`entrypoints/wire_driver.py`), with `tokenspeed_engine.host_binary()` naming the installed `ts-host`, and `ts-l3`'s executor for Python tests over a data plane's Host pool. |
 | `ts-collective` | `tokenspeed-collective` | CPU collectives among an engine's ranks over a TCP mesh: broadcast, all-gather and all-reduce, each frame checked against the collective the receiver is in. |
 | `ts-scheduler` | `tokenspeed-scheduler` | The C++ scheduler and its nanobind module compiled into the binary, with a `cxx` facade for the control thread. The module is registered as a built-in of the embedded interpreter, so the plans Python reads are the same C++ objects the control thread produced. |
 | `ts-control` | `tokenspeed-control` | One rank's control plane: ingress checks, request state and output processing, the scheduling loop and its in-flight queue, cache-op acknowledgment, control operations, grammars, the expert rebalance, KV events, the engine side of the msgpack wire, and the per-round agreements among ranks. |

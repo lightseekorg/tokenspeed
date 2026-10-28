@@ -64,34 +64,89 @@ def gpu_used_mib(index: int = _PHYS_GPU) -> int:
     return int(out.decode().strip().splitlines()[0])
 
 
-def _ok(result) -> bool:
-    """Normalize a control reply to a success bool. The engine API is uneven:
-    ``release/resume_memory_occupation`` return a ``*ReqOutput`` dataclass with
-    ``.success``, while ``resume_scheduler`` returns a bare bool."""
-    if isinstance(result, bool):
-        return result
-    return getattr(result, "success", True) is not False
+class _Engine:
+    """An engine driven over its wire, with the control operations this
+    script exercises: each one runs on every engine and succeeds only if
+    every engine's reply does."""
 
+    def __init__(self, model, *, enable_prefix_caching, extra_args=()):
+        from transformers import AutoTokenizer
 
-def make_engine(Engine, model, *, enable_prefix_caching):
-    return Engine(
-        disable_autotune=True,
-        model=model,
-        enable_memory_saver=True,
-        enable_prefix_caching=enable_prefix_caching,
-        # KVStore requires prefix caching (mutually exclusive with it disabled),
-        # so the KV-release config (prefix caching off) must also disable KVStore.
-        disable_kvstore=not enable_prefix_caching,
-        gpu_memory_utilization=float(os.environ.get("GMU", "0.1")),
-        max_model_len=2048,
-        trust_remote_code=True,
-        log_level="info",
-    )
+        from tokenspeed.runtime.entrypoints.wire_driver import WireDriver
+
+        self.tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
+        self.driver = WireDriver(
+            [
+                "--disable-autotune",
+                "--model",
+                model,
+                "--enable-memory-saver",
+                (
+                    "--enable-prefix-caching"
+                    if enable_prefix_caching
+                    else "--disable-prefix-caching"
+                ),
+                "--gpu-memory-utilization",
+                os.environ.get("GMU", "0.1"),
+                "--max-model-len",
+                "2048",
+                "--trust-remote-code",
+                "--log-level",
+                "info",
+                # KVStore requires prefix caching (mutually exclusive with it
+                # disabled), so the KV-release config (prefix caching off)
+                # must also disable KVStore.
+                *([] if enable_prefix_caching else ["--disable-kvstore"]),
+                *extra_args,
+            ],
+            num_engines=1,
+            routing="round_robin",
+            startup_timeout_s=3600,
+        )
+
+    def generate(self, prompt: str, sampling_params: dict) -> list[int]:
+        from tokenspeed.runtime.entrypoints.wire_driver import generate_request
+
+        [completion] = self.driver.generate(
+            [generate_request(self.tokenizer.encode(prompt), sampling_params)]
+        )
+        return completion.output_ids
+
+    def _all_succeed(self, operation) -> bool:
+        return all(reply.success for reply in self.driver.control(operation))
+
+    def release(self, tags=None) -> bool:
+        from tokenspeed.runtime.engine.io_struct import (
+            ReleaseMemoryOccupationReqInput,
+        )
+
+        return self._all_succeed(ReleaseMemoryOccupationReqInput(tags=tags))
+
+    def resume(self, tags=None) -> bool:
+        from tokenspeed.runtime.engine.io_struct import (
+            ResumeMemoryOccupationReqInput,
+        )
+
+        return self._all_succeed(ResumeMemoryOccupationReqInput(tags=tags))
+
+    def resume_scheduler(self) -> bool:
+        from tokenspeed.runtime.engine.io_struct import ResumeSchedulerReqInput
+
+        return self._all_succeed(ResumeSchedulerReqInput())
+
+    def is_sleeping(self) -> bool:
+        from tokenspeed.runtime.engine.io_struct import IsSleepingReqInput
+
+        return any(
+            reply.is_sleeping for reply in self.driver.control(IsSleepingReqInput())
+        )
+
+    def shutdown(self) -> None:
+        self.driver.shutdown()
 
 
 def main() -> None:
     model = sys.argv[1] if len(sys.argv) > 1 else "Qwen/Qwen3-0.6B"
-    from tokenspeed.runtime.entrypoints.engine import Engine
 
     sp = {"temperature": 0.0, "max_new_tokens": 16}
     prompt = "The capital of France is"
@@ -100,18 +155,17 @@ def main() -> None:
     # Engine 1: prefix caching OFF — the supported config for KV release.
     # Covers A, B, C, D, F, G.
     # ====================================================================
-    engine = make_engine(Engine, model, enable_prefix_caching=False)
+    engine = _Engine(model, enable_prefix_caching=False)
 
     print("[boot] is_sleeping:", engine.is_sleeping())
     base = engine.generate(prompt, sp)
-    base_text = base["text"] if isinstance(base, dict) else base[0]["text"]
-    print("[baseline]", repr(base_text))
+    print("[baseline]", base)
 
     used0 = gpu_used_mib()
     print(f"[memA] used before release: {used0} MiB")
 
     # --- Case A: full release frees GPU memory ---
-    r = engine.release_memory_occupation()
+    r = engine.release()
     print("[A] release ->", r, "is_sleeping:", engine.is_sleeping())
     used1 = gpu_used_mib()
     print(f"[memA] used after release: {used1} MiB (freed {used0 - used1} MiB)")
@@ -121,12 +175,12 @@ def main() -> None:
     # --- Case F (#1): scheduler resume must NOT wake a released engine ---
     f = engine.resume_scheduler()
     print("[F] resume_scheduler while released ->", f)
-    assert not _ok(f), "resume_scheduler must fail while memory is released"
+    assert not f, "resume_scheduler must fail while memory is released"
     assert (
         engine.is_sleeping() is True
     ), "still sleeping after rejected scheduler resume"
 
-    engine.resume_memory_occupation()
+    engine.resume()
     print("[A] resume -> is_sleeping:", engine.is_sleeping())
     used2 = gpu_used_mib()
     print(f"[memA] used after resume: {used2} MiB")
@@ -134,49 +188,44 @@ def main() -> None:
 
     # --- Case B: token-identical generation across a sleep cycle ---
     after = engine.generate(prompt, sp)
-    after_text = after["text"] if isinstance(after, dict) else after[0]["text"]
-    print("[B] after-wake:", repr(after_text))
-    assert (
-        after_text == base_text
-    ), f"output changed across sleep: {base_text!r} != {after_text!r}"
+    print("[B] after-wake:", after)
+    assert after == base, f"output changed across sleep: {base} != {after}"
     print("[B] token-identical across sleep cycle: OK")
 
     # --- Case C: RL multi-stage tag flow ---
-    engine.release_memory_occupation(tags=["weights", "kv_cache"])
+    engine.release(tags=["weights", "kv_cache"])
     assert engine.is_sleeping() is True
-    engine.resume_memory_occupation(tags=["weights"])
+    engine.resume(tags=["weights"])
     print("[C] after resume weights -> is_sleeping:", engine.is_sleeping())
     assert engine.is_sleeping() is True, "kv still released => still sleeping"
-    engine.resume_memory_occupation(tags=["kv_cache"])
+    engine.resume(tags=["kv_cache"])
     assert engine.is_sleeping() is False, "fully awake after kv resume"
-    c_text = engine.generate(prompt, sp)
-    c_text = c_text["text"] if isinstance(c_text, dict) else c_text[0]["text"]
-    print("[C] multi-stage wake generate:", repr(c_text))
+    print("[C] multi-stage wake generate:", engine.generate(prompt, sp))
     print("[C] multi-stage tag flow: OK")
 
     # --- Case G (#2): partial release, then DEFAULT resume(None) ---
-    engine.release_memory_occupation(tags=["weights"])
+    engine.release(tags=["weights"])
     assert engine.is_sleeping() is True
-    g = engine.resume_memory_occupation()  # tags=None => wake what is asleep
+    g = engine.resume()  # tags=None => wake what is asleep
     print("[G] default resume after weights-only release ->", g)
-    assert _ok(g), "default resume must restore the weights-only release"
+    assert g, "default resume must restore the weights-only release"
     assert (
         engine.is_sleeping() is False
     ), "default resume must fully wake a partial release"
-    g_text = engine.generate(prompt, sp)
-    g_text = g_text["text"] if isinstance(g_text, dict) else g_text[0]["text"]
-    assert g_text == base_text, "output changed after partial-release default-resume"
+    assert (
+        engine.generate(prompt, sp) == base
+    ), "output changed after partial-release default-resume"
     print("[G] default-resume of partial release: OK")
 
     # --- Case D: error paths ---
-    d1 = engine.resume_memory_occupation(tags=["weights"])  # nothing released
+    d1 = engine.resume(tags=["weights"])  # nothing released
     print("[D] resume not-released ->", d1)
-    assert not _ok(d1), "resume of not-released tag must fail"
-    engine.release_memory_occupation(tags=["weights"])
-    d2 = engine.release_memory_occupation(tags=["weights"])  # double release
+    assert not d1, "resume of not-released tag must fail"
+    engine.release(tags=["weights"])
+    d2 = engine.release(tags=["weights"])  # double release
     print("[D] double release ->", d2)
-    assert not _ok(d2), "double release must fail"
-    engine.resume_memory_occupation(tags=["weights"])  # clean up
+    assert not d2, "double release must fail"
+    engine.resume(tags=["weights"])  # clean up
     print("[D] error paths: OK")
 
     engine.shutdown()
@@ -185,28 +234,26 @@ def main() -> None:
     # Engine 2: prefix caching ON (default) — KV release must be REJECTED.
     # Covers E (#3 fail-closed).
     # ====================================================================
-    engine2 = make_engine(Engine, model, enable_prefix_caching=True)
+    engine2 = _Engine(model, enable_prefix_caching=True)
     try:
-        e_kv = engine2.release_memory_occupation(tags=["kv_cache"])
+        e_kv = engine2.release(tags=["kv_cache"])
         print("[E] release kv_cache (prefix caching on) ->", e_kv)
-        assert not _ok(
-            e_kv
-        ), "kv_cache release must be rejected when prefix caching is on"
+        assert not e_kv, "kv_cache release must be rejected when prefix caching is on"
         assert (
             engine2.is_sleeping() is False
         ), "rejected release must not put engine to sleep"
 
-        e_all = engine2.release_memory_occupation()  # tags=None includes kv_cache
+        e_all = engine2.release()  # tags=None includes kv_cache
         print("[E] release all (prefix caching on) ->", e_all)
-        assert not _ok(e_all), "full release must be rejected (includes kv_cache)"
+        assert not e_all, "full release must be rejected (includes kv_cache)"
         assert engine2.is_sleeping() is False
 
         # weights-only release is still allowed (no KV discarded).
-        e_w = engine2.release_memory_occupation(tags=["weights"])
+        e_w = engine2.release(tags=["weights"])
         print("[E] release weights (prefix caching on) ->", e_w)
-        assert _ok(e_w), "weights-only release must still succeed"
+        assert e_w, "weights-only release must still succeed"
         assert engine2.is_sleeping() is True
-        engine2.resume_memory_occupation(tags=["weights"])
+        engine2.resume(tags=["weights"])
         assert engine2.is_sleeping() is False
         print("[E] fail-closed KV release: OK")
     finally:
@@ -224,33 +271,27 @@ def main() -> None:
     if not draft:
         print("[H] (#4 draft pool) SKIPPED — set TOKENSPEED_DRAFT_MODEL to run")
     else:
-        engine3 = Engine(
-            disable_autotune=True,
-            model=model,
-            enable_memory_saver=True,
+        engine3 = _Engine(
+            model,
             enable_prefix_caching=False,
-            speculative_algorithm=os.environ.get("TOKENSPEED_SPEC_ALGO", "EAGLE3"),
-            speculative_draft_model_path=draft,
-            gpu_memory_utilization=float(os.environ.get("GMU", "0.1")),
-            max_model_len=2048,
-            trust_remote_code=True,
-            log_level="info",
+            extra_args=[
+                "--speculative-algorithm",
+                os.environ.get("TOKENSPEED_SPEC_ALGO", "EAGLE3"),
+                "--speculative-draft-model-path",
+                draft,
+            ],
         )
         try:
             h_base = engine3.generate(prompt, sp)
-            h_base = h_base["text"] if isinstance(h_base, dict) else h_base[0]["text"]
-            engine3.release_memory_occupation()  # frees target + draft KV
+            engine3.release()  # frees target + draft KV
             assert engine3.is_sleeping() is True
-            engine3.resume_memory_occupation()  # must repair BOTH pools
+            engine3.resume()  # must repair BOTH pools
             assert engine3.is_sleeping() is False
             h_after = engine3.generate(prompt, sp)
-            h_after = (
-                h_after["text"] if isinstance(h_after, dict) else h_after[0]["text"]
-            )
             # Coherent (non-empty) output and no crash from garbage draft KV.
             assert (
                 h_after and h_after == h_base
-            ), f"spec output changed/empty after sleep: {h_base!r} != {h_after!r}"
+            ), f"spec output changed/empty after sleep: {h_base} != {h_after}"
             print("[H] spec-decode draft pool repaired after wake: OK")
         finally:
             engine3.shutdown()

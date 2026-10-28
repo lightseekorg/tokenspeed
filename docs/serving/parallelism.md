@@ -164,7 +164,7 @@ The decode preset for a 128-way DP MLA model is thus one node-local group
 of 8 reused three times:
 
 ```bash
-tokenspeed serve <model> \
+tokenspeed serve --headless <model> \
   --world-size 128 --nprocs-per-node 8 --attn-tp-size 1 --data-parallel-size 128 \
   --attn-head-tp-size 8 --dense-tp-size 8 --lm-head-tp-size 8 \
   --tp-batch-invariant attn+dense --disaggregation-mode decode ...
@@ -183,24 +183,22 @@ reduce-scatter remains batch-invariant, see `docs/design/numerics.md`).
 
 Each attention-DP rank owns a private prefix cache, so multi-turn requests
 only reuse their cache when every turn lands on the same rank. The
-`data_parallel_rank` request field (`Engine.generate` / `async_generate`, or
-the gateway's gRPC protocol) pins a request to one rank: it dispatches
-straight there, bypassing load balancing — overload spill is the router's
-job. An invalid pin fails that request. The engine keeps serving. Engines
-without attention DP drop the pin.
+`data_parallel_rank` field of the wire request a frontend submits pins a
+request to one rank: the frontend dispatches it straight there, bypassing load
+balancing — overload spill is the router's job. A pin that names no rank fails
+that request. The engine keeps serving.
 
-Prefill engines ignore the pin: the decode side finds a request's prefill
-rank from its `bootstrap_room` residue (`room % dp_size`), so steer prefill
-placement by minting the room instead. The engine logs and ignores a
-conflicting pin rather than rejecting it. Decode engines honor the pin,
-since any decode rank finds the prefill rank from the room; without one, or
-with one out of range (logged and ignored), the room residue places the
-request.
+Disaggregated prefill and decode requests each honor their own rank pin,
+since any decode rank finds the prefill rank from the room. The
+`bootstrap_room` still identifies the prefill KV source: `room % dp_size`
+must match the rank a prefill pin selects, so a frontend pins the prefill
+rank and mints the room from one decision. Without a pin, a PD request
+follows the room residue (`room % dp_size`).
 
-With the bundled gateway, pass `--policy cache_aware --dp-aware` to
-`ts serve` to enable per-rank affinity routing. This requires bundled smg
-releases that carry the TokenSpeed dp-affinity support; see the lockstep
-note in `serve_smg.py`.
+Under `ts serve`, the engine's attention-DP ranks register with the bundled
+gateway as one grouped worker, which places each unpinned request on its
+least-loaded rank itself; the gateway's `--dp-aware` expansion does not apply
+to it.
 
 ## MoE deployments
 
@@ -402,7 +400,9 @@ is decoding", so one extending rank moves the whole group to the normal legs.
 
 When DeepEP is selected, TokenSpeed disables the prefill CUDA graph:
 normal-mode dispatch reports its per-expert receive counts to the host, and a
-graph cannot capture a host sync. Decode graphs are unaffected.
+graph cannot capture a host sync. Decode graphs replay the low-latency legs;
+`--deepep-mode normal` has none to replay, so it disables CUDA graphs
+altogether.
 
 For block-scale FP8 decode on NVIDIA, the low-latency path keeps routing
 metadata in DeepEP's required contiguous int64/float32 formats across both
@@ -475,14 +475,13 @@ replicas live on other ranks.
    counters once capture is done, so the first window -- a profile's or a
    rebalance's -- starts at the first served forward.
 
-   ```bash
-   curl -X POST localhost:8401/start_profile -H 'Content-Type: application/json' \
-     -d '{"output_dir": "/tmp/expert-load", "activities": ["EXPERT_LOAD"]}'
-   # ... serve the workload ...
-   curl -X POST localhost:8401/stop_profile
-   ```
+   Start a profile with the `EXPERT_LOAD` activity and an `output_dir` (the
+   engine's `ProfileReq` control operation, which the frontend driving the
+   engine sends; under `ts serve`, the gateway's `POST /start_profile` with
+   `{"activities": ["EXPERT_LOAD"], "output_dir": ...}`), serve the
+   workload, then stop the profile (`POST /stop_profile`).
 
-   `stop_profile` writes one record per rank,
+   Stopping writes one record per rank,
    `<id>-<rank tag>.expert-load.pt`, holding what *that rank's* router
    counted: `physical_count` (`[layers, slots]`, int64), the same summed
    over each logical expert's replicas as `logical_count`
@@ -572,8 +571,8 @@ tables right after, so a forward never sees a layer whose tables and slots
 disagree.
 TokenSpeed allows `--ep-num-redundant-experts 0`: the rebalance then only
 permutes experts across ranks. `--init-expert-location` still seeds the first
-placement. `POST /rebalance_experts` starts one rebalance now (it replies
-once it takes the load snapshot; the moves follow). TokenSpeed refuses the
+placement. The `RebalanceExpertsReqInput` control operation starts one
+rebalance now (it replies once it takes the load snapshot; the moves follow). TokenSpeed refuses the
 `EXPERT_LOAD` profile activity under `--enable-eplb`, since the rebalance
 owns the same counters. The engine log reports the balancedness each snapshot
 saw and the one the new placement is expected to reach.
@@ -771,7 +770,7 @@ A preset for an eight-GPU prefill engine with head TP and the
 batch-invariant `o_proj`:
 
 ```bash
-tokenspeed serve <dsa-model> \
+tokenspeed serve --headless <dsa-model> \
   --disaggregation-mode prefill \
   --attn-tp-size 8 --dense-tp-size 1 --enable-expert-parallel \
   --kv-parallel-size 8 --query-context-parallel-size 8 \
@@ -808,7 +807,13 @@ Each node must use the same model, backend, precision, and scheduler settings.
 Only `--node-rank` should differ between nodes.
 
 Run one `tokenspeed serve` per node. Node rank 0 serves the HTTP API. Higher
-ranks run the engine only and expose no endpoint.
+ranks run the engine only and expose no endpoint. Each attention-DP replica's
+first rank registers with node 0's bundled gateway: over a same-host socket
+when every one of them is on node 0, otherwise over TCP. The gateway then
+listens on the host of `--dist-init-addr`, at the port below its, which every
+node derives from its own flags, so keep that port free on node 0 and
+reachable from the other nodes. These sockets carry no authentication: run
+the nodes on a trusted network.
 
 ### Under a launcher
 
@@ -863,13 +868,12 @@ particular, do not mix IB and Socket selection or different
 Stop every node. A node that stops does not stop the others: they find out
 at their next collective with it, which fails or can hang.
 
-A node of rank 1 or higher that receives SIGTERM or SIGINT, or whose
-scheduler fails, sends SIGTERM to the engine rank processes it started and
-gives them `TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT` seconds (default 10)
-to exit. It then kills whatever is left of them and of the processes they
-started, and exits by the signal it received. On Linux the rank processes
-are also killed when the node process itself is killed, for example with
-SIGKILL at the end of a grace period.
+A node that receives SIGTERM or SIGINT, or whose scheduler fails, sends
+SIGTERM to the engine rank processes it started and gives them 30 seconds to
+exit. It then kills whatever is left of them and of the processes they
+started. On Linux the rank processes of a node of rank 1 or higher are also
+killed when the node process itself is killed, for example with SIGKILL at
+the end of a grace period.
 
 ## Emulating rank 0 on one GPU
 

@@ -57,7 +57,7 @@ use ts_control::{
     control::ControlConfig,
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, COMMIT_DELAY_FORWARDS},
     event_loop::{EventLoop, LoopConfig, LoopError, Ranks, Subsystems},
-    grammar::{GrammarConfig, Grammars},
+    grammar::{GrammarConfig, Grammars, ReasoningGrammar},
     ingress::{IngressLimits, LogprobServability},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
@@ -234,6 +234,24 @@ impl Eplb {
     }
 }
 
+/// The grammar settings' `reasoning` (`rust_host.GrammarSettings`), if
+/// grammars are on and it is set.
+fn reasoning_grammar(grammar: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGrammar>> {
+    if grammar.is_none() {
+        return Ok(None);
+    }
+    let reasoning = grammar.getattr("reasoning")?;
+    if reasoning.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ReasoningGrammar {
+        continues: reasoning.getattr("continues")?.extract()?,
+        may_open: reasoning.getattr("may_open")?.extract()?,
+        schema_slot: reasoning.getattr("schema_slot")?.extract()?,
+        markers: reasoning.getattr("markers")?.extract()?,
+    }))
+}
+
 /// Which metrics this rank exports, and where (`rust_host.HostConfig`'s
 /// `metrics_*` fields).
 struct Metrics {
@@ -337,6 +355,7 @@ impl HostConfig {
                 requires_bootstrap,
                 multimodal: config.getattr("multimodal")?.extract()?,
                 grammar: !config.getattr("grammar")?.is_none(),
+                reasoning: reasoning_grammar(&config.getattr("grammar")?)?,
                 logprobs: {
                     let servability = config.getattr("logprob_servability")?;
                     LogprobServability {
@@ -548,7 +567,8 @@ fn serve(args: &Args) -> Result<(), HostError> {
 
     // The replica's first member speaks for it.
     let transport = if ranks.replica.index() == 0 {
-        let ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+        let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+        ready.declare_scheduler();
         Some(EngineTransport::connect(
             &config.handshake_address,
             config.engine_index,

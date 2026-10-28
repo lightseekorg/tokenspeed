@@ -378,7 +378,9 @@ class MoELayer(torch.nn.Module):
             process_group = pg_manager.get_device_process_group(mapping.moe.ep_group)
         # --moe-combine-order: how a token's routed contributions meet across
         # the MoE TP-EP group (docs/design/numerics.md, alignment.trainer).
-        # ServerArgs already refused MoE TP > 1 and DeepEP under "slot".
+        # ServerArgs already refused MoE TP > 1 under "slot"; over DeepEP the
+        # plan admits only a leaf that owns the exchange and folds in slot
+        # order (supports_all_to_all_ep with the slot combine).
         combine_order = global_server_args_dict["moe_combine_order"]
         self.combine_order: str = combine_order
         if combine_order == "slot" and self.ep_size > 1:

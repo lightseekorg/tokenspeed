@@ -49,6 +49,13 @@ class TestServerArgs:
         tp8.mapping.rank = 5
         assert tp8.mapping.lm_head.tp_group == tp8.mapping.attn.tp_group
 
+    def test_head_tp_exchange_max_rows_is_configurable(self):
+        assert ServerArgs(**DP8).head_tp_exchange_max_rows == 256
+        args = ServerArgs(**DP8, head_tp_exchange_max_rows=512)
+        assert args.head_tp_exchange_max_rows == 512
+        with pytest.raises(ValueError, match="head-tp-exchange-max-rows"):
+            ServerArgs(**DP8, head_tp_exchange_max_rows=0)
+
     def test_decode_preset_resolves_one_node_local_group(self):
         args = ServerArgs(
             **DP8,

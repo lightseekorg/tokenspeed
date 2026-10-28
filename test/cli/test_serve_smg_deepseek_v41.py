@@ -32,7 +32,6 @@ import argparse
 import importlib.util
 import json
 import os
-import signal
 import socket
 import subprocess
 import sys
@@ -45,92 +44,54 @@ import pytest
 
 
 def _serve_fake_engine():
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    from concurrent.futures import ThreadPoolExecutor
-    from test.cli._fixtures.fake_engine import _FakeHealth
+    """The CPU fake engine (``test.cli._fixtures.fake_engine``) answering as a
+    V4.1 checkpoint: "OK", after stub reasoning when the prompt opens a think
+    block. It records each request's prompt ids, and its multimodal items as
+    JSON, beside ``TOKENSPEED_V41_TEST_CAPTURE``."""
+    from test.cli._fixtures.fake_engine import serve
 
-    import grpc
-    from grpc_health.v1 import health_pb2_grpc
-    from smg_grpc_proto import tokenspeed_scheduler_pb2 as pb
-    from smg_grpc_proto import tokenspeed_scheduler_pb2_grpc as pbg
     from tokenizers import Tokenizer
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--model", required=True)
     args, _ = parser.parse_known_args()
     tokenizer = Tokenizer.from_file(str(Path(args.model) / "tokenizer.json"))
     capture = Path(os.environ["TOKENSPEED_V41_TEST_CAPTURE"])
 
-    class Engine(pbg.TokenSpeedSchedulerServicer):
-        def GetModelInfo(self, request, context):
-            return pb.GetModelInfoResponse(
-                model_path=args.model,
-                tokenizer_path=args.model,
-                served_model_name="v41-text-test",
-                model_type="deepseek_v41",
-                architectures=["DeepseekV41ForCausalLM"],
-                max_context_length=16384,
-                max_req_input_len=16384,
-                vocab_size=tokenizer.get_vocab_size(),
-                eos_token_ids=[tokenizer.token_to_id("<｜end▁of▁sentence｜>")],
-                bos_token_id=tokenizer.token_to_id("<｜begin▁of▁sentence｜>"),
-                weight_version="test",
-                supports_vision=True,
-                supports_multimodal=True,
-                multimodal_encoder_dtype="float32",
-            )
-
-        def HealthCheck(self, request, context):
-            return pb.HealthCheckResponse(healthy=True)
-
-        def GetServerInfo(self, request, context):
-            return pb.GetServerInfoResponse()
-
-        def GetLoads(self, request, context):
-            return pb.GetLoadsResponse()
-
-        def Generate(self, request, context):
-            capture.with_suffix(".pb").write_bytes(request.SerializeToString())
-            thinking = request.tokenized.input_ids[-1] == tokenizer.token_to_id(
-                "<think>"
-            )
-            output = tokenizer.encode(
-                "stub reasoning.</think>OK" if thinking else "OK",
-                add_special_tokens=False,
-            ).ids
-            with capture.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(list(request.tokenized.input_ids)) + "\n")
-            if request.stream:
-                yield pb.GenerateResponse(
-                    request_id=request.request_id,
-                    chunk=pb.GenerateStreamChunk(
-                        token_ids=output,
-                        prompt_tokens=len(request.tokenized.input_ids),
-                        completion_tokens=len(output),
-                    ),
+    def respond(request):
+        prompt = request.input_ids_unpadded or request.input_ids
+        if request.multimodal_inputs is not None:
+            items = [
+                {
+                    "feature_shape": list(item.feature.shape),
+                    "model_specific_data": {
+                        name: tensor.flatten().tolist()
+                        for name, tensor in item.model_specific_data.items()
+                    },
+                    "offsets": item.offsets,
+                    "pad_value": item.pad_value,
+                }
+                for item in request.multimodal_inputs.mm_items
+            ]
+            capture.with_suffix(".mm.json").write_text(
+                json.dumps(
+                    {
+                        "items": items,
+                        "input_ids": request.input_ids,
+                        "input_ids_unpadded": prompt,
+                    }
                 )
-            yield pb.GenerateResponse(
-                request_id=request.request_id,
-                complete=pb.GenerateComplete(
-                    output_ids=output,
-                    finish_reason="stop",
-                    prompt_tokens=len(request.tokenized.input_ids),
-                    completion_tokens=len(output),
-                ),
             )
+        thinking = prompt[-1] == tokenizer.token_to_id("<think>")
+        output = tokenizer.encode(
+            "stub reasoning.</think>OK" if thinking else "OK",
+            add_special_tokens=False,
+        ).ids
+        with capture.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(list(prompt)) + "\n")
+        return output
 
-    server = grpc.server(ThreadPoolExecutor(max_workers=4))
-    health_pb2_grpc.add_HealthServicer_to_server(_FakeHealth(), server)
-    pbg.add_TokenSpeedSchedulerServicer_to_server(Engine(), server)
-    server.add_insecure_port(f"{args.host}:{args.port}")
-    signal.signal(signal.SIGTERM, lambda _sig, _frame: server.stop(0))
-    server.start()
-    try:
-        server.wait_for_termination(timeout=90)
-    finally:
-        server.stop(0).wait(timeout=5)
+    serve(respond=respond, max_model_len=16384)
 
 
 @pytest.mark.parametrize(
@@ -224,7 +185,7 @@ def _free_port():
 @pytest.fixture(scope="module")
 def gateway(reference, tmp_path_factory):
     pytest.importorskip("smg")
-    pytest.importorskip("smg_grpc_proto")
+    pytest.importorskip("zmq")
     snapshot, _, _ = reference
     directory = tmp_path_factory.mktemp("v41-gateway")
     capture = directory / "requests.jsonl"
@@ -249,6 +210,8 @@ def gateway(reference, tmp_path_factory):
                 "serve",
                 "--model",
                 str(snapshot),
+                "--served-model-name",
+                "v41-text-test",
                 "--trust-remote-code",
                 "--node-rank",
                 "0",
@@ -256,8 +219,6 @@ def gateway(reference, tmp_path_factory):
                 "127.0.0.1",
                 "--port",
                 str(port),
-                "--control-port",
-                str(_free_port()),
                 "--prometheus-host",
                 "127.0.0.1",
                 "--prometheus-port",
@@ -434,9 +395,7 @@ def test_http_image_reaches_engine_in_v41_format(gateway):
     import base64
     import io
 
-    import numpy as np
     from PIL import Image
-    from smg_grpc_proto import tokenspeed_scheduler_pb2 as pb
 
     url, capture = gateway
     pixels = io.BytesIO()
@@ -463,28 +422,22 @@ def test_http_image_reaches_engine_in_v41_format(gateway):
     )
     with urllib.request.urlopen(request, timeout=30) as response:
         assert json.load(response)["choices"][0]["message"]["content"] == "OK"
-    generated = pb.GenerateRequest.FromString(capture.with_suffix(".pb").read_bytes())
-    assert len(generated.mm_inputs.items) == 1
-    item = generated.mm_inputs.items[0]
-    assert item.encoder_input.shape[0] > 0
-    assert list(item.encoder_input.shape[1:]) == [3, 14, 14]
-    metadata = item.model_specific_tensors
+    generated = json.loads(capture.with_suffix(".mm.json").read_text())
+    assert len(generated["items"]) == 1
+    item = generated["items"][0]
+    assert item["feature_shape"][0] > 0
+    assert item["feature_shape"][1:] == [3, 14, 14]
+    metadata = item["model_specific_data"]
     assert {"vit_grid", "llm_grid", "types"} <= metadata.keys()
-
-    def integers(name):
-        tensor = metadata[name]
-        assert tensor.WhichOneof("payload") == "inline"
-        return np.frombuffer(tensor.inline, dtype=np.int64).tolist()
-
-    height, width = integers("llm_grid")
-    types = integers("types")
+    height, width = metadata["llm_grid"]
+    types = metadata["types"]
     assert types == [0] + ([1] * width + [2]) * height + [3]
-    assert len(item.placeholders) == 1
-    span = item.placeholders[0]
-    assert span.length == len(types)
-    assert list(
-        generated.tokenized.input_ids[span.offset : span.offset + span.length]
-    ) == [129264] * len(types)
+    # One inclusive span of image tokens, which the wire carries as the
+    # item's pad value.
+    [(start, end)] = item["offsets"]
+    assert end - start + 1 == len(types)
+    assert generated["input_ids_unpadded"][start : end + 1] == [129264] * len(types)
+    assert generated["input_ids"][start : end + 1] == [item["pad_value"]] * len(types)
 
 
 def test_http_streaming_chat(gateway):

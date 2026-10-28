@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar
 
@@ -67,13 +67,13 @@ if TYPE_CHECKING:
 class CacheRecipe(ABC):
     """One model family's cache recipe.
 
-    The pipeline is the same for every family and lives once, in :meth:`setup`:
+    The pipeline is the same for every family and lives once, in :meth:`setup_for_layers`:
 
     ``layers -> group -> pack -> bind``
 
     A family fills in the seams -- which layers exist and how they collapse
     into groups, what bytes each layer costs, how tightly groups pack into a
-    physical parent, and how many parents the budget affords. It never
+    physical parent, and which model limits cap the agreed capacity. It never
     restates the order of the stages.
     """
 
@@ -113,7 +113,29 @@ class CacheRecipe(ABC):
     # ------------------------------------------------------------------
 
     def setup(self) -> CacheSetup:
-        """Run the pipeline for this family and bind it to the budget."""
+        """Build a complete, local cache without distributed capacity agreement."""
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
+            local_cache_capacity,
+        )
+
+        return self.setup_for_layers(
+            resident_cache_window=(0, len(self.layer_types)),
+            synchronize_capacity=local_cache_capacity,
+        )
+
+    def setup_for_layers(
+        self,
+        *,
+        resident_cache_window: tuple[int, int],
+        synchronize_capacity: Callable[[int, str | None], int],
+    ) -> CacheSetup:
+        """Pack globally, agree on resident capacity, then bind the complete plan.
+
+        The runtime supplies the stage's cache-layer window and a collective
+        over capacity limits (probe builds agree on their minimum demand).
+        Errors travel through the same callback so a rank with insufficient
+        memory cannot leave its peers waiting in a collective.
+        """
         from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
             CachePoolSpec,
             CacheSetup,
@@ -128,6 +150,11 @@ class CacheRecipe(ABC):
             max_padding_fraction=self.max_padding_fraction,
         )
         self.check_layout(layout)
+        if type(self).num_lcm_blocks is not CacheRecipe.num_lcm_blocks:
+            raise TypeError(
+                "cache recipes must override select_num_lcm_blocks, not "
+                "num_lcm_blocks: resident memory limits are owned by the runtime"
+            )
         specs = tuple(spec for spec, _ in groups)
         probe_parents = None
         if self.probe_batch_rows is not None:
@@ -152,24 +179,59 @@ class CacheRecipe(ABC):
                 * (policy.hot_tokens + policy.reserved_tokens),
             )
         )
-        if offload is not None:
-            num_lcm_blocks, offload = compute_offload_capacity(
-                layout,
-                specs,
-                offload=offload,
-                device_budget_bytes=self.cache_budget_bytes - self.workspace_bytes(),
-                max_lcm_blocks=self._capped_parents(
-                    2**31 - 1,
-                    parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
-                ),
-                probe_lcm_blocks=probe_parents,
-            )
-        elif probe_parents is not None:
-            num_lcm_blocks = probe_parents
-        else:
-            num_lcm_blocks = self.num_lcm_blocks(layout)
+        unit = layout.bind(1).narrow_to_layers(*resident_cache_window)
+        workspace_bytes = self.workspace_bytes()
+        local_limit, error = 0, None
+        try:
+            if offload is not None:
+                # Offload policies currently bind complete model field sets.
+                # A partial stage must not price full-model hot/history pools
+                # as if they were resident-only allocations.
+                if unit.fields != layout.fields:
+                    raise ValueError("PP offload requires stage-local storage policies")
+                local_limit, offload = compute_offload_capacity(
+                    layout,
+                    specs,
+                    offload=offload,
+                    device_budget_bytes=self.cache_budget_bytes - workspace_bytes,
+                    max_lcm_blocks=self._capped_parents(
+                        self.parent_id_limit(layout),
+                        parent_tokens=self._max_packing(layout)
+                        * layout.prefix_granularity,
+                    ),
+                    probe_lcm_blocks=probe_parents,
+                )
+            elif probe_parents is not None:
+                local_limit = probe_parents
+            else:
+                local_limit = min(
+                    self._budgeted_parents(
+                        self.cache_budget_bytes - workspace_bytes,
+                        unit.resident_block_bytes,
+                    ),
+                    self.parent_id_limit(layout),
+                )
+        except ValueError as exc:
+            error = str(exc)
+        capacity = synchronize_capacity(local_limit, error)
+        num_lcm_blocks = (
+            self.select_num_lcm_blocks(layout, max_lcm_blocks=capacity)
+            if offload is None and self.probe_batch_rows is None
+            else capacity
+        )
+        if not 1 <= num_lcm_blocks <= capacity:
+            raise ValueError("recipe capacity must fit the agreed parent limit")
         memory_plan = layout.bind(num_lcm_blocks)
         storage_plan = plan_cache_storage(memory_plan, specs, offload=offload)
+        resident_storage = plan_cache_storage(
+            memory_plan.narrow_to_layers(*resident_cache_window), specs, offload=offload
+        )
+        if (
+            self.probe_batch_rows is None
+            and resident_storage.device_budget_bytes + workspace_bytes
+            > self.cache_budget_bytes
+        ):
+            raise ValueError("resident cache storage exceeds the planned budget")
         return CacheSetup(
             spec=CachePoolSpec(
                 family=self.family,
@@ -187,9 +249,11 @@ class CacheRecipe(ABC):
             cache_budget_bytes=(
                 self.cache_budget_bytes
                 if self.probe_batch_rows is None
-                else self.workspace_bytes() + storage_plan.device_budget_bytes
+                else workspace_bytes + resident_storage.device_budget_bytes
             ),
-            fixed_workspace_bytes=self.workspace_bytes(),
+            fixed_workspace_bytes=workspace_bytes,
+            local_parent_limit=local_limit,
+            agreed_parent_limit=capacity,
             uses_paged_state_verify=self.uses_paged_state_verify,
         )
 
@@ -341,14 +405,25 @@ class CacheRecipe(ABC):
     # ------------------------------------------------------------------
 
     def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        """Physical parents to allocate, excluding the reserved null parent.
-
-        The budget minus this family's fixed workspace, capped by the
-        configured token limit.
-        """
+        """Standalone full-layout sizing; families override the selection seam."""
         usable_bytes = self.cache_budget_bytes - self.workspace_bytes()
+        return self.select_num_lcm_blocks(
+            layout,
+            max_lcm_blocks=min(
+                self._budgeted_parents(usable_bytes, layout.lcm_block_bytes),
+                self.parent_id_limit(layout),
+            ),
+        )
+
+    def parent_id_limit(self, layout: CacheLayout) -> int:
+        """Keep both physical and sharded virtual CacheBlock IDs in int32."""
+        # The null parent's virtual slots also occupy IDs in this range.
+        return 2**31 // self._max_packing(layout) - 1
+
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
+        """Apply model/token constraints to an already agreed memory limit."""
         return self._capped_parents(
-            self._budgeted_parents(usable_bytes, layout.lcm_block_bytes),
+            max_lcm_blocks,
             parent_tokens=self._max_packing(layout) * layout.prefix_granularity,
         )
 
@@ -358,6 +433,8 @@ class CacheRecipe(ABC):
         The one place the budget floor is checked, so every family fails the
         same way when it cannot hold the null parent plus one usable parent.
         """
+        if parent_bytes <= 0:
+            raise ValueError("resident cache must contain at least one physical plane")
         budgeted = usable_bytes // parent_bytes - 1
         if budgeted < 1:
             raise ValueError(

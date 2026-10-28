@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # EPD (encode-prefill-decode) 1E-1P-2D smoke/eval topology on a single node.
 #
-# Serves nvidia/Qwen3.5-122B-A10B-NVFP4 (override via MODEL). TokenSpeed's EPD
-# data plane requires gRPC, so workers are launched via
-# `python3 -m smg_grpc_servicer.tokenspeed`
-# (one unified entrypoint for all roles) rather than a role-specific adapter.
-# The encode worker is LM-free: it runs only the vision tower and ships image
-# embeddings to prefill over Mooncake; pixels reach it INLINE over gRPC (the
-# default, no node-specific RDMA-listen config). Topology (4 GPUs, all TP1):
+# Serves nvidia/Qwen3.5-122B-A10B-NVFP4 (override via MODEL): headless
+# TokenSpeed engines behind SMG's gateway, all on its direct ZMQ lane. The
+# encode server is LM-free: it runs only the vision tower and ships image
+# embeddings to prefill over Mooncake; the gateway sends it the pixels inline
+# as encode requests. The gateway takes the encode and prefill engines'
+# bootstrap addresses from their handshakes. Topology (4 GPUs, all TP1):
 #   encode @ GPU0  +  prefill @ GPU1  +  decode0 @ GPU2  +  decode1 @ GPU3
 # The two decode workers are independent instances; the gateway round-robins
 # requests across them (--decode-policy round_robin).
@@ -15,6 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$SCRIPT_DIR/worker_cleanup.sh"
+source "$SCRIPT_DIR/smg_lane.sh"
 
 MODEL=${MODEL:-nvidia/Qwen3.5-122B-A10B-NVFP4}
 SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-$MODEL}
@@ -26,8 +26,7 @@ ENCODE_WS=${ENCODE_WS:-1}
 PREFILL_WS=${PREFILL_WS:-1}
 DECODE0_WS=${DECODE0_WS:-1}
 DECODE1_WS=${DECODE1_WS:-1}
-# Stay below Linux's default ephemeral range: outbound connections can claim
-# these ports while the workers load their models, before gRPC binds them.
+# The engines' --port seeds their derived ports; they serve no HTTP.
 ENCODE_PORT=${ENCODE_PORT:-15004}
 PREFILL_PORT=${PREFILL_PORT:-15001}
 DECODE0_PORT=${DECODE0_PORT:-15011}
@@ -55,10 +54,7 @@ LOG_DIR=${EPD_CI_LOG_DIR:-.ci-artifacts/epd-qwen35-122b-1e1p2d}
 # All startup stages share one two-hour budget.
 startup_deadline=$((SECONDS + ${EPD_STARTUP_TIMEOUT:-7200}))
 
-# The E->P embedding ships over Mooncake; pixels go inline over gRPC, sized by
-# TOKENSPEED_GRPC_MAX_MESSAGE_BYTES.
-export TOKENSPEED_GRPC_MAX_MESSAGE_BYTES=${TOKENSPEED_GRPC_MAX_MESSAGE_BYTES:-536870912}
-export TOKENSPEED_SKIP_GRPC_WARMUP=${TOKENSPEED_SKIP_GRPC_WARMUP:-1}
+# The E->P embedding ships over Mooncake.
 export MC_INTRANODE_NVLINK=${MC_INTRANODE_NVLINK:-1}
 export MC_INTRA_NVLINK=${MC_INTRA_NVLINK:-1}
 export LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
@@ -97,6 +93,12 @@ echo "[epd-1e1p2d] model=$MODEL served=$SERVED_MODEL_NAME model_path=$MODEL_PATH
 echo "[epd-1e1p2d] encode=gpu${ENCODE_GPUS}/${ENCODE_PORT} prefill=gpu${PREFILL_GPUS}/${PREFILL_PORT} decode0=gpu${DECODE0_GPUS}/${DECODE0_PORT} decode1=gpu${DECODE1_GPUS}/${DECODE1_PORT} lb=${LB_HOST}:${LB_PORT}"
 echo "[epd-1e1p2d] encode_routing=$ENCODE_ROUTING_POLICY enable_mtp=$ENABLE_MTP moe=$MOE_BACKEND attn=$ATTENTION_BACKEND"
 
+SOCKET_DIR=$(lane_socket_dir)
+ENCODE_URL="ipc://$SOCKET_DIR/encode"
+PREFILL_URL="ipc://$SOCKET_DIR/prefill"
+DECODE0_URL="ipc://$SOCKET_DIR/decode0"
+DECODE1_URL="ipc://$SOCKET_DIR/decode1"
+
 pids=()
 logs=()
 cleanup() {
@@ -106,50 +108,16 @@ cleanup() {
     stop_worker_pids \
       "epd-1e1p2d" "${WORKER_SHUTDOWN_TIMEOUT:-30}" "${pids[@]}"
   fi
+  rm -rf "$SOCKET_DIR"
   exit "$code"
 }
 trap cleanup EXIT INT TERM
-
-wait_http() {
-  local name=$1
-  local url=$2
-  local deadline=$3
-  until curl --connect-timeout 2 --max-time 5 -fsS "$url" >/dev/null 2>&1; do
-    if ((SECONDS >= deadline)); then
-      echo "[epd-1e1p2d] timed out waiting for $name at $url" >&2
-      return 1
-    fi
-    sleep 5
-  done
-  echo "[epd-1e1p2d] $name ready at $url"
-}
-
-wait_serving() {
-  local label=$1
-  local pid=$2
-  local deadline=$3
-  local log="$LOG_DIR/${label}.log"
-  until grep -q "health status -> SERVING" "$log" 2>/dev/null; do
-    if ! kill -0 "$pid" 2>/dev/null; then
-      echo "[epd-1e1p2d] $label exited before reaching SERVING (log=$log)" >&2
-      tail -n 200 "$log" >&2 || true
-      return 1
-    fi
-    if ((SECONDS >= deadline)); then
-      echo "[epd-1e1p2d] timed out waiting for $label to reach SERVING (log=$log)" >&2
-      tail -n 200 "$log" >&2 || true
-      return 1
-    fi
-    sleep 5
-  done
-  echo "[epd-1e1p2d] $label SERVING"
-}
 
 # Shared engine args (mirrors serve_qwen35_397b_nvfp4_pd_1p1d.sh COMMON_ARGS).
 COMMON_ARGS=(
   --model "$MODEL"
   --served-model-name "$SERVED_MODEL_NAME"
-  --host 0.0.0.0
+  --host 127.0.0.1
   --trust-remote-code
   --moe-backend "$MOE_BACKEND"
   --attention-backend "$ATTENTION_BACKEND"
@@ -182,6 +150,38 @@ elif [[ "$ENABLE_MTP" != "0" ]]; then
   exit 2
 fi
 
+ALIAS_ARGS=()
+if [[ "$SERVED_MODEL_NAME" != "$MODEL_PATH" ]]; then
+  ALIAS_ARGS=(--model-alias "$SERVED_MODEL_NAME=$MODEL_PATH")
+fi
+
+# The gateway binds every worker's sockets; the engines dial in once loaded.
+echo "[epd-1e1p2d] starting smg gateway log=$LOG_DIR/gateway.log"
+python3 -m smg launch \
+  --epd-disaggregation \
+  --backend tokenspeed \
+  --encode "$ENCODE_URL" \
+  --prefill "$PREFILL_URL" \
+  --decode "$DECODE0_URL" \
+  --decode "$DECODE1_URL" \
+  --host "$LB_HOST" \
+  --port "$LB_PORT" \
+  --model-path "$MODEL_PATH" \
+  --tokenizer-path "$MODEL_PATH" \
+  "${ALIAS_ARGS[@]}" \
+  --reasoning-parser passthrough \
+  --encode-policy "$ENCODE_ROUTING_POLICY" \
+  --prefill-policy round_robin \
+  --decode-policy round_robin \
+  --request-timeout-secs 1800 \
+  --disable-circuit-breaker \
+  --log-level info \
+  --prometheus-port "$PROMETHEUS_PORT" \
+  >"$LOG_DIR/gateway.log" 2>&1 &
+pids+=("$!")
+logs+=("$LOG_DIR/gateway.log")
+lane_wait_http epd-1e1p2d lb "http://127.0.0.1:${LB_PORT}/liveness" "$startup_deadline" "${pids[@]}"
+
 start_worker() {
   local label=$1            # log/display name (e.g. decode0); decouples replicas
   local mode=$2             # --disaggregation-mode workers from the replica label
@@ -190,67 +190,41 @@ start_worker() {
   local port=$5
   local dist_port=$6
   local bootstrap_port=$7   # empty for decode
+  local url=$8
   local log="$LOG_DIR/${label}.log"
+  local -a dial
+  read -r -a dial <<< "$(lane_dial_args 127.0.0.1 "$(lane_handshake_port "$url")")"
   # Speculative decoding is LM-only; keep the encode worker independent.
   local -a role_mtp_args=()
   if [[ "$mode" != "encode" ]]; then
     role_mtp_args=("${MTP_ARGS[@]}")
   fi
-  echo "[epd-1e1p2d] starting ${label} (mode=$mode): gpus=$gpus ws=$world_size port=$port dist=$dist_port bootstrap=${bootstrap_port:-none} log=$log"
+  echo "[epd-1e1p2d] starting ${label} (mode=$mode): gpus=$gpus ws=$world_size worker=$url dist=$dist_port bootstrap=${bootstrap_port:-none} log=$log"
   (
     export CUDA_VISIBLE_DEVICES="$gpus"
-    exec python3 -m smg_grpc_servicer.tokenspeed \
+    exec python3 -m tokenspeed.runtime.entrypoints.engine \
       "${COMMON_ARGS[@]}" \
       "${role_mtp_args[@]}" \
       --world-size "$world_size" \
       --disaggregation-mode "$mode" \
       ${bootstrap_port:+--disaggregation-bootstrap-port "$bootstrap_port"} \
       --dist-init-addr "127.0.0.1:${dist_port}" \
-      --port "$port"
+      --port "$port" \
+      "${dial[@]}"
   ) >"$log" 2>&1 &
   pids+=("$!")
   logs+=("$log")
 }
 
-# Encode is LM-free (vision tower only); pixels reach it inline over gRPC.
-start_worker encode encode "$ENCODE_GPUS" "$ENCODE_WS" "$ENCODE_PORT" "$ENCODE_DIST_PORT" "$ENCODE_BOOTSTRAP_PORT"
-start_worker prefill prefill "$PREFILL_GPUS" "$PREFILL_WS" "$PREFILL_PORT" "$PREFILL_DIST_PORT" "$PREFILL_BOOTSTRAP_PORT"
-start_worker decode0 decode "$DECODE0_GPUS" "$DECODE0_WS" "$DECODE0_PORT" "$DECODE0_DIST_PORT" ""
-start_worker decode1 decode "$DECODE1_GPUS" "$DECODE1_WS" "$DECODE1_PORT" "$DECODE1_DIST_PORT" ""
+# Encode is LM-free (vision tower only); its first rank dials the gateway and
+# takes the encode requests.
+start_worker encode encode "$ENCODE_GPUS" "$ENCODE_WS" "$ENCODE_PORT" "$ENCODE_DIST_PORT" "$ENCODE_BOOTSTRAP_PORT" "$ENCODE_URL"
+start_worker prefill prefill "$PREFILL_GPUS" "$PREFILL_WS" "$PREFILL_PORT" "$PREFILL_DIST_PORT" "$PREFILL_BOOTSTRAP_PORT" "$PREFILL_URL"
+start_worker decode0 decode "$DECODE0_GPUS" "$DECODE0_WS" "$DECODE0_PORT" "$DECODE0_DIST_PORT" "" "$DECODE0_URL"
+start_worker decode1 decode "$DECODE1_GPUS" "$DECODE1_WS" "$DECODE1_PORT" "$DECODE1_DIST_PORT" "" "$DECODE1_URL"
 
-# Gate on each worker's model-loaded "SERVING" health (registration != loaded).
-wait_serving encode "${pids[0]}" "$startup_deadline"
-wait_serving prefill "${pids[1]}" "$startup_deadline"
-wait_serving decode0 "${pids[2]}" "$startup_deadline"
-wait_serving decode1 "${pids[3]}" "$startup_deadline"
-wait_http encode-bootstrap "http://127.0.0.1:${ENCODE_BOOTSTRAP_PORT}/health" "$startup_deadline"
-
-echo "[epd-1e1p2d] starting smg gateway log=$LOG_DIR/gateway.log"
-python3 -m smg launch \
-  --epd-disaggregation \
-  --encode "grpc://127.0.0.1:${ENCODE_PORT}" "$ENCODE_BOOTSTRAP_PORT" \
-  --prefill "grpc://127.0.0.1:${PREFILL_PORT}" "$PREFILL_BOOTSTRAP_PORT" \
-  --decode "grpc://127.0.0.1:${DECODE0_PORT}" \
-  --decode "grpc://127.0.0.1:${DECODE1_PORT}" \
-  --host "$LB_HOST" \
-  --port "$LB_PORT" \
-  --model-path "$MODEL_PATH" \
-  --tokenizer-path "$MODEL_PATH" \
-  --reasoning-parser passthrough \
-  --encode-policy "$ENCODE_ROUTING_POLICY" \
-  --prefill-policy round_robin \
-  --decode-policy round_robin \
-  --request-timeout-secs 1800 \
-  --disable-circuit-breaker \
-  --disable-load-monitoring \
-  --disable-health-check \
-  --log-level info \
-  --prometheus-port "$PROMETHEUS_PORT" \
-  >"$LOG_DIR/gateway.log" 2>&1 &
-pids+=("$!")
-logs+=("$LOG_DIR/gateway.log")
-
-wait_http lb "http://127.0.0.1:${LB_PORT}/v1/models" "$startup_deadline"
+# Ready once every engine registered.
+lane_wait_http epd-1e1p2d engines "http://127.0.0.1:${LB_PORT}/readiness" "$startup_deadline" "${pids[@]}"
 echo "[epd-1e1p2d] serving on http://127.0.0.1:${LB_PORT}/v1"
 
 # A worker's failure status must not end the script (set -e) before the

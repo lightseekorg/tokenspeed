@@ -50,6 +50,9 @@ from tokenspeed.runtime.distributed.comm_backend.trtllm_allreduce import (
     MAX_ONESHOT_BYTES,
     TrtllmAllReduceBackend,
 )
+from tokenspeed.runtime.distributed.process_group_manager import (
+    process_group_manager as pg_manager,
+)
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 logger = logging.getLogger(__name__)
@@ -121,6 +124,9 @@ class AutoBackend(CommBackend):
         self._rsag = TritonRSAGBackend(fallback=self._nccl)
         # Projection fallbacks retain Auto's ordinary routing and numerics.
         self._projection = ProjectionBackend(fallback=self)
+        # Lamport token/channel-shard exchanges prepared by layers at build
+        # time (prepare_shard_exchange), keyed by (group, full channel width).
+        self._shard_exchanges: dict[tuple[Group, int], object] = {}
 
     @property
     def nccl(self) -> NcclBackend:
@@ -588,6 +594,62 @@ class AutoBackend(CommBackend):
         if self.route(Collective.REDUCE_SCATTER, tensor, group) is Route.ORDERED_FOLD:
             return self._ordered_fold_reduce_scatter(tensor, group)
         return self._nccl.reduce_scatter(tensor, group)
+
+    def prepare_shard_exchange(
+        self, group: Group, channels: int, max_rows: int, dtype: torch.dtype
+    ) -> bool:
+        # The Lamport exchange (tokenspeed_a2a_lamport): one NVLink hop per
+        # packet instead of NCCL's send/recv kernel, for the small decode
+        # exchanges of head / tensor parallel layouts. Pure data movement,
+        # every bit preserved, so no numerics envelope vetoes it.
+        world_size = len(group)
+        if (
+            not current_platform().is_nvidia
+            or dtype != torch.bfloat16
+            or world_size not in (2, 4, 8)
+            or channels % (2 * world_size)
+            or max_rows < 1
+            or 3 * max_rows * channels // 2 > 2**31 - 1
+            or self._group_spans_nodes(group)
+        ):
+            return False
+        prepared = self._shard_exchanges.get((group, channels))
+        if prepared is not None:
+            # Growing would move scratch that captured graphs hold.
+            return prepared.max_rows >= max_rows
+        from tokenspeed_kernel.ops.communication.cuda import TokenSpeedA2ALamportState
+
+        device = torch.device("cuda", torch.cuda.current_device())
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        self._shard_exchanges[(group, channels)] = TokenSpeedA2ALamportState(
+            pg_manager.get_device_process_group(group),
+            max_rows,
+            channels,
+            device,
+            min(128, sms),
+        )
+        return True
+
+    def try_shard_exchange(
+        self, tensor: torch.Tensor, group: Group, inverse: bool
+    ) -> torch.Tensor | None:
+        world_size = len(group)
+        rows = tensor.shape[0] // world_size if inverse else tensor.shape[0]
+        channels = tensor.shape[1] * world_size if inverse else tensor.shape[1]
+        state = self._shard_exchanges.get((group, channels))
+        # Only group-wide facts decide (preparation, rows, dtype): every rank
+        # takes the same path. Layout is fixed up locally.
+        if state is None or rows > state.max_rows or tensor.dtype != torch.bfloat16:
+            return None
+        from tokenspeed_kernel.ops.communication.cuda import tokenspeed_a2a_lamport
+
+        sent = tensor.contiguous()
+        if sent.data_ptr() % 16:
+            sent = sent.clone()
+        out = sent.new_empty(
+            (rows, channels) if inverse else (world_size * rows, channels // world_size)
+        )
+        return tokenspeed_a2a_lamport(state, sent, inverse=inverse, out=out)
 
     def all_to_all_single(
         self,

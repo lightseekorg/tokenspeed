@@ -15,7 +15,6 @@ For a compact compatibility table, see
 | `--model` | Equivalent to positional `model`. |
 | `--tokenizer` | Tokenizer path when it differs from the model path. |
 | `--tokenizer-mode` | Select tokenizer behavior. `auto` uses fast tokenizers and model-specific hooks when available. |
-| `--skip-tokenizer-init` | Skip tokenizer initialization for input-ID-only serving paths. |
 | `--load-format` | Weight loading format: `auto`, `pt`, `safetensors`, `instanttensor`, `npcache`, `dummy`, or `extensible`. See [InstantTensor](/guides/instanttensor) for the accelerated NVIDIA loader. |
 | `--trust-remote-code` | Allow custom model code from the model repository. |
 | `--revision` | Model branch, tag, or commit. |
@@ -107,44 +106,26 @@ switch an envelope folds is also available individually under `auto`.
 | --- | --- |
 | `--host` | HTTP bind host. |
 | `--port` | HTTP bind port. |
-| `--served-model-name` | Model name returned by the OpenAI-compatible API. |
+| `--served-model-name` | The model's name in metric labels. Under `ts serve`, requests may also name the model by it; the OpenAI-compatible API lists the model path. |
 | `--api-key` | SMG gateway API key for authorization with upstream workers. |
 | `--chat-template` | Built-in chat template name or template file path (handled by the smg gateway). |
 | `--stream-interval` | Streaming buffer interval in generated tokens. Smaller values stream more frequently. |
-| `--stream-output` | Return generated text as disjoint streaming segments. |
-| `--weight-version` | Initial model-weight version stamped into generation metadata. Defaults to `default`. |
-| `--rl-control-host` | Bind host for the in-engine RL control app. Defaults to `--host`. |
-| `--rl-control-api-key` | Bearer token required on every RL control route. Unset leaves the app open, which is what slime expects by default. |
-| `--model-update-config` | JSON object handed to the Model Updater SDK for `POST /update_weights_from_mooncake`. Requires the three flags below; see [Mooncake weight updates](#mooncake-weight-updates). |
+| `--weight-version` | Initial model-weight version, the L3 cache's namespace (see [Weight versions](#weight-versions)). Defaults to `default`. |
+| `--model-update-config` | JSON object handed to the Model Updater SDK for the Mooncake weight update. Requires the three flags below; see [Mooncake weight updates](#mooncake-weight-updates). |
 | `--model-update-sdk-module` | Import path of the Model Updater SDK module. Imported in the scheduler process on the first Mooncake update, not at startup. Required with `--model-update-config`. |
 | `--model-update-engine-type` | SDK `EngineType` member name for this engine, resolved as `EngineType[value.upper()]`. Required with `--model-update-config`. |
 | `--model-update-draft-weights` | `retain` or `refresh`: whether a Mooncake update also streams the speculative draft model's weights. Required with `--model-update-config`. |
 
-### Weight version metadata
+### Weight versions
 
-Every generation response includes the current version in
-`meta_info["weight_version"]`. RL trainers can use this value to identify the
-policy version that produced a sample.
-
-The SGLang-compatible `update_weights_from_distributed`,
-`update_weights_from_mooncake`, `update_weights_from_tensor`, and
-`update_weights_from_disk` requests accept an
-optional `weight_version`. The version changes only after the update succeeds.
-`Engine.update_weights_from_distributed` requires `weight_version`. Pass
-`None` to keep the current value on an intermediate update. Flushed L3
-updates must pass a caller-supplied identity so independent checkpoints
-cannot share a minted successor. When L3 is on, a
-new `weight_version` requires `flush_cache=True`. Intermediate updates may
-pass `None` until the last call flushes.
-
-Use `GET /get_weight_version` to read the current value,
-and `GET /model_info` to read the model path and version together.
-When L3 storage is disabled, `POST /update_weight_version` with
-`{"new_version": "..."}` sets the value directly. With L3 enabled, this endpoint
-returns HTTP 400 without changing the version: changing only frontend metadata
-would leave the cache namespace on the old checkpoint. Use
-`POST /update_weights_from_distributed` with an explicit `weight_version` and
-`flush_cache=True` to coordinate the weight load and cache namespace change.
+The weight loads (see [RL weight updates](#rl-weight-updates)) take an
+optional `weight_version`. With L3 storage on, it names the namespace that new
+pages publish under (`--weight-version` names the first one), and it changes
+only after the load succeeds on every rank. A new `weight_version` requires
+`flush_cache=True`, and a flushed load must name its version, so independent
+checkpoints cannot share a namespace. Intermediate loads pass `None` to keep
+the current one until the last load flushes. Without L3 storage the engine
+keeps no version.
 
 ### Logprobs
 
@@ -153,21 +134,22 @@ would leave the cache namespace on the old checkpoint. Use
 | `--enable-output-logprobs` | Gate for every logprob request. Off by default; the sampler gathers logprobs only when on, and a request asking for them on a server without the flag is rejected. |
 | `--input-logprob-chunk-tokens` | Prompt rows pushed through the LM head per chunk when a request asks for prompt (input) logprobs. Defaults to `256`. A sizing knob only: the transient per-chunk cost is about `chunk × vocab × (2 + 2 + 4)` bytes (the bf16 logits shard, the bf16 TP-gathered logits, the fp32 log-softmax), so the default costs about 256 MiB at a 128K vocabulary, and the value never changes a result (log-softmax is row-local). |
 
-Two request dialects share one compute path. The vLLM dialect
-(`sampling_params.logprobs`) returns the sampled tokens' logprobs under
-`meta_info["logprobs"]`. The SGLang dialect (`/generate` with
-`return_logprob=true`) returns `meta_info["output_token_logprobs"]` as
-`(logprob, token_id, text|null)` triples and, with `logprob_start_len`,
-prompt (input) logprobs under `meta_info["input_token_logprobs"]`:
+A request asks for logprobs with `return_logprob`. Its output frames carry
+the sampled tokens' logprobs with their ids (`output_token_logprobs_val` and
+`_idx`) and, with `logprob_start_len`, prompt (input) logprobs
+(`input_token_logprobs_val` and `_idx`):
 
 - `logprob_start_len=-1` (the default) returns the single entry
-  `[(null, input_ids[-1], text)]` and computes nothing extra.
+  `(null, input_ids[-1])` and computes nothing extra.
 - `logprob_start_len=s` with `0 <= s < len(input_ids)` returns
-  `len(input_ids) - s` entries: `(null, input_ids[s], text)` first, then the
+  `len(input_ids) - s` entries: `(null, input_ids[s])` first, then the
   logprob of each following prompt token given its prefix. `s >= len(input_ids)`
   is a 400.
-- `return_text_in_logprobs` fills the text field; `logprob_format` selects
-  `"vllm"`, `"sglang"`, or `"both"`.
+
+`ts serve`'s gateway (SMG's direct lane) carries the sampled tokens'
+logprobs, the prompt logprobs and the top candidates the engine computes;
+which of its routes renders them is the gateway's (`/generate` returns the
+prompt logprobs, chat completions the candidates).
 
 The engine computes prompt logprobs with the same fp32 log-softmax as the
 output logprobs (see `docs/design/numerics.md`), accumulates them across
@@ -184,8 +166,8 @@ A NaN or infinite prompt logprob terminates the request with a
 The ingress refuses with a 400 any request with `logprob_start_len >= 0`
 that asks for at least one prompt logprob when the engine cannot score every
 prompt position: models that narrow their prefill rows (DeepSeek V4.1's CED
-decoder keeps only each prompt's last window for the LM head). The scheduler
-reports this capability at startup and the frontend checks it before
+decoder keeps only each prompt's last window for the LM head). The data plane
+reports this capability at startup and the host's ingress checks it before
 admitting the request, so the data plane never has to. The ingress also
 refuses multimodal prompts (their media positions carry content-hash ids,
 not tokens) and any prompt whose client-supplied `input_ids` fall outside
@@ -205,65 +187,73 @@ only after scoring the prompt rows.
 
 In a disaggregated deployment the prefill node and the decode node each
 return their own frames, exactly as SGLang's do: the prefill node's finished
-frame carries `meta_info.input_token_logprobs` (and the bootstrap token under
+frame carries `input_token_logprobs` (and the bootstrap token under
 `output_token_logprobs`), while the decode node's frames carry
 `output_token_logprobs` only and never `input_token_logprobs`. The prefill
 node forwards the bootstrap token's logprob to the decode node, so the decode
 node's `output_token_logprobs` covers every generated token. Merging the two
-into one response is the router's job -- an SGLang `mini_lb`-style router or
-the Dynamo compatibility frontend joins the prefill node's prompt logprobs
-with the decode node's output, just as it does for SGLang. The direct msgpack
-scheduler drive (SMG) carries sampled-token logprobs only: it refuses a
-`logprob_start_len` that would produce prompt logprobs rather than compute
-and drop them.
+into one response is the router's job: it joins the prefill node's prompt
+logprobs with the decode node's output, just as it does for SGLang.
 
 `top_logprobs_num=k` (1 to 20) adds each position's `k` most likely tokens,
-most likely first, as `(logprob, token_id, text|null)` triples:
-`meta_info["input_top_logprobs"]` beside the prompt logprobs (`null` for the
-first position, like its value) and `meta_info["output_top_logprobs"]`
-beside the sampled token. They come from the same fp32 log-softmax as the
+most likely first, as `(logprob, token_id)` pairs: `input_top_logprobs`
+beside the prompt logprobs (`null` for the first position, like its value)
+and `output_top_logprobs` beside the sampled token. They come from the same fp32 log-softmax as the
 values. The engine computes them where the forward runs eagerly, so the
 ingress takes `top_logprobs_num` only for a request whose every token is
 sampled in its prefill (`max_new_tokens` 0 or 1, as an `echo` scoring request
 sends) and with `--logprob-order torch`; a longer generation, pipeline
-parallelism and disaggregated prefill and decode get a 400, and the direct
-msgpack scheduler drive refuses it. `token_ids_logprob` is not supported yet.
+parallelism and disaggregated prefill and decode get a 400.
+`token_ids_logprob` is not supported yet.
 
 This runtime requires a `tokenspeed-scheduler` build that has
 `RequestSpec.max_cached_prefix_tokens` (the admission-probe bound; see
 `docs/design/scheduler.md` §1): every admission sets it, so an older scheduler
 fails at the first request, not only at the first prompt-logprob request.
 
-### Slime RL compatibility
+### RL weight updates
 
-TokenSpeed exposes the SGLang HTTP surface used by slime. The supported path is
-an externally launched TokenSpeed rollout engine on separate GPUs, using full
-NCCL weight updates. Attention data parallelism of any size is supported:
-each weight op fans out to every DP worker and the frontend ANDs the
-replies, and the scheduler completes an op only in a round where every DP
-rank holds it (see [Weight updates under attention DP](#weight-updates-under-attention-dp)).
+An RL trainer's operations are control operations on the engine's wire
+(`zmq_wire.CONTROL_REQUESTS`). The frontend that drives the engine sends each
+to every engine of the replica and gets every engine's reply, through the
+engine's client library (`ts-client`, or its Python binding,
+`tokenspeed_engine.FrontendListener`):
 
-- rollout: `POST /generate`, `POST /abort_request`, `GET /v1/loads`, and
-  `GET /health_generate`;
-- update coordination: `POST /pause_generation`,
-  `POST /continue_generation`, and `GET /flush_cache`;
-- NCCL weight sync: `POST /init_weights_update_group`,
-  `POST /update_weights_from_distributed`, and
-  `POST /destroy_weights_update_group`;
-- memory control: `POST /release_memory_occupation` and
-  `POST /resume_memory_occupation`.
+- update coordination: `PauseSchedulerReqInput`, `ResumeSchedulerReqInput`,
+  and `FlushCacheReqInput`;
+- NCCL weight sync: `InitWeightsUpdateGroupReqInput`,
+  `UpdateWeightsFromDistributedReqInput`, and
+  `DestroyWeightsUpdateGroupReqInput`;
+- checkpoint loads: `UpdateWeightsFromMooncakeReqInput` and
+  `UpdateWeightFromDiskReqInput`;
+- memory control: `ReleaseMemoryOccupationReqInput` and
+  `ResumeMemoryOccupationReqInput`.
 
-Use TokenSpeed's control-server address, not its OpenAI gateway address, as the
-external rollout-engine address. Real rollout log probabilities require
-`--enable-output-logprobs`.
+TokenSpeed serves no HTTP route for them. `ts serve`'s gateway (SMG's direct
+lane) serves them under its `/v1/rl` routes (`--enable-rl`), with the
+SGLang-compatible route names and bodies: each POST route is a control call
+of the same name on every engine of the worker, its JSON body the call's
+argument, read with the route's field names and defaults
+(`ts-control/src/calls.rs`): `pause_generation`, `continue_generation`,
+`init_weights_update_group`, `destroy_weights_update_group`,
+`update_weights_from_distributed`, `update_weights_from_disk`,
+`update_weights_from_mooncake`, `release_memory_occupation`,
+`resume_memory_occupation`, `rebalance_experts` and `flush_cache`. The GET
+routes, such as `get_weight_version`, have no call, and a response's
+`weight_version` stays the one the engine registered with. Attention data
+parallelism of any size is
+supported: the scheduler completes an operation only in a round where every
+DP rank holds it (see
+[Weight updates under attention DP](#weight-updates-under-attention-dp)).
+Real rollout log probabilities require `--enable-output-logprobs`.
 
 #### Releasing GPU memory (`--enable-memory-saver`)
 
-`POST /release_memory_occupation` frees GPU memory between rollouts so a
-trainer colocated on the same GPUs can use it; `POST
-/resume_memory_occupation` maps it back. Both take optional `tags`; a release
-without tags frees every region the engine has, a resume without tags restores
-whatever is released:
+`ReleaseMemoryOccupationReqInput` frees GPU memory between rollouts so a
+trainer colocated on the same GPUs can use it;
+`ResumeMemoryOccupationReqInput` maps it back. Both take optional `tags`; a
+release without tags frees every region the engine has, a resume without tags
+restores whatever is released:
 
 | Tag | Memory | On resume |
 | --- | --- | --- |
@@ -280,33 +270,24 @@ disaggregated engine finishes new requests with an abort. Weight updates are
 refused while `weights` or `nccl` is released, so the RL order is: release
 everything, train, resume `["nccl", "cuda_graph", "weights"]` (without `nccl`
 on an older NCCL), push the new
-weights (`update_weights_from_mooncake`), resume `["kv_cache"]`. Sparse KV
+weights (`UpdateWeightsFromMooncakeReqInput`), resume `["kv_cache"]`. Sparse KV
 offload keeps its pinned Host history mapped across a release and zeroes it on
 resume. Other device memory (input buffers, communication workspaces such as
 symmetric memory or DeepEP buffers, the prefill CUDA graphs) stays resident.
 
 Queued weight operations finish before a release frees memory. If a PD engine
 is paused with buffered requests, release is refused: resume and drain those
-requests first. While any region is released, `pause_generation` is refused;
-wake with `resume_memory_occupation` first.
+requests first. While any region is released, a pause is refused; resume the
+memory first.
 
 With memory saver enabled, startup skips the disposable CUDA-graph memory
 probe and captures the serving graphs once. The installed memory saver cannot
 destroy a tagged probe pool and then capture again. Graph memory is therefore
 not reserved by that probe; leave headroom in `--gpu-memory-utilization`.
 
-These slime paths are not yet supported end to end:
-
-- colocated CUDA-IPC updates through `update_weights_from_tensor`;
-- quantized-update hooks `post_process_weights` and `weights_checker`;
-- disk-delta `pull_weights`;
-- slime's retained top-p token set (`rollout_top_p != 1.0`). Use
-  `--rollout-top-p 1.0` until TokenSpeed returns that metadata;
-- rollout routing replay (`--use-rollout-routing-replay`).
-
-`POST /update_weights_from_disk` reloads the weights in place from a checkpoint
-directory (`{"model_path": ..., "load_format": ...}`; `load_format` defaults to
-the server's). It takes the same scheduler path as the distributed and
+`UpdateWeightFromDiskReqInput` reloads the weights in place from a checkpoint
+directory (`model_path`, and `load_format`, which defaults to the server's).
+It takes the same scheduler path as the distributed and
 Mooncake updates: the `weight_version` checks, the attention-DP same-round gate,
 a cache flush before the load, and the replica-wide result. The reply counts
 the checkpoint tensors actually read, and a checkpoint that yields none is a
@@ -320,9 +301,7 @@ transformed the model's weights after loading them, because a checkpoint holds
 those weights untransformed: quantized checkpoints (FP8, MXFP4, NVFP4,
 compressed-tensors), and MoE layers whose kernel repacks the experts, which
 includes the FlashInfer TRT-LLM and CUTLASS kernels for unquantized experts.
-Restart the engine with the new checkpoint instead. (`rl.update_from` still
-lists `disk` for such a model: it describes the engine, not the loaded model.)
-Unquantized dense models,
+Restart the engine with the new checkpoint instead. Unquantized dense models,
 and unquantized MoE on a kernel that keeps the checkpoint layout (the Triton
 kernel, or the Gluon kernel on gfx950), reload in place.
 
@@ -334,52 +313,37 @@ the load has started says that the worker's weights may now mix the two
 checkpoints: reload a complete checkpoint or restart the engine before relying
 on its output. The weight version does not advance on any failure.
 
-`POST /update_weights_from_tensor` stays on the router for slime-compatible
-clients, but answers `501 Not Implemented` with
-`{"success": false, "message": "..."}` before anything reaches the scheduler:
-TokenSpeed's scheduler does not implement the CUDA-IPC receive path. Use
-`POST /update_weights_from_distributed`, `POST /update_weights_from_disk`, or
-the Mooncake update described below. For the same reason the engine advertises
-`rl.update_from = "disk,distributed,mooncake"`, so a gateway never routes a
-tensor update here.
+`UpdateWeightsFromTensorReqInput` (colocated CUDA-IPC updates) fails before
+anything reaches the scheduler: TokenSpeed's scheduler does not implement the
+CUDA-IPC receive path. Use the distributed or disk update, or the Mooncake
+update described below.
 
 ### Weight updates under attention DP
 
-With `--data-parallel-size > 1`, the frontend sends
-`init_weights_update_group`, `update_weights_from_distributed`,
-`update_weights_from_mooncake`, and `destroy_weights_update_group` to every
-attention-DP worker and ANDs the replies (joining distinct messages with
-` | `). It sends `update_weights_from_disk` to every worker the same way and
-ANDs those replies too, but joins every message with ` | `, repeats included.
+With `--data-parallel-size > 1`, the frontend sends every weight operation
+to every attention-DP engine and combines their replies.
 Each scheduler queues the op and completes it only in a round where every DP
 rank holds the same kind of op at the head of its queue, decided on the
 per-round DP all-reduce that already carries flush intent. One op completes
 per round. TokenSpeed then MIN-reduces the device result across the replica
 before it publishes the L3 weight version, so a failure on one rank fails the
 update everywhere. A rank whose peer never receives the op waits
-indefinitely, as with `/flush_cache`. The design rationale is in
+indefinitely, as with a cache flush. The design rationale is in
 `docs/design/event-loop.md`.
 
-Only the three loads (distributed, Mooncake, and disk) take the frontend's
-model-update writer lock (the lock keeps generation out while the load
-rewrites parameters). `init_weights_update_group` and
-`destroy_weights_update_group` rewrite nothing and do not wait for in-flight
-generation, so the trainer's
-rendezvous is not held up by long requests.
+The engine does not wait for running requests before a load: a request that
+runs across one generates under both weights. Pause first (see the
+trainer-side contract below) when that matters.
 
 ### Mooncake weight updates
 
-`POST /update_weights_from_mooncake` loads one committed checkpoint version
+`UpdateWeightsFromMooncakeReqInput` loads one committed checkpoint version
 that the RL trainer published to a Mooncake weight store through the Model
-Updater SDK. Body: `{"version": int, "flush_cache": bool = true,
-"weight_version": str | null}`. A missing or non-integer `version` is a 400.
-The `flush_cache` wire default mirrors the reference engine's (FluentLLM's)
-API so its trainer clients work unchanged. Every scheduler process reads its
-own shard with its global rank as the SDK reader rank, on the forward
-thread, ordered against forwards like the distributed update. The reply
-arrives only after every worker finished its read, so the control server
-proxies this route with a longer inactivity timeout (3600 s) than the other
-RL routes.
+Updater SDK. Fields: `version` (an integer), `flush_cache` (default true),
+and `weight_version` (optional). Every scheduler process reads its own shard
+with its global rank as the SDK reader rank, on the forward thread, ordered
+against forwards like the distributed update. The reply arrives only after
+every worker finished its read.
 
 Start the server with the four `--model-update-*` flags (table above): the
 engine imports the SDK module lazily on the first update, and a missing
@@ -398,11 +362,11 @@ stamps the version into generation metadata.
 
 Trainer-side contract:
 
-- Pause dispatch at the router before calling and resume after the reply.
-  The scheduler's control thread blocks for the duration of the SDK read,
-  so load reporting, PD transfer polling, and health responses stall on
-  every worker. The frontend's writer lock only drains requests already
-  admitted on this engine.
+- Pause dispatch at the router, or the engine (`PauseSchedulerReqInput`),
+  before calling and resume after the reply: requests that run across the
+  load generate under both weights. The scheduler's control thread blocks
+  for the duration of the SDK read, so load reporting, PD transfer polling,
+  and health responses stall on every worker.
 - While PD transfers or Host write-backs are in flight on any replica rank,
   the engine rejects `flush_cache=true` (and skips the load). Retry after
   they drain, or send intermediate updates with `flush_cache=false` and
@@ -434,25 +398,6 @@ Trainer-side contract:
   (a successful retry streams the whole checkpoint and restores consistency)
   or restart the engine before resuming dispatch. The same holds for the
   distributed update.
-
-### Driving TokenSpeed from an external gateway
-
-A gateway that fronts several engines (for example SMG with `--enable-rl`)
-talks to this control app directly. The `ts serve` sidecar is not involved.
-Launch the engine with `--rl-control-port <port>` and
-`--rl-control-host <address the gateway can reach>` (the default binds
-localhost only). Unless the network is trusted, set `--rl-control-api-key`:
-an open control app on a routable host accepts weight updates from anyone who
-can connect. The engine puts the resulting control URL and its capabilities
-(`rl.control_url`, `rl.pause_modes`, `rl.update_from`, ...) into its server
-info. SMG reads them when it registers the gRPC worker, so the gateway side
-needs no configuration. The routes keep slime's expectations:
-`POST /pause_generation` accepts `{"mode": "wait"|"abort"|"keep"}` (default
-`wait`), and `/flush_cache` answers on both GET and POST. Routes with optional
-bodies accept an omitted body, but malformed or non-object JSON answers `400`
-before any control operation runs. The engine does not advertise wildcard
-bind addresses (`0.0.0.0` or `::`) as control URLs. Use a concrete address
-for gateway discovery.
 
 ## Scheduler and memory
 
@@ -508,6 +453,7 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--attn-head-tp-size` | Shard the MLA head projections (`q_b_proj`, `kv_b_proj`, `o_proj`) by heads over this many contiguous ranks that hold different rows; the attention exchanges heads for tokens around its core. Over attention-DP ranks (needs attention TP 1, attention DP and `--disaggregation-mode decode`; each rank keeps its own KV) the layout serves decode rows only, so it sets `--disable-prefill-graph` and tunes on a decode step; it admits any `max_new_tokens`, because a retracted request resumes by restore rather than by a recovery prefill. Over the query shards of a prefill engine (must equal `--query-context-parallel-size`) the extend rows run the absorbed sparse prefill through the exchange and none of the decode-only rules apply. Defaults to the ranks holding the same rows: the attention TP size, or 1 (head-replicated) under `--query-context-parallel-size`. See [Parallelism](../serving/parallelism.md#decode-side-tp-layouts-under-attention-dp). |
 | `--lm-head-tp-size` | Vocab-shard the LM head over this many contiguous ranks. Under attention DP the default 1 replicates it; a wider group gathers the ranks' rows before the logits GEMM and transposes the shards back. Without attention DP it must equal the attention TP size. Not combinable with `--dp-sampling`; under attention DP, requests asking for prompt logprobs (`logprob_start_len`) are refused. |
 | `--tp-batch-invariant` | `none` (default), `attn`, or `attn+dense`: make the head-sharded `o_proj` and the dense `down_proj` column-parallel on hidden (all-gather of the reduction dim, full-K GEMM, all-to-all back to own rows) so no cross-rank sum remains outside MoE and the bits equal a TP1 full-K GEMM. `attn` needs `--attn-head-tp-size` > 1; `attn+dense` also needs a dense TP group wider than attention TP (so not under `--query-context-parallel-size`, whose dense group is 1 or the attention TP width; only `attn` applies there); both need unquantized `o_proj` / `down_proj`, judged on the checkpoint's resolved quantization (a quantized checkpoint passes when its `disable_quant_module` excludes `self_attn` and, for `attn+dense`, `dense_mlp` / `mlps`). |
+| `--head-tp-exchange-max-rows` | Rows per rank the head-TP Lamport exchanges are prepared for (the absorbed query, the latent attention output, and, under `--tp-batch-invariant`, the `o_proj` rows). The symmetric-memory scratch is allocated before CUDA-graph capture; larger forwards fall back to the generic all-to-all. Only used with `--attn-head-tp-size` > 1. 256 (default). |
 | `--query-context-parallel-size` | Query context parallelism (QCP) on the PD prefill role: shard every extend forward's rows over the attention TP group, rank `r` computing a contiguous slice of the chunk against the gathered KV history of its requests (the KV write, index-K write, sampled rows and prompt-logprob rows are gathered across the group; the scheduler, cache allocation and PD transfer are unchanged, and `--chunked-prefill-size` keeps counting the whole chunk). Requires `--disaggregation-mode prefill` and must equal both `--attn-tp-size` and `--kv-parallel-size` (the shard is a layout over the sharded pages, so it inherits KVP's rules: Host KVStore, snapshot pool and L3 use the same owner translation); attention DP 1, no `--enable-mixed-batch`, `--dense-tp-size` and the MoE TP×EP group each 1 or the attention TP width; GPU DSA attention with a bf16 KV cache (the gathered write stores native latent rows), checked where the attention config is built. The prefill stays eager -- the GPU DSA backend declares no prefill graph under a shard -- without `--disable-prefill-graph` on the launch. The attention weights are head-replicated unless `--attn-head-tp-size` equals it, which shards them over the shard group. 1 (default) is off. |
 | `--dense-tp-size` | Tensor parallel size for dense layers. Defaults to the attention TP width: the full world without DP attention, one replica with it. |
 | `--moe-tp-size` | Tensor parallel size for MoE layers. |
@@ -536,8 +482,8 @@ split knobs.
 | `--init-expert-location` | `trivial` (default). Otherwise the form is decided in order: inline JSON when the value starts with `{`, a directory of per-rank `*.expert-load.pt` records (merged), an existing `.pt`/`.json` file, else a glob over record files (merged). A `logical_count` `[layers, experts]` load record derives the placement with the EPLB algorithm, a `physical_to_logical_map` `[layers, slots]` pins one exactly. |
 | `--ep-dispatch-algorithm` | How routing picks among an expert's replicas; required with any of the flags above or below. `static_with_zero_expert` for models with zero experts (LongCat), `static` otherwise; `dynamic`/`dynamic_with_zero_expert`/`fake` draw at random (refused under `--numerics rl-bitwise` and on replicated-input EP). |
 | `--eplb-algorithm` | `auto` (default), `deepseek`, or `deepseek_hierarchical`. |
-| `--expert-distribution-recorder-mode` | `stat` (the only mode): count the routes to every physical expert so the `EXPERT_LOAD` profile activity (`/start_profile` ... `/stop_profile`) can write each rank's load record and `--enable-eplb` can rebalance from the counters. |
-| `--enable-eplb` | Online expert rebalancing: every `--eplb-rebalance-num-iterations` forwards the routing load since the previous snapshot is rebalanced with the EPLB algorithm and the expert weights move between slots. Requires `--expert-distribution-recorder-mode stat` and a static `--ep-dispatch-algorithm`, both explicit, and `ep_size > 1`; `--ep-num-redundant-experts 0` is allowed (permutation only). `POST /rebalance_experts` starts one rebalance now. Under a `--numerics` envelope it rides the placement-independent slot-order MoE combine the envelope folds in (`--moe-combine-order slot`). |
+| `--expert-distribution-recorder-mode` | `stat` (the only mode): count the routes to every physical expert so the `EXPERT_LOAD` profile activity can write each rank's load record when its profile stops and `--enable-eplb` can rebalance from the counters. |
+| `--enable-eplb` | Online expert rebalancing: every `--eplb-rebalance-num-iterations` forwards the routing load since the previous snapshot is rebalanced with the EPLB algorithm and the expert weights move between slots. Requires `--expert-distribution-recorder-mode stat` and a static `--ep-dispatch-algorithm`, both explicit, and `ep_size > 1`; `--ep-num-redundant-experts 0` is allowed (permutation only). The `RebalanceExpertsReqInput` control operation starts one rebalance now. Under a `--numerics` envelope it rides the placement-independent slot-order MoE combine the envelope folds in (`--moe-combine-order slot`). |
 | `--eplb-rebalance-num-iterations` | Forwards between two load snapshots; required with `--enable-eplb`, `> 0`. |
 | `--eplb-rebalance-layers-per-chunk` | MoE layers whose experts move in one scheduling round; required with `--enable-eplb`, `1..num MoE layers`. Fewer layers per chunk bound the per-round stall. |
 
@@ -558,7 +504,7 @@ for the online variant.
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
-| `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. |
+| `--deepep-mode` | DeepEP mode: `auto`, `normal`, or `low_latency`. `auto` uses `low_latency` for decode batches and `normal` for prefill batches. `normal` reads its per-expert receive counts on the host, so it forces eager execution and disables CUDA graphs. |
 | `--sampling-backend` | Sampling backend: `greedy`, `flashinfer`, `flashinfer_full`, `triton`, or `triton_full`. |
 
 Set backend choices explicitly in production. `auto` is useful for bring-up, but
@@ -870,8 +816,6 @@ which keeps it when recreating a session after a memory resume.
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
-| `--enable-log-requests` | Log request metadata and optionally payloads. On by default; `--no-enable-log-requests` disables. |
-| `--log-requests-level` | Request logging verbosity: level 0 logs metadata without reconstructing prompt text; levels 1 and 2 include truncated and full payloads, respectively. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
@@ -901,7 +845,7 @@ bootstrapping share.
 queue-wait histogram (`--enable-metrics`): the wall time from a request's
 submission to the scheduler's waiting queue to its first dispatch into a
 forward batch, observed once per request. The enqueue point is submission —
-tokenizer-manager and IPC wait are not included, and neither are the waits
+frontend and IPC wait are not included, and neither are the waits
 that precede submission: a structured-output request's grammar-compile wait
 (readiness gates submission), a pause admission hold, and an EPD embedding
 wait all stay out of the sample. A request preempted by capacity retraction
@@ -923,61 +867,33 @@ does not start a Prometheus endpoint.
 
 ### Prometheus metrics
 
-With `--enable-metrics` and the `prometheus` reporter, every engine process on a node (scheduler ranks and
-the tokenizer manager) writes its metrics to a node-local
-`PROMETHEUS_MULTIPROC_DIR`, and the engine's main process aggregates and
-serves them as `GET /metrics` in Prometheus text format. Scrape it at
+With `--enable-metrics` and the `prometheus` reporter, every engine rank on a
+node writes its metrics to a node-local `PROMETHEUS_MULTIPROC_DIR`, and the
+node's launcher process aggregates and serves them as `GET /metrics` in
+Prometheus text format. Scrape it at
 `http://<metrics-host>:<metrics-port>/metrics`; the bound address is logged at
 startup. Scrape traffic shares nothing with the request path — a bind failure
 degrades to an error log and serving continues.
 
 Where the endpoint lives depends on the launch mode:
 
-- **Single node / `ts serve`**: the engine's main process serves `/metrics`
-  on `--metrics-port` (an allocated free port if unset). `ts serve` pins this
+- **Single node / `ts serve`**: the engine's launcher process serves
+  `/metrics` on `--metrics-port` (an allocated free port if unset). `ts serve` pins this
   port itself and prints `engine metrics available at http://...` once ready.
   The gateway's own router metrics are separate: smg serves them on its
   `--prometheus-port`, which `ts serve` also allocates per launch.
-- **Multi-node**: the main node (`node_rank == 0`) behaves as above. Follower
-  nodes (`node_rank >= 1`) run no tokenizer manager; their dummy health-check
-  server exposes `/metrics` (plus `/health`) on the engine's `--host`/`--port`
-  instead. Scrape every node — the multiprocess directory is node-local, so no
-  single endpoint covers the whole cluster.
+- **Multi-node**: every node's launcher serves its own node's `/metrics` the
+  same way. Scrape every node — the multiprocess directory is node-local, so
+  no single endpoint covers the whole cluster.
 
-### Latency histograms
+### Request metrics
 
-| Metric | Semantics |
-| --- | --- |
-| `tokenspeed:request_time_per_output_token_seconds` | End-to-end latency divided by output tokens; includes queueing and TTFT. |
-| `tokenspeed:request_queue_time_seconds` | Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. |
-| `tokenspeed:decode_time_per_output_token_seconds` | Decode time per output token after the first output frame; excludes queueing and TTFT. |
-| `tokenspeed:inter_token_latency_seconds` | Per-token interval between output frames, measured by frontend wall clock. |
-| `tokenspeed:scheduler_inter_token_latency_seconds` | Per-token interval between output frames, measured by scheduler timestamps. |
-
-`tokenspeed:time_to_first_token_seconds` and
-`tokenspeed:e2e_request_latency_seconds` carry a `stream` label
-(`"true"`/`"false"`, the request's streaming flag) in addition to the base
-labels.
-
-### Request counters, token distributions, and preemptions
-
-The request counters `tokenspeed:num_requests_total` (every finished request)
-and `tokenspeed:request_success_total` (finished without an abort) carry two
-labels beyond the base `model_name`/`app_key`:
-
-| Label | Values |
-| --- | --- |
-| `finish_reason` | `stop`, `length`, `abort`, `abort:transfer_failed`, `abort:unknown_error`, `abort:numerical_error`, `abort:capacity_abort`, `unknown`. The finish-reason type (`BaseFinishReason.to_json()`), with the bounded `ABORT_CODE` subclass folded in as `abort:<code>`; an abort with an unrecognized `err_type` stays plain `abort`. Unbounded payloads (abort message, matched stop string) are never labels. |
-| `stream` | `"true"` / `"false"` — the request's streaming flag. |
-
-Two per-request histograms (same `stream` label, observed once at request
-finish) use a 1-2-5 bucket grid (1, 2, 5, 10, …) capped at the model's
-context length:
-
-| Metric | Semantics |
-| --- | --- |
-| `tokenspeed:request_prompt_tokens` | Prompt token count per finished request. |
-| `tokenspeed:request_generation_tokens` | Generation token count per finished request. |
+The engine exports the scheduler's view of a request: the queue wait above
+(`tokenspeed:request_queue_time_seconds`), the running and waiting gauges,
+and the preemption and abort counters. Latency from the client's side
+(time to first token, inter-token latency, end-to-end latency) and the
+per-request finish counts are the frontend's: under `ts serve`, SMG's router
+metrics on its `--prometheus-port`.
 
 The scheduler process exports `tokenspeed:num_preemptions_total`: requests
 preempted by a capacity retraction — suspended
@@ -987,22 +903,6 @@ increment per retraction victim, counted from the plan's snapshot-store ops;
 forced retractions from `--debug-force-retraction-interval` count too. A
 retraction whose victim cannot be imaged aborts it instead — those are
 `tokenspeed:num_capacity_aborted_requests`, never preemptions.
-
-The cached/uncached token split (the billing split Baseten/Fireworks-style
-dashboards show) derives from existing counters; no dedicated metric is needed:
-
-```promql
-cached_prompt_tokens   = tokenspeed:prefix_cache_hits_total
-uncached_prompt_tokens = tokenspeed:prompt_tokens_total - tokenspeed:prefix_cache_hits_total
-```
-
-**Wire-compatibility note.** Adding `finish_reason` to
-`tokenspeed:num_requests_total` / `tokenspeed:request_success_total` and
-`stream` to `tokenspeed:time_to_first_token_seconds` /
-`tokenspeed:e2e_request_latency_seconds` changes those metrics' series
-identity: the pre-change series (without the new labels) stop updating, and
-queries pinning an exact label set must include the new labels. Aggregate
-queries (`sum by (...)` that drops them) are unaffected.
 
 ### Per-request stats
 
@@ -1081,6 +981,7 @@ features directly:
 - `--attn-head-tp-size`
 - `--lm-head-tp-size`
 - `--tp-batch-invariant`
+- `--head-tp-exchange-max-rows`
 - `--dense-tp-size`
 - `--moe-tp-size`
 - `--kvstore-*`

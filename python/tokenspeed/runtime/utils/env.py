@@ -52,6 +52,7 @@ global_server_args_dict: dict = {
     "moe_combine_order": ServerArgs.moe_combine_order,
     "dsa_slot_order": ServerArgs.dsa_slot_order,
     "tp_batch_invariant": ServerArgs.tp_batch_invariant,
+    "head_tp_exchange_max_rows": ServerArgs.head_tp_exchange_max_rows,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,
     "device": ServerArgs.device,
     "draft_model_path_use_base": ServerArgs.draft_model_path_use_base,
@@ -112,6 +113,7 @@ def global_server_args_dict_update(server_args: ServerArgs):
             "moe_combine_order": server_args.moe_combine_order,
             "dsa_slot_order": server_args.dsa_slot_order,
             "tp_batch_invariant": server_args.tp_batch_invariant,
+            "head_tp_exchange_max_rows": server_args.head_tp_exchange_max_rows,
             "low_latency_max_num_tokens_per_gpu": server_args.low_latency_max_num_tokens_per_gpu,
             "device": server_args.device,
             "draft_model_path_use_base": server_args.draft_model_path_use_base,
@@ -267,9 +269,7 @@ class Envs:
     # Test and debug
     TOKENSPEED_CUDA_COREDUMP = EnvBool(False)
     TOKENSPEED_CUDA_COREDUMP_DIR = EnvStr("/tmp/tokenspeed_cuda_coredumps")
-    TOKENSPEED_PROFILE_WITH_STACK = EnvBool(True)
     TOKENSPEED_CUPTI_GRAPH_WARMUP = EnvBool(False)
-    TOKENSPEED_TEST_REQUEST_TIME_STATS = EnvBool(False)
     TOKENSPEED_LOG_SPEC_ACCEPT_LENGTHS = EnvBool(False)
     # Rank 0 logs EAGLE-Harness rounds per batch bucket and verify width every N rounds (0: off).
     TOKENSPEED_EAGLE_HARNESS_ROUND_STATS = EnvInt(0)
@@ -298,10 +298,6 @@ class Envs:
     TOKENSPEED_KIMI_K3_O_PROJ_TP_SIZE = EnvInt(1)
 
     # Scheduler
-    TOKENSPEED_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
-    # Seconds a blocking node of rank >= 1 gives its schedulers to exit on
-    # SIGTERM before it kills them, when it is stopped.
-    TOKENSPEED_NONZERO_RANK_SHUTDOWN_TIMEOUT = EnvFloat(10.0)
     # The ts-host binary each engine rank runs; by default the one installed
     # with the tokenspeed-engine wheel (``tokenspeed_engine.host_binary()``).
     TOKENSPEED_HOST_BINARY = EnvStr(None)
@@ -355,7 +351,6 @@ class Envs:
     TOKENSPEED_WORKSPACE_TRTLLM_MHA_MB = EnvInt(512)
     TOKENSPEED_WORKSPACE_TRTLLM_MLA_MB = EnvInt(256)
     TOKENSPEED_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
-    TOKENSPEED_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
     TOKENSPEED_FORCE_FAKE_FULL_NVLINK = EnvBool(False)
     TOKENSPEED_HEALTH_CHECK_TIMEOUT = EnvInt(20)
     TOKENSPEED_HOST_IP = EnvStr("")
@@ -374,10 +369,6 @@ class Envs:
     TOKENSPEED_ENABLE_TORCH_INFERENCE_MODE = EnvBool(True)
     TOKENSPEED_NUMA_AWARE_WORKER_AFFINITY = EnvBool(True)
     TOKENSPEED_REQUEST_CONVERSION_WORKERS = EnvInt(8)
-    # Rollout escape hatch: revert engine IPC (frontend <-> controller <->
-    # scheduler ZMQ hops) from msgpack back to pickle. Read once at import of
-    # engine.io_struct.
-    TOKENSPEED_USE_PICKLE_IPC = EnvBool(False)
 
     # Qwen4-Exp QSA
     TOKENSPEED_QWEN4_EXP_QSA_TOPK_PATH = EnvStr("auto")
