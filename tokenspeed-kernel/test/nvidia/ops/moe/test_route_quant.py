@@ -283,7 +283,9 @@ def native_input_weights(request):
     return *weights, *scales
 
 
-def exercise_native_consumer(native, weights, tokens, topk, ep_size, ep_rank):
+def exercise_native_consumer(
+    native, weights, tokens, topk, ep_size, ep_rank, *, use_fused_finalize
+):
     w1, w2, s1, s2 = weights
     experts, hidden = w1.shape[0], w1.shape[2]
     origin = experts * ep_rank
@@ -303,7 +305,7 @@ def exercise_native_consumer(native, weights, tokens, topk, ep_size, ep_rank):
         output_dtype=torch.bfloat16,
         quant_scales=[s1, s2],
         use_deepseek_fp8_block_scale=True,
-        use_fused_finalize=False,
+        use_fused_finalize=use_fused_finalize,
         ep_size=ep_size,
         ep_rank=ep_rank,
         expected_m=max(1, (tokens * topk + experts - 1) // experts),
@@ -384,11 +386,23 @@ def exercise_native_consumer(native, weights, tokens, topk, ep_size, ep_rank):
 
 @pytest.mark.parametrize("tokens", TOKENS)
 @pytest.mark.parametrize("ep_size,ep_rank", ((1, 0), (3, 2)))
+@pytest.mark.parametrize("use_fused_finalize", (False, True))
 def test_prepared_input_matches_native_moe(
-    native_input_consumer, native_input_weights, tokens, ep_size, ep_rank
+    native_input_consumer,
+    native_input_weights,
+    tokens,
+    ep_size,
+    ep_rank,
+    use_fused_finalize,
 ):
     exercise_native_consumer(
-        native_input_consumer, native_input_weights, tokens, 5, ep_size, ep_rank
+        native_input_consumer,
+        native_input_weights,
+        tokens,
+        5,
+        ep_size,
+        ep_rank,
+        use_fused_finalize=use_fused_finalize,
     )
 
 
@@ -396,7 +410,63 @@ def test_prepared_input_matches_native_moe(
 def test_prepared_input_tma_row_padding(
     native_input_consumer, native_input_weights, topk
 ):
-    exercise_native_consumer(native_input_consumer, native_input_weights, 1, topk, 3, 2)
+    exercise_native_consumer(
+        native_input_consumer,
+        native_input_weights,
+        1,
+        topk,
+        3,
+        2,
+        use_fused_finalize=False,
+    )
+
+
+def test_prepared_input_preserves_finalize_configuration(
+    native_input_consumer, native_input_weights
+):
+    from inspect import unwrap
+
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import _private_entrypoint
+
+    # Trace/logging wrappers have their own globals; use the native function's.
+    entrypoint = unwrap(_private_entrypoint(True, 4, -1))
+    module = entrypoint.__globals__["get_cutlass_fused_moe_module"](
+        "90", enable_sm90_moe_optimizations=True
+    )
+    runners = module.MoERunner.runner_dict
+    saved_runners = runners.copy()
+    w1, w2, s1, s2 = native_input_weights
+    x = torch.randn((8, w1.shape[2]), device="cuda", dtype=torch.bfloat16) * 0.1
+    ids = torch.arange(40, device="cuda", dtype=torch.int32).view(8, 5) % w1.shape[0]
+    scales = torch.softmax(torch.randn((8, 5), device="cuda"), dim=-1)
+    prepared = route_quant_fp8(
+        x, ids, experts=w1.shape[0], expert_offset=0, solution="cute_dsl"
+    )
+    arguments = dict(
+        input=x,
+        token_selected_experts=ids,
+        token_final_scales=scales,
+        fc1_expert_weights=w1,
+        fc2_expert_weights=w2,
+        output_dtype=torch.bfloat16,
+        quant_scales=[s1, s2],
+        use_deepseek_fp8_block_scale=True,
+        expected_m=2,
+        enable_pdl=False,
+        prepared_input=prepared,
+    )
+    try:
+        runners.clear()
+        separate = native_input_consumer(**arguments, use_fused_finalize=False)[0]
+        assert len(runners) == 1
+        native_policy = native_input_consumer(**arguments, use_fused_finalize=True)[0]
+        # Equal outputs alone cannot detect an overwritten policy on block-FP8.
+        # The real native cache must retain both explicitly requested policies.
+        assert len(runners) == 2
+        assert_bytes(native_policy, separate)
+    finally:
+        torch.cuda.synchronize()
+        runners.update(saved_runners)
 
 
 class PlannedRouteWeights(torch.nn.Module):
@@ -536,7 +606,7 @@ def exercise_planned_moe(native, matrices, tokens, topk, ep_size, ep_rank):
         graph.reset()
 
 
-@pytest.mark.parametrize("tokens", (0, 2, 7, *TOKENS))
+@pytest.mark.parametrize("tokens", (0, 2, 7, 9, 15, 17, *TOKENS))
 @pytest.mark.parametrize("ep_size,ep_rank", ((1, 0), (3, 2)))
 def test_registered_moe_input_path(
     native_input_consumer, native_input_weights, tokens, ep_size, ep_rank
@@ -550,3 +620,26 @@ def test_registered_moe_input_path(
 @pytest.mark.parametrize("tokens", (1, 8, 128))
 def test_route_quantization_widths(hidden, tokens):
     exercise_route_graph(tokens, 33, 5, hidden)
+
+
+def test_native_schedule_repeated_transitions():
+    from tokenspeed_kernel.ops.moe.cute_dsl import _RouteQuantMoEState
+
+    state = _RouteQuantMoEState(torch.add, torch.mul)
+    left, right = torch.tensor(2), torch.tensor(3)
+    for tokens, expected in (
+        (16, 5),
+        (17, 6),
+        (1, 5),
+        (4096, 6),
+        (15, 5),
+        (32, 6),
+        (0, 5),
+        (2, 5),
+        (7, 5),
+        (9, 5),
+        (8192, 6),
+        (8, 5),
+    ):
+        actual = state.native_for_tokens(tokens)(left, right)
+        assert actual.item() == expected

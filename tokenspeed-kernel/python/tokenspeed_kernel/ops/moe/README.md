@@ -60,14 +60,17 @@ standard SwiGLU, and top-k in
 that use native input preparation, whose permutation requires distinct IDs.
 The standalone route quantizer accepts repeated IDs, but that broader contract
 does not extend to the complete MoE solution.
-It initializes the optimized native module with FC1 stage cap 4 and the
-upstream FC2 stage policy before processing weights; the native expected-M
-estimate remains in effect. Existing higher-priority MoE solutions retain their
+It prepares two cached native modules before processing weights. Batches of at
+most 16 tokens use FC1 stage cap 4 and expert lookup; larger batches use the
+original stage and lookup policies. Both retain native FC2 and expected-M
+selection. Module compilation happens during initialization, before warmup and
+graph capture; weight preprocessing runs once and both modules share the same
+processed tensors. Existing higher-priority MoE solutions retain their
 automatic selection preference.
 
 At TP=1, supported token buckets and local expert counts use the registered
 route quantizer. Other token counts, TP configurations, and larger local expert
-counts use the same native callable's input preparation. Every call owns its
+counts use the selected native callable's input preparation. Every call owns its
 route buffers; graph capture keeps the allocator's captured storage alive.
 Both paths preserve native GEMM and finalized-output semantics. Deferred output,
 all-to-all, clamped activation, and the batch-invariant numerical envelope are
@@ -435,8 +438,9 @@ kernel's own finalized output.
 
 `route_quant_fp8(input, ids, experts=..., expert_offset=..., solution=...)`
 produces packed block-FP8 rows and their native expert offsets in one launch.
-The Hopper implementation accepts BF16 width 512, a contiguous local expert
-interval with 1–1024 experts, and model-static top-k values from 1 to 32.
+The Hopper implementation accepts BF16 inputs with a positive width divisible
+by 128, a contiguous local interval with 1–1024 experts, and model-static top-k
+values from 1 to 32.
 Negative and nonlocal IDs have inverse row -1 and produce no packed row.
 The currently implemented token buckets are 1, 8, 16, 32, 64, 128, 256, 1024,
 and 4096. Callers retain their existing producer for other input geometry.
@@ -460,7 +464,9 @@ The private SM90 runner accepts `prepared_input` from `route_quant_fp8`, bound
 to the same input and expert IDs. It reads the producer's packed FP8 rows,
 FP32 scales, offsets and slot-major inverse directly. The native expert GEMMs,
 activation and weighted finalizer retain their algorithms and stage settings.
-Other callers keep their existing input producer.
+The consumer forwards `use_fused_finalize` unchanged to the native runner;
+prepared input does not select a different finalization policy. Other callers
+keep their existing input producer.
 
 Packed capacity is rounded to four rows for TMA; scale capacity includes the
 per-expert padding. Only rows below `offsets[-1]` are valid. The native consumer

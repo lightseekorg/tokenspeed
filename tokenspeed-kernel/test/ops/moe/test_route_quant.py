@@ -167,7 +167,13 @@ def test_native_consumer_accepts_padded_capacity(small_storage):
 
 @pytest.mark.parametrize("field", ("packed", "scales", "inverse", "offsets"))
 def test_native_consumer_rejects_truncated_allocation(small_storage, field):
-    tensor = getattr(small_storage, field)
+    tensors = {
+        "packed": small_storage.packed,
+        "scales": small_storage.scales,
+        "inverse": small_storage.inverse,
+        "offsets": small_storage.offsets,
+    }
+    tensor = tensors[field]
     malformed = dataclasses.replace(small_storage, **{field: tensor[:-1]})
     with pytest.raises(ValueError, match="layout"):
         validate_storage(malformed)
@@ -181,7 +187,13 @@ def test_native_consumer_rejects_overlapping_metadata(small_storage):
 
 @pytest.mark.parametrize("changed", ("input", "ids", "experts", "expert_offset"))
 def test_native_consumer_rejects_other_producer(small_storage, changed):
-    value = getattr(small_storage, changed)
+    values = {
+        "input": small_storage.input,
+        "ids": small_storage.ids,
+        "experts": small_storage.experts,
+        "expert_offset": small_storage.expert_offset,
+    }
+    value = values[changed]
     value = value.clone() if isinstance(value, torch.Tensor) else value + 1
     with pytest.raises(ValueError, match="different inputs or experts"):
         validate_storage(small_storage, **{changed: value})

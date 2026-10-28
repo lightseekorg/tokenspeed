@@ -51,7 +51,12 @@ def cute_dsl_route_quant_fp8(storage):
 
 @dataclass(frozen=True)
 class _RouteQuantMoEState:
-    native: Callable
+    small_batch_native: Callable
+    original_native: Callable
+
+    def native_for_tokens(self, tokens: int) -> Callable:
+        # Keep the original schedule beyond the measured small-batch benefit.
+        return self.small_batch_native if tokens <= 16 else self.original_native
 
 
 def cute_dsl_fp8_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
@@ -71,11 +76,14 @@ def cute_dsl_fp8_moe_process_weights(plan: dict, w: torch.nn.Module) -> None:
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
     # Build before mutating checkpoint storage; a failed build can be retried.
-    native = make_cutlass_fused_moe(
+    small_batch_native = make_cutlass_fused_moe(
         mode="optimized", max_num_stages_fc1=4, max_num_stages_fc2=-1
     )
+    original_native = make_cutlass_fused_moe(
+        mode="expected_m", max_num_stages_fc1=-1, max_num_stages_fc2=-1
+    )
     flashinfer_cutlass_fp8_moe_weights(plan, w)
-    w._moe_backend_state = _RouteQuantMoEState(native)
+    w._moe_backend_state = _RouteQuantMoEState(small_batch_native, original_native)
 
 
 @register_kernel(
@@ -124,7 +132,7 @@ def cute_dsl_fp8_moe_apply(
     """Execute the planned FP8 experts with precomputed route IDs and weights.
 
     ``x`` is BF16 [tokens, hidden]; ``w`` owns processed checkpoint weights and
-    the native callable initialized by ``moe_process_weights``. The remaining
+    the native callables initialized by ``moe_process_weights``. The remaining
     arguments follow ``moe_apply``. Returns finalized BF16 [tokens, hidden].
     """
     if not do_finalize:
@@ -167,7 +175,8 @@ def cute_dsl_fp8_moe_apply(
             expert_offset=w.w13_weight.shape[0] * w.ep_rank,
             solution="cute_dsl",
         )
-    return state.native(
+    native = state.native_for_tokens(x.shape[0])
+    return native(
         output=output,
         input=x,
         token_selected_experts=ids,

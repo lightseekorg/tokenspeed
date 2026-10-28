@@ -790,7 +790,7 @@ index 173998b089af816e873dac5d67ae12f3ab1acc30..74c5957e8f88867648da03a3545b9dcd
 +}
 +
 diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
-index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..cd278d69bf0bfcf1440822f6b8f3e83fe29a5380 100644
+index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd464150b97b00 100644
 --- a/flashinfer/fused_moe/core.py
 +++ b/flashinfer/fused_moe/core.py
 @@ -647,0 +648,23 @@
@@ -918,12 +918,11 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..cd278d69bf0bfcf1440822f6b8f3e83f
 +            min_latency_mode=min_latency_mode,
 +            backend=backend,
 +        )
-@@ -1623,0 +1724,4 @@
+@@ -1623,0 +1724,3 @@
 +    if prepared_input is not None:
 +        if not use_deepseek_fp8_block_scale or min_latency_mode or enable_alltoall or tp_size != 1:
 +            raise ValueError("Prepared input requires SM90 block-FP8 without TP/all-to-all")
-+        use_fused_finalize = False
-@@ -1634 +1738,7 @@
+@@ -1634 +1737,7 @@
 -        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
 +        if enable_sm90_moe_optimizations:
 +            module = get_cutlass_fused_moe_module(
@@ -932,6 +931,6 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..cd278d69bf0bfcf1440822f6b8f3e83f
 +        else:
 +            module = get_cutlass_fused_moe_module(device_arch)
 +        return module.cutlass_fused_moe(
-@@ -1671,0 +1782,2 @@
+@@ -1671,0 +1781,2 @@
 +            expected_m=expected_m,
 +            prepared_input=prepared_input,
