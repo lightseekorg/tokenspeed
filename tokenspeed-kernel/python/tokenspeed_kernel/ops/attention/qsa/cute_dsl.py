@@ -125,7 +125,7 @@ def cute_dsl_tma_gather_qsa_prefill(
     metadata_capacity_rows: int | None,
     k_scale: float | torch.Tensor | None,
     v_scale: float | torch.Tensor | None,
-    sparse_metadata: QSASparseMetadata,
+    sparse_metadata: QSASparseMetadata | None,
 ) -> torch.Tensor:
     """Run SM107 TMA gather attention over request-local prefill spans.
 

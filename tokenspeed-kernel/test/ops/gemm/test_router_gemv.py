@@ -81,53 +81,48 @@ def _tf32(t: torch.Tensor) -> torch.Tensor:
     + [(5, 1000, 100), (20, 4608, 80)],
 )
 def test_tf32_router_rounds_like_cublas_where_cublas_uses_tf32(
-    device: str, monkeypatch: pytest.MonkeyPatch, rows: int, hidden: int, columns: int
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    set_matmul_precision,
+    rows: int,
+    hidden: int,
+    columns: int,
 ) -> None:
     """Three to 32 rows run on tensor cores when cuBLAS would use TF32 anyway."""
     if not current_platform().is_nvidia:
         pytest.skip("the TF32 tensor-core path is NVIDIA-only")
-    # pytest's monkeypatch cannot restore torch.backends.cuda.matmul settings
-    # (they never land in the instance __dict__ it records, so teardown leaks
-    # them); the legacy allow_tf32 setter keeps fp32_precision in sync.
-    old_tf32 = torch.backends.cuda.matmul.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = True
+    set_matmul_precision("tf32")
     monkeypatch.delenv("NVIDIA_TF32_OVERRIDE", raising=False)
-    try:
-        torch.manual_seed(29)
-        x = torch.randn(rows, hidden, dtype=torch.float32, device=device)
-        weight = torch.randn(hidden, columns, dtype=torch.float32, device=device)
-        # Row 0 sits exactly between two TF32 values; row 1 carries a NaN that must survive.
-        x[0] = 1 + 2**-11
-        weight[:, 0] = 1.0
-        x.view(torch.int32)[1, 0] = 0x7FFFFFFF
-        counters = fp32_router_gemv_counters(columns, torch.device(device))
+    torch.manual_seed(29)
+    x = torch.randn(rows, hidden, dtype=torch.float32, device=device)
+    weight = torch.randn(hidden, columns, dtype=torch.float32, device=device)
+    # Row 0 sits exactly between two TF32 values; row 1 carries a NaN that must survive.
+    x[0] = 1 + 2**-11
+    weight[:, 0] = 1.0
+    x.view(torch.int32)[1, 0] = 0x7FFFFFFF
+    counters = fp32_router_gemv_counters(columns, torch.device(device))
 
-        def no_cublas(*args: object) -> torch.Tensor:
-            raise AssertionError("3-32 rows must not fall back to torch.matmul")
+    def no_cublas(*args: object) -> torch.Tensor:
+        raise AssertionError("3-32 rows must not fall back to torch.matmul")
 
-        with monkeypatch.context() as patch:
-            patch.setattr(torch, "matmul", no_cublas)
-            out = fp32_router_gemv(x, weight, 0.125, counters, False)
-            for enable_pdl in (False, True):
-                again = fp32_router_gemv(x, weight, 0.125, counters, enable_pdl)
-                assert torch.equal(again.view(torch.int32), out.view(torch.int32))
-        assert out[1].isnan().all()
-        keep = torch.arange(rows, device=device) != 1
-        expected = (_tf32(x[keep]).double() @ _tf32(weight).double()) * 0.125
-        torch.testing.assert_close(
-            out[keep].double(),
-            expected,
-            rtol=1e-5,
-            atol=1e-5 * expected.abs().max().item(),
-        )
-        assert counters.eq(0).all()
-        # Without TF32 the rows go to cuBLAS's FP32 matmul.
-        monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
-        fallback = fp32_router_gemv(x, weight, 0.125, counters, False)
-        cublas = torch.matmul(x, weight) * 0.125
-        assert torch.equal(fallback.view(torch.int32), cublas.view(torch.int32))
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = old_tf32
+    with monkeypatch.context() as patch:
+        patch.setattr(torch, "matmul", no_cublas)
+        out = fp32_router_gemv(x, weight, 0.125, counters, False)
+        for enable_pdl in (False, True):
+            again = fp32_router_gemv(x, weight, 0.125, counters, enable_pdl)
+            assert torch.equal(again.view(torch.int32), out.view(torch.int32))
+    assert out[1].isnan().all()
+    keep = torch.arange(rows, device=device) != 1
+    expected = (_tf32(x[keep]).double() @ _tf32(weight).double()) * 0.125
+    torch.testing.assert_close(
+        out[keep].double(), expected, rtol=1e-5, atol=1e-5 * expected.abs().max().item()
+    )
+    assert counters.eq(0).all()
+    # Without TF32 the rows go to cuBLAS's FP32 matmul.
+    monkeypatch.setenv("NVIDIA_TF32_OVERRIDE", "0")
+    fallback = fp32_router_gemv(x, weight, 0.125, counters, False)
+    cublas = torch.matmul(x, weight) * 0.125
+    assert torch.equal(fallback.view(torch.int32), cublas.view(torch.int32))
 
 
 def test_fp32_router_gemv_replays_under_graph_capture(device: str) -> None:
