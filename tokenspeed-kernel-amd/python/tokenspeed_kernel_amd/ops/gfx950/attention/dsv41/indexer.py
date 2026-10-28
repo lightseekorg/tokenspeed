@@ -929,6 +929,8 @@ def dsv41_index_logits_gfx950(
         num_warps=2,
         waves_per_eu=4,
         enable_fp_fusion=False,
+        # With the current LLVM, SLP vectorization slows this kernel.
+        llvm_cl_opts="vectorize-slp=false",
     )
 
 
