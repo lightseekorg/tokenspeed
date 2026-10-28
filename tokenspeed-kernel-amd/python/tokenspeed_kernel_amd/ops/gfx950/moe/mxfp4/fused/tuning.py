@@ -98,6 +98,9 @@ class _RouteTileConfig(NamedTuple):
 
 _DECODE_STAGE1 = _RouteTileStage(64, 128, False)
 _WIDE_STAGE1 = _RouteTileStage(128, 256, True)
+# At EP1, overlapping the next K tile's loads did not help (pipelined time
+# 1.00-1.01x unpipelined on average at 17-128 rows), so pipelining is off.
+_EP1_STAGE = _RouteTileStage(128, 256, False)
 
 # Key: hidden width, intermediate width, local experts, global experts, top-k.
 # Entries: inclusive row bounds and the route-tile schedule. Rows outside every
@@ -134,6 +137,14 @@ _EP8_ROUTE_TILES = _SINGLE_PROGRAM_ROUTE_TILES + (
 _ROUTE_TILE_CONFIGS = {
     (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
     (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
+    # EP1 (TP8 intermediate shard), 17-128 rows: 0.92-0.99x the staged
+    # package's time (113 -> 107 us at 32 rows); with both uniform and Zipf
+    # routing it breaks even at 160 rows. Direct decode still serves 16 rows
+    # and fewer.
+    (4096, 512, 256, 256, 8): (
+        (17, 64, _RouteTileConfig(64, _EP1_STAGE, _EP1_STAGE)),
+        (65, 128, _RouteTileConfig(128, _EP1_STAGE, _EP1_STAGE)),
+    ),
 }
 assert all(
     config.route_capacity & (config.route_capacity - 1) == 0
