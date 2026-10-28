@@ -916,7 +916,7 @@ Its responsibilities:
   prefix publication streams to the Host tier
   (`stream_device_cache_to_host_`) on the fused and P roles; the D role's
   Host tier holds retraction images only. Under `kWriteBack` (not on the D
-  role, no sliding-window group, at most 64 groups, no L3: `Validate`)
+  role, at most 64 groups, no L3: `Validate`)
   nothing streams at publication; what an admission or a restore evicts is
   written back instead (below).
   Under `kWriteThrough` a `pending_stores_` queue drives D2H transfers,
@@ -951,8 +951,8 @@ Its responsibilities:
   publishes history-cache Device entries but streams none of them and
   publishes no state. At finish — and at the PD transfer ACK — every entry the
   request published (pages, tail, state slot 1) is queued before request
-  ownership is released. Ordinary sliding-window entries always stream when
-  published. The queue is drained by
+  ownership is released. Under write-through, ordinary sliding-window
+  entries stream whenever published. The queue is drained by
   `TierTransferManager::StartPendingStores(guard, cause)`, and every store it
   issues pins its Device sources until the ACK. A retraction does not use the
   queue: the scheduler publishes the victim's computed prefix the same way,

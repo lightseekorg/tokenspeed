@@ -859,7 +859,7 @@ to normal eviction.
 
 **Host L2: write-back.** With `host_write_policy` `kWriteBack`
 (`--kvstore-write-policy write_back`; this role or the fused one (§3.3), no
-sliding-window group, no L3, and in the runtime one pipeline stage and no
+L3, and in the runtime one pipeline stage and no
 query shard) nothing streams to the Host at publication. Instead what an
 admission evicts for the cache leaves by whole segments — or, for a request
 alone that whole segments cannot fund, block by block (§1.4) — and is
@@ -1289,9 +1289,13 @@ must use matching contracts; releases follow the sequence in AGENTS.md.
   a tail hit's copy source may be evicted and re-granted by a later admission
   of the same round, as a fresh page or as another copy's destination -- and
   changing `DeviceHandle.execute`'s ordering breaks it. Within the copies,
-  the arena reads a block before any pair overwrites it (`CacheArena.
-  copy_blocks` runs such pairs in a later wave), so every source is read as
-  it was when the plan was built. A copy destination is never zeroed.
+  the arena reads each source byte range before any pair overwrites it
+  (`CacheArena.copy_blocks` orders waves across all groups by their field
+  byte ranges). This includes a sliding-window block whose LCM parent is
+  re-granted to another group with different packing. Disjoint child ranges
+  remain independent, so parent reuse alone does not form a copy cycle.
+  Every source is read as it was when the plan was built. A copy destination
+  is never zeroed.
 - A published block is never written again: a tail's blocks are copied into
   the hitter's table (or loaded from Host into private pages), an owner that
   keeps writing past a publication point moves to fresh copies of the blocks

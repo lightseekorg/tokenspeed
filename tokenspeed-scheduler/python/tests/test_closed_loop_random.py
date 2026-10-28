@@ -32,7 +32,7 @@ of a sliding-window group was found this way.
 The fused and P roles also run with a Host L2: under the write-through
 policy, which stores what is published, and under the write-back policy,
 which copies what an admission or a restore evicts to the Host in the same
-plan (without the sliding-window group, which write-back refuses).
+plan, including cached sliding-window groups beside the State groups.
 The P role also runs with the history group's pages dealt over two and four
 KV-parallel shards under write-back, and over two under write-through. Every
 Host op is acknowledged zero to three plans late, out of order and now and
@@ -174,7 +174,7 @@ class _Loop:
             pages=self.rng.choice([24, 40, 64]),
             history_block=self.rng.choice([P, P // 2]),
             # Drawn either way, so a seed keeps its other draws.
-            sliding=self.rng.random() < 0.4 and not self.uses_write_back,
+            sliding=self.rng.random() < 0.4,
             host_pages=host_pages,
             policy=policy,
             kv_shards=kv_shards,
@@ -463,7 +463,6 @@ def test_random_closed_loop_never_raises(role: str, seed: int) -> None:
     ],
 )
 @pytest.mark.parametrize("host_pages", [9, 17, 33])
-@pytest.mark.parametrize("seed", range(12))
 def test_random_host_acks_leave_nothing_in_flight(
     policy: str,
     role: str,
@@ -474,61 +473,69 @@ def test_random_host_acks_leave_nothing_in_flight(
     mixed: bool,
     inject_aborts: bool,
     host_pages: int,
-    seed: int,
 ) -> None:
-    loop = _Loop(
-        seed,
-        getattr(ts.SchedulerConfig.Role, role),
-        host_pages=host_pages,
-        policy=getattr(ts.SchedulerConfig.HostWritePolicy, policy),
-        kv_shards=kv_shards,
-        num_snapshot_pages=num_snapshot_pages,
-        max_retracted_requests=max_retracted_requests,
-        force_retraction_interval=force_retraction_interval,
-        mixed=mixed,
-        inject_aborts=inject_aborts,
-        shuffle_groups=True,
-    )
-    loop.run(ROUNDS)
-    # No new prompt: land what is out and acknowledge everything, round after
-    # round, until every request has left the scheduler and a plan has
-    # nothing left to run -- the plans that follow finish the live requests
-    # and copy and load more (a finish stores at the plan after it),
-    # acknowledged in turn.
-    for loop.round in range(ROUNDS, 10 * ROUNDS):
-        while loop.pending:
-            loop.land(loop.pending.pop(0))
-        loop.acknowledge(everything=True)
-        if loop.remote or loop.prefill_only:
-            loop.peer(None)
-        plan = loop.scheduler.next_execution_plan()
-        assert loop.scheduler.host_cache_stats().retraction_stores.image_refused == 0
-        loop.queue_acks(plan)
-        if loop.remote or loop.prefill_only:
-            loop.peer(plan)
-        # Finished, or aborted by the scheduler for capacity.
-        for request_id in [
-            r for r in loop.live if loop.scheduler.request_token_size(r) == -1
-        ]:
-            del loop.live[request_id]
-        if (
-            not loop.live
-            and not any(op.request_ids for op in plan.forward)
-            and not plan.cache
-            and plan.remote_decode is None
-            and not loop.acks
-        ):
-            break
-        loop.pending.append(plan)
-    else:
-        pytest.fail("the loop did not drain")
-    assert loop.write_back_rows > 0, "the Host was written"
-    assert loop.scheduler.host_pool_pinned_blocks() == 0
-    # No copy is in flight: a cache flush could go ahead.
-    assert loop.scheduler.can_clear_cache()
-    if inject_aborts:
+    # Window retention can make every attempted image in one seed too
+    # large for these deliberately small pools. Require activity across the
+    # seeds, while checking correctness and complete draining for each one.
+    activity = {"evictions": 0, "retractions": 0, "restores": 0, "aborts": 0}
+    for seed in range(12):
+        loop = _Loop(
+            seed,
+            getattr(ts.SchedulerConfig.Role, role),
+            host_pages=host_pages,
+            policy=getattr(ts.SchedulerConfig.HostWritePolicy, policy),
+            kv_shards=kv_shards,
+            num_snapshot_pages=num_snapshot_pages,
+            max_retracted_requests=max_retracted_requests,
+            force_retraction_interval=force_retraction_interval,
+            mixed=mixed,
+            inject_aborts=inject_aborts,
+            shuffle_groups=True,
+        )
+        loop.run(ROUNDS)
+        # No new prompt: land what is out and acknowledge everything, round after
+        # round, until every request has left the scheduler and a plan has
+        # nothing left to run -- the plans that follow finish the live requests
+        # and copy and load more (a finish stores at the plan after it),
+        # acknowledged in turn.
+        for loop.round in range(ROUNDS, 10 * ROUNDS):
+            while loop.pending:
+                loop.land(loop.pending.pop(0))
+            loop.acknowledge(everything=True)
+            if loop.remote or loop.prefill_only:
+                loop.peer(None)
+            plan = loop.scheduler.next_execution_plan()
+            assert (
+                loop.scheduler.host_cache_stats().retraction_stores.image_refused == 0
+            )
+            loop.queue_acks(plan)
+            if loop.remote or loop.prefill_only:
+                loop.peer(plan)
+            # Finished, or aborted by the scheduler for capacity.
+            for request_id in [
+                r for r in loop.live if loop.scheduler.request_token_size(r) == -1
+            ]:
+                del loop.live[request_id]
+            if (
+                not loop.live
+                and not any(op.request_ids for op in plan.forward)
+                and not plan.cache
+                and plan.remote_decode is None
+                and not loop.acks
+            ):
+                break
+            loop.pending.append(plan)
+        else:
+            pytest.fail("the loop did not drain")
+        assert loop.write_back_rows > 0, "the Host was written"
+        assert loop.scheduler.host_pool_pinned_blocks() == 0
+        # No copy is in flight: a cache flush could go ahead.
+        assert loop.scheduler.can_clear_cache()
         stats = loop.scheduler.host_cache_stats()
-        assert stats.eviction_stores.ops > 0
-        assert stats.retraction_stores.ops > 0
-        assert stats.restore_loads.ops > 0
-        assert loop.aborts > 0
+        activity["evictions"] += stats.eviction_stores.ops
+        activity["retractions"] += stats.retraction_stores.ops
+        activity["restores"] += stats.restore_loads.ops
+        activity["aborts"] += loop.aborts
+    if inject_aborts:
+        for name, count in activity.items():
+            assert count > 0, f"no {name} across the twelve seeds"

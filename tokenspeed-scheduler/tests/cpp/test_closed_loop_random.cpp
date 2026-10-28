@@ -178,6 +178,18 @@ struct ClosedLoop {
                                                         .attn_kind = AttnKind::kState,
                                                         .transfer_policy = CacheTransferPolicy::LatestSnapshot});
         }
+        // Keep the existing random stream while covering ordinary and
+        // replayable windows under both policies and mirrored rank plans.
+        if (seed % 3 == 0) {
+            cfg.cache_groups.push_back(CacheGroupConfig{.group_id = "sliding",
+                                                        .block_granularity = history_block,
+                                                        .total_pages = (device_pages - 1) * 2 + 1,
+                                                        .cache_blocks_per_lcm_block = 2,
+                                                        .attn_kind = AttnKind::kSlidingWindow,
+                                                        .sliding_window_tokens = 12,
+                                                        .replayable = seed % 5 == 0,
+                                                        .transfer_policy = CacheTransferPolicy::FullSuffix});
+        }
         SetTestSnapshotPool(cfg);
         if (role == Role::kFused && !capacity_retraction && force_retraction_interval == 0) {
             cfg.snapshot_allocator.total_pages = 1;

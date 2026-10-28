@@ -1225,11 +1225,11 @@ the evicted pages to the Host before its forward pass can write over them,
 so the copy adds to that step's time.
 
 `write_back` runs on the fused and prefill roles, not with
-`--disaggregation-mode decode`. It requires Host L2,
+`--disaggregation-mode decode`. Both cached and replayable sliding-window
+groups are supported. It requires Host L2,
 `--pipeline-parallel-size 1`, `--query-context-parallel-size 1` and no
-`--kvstore-storage-backend`, and a model whose KV cache has no sliding-window
-group (sliding-window attention layers make one) and at most 64 cache groups;
-startup refuses it otherwise, the last two once the model's cache groups are
+`--kvstore-storage-backend`, and a model with at most 64 cache groups;
+startup refuses it otherwise, the group limit once the model's cache groups are
 built.
 
 Under `write_back`:

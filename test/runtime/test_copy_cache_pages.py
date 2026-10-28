@@ -169,7 +169,12 @@ class TestCopyWavesTest:
     def _waves(self, pairs):
         from tokenspeed.runtime.layers.attention.kv_cache.arena import _copy_waves
 
-        return [wave.tolist() for wave in _copy_waves(np.asarray(pairs))]
+        return [
+            wave["cache"].tolist()
+            for wave in _copy_waves(
+                {"cache": np.asarray(pairs)}, {"cache": ((0, 1, 1),)}
+            )
+        ]
 
     def test_independent_pairs_form_one_wave(self):
         assert (self._waves([[1, 3], [2, 4], [1, 5]])) == ([[[1, 3], [2, 4], [1, 5]]])
@@ -184,6 +189,20 @@ class TestCopyWavesTest:
     def test_a_cycle_is_rejected(self):
         with pytest.raises((ValueError), match=("cycle")):
             self._waves([[1, 2], [2, 1]])
+
+    def test_a_cycle_between_differently_packed_groups_is_rejected(self):
+        from tokenspeed.runtime.layers.attention.kv_cache.arena import _copy_waves
+
+        # History reads [8, 16) and writes [16, 24); recent reads [16, 20)
+        # and writes [8, 12). Neither copy may overwrite the other's source.
+        with pytest.raises(ValueError, match="cycle"):
+            _copy_waves(
+                {
+                    "history": np.asarray([[1, 2]]),
+                    "recent": np.asarray([[3, 1]]),
+                },
+                {"history": ((0, 8, 8),), "recent": ((4, 4, 4),)},
+            )
 
     def test_no_pairs_no_waves(self):
         assert (self._waves(np.zeros((0, 2), dtype=np.int32))) == ([])
@@ -886,6 +905,88 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
 
 @pytest.mark.skipif(not (torch.cuda.is_available()), reason=("requires CUDA"))
 class TestCacheArenaCopyBlocksCudaTest:
+    @pytest.mark.parametrize("reverse_groups", [False, True])
+    def test_cross_group_reuse_reads_the_window_before_overwriting_its_parent(
+        self, reverse_groups
+    ):
+        # A history block fills a parent; two recent-window blocks share one.
+        # The history copy overwrites the two window sources, so both window
+        # copies must run first regardless of the groups' declaration order.
+        declarations = (
+            one_group(
+                "history",
+                CacheFieldSpec("history.k", "shared", (8,), "uint8"),
+                rows_per_page=2,
+            ),
+            one_group(
+                "recent",
+                CacheFieldSpec("recent.k", "shared", (4,), "uint8"),
+                attn_kind="sliding_window",
+                sliding_window_tokens=1,
+                rows_per_page=1,
+            ),
+        )
+        arena = make_arena(
+            pack(
+                declarations,
+                prefix_granularity=2,
+                cache_blocks_per_lcm_block={"history": 1, "recent": 2},
+            ).bind(3),
+            "cuda",
+            cache_group_specs=tuple(spec for spec, _ in declarations),
+        )
+        initial = torch.arange(arena.buffer.numel(), dtype=torch.uint8)
+        arena.buffer.copy_(initial)
+        pairs = {
+            "history": np.asarray([[1, 2]], dtype=np.int32),
+            "recent": np.asarray([[3, 5], [4, 6]], dtype=np.int32),
+        }
+        if reverse_groups:
+            pairs = dict(reversed(tuple(pairs.items())))
+
+        arena.copy_blocks(pairs)
+        torch.cuda.synchronize()
+
+        # Bytes 16:24 were the recent group's two source blocks; the full
+        # history copy now owns them. Bytes 24:32 must retain their old data.
+        expected = initial.clone()
+        expected[16:24] = initial[8:16]
+        expected[24:32] = initial[16:24]
+        torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
+
+    def test_disjoint_child_copies_between_two_parents_need_no_temporary_storage(self):
+        # Both groups use the same plane and packing. The parents exchange
+        # ownership, but the individual source and destination byte ranges
+        # are disjoint; ordering by whole parent would invent a cycle.
+        plan = pack(
+            tuple(
+                one_group(
+                    group,
+                    CacheFieldSpec(f"{group}.k", "shared", (4,), "uint8"),
+                    rows_per_page=1,
+                )
+                for group in ("history", "recent")
+            ),
+            prefix_granularity=2,
+            cache_blocks_per_lcm_block={"history": 2, "recent": 2},
+        ).bind(2)
+        arena = make_arena(plan, "cuda")
+        initial = torch.arange(arena.buffer.numel(), dtype=torch.uint8)
+        arena.buffer.copy_(initial)
+
+        arena.copy_blocks(
+            {
+                "history": np.asarray([[1, 3]], dtype=np.int32),
+                "recent": np.asarray([[4, 2]], dtype=np.int32),
+            }
+        )
+        torch.cuda.synchronize()
+
+        expected = initial.clone()
+        expected[16:20] = initial[8:12]
+        expected[12:16] = initial[20:24]
+        torch.testing.assert_close(arena.buffer.cpu(), expected, rtol=0, atol=0)
+
     def test_copies_every_field_of_the_source_block_byte_for_byte(self):
         arena = _arena("cuda")
         generator = torch.Generator(device="cpu").manual_seed(0)

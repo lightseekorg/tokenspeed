@@ -808,9 +808,9 @@ TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
 
 // Write-back runs on every role but D (which parallel layouts run it is the
 // runtime's to decide): it needs a Host tier, takes a sharded group and the
-// fused role's snapshot pool, and refuses the D role, L3, a sliding-window
-// group and more groups than the 64 bits that mark a hash's written-back
-// groups.
+// fused role's snapshot pool, and supports cached and replayable windows.
+// It refuses the D role, L3 and more groups than the 64 bits that mark a
+// hash's written-back groups.
 TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     const auto prefill = [] {
         SchedulerConfig config = MakeValidConfig();
@@ -848,7 +848,7 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
     EXPECT_NO_THROW(sharded.Validate());
     EXPECT_NO_THROW(Scheduler{sharded});
 
-    // A sliding-window group beside the full one, replayable or not: named.
+    // Both cached and replayable sliding windows share the write-back path.
     for (const bool replayable : {false, true}) {
         SCOPED_TRACE(replayable);
         SchedulerConfig sliding = prefill();
@@ -862,8 +862,7 @@ TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
         sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         EXPECT_NO_THROW(sliding.Validate()) << "write-through takes it";
         sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
-        ExpectRejectedNamingGroup(sliding, "does not support a sliding-window group");
-        ExpectRejectedNamingGroup(sliding, "swa");
+        EXPECT_NO_THROW(Scheduler{sliding});
     }
 
     // 64 groups construct a write-back scheduler; a 65th is refused before

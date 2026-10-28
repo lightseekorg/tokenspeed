@@ -84,12 +84,8 @@ void SchedulerConfig::Validate() const {
     // Write-back needs no KV-parallel check: each Host block takes its Device
     // block's bucket (docs/design/scheduler.md §5).
     //
-    // No sliding-window group yet. Such a group takes Device copies (a hit's
-    // private copy of a tail block) as a full-attention group does, and the
-    // runtime orders one plan's copies so that a block is read before it is
-    // overwritten within each group only: a page one group's copy reads that a
-    // later admission of the plan evicts and grants as another group's copy
-    // destination could be overwritten first.
+    // Device copies read their sources before any copy in the plan overwrites
+    // those bytes, including when another group reuses the same LCM block.
     if (host_write_policy == HostWritePolicy::kWriteBack) {
         if (!HasHostCache()) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
@@ -101,12 +97,6 @@ void SchedulerConfig::Validate() const {
         }
         if (enable_l3_storage) {
             throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");
-        }
-        for (const CacheGroupConfig& group : cache_groups) {
-            if (group.attn_kind == AttnKind::kSlidingWindow) {
-                throw std::invalid_argument("Cache group '" + group.group_id +
-                                            "': host_write_policy WriteBack does not support a sliding-window group");
-            }
         }
         // BoundaryTree::Node::written_back_group_bits keeps one bit per group.
         if (cache_groups.size() > 64) {
