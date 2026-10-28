@@ -6,7 +6,7 @@ name: PR Test Finish
 # would stay pending. This workflow starts for such PRs and reports `finish`.
 # Keep the ignored paths equal to the union of the `pull_request` paths of
 # nvidia-b200-tests, pr-test-nvidia-arm, amd-mi350-tests, amd-mi450-tests and
-# amd-kernel-benchmark.
+# amd-kernel-benchmark. test/ci_system/test_dispatch_workflows.py checks this.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
