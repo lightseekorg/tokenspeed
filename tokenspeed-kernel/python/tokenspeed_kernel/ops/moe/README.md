@@ -115,7 +115,7 @@ and fills the lookup table per expert instead of searching per tile.
 
 The private `optimized` mode fuses eligible block-FP8 SwiGLU calls with
 hidden size 512, intermediate size 1024, at most 256 input rows, and a positive
-`expected_m < 32`. Bias, LoRA, AWQ, min-latency mode and a separate FC2 FP8
+`expected_m < 32`. Bias, LoRA, AWQ, min-latency mode, and a separate FC2 FP8
 quantization scale retain their existing paths. The supported paired tile has
 128 output channels per half and at most 32 token rows; other shapes retain the
 existing execution path.
