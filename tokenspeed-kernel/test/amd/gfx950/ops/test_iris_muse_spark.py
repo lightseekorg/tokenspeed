@@ -1293,7 +1293,8 @@ def _muse_lamport_gather_mxfp4_worker(rank, world_size, device):
             num_warps=1,
         )
 
-    for rows in (1, 3, 16):
+    # 128 rows exceed the pull variant's 84 ready flags; Lamport needs none.
+    for rows in (1, 3, 16, 128):
         if rows == 1:
             published = state.all_reduce.acquire_outputs(((1, width),))[0]
             local = published[:, rank * local_width : (rank + 1) * local_width]
