@@ -3206,12 +3206,18 @@ def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only)
     "rank,prefixed,reverse",
     [(0, False, False), (1, True, True), (2, False, True), (3, True, False)],
 )
-@pytest.mark.parametrize("intermediate", [128, 2304])
+@pytest.mark.parametrize(
+    "intermediate,major,expected_width", [(128, 9, 512), (2304, 10, 2304)]
+)
 def test_strict_checkpoint_load_tp4_ep4(
-    monkeypatch, rank, prefixed, reverse, tmp_path, intermediate
+    monkeypatch, rank, prefixed, reverse, tmp_path, intermediate, major, expected_width
 ):
     config = _loader_config()
     config.moe_intermediate_size = intermediate
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(major, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
     with set_default_torch_dtype(torch.bfloat16):
         model = _loader_model(monkeypatch, config, rank, "cpu")
     weights = _checkpoint(config)
@@ -3249,6 +3255,7 @@ def test_strict_checkpoint_load_tp4_ep4(
         atol=0,
     )
     for i, layer in enumerate(model.model.layers):
+        assert layer.ffn.experts.intermediate_size == expected_width
         a = f"layers.{i}.attn"
         raw = weights[a + ".wo_a.weight"].float()
         scales = (
@@ -3260,7 +3267,7 @@ def test_strict_checkpoint_load_tp4_ep4(
         expected = (raw * scales).bfloat16().chunk(4, 0)[rank]
         torch.testing.assert_close(layer.attn.wo_a.weight, expected, rtol=0, atol=0)
         codes = weights[a + ".wq_b.weight"].chunk(4, 0)[rank]
-        if current_platform().is_hopper:
+        if platform.is_hopper:
             # Loaded straight into BF16; scales fold in after loading.
             assert layer.attn.wq_b.weight.dtype == torch.bfloat16
             torch.testing.assert_close(

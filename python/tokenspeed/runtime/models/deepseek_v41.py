@@ -1297,7 +1297,7 @@ class DeepseekV41MoE(DeepseekV4MoE):
             128
             if mega_moe
             and current_platform().is_blackwell
-            and vars(config).get("expert_dtype") == "fp4"
+            and config.expert_dtype == "fp4"
             else 512
         )
         padded = mega_moe and config.moe_intermediate_size % alignment != 0
