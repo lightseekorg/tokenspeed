@@ -337,15 +337,12 @@ class KimiK3Recipe(CacheRecipe):
     # ---- capacity: the scheduler's concurrency decides, then a search ----
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes - self.workspace_bytes(), layout.lcm_block_bytes
-        )
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
         if self.token_limit is None:
-            return budgeted
+            return max_lcm_blocks
         # A token limit caps history, not the unsharded KDA working set.
         # Use the same per-group demand as the inverse capacity calculation.
-        return min(budgeted, self.parents_needed(layout, self.token_limit))
+        return min(max_lcm_blocks, self.parents_needed(layout, self.token_limit))
 
     @override
     def token_capacity(self, layout: CacheLayout, num_lcm_blocks: int) -> int:

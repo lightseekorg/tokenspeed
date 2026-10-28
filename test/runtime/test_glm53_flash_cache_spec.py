@@ -336,20 +336,6 @@ def test_lcm_parent_budget_preserves_heterogeneous_group_demand(
     )
     budgeted = expected + budget_slack
 
-    class Recipe:
-        family = "GLM-5.3-Flash"
-        cache_budget_bytes = (budgeted + 1) * layout.lcm_block_bytes
-        _budgeted_parents = CacheRecipe._budgeted_parents
-
-        def workspace_bytes(self) -> int:
-            return 0
-
-        def parents_needed(self, candidate_layout, token_capacity: int) -> int:
-            assert candidate_layout is layout
-            assert token_capacity == token_limit
-            return expected
-
-    recipe = Recipe()
+    recipe = _recipe(tp_size=4, mla_cache_dtype=torch.bfloat16, draft_layers=1)
     recipe.token_limit = token_limit
-
-    assert Glm53FlashRecipe.num_lcm_blocks(recipe, layout) == expected
+    assert recipe.select_num_lcm_blocks(layout, max_lcm_blocks=budgeted) == expected

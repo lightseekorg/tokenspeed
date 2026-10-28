@@ -63,7 +63,7 @@ from tokenspeed.runtime.utils import (
     nullable_str,
 )
 from tokenspeed.runtime.utils.launcher import check_dist_init_port, detect_topology
-from tokenspeed.runtime.utils.network import is_port_available
+from tokenspeed.runtime.utils.network import is_port_available, join_host_port
 from tokenspeed.runtime.utils.spec_block_geometry import (
     BLOCK_SPEC_ALGORITHMS,
     BLOCK_SPEC_RULES,
@@ -346,7 +346,6 @@ class ServerArgs:
     model: str
     tokenizer: str | None = None
     tokenizer_mode: str = "auto"
-    skip_tokenizer_init: bool = False
     load_format: str = "auto"
     trust_remote_code: bool = True
     dtype: str = "auto"
@@ -394,10 +393,6 @@ class ServerArgs:
 
     # Other runtime options
     stream_interval: int = 1
-    stream_output: bool = False
-    # Inline detokenization is the only supported path and is intentionally
-    # not configurable from the CLI.
-    enable_inline_detokenizer: bool = True
     seed: int | None = None
     distributed_timeout_seconds: int | None = None
     download_dir: str | None = None
@@ -408,8 +403,6 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
-    enable_log_requests: bool = True
-    log_requests_level: int = 0
     enable_log_request_stats: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
@@ -426,25 +419,13 @@ class ServerArgs:
     # Cache events
     kv_events_config: str | None = None
 
-    # Port for the in-engine SGLang-compatible RL control app (weight sync,
-    # pause/resume, and memory occupation). Set by the ``ts serve`` orchestrator;
-    # None disables the in-engine app.
-    rl_control_port: int | None = None
-    # Bind host for the in-engine RL control app. None binds the engine's
-    # --host. Bind a reachable address (and set --rl-control-api-key) when an
-    # external gateway drives this engine.
-    rl_control_host: str | None = None
-    # Bearer token the in-engine RL control app requires on every route. None
-    # leaves it open, which is what slime expects by default. Never exported in server info.
-    rl_control_api_key: str | None = dataclasses.field(default=None, repr=False)
-    # Version identifier for the model weights. Stamped into every generation
-    # response's meta_info so RL trainers know which policy version produced each
-    # sample. Updated atomically after a successful weight push when the trainer
-    # supplies a new version string.
+    # Version identifier for the model weights: the L3 cache's namespace,
+    # which a flushed weight update that names a new version replaces.
     weight_version: str = "default"
-    # Model Updater SDK (``/update_weights_from_mooncake``). The config is an
-    # opaque JSON object handed to the SDK; the other three are required with
-    # it and must stay unset without it (validated in ``validate``).
+    # Model Updater SDK (the ``UpdateWeightsFromMooncake`` control operation).
+    # The config is an opaque JSON object handed to the SDK; the other three
+    # are required with it and must stay unset without it (validated in
+    # ``validate``).
     model_update_config: str | None = None
     # Import path of the SDK module exposing ``make_model_updater``,
     # ``ModelUpdaterConfig``, ``EngineType``, ``MooncakeWeightStore``,
@@ -464,7 +445,6 @@ class ServerArgs:
     # "8,11,11,8"). Default None = even split, remainder to the front. Use to
     # lighten the embed (first) and lm_head (last) stages.
     pp_layer_partition: tuple[int, ...] | None = None
-    load_balance_method: str = "shortest_queue"
     load_watch_interval: float = 0.02
 
     # Expert parallelism
@@ -537,7 +517,6 @@ class ServerArgs:
 
     # Hugging Face model config overrides in JSON
     hf_overrides: str = "{}"
-    preferred_sampling_params: str | None = None
 
     # Kernel backend
     attention_backend: str | None = None
@@ -587,8 +566,8 @@ class ServerArgs:
     grammar_backend: str | None = None
     # Model-declared constrained decoding policy, reported through server info.
     constrained_decoding: Literal["requested", "always"] | None = None
-    # Used by ``input_processor`` to defer json_schema grammars past the
-    # model's reasoning channel.
+    # Lets the host defer json_schema grammars past the model's reasoning
+    # channel (``reasoning_structural_tag.reasoning_grammar``).
     reasoning_parser: str | None = None
     grammar_compile_timeout_secs: float = 30.0
     grammar_compile_max_retries: int = 2
@@ -716,6 +695,10 @@ class ServerArgs:
     # make the sharded o_proj / dense down_proj column-parallel on hidden so
     # no cross-rank reduction remains outside MoE (TP batch invariance).
     attn_head_tp_size: int | None = None
+    # Rows per rank the head-TP Lamport exchanges are prepared for. The
+    # scratch is allocated before graph capture, so larger forwards fall
+    # back to the generic all-to-all instead of growing it at runtime.
+    head_tp_exchange_max_rows: int = 256
     lm_head_tp_size: int | None = None
     tp_batch_invariant: Literal["none", "attn", "attn+dense"] = "none"
     dense_tp_size: int | None = None
@@ -728,6 +711,7 @@ class ServerArgs:
     mm_encoder_tp_mode: Literal["weights", "data"] = "weights"
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
+    enable_external_encoder: bool = False
     disaggregation_mode: str = "null"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
@@ -1215,6 +1199,8 @@ class ServerArgs:
         weights' quantization is checked once the checkpoint's is resolved
         (:meth:`validate_tp_batch_invariant_weights`).
         """
+        if self.head_tp_exchange_max_rows < 1:
+            raise ValueError("--head-tp-exchange-max-rows must be positive")
         attn = self.mapping.attn
         if attn.head_tp_serves_decode_only:
             # Head TP over attention-DP ranks serves absorbed decode rows
@@ -1758,6 +1744,19 @@ class ServerArgs:
                 f"{self.mapping.dense.tp_size!s}!",
             )
 
+        if (
+            self.all2all_backend == "deepep"
+            and self.deepep_mode == "normal"
+            and not self.enforce_eager
+        ):
+            # A decode graph captures the MoE's dispatch and combine. Only the
+            # low-latency legs replay; the normal dispatch reads its
+            # per-expert receive counts on the host, which a graph cannot
+            # capture (the prefill graph is off under DeepEP for the same
+            # reason).
+            self.enforce_eager = True
+            logger.info("CUDA graph is disabled under --deepep-mode normal")
+
     def resolve_numerics(self):
         """Fold the ``--numerics`` envelope into the individual switches.
 
@@ -1796,20 +1795,15 @@ class ServerArgs:
             self.enable_allreduce_fusion = False
             # The slot-order fold runs over the EP group inside the MoE leaf:
             # a K-split (MoE TP) down projection would need a second,
-            # rank-ordered fold after it, and DeepEP's all-to-all owns that
-            # exchange itself (and hands the leaf a NCCL group, not the EP
-            # device group the fold runs on).
+            # rank-ordered fold after it. Under --all2all-backend deepep the
+            # leaf must itself own the exchange and fold the routes in slot
+            # order: the MoE plan selects only a kernel declaring both traits
+            # and refuses the launch otherwise.
             if self.mapping.moe.tp_size != 1:
                 raise ValueError(
                     "--moe-combine-order slot needs MoE TP 1: a K-split down "
                     "projection would need a second, rank-ordered fold after "
                     f"the slot-order one (got --moe-tp-size {self.mapping.moe.tp_size})"
-                )
-            if self.all2all_backend == "deepep":
-                raise ValueError(
-                    "--moe-combine-order slot folds the routed outputs over the "
-                    "EP group inside the MoE leaf; --all2all-backend deepep "
-                    "performs that exchange itself and cannot be combined with it"
                 )
 
     def _resolve_rl_bitwise(self):
@@ -1957,6 +1951,13 @@ class ServerArgs:
             raise ValueError(
                 "--pp-layer-partition requires --pipeline-parallel-size > 1"
             )
+        if self.enable_external_encoder and self.disaggregation_mode not in (
+            "null",
+            "prefill",
+        ):
+            raise ValueError(
+                "--enable-external-encoder requires aggregated or prefill serving"
+            )
         # PD disaggregation. The prefill role keeps the ordinary graph flags:
         # it never runs a decode step, so the decode graph has nothing to
         # capture (ModelExecutorConfig.prefill_only), while its extend
@@ -1977,17 +1978,6 @@ class ServerArgs:
                     "multiple independent encode servers for horizontal scale."
                 )
             self.enable_prefix_caching = False
-
-        if (
-            self.disaggregation_mode == "prefill"
-            and self.load_balance_method != "round_robin"
-        ):
-            if self.mapping.has_attn_dp:
-                raise ValueError(
-                    "Not supported when "
-                    f"{self.disaggregation_mode=} {self.load_balance_method=} "
-                    f"{self.mapping.attn.dp_size=}"
-                )
 
     def _handle_kvstore(self):
         if self.disaggregation_mode == "encode":
@@ -2366,12 +2356,6 @@ class ServerArgs:
             "'slow' will always use the slow tokenizer.",
         )
         parser.add_argument(
-            "--skip-tokenizer-init",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.skip_tokenizer_init,
-            help="If set, skip init tokenizer and pass input_ids in generate request",
-        )
-        parser.add_argument(
             "--language-model-only",
             action="store_true",
             default=ServerArgs.language_model_only,
@@ -2509,7 +2493,8 @@ class ServerArgs:
             "--served-model-name",
             type=str,
             default=ServerArgs.served_model_name,
-            help="Override the model name returned by the v1/models endpoint in OpenAI API server.",
+            help="The model's name in metric labels. Under `ts serve`, requests may also name "
+            "the model by it.",
         )
         parser.add_argument(
             "--revision",
@@ -2715,11 +2700,6 @@ class ServerArgs:
             help="The interval (or buffer size) for streaming in terms of the token length. A smaller value makes streaming smoother, while a larger value makes the throughput higher",
         )
         parser.add_argument(
-            "--stream-output",
-            action="store_true",
-            help="Whether to output as a sequence of disjoint segments.",
-        )
-        parser.add_argument(
             "--seed",
             metavar="SEED",
             type=int,
@@ -2758,19 +2738,6 @@ class ServerArgs:
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
-        )
-        parser.add_argument(
-            "--enable-log-requests",
-            action=argparse.BooleanOptionalAction,
-            default=ServerArgs.enable_log_requests,
-            help="Log metadata, inputs, outputs of all requests (default on; --no-enable-log-requests to disable). The verbosity is decided by --log-requests-level",
-        )
-        parser.add_argument(
-            "--log-requests-level",
-            type=int,
-            default=0,
-            help="0: Log metadata. 1. Log metadata and partial input/output. 2. Log every input/output.",
-            choices=[0, 1, 2],
         )
         parser.add_argument(
             "--enable-log-request-stats",
@@ -2868,17 +2835,6 @@ class ServerArgs:
             "the remainder on the front stages.",
         )
         parser.add_argument(
-            "--load-balance-method",
-            type=str,
-            default=ServerArgs.load_balance_method,
-            help="The load balancing strategy for data parallelism.",
-            choices=[
-                "round_robin",
-                "shortest_queue",
-                "minimum_cache_usage",
-            ],
-        )
-        parser.add_argument(
             "--load-watch-interval",
             type=float,
             default=ServerArgs.load_watch_interval,
@@ -2945,8 +2901,8 @@ class ServerArgs:
             "with the EPLB algorithm and the expert weights move between slots, "
             "--eplb-rebalance-layers-per-chunk layers per scheduling round. "
             "Requires --expert-distribution-recorder-mode stat and a static "
-            "--ep-dispatch-algorithm, both explicit; POST /rebalance_experts "
-            "triggers one rebalance manually.",
+            "--ep-dispatch-algorithm, both explicit; the RebalanceExpertsReqInput "
+            "control operation triggers one rebalance manually.",
         )
         parser.add_argument(
             "--eplb-rebalance-num-iterations",
@@ -3052,11 +3008,6 @@ class ServerArgs:
             type=str,
             help="A dictionary in JSON string format used to override default model configurations.",
             default=ServerArgs.hf_overrides,
-        )
-        parser.add_argument(
-            "--preferred-sampling-params",
-            type=str,
-            help="Default sampling settings as JSON for SMG's gRPC GetModelInfo response.",
         )
 
         # Kernel backend. Names are validated against the backend registry
@@ -3710,6 +3661,16 @@ class ServerArgs:
             "(head-replicated) under --query-context-parallel-size.",
         )
         parser.add_argument(
+            "--head-tp-exchange-max-rows",
+            type=int,
+            default=ServerArgs.head_tp_exchange_max_rows,
+            help="Rows per rank the head-TP Lamport exchanges are prepared for "
+            "(the absorbed query, the latent attention output, and the TP-BI "
+            "o_proj rows). The symmetric-memory scratch is allocated before "
+            "graph capture; larger forwards fall back to the generic all-to-all. "
+            "Only used with --attn-head-tp-size > 1.",
+        )
+        parser.add_argument(
             "--lm-head-tp-size",
             type=int,
             default=ServerArgs.lm_head_tp_size,
@@ -4001,6 +3962,11 @@ class ServerArgs:
         )
         # Disaggregation
         parser.add_argument(
+            "--enable-external-encoder",
+            action="store_true",
+            help="Receive external encoder embeddings in aggregated or prefill serving.",
+        )
+        parser.add_argument(
             "--disaggregation-mode",
             type=str,
             default="null",
@@ -4052,42 +4018,20 @@ class ServerArgs:
             help="The URL of the PD disaggregation load balancer. If set, the prefill/decode server will register with the load balancer.",
         )
 
-        # SGLang-compatible RL control app.
-        parser.add_argument(
-            "--rl-control-port",
-            type=int,
-            default=ServerArgs.rl_control_port,
-            help="Port for the in-engine RL control-plane HTTP app (weight sync, "
-            "pause/resume, memory occupation). Normally allocated automatically "
-            "by the `ts serve` orchestrator.",
-        )
-        parser.add_argument(
-            "--rl-control-host",
-            type=str,
-            default=ServerArgs.rl_control_host,
-            help="Bind host for the in-engine RL control-plane HTTP app. Defaults to "
-            "--host. Bind a reachable address when an external gateway drives the "
-            "engine, and set --rl-control-api-key.",
-        )
-        parser.add_argument(
-            "--rl-control-api-key",
-            type=str,
-            default=ServerArgs.rl_control_api_key,
-            help="Bearer token required on every RL control-plane route. Unset "
-            "leaves the app open, which is what slime expects by default.",
-        )
         parser.add_argument(
             "--weight-version",
             type=str,
             default=ServerArgs.weight_version,
-            help="Initial model-weight version stamped into generation metadata.",
+            help="Initial model-weight version: the L3 cache's namespace, which a "
+            "flushed weight update naming a new version replaces.",
         )
         parser.add_argument(
             "--model-update-config",
             type=str,
             default=ServerArgs.model_update_config,
-            help="JSON object handed to the Model Updater SDK for "
-            "/update_weights_from_mooncake. Requires --model-update-sdk-module, "
+            help="JSON object handed to the Model Updater SDK for the "
+            "UpdateWeightsFromMooncake control operation. Requires "
+            "--model-update-sdk-module, "
             "--model-update-engine-type and --model-update-draft-weights.",
         )
         parser.add_argument(
@@ -4095,7 +4039,7 @@ class ServerArgs:
             type=str,
             default=ServerArgs.model_update_sdk_module,
             help="Import path of the Model Updater SDK module (imported lazily "
-            "on the first /update_weights_from_mooncake).",
+            "on the first Mooncake weight update).",
         )
         parser.add_argument(
             "--model-update-engine-type",
@@ -4109,7 +4053,7 @@ class ServerArgs:
             type=str,
             choices=["retain", "refresh"],
             default=ServerArgs.model_update_draft_weights,
-            help="Whether /update_weights_from_mooncake also streams the "
+            help="Whether a Mooncake weight update also streams the "
             "speculative draft model's weights: 'retain' updates the target "
             "only, 'refresh' updates target and draft.",
         )
@@ -4145,7 +4089,7 @@ class ServerArgs:
 
         # Only pass fields that argparse actually produced. Falling back to
         # ``None`` for missing attrs would silently clobber dataclass defaults
-        # for non-CLI-exposed fields (e.g. ``enable_inline_detokenizer``).
+        # for non-CLI-exposed fields.
         attrs = [attr.name for attr in dataclasses.fields(cls)]
         return cls(
             **{attr: getattr(args, attr) for attr in attrs if hasattr(args, attr)}
@@ -4157,8 +4101,13 @@ class ServerArgs:
         return f"http://{self.host}:{self.port}"
 
     def zmq_handshake_endpoint(self) -> str:
-        """The frontend handshake endpoint the engine ranks dial, composed from ``--data-parallel-address``/``--data-parallel-rpc-port``."""
-        return f"tcp://{self.data_parallel_address}:{self.data_parallel_rpc_port}"
+        """The frontend handshake endpoint the engine ranks dial, composed from
+        ``--data-parallel-address``/``--data-parallel-rpc-port`` (an IPv6
+        address bracketed)."""
+        address = join_host_port(
+            self.data_parallel_address, self.data_parallel_rpc_port
+        )
+        return f"tcp://{address}"
 
 
 def prepare_server_args(argv: list[str]) -> ServerArgs:
@@ -4183,10 +4132,9 @@ ZMQ_TCP_PORT_DELTA = 233
 
 @dataclasses.dataclass
 class PortArgs:
-    # The ipc filename for AsyncLLM to receive BatchTokenIDOut directly
-    # from the scheduler (zmq).
+    # Reserved in the port cluster; no process binds it.
     tokenizer_ipc_name: str
-    # The ipc filename for scheduler (rank 0) to receive inputs from tokenizer (zmq)
+    # Reserved in the port cluster; no process binds it.
     scheduler_input_ipc_name: str
 
     # The port for nccl initialization (torch.dist)
@@ -4195,7 +4143,7 @@ class PortArgs:
     # The resolved rendezvous address after moving past busy local ports.
     dist_init_addr: str
 
-    # The ipc filename for rpc call between Engine and Scheduler
+    # Reserved in the port cluster; no process binds it.
     rpc_ipc_name: str
 
     # The ipc filename for Scheduler to send metrics
@@ -4263,7 +4211,6 @@ class PortArgs:
             rpc_port = port_base + 2
             metrics_ipc_port = port_base + 3
             if dp_rank is None:
-                # TokenizerManager to DataParallelController
                 scheduler_input_port = port_base + 4
             else:
                 scheduler_input_port = port_base + 2 + 1 + dp_rank

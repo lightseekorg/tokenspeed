@@ -25,16 +25,84 @@ from __future__ import annotations
 import math
 from functools import lru_cache
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
 import torch
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_tma_gather.combine import (
-    compile_combine,
-)
-from tokenspeed_kernel.thirdparty.cute_dsl._qsa_tma_gather.kernel import (
-    TmaGatherSparseAttentionKernel,
-)
+
+
+def tma_gather_layout_error(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_ids: torch.Tensor,
+    seq_kv_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    page_size: int,
+    *,
+    output: torch.Tensor | None = None,
+) -> str | None:
+    """Describe an unsupported physical layout, without loading the CuTe runtime.
+
+    Args:
+        q: Rank-three or rank-four queries; head geometry is checked by the caller.
+        k: Rank-three NHD key cache.
+        v: Rank-three NHD value cache.
+        block_ids: Logical block lists with contiguous storage.
+        seq_kv_lens: Live per-request KV lengths.
+        block_table: Rank-two page table with contiguous columns.
+        page_size: Physical cache page size.
+        output: Optional caller-owned output to check alongside the inputs.
+
+    Returns:
+        The first layout violation, or None. Both dispatch and execution use
+        this check; shape relationships and BF16 signatures belong to the caller.
+    """
+    operands = {"q": q, "k": k, "v": v}
+    if output is not None:
+        operands["output"] = output
+    if not q.is_cuda or any(
+        t.device != q.device
+        for t in (*operands.values(), block_ids, seq_kv_lens, block_table)
+    ):
+        return "TMA operands must be on the same CUDA device"
+    if not 0 < k.shape[1] < 65536:
+        return "KV heads exceed the CLC work-item encoding"
+    if v.shape != k.shape:
+        return "K/V must have the same NHD cache shape"
+    if (
+        page_size < 1
+        or page_size % 4
+        or not page_size <= k.shape[0] < 2**31
+        or k.shape[0] % page_size
+    ):
+        return "Cache slots must be whole pages within the TMA row-coordinate range"
+    if block_ids.numel() >= 2**31:
+        return "Selected-block entries exceed the Int32 index range"
+    for name, tensor in operands.items():
+        if (
+            tensor.stride(-1) != 1
+            or tensor.data_ptr() % 16
+            or any(s % 8 for s in tensor.stride()[:-1])
+        ):
+            return f"{name} must have a contiguous head dimension and 16-byte aligned strides/base"
+        if name in ("q", "output") and any(
+            tensor.stride(i) < tensor.shape[i + 1] * tensor.stride(i + 1)
+            for i in range(tensor.ndim - 1)
+        ):
+            return f"{name} must have non-overlapping BSHD rows"
+    if not k.is_contiguous() or not v.is_contiguous():
+        return "K/V must use contiguous NHD cache storage"
+    for name, tensor in (("block_ids", block_ids), ("seq_kv_lens", seq_kv_lens)):
+        if tensor.dtype is not torch.int32 or not tensor.is_contiguous():
+            return f"{name} must use contiguous int32 storage"
+    if block_ids.data_ptr() % 16:
+        return "block_ids must be 16-byte aligned"
+    if (
+        block_table.dtype is not torch.int32
+        or block_table.shape[1] < 1
+        or block_table.stride(1) != 1
+        or block_table.stride(0) < block_table.shape[1]
+    ):
+        return "block_table must be int32 [B,max_pages] with contiguous columns"
+    return None
 
 
 @lru_cache(maxsize=None)
@@ -45,6 +113,13 @@ def _prepare(
     enable_pdl: bool,
     query_group_size: int,
 ):
+    from tokenspeed_kernel.thirdparty.cute_dsl._qsa_tma_gather.combine import (
+        compile_combine,
+    )
+    from tokenspeed_kernel.thirdparty.cute_dsl._qsa_tma_gather.kernel import (
+        TmaGatherSparseAttentionKernel,
+    )
+
     # Only model-static geometry and the explicit tactic key compilation.
     kernel = TmaGatherSparseAttentionKernel(
         page_size=page_size, split_kv=split_kv, query_group_size=query_group_size
@@ -64,7 +139,7 @@ class TmaGatherSparseAttention:
 
     The constructor compiles the selected static tactic outside CUDA capture.
     ``execute`` reads live metadata on device and uses caller-owned output and
-    scratch. This low-level entry is not registered for runtime dispatch yet.
+    scratch. The QSA ops layer registers the unsplit single-query prefill tactic.
 
     Args:
         page_size: Positive physical page size, divisible by four.
@@ -133,7 +208,8 @@ class TmaGatherSparseAttention:
         """Compute per-query sparse attention into ``output`` on the current stream.
 
         Args:
-            q: BF16 ``[B,S,Hq,256]`` with aligned outer strides; S is 1..4.
+            q: BF16 ``[B,S,Hq,256]`` with aligned outer strides and positive S.
+                Each request has S consecutive queries ending at its KV length.
             k: Contiguous BF16 NHD cache ``[slots,Hkv,256]``. Hq/Hkv is 12.
             v: Same shape and storage contract as k.
             block_ids: Contiguous int32 ``[B,S,512]`` logical four-token blocks.
@@ -154,9 +230,12 @@ class TmaGatherSparseAttention:
         Returns:
             The same output tensor. All-invalid and zero-length rows output zero.
         """
-        if q.ndim != 4 or q.shape[-1] != 256 or not 1 <= q.shape[1] <= 4:
-            raise ValueError("q must have shape [B, S in 1..4, Hq, 256]")
+        if q.ndim != 4 or q.shape[-1] != 256 or q.shape[1] < 1:
+            raise ValueError("q must have shape [B, S >= 1, Hq, 256]")
         b, sq, h, _ = q.shape
+        # The staged list address uses an Int32 offset into [B,S,512].
+        if b * sq * 512 >= 2**31:
+            raise ValueError("Selected-block entries exceed the Int32 index range")
         if sq % self.query_group_size:
             raise ValueError("query_length must be divisible by query_group_size")
         if b >= 65536:
@@ -169,59 +248,25 @@ class TmaGatherSparseAttention:
             or v.shape != k.shape
         ):
             raise ValueError("K/V must be [slots,Hkv,256] with Hq/Hkv=12")
-        if k.shape[1] >= 65536:
-            raise ValueError("KV heads exceed the CLC work-item encoding")
         page = self.page_size
-        if k.shape[0] < page or k.shape[0] % page or k.shape[0] >= 2**31:
-            raise ValueError(
-                "Cache slots must be whole pages within the TMA row-coordinate range"
-            )
         if output.shape != q.shape:
             raise ValueError("output must have q's shape")
         for name, tensor in (("q", q), ("k", k), ("v", v), ("output", output)):
             if tensor.device != self.device or tensor.dtype is not torch.bfloat16:
                 raise ValueError(f"{name} must be BF16 on {self.device}")
-            if (
-                tensor.stride(-1) != 1
-                or tensor.data_ptr() % 16
-                or any(s % 8 for s in tensor.stride()[:-1])
-            ):
-                raise ValueError(
-                    f"{name} must have a contiguous head dimension and 16-byte aligned strides/base"
-                )
-        for name, tensor in (("q", q), ("output", output)):
-            bs, qs, hs, _ = tensor.stride()
-            if hs < 256 or qs < h * hs or bs < sq * qs:
-                raise ValueError(f"{name} must have non-overlapping BSHD rows")
-        if not k.is_contiguous() or not v.is_contiguous():
-            raise ValueError("K/V must use contiguous NHD cache storage")
         for name, tensor, shape in (
             ("block_ids", block_ids, (b, sq, 512)),
             ("seq_kv_lens", seq_kv_lens, (b,)),
         ):
-            if (
-                tensor.shape != shape
-                or tensor.dtype is not torch.int32
-                or tensor.device != self.device
-                or not tensor.is_contiguous()
-            ):
-                raise ValueError(
-                    f"{name} has an invalid shape, dtype, device or layout"
-                )
-        if block_ids.data_ptr() % 16:
-            raise ValueError("block_ids must be 16-byte aligned")
-        if (
-            block_table.ndim != 2
-            or block_table.shape[0] != b
-            or block_table.shape[1] < 1
-            or block_table.dtype is not torch.int32
-            or block_table.device != self.device
-            or block_table.stride(1) != 1
-            or block_table.stride(0) < block_table.shape[1]
-        ):
-            raise ValueError(
-                "block_table must be int32 [B,max_pages] with contiguous columns"
-            )
+            if tensor.shape != shape:
+                raise ValueError(f"{name} has an invalid shape")
+        if block_table.ndim != 2 or block_table.shape[0] != b:
+            raise ValueError("block_table must have one row per request")
+        layout_error = tma_gather_layout_error(
+            q, k, v, block_ids, seq_kv_lens, block_table, page, output=output
+        )
+        if layout_error is not None:
+            raise ValueError(layout_error)
         if not math.isfinite(scale):
             raise ValueError("scale must be finite")
         need = self.workspace_bytes(batch_size=b, query_length=sq, num_query_heads=h)
@@ -241,6 +286,10 @@ class TmaGatherSparseAttention:
             raise ValueError("split_kv=1 does not use workspace; pass None")
         if b == 0:
             return output
+        import cuda.bindings.driver as cuda
+        import cutlass
+        import cutlass.cute as cute
+
         gmem = cute.AddressSpace.gmem
 
         def ptr(tensor, dtype, align):

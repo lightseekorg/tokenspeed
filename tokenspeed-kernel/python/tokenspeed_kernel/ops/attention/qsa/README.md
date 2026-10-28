@@ -3,9 +3,33 @@
 ## TMA gather sparse attention
 
 `thirdparty/cute_dsl/qsa_tma_gather.py` provides `TmaGatherSparseAttention`, an explicit,
-caller-buffered entry for the SM107 TMA-gather4 sparse attention kernel. It is
-not registered for runtime selection yet. The existing QSA dispatch remains the
-serving path while the source port is reviewed and optimized.
+caller-buffered entry for the SM107 TMA-gather4 sparse attention kernel.
+`cute_dsl_tma_gather_qsa_prefill` registers its unsplit, single-query tactic as
+the default for SM107 BF16 prefill with 256-wide heads, twelve query heads per
+KV head, four-token blocks and 512 selected blocks. Logical metadata must be
+present, K/V must use contiguous NHD storage, and K/V descales must be absent.
+The existing registry retains other hardware, layouts, dtypes and decode/MTP.
+The registered name can be overridden through the normal kernel selection API;
+no model-specific switch or direct third-party runtime import is needed.
+The solution override `cute_dsl` keeps its existing direct-slot decode kernel;
+use the full registered name to force TMA prefill. Normal selection with
+`solution="cute_dsl"` still filters prefill/decode traits.
+
+The ops adapter launches each nonempty request span using the existing CPU
+`query_start_loc`. Positions are consecutive within a span; the forward layout's
+live `seq_lens` is passed through without per-request tensor arithmetic.
+This supports full, chunk and ragged prefill
+without synchronizing GPU metadata to the CPU. Query counts, lengths and page
+table strides remain runtime inputs. The prepared plan caches only static code;
+outputs belong to each call (or capture), while lengths are views of the existing
+forward metadata, with no extra
+request state or persistent scratch. Warm the static page-size/PDL combination
+before standalone CUDA graph capture.
+
+The registry declares static dtype/head/block requirements. Dispatch and the
+prepared entry share one physical-layout check, so alignment and stride changes
+cannot silently diverge between selection and execution. The host check does
+not import CuTe or CUDA bindings; compilation and launch load them on demand.
 
 The port owns its computational source under `thirdparty/cute_dsl/_qsa_tma_gather/`.
 It uses the existing CUTLASS DSL 4.8/CUDA dependencies and does not import cuDNN
@@ -21,8 +45,8 @@ cached gather4 instruction with MSA, whose existing helper interfaces remain val
 These files retain the applicable NVIDIA and MiniMax MIT notices.
 
 `common.py` contains the needed helpers from `sdpa/fwd/kernels/_common_blackwell.py`.
-The kernel constructor records the two-softmax-group geometry from
-`make_cfg_d256_sparse` in `sdpa/fwd/config_sm107.py`, deriving storage sizes and
+The kernel constructor adapts the geometry from `make_cfg_d256_sparse` in
+`sdpa/fwd/config_sm107.py`, deriving storage sizes and
 barrier arrival counts. It checks that all MMA operands fit the 256 KiB shared
 address window used by the descriptor format. Reduction order, masked-row
 handling and CLC consumer credits stay local to this implementation.
@@ -43,8 +67,10 @@ each tactic's static geometry and CuTe entry points. Compiled callables are
 cached by device, page size, split count, query group size and PDL; distinct prepared tactics
 can coexist without module-global configuration. The entry takes:
 
-- BF16 Q/O in `[B,S,Hq,256]`, with `S` from 1 to 4 and non-overlapping BSHD
-  rows. Outer strides may include padding but must be 16-byte aligned.
+- BF16 Q/O in `[B,S,Hq,256]`, with positive `S` and non-overlapping BSHD rows.
+  Each request has the same query count, covering its final `S` KV positions;
+  this includes full and chunk prefill. Outer strides may include padding but
+  must be 16-byte aligned. `B*S*512` must fit a signed 32-bit list index.
 - Contiguous BF16 NHD K/V caches `[slots,Hkv,256]`, with `Hq/Hkv=12` and a
   physical page size divisible by four. Q/K/V are not repacked.
 - Contiguous int32 selected logical blocks `[B,S,512]`, independently for each
@@ -70,16 +96,19 @@ replay; there is no separate replay metadata implementation.
 
 `query_group_size=1` handles one query and one KV head per work item, with twelve
 heads in a sixteen-column MMA tile. The experimental `query_group_size=2` tactic
-uses a 32-column tile, with sixteen padded columns per query. It requires S=2 or
-4 and identical 512-entry selection lists within each consecutive pair; this
+uses a 32-column tile, with sixteen padded columns per query. It requires even S
+and identical 512-entry selection lists within each consecutive pair; this
 device-data precondition is the caller's responsibility. Independent lists use
 group size one. The selected prefix and the union of open tails are loaded once;
 each query masks its own selected count and causal tail. A tail that becomes a
 completed block at the next position must not receive duplicate softmax weight.
 
-Both tactics use two four-warp softmax groups and eight gather warps, with
-separate MMA, Q/list-load and CLC scheduler warps. In the paired tactic each
-softmax group owns one query. The K/V ring has three slots for one query and two
+Both tactics use two four-warp softmax groups per query and eight shared gather
+warps, with separate MMA, Q/list-load and CLC scheduler warps. Each softmax group
+owns eight padded head columns. The paired tactic has four groups and 896
+threads per CTA; the single-query tactic has two groups and 640 threads. Stage
+and scheduler barrier counts follow the participating threads and warps. The
+K/V ring has three slots for one query and two
 for a pair; two Q/list slots and two score/probability slots keep the same
 producer/last-reader ownership. For paired queries, Q/P/KV operand storage is
 32/16/128 KiB, excluding list, reduction and synchronization storage; TMEM uses
@@ -105,5 +134,7 @@ once after reduction. This is not a bitwise-equivalence guarantee with another
 attention provider. Tests include a high-precision mathematical reference,
 exact missing-page cases, and eager/graph agreement.
 
-Runtime registry integration, metadata/workspace ownership in the serving
-backend, dispatch policy and further pipeline tuning are separate changes.
+Provider agreement and model quality are separate checks: the BF16 probability
+rounding can change logits after later layers even when individual attention
+outputs meet their mathematical tolerance. Default selection does not imply
+bitwise equivalence with FA2 or a model-level quality acceptance result.

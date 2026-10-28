@@ -23,9 +23,9 @@
 """SM107 sparse attention with TMA gather4 and a persistent CLC scheduler.
 
 Each work item is one or two consecutive queries and one KV head, with twelve
-heads in sixteen padded columns per query. Two four-warp softmax groups share
-eight gather warps; MMA, Q/list loads and scheduling each have one warp. Paired
-queries share a selected-block list, with independent causal masks. Two K/V
+heads in sixteen padded columns per query. Each query uses two four-warp softmax
+groups, sharing eight gather warps. MMA, Q/list loads and scheduling each have
+one warp. Paired queries share a selected-block list, with independent causal masks. Two K/V
 slots in the paired tactic leave room for wider Q/P operands; the single-query
 tactic uses three. No CTA-wide barrier follows initialization.
 
@@ -163,7 +163,9 @@ class TmaGatherSparseAttentionKernel:
         self.stages_q = 2
         self.stages_ids = 2
         self.scheduler_stages = 2
-        self.softmax_groups = 2
+        # Eight columns per group keeps per-thread softmax state independent
+        # of the number of queries sharing the K/V tile.
+        self.softmax_groups = 2 * query_group_size
         self.softmax_warps_per_group = 4
         self.softmax_warps = self.softmax_groups * self.softmax_warps_per_group
         self.cols_per_group = self.n_q // self.softmax_groups
@@ -200,7 +202,8 @@ class TmaGatherSparseAttentionKernel:
         self.ids_slot_bytes = self.ids_tx_bytes + 64
         self.qk_granu_elems = self.gather_box_elems
         self.qk_iters = self.tile_k // self.qk_granu_elems
-        self.tmem_cols = self.n_q * self.softmax_groups * 2
+        # Two score slots and two D128 output blocks; unrelated to warp groups.
+        self.tmem_cols = self.n_q * (self.stages_s + self.tile_o // 128)
         self.s_acc_off = (0, self.n_q)
         self.o_off = (self.n_q * 2, self.n_q * 3)
         self.storage_dtype = cutlass.BFloat16
@@ -1237,9 +1240,9 @@ class TmaGatherSparseAttentionKernel:
             query_tok = out_tok
             query_col0 = col0
             if cutlass.const_expr(self.query_group_size == 2):
-                # One four-warp group owns each query's sixteen padded head columns.
-                query_tok = out_tok + grp
-                query_col0 = cutlass.Int32(0)
+                # Two groups own each query's sixteen padded head columns.
+                query_tok = out_tok + col0 // cutlass.Int32(self.query_head_tile)
+                query_col0 = col0 % cutlass.Int32(self.query_head_tile)
                 pos = query_tok + eff_seqlen_kv - eff_seqlen_q
             query_vis = cute.math.max(
                 cute.math.min(pos + cutlass.Int32(1), eff_seqlen_kv), cutlass.Int32(0)

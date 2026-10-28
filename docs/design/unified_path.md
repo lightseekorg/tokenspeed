@@ -78,6 +78,10 @@ FlashInfer receives host CSR metadata derived from those mirrors, with fresh
 pinned sources for asynchronous uploads. Planning does not download device
 lengths or indptrs; mixed batches apply the same rule to their extend rows.
 
+NPU graph task updates and replay run in inference mode because they write the
+output tensors allocated during capture. This applies to active and idle DP
+ranks; callers need not establish an inference context.
+
 ### Buffer sizing: the ladder is a performance subset, never a capacity limit
 
 `ForwardStepRunner` distinguishes `max_capture_bs` (top of the capture ladder,
@@ -118,7 +122,10 @@ fail before a context-parallel kernel is launched. The backend takes its CP
 degree and ranks from the host topology and passes that degree to every fused
 collective. The installed operators' Meta implementations validate topology
 and head layout before execution or graph capture; the framework carries no
-CP degree whitelist. The current native fusion remains specialized for DCP8.
+CP degree whitelist. DSA native fusion remains specialized for DCP8; prepared Ascend MLA also
+admits the H32 geometry on TP8/DCP8. Its head count, Q latent
+width and borrowed producer views follow the model, with the same projection,
+owner-store and FP32 LSE merge path.
 Bindings must supply Meta implementations for this startup check; a missing
 Meta kernel reports a binding upgrade, separately from unsupported topology.
 
@@ -933,10 +940,6 @@ Pipeline parallelism is the one prefill configuration that forces eager:
 each stage threads its boundary state through an eager stage forward
 (`ModelExecutor._run_target_forward`), so `ServerArgs.resolve_disaggregation`
 sets `enforce_eager` for `--pipeline-parallel-size > 1`, not for the role.
-The DeepSeek-V4.1 Flash PD gate
-(`test/ci_system/serve_deepseek_v41_flash_pd_1p1d.sh`) runs the prefill
-role with its graphs and passes `--disable-prefill-graph` to the decode role
-only.
 
 ### Sampling has no greedy branch
 
@@ -1248,8 +1251,13 @@ the selected top-k rows with the queries.
 
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
-Only decode may use CuTe. PrimTS accepts supported BF16 prefill and decode
-with logical block candidates on SM100/SM103; groups stay within each request.
+CuTe serves supported uniform decode on SM100/SM103/SM107 and unscaled BF16
+prefill on SM107 through the TMA gather solution. The latter takes consecutive
+query positions within each request span and uses the existing logical metadata;
+its KV lengths are views of the existing forward layout, without per-layer
+reconstruction. It keeps no request state or persistent scratch. PrimTS accepts supported BF16
+prefill and decode with logical block candidates on SM100/SM103; groups stay
+within each request.
 Other supported NVIDIA inputs use FA2 over equivalent physical slots.
 All kernels share the cache writer and sparse-attention call. The indexer
 returns physical slots across graph breaks and keeps logical candidates
@@ -1261,8 +1269,9 @@ Calls, including graph replays, are ordered across streams. Rebinding drops
 eager plans; capture sessions retain graph plans and allocations until release.
 Scratch may grow without moving graph inputs. Each run regenerates its data.
 
-QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
-candidates from the zero-initialized slot 1 of the reserved null page.
+QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and the direct-slot
+CuTe kernel read invalid candidates from the zero-initialized slot 1 of the
+reserved null page. TMA gather masks the entire null page before scoring.
 Writers must leave that read slot untouched. The indexer retains its `-1`
 sentinel, and consumers derive their masks from the original selection.
 

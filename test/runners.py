@@ -22,19 +22,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import json
 import multiprocessing as mp
 import os
 import queue
 from dataclasses import dataclass
 from test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, calculate_rouge_l
-from typing import Any, List, Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM, GenerationConfig
 
-from tokenspeed.runtime.entrypoints.engine import Engine
+from tokenspeed.runtime.entrypoints.wire_driver import WireDriver, generate_request
 from tokenspeed.runtime.utils import get_device
 from tokenspeed.runtime.utils.hf_transformers_utils import get_tokenizer
 
@@ -340,224 +339,131 @@ class HFRunner:
 
 
 class RTRunner:
+    """The engine under test, driven over its wire (``WireDriver``): the
+    runner tokenizes the prompts and detokenizes the outputs, as a frontend
+    does."""
+
     _port_counter = 0  # Class-level port counter
 
     def __init__(
         self,
         model_path: str,
+        *,
         torch_dtype: torch.dtype,
-        model_type: str,
-        world_size: int = 1,
-        ep_size: int = 1,
-        port: int = None,  # None means auto-increment
-        attention_backend: Optional[str] = None,
-        enforce_eager: bool = False,
-        enable_prefix_caching: bool = True,
-        chunked_prefill_size: Optional[int] = None,
-        max_model_len: Optional[int] = None,
-        max_total_tokens: Optional[int] = None,
-        prefix_granularity: Optional[int] = 64,
-        data_parallel_size: int = 1,
-        tokenizer: Optional[str] = None,
-        gpu_memory_utilization: float = 0.65,
-        trust_remote_code: bool = False,
-        speculative_draft_model_path: Optional[str] = None,
-        speculative_algorithm: Optional[str] = None,
-        speculative_num_steps: Optional[int] = None,
-        speculative_eagle_topk: Optional[int] = None,
-        speculative_num_draft_tokens: Optional[int] = None,
-        disable_overlap_schedule: bool = False,
-        max_cudagraph_capture_size: int = 4,
-        hf_overrides: Optional[dict[str, Any]] = None,
-        disable_prefill_graph: bool = False,
-        disable_kvstore: bool = True,
-        **kwargs,
+        world_size: int,
+        trust_remote_code: bool,
+        enforce_eager: bool,
+        extra_args: list[str],
     ):
-        # Auto-assign port if not specified
-        if port is None:
-            port = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + RTRunner._port_counter
-            RTRunner._port_counter += 1
+        """Start the engine.
 
-        self.model_type = model_type
-        self.is_generation = model_type == "generation"
-        if not self.is_generation:
-            raise ValueError("Embedding, rerank, and reward model runners are removed.")
-
-        spec_kwargs = {}
-        if speculative_draft_model_path:
-            spec_kwargs["speculative_draft_model_path"] = speculative_draft_model_path
-            spec_kwargs["speculative_algorithm"] = speculative_algorithm
-            spec_kwargs["speculative_num_steps"] = speculative_num_steps
-            spec_kwargs["speculative_eagle_topk"] = speculative_eagle_topk
-            spec_kwargs["speculative_num_draft_tokens"] = speculative_num_draft_tokens
-
-        self.engine = Engine(
-            model=model_path,
-            world_size=world_size,
-            ep_size=ep_size,
-            dtype=get_dtype_str(torch_dtype),
-            port=port,
-            gpu_memory_utilization=gpu_memory_utilization,
-            trust_remote_code=trust_remote_code,
-            attention_backend=attention_backend,
-            enforce_eager=enforce_eager,
-            # Output (decode-token) logprobs are gated by this static server arg
-            # (the sampler only gathers them when on). The runner compares them
-            # against the HF reference, so enable it for all RT runs.
-            enable_output_logprobs=True,
-            enable_prefix_caching=enable_prefix_caching,
-            chunked_prefill_size=chunked_prefill_size,
-            max_model_len=max_model_len,
-            max_total_tokens=max_total_tokens,
-            prefix_granularity=prefix_granularity,
-            data_parallel_size=data_parallel_size,
-            tokenizer=tokenizer,
-            disable_overlap_schedule=disable_overlap_schedule,
-            max_cudagraph_capture_size=max_cudagraph_capture_size,
-            hf_overrides=(json.dumps(hf_overrides) if hf_overrides else "{}"),
-            disable_prefill_graph=disable_prefill_graph,
-            disable_kvstore=disable_kvstore,
-            **spec_kwargs,
-            **kwargs,
+        Args:
+            model_path: The model.
+            torch_dtype: Its dtype.
+            world_size: Its ranks, one attention-TP group.
+            trust_remote_code: Whether to load the model's own code.
+            enforce_eager: Run without CUDA graphs.
+            extra_args: More of the engine's command line.
+        """
+        # Distinct derived ports for runners that start one after another.
+        port = DEFAULT_PORT_FOR_SRT_TEST_RUNNER + RTRunner._port_counter
+        RTRunner._port_counter += 1
+        argv = [
+            "--model",
+            model_path,
+            "--dtype",
+            get_dtype_str(torch_dtype),
+            "--world-size",
+            str(world_size),
+            "--port",
+            str(port),
+            "--gpu-memory-utilization",
+            "0.65",
+            "--prefix-granularity",
+            "64",
+            "--max-cudagraph-capture-size",
+            "4",
+            "--disable-kvstore",
+            # Output (decode-token) logprobs are gated by this static server
+            # arg (the sampler only gathers them when on). The runner compares
+            # them against the HF reference, so enable it for all RT runs.
+            "--enable-output-logprobs",
+            "--trust-remote-code" if trust_remote_code else "--no-trust-remote-code",
+        ]
+        if enforce_eager:
+            argv.append("--enforce-eager")
+        self.engine = WireDriver(
+            [*argv, *extra_args],
+            num_engines=1,
+            routing="round_robin",
+            startup_timeout_s=3600,
         )
+        self.tokenizer = get_tokenizer(model_path, trust_remote_code=trust_remote_code)
 
-        if tokenizer is None:
-            self.tokenizer = get_tokenizer(
-                model_path, trust_remote_code=trust_remote_code
-            )
-        else:
-            self.tokenizer = None
+    def _requests(self, prompts: list[str], sampling_params: dict, **fields) -> list:
+        return [
+            generate_request(self.tokenizer.encode(prompt), sampling_params, **fields)
+            for prompt in prompts
+        ]
 
-    def load_lora_adapter(self, lora_name: str, lora_path: str, pinned: bool = False):
-        return self.engine.load_lora_adapter(lora_name, lora_path, pinned)
-
-    def unload_lora_adapter(self, lora_name: str):
-        return self.engine.unload_lora_adapter(lora_name)
+    def _text(self, output_ids: list[int]) -> str:
+        return self.tokenizer.decode(output_ids, skip_special_tokens=True)
 
     def forward(
         self,
-        prompts: Union[
-            List[List[str]], List[str], List[torch.Tensor]
-        ] = DEFAULT_PROMPTS,
-        max_new_tokens: int = 8,
-        lora_paths: Optional[List[str]] = None,
-        logprob_start_len: int = 0,
-        top_k: Optional[int] = None,
-        token_ids_logprob: Optional[List[int]] = None,
-    ):
-        if self.is_generation:
-            return self.forward_generation_raw(
-                engine=self.engine,
-                prompts=prompts,
-                max_new_tokens=max_new_tokens,
-                lora_paths=lora_paths,
-                logprob_start_len=logprob_start_len,
-                top_k=top_k,
-                token_ids_logprob=token_ids_logprob,
-            )
-        else:
-            raise ValueError("Embedding, rerank, and reward model runners are removed.")
-
-    def batch_forward(
-        self,
         prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
-        max_new_tokens=8,
-    ):
-        """
-        testing serving by sending all prompts once
-        only return output strings and no logprobs
-        """
-        if self.is_generation:
-            return self.batch_forward_generation_raw(
-                engine=self.engine,
-                prompts=prompts,
-                max_new_tokens=max_new_tokens,
-            )
-        else:
-            raise ValueError("Embedding, rerank, and reward model runners are removed.")
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        self.engine.shutdown()
-        del self.engine
-
-    @staticmethod
-    def forward_generation_raw(
-        engine: Engine,
-        prompts: Union[List[str], List[torch.Tensor]],
         max_new_tokens: int = 8,
-        lora_paths: Optional[List[str]] = None,
-        logprob_start_len: int = 0,
-        top_k: Optional[int] = None,
-        token_ids_logprob: Optional[List[int]] = None,
-    ):
-        # Output logprobs only: request the sampled token's logprob at each
-        # output position via SamplingParams.logprobs=0. Prompt/top-k/token-id
-        # logprobs are not supported, so their ModelOutput fields stay None.
-        # (logprob_start_len / token_ids_logprob are accepted for call-site
-        # compatibility but ignored.)
-        output_strs = []
-        output_ids = []
-        output_token_logprobs_lst = []
-
-        sampling_params = {
-            "max_new_tokens": max_new_tokens,
-            "temperature": 0,
-            "logprobs": 0,
-        }
-        if top_k:
-            sampling_params["top_k"] = top_k
-
-        for i, prompt in enumerate(prompts):
-            response = engine.generate(
-                prompt,
-                sampling_params=sampling_params,
+    ) -> "ModelOutput":
+        """Greedy generation, one prompt at a time, with the sampled tokens'
+        logprobs."""
+        output_strs, output_ids, output_token_logprobs_lst = [], [], []
+        for prompt in prompts:
+            [completion] = self.engine.generate(
+                self._requests(
+                    [prompt],
+                    {"max_new_tokens": max_new_tokens, "temperature": 0},
+                    return_logprob=True,
+                )
             )
-            text = response["text"]
-
+            text = self._text(completion.output_ids)
             # Check if the text is empty or only whitespace.
             if not text.strip():
                 raise ValueError(
                     "Received an empty text response. Please verify your input or model configuration."
                 )
             output_strs.append(text)
-            output_ids.append(response["output_ids"])
-
-            # meta_info["logprobs"] is a list[dict[token_id, Logprob]] (one dict
-            # per generated token, holding the sampled token at rank 0). Flatten
-            # to (logprob, token_id) tuples per position.
-            per_token = []
-            for pos in response["meta_info"].get("logprobs", []):
-                tid, lp = next(iter(pos.items()))
-                per_token.append((lp.logprob, tid))
-            output_token_logprobs_lst.append(per_token)
-
+            output_ids.append(completion.output_ids)
+            output_token_logprobs_lst.append(
+                list(zip(completion.output_token_logprobs, completion.output_ids))
+            )
         return ModelOutput(
             output_strs=output_strs,
             output_ids=output_ids,
             output_token_logprobs_lst=output_token_logprobs_lst,
         )
 
-    @staticmethod
-    def batch_forward_generation_raw(
-        prompts: Union[List[str], List[torch.Tensor]],
-        max_new_tokens,
-        engine,
-    ):
-        # the return value contains logprobs from prefill
-        output_strs = []
-        sampling_params = {"max_new_tokens": max_new_tokens, "temperature": 0}
-        response = engine.generate(
-            prompts,
-            sampling_params=sampling_params,
+    def batch_forward(
+        self,
+        prompts: Union[List[str], List[torch.Tensor]] = DEFAULT_PROMPTS,
+        max_new_tokens=8,
+    ) -> "ModelOutput":
+        """Greedy generation of every prompt at once; output strings only."""
+        completions = self.engine.generate(
+            self._requests(
+                prompts, {"max_new_tokens": max_new_tokens, "temperature": 0}
+            )
         )
-        output_strs = [r["text"] for r in response]
-
         return ModelOutput(
-            output_strs=output_strs,
+            output_strs=[
+                self._text(completion.output_ids) for completion in completions
+            ]
         )
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.engine.shutdown()
 
 
 def monkey_patch_gemma2_sdpa():

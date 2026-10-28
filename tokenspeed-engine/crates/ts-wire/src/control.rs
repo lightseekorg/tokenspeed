@@ -313,6 +313,61 @@ pub const PROFILE_START: i64 = 1;
 /// `ProfileReq.kind` that stops it.
 pub const PROFILE_STOP: i64 = 2;
 
+/// A control operation named by method, the other payload a CONTROL message
+/// carries: the array `[call_id, method, args]`, as SMG calls a scheduler's
+/// operations on every engine it drives. The engine turns it into its own
+/// [`ControlRequest`] and answers with one [`ControlReplySlim`] under
+/// `call_id`. It is told apart from a [`ControlRequest`] by its first
+/// element: an integer here, the struct's tag string there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlCall {
+    /// The caller's id for the call; the reply carries it.
+    pub call_id: i64,
+    /// The operation, such as `flush_cache`.
+    pub method: String,
+    /// The operation's positional arguments.
+    pub args: Vec<Value>,
+}
+
+impl Wire for ControlCall {
+    fn encode(&self, encoder: &mut Encoder) {
+        encoder.array_len(3);
+        encoder.int(self.call_id);
+        encoder.str(&self.method);
+        self.args.encode(encoder);
+    }
+
+    fn decode(decoder: &mut Decoder<'_>) -> Result<Self> {
+        let len = decoder.array_len()?;
+        if len != 3 {
+            return Err(Error::Invalid(format!(
+                "a control call is [call_id, method, args], got {len} elements"
+            )));
+        }
+        Ok(Self {
+            call_id: decoder.integer()?.narrow("call_id")?,
+            method: decoder.str()?.to_owned(),
+            args: Vec::<Value>::decode(decoder)?,
+        })
+    }
+}
+
+wire_struct! {
+    /// The answer to a [`ControlCall`], exactly one per call.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct ControlReplySlim: array("ControlReplySlim") {
+        /// The call's id.
+        pub call_id: i64,
+        /// Whether the operation succeeded.
+        pub success: bool,
+        /// Why it failed, or the engine's words about it; `None` when there
+        /// are none.
+        pub message: Option<String> = None,
+        /// The answering engine.
+        pub engine_index: i64 = 0,
+    }
+}
+
 /// Declares an enum over tagged structs, decoded by their tag.
 macro_rules! tagged_union {
     (
@@ -465,6 +520,35 @@ impl ControlRequest {
     }
 }
 
+impl ControlOutput {
+    /// Whether the operation succeeded, and the engine's words about it
+    /// (`None` when it said nothing): what a [`ControlReplySlim`] carries.
+    pub fn outcome(&self) -> (bool, Option<String>) {
+        fn said(success: bool, message: &str) -> (bool, Option<String>) {
+            (success, (!message.is_empty()).then(|| message.to_owned()))
+        }
+        match self {
+            Self::FlushCache(output) => (output.success, None),
+            Self::PauseScheduler(output) => said(output.success, &output.message),
+            Self::ResumeScheduler(output) => said(output.success, &output.message),
+            Self::UpdateWeightFromDisk(output) => said(output.success, &output.message),
+            Self::UpdateWeightsFromDistributed(output) => said(output.success, &output.message),
+            Self::UpdateWeightsFromTensor(output) => said(output.success, &output.message),
+            Self::InitWeightsUpdateGroup(output) => said(output.success, &output.message),
+            Self::DestroyWeightsUpdateGroup(output) => said(output.success, &output.message),
+            Self::UpdateWeightsFromMooncake(output) => said(output.success, &output.message),
+            Self::RebalanceExperts(output) => said(output.success, &output.message),
+            Self::ReleaseMemoryOccupation(output) => said(output.success, &output.message),
+            Self::ResumeMemoryOccupation(output) => said(output.success, &output.message),
+            Self::Profile(output) => said(output.success, &output.message),
+            Self::IsSchedulerPaused(_) | Self::IsSleeping(_) | Self::GetInternalState(_) => {
+                (true, None)
+            }
+            Self::SetInternalState(output) => (output.updated, None),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,5 +574,67 @@ mod tests {
             assert_eq!(decoded, request);
         }
         assert!(!ControlOutput::knows("BatchTokenIDOutSlim"));
+    }
+
+    /// SMG's control call `(call_id, method, args)`, as its msgpack encoder
+    /// writes `(7, "flush_cache", [5.0])`.
+    const FLUSH_CALL: &[u8] = &[
+        0x93, 0x07, 0xab, b'f', b'l', b'u', b's', b'h', b'_', b'c', b'a', b'c', b'h', b'e', 0x91,
+        0xcb, 0x40, 0x14, 0, 0, 0, 0, 0, 0,
+    ];
+
+    #[test]
+    fn a_control_call_reads_as_smg_writes_it() {
+        let call: ControlCall = decode_frames(&[bytes::Bytes::from_static(FLUSH_CALL)]).unwrap();
+        assert_eq!(
+            call,
+            ControlCall {
+                call_id: 7,
+                method: "flush_cache".to_owned(),
+                args: vec![Value::Float(5.0)],
+            }
+        );
+        assert_eq!(
+            encode_frames(&call),
+            [bytes::Bytes::from_static(FLUSH_CALL)]
+        );
+    }
+
+    #[test]
+    fn a_control_reply_is_the_tag_then_its_four_fields() {
+        let reply = ControlReplySlim {
+            call_id: 7,
+            success: true,
+            message: None,
+            engine_index: 1,
+        };
+        let mut expected = vec![0x95, 0xb0];
+        expected.extend_from_slice(b"ControlReplySlim");
+        expected.extend_from_slice(&[0x07, 0xc3, 0xc0, 0x01]);
+        assert_eq!(encode_frames(&reply), [bytes::Bytes::from(expected)]);
+        assert_eq!(
+            ControlReplySlim::FIELDS,
+            ["call_id", "success", "message", "engine_index"]
+        );
+    }
+
+    #[test]
+    fn a_reply_names_its_outcome() {
+        let refused = ControlOutput::FlushCache(FlushCacheReqOutput {
+            rid: None,
+            http_worker_ipc: None,
+            success: false,
+        });
+        assert_eq!(refused.outcome(), (false, None));
+        let started = ControlOutput::Profile(ProfileReqOutput {
+            rid: None,
+            http_worker_ipc: None,
+            success: true,
+            message: "Start profiling.".to_owned(),
+        });
+        assert_eq!(
+            started.outcome(),
+            (true, Some("Start profiling.".to_owned()))
+        );
     }
 }

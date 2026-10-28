@@ -398,6 +398,26 @@ def test_paired_queries_wrap_and_refresh_graph(split, pdl):
     torch.testing.assert_close(output, torch.zeros_like(output), atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("queries", [2, 4])
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_paired_queries_keep_head_columns_separate(queries, split, pdl):
+    # Random query/head/channel values expose mixed-up half-head groups.
+    # One K/V tile allows an independent reference with BF16 probabilities.
+    case = list(_case(3, queries, 31, 64, strided=True))
+    case[0].mul_(0.25)
+    case[3].copy_(torch.arange(512, dtype=torch.int32, device="cuda"))
+    plan = _plan(64, split, pdl, query_group_size=2)
+    output, workspace = _buffers(plan, case[0])
+    _run(plan, case, output, workspace)
+    torch.testing.assert_close(
+        output.cpu().double(),
+        _reference(case, 64, probability_dtype=torch.bfloat16),
+        atol=2e-3,
+        rtol=2e-2,
+    )
+
+
 def test_paired_plan_requires_even_query_length():
     plan = _plan(64, 1, False, query_group_size=2)
     for queries in (1, 3):
@@ -405,3 +425,353 @@ def test_paired_plan_requires_even_query_length():
         output, workspace = _buffers(plan, case[0])
         with pytest.raises(ValueError, match="divisible"):
             _run(plan, case, output, workspace)
+
+
+@pytest.mark.parametrize(
+    "query_group_size,queries", [(1, 5), (1, 257), (2, 6), (2, 258)]
+)
+@pytest.mark.parametrize("split", [1, 4])
+@pytest.mark.parametrize("pdl", [False, True])
+def test_long_queries_match_short_chunks(query_group_size, queries, split, pdl):
+    case = list(_case(2, queries, queries + 131, 64, strided=True))
+    q, k, v, ids, lengths, table = case
+    if query_group_size == 2:
+        ids.copy_(torch.arange(512, dtype=torch.int32, device="cuda"))
+    plan = _plan(64, split, pdl, query_group_size=query_group_size)
+    output, workspace = _buffers(plan, q)
+    _run(plan, case, output, workspace)
+
+    # The existing short-query contract independently establishes each chunk's
+    # bottom-right causal position, without changing its selection order.
+    expected = torch.empty_like(q)
+    for start in range(0, queries, 4):
+        end = min(start + 4, queries)
+        chunk = (
+            q[:, start:end],
+            k,
+            v,
+            ids[:, start:end].contiguous(),
+            lengths - queries + end,
+            table,
+        )
+        _run(plan, chunk, expected[:, start:end], workspace)
+    torch.testing.assert_close(output, expected, atol=0, rtol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(plan, case, output, workspace)
+    v.neg_()
+    graph.replay()
+    torch.testing.assert_close(output, -expected, atol=0, rtol=0)
+
+
+def test_long_queries_reject_list_index_overflow():
+    case = list(_case(1, 1, 1, 4, strided=False))
+    plan = _plan(4, 1, False, query_group_size=1)
+    output = torch.empty_like(case[0])
+    # Expanded storage lets the host reject an oversized shape before launch.
+    case[0] = case[0].expand(1, 2**22, 24, 256)
+    with pytest.raises(ValueError, match="Int32 index range"):
+        _run(plan, case, output, None)
+
+
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_prefill_registry_ragged_and_live_graph_metadata(position_dtype, enable_pdl):
+    from tokenspeed_kernel.ops.attention.qsa import (
+        QSASparseMetadata,
+        QSAWorkspace,
+        qsa_sparse_attention,
+        select_qsa_sparse_attention_kernel,
+    )
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+    from tokenspeed_kernel.platform import pdl_enabled
+    from tokenspeed_kernel.workspace import capture_session
+
+    case = _case(3, 6, 140, 64, strided=True)
+    q, k, v, ids, lengths, table = case
+    flat = torch.cat((q[0, :5], q[2]))
+    blocks = torch.cat((ids[0, :5], ids[2]))
+    positions = torch.cat((torch.arange(134, 139), torch.arange(134, 140))).to(
+        device="cuda", dtype=position_dtype
+    )
+    seq_lens = torch.tensor([139, 0, 140], dtype=torch.int32, device="cuda")
+    metadata = QSASparseMetadata(
+        blocks,
+        table,
+        torch.tensor([0] * 5 + [2] * 6, device="cuda", dtype=torch.int32),
+        positions,
+        (0, 5, 5, 11),
+        64,
+        4,
+        QSAWorkspace(),
+        seq_lens=seq_lens,
+    )
+    slots = qwen4_exp_qsa_selected_slots(
+        blocks,
+        ((positions + 1) // 4).to(torch.int32),
+        positions,
+        metadata.token_to_request,
+        table,
+        64,
+        4,
+        2048,
+        enable_pdl=False,
+    )
+    kwargs = dict(
+        max_seqlen_q=None,
+        k_scale=None,
+        v_scale=None,
+        sparse_metadata=metadata,
+        override=None,
+        solution=None,
+    )
+    selected = select_qsa_sparse_attention_kernel(flat, k, v, slots, **kwargs)
+    assert selected.name == "cute_dsl_tma_gather_qsa_prefill"
+
+    def call():
+        return qsa_sparse_attention(
+            flat, k, v, slots, scale=1 / 16, metadata_capacity_rows=None, **kwargs
+        )
+
+    def reference():
+        expected = _reference(case, 64, probability_dtype=None)
+        return torch.cat((expected[0, :5], expected[2])).cuda().to(torch.bfloat16)
+
+    previous_pdl = pdl_enabled()
+    pdl_enabled(enable_pdl)
+    try:
+        torch.testing.assert_close(call(), reference(), atol=2e-3, rtol=2e-2)
+        graph = torch.cuda.CUDAGraph()
+        with capture_session(graph), torch.cuda.graph(graph):
+            output = call()
+        # Lengths belong to the forward layout and are refreshed in place.
+        # Captured attention must consume them along with the updated page table.
+        lengths.add_(4)
+        seq_lens.add_(4)
+        positions.add_(4)
+        table.copy_(table.flip(0))
+        v.neg_()
+        graph.replay()
+        torch.testing.assert_close(output, reference(), atol=2e-3, rtol=2e-2)
+        torch.testing.assert_close(output, call(), atol=0, rtol=0)
+    finally:
+        pdl_enabled(previous_pdl)
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["metadata", "heads", "blocks_stride", "scale", "fp8", "decode"]
+)
+def test_prefill_registry_preserves_fallbacks(unsupported):
+    from dataclasses import replace
+
+    from tokenspeed_kernel.numerics.torch.attention.qsa import (
+        torch_qsa_selected_attention,
+    )
+    from tokenspeed_kernel.ops.attention.qsa import (
+        QSASparseMetadata,
+        QSAWorkspace,
+        qsa_sparse_attention,
+        select_qsa_sparse_attention_kernel,
+    )
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+
+    q, k, v, ids, lengths, table = _case(1, 1, 140, 64, strided=False)
+    q, blocks = q[0], ids[0]
+    positions = lengths - 1
+    requests = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    metadata = QSASparseMetadata(
+        blocks,
+        table,
+        requests,
+        positions,
+        (0, 1),
+        64,
+        4,
+        QSAWorkspace(),
+        seq_lens=lengths,
+    )
+    slots = qwen4_exp_qsa_selected_slots(
+        blocks,
+        lengths // 4,
+        positions,
+        requests,
+        table,
+        64,
+        4,
+        2048,
+        enable_pdl=False,
+    )
+    key_scale = None
+    value_scale = None
+    width = None
+    if unsupported == "metadata":
+        metadata = None
+    elif unsupported == "heads":
+        q = q[:, :12].contiguous()
+    elif unsupported == "blocks_stride":
+        padded = torch.empty((1, 1024), dtype=torch.int32, device="cuda")
+        padded[:, ::2].copy_(blocks)
+        metadata = replace(metadata, selected_blocks=padded[:, ::2])
+    elif unsupported == "scale":
+        # BF16 has no FP8 descale. An explicitly supplied unit scale still
+        # selects the existing fallback instead of being discarded by TMA.
+        key_scale = 1.0
+    elif unsupported == "fp8":
+        k, v = k.to(torch.float8_e4m3fn), v.to(torch.float8_e4m3fn)
+        # The runtime's FP8 cache path supplies explicit unit descales.
+        key_scale = value_scale = 1.0
+    else:
+        width = 1
+    kwargs = dict(
+        max_seqlen_q=width,
+        k_scale=key_scale,
+        v_scale=value_scale,
+        sparse_metadata=metadata,
+        override=None,
+        solution=None,
+    )
+    selected = select_qsa_sparse_attention_kernel(q, k, v, slots, **kwargs)
+    expected_kernel = (
+        "cute_dsl_blackwell_qsa_sparse_attention"
+        if width is not None
+        else (
+            "flashinfer_fa2_fp8_qsa_sparse_attention"
+            if unsupported == "fp8"
+            else "flashinfer_fa2_qsa_sparse_attention"
+        )
+    )
+    assert selected.name == expected_kernel
+    actual = qsa_sparse_attention(
+        q, k, v, slots, scale=1 / 16, metadata_capacity_rows=None, **kwargs
+    )
+    expected = torch_qsa_selected_attention(
+        q,
+        k,
+        v,
+        slots,
+        1 / 16,
+        1.0 if key_scale is None else key_scale,
+        1.0 if value_scale is None else value_scale,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)
+
+
+@pytest.mark.parametrize("query_width", [1, 4])
+@pytest.mark.parametrize("override_source", ["callsite", "context", "environment"])
+def test_cute_dsl_solution_override_preserves_decode(
+    query_width, override_source, monkeypatch
+):
+    from contextlib import nullcontext
+
+    from tokenspeed_kernel.ops.attention.qsa import qsa_sparse_attention
+    from tokenspeed_kernel.ops.attention.qsa.triton import qwen4_exp_qsa_selected_slots
+    from tokenspeed_kernel.selection import kernel_override
+
+    case = _case(2, query_width, 140, 64, strided=False)
+    q, k, v, ids, lengths, table = case
+    q.mul_(0.25)
+    positions = torch.arange(140 - query_width, 140, device="cuda").repeat(2)
+    requests = torch.arange(2, dtype=torch.int32, device="cuda").repeat_interleave(
+        query_width
+    )
+    slots = qwen4_exp_qsa_selected_slots(
+        ids.flatten(0, 1),
+        ((positions + 1) // 4).int(),
+        positions,
+        requests,
+        table,
+        64,
+        4,
+        2048,
+        enable_pdl=False,
+    )
+    env_key = "TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_QSA_SPARSE_ATTENTION"
+    monkeypatch.delenv(env_key, raising=False)
+    if override_source == "environment":
+        monkeypatch.setenv(env_key, "cute_dsl")
+    context = (
+        kernel_override("attention", "qsa_sparse_attention", "cute_dsl")
+        if override_source == "context"
+        else nullcontext()
+    )
+    with context:
+        output = qsa_sparse_attention(
+            q.flatten(0, 1),
+            k,
+            v,
+            slots,
+            scale=1 / 16,
+            max_seqlen_q=query_width,
+            metadata_capacity_rows=None,
+            k_scale=None,
+            v_scale=None,
+            override="cute_dsl" if override_source == "callsite" else None,
+            solution=None,
+            sparse_metadata=None,
+        )
+    torch.testing.assert_close(
+        output.cpu().double(),
+        _reference(case, 64, probability_dtype=None).flatten(0, 1),
+        atol=2e-3,
+        rtol=2e-2,
+    )
+
+
+@pytest.mark.parametrize(
+    "invalid", ["q_alignment", "kv_stride", "blocks_stride", "table_stride"]
+)
+def test_dispatch_and_prepared_entry_reject_the_same_tma_layout(invalid):
+    from tokenspeed_kernel.ops.attention.qsa import (
+        QSASparseMetadata,
+        QSAWorkspace,
+        select_qsa_sparse_attention_kernel,
+    )
+
+    case = list(_case(2, 1, 140, 64, strided=False))
+    q, k, v, ids, lengths, table = case
+    if invalid == "q_alignment":
+        case[0] = torch.empty((*q.shape[:-1], 264), dtype=q.dtype, device=q.device)[
+            ..., 1:257
+        ]
+    elif invalid == "kv_stride":
+        case[1] = torch.empty(
+            (k.shape[0] * 2, *k.shape[1:]), dtype=k.dtype, device=k.device
+        )[::2]
+    elif invalid == "blocks_stride":
+        case[3] = torch.empty((2, 1, 1024), dtype=ids.dtype, device=ids.device)[
+            ..., ::2
+        ]
+    else:
+        case[5] = torch.empty(
+            (2, table.shape[1] * 2), dtype=table.dtype, device=table.device
+        )[:, ::2]
+    q, k, v, ids, lengths, table = case
+    metadata = QSASparseMetadata(
+        ids[:, 0],
+        table,
+        torch.arange(2, dtype=torch.int32, device="cuda"),
+        lengths - 1,
+        (0, 1, 2),
+        64,
+        4,
+        QSAWorkspace(),
+        seq_lens=lengths,
+    )
+    selected = select_qsa_sparse_attention_kernel(
+        q[:, 0],
+        k,
+        v,
+        torch.empty((2, 2051), dtype=torch.int32, device="cuda"),
+        max_seqlen_q=None,
+        k_scale=None,
+        v_scale=None,
+        sparse_metadata=metadata,
+        override=None,
+        solution=None,
+    )
+    assert selected.name == "flashinfer_fa2_qsa_sparse_attention"
+    plan = _plan(64, 1, False, query_group_size=1)
+    output, workspace = _buffers(plan, q)
+    with pytest.raises(ValueError, match="aligned|contiguous"):
+        _run(plan, case, output, workspace)

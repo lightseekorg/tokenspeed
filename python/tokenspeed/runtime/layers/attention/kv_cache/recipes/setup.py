@@ -149,6 +149,8 @@ class CacheSetup:
     num_draft_layers: int
     cache_budget_bytes: int
     fixed_workspace_bytes: int
+    local_parent_limit: int
+    agreed_parent_limit: int
     # The linear backend verifies from paged state and owns the planned
     # ``fixed_workspace_bytes`` of verify staging.
     uses_paged_state_verify: bool
