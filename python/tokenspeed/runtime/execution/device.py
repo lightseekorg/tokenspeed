@@ -521,8 +521,8 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
-        l2 = self._l2 if cache_ops else None
-        if l2 is not None:
+        l2 = self._l2
+        if l2 is not None and cache_ops:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
             # default stream the zeroing runs on, before the zeroing is
@@ -543,6 +543,12 @@ class DeviceHandle:
         if l2 is not None:
             # Behind the zeroing: the loads' destinations were zeroed on the
             # default stream, so that is the prerequisite they order after.
+            # Every plan makes the call, with a load or not: it points the
+            # layerwise load waits at this plan's load or at none, so neither
+            # an eager layer nor a prefill graph replay of this plan waits on
+            # an earlier plan's load. Without cache ops it enqueues nothing,
+            # and a draft round still pending from the previous forward began
+            # in that forward, behind the waits for that plan's load.
             l2.submit_load_backs(cache_ops, prerequisite_stream=executor.default_stream)
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,

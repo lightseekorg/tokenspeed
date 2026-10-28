@@ -572,6 +572,10 @@ class HostCacheExecutor:
     def submit_load_backs(self, cache_ops: Sequence, *, prerequisite_stream) -> None:
         """Launch the plan's H2D loads; runs after the plan's page zeroing.
 
+        The device handle calls it on every plan, cache ops or none: it also
+        points the layerwise load trackers at this plan's load, or at none,
+        which is what the forward's layers and a prefill graph replay wait on.
+
         Every load-back row reads a Host L2 entry that is already there (an
         L3 prefetch, when one ran, filled and published it before the
         request was admitted), so a load cannot miss. A ``RestoreOp`` rides

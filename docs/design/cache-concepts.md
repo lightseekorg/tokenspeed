@@ -360,7 +360,12 @@ the pool's layerwise load tracker before their first read or write. A wait in a
 later attention-buffer accessor is too late: the side-cache kernels would
 already be racing the asynchronous H2D restore. Place the fence immediately
 before the first cache-field access so independent projections can still
-overlap the load.
+overlap the load. The fences are eager calls, so a captured prefill graph
+segment holds none: the latent rows an attention prologue writes there (into a
+page a tail hit loads) and the State checkpoint an inline KDA layer reads there
+would race the load. `PrefillGraph.replay` therefore waits for the plan's whole
+Host load before the first segment; a replayed forward overlaps only its
+embedding with that load.
 
 A batched post-verification commit is the one side-cache writer that issues no
 fence of its own. It moves every bound layer's fields in a single launch, so it
