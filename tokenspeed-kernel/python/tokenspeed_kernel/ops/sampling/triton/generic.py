@@ -72,6 +72,10 @@ def _gumbel_sample_generic_pool_kernel(
     top_k_disabled = top_k_raw == TOP_K_DISABLED
     top_k = tl.minimum(tl.maximum(top_k_raw, 1), TOPK_PAD)
     top_k = tl.minimum(top_k, vocab_size)
+    # A block's candidates past the row's top-k never reach the final
+    # top-k (each would need top_k better values already kept), so a
+    # finite top-k inserts only that many; a disabled one inserts none.
+    block_ranks = tl.where(top_k_disabled, 0, top_k)
     min_p = tl.full((), 0.0, tl.float32)
     if min_p_pool_ptr is not None:
         min_p = tl.load(min_p_pool_ptr + pool_idx).to(tl.float32)
@@ -103,10 +107,6 @@ def _gumbel_sample_generic_pool_kernel(
 
         block_top_vals = tl.topk(vals, TOPK_PAD)
         remaining = vals
-        # A block's candidates past the row's top-k never reach the final
-        # top-k (each would need top_k better values already kept), so a
-        # finite top-k inserts only that many; a disabled one inserts none.
-        block_ranks = tl.where(top_k_disabled, 0, top_k)
         for block_rank in tl.range(0, block_ranks):
             cand_val = tl.max(
                 tl.where(rank_offsets == block_rank, block_top_vals, float("-inf")),
@@ -238,7 +238,7 @@ def _gumbel_sample_generic_pool_kernel(
 
         min_p_accept = best_logit >= row_max + min_p_log_threshold
         accepted = (before < (top_p * total)) & min_p_accept
-        take = (disabled_found == 0) & accepted
+        take = accepted
         disabled_token = tl.where(take, best_id, disabled_token)
         disabled_found = tl.where(accepted, 1, disabled_found)
         attempt += 1
