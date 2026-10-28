@@ -613,6 +613,7 @@ def test_route_tiled_gemms_preserve_route_slots(rows: int) -> None:
         BLOCK_N=64,
         BLOCK_K=128,
         BLOCK_M=16,
+        PIPELINE_K=False,
         num_warps=4,
     )
     gluon_mxfp4_moe_stage2_route_tiles_gfx950[(64,)](
@@ -635,6 +636,7 @@ def test_route_tiled_gemms_preserve_route_slots(rows: int) -> None:
         BLOCK_N=16,
         BLOCK_K=128,
         BLOCK_M=16,
+        PIPELINE_K=False,
         num_warps=1,
     )
     owned = (ids.flatten() >= expert_start) & (
@@ -851,7 +853,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
     )
     # The actual startup lifecycle warms families; these held-out tails must
     # execute through public dispatch without compiling new variants.
-    row_counts = (3, 5, 31, 53, 128, 191, 207, 8191, 8192)
+    row_counts = (3, 5, 31, 53, 64, 65, 128, 191, 207, 256, 257, 8191, 8192)
     if ep_size == 1:
         # Exercise every density-selected row tile with an unwarmed token tail.
         row_counts = (*row_counts[:-2], 263, 1031, 2055, 4103, *row_counts[-2:])
