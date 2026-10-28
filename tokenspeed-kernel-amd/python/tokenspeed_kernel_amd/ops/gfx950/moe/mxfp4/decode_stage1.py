@@ -31,6 +31,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel_amd._triton import gl, gluon, triton
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.decode_common import (
+    _direct_mxfp4_k_loop,
     _direct_mxfp4_load_tile,
     _direct_mxfp4_mfma,
     _direct_mxfp4_mfma_layouts,
@@ -403,6 +404,7 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
     BLOCK_N: gl.constexpr,
     BLOCK_K: gl.constexpr,
     BLOCK_M: gl.constexpr,
+    PIPELINE_K: gl.constexpr,
 ):
     """Batch one expert's route tile and store intermediates in token/slot order."""
     gl.static_assert(HIDDEN % BLOCK_K == 0, "route tiles require complete K tiles")
@@ -449,38 +451,37 @@ def gluon_mxfp4_moe_stage1_route_tiles_gfx950(
         ncols = n * BLOCK_N + bn
         nscols = n * BLOCK_N + bsn
         acc = gl.zeros((BLOCK_M, BLOCK_N), gl.float32, mfma)
-        for kt in range(K_PACKED // KP):
-            a, b, sa, sb = _direct_mxfp4_load_tile(
-                kt,
-                ak,
-                bk,
-                ask,
-                bsk,
-                am,
-                asm,
-                x,
-                xscale,
-                w,
-                wscale,
-                xoff,
-                woff,
-                wsoff,
-                ncols,
-                nscols,
-                soff,
-                1,
-                XS0,
-                XS1,
-                SS0,
-                SS1,
-                TWO_I,
-                D,
-                TWO_I,
-                K_PACKED,
-                KP,
-                KS,
-            )
-            acc = _direct_mxfp4_mfma(acc, a, b, sa, sb)
+        acc = _direct_mxfp4_k_loop(
+            acc,
+            ak,
+            bk,
+            ask,
+            bsk,
+            am,
+            asm,
+            x,
+            xscale,
+            w,
+            wscale,
+            xoff,
+            woff,
+            wsoff,
+            ncols,
+            nscols,
+            soff,
+            1,
+            XS0,
+            XS1,
+            SS0,
+            SS1,
+            TWO_I,
+            D,
+            TWO_I,
+            K_PACKED,
+            KP,
+            KS,
+            PIPELINE_K,
+        )
         tile = _direct_swiglu_reduce(acc, 1.0, 0.0, 0.0, BLOCK_N // 2)
         packed, scale = _mxfp4_quantize_tile(tile)
         pr = gl.arange(0, BLOCK_M, layout=gl.SliceLayout(1, packed.type.layout))

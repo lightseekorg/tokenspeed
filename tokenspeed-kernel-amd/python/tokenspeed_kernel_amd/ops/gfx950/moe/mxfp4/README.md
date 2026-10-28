@@ -33,8 +33,10 @@ row), so all row counts sharing a capacity reuse one compilation. The GEMMs
 run a fixed persistent grid over the device-side descriptor count and have no
 row-dependent compile-time parameters.
 `fused/tuning.py:_ROUTE_TILE_CONFIGS` sets which shapes and rows take this path
-and the second GEMM's tile; other rows use the staged package path, which
-produces bitwise-identical results.
+and each GEMM's tile widths, and whether it issues the next K tile's loads
+before the current MFMA (`PIPELINE_K`). Neither changes the K accumulation
+order, so every schedule, and the staged package path that serves the other
+rows, produces bitwise-identical results.
 
 For the staged package's second GEMM, TP uses direct BF16 atomic accumulation
 through 2048 tokens with E2M1 activations (64 with E4M3), and scratch-plus-FP32
@@ -52,7 +54,7 @@ owns only a sparse subset of the routed experts.
 | `__init__.py` | Package exports: the stage invokers, the top-k route entries, the prefill weight aliases, and the scale gather. |
 | `prefill_stage1.py` / `prefill_stage2.py` | Block-ragged MXFP4/MXFP8-activation, MXFP4-weight prefill GEMMs (gdot128-preshuffled weights). |
 | `decode_stage1.py` / `decode_stage2.py` | A4W4 direct and route-tiled MFMA GEMMs. Stage 1 fuses SwiGLU and optional quantization; deferred execution preserves individual stage-2 route outputs. |
-| `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`, and the compact scaled-upcast scale tile `situ_decode.py` reuses. |
+| `decode_common.py` | Direct CDNA4 MFMA primitives shared by both decode stages: tile addressing, MXFP4 operand loads, `mfma_scaled`, the K loop (optionally pipelined), and the compact scaled-upcast scale tile `situ_decode.py` reuses. |
 | `routing.py` | Fused dense top-k route kernels (softmax, sigmoid-bias, and a prefill variant); output is top-k only, **not** ragged metadata (contrast `fused/routing.py`). |
 | `moe_sorting.py` | Block-aligned expert sort for grouped GEMMs and route descriptors for route-tiled GEMMs. |
 | `situ_decode.py` / `situ_grouped.py` | A16W4 in-situ expert-parallel paths: route-direct warp decode reads linear or gdot128 weights, while the contiguous-EP grouped GEMM reads linear weights. |

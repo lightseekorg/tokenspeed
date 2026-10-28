@@ -246,3 +246,143 @@ def _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale):
         b_format="e2m1",
         acc=acc,
     )
+
+
+@gluon.jit
+def _direct_mxfp4_k_loop(
+    acc,
+    ak,
+    bk,
+    ask,
+    bsk,
+    am,
+    asm,
+    x_ptr,
+    x_scale_ptr,
+    w_ptr,
+    w_scale_ptr,
+    x_row_off,
+    w_expert_off,
+    s_expert_off,
+    n_cols,
+    n_cols_s,
+    x_scale_row,
+    stride_xk,
+    stride_xslin,
+    stride_xsnb,
+    stride_slin,
+    stride_snb,
+    N_PHYS,
+    K_DIM,
+    N_DIM,
+    K_PACKED: gl.constexpr,
+    BLOCK_K_PACKED: gl.constexpr,
+    BLOCK_K_SCALE: gl.constexpr,
+    PIPELINE_K: gl.constexpr,
+):
+    """Accumulate every K tile in order into ``acc``.
+
+    ``PIPELINE_K`` holds one K tile in VGPRs while the next tile's loads are
+    issued, so the loads of step ``kt + 1`` overlap the MFMA of step ``kt``.
+    The MFMA order is the same either way, so results are bitwise identical.
+    """
+    NUM_KT: gl.constexpr = K_PACKED // BLOCK_K_PACKED
+    if PIPELINE_K and NUM_KT > 1:
+        a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
+            0,
+            ak,
+            bk,
+            ask,
+            bsk,
+            am,
+            asm,
+            x_ptr,
+            x_scale_ptr,
+            w_ptr,
+            w_scale_ptr,
+            x_row_off,
+            w_expert_off,
+            s_expert_off,
+            n_cols,
+            n_cols_s,
+            x_scale_row,
+            stride_xk,
+            stride_xslin,
+            stride_xsnb,
+            stride_slin,
+            stride_snb,
+            N_PHYS,
+            K_DIM,
+            N_DIM,
+            K_PACKED,
+            BLOCK_K_PACKED,
+            BLOCK_K_SCALE,
+        )
+        for kt in range(0, NUM_KT - 1):
+            next_a, next_b, next_a_scale, next_b_scale = _direct_mxfp4_load_tile(
+                kt + 1,
+                ak,
+                bk,
+                ask,
+                bsk,
+                am,
+                asm,
+                x_ptr,
+                x_scale_ptr,
+                w_ptr,
+                w_scale_ptr,
+                x_row_off,
+                w_expert_off,
+                s_expert_off,
+                n_cols,
+                n_cols_s,
+                x_scale_row,
+                stride_xk,
+                stride_xslin,
+                stride_xsnb,
+                stride_slin,
+                stride_snb,
+                N_PHYS,
+                K_DIM,
+                N_DIM,
+                K_PACKED,
+                BLOCK_K_PACKED,
+                BLOCK_K_SCALE,
+            )
+            acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
+            a, b, a_scale, b_scale = next_a, next_b, next_a_scale, next_b_scale
+        acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
+    else:
+        for kt in range(NUM_KT):
+            a, b, a_scale, b_scale = _direct_mxfp4_load_tile(
+                kt,
+                ak,
+                bk,
+                ask,
+                bsk,
+                am,
+                asm,
+                x_ptr,
+                x_scale_ptr,
+                w_ptr,
+                w_scale_ptr,
+                x_row_off,
+                w_expert_off,
+                s_expert_off,
+                n_cols,
+                n_cols_s,
+                x_scale_row,
+                stride_xk,
+                stride_xslin,
+                stride_xsnb,
+                stride_slin,
+                stride_snb,
+                N_PHYS,
+                K_DIM,
+                N_DIM,
+                K_PACKED,
+                BLOCK_K_PACKED,
+                BLOCK_K_SCALE,
+            )
+            acc = _direct_mxfp4_mfma(acc, a, b, a_scale, b_scale)
+    return acc

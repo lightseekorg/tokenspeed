@@ -1054,9 +1054,10 @@ def _launch_mxfp4_route_tiles(
         SS1=w13_scale.stride(2),
         OS0=q_inter_scale.stride(0),
         OS1=q_inter_scale.stride(1),
-        BLOCK_N=64,
-        BLOCK_K=128,
+        BLOCK_N=config.stage1.block_n,
+        BLOCK_K=config.stage1.block_k,
         BLOCK_M=block_m,
+        PIPELINE_K=config.stage1.pipeline_k,
         num_warps=4,
     )
     gluon_mxfp4_moe_stage2_route_tiles_gfx950[(2048,)](
@@ -1076,9 +1077,10 @@ def _launch_mxfp4_route_tiles(
         SE=w2_scale.stride(0),
         SS0=w2_scale.stride(1),
         SS1=w2_scale.stride(2),
-        BLOCK_N=config.stage2_block_n,
-        BLOCK_K=config.stage2_block_k,
+        BLOCK_N=config.stage2.block_n,
+        BLOCK_K=config.stage2.block_k,
         BLOCK_M=block_m,
+        PIPELINE_K=config.stage2.pipeline_k,
         num_warps=1,
     )
     return out, None, expanded_idx
