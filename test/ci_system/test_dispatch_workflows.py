@@ -1,12 +1,15 @@
+import json
 import os
+import re
 import shlex
 import subprocess
+import sys
 from collections import Counter
 from pathlib import Path
 
 import pytest
 import yaml
-from pipeline import build_matrix
+from pipeline import build_matrix, merge_env, shell_run
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 K8S_RUNNER_PREFIXES = ("b200-", "amd-", "gb200-", "b300-")
@@ -22,6 +25,15 @@ PR_TEST_WORKFLOWS = (
     "amd-mi450-tests.yml",
     "nvidia-b200-tests.yml",
     "pr-test-nvidia-arm.yml",
+)
+MI450_STACK_KEYS = (
+    "ROCM_NIGHTLY_INDEX",
+    "ROCM_SDK_VERSION",
+    "ROCM_SYSTEMS_REF",
+    "TORCH_DEVICE_PACKAGE",
+    "TORCH_INDEX_URL",
+    "TORCH_VERSION",
+    "TORCHVISION_VERSION",
 )
 
 
@@ -44,6 +56,133 @@ def test_pr_workflow_can_classify_pull_request_files(name: str):
         "contents": "read",
         "pull-requests": "read",
     }
+
+
+@pytest.mark.parametrize("group", ["amd-mi350", "amd-mi450"])
+@pytest.mark.parametrize(
+    ("paths", "full_groups", "import_groups"),
+    [
+        (
+            {
+                "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx1250/attention/mha/prefill.py"
+            },
+            {"amd-mi450"},
+            {"amd-mi350"},
+        ),
+        (
+            {"tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/mhc.py"},
+            {"amd-mi350"},
+            {"amd-mi450"},
+        ),
+        (
+            {"tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/_triton.py"},
+            {"amd-mi350", "amd-mi450"},
+            set(),
+        ),
+        (
+            {
+                "tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py"
+            },
+            {"amd-mi450"},
+            set(),
+        ),
+        (
+            {"test/ci/ut/import-tokenspeed-kernel-mi350.yaml"},
+            set(),
+            {"amd-mi350"},
+        ),
+        (
+            {"test/ci_system/mi450_sim_env.sh"},
+            {"amd-mi450"},
+            {"amd-mi450"},
+        ),
+    ],
+)
+def test_amd_workflow_builds_architecture_matrices(
+    tmp_path, group, paths, full_groups, import_groups
+):
+    workflow = load_yaml(REPO_ROOT / f".github/workflows/{group}-tests.yml")
+    step = next(
+        step for step in workflow["jobs"]["scan"]["steps"] if step.get("id") == "scan"
+    )
+    changed = tmp_path / "tokenspeed-changed-files.txt"
+    changed.write_text("\n".join(sorted(paths)))
+    classified = subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "test/ci_system/ci_path_filter.py"),
+            "--runner-group",
+            group,
+            "--event-name",
+            "pull_request",
+            "--repo-root",
+            str(REPO_ROOT),
+            str(changed),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    flags = dict(line.split("=", 1) for line in classified.stdout.splitlines())
+    full = flags["should_run"] == "true"
+    imports = flags["should_run_import_check"] == "true"
+    assert full == (group in full_groups)
+    assert imports == (group in import_groups)
+    script = (
+        step["run"]
+        .replace("${{ steps.changes.outputs.should_run }}", str(full).lower())
+        .replace(
+            "${{ steps.changes.outputs.should_run_import_check }}", str(imports).lower()
+        )
+    )
+    script = re.sub(r"\$\{\{ github.event_name.*?\}\}", "per-commit", script)
+    output = tmp_path / "outputs"
+    env = {
+        **os.environ,
+        "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_OUTPUT": str(output),
+        "TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS": "",
+    }
+    result = subprocess.run(
+        ["bash", "-c", script], cwd=REPO_ROOT, env=env, capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+    values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    matrices = {
+        stage: json.loads(values[f"{stage}_matrix"])["include"]
+        for stage in ("unit", "model", "import")
+    }
+    assert bool(matrices["unit"]) == full
+    if not full:
+        assert matrices["model"] == []
+    assert bool(matrices["import"]) == imports
+    assert all(entry["workflow_stage"] == "unit-test" for entry in matrices["unit"])
+    assert all(entry["workflow_stage"] == "model-test" for entry in matrices["model"])
+    if imports:
+        suffix = "mi350" if group == "amd-mi350" else "mi450-sim"
+        assert [entry["config"] for entry in matrices["import"]] == [
+            f"test/ci/ut/import-tokenspeed-kernel-{suffix}.yaml"
+        ]
+
+
+@pytest.mark.parametrize("name", ["amd-mi350-tests.yml", "amd-mi450-tests.yml"])
+@pytest.mark.parametrize("failed", [None, "SCAN_RESULT", "IMPORT_CHECK_RESULT"])
+def test_amd_finish_rejects_scan_and_import_failures(tmp_path, name, failed):
+    workflow = load_yaml(REPO_ROOT / ".github/workflows" / name)
+    step = workflow["jobs"]["finish"]["steps"][0]
+    env = {**os.environ, **{key: "skipped" for key in step["env"]}}
+    env["SCAN_RESULT"] = "success"
+    if failed is not None:
+        env[failed] = "failure"
+    result = subprocess.run(
+        ["bash", "-c", step["run"]],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert (result.returncode == 0) == (failed is None), result.stdout
 
 
 def run_slurm_dispatch_script(
@@ -1275,19 +1414,99 @@ def test_mi450_sim_uses_bounded_smoke_suite():
     assert "tokenspeed-kernel/test/amd/ops/attention" in task["env"]["MI450_SIM_TESTS"]
 
 
+def mi450_env_dump_command():
+    code = (
+        "import json, os; "
+        f"print(json.dumps({{key: os.environ[key] for key in {MI450_STACK_KEYS!r}}}))"
+    )
+    return f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+
+
+def read_mi450_sim_env(path):
+    result = subprocess.run(
+        ["sh", "-c", f'. "$1"\n{mi450_env_dump_command()}', "mi450-env", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize(
+    "task_name", ["import-tokenspeed-kernel", "ut-tokenspeed-kernel"]
+)
+@pytest.mark.parametrize("case", ["success", "missing-env", "setup-failure"])
+def test_mi450_installers_receive_shared_stack(tmp_path, task_name, case):
+    task = load_yaml(REPO_ROOT / f"test/ci/ut/{task_name}-mi450-sim.yaml")
+    scripts = tmp_path / "test/ci_system"
+    scripts.mkdir(parents=True)
+    profile = scripts / "mi450_sim_env.sh"
+    if case != "missing-env":
+        # A shared-file edit must reach both installers without task YAML edits.
+        profile.write_text(
+            (REPO_ROOT / "test/ci_system/mi450_sim_env.sh").read_text()
+            + "\nexport ROCM_SYSTEMS_REF=test-shared-revision\n"
+        )
+    # Replace only the installers that need root and external package downloads.
+    (scripts / "setup_mi450_sim.sh").write_text(
+        f"{mi450_env_dump_command()} > setup-env.json\n"
+        f"exit {73 if case == 'setup-failure' else 0}\n"
+    )
+    (scripts / "install_deps_rocm.sh").write_text(
+        'test "$WORKSPACE" = "$PWD" || exit 1\n'
+        'test "$GFX_ARCH" = gfx1250 || exit 1\n'
+        f"{mi450_env_dump_command()} > deps-env.json\n"
+    )
+    env = merge_env(task["env"])
+    env.update({key: "stale-runner-value" for key in MI450_STACK_KEYS})
+    for command in task["install"]:
+        result = shell_run(command, env=env, cwd=tmp_path, dry_run=False, check=False)
+        if result["returncode"]:
+            break
+
+    if case == "missing-env":
+        assert result["returncode"] != 0
+        assert not (tmp_path / "setup-env.json").exists()
+    else:
+        expected = read_mi450_sim_env(profile)
+        assert json.loads((tmp_path / "setup-env.json").read_text()) == expected
+        assert result["returncode"] == (73 if case == "setup-failure" else 0)
+    if case == "success":
+        assert json.loads((tmp_path / "deps-env.json").read_text()) == expected
+    else:
+        assert not (tmp_path / "deps-env.json").exists()
+
+
+def test_standalone_mi450_setup_loads_shared_stack(tmp_path):
+    scripts = tmp_path / "setup with spaces"
+    scripts.mkdir()
+    for name in ("setup_mi450_sim.sh", "mi450_sim_env.sh"):
+        (scripts / name).write_text((REPO_ROOT / "test/ci_system" / name).read_text())
+    # Stop at the first privileged operation; no packages or GPU are accessed.
+    sudo = scripts / "sudo"
+    sudo.write_text(f"#!/bin/sh\n{mi450_env_dump_command()}\nexit 73\n")
+    sudo.chmod(0o755)
+    env = {**os.environ, **{key: "stale-runner-value" for key in MI450_STACK_KEYS}}
+    env["PATH"] = f"{scripts}:{env['PATH']}"
+    result = subprocess.run(
+        ["bash", str(scripts / "setup_mi450_sim.sh")],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 73, result.stderr
+    assert json.loads(result.stdout) == read_mi450_sim_env(scripts / "mi450_sim_env.sh")
+
+
 def test_mi450_sim_pins_one_rocm_nightly():
-    env = load_yaml(REPO_ROOT / "test/ci/ut/ut-tokenspeed-kernel-mi450-sim.yaml")["env"]
-    setup_script = (REPO_ROOT / "test/ci_system/setup_mi450_sim.sh").read_text()
+    env = read_mi450_sim_env(REPO_ROOT / "test/ci_system/mi450_sim_env.sh")
 
     # PyTorch requires the exact ROCm SDK build it was built against.
     rocm_build = f"+rocm{env['ROCM_SDK_VERSION']}"
     for name in ("TORCH_VERSION", "TORCHVISION_VERSION", "TORCH_DEVICE_PACKAGE"):
         assert env[name].endswith(rocm_build), name
-    # Standalone runs of the setup script default to the lane's pins, and a
-    # cached rocJITsu build is reused only for those same pins.
-    for name in ("ROCM_SYSTEMS_REF", "ROCM_SDK_VERSION"):
-        assert f"{name}=${{{name}:-{env[name]}}}" in setup_script
-    assert 'build_key="${ROCM_SYSTEMS_REF}:${ROCM_SDK_VERSION}"' in setup_script
+    assert env["TORCH_INDEX_URL"] == env["ROCM_NIGHTLY_INDEX"]
 
 
 def test_mi450_sim_uses_stock_triton_compatible_libhip_path():

@@ -1293,6 +1293,55 @@ When the grid leaves CUs idle, the launcher splits the KV stream and
 most one wave of CTAs and stream at least four pages each, since every split
 pays a fixed prologue and an FP32 partial store.
 
+### gfx1250 MHA prefill
+
+The kernel computes causal attention over packed sequences with equal or ragged
+lengths. It supports BF16, FP16, and FP8, head dimensions 64 and 128, grouped
+query heads, sliding windows, sinks, and natural-log LSE output.
+
+BF16/FP16 use finite tile and wave-count buckets. Compatible GQA groups pack
+query heads into matrix rows so they share K/V loads. Short sequences use one-
+or two-key-tile schedules with TDM query loads and fused K/V transfers. Short
+eight-wave tiles preserve wave ownership through the output store. Long
+sequences overlap K/V transfers with QK, softmax, and PV through a double
+buffer; selected layouts defer probability reductions to reduce loop work.
+
+Strongly imbalanced ragged batches compact live query tiles onto the grid.
+Partial query tiles remain masked and can use smaller matrices while reusing
+resident K/V. Request counts, uniform lengths, and tail lengths are runtime
+values; changing them within a tile/feature bucket does not recompile kernels.
+The launch policy and its thresholds live in `mha/prefill.py`.
+
+QK and PV accumulate in FP32. The denominator uses probabilities before rounding
+them to the input dtype for PV. Dot products must be finite in FP32. Online
+softmax subtracts the maximum before scaling, preserving large finite scores.
+Sink-derived initial references are capped at the FP32 maximum to prevent
+positive overflow when converting to unscaled score units.
+The fixed-shift schedule changes probability rounding, so its results are
+numerically equivalent within tolerance, rather than bitwise identical.
+
+The normalization modes have these prerequisites and numerical bounds:
+
+| Mode | Eligibility | Numerical contract |
+| --- | --- | --- |
+| Online softmax | General path, including FP8 and windows | Keep the maximum in unscaled score units; update it and rescale FP32 state for each key tile. |
+| Single-tile normalization | Short BF16/FP16, D128, 256 query rows, 128 keys, eight waves, no sinks/LSE | Subtract the tile maximum, accumulate the FP32 denominator, then round probabilities for PV. A finite maximum seed gives masked rows zero probability. |
+| Fixed first-tile shift | BF16/FP16, four waves, D64/D128, 64/128-key tiles, no window, at least three key tiles | Keep the first tile's shift. Require an absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. |
+| Online retry | Any valid row fails a fixed-shift guard | Recompute the workgroup with subtract-before-scale online softmax in the same launch and buffers, overwriting provisional output and LSE. |
+
+The shift bound limits cancellation; NaN-propagating reductions detect invalid
+output, and the denominator bound prevents reciprocal underflow. Masked rows do
+not participate in retry decisions. Guards evaluate current tensor values on
+every graph replay; high-range inputs can pay for both passes.
+
+LSE describes key logits and excludes sinks. When both are requested, the kernel
+writes key-only LSE before adding sinks to output normalization with stable
+rescaling. For BF16, values and the final denominator share a power-of-two
+downscale based on sequence length, bounding the online value sum before sink
+rescaling without changing probability rounding or key-only LSE. Tests cover
+this contract with independent FP64 attention, changing graph inputs, storage
+offsets, ragged boundaries, and bounded JIT specialization.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
@@ -1354,6 +1403,49 @@ and scaled), beta-scaled v, beta and decay into LDS once, so the serial steps
 wait only on LDS rather than one global round trip per token. The kernel is
 HBM bound: it reads the state once and writes it once per destination.
 
+### KDA chunked prefill (gfx950 / gfx1250)
+
+`gluon_kda_paged_prefill_gfx950` and `gluon_kda_paged_prefill_gfx1250` run
+KDA prefill over packed variable-length sequences, from and into the V-major
+state layout of the decode pool.
+
+#### Contract
+
+- q, k and raw g are `[1, T, H, K]`, v is `[1, T, H, V]` and beta logits are
+  `[1, T, H]`, in FP16 or BF16, with `K = V = 128`. A_log is `[H]` and
+  dt_bias `[H, K]`. An optional `lower_bound` selects the safe decay gate.
+- `cu_seqlens` (`[N + 1]`) delimits the sequences, which may be empty. The
+  initial and final states are FP32 `[N, H, V, K]`.
+- `cu_seqlens_cpu`, the host copy of the bounds, lets the chunk schedule be
+  planned on the host without a device read-back. The plan is reused by
+  tensor identity across the layers of a forward. Without it, `cu_seqlens`
+  is read back on each call.
+- Token, sequence, chunk and time-group counts are runtime values. Row
+  blocks and warp counts come from a fixed menu.
+
+#### Algorithm
+
+Sequences are cut into 64-token chunks that never cross a sequence boundary.
+One prepare program per (chunk, head) computes the gated, L2-normalized q and
+k, the chunk's cumulative decay, Aqk, and W and U through the FP32 inverse of
+`I + Akk`: its 16-token diagonal blocks by repeated squaring and the
+off-diagonal blocks from band-shifted products, with beta folded into its
+columns. It writes W, U, Qg, Kg, Aqk and exp2 of each chunk's last decay.
+
+A state walk then carries the state across the chunks. Each warp keeps 16
+state rows in registers, W, U, Kg, Qg and Aqk stream through a two-slot LDS
+ring, and the chunk output is written in the same pass. When too few
+sequences would leave CUs idle, each sequence is split into up to 32 time
+groups. Every group but the last is summarized as `S_out = S_in M + B`, a
+chain kernel turns the summaries into each group's entry state, and all
+groups then walk at once; the last one writes the final state.
+
+gfx1250 loads every tile with TDM, picks WMMA layouts whose results feed the
+next product without leaving registers, walks with the `coexec` scheduler
+(which the backend otherwise applies only up to four warps), and prefetches
+M and B three groups ahead in the chain. gfx950 uses MFMA and schedules its
+prepare kernel with `max-ilp`.
+
 ### KDA records verify and commit (gfx950 / gfx1250)
 
 Standard target decode is a one-token verify window. Both standard and
@@ -1361,8 +1453,8 @@ speculative decode follow verify, acceptance, and commit. Verify retains
 the Gluon fused convolution, LDS vectors and batched value-split selection.
 GFX950 uses 32-row state panels for one-token windows with a bounded gate
 and no value split. Other cases use 16-row panels. Verify preserves committed
-FP32 state. It saves correction U in FP32, and unnormalized K and raw gate in
-the activation dtype.
+FP32 or BF16 state and widens it to FP32. It saves correction U in FP32,
+and unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
 the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
@@ -1390,9 +1482,9 @@ instrumentation. Interval and generation guards remain active; invalid
 records are skipped without device assertions.
 
 Batched descriptors use the shared ten-column table: original QKV (0), conv
-history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
-The remaining columns are reserved. Recovery retains one program per head,
-request and layer. It stages accepted
+history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 or BF16
+state (8). The remaining columns are reserved. Recovery retains one program
+per head, request and layer. It stages accepted
 U, K and raw gate once in LDS, then applies the same updates per value panel.
 It commits each head's convolution history after loading all old taps,
 including when source and destination alias. History retains its bound pool

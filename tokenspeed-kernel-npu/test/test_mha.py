@@ -80,6 +80,38 @@ def test_mha_prefill() -> None:
     torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
+def test_mha_prefill_from_fused_qkv() -> None:
+    """Prefill must accept q/k/v split views of one fused qkv projection.
+
+    The model hands the kernel q/k/v carved out of a single fused output, so
+    each is a non-contiguous view. FIA's non-paged path rejects those.
+    """
+    lengths = [3, 5]
+    q_heads, kv_heads, head_size = 4, 2, 64
+    total = sum(lengths)
+    qkv = torch.randn(
+        total, (q_heads + 2 * kv_heads) * head_size, dtype=torch.bfloat16, device="npu"
+    )
+    q, k, v = qkv.split(
+        [q_heads * head_size, kv_heads * head_size, kv_heads * head_size], dim=-1
+    )
+    q = q.view(-1, q_heads, head_size)
+    k = k.view(-1, kv_heads, head_size)
+    v = v.view(-1, kv_heads, head_size)
+    assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+    cumulative = torch.tensor([0, 3, 8], dtype=torch.int32, device="npu")
+
+    output = mha_prefill(q, k, v, cumulative, [0, 3, 8], max(lengths))
+    expected = torch.cat(
+        [
+            _attention(q[:3], k[:3], v[:3], causal=True),
+            _attention(q[3:], k[3:], v[3:], causal=True),
+        ]
+    )
+
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
+
+
 def test_mha_extend_with_paged_cache() -> None:
     page_size = 128
     q_lengths = [2, 3]

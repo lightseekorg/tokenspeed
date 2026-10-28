@@ -31,7 +31,7 @@ pub enum Routing {
     /// Prefill/decode disaggregation: rank `bootstrap_room % num_engines`,
     /// or the rank a request's `data_parallel_rank` pins it to. Every
     /// request must carry a `bootstrap_room`. A prefill pin must match the
-    /// room residue (checked at ingress); a decode pin may differ.
+    /// room residue; a decode pin may differ.
     BootstrapRoom,
 }
 

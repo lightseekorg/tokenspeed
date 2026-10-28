@@ -212,39 +212,55 @@ class TestInklingReferenceParity:
         identity is noise — but the logprob values themselves are a sharp
         full-stack numerical check.
         """
-        from tokenspeed.runtime.entrypoints.engine import Engine
+        from tokenspeed.runtime.entrypoints.wire_driver import (
+            WireDriver,
+            generate_request,
+        )
 
-        engine = Engine(
-            disable_autotune=True,
-            model=INKLING_BF16,
-            hf_overrides=truncation_hf_overrides(),
-            load_format="dummy",
-            attention_backend="fa4",
-            enable_prefix_caching=False,
-            disable_kvstore=True,
-            enforce_eager=True,
-            enable_output_logprobs=True,
-            dtype="bfloat16",
-            gpu_memory_utilization=0.3,
-            max_model_len=2048,
-            max_num_seqs=4,
-            log_level="warning",
+        engine = WireDriver(
+            [
+                "--disable-autotune",
+                "--model",
+                INKLING_BF16,
+                "--hf-overrides",
+                truncation_hf_overrides(),
+                "--load-format",
+                "dummy",
+                "--attention-backend",
+                "fa4",
+                "--disable-prefix-caching",
+                "--disable-kvstore",
+                "--enforce-eager",
+                "--enable-output-logprobs",
+                "--dtype",
+                "bfloat16",
+                "--gpu-memory-utilization",
+                "0.3",
+                "--max-model-len",
+                "2048",
+                "--max-num-seqs",
+                "4",
+                "--log-level",
+                "warning",
+            ],
+            num_engines=1,
+            routing="round_robin",
+            startup_timeout_s=3600,
         )
         try:
-            out = engine.generate(
-                input_ids=PROMPT_IDS,
-                sampling_params={
-                    "temperature": 0.0,
-                    "max_new_tokens": DECODE_STEPS,
-                },
-                return_logprob=True,
+            [result] = engine.generate(
+                [
+                    generate_request(
+                        PROMPT_IDS,
+                        {"temperature": 0.0, "max_new_tokens": DECODE_STEPS},
+                        return_logprob=True,
+                    )
+                ]
             )
-            result = out if isinstance(out, dict) else out[0]
-            engine_ids = result["output_ids"][-DECODE_STEPS:]
-            meta = result["meta_info"]
-            # List of (logprob, token_id, ...) per generated token. (Prompt
-            # logprobs are not supported by the engine yet.)
-            output_lps = meta["output_token_logprobs"]
+            engine_ids = result.output_ids[-DECODE_STEPS:]
+            # (logprob, token_id) per generated token. (Prompt logprobs are
+            # not supported by the engine yet.)
+            output_lps = list(zip(result.output_token_logprobs, result.output_ids))
         finally:
             engine.shutdown()
         assert (len(output_lps)) == (DECODE_STEPS)

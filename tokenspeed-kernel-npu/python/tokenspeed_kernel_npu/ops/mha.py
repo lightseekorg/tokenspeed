@@ -82,10 +82,12 @@ def mha_prefill(
         sinks=sinks,
         return_lse=return_lse,
     )
+    # q/k/v usually arrive as views split out of one fused qkv projection, and
+    # the non-paged FIA path rejects non-contiguous inputs.
     output, _ = torch_npu.npu_fused_infer_attention_score(
-        q,
-        k,
-        v,
+        q.contiguous(),
+        k.contiguous(),
+        v.contiguous(),
         atten_mask=_causal_mask(q.device),
         actual_seq_lengths=cu_seqlens_cpu[1:],
         actual_seq_lengths_kv=cu_seqlens_cpu[1:],

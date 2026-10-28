@@ -90,30 +90,56 @@ def prepare_w4a4_grouped_plan(weights: W4A4MoePlan) -> W4A4GroupedPlan:
     return W4A4GroupedPlan(weights, encode(weights.scale13), encode(weights.scale2))
 
 
-def w4a4_grouped_experts(x, counts, *, rows, plan: W4A4GroupedPlan):
-    """Execute sorted, unpadded rows with Cube FlatQuant and two separate GMMs.
+def w4a4_grouped_experts(
+    x,
+    ids,
+    weights,
+    *,
+    expert_start: int,
+    num_experts: int,
+    plan: W4A4GroupedPlan,
+):
+    """Return local BF16 expert partials using official routing and GMMs.
 
-    ``counts`` is INT64 [local_experts], containing row counts, not offsets.
-    ``rows`` gathers input tokens into contiguous expert order. FlatQuant13
-    runs once per input token before that gather. No EP communication
-    happens here. NZ-transposed weights are passed as transpose views, not
-    repacked in forward. GMM's BF16 output has the official FP16 intermediate
-    rounding, unlike the fused operator's INT32/vector dequantization.
+    ``ids`` contains group-local expert IDs, with the same [tokens, topk]
+    shape as ``weights``. Only the interval starting at ``expert_start`` and
+    owned by ``plan.weights`` contributes. ``num_experts`` includes identity
+    experts, which stay outside that interval. No EP communication happens
+    here. FlatQuant13 runs once per input token before routing; NZ weights
+    retain their prepared storage. Official GMM's BF16 output rounds through
+    FP16, unlike the fused operator's INT32/vector dequantization.
     """
     import flash_ops  # noqa: F401
     import torch_npu
 
-    if rows.numel() == 0:
-        return x.new_empty((0, x.shape[1]))
     state = plan.weights
+    local_experts = state.w13.shape[0]
+    if (
+        x.ndim != 2
+        or x.dtype != torch.bfloat16
+        or ids.ndim != 2
+        or ids.shape != weights.shape
+        or ids.shape[0] != x.shape[0]
+        or ids.shape[1] == 0
+        or ids.dtype != torch.int32
+        or weights.dtype not in (torch.bfloat16, torch.float32)
+        or ids.device != x.device
+        or weights.device != x.device
+        or expert_start < 0
+        or expert_start + local_experts > num_experts
+    ):
+        raise ValueError("Invalid W4A4 expert routing inputs or local interval")
+    if x.shape[0] == 0:
+        return torch.empty_like(x)
 
-    def quantize(value, stage):
+    def quantize(value, stage, *, counts):
         packed, scales = torch.ops.custom.flat_quant(
             value.reshape(value.shape[0], stage.left.shape[0], stage.right.shape[0]),
             stage.left,
             stage.right,
             clip_ratio=stage.clip,
             dst_dtype=16,
+            group_list=counts,
             group_list_type=1,
         )
         return packed.flatten(1), scales.float()
@@ -133,12 +159,37 @@ def w4a4_grouped_experts(x, counts, *, rows, plan: W4A4GroupedPlan):
             group_list_type=1,
         )[0]
 
-    packed, scales = quantize(x, state.first)
-    packed, scales = packed[rows], scales[rows]
+    packed, scales = quantize(x, state.first, counts=None)
+    # quant_mode=-1 copies packed INT4 as opaque INT8 bytes and applies the
+    # same permutation to FP32 token scales; it does not quantize again.
+    expanded, rows, counts, scales = torch_npu.npu_moe_init_routing_v2(
+        packed.view(torch.int8),
+        ids,
+        scale=scales,
+        active_num=ids.numel(),
+        expert_num=num_experts,
+        quant_mode=-1,
+        active_expert_range=[expert_start, expert_start + local_experts],
+        expert_tokens_num_type=1,
+        expert_tokens_num_flag=True,
+        row_idx_type=0,
+        drop_pad_mode=0,
+    )
+    packed = expanded.view(torch.int32)
     hidden = matmul(packed, scales, state.w13, plan.scale13)
-    hidden = torch_npu.npu_swiglu(hidden, dim=-1)
-    packed, scales = quantize(hidden, state.second)
-    return matmul(packed, scales, state.w2, plan.scale2)
+    # The capacity tail can be unwritten when other shards or identity
+    # experts own routes. Group-aware consumers read only the valid prefix.
+    hidden = torch_npu.mlp_split_swiglu(
+        hidden,
+        counts.to(torch.int32),
+        local_exp_start=0,
+        local_exp_end=local_experts,
+    )
+    packed, scales = quantize(hidden, state.second, counts=counts)
+    hidden = matmul(packed, scales, state.w2, plan.scale2)
+    return torch_npu.npu_moe_finalize_routing(
+        hidden.unsqueeze(1), None, None, None, weights, rows, ids, 3
+    )
 
 
 def prepare_flatquant_stage(left, right, clip, *, width: int) -> FlatQuantStage:

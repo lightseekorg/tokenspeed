@@ -123,10 +123,6 @@ class TestAttentionBackendChoices:
             with pytest.raises((ValueError), match=(f"Unknown {flag} 'bogus'")):
                 registry.validate_attention_backend_name("bogus", flag=flag)
 
-    def test_inline_detokenizer_is_forced_on(self):
-        args = prepare_server_args(["--model", "x"])
-        assert args.enable_inline_detokenizer
-
     def test_kda_prefill_graph_uses_shared_args_not_worker_environment(self, subtests):
         spec = MHAConfig(
             num_attention_heads=4, num_kv_heads=4, head_dim=128, attn_tp_size=1

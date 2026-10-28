@@ -79,7 +79,6 @@ class TestSplitHeadlessArgv:
             "--engine-startup-timeout",
             "--gateway-startup-timeout",
             "--drain-timeout",
-            "--control-port",
         ],
     )
     def test_orchestrator_flags_rejected(self, flag):
@@ -218,6 +217,12 @@ class TestHandshakeEndpointDefaults:
             )
         )
         assert composed == "tcp://127.0.0.1:30500"
+        ipv6 = server_args.ServerArgs.zmq_handshake_endpoint(
+            types.SimpleNamespace(
+                data_parallel_address="fd00::5", data_parallel_rpc_port=31000
+            )
+        )
+        assert ipv6 == "tcp://[fd00::5]:31000"
 
     @pytest.mark.parametrize(
         "flag, value",

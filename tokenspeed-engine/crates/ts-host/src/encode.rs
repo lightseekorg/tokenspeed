@@ -23,17 +23,14 @@
 //!
 //! The embedded interpreter loads the vision tower and allocates the send
 //! ring. The host then starts the embedding sender over the ring (the
-//! attention-TP group's first rank also the node's bootstrap server and the
-//! request intake), connects the group's mesh, and runs `ts-control`'s
-//! encode loop, whose data-plane calls go to the forward thread; the
-//! completion query runs on this, the control thread.
+//! attention-TP group's first rank also hosts the node's bootstrap server
+//! and dials the frontend, which sends it the encode requests), connects the
+//! group's mesh, and runs `ts-control`'s encode loop, whose data-plane calls
+//! go to the forward thread; the completion query runs on this, the control
+//! thread.
 
 use std::{
-    sync::{
-        atomic::AtomicBool,
-        mpsc::{self, RecvTimeoutError, TryRecvError},
-        Arc, Mutex, MutexGuard,
-    },
+    sync::{atomic::AtomicBool, mpsc, Arc, Mutex, MutexGuard},
     thread,
     time::Duration,
 };
@@ -47,25 +44,34 @@ use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     encode::{EncodeConfig, EncodeDataPlane, EncodeLoop, EncodedRows, Intake, Ring},
     event_loop::DataPlaneError,
+    transport::EncodeIntake,
 };
 use ts_pd::{
     bootstrap::{BootstrapServer, Registry},
     epd::sender::{Sender, SenderConfig},
     PeerConfig,
 };
-use zeromq::{Socket, SocketRecv};
+use ts_wire::EngineCoreReadyResponse;
 
 use crate::{data_plane::describe, python_error, HostError, HANDSHAKE_TIMEOUT};
 
 /// The attention-TP group's collective id.
 const TP_GROUP: u32 = 0;
 
+/// Where the first rank dials its frontend, as which engine, and the ready
+/// response it registers with.
+struct FrontendDial {
+    handshake_address: String,
+    engine_index: u16,
+    ready_response: Vec<u8>,
+}
+
 /// What `encode_host.EncodeSettings` carries.
 struct Settings {
     rank: usize,
     tp_ranks: Vec<usize>,
     collective_bind_host: String,
-    intake: Option<String>,
+    frontend: Option<FrontendDial>,
     bootstrap_port: Option<u16>,
     sender: SenderConfig,
     config: EncodeConfig,
@@ -88,7 +94,14 @@ impl Settings {
         Ok(Self {
             rank,
             collective_bind_host: get("collective_bind_host")?.extract()?,
-            intake: get("intake")?.extract()?,
+            frontend: match get("handshake_address")?.extract::<Option<String>>()? {
+                Some(handshake_address) => Some(FrontendDial {
+                    handshake_address,
+                    engine_index: get("engine_index")?.extract()?,
+                    ready_response: get("ready_response")?.extract()?,
+                }),
+                None => None,
+            },
             bootstrap_port: get("bootstrap_port")?.extract()?,
             sender: SenderConfig {
                 peer: PeerConfig {
@@ -151,12 +164,20 @@ pub fn serve(bootstrap: Py<PyAny>, stop: &AtomicBool) -> Result<(), HostError> {
     })?;
     let mesh = Mesh::connect(settings.rank, listener, &addresses, HANDSHAKE_TIMEOUT)?;
     let group = Group::new(TP_GROUP, settings.tp_ranks.clone(), settings.rank)?;
-    let intake = settings
-        .intake
-        .as_deref()
-        .map(ZmqIntake::bind)
-        .transpose()?
-        .map(|intake| Box::new(intake) as Box<dyn Intake + Send>);
+    let intake = match &settings.frontend {
+        Some(dial) => {
+            let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&dial.ready_response)?;
+            ready.declare_encoder();
+            let intake = EncodeIntake::connect(
+                &dial.handshake_address,
+                dial.engine_index,
+                ready,
+                HANDSHAKE_TIMEOUT,
+            )?;
+            Some(Box::new(intake) as Box<dyn Intake + Send>)
+        }
+        None => None,
+    };
 
     for method in ["report_ready", "enter_serving"] {
         Python::attach(|py| {
@@ -178,66 +199,6 @@ pub fn serve(bootstrap: Py<PyAny>, stop: &AtomicBool) -> Result<(), HostError> {
     // Stops the forward thread and the sender's threads.
     drop(encode);
     Ok(served?)
-}
-
-/// The first rank's PULL socket for the frontend's encode requests.
-struct ZmqIntake {
-    messages: mpsc::Receiver<Vec<Bytes>>,
-    _runtime: tokio::runtime::Runtime,
-}
-
-impl ZmqIntake {
-    /// Bind `endpoint` (`tcp://host:port`), which the frontend connects to.
-    fn bind(endpoint: &str) -> Result<Self, HostError> {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("ts-encode-intake")
-            .enable_all()
-            .build()?;
-        let mut pull = zeromq::PullSocket::new();
-        runtime
-            .block_on(pull.bind(endpoint))
-            .map_err(|error| HostError::Interpreter(format!("binding {endpoint}: {error}")))?;
-        let (incoming, messages) = mpsc::channel();
-        runtime.spawn(async move {
-            loop {
-                match pull.recv().await {
-                    Ok(message) => {
-                        if incoming.send(message.into_vec()).is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "the encode request socket closed");
-                        return;
-                    }
-                }
-            }
-        });
-        Ok(Self {
-            messages,
-            _runtime: runtime,
-        })
-    }
-}
-
-impl Intake for ZmqIntake {
-    fn receive(&mut self, wait: Duration) -> Vec<Vec<Bytes>> {
-        let first = if wait.is_zero() {
-            self.messages.try_recv().map_err(|error| match error {
-                TryRecvError::Empty => RecvTimeoutError::Timeout,
-                TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
-            })
-        } else {
-            self.messages.recv_timeout(wait)
-        };
-        let Ok(first) = first else {
-            return Vec::new();
-        };
-        let mut received = vec![first];
-        received.extend(self.messages.try_iter());
-        received
-    }
 }
 
 /// An operation for the forward thread.

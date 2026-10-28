@@ -18,7 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""``/update_weights_from_mooncake`` from the HTTP route down to the SDK call.
+"""The ``UpdateWeightsFromMooncake`` control operation from the device down
+to the SDK call.
 
 The Model Updater SDK is not a dependency: the adapter is exercised against a
 fake module installed in ``sys.modules`` under the configured import path.
@@ -33,16 +34,10 @@ from unittest import mock
 
 import pytest
 import torch
-from fastapi.testclient import TestClient
 
 from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromMooncakeReqInput,
-    mooncake_load_weight_version,
-)
-from tokenspeed.runtime.entrypoints import control_server
-from tokenspeed.runtime.entrypoints.sglang_compat_http import (
-    build_sglang_compat_app,
 )
 from tokenspeed.runtime.execution.device import DeviceHandle
 from tokenspeed.runtime.execution.drafter.base import BaseDrafter
@@ -52,116 +47,6 @@ from tokenspeed.runtime.execution.model_update import (
     model_update_adapter_for,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs, prepare_server_args
-
-# --------------------------------------------------------------------------
-# HTTP route
-# --------------------------------------------------------------------------
-
-
-class _FakeLLM:
-    def __init__(self, *, storage_backend=None) -> None:
-        self.server_args = SimpleNamespace(
-            weight_version="default",
-            model="model-x",
-            kvstore_storage_backend=storage_backend,
-            rl_control_api_key=None,
-        )
-        self.updates: list = []
-        self.succeed = True
-
-    async def update_weights_from_mooncake(self, obj):
-        self.updates.append(obj)
-        return self.succeed, "applied"
-
-
-def _post(llm, body):
-    return TestClient(build_sglang_compat_app(llm)).post(
-        "/update_weights_from_mooncake", json=body
-    )
-
-
-def test_route_requires_an_integer_version():
-    llm = _FakeLLM()
-    for body in ({}, {"version": "3"}, {"version": 3.5}, {"version": True}):
-        response = _post(llm, body)
-        assert response.status_code == 400, body
-        assert not response.json()["success"]
-    assert llm.updates == []
-    assert llm.server_args.weight_version == "default"
-
-
-def test_flushed_load_defaults_the_namespace_to_the_version_and_stamps():
-    llm = _FakeLLM()
-    response = _post(llm, {"version": 7})
-    assert response.status_code == 200
-    (req,) = llm.updates
-    assert isinstance(req, UpdateWeightsFromMooncakeReqInput)
-    assert (req.version, req.flush_cache, req.weight_version) == (7, True, "7")
-    assert llm.server_args.weight_version == "7"
-    assert "Weight version updated to 7" in response.json()["message"]
-
-
-def test_explicit_weight_version_and_unflushed_load():
-    llm = _FakeLLM()
-    response = _post(llm, {"version": 7, "weight_version": "ckpt-7"})
-    assert response.status_code == 200
-    assert llm.updates[-1].weight_version == "ckpt-7"
-    assert llm.server_args.weight_version == "ckpt-7"
-
-    response = _post(llm, {"version": 8, "flush_cache": False})
-    assert response.status_code == 200
-    assert llm.updates[-1].weight_version is None
-    assert llm.server_args.weight_version == "ckpt-7"
-
-
-def test_failure_leaves_the_version_alone():
-    llm = _FakeLLM()
-    llm.succeed = False
-    response = _post(llm, {"version": 7})
-    assert response.status_code == 400
-    assert llm.server_args.weight_version == "default"
-
-
-def test_request_fields_are_explicit_and_the_default_lives_in_one_helper():
-    # The wire default is the HTTP route's; the request object and the
-    # Engine API take every field explicitly.
-    import inspect
-
-    from tokenspeed.runtime.entrypoints.engine import Engine
-
-    with pytest.raises(TypeError):
-        UpdateWeightsFromMooncakeReqInput(version=3)
-    flush_cache = inspect.signature(Engine.update_weights_from_mooncake).parameters[
-        "flush_cache"
-    ]
-    assert flush_cache.kind is inspect.Parameter.KEYWORD_ONLY
-    assert flush_cache.default is inspect.Parameter.empty
-    assert (
-        mooncake_load_weight_version(version=3, flush_cache=True, weight_version=None)
-        == "3"
-    )
-    assert (
-        mooncake_load_weight_version(version=3, flush_cache=False, weight_version=None)
-        is None
-    )
-    assert (
-        mooncake_load_weight_version(
-            version=3, flush_cache=False, weight_version="ckpt"
-        )
-        == "ckpt"
-    )
-
-
-def test_control_server_proxies_the_route_with_a_long_read_timeout():
-    routes = {
-        (route.path, frozenset(route.methods or []))
-        for route in control_server.app.routes
-    }
-    assert ("/update_weights_from_mooncake", frozenset({"POST"})) in routes
-    assert control_server._WEIGHT_LOAD_PROXY_TIMEOUT.sock_read > (
-        control_server._PROXY_TIMEOUT.sock_read
-    )
-
 
 # --------------------------------------------------------------------------
 # Device dispatch: which models the SDK updates

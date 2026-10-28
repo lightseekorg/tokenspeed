@@ -79,6 +79,15 @@ def _packed_fia(
 _LIB.impl("dcp_mla.out", _packed_fia, "PrivateUse1")
 
 
+class _MLACaptureOutputs(dict):
+    """Keep the caller's BF16 destination in this capture invocation only."""
+
+    def __init__(self, kwargs):
+        super().__init__(kwargs)
+        self.output = kwargs["out"]
+        self["out"] = torch.empty_like(self.output, dtype=torch.float32)
+
+
 @register_npu_graph_handler(["dcp_mla.out"])
 class _DCPMLAHandler(NpuGraphOpHandler):
     @classmethod
@@ -89,7 +98,24 @@ class _DCPMLAHandler(NpuGraphOpHandler):
         record.args[5] = _BINDINGS[record.args[4]].values
 
     @classmethod
+    def prepare_capture(cls, func, args, kwargs):
+        if kwargs["out"].dtype == torch.bfloat16:
+            kwargs = _MLACaptureOutputs(kwargs)
+        return func, args, kwargs
+
+    @classmethod
+    def postprocess_result(cls, result, kwargs):
+        if isinstance(kwargs, _MLACaptureOutputs):
+            kwargs.output.copy_(result[0])
+            return kwargs.output, result[1]
+        return result
+
+    @classmethod
     def record_wrap_kwarg(cls, key, value, tensor_param_names):
+        # The graph record owns this newly allocated FP32 scratch. There
+        # is no global tensor cache; destroying the graph releases it.
+        if key == "out":
+            return value
         return super().record_wrap_kwarg(
             key, value, [*tensor_param_names, "out", "lse"]
         )

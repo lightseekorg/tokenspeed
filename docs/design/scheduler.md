@@ -54,6 +54,12 @@ local hits. Retraction remains an exact image restore, never an L3 re-prefill.
 The D role probes Device history and receives missing data from its peer.
 See [asynchronous L3](async-l3-cache.md) for lifetime and admission limits.
 
+A first admission with no free request-pool row skips prefix hashing and
+matching. This is a slot constraint, not a KV capacity failure: it does not
+trigger retraction. Asynchronous L3 preparation runs before forward scheduling
+and can still fetch Host data while rows are full, because it owns no row.
+Resident prefill chunks and restore admissions keep their existing paths.
+
 **What the probe may claim.** Before the first chunk, `matchPrefixAtAdmission`
 probes the prefix cache for the prompt's leading pages and for a published
 tail inside the page after them (`CacheCoordinator::ProbePromptPrefix`, see

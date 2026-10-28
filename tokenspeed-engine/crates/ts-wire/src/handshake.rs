@@ -34,7 +34,16 @@
 //!
 //! These structs use the map layout, matching the frontend's named codec.
 
-use crate::{codec::Dict, value::Value};
+use crate::{
+    codec::Dict,
+    control::ControlReplySlim,
+    frames::{REQUEST_ABORT, REQUEST_ADD, REQUEST_CONTROL, REQUEST_ENCODE},
+    multimodal::{EncodeRequest, MultimodalDataItem, MultimodalInputs},
+    output::BatchTokenIDOutSlim,
+    request::{SessionParams, TokenizedGenerateReqInput},
+    sampling::SamplingParams,
+    value::Value,
+};
 
 /// HELLO status.
 pub const STATUS_HELLO: &str = "HELLO";
@@ -53,6 +62,10 @@ wire_struct! {
         pub headless: Option<bool> = None,
         /// Hash of the engine's parallel configuration.
         pub parallel_config_hash: Option<String> = None,
+        /// How many engines dial the frontend as one group (one per
+        /// attention-DP rank; an EPD encode server dials alone), so a
+        /// frontend not told the count awaits them all.
+        pub engine_count: Option<i64> = None,
     }
 }
 
@@ -129,5 +142,89 @@ wire_struct! {
         pub kv_cache_max_concurrency: Option<f64> = None,
         /// KV event publisher configuration.
         pub kv_events_config: Option<Dict<Value, Value>> = None,
+        /// The request types the engine takes ([`REQUEST_ADD`], ...); none
+        /// listed means add and abort.
+        pub request_types: Vec<String> = Vec::new(),
+        /// The field order of each positional struct the engine decodes or
+        /// emits, by struct name (a tag is not a field): a frontend finds
+        /// the optional output columns by name and checks the request
+        /// layouts it encodes against these.
+        pub positional_layouts: Dict<String, Vec<String>> = Dict::default(),
+        /// The engine's role: `null`, `prefill`, `decode` or `encode`.
+        pub disaggregation_mode: Option<String> = None,
+        /// Where a prefill or encode engine's bootstrap server listens: the
+        /// rendezvous a frontend puts on the requests it routes there.
+        pub bootstrap_host: Option<String> = None,
+        /// See `bootstrap_host`.
+        pub bootstrap_port: Option<i64> = None,
+        /// The checkpoint's `model_type`.
+        pub model_type: Option<String> = None,
+        /// The checkpoint's `architectures`.
+        pub architectures: Vec<String> = Vec::new(),
+        /// Whether the language model's rotary positions are MRoPE (its
+        /// rope config names an `mrope_section` or an `mrope` type); `None`
+        /// when it has no rope config. A frontend that sends multimodal
+        /// items computes their MRoPE positions from this and the three
+        /// layout facts below.
+        pub mrope_positions: Option<bool> = None,
+        /// The vision tower's `spatial_merge_size`.
+        pub spatial_merge_size: Option<i64> = None,
+        /// The image placeholder token id.
+        pub image_token_id: Option<i64> = None,
+        /// The video placeholder token id.
+        pub video_token_id: Option<i64> = None,
     }
+}
+
+impl EngineCoreReadyResponse {
+    /// Whether the engine takes requests of type `kind`; one that lists none
+    /// takes add and abort.
+    pub fn takes(&self, kind: &str) -> bool {
+        if self.request_types.is_empty() {
+            return kind == REQUEST_ADD || kind == REQUEST_ABORT;
+        }
+        self.request_types.iter().any(|listed| listed == kind)
+    }
+
+    /// Declare a scheduler engine's request types and positional layouts.
+    pub fn declare_scheduler(&mut self) {
+        self.request_types = [REQUEST_ADD, REQUEST_ABORT, REQUEST_CONTROL]
+            .map(str::to_owned)
+            .to_vec();
+        self.positional_layouts = layouts(&[
+            (
+                "TokenizedGenerateReqInput",
+                TokenizedGenerateReqInput::FIELDS,
+            ),
+            ("SamplingParams", SamplingParams::FIELDS),
+            ("SessionParams", SessionParams::FIELDS),
+            ("MultimodalInputs", MultimodalInputs::FIELDS),
+            ("MultimodalDataItem", MultimodalDataItem::FIELDS),
+            ("BatchTokenIDOutSlim", BatchTokenIDOutSlim::FIELDS),
+            ("ControlReplySlim", ControlReplySlim::FIELDS),
+        ]);
+    }
+
+    /// Declare an EPD encode server's request types and positional layouts.
+    pub fn declare_encoder(&mut self) {
+        self.request_types = vec![REQUEST_ENCODE.to_owned()];
+        self.positional_layouts = layouts(&[
+            ("EncodeRequest", EncodeRequest::FIELDS),
+            ("MultimodalDataItem", MultimodalDataItem::FIELDS),
+        ]);
+    }
+}
+
+fn layouts(structs: &[(&str, &[&str])]) -> Dict<String, Vec<String>> {
+    Dict(
+        structs
+            .iter()
+            .map(|(name, fields)| {
+                (
+                    (*name).to_owned(),
+                    fields.iter().map(|field| (*field).to_owned()).collect(),
+                )
+            })
+            .collect(),
+    )
 }

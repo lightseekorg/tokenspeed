@@ -32,25 +32,27 @@ structural-tag JSON string that:
 2. Substitutes the response-channel content (default ``any_text``) with
    the supplied content format, so the constraint only kicks in inside
    that channel — reasoning content stays free-form.
-3. Picks the template's reasoning mode from the prompt. A chat template
-   may open the reasoning block in the prompt (``...<think>\\n``) or leave
-   it to the model, depending on the model and on options such as
-   ``enable_thinking``. ``prompt_ends_in_reasoning()`` tells which from
-   the prompt tokens.
+3. Picks the template's reasoning mode: a chat template may open the
+   reasoning block in the prompt (``...<think>\\n``) or leave it to the
+   model, depending on the model and on options such as
+   ``enable_thinking``.
 
 This avoids the channel-preamble corruption that activating any grammar
 at token 0 would cause for reasoning models (the model emits
 ``<|channel|>analysis<|message|>...`` etc. before the response, and a
 naïve grammar would reject those tokens).
 
-Convenience wrappers per content type are provided
-(``..._json_schema``, ``..._regex``, ``..._grammar``); call sites that
-already have an xgrammar Format instance can call the base function.
+The engine applies it to a request's ``json_schema`` at admission (the
+host's ingress), whatever frontend sent the request: ``reasoning_grammar``
+gives the host the tags for both modes, with a slot for the schema, and the
+reasoning block's marker ids, from which the host tells the mode by the
+prompt.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import dataclasses
+import json
 from typing import Any
 
 # smg reasoning_parser name → xgrammar builtin model template. Keys
@@ -137,29 +139,11 @@ def reasoning_block_markers(reasoning_parser: str) -> tuple[str, str] | None:
     return block.begin, block.end
 
 
-def prompt_ends_in_reasoning(
-    prompt_ids: Sequence[int], begin_id: int, end_id: int
-) -> bool:
-    """Return whether the prompt ends inside an open reasoning block.
-
-    True when the last reasoning marker in the prompt is the opener, as in a
-    prompt that ends with ``<think>\\n``. False when the prompt never opens
-    the block, or closes it, for example ``<think>\\n\\n</think>\\n\\n`` with
-    thinking off or the reasoning of an earlier turn.
-    """
-    for token_id in reversed(prompt_ids):
-        if token_id == end_id:
-            return False
-        if token_id == begin_id:
-            return True
-    return False
-
-
 def structural_tag_for_reasoning_response(
     reasoning_parser: str,
     content_format: Any,
     *,
-    prompt_opens_reasoning: bool | None,
+    prompt_opens_reasoning: bool,
 ) -> str | None:
     """Build a JSON-serialized xgrammar structural tag for ``reasoning + content``.
 
@@ -168,23 +152,18 @@ def structural_tag_for_reasoning_response(
     replaces the response channel's default ``any_text``.
 
     ``prompt_opens_reasoning`` says whether the prompt ends inside an open
-    reasoning block (see ``prompt_ends_in_reasoning``). If it does, the
-    reply continues that block (xgrammar's ``"enabled"`` mode). If not, the
-    reply may open the block itself or answer directly (``"auto"``).
+    reasoning block. If it does, the reply continues that block (xgrammar's
+    ``"enabled"`` mode). If not, the reply may open the block itself or
+    answer directly (``"auto"``).
 
     Returns ``None`` if ``reasoning_parser`` has no xgrammar mapping —
     the caller should leave the user's constraint unchanged in that case.
-    Also returns ``None`` when ``prompt_opens_reasoning`` is ``None``: the
-    mode depends on the prompt, so a caller that cannot see it (such as the
-    gRPC servicer, which converts sampling params before the request reaches
-    the engine) keeps the plain constraint, and ``InputProcessor`` wraps it
-    once the prompt is known.
     """
     if reasoning_parser == "inkling":
         return _structural_tag_for_inkling(content_format)
 
     model = _REASONING_PARSER_TO_XGRAMMAR_MODEL.get(reasoning_parser)
-    if model is None or prompt_opens_reasoning is None:
+    if model is None:
         return None
 
     import xgrammar
@@ -264,54 +243,73 @@ def structural_tag_for_reasoning_response(
     return tag.model_dump_json(by_alias=True)
 
 
-def structural_tag_for_reasoning_json_schema(
-    reasoning_parser: str,
-    user_schema: Any,
-    *,
-    prompt_opens_reasoning: bool | None = None,
-) -> str | None:
-    """Convenience wrapper: response channel constrained to a JSON schema.
+# The JSON schema a template's answer carries until the host puts a
+# request's schema there: an object no request sends.
+_SCHEMA_SLOT = {"__tokenspeed_reasoning_schema__": True}
 
-    ``prompt_opens_reasoning`` defaults to ``None`` because the gRPC servicer
-    calls this with two arguments, without the prompt; it then keeps
-    ``json_schema`` and ``InputProcessor`` wraps it.
+
+@dataclasses.dataclass(frozen=True)
+class ReasoningGrammar:
+    """How the engine lets a request's JSON schema wait for the reasoning
+    block (``--reasoning-parser``): structural tags whose answer is
+    ``schema_slot``, which the host replaces with the request's schema.
+
+    Attributes:
+        continues: The tag for a reply that continues a reasoning block the
+            prompt opened.
+        may_open: The tag for a reply that may open the block itself or
+            answer directly.
+        schema_slot: The JSON text in both tags that the schema replaces.
+        markers: The block's opener and closer token ids, which tell
+            whether a prompt ends inside the block: it does when the last of
+            them in the prompt is the opener. None when they are not single
+            tokens; every prompt then counts as having opened the block.
     """
+
+    continues: str
+    may_open: str
+    schema_slot: str
+    markers: tuple[int, int] | None
+
+
+def _reasoning_marker_ids(reasoning_parser: str, tokenizer) -> tuple[int, int] | None:
+    markers = reasoning_block_markers(reasoning_parser)
+    if markers is None:
+        return None
+    ids = [tokenizer.convert_tokens_to_ids(marker) for marker in markers]
+    if not all(isinstance(i, int) for i in ids):
+        return None
+    if list(tokenizer.convert_ids_to_tokens(ids)) != list(markers):
+        return None
+    return ids[0], ids[1]
+
+
+def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | None:
+    """The engine's ``ReasoningGrammar`` for ``reasoning_parser``, or None
+    when xgrammar has no template for it: a JSON schema then constrains the
+    whole reply."""
     from xgrammar.structural_tag import JSONSchemaFormat
 
-    return structural_tag_for_reasoning_response(
-        reasoning_parser,
-        JSONSchemaFormat(json_schema=user_schema),
-        prompt_opens_reasoning=prompt_opens_reasoning,
-    )
-
-
-def structural_tag_for_reasoning_regex(
-    reasoning_parser: str,
-    pattern: str,
-    *,
-    prompt_opens_reasoning: bool | None,
-) -> str | None:
-    """Convenience wrapper: response channel constrained to a regex pattern."""
-    from xgrammar.structural_tag import RegexFormat
-
-    return structural_tag_for_reasoning_response(
-        reasoning_parser,
-        RegexFormat(pattern=pattern),
-        prompt_opens_reasoning=prompt_opens_reasoning,
-    )
-
-
-def structural_tag_for_reasoning_grammar(
-    reasoning_parser: str,
-    ebnf_grammar: str,
-    *,
-    prompt_opens_reasoning: bool | None,
-) -> str | None:
-    """Convenience wrapper: response channel constrained to an EBNF grammar."""
-    from xgrammar.structural_tag import GrammarFormat
-
-    return structural_tag_for_reasoning_response(
-        reasoning_parser,
-        GrammarFormat(grammar=ebnf_grammar),
-        prompt_opens_reasoning=prompt_opens_reasoning,
+    tags = [
+        structural_tag_for_reasoning_response(
+            reasoning_parser,
+            JSONSchemaFormat(json_schema=_SCHEMA_SLOT),
+            prompt_opens_reasoning=opens,
+        )
+        for opens in (True, False)
+    ]
+    if None in tags:
+        return None
+    schema_slot = json.dumps(_SCHEMA_SLOT, separators=(",", ":"))
+    for tag in tags:
+        if tag.count(schema_slot) != 1:
+            raise RuntimeError(
+                f"reasoning-parser={reasoning_parser}: the structural tag "
+                f"carries the schema slot {tag.count(schema_slot)} times"
+            )
+    return ReasoningGrammar(
+        continues=tags[0],
+        may_open=tags[1],
+        schema_slot=schema_slot,
+        markers=_reasoning_marker_ids(reasoning_parser, tokenizer),
     )

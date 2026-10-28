@@ -1489,7 +1489,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// `POST /rebalance_experts`: take the snapshot now, if no rebalance runs.
+    /// `RebalanceExpertsReqInput`: take the snapshot now, if no rebalance runs.
     fn begin_manual_rebalance(&mut self) -> Result<(bool, String), LoopError> {
         let Some(controller) = self.eplb.as_mut() else {
             return Ok((
@@ -2026,6 +2026,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 EngineRequest::Control(request) => {
                     self.register(std::mem::take(&mut admissions), outputs, released)?;
                     self.control(*request)?;
+                }
+                // The transport turns calls into operations and drops encode
+                // requests; a frontend that passes them on has nothing here.
+                EngineRequest::Call(_) | EngineRequest::Encode(_) => {
+                    tracing::warn!("dropping a message the scheduler does not take")
                 }
             }
         }

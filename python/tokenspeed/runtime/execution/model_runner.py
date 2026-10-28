@@ -139,7 +139,7 @@ class ModelRunner:
         self._disk_reload_shapes: dict[str, tuple[int, ...]] | None = None
         self._weight_update_pg: torch.distributed.ProcessGroup | None = None
         self._weight_update_device: torch.device | None = None
-        # Model Updater SDK client for /update_weights_from_mooncake; None
+        # Model Updater SDK client for the Mooncake weight update; None
         # without --model-update-config and on the draft runner. Holds only
         # the arguments until the first update imports the SDK (on the
         # forward thread).
