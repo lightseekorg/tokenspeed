@@ -25,7 +25,16 @@ CDNA4 scales into route order instead of quantizing the BF16 input again.
 Route-tiled GEMMs group each expert's routes into small tiles described by
 `(start, count, expert)`. Both GEMMs reuse these descriptors and preserve
 token/slot order for intermediates and outputs. Matrix dimensions, top-k and
-expert counts are explicit kernel parameters.
+expert counts are explicit kernel parameters. Up to 16 rows one program builds
+the descriptors; above that each expert packs its routes into a fixed-length
+list whose length is a power-of-two capacity no smaller than the row count (a
+token's top-k expert IDs are distinct, so an expert gets at most one route per
+row), so all row counts sharing a capacity reuse one compilation. The GEMMs
+run a fixed persistent grid over the device-side descriptor count and have no
+row-dependent compile-time parameters.
+`fused/tuning.py:_ROUTE_TILE_CONFIGS` sets which shapes and rows take this path
+and the second GEMM's tile; other rows use the staged package path, which
+produces bitwise-identical results.
 
 For the staged package's second GEMM, TP uses direct BF16 atomic accumulation
 through 2048 tokens with E2M1 activations (64 with E4M3), and scratch-plus-FP32
