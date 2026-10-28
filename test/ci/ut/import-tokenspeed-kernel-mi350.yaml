@@ -1,0 +1,21 @@
+api_version: ci.tokenspeed.io/v1
+name: import-tokenspeed-kernel-mi350
+type: ut
+workflow_stage: import-check
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi355-1gpu
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+ut:
+  commands:
+    # Import real adapters and exercise both AMD registrations. The existing
+    # selection tests intercept kernel calls; no numerical workloads run here.
+    - python3 -m pytest tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection -k 'cdna4 or cdna5' -v
+report:
+  github_step_summary: true

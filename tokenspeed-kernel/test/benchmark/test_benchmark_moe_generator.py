@@ -58,7 +58,7 @@ def _use_cpu_allocations(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _beam_request(**overrides) -> BenchmarkRequest:
     fragment = (
-        Path(__file__).resolve().parents[1] / "benchmarks/amd/gfx950/beam/moe.json"
+        Path(__file__).resolve().parents[2] / "benchmarks/amd/gfx950/beam/moe.json"
     )
     parameters = json.loads(fragment.read_text())["common_parameters"]
     # Keep the same TP4/grouped-route contract with small real tensors.

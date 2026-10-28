@@ -32,7 +32,7 @@ from types import SimpleNamespace
 
 import pytest
 
-_AMD = Path(__file__).resolve().parents[5] / "tokenspeed-kernel-amd"
+_AMD = Path(__file__).resolve().parents[6] / "tokenspeed-kernel-amd"
 _PACKAGE = "tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4"
 _DIRECTORY = _AMD / "python" / Path(*_PACKAGE.split("."))
 
