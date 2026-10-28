@@ -167,7 +167,9 @@ tier. During the normal startup forward under
 `ops.tuning.kernel_warmup(enabled=True)`, the selected implementation compiles
 its reachable variants. CuTe prepares its launch buckets and transports;
 Triton uses JIT warmup for its launch tiers with the actual operand types,
-alignments and strides. These additional variants are compiled without
+alignments and strides. The general fallback prepares both step and tree forms
+when a chain can cross their batch-size threshold, including when startup warms
+only the largest batch. These additional variants are compiled without
 launching on caller buffers. Runtime workspace allocation performs no
 kernel-specific warmup, and serving calls reuse the prepared kernels.
 Tests cover automatic selection, explicit overrides, exact accepted-prefix

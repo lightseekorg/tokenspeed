@@ -727,7 +727,9 @@ def test_verify_kernel_warmup_preserves_inputs(tokens, solution):
     assert all(torch.equal(value, saved) for value, saved in zip(tensors, before))
 
 
-def test_general_verify_warmup_covers_larger_batches():
+@pytest.mark.parametrize("warmup_batch", [6, 1])
+@pytest.mark.parametrize("tokens", [13, 16])
+def test_general_verify_warmup_covers_batch_changes(warmup_batch, tokens):
     from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp
     from tokenspeed_kernel.ops.attention.gdn.triton import (
         _fused_gdn_decode_update_kernel,
@@ -735,16 +737,20 @@ def test_general_verify_warmup_covers_larger_batches():
     )
     from utils import assert_no_triton_compile
 
+    # Each direction must warm from scratch, independent of earlier tests.
+    _fused_gdn_decode_update_kernel.device_caches.clear()
+    _gdn_tree_verify_chunked_kernel.device_caches.clear()
+
     pool = torch.randn(2, 4, 24, 32, device="cuda", dtype=torch.float32) * 0.02
     before = pool.clone()
 
     def inputs(batch):
         return dict(
-            q=torch.randn(batch, 16, 2, 32, device="cuda", dtype=torch.bfloat16),
-            k=torch.randn(batch, 16, 2, 32, device="cuda", dtype=torch.bfloat16),
-            v=torch.randn(batch, 16, 4, 24, device="cuda", dtype=torch.bfloat16),
-            a=torch.zeros(batch, 16, 4, device="cuda", dtype=torch.bfloat16),
-            b=torch.zeros(batch, 16, 4, device="cuda", dtype=torch.bfloat16),
+            q=torch.randn(batch, tokens, 2, 32, device="cuda", dtype=torch.bfloat16),
+            k=torch.randn(batch, tokens, 2, 32, device="cuda", dtype=torch.bfloat16),
+            v=torch.randn(batch, tokens, 4, 24, device="cuda", dtype=torch.bfloat16),
+            a=torch.zeros(batch, tokens, 4, device="cuda", dtype=torch.bfloat16),
+            b=torch.zeros(batch, tokens, 4, device="cuda", dtype=torch.bfloat16),
             A_log=torch.zeros(4, device="cuda", dtype=torch.float32),
             dt_bias=torch.zeros(4, device="cuda", dtype=torch.float32),
             initial_state=pool,
@@ -756,15 +762,21 @@ def test_general_verify_warmup_covers_larger_batches():
         )
 
     with kernel_warmup(enabled=True):
-        actual = gdn_decode_mtp(**inputs(1))
+        actual = gdn_decode_mtp(**inputs(warmup_batch))
     assert actual.isfinite().all()
-    # Cross both the chain-to-tree threshold and its value-tile boundary.
+    # Cross the step/tree threshold in both directions and the value-tile boundary.
     boundary = current_platform().sm_count // 4
     with assert_no_triton_compile(
         _fused_gdn_decode_update_kernel, _gdn_tree_verify_chunked_kernel
     ):
-        for batch in (2, 6, max(6, boundary), max(6, boundary + 1), 64):
-            assert gdn_decode_mtp(**inputs(batch)).isfinite().all()
+        for batch in (1, 2, 6, max(6, boundary), max(6, boundary + 1), 64):
+            case = inputs(batch)
+            actual = gdn_decode_mtp(**case)
+            assert actual.isfinite().all()
+            if batch == 1:
+                torch.testing.assert_close(
+                    actual.double(), reference(case), atol=1e-4, rtol=2**-7
+                )
     assert torch.equal(pool, before)
 
 

@@ -489,12 +489,14 @@ def _launch_fused_gdn_decode_update(
     intermediate_states_buffer: torch.Tensor | None,
     per_token_output_state_indices: torch.Tensor | None,
     tree_ancestors: torch.Tensor | None,
+    compile_only: bool,
 ) -> torch.Tensor:
     """Shared launcher for the ``gdn_decode_step`` (T=1) / ``gdn_decode_mtp``
     (T>1) Triton fallback kernels. q/k: [B, T, H, K]; v: [B, T, HV, V]; a/b:
     [B, T, HV]; initial_state is the K-last [pool_size, HV, V, K] SSM state
     pool (the shared runtime contract -- see module docstring); output_state
     is the K-last pool the output-state indices address (None: initial_state).
+    ``compile_only`` prepares the specialization without launching it.
     """
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
@@ -519,7 +521,7 @@ def _launch_fused_gdn_decode_update(
     assert NK == 1, "NK > 1 is not supported yet"
 
     grid = (NK, NV, B * HV)
-    _fused_gdn_decode_update_kernel[grid](
+    arguments = dict(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -562,6 +564,10 @@ def _launch_fused_gdn_decode_update(
         ENABLE_PDL=enable_pdl,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
+    if compile_only:
+        _fused_gdn_decode_update_kernel.warmup(**arguments, grid=grid)
+    else:
+        _fused_gdn_decode_update_kernel[grid](**arguments)
     return o
 
 
@@ -618,6 +624,7 @@ def triton_gdn_decode_step(
         intermediate_states_buffer=None,
         per_token_output_state_indices=None,
         tree_ancestors=None,
+        compile_only=False,
     )
 
 
@@ -995,6 +1002,28 @@ def triton_gdn_decode_mtp(
                 compile_only=True,
             )
         if form is GdnChainVerifyForm.TREE:
+            if is_warming_up() and replay_payload is None:
+                # A smaller serving batch can select the step form instead.
+                _launch_fused_gdn_decode_update(
+                    q,
+                    k,
+                    v,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    initial_state=initial_state,
+                    initial_state_indices=initial_state_indices,
+                    output_state=None,
+                    scale=scale,
+                    use_qk_l2norm=use_qk_l2norm,
+                    disable_state_update=True,
+                    output_state_indices=None,
+                    intermediate_states_buffer=None,
+                    per_token_output_state_indices=None,
+                    tree_ancestors=None,
+                    compile_only=True,
+                )
             tree_ancestors = _chain_ancestors(q)
     if (
         tree_ancestors is not None
@@ -1037,6 +1066,7 @@ def triton_gdn_decode_mtp(
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
         tree_ancestors=tree_ancestors,
+        compile_only=False,
     )
 
 
