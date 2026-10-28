@@ -158,7 +158,10 @@ def prepare_gdn_decode_step(
 
     model_profile, profile = _profile(request)
     batch = _positive(request.parameters, "batch")
-    spec = _select_registration(request, platform, {"head_dim": profile.head_dim})
+    traits = {"head_dim": profile.head_dim, "value_head_dim": profile.value_head_dim}
+    if request.solution is None:
+        traits["state_dtype"] = torch.float32
+    spec = _select_registration(request, platform, traits)
     inputs = _decode_inputs(request.seed, batch, 1, profile)
     state = _state_pool(batch, profile)
     indices = torch.arange(batch, device="cuda", dtype=torch.int32)
@@ -208,7 +211,10 @@ def prepare_gdn_decode_mtp(
             "GDN state_writes must be one of: "
             f"{', '.join(sorted(_IMPLEMENTED_STATE_WRITES))}"
         )
-    spec = _select_registration(request, platform, {"head_dim": profile.head_dim})
+    traits = {"head_dim": profile.head_dim, "value_head_dim": profile.value_head_dim}
+    if request.solution is None:
+        traits["state_dtype"] = torch.float32
+    spec = _select_registration(request, platform, traits)
     inputs = _decode_inputs(request.seed, batch, tokens, profile)
     per_token = state_writes == "per_token"
     # Committed rows first, then one scratch row per verified position.
