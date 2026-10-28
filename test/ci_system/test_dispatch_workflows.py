@@ -507,8 +507,7 @@ def test_amd_kernel_benchmarks_run_in_their_own_workflow():
     assert workflow["name"] == "AMD Kernel Benchmark"
     triggers = workflow.get("on") or workflow.get(True)
     assert "labeled" not in triggers["pull_request"]["types"]
-    # tokenspeed-mla is NVIDIA-only, so its changes must not start the post-submit
-    # run. On pull requests the scan's path filter skips the benchmark instead.
+    # tokenspeed-mla is NVIDIA-only, so its changes must not start the workflow.
     assert "tokenspeed-mla/**" not in triggers["push"]["paths"]
     jobs = workflow["jobs"]
     assert (
