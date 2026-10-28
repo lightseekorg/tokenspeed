@@ -57,7 +57,7 @@ class FusedTPProjectionState:
     """Collectively prepare a TP2/4/8 projection before graph capture.
 
     Args:
-        group: Node-local GB300 ranks in weight-shard order: TP2/4 for rows,
+        group: NVLink-connected GB300 ranks in weight-shard order: TP2/4 for rows,
             TP2/4/8 for columns.
         device: This rank's CUDA device, with 152 SMs available to the grid.
         max_rows: Maximum physical rows on any owner.

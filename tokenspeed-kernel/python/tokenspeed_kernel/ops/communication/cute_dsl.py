@@ -56,7 +56,7 @@ def create_fused_tp_column_projection_state(
     """Allocate and compile column-projection state before graph capture.
 
     Args:
-        group: Two, four, or eight node-local peers, in output-shard order.
+        group: Two, four, or eight NVLink-connected peers, in output-shard order.
         device: This peer's GB300 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by 128.
@@ -84,7 +84,7 @@ def create_fused_tp_row_projection_state(
     """Collectively allocate and compile a workspace before graph capture.
 
     Args:
-        group: Two or four node-local peers, in input-shard order.
+        group: Two or four NVLink-connected peers, in input-shard order.
         device: This peer's GB300 CUDA device.
         max_rows: Maximum physical rows on any owner, used to prepare row buckets.
         input_size: Full input width, divisible by group size times 128.
@@ -113,7 +113,7 @@ def fused_tp_column_projection_supported(
     """Return whether the layout and device support fused column projection.
 
     Args:
-        group_size: Number of ranks in a node-local projection group.
+        group_size: Number of ranks in a NVLink-connected projection group.
         input_size: Full input channel count.
         output_size: Full padded output channel count.
         max_rows: Positive prepared capacity per owner.
@@ -122,7 +122,7 @@ def fused_tp_column_projection_supported(
 
     Returns:
         Whether this fixed schedule can be prepared. The caller must separately
-        agree on node locality and eligibility across the group.
+        agree on peer-memory reachability and eligibility across the group.
     """
     return (
         current_platform().is_nvidia
@@ -149,7 +149,7 @@ def fused_tp_row_projection_supported(
     """Return whether the static layout and device match the kernel constraints.
 
     Args:
-        group_size: Number of ranks in a node-local projection group.
+        group_size: Number of ranks in a NVLink-connected projection group.
         input_size: Full input channel count.
         output_size: Full padded output channel count.
         max_rows: Positive prepared capacity per owner.
@@ -158,7 +158,7 @@ def fused_tp_row_projection_supported(
 
     Returns:
         Whether this fixed schedule can be prepared. The caller must separately
-        agree on node locality and eligibility across the group.
+        agree on peer-memory reachability and eligibility across the group.
     """
     return (
         current_platform().is_nvidia

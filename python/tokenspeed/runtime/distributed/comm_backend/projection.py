@@ -419,8 +419,8 @@ class ProjectionBackend:
             "Lamport transport is unavailable for this device, dtype, or routing policy"
         )
         if use_lamport:
-            # CUDA IPC requires a node-local group. Agree on topology before
-            # any rank attempts collective native allocation.
+            # Cross-host peer access requires a verified NVLink fabric on
+            # every rank before collective shared-memory allocation.
             from tokenspeed_kernel.ops.communication.cute_dsl import (
                 fused_tp_column_projection_supported,
                 fused_tp_row_projection_supported,
@@ -475,7 +475,9 @@ class ProjectionBackend:
                 raise ValueError(
                     "Batch-invariant collective setting differs across ranks"
                 )
-            if len({value[0] for value in hosts}) == 1:
+            from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
+
+            if len({value[0] for value in hosts}) == 1 or group_has_fabric(spec.group):
                 self._prepare_lamport(workspace, use_lamport_reduction)
                 if all(value[2] for value in hosts):
                     from tokenspeed_kernel.ops.communication.cute_dsl import (
@@ -507,7 +509,9 @@ class ProjectionBackend:
                 elif fused_disabled_reason is None:
                     fused_disabled_reason = "one or more peers cannot prepare fusion"
             else:
-                fused_disabled_reason = "the projection group spans multiple nodes"
+                fused_disabled_reason = (
+                    "the cross-host projection group lacks NVLink fabric"
+                )
 
         if (
             workspace.fused_column is None

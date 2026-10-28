@@ -110,7 +110,19 @@ class SharedExpertCommunication:
         self.gather = self.reduction = None
         # Native kernels support TP2/4/8/16; the gather wrapper requires
         # 128-aligned widths. Other geometries use NCCL.
-        if parallel.tp_size in (2, 4, 8, 16) and hidden > 0 and hidden % 128 == 0:
+        from tokenspeed_kernel.ops.communication.fabric import (
+            group_has_fabric,
+            group_host_span,
+        )
+
+        host_span = group_host_span(parallel.tp_group)
+        peer_access = host_span in (None, 1) or group_has_fabric(parallel.tp_group)
+        if (
+            parallel.tp_size in (2, 4, 8, 16)
+            and hidden > 0
+            and hidden % 128 == 0
+            and peer_access
+        ):
             group = pg_manager.get_process_group("nccl", parallel.tp_group)
             self.gather = TrtllmAllGatherState(
                 group, min(capacity, 128), hidden, device, True

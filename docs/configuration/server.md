@@ -518,6 +518,8 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 | `--pp-layer-partition` | Explicit per-stage layer counts, front to back (`"24,24,24,21"`); one entry per stage, summing to the model's layer count. Default: even split with the remainder on the front stages. |
 | `--world-size` | Total worker process count across all nodes. |
 | `--nprocs-per-node` | Worker process count per node. |
+| `--base-gpu-id` | First visible CUDA device ordinal used by this instance on each node. |
+| `--gpu-id-step` | Spacing between local workers' CUDA device ordinals. |
 | `--nnodes` | Number of nodes. |
 | `--node-rank` | Rank of the current node. |
 | `--dist-init-addr` | Distributed initialization address. |
@@ -526,6 +528,20 @@ issue budget, while `--max-total-tokens` controls the global token pool.
 Use `--tensor-parallel-size` for simple launches. When attention, dense,
 and MoE layers need different process groups, use the TokenSpeed-specific
 split knobs.
+
+### Mixed prefill/decode placement
+
+Prefill and decode instances can occupy disjoint GPUs on the same hosts. Each
+instance selects local devices as `base_gpu_id + local_rank * gpu_id_step`.
+For example, on a host exposing four GPUs, use two local workers per instance:
+`--base-gpu-id 0 --gpu-id-step 2` selects GPUs 0 and 2, while
+`--base-gpu-id 1 --gpu-id-step 2` selects GPUs 1 and 3. Give the instances separate
+service and rendezvous ports, and budget their host caches together.
+
+A tensor-parallel group may then span hosts. Native shared-buffer collectives
+and fused projections can use verified NVLink fabric across those hosts; local
+groups retain CUDA IPC. A cross-host group without fabric support uses a
+compatible fallback instead of importing CUDA IPC handles across hosts.
 
 ### Expert placement
 

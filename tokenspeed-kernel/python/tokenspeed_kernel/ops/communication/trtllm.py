@@ -1537,7 +1537,7 @@ if current_platform().is_nvidia:
     # Their registry modes are separate from stateless/auto-dispatched ops.
 
     class TrtllmAllGatherState:
-        """Own BF16 AllGather IPC scratch for serialized auxiliary-stream calls."""
+        """Own BF16 AllGather peer scratch for serialized auxiliary-stream calls."""
 
         def __init__(self, group, max_rows, hidden, device, oneshot):
             from tokenspeed_kernel.thirdparty.cuda.trtllm import (
@@ -1733,10 +1733,10 @@ if current_platform().is_nvidia:
         return state.gather(inputs)
 
     class TrtllmReduceScatterState:
-        """Own IPC scratch shared by sequential layers, not by concurrent streams.
+        """Own peer scratch shared by sequential layers, not by concurrent streams.
 
         Args:
-            group: 2/4/8/16-rank process group on a CUDA-IPC-accessible topology.
+            group: 2/4/8/16-rank group reachable through CUDA IPC or NVLink fabric.
             max_rows: Prepared physical rows per rank, at most 128.
             hidden: Output width, a positive multiple of eight BF16 elements.
             device: Current rank's CUDA device, already selected by the caller.

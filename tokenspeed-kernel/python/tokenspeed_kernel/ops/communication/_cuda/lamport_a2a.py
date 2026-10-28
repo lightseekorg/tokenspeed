@@ -58,10 +58,15 @@ class TokenSpeedA2ALamportState:
         dist.all_gather_object(
             contracts, (socket.gethostname(), max_rows, channels, blocks), group=group
         )
-        if any(contract != contracts[0] for contract in contracts):
+        if any(contract[1:] != contracts[0][1:] for contract in contracts):
             raise ValueError(
-                "A2A requires one host and identical capacity, channels, and grid on all ranks"
+                "A2A requires identical capacity, channels, and grid on all ranks"
             )
+        if len({contract[0] for contract in contracts}) > 1:
+            from tokenspeed_kernel.ops.communication.fabric import group_has_fabric
+
+            if not group_has_fabric(dist.get_process_group_ranks(group)):
+                raise ValueError("Cross-host A2A requires NVLink fabric on every rank")
         self.tp_size = group.size()
         if (
             self.tp_size not in (2, 4, 8)

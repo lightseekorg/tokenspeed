@@ -213,9 +213,42 @@ class CudaRTLibrary:
 if current_platform().is_nvidia:
     cudart = CudaRTLibrary()
 
+    class _FabricSharedBuffer(list[int]):
+        """Peer addresses whose symmetric allocation outlives native kernels."""
+
+        def __init__(self, size_in_bytes: int, group: ProcessGroup):
+            import torch.distributed._symmetric_memory as symm_mem
+
+            self.tensor = symm_mem.empty(
+                size_in_bytes, dtype=torch.uint8, device="cuda"
+            )
+            self.handle = symm_mem.rendezvous(self.tensor, group)
+            super().__init__(self.handle.buffer_ptrs)
+
+        def close(self, group: ProcessGroup) -> None:
+            torch.cuda.synchronize()
+            dist.barrier(group=group)
+            self.handle = None
+            self.tensor = None
+            self.clear()
+            dist.barrier(group=group)
+
     def create_shared_buffer(
         size_in_bytes: int, group: Optional[ProcessGroup] = None
     ) -> List[int]:
+        from tokenspeed_kernel.ops.communication.fabric import (
+            group_has_fabric,
+            group_host_span,
+        )
+
+        if group is None:
+            group = dist.group.WORLD
+        ranks = dist.get_process_group_ranks(group)
+        span = group_host_span(ranks)
+        if span is not None and span > 1:
+            if not group_has_fabric(ranks):
+                raise RuntimeError("Cross-host shared buffers require NVLink fabric")
+            return _FabricSharedBuffer(size_in_bytes, group)
         pointer = cudart.cudaMalloc(size_in_bytes)
         handle = cudart.cudaIpcGetMemHandle(pointer)
         if group is None:
@@ -241,6 +274,9 @@ if current_platform().is_nvidia:
         """Collectively close peer mappings before freeing the exported allocation."""
         if group is None:
             group = dist.group.WORLD
+        if isinstance(pointers, _FabricSharedBuffer):
+            pointers.close(group)
+            return
         rank = dist.get_rank(group=group)
         cudart.cudaDeviceSynchronize()
         for peer, pointer in enumerate(pointers):
