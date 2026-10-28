@@ -1522,6 +1522,9 @@ if platform.is_amd:
             _extract_gluon_raw_s,
             _extract_gluon_raw_w,
         )
+        from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (
+            _ROUTE_TILE_CONFIGS,
+        )
         from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
             empty_swizzled_cdna4_mxfp4_scale,
         )
@@ -1573,32 +1576,49 @@ if platform.is_amd:
             w.w2_precision_config.out_dtype,
         )
         # Runtime M has two integer-alignment classes. Sort widths grow only
-        # at these bounds; the direct/compact decode kernels have two row tiles.
-        representatives = (
-            1,
-            2,
-            4,
-            16,
-            17,
-            32,
-            49,
-            64,
-            65,
-            80,
-            129,
-            144,
-            192,
-            193,
-            257,
-            272,
-            513,
-            528,
-            1025,
-            1040,
-            2049,
-            2064,
-            4097,
-            4112,
+        # at these bounds; the direct decode kernels have two row tiles. The
+        # first and last row count of every _ROUTE_TILE_CONFIGS entry warm up
+        # that entry's schedule and route capacity.
+        route_tile_shape = (
+            4096,
+            tensors[0].shape[-1] // 2,
+            w.num_local_experts,
+            256,
+            8,
+        )
+        route_tile_rows = {
+            rows
+            for min_rows, max_rows, _ in _ROUTE_TILE_CONFIGS.get(route_tile_shape, ())
+            for rows in (min_rows, max_rows)
+        }
+        representatives = sorted(
+            route_tile_rows
+            | {
+                1,
+                2,
+                4,
+                16,
+                17,
+                32,
+                49,
+                64,
+                65,
+                80,
+                129,
+                144,
+                192,
+                193,
+                257,
+                272,
+                513,
+                528,
+                1025,
+                1040,
+                2049,
+                2064,
+                4097,
+                4112,
+            }
         )
         max_tokens = min(int(plan["warmup_max_num_tokens"]), 8192)
         pending = [

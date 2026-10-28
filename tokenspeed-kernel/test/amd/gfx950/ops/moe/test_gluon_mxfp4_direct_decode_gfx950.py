@@ -50,6 +50,13 @@ from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused import (  # noqa: E402
     _extract_gluon_raw_w,
     _quantize_mxfp4_activation,
 )
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.moe import (  # noqa: E402
+    _launch_mxfp4_route_tiles,
+)
+from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.fused.tuning import (  # noqa: E402
+    _ROUTE_TILE_CONFIGS,
+    _RouteTileConfig,
+)
 from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.moe_sorting import (  # noqa: E402
     _max_padded_route_capacity,
     _moe_sorting_stage1_kernel,
@@ -650,6 +657,117 @@ def test_route_tiled_gemms_preserve_route_slots(rows: int) -> None:
     )
     torch.testing.assert_close(
         output[owned].view(torch.int16),
+        reference[owned].view(torch.int16),
+        atol=0,
+        rtol=0,
+    )
+
+
+# Each table schedule at both ends of its row range; the upper end fills an
+# expert's route list when it equals the capacity.
+_ROUTE_TILE_CASES = sorted(
+    {
+        (rows, config)
+        for entries in _ROUTE_TILE_CONFIGS.values()
+        for min_rows, max_rows, config in entries
+        for rows in (min_rows, max_rows)
+    }
+)
+
+
+@pytest.mark.parametrize(("rows", "config"), _ROUTE_TILE_CASES)
+def test_route_tile_schedules_match_direct_reference(
+    rows: int, config: _RouteTileConfig
+) -> None:
+    """Every route-tile schedule keeps every route, up to a full expert list."""
+    generator = torch.Generator(device="cuda").manual_seed(rows)
+    _, _, _, _, w13, s13, w2, s2 = _make_runtime_weights(generator, scale=120)
+    packed, scales = _quantize_mxfp4_activation(
+        _exact_mxfp4_activation(rows, HIDDEN, generator)
+    )
+    expert_start = NUM_EXPERTS
+    # Every token routes to the same local experts, so each of them holds
+    # exactly ``rows`` routes: a full list when rows == capacity. The last
+    # token's last route belongs to another rank.
+    ids = (
+        torch.arange(
+            expert_start, expert_start + TOPK, device="cuda", dtype=torch.int32
+        )
+        .expand(rows, TOPK)
+        .clone()
+    )
+    ids[-1, -1] += NUM_EXPERTS
+    weights = torch.full((rows, TOPK), 1 / TOPK, device="cuda")
+    reference_intermediate = torch.empty(
+        (rows * TOPK, INTERMEDIATE // 2), dtype=torch.uint8, device="cuda"
+    )
+    reference_scales = empty_swizzled_cdna4_mxfp4_scale(
+        rows * TOPK, INTERMEDIATE // 32, device="cuda"
+    )
+    reference = torch.empty((rows * TOPK, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    reference_mapping = torch.empty(rows * TOPK, dtype=torch.int32, device="cuda")
+    invoke_stage1_mxfp4_mfma_decode_gluon(
+        packed,
+        scales,
+        w13,
+        s13,
+        ids,
+        reference_intermediate,
+        TOPK,
+        expert_start,
+        reference_scales,
+        BLOCK_N=64,
+        swiglu_alpha=1.0,
+        swiglu_limit=0.0,
+        swiglu_beta=0.0,
+    )
+    invoke_stage2_mxfp4_mfma_decode_gluon(
+        reference_intermediate,
+        reference_scales,
+        w2,
+        s2,
+        ids,
+        weights,
+        reference,
+        TOPK,
+        expert_start,
+        False,
+        reference_mapping,
+        BLOCK_N=16,
+        BLOCK_K=128,
+        PIPELINE_K=False,
+    )
+    intermediate = torch.empty_like(reference_intermediate)
+    intermediate_scales = empty_swizzled_cdna4_mxfp4_scale(
+        rows * TOPK, INTERMEDIATE // 32, device="cuda"
+    )
+    output = torch.full_like(reference, float("nan"))
+    actual, bias, mapping = _launch_mxfp4_route_tiles(
+        packed,
+        scales,
+        w13,
+        s13,
+        w2,
+        s2,
+        ids,
+        intermediate,
+        intermediate_scales,
+        output,
+        expert_start=expert_start,
+        top_k=TOPK,
+        config=config,
+    )
+    assert bias is None
+    assert actual.data_ptr() == output.data_ptr()
+    owned = (ids.flatten() >= expert_start) & (
+        ids.flatten() < expert_start + NUM_EXPERTS
+    )
+    expected_mapping = torch.where(
+        owned, torch.arange(rows * TOPK, device="cuda", dtype=torch.int32), -1
+    )
+    torch.testing.assert_close(mapping, expected_mapping, atol=0, rtol=0)
+    torch.testing.assert_close(
+        actual[owned].view(torch.int16),
         reference[owned].view(torch.int16),
         atol=0,
         rtol=0,
