@@ -51,12 +51,12 @@ of the request that follow the row's).
   selection). A block of the global top-k is in the top-k of its chunk, so
   the two levels select exactly.
 * attention (Q5), ``KV_HEADS * SPLITS`` tasks: the attended tokens are the
-  tokens of the selected blocks, then the tokens of the partial block. Q5
-  splits them as TokenSpeed splits them (16-token tiles over 32 splits).
-  Each task publishes its FP32 ``acc / l`` and base-2 ``lse`` for the 12 q
-  heads of its KV head.
-* merge (Q6), 48 tasks of 128 dims of a head: LSE merge, BF16, then
-  ``bf16(a * sigmoid(gate))`` published as BF16 for ``o_proj``.
+  tokens of the selected blocks, then the tokens of the partial block. Split
+  ``s`` takes tokens ``SPLIT_TOKENS * s ..`` (:func:`used_splits`), so the
+  splits past the tokens have no work. Each task of a used split publishes
+  its FP32 ``acc / l`` and base-2 ``lse`` for the 12 q heads of its KV head.
+* merge (Q6), 48 tasks of 128 dims of a head: LSE merge of the used splits,
+  BF16, then ``bf16(a * sigmoid(gate))`` published as BF16 for ``o_proj``.
 
 The current token's k and v come from mailboxes, not from the cache. The
 cache write of another CTA in the same launch need not be visible yet.
@@ -81,7 +81,13 @@ block member that an earlier draft step staged comes from there.
 from __future__ import annotations
 
 from tokenspeed_kernel_amd._triton import aggregate, gl, gluon, triton
-from tokenspeed_kernel_amd.ops.gfx950.monokernel import bf16, mx, schedule, trace
+from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
+    bf16,
+    mailbox,
+    mx,
+    schedule,
+    trace,
+)
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Stage, placement
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.qwen4_exp.dims import EPS, HIDDEN
 
@@ -114,9 +120,18 @@ SCORE_TASKS = gl.constexpr(255)  # every CTA but the one of Q4F
 SCORE_CHUNK = gl.constexpr(128)  # blocks a Q3 task scores per pass
 SPLITS = gl.constexpr(32)
 TILE = gl.constexpr(16)
-SPLIT_TOKENS = gl.constexpr(128)  # bound of one split's tokens (5 tiles)
+# The tokens of a split. 17 splits hold the most attended tokens,
+# COMPRESS * TOPK_BLOCKS + COMPRESS - 1. A split that holds every token
+# it can makes few splits to publish and merge: a merge task polls 1 KiB
+# per split.
+SPLIT_TOKENS = gl.constexpr(128)
 ATTN_TASKS = gl.constexpr(64)  # KV_HEADS * SPLITS
+assert int(SPLITS) * int(SPLIT_TOKENS) >= int(COMPRESS) * (int(TOPK_BLOCKS) + 1) - 1
 MERGE_TASKS = gl.constexpr(48)  # HEADS * 2 halves of 128 dims
+# Q6 runs at most this many rows of merge tasks at once. Its tasks then fit
+# on the CTAs before C1's, so C1's weights stream while Q6 runs. A task of a
+# plan with more rows merges one task of each further row too.
+MERGE_ROWS = 2
 QK_SCALE = gl.constexpr(0.09016844005556021)  # HEAD ** -0.5 * log2(e)
 
 REGIONS = (
@@ -174,7 +189,7 @@ def stages(
         ),
         Stage(
             "q6",
-            int(MERGE_TASKS) * attended,
+            int(MERGE_TASKS) * min(attended, MERGE_ROWS),
             q6,
             reads=("part", "lse", "qp"),
             writes=("obf",),
@@ -1011,14 +1026,33 @@ def _attend_tokens(mb, L, tok, j, n, nsel, complete, cache):
 
 
 @gluon.jit
+def _attended(cache):
+    """The number of attended tokens of ``cache``'s row (see
+    :func:`_attend_tokens`)."""
+    L = cache.length() - 1
+    complete = (L + 1) // COMPRESS
+    nsel = gl.minimum(complete, TOPK_BLOCKS)
+    return COMPRESS * nsel + (L + 1 - COMPRESS * complete)
+
+
+@gluon.jit
+def used_splits(cache):
+    """The splits of ``SPLIT_TOKENS`` tokens that hold ``cache``'s row's
+    attended tokens."""
+    return (_attended(cache) + SPLIT_TOKENS - 1) // SPLIT_TOKENS
+
+
+@gluon.jit
 def attention_stage(mb, task, tok, cache, CHAIN: gl.constexpr, STAGE: gl.constexpr):
     """Q5 task ``task`` = (KV head ``g``, split ``s``) of a row that is token
     ``tok`` of its request, of a launch of ``CHAIN`` tokens per request (the
     launch's ``Plan.chain``, also when ``mb`` is the view of one row)."""
     mb.stamp(STAGE, trace.START)
-    kv = _attention_issue(mb, task, tok, cache)
-    gl.amd.hint.sched_barrier()
-    _attention_finish(mb, task, tok, kv, CHAIN, STAGE)
+    # A split past the attended tokens has no work, and Q6 does not read it.
+    if task % SPLITS < used_splits(cache):
+        kv = _attention_issue(mb, task, tok, cache)
+        gl.amd.hint.sched_barrier()
+        _attention_finish(mb, task, tok, kv, CHAIN, STAGE)
     # The next stage on this CTA issues its weight loads after every wave's
     # stores here. Else the late waves' stores queue behind those loads, and
     # Q6 waits about 10 us for them (4 rows).
@@ -1054,8 +1088,7 @@ def _attention_issue(mb, task, tok, cache):
     complete = (L + 1) // COMPRESS
     nsel = gl.minimum(complete, TOPK_BLOCKS)
     n = COMPRESS * nsel + (L + 1 - COMPRESS * complete)
-    tiles = (n + TILE - 1) // TILE
-    per = (tiles + SPLITS - 1) // SPLITS * TILE
+    per = SPLIT_TOKENS
     first = s * per
     k_layout: gl.constexpr = _attention_layouts(gl.num_warps())[2]
     v_load: gl.constexpr = _attention_layouts(gl.num_warps())[3]
@@ -1199,28 +1232,38 @@ def _bf16_values(words):
 
 
 @gluon.jit
-def merge_stage(mb, task, STAGE: gl.constexpr):
-    """Q6 task ``task`` = (head ``h``, dims ``128 * half ..``)."""
+def merge_stage(mb, task, cache, STAGE: gl.constexpr):
+    """Q6 task ``task`` = (head ``h``, dims ``128 * half ..``) of
+    ``cache``'s row: the LSE merge of the splits that hold its tokens."""
     mb.stamp(STAGE, trace.START)
     h = task // 2
     half = task % 2
     g = h // GROUP
     hh = h % GROUP
-    ml: gl.constexpr = gl.BlockedLayout([1, 4], [2, 32], [gl.num_warps(), 1], [1, 0])
+    NW: gl.constexpr = gl.num_warps()
+    # [split, dim]: wave w holds splits 8 (w // 2) .. 8 (w // 2) + 7, so a
+    # wave without a used split skips the poll.
+    ml: gl.constexpr = gl.BlockedLayout([SPLITS // 4, 1], [1, 64], [4, NW // 4], [1, 0])
     s = gl.arange(0, SPLITS, gl.SliceLayout(1, ml))
     c = half * 128 + gl.arange(0, 128, gl.SliceLayout(0, ml))
-    part = ((s[:, None] * KV_HEADS + g) * GROUP + hh) * HEAD + c[None, :]
+    used = used_splits(cache)
+    # Q2 published the gate long before Q5 ends: this poll returns while
+    # Q5 runs.
     gate = (h * 2 * HEAD + HEAD + c) // 2
-    got_p, got_l, got_g = mb.poll_many(
-        ("part", "lse", "qp"), (part, s * HEADS + h, gate)
-    )
+    (got_g,) = mb.poll_many(("qp",), (gate,))
+    # The pairs of a split past the used ones repeat the last used one.
+    sp = gl.minimum(s, used - 1)
+    part = ((sp[:, None] * KV_HEADS + g) * GROUP + hh) * HEAD + c[None, :]
+    lanes = gl.arange(0, 64 * NW, mailbox.lane_layout(NW))
+    spin = (lanes // 64 // (NW // 4) * (SPLITS // 4) < used).to(gl.int32)
+    got_p, got_l = mb.poll_many_waves(("part", "lse"), (part, sp * HEADS + h), spin)
     mb.stamp(STAGE, trace.READY)
-    lse = got_l.to(gl.float32, bitcast=True)
+    on = s < used
+    lse = gl.where(on, got_l.to(gl.float32, bitcast=True), float("-inf"))
     top = gl.max(lse, axis=0)
     w = gl.exp2(lse - top)
-    out = gl.sum(got_p.to(gl.float32, bitcast=True) * w[:, None], axis=0) / gl.sum(
-        w, axis=0
-    )
+    p = gl.where(on[:, None], got_p.to(gl.float32, bitcast=True), 0.0)
+    out = gl.sum(p * w[:, None], axis=0) / gl.sum(w, axis=0)
     a = out.to(gl.bfloat16).to(gl.float32)
     gated = a * mx.sigmoid(mx.bf16_half(got_g, HEAD + c))
     mb.stamp(STAGE, trace.COMPUTED)
@@ -1231,6 +1274,7 @@ def merge_stage(mb, task, STAGE: gl.constexpr):
 __all__ = [
     "ATTN_TASKS",
     "Cache",
+    "MERGE_ROWS",
     "MERGE_TASKS",
     "PROJ_TASKS",
     "PROLOGUE_TASKS",
@@ -1244,4 +1288,5 @@ __all__ = [
     "score_stage",
     "topk_final_stage",
     "topk_stage",
+    "used_splits",
 ]

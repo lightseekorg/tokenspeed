@@ -87,6 +87,12 @@ def _stage_tasks(plan, name):
     return plan.plan.stage(name).tasks
 
 
+@gluon.constexpr_function
+def stage_tasks(plan, name):
+    """The number of tasks of stage ``name``."""
+    return _stage_tasks(plan, name)
+
+
 @gluon.jit
 def stage_task(plan: gl.constexpr, name: gl.constexpr):
     """``(task, active)``: this CTA's task of stage ``name``, a stage of at
@@ -151,4 +157,5 @@ __all__ = [
     "stage_event",
     "stage_rounds",
     "stage_task",
+    "stage_tasks",
 ]

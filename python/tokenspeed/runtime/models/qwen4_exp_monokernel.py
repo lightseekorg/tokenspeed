@@ -563,6 +563,7 @@ class MonokernelStep:
             monokernels.steps,
         )
         if index in monokernels.delta:
+            following = monokernels.fused.get(index + 1)
             out = _delta_decode(
                 layer,
                 fused,
@@ -572,6 +573,7 @@ class MonokernelStep:
                 residual,
                 input_ids,
                 ctx,
+                None if following is None else following.late_weights,
             )
             return out, None
         if index == monokernels.final_mixer_layer:
@@ -621,12 +623,15 @@ def _delta_decode(
     residual,
     input_ids: torch.Tensor,
     ctx: ForwardContext,
+    warm: torch.Tensor | None,
 ) -> torch.Tensor:
     """Run one Gated DeltaNet layer launch. Returns the output streams.
 
     For the layer with a PLE block, the kernel also does the n-gram lookup
     from the token and the block's context page. The model skips the lookup
-    prefetch for such a step.
+    prefetch for such a step. ``warm`` is the next fused layer's
+    ``late_weights`` (None when the next layer is not fused), which the
+    launch may read into the memory-side cache.
     """
     rows = hidden_states.shape[0]
     hidden_states = _streams(layer, hidden_states, residual)
@@ -667,6 +672,7 @@ def _delta_decode(
         step=steps.step,
         layer_index=layer.layer_id,
         ple=ple,
+        warm=warm,
     )
     return out
 

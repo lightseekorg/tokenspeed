@@ -86,7 +86,7 @@ if _qwen4_exp_layer is not None:
     )
     def gluon_qwen4_exp_delta_layer_prepare_gfx950(
         *, tensors: dict[str, Any], dense_tiled: bool, max_rows: int
-    ) -> tuple[Any, int]:
+    ) -> tuple[Any, int, torch.Tensor]:
         t = dict(tensors)
         ple = t.pop("ple", None)
         weights = _qwen4_exp_weights.pack_delta_layer(
@@ -100,7 +100,7 @@ if _qwen4_exp_layer is not None:
         plan = _qwen4_exp_layer.delta_plan(
             ple is not None, max_rows, 1, _qwen4_exp_layer.experts_format(weights)
         )
-        return weights, plan.scratch_pairs
+        return weights, plan.scratch_pairs, _qwen4_exp_layer.late_weights(weights)
 
     @register_kernel(
         "monokernel",
@@ -121,6 +121,7 @@ if _qwen4_exp_layer is not None:
         step: torch.Tensor,
         layer_index: int,
         ple: dict[str, torch.Tensor] | None,
+        warm: torch.Tensor | None,
         **state: Any,
     ) -> None:
         _qwen4_exp_layer.launch_gluon_qwen4_exp_delta_layer_gfx950(
@@ -132,6 +133,7 @@ if _qwen4_exp_layer is not None:
             layer=layer_index,
             trace_buf=None,
             ple_step=None if ple is None else _qwen4_exp_layer.PleStep(**ple),
+            warm=warm,
             **state,
         )
 
@@ -147,7 +149,7 @@ if _qwen4_exp_layer is not None:
     )
     def gluon_qwen4_exp_qsa_layer_prepare_gfx950(
         *, tensors: dict[str, Any], dense_tiled: bool, max_rows: int
-    ) -> tuple[Any, int]:
+    ) -> tuple[Any, int, torch.Tensor]:
         t = dict(tensors)
         final_mixer = t.pop("final_mixer", None)
         weights = _qwen4_exp_weights.pack_qsa_layer(
@@ -168,7 +170,7 @@ if _qwen4_exp_layer is not None:
             _qwen4_exp_layer.experts_format(weights),
             False,
         )
-        return weights, plan.scratch_pairs
+        return weights, plan.scratch_pairs, _qwen4_exp_layer.late_weights(weights)
 
     @register_kernel(
         "monokernel",

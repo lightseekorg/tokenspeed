@@ -63,11 +63,15 @@ class FusedDecodeLayer:
         weights: The kernel's packed weights (opaque to the caller).
         scratch_pairs: int64 mailbox pairs the kernel needs. One scratch
             buffer serves every layer of a step.
+        late_weights: int32 words of the packed weights that the layer's
+            launch reads last, for the launch before it to warm (``warm`` of
+            :func:`qwen4_exp_delta_layer_decode`), or None.
     """
 
     decode: Any
     weights: Any
     scratch_pairs: int
+    late_weights: torch.Tensor | None
 
 
 def _select(mode: str, max_rows: int, override: str | None):
@@ -85,10 +89,15 @@ def _prepare(kind: str, max_rows: int, tensors, dense_tiled: bool, override):
         if override is not None:
             raise
         return None
-    weights, scratch_pairs = prepare(
+    weights, scratch_pairs, late_weights = prepare(
         tensors=tensors, dense_tiled=dense_tiled, max_rows=max_rows
     )
-    return FusedDecodeLayer(decode=decode, weights=weights, scratch_pairs=scratch_pairs)
+    return FusedDecodeLayer(
+        decode=decode,
+        weights=weights,
+        scratch_pairs=scratch_pairs,
+        late_weights=late_weights,
+    )
 
 
 def prepare_qwen4_exp_delta_layer(
@@ -134,6 +143,7 @@ def qwen4_exp_delta_layer_decode(
     step: torch.Tensor,
     layer_index: int,
     ple: dict[str, torch.Tensor] | None,
+    warm: torch.Tensor | None,
 ) -> None:
     """One decode step, or one speculative verify, of a packed Gated
     DeltaNet layer.
@@ -180,6 +190,10 @@ def qwen4_exp_delta_layer_decode(
             In a verify, these are the verify scratch and its rows. ``ple``
             is None for any other layer. The kernel does the n-gram lookup
             itself.
+        warm: The next launch's ``late_weights`` (None for the last layer).
+            The launch may read them into the memory-side cache while it has
+            little HBM traffic, so the next launch reads them sooner. It
+            leaves them unchanged.
     """
     layer.decode(
         weights=layer.weights,
@@ -197,6 +211,7 @@ def qwen4_exp_delta_layer_decode(
         step=step,
         layer_index=layer_index,
         ple=ple,
+        warm=warm,
     )
 
 

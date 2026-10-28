@@ -129,6 +129,43 @@ if is_cdna4():
         assert bad[:consumers].tolist() == [0] * consumers
         assert (int(scratch[0].item()) >> 32) & 0xFFFFFFFF == launch_tag(value, 3)
 
+    @gluon.jit
+    def _waves_kernel(scratch, step_ptr, out, SPIN: gl.constexpr):
+        # CTA 1 publishes pairs 0 .. 1023. CTA 0's waves below SPIN poll two
+        # tensors of them; the other waves point at pairs that no one writes.
+        pid = gl.program_id(0)
+        tag = mailbox.launch_tag(step_ptr, 3)
+        lanes = gl.arange(0, 64 * gl.num_warps(), mailbox.lane_layout(gl.num_warps()))
+        if pid == 1:
+            mailbox.put(scratch, lanes, lanes * 3 + tag, tag)
+            mailbox.put(scratch, 512 + lanes, lanes * 5 + tag, tag)
+        else:
+            spin = lanes // 64 < SPIN
+            first, second = mailbox.poll_many_waves(
+                scratch,
+                (
+                    gl.where(spin, lanes, 2048 + lanes),
+                    512 + gl.where(spin, lanes, 2048),
+                ),
+                tag,
+                spin.to(gl.int32),
+            )
+            gl.store(out + lanes, first, mask=spin)
+            gl.store(out + 512 + lanes, second, mask=spin)
+
+    def test_waves_without_spin_skip_the_poll():
+        scratch = torch.zeros(4096, dtype=torch.int64, device="cuda")
+        out = torch.full((1024,), -1, dtype=torch.int32, device="cuda")
+        step = torch.full((1,), 5, dtype=torch.int32, device="cuda")
+        # The waves past 3 would wait for ever on pairs that no CTA writes.
+        _waves_kernel[(2,)](scratch, step, out, 3, num_warps=8)
+        torch.cuda.synchronize()
+        tag = launch_tag(5, 3)
+        lanes = torch.arange(192)
+        assert out[:192].tolist() == (lanes * 3 + tag).tolist()
+        assert out[512:704].tolist() == (lanes * 5 + tag).tolist()
+        assert (out[192:512] == -1).all() and (out[704:] == -1).all()
+
     # A poll whose pair never arrives, with a small retry bound so that the
     # test is quick. It runs in its own process: the trap ends the process's
     # GPU context.

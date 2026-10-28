@@ -90,7 +90,7 @@ def _qsa_kernel(scratch, step, qsa_weights, cache, trace_buf, PLAN: gl.constexpr
         qsa.attention_stage(mb, task, 0, row, 1, "q5")
     task, active = schedule.stage_task(PLAN, "q6")
     if active:
-        qsa.merge_stage(mb, task, "q6")
+        qsa.merge_stage(mb, task, row, "q6")
     trace.flush(table, trace_buf)
 
 

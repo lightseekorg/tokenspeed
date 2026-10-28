@@ -25,6 +25,7 @@ Read these documents with this one:
 | `bf16.py` | The BF16-weight, BF16-activation GEMV and the BF16 row loads. |
 | `weights.py` | Host side: the weight and scale layouts that `mx.py` and `bf16.py` read. |
 | `trace.py` | Timestamps for each wave and stage inside a launch. |
+| `warm.py` | A warm task: reads weights of the next launch into the memory-side cache, through LDS, with no registers. |
 
 | Model directory | Model |
 |---|---|
@@ -122,6 +123,7 @@ Memory rules on gfx950 (coarse-grained VRAM):
 | `put(region, index, payload, mask)` | Publishes 32-bit payloads at pairs `index` of a region. |
 | `poll(region, index)` | Waits for the pairs and returns the payloads. |
 | `poll_many(regions, indices)`, `poll_pairs(offsets)` | Polls several index tensors, four in one round trip. `pairs(region, index)` gives the offsets for `poll_pairs`, so one tensor can mix regions. |
+| `poll_waves(region, index, spin)`, `poll_many_waves(regions, indices, spin)` | Polls by the waves whose `spin` is non-zero only. Use them when whole waves hold pairs that the stage does not need. |
 | `row(r)`, `row_offset(row)` | Address the copies of another row. |
 | `pre_poll(region, hints)`, `pre_poll_spread(region, N)` | Let wave 0 spin on hint pairs before a wide poll. |
 | `stamp(stage, point)` | Records a trace point. |
