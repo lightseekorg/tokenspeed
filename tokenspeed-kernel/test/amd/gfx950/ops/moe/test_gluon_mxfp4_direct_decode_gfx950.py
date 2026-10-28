@@ -853,7 +853,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
     )
     # The actual startup lifecycle warms families; these held-out tails must
     # execute through public dispatch without compiling new variants.
-    row_counts = (3, 5, 31, 53, 64, 65, 128, 191, 207, 256, 257, 8191, 8192)
+    row_counts = (3, 5, 18, 31, 47, 53, 64, 65, 128, 191, 207, 256, 257, 8191, 8192)
     if ep_size == 1:
         # Exercise every density-selected row tile with an unwarmed token tail.
         row_counts = (*row_counts[:-2], 263, 1031, 2055, 4103, *row_counts[-2:])

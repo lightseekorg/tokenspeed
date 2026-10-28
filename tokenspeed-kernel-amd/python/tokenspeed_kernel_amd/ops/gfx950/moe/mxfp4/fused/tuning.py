@@ -107,24 +107,29 @@ _EP1_STAGE = _RouteTileStage(128, 256, False)
 # entry fall through to the grouped (staged package) path, which produces
 # bitwise-identical results.
 #
-# The decode entries keep the schedule they used before this table. The other
-# entries were measured on MI355X against the staged package path: one MoE
-# layer per call in graph replay, rotating over four weight copies so weights
-# come from HBM, with uniform and Zipf(1.0) expert routing, three random
-# routing samples each. Each entry's upper row bound is the largest
-# power-of-two route capacity below the first row count at which some sample
-# ran slower than the package path.
-_DECODE_ROUTE_TILES = (
+# The EP4 and EP8 4-16 row entries were not re-measured. The other entries
+# were measured on MI355X against the staged package path: one MoE layer per
+# call in graph replay, rotating over four weight copies so weights come from
+# HBM, with uniform and Zipf(1.0) expert routing, three random routing samples
+# each. Each entry's upper row bound is the largest power-of-two route
+# capacity below the row count from which samples are consistently slower
+# than the package path; isolated outliers are noted per entry.
+_SINGLE_PROGRAM_ROUTE_TILES = (
     (4, 8, _RouteTileConfig(16, _DECODE_STAGE1, _RouteTileStage(16, 256, False))),
     (9, 16, _RouteTileConfig(16, _DECODE_STAGE1, _RouteTileStage(16, 128, False))),
+)
+_DECODE_ROUTE_TILES = _SINGLE_PROGRAM_ROUTE_TILES + (
     (17, 48, _RouteTileConfig(64, _DECODE_STAGE1, _RouteTileStage(16, 128, False))),
 )
 # EP8 (32 local experts), 49-256 rows: 0.77-0.84x the staged package's time
 # with uniform routing (201 -> 156 us at 128 rows) and 0.67-0.91x with Zipf,
 # except one very skewed 224-row sample at 1.03x. Zipf samples are slower from
-# 384 rows, so the bound is 256.
-_EP8_ROUTE_TILES = _DECODE_ROUTE_TILES + (
-    (49, 64, _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 128, True))),
+# 384 rows, so the bound is 256. EP8 17-64 rows: 0.83-0.96x the time of the
+# _DECODE_ROUTE_TILES schedule over four samples (146 -> 124 us at 48 rows,
+# uniform routing); in the down projection (stage 2), a 256-wide K tile is
+# within ~2% of a 128-wide one at 49-64 rows.
+_EP8_ROUTE_TILES = _SINGLE_PROGRAM_ROUTE_TILES + (
+    (17, 64, _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 256, True))),
     (65, 128, _RouteTileConfig(128, _WIDE_STAGE1, _RouteTileStage(64, 128, True))),
     # More routes per expert favor the longer down-projection K tile.
     (129, 256, _RouteTileConfig(256, _WIDE_STAGE1, _RouteTileStage(64, 256, True))),
