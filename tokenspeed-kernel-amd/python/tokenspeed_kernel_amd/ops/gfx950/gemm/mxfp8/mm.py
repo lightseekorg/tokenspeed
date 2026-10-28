@@ -2444,12 +2444,13 @@ def _launch_pipeline_fp32_or_native(
         num_warps=waves,
         waves_per_eu=waves_per_eu,
         llvm_fn_attrs=(("amdgpu-agpr-alloc", "0,0"),),
-        # The 256x256 tile runs at the register limit and spills; unbounded
-        # SLP vectorizer scheduling lengthens live ranges and spills more.
-        # Bounding it removes the spills there but slows the smaller tiles.
+        # The FP32-scale 256x256 tile runs at the register limit and spills;
+        # unbounded SLP vectorizer scheduling lengthens live ranges and spills
+        # more. Bounding it removes the spills there, but slows the smaller
+        # tiles and no longer helps the native-scale tile.
         **(
             {"llvm_cl_opts": "slp-schedule-budget=100"}
-            if (block_m, block_n) == (256, 256)
+            if fp32_scales and (block_m, block_n) == (256, 256)
             else {}
         ),
     )
