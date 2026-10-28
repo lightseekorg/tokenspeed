@@ -97,9 +97,9 @@ def _layer(dim: int, sliding_window_size: int = -1):
 
 def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_left=-1):
     """Paged K/V rows for every request's keys, queries, window masks, and the
-    fp32 reference: row r sees the prefix and window key j when bit j is set.
-    With ``window_left`` the row decodes at the prefix end and sees only the
-    last ``window_left + 1`` prefix keys."""
+    fp32 reference: row r sees the prefix and window key j when bit j % 64 of
+    its mask word j // 64 is set. With ``window_left`` the row decodes at the
+    prefix end and sees only the last ``window_left + 1`` prefix keys."""
     bs = len(seq_lens)
     pages = (max(seq_lens) + PAGE - 1) // PAGE
     table = torch.zeros(bs, max_pages, dtype=torch.int32)
@@ -108,11 +108,27 @@ def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_le
     k_rows = torch.randn(rows_shape, generator=gen).bfloat16()
     v_rows = torch.randn(rows_shape, generator=gen).bfloat16()
     q = torch.randn(bs * rows, HQ, dim, generator=gen).bfloat16()
-    bits = torch.randint(0, 1 << 62, (bs * rows,), generator=gen)
-    # With a poison, rows only see step 1's slots (later lane steps unwritten yet).
-    seen_width = window if poison is None else rows
-    if seen_width < 62:
-        bits &= (1 << seen_width) - 1
+    words = (window + 63) // 64
+    if words == 1:
+        bits = torch.randint(0, 1 << 62, (bs * rows,), generator=gen)
+        # With a poison, rows only see step 1's slots (later lane steps unwritten yet).
+        seen_width = window if poison is None else rows
+        if seen_width < 62:
+            bits &= (1 << seen_width) - 1
+    else:
+        assert poison is None
+        # Full 64-bit words (the sign bit included), the last one cut to the window.
+        bits = torch.randint(
+            -(1 << 63), (1 << 63) - 1, (bs * rows, words), generator=gen
+        )
+        if window % 64:
+            bits[:, -1] &= (1 << (window % 64)) - 1
+        bits = bits.flatten()
+    # Each row's mask as one Python int: window slot j is bit j.
+    row_bits = [
+        sum((w & ((1 << 64) - 1)) << (64 * i) for i, w in enumerate(row))
+        for row in bits.view(bs * rows, words).tolist()
+    ]
     ref = torch.empty(bs * rows, HQ, dim)
     for b, length in enumerate(seq_lens):
         pos = torch.arange(length)
@@ -127,7 +143,7 @@ def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_le
                     first <= j < prefix
                     or (
                         j >= prefix
-                        and bool((int(bits[b * rows + i]) >> (j - prefix)) & 1)
+                        and bool((row_bits[b * rows + i] >> (j - prefix)) & 1)
                     )
                     for j in range(length)
                 ]
@@ -140,7 +156,7 @@ def _problem(seq_lens, rows, window, max_pages, gen, dim, poison=None, window_le
         for b, length in enumerate(seq_lens):
             seen = 0
             for i in range(rows):
-                seen |= int(bits[b * rows + i])
+                seen |= row_bits[b * rows + i]
             prefix = length - window
             for j in range(rows, window):
                 if not (seen >> j) & 1:
@@ -207,12 +223,15 @@ def test_tree_lanes_match_reference(topk, steps, poison):
     )
 
 
+# 80 slots: two mask words per row, the second partly used.
+@pytest.mark.parametrize("topk,steps", [(4, 5), (8, 11)])
 @pytest.mark.parametrize("window_left", [-1, 40])
-def test_eagle4_lanes_match_reference(window_left):
+def test_eagle4_lanes_match_reference(window_left, topk, steps):
     """EAGLE-4 lanes: a sliding-window draft layer decodes each lane row's
-    prefix alone (per-row tables), then its window ancestors."""
-    dim, topk, steps = 128, 4, 5
-    gen = torch.Generator().manual_seed(window_left + 2)
+    prefix alone (per-row tables), then its window ancestors; windows past 64
+    slots read the ancestors from the next mask word."""
+    dim = 128
+    gen = torch.Generator().manual_seed(window_left + topk * steps)
     window = (steps - 1) * topk
     # Prefixes past, at, and inside the sliding window.
     frontier = [700, 41, 3, 130]
@@ -224,10 +243,11 @@ def test_eagle4_lanes_match_reference(window_left):
     lanes = Eagle4TreeLanes(
         topk, steps, 8, torch.device("cuda"), slides=window_left >= 0
     )
+    assert lanes.mask_words == (window + 63) // 64
     backend.bind_tree_draft(lanes)
     bs = len(frontier)
     lanes.set_frontier(bs, torch.tensor(frontier, dtype=torch.int32, device="cuda"))
-    lanes.lane_mask[: bs * topk] = bits
+    lanes.lane_mask[: bs * topk * lanes.mask_words] = bits
     backend.refresh_decode_metadata(
         bs, bs, torch.tensor(frontier, dtype=torch.int32, device="cuda"), table
     )
@@ -239,6 +259,112 @@ def test_eagle4_lanes_match_reference(window_left):
     torch.testing.assert_close(
         out.view(-1, HQ, dim).float().cpu(), ref, atol=2e-2, rtol=2e-2
     )
+
+
+@pytest.mark.parametrize("lane_rows", [False, True], ids=["verify", "lanes"])
+def test_tree_cascade_graph_replay_matches_eager(lane_rows):
+    """One graph captured at the capture seeding replays prefixes of zero,
+    short and long length and padding requests: every replay refreshes the
+    cascade metadata (the verify prefix lengths, the lane frontiers) in place,
+    and its live rows equal an eager forward of the same inputs."""
+    dim, graph_bs = 128, 4
+    if lane_rows:
+        topk, steps = 4, 5
+        rows, window = topk, (steps - 1) * topk
+    else:
+        rows = window = 16
+    backend = _backend(window, max_bs=8, is_draft=lane_rows, dim=dim)
+    pages = backend.max_num_pages
+    lanes = None
+    if lane_rows:
+        lanes = Eagle4TreeLanes(topk, steps, 8, torch.device("cuda"), slides=False)
+        backend.bind_tree_draft(lanes)
+        mask = lanes.lane_mask
+    else:
+        mask = torch.zeros(8 * rows, dtype=torch.int64, device="cuda")
+        backend.bind_tree_verify(
+            TreeVerifyInputs(mask, rows, torch.zeros(8, rows, dtype=torch.int32))
+        )
+    # The graph reads these buffers; each replay copies a new problem in.
+    rows_shape = ((graph_bs * pages + 1) * PAGE, HKV, dim)
+    k_buf = torch.zeros(rows_shape, dtype=torch.bfloat16, device="cuda")
+    v_buf = torch.zeros_like(k_buf)
+    pool = SimpleNamespace(
+        get_key_buffer=lambda _: k_buf, get_value_buffer=lambda _: v_buf
+    )
+    q_buf = torch.zeros(graph_bs * rows, HQ, dim, dtype=torch.bfloat16, device="cuda")
+    layer = _layer(dim)
+
+    def forward(bs):
+        if lanes is not None:
+            lanes.active = True
+        out = backend.forward_decode(
+            q_buf[: bs * rows], None, None, layer, None, pool, bs
+        )
+        if lanes is not None:
+            lanes.active = False
+        return out
+
+    def set_frontier(frontier):
+        if lanes is not None:
+            lanes.set_frontier(
+                len(frontier), torch.tensor(frontier, dtype=torch.int32, device="cuda")
+            )
+
+    # Capture seeding: every request is padding (seq_len 1, null pages).
+    backend.init_forward_metadata_capture_cuda_graph(
+        graph_bs,
+        torch.ones(graph_bs, dtype=torch.int32, device="cuda"),
+        torch.zeros(graph_bs, pages, dtype=torch.int32, device="cuda"),
+    )
+    set_frontier([0] * graph_bs)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        forward(graph_bs)  # compile outside the capture
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = forward(graph_bs)
+
+    # Committed prefixes of the live requests; the rest of the batch is padding.
+    for case, committed in enumerate([[0, 0, 130, 700], [3, 64, 1], [0]]):
+        gen = torch.Generator().manual_seed(case)
+        live = len(committed)
+        seq_lens = [c + window for c in committed]
+        table, q, bits, case_pool, ref = _problem(
+            seq_lens, rows, window, pages, gen, dim
+        )
+        case_k = case_pool.get_key_buffer(0)
+        k_buf.zero_()
+        v_buf.zero_()
+        k_buf[: case_k.shape[0]].copy_(case_k)
+        v_buf[: case_k.shape[0]].copy_(case_pool.get_value_buffer(0))
+        q_buf.zero_()
+        q_buf[: live * rows].copy_(q)
+        mask.zero_()
+        mask[: live * rows].copy_(bits)
+        # Lanes decode at the frontier; verify presents its keys window included.
+        live_lens = committed if lane_rows else seq_lens
+        padded_lens = torch.tensor(
+            live_lens + [1] * (graph_bs - live), dtype=torch.int32, device="cuda"
+        )
+        padded_table = torch.cat([table, table.new_zeros(graph_bs - live, pages)])
+
+        backend.refresh_decode_metadata(
+            graph_bs, live, padded_lens, padded_table, for_graph_replay=True
+        )
+        set_frontier(committed + [0] * (graph_bs - live))
+        graph.replay()
+        replayed = graph_out[: live * rows].float().cpu()
+
+        backend.refresh_decode_metadata(live, live, padded_lens, table)
+        set_frontier(committed)
+        eager = forward(live).float().cpu()
+        torch.testing.assert_close(replayed, eager, atol=0, rtol=0)
+        torch.testing.assert_close(
+            replayed.view(-1, HQ, dim), ref, atol=2e-2, rtol=2e-2
+        )
 
 
 def test_tree_verify_refuses_a_sliding_window_layer():
