@@ -65,8 +65,10 @@ def test_gumbel_scratch_shape_covers_the_kernel_blocks() -> None:
         gumbel_scratch_shape(4, 0)
 
 
-def _top_k_top_p_gumbel_scratch(rows: int, vocab_size: int, device: str):
-    num_blocks = (vocab_size + 2047) // 2048
+def _top_k_top_p_gumbel_scratch(
+    rows: int, vocab_size: int, device: str, block_size: int = 2048
+):
+    num_blocks = (vocab_size + block_size - 1) // block_size
     num_candidates = num_blocks * 128
     candidate_ids = torch.empty(
         (rows, num_candidates), dtype=torch.int32, device=device
@@ -488,6 +490,66 @@ def test_gumbel_top_k_top_p_masks_short_tail_block_candidates(device: str) -> No
     assert not torch.isnan(candidate_logits).any()
     allowed = _top_k_topp_allowed_ids(logits[0], 1.0, 100, 1.0)
     assert int(sampled.item()) in allowed
+
+
+def _verify_top_k_top_p_scratch(rows: int, vocab_size: int, device: str):
+    # The serving layout: 1024-token blocks with the CUDA-graph pad of 128.
+    # Stale scratch that would win any merge it took part in proves that
+    # each launch reads only candidates it wrote itself.
+    candidate_ids, candidate_logits, out = _top_k_top_p_gumbel_scratch(
+        rows, vocab_size, device, block_size=1024
+    )
+    candidate_ids.fill_(1)
+    candidate_logits.fill_(float("inf"))
+    return candidate_ids, candidate_logits, out
+
+
+def test_gumbel_top_k_top_p_greedy_rows_take_the_lowest_id_argmax(
+    device: str,
+) -> None:
+    torch.manual_seed(5031)
+    n, vocab_size = 4, 5000
+    rows = 2 * n
+    logits = torch.randn((rows, vocab_size), dtype=torch.float32, device=device) * 3.0
+    best = logits.max() + 1.0
+    logits[0, [300, 10]] = best  # a tie inside one vocab block
+    logits[1, [4100, 1500]] = best  # a tie across blocks, one in the short tail
+    logits[2, vocab_size - 1] = best
+    req_pool_indices = torch.tensor([3, 1], dtype=torch.int32, device=device)
+    # Top-p, min-p and temperature must not change a greedy (top_k 1) pick.
+    pool_rows = 4
+    temperature_pool = torch.tensor([1.0, 0.6, 1.0, 1.3], device=device)
+    top_k_pool = torch.ones((pool_rows,), dtype=torch.int32, device=device)
+    top_p_pool = torch.tensor([1.0, 0.5, 1.0, 1.0], device=device)
+    min_p_pool = torch.tensor([0.0, 0.0, 0.0, 0.3], device=device)
+    seed_pool = torch.arange(41, 41 + pool_rows, dtype=torch.int64, device=device)
+    offsets_pool = torch.arange(3, 3 + pool_rows, dtype=torch.int64, device=device)
+    candidate_ids, candidate_logits, out = _verify_top_k_top_p_scratch(
+        rows, vocab_size, device
+    )
+
+    sampled = gumbel_sample_top_k_top_p_from_pools(
+        logits,
+        req_pool_indices,
+        temperature_pool,
+        top_k_pool,
+        top_p_pool,
+        seed_pool,
+        offsets_pool,
+        candidate_ids,
+        candidate_logits,
+        out,
+        min_p_pool=min_p_pool,
+        block_size=1024,
+        top_k_pad=128,
+        num_tokens_per_req=n,
+    )
+
+    # torch.argmax returns the first (lowest-id) maximum.
+    torch.testing.assert_close(
+        sampled, torch.argmax(logits, dim=-1).to(torch.int32), rtol=0, atol=0
+    )
+    assert sampled[:3].tolist() == [10, 1500, vocab_size - 1]
 
 
 def test_gumbel_top_k_top_p_qrita_verify_idx_mapping_matches_expanded_rows(
