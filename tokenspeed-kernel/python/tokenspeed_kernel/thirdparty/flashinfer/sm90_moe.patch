@@ -1,5 +1,5 @@
 diff --git a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
-index c4f877e2e6fe73635767fad786f938a50a5f09da..f39c443f64c2b6874f593f1599da823961e17cf9 100644
+index c4f877e2e6fe73635767fad786f938a50a5f09da..37c3a54a3adfb242d25689255318eaa15f8d7adc 100644
 --- a/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 +++ b/csrc/fused_moe/cutlass_backend/cutlass_fused_moe_kernels.cuh
 @@ -58,0 +59 @@
@@ -138,10 +138,12 @@ index c4f877e2e6fe73635767fad786f938a50a5f09da..f39c443f64c2b6874f593f1599da8239
 @@ -4316 +4349 @@ void CutlassMoeFCRunner<
 -                min_latency_params.active_expert_global_ids, enable_pdl);
 +                min_latency_params.active_expert_global_ids, enable_pdl, -1, nullptr);
-@@ -4393,0 +4427,16 @@ void CutlassMoeFCRunner<
+@@ -4393,0 +4427,18 @@ void CutlassMoeFCRunner<
 +    float* fused_fc2_scales = nullptr;
 +#if defined(ENABLE_FP8_BLOCK_SCALE) && defined(FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT) && \
 +    FLASHINFER_SM90_MOE_FUSE_SWIGLU_QUANT
++    // Fusion is decided here and cannot fall back later: grouped_gemm_dispatch throws unless
++    // these conditions select a 128-channel swapAB tile of at most 32 rows. Keep both in sync.
 +    if (blockscale_gemm_runner && fp8_blockscale_gemm::getDeepGemmEnabled() &&
 +        fc1_activation_type.activation_type == ActivationType::Swiglu &&
 +        !use_lora && !use_awq && !min_latency_mode && fc1_expert_biases == nullptr &&
@@ -155,10 +157,10 @@ index c4f877e2e6fe73635767fad786f938a50a5f09da..f39c443f64c2b6874f593f1599da8239
 +      gemm2_result = glu_inter_result_;
 +    }
 +#endif
-@@ -4435 +4484 @@ void CutlassMoeFCRunner<
+@@ -4435 +4486 @@ void CutlassMoeFCRunner<
 -                nullptr, enable_pdl);
 +                nullptr, enable_pdl, expected_m, fused_fc2_scales);
-@@ -4448,9 +4497,10 @@ void CutlassMoeFCRunner<
+@@ -4448,9 +4499,10 @@ void CutlassMoeFCRunner<
 -    Self::gemm2(
 -        moe_gemm_runner_, blockscale_gemm_runner, gemm2_input, gemm2_result, final_output,
 -        expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases,
@@ -1063,7 +1065,7 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..fb83c9f2f4ab1c148d47fcf8d65890c3
 +  // This call's unpadded row capacity; quantization rounds its launch up separately.
 +  int64_t shape_m_ = 0;
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..dddaddf6161129729fb072fa8075872685e52676 100644
+index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..d72c3ed63270e9cd01e8de81e2fb5838deba77a1 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 @@ -1350 +1350 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
@@ -1093,12 +1095,14 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..dddaddf6161129729fb072fa80758726
 @@ -1480 +1485 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset);
 +        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, false, false, false, false);
-@@ -1487,0 +1493,14 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1487,0 +1493,16 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 +    // Paired row tiles double the accumulators; keep them to the small token tiles of decode.
 +    bool paired = paired_rows && shape_n % (2 * block_k) == 0;
 +    auto config = deep_gemm::jit::get_best_gemm_config(shape_n, expected_m, shape_k, num_problems,
 +                                                       num_device_sms, false, true, max_num_stages,
 +                                                       paired);
++    // runMoe has already committed to fusion from its own shape checks, so this call cannot fall
++    // back to the unfused path; keep those eligibility conditions in sync with this check.
 +    TLLM_CHECK_WITH_INFO(fused_output == nullptr ||
 +                             (paired && std::get<0>(config) == 128 && std::get<1>(config) <= 32),
 +                         "Unsupported tile configuration for fused SwiGLU quantization");
@@ -1108,7 +1112,7 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..dddaddf6161129729fb072fa80758726
 +                                                    num_device_sms, false, true, max_num_stages,
 +                                                    false);
 +    }
-@@ -1489,2 +1508,15 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1489,2 +1510,15 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        deep_gemm::jit::get_best_gemm_config(shape_n, expected_m, shape_k, num_problems,
 -                                             num_device_sms, false, true);
 +        config;
@@ -1126,21 +1130,21 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..dddaddf6161129729fb072fa80758726
 +    // read before griddepcontrol.wait are already final. Other grouped GEMMs stay stream-ordered,
 +    // as upstream.
 +    bool const programmatic_launch = enable_pdl && (fused_output != nullptr || fused_fc1_input);
-@@ -1493 +1525,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1493 +1527,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true);
 +        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true, paired,
 +        fused_output != nullptr, prefetch_first_tile);
-@@ -1500 +1533,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1500 +1535,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
 +        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded,
 +        fused_output, fused_scales, programmatic_launch);
-@@ -1509 +1543,4 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1509 +1545,4 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          bool internal_quantize_a = true, bool internal_quantize_b = true) {
 +                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages,
 +                          int64_t quant_shape_m, bool paired_rows,
 +                          __nv_fp8_e4m3* fused_output, float* fused_scales, bool fused_fc1_input,
 +                          bool enable_pdl) {
-@@ -1521,3 +1558,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1521,3 +1560,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs),
 -                              div_up(max_shape_m * scales_dim_x, NumThreads / 32));
 -    // Binary search is expected to have lower complexity when max_shape_m is small
@@ -1150,18 +1154,18 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..dddaddf6161129729fb072fa80758726
 +        1, std::min(static_cast<int64_t>(kNumDeviceSMs),
 +                    div_up(quant_shape_m * scales_dim_x, NumThreads / 32)));
 +    // Binary search is expected to have lower complexity when quant_shape_m is small
-@@ -1525 +1565 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1525 +1567 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -        static_cast<double>(max_shape_m) * scales_dim_x /
 +        static_cast<double>(quant_shape_m) * scales_dim_x /
-@@ -1553 +1593,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1553 +1595,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          stream);
 +                          stream, max_num_stages, paired_rows, fused_output, fused_scales, fused_fc1_input,
 +                          enable_pdl);
-@@ -1578 +1619,2 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1578 +1621,2 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
 -      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms);
 +      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms,
 +                                           false, false, -1, false);
-@@ -1582 +1624 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1582 +1626 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
 -      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched);
 +      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched, false, false, false, false);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h

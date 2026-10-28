@@ -131,8 +131,9 @@ dependents; other grouped GEMMs stay stream-ordered, as upstream. The matching
 eight-stage FC2 can load its first weight tile and weight scales into shared
 memory before waiting for FC1. FC1 triggers dependents only after its own
 dependency wait and writes neither routing metadata nor weights; activation
-and activation-scale reads remain after the dependency wait. `enable_pdl=False` keeps all grouped launches ordered and
-disables this first-tile prefetch.
+and activation-scale reads remain after the dependency wait.
+`enable_pdl=False` keeps all grouped launches ordered and disables this
+first-tile prefetch.
 Prepare and warm the callable before graph capture. Fusion and prefetch variants
 have distinct content-keyed kernel caches, and route metadata is refreshed on
 replay. Performance depends on routing; benchmark the intended workload.
