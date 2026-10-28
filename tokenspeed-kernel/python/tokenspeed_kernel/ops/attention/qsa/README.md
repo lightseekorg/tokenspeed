@@ -205,9 +205,9 @@ policy cannot change their padding.
 On SM100/SM103, an FP8 grid of at least `3 * SM_count / 16` output tiles picks
 its query rows per CTA and KV splits from 1x1, 2x1, 1x2 and 1x4. With one
 resident CTA per SM, the choice minimizes the wave count times the per-CTA
-work: the 2048-entry prefix slots its rows gather within one KV split, plus a
-fixed cost fitted on SM103. Smaller grids, and every FP8 grid on SM107, keep
-the split rule with one query per CTA.
+work: each of its query rows gathers the 2048-entry prefix slots within one KV
+split and adds a fixed per-row cost fitted on SM103. Smaller grids, and every
+FP8 grid on SM107, keep the split rule with one query per CTA.
 
 This selects static geometry inside the existing decode provider. Cache
 layout, writers, prefix/offload ownership and descales keep their contracts.

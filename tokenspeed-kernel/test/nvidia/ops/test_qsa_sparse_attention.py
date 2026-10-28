@@ -1341,8 +1341,8 @@ def test_qsa_sparse_attention_blackwell_fp8_decode_grids_match_reference(
     device: str, rows: int, q_heads: int, kv_heads: int, logit_gain: float
 ) -> None:
     """FP8 decode grids large enough to pick their rows/CTA and KV splits by
-    wave count (one split, two rows per CTA at odd rows, or two splits) match
-    the reference over full selections with holes and a padded request."""
+    wave count match the reference over full selections with holes and a
+    padded request."""
     platform = current_platform()
     if platform.arch_version not in (ArchVersion(10, 0), ArchVersion(10, 3)):
         pytest.skip(
@@ -1905,14 +1905,14 @@ def test_qsa_sparse_attention_blackwell_large_kv_offsets(
         (416, 4, True, 152, (1, 1, 3, True)),
         (512, 1, True, 80, (1, 1, 3, True)),
         # FP8 sizes rows/CTA and splits by wave-quantized per-CTA tile work.
-        (512, 1, False, 152, (2, 1, 1, False)),
+        (512, 1, False, 152, (1, 1, 1, False)),
         (8, 1, False, 152, (1, 8, 1, False)),
         (16, 2, False, 152, (1, 4, 1, False)),
         (48, 1, False, 152, (1, 2, 1, False)),
         (72, 2, False, 152, (1, 1, 1, False)),
         (80, 2, False, 152, (1, 2, 1, False)),
         (224, 2, False, 152, (1, 1, 1, False)),
-        (288, 2, False, 152, (2, 1, 1, False)),
+        (288, 2, False, 152, (1, 1, 1, False)),
         (352, 2, False, 152, (1, 1, 1, False)),
     ],
 )
@@ -1942,7 +1942,7 @@ def test_qsa_sparse_attention_blackwell_output_tiling(
         # SM100/SM103 use tile16 at every size and size large grids by waves.
         (False, 152, 8, (16, 4, 1)),
         (False, 152, 72, (16, 1, 1)),
-        (False, 152, 288, (16, 1, 2)),
+        (False, 152, 288, (16, 1, 1)),
     ],
 )
 def test_qsa_sparse_attention_blackwell_fp8_tile_and_grid_by_arch(
