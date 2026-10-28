@@ -284,6 +284,52 @@ def test_deferred_native_matches_whole_moe(
     exercise_deferred_native(native_routes, weights, tokens, ep_size, ep_rank, 5)
 
 
+def test_deferred_native_rejects_conflicting_finalization(native_routes, weights):
+    native, deferred = native_routes
+    w1, w2, s1, s2 = weights
+    tokens, topk = 8, 5
+    experts, hidden = w1.shape[0], w1.shape[2]
+    x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16) * 0.1
+    ids = (
+        torch.arange(tokens * topk, device="cuda", dtype=torch.int32).view(tokens, topk)
+        % experts
+    )
+    route_weights = torch.softmax(torch.randn((tokens, topk), device="cuda"), -1)
+    arguments = dict(
+        input=x,
+        token_selected_experts=ids,
+        token_final_scales=route_weights,
+        fc1_expert_weights=w1,
+        fc2_expert_weights=w2,
+        ep_size=1,
+        ep_rank=0,
+        expected_m=max(1, (tokens * topk + experts - 1) // experts),
+        enable_pdl=False,
+    )
+    reference = deferred(**arguments, fc1_scales=s1, fc2_scales=s2)
+    partial = torch.full_like(reference.partial, -23)
+    route_map = torch.full_like(reference.inverse.T.reshape(-1), -999)
+    offsets = torch.full_like(reference.expert_offsets, -999)
+    before = tuple(tensor.clone() for tensor in (partial, route_map, offsets))
+    destinations = dict(output=partial, route_map=route_map, expert_offsets=offsets)
+    native_arguments = dict(
+        **arguments,
+        **destinations,
+        output_dtype=torch.bfloat16,
+        quant_scales=[s1, s2],
+        use_deepseek_fp8_block_scale=True,
+    )
+    with pytest.raises(ValueError, match="require use_fused_finalize=False"):
+        native(**native_arguments, use_fused_finalize=True)
+    for actual, expected in zip((partial, route_map, offsets), before):
+        assert_bytes(actual, expected)
+    native(**native_arguments, use_fused_finalize=False)
+    valid_rows = int(reference.valid_rows.item())
+    assert_bytes(partial[:valid_rows], reference.partial[:valid_rows])
+    assert_bytes(route_map, reference.inverse.T.reshape(-1))
+    assert_bytes(offsets, reference.expert_offsets)
+
+
 @pytest.mark.parametrize("tokens", (1, 256))
 @pytest.mark.parametrize("topk", (1, 2, 4, 8, 16, 32))
 def test_deferred_native_model_dimensions(

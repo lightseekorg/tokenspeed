@@ -742,7 +742,7 @@ index 173998b089af816e873dac5d67ae12f3ab1acc30..74c5957e8f88867648da03a3545b9dcd
 +}
 +
 diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
-index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..2f22809f8b35aeef785c50295f7e2c8fda135708 100644
+index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..d4a2aa22087ac49f9d85215b311c14cb6de254e4 100644
 --- a/flashinfer/fused_moe/core.py
 +++ b/flashinfer/fused_moe/core.py
 @@ -647,0 +648,23 @@
@@ -879,15 +879,16 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..2f22809f8b35aeef785c50295f7e2c8f
 +            min_latency_mode=min_latency_mode,
 +            backend=backend,
 +        )
-@@ -1623,0 +1728,7 @@
+@@ -1623,0 +1728,8 @@
 +    if (route_map is None) != (expert_offsets is None):
 +        raise ValueError("Deferred route map and expert offsets must be supplied together")
 +    if route_map is not None:
 +        if not use_deepseek_fp8_block_scale or min_latency_mode or enable_alltoall or tp_size != 1:
 +            raise ValueError("Deferred finalize requires SM90 block-FP8 without TP/all-to-all")
 +        num_rows *= token_selected_experts.shape[1]
-+        use_fused_finalize = False
-@@ -1634 +1745,7 @@
++        if use_fused_finalize:
++            raise ValueError("Deferred outputs require use_fused_finalize=False")
+@@ -1634 +1746,7 @@
 -        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
 +        if enable_sm90_moe_optimizations:
 +            module = get_cutlass_fused_moe_module(
@@ -896,7 +897,7 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..2f22809f8b35aeef785c50295f7e2c8f
 +        else:
 +            module = get_cutlass_fused_moe_module(device_arch)
 +        return module.cutlass_fused_moe(
-@@ -1671,0 +1789,3 @@
+@@ -1671,0 +1790,3 @@
 +            expected_m=expected_m,
 +            route_map=route_map,
 +            expert_offsets=expert_offsets,

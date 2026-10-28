@@ -85,6 +85,9 @@ initialized rows; remote routes must not read the unused allocation tail.
 Caller-provided destinations must be disjoint and remain live until all
 consumers finish. Graph replay refreshes their contents without changing
 addresses. Separate streams require ordinary producer/consumer dependencies.
+The adapter explicitly disables native fused finalization. Direct native calls
+with deferred destinations must also pass `use_fused_finalize=False`; a
+conflicting request raises before any destination is written.
 
 `combine_quant_fp8` reduces routes in slot order, rounds the sum to BF16, and
 quantizes each 128-channel block to E4M3. Scales use logical `[tokens, hidden/128]` and
