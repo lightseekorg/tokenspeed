@@ -153,7 +153,16 @@ def _attention_worker(rank: int, port: int) -> None:
         world_size=8,
         timeout=timedelta(seconds=180),
     )
-    group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+    try:
+        group = dist.new_group(backend="nccl", timeout=timedelta(seconds=180))
+        _check_attention_mix(rank, device, group)
+    finally:
+        dist.destroy_process_group()
+
+
+def _check_attention_mix(
+    rank: int, device: torch.device, group: dist.ProcessGroup
+) -> None:
     from tokenspeed_kernel.ops.communication._iris.kimi_k3 import (
         prepare_k3_communication,
     )
@@ -601,7 +610,6 @@ def _attention_worker(rank: int, port: int) -> None:
             )
             torch.testing.assert_close(results[4], expected_moe, atol=0, rtol=0)
     assert pointers == tuple(t.data_ptr() for t in buffers)
-    dist.destroy_process_group()
 
 
 @pytest.mark.skipif(
