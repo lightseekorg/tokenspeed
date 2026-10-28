@@ -205,8 +205,9 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
     BlockTable table;
     std::array<GroupDemand, 1> no_demand{GroupDemand{.table = &table}};
     Measure("admit_no_demand_cached_pool", pool_size, 0, iterations, [&] {
-        const std::optional<CacheCoordinator::AdmissionResult> result = coordinator.Admit(
-            coordinator.ProbePrefix({}), no_demand, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+        const std::optional<CacheCoordinator::AdmissionResult> result =
+            coordinator.Admit(coordinator.ProbePrefix({}), no_demand, RequestProgress{},
+                              /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false);
         if (!result) {
             std::abort();
         }
@@ -216,8 +217,9 @@ void MeasureAdmission(std::int32_t pool_size, std::int32_t iterations) {
     std::array<GroupDemand, 1> demand{GroupDemand{.table = &table, .extent = DenseGrowth{4}}};
     std::uint64_t next_key = static_cast<std::uint64_t>(pool_size);
     Measure("admit_small_demand_evict_and_restore", pool_size, 1, iterations, [&] {
-        const std::optional<CacheCoordinator::AdmissionResult> result = coordinator.Admit(
-            coordinator.ProbePrefix({}), demand, RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+        const std::optional<CacheCoordinator::AdmissionResult> result =
+            coordinator.Admit(coordinator.ProbePrefix({}), demand, RequestProgress{},
+                              /*request_access_epoch=*/std::nullopt, /*evict_blocks_past_segments=*/false);
         if (!result) {
             std::abort();
         }
@@ -258,7 +260,8 @@ void MeasurePinnedAdmission(std::int32_t pool_size, std::int32_t iterations) {
     BlockTable table;
     const std::array demand{GroupDemand{.table = &table, .extent = DenseGrowth{4}}};
     Measure("admit_small_demand_all_pinned", pool_size, 1, iterations, [&] {
-        const auto result = coordinator.Admit(coordinator.ProbePrefix({}), demand, RequestProgress{}, std::nullopt);
+        const auto result = coordinator.Admit(coordinator.ProbePrefix({}), demand, RequestProgress{}, std::nullopt,
+                                              /*evict_blocks_past_segments=*/false);
         if (result) {
             std::abort();
         }

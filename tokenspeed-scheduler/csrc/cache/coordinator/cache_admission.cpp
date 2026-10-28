@@ -96,7 +96,8 @@ public:
                      std::optional<std::int32_t> num_computed_tokens, const CompletedPages* completed,
                      const CacheCoordinator::PrefixProbe& prefix, std::span<const PlannedShape> shapes,
                      std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
-                     const BoundaryTree& boundary_tree, bool evicts_segments, std::vector<VictimSet>& victims)
+                     const BoundaryTree& boundary_tree, bool evicts_segments, bool evicts_blocks_past_segments,
+                     std::vector<VictimSet>& victims)
         : coordinator_{coordinator},
           groups_{groups},
           geometry_{geometry},
@@ -111,6 +112,7 @@ public:
           claimed_{claimed},
           boundary_tree_{boundary_tree},
           evicts_segments_{evicts_segments},
+          evicts_blocks_past_segments_{evicts_blocks_past_segments},
           victims_{victims},
           shadow_{pool, groups},
           shape_need_(groups.size()),
@@ -143,6 +145,10 @@ public:
         };
         bool candidates_ran_out = false;
         std::size_t next_deferred_shared_page = 0;
+        // Once the shared pages ran out as well: the candidates the segment
+        // rules passed over, tried again block by block.
+        bool blocks_alone = false;
+        std::size_t next_passed_over = 0;
         while (!shadow_.Fits(shape_need_, blocks_needed_)) {
             std::optional<VictimCandidate> candidate = nextVictimCandidate();
             if (!candidate && next_deferred_shared_page < deferred_shared_pages_.size()) {
@@ -180,13 +186,22 @@ public:
                 }
                 candidate = deferred_shared_pages_[next_deferred_shared_page++];
             }
+            if (!candidate && evicts_blocks_past_segments_ && next_passed_over < passed_over_.size()) {
+                blocks_alone = true;
+                candidate = passed_over_[next_passed_over++];
+            }
             if (!candidate) {
                 return false;
             }
             const std::uint32_t group_id = candidate->group_id;
             const CacheBlockLocation location = candidate->location;
-            // Already leaving with an earlier set, or found unable to leave.
-            if (set_member_by_location_.contains(location) || unevictable_locations_.contains(location)) {
+            // Already leaving with an earlier set, or found unable to leave
+            // (passed over: tried again block by block).
+            if (set_member_by_location_.contains(location)) {
+                continue;
+            }
+            if (!blocks_alone && unevictable_locations_.contains(location)) {
+                passed_over_.push_back(*candidate);
                 continue;
             }
             VictimSet set{.is_request_reclaim = request_reclaim_locations_.contains(location)};
@@ -221,15 +236,15 @@ public:
                             .group_id = entry.group_id, .location = entry.location, .in_stranded_suffix = false});
                     }
                 }
-            } else if (num_staying_checkpoint_boundaries(*candidate_node) >= 2) {
+            } else if (blocks_alone ? coordinator_.GroupIsState(group_id)
+                                    : num_staying_checkpoint_boundaries(*candidate_node) >= 2) {
                 // Deeper checkpoint boundaries still read this page. A nested
                 // checkpoint leaves alone, every State group's at once; the
                 // page leaves with the last checkpoint boundary under it, or is
-                // tried again once the candidates run out.
+                // tried again once the candidates run out. Block by block, every
+                // checkpoint leaves so.
                 if (!coordinator_.GroupIsState(group_id)) {
-                    if (!candidates_ran_out) {
-                        deferred_shared_pages_.push_back(*candidate);
-                    }
+                    (candidates_ran_out ? passed_over_ : deferred_shared_pages_).push_back(*candidate);
                     continue;
                 }
                 bool evictable = true;
@@ -253,10 +268,12 @@ public:
                 // or a hit this admission keeps, or one the Device does not
                 // hold -- and everything the Device holds under them, so no
                 // Device page outlives its parent. The climb keeps the entries
-                // of each node it passes, from the candidate's parent up.
+                // of each node it passes, from the candidate's parent up. Block
+                // by block, a page leaves with its boundary's blocks not in use
+                // and everything under it, climbing nowhere.
                 const BoundaryTree::Node* top = candidate_node;
                 std::vector<std::pair<const BoundaryTree::Node*, std::vector<NodeEntry>>> climbed;
-                if (num_staying_checkpoint_boundaries(*candidate_node) == 1) {
+                if (!blocks_alone && num_staying_checkpoint_boundaries(*candidate_node) == 1) {
                     while (top->parent != nullptr && top->parent->on_device &&
                            num_staying_checkpoint_boundaries(*top->parent) == 1) {
                         std::vector<NodeEntry> entries = coordinator_.NodeEntries(pool_, *top->parent);
@@ -316,6 +333,9 @@ public:
                     const std::vector<NodeEntry> entries = climbed_node ? std::move(climbed[next_climbed++].second)
                                                                         : coordinator_.NodeEntries(pool_, *frame.node);
                     for (const NodeEntry& entry : entries) {
+                        if (blocks_alone && frame.node == candidate_node && !is_evictable(entry)) {
+                            continue;
+                        }
                         evictable = evictable && is_evictable(entry);
                         set.members.push_back(VictimSet::Member{.group_id = entry.group_id,
                                                                 .location = entry.location,
@@ -330,6 +350,9 @@ public:
                     stack.pop_back();
                 }
                 if (!evictable) {
+                    if (!blocks_alone) {
+                        passed_over_.push_back(*candidate);
+                    }
                     unevictable_locations_.insert(same_set.begin(), same_set.end());
                     continue;
                 }
@@ -356,7 +379,9 @@ public:
                     }
                     set.members.insert(set.members.end(), walked.members.begin() + next_walked, walked.members.end());
                 }
-                segment_top = top;
+                // A page leaving block by block may leave blocks in use at its
+                // boundary: no later walk takes it for that node's subtree.
+                segment_top = blocks_alone ? nullptr : top;
             }
             _assert(std::ranges::find(set.members.begin() + static_cast<std::ptrdiff_t>(num_taken_over_members),
                                       set.members.end(), location, &VictimSet::Member::location) != set.members.end(),
@@ -862,6 +887,9 @@ private:
     // Whether a victim takes its segment along
     // (CacheCoordinator::write_back_evictions_).
     bool evicts_segments_;
+    // Whether, once the segments cannot fund the demand, what they passed over
+    // leaves block by block (Admit's evict_blocks_past_segments).
+    bool evicts_blocks_past_segments_;
     std::vector<VictimSet>& victims_;
     // The pool as the tentative victims would leave it.
     ShadowOccupancy shadow_;
@@ -895,6 +923,10 @@ private:
     // Pages two or more Device checkpoint boundaries depend on, passed over
     // while candidates last, oldest first: tried again once they run out.
     std::vector<VictimCandidate> deferred_shared_pages_;
+    // Candidates no segment rule let leave (a set member in use or kept, or a
+    // shared page still shared once the candidates ran out), oldest first:
+    // tried again block by block once the shared pages run out too.
+    std::vector<VictimCandidate> passed_over_;
     // Per tree node: how many checkpoint boundaries at or under it have every
     // Device checkpoint in a selected set, counted once the candidates run out.
     std::unordered_map<const BoundaryTree::Node*, std::int32_t> leaving_checkpoint_boundary_counts_;
@@ -906,7 +938,8 @@ std::optional<AdmissionPlan> planAdmission(const CacheCoordinator& coordinator, 
                                            CacheCoordinator::PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                            const RequestProgress& progress, std::span<const PlannedShape> shapes,
                                            std::span<const std::pair<std::uint32_t, CacheBlockLocation>> claimed,
-                                           const BoundaryTree& boundary_tree, bool evicts_segments) {
+                                           const BoundaryTree& boundary_tree, bool evicts_segments,
+                                           bool evicts_blocks_past_segments) {
     _assert(demands.size() == groups.size(), "demands/groups size mismatch");
 
     std::vector<VictimSet> victims;
@@ -924,6 +957,7 @@ std::optional<AdmissionPlan> planAdmission(const CacheCoordinator& coordinator, 
                              claimed,
                              boundary_tree,
                              evicts_segments,
+                             evicts_blocks_past_segments,
                              victims};
     if (!planner.Plan()) {
         return std::nullopt;
@@ -973,7 +1007,7 @@ void CacheCoordinator::ReleaseStateInputs(std::span<BlockTable> tables) {
 
 std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     PrefixProbe&& prefix, std::span<const GroupDemand> demands, const RequestProgress& progress,
-    std::optional<std::uint64_t> request_access_epoch) {
+    std::optional<std::uint64_t> request_access_epoch, bool evict_blocks_past_segments) {
     _assert(demands.size() == groups_.size(), "demands/groups size mismatch");
     for (std::size_t i = 0; i < demands.size(); ++i) {
         _assert(demands[i].table != nullptr, "group demand requires a block table");
@@ -1023,12 +1057,12 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     std::optional<AdmissionPlan> candidate =
         planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_,
                       copies_in ? PrefixProbe{prefix} : PrefixProbe{std::move(prefix)}, demands, effective,
-                      /*shapes=*/{}, /*claimed=*/{}, boundary_tree_, write_back_evictions_);
+                      /*shapes=*/{}, /*claimed=*/{}, boundary_tree_, write_back_evictions_, evict_blocks_past_segments);
     if (!candidate && copies_in) {
         effective = withoutTailPublication(progress);
-        candidate =
-            planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix), demands,
-                          effective, /*shapes=*/{}, /*claimed=*/{}, boundary_tree_, write_back_evictions_);
+        candidate = planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix),
+                                  demands, effective, /*shapes=*/{}, /*claimed=*/{}, boundary_tree_,
+                                  write_back_evictions_, evict_blocks_past_segments);
     }
     if (!candidate) {
         return std::nullopt;
@@ -1351,7 +1385,8 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
         }
         candidate =
             planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, ProbePrefix({}), demands,
-                          RequestProgress{}, shapes, protected_locations, boundary_tree_, write_back_evictions_);
+                          RequestProgress{}, shapes, protected_locations, boundary_tree_, write_back_evictions_,
+                          /*evicts_blocks_past_segments=*/false);
         if (candidate || protected_locations.empty() || !write_back_evictions_) {
             break;
         }

@@ -334,9 +334,10 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
                                                                   CacheCoordinator::PrefixProbe&& prefix,
                                                                   std::span<const GroupDemand> demands,
                                                                   const RequestProgress& progress,
-                                                                  std::optional<std::uint64_t> request_access_epoch) {
+                                                                  std::optional<std::uint64_t> request_access_epoch,
+                                                                  bool evict_blocks_past_segments) {
     std::optional<CacheCoordinator::AdmissionResult> result =
-        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch);
+        coordinator_.Admit(std::move(prefix), demands, progress, request_access_epoch, evict_blocks_past_segments);
     if (!result) {
         feedback.admission_failed = true;
         return std::nullopt;
@@ -354,8 +355,13 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
         registerKvEventPrefixPages(request, cache_progress.prefix_hashes,
                                    static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
     }
+    // Alone, the request has no release to wait for: when whole segments
+    // cannot fund it, blocks leave one by one (docs/design/scheduler.md §1.4).
+    const bool others_hold_pages = std::ranges::any_of(requests_, [&request](const std::unique_ptr<Request>& other) {
+        return other.get() != &request && other->HoldsPages();
+    });
     return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
-                 cache_progress.access_epoch);
+                 cache_progress.access_epoch, /*evict_blocks_past_segments=*/!others_hold_pages);
 }
 
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
@@ -406,25 +412,26 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // locally and never retracts, so there is no decode room to prepay.
     const std::int32_t headroom = config_.role == Role::kP ? 0 : request->AdmissionHeadroom(kRetractionSafeSteps);
     std::vector<BlockTable> tables(static_cast<std::size_t>(coordinator_.NumGroups()));
+    // Whether another request holds pages. Alone, the request asks for what
+    // max_single_request_tokens counts and waits for no release (below).
+    const bool others_hold_pages = std::ranges::any_of(requests_, [request](const std::unique_ptr<Request>& other) {
+        return other.get() != request && other->HoldsPages();
+    });
     // The first chunk's demands for a chunk of `tokens`, with or without an
     // in-forward State checkpoint.
     const auto chunk_demands = [&](std::int32_t tokens, bool checkpoint) {
         // Sliding-window prepay (docs/design/scheduler.md §1). A remote
         // landing has no later local chunk: the peer fills the whole prompt.
         const std::int32_t later_chunk_tokens = source == fsm::PrefillSource::kLocal ? unscheduled - tokens : 0;
-        // Only beside another page holder, so a request alone asks for what
-        // max_single_request_tokens counts. Any holder, not only one sharing
+        // Only beside another page holder. Any holder, not only one sharing
         // the hit: hit pages may become shared after this admission.
-        const bool others_hold_pages = (hit_tokens > 0 || later_chunk_tokens > 0) &&
-                                       std::ranges::any_of(requests_, [request](const std::unique_ptr<Request>& other) {
-                                           return other.get() != request && other->HoldsPages();
-                                       });
+        const bool prepays = (hit_tokens > 0 || later_chunk_tokens > 0) && others_hold_pages;
         const PrefillReserve reserve{
             .decode_input_tokens = decode_input_tokens,
             .completes_prefill = tokens == unscheduled,
             .prompt_headroom_tokens = headroom > 0 ? unscheduled - tokens + headroom : 0,
-            .swa_hit_tokens = others_hold_pages ? hit_tokens : 0,
-            .swa_later_chunk_tokens = others_hold_pages ? later_chunk_tokens : 0,
+            .swa_hit_tokens = prepays ? hit_tokens : 0,
+            .swa_later_chunk_tokens = prepays ? later_chunk_tokens : 0,
             .swa_prompt_after_hit_tokens = unscheduled,
         };
         // Every State table starts as [checkpoint or zero state, fresh] for a
@@ -478,9 +485,10 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // round (a cache this full keeps no spare block).
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
-        admission =
-            coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe}, chunk_demands(tokens_this_round, true),
-                               RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+        admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
+                                       chunk_demands(tokens_this_round, true), RequestProgress{},
+                                       /*request_access_epoch=*/std::nullopt,
+                                       /*evict_blocks_past_segments=*/!others_hold_pages);
         if (!admission) {
             writes_checkpoint = false;
             tokens_this_round = state_checkpoint - hit_tokens;
@@ -488,7 +496,8 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     }
     if (!admission) {
         admission = coordinator_.Admit(std::move(match.probe), chunk_demands(tokens_this_round, false),
-                                       RequestProgress{}, /*request_access_epoch=*/std::nullopt);
+                                       RequestProgress{}, /*request_access_epoch=*/std::nullopt,
+                                       /*evict_blocks_past_segments=*/!others_hold_pages);
     }
     if (!admission) {
         feedback.admission_failed = true;

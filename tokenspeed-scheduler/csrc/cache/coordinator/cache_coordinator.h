@@ -278,10 +278,15 @@ public:
     // transaction, before the new pages are acquired. Under
     // write_back_evictions each set of cache victims is recorded for the
     // plan's drain (TakeEvictedSegments); each call erases the records it
-    // added that ended up empty.
+    // added that ended up empty. evict_blocks_past_segments (write-back only):
+    // once whole segments cannot fund the admission, what they passed over
+    // leaves block by block, written back like any set -- for a request no
+    // other one holds pages beside, which waiting would never fund
+    // (docs/design/scheduler.md §1.4).
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
-                                         std::optional<std::uint64_t> request_access_epoch);
+                                         std::optional<std::uint64_t> request_access_epoch,
+                                         bool evict_blocks_past_segments);
 
     // The data slots of a retracted request are the non-null slots covering
     // [0, num_tokens) in every group -- the unaligned tail block included;

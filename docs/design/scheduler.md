@@ -451,7 +451,13 @@ pages prepays nothing, so the prepay never makes a request the bound accepts
 inadmissible on its own. Beside other requests the prepay can ask for up to
 one window lookback more than the bound counts; such a request waits until
 their pages are released, at the latest until it is alone, unless later
-arrivals keep taking the pages.
+arrivals keep taking the pages. Under Host write-back (§3.1) the Device
+evicts by whole segments, and a segment holding a block in use cannot leave
+— the request's own blocks included, such as the pages under the checkpoint
+it resumed from. So once whole segments cannot fund the admission of a
+request no other one holds pages beside, the blocks they passed over leave
+one by one (`cache-concepts.md`, `AdmissionPlanner`): alone, there is no
+release left to wait for. Beside another page holder it waits as above.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -852,8 +858,10 @@ to normal eviction.
 (`--kvstore-write-policy write_back`; this role or the fused one (§3.3), no
 sliding-window group, no L3, and in the runtime one pipeline stage and no
 query shard) nothing streams to the Host at publication. Instead what an
-admission evicts for the cache leaves by whole segments and is written back in
-the same plan, by the drain right after the build (one stream-ordered op, §2);
+admission evicts for the cache leaves by whole segments — or, for a request
+alone that whole segments cannot fund, block by block (§1.4) — and is
+written back in the same plan, by the drain right after the build (one
+stream-ordered op, §2);
 how a segment is recorded, placed, published or dropped is in [Cache
 concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator). Every
 attention-TP rank of the replica runs the same plan and copies the rows it
@@ -982,8 +990,9 @@ admission as a newcomer.
 writes back as the P role does (§3.1): nothing streams to the Host at a
 publication — the prompt end at the first decode, each page a decode
 completes, the finish, a retraction — and what an admission or a restore
-evicts for the cache leaves by whole segments, copied to the Host in the plan
-that evicts it. A mixed batch's admissions and decode steps share the one
+evicts for the cache leaves by whole segments (an admission of a request
+alone also block by block, §1.4), copied to the Host in the plan that evicts
+it. A mixed batch's admissions and decode steps share the one
 drain after the build. A segment's ACK can also land after a plan that only
 restores (§4). A retraction image's L2 leg takes the published slots not on
 the Host already as §2 plans them (whole segments first), and the snapshot

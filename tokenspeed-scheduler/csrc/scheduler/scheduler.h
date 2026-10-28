@@ -254,7 +254,8 @@ private:
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
                                                            const RequestProgress& progress,
-                                                           std::optional<std::uint64_t> request_access_epoch);
+                                                           std::optional<std::uint64_t> request_access_epoch,
+                                                           bool evict_blocks_past_segments);
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
         std::span<const GroupDemand> demands, const RequestProgress& progress);

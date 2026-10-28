@@ -2683,6 +2683,73 @@ TEST_P(StateCheckpointPrefillHostShardSuite, PdTransferPinnedPagesAreNeverVictim
         << "s1's pages leave only once its transfer finished";
 }
 
+// s1's 8-token session leaves its prompt-end checkpoint at 8. big sends s1's
+// prompt and more, up to the single-request bound of 11 usable parents: it
+// resumes at 8, and its last chunk needs every parent, five for its KV and six
+// for its State slots. Once big's KV reaches its third parent, the checkpoint
+// at 8 is the only cache left, and its segment holds big's own pages at and
+// under 8, in use: no whole segment can leave. Alone, big has no release to
+// wait for, so the checkpoint leaves block by block -- every State group's at
+// once, written back -- the pages big holds stay, and big runs to its hand-off
+// with no idle round. The checkpoint lands on the Host, where s1's next turn
+// resumes from it over the Device's KV.
+TEST_F(StateCheckpointPrefillHostSuite, APromptAloneEvictsTheCheckpointOnItsOwnPathBlockByBlock) {
+    device_pages_ = 12;
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    std::vector<std::int32_t> s1 = MakeTokens(8);
+    const ExecutionPlan s1_handoff = CompleteSession("s1", s1);
+    const std::int32_t prompt = scheduler_->MaxSingleRequestTokens() - 1;
+    std::vector<std::int32_t> big = s1;
+    const std::vector<std::int32_t> rest = MakeTokens(prompt - 8, 3000);
+    big.insert(big.end(), rest.begin(), rest.end());
+    Submit(RequestSpec{.request_id = "big", .tokens = big, .max_new_tokens = 1});
+    SendBootstrapped("big");
+
+    using Rows = std::vector<std::pair<std::string, std::int32_t>>;
+    const std::array<std::string, 4> group_names{"full", "state0", "state1", "state2"};
+    Rows written_back;
+    std::int32_t resumed_at = -1;
+    std::int32_t computed = 0;
+    std::optional<ExecutionPlan> handoff;
+    for (std::int32_t round = 0; round < 16 && !handoff; ++round) {
+        ExecutionPlan plan = PlanOnce();
+        for (const CacheOperation& operation : ExtractCacheOpsOfKind<WriteBackBatch>(plan)) {
+            const WriteBackBatch& store = std::get<WriteBackBatch>(operation);
+            for (std::size_t op = 0; op < store.op_ids.size(); ++op) {
+                for (std::size_t row = 0; row < store.src_pages[op].size(); ++row) {
+                    written_back.emplace_back(group_names[store.group_ids[op][row]], store.src_pages[op][row]);
+                }
+            }
+        }
+        AckWriteBacks(plan);
+        if (plan.remote_decode.has_value()) {
+            handoff = std::move(plan);
+            break;
+        }
+        const ForwardBatch* batch = FindForwardBatch(plan);
+        ASSERT_TRUE(batch != nullptr && batch->request_ids == std::vector<std::string>{"big"})
+            << "big waits at " << computed << " of " << prompt << " tokens";
+        if (resumed_at < 0) {
+            resumed_at = batch->extend_prefix_lens[0];
+        }
+        computed = batch->extend_prefix_lens[0] + batch->input_lengths[0];
+        SendForwardDone("big", computed == prompt ? std::vector<std::int32_t>{900} : std::vector<std::int32_t>{});
+    }
+    ASSERT_TRUE(handoff.has_value());
+    EXPECT_EQ(resumed_at, 8);
+    const Rows checkpoint{{"state0", s1_handoff.remote_decode->block_tables.at("state0").at(0)[1]},
+                          {"state1", s1_handoff.remote_decode->block_tables.at("state1").at(0)[1]},
+                          {"state2", s1_handoff.remote_decode->block_tables.at("state2").at(0)[1]}};
+    EXPECT_EQ(written_back, checkpoint) << "only the checkpoint at 8 leaves";
+    SendPdSucceeded("big");
+    AckWriteBacks(PlanOnce());
+
+    s1.push_back(77);
+    const Resume resumed = Probe("s1-next", s1);
+    EXPECT_EQ(resumed.prefix_tokens, 8);
+    EXPECT_EQ(resumed.load_rows, 3) << "the three checkpoints load from the Host";
+}
+
 // a's prompt is handed off and its transfer is out while s1, s2 and then b
 // run: b's prefill needs room, and of the cache it evicts s1 and writes it
 // back, writing back no page a's transfer pins. Then a's transfer fails

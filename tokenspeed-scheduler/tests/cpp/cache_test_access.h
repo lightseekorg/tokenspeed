@@ -128,7 +128,7 @@ inline std::optional<CacheCoordinator::AdmissionResult> AdmitForTest(
         }
         demands.push_back(demand);
     }
-    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt);
+    return coordinator.Admit(std::move(prefix), demands, progress, std::nullopt, /*evict_blocks_past_segments=*/false);
 }
 
 // The overloads without progress admit a request that has computed nothing

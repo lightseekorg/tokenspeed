@@ -1195,7 +1195,8 @@ Device room and hits, never correctness. The victim sets:
   candidate's own boundary counts as a stranded suffix
   (`DeviceEvictionStats::stranded_suffix`). One block in use anywhere in the
   subtree passes the whole set over, never a part of it; a branch of the
-  subtree without such a block may still leave as a set of its own.
+  subtree without such a block may still leave as a set of its own, and only
+  the block-by-block pass below takes part of it.
 
 The climb reads the real checkpoint-boundary counts, not the shadow's, so two
 sibling segments chosen in one plan leave their shared pages on the Device for
@@ -1207,6 +1208,21 @@ that the segments under them, taken whole, would fund. A set that contains an
 earlier one takes it in whole, each block keeping the reason it was chosen for;
 sets of one plan are therefore disjoint, and the restore pass returns or keeps
 each one whole.
+
+When the shared pages leave the demand unmet as well, an admission whose
+request no other one holds pages beside (`Admit`'s
+`evict_blocks_past_segments`, from `Request::HoldsPages`) takes the candidates
+the segment rules passed over block by block, oldest first: a checkpoint
+leaves alone with every State group's at its hash, as a nested one does; a
+page leaves with the blocks of its boundary not in use and everything the
+Device holds under it, climbing nowhere, so the coverage stays closed (a
+boundary that keeps a block in use stays on the Device). Each such set is
+recorded and written back like a segment, a block no probe could resume from
+dropped. Waiting would never fund such an admission: the blocks in use are
+its own, as when it resumed from a checkpoint whose segment holds the pages
+under it (`scheduler.md` §1.4). Beside another page holder it waits for that
+holder's release instead, and a restore, which falls back to claiming
+nothing (below), never takes blocks this way.
 
 A restore of a retracted request (`scheduler.md` §4) protects the blocks it
 claims like prefix hits. Under segment eviction a set holding one never
