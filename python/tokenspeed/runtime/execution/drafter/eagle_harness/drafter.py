@@ -177,10 +177,10 @@ class EagleHarness(Eagle4):
     per (padded batch, depth) serves every round; a padded batch captures the
     depths its rounds can reach.
 
-    With the device policy, where the platform has device-side graph launch
+    With the device policy, where the platform has the device-chain ops
     (``eagle_harness_device_chain_available``), a round on captured graphs is
     device-chained (``DeviceChain``): the host launches depth 1's graph behind the decode
-    graph (``replay_decode_graph``), and each depth's graph launches the next
+    graph (``replay_decode_graph``), and each depth's graph chooses the next
     one or the finalize on the GPU. Otherwise (eager rounds, exec mode 2)
     ``finish_round`` launches depth 1, the host each next depth once its
     decision lands, and the finalize in ``complete_round``.
@@ -210,8 +210,6 @@ class EagleHarness(Eagle4):
         self._chain: DeviceChain | None = None
         # Whether the coming round draws its children (prepare_round_sampling).
         self._round_sampled = False
-        # Recorded on the round stream behind the decode graph a round follows.
-        self._target_done = torch.cuda.Event()
         # The padded batch whose round replay_decode_graph launched, until finish_round.
         self._launched_rows: int | None = None
         # The round finish_round started and complete_round finishes.
@@ -249,8 +247,8 @@ class EagleHarness(Eagle4):
         # Children come from draft_topk; the head's argmax would go unread.
         logits_processor.do_argmax = False
         self.policy = self._make_policy(config.num_nodes, topk, depth)
-        # Without device-side graph launch (HIP), the host launches each depth
-        # once its decision lands, as in an eager round.
+        # Without the device-chain ops, the host launches each depth once its
+        # decision lands, as in an eager round.
         if (
             isinstance(self.policy, DevicePolicy)
             and eagle_harness_device_chain_available()
@@ -571,10 +569,10 @@ class EagleHarness(Eagle4):
     def replay_decode_graph(
         self, graph: torch.cuda.CUDAGraph, *, bs: int, graph_bs: int
     ) -> None:
-        """With device-chained rounds, replay the decode graph on the round
-        stream and launch its round's depth 1 behind it: the forward's stream
-        waits for the decode graph alone, so the verified-state commit, the
-        outputs and the next forward's staging run beside the round."""
+        """With device-chained rounds, launch the round's depth 1 on the round
+        stream behind the decode graph: the forward's stream does not wait for
+        the round, so the verified-state commit, the outputs and the next
+        forward's staging run beside it."""
         if self._chain is None or bs == 0:
             graph.replay()
             return
@@ -584,21 +582,22 @@ class EagleHarness(Eagle4):
                 "the round the last replay launched"
             )
         self._open_round(bs, graph_bs, num_extends=0)
-        stream, round_stream = torch.cuda.current_stream(), self._round_stream
-        round_stream.wait_stream(stream)
+        # The decode graph stays on the forward's stream: replayed on the round
+        # stream instead, it ran about 5 ms per round slower on MI355X.
+        graph.replay()
+        round_stream = self._round_stream
+        round_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(round_stream):
-            graph.replay()
-            self._target_done.record()
-            # Its graph launches the rest of the round.
             self._depth_graphs[(graph_bs, 1)].replay()
-        stream.wait_event(self._target_done)
+        # The chain launches the rest of the round.
+        self._chain.begin(round_stream)
         self._launched_rows = graph_bs
 
     @maybe_inference_mode()
     def finish_round(self, ctx: ForwardContext, graph_bs: int | None) -> None:
         """Start drafting the depths the policy decides, on the round stream:
         begin the round and launch depth 1 (unless the decode graph's replay
-        did); a device-chained round launches the rest on the GPU, otherwise
+        did); a device-chained round chooses the rest on the GPU, otherwise
         every next depth whose decision has landed launches here and the rest
         in ``complete_round``.
 
@@ -610,6 +609,9 @@ class EagleHarness(Eagle4):
         bs = ctx.bs
         launched, self._launched_rows = self._launched_rows, None
         if bs == 0 or self.input_buffers.all_extends_mid_chunk:
+            if launched is not None:
+                # No forward finishes the round the decode graph launched.
+                self._chain.join()
             return
         if launched is None:
             self._open_round(bs, graph_bs, num_extends=ctx.num_extends)
@@ -634,8 +636,9 @@ class EagleHarness(Eagle4):
             if self.measurement is not None:
                 self._measure_round(pending)
             elif chained:
-                # Its graph launches the rest of the round.
                 self._depth_graphs[(graph_bs, 1)].replay()
+                # The chain launches the rest of the round.
+                self._chain.begin(self._round_stream)
             else:
                 # Depth 1 begins the round on the device; the policy always drafts it.
                 self._launch_depth(pending, 1)
@@ -723,6 +726,8 @@ class EagleHarness(Eagle4):
                     self._finalize_graphs[(pending.graph_bs, pending.sampled)].replay()
                 else:
                     self._write_verify_tree(pending.bs, pending.sampled)
+        else:
+            self._chain.join()
         pending.stream.wait_stream(self._round_stream)
 
     def _advance(self, pending: _PendingRound, *, pause_before_wait: bool) -> None:
@@ -825,9 +830,9 @@ class EagleHarness(Eagle4):
         per depth serves every round. Only the depths reachable by the rounds
         that replay it: of floor + 1 to ``graph_bs`` live requests
         (``decode_graph_floors``; floor 0 for a padded batch it does not list).
-        A device chain's depths launch the round's next graph after their
-        decision; depths 2 and on and the finalize are instantiated for device
-        launch."""
+        A device chain's depths choose the round's next graph after their
+        decision; depths 2 and on and the finalize are instantiated for the
+        chain."""
         floor = dict(self.harness.decode_graph_floors).get(graph_bs, 0)
         depths = max(self.round_depth(bs) for bs in range(floor + 1, graph_bs + 1))
         lanes = self._lane_context(graph_bs, None, None, True)
@@ -839,7 +844,7 @@ class EagleHarness(Eagle4):
             for depth in range(1, depths + 1):
                 self._draft_depth(graph_bs, lanes, depth, decide=False, chain=False)
                 torch.cuda.synchronize()
-                # The host launches depth 1 (an ordinary graph); the GPU, the rest.
+                # The host launches depth 1 (an ordinary graph); the chain, the rest.
                 graph = torch.cuda.CUDAGraph(keep_graph=chain is not None and depth > 1)
                 with torch.cuda.graph(graph, pool=pool, stream=stream):
                     self._draft_depth(

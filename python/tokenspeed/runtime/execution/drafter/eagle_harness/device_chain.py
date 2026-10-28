@@ -18,31 +18,43 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""EAGLE-Harness device-chained rounds: a round's captured graphs launch one
+"""EAGLE-Harness device-chained rounds: a round's captured graphs choose one
 another on the GPU, so the host launches depth 1 and never waits on the
 round's decisions.
 
 Each depth's graph holds a kernel, right after the depth's decision, that
-tail-launches the round's next graph of its padded batch: depth ``d + 1``
-while ``go[d + 1]`` is set, else the finalize graph, sampled or not. A tail
-launch starts once the launching graph has completed, and the stream that
-launched depth 1 runs its later work after the whole round. Depth 1 is an
-ordinary graph the host launches; the later depths and the finalize are
-instantiated for device launch, which allows kernel, memcpy and memset nodes
-and fork/join edges, but no event nodes. A device launch skips torch's
-``CUDAGraph.replay``, which advances the philox offsets of the torch
-generators a graph captured: the round graphs draw from their own counters
-(``eagle_harness_sample_children``) and must capture no torch random op. A
-round reaching a graph its batch did not capture traps on the device (a sticky
-CUDA error); the drafter refuses such a round on the host before launching it.
+chooses the round's next graph of its padded batch: depth ``d + 1`` while
+``go[d + 1]`` is set, else the finalize graph, sampled or not. On CUDA the
+kernel tail-launches it (device-side graph launch). HIP has no device-side
+graph launch: the kernel posts its choice to host memory, where a native
+launcher thread (per device, outside the GIL) launches it on the round's
+stream. Either way the next graph starts once the choosing graph has
+completed, and since a depth's decision runs at its start, the next graph is
+chosen while the GPU still drafts the depth before it.
+
+A round is begun (``begin``) once the host has queued its depth 1 on the
+round's stream; nothing else is queued there until ``join`` returns (at once
+on CUDA; on HIP once the finalize is queued, at most until the last decision
+lands), and the stream then runs its later work after the whole round. Each
+round is joined before the next one's work is queued there. Depth 1 is an ordinary graph the host launches; the later depths and
+the finalize are instantiated for the chain (on CUDA for device launch, which
+allows kernel, memcpy and memset nodes and fork/join edges, but no event
+nodes). A chain launch skips torch's ``CUDAGraph.replay``, which advances the
+philox offsets of the torch generators a graph captured: the round graphs draw
+from their own counters (``eagle_harness_sample_children``) and must capture
+no torch random op. A round reaching a graph its batch did not capture traps
+on the device; the drafter refuses such a round on the host before launching
+it.
 """
 
 from __future__ import annotations
 
 import torch
 from tokenspeed_kernel.ops.sampling.eagle_harness import (
+    eagle_harness_chain_begin,
     eagle_harness_chain_destroy,
     eagle_harness_chain_instantiate,
+    eagle_harness_chain_join,
     eagle_harness_chain_load,
     eagle_harness_chain_next,
 )
@@ -51,7 +63,7 @@ __all__ = ["DeviceChain"]
 
 
 class DeviceChain:
-    """The device-launchable round graphs of each padded batch.
+    """The chained round graphs of each padded batch.
 
     Args:
         max_bs: The largest padded batch.
@@ -67,14 +79,30 @@ class DeviceChain:
         )
         # Per padded batch: the exec handles it owns.
         self._handles: dict[int, list[int]] = {}
+        # The stream of the round begun and not yet joined (None: none).
+        self._stream: torch.cuda.Stream | None = None
         # Loaded here: the first launch may be inside a graph capture.
-        eagle_harness_chain_load()
+        with torch.cuda.device(device):
+            eagle_harness_chain_load()
+
+    def begin(self, stream: torch.cuda.Stream) -> None:
+        """Begin the round whose depth 1 the host has just queued on
+        ``stream``: the chain launches the rest behind it."""
+        eagle_harness_chain_begin(stream.cuda_stream)
+        self._stream = stream
+
+    def join(self) -> None:
+        """Return once the begun round has queued its last graph on its
+        stream, which then runs work queued from now on after the round."""
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            eagle_harness_chain_join(stream.cuda_stream)
 
     def end_depth(
         self, rows: int, depth: int, go: torch.Tensor, sampled: torch.Tensor
     ) -> None:
         """Enqueue, inside depth ``depth``'s graph at padded batch ``rows``,
-        the launch of the round's next graph, which starts once that graph
+        the choice of the round's next graph, which starts once that graph
         has ended."""
         eagle_harness_chain_next(self._execs[rows], go, sampled, depth, self.last_depth)
 
@@ -86,7 +114,7 @@ class DeviceChain:
         stream: torch.cuda.Stream,
     ) -> None:
         """Instantiate the graphs of padded batch ``rows`` (``keep_graph``
-        captures) for device launch: ``depths`` from depth 2, ``finalize``
+        captures) for the chain: ``depths`` from depth 2, ``finalize``
         not sampled then sampled (when captured), and publish their handles
         to its chain."""
         handles = [
@@ -101,7 +129,8 @@ class DeviceChain:
         self._handles[rows] = handles
 
     def release(self) -> None:
-        """Free every exec handle, once no round runs."""
+        """Free every exec handle, once no round is being launched."""
+        self.join()
         torch.cuda.synchronize()
         for handles in self._handles.values():
             for handle in handles:

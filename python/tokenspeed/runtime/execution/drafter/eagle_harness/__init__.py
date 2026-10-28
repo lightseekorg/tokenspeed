@@ -30,9 +30,9 @@ depth's graph, after its decision, launches the next depth while its go flag
 is set, else the finalize, so the host launches depth 1 only, behind the
 decode graph (``replay_decode_graph``); an eager round has the host poll a
 pinned flag to launch each depth (the event loop's one named host-polling
-exception). Where the platform has no device-side graph launch (HIP), every
-round runs like an eager one over its captured depth graphs: the host launches
-each depth once its go flag lands. The round drafts on the drafter's round stream, which owns the
+exception). Where the platform has no device-side graph launch (HIP), the
+graphs still choose the next graph on the GPU, and a native launcher thread
+launches it (see ``DeviceChain``). The round drafts on the drafter's round stream, which owns the
 kernel workspace until the next forward's settle (``complete_round``) joins
 it.
 Exec mode 2 drains the GPU around each round's depths to time them; it

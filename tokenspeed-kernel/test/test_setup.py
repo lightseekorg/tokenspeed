@@ -385,6 +385,7 @@ def test_rocm_build_compiles_each_hip_group_for_gfx950(monkeypatch, tmp_path) ->
     compiles = [call for call in calls if "-c" in call]
     links = [call for call in calls if "-shared" in call]
     assert sorted(Path(call[call.index("-c") + 1]).name for call in compiles) == [
+        "eagle_harness_chain.hip",
         "eagle_harness_policy.hip",
         "eagle_harness_tree.hip",
     ]
@@ -394,6 +395,7 @@ def test_rocm_build_compiles_each_hip_group_for_gfx950(monkeypatch, tmp_path) ->
         assert {"--offload-arch=gfx950", "-ffp-contract=off"} <= set(call)
     linked = sorted(Path(call[-1]).relative_to(tmp_path) for call in links)
     assert [path.as_posix() for path in linked] == [
+        "eagle_harness_chain/eagle_harness_chain.so",
         "eagle_harness_policy/eagle_harness_policy.so",
         "eagle_harness_tree/eagle_harness_tree.so",
     ]

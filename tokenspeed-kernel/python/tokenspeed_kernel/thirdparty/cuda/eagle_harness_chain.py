@@ -32,8 +32,10 @@ from pathlib import Path
 import torch
 
 __all__ = [
+    "eagle_harness_chain_begin",
     "eagle_harness_chain_destroy",
     "eagle_harness_chain_instantiate",
+    "eagle_harness_chain_join",
     "eagle_harness_chain_load",
     "eagle_harness_chain_next",
 ]
@@ -95,3 +97,19 @@ def eagle_harness_chain_next(
     not sampled and sampled. The tail launch runs once the launching graph
     has completed; a zero handle where the round goes traps."""
     _module().eagle_harness_chain_next(execs, go, sampled, depth, last_depth)
+
+
+def eagle_harness_chain_begin(stream: int) -> None:
+    """Begin the round whose depth 1 graph the caller has just queued on
+    ``stream`` (raw ``cudaStream_t``): the chain launches its later graphs
+    behind it. Queue nothing else on ``stream`` until
+    ``eagle_harness_chain_join``, which must end each round before the next
+    round's work is queued there. A no-op here, where the graphs launch one
+    another on the device; a platform that launches the chain from the host
+    hands the round to its launcher here."""
+
+
+def eagle_harness_chain_join(stream: int) -> None:
+    """Return once the round begun on ``stream`` has queued its last graph,
+    so work queued on ``stream`` from then on runs after the whole round: at
+    once here, where tail launches order it."""

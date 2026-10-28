@@ -1040,6 +1040,7 @@ class CudaKernelBuilder:
 ROCM_KERNEL_GROUPS = [
     ("eagle_harness_tree", [HIP_CSRC_DIR / "eagle_harness_tree.hip"]),
     ("eagle_harness_policy", [HIP_CSRC_DIR / "eagle_harness_policy.hip"]),
+    ("eagle_harness_chain", [HIP_CSRC_DIR / "eagle_harness_chain.hip"]),
 ]
 
 

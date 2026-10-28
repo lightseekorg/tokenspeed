@@ -18,9 +18,10 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Registers the HIP build of the EAGLE-Harness ops (AMD gfx950). There are no
-device-chain ops: HIP has no device-side graph launch, so the host launches
-each draft depth once its go flag lands."""
+"""Registers the HIP build of the EAGLE-Harness ops (AMD gfx950), including
+the device-chain ops: HIP has no device-side graph launch, so a depth's graph
+posts the round's next graph to a native launcher thread
+(``thirdparty/hip/csrc/eagle_harness_chain.hip``)."""
 
 from __future__ import annotations
 
@@ -34,10 +35,11 @@ from tokenspeed_kernel.signature import format_signature
 
 if current_platform().is_amd:
     import tokenspeed_kernel.thirdparty.hip.eagle_harness as _tree
+    import tokenspeed_kernel.thirdparty.hip.eagle_harness_chain as _chain
     import tokenspeed_kernel.thirdparty.hip.eagle_harness_policy as _policy
 
     # The wrappers load their library on first call, so registering needs no build.
-    for _module in (_tree, _policy):
+    for _module in (_tree, _policy, _chain):
         for _op in _module.__all__:
             register_kernel(
                 "sampling",

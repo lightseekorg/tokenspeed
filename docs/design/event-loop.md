@@ -323,6 +323,9 @@ collective state. EAGLE-Harness chains a round's captured graphs on the GPU,
 behind the decode graph (`BaseDrafter.replay_decode_graph`), so what the
 forward queues after that graph (the verified-state commit, the outputs) runs
 beside the round too; an eager round polls a pinned flag to launch each depth.
+HIP has no device-side graph launch: there a native launcher thread launches
+each graph the GPU chose, and `complete_round` waits for its last launch,
+which the round's last decision allows while the depth before it still runs.
 
 A JIT compilation on the forward thread is the same kind of stall, only
 longer: the round waits 100 ms to seconds while a kernel compiles for a new

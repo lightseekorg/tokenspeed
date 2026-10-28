@@ -109,10 +109,10 @@ pytestmark = pytest.mark.skipif(
     or not (current_platform().is_nvidia or current_platform().is_cdna4),
     reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
-# Device-chained rounds launch graphs from the GPU, which HIP cannot.
+# Device-chained rounds: CUDA's device-side graph launch, HIP's launcher thread.
 needs_device_chain = pytest.mark.skipif(
     not eagle_harness_device_chain_available(),
-    reason="needs device-side graph launch",
+    reason="needs the eagle_harness device-chain ops",
 )
 
 # Trees of K children per node, STEPS steps, NODES verified; POOL slots, MAX_BS a round.
@@ -605,7 +605,8 @@ def test_a_round_drafts_beside_the_next_forwards_staging(tmp_path, graphs) -> No
 def test_a_device_chained_round_completes_without_the_host(tmp_path) -> None:
     """A round on captured graphs writes its verify tree on the GPU though
     every decision lands late: the round stream holds the tree of an eager
-    round run in program order before ``complete_round`` is called."""
+    round run in program order before ``complete_round`` is called, once the
+    chain has queued the round's last graph (no host decision wait)."""
     _write_cost_data(str(tmp_path))
     root = str(tmp_path)
     chained = _rounds(root, late=True, forward_cycles=0, shape=_TREE)
@@ -621,6 +622,7 @@ def test_a_device_chained_round_completes_without_the_host(tmp_path) -> None:
             slots = rounds.draft(bs, random.Random(i))
             rounds.finish_round(bs)
             if rounds is chained:
+                rounds.drafter._chain.join()
                 rounds.drafter._round_stream.synchronize()
                 trees.append(rounds.verify_tree(slots))
             rounds.drafter.complete_round()
@@ -636,8 +638,8 @@ def test_a_device_chained_round_completes_without_the_host(tmp_path) -> None:
 def test_a_round_launched_behind_the_decode_graph_drafts_beside_the_forward(
     tmp_path,
 ) -> None:
-    """``replay_decode_graph`` replays the decode graph on the round stream
-    and launches its device-chained round behind it: the forward's stream
+    """``replay_decode_graph`` launches its device-chained round on the round
+    stream behind the decode graph: the forward's stream
     reads what the decode graph wrote while the round still drafts, and the
     round writes the verify trees of an eager round run in program order."""
     _write_cost_data(str(tmp_path))

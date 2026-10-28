@@ -27,9 +27,11 @@ keep one contract per op, documented on the CUDA wrapper of the same name in
 ``tokenspeed_kernel.thirdparty.cuda.eagle_harness``,
 ``...eagle_harness_policy`` and ``...eagle_harness_chain``.
 
-The device-chain ops (a graph launching the next depth's graph from the
-device) exist only where the platform has device-side graph launch; check
-``eagle_harness_device_chain_available()`` before using them.
+The device-chain ops (a depth's graph choosing the round's next graph on the
+device) exist where the platform can launch that choice without the Python
+host: by device-side graph launch (CUDA), or by a native launcher thread the
+GPU posts its choice to (HIP). Check ``eagle_harness_device_chain_available()``
+before using them.
 """
 
 from __future__ import annotations
@@ -66,6 +68,8 @@ __all__ = [
     "eagle_harness_chain_instantiate",
     "eagle_harness_chain_destroy",
     "eagle_harness_chain_next",
+    "eagle_harness_chain_begin",
+    "eagle_harness_chain_join",
 ]
 
 
@@ -76,8 +80,8 @@ def _kernel(op: str) -> SelectedKernel:
 
 
 def eagle_harness_device_chain_available() -> bool:
-    """Whether the platform has the device-chain ops (device-side graph
-    launch): ``eagle_harness_chain_*`` are usable only when this is True."""
+    """Whether the platform has the device-chain ops: ``eagle_harness_chain_*``
+    are usable only when this is True."""
     try:
         _kernel("eagle_harness_chain_next")
     except NoKernelFoundError:
@@ -473,3 +477,13 @@ def eagle_harness_chain_next(
 ) -> None:
     """Registry-dispatched; the contract is on the CUDA wrapper of this name."""
     return _kernel("eagle_harness_chain_next")(execs, go, sampled, depth, last_depth)
+
+
+def eagle_harness_chain_begin(stream: int) -> None:
+    """Registry-dispatched; the contract is on the CUDA wrapper of this name."""
+    return _kernel("eagle_harness_chain_begin")(stream)
+
+
+def eagle_harness_chain_join(stream: int) -> None:
+    """Registry-dispatched; the contract is on the CUDA wrapper of this name."""
+    return _kernel("eagle_harness_chain_join")(stream)
