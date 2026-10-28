@@ -1263,11 +1263,11 @@ def _gdn_replay_commit_kernel(
             gl.store(p_out, b_h.to(p_out.dtype.element_ty), mask=mask_h)
 
 
-# Pipelined variant for 16-bit states with 128-wide keys: one CTA per (layer,
-# request, key head) walks its value heads' V tiles through a two-stage cp.async
-# shared-memory ring, so the next tile's state streams in while the current tile
-# replays (the per-tile kernel above has nothing in flight while its CTAs
-# compute). The per-tile gate math, the chunk loop around the token steps and
+# Pipelined variant for BF16 states and payloads with 128-wide keys: one CTA per
+# (layer, request, key head) walks its value heads' V tiles through a two-stage
+# cp.async shared-memory ring, so the next tile's state streams in while the
+# current tile replays (the per-tile kernel above has nothing in flight while its
+# CTAs compute). The per-tile gate math, the chunk loop around the token steps and
 # all register layouts are the kernel above's, so results are bitwise equal:
 # the compiler pairs and contracts the fp32 step math per block, and moving the
 # step loop out of the chunk loop or normalizing keys from a vector shared-memory
@@ -1521,9 +1521,14 @@ def _ring_replay_supported(
     head_v_dim: int,
     state_dtype: torch.dtype,
 ) -> bool:
-    """Shapes the pipelined replay covers; pool-row alignment is the caller's."""
+    """Shapes the pipelined replay covers; pool-row alignment is the caller's.
+
+    Its cp.async copies move payload value rows and state tiles byte for byte
+    into BF16 shared memory, so the payload must be BF16 like the state.
+    """
     return (
         current_platform().is_nvidia
+        and payload.dtype == torch.bfloat16
         and state_dtype == torch.bfloat16
         and head_k_dim == 128
         and head_v_dim % 64 == 0
@@ -1562,7 +1567,7 @@ def triton_gdn_replay_commit(
     head_k_dim: int,
     head_v_dim: int,
     state_dtype: torch.dtype,
-    rows_aligned: bool = False,
+    rows_aligned: bool,
 ) -> None:
     """Replay all GDN layers and write their final accepted states.
 
@@ -1584,9 +1589,10 @@ def triton_gdn_replay_commit(
         head_k_dim: Key/state dimension ``K``.
         head_v_dim: Value/state dimension ``V``.
         state_dtype: Common recurrent-state element dtype.
-        rows_aligned: Every pool base address and row stride is a multiple of
-            16 bytes (known from the host-side pool tables); enables the
-            pipelined kernel where its shapes apply.
+        rows_aligned: Whether every pool base address and row stride is a
+            multiple of 16 bytes (known from the host-side pool tables);
+            ``True`` enables the pipelined kernel where its shapes and dtypes
+            apply.
 
     Returns:
         ``None``. Every layer's accepted state is written through its pool

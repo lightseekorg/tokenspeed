@@ -32,10 +32,13 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_decode_mtp,
     gdn_replay_commit,
 )
-from tokenspeed_kernel.ops.attention.gdn.triton import _gdn_replay_commit_kernel
+from tokenspeed_kernel.ops.attention.gdn.triton import (
+    _gdn_replay_commit_kernel,
+    _gdn_replay_commit_ring_kernel,
+)
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
-from utils import assert_no_triton_compile
+from utils import assert_no_triton_compile, compiled_kernels
 
 _STATE_TOLERANCES = {
     torch.bfloat16: {"rtol": 2e-2, "atol": 1e-3},
@@ -148,7 +151,8 @@ def _replay(
     read: torch.Tensor,
     write: torch.Tensor,
     accepted: torch.Tensor,
-    rows_aligned: bool = False,
+    *,
+    rows_aligned: bool,
 ) -> None:
     """Pack one layer into the same layer-major API used by the runtime."""
     batch, draft_tokens, num_k_heads, head_k_dim = k.shape
@@ -213,6 +217,7 @@ def test_gdn_replay_commit_matches_accepted_prefix_reference(
         read,
         write,
         accepted,
+        rows_aligned=False,
     )
 
     torch.testing.assert_close(
@@ -228,12 +233,27 @@ def test_gdn_replay_commit_matches_accepted_prefix_reference(
     torch.testing.assert_close(pool[untouched], original[untouched])
 
 
+def _record_ring_gate(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
+    """Record each decision of the pipelined-replay gate in the returned list."""
+    gate = gdn_triton._ring_replay_supported
+    taken = []
+
+    def recording_gate(*args):
+        taken.append(gate(*args))
+        return taken[-1]
+
+    monkeypatch.setattr(gdn_triton, "_ring_replay_supported", recording_gate)
+    return taken
+
+
+@pytest.mark.parametrize("edges", [False, True])
 @pytest.mark.parametrize("head_v_dim", [64, 128])
 @pytest.mark.parametrize("accepted_list", [[0, 1, 3, 4], [4, 4, 4, 4], [2, 0, 1, 3]])
 def test_gdn_replay_commit_ring_matches_reference_kernel_bitwise(
     device: str,
     head_v_dim: int,
     accepted_list: list[int],
+    edges: bool,
     monkeypatch,
     require,
 ):
@@ -244,14 +264,53 @@ def test_gdn_replay_commit_ring_matches_reference_kernel_bitwise(
         device, torch.bfloat16, head_k_dim=128, head_v_dim=head_v_dim
     )
     accepted = torch.tensor(accepted_list, device=device, dtype=torch.int32)
-    gate = gdn_triton._ring_replay_supported
-    taken = []
+    if edges:
+        read[0] = -1  # A fresh request: the masked state copy zero-fills.
+        write[1] = read[1]  # An in-place commit.
+        write[-1] = -1  # CUDA graph padding must not store.
+        for row, length in enumerate(accepted_list):
+            for tensor in (k, v, a, b):
+                tensor[row, length:] = float("nan")  # Rejected tokens.
+    # A store to page -1 would land in the leading guard row.
+    guarded = torch.cat((torch.randn_like(pool[:1]), pool))
+    taken = _record_ring_gate(monkeypatch)
+    pools = []
+    for rows_aligned in (False, True):
+        out = guarded.clone()
+        _replay(
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            out[1:],
+            read,
+            write,
+            accepted,
+            rows_aligned=rows_aligned,
+        )
+        pools.append(out)
 
-    def recording_gate(*args):
-        taken.append(gate(*args))
-        return taken[-1]
+    assert taken == [True]
+    assert torch.equal(pools[0].view(torch.int16), pools[1].view(torch.int16))
+    assert torch.equal(pools[1][0], guarded[0])
 
-    monkeypatch.setattr(gdn_triton, "_ring_replay_supported", recording_gate)
+
+def test_gdn_replay_commit_ring_skips_float16_payload(
+    device: str, monkeypatch, require
+):
+    """The pipelined kernel stages value rows as raw BF16, so an FP16 payload
+    over a BF16 state pool keeps the per-tile kernel despite aligned rows."""
+    require("attention", "gdn_replay_commit", "triton", torch.float16, "q")
+    k, v, a, b, A_log, dt_bias, pool, read, write, accepted = _inputs(
+        device, torch.bfloat16, head_k_dim=128, head_v_dim=128
+    )
+    k, v, a, b = (tensor.half() for tensor in (k, v, a, b))
+    expected = _reference_states(
+        k, v, a, b, A_log, dt_bias, pool[read.long()], accepted
+    )
+    taken = _record_ring_gate(monkeypatch)
     pools = []
     for rows_aligned in (False, True):
         out = pool.clone()
@@ -270,8 +329,13 @@ def test_gdn_replay_commit_ring_matches_reference_kernel_bitwise(
         )
         pools.append(out)
 
-    assert taken == [True]
+    assert taken == [False]
     assert torch.equal(pools[0].view(torch.int16), pools[1].view(torch.int16))
+    torch.testing.assert_close(
+        pools[1][write.long()].float(),
+        expected.to(torch.bfloat16).float(),
+        **_STATE_TOLERANCES[torch.bfloat16],
+    )
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16, torch.float32])
@@ -302,7 +366,19 @@ def test_gdn_replay_commit_preserves_unaligned_pool_padding(
     )
     original = backing.clone()
 
-    _replay(k, v, a, b, A_log, dt_bias, padded_pool, read, write, accepted)
+    _replay(
+        k,
+        v,
+        a,
+        b,
+        A_log,
+        dt_bias,
+        padded_pool,
+        read,
+        write,
+        accepted,
+        rows_aligned=False,
+    )
 
     torch.testing.assert_close(
         padded_pool[write.long()].float(),
@@ -346,7 +422,7 @@ def test_gdn_replay_commit_reuses_shared_chunks_without_reading_rejected_tokens(
         k, v, a, b, A_log, dt_bias, pool[read.long()], accepted
     )
 
-    _replay(k, v, a, b, A_log, dt_bias, pool, read, write, accepted)
+    _replay(k, v, a, b, A_log, dt_bias, pool, read, write, accepted, rows_aligned=False)
 
     torch.testing.assert_close(
         pool[write.long()].float(),
@@ -355,13 +431,24 @@ def test_gdn_replay_commit_reuses_shared_chunks_without_reading_rejected_tokens(
     )
 
 
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ("state_dtype", "rows_aligned"),
+    [(torch.bfloat16, False), (torch.float32, False), (torch.bfloat16, True)],
+)
 def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
-    device: str, state_dtype: torch.dtype, require
+    device: str, state_dtype: torch.dtype, rows_aligned: bool, require
 ):
     require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    if rows_aligned and not current_platform().is_nvidia:
+        pytest.skip("the pipelined replay is NVIDIA-only")
     H, HV, K, V = 2, 4, 128, 128
     width = H * K + HV * V + 2 * HV
+    # Aligned BF16 rows take the pipelined kernel, which covers up to 8 tokens.
+    kernel, longest_window = (
+        (_gdn_replay_commit_ring_kernel, 8)
+        if rows_aligned
+        else (_gdn_replay_commit_kernel, 16)
+    )
 
     def commit(batch: int, tokens: int, capacity: int, layers: int):
         payload = torch.randn(
@@ -391,13 +478,17 @@ def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
             geometry=(H, HV, K, V),
             state_dtype=pool.dtype,
             solution="triton",
+            rows_aligned=rows_aligned,
         )
         torch.cuda.synchronize()
 
+    kernel.device_caches.clear()
     commit(batch=1, tokens=1, capacity=7, layers=2)
-    with assert_no_triton_compile(_gdn_replay_commit_kernel):
+    # With the cache cleared, a compiled binary shows the warm-up launched it.
+    assert len(compiled_kernels(kernel)) == 1
+    with assert_no_triton_compile(kernel):
         commit(batch=4, tokens=3, capacity=13, layers=3)
-        commit(batch=17, tokens=16, capacity=281, layers=1)
+        commit(batch=17, tokens=longest_window, capacity=281, layers=1)
 
 
 @pytest.mark.parametrize("batch", [16, 32, 64])
@@ -450,6 +541,7 @@ def test_gdn_replay_commit_tp4_graph_refresh(
             geometry=(H, HV, K, V),
             state_dtype=state_dtype,
             solution="triton",
+            rows_aligned=False,
         )
 
     commit()
@@ -520,6 +612,7 @@ def test_gdn_replay_commit_ignores_rejected_suffix(device: str, require):
         read,
         write,
         accepted,
+        rows_aligned=False,
     )
 
     k_changed, v_changed, a_changed, b_changed = (
@@ -541,6 +634,7 @@ def test_gdn_replay_commit_ignores_rejected_suffix(device: str, require):
         read,
         write,
         accepted,
+        rows_aligned=False,
     )
 
     torch.testing.assert_close(changed[write.long()], baseline[write.long()])
@@ -570,6 +664,7 @@ def test_gdn_replay_commit_handles_fresh_and_padding_rows(device: str, require):
         read,
         write,
         accepted,
+        rows_aligned=False,
     )
 
     torch.testing.assert_close(
@@ -633,6 +728,7 @@ def test_gdn_replay_commit_matches_flashinfer_qwen_geometry(device: str, require
         read,
         write,
         accepted,
+        rows_aligned=False,
     )
     expected = torch.stack(
         [flashinfer_pool[scratch_rows[row, accepted[row] - 1]] for row in range(batch)]
@@ -750,6 +846,7 @@ def test_gdn_replay_commit_replays_disjoint_layer_pools_in_one_launch(
         geometry=(num_k_heads, num_v_heads, head_k_dim, head_v_dim),
         state_dtype=torch.float32,
         solution="triton",
+        rows_aligned=False,
     )
 
     for layer_pool, layer_write, layer_expected in zip(pools, writes, expected):
@@ -785,7 +882,7 @@ def test_gdn_replay_commit_batch_heads_exceed_grid_z_limit(device: str, require)
         k, v, a, b, A_log, dt_bias, pool[read.long()], accepted
     )
 
-    _replay(k, v, a, b, A_log, dt_bias, pool, read, write, accepted)
+    _replay(k, v, a, b, A_log, dt_bias, pool, read, write, accepted, rows_aligned=False)
 
     torch.testing.assert_close(pool[write.long()], expected, rtol=2e-2, atol=3e-2)
 
@@ -830,6 +927,7 @@ def test_gdn_replay_commit_layer_offsets_beyond_int32(device: str, require):
             geometry=(H, HV, K, V),
             state_dtype=torch.float32,
             solution="triton",
+            rows_aligned=False,
         )
 
     commit(payload, parameters, pools)
