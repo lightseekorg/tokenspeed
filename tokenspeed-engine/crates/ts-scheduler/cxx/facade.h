@@ -41,6 +41,7 @@ struct TransferBatchView;
 struct SchedulerAbortView;
 struct SchedulerSizes;
 struct AdmissionSnapshot;
+struct PrefillGateProbe;
 struct CacheGroupPages;
 struct KvEventView;
 struct StorageTickView;
@@ -50,7 +51,8 @@ struct StorageStatsView;
 struct PrefixHitView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
-std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler);
+std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler,
+                                                               bool allow_prefill);
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events);
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
@@ -60,6 +62,7 @@ std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_i
 AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step);
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler);
+PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
 rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);

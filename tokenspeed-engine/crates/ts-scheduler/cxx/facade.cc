@@ -66,8 +66,9 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
     scheduler.SubmitRequests(converted);
 }
 
-std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler) {
-    return std::make_unique<tokenspeed::ExecutionPlan>(scheduler.NextExecutionPlan());
+std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler, bool allow_prefill) {
+    return std::make_unique<tokenspeed::ExecutionPlan>(
+        scheduler.NextExecutionPlan(tokenspeed::Scheduler::PlanOptions{.allow_prefill = allow_prefill}));
 }
 
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events) {
@@ -215,6 +216,14 @@ SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {
 }
 
 std::int32_t active_lcm_blocks(const tokenspeed::Scheduler& scheduler) { return scheduler.ActiveLcmBlocks(); }
+
+PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler) {
+    const tokenspeed::Scheduler::PrefillGateProbe probe = scheduler.ProbePrefillGate();
+    return PrefillGateProbe{
+        .wants_prefill = probe.wants_prefill,
+        .has_decode_work = probe.has_decode_work,
+    };
+}
 
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id) {
     const std::string id(group_id);

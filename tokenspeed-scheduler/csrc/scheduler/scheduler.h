@@ -99,7 +99,37 @@ public:
 
     void SubmitRequests(const std::vector<RequestSpec>& request_specs);
 
-    ExecutionPlan NextExecutionPlan();
+    // What one plan call may do, decided by the control plane's prefill-delay
+    // vote (docs/design/prefill-delay.md).
+    struct PlanOptions {
+        // The fused role may schedule prefill work this round: resident
+        // chunks and fresh prompts. False holds all of it for a later round;
+        // decode work is unaffected. The P role (prompt-only) and the D role
+        // (whose prompts are the peer's work) ignore it.
+        bool allow_prefill;
+    };
+    ExecutionPlan NextExecutionPlan(PlanOptions options);
+
+    // What the control plane's prefill-delay vote reads from every
+    // attention-DP rank before deciding a plan. Read-only.
+    struct PrefillGateProbe {
+        // Prefill work this rank could schedule now and the Device pool can
+        // take: a resident chunk or an admitted prompt, below the prefill
+        // watermark.
+        bool wants_prefill;
+        // Decode work this rank's round would otherwise run: a first decode
+        // or a decoding request. A rank with none has nothing to protect
+        // from a prefill round, so the vote does not count it as a blocker.
+        bool has_decode_work;
+    };
+    PrefillGateProbe ProbePrefillGate() const;
+
+    // Hold prefill back while the Device pool is this full, whether or not a
+    // vote admits it: admission at this pressure would retract a decoding
+    // victim, and the gates exist to batch prefills, not to trade them for
+    // decodes.
+    static constexpr float kPrefillWatermark = 0.9F;
+
     void Advance(const ExecutionEvent& event);
     std::vector<KvCacheEvent> DrainKvEvents();
     // Testing/control-plane operation. A successful return means the complete
@@ -249,7 +279,7 @@ private:
         std::vector<SnapshotRestoreOperation> snapshot_restores;
     };
     BuiltOperations buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
-                                           std::vector<WriteBackOperation>& write_back_operations);
+                                           std::vector<WriteBackOperation>& write_back_operations, PlanOptions options);
     // What considering a Submitted request for admission produced: the
     // first-chunk event (admitted), or no event (feedback distinguishes
     // capacity failure from waiting for a request slot).
@@ -612,7 +642,7 @@ private:
     void buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                std::vector<WriteBackOperation>& write_back_operations);
     void buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                        std::vector<WriteBackOperation>& write_back_operations);
+                        std::vector<WriteBackOperation>& write_back_operations, bool allow_prefill);
     // True when a local-prefill candidate has been held back by the
     // prefill/decode interval for prefill_decode_interval rounds in total
     // (docs/design/scheduler.md §3.3).
