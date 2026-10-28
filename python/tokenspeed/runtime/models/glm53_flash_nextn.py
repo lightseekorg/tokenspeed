@@ -151,6 +151,7 @@ class Glm53FlashForConditionalGenerationNextN(nn.Module):
         self.config = config.text_config
         self.mapping = mapping
         self.quant_config = quant_config
+        self.index_share_for_mtp_iteration = self.config.index_share_for_mtp_iteration
         self.model = Glm53FlashModelNextN(
             self.config,
             mapping,

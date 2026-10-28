@@ -1276,6 +1276,9 @@ class Glm53FlashDecoderLayer(nn.Module):
                 alt_stream=alt_stream,
             )
             self.self_attn.is_nextn = is_nextn
+            if is_nextn and config.index_share_for_mtp_iteration:
+                # Later draft steps reuse the first step's sparse selection.
+                self.self_attn.skip_indexer_topk = True
 
         if self.is_moe_layer:
             self.mlp = Glm53FlashMoE(
