@@ -173,6 +173,18 @@ def test_native_prefill_bitwise_parity(native_cuda, lengths, fresh):
     assert torch.equal(state, state_before)
 
 
+@pytest.mark.parametrize("lengths", [[100], [33, 67]])
+def test_bf16_initial_state_is_widened_before_the_native_scan(native_cuda, lengths):
+    """A BF16 state pool scans exactly like its FP32 widening, FP32 out."""
+    inputs, state, bounds, cpu = _inputs("cuda", lengths)
+    narrow = state.to(torch.bfloat16)
+    expected = _actual(inputs, narrow.float(), bounds, cpu, "v_major")
+    actual = _actual(inputs, narrow, bounds, cpu, "v_major")
+    # assert_close also checks dtype: the final state comes back FP32.
+    torch.testing.assert_close(actual.out, expected.out, atol=0, rtol=0)
+    torch.testing.assert_close(actual.final_state, expected.final_state, atol=0, rtol=0)
+
+
 def test_capacity_compatibility_fallback(native_cuda, monkeypatch):
     inputs, state, bounds, cpu = _inputs("cuda", [1, 67])
     tensors = (

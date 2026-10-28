@@ -1403,6 +1403,49 @@ and scaled), beta-scaled v, beta and decay into LDS once, so the serial steps
 wait only on LDS rather than one global round trip per token. The kernel is
 HBM bound: it reads the state once and writes it once per destination.
 
+### KDA chunked prefill (gfx950 / gfx1250)
+
+`gluon_kda_paged_prefill_gfx950` and `gluon_kda_paged_prefill_gfx1250` run
+KDA prefill over packed variable-length sequences, from and into the V-major
+state layout of the decode pool.
+
+#### Contract
+
+- q, k and raw g are `[1, T, H, K]`, v is `[1, T, H, V]` and beta logits are
+  `[1, T, H]`, in FP16 or BF16, with `K = V = 128`. A_log is `[H]` and
+  dt_bias `[H, K]`. An optional `lower_bound` selects the safe decay gate.
+- `cu_seqlens` (`[N + 1]`) delimits the sequences, which may be empty. The
+  initial and final states are FP32 `[N, H, V, K]`.
+- `cu_seqlens_cpu`, the host copy of the bounds, lets the chunk schedule be
+  planned on the host without a device read-back. The plan is reused by
+  tensor identity across the layers of a forward. Without it, `cu_seqlens`
+  is read back on each call.
+- Token, sequence, chunk and time-group counts are runtime values. Row
+  blocks and warp counts come from a fixed menu.
+
+#### Algorithm
+
+Sequences are cut into 64-token chunks that never cross a sequence boundary.
+One prepare program per (chunk, head) computes the gated, L2-normalized q and
+k, the chunk's cumulative decay, Aqk, and W and U through the FP32 inverse of
+`I + Akk`: its 16-token diagonal blocks by repeated squaring and the
+off-diagonal blocks from band-shifted products, with beta folded into its
+columns. It writes W, U, Qg, Kg, Aqk and exp2 of each chunk's last decay.
+
+A state walk then carries the state across the chunks. Each warp keeps 16
+state rows in registers, W, U, Kg, Qg and Aqk stream through a two-slot LDS
+ring, and the chunk output is written in the same pass. When too few
+sequences would leave CUs idle, each sequence is split into up to 32 time
+groups. Every group but the last is summarized as `S_out = S_in M + B`, a
+chain kernel turns the summaries into each group's entry state, and all
+groups then walk at once; the last one writes the final state.
+
+gfx1250 loads every tile with TDM, picks WMMA layouts whose results feed the
+next product without leaving registers, walks with the `coexec` scheduler
+(which the backend otherwise applies only up to four warps), and prefetches
+M and B three groups ahead in the chain. gfx950 uses MFMA and schedules its
+prepare kernel with `max-ilp`.
+
 ### KDA records verify and commit (gfx950 / gfx1250)
 
 Standard target decode is a one-token verify window. Both standard and
@@ -1410,8 +1453,8 @@ speculative decode follow verify, acceptance, and commit. Verify retains
 the Gluon fused convolution, LDS vectors and batched value-split selection.
 GFX950 uses 32-row state panels for one-token windows with a bounded gate
 and no value split. Other cases use 16-row panels. Verify preserves committed
-FP32 state. It saves correction U in FP32, and unnormalized K and raw gate in
-the activation dtype.
+FP32 or BF16 state and widens it to FP32. It saves correction U in FP32,
+and unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
 the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
@@ -1439,9 +1482,9 @@ instrumentation. Interval and generation guards remain active; invalid
 records are skipped without device assertions.
 
 Batched descriptors use the shared ten-column table: original QKV (0), conv
-history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
-The remaining columns are reserved. Recovery retains one program per head,
-request and layer. It stages accepted
+history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 or BF16
+state (8). The remaining columns are reserved. Recovery retains one program
+per head, request and layer. It stages accepted
 U, K and raw gate once in LDS, then applies the same updates per value panel.
 It commits each head's convolution history after loading all old taps,
 including when source and destination alias. History retains its bound pool
@@ -2121,8 +2164,14 @@ Sinkhorn divisions use the hardware reciprocal (about one ulp).
 
 The post and collapse kernels move eight contiguous BF16 values per lane.
 Post runs one token per CTA so its twenty coefficients are scalar loads that
-never wait behind the vector stores. The collapse runs one token per CTA so
-the optional RMSNorm reduces the whole row once.
+never wait behind the vector stores. Large post calls (prefill chunks) stream
+far more than the caches hold, so above 2048 tokens adjacent CTAs take
+adjacent hidden blocks of one token and all vector accesses are non-temporal:
+the CTAs in flight cover contiguous rows, and the post neither caches its dead
+inputs nor evicts the dirty lines earlier kernels left behind. Smaller calls
+keep ordinary caching so the next pre-mapping can read the new streams from
+cache. The collapse runs one token per CTA so the optional RMSNorm reduces the
+whole row once.
 
 ### gfx950 Qwen4 hyper-connection mix
 

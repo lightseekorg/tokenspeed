@@ -337,6 +337,7 @@ def test_kda_fused_replay_batch_size():
             stamps,
             activation_ref,
             activation_ref,
+            torch.empty(0, dtype=torch.float32, device=DEVICE),
             BATCH=batch,
             qkv_stride=4608,
             conv_stride=13824,

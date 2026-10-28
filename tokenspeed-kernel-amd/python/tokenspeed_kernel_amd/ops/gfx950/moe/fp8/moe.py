@@ -43,10 +43,16 @@ def _packed_schedule(
     num_experts_local: int,
     num_experts_total: int,
 ) -> tuple[str, int]:
-    """Select tiny warp, small split, or large expert computation."""
+    """Select tiny warp, small split, or large expert computation.
+
+    Decode and speculative-verify batches through 64 rows keep 16-row expert
+    blocks. Top-k routing spreads them over many experts with few rows each,
+    so streaming each touched expert's weights dominates and 64-row blocks
+    would mostly compute padding.
+    """
     if 0 < num_tokens <= 4 and num_experts_local == num_experts_total:
         return "warp", 1
-    if num_tokens > 32:
+    if num_tokens > 64:
         return "large", 1
     from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (
         packed_fp8_split_count,
