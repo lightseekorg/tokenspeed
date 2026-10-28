@@ -31,12 +31,12 @@ import dataclasses
 from collections.abc import Iterable
 
 import torch
-from tokenspeed_kernel.ops.sampling.triton.candidate_head import gather_dot
-from tokenspeed_kernel.thirdparty.cuda.eagle4_candidate import (
+from tokenspeed_kernel.ops.sampling import (
     eagle4_candidate_supports,
     eagle4_candidate_tail,
     eagle4_shard_topk,
 )
+from tokenspeed_kernel.ops.sampling.triton.candidate_head import gather_dot
 from torch import nn
 from transformers import LlamaConfig
 

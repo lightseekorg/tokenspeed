@@ -1527,6 +1527,53 @@ with per-lane candidate updates and reducing across lanes once per row. The
 kernel masks TDM's zero padding before comparison. Tile sizes account for
 element size and batch size to limit shared-memory usage.
 
+### EAGLE-4 candidate head
+
+`tokenspeed_kernel.ops.sampling.eagle4_shard_topk` and
+`eagle4_candidate_tail` run the EAGLE-4 low-rank candidate head around its
+candidate all-gather. On gfx950 they select
+`gluon_eagle4_shard_topk_gfx950` and `gluon_eagle4_candidate_tail_gfx950`; the
+CUDA kernels serve SM90 onward. Both solutions return the same results.
+
+#### Contract
+
+- The shard top-k takes `[M, N]` BF16 scores of a vocab shard and writes
+  `torch.topk(scores, k, sorted=False).indices + vocab_start` into a
+  `[M, k]` int64 view with any row stride. The order is CUDA's: keys above
+  the k-th largest by position, then its first ties by position. ROCm's
+  `torch.topk` leaves that order open.
+- The tail takes `[R, M, NC]` BF16 logits and int64 ids of the gathered rank
+  blocks, with any rank and row strides. It keeps the NC largest in the same
+  order. It writes FP32 logits, their ids, and with `top_k > 0` the draft
+  top-k probabilities and ids. The probabilities equal `torch.softmax` bit for
+  bit; tied probabilities go in slot order.
+- The tail covers NC in 32, 64, 128 and 256, `R * NC <= 1024` and
+  `top_k <= 32`. Row counts and strides are runtime arguments; `k`, `NC`, `R`,
+  `top_k` and the split sizes, which `N` fixes, are compile-time.
+
+#### Algorithm
+
+The shard top-k is a radix select on the order-preserving 16-bit key of each
+BF16 score. Each row splits into up to 16 column ranges, and each workgroup
+loops over register tiles of up to 2048 columns in its range. Two histogram
+passes find the k-th largest key, one byte at a time, using `gl.histogram`.
+Each split writes its own histogram, so no atomics are needed. A per-row
+kernel sums the split histograms, finds the k-th key, and takes prefix sums
+of each split's counts above it and tied with it. Those prefix sums are the
+split's output bases. The emit pass rereads the scores and places each key
+with a tile prefix sum. It skips the scans of tiles that hold none of the k
+keys.
+
+The tail runs one workgroup per row, with one element per gathered candidate.
+For `R > 1` it runs the same two-byte select in registers and scatters the NC
+kept candidates into the output. A barrier orders those writes before the
+softmax reads them back in slot order. The softmax repeats torch's
+64-lane-wave reduction. Lane `l` of a `min(NC, 64)`-wide warp adds
+`exp(x - max)` over slots `l`, `l + warp`, and so on. The lanes then combine
+by xor butterfly, written as repeated half folds of a reshaped vector, with
+libdevice `exp` and round-to-nearest division. The draft top-k repeats an
+argmax that breaks ties toward the lower slot.
+
 ## MoE
 
 ### Packed FP8 routed experts on gfx950
