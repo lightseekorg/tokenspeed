@@ -1015,8 +1015,9 @@ Its responsibilities:
   another bucket has room. Host victims are whole as well, never in use, and
   never take or sit right under a page an eviction write-back is still
   bringing, which would otherwise arrive with nothing under it; dead entries
-  go first, Host-only cache last. `AcquireHostSegments` documents the victim
-  shapes, the ranking and the restore pass.
+  (judged by the Host's checkpoint boundaries alone, unlike the collection
+  below) go first, Host-only cache last. `AcquireHostSegments` documents the
+  victim shapes, the ranking and the restore pass.
 * **L3 under flat KV.** Host L2 is one compact pinned byte buffer indexed by
   CacheBlock IDs. D2H ACKs are replica-agreed and publish Host entries without
   waiting for L3. Independent PUT tickets pin resident Host sources at
@@ -1120,7 +1121,11 @@ Its responsibilities:
   a live request's table holds is taken, and what is in use, or has a store
   still on its way into it, waits for a later plan. `ClearDeviceCache` writes
   nothing back and empties the queue: a Device-only clear loses what only the
-  Device holds and never collects Host L2.
+  Device holds and never collects Host L2. Host placement's dead class
+  (`AcquireHostSegments`, above) counts the Host's checkpoint boundaries
+  only: a Host page with checkpoint boundaries under it, but only on the
+  Device, is dead there (ranked first, counted under
+  `HostEvictionStats::dead_entry`), though the collection would keep it.
 * **Mutation reporting.** `SetCacheMutationSink` reports per-group cache
   insertions/removals; the scheduler folds them into one externally visible
   prefix event. Whether a scheduler-level boundary is fully, partially, or not
@@ -1231,9 +1236,12 @@ copy-in (above), an in-forward State checkpoint's block (`scheduler.md` §1.2)
 — is dropped first and never pays for such an eviction. Waiting would never
 fund such an admission: the blocks in use are its own, as when it resumed
 from a checkpoint whose segment holds the pages under it (`scheduler.md`
-§1.4). Beside another page holder it waits for that holder's release instead,
-and a restore, which falls back to claiming nothing (below), never takes
-blocks this way.
+§1.4). The pass does not always fund it either: a prefix hit the admission
+keeps never leaves, so on a KV-sharded pool of a few pages a request alone
+can still wait for good (`scheduler.md` §1.4). Beside another page holder it
+waits for that holder's release instead, even where write-through, which
+evicts block by block, could fund it at once; and a restore, which falls back
+to claiming nothing (below), never takes blocks this way.
 
 A restore of a retracted request (`scheduler.md` §4) protects the blocks it
 claims like prefix hits. Under segment eviction a set holding one never

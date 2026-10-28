@@ -160,7 +160,9 @@ CacheCoordinator::HostPlacementPlan CacheCoordinator::planHostSegments(
         // Dead on the Host: a tail no probe enumerates any more; a
         // checkpoint boundary missing some State group's checkpoint; with
         // State groups, a node with no remaining Host checkpoint boundary
-        // at or under it.
+        // at or under it. Only the Host's checkpoint boundaries count here:
+        // a Device checkpoint boundary under the node does not keep it out
+        // of this class, as it keeps it from CollectDeadEntries.
         const bool dead = (node.tail_tokens > 0 && !tails_.Contains(*node.hash)) ||
                           (num_checkpoint_entries > 0 && num_checkpoint_entries < num_state_groups_) ||
                           (num_state_groups_ > 0 && num_remaining_checkpoint_boundaries(node) == 0);

@@ -1235,10 +1235,11 @@ built.
 Under `write_back`:
 
 - Clearing only the GPU cache, as `POST /release_memory_occupation` does
-  when it releases `kv_cache`, loses what only the GPU holds, and with it the
-  Host pages that continue a prefix only the GPU held: nothing can reach them
-  any more, and the Host reclaims them. `/flush_cache` clears both tiers
-  under either policy.
+  when it releases `kv_cache`, loses what only the GPU holds. The Host pages
+  that continue a prefix only the GPU held stay in Host L2: they serve hits
+  again once a request recomputes that prefix on the GPU, and otherwise leave
+  only through Host LRU eviction. `/flush_cache` clears both tiers under
+  either policy.
 - Not everything the GPU evicts reaches the Host: what a request releases
   itself, what nothing can resume from any more, and pages evicted together
   that the Host cannot fit as a whole are dropped.

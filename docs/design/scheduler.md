@@ -460,7 +460,15 @@ one by one (`cache-concepts.md`, `AdmissionPlanner`): alone, there is no
 release left to wait for. Only the admission's last variant takes them: an
 optional part of it — a copy-in (§1) or an in-forward checkpoint's block
 (§1.2) — is dropped first and never pays for such an eviction. Beside
-another page holder it waits as above.
+another page holder no block leaves one by one: the request waits for that
+holder's release (on the P role, until its PD transfer is acknowledged),
+where write-through, which evicts block by block, could fund it at once.
+The block-by-block pass lifts only the segment rule. Under either policy the
+blocks the admission's own prefix hit keeps never leave, and the
+tail-handover charge (below) is bucket-blind, so on a KV-sharded pool of a
+few pages a request alone can still wait for good, when its hit holds the
+only cache left and its copy of the tail needs a page in a bucket that is
+full.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
@@ -567,8 +575,14 @@ edges of the loop:
   left to take its pages): the retraction would cost its image's copies and
   its restore and serve no one, so it waits for a completion instead.
 - **A grant that cannot legally join its round's batch** (a fused prefill
-  beside decodes outside mixed mode) still retracts one victim, and the next
-  round's phase order (§3) tries the blocker before any other claim.
+  beside decodes outside mixed mode) still retracts one victim, and the
+  blocker waits for the next round, whose restore phase runs first (§3.3):
+  the victim's own readmission, once its image has landed, can take the freed
+  pages back before the blocker tries. So while decodes keep running, the
+  victim can be retracted and restored as often as every other round, paying
+  its image and its restore each time, and a redirect (above) does not break
+  that loop. It ends when the decodes finish: with no decode in its round,
+  the grant joins that round.
 
 **The image has two legs, both stream-ordered.** `retractVictim` first
 publishes the victim's computed frontier into the Device index exactly as a

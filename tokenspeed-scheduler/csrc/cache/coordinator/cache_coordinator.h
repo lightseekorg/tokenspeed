@@ -516,8 +516,10 @@ public:
         // A segment plan took it as a checkpoint boundary a deeper Device one
         // supersedes.
         HostEvictionCounts superseded;
-        // A segment plan took it as a dead entry, CollectDeadEntries evicted
-        // it, or a settled write-back cancelled it (a held member).
+        // A segment plan took it as a dead entry (judged by the Host's
+        // checkpoint boundaries alone, so a Device checkpoint boundary may
+        // still be under it), CollectDeadEntries evicted it, or a settled
+        // write-back cancelled it (a held member).
         HostEvictionCounts dead_entry;
         // The per-prior tail cap dropped its tail, entry by entry after the
         // tail's Device blocks (device_resident when the Device kept a pinned
@@ -586,15 +588,17 @@ public:
     // bringing to the Host (it would arrive with nothing under it). Victims go
     // by class: dead entries (a checkpoint boundary missing a State group's
     // checkpoint, a tail no probe enumerates, a page no Host checkpoint
-    // boundary depends on) first; then duplicates of a boundary the Device
-    // resumes and checkpoint boundaries a deeper Device checkpoint boundary on
-    // their chain supersedes, the newest Device copy first; then Host-only
-    // cache, least recently used first. Once a victim took every Host page
-    // under the page above it, that page is a candidate too. The restore pass
-    // then returns, newest first, each victim the placed segments can do
-    // without and whose parent page stays. A dropped segment's rows hold empty
-    // references. A retraction image's leg under the write-back policy plans
-    // its boundaries this way first (NumHostBoundariesThatFit).
+    // boundary depends on -- even one with a Device checkpoint boundary under
+    // it, which CollectDeadEntries, counting both tiers, would keep) first;
+    // then duplicates of a boundary the Device resumes and checkpoint
+    // boundaries a deeper Device checkpoint boundary on their chain
+    // supersedes, the newest Device copy first; then Host-only cache, least
+    // recently used first. Once a victim took every Host page under the page
+    // above it, that page is a candidate too. The restore pass then returns,
+    // newest first, each victim the placed segments can do without and whose
+    // parent page stays. A dropped segment's rows hold empty references. A
+    // retraction image's leg under the write-back policy plans its boundaries
+    // this way first (NumHostBoundariesThatFit).
     HostAllocationBatch AcquireHostSegments(std::span<const std::uint32_t> group_ids,
                                             std::span<const std::int32_t> buckets,
                                             std::span<const HostSegmentRows> segments);

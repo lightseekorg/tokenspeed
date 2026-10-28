@@ -1036,9 +1036,13 @@ void Scheduler::onImageDoesNotFit(Request& victim, ImageShortfall shortfall, Pla
 // deadlock once every resident needs a page.
 //
 // A grant that cannot join its round (a fused prefill beside an already-built
-// decode batch outside mixed mode) still retracts one victim: the next
-// round's phase order tries the blocker before any other claim on the freed
-// pages.
+// decode batch outside mixed mode) still retracts one victim, and the blocker
+// waits for the next round, whose restore phase runs first: the victim's own
+// readmission, once its image has landed, can take the freed pages back
+// before the blocker tries. So while decodes keep running, the victim can be
+// retracted and restored as often as every other round (the redirect below
+// does not prevent it), until the decodes finish and the grant joins its
+// round.
 void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build,
                                         std::span<Request* const> candidates,
                                         std::vector<WriteBackOperation>& write_back_operations) {
