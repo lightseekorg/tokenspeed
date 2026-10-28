@@ -71,6 +71,15 @@ _GROUPED_MOE_CONFIGS = {
 }
 
 
+class _RouteTileStage(NamedTuple):
+    """One route-tiled GEMM's output and K tile widths, and whether it issues
+    the next K tile's loads before the current MFMA (``PIPELINE_K``)."""
+
+    block_n: int
+    block_k: int
+    pipeline_k: bool
+
+
 class _RouteTileConfig(NamedTuple):
     """Route-tiled A4W4 expert schedule (deferred, token/slot-order outputs).
 
@@ -83,21 +92,43 @@ class _RouteTileConfig(NamedTuple):
     """
 
     route_capacity: int
-    stage2_block_n: int
-    stage2_block_k: int
+    stage1: _RouteTileStage
+    stage2: _RouteTileStage
 
+
+_DECODE_STAGE1 = _RouteTileStage(64, 128, False)
+_WIDE_STAGE1 = _RouteTileStage(128, 256, True)
 
 # Key: hidden width, intermediate width, local experts, global experts, top-k.
 # Entries: inclusive row bounds and the route-tile schedule. Rows outside every
 # entry fall through to the grouped (staged package) path, which produces
 # bitwise-identical results.
+#
+# The decode entries keep the schedule they used before this table. The other
+# entries were measured on MI355X against the staged package path: one MoE
+# layer per call in graph replay, rotating over four weight copies so weights
+# come from HBM, with uniform and Zipf(1.0) expert routing, three random
+# routing samples each. Each entry's upper row bound is the largest
+# power-of-two route capacity below the first row count at which some sample
+# ran slower than the package path.
+_DECODE_ROUTE_TILES = (
+    (4, 8, _RouteTileConfig(16, _DECODE_STAGE1, _RouteTileStage(16, 256, False))),
+    (9, 16, _RouteTileConfig(16, _DECODE_STAGE1, _RouteTileStage(16, 128, False))),
+    (17, 48, _RouteTileConfig(64, _DECODE_STAGE1, _RouteTileStage(16, 128, False))),
+)
+# EP8 (32 local experts), 49-256 rows: 0.77-0.84x the staged package's time
+# with uniform routing (201 -> 156 us at 128 rows) and 0.67-0.91x with Zipf,
+# except one very skewed 224-row sample at 1.03x. Zipf samples are slower from
+# 384 rows, so the bound is 256.
+_EP8_ROUTE_TILES = _DECODE_ROUTE_TILES + (
+    (49, 64, _RouteTileConfig(64, _WIDE_STAGE1, _RouteTileStage(64, 128, True))),
+    (65, 128, _RouteTileConfig(128, _WIDE_STAGE1, _RouteTileStage(64, 128, True))),
+    # More routes per expert favor the longer down-projection K tile.
+    (129, 256, _RouteTileConfig(256, _WIDE_STAGE1, _RouteTileStage(64, 256, True))),
+)
 _ROUTE_TILE_CONFIGS = {
-    (4096, 4096, local_experts, 256, 8): (
-        (4, 8, _RouteTileConfig(16, 16, 256)),
-        (9, 16, _RouteTileConfig(16, 16, 128)),
-        (17, 48, _RouteTileConfig(64, 16, 128)),
-    )
-    for local_experts in (32, 64)
+    (4096, 4096, 32, 256, 8): _EP8_ROUTE_TILES,
+    (4096, 4096, 64, 256, 8): _DECODE_ROUTE_TILES,
 }
 assert all(
     config.route_capacity & (config.route_capacity - 1) == 0
