@@ -437,6 +437,14 @@ Value projection stays separate to preserve its explicit rounding boundary.
 Provider registration owns dtype, head geometry and hardware constraints.
 The ordinary auto envelope retains its existing dynamic selection policy.
 
+### Explicit projection plans
+
+The existing `gemm/mm` plan also accepts already quantized FP8 operands and
+canonical scales. Quantization stays in the caller's existing quantization
+hook; an online quantizer is not selected by a frozen GEMM plan. The ordinary
+FP8 linear method retains its original dynamic selection and has no new plan
+field or forwarding path.
+
 ## Logprobs: one arithmetic for prompt and output
 
 A returned logprob is the launch's `--logprob-order` applied to the row --
