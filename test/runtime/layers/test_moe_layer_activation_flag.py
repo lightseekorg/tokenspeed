@@ -48,6 +48,7 @@ def _layer(monkeypatch, quant_config, *, flag: bool, override=None):
     monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", flag)
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     MoELayer(
+        deterministic_finalize=False,
         top_k=2,
         num_experts=8,
         hidden_size=256,

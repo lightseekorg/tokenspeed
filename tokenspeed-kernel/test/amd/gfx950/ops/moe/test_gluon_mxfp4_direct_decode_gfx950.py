@@ -686,6 +686,7 @@ def test_package_muse_changed_graph_inputs(ep_size) -> None:
     )
     plan = moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         requires_deferred_finalize=True,

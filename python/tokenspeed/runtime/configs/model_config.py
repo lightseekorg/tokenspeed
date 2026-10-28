@@ -94,6 +94,8 @@ _DSA_ARCHITECTURES = frozenset(
     {
         "GlmMoeDsaForCausalLM",
         "GlmMoeDsaForCausalLMNextN",
+        "HYV4ForCausalLM",
+        "HYV4ForCausalLMNextN",
         # DeepSeek-V3.2: V3 MLA/MoE backbone + DSA sparse indexer. Same
         # attention family and indexer geometry as GLM-DSA.
         "DeepseekV32ForCausalLM",
@@ -1128,6 +1130,7 @@ class ModelConfig:
             "nvfp4",
             "mxfp4",
             "modelopt_mixed",
+            "modelopt_mxfp8",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",

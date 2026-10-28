@@ -281,6 +281,7 @@ def test_unbuildable_private_module_keeps_trtllm_at_128(
     def planned(ispp, **kwargs):
         return kernel_moe_plan(
             "unquant",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             routing_mode=routing_mode,
@@ -404,6 +405,7 @@ def test_trtllm_unquant_admits_gated_sizes_the_launcher_accepts(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "unquant",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             routing_mode=routing_mode,
@@ -505,6 +507,7 @@ def test_64_aligned_outputs_match_128_padded(
     def run(ispp):
         plan = kernel_moe_plan(
             "unquant",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             routing_mode=routing_mode,
@@ -817,6 +820,7 @@ def _plan(platform, weight_dtype, routing_mode=None, **kwargs):
         KernelRegistry.get().clear_cache()
         return kernel_moe_plan(
             weight_dtype,
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             routing_mode=routing_mode,
@@ -1066,6 +1070,7 @@ def test_fp32_bias_plan_routes_like_precomputed_fp32_topk(
     def plan(**kwargs):
         return kernel_moe_plan(
             "unquant",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             ep_size=ep_size,

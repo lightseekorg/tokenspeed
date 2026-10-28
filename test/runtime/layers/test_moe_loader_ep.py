@@ -90,6 +90,7 @@ def test_mtp_fp8_block_scales_load_into_local_ep_expert(
         }
     )
     layer = MoELayer(
+        deterministic_finalize=False,
         top_k=2,
         num_experts=4,
         hidden_size=256,

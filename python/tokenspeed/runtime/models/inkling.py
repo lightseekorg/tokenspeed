@@ -896,6 +896,7 @@ class InklingSparseMoeBlock(nn.Module):
             self.experts: nn.Module = InklingTorchMoEExperts(config)
         else:
             self.experts = MoELayer(
+                deterministic_finalize=False,
                 top_k=config.num_experts_per_tok,
                 num_experts=config.n_routed_experts,
                 hidden_size=config.hidden_size,

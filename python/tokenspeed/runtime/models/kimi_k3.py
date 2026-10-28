@@ -1981,6 +1981,7 @@ class KimiLinearMoE(nn.Module):
         # implementation when one exists and otherwise selects a precomputed-
         # TopK fallback (for example NVFP4, AMD-native, or Marlin SiTU).
         self.experts = MoELayer(
+            deterministic_finalize=False,
             top_k=self.top_k,
             num_experts=self.num_experts,
             hidden_size=self.routed_hidden,

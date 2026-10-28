@@ -49,7 +49,9 @@ def _plan(**overrides) -> dict:
         solution="triton",
     )
     kwargs.update(overrides)
-    return kernel_moe_plan("fp8_channel", **kwargs)
+    return kernel_moe_plan(
+        "fp8_channel", requires_deterministic_finalize=False, **kwargs
+    )
 
 
 def _plan_on(platform, **overrides) -> dict:

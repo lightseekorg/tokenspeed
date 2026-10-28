@@ -327,6 +327,7 @@ class _RuntimeLongcatMoE(nn.Module):
                 self.expert_placement, config, layer_index, self.mapping
             )
         self.experts = _MoELayer(
+            deterministic_finalize=False,
             top_k=config.moe_topk,
             num_experts=(
                 config.n_routed_experts

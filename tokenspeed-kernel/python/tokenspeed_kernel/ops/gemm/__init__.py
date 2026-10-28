@@ -43,6 +43,7 @@ from tokenspeed_kernel.ops.gemm._triton.kimi3 import (
     kimi3_projection_gemv,
     kimi3_shared_situ_projection_gemv,
 )
+from tokenspeed_kernel.ops.gemm.mxfp8 import Mxfp8LinearPlan, prepare_mxfp8_linear
 from tokenspeed_kernel.ops.gemm.triton_router_gemv import fp32_router_gemv_counters
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.ops.quantization.triton import _quantize_fp8_group32_swizzled
@@ -79,6 +80,9 @@ from tokenspeed_kernel.workspace import zeroed_state
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    # Prepared MXFP8 weight-only linears
+    "Mxfp8LinearPlan",
+    "prepare_mxfp8_linear",
     # GEMM
     "bmm",
     "mm",
@@ -3882,6 +3886,7 @@ import tokenspeed_kernel.ops.gemm.deepgemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.gluon  # noqa: E402,F401
+import tokenspeed_kernel.ops.gemm.marlin  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.native  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton  # noqa: E402,F401
 import tokenspeed_kernel.ops.gemm.triton_fp8_channel  # noqa: E402,F401

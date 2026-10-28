@@ -921,7 +921,10 @@ staging buffer used for per-step model inputs must therefore have per-step
 lifetime, or use an explicit synchronization before reuse. This applies to
 MTP/GDN mamba state indices as well as token, length, and request-pool inputs.
 
-CUDA IPC collectives are node-local. The mnnvl fabric workspace spans nodes.
+CUDA IPC collectives are node-local. Before arming a TRT-LLM IPC workspace,
+ranks compare physical host identities using the same boot-ID probe as the
+fabric map, so container hostnames cannot disguise a cross-node group or
+unnecessarily disable a local workspace. The mnnvl fabric workspace spans nodes.
 `AutoBackend` serves single-tensor SUM all-reduces (16-bit, or fp32 where a
 single-node workspace was armed for it; mnnvl serves 16-bit only) on groups
 whose fan-in is 2, 4, 8, or 16 through the armed workspace -- one-shot

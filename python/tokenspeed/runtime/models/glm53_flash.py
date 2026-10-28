@@ -473,6 +473,7 @@ class Glm53FlashMoE(DeepseekV3MoE):
             )
         self.gate = MoEGate(config=config, prefix=add_prefix("gate", prefix))
         self.experts = MoELayer(
+            deterministic_finalize=False,
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,
@@ -1000,14 +1001,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
             [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
             dim=-1,
         )
-        kv_a = latent_cache[..., : self.kv_lora_rank]
-        q_norm = torch.empty_like(q_a)
-        if q_a.size(0) > 0:
-            self.fused_qk_layernorm(
-                input_q_a=q_a,
-                input_kv_a=kv_a,
-                output_q_a=q_norm,
-            )
+        q_norm = self._norm_qkv(q_a, latent_cache, ctx)
 
         logical_num_tokens = q_norm.shape[0]
         if ctx.num_extends > 0:
@@ -1171,11 +1165,11 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         page_table: torch.Tensor,
         q_len_per_req: int,
         decode_start: int,
-        num_tokens: int,
         num_decode_tokens: int,
         topk: int,
     ) -> GlmDsaDecodeTopK:
         del topk
+        num_tokens = indexer_output.query.shape[0]
         writes_full_workspace = decode_start == 0 and num_decode_tokens == num_tokens
         topk_indices = self._get_decode_topk_workspace(
             num_tokens,
@@ -1205,6 +1199,7 @@ class Glm53FlashAttention(GlmMoeDsaAttention):
         return GlmDsaDecodeTopK(
             topk_indices=topk_indices,
             topk_lens=topk_lens,
+            row_offset=0,
         )
 
     def _compute_prefill_topk_indices(

@@ -65,6 +65,7 @@ from tokenspeed.runtime.layers.parameter import (
 from tokenspeed.runtime.layers.quantization import (
     Fp8Config,
     ModelOptMixedConfig,
+    ModelOptMxfp8Config,
     Mxfp4Config,
     Nvfp4Config,
     W8A8Fp8Config,
@@ -211,7 +212,7 @@ class LinearBase(torch.nn.Module):
             # honors the checkpoint's ignored layers, and refuses unsupported
             # combinations such as a quantized MLA kv_b_proj.
             self.quant_method = quant_config.get_quant_method(self, prefix)
-        elif isinstance(quant_config, ModelOptMixedConfig):
+        elif isinstance(quant_config, (ModelOptMixedConfig, ModelOptMxfp8Config)):
             self.quant_method = quant_config.get_quant_method(self, prefix)
         else:
             if isinstance(quant_config, Fp8Config):

@@ -53,6 +53,8 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 # smg reasoning_parser name → xgrammar builtin model template. Keys
@@ -72,6 +74,54 @@ _REASONING_PARSER_TO_XGRAMMAR_MODEL: dict[str, str] = {
     "qwen3_thinking": "qwen_3",
     "glm45": "glm_4_7",
 }
+
+# HY4 releases can suffix their special tokens, for example <think:abc123>.
+_HY_V4_THINK_START = re.compile(r"<think(:[^\s>]+)?>")
+
+
+def hy_v4_think_tokens(vocab: Mapping[str, int]) -> tuple[int, str] | None:
+    """Find a matching HY4 think opener ID and closer string in the vocabulary."""
+    pairs = []
+    for token, token_id in vocab.items():
+        match = _HY_V4_THINK_START.fullmatch(token)
+        if match is not None:
+            end = f"</think{match.group(1) or ''}>"
+            if end in vocab:
+                pairs.append((token_id, end))
+    if len(pairs) > 1:
+        raise ValueError("HY4 tokenizer has ambiguous think-token pairs")
+    return pairs[0] if pairs else None
+
+
+def structural_tag_for_hy_v4_response(
+    content_format: Any,
+    prompt_ids: Sequence[int],
+    think_tokens: tuple[int, str],
+) -> str | None:
+    """Constrain HY4's answer after the reasoning block opened by its template.
+
+    Return None for a prompt that does not end in the opener, including
+    ``no_think`` prompts, so the caller constrains the answer from token zero.
+    """
+    think_start_id, think_end = think_tokens
+    if not prompt_ids or prompt_ids[-1] != think_start_id:
+        return None
+
+    from xgrammar.structural_tag import (
+        AnyTextFormat,
+        SequenceFormat,
+        StructuralTag,
+        TagFormat,
+    )
+
+    return StructuralTag(
+        format=SequenceFormat(
+            elements=[
+                TagFormat(begin="", content=AnyTextFormat(), end=think_end),
+                content_format,
+            ]
+        )
+    ).model_dump_json(by_alias=True)
 
 
 def _structural_tag_for_inkling(content_format: Any) -> str:
@@ -288,16 +338,36 @@ def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | No
     """The engine's ``ReasoningGrammar`` for ``reasoning_parser``, or None
     when xgrammar has no template for it: a JSON schema then constrains the
     whole reply."""
-    from xgrammar.structural_tag import JSONSchemaFormat
+    from xgrammar.structural_tag import JSONSchemaFormat, StructuralTag
 
-    tags = [
-        structural_tag_for_reasoning_response(
-            reasoning_parser,
-            JSONSchemaFormat(json_schema=_SCHEMA_SLOT),
-            prompt_opens_reasoning=opens,
-        )
-        for opens in (True, False)
-    ]
+    if reasoning_parser == "hy_v4":
+        vocab = tokenizer.get_vocab()
+        think_tokens = hy_v4_think_tokens(vocab)
+        if think_tokens is None:
+            raise ValueError(
+                "reasoning-parser=hy_v4 requires a matching think-token pair "
+                "in the checkpoint tokenizer"
+            )
+        start_id, end = think_tokens
+        content = JSONSchemaFormat(json_schema=_SCHEMA_SLOT)
+        # The host selects by the last opener/closer in the actual prompt.
+        # HY4's closed block means no_think, which constrains the whole reply.
+        tags = [
+            structural_tag_for_hy_v4_response(content, [start_id], think_tokens),
+            StructuralTag(format=content).model_dump_json(by_alias=True),
+        ]
+        marker_ids = (start_id, vocab[end])
+    else:
+        tags = [
+            structural_tag_for_reasoning_response(
+                reasoning_parser,
+                JSONSchemaFormat(json_schema=_SCHEMA_SLOT),
+                prompt_opens_reasoning=opens,
+            )
+            for opens in (True, False)
+        ]
+        marker_ids = _reasoning_marker_ids(reasoning_parser, tokenizer)
+
     if None in tags:
         return None
     schema_slot = json.dumps(_SCHEMA_SLOT, separators=(",", ":"))
@@ -311,5 +381,5 @@ def reasoning_grammar(reasoning_parser: str, tokenizer) -> ReasoningGrammar | No
         continues=tags[0],
         may_open=tags[1],
         schema_slot=schema_slot,
-        markers=_reasoning_marker_ids(reasoning_parser, tokenizer),
+        markers=marker_ids,
     )

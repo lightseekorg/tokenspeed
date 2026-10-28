@@ -50,6 +50,7 @@ class KVCacheFormat(Enum):
     MXFP8 = "mxfp8"
     FP8_PER_TENSOR = "fp8_per_tensor"
     FP8_PER_TOKEN_HEAD = "fp8_per_token_head"
+    FP8_FLASHMLA = "fp8_flashmla"
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,19 @@ class HeadNorm:
     q_weight: torch.Tensor
     k_weight: torch.Tensor
     weight_offset: float
+    eps: float
+
+
+@dataclass(frozen=True)
+class LatentNorm:
+    """RMSNorm fused into a packed MLA cache write, before FP8 rounding.
+
+    Attributes:
+        weight: Dense latent-channel weights, applied in fp32.
+        eps: Epsilon added to the fp32 mean square.
+    """
+
+    weight: torch.Tensor
     eps: float
 
 
@@ -191,7 +205,9 @@ class LatentKVCache:
     Attributes:
         kv_cache: ``[slots, 1, kv_lora_rank + rope_dim]`` FP8 e4m3 or native
             rows, a strided [pages, page_size, 1, width] view of those rows,
-            or the planes of an FP8_PER_TOKEN_HEAD cache.
+            the planes of an FP8_PER_TOKEN_HEAD cache, or packed FlashMLA
+            uint8 rows with 512 E4M3 values, four FP32 scales and 64 BF16
+            RoPE values (656 bytes, including zero RoPE values for NoPE).
         sanitize: Replace NaN/Inf with finite values before storing.
         slots: Dense 1-D destination slot of each written row.
         write_mask: True for each row to store, or None to store every row;
@@ -207,6 +223,8 @@ class LatentKVCache:
     def format(self) -> KVCacheFormat:
         if isinstance(self.kv_cache, PerTokenHeadPlanes):
             return KVCacheFormat.FP8_PER_TOKEN_HEAD
+        if self.kv_cache.dtype == torch.uint8:
+            return KVCacheFormat.FP8_FLASHMLA
         if self.kv_cache.dtype == torch.float8_e4m3fn:
             return KVCacheFormat.FP8
         return KVCacheFormat.NATIVE

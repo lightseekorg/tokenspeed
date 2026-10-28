@@ -109,6 +109,7 @@ def _module(e: int, d: int, i: int, topk: int):
 def _plan(policy: str):
     return kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="situ",
         routing_mode="precomputed_topk",

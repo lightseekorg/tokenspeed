@@ -78,7 +78,7 @@ THIRDPARTY_DIR = ROOT / "tokenspeed_kernel" / "thirdparty"
 BASE_VERSION = "0.1.4"
 BACKEND_ENV = "TOKENSPEED_KERNEL_BACKEND"
 VALID_BACKENDS = {"cuda", "rocm", "npu"}
-DEFAULT_CUDA_ARCHS = ("100a", "103a")
+DEFAULT_CUDA_ARCHS = ("90a", "100a", "103a")
 
 # CUDA kernels source and output directories
 CUDA_CSRC_DIR = THIRDPARTY_DIR / "cuda" / "csrc"
@@ -565,7 +565,7 @@ class CudaKernelBuilder:
         self.kernel_groups = kernel_groups
         self.verbose = verbose
 
-    # Target GPU architectures: detect from the CUDA driver or use env var override.
+    # Build Hopper and Blackwell targets unless the caller selects architectures.
     # FLASHINFER_CUDA_ARCH_LIST is accepted for compatibility, but TokenSpeed
     # docs prefer TOKENSPEED_CUDA_ARCH=100 on GB200.
     def _normalize_cuda_arch(self, arch):
@@ -1101,6 +1101,13 @@ setup(
             "objs/**/*.so",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
+            # Pinned dense Marlin MXFP8 optional-JIT source closure.
+            "csrc/marlin_mxfp8_dense/*.cu",
+            "csrc/marlin_mxfp8_dense/*.h",
+            "csrc/marlin_mxfp8_dense/*.cuh",
+            "csrc/marlin_mxfp8_dense/core/*.hpp",
+            "csrc/marlin_mxfp8_dense/LICENSE",
+            "csrc/marlin_mxfp8_dense/SOURCE.json",
             "csrc/include/**/*.h",
             "csrc/include/**/*.cuh",
         ],

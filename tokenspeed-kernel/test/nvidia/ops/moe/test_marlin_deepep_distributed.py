@@ -136,6 +136,7 @@ def test_marlin_deepep_matches_replicated_reference() -> None:
     mode = _deepep_mode()
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="situ",
         routing_mode="precomputed_topk",

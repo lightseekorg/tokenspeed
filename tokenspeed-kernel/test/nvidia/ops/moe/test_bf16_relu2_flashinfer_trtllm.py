@@ -175,6 +175,7 @@ def test_moe_plan_selects_the_bf16_relu2_kernels(routing_mode):
 
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="relu2",
         routing_mode=routing_mode,

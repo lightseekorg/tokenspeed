@@ -85,6 +85,7 @@ def _weights(seed: int = 0) -> torch.nn.Module:
 def _plan(solution: str | None) -> dict:
     return moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         routing_mode="precomputed_topk",

@@ -61,7 +61,7 @@ def _plan_kwargs(monkeypatch, **layer_kwargs) -> dict:
         prefix="model.layers.0.mlp",
     )
     kwargs.update(layer_kwargs)
-    MoELayer(**kwargs)
+    MoELayer(deterministic_finalize=False, **kwargs)
     assert len(plans) == 1
     return plans[0]
 

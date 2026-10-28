@@ -28,6 +28,10 @@ from tokenspeed_kernel.ops.attention.prologue import (
     LatentKVCache,
     PerTokenHeadPlanes,
 )
+from tokenspeed_kernel.ops.kvcache.flashmla import (
+    get_flashmla_kv_buffer,
+    set_flashmla_kv_buffer,
+)
 from tokenspeed_kernel.ops.kvcache.per_token_head import store_latent_per_token_head
 from tokenspeed_kernel.ops.kvcache.triton import (
     get_mla_kv_buffer_triton,
@@ -108,7 +112,7 @@ class MLATokenToKVPool(CachePool):
         buffer = self.kv_buffer[layer_id]
         if buffer is None:
             raise ValueError(f"layer {layer_id} is a KDA state layer")
-        if self.quant_method == "per_token_head":
+        if self.quant_method in ("per_token_head", "flashmla"):
             return buffer
         elif self.store_dtype != self.dtype:
             return buffer.view(self.dtype)
@@ -116,6 +120,8 @@ class MLATokenToKVPool(CachePool):
             return buffer
 
     def get_value_buffer(self, layer_id: int):
+        if self.quant_method == "flashmla":
+            raise ValueError("Packed FlashMLA KV requires sparse attention")
         if self.layerwise_load_tracker is not None:
             self.layerwise_load_tracker.wait_for_layer(layer_id)
         buffer = self.kv_buffer[layer_id]
@@ -178,6 +184,16 @@ class MLATokenToKVPool(CachePool):
         if sanitize is None:
             sanitize = self.latent_write_sanitizes
         layer_id = layer.layer_id
+        if self.quant_method == "flashmla":
+            set_flashmla_kv_buffer(
+                self.kv_buffer[layer_id],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                sanitize=sanitize,
+                write_mask=write_mask,
+            )
+            return
         if self.quant_method == "per_token_head":
             if write_mask is not None:
                 raise ValueError("Per-token quantized MLA writes do not support a mask")
@@ -211,7 +227,9 @@ class MLATokenToKVPool(CachePool):
         dst_dtype: torch.dtype | None = None,
     ):
         layer_id = layer.layer_id
-        dst_dtype = dst_dtype or self.dtype
+        dst_dtype = dst_dtype or (
+            self.model_dtype if self.quant_method == "flashmla" else self.dtype
+        )
 
         if self.quant_method == "per_token_head":
             k_lora_cache, k_scale_cache, k_rope_cache = self.kv_buffer[layer_id]
@@ -230,6 +248,8 @@ class MLATokenToKVPool(CachePool):
         """Split rows ``loc`` of a ``[slots, 1, kv_cache_dim]`` latent plane in
         the cache dtype -- this pool's own, or rows gathered from page owners
         -- into ``dst_dtype`` latent and RoPE keys."""
+        if self.quant_method == "flashmla":
+            return get_flashmla_kv_buffer(rows, loc, self.qk_rope_head_dim, dst_dtype)
         cache_k_nope = torch.empty(
             (loc.shape[0], 1, self.kv_lora_rank),
             dtype=dst_dtype,

@@ -39,6 +39,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from tokenspeed_kernel.platform import current_platform
 
 __all__ = [
@@ -46,6 +47,7 @@ __all__ = [
     "gather_fabric_map",
     "group_has_fabric",
     "group_host_span",
+    "group_spans_hosts",
 ]
 
 logger = logging.getLogger(__name__)
@@ -207,6 +209,30 @@ def _host_identity() -> int:
     digest = hashlib.blake2b(name.encode(), digest_size=8).digest()
     # Signed 64-bit, because the gather carries it in an int64 tensor.
     return int.from_bytes(digest, "big") >> 1
+
+
+def group_spans_hosts(group: dist.ProcessGroup | None) -> bool:
+    """Whether a process group crosses a physical host boundary.
+
+    CUDA IPC workspaces must be rejected before opening peer handles: a failed
+    open can leave a sticky CUDA context error. Container hostnames may be
+    identical across hosts or different on one host, so reuse the fabric
+    probe's host identity instead.
+
+    Args:
+        group: The process group to inspect collectively, or None for WORLD.
+
+    Returns:
+        True when ranks report different host identities.
+        Without an initialized process group, returns False.
+    """
+    if not dist.is_initialized():
+        return False
+    hosts = [None] * dist.get_world_size(group)
+    dist.all_gather_object(hosts, _host_identity(), group=group)
+    # A failed collective must propagate, rather than treating an unknown
+    # topology as safe for CUDA IPC.
+    return len(set(hosts)) > 1
 
 
 def gather_fabric_map() -> list[bool]:

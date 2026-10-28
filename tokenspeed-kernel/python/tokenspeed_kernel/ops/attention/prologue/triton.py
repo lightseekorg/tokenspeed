@@ -32,6 +32,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     HeadNorm,
     KVCacheFormat,
     LatentKVCache,
+    LatentNorm,
     MLAPrologueOutput,
     RopeStyle,
     Rotary,
@@ -504,7 +505,10 @@ def triton_mla_prologue(
     rotary: Rotary | None,
     cache: LatentKVCache,
     enable_pdl: bool,
+    norm: LatentNorm | None = None,
 ) -> MLAPrologueOutput:
+    if norm is not None:
+        raise ValueError("latent RMSNorm requires the packed FlashMLA writer")
     del expanded
     rank = latent_cache.shape[-1] - q_pe.shape[-1]
     latent = latent_cache.unsqueeze(1)

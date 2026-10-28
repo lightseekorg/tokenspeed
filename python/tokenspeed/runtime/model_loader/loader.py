@@ -48,6 +48,7 @@ from tokenspeed.runtime.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from tokenspeed.runtime.layers.quantization.modelopt_mxfp8 import ModelOptMxfp8Config
 from tokenspeed.runtime.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
@@ -155,6 +156,17 @@ def _initialize_model(
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
     quant_config = _get_quantization_config(model_config, load_config)
+    if isinstance(quant_config, ModelOptMxfp8Config):
+        # Deferred: the model base imports this package through weight_utils.
+        from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
+
+        if not (
+            issubclass(model_class, BaseCausalLM)
+            and model_class.supports_modelopt_mxfp8
+        ):
+            raise ValueError(
+                f"{model_class.__name__} does not support ModelOpt MXFP8 checkpoints"
+            )
     if quant_config is not None:
         replacements = getattr(model_class, "quant_module_name_replacements", None)
         if replacements:
@@ -371,10 +383,12 @@ class DefaultModelLoader(BaseModelLoader):
             source.model_or_path, source.revision, source.fall_back_to_pt
         )
         hf_weights_files.sort()
-        # Filtered models can consume different shard lists on different ranks.
-        # Keep their independent prefetch rather than assign reads to absent peers.
+        # An explicit load group consumes the same checkpoint stream. Filtered
+        # models without that contract may select different shards per rank.
         local_rank, local_world_size = 0, 1
-        if use_safetensors and weight_name_filter is None:
+        if use_safetensors and (
+            weight_name_filter is None or checkpoint_load_group is not None
+        ):
             node_start = mapping.node_rank * mapping.nprocs_per_node
             local_ranks = tuple(
                 rank

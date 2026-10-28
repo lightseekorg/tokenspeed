@@ -349,6 +349,40 @@ def test_no_sink_combine_preserves_contiguous_mla_output(monkeypatch, batch, dty
     assert merged.view(batch, -1).shape == (batch, 4 * 512)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("with_sink", [False, True])
+def test_replicated_head_combine_applies_one_sink(monkeypatch, with_sink):
+    from tokenspeed.runtime.layers.attention.dcp import comm
+
+    output = torch.randn(3, 8, 512, dtype=torch.bfloat16, device="cuda")
+    output[-1].zero_()
+    lse = torch.randn(3, 8, dtype=torch.float32, device="cuda")
+    lse[-1].fill_(-torch.inf)
+    lse[0, 2] = torch.inf  # Native empty-context sentinel.
+    lse[0, -1] = torch.inf  # Also coincide with a positive-infinity sink.
+    sink = torch.linspace(-2, 4, 8, device="cuda") if with_sink else None
+    if sink is not None:
+        sink[0], sink[-1] = -torch.inf, torch.inf
+    # Identical independent context shards exercise the real weight and sink
+    # kernels while substituting only the process collective boundary.
+    monkeypatch.setattr(
+        comm, "all_gather", lambda x, group, dim: torch.cat([x] * len(group), dim=dim)
+    )
+    monkeypatch.setattr(comm, "all_reduce", lambda x, group: x * len(group))
+    actual = comm.combine_attention_partials(
+        output, lse, group=(0, 1), rank=0, sink=sink, keep_all_heads=True
+    )
+    expected = output.float().masked_fill(torch.isinf(lse)[..., None], 0)
+    if sink is not None:
+        global_lse = lse.masked_fill(torch.isposinf(lse), -torch.inf) + torch.log(
+            torch.tensor(2.0, device="cuda")
+        )
+        factor = torch.sigmoid(global_lse - sink).nan_to_num()
+        expected = expected * factor[..., None]
+    torch.testing.assert_close(actual, expected.bfloat16(), atol=0.0078125, rtol=0.01)
+    assert actual.is_contiguous() and not actual[-1].any()
+
+
 def test_hybrid_forwards_runtime_geometry_to_both_children():
     from types import SimpleNamespace
 
@@ -827,6 +861,7 @@ def test_dsa_decode_partitions_candidates_and_merges_gathered_heads(
         v_head_dim=128,
         scaling=0.1,
         logit_cap=0.0,
+        attn_sink=None,
     )
 
     def gather(q, group):

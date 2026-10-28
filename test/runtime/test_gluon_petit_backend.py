@@ -426,7 +426,7 @@ def test_petit_layer_constraints(
         mock.patch.object(expert_module, "create_layer_weights") as weights,
     ):
         with pytest.raises(ValueError, match=error) if error else nullcontext():
-            MoELayer(**layer_args)
+            MoELayer(deterministic_finalize=False, **layer_args)
         if error:
             plan.assert_not_called()
             weights.assert_not_called()

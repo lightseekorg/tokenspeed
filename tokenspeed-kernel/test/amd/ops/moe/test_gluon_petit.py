@@ -46,6 +46,7 @@ def test_petit_plan_selects_gluon_registration(profile, mi350_platform) -> None:
     ):
         plan = moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation=profile.activation,
             routing_mode="precomputed_topk",
@@ -76,6 +77,7 @@ def test_petit_cannot_replace_explicit_deepep(mi350_platform) -> None:
     ), pytest.raises(NoKernelFoundError):
         moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="swiglu",
             routing_mode="precomputed_topk",

@@ -217,6 +217,7 @@ def _expert_provider(registry, invariant):
 def _plan(solution):
     return moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.float32,
         routing_mode="precomputed_topk",
         a2a_backend="none",

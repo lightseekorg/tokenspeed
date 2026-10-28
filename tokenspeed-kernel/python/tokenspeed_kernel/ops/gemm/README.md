@@ -108,3 +108,18 @@ converts canonical FP32 1x128 activation and 128x128 weight scales to the
 required layout without UE8M0 rounding. Conversion is part of each call,
 including graph capture; no persistent weight cache is created. Unsupported
 forced calls fail explicitly. It does not claim batch-invariant numerics.
+
+## ModelOpt MXFP8 weight-only linears
+
+`prepare_mxfp8_linear` selects a backend once, before graph capture, from raw
+E4M3 weights and uint8 E8M0 scales of shape `[N, K/32]`. The prepared plan owns
+the packed storage; execution keeps BF16 activations and returns BF16 results.
+The Marlin backend uses FP32 split-K reduction when requested and allocates
+independent scratch for each call, including captured calls. Preparation
+requires K divisible by 32 and pads N/K to supported native tiles. Scale byte
+255 is NaN; Marlin also rejects byte 0 because its scale conversion flushes
+that encoding. This latter restriction belongs to this backend, not E8M0.
+
+Ordinary dense GEMMs never expand all weights to BF16. Absorbed MLA explicitly
+materializes its K/V projections once during loading by inverting the packed
+layout. Live changes to raw weights require a fresh model load.

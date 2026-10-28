@@ -27,7 +27,13 @@ from tokenspeed.runtime.utils.env import global_server_args_dict
 from tokenspeed.runtime.utils.triton import tl, triton
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize_on_alignment=[
+        "chunk_start_idx_ptr",
+        "chunk_seq_lens_ptr",
+        "chunk_cum_seq_lens_ptr",
+    ]
+)
 def create_chunked_cache_kv_indices_paged(
     page_table_ptr,  # [bs, max_pages], row i == batch position i
     chunk_start_idx_ptr,  # (batch_size,)
@@ -130,6 +136,21 @@ def get_chunks_paged(prefix_lens, prefix_lens_cpu, page_table, page_size):
     the batch-ordered ``[bs, max_pages]`` kernel page table."""
     device: torch.device = prefix_lens.device
     batch_size = len(prefix_lens_cpu)
+    from tokenspeed_kernel.ops.tuning import is_warming_up
+
+    if is_warming_up():
+        # Startup may have no cached prefix. Compile its gather without
+        # inventing cached rows or accessing the placeholder page table.
+        create_chunked_cache_kv_indices_paged.warmup(
+            page_table,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            torch.int32,
+            page_table.shape[1],
+            page_size,
+            grid=(batch_size,),
+        )
 
     chunk_len = prefix_chunk_len(batch_size)
     max_prefix = prefix_lens_cpu.max().item()

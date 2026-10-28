@@ -1399,6 +1399,14 @@ strides chosen by the common packer.
 Groups whose fields do not fit the attention planes, or whose exact strides
 require inconsistent packing ratios, retain separate planes.
 
+GLM-5.3-Flash uses dedicated planes for packed FlashMLA latent pages. Their
+656-byte rows do not divide the KDA slab alignment, so sharing those slabs
+would introduce padding that FlashMLA's implicit page addressing cannot read.
+Ordinary MLA retains its shared planes; pooled Index-K fields retain explicit
+strides. The common arena budget includes the separate packed planes.
+Each group's unused planes reduce capacity relative to an exact shared layout;
+this recipe accepts that space cost while retaining exact-stride validation.
+
 **No round-trip reconciliation.** The pipeline is arranged so that pairs which
 would otherwise need cross-checking cannot differ:
 
@@ -1609,6 +1617,14 @@ copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse
 prefill instead combines local sparse-attention partials.
+An optional per-head attention sink adds one zero-value term to the global
+softmax denominator. DSA's context-sharded prefill and decode therefore call
+local sparse cores without a sink and supply it once to
+`combine_attention_partials`, after collecting every context shard. This also
+applies when query heads are replicated and the output is all-reduced. Query
+shards that gather their complete history instead pass the sink directly to
+the core; those queries have no partial-output merge. The sink must cover the
+heads the caller returns, including every head in the replicated-head form.
 Ascend's generic MLA prefill gathers each layer's complete cache plane into
 an owner-major temporary view. That view is not published as persistent cache;
 its allocation and communication scale with layer capacity, including unused

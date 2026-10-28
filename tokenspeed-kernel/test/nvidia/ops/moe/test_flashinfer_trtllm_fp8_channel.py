@@ -394,7 +394,9 @@ def _plan_on(platform, **overrides) -> dict:
     try:
         Platform.override(platform)
         registry.clear_cache()
-        return kernel_moe_plan("fp8_channel", **kwargs)
+        return kernel_moe_plan(
+            "fp8_channel", requires_deterministic_finalize=False, **kwargs
+        )
     finally:
         Platform.override(real_platform)
         registry.clear_cache()

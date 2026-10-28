@@ -68,6 +68,7 @@ def test_bf16_precision_policy_keeps_input_and_backend_validation(
     torch.set_default_dtype(input_dtype)
     with pytest.raises(ValueError, match=diagnostic):
         MoELayer(
+            deterministic_finalize=False,
             top_k=2,
             num_experts=4,
             hidden_size=128,

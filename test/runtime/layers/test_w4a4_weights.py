@@ -131,6 +131,7 @@ def test_w4a4_plan_selects_only_the_fused_kernel():
         pytest.skip("requires Ascend registration")
     plan = tokenspeed_kernel.moe_plan(
         "int4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         routing_mode="precomputed_topk",

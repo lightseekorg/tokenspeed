@@ -138,6 +138,7 @@ def test_routed_deferred_finalize_matches_finalized(
 
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         routing_mode="precomputed_topk",

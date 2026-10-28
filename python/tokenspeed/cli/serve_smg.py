@@ -91,6 +91,8 @@ DEEPSEEK_V4_TOOL_CALL_PARSER = "deepseek_v4"
 DEEPSEEK_V41_REASONING_PARSER = "deepseek_v41"
 GLM_REASONING_PARSER = "glm45"
 GLM_TOOL_CALL_PARSER = "glm47_moe"
+HY_V4_REASONING_PARSER = "hy_v4"
+HY_V4_TOOL_CALL_PARSER = "hy_v4"
 INKLING_REASONING_PARSER = "inkling"
 INKLING_TOOL_CALL_PARSER = "inkling"
 INKLING_ATTENTION_BACKEND = "fa4"
@@ -518,6 +520,21 @@ def _is_inkling_model(model_id: str | None) -> bool:
     )
 
 
+def _is_hy_v4_model(model_id: str | None) -> bool:
+    if not model_id:
+        return False
+    config = _load_model_config(model_id)
+    if config.get("model_type") == "hy_v4" or any(
+        arch in {"HYV4ForCausalLM", "HYV4ForCausalLMNextN"}
+        for arch in (config.get("architectures") or [])
+    ):
+        return True
+    return (
+        re.search(r"(?:^|[/_-])hy[-_]?v?4(?:[-_/]|$)", model_id, re.IGNORECASE)
+        is not None
+    )
+
+
 def _is_kimi_k3_model(model_id: str | None) -> bool:
     if not model_id:
         return False
@@ -639,6 +656,16 @@ def _args_with_default_model_parsers(
             gateway_result.extend(["--reasoning-parser", GLM_REASONING_PARSER])
         if "--tool-call-parser" not in gateway_result:
             gateway_result.extend(["--tool-call-parser", GLM_TOOL_CALL_PARSER])
+
+    elif _is_hy_v4_model(model_id):
+        if (
+            "--reasoning-parser" not in engine_result
+            and "--reasoning-parser" not in gateway_result
+        ):
+            engine_result.extend(["--reasoning-parser", HY_V4_REASONING_PARSER])
+            gateway_result.extend(["--reasoning-parser", HY_V4_REASONING_PARSER])
+        if "--tool-call-parser" not in gateway_result:
+            gateway_result.extend(["--tool-call-parser", HY_V4_TOOL_CALL_PARSER])
 
     elif _is_inkling_model(model_id):
         if (

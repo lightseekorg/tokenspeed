@@ -3335,6 +3335,7 @@ def test_deepep_selects_apply_kernel_by_weight_dtype_without_pinned_solution(
         registry.clear_cache()
         plan = kernel_moe_plan(
             weight_dtype,
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             a2a_backend="deepep",
@@ -3378,6 +3379,7 @@ def test_nvfp4_deepep_rejects_modes_without_normal_legs(
         with pytest.raises(ValueError, match="does not support deepep_mode"):
             kernel_moe_plan(
                 "nvfp4",
+                requires_deterministic_finalize=False,
                 input_dtype=torch.bfloat16,
                 activation="silu",
                 routing_mode="precomputed_topk",
@@ -3410,6 +3412,7 @@ def test_moe_plan_rejects_persistent_workspace_for_ordinary_kernel(
         with pytest.raises(ValueError, match="does not support persistent workspace"):
             kernel_moe_plan(
                 "unquant",
+                requires_deterministic_finalize=False,
                 input_dtype=torch.bfloat16,
                 activation="silu",
                 routing_mode="precomputed_topk",
@@ -3466,6 +3469,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
         registry.clear_cache()
         plan = kernel_moe_plan(
             "fp8",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             a2a_backend="deepep",
@@ -3495,6 +3499,7 @@ def test_deepep_plan_carries_mode_and_low_latency_capacity(b200_platform) -> Non
 def test_moe_plan_defaults_deepep_mode_to_auto() -> None:
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         routing_mode="precomputed_topk",
@@ -3526,6 +3531,7 @@ def test_moe_plan_rejects_invalid_deepep_mode(
     with pytest.raises(ValueError, match=match):
         kernel_moe_plan(
             "fp8",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             a2a_backend=a2a_backend,
@@ -3854,7 +3860,9 @@ def test_gfx950_dynamic_mxfp4_moe_selects_gluon_a4w4(
             combine_order="rank",
             features=frozenset(),
         )
-        return kernel_moe_plan("mxfp4", **{**kwargs, **overrides})
+        return kernel_moe_plan(
+            "mxfp4", requires_deterministic_finalize=False, **{**kwargs, **overrides}
+        )
 
     registry = KernelRegistry.get()
     real_platform = Platform.get()
@@ -3972,7 +3980,7 @@ def _moe_fp8_channel_plan(platform: PlatformInfo, **overrides) -> dict:
     try:
         Platform.override(platform)
         registry.clear_cache()
-        return kernel_moe_plan(**kwargs)
+        return kernel_moe_plan(requires_deterministic_finalize=False, **kwargs)
     finally:
         Platform.override(real_platform)
         registry.clear_cache()
@@ -4247,6 +4255,7 @@ def test_gluon_mxfp4_plan_selects_dynamic_apply_on_cdna4(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="swiglu",
             ep_size=1,
@@ -4286,6 +4295,7 @@ def test_triton_mxfp4_supports_input_activation_dtype(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="swiglu",
             routing_mode="precomputed_topk",
@@ -4349,6 +4359,7 @@ def test_kimi3_mxfp4_situ_selection_on_cdna4(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="situ",
             routing_mode="precomputed_topk",
@@ -4396,6 +4407,7 @@ def test_gluon_mxfp4_swiglu_ep_traits_select_matching_kernel(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="swiglu",
             routing_mode="precomputed_topk",
@@ -4436,6 +4448,7 @@ def test_gluon_mxfp4_a4w4_deferred_traits_select_matching_kernel(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             requires_deferred_finalize=True,
@@ -4476,6 +4489,7 @@ def test_kimi3_mxfp4_situ_ep8_bias_avoids_a8_apply(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="situ",
             routing_mode="precomputed_topk",
@@ -4570,6 +4584,7 @@ def test_kimi3_mxfp4_situ_tp_selection_on_cdna5(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="situ",
             routing_mode="precomputed_topk",
@@ -4611,6 +4626,7 @@ def test_dsv41_mxfp4_swiglu_tp_selection_on_cdna5(
         registry.clear_cache()
         plan = kernel_moe_plan(
             "mxfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="swiglu",
             routing_mode="precomputed_topk",
@@ -4873,6 +4889,7 @@ def test_gluon_mxfp4_gfx1250_situ_apply_forwards_activation(
 def _moe_apply_unquant_trtllm() -> object:
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         requires_deferred_finalize=True,
@@ -4937,6 +4954,7 @@ def _moe_topk_hash() -> object:
 def _moe_apply_unquant_cutlass() -> object:
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=2,
@@ -4963,6 +4981,7 @@ def _moe_apply_unquant_cutlass() -> object:
 def _moe_apply_fp8_cutlass() -> object:
     plan = kernel_moe_plan(
         "fp8",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=2,
@@ -5004,6 +5023,7 @@ def _moe_apply_mxfp4_plan(
     # 3072-wide FFN.
     return kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",
@@ -5231,6 +5251,7 @@ def _moe_apply_mxfp4_situ_auto() -> object:
 def _moe_apply_fp8_trtllm() -> object:
     plan = kernel_moe_plan(
         "fp8",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=2,
@@ -5258,6 +5279,7 @@ def _moe_apply_fp8_trtllm() -> object:
 def _moe_apply_nvfp4_trtllm() -> object:
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         requires_deferred_finalize=True,
@@ -5291,6 +5313,7 @@ def _moe_apply_nvfp4_trtllm() -> object:
 def _moe_apply_nvfp4_cutlass() -> object:
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=2,
@@ -5318,6 +5341,7 @@ def _moe_apply_nvfp4_cutlass() -> object:
 def _moe_apply_nvfp4_trtllm_routed() -> object:
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         routing_mode="precomputed_topk",
@@ -5359,6 +5383,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
     # router_logits), so the routed variant sits at a lower priority.
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=2,
@@ -5387,6 +5412,7 @@ def _moe_apply_nvfp4_trtllm_unconstrained_routing() -> object:
 def _moe_apply_unquant_trtllm_routed() -> object:
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         routing_mode="precomputed_topk",
@@ -5425,6 +5451,7 @@ def _moe_apply_unquant_trtllm_routed() -> object:
 def _moe_apply_nvfp4_deepep_cutedsl() -> object:
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         a2a_backend="deepep",
@@ -5455,6 +5482,7 @@ def _moe_apply_nvfp4_deepep_cutedsl() -> object:
 def _moe_apply_fp8_deepep_deep_gemm() -> object:
     plan = kernel_moe_plan(
         "fp8",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         routing_mode="precomputed_topk",
@@ -5496,6 +5524,7 @@ def _moe_apply_fp8_deepep_deep_gemm() -> object:
 def _moe_apply_mxfp4_trtllm() -> object:
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=2,
@@ -5523,6 +5552,7 @@ def _moe_apply_mxfp4_trtllm() -> object:
 def _moe_apply_mxfp4_triton() -> object:
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         routing_mode="precomputed_topk",
@@ -5560,6 +5590,7 @@ def _moe_apply_mxfp4_triton() -> object:
 def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> object:
     plan = kernel_moe_plan(
         "fp8",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=1,
@@ -5592,6 +5623,7 @@ def _moe_apply_fp8_block(ispp: int, apply: str, preprocessor: str | None) -> obj
 def _moe_apply_unquant_triton() -> object:
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         routing_mode="precomputed_topk",
@@ -5629,6 +5661,7 @@ def _moe_apply_unquant_triton() -> object:
 def _moe_apply_mxfp4_gluon() -> object:
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ispp=128,
@@ -5655,6 +5688,7 @@ def _moe_apply_mxfp4_gluon() -> object:
 def _moe_apply_mxint4_trtllm() -> object:
     plan = kernel_moe_plan(
         "mxint4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=2,
@@ -5681,6 +5715,7 @@ def _moe_apply_mxint4_trtllm() -> object:
 def _moe_apply_mxfp4_dynamic_tp() -> object:
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         ep_size=1,
@@ -7545,6 +7580,7 @@ def test_b200_fp8_swiglu_selects_trtllm_routed_moe(
 
         plan = kernel_moe_plan(
             "fp8",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="swiglu",
             routing_mode="precomputed_topk",
@@ -8237,3 +8273,55 @@ def test_kernel_api_selection(
         registry.clear_cache()
 
     assert calls == [case.expected]
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_marlin_mxfp8_selects_original_group32_weights(h100_platform, deterministic):
+    registry = KernelRegistry.get()
+    previous = Platform.get()
+    try:
+        Platform.override(h100_platform)
+        registry.clear_cache()
+        plan = kernel_moe_plan(
+            "fp8",
+            input_dtype=torch.bfloat16,
+            activation="swiglu",
+            routing_mode="precomputed_topk",
+            ep_size=32,
+            ispp=2048,
+            requires_deterministic_finalize=deterministic,
+            hidden=6144,
+            swiglu_form="standard",
+            activation_clamped=True,
+            expert_id_repeats=True,
+            num_experts=256,
+            top_k=8,
+            fp8_scale_block_shape=(1, 32),
+            fast_math=False,
+            combine_order="rank",
+            features=frozenset(),
+            solution="marlin",
+        )
+        assert plan["apply_kernel_name"] == "marlin_mxfp8_precomputed_moe_apply"
+        assert plan["deterministic_finalize"] is deterministic
+        with pytest.raises((ValueError, kernel_NoKernelFoundError)):
+            kernel_moe_plan(
+                "fp8",
+                input_dtype=torch.bfloat16,
+                activation="swiglu",
+                routing_mode="precomputed_topk",
+                requires_deterministic_finalize=True,
+                hidden=6144,
+                ispp=2048,
+                swiglu_form="standard",
+                activation_clamped=True,
+                expert_id_repeats=True,
+                fp8_scale_block_shape=(1, 32),
+                fast_math=False,
+                combine_order="slot",
+                features=frozenset(),
+                solution="marlin",
+            )
+    finally:
+        Platform.override(previous)
+        registry.clear_cache()

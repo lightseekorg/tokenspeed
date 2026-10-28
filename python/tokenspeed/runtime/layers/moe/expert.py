@@ -93,6 +93,8 @@ class MoELayer(torch.nn.Module):
         routing_mode: str | None = None,
         internal_activation_dtype_override: str | None = None,
         persistent_max_num_tokens_per_gpu: int | None = None,
+        *,
+        deterministic_finalize: bool,
     ):
         super().__init__()
         self.layer_index = layer_index
@@ -496,6 +498,7 @@ class MoELayer(torch.nn.Module):
             raise ValueError("MoE output_scale requires an explicit precision policy")
         self.plan = kernel_moe_plan(
             self._quant_kind,
+            requires_deterministic_finalize=deterministic_finalize,
             input_dtype=input_dtype,
             activation=self.activation,
             # e.g. "precomputed_topk" when fused kernels cannot reproduce the routing; None = unconstrained.

@@ -79,7 +79,7 @@ def _plan(combine_order: str, **overrides) -> dict:
         features=frozenset(),
     )
     kwargs.update(overrides)
-    return moe_plan("unquant", **kwargs)
+    return moe_plan("unquant", requires_deterministic_finalize=False, **kwargs)
 
 
 @pytest.fixture

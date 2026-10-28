@@ -27,12 +27,16 @@ from __future__ import annotations
 import json
 
 import pytest
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
     ReasoningGrammar,
+    hy_v4_think_tokens,
     reasoning_block_markers,
     reasoning_grammar,
+    structural_tag_for_hy_v4_response,
 )
 
 xgrammar = pytest.importorskip("xgrammar")
@@ -147,6 +151,59 @@ def _accepts(structural_tag: str, reply: str) -> bool:
         terminate_without_stop_token=True,
     )
     return matcher.accept_string(reply) and matcher.is_terminated()
+
+
+@pytest.mark.parametrize("suffix", ["", ":abc123"])
+def test_hy_v4_schema_waits_for_the_tokenizers_reasoning_closer(suffix):
+    opener, closer = f"<think{suffix}>", f"</think{suffix}>"
+    vocab = {"[UNK]": 0, "user": 1, opener: 2, closer: 3, "tail": 4}
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="[UNK]")),
+        unk_token="[UNK]",
+        additional_special_tokens=[opener, closer],
+    )
+    grammar = reasoning_grammar("hy_v4", tokenizer)
+    assert grammar.markers == (2, 3)
+    assert hy_v4_think_tokens(tokenizer.get_vocab()) == (2, closer)
+    # Text after the opener does not close the reasoning block. A later
+    # opener wins over the preceding turn's close marker at host admission.
+    for prompt in ([1, 2], [1, 2, 4], [1, 2, 3, 1, 2]):
+        tag = _host_tag(grammar, prompt)
+        assert _accepts(tag, f"Paris is the capital.{closer}{_ANSWER}")
+        assert not _accepts(tag, f"Reasoning.{closer}{_WRONG_ANSWER}")
+        assert not _accepts(tag, _ANSWER)
+    for prompt in ([1, 2, 3], [1, 2, 3, 4], [1]):
+        tag = _host_tag(grammar, prompt)
+        assert _accepts(tag, _ANSWER)
+        assert not _accepts(tag, _WRONG_ANSWER)
+        assert not _accepts(tag, f"Reasoning.{closer}{_ANSWER}")
+
+
+def test_hy_v4_requires_matching_think_suffixes():
+    vocab = {"[UNK]": 0, "<think:one>": 1, "</think:two>": 2}
+    assert hy_v4_think_tokens(vocab) is None
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=Tokenizer(WordLevel(vocab, unk_token="[UNK]")),
+        unk_token="[UNK]",
+    )
+    with pytest.raises(ValueError, match="matching think-token pair"):
+        reasoning_grammar("hy_v4", tokenizer)
+    with pytest.raises(ValueError, match="ambiguous"):
+        hy_v4_think_tokens(
+            {"<think>": 0, "</think>": 1, "<think:other>": 2, "</think:other>": 3}
+        )
+
+
+def test_hy_v4_direct_tag_helper_preserves_no_think_constraint():
+    from xgrammar.structural_tag import JSONSchemaFormat
+
+    content = JSONSchemaFormat(json_schema=_SCHEMA)
+    think_tokens = (2, "</think:abc123>")
+    assert structural_tag_for_hy_v4_response(content, [], think_tokens) is None
+    assert structural_tag_for_hy_v4_response(content, [2, 3], think_tokens) is None
+    tag = structural_tag_for_hy_v4_response(content, [1, 2], think_tokens)
+    assert _accepts(tag, f"Reasoning.</think:abc123>{_ANSWER}")
+    assert not _accepts(tag, f"Reasoning.</think:abc123>{_WRONG_ANSWER}")
 
 
 # (model, reasoning parser, chat template options, accepted replies, refused

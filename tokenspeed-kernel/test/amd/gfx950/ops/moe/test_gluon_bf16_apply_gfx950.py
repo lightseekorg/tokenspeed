@@ -81,6 +81,7 @@ def test_gluon_bf16_moe_apply_matches_reference(num_tokens):
 
     plan = kernel_moe_plan(
         "bf16",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ispp=I_R,  # I_R=256 satisfies the kernel's ispp_alignment gate

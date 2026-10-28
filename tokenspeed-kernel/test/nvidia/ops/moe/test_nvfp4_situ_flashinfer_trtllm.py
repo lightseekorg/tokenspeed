@@ -426,6 +426,7 @@ def test_moe_plan_selects_nvfp4_situ_routed_kernel(
 
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="situ",
         routing_mode=routing_mode,
@@ -544,6 +545,7 @@ def test_nvfp4_silu_plan_executes_and_replays(
 ) -> None:
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode=routing_mode,

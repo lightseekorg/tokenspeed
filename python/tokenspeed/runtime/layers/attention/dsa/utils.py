@@ -68,11 +68,16 @@ def _prepare_dsa_topk_for_mtp_decode(
 
     topk_indices = decode_topk.topk_indices
     topk_lens = decode_topk.topk_lens
-    if num_prefill_rows <= 0 and topk_indices.shape[0] <= gather_ids.numel():
+    if (
+        num_prefill_rows <= 0
+        and decode_topk.row_offset == 0
+        and topk_indices.shape[0] <= gather_ids.numel()
+    ):
         return dsa_topk
     if num_prefill_rows <= 0:
-        selected_indices = topk_indices.index_select(0, gather_ids)
-        selected_lens = topk_lens.index_select(0, gather_ids)
+        decode_rows = gather_ids - decode_topk.row_offset
+        selected_indices = topk_indices.index_select(0, decode_rows)
+        selected_lens = topk_lens.index_select(0, decode_rows)
     else:
         if prefill_topk is None:
             return dsa_topk
@@ -87,6 +92,7 @@ def _prepare_dsa_topk_for_mtp_decode(
             device=topk_lens.device, dtype=topk_lens.dtype
         )
         if decode_rows.numel() > 0:
+            decode_rows = decode_rows - decode_topk.row_offset
             selected_indices = torch.cat(
                 (selected_indices, topk_indices.index_select(0, decode_rows)),
                 dim=0,
@@ -100,4 +106,5 @@ def _prepare_dsa_topk_for_mtp_decode(
         decode_topk,
         topk_indices=selected_indices,
         topk_lens=selected_lens,
+        row_offset=0,
     )

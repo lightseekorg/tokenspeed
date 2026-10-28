@@ -217,6 +217,7 @@ def test_beam_channel_ordinary_admission_without_a_timing_override(mi350_platfor
         KernelRegistry.get().clear_cache()
         plan = moe_ops.moe_plan(
             "fp8_channel",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="silu",
             requires_deferred_finalize=False,

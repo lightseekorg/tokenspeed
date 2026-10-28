@@ -595,9 +595,10 @@ TORCH_NCCL_BLOCKING_WAIT=1 tokenspeed serve moonshotai/Kimi-K3 \
 
 ## GLM5 / GLM5.2
 
-GLM5 launches usually need remote code, long context, expert parallelism, FP8 KV
-cache, and the TRTLLM MoE backend. GLM5.2 FP8 is available on Hugging Face as
-`zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning parser to `glm45`.
+GLM5 launches usually use remote code, long context, expert parallelism, and FP8 KV
+cache. The example below selects the TRTLLM MoE backend on Blackwell. GLM5.2 FP8 is
+available on Hugging Face as `zai-org/GLM-5.2-FP8`. TokenSpeed defaults the reasoning
+parser to `glm45`.
 Pass an explicit parser flag to override it. GLM5 DSA prefill planning reuses
 the host-side request lengths and the packed page/row plan across full-indexer
 layers. When integrating a custom attention backend, keep the
@@ -638,6 +639,42 @@ ts serve zai-org/GLM-5.3 \
   --speculative-algorithm MTP \
   --speculative-num-steps 3
 ```
+
+On Hopper, including H20, select `--moe-backend flashinfer_cutlass` with
+`--kv-cache-dtype fp8`. DSA uses FlashMLA's packed FP8 cache and keeps queries in
+BF16. For GLM-5.3, the 2048-wide shared expert is sharded over the MoE TP × EP
+group. Each shard must align to the checkpoint's 128-element weight blocks,
+so this group cannot exceed 16 ranks.
+
+For two nodes with eight H20 GPUs each, set `NODE_RANK` to 0 or 1 and
+`HEAD_NODE_IP` to the first node's address. This example serves the base model
+without speculation:
+
+```bash
+ts serve zai-org/GLM-5.3 \
+  --trust-remote-code \
+  --nnodes 2 --node-rank "$NODE_RANK" \
+  --dist-init-addr "${HEAD_NODE_IP}:23456" \
+  --attn-tp-size 16 --dense-tp-size 16 \
+  --moe-tp-size 1 --expert-parallel-size 16 \
+  --moe-backend flashinfer_cutlass \
+  --kv-cache-dtype fp8 \
+  --max-model-len 65536 --max-total-tokens 196608 --max-num-seqs 32 \
+  --chunked-prefill-size 4096 --max-cudagraph-capture-size 32 \
+  --gpu-memory-utilization 0.8 --disable-kvstore
+```
+
+## HY4 Preview
+
+HY4 Preview's ModelOpt MXFP8 checkpoint uses E4M3 weights and E8M0 scales
+with groups of 32 input channels. The Hopper baseline uses Marlin W8A16
+for quantized dense and expert projections, and shared FlashMLA for its
+gated sparse attention with learnable sinks. It also supports the checkpoint's
+MTP block; keep MTP off for the initial backend comparison.
+
+See [HY4 Preview MXFP8 on Hopper](hyv4-mxfp8-marlin.md) for the required
+kernel capabilities, numerical boundaries, topology constraints and a
+four-node launch template.
 
 ## GLM 5.3 Flash
 

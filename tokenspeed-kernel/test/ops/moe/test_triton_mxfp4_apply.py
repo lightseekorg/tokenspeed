@@ -71,6 +71,7 @@ def test_triton_mxfp4_moe_matches_torch(
     weights.activation_situ_linear_beta = 25.0
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",
@@ -166,6 +167,7 @@ def test_triton_mxfp4_moe_defers_local_ep_routes() -> None:
     weights.w13_input_layout = "concatenated"
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="silu",
         requires_deferred_finalize=True,

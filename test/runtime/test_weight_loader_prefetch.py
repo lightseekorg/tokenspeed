@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 import tempfile
@@ -44,6 +45,61 @@ def _fake_available_memory(available):
 
 
 class TestWeightLoaderPrefetch:
+    @pytest.mark.parametrize("shared_group", [False, True])
+    def test_filtered_checkpoint_read_volume_and_values(
+        self, tmp_path, monkeypatch, shared_group
+    ):
+        """A declared cohort reads each retained shard once, preserving tensors."""
+        expected = {}
+        weight_map = {}
+        kept_files = []
+        for index in range(4):
+            name = f"kept.{index}" if index < 3 else "discarded.3"
+            tensor = weight_utils.torch.arange(8, dtype=weight_utils.torch.float32)
+            tensor = tensor + index
+            path = tmp_path / f"model-{index:05d}.safetensors"
+            weight_utils.safetensors.torch.save_file({name: tensor}, str(path))
+            weight_map[name] = path.name
+            if index < 3:
+                expected[f"target.{name}"] = tensor
+                kept_files.append(str(path))
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"weight_map": weight_map})
+        )
+        actual_bytes = Counter()
+        lock = threading.Lock()
+        read_range = CheckpointPrefetcher._read_range
+
+        def measure_read(path, start, end):
+            size = read_range(path, start, end)
+            with lock:
+                actual_bytes[path] += size
+            return size
+
+        monkeypatch.setattr(
+            CheckpointPrefetcher, "_read_range", staticmethod(measure_read)
+        )
+        loader = DefaultModelLoader(LoadConfig(weight_loader_prefetch_num_threads=1))
+        source = DefaultModelLoader.Source(str(tmp_path), None, prefix="target.")
+        for rank in (4, 5):
+            loaded = dict(
+                loader._get_weights_iterator(
+                    source,
+                    lambda name: name.startswith("target.kept."),
+                    (4, 5) if shared_group else None,
+                    Mapping(rank=rank, world_size=8, nprocs_per_node=4),
+                )
+            )
+            assert loaded.keys() == expected.keys()
+            for name, tensor in loaded.items():
+                weight_utils.torch.testing.assert_close(
+                    tensor, expected[name], rtol=0, atol=0
+                )
+        copies = 1 if shared_group else 2
+        assert actual_bytes == Counter(
+            {path: os.path.getsize(path) * copies for path in kept_files}
+        )
+
     def _parse_server_args(self, cli):
         parser = argparse.ArgumentParser()
         ServerArgs.add_cli_args(parser)

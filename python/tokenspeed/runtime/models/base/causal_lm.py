@@ -127,6 +127,10 @@ class BaseCausalLM(nn.Module):
     # refuses the placement flags for a model that does not, so a placement
     # is never installed only to be ignored.
     supports_expert_placement: ClassVar[bool] = False
+    # The loader must preserve and pair ModelOpt E4M3 weights and E8M0 scales.
+    supports_modelopt_mxfp8: ClassVar[bool] = False
+    # Repacked quantized/absorbed state may require a new model instance.
+    supports_live_weight_updates: ClassVar[bool] = True
 
     @property
     def routed_experts_weights_of_layer(self) -> dict[int, list[torch.Tensor]]:
@@ -441,8 +445,12 @@ class BaseCausalLM(nn.Module):
         """Enter a live weight-update session.
 
         Raises:
-            RuntimeError: A session is already active.
+            RuntimeError: Updates are unsupported or a session is already active.
         """
+        if not self.supports_live_weight_updates:
+            raise RuntimeError(
+                f"{type(self).__name__} does not support live weight updates"
+            )
         if self._weight_update_active:
             raise RuntimeError(
                 f"{type(self).__name__}: a weight-update session is already active"

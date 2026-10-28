@@ -137,6 +137,7 @@ def test_triton_bf16_moe_matches_torch(
     weights.activation_situ_linear_beta = 25.0
     plan = kernel_moe_plan(
         "unquant",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",

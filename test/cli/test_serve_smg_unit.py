@@ -43,6 +43,8 @@ from tokenspeed.cli.serve_smg import (
     _DEFAULT_SMG_DISABLE_FLAGS,
     DEEPSEEK_V4_REASONING_PARSER,
     DEEPSEEK_V4_TOOL_CALL_PARSER,
+    HY_V4_REASONING_PARSER,
+    HY_V4_TOOL_CALL_PARSER,
     INKLING_ATTENTION_BACKEND,
     INKLING_REASONING_PARSER,
     INKLING_TOOL_CALL_PARSER,
@@ -69,6 +71,7 @@ from tokenspeed.cli.serve_smg import (
     _gateway_args_with_smg_disable_defaults,
     _get_from_args,
     _is_deepseek_v4_model,
+    _is_hy_v4_model,
     _is_inkling_model,
     _is_kimi_k3_model,
     _is_muse_spark_model,
@@ -421,6 +424,13 @@ def _make_kimi_k3_model_dir(tmp_path):
     return str(tmp_path)
 
 
+def _make_hy_v4_model_dir(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"model_type": "hy_v4", "architectures": ["HYV4ForCausalLM"]})
+    )
+    return str(tmp_path)
+
+
 class _ModelFamily(NamedTuple):
     """One model family's detector and the parser defaults it injects."""
 
@@ -463,6 +473,14 @@ _MODEL_FAMILIES = (
         _is_kimi_k3_model,
         KIMI_K3_REASONING_PARSER,
         KIMI_K3_TOOL_CALL_PARSER,
+    ),
+    _ModelFamily(
+        "hy_v4",
+        "tencent/Hy4-preview",
+        _make_hy_v4_model_dir,
+        _is_hy_v4_model,
+        HY_V4_REASONING_PARSER,
+        HY_V4_TOOL_CALL_PARSER,
     ),
 )
 
@@ -537,6 +555,23 @@ def test_model_parser_defaults_preserve_explicit_values(tmp_path, family):
         engine_args,
         gateway_args,
     )
+
+
+@pytest.mark.parametrize("architecture", ["HYV4ForCausalLM", "HYV4ForCausalLMNextN"])
+def test_hy_v4_parser_defaults_follow_local_architecture(tmp_path, architecture):
+    (tmp_path / "config.json").write_text(json.dumps({"architectures": [architecture]}))
+    model = str(tmp_path)
+    engine, gateway = _args_with_default_model_parsers(
+        ["--model", model], ["--model", model, "--tool-call-parser", "json"]
+    )
+    assert _get_from_args(engine, "--reasoning-parser") == "hy_v4"
+    assert _get_from_args(gateway, "--reasoning-parser") == "hy_v4"
+    assert _get_from_args(gateway, "--tool-call-parser") == "json"
+
+
+@pytest.mark.parametrize("model", ["tencent/Hy40-preview", "other/myhy4", "other/hy3"])
+def test_hy_v4_parser_detection_does_not_match_other_model_names(model):
+    assert not _is_hy_v4_model(model)
 
 
 def test_deepseek_v4_parser_defaults_fill_missing_parser_only():

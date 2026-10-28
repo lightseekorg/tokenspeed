@@ -403,3 +403,31 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+
+### MXFP8 weight-only experts
+
+The Marlin apply path accepts original E4M3 weights and raw E8M0 scales per
+`1 x 32` weight block on NVIDIA SM90+. Weight preparation repacks each local
+expert once and retains the compressed storage. Both projections use BF16
+activations and FP32 split-K reduction. Routed SwiGLU supports a standard
+sigmoid with an optional clamp; shared and dense experts choose their own
+activation contract.
+
+`requires_deterministic_finalize` is explicit in `moe_plan`. When true,
+selection requires a declared deterministic implementation. Marlin uses
+stable route alignment and folds each token's expert slots in order. This
+promises repeatability at fixed shape and topology, not batch invariance.
+`combine_order="rank"` leaves inter-rank reduction to the runtime; this leaf
+does not implement slot-order communication, all-to-all EP, or deferred
+finalization. Repeated expert IDs count once per route slot; masked and
+nonlocal IDs contribute zero.
+
+The shared BF16 epilogue first rounds each GEMM2 result and route weight to
+BF16, rounds their product to BF16, then accumulates slots in FP32. It can
+also consume routes already weighted by the native Marlin epilogue. Other
+GEMM implementations can reuse this arithmetic without depending on Marlin.
+E8M0 byte `0` represents `2**-127`, but Marlin's BF16 scale decoder flushes
+that encoding; preparation therefore rejects it along with NaN byte `255`
+before publishing any prepared weight. Supported scale bytes do not guarantee
+that an arbitrary weight/scale product remains finite.

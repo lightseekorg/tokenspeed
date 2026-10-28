@@ -45,6 +45,7 @@ from tokenspeed.runtime.model_loader.weight_utils import (
     non_unit_kv_scale_message,
     record_non_unit_kv_scales,
 )
+from tokenspeed.runtime.models.base.causal_lm import BaseCausalLM
 from tokenspeed.runtime.models.base.weight_update import weight_update_session
 from tokenspeed.runtime.moe.expert_location import (
     build_expert_placement,
@@ -376,6 +377,16 @@ class ModelRunner:
         against torch silently splitting it off the engine's own communicator
         instead of rendezvousing with the trainer.
         """
+        # Refuse before rendezvous so the trainer cannot start broadcasting
+        # weights that this model's prepared layouts cannot accept.
+        if (
+            isinstance(self.model, BaseCausalLM)
+            and not self.model.supports_live_weight_updates
+        ):
+            return (
+                False,
+                f"{type(self.model).__name__} does not support live weight updates",
+            )
         from packaging.version import parse as _parse_version
         from torch.distributed.distributed_c10d import (
             Backend,

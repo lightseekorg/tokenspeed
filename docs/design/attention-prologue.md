@@ -4,8 +4,10 @@ Everything between a layer's projections and its core attention is one
 operation: optional per-head QK RMSNorm, RoPE (full, partial, or multimodal),
 quantization, and the KV cache write. Models describe which steps apply to a
 `PagedAttention` layer. They never apply its per-head norm, rotate, quantize, or
-write its new K/V rows themselves. An MLA model still normalizes its latent
-and projects its absorbed query before the prologue. DeepSeek-V4 and V4.1
+write its new K/V rows themselves. An MLA model normally normalizes its latent
+and projects its absorbed query before the prologue. GLM's packed FlashMLA
+path passes raw latent rows and `LatentNorm` instead: the cache writer fuses
+RMSNorm with quantization, keeping the norm result in fp32. DeepSeek-V4 and V4.1
 attention is not a `PagedAttention` layer and keeps its own fused steps over
 its own cache groups.
 
@@ -18,7 +20,7 @@ first:
 * `gqa_prologue(q, k, v, *, norm, rotary, cache, return_kv,
   solution, override)` for multi-head and grouped-query attention;
 * `mla_prologue(query, q_pe, latent_cache, *, expanded, rotary,
-  cache, solution, override)` for multi-head latent attention; `cache=None`
+  cache, solution, override, norm=None)` for multi-head latent attention; `cache=None`
   rotates without storing and returns the latent for `latent_store(latent,
   *, kv_lora_rank, cache)`, so a caller can gather rows between the two
   (query context parallelism);
@@ -49,6 +51,12 @@ it at the store, as the pool converted them on write, and its activations stay
 fp16.
 
 ## Accepted inputs
+
+Startup warmup compiles the fused MLA writer's finite token-tile choices and
+runtime integer specialization classes. Compilation does not execute extra
+rotations or cache writes: an in-place query is rotated exactly once. Prefix
+chunk gathers also compile when startup has an empty prefix, and metadata
+slice alignment does not create additional serving specializations.
 
 The entries validate each request once, from metadata only, and raise
 `ValueError` when it breaks one of these rules:
@@ -260,9 +268,36 @@ the `scaled-fp8` cache signature: trtllm-gen folds `k_scale` into the logit
 scale and `v_scale` into the output's. A cache of another dtype ignores the
 scales. MLA caches run at unit scale.
 
-An MLA layer reads its query in the activation dtype, except that an FP8
+An MLA layer reads its query in the activation dtype, except that a plain FP8
 latent cache gets an FP8 query, and FP8 expanded keys and values, whichever MLA
 backend serves the layer. A per-token-head cache keeps the activation dtype.
+
+Hopper DSA uses the packed FlashMLA FP8 format: 512 E4M3 latent values,
+four FP32 scales (one per 128 values), and 64 BF16 RoPE values, totaling
+656 bytes per row. Each scale is the group's maximum absolute value divided
+by 448, floored at `1e-4` to match vLLM, and rounded up to a power of two
+(so the minimum stored scale is `2**-13`). The scale remains
+FP32 in the cache and is exactly representable when FlashMLA converts it to
+BF16. At the largest finite BF16 scale, `2**120`, the writer saturates the
+E4M3 values to ±240: the next value, ±256, would dequantize beyond BF16's
+finite range. Lower scales retain the full ±448 range. NoPE models write zero
+into the RoPE tail. Its query stays
+BF16. The composite MLA prologue rotates the inputs and stores these packed
+rows; the ordinary and GLM-5.3-Flash cache recipes account for the complete
+row. Sparse prefill reads the same packed cache through the FlashMLA sparse
+decode kernel with one query per row. Decode and speculative verification
+use that kernel with their actual query count. Query context parallelism
+continues to require the BF16 cache.
+
+GLM supplies unnormalized BF16 latent projection rows and the existing
+latent RMSNorm weight and epsilon to this packed writer. It computes the
+512-channel RMSNorm in fp32 and quantizes that result directly, as vLLM's
+fused writer does, without an intermediate BF16 rounding. Sanitization, when
+requested, applies after the norm and before quantization. Query normalization
+still outputs BF16 with its existing weight and epsilon; other cache formats
+keep the previous dual Q/KV normalization. RoPE and sparse prefill/decode
+selection are unchanged. The optional `LatentNorm` is supported only for
+absorbed packed FlashMLA writes, not expanded attention or gathered latent rows.
 
 MXFP8 is a GQA format for 128-wide key and value heads. FP8 per-token-head is
 an MLA format.
@@ -344,3 +379,27 @@ Weights and communication resources are prepared before graph capture. Native
 communication reuses the existing HCCL window and validates its capacity during
 preparation. Resource owners keep buffers alive until all referencing graphs
 are destroyed and outstanding work is drained, then release them.
+
+
+## Sparse attention sinks on Hopper
+
+DSA's optional `attn_sink` is an FP32 vector with exactly one logit per actual
+query head, on the query device. Only providers declaring `attention_sink`
+may receive it; kernel overrides cannot force a provider that lacks this
+feature. Omitting the sink preserves the existing provider contract.
+
+The installed FlashMLA implementation applies the sink before rounding the
+output to BF16, but returns the LSE of the selected KV logits alone. The DSA
+facade returns the total natural-log FP32 LSE when requested, including the
+sink through `logaddexp`. An empty selection has zero output and LSE equal
+to the sink, or negative infinity without one. Padding query heads adds
+negative-infinity sink logits, so padding introduces no probability mass.
+Context partials omit the sink and the distributed combine applies it once.
+
+Regular BF16 sparse decode with a sink shares FlashMLA's sparse prefill kernel:
+each query row carries its already selected causal slots, including multi-token
+verify rows. No-sink BF16 decode retains its existing provider selection; this
+also covers the no-sink partials used by context-sharded attention. Packed FP8 decode and prefill keep their existing sparse decode routing.
+Neither route changes KV quantization, its `1e-4` scale floor, or the extreme
+value overflow guard. BF16 sparse attention currently requires a 64-wide RoPE
+portion; the packed FP8 route also supports the existing zero-RoPE layout.

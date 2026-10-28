@@ -84,6 +84,7 @@ def _plan(
 ) -> dict:
     plan = kernel_moe_plan(
         "fp8",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",

@@ -61,7 +61,7 @@ def _plan(**changes: object) -> dict:
         "features": frozenset(),
     }
     arguments.update(changes)
-    return moe_plan(**arguments)
+    return moe_plan(requires_deterministic_finalize=False, **arguments)
 
 
 @pytest.mark.parametrize("ep_size,ispp", [(1, 512), (4, 2048)])

@@ -361,11 +361,18 @@ def test_overflow_grouped_query_causality():
     assert_selection(scores, lengths, output)
 
 
-@pytest.mark.parametrize("rows,width", [(1, 8192), (1, 131072)])
+@pytest.mark.parametrize(
+    "rows,width",
+    [(1, 8192), (1, 131072), (1, 131136), (1, 262144), (32, 262144), (1, 262148)],
+)
 @pytest.mark.parametrize("enable_pdl", [False, True])
 def test_overflow_graph_refresh(rows, width, enable_pdl):
     topk = 2048
-    scores = (1.0 + torch.arange(width, device="cuda") * 2**-23).unsqueeze(0)
+    scores = (
+        (1.0 + torch.arange(width, device="cuda") * 2**-23)
+        .expand(rows, -1)
+        .contiguous()
+    )
     lengths = torch.full((rows,), width, device="cuda", dtype=torch.int32)
     output = torch.full((rows, topk), -77, device="cuda", dtype=torch.int32)
 

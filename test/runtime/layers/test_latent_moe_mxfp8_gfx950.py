@@ -54,6 +54,7 @@ def prepared_latent_experts():
             ),
         ):
             experts = MoELayer(
+                deterministic_finalize=False,
                 top_k=16,
                 num_experts=896,
                 hidden_size=3584,

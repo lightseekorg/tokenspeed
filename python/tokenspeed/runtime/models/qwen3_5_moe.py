@@ -323,6 +323,7 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             prefix=add_prefix("gate", prefix),
         )
         self.experts = MoELayer(
+            deterministic_finalize=False,
             top_k=config.num_experts_per_tok,
             num_experts=config.num_experts,
             hidden_size=config.hidden_size,

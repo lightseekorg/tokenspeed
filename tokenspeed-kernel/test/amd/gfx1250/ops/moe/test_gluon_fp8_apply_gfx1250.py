@@ -95,6 +95,7 @@ def _experts(
 def _plan(activation: str, swiglu_limit: float | None) -> dict:
     plan = moe_plan(
         "fp8",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation=activation,
         routing_mode="precomputed_topk",

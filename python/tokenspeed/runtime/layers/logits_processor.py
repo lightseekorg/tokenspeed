@@ -424,6 +424,7 @@ class LogitsProcessor(nn.Module):
 
         # Gate the fused lm_head GEMM to Kimi only. See ``_lm_head_matmul``.
         self._use_fused_lm_head = getattr(self.config, "model_type", None) == "kimi_k2"
+        self._fp32_lm_head = getattr(self.config, "head_dtype", None) == "float32"
 
     def require_full_vocab_logits(self) -> None:
         """Turn the fused draft argmax off so every forward returns full-vocab logits.
@@ -1179,7 +1180,22 @@ class LogitsProcessor(nn.Module):
                 )
             else:
                 cast_hidden = hidden_states.to(lm_head.weight.dtype)
-                if current_platform().is_amd:
+                if self._fp32_lm_head:
+                    # The head's logits stay FP32. CUDA's BF16-input FP32-output
+                    # GEMM avoids keeping a second full-vocabulary weight copy.
+                    # FP32 accumulation/output does not imply the reduction
+                    # order is bitwise identical to an FP32-input GEMM.
+                    weight = lm_head.weight
+                    if cast_hidden.is_cuda and weight.dtype in (
+                        torch.bfloat16,
+                        torch.float16,
+                    ):
+                        logits = torch.mm(
+                            cast_hidden, weight.T, out_dtype=torch.float32
+                        )
+                    else:
+                        logits = cast_hidden.float() @ weight.float().T
+                elif current_platform().is_amd:
                     logits = kernel_mm(cast_hidden, lm_head.weight)
                 elif self._use_fused_lm_head:
                     logits = _lm_head_matmul(cast_hidden, lm_head.weight)

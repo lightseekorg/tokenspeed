@@ -193,6 +193,7 @@ class _TestMoeLayer(torch.nn.Module):
 def _make_plan(profile: _BenchmarkProfile) -> dict:
     return kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation=profile.activation,
         requires_deferred_finalize=False,

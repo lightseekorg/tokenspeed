@@ -19,6 +19,7 @@
 # SOFTWARE.
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.mxfp4 import Mxfp4LinearMethod
+from tokenspeed.runtime.layers.dense.mxfp8 import ModelOptMxfp8LinearMethod
 from tokenspeed.runtime.layers.dense.nvfp4 import (
     Nvfp4LinearMethod,
     Nvfp4W4A16LinearMethod,
@@ -29,6 +30,7 @@ from tokenspeed.runtime.layers.dense.w8a8_fp8 import W8A8Fp8LinearMethod
 __all__ = [
     "Fp8LinearMethod",
     "Mxfp4LinearMethod",
+    "ModelOptMxfp8LinearMethod",
     "Nvfp4LinearMethod",
     "Nvfp4W4A16LinearMethod",
     "UnquantizedLinearMethod",

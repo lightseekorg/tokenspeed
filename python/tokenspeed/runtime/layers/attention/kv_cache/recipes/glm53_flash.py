@@ -262,6 +262,11 @@ def declare_glm53_flash_groups(
             dsa = _require_dsa_config(
                 config, "target" if layer_id < target_layers else "draft"
             )
+            if config.kv_cache_quant_method == "flashmla":
+                # Packed MLA pages require their exact byte stride. KDA state
+                # planes align to a full state slab; the 656-byte packed row
+                # does not divide that slab, so sharing would add page padding.
+                plane_id = f"packed_mla.{occurrence}"
             return (
                 CacheFieldSpec(
                     f"layer.{layer_id}.latent_kv",
@@ -269,7 +274,7 @@ def declare_glm53_flash_groups(
                     (
                         GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
                         1,
-                        dsa.kv_lora_rank + dsa.qk_rope_head_dim,
+                        dsa.cache_storage_dim(config),
                     ),
                     scatter_stored_dtype_name(config.kv_cache_dtype),
                 ),
@@ -373,7 +378,10 @@ class Glm53FlashRecipe(CacheRecipe):
     @property
     @override
     def max_padding_fraction(self) -> float:
-        return float("inf") if self.num_draft_layers else 0.25
+        # Dedicated packed-MLA planes leave space unused by KDA parents (and
+        # vice versa). The arena byte budget still bounds their total storage.
+        separate_planes = self.attn_config.kv_cache_quant_method == "flashmla"
+        return float("inf") if self.num_draft_layers or separate_planes else 0.25
 
     @cached_property
     def tail_extra_slots(self) -> int:
@@ -401,12 +409,21 @@ class Glm53FlashRecipe(CacheRecipe):
             for spec, _ in groups
             if spec.group_id.startswith(LINEAR_ATTENTION)
         ]
-        return glm53_flash_packing_counts(
+        packing = glm53_flash_packing_counts(
             tp_size=self._dsa_config.attn_tp_size,
             mla_element_size=self.attn_config.kv_cache_dtype.itemsize,
             recurrent_state_dtype=self._recurrent_dtype,
             state_group_ids=state_group_ids,
         )
+        if self.attn_config.kv_cache_quant_method == "flashmla":
+            # Preserve the latent plane's byte budget when its rows also
+            # carry group scales and an unquantized RoPE tail.
+            packing[FULL_ATTENTION] = (
+                packing[FULL_ATTENTION]
+                * self._dsa_config.kv_cache_dim
+                // self._dsa_config.cache_storage_dim(self.attn_config)
+            )
+        return packing
 
     @cached_property
     def replay_kda(self) -> bool:
@@ -454,18 +471,16 @@ class Glm53FlashRecipe(CacheRecipe):
 
     @override
     def check_layout(self, layout: CacheLayout) -> None:
-        group_counts = {
-            label: sum(1 for group_id in self.group_ids if group_id == label)
-            for label in dict.fromkeys(self.group_ids)
+        expected_planes = {
+            field.plane_id for _, fields in self.groups() for field in fields
         }
-        # Index fields use the slot immediately after the last MLA field.  A
-        # target-only layout aliases that slot with the wider KDA state slab;
-        # adding a draft MLA layer consumes the alias and needs one more plane.
-        expected = max(max(group_counts.values()), group_counts[FULL_ATTENTION] + 1)
-        if len(layout.plane_bytes) != expected:
+        # Packed MLA has dedicated planes; ordinary MLA can share KDA slabs.
+        # The pooled index plane may alias a KDA slab in either layout.
+        actual_planes = {plane_id for plane_id, _ in layout.plane_bytes}
+        if actual_planes != expected_planes:
             raise ValueError(
-                f"GLM-5.3-Flash LCM requires {expected} planes, got "
-                f"{len(layout.plane_bytes)}"
+                f"GLM-5.3-Flash LCM requires planes {sorted(expected_planes)}, "
+                f"got {sorted(actual_planes)}"
             )
 
     @override

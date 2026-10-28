@@ -200,6 +200,7 @@ def _planned_unquant_ispp(monkeypatch, activation: str, ispp: int) -> int:
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     tp_size = 4
     MoELayer(
+        deterministic_finalize=False,
         top_k=2,
         num_experts=8,
         hidden_size=2048,
@@ -234,6 +235,7 @@ def _fp8_block_layer(monkeypatch, backend: str, tp_rank: int):
     monkeypatch.setitem(global_server_args_dict, "moe_mxfp4_fp8_activation", False)
     monkeypatch.setitem(global_server_args_dict, "ep_num_redundant_experts", 0)
     layer = MoELayer(
+        deterministic_finalize=False,
         top_k=1,
         num_experts=1,
         hidden_size=_FP8_HIDDEN,

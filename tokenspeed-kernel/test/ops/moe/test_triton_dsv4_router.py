@@ -294,6 +294,7 @@ def test_router_to_mxfp4_experts(tokens: int) -> None:
     weights.swiglu_beta = 0.0
     plan = moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         requires_deferred_finalize=False,

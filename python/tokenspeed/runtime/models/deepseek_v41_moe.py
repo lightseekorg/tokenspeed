@@ -353,6 +353,7 @@ class DeepseekV4MoE(nn.Module):
             config, quant_config
         )
         self.experts = MoELayer(
+            deterministic_finalize=False,
             top_k=config.num_experts_per_tok,
             num_experts=config.n_routed_experts,
             hidden_size=config.hidden_size,

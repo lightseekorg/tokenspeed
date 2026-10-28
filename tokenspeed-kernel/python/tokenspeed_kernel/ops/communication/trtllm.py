@@ -121,7 +121,10 @@ trtllm_allreduce_fusion = error_fn
 trtllm_create_ipc_workspace_for_all_reduce_fusion = error_fn
 
 if current_platform().is_nvidia:
-    from tokenspeed_kernel.ops.communication.fabric import fabric_allocation_supported
+    from tokenspeed_kernel.ops.communication.fabric import (
+        fabric_allocation_supported,
+        group_spans_hosts,
+    )
     from tokenspeed_kernel.thirdparty.cuda.trtllm import (
         _MNNVL_SUPPORTED_WORLD_SIZES,
         MNNVL_PREFER_IPC_BYTES,
@@ -228,35 +231,16 @@ if current_platform().is_nvidia:
         return workspace
 
     def _group_spans_nodes(group) -> bool:
-        """True when the process group spans hosts.
-
-        CUDA-IPC handles cannot cross a node boundary, and a failed creation
-        attempt does not merely fail -- it leaves a sticky CUDA context error
-        that kills the next allocation. So this must be decided before trying,
-        not caught afterwards.
-        """
-        import socket
-
-        try:
-            world = (
-                dist.get_world_size(group)
-                if group is not None
-                else dist.get_world_size()
-            )
-            names = [None] * world
-            dist.all_gather_object(names, socket.gethostname(), group=group)
-            return len(set(names)) > 1
-        except Exception:  # noqa: BLE001 -- no distributed context: single node
-            return False
+        return group_spans_hosts(group)
 
     def group_spans_nodes(group: dist.ProcessGroup) -> bool:
-        """Whether the group's ranks live on more than one host.
+        """Whether the group's ranks live on more than one physical host.
 
         Args:
-            group: process group to inspect; collective (hostname gather).
+            group: process group to inspect collectively.
 
         Returns:
-            True when at least two distinct hosts are present.
+            True when ranks report different host identities.
         """
         return _group_spans_nodes(group)
 

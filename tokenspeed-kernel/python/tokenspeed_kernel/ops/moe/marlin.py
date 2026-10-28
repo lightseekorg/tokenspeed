@@ -45,6 +45,7 @@ from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 from tokenspeed_kernel.thirdparty.cuda.marlin import gptq_marlin_repack
 from tokenspeed_kernel.thirdparty.cuda.marlin_moe import (
+    FLOAT4_E2M1F_ID,
     marlin_make_workspace,
     marlin_permute_scales,
     moe_align_block_size,
@@ -84,7 +85,7 @@ def _swiglu_limit(w: torch.nn.Module) -> float | None:
     beta = getattr(w, "swiglu_beta", None)
     if alpha not in (None, 1.0) or beta not in (None, 0.0):
         raise ValueError(
-            "Marlin MXFP4 MoE supports only standard SwiGLU with an optional "
+            "Marlin MoE supports only standard SwiGLU with an optional "
             f"clamp limit; got alpha={alpha!r}, swiglu_beta={beta!r}"
         )
     if swiglu_arg is None:
@@ -304,7 +305,11 @@ def marlin_mxfp4_local_moe_apply(
     num_tokens, top_k = local_topk_ids.shape
     block_m = _block_size_m(num_tokens, top_k, num_local_experts)
     sorted_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        local_topk_ids, block_m, num_local_experts
+        local_topk_ids,
+        block_m,
+        num_local_experts,
+        expert_start=0,
+        deterministic=False,
     )
 
     workspace = marlin_make_workspace(x.device)
@@ -320,6 +325,7 @@ def marlin_mxfp4_local_moe_apply(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=top_k,
         mul_topk_weights=False,
@@ -327,6 +333,7 @@ def marlin_mxfp4_local_moe_apply(
         size_m=num_tokens,
         size_n=gemm1_n,
         size_k=hidden,
+        use_fp32_reduce=True,
     ).view(-1, gemm1_n)
 
     if activation == "situ":
@@ -355,6 +362,7 @@ def marlin_mxfp4_local_moe_apply(
         expert_ids,
         num_tokens_post_padded,
         topk_weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=True,
@@ -362,6 +370,7 @@ def marlin_mxfp4_local_moe_apply(
         size_m=num_tokens * top_k,
         size_n=hidden,
         size_k=ispp,
+        use_fp32_reduce=True,
     ).view(num_tokens, top_k, hidden)
 
     return intermediate3.sum(dim=1)
@@ -419,6 +428,7 @@ def marlin_mxfp4_masked_moe_apply(
         expert_ids,
         total,
         weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=False,
@@ -448,6 +458,7 @@ def marlin_mxfp4_masked_moe_apply(
         expert_ids,
         total,
         weights,
+        b_q_type_id=FLOAT4_E2M1F_ID,
         moe_block_size=block_m,
         top_k=1,
         mul_topk_weights=False,
@@ -458,3 +469,7 @@ def marlin_mxfp4_masked_moe_apply(
         use_fp32_reduce=True,
     )
     return unpack_recv_rows(output, masked_m, offsets, recv_x, block_m)
+
+
+# Register the additional weight format without changing the MXFP4 module API.
+import tokenspeed_kernel.ops.moe._marlin.mxfp8  # noqa: E402,F401

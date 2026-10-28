@@ -284,6 +284,7 @@ class GptOssSparseMoeBlock(nn.Module):
             )
 
         self.experts = MoELayer(
+            deterministic_finalize=False,
             top_k=top_k,
             num_experts=self.num_experts,
             hidden_size=config.hidden_size,

@@ -23,6 +23,7 @@ kernel."""
 
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 
 import torch
@@ -32,6 +33,7 @@ from tokenspeed_kernel.ops.attention.prologue.types import (
     HeadNorm,
     KVCacheFormat,
     LatentKVCache,
+    LatentNorm,
     MLAExpandedKV,
     MXFP8Scales,
     Rotary,
@@ -158,6 +160,7 @@ def check_mla_request(
     expanded: MLAExpandedKV | None,
     rotary: Rotary | None,
     cache: LatentKVCache | None,
+    norm: LatentNorm | None = None,
 ) -> None:
     """Reject an MLA request any solution would misread; metadata only.
 
@@ -178,8 +181,23 @@ def check_mla_request(
         expanded_key,
         _rotary_key(rotary),
         None if cache is None else _cache_key(cache),
+        (
+            None
+            if norm is None
+            else (_layout(norm.weight), norm.weight.device, query.device, norm.eps)
+        ),
     )
-    _once(key, _check_mla_request, query, q_pe, latent_cache, expanded, rotary, cache)
+    _once(
+        key,
+        _check_mla_request,
+        query,
+        q_pe,
+        latent_cache,
+        expanded,
+        rotary,
+        cache,
+        norm,
+    )
 
 
 def _check_slots(cache: HeadKVCache | LatentKVCache, num_tokens: int) -> None:
@@ -352,6 +370,7 @@ def _check_mla_request(
     expanded: MLAExpandedKV | None,
     rotary: Rotary | None,
     cache: LatentKVCache | None,
+    norm: LatentNorm | None,
 ) -> None:
     """Reject an MLA request any solution would misread; metadata only."""
     if query.dim() != 3:
@@ -366,6 +385,24 @@ def _check_mla_request(
     num_tokens, num_heads, width = query.shape
     rope_dim = q_pe.shape[-1]
     kv_lora_rank = latent_cache.shape[-1] - rope_dim
+    if norm is not None:
+        if (
+            cache is None
+            or cache.format is not KVCacheFormat.FP8_FLASHMLA
+            or expanded is not None
+        ):
+            raise ValueError("latent RMSNorm requires an absorbed FlashMLA cache write")
+        if (
+            norm.weight.shape != (kv_lora_rank,)
+            or not norm.weight.is_contiguous()
+            or norm.weight.dtype not in (query.dtype, torch.float32)
+            or norm.weight.device != query.device
+            or not math.isfinite(norm.eps)
+            or norm.eps < 0
+        ):
+            raise ValueError(
+                "latent RMSNorm requires dense weights and finite nonnegative eps"
+            )
     if latent_cache.shape[0] != num_tokens or kv_lora_rank <= 0:
         raise ValueError(
             f"latent_cache {tuple(latent_cache.shape)} is not [{num_tokens}, rank + {rope_dim}]"
@@ -472,6 +509,18 @@ def _check_latent_cache(
             f"per-token-head planes are not dense [slots, 1, ·] of {kv_lora_rank} "
             f"latent, 1 scale and {rope_dim} RoPE channels"
         )
+    elif cache.format is KVCacheFormat.FP8_FLASHMLA:
+        if (
+            activation.dtype != torch.bfloat16
+            or kv_lora_rank != 512
+            or rope_dim not in (0, 64)
+        ):
+            raise ValueError(
+                "FlashMLA KV requires BF16 activations, latent width 512 "
+                "and RoPE width 0 or 64"
+            )
+        rows = ((cache.kv_cache, 656),)
+        malformed = "FlashMLA KV requires dense uint8 rows of 656 bytes"
     else:
         rows = ((cache.kv_cache, kv_lora_rank + rope_dim),)
         malformed = (

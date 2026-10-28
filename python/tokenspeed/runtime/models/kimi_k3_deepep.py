@@ -91,6 +91,7 @@ class KimiLinearMoEDeepEP(nn.Module):
         situ_beta, situ_linear_beta = _situ_betas(config)
         self.gate = KimiLinearMoEGate(config.hidden_size, config.num_experts)
         self.experts = MoELayer(
+            deterministic_finalize=False,
             top_k=self.top_k,
             num_experts=self.num_experts,
             hidden_size=self.routed_hidden,

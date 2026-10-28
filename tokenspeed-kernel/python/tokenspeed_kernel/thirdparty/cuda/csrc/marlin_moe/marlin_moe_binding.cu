@@ -20,8 +20,8 @@
 
 // Marlin WNA16 MoE GEMM (vendored), pre-compiled with the specializations
 // tokenspeed needs: bf16 activations, no expert bias.
-// MXFP4 (E8M0 group-32 scales) is only numerically valid on the bf16
-// activation path, so no fp16 instantiation is exported.
+// MXFP4 and MXFP8 with E8M0 group-32 scales require the bf16 activation
+// path, so no fp16 instantiation is exported.
 
 #include <tvm/ffi/function.h>
 

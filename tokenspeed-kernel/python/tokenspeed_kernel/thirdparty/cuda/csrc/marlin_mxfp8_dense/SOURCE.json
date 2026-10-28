@@ -1,0 +1,55 @@
+{
+  "repository": "https://github.com/vllm-project/vllm",
+  "revision": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+  "license": "Apache-2.0",
+  "files": {
+    "csrc/libtorch_stable/quantization/marlin/dequant.h": {
+      "sha256": "39c4640d2de39374ef5d96e7fa27701a675922113c3f5b05d45369321090e728",
+      "bytes": 22312,
+      "local": "dequant.h",
+      "modification": "none"
+    },
+    "csrc/libtorch_stable/quantization/marlin/kernel.h": {
+      "sha256": "514880c59d619047e4335b782be07aff2a47e1272b0ce0cfaa3d3098a2f8c931",
+      "bytes": 2265,
+      "local": "kernel.h",
+      "modification": "none"
+    },
+    "csrc/libtorch_stable/quantization/marlin/marlin.cuh": {
+      "sha256": "8a129f1f3086d83c7f33ee8fdb38a0d68c0b167c99c9cef60394c3219ede86b7",
+      "bytes": 5075,
+      "local": "marlin.cuh",
+      "modification": "Normalize final newline for repository formatting."
+    },
+    "csrc/libtorch_stable/quantization/marlin/marlin_dtypes.cuh": {
+      "sha256": "15b90a65eadb200a3f7165e2e0d7d899f36d4993b20dbd89093ef2cea274da71",
+      "bytes": 3902,
+      "local": "marlin_dtypes.cuh",
+      "modification": "none"
+    },
+    "csrc/libtorch_stable/quantization/marlin/marlin_mma.h": {
+      "sha256": "bf863d252bfc468eaff42b2c1bda583c5e6ab97ceacf0ac248c164564ddcce9b",
+      "bytes": 12756,
+      "local": "marlin_mma.h",
+      "modification": "Normalize final newline for repository formatting."
+    },
+    "csrc/libtorch_stable/quantization/marlin/marlin_template.h": {
+      "sha256": "be1300672e0072b4d93826139c1869efe407238b30f7fbddad1271f82235bc37",
+      "bytes": 81605,
+      "local": "marlin_template.h",
+      "modification": "none"
+    },
+    "csrc/core/scalar_type.hpp": {
+      "sha256": "8d3671759c43a0219f51e3a1f32c94ef5d70ecc99e264100f4015a781d94bb99",
+      "bytes": 14131,
+      "local": "core/scalar_type.hpp",
+      "modification": "Replace Torch exception include with standard C++ exception adapter."
+    },
+    "csrc/libtorch_stable/quantization/marlin/marlin.cu": {
+      "sha256": "522ca0a4077ded473c2415e2bc20c14569e2c523e3456f632bbd71202befa00f",
+      "bytes": 35033,
+      "local": "marlin_mxfp8_binding.cu",
+      "modification": "Preserve host launch/dispatch; replace torch wrapper with narrow TVM FFI and instantiate only MXFP8 BF16 group32 kernels."
+    }
+  }
+}

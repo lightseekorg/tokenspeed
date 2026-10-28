@@ -318,6 +318,7 @@ def test_moe_plan_selects_the_relu2_kernels(routing_mode):
 
     plan = kernel_moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="relu2",
         routing_mode=routing_mode,
@@ -351,6 +352,7 @@ def test_moe_plan_rejects_an_intermediate_width_off_128_rows():
     with pytest.raises(NoKernelFoundError):
         kernel_moe_plan(
             "nvfp4",
+            requires_deterministic_finalize=False,
             input_dtype=torch.bfloat16,
             activation="relu2",
             routing_mode=None,

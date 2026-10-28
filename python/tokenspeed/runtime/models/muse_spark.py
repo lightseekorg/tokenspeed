@@ -1099,6 +1099,7 @@ class MuseSparkMoE(nn.Module):
         )
         if self.quantized_experts:
             self.experts = MoELayer(
+                deterministic_finalize=False,
                 top_k=self.topk,
                 num_experts=self.num_experts,
                 hidden_size=compressed_size,

@@ -324,6 +324,7 @@ def tp8_channel_fixture():
     )
     candidate["precision_policy"] = "default"
     native = moe_plan(
+        requires_deterministic_finalize=False,
         weight_dtype="fp8_channel",
         input_dtype=torch.bfloat16,
         activation="silu",

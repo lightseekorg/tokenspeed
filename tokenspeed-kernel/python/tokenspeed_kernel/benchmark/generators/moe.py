@@ -634,6 +634,7 @@ def _prepare_routed_weights(
     from tokenspeed_kernel.ops import moe as moe_ops
 
     plan = moe_ops.moe_plan(
+        requires_deterministic_finalize=False,
         weight_dtype=weight_dtype_name,
         input_dtype=input_dtype,
         activation=activation,

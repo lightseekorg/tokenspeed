@@ -52,6 +52,7 @@ def test_moe_bf16_route_precision_rejects_unsupported_contract(
         torch.set_default_dtype(dtype)
         with pytest.raises(ValueError, match=error):
             MoELayer(
+                deterministic_finalize=False,
                 top_k=2,
                 num_experts=4,
                 hidden_size=128,
@@ -160,6 +161,7 @@ def test_moe_layer_builds_ep8_local_expert_partition(
         expert_module, "get_all2all_backend", lambda: All2AllBackend(backend)
     )
     layer = MoELayer(
+        deterministic_finalize=False,
         top_k=16,
         num_experts=896,
         hidden_size=3584,
@@ -198,6 +200,7 @@ def test_moe_layer_builds_ep8_local_expert_partition(
 def test_moe_layer_rejects_uneven_contiguous_ep_partition() -> None:
     with pytest.raises(ValueError, match="must be divisible"):
         MoELayer(
+            deterministic_finalize=False,
             top_k=2,
             num_experts=10,
             hidden_size=32,
@@ -233,6 +236,7 @@ def test_moe_layer_uses_mixed_fp8_block_scale_child_config(
     )
 
     layer = MoELayer(
+        deterministic_finalize=False,
         top_k=2,
         num_experts=4,
         hidden_size=256,
@@ -281,6 +285,7 @@ def test_moe_layer_applies_outer_mixed_exclusion(
     )
 
     layer = MoELayer(
+        deterministic_finalize=False,
         top_k=2,
         num_experts=4,
         hidden_size=256,
@@ -328,6 +333,7 @@ def test_moe_layer_requests_dynamic_mxfp4_activations(
     )
 
     MoELayer(
+        deterministic_finalize=False,
         top_k=2,
         num_experts=4,
         hidden_size=128,
@@ -418,7 +424,7 @@ def vendor_layer(monkeypatch):
         original_dtype = torch.get_default_dtype()
         try:
             torch.set_default_dtype(torch.bfloat16)
-            return MoELayer(**layer_kwargs)
+            return MoELayer(deterministic_finalize=False, **layer_kwargs)
         finally:
             torch.set_default_dtype(original_dtype)
 
@@ -482,6 +488,7 @@ def test_deferred_routes_carry_the_precomputed_weights(monkeypatch) -> None:
         torch.set_default_dtype(torch.bfloat16)
         with torch.device("cuda"):
             layer = MoELayer(
+                deterministic_finalize=False,
                 top_k=2,
                 num_experts=4,
                 hidden_size=256,

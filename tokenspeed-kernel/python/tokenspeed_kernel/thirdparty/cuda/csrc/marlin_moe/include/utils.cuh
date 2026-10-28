@@ -33,6 +33,7 @@
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+#include <sstream>
 #include <utility>
 
 // Scalar / packed dtype aliases used by marlin/marlin_dtypes.cuh (global
@@ -62,8 +63,12 @@ __host__ __device__ constexpr auto div_ceil(T a, U b) {
 namespace host {
 
 template <typename Cond, typename... Args>
-inline void RuntimeCheck(Cond&& condition, Args&&...) {
-  TVM_FFI_ICHECK(static_cast<bool>(condition));
+inline void RuntimeCheck(Cond&& condition, Args&&... args) {
+  if (!static_cast<bool>(condition)) {
+    std::ostringstream message;
+    (message << ... << args);
+    TVM_FFI_ICHECK(false) << message.str();
+  }
 }
 
 inline void RuntimeDeviceCheck(cudaError_t error) {

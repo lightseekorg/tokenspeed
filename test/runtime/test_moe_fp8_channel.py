@@ -482,6 +482,7 @@ def _moe_layer(tp_size, intermediate_size=512):
     torch.set_default_dtype(torch.bfloat16)
     try:
         return MoELayer(
+            deterministic_finalize=False,
             top_k=2,
             num_experts=4,
             hidden_size=256,

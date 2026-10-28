@@ -40,6 +40,7 @@ from tokenspeed_kernel.ops.attention.prologue import (
     HeadNorm,
     KVCacheFormat,
     LatentKVCache,
+    LatentNorm,
     MLAExpandedKV,
     MLAPrologueOutput,
     Rotary,
@@ -153,6 +154,8 @@ class PagedAttention(nn.Module):
         self.scaling = scaling
         self.layer_id = layer_id
         self.logit_cap = logit_cap
+        # Optional per-head sink logits, bound by models that include a sink.
+        self.attn_sink: torch.Tensor | None = None
         # window_left of the compute mask: -1 for full attention, 0 for the current token only.
         if sliding_window_size is None or sliding_window_size < -1:
             raise ValueError(
@@ -399,6 +402,7 @@ class PagedAttention(nn.Module):
         slots: torch.Tensor,
         expanded: MLAExpandedKV | None,
         key_rows: QueryShardGather | None,
+        norm: LatentNorm | None = None,
     ) -> MLAPrologueOutput:
         """Run an MLA layer's prologue: rotate, write the latent rows to
         ``slots``, and return attention inputs (FP8 for an FP8 cache, not
@@ -420,6 +424,8 @@ class PagedAttention(nn.Module):
                 local rows, all-gathers the rotated latent to the span and
                 stores it owner-masked, so every rank writes the pages it
                 owns whichever rank computed the row.
+            norm: Optional RMSNorm for raw latent projection rows, fused
+                into the packed FlashMLA cache write.
         """
         rotary = (
             None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions)
@@ -434,7 +440,10 @@ class PagedAttention(nn.Module):
                 cache=self._local_target(slots, ctx),
                 solution=None,
                 override=None,
+                norm=norm,
             )
+        if norm is not None:
+            raise ValueError("a query shard cannot gather an unnormalized latent")
         if expanded is not None:
             raise ValueError(
                 "a query shard writes its latent through the absorbed prologue; "

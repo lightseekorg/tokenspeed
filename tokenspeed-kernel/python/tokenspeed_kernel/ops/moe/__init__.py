@@ -1491,6 +1491,7 @@ def _build_traits(
     weight_dtype: str,
     activation: str | None,
     requires_deferred_finalize: bool,
+    requires_deterministic_finalize: bool,
     routing_mode: str | None,
     a2a_backend: str | None,
     ep_size: int | None,
@@ -1520,6 +1521,8 @@ def _build_traits(
         traits["activation"] = activation
     if requires_deferred_finalize:
         traits["supports_deferred_finalize"] = True
+    if requires_deterministic_finalize:
+        traits["deterministic_finalize"] = True
     if routing_mode is not None:
         traits["routing_mode"] = routing_mode
 
@@ -1559,19 +1562,30 @@ def _select_moe_apply(
     features: frozenset[str],
 ):
     signature = format_signature(x=dense_tensor_format(input_dtype))
-    if "batch_invariant" in features:
+    if "batch_invariant" in features or traits.get("deterministic_finalize", False):
         selected = KernelPlan.select(
             "moe",
             "apply",
             signature,
             features=features,
             static_traits=traits,
-            variable_traits=frozenset({"m", "num_tokens", "batch_size"}),
+            variable_traits=(
+                frozenset({"m", "num_tokens", "batch_size"})
+                if "batch_invariant" in features
+                else frozenset()
+            ),
             solution=solution,
             declared_traits=(
-                frozenset({"combine_order"})
-                if traits["combine_order"] == "slot"
-                else frozenset()
+                (
+                    frozenset({"combine_order"})
+                    if traits["combine_order"] == "slot"
+                    else frozenset()
+                )
+                | (
+                    frozenset({"deterministic_finalize"})
+                    if traits.get("deterministic_finalize", False)
+                    else frozenset()
+                )
             ),
             ignore_layout=True,
         )
@@ -1809,6 +1823,7 @@ def moe_plan(
     ep_size: int | None = None,
     ispp: int | None = None,
     *,
+    requires_deterministic_finalize: bool,
     hidden: int | None,
     swiglu_form: str | None,
     activation_clamped: bool,
@@ -1836,6 +1851,9 @@ def moe_plan(
         input_dtype: Hidden-state dtype used for the apply-kernel signature.
         activation: Optional activation name required by the layer.
         requires_deferred_finalize: Require a kernel that can defer finalize.
+        requires_deterministic_finalize: Require a declared fixed-order route
+            reduction. This is run determinism for a fixed shape and topology,
+            not a batch-invariance guarantee.
         routing_mode: Optional routing-mode requirement. "precomputed_topk"
             requires a kernel that consumes externally computed top-k ids and
             weights (for models whose routing function the fused kernels
@@ -1941,6 +1959,7 @@ def moe_plan(
         weight_dtype=weight_dtype,
         activation=activation,
         requires_deferred_finalize=requires_deferred_finalize,
+        requires_deterministic_finalize=requires_deterministic_finalize,
         routing_mode=routing_mode,
         a2a_backend=a2a_backend,
         ep_size=ep_size,
@@ -1990,6 +2009,12 @@ def moe_plan(
             f"MoE kernel {apply_spec.name!r} does not support persistent workspace"
         )
 
+    if requires_deterministic_finalize and True not in apply_spec.traits.get(
+        "deterministic_finalize", frozenset()
+    ):
+        raise ValueError(
+            f"MoE kernel {apply_spec.name!r} does not support deterministic finalize"
+        )
     routing_modes = apply_spec.traits.get("routing_mode", frozenset())
     # With an FP32 correction bias, precomputed top-k also means routing
     # outside a kernel that could route itself.
@@ -2029,6 +2054,7 @@ def moe_plan(
     return {
         "weight_dtype": weight_dtype,
         "activation": activation,
+        "deterministic_finalize": requires_deterministic_finalize,
         "apply_kernel_name": apply_spec.name,
         "apply_kernel": kernel,
         "input_dtype": input_dtype,

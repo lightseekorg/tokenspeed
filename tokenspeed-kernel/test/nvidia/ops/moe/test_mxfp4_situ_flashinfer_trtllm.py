@@ -241,6 +241,7 @@ def test_swiglu_deferred_finalize(num_tokens, precomputed, monkeypatch) -> None:
     w = _MoEWeights(raw).cuda()
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=1,
@@ -367,6 +368,7 @@ def test_moe_plan_selects_mxfp4_situ_hybrid_routing() -> None:
 
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="situ",
         ep_size=1,
@@ -394,6 +396,7 @@ def test_swiglu_quantizer_keeps_native_padding(monkeypatch) -> None:
     w = _MoEWeights(raw).cuda()
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="swiglu",
         ep_size=1,
@@ -462,6 +465,7 @@ def test_situ_dispatch_autotune_preserves_normal_output(
     w._situ_output_buffer = torch.empty_like(hidden_states)
     plan = kernel_moe_plan(
         "mxfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="situ",
         requires_deferred_finalize=True,

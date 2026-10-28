@@ -203,6 +203,7 @@ class MiniMaxM3SparseMoeBlock(nn.Module):
             "routing_method_type": RoutingMethodType.MiniMax2,
         }
         self.experts = MoELayer(
+            deterministic_finalize=False,
             top_k=config.num_experts_per_tok,
             num_experts=config.num_local_experts,
             hidden_size=config.hidden_size,

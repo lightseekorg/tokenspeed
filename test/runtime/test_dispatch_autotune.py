@@ -782,6 +782,7 @@ class _SituWeightsDouble:
 
 def _situ_plan(routing_mode):
     return moe_module.moe_plan(
+        requires_deterministic_finalize=False,
         weight_dtype="mxfp4",
         input_dtype=torch.bfloat16,
         activation="situ",

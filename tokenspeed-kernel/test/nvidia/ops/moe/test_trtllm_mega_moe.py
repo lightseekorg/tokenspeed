@@ -191,6 +191,7 @@ def run_correctness(capacity: int, live_tokens: int, tune: bool):
     torch.manual_seed(713 + dist.get_rank())
     plan = moe_plan(
         "nvfp4",
+        requires_deterministic_finalize=False,
         input_dtype=torch.bfloat16,
         activation="situ",
         requires_deferred_finalize=False,
