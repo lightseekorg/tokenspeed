@@ -156,6 +156,17 @@ def projection_stage(mb, task, weights, state, X: gl.constexpr, STAGE: gl.conste
     _projection_finish(mb, work, tiles, weights, state, X, STAGE)
 
 
+def slot_work_host(slot: int) -> int:
+    """:func:`_slot_work` on the host."""
+    z_first, conv_tasks = int(Z_FIRST), int(CONV_TASKS)
+    z_tasks = int(PROJ_TASKS) - conv_tasks
+    if slot < z_first:
+        return slot
+    if slot < z_first + z_tasks:
+        return slot - z_first + conv_tasks
+    return slot - z_tasks
+
+
 @gluon.jit
 def _slot_work(slot):
     """The B1 task (conv tasks first, then z) that runs in plan slot
@@ -395,8 +406,15 @@ def _shift_rows(x, D: gl.constexpr):
 
 @gluon.constexpr_function
 def _state_layout(num_warps):
-    """``[V, K]`` head state: 8 consecutive K per lane, 16 lanes span K."""
-    return gl.BlockedLayout([4, 8], [4, 16], [num_warps, 1], [1, 0])
+    """``[V, K]`` head state: 16 consecutive K per lane, 8 lanes span K.
+
+    A token reduces the state over K twice. With 8 lanes along K (not 16),
+    each reduction takes 3 cross-lane steps for 2 rows a thread instead of 4
+    steps for 4 rows: the token loop runs a third fewer instructions.
+    """
+    return gl.BlockedLayout(
+        [HEAD // (8 * num_warps), 16], [8, 8], [num_warps, 1], [1, 0]
+    )
 
 
 @gluon.jit
@@ -462,17 +480,19 @@ def _recurrence_finish(
     c = gl.arange(0, HEAD, gl.SliceLayout(0, sl))
     # One poll for every token reads q and k of the key head and v and z of
     # the value head (each [token, 2, 128]). The poll then reads b and a. A
-    # pair holds two BF16 values. kl / vl hold every token's vectors in each
-    # thread, in the lanes of the state layout's K / V slices. A poll in these
-    # layouts would make a thread hold 16 pairs a token. Thus, past one token,
-    # the poll is dense (two pairs a thread) and one conversion moves the
-    # values.
+    # pair holds two BF16 values. vl holds every token's v and z in each
+    # thread, in the lanes of the state layout's V slice. A poll in this
+    # layout would make a thread hold 16 pairs a token. Thus, past one
+    # token, the poll is dense (two pairs a thread) and one conversion moves
+    # the values.
     # The code loads slot_out before the poll. After the poll, the load would
     # delay the state store.
     slot_out = gl.load(state.state_out + request)
     NW: gl.constexpr = gl.num_warps()
     kl: gl.constexpr = gl.BlockedLayout([NP, 2, 8], [1, 4, 16], [1, 1, NW], [2, 1, 0])
-    vl: gl.constexpr = gl.BlockedLayout([NP, 2, 4], [1, 16, 4], [1, 1, NW], [1, 2, 0])
+    vl: gl.constexpr = gl.BlockedLayout(
+        [NP, 2, HEAD // (8 * NW)], [1, 8, 8], [1, 1, NW], [1, 2, 0]
+    )
     lp: gl.constexpr = gl.BlockedLayout([1, 1, 2], [1, 1, 64], [4, 2, 1], [2, 1, 0])
     ql: gl.constexpr = kl if N == 1 else lp
     vpl: gl.constexpr = vl if N == 1 else lp
@@ -484,39 +504,48 @@ def _recurrence_finish(
     ba_i = mb.row_offset(first + gl.minimum(tok2, N - 1)) + i * VALUE_HEADS + vh
     got_qk, got_vz, got_ba = mb.poll_many(("qkvz", "qkvz", "ba"), (qk_i, vz_i, ba_i))
     mb.stamp(STAGE, trace.READY)
-    qk_all = gl.convert_layout(mx.bf16_half(got_qk, qk_e), kl)
     vz_all = gl.convert_layout(mx.bf16_half(got_vz, vz_e), vl)
-    ba_all = got_ba.to(gl.float32, bitcast=True)
-    qs, ks = _token_vectors(qk_all, gl.SliceLayout(0, sl))
     vs, zs = _token_vectors(vz_all, gl.SliceLayout(1, sl))
+    # The work of the tokens that does not need the state runs before the
+    # token loop, for every token at once: in the token loop, each wave
+    # would repeat it for each token. pl holds the tokens in groups of lanes
+    # and q and k in waves, so one instruction normalizes every q and k.
+    # The token loop reads them from LDS.
+    pl: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 8], [4, 1, 16], [1, 2, NW // 2], [2, 1, 0]
+    )
+    qk = gl.convert_layout(mx.bf16_half(got_qk, qk_e), pl)
+    qk_n = qk * gl.rsqrt(gl.sum(qk * qk, axis=2) + EPS)[:, :, None]
+    qk_smem = gl.allocate_shared_memory(
+        gl.float32, [NP * 2, HEAD], gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
+    )
+    qk_smem.store(gl.reshape(qk_n, [NP * 2, HEAD]))
+    # beta (from b) and the decay (from a) of every token, one value a
+    # thread, then all of them in every thread.
+    ba = got_ba.to(gl.float32, bitcast=True)
+    gates = gl.where(i == 0, mx.sigmoid(ba), gl.exp(neg_a * _softplus(ba + a_bias)))
+    hl: gl.constexpr = gl.BlockedLayout([NP, 2], [64, 1], [NW, 1], [1, 0])
+    ih = gl.arange(0, 2, gl.SliceLayout(0, hl))[None, :]
+    ba_h = gl.convert_layout(ba, hl)
+    gates = gl.convert_layout(gates, hl)
+    b_all = gl.sum(gl.where(ih == 0, ba_h, 0.0), axis=1)
+    a_all = gl.sum(gl.where(ih == 1, ba_h, 0.0), axis=1)
+    betas = gl.sum(gl.where(ih == 0, gates, 0.0), axis=1)
+    decays = gl.sum(gl.where(ih == 1, gates, 0.0), axis=1)
+    th = gl.arange(0, NP, gl.SliceLayout(1, hl))
+    gl.barrier()
     outs = ()
     for t in gl.static_range(N):
-        q, k, v = qs[t], ks[t], vs[t]
-        ba = gl.sum(gl.where(tok2 == t, ba_all, 0.0), axis=0)
-        ib = gl.arange(0, 2, ba.type.layout)
-        b = gl.sum(gl.where(ib == 0, ba, 0.0), axis=0)
-        a = gl.sum(gl.where(ib == 1, ba, 0.0), axis=0)
-        if replay is not None:
-            # TokenSpeed's replay payload: k, v after the conv (before the L2
-            # norm), then the raw a and b.
-            row_ptr = replay + (first + t).to(gl.int64) * state.replay_stride
-            if vh % (VALUE_HEADS // KEY_HEADS) == 0:
-                gl.store(row_ptr + kh * HEAD + c, k.to(gl.bfloat16))
-            gl.store(row_ptr + KEY + vh * HEAD + r, v.to(gl.bfloat16))
-            ga = gl.arange(0, 1, gl.SliceLayout(1, sl))
-            gl.store(row_ptr + KEY + VALUE + vh + ga, (a + ga * 0.0).to(gl.bfloat16))
-            gl.store(
-                row_ptr + KEY + VALUE + VALUE_HEADS + vh + ga,
-                (b + ga * 0.0).to(gl.bfloat16),
-            )
-        q = q * gl.rsqrt(gl.sum(q * q, axis=0) + EPS)
-        k = k * gl.rsqrt(gl.sum(k * k, axis=0) + EPS)
-        decay = gl.exp(neg_a * _softplus(a + a_bias))
-        beta = mx.sigmoid(b)
+        # q and k as [1, 128] rows in the state layout.
+        q = qk_smem.slice(2 * t, 1, 0).load(sl)
+        k = qk_smem.slice(2 * t + 1, 1, 0).load(sl)
+        v = vs[t]
+        decay = gl.sum(gl.where(th == t, decays, 0.0), axis=0)
+        beta = gl.sum(gl.where(th == t, betas, 0.0), axis=0)
         head_state = head_state * decay
-        delta = beta * (v - gl.sum(head_state * k[None, :], axis=1))
-        head_state = head_state + delta[:, None] * k[None, :]
-        o = gl.sum(head_state * q[None, :], axis=1) * SCALE
+        delta = beta * (v - gl.sum(head_state * k, axis=1))
+        head_state = head_state + delta[:, None] * k
+        o = gl.sum(head_state * q, axis=1) * SCALE
         if t == N - 1:
             # The state after the request's last token (no page in a verify).
             head = vh * (HEAD * HEAD) + r[:, None] * HEAD + c[None, :]
@@ -526,42 +555,93 @@ def _recurrence_finish(
         outs += (o.to(gl.bfloat16).to(gl.float32),)
     mb.stamp(STAGE, trace.COMPUTED)
     _publish_heads(mb, first, vh, outs, zs, w)
+    if replay is not None:
+        # TokenSpeed's replay payload of every token: k, v after the conv
+        # (before the L2 norm), then the raw a and b. The stores issue last:
+        # a later wait for a load would wait for them too (vmcnt counts
+        # stores).
+        _store_replay(state, first, vh, kh, qk, vz_all, a_all, b_all, th, N)
     mb.stamp(STAGE, trace.END)
+
+
+@gluon.jit
+def _store_replay(state, first, vh, kh, qk, vz, a, b, tok, N: gl.constexpr):
+    """Store every token's ``[k | v | a | b]`` of value head ``vh`` (key
+    head ``kh``) in TokenSpeed's replay payload. ``qk`` and ``vz`` are the
+    polled ``[token, 2, 128]`` values, ``a`` and ``b`` the ``[token]``
+    logits (index ``tok``)."""
+    ql: gl.constexpr = qk.type.layout
+    tq = gl.arange(0, qk.shape[0], gl.SliceLayout(1, gl.SliceLayout(2, ql)))
+    hq = gl.arange(0, 2, gl.SliceLayout(0, gl.SliceLayout(2, ql)))
+    eq = gl.arange(0, HEAD, gl.SliceLayout(0, gl.SliceLayout(1, ql)))
+    rows = state.replay + (first + tq).to(gl.int64)[:, None, None] * state.replay_stride
+    # The first value head of a key head stores the key.
+    gl.store(
+        rows + kh * HEAD + 0 * hq[None, :, None] + eq[None, None, :],
+        qk.to(gl.bfloat16),
+        mask=(tq < N)[:, None, None]
+        & (hq == 1)[None, :, None]
+        & (vh % (VALUE_HEADS // KEY_HEADS) == 0),
+    )
+    vl: gl.constexpr = vz.type.layout
+    tv = gl.arange(0, vz.shape[0], gl.SliceLayout(1, gl.SliceLayout(2, vl)))
+    hv = gl.arange(0, 2, gl.SliceLayout(0, gl.SliceLayout(2, vl)))
+    ev = gl.arange(0, HEAD, gl.SliceLayout(0, gl.SliceLayout(1, vl)))
+    rows = state.replay + (first + tv).to(gl.int64)[:, None, None] * state.replay_stride
+    gl.store(
+        rows + KEY + vh * HEAD + 0 * hv[None, :, None] + ev[None, None, :],
+        vz.to(gl.bfloat16),
+        mask=(tv < N)[:, None, None] & (hv == 0)[None, :, None],
+    )
+    rows = state.replay + (first + tok).to(gl.int64) * state.replay_stride
+    gl.store(rows + KEY + VALUE + vh, a.to(gl.bfloat16), mask=tok < N)
+    gl.store(rows + KEY + VALUE + VALUE_HEADS + vh, b.to(gl.bfloat16), mask=tok < N)
 
 
 @gluon.jit
 def _publish_heads(mb, first, vh, outs, zs, w):
     """The gated RMS norm ``rms(o) * sigmoid(z) * w`` (FP32) of value head
     ``vh`` of every token ``t`` (``outs[t]``, ``zs[t]``), published as BF16
-    in the token's row. The tokens share one reduction across waves."""
+    in the token's row. The tokens share one reduction across waves and one
+    layout conversion."""
     N: gl.constexpr = len(outs)
-    partial = ()
-    for t in gl.static_range(N):
-        partial += (outs[t] * outs[t],)
-    if N == 1:
-        sums = (gl.sum(partial[0], axis=0),)
-    elif N == 2:
-        sums = gl.reduce(partial, 0, _add2)
-    elif N == 3:
-        sums = gl.reduce(partial, 0, _add3)
+    NP: gl.constexpr = triton.next_power_of_2(N)
+    o = _stack(outs, NP)
+    z = _stack(zs, NP)
+    rms = gl.rsqrt(gl.sum(o * o, axis=0) * (1.0 / HEAD) + EPS)
+    # The stack keeps each column in the vectors' lanes: no data moves.
+    w = gl.convert_layout(w, gl.SliceLayout(1, o.type.layout))
+    y = o * rms[None, :] * mx.sigmoid(z) * w[:, None]
+    # [token, 64, 2]: a BF16 pair in one thread.
+    pl: gl.constexpr = gl.BlockedLayout(
+        [1, 1, 2], [1, 64, 1], [NP, gl.num_warps() // NP, 1], [2, 1, 0]
+    )
+    y = gl.permute(y.to(gl.bfloat16), [1, 0])
+    y = gl.convert_layout(gl.reshape(y, [NP, HEAD // 2, 2]), pl)
+    word = mx.pack_bf16_pairs(y)
+    wl: gl.constexpr = word.type.layout
+    t = gl.arange(0, NP, gl.SliceLayout(1, wl))[:, None]
+    i = gl.arange(0, HEAD // 2, gl.SliceLayout(0, wl))[None, :]
+    mb.put(
+        "obf",
+        mb.row_offset(first + t) + vh * (HEAD // 2) + i,
+        word,
+        mask=(t < N) & (i >= 0),
+    )
+
+
+@gluon.jit
+def _stack(xs, NP: gl.constexpr):
+    """``[E, NP]`` of the ``[E]`` vectors ``xs`` (1, 2 or 4 of them, columns
+    past ``len(xs)`` are copies), each column in the vectors' layout."""
+    N: gl.constexpr = len(xs)
+    if NP == 1:
+        out = xs[0][:, None]
+    elif NP == 2:
+        out = gl.join(xs[0], xs[N - 1])
     else:
-        sums = gl.reduce(partial, 0, _add4)
-    for t in gl.static_range(N):
-        rms = gl.rsqrt(sums[t] * (1.0 / HEAD) + EPS)
-        y = outs[t] * rms * mx.sigmoid(zs[t]) * w
-        mx.put_bf16(mb.row(first + t), "obf", vh * (HEAD // 2), y)
-
-
-@gluon.jit
-def _add2(a0, a1, b0, b1):
-    return a0 + b0, a1 + b1
-
-
-@gluon.jit
-def _add3(a0, a1, a2, b0, b1, b2):
-    return a0 + b0, a1 + b1, a2 + b2
-
-
-@gluon.jit
-def _add4(a0, a1, a2, a3, b0, b1, b2, b3):
-    return a0 + b0, a1 + b1, a2 + b2, a3 + b3
+        # Column 2 a + b of [E, 2 (a), 2 (b)] (the inverse of _tokens).
+        lo = gl.join(xs[0], xs[min(2, N - 1)])
+        hi = gl.join(xs[min(1, N - 1)], xs[min(3, N - 1)])
+        out = gl.reshape(gl.join(lo, hi), [xs[0].shape[0], 4])
+    return out

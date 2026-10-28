@@ -332,6 +332,7 @@ def test_delta_layer_matches_tokenspeed_math(ple_context):
         replay=None,
         scratch=scratch,
         step=torch.full((1,), 3, dtype=torch.int32, device=dev),
+        warm=None,
         layer_index=0,
         ple=ple_block.step() if with_ple else None,
     )
@@ -597,6 +598,7 @@ def test_one_row_input_equals_repeated_streams(with_ple):
             replay=None,
             scratch=scratch,
             step=torch.full((1,), 7 + step, dtype=torch.int32, device=dev),
+            warm=None,
             layer_index=0,
             ple=ple_step,
         )
@@ -674,6 +676,7 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
         replay=payload,
         scratch=scratch,
         step=torch.full((1,), 3, dtype=torch.int32, device=dev),
+        warm=fused.late_weights,
         layer_index=0,
         ple=(
             {
@@ -711,6 +714,7 @@ def test_delta_layer_verify_equals_decode_steps(requests, chain, with_ple):
             replay=None,
             scratch=scratch,
             step=torch.full((1,), 100 + step, dtype=torch.int32, device=dev),
+            warm=None,
             layer_index=0,
             ple=(
                 {
@@ -815,6 +819,7 @@ def test_delta_layer_rows_equal_one_row_launches(rows, with_ple):
                 replay=None,
                 scratch=scratch,
                 step=torch.full((1,), step + first, dtype=torch.int32, device=dev),
+                warm=None,
                 layer_index=0,
                 ple=ple,
             )
@@ -828,6 +833,61 @@ def test_delta_layer_rows_equal_one_row_launches(rows, with_ple):
     run(alone, 1, 100)
     for name in together:
         assert torch.equal(together[name], alone[name]), name
+
+
+def test_warming_the_next_layer_changes_no_result():
+    """A 4-row launch that warms the next layer's weights computes and
+    writes exactly what it does without warming, and leaves the warm words
+    unchanged (here a count that is not a multiple of a CTA's load step)."""
+    g = torch.Generator().manual_seed(21)
+    dev = "cuda"
+    rows = 4
+    fused = prepare_qwen4_exp_delta_layer(
+        max_rows=rows, tensors=_delta_tensors(g, False), dense_tiled=False
+    )
+    scratch = torch.zeros(fused.scratch_pairs, dtype=torch.int64, device=dev)
+    page_in = torch.arange(rows, dtype=torch.int32, device=dev) * 2 + 1
+    page_out = page_in + 1
+    h = (torch.randn(rows, WIDTH, generator=g) * 3).bfloat16().cuda()
+    initial = {
+        "conv": torch.randn(2 * rows + 1, QKV, 3, generator=g).bfloat16().cuda(),
+        "ssm": (torch.randn(2 * rows + 1, 48, HEAD, HEAD, generator=g) * 0.1).cuda(),
+    }
+    warm = torch.randint(-(2**31), 2**31 - 1, (1_000_004,), dtype=torch.int32).cuda()
+    warm0 = warm.clone()
+
+    def run(warm_words):
+        state = {k: v.clone() for k, v in initial.items()}
+        h_out = torch.empty(rows, WIDTH, dtype=torch.bfloat16, device=dev)
+        qwen4_exp_delta_layer_decode(
+            fused,
+            h,
+            h_out,
+            chain=1,
+            conv_state=state["conv"],
+            ssm_state=state["ssm"],
+            state_in=page_in,
+            state_out=page_out,
+            conv_out=state["conv"],
+            conv_out_rows=page_out,
+            replay=None,
+            scratch=scratch,
+            step=torch.full(
+                (1,), 40 if warm_words is None else 41, dtype=torch.int32, device=dev
+            ),
+            layer_index=0,
+            ple=None,
+            warm=warm_words,
+        )
+        torch.cuda.synchronize()
+        return h_out, state
+
+    cold_out, cold_state = run(None)
+    warm_out, warm_state = run(warm)
+    assert torch.equal(cold_out, warm_out)
+    for name in cold_state:
+        assert torch.equal(cold_state[name], warm_state[name]), name
+    assert torch.equal(warm, warm0)
 
 
 def _qsa_tensors(g, final: bool, experts: str) -> dict:

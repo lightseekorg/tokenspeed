@@ -233,6 +233,18 @@ def poll_waves(scratch, offsets, tag, spin):
 
 
 @gluon.jit
+def poll_many_waves(scratch, offsets, tag, spin):
+    """:func:`poll_waves` of a tuple of at most four index tensors (any
+    layouts) in one round trip. Returns the tuple of their payloads."""
+    gl.static_assert(len(offsets) <= 4, "one round trip polls four tensors")
+    pairs = _poll_n(scratch, offsets, tag, spin)
+    payloads = ()
+    for k in gl.static_range(len(offsets)):
+        payloads += (_payload(pairs[k]),)
+    return payloads
+
+
+@gluon.jit
 def poll_many(scratch, offsets, tag):
     """:func:`poll` of a tuple of index tensors (any layouts), four per round
     trip. Returns the tuple of their payloads."""
@@ -354,6 +366,15 @@ class Mailbox:
         return poll_waves(
             self.scratch + schedule.region(self.plan, region), index, self.tag, spin
         )
+
+    @gluon.jit
+    def poll_many_waves(self, regions: gl.constexpr, indices, spin):
+        """:meth:`poll_many` of at most four index tensors, by the waves
+        whose ``spin`` is non-zero (:func:`poll_many_waves`)."""
+        offsets = ()
+        for k in gl.static_range(len(regions)):
+            offsets += (self.pairs(regions[k], indices[k]),)
+        return poll_many_waves(self.scratch, offsets, self.tag, spin)
 
     @gluon.jit
     def poll_many(self, regions: gl.constexpr, indices):

@@ -62,7 +62,7 @@ seam. The switch `--decode-monokernel` enables it.
 ## Stages
 
 ```
-Gated DeltaNet layer:  [p1 p2] a1 a2 | b1 b3                  | c1 | m1 m2 m3 m4 m5
+Gated DeltaNet layer:  [p1 p2] a1 a2 | b1 b3             [w1] | c1 | m1 m2 m3 m4 m5
 QSA attention layer:   a1 a2 | q1 q2 q3 q4 q4f q5 q6          | c1 | m1 m2 m3 m4 m5 [f1 f2]
 ```
 
@@ -74,18 +74,19 @@ live row.
 | Stage | Module | Tasks | Base | Work |
 |---|---|---|---|---|
 | `p1` | `ple.py` | 200 | 0 | Hashes the token's n-gram ids, gathers the embedding row, and projects the PLE key and value (BF16 `kv_proj`). |
-| `p2` | `ple.py` | 80 per row | 176 | The gate, the Gemma norms and the dilated depthwise conv of 128 channels of one stream. Writes the next conv state. |
-| `a1`, `m1`, `f1` | `hc.py` | 80 + 8 per row | 0, 0, 57 | Mixer reduce: the per-stream Gemma norm and the low-rank down projection of 16 low-rank columns of one stream, for every row; or one row's inject logit of one stream half. |
+| `p2` | `ple.py` | 40 per row | 96 | The gate, the Gemma norms and the dilated depthwise conv of 256 channels of one stream, in two passes. Writes the next conv state. |
+| `a1`, `m1`, `f1` | `hc.py` | 80 + 8 per row | 0, 0 (28 with `w1`), 57 | Mixer reduce: the per-stream Gemma norm and the low-rank down projection of 16 low-rank columns of one stream, for every row; or one row's inject logit of one stream half. |
 | `a2`, `m2`, `f2` | `hc.py` | 80 | 176, 176, 0 | Mixer mix: the up projection of 32 columns of each stream. Publishes the mixed row as BF16 (`m2` also as MXFP4, the experts' input). |
 | `b1` | `gdn.py` | 256 | 28 | 64 rows of `in_proj_qkvzba`. Tasks 0 to 159 also run the causal conv. Tasks 160 to 255 also compute one `in_proj_b` / `in_proj_a` logit each. |
 | `b3` | `gdn.py` | 48 per row | 28 | The gated delta rule of one value head, then the gated RMS norm. Publishes the result as BF16. |
 | `q1` | `qsa.py` | 218 | 28 | 64 rows of `qkv_proj` or `index_qk_proj`. |
-| `q2` | `qsa.py` | 31 per row | 246 | Q and K norm and MRoPE, the KV cache write, the index q heads, and the index key with its block compression. |
+| `q2` | `qsa.py` | 31 per row | 200 | Q and K norm and MRoPE, the KV cache write, the index q heads, and the index key with its block compression. |
 | `q3` | `qsa.py` | 255 per row | 0 | Block scores `sum_h relu(q_h . k_b)`. Only when there are more complete blocks than `TOPK_BLOCKS`. |
 | `q4` | `qsa.py` | 8 per row | 20 | The top `TOPK_BLOCKS` blocks of one chunk of `SELECT_CHUNK` blocks: four 8-bit radix passes in LDS. |
 | `q4f` | `qsa.py` | 1 per row | 255 | The top blocks of the chunks' candidates, when there is more than one chunk. |
-| `q5` | `qsa.py` | 64 per row | 64 | Attention of one KV head over one of 32 splits. Publishes `acc / l` and the base-2 LSE. |
-| `q6` | `qsa.py` | 48 per row | 0 (up to 2 rows), 128 | The LSE merge of 128 dims of a head, then the output gate. Publishes the result as BF16. |
+| `q5` | `qsa.py` | 64 per row | 68 | Attention of one KV head over one of 32 splits of 128 tokens. Publishes `acc / l` and the base-2 LSE. A split past the attended tokens does nothing. The tasks are split-major: split `s` of every row comes before split `s + 1`. |
+| `q6` | `qsa.py` | 48 per row, up to 2 rows | 0 | The LSE merge of 128 dims of a head over the used splits, then the output gate. Publishes the result as BF16. Past 2 rows, a task also merges the same dims of the further rows. |
+| `w1` | `warm.py` | 28, past 2 rows | 0 | Reads the next layer's late first-projection weights (`layer.late_weights`) into the memory-side cache. |
 | `c1` | `out_proj.py` | 160 | 96 | The output projection of 16 hidden columns, then the gated residual combine of the 4 streams. |
 | `m3` | `moe.py` | 65 (130 past 2 rows) | 28 | Router logits of 8 experts each, for every row or (past 2 rows) for 2 rows. The last block of experts is the shared expert gate. |
 | `m4` | `moe.py` | 220 (200 + 20 / C past 1 row) | 93 | Routes, then the gate and up projection of 32 intermediate columns of one routed rank, or of `C` (`shared_blocks`) 32-column blocks of the shared expert, read once for every row. Publishes `silu(gate) * up` as MXFP4. |
@@ -113,6 +114,14 @@ timeline:
   Without this wait, their weight streams compete with the mixer's.
 - `m1` uses the CTAs of `a1`. The `a1` tasks end long before the MLP half
   starts.
+- Past 2 rows, a Gated DeltaNet layer warms the next layer (`w1`). On A2's
+  CTAs, the first projection (`b1` or `q1`) starts after A2 and ends last.
+  CTAs 0-27 read those tasks' weights after their B1 task, and `m1` then
+  starts at CTA 28. The next launch reads the weights from the memory-side
+  cache: about 3 us less per warmed layer at 4 rows. At 1 or 2 rows, `m1`
+  at CTA 28 costs about as much as the warm saves. A QSA layer has no CTAs
+  that are idle long enough: its warm tasks slowed it more than they
+  saved.
 - A CTA that runs two stages issues the loads of the second stage early,
   through one helper:
   - `projection_recurrence_stage` (`b1` and `b3`) issues the recurrent state
@@ -128,6 +137,12 @@ timeline:
   its producer publishes last: the mix stages' inverse RMS and streams (past
   one row), M5's residual and gates, and C1's inject logits. Each poll round
   trip takes about 1 us, so the last one then carries only the late pairs.
+- `q2` starts on A2's CTAs (200). Their Q1 tasks end last, and `q2` waits
+  for every Q1 task anyway. `q5` starts after `q2`'s last CTA (68), and its
+  tasks are split-major. Thus the used splits take CTAs from 68 on, whose
+  Q1 tasks end early and which have no `q2` task: their K / V gathers
+  issue right after Q1. The QSA layer at 4 rows was 2 to 6 us faster (300
+  to 1500 tokens), the catch-up step 5 us.
 - `q4f` has its own CTA (255). On a shared CTA, it was about 20 us late at
   128K tokens.
 - `f1` and `f2` run on CTAs that are idle after the MoE.
@@ -155,6 +170,26 @@ timeline:
   read several rows at once, and rows whose starts share an LDS bank
   conflict: a 4-row B1 GEMV took 1.7 instead of 0.64 us. M5's batch rows
   and scale runs gained nothing from padding.
+- `q5` fills each split with up to 128 tokens (one tile), not the
+  tokens spread over all 32 splits: at 1500 tokens, 12 splits run instead
+  of 32. `q6` then polls 1 KiB per used split, and the waves of the unused
+  splits skip the poll. A spread split had less to attend, but `q5`'s time
+  is about the same for one tile, and the merge polled 64 KiB a task
+  (QSA layer 2 to 5 us slower at 4 rows).
+- `b3` runs the work of the tokens that does not need the state before the
+  token loop, for every token at once: the q and k norms, the gates and the
+  replay payload stores. In the loop, each of the 8 waves repeated it for
+  every token. The state layout has 8 lanes along K, so a token's two
+  reductions over K take 3 cross-lane steps for 2 rows a thread (16 lanes:
+  4 steps for 4 rows). The loop of 4 tokens then ran 548 instead of 877
+  instructions a wave, and the layer was 3 us faster at 4 rows.
+- `b3` publishes every token's output with one layout conversion and issues
+  the replay stores last: a later wait for a load also waits for the stores
+  before it (`vmcnt` counts stores).
+- A mixer reduce task normalizes its rows with one reduction across waves
+  for all rows (`hc._inverse_rms_rows`).
+- The mix stage's low-rank poll skips the waves whose groups repeat the last
+  group (6 of the 16 groups).
 - `q5` merges the launch's own tokens (from the mailbox) into its K / V
   tiles. Their rows go through LDS once and load in the tiles' layouts; a
   per-token register reduction and layout conversion each cost an LDS round
@@ -177,7 +212,8 @@ timeline:
   inject logits run one row per task, so the rows' norms run on different
   CTAs.
 - The state stages (`p2`, `b3`, `q2` to `q6`) run one task per row and use
-  `schedule.row_task`.
+  `schedule.row_task`. Past 2 rows, a `q6` task runs several rows' tasks
+  in turn, so `q6` stays on the CTAs before C1's.
 - The launchers take the lengths, the page tables, and the state pages once a
   request (`[rows // chain]`), and the positions, tokens, and output rows once
   a row. `qsa.Cache.row` and `ple.Step.row` point at the row's request;

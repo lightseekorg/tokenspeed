@@ -265,8 +265,11 @@ def _reduce_down(mb, task, streams, mixer, P: gl.constexpr, STAGE: gl.constexpr)
     )
     xs = _stream_rows(mb, h_raw, streams.src, first, 1, R)
     mb.stamp(STAGE, trace.READY)
+    invs = _inverse_rms_rows(xs)
     for r in gl.static_range(R):
-        y, inv = _normalize(xs[r], w_raw)
+        inv = invs[r]
+        y = xs[r] * inv[:, None, None] * (1.0 + w_raw.to(gl.float32))
+        y = y.to(gl.bfloat16).to(gl.float32)
         if block == 0:
             one = gl.arange(0, 1, inv.type.layout)
             mb.row(r).put(P + "inv", stream + one, inv)
@@ -340,6 +343,44 @@ def _stream_rows(
             x = gl.convert_layout(x, _stream_layout(gl.num_warps()))
             xs += (gl.where(valid, x, 0.0),)
     return xs
+
+
+@gluon.jit
+def _inverse_rms_rows(xs):
+    """The per-stream inverse RMS of each of the streams ``xs`` (1 to 4
+    tensors), as :func:`_normalize` computes it. The rows share one
+    reduction across waves."""
+    R: gl.constexpr = len(xs)
+    sq = ()
+    for r in gl.static_range(R):
+        sq += (gl.sum(xs[r] * xs[r], axis=2),)
+    if R == 1:
+        sums = (gl.sum(sq[0], axis=1),)
+    elif R == 2:
+        sums = gl.reduce(sq, 1, _add2)
+    elif R == 3:
+        sums = gl.reduce(sq, 1, _add3)
+    else:
+        sums = gl.reduce(sq, 1, _add4)
+    invs = ()
+    for r in gl.static_range(R):
+        invs += (gl.rsqrt(sums[r] * (1.0 / HIDDEN) + EPS),)
+    return invs
+
+
+@gluon.jit
+def _add2(a0, a1, b0, b1):
+    return a0 + b0, a1 + b1
+
+
+@gluon.jit
+def _add3(a0, a1, a2, b0, b1, b2):
+    return a0 + b0, a1 + b1, a2 + b2
+
+
+@gluon.jit
+def _add4(a0, a1, a2, a3, b0, b1, b2, b3):
+    return a0 + b0, a1 + b1, a2 + b2, a3 + b3
 
 
 @gluon.jit
@@ -464,7 +505,13 @@ def mix_stage(
             P + "lr",
             (lanes % 4) * LOWRANK + gl.minimum(lanes // 4, LOWRANK // 16 - 1) * 16 + 15,
         )
-        polled = mb.poll_many((P + "lr",), (indices[0],)) + early
+        # Wave w holds groups 2 w and 2 w + 1 (_lowrank_layout). Groups past
+        # UP_KITS repeat the last one, and the mix masks them after the
+        # SiLU. Thus only the waves with real groups poll: the other waves
+        # would load 3 / 8 of the pairs again.
+        gl.static_assert(2 * gl.num_warps() == 16, "one copy of the 16 groups")
+        lr_waves = (lanes // 64 < (UP_KITS + 1) // 2).to(gl.int32)
+        polled = (mb.poll_waves(P + "lr", indices[0], lr_waves),) + early
     else:
         polled = mb.poll_many(_mix_regions(P, SRC), indices)
     if SRC != "":

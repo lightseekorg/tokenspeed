@@ -31,8 +31,9 @@ P2 runs one row per task (``mb`` is that row's view).
      row's context page). An EOS blocks the older one.
   2. The task gathers 16 table rows of 160 values.
   3. It projects key ``[4 * HIDDEN]`` then value ``[HIDDEN]``, BF16 out.
-* gate and conv (P2), 80 tasks of 128 channels of one stream ``b``. The
-  stage computes as TokenSpeed's fused kernels do:
+* gate and conv (P2), 40 tasks of 256 channels of one stream ``b``, in
+  two passes of 128 channels. At 4 rows, the stage then fits the grid in
+  one round. The stage computes as TokenSpeed's fused kernels do:
 
   - ``kn``, ``qn`` are the Gemma-normed key and stream (BF16 ``1 + w``).
   - The stream's gate is ``sigmoid(sign(g) * sqrt(max(|g|, 1e-6)))`` with
@@ -66,8 +67,9 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel.qwen4_exp.dims import (
 
 KV_N = gl.constexpr(12800)  # key WIDTH, then value HIDDEN
 PROJ_TASKS = gl.constexpr(200)  # KV_N / 64
-CHUNK = gl.constexpr(128)  # channels of a P2 task
-CONV_TASKS = gl.constexpr(80)  # WIDTH / CHUNK
+CHUNK = gl.constexpr(128)  # channels of one P2 pass
+PASSES = gl.constexpr(2)  # passes of a P2 task
+CONV_TASKS = gl.constexpr(40)  # WIDTH / (CHUNK * PASSES)
 STATE = gl.constexpr(9)  # (kernel 4 - 1) * dilation 3
 INV_SQRT_D = gl.constexpr(0.019764235376052372)  # 1 / sqrt(HIDDEN)
 NGRAM_HEADS = gl.constexpr(16)  # 8 bigram heads, then 8 trigram heads
@@ -261,7 +263,10 @@ def _gemma(x, gamma):
 @gluon.jit
 def conv_stage(mb, task, tok, streams, weights, step, STAGE: gl.constexpr):
     """P2 task ``task`` of a row that is token ``tok`` of its request: stream
-    ``b = task // 20``, channels ``128 (task % 20) ..``.
+    ``b = task // 10``, channels ``256 (task % 10) ..`` in two passes.
+
+    The task loads all its inputs before it polls the key and value, the
+    next state's taps included.
 
     ``mb``, ``streams`` (the layer's global input :class:`hc.Streams`) and
     ``step`` are the row's views. The state after the row's token goes to
@@ -278,9 +283,10 @@ def conv_stage(mb, task, tok, streams, weights, step, STAGE: gl.constexpr):
     out_stride = step.conv_out_stride
     mb.stamp(STAGE, trace.START)
     N: gl.constexpr = schedule.chain(mb.plan)
-    b = task // (HIDDEN // CHUNK)
+    TASK_CH: gl.constexpr = CHUNK * PASSES
+    b = task // (HIDDEN // TASK_CH)
     first = b * HIDDEN
-    cb = (task % (HIDDEN // CHUNK)) * CHUNK
+    cb0 = (task % (HIDDEN // TASK_CH)) * TASK_CH
     # The whole stream as [32, 128] (rows 20-31 empty) for the norms and gate.
     sl: gl.constexpr = gl.BlockedLayout([1, 2], [1, 64], [gl.num_warps(), 1], [1, 0])
     r = gl.arange(0, 32, gl.SliceLayout(1, sl))
@@ -291,66 +297,99 @@ def conv_stage(mb, task, tok, streams, weights, step, STAGE: gl.constexpr):
     wk = gl.load(gk + first + e, mask=valid, other=0.0).to(gl.float32)
     wq = gl.load(gq + first + e, mask=valid, other=0.0).to(gl.float32)
     wc = gl.load(gc + first + e, mask=valid, other=0.0).to(gl.float32)
-    # The task's channels. Token tok's taps are S[tok], S[tok + 3], S[tok +
-    # 6] of its request's sequence S: the input page's 9 taps, then each
-    # token's nrm.
     cl: gl.constexpr = gl.BlockedLayout([1], [64], [gl.num_warps()], [0])
-    ch = first + cb + gl.arange(0, CHUNK, cl)
     p_in = gl.load(step.page_in)
     state_in = step.conv_state + gl.maximum(p_in, 0).to(gl.int64) * step.page_stride
-    has_in = (ch >= 0) & (p_in > 0)
-    s0 = gl.load(state_in + ch * STATE + tok, mask=has_in, other=0.0).to(gl.float32)
-    s3 = gl.load(state_in + ch * STATE + tok + 3, mask=has_in, other=0.0).to(gl.float32)
-    s6 = gl.load(
-        state_in + ch * STATE + tok + 6, mask=has_in & (tok + 6 < STATE), other=0.0
-    ).to(gl.float32)
-    w0 = gl.load(conv_w + ch * 4).to(gl.float32)
-    w1 = gl.load(conv_w + ch * 4 + 1).to(gl.float32)
-    w2 = gl.load(conv_w + ch * 4 + 2).to(gl.float32)
-    w3 = gl.load(conv_w + ch * 4 + 3).to(gl.float32)
-    h_ch = gl.load(streams.element(0, ch)).to(gl.float32)
+    # Each pass's channels. Token tok's taps are S[tok], S[tok + 3], S[tok +
+    # 6] of its request's sequence S: the input page's 9 taps, then each
+    # token's nrm.
+    inputs = ()
+    for k in gl.static_range(PASSES):
+        ch = first + cb0 + k * CHUNK + gl.arange(0, CHUNK, cl)
+        has_in = (ch >= 0) & (p_in > 0)
+        inputs += (
+            (
+                gl.load(state_in + ch * STATE + tok, mask=has_in, other=0.0).to(
+                    gl.float32
+                ),
+                gl.load(state_in + ch * STATE + tok + 3, mask=has_in, other=0.0).to(
+                    gl.float32
+                ),
+                gl.load(
+                    state_in + ch * STATE + tok + 6,
+                    mask=has_in & (tok + 6 < STATE),
+                    other=0.0,
+                ).to(gl.float32),
+                gl.load(conv_w + ch * 4).to(gl.float32),
+                gl.load(conv_w + ch * 4 + 1).to(gl.float32),
+                gl.load(conv_w + ch * 4 + 2).to(gl.float32),
+                gl.load(conv_w + ch * 4 + 3).to(gl.float32),
+                gl.load(streams.element(0, ch)).to(gl.float32),
+            ),
+        )
+    # The next state's taps from the input page, loaded before the poll.
+    taps = ()
+    for k in gl.static_range(PASSES):
+        ch = first + cb0 + k * CHUNK + gl.arange(0, CHUNK, cl)
+        has_in = (ch >= 0) & (p_in > 0)
+        for j in gl.static_range(STATE - 1):
+            taps += (
+                gl.load(
+                    state_in + ch * STATE + tok + 1 + j,
+                    mask=has_in & (tok + 1 + j < STATE),
+                    other=0.0,
+                ),
+            )
+    q0 = q
+    if N > 3:
+        q0 = gl.load(
+            streams.element(-3, first + e), mask=valid & (tok >= 3), other=0.0
+        ).to(gl.float32)
     gl.amd.hint.sched_barrier()
     gated, nrm = _gated_norm(mb, q, first, e, valid, wk, wq, wc)
     mb.stamp(STAGE, trace.READY)
-    # The task's channels of gated and nrm.
-    sel = valid & (e >= cb) & (e < cb + CHUNK)
-    gated_ch = gl.convert_layout(gl.sum(gl.where(sel, gated, 0.0), axis=0), cl)
-    nrm_ch = gl.convert_layout(gl.sum(gl.where(sel, nrm, 0.0), axis=0), cl)
+    nrm0 = nrm
     if N > 3:
         # Token 3 of a request takes S[9], token 0's nrm. This task recomputes
         # it from that token's inputs (3 rows back) and does not read it from
         # the task of that token.
         if tok >= 3:
-            q0 = gl.load(streams.element(-3, first + e), mask=valid, other=0.0).to(
-                gl.float32
-            )
             _, nrm0 = _gated_norm(mb.row(-3), q0, first, e, valid, wk, wq, wc)
-            s6 = gl.convert_layout(gl.sum(gl.where(sel, nrm0, 0.0), axis=0), cl)
-    acc = (((w0 * s0) + w1 * s3) + w2 * s6) + w3 * nrm_ch
-    act = (acc * (1.0 / (1.0 + gl.exp(-acc)))).to(gl.bfloat16).to(gl.float32)
-    act = (act + gated_ch).to(gl.bfloat16).to(gl.float32)
-    out = (act + h_ch).to(gl.bfloat16).to(gl.float32)
-    mb.stamp(STAGE, trace.COMPUTED)
-    mx.put_bf16(mb, "ph", (first + cb) // 2, out)
-    # The state after this token is S[tok + 1 .. tok + 9]: the input page's
-    # taps tok + 1 .. 8, then nrm of the request's tokens 0 .. tok. This task
-    # writes the page's taps of its own row and its nrm into the rows of its
-    # token and the request's later tokens.
     page = gl.load(out_rows)
-    dst = conv_out + page.to(gl.int64) * out_stride + ch * STATE
-    write = (ch >= 0) & (page > 0)
-    for k in gl.static_range(STATE - 1):
-        from_page = tok + 1 + k < STATE
-        tap = gl.load(
-            state_in + ch * STATE + tok + 1 + k, mask=has_in & from_page, other=0.0
-        )
-        gl.store(dst + k, tap, mask=write & from_page)
-    for d in gl.static_range(N):
-        later = gl.load(out_rows + d, mask=tok + d < N, other=0)
-        to = conv_out + later.to(gl.int64) * out_stride + ch * STATE + STATE - 1 - d
-        gl.store(
-            to, nrm_ch.to(gl.bfloat16), mask=(ch >= 0) & (later > 0) & (tok + d < N)
-        )
+    for k in gl.static_range(PASSES):
+        cb = cb0 + k * CHUNK
+        ch = first + cb + gl.arange(0, CHUNK, cl)
+        has_in = (ch >= 0) & (p_in > 0)
+        s0, s3, s6, w0, w1, w2, w3, h_ch = inputs[k]
+        # The pass's channels of gated and nrm.
+        sel = valid & (e >= cb) & (e < cb + CHUNK)
+        gated_ch = gl.convert_layout(gl.sum(gl.where(sel, gated, 0.0), axis=0), cl)
+        nrm_ch = gl.convert_layout(gl.sum(gl.where(sel, nrm, 0.0), axis=0), cl)
+        if N > 3:
+            if tok >= 3:
+                s6 = gl.convert_layout(gl.sum(gl.where(sel, nrm0, 0.0), axis=0), cl)
+        acc = (((w0 * s0) + w1 * s3) + w2 * s6) + w3 * nrm_ch
+        act = (acc * (1.0 / (1.0 + gl.exp(-acc)))).to(gl.bfloat16).to(gl.float32)
+        act = (act + gated_ch).to(gl.bfloat16).to(gl.float32)
+        out = (act + h_ch).to(gl.bfloat16).to(gl.float32)
+        if k == PASSES - 1:
+            mb.stamp(STAGE, trace.COMPUTED)
+        mx.put_bf16(mb, "ph", (first + cb) // 2, out)
+        # The state after this token is S[tok + 1 .. tok + 9]: the input
+        # page's taps tok + 1 .. 8, then nrm of the request's tokens 0 ..
+        # tok. This task writes the page's taps of its own row and its nrm
+        # into the rows of its token and the request's later tokens.
+        dst = conv_out + page.to(gl.int64) * out_stride + ch * STATE
+        write = (ch >= 0) & (page > 0)
+        for j in gl.static_range(STATE - 1):
+            from_page = tok + 1 + j < STATE
+            gl.store(dst + j, taps[k * (STATE - 1) + j], mask=write & from_page)
+        for d in gl.static_range(N):
+            later = gl.load(out_rows + d, mask=tok + d < N, other=0)
+            to = conv_out + later.to(gl.int64) * out_stride + ch * STATE + STATE - 1 - d
+            gl.store(
+                to, nrm_ch.to(gl.bfloat16), mask=(ch >= 0) & (later > 0) & (tok + d < N)
+            )
     mb.stamp(STAGE, trace.END)
 
 

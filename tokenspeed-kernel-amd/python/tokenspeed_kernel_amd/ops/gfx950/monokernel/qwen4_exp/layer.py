@@ -55,6 +55,7 @@ from tokenspeed_kernel_amd.ops.gfx950.monokernel import (
     mailbox,
     schedule,
     trace,
+    warm,
 )
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.plan import Plan, Stage
 from tokenspeed_kernel_amd.ops.gfx950.monokernel.qwen4_exp import (
@@ -81,14 +82,19 @@ C1_BASE = 96
 # The routed and shared experts' formats a plan supports: MXFP4 weights and
 # activations (moe.py) or BF16 (moe_bf16.py).
 EXPERTS = ("mxfp4", "bf16")
+# Past 2 rows, a Gated DeltaNet layer's CTAs 0 .. WARM_TASKS - 1 warm the
+# next launch's late first-projection weights (warm.py) before C1. They are
+# idle from B1's end to the MoE once M1 starts after them.
+WARM_TASKS = 28
 
 
 def _tail(
-    src: tuple[str, ...], final: bool, rows: int, experts: str
+    src: tuple[str, ...], final: bool, rows: int, experts: str, warm_next: bool
 ) -> tuple[Stage, ...]:
     """The output projection, the MLP mixer and the MoE. ``src`` names the
     mailbox region of the input streams, if any. ``experts`` is the experts'
-    format (:data:`EXPERTS`).
+    format (:data:`EXPERTS`). With ``warm_next``, warm tasks (``w1``) run
+    first, and M1 starts after their CTAs.
 
     With ``final``, the model's final mixer runs after the MoE on the output
     streams (M5 also publishes them in region ``h``), on CTAs that are idle
@@ -101,9 +107,16 @@ def _tail(
         raise ValueError(f"experts must be one of {EXPERTS}, got {experts!r}")
     mxfp4 = experts == "mxfp4"
     return (
+        *((Stage("w1", WARM_TASKS, 0),) if warm_next else ()),
         *out_proj.stages({"c1": C1_BASE}, "a_", src),
         # The MLP mixer also publishes its row as MXFP4 for MXFP4 experts.
-        *hc.stages("m_", {"m1": 0, "m2": 176}, rows, ("w",), mxfp4),
+        *hc.stages(
+            "m_",
+            {"m1": WARM_TASKS if warm_next else 0, "m2": 176},
+            rows,
+            ("w",),
+            mxfp4,
+        ),
         *(moe if mxfp4 else moe_bf16).stages(
             # M5 first takes the CTAs after M4's: their M5 weights stream
             # while M4 runs.
@@ -148,12 +161,15 @@ def delta_plan(with_ple: bool, rows: int, chain: int, experts: str) -> Plan:
     """
     src = ("ph",) if with_ple else ()
     stages = (
-        *(ple.stages({"p1": 0, "p2": 176}, rows) if with_ple else ()),
+        # P2 takes CTAs without an A1 task where it can: A1's loads then
+        # need not wait behind P2's.
+        *(ple.stages({"p1": 0, "p2": 96}, rows) if with_ple else ()),
         *hc.stages("a_", {"a1": 0, "a2": 176}, rows, src, False),
         # B1's slots map to its tasks so that the z tasks avoid A2's CTAs
         # (gdn.Z_FIRST).
         *gdn.stages({"b1": 0, "b3": 28}, rows, chain, "a_"),
-        *_tail(src, False, rows, experts),
+        # Past 2 rows, the layer warms the next one's weights (WARM_TASKS).
+        *_tail(src, False, rows, experts, rows > 2),
     )
     regions = _regions(gdn.REGIONS, False, experts) + (ple.REGIONS if with_ple else ())
     return Plan(grid=GRID, stages=stages, regions=regions, rows=rows, chain=chain)
@@ -174,11 +190,11 @@ def qsa_plan(final: bool, rows: int, chain: int, experts: str, catch_up: bool) -
     if catch_up and rows != chain:
         raise ValueError(f"a catch-up plan serves one request, got {rows} / {chain}")
     attended = 1 if catch_up else rows
-    # Q6 takes the CTAs before C1's when its tasks fit there (up to two
-    # rows): C1's weights then stream while Q6 runs.
-    q6 = 0 if int(qsa.MERGE_TASKS) * attended <= C1_BASE else 128
+    # Q6 takes the CTAs before C1's (at most qsa.MERGE_ROWS rows of tasks):
+    # C1's weights then stream while Q6 runs.
+    assert int(qsa.MERGE_TASKS) * qsa.MERGE_ROWS <= C1_BASE
     attention = qsa.stages(
-        {"q1": 28, "q2": 246, "q3": 0, "q4": 20, "q4f": 255, "q5": 64, "q6": q6},
+        {"q1": 28, "q2": 200, "q3": 0, "q4": 20, "q4f": 255, "q5": 68, "q6": 0},
         rows,
         attended,
         "a_",
@@ -186,7 +202,7 @@ def qsa_plan(final: bool, rows: int, chain: int, experts: str, catch_up: bool) -
     stages = (
         *hc.stages("a_", {"a1": 0, "a2": 176}, rows, (), False),
         *attention,
-        *_tail((), final, attended, experts),
+        *_tail((), final, attended, experts, False),
     )
     return Plan(
         grid=GRID,
@@ -289,12 +305,27 @@ def _tail_stages(
     experts,
     final_mixer,
     mixed_out,
+    warm_ptr,
+    warm_quads,
     PLAN: gl.constexpr,
 ):
     """The stages of :func:`_tail` (``streams``: the layer's input).
     The function reads ``final_mixer`` (the operand of ``hc.Mixer``) and
-    ``mixed_out`` only when ``PLAN`` has the final mixer."""
+    ``mixed_out`` only when ``PLAN`` has the final mixer, and the
+    ``4 * warm_quads`` int32 words at ``warm_ptr`` only when it has the
+    warm tasks."""
     OUT: gl.constexpr = "h" if schedule.has_stage(PLAN, "f1") else ""
+    if schedule.has_stage(PLAN, "w1"):
+        task, active = schedule.stage_task(PLAN, "w1")
+        if active:
+            warm.warm_stage(
+                mb,
+                task,
+                warm_ptr,
+                warm_quads,
+                schedule.stage_tasks(PLAN, "w1"),
+                "w1",
+            )
     task, active = schedule.stage_task(PLAN, "c1")
     if active:
         out_proj.out_stage(mb, task, out_w, streams, "", "a_", "c1")
@@ -369,7 +400,9 @@ def _delta_stages(mb, weights, state, PLAN: gl.constexpr):
         gdn.recurrence_stage(mb, b3_request, b3_head, weights, state, "b3")
 
 
-@gluon.jit
+# The warm word counts differ between the next layers' kinds (and are 0 for the last
+# one): a runtime value, not a specialization.
+@gluon.jit(do_not_specialize=("warm_quads",))
 def gluon_qwen4_exp_delta_layer_gfx950(
     scratch,
     step,
@@ -385,6 +418,8 @@ def gluon_qwen4_exp_delta_layer_gfx950(
     experts,
     ple_weights,
     ple_step,
+    warm_ptr,
+    warm_quads,
     trace_buf,
     PLAN: gl.constexpr,
 ):
@@ -393,7 +428,8 @@ def gluon_qwen4_exp_delta_layer_gfx950(
     The tuple operands hold the fields of ``hc.Mixer`` (``attn_mixer``,
     ``mlp_mixer``), ``gdn.Weights``, ``gdn.State``, ``moe.Weights``
     (``experts``), ``ple.Weights`` and ``ple.Step``. The PLE operands are
-    ``None`` unless ``PLAN`` has the PLE stages.
+    ``None`` unless ``PLAN`` has the PLE stages. The warm tasks read the
+    ``4 * warm_quads`` int32 words at ``warm_ptr`` (0: none).
     """
     table = trace.allocate(trace_buf)
     mb = mailbox.Mailbox(scratch, mailbox.launch_tag(step, layer), PLAN, table)
@@ -427,6 +463,8 @@ def gluon_qwen4_exp_delta_layer_gfx950(
         _expert_weights(experts, PLAN),
         None,
         None,
+        warm_ptr,
+        warm_quads,
         PLAN,
     )
     trace.flush(table, trace_buf)
@@ -463,14 +501,28 @@ def _attention_stages(mb, cache, TOK0, CHAIN0: gl.constexpr, PLAN: gl.constexpr)
         qsa.topk_final_stage(mb.row(task), 0, cache.row(task, CHAIN).length(), "q4f")
     task, active = schedule.stage_task(PLAN, "q5")
     if active:
-        row, split, tok = schedule.row_task(PLAN, task, qsa.ATTN_TASKS)
+        # The tasks are split-major: the used splits (the low ones) of every
+        # row take the first CTAs of Q5, whose Q1 tasks end early.
+        PAIRS: gl.constexpr = schedule.stage_tasks(PLAN, "q5") // qsa.SPLITS
+        pair = task % PAIRS
+        row = pair // qsa.KV_HEADS
+        split = (pair % qsa.KV_HEADS) * qsa.SPLITS + task // PAIRS
+        tok = row % CHAIN
         qsa.attention_stage(
             mb.row(row), split, tok + TOK0, cache.row(row, CHAIN), CHAIN0, "q5"
         )
     task, active = schedule.stage_task(PLAN, "q6")
     if active:
-        row, task, _ = schedule.row_task(PLAN, task, qsa.MERGE_TASKS)
-        qsa.merge_stage(mb.row(row), task, "q6")
+        # Task t merges tasks t, t + TASKS, ... of the attended rows.
+        TASKS: gl.constexpr = schedule.stage_tasks(PLAN, "q6")
+        MERGES: gl.constexpr = qsa.MERGE_TASKS * (
+            schedule.stage_tasks(PLAN, "q5") // qsa.ATTN_TASKS
+        )
+        for j in gl.static_range((MERGES + TASKS - 1) // TASKS):
+            index = task + j * TASKS
+            if index < MERGES:
+                row, merge, _ = schedule.row_task(PLAN, index, qsa.MERGE_TASKS)
+                qsa.merge_stage(mb.row(row), merge, cache.row(row, CHAIN), "q6")
 
 
 @gluon.jit
@@ -534,6 +586,8 @@ def gluon_qwen4_exp_qsa_layer_gfx950(
             _expert_weights(experts, LIVE),
             final_mixer,
             mixed_out,
+            None,
+            0,
             LIVE,
         )
     else:
@@ -547,6 +601,8 @@ def gluon_qwen4_exp_qsa_layer_gfx950(
             _expert_weights(experts, PLAN),
             final_mixer,
             mixed_out,
+            None,
+            0,
             PLAN,
         )
     trace.flush(table, trace_buf)
@@ -580,6 +636,33 @@ def _advance_step(step, G: gl.constexpr):
     if done == G - 1:
         gl.store(step + 1, 0)
         gl.store(step, gl.load(step) + 1)
+
+
+def late_weights(weights: DeltaLayerWeights | QsaLayerWeights) -> torch.Tensor:
+    """The weights of a layer's first projection (B1 or Q1) that its launch
+    reads last, as int32 words: those of the tasks on A2's CTAs, which start
+    after A2. The previous launch can warm them (``warm`` of
+    :func:`launch_gluon_qwen4_exp_delta_layer_gfx950`). For Q1, these are its
+    ``qkv_proj`` tasks there (the index projection's few tasks are left out).
+    """
+    delta = isinstance(weights, DeltaLayerWeights)
+    plan = (
+        delta_plan(False, MAX_ROWS, MAX_ROWS, "mxfp4")
+        if delta
+        else qsa_plan(False, MAX_ROWS, MAX_ROWS, "mxfp4", False)
+    )
+    a2, first = plan.stage("a2"), plan.stage("b1" if delta else "q1")
+    ctas = {(a2.base + t) % plan.grid for t in range(a2.tasks)}
+    slots = [t for t in range(first.tasks) if (first.base + t) % plan.grid in ctas]
+    if delta:
+        tasks = sorted(gdn.slot_work_host(t) for t in slots)
+        w, rows = weights.qkvzba, int(gdn.ROWS)
+    else:
+        tasks = [t for t in slots if t < int(qsa.QKV_TASKS)]
+        w, rows = weights.qkv_w, int(qsa.ROWS)
+    if tasks != list(range(tasks[0], tasks[-1] + 1)):
+        raise AssertionError("the late tasks' weights must be contiguous")
+    return w[tasks[0] * rows : (tasks[-1] + 1) * rows].reshape(-1).view(torch.int32)
 
 
 # Rows one launch serves: the GEMVs carry the rows in the MFMA rows,
@@ -693,6 +776,7 @@ def launch_gluon_qwen4_exp_delta_layer_gfx950(
     layer: int,
     trace_buf: torch.Tensor | None,
     ple_step: PleStep | None,
+    warm: torch.Tensor | None,
 ) -> None:
     """Run one Gated DeltaNet layer for ``rows`` (1 to ``MAX_ROWS``) token
     rows: ``chain`` consecutive tokens per request (1 for decode, ``k + 1``
@@ -730,9 +814,20 @@ def launch_gluon_qwen4_exp_delta_layer_gfx950(
         trace_buf: Optional int64 ``[GRID, trace.EVENTS, NUM_WARPS]`` stage timestamps.
         ple_step: The PLE block's per-step operands, exactly when ``weights``
             has a PLE block.
+        warm: None, or int32 words that the next launch reads late
+            (:func:`late_weights` of its layer). Past 2 rows, the launch
+            reads them into the memory-side cache (``warm.py``). The words
+            stay unchanged.
     """
     if (weights.ple is None) != (ple_step is None):
         raise ValueError("ple_step must be given exactly for a layer with PLE")
+    if warm is not None and (
+        warm.dtype != torch.int32
+        or warm.dim() != 1
+        or not warm.is_contiguous()
+        or warm.numel() % 4
+    ):
+        raise ValueError("warm must be contiguous int32 words, 4 at a time")
     plan = delta_plan(weights.ple is not None, _rows(h), chain, experts_format(weights))
     _check_streams(h, h_out, scratch, plan, plan.rows)
     _check_rows(plan, conv_out_rows=conv_out_rows)
@@ -790,6 +885,9 @@ def launch_gluon_qwen4_exp_delta_layer_gfx950(
         weights.moe.kernel_args(),
         None if ple_step is None else weights.ple.kernel_args(),
         None if ple_step is None else ple_step.kernel_args(),
+        # Without warm words, the warm tasks read none (any int32 pointer).
+        step if warm is None else warm,
+        0 if warm is None else warm.numel() // 4,
         trace_buf,
         plan.key,
         num_warps=NUM_WARPS,
