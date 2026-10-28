@@ -1,0 +1,38 @@
+name: PR Test Finish
+
+# The default-branch ruleset requires a check named `finish`. The PR test
+# workflows report it, but each is limited by `paths`, so a PR that changes
+# none of those paths (for example docs only) starts none of them and `finish`
+# would stay pending. This workflow starts for such PRs and reports `finish`.
+# Keep the ignored paths equal to the union of the `pull_request` paths of
+# nvidia-b200-tests, pr-test-nvidia-arm, amd-mi350-tests, amd-mi450-tests and
+# amd-kernel-benchmark.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [main]
+    paths-ignore:
+      - "python/pyproject.toml"
+      - "python/tokenspeed/**"
+      - "tokenspeed-kernel/**"
+      - "tokenspeed-kernel-amd/**"
+      - "tokenspeed-mla/**"
+      - "tokenspeed-engine/**"
+      - "tokenspeed-scheduler/**"
+      - "test/**"
+      - ".github/workflows/amd-kernel-benchmark.yml"
+      - ".github/workflows/amd-mi350-tests.yml"
+      - ".github/workflows/amd-mi450-tests.yml"
+      - ".github/workflows/nvidia-b200-tests.yml"
+      - ".github/workflows/pr-test-nvidia-arm.yml"
+      - ".github/workflows/run-ci-task-matrix.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  finish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Finish
+        run: echo "No GPU test paths changed."
