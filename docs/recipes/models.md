@@ -501,10 +501,58 @@ Blackwell GPU (B200/B300). On other NVIDIA platforms, use
 
 ### AMD
 
-The standard AMD path on 8x gfx950 uses the `mla` backend, which selects MLA
-kernels automatically. Use `gluon` to require Gluon MLA kernels for both the
-target and, when speculative decoding is enabled, its MLA drafter. For TP8/EP8,
-automatic MoE selection uses the specialized Gluon SiTU kernels:
+On 8x MI350X/MI355X (gfx950), serve with the Eagle3 draft at TP8 and expert
+parallelism disabled. This is the configuration of the per-commit MI35x
+50K-input/500-output perf job. Against the speculator-free TP8/EP8 launch
+below, TP8/EP1 cuts prefill latency enough to improve end-to-end latency at
+concurrency 16, despite a higher per-token decode latency.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3 \
+  --served-model-name kimi-k3 \
+  --trust-remote-code \
+  --max-model-len 65536 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --ep-size 1 \
+  --mm-encoder-tp-mode data \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-eagle-topk 1 \
+  --speculative-draft-model-quantization unquant \
+  --eagle3-layers-to-capture 2,46,90 \
+  --attention-backend gluon \
+  --drafter-attention-backend gluon \
+  --moe-backend auto \
+  --max-num-seqs 16 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --max-cudagraph-capture-size 16 \
+  --cudagraph-capture-sizes 1 2 4 8 16 \
+  --disable-prefill-graph \
+  --gpu-memory-utilization 0.92 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- `gluon` requires Gluon MLA kernels for both the target and its MLA drafter.
+  The explicit policy fails fast when the current GPU, dtype, or attention shape
+  has no registered Gluon kernel, instead of silently selecting another
+  solution. `--attention-backend mla --drafter-attention-backend mla` lets
+  TokenSpeed select the MLA kernels automatically.
+- `--disable-prefill-graph` skips prefill CUDA graphs, which need 40 buckets on
+  top of the decode ones and run out of memory at this memory fraction.
+  Speculative decoding runs on the decode graphs.
+- To raise `--max-num-seqs`, extend `--cudagraph-capture-sizes` and
+  `--max-cudagraph-capture-size` with it.
+- AMD defaults to greedy sampling, which ignores per-request `temperature`,
+  `top_p`, and `top_k`.
+
+Without speculative decoding, use TP8/EP8. Automatic MoE selection then uses
+the specialized Gluon SiTU kernels:
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3 \
@@ -522,17 +570,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --host 0.0.0.0 \
   --port 8000
 ```
-
-To force Gluon attention for an Eagle3 launch, replace the attention option
-above and add the drafter option:
-
-```bash
-  --attention-backend gluon \
-  --drafter-attention-backend gluon
-```
-
-The explicit policy fails fast when the current GPU, dtype, or attention shape
-has no registered Gluon kernel instead of silently selecting another solution.
 
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
@@ -646,12 +683,23 @@ ts serve \
   --trust-remote-code \
   --attn-tp-size 4 \
   --ep-size 1 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 65536 \
+  --max-num-seqs 16 \
+  --max-total-tokens 1048576 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --max-cudagraph-capture-size 16 \
+  --cudagraph-capture-sizes 1 2 4 8 16 \
   --sampling-backend triton \
   --speculative-algorithm MTP \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4
 ```
+
+`--max-total-tokens 1048576` holds sixteen concurrent 50K-token requests in the
+KV cache on four GPUs; a 524288-token budget queues some of them.
 
 ## Qwen3 dense / Qwen3 30B-A3B
 

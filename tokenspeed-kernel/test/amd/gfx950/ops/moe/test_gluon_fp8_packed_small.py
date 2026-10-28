@@ -171,8 +171,12 @@ def _fixture(
     outlier: bool,
     hidden: int,
     intermediate: int,
+    *,
+    local_experts: int | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    local_experts = 8 if ep_size == 1 else 4
+    # Omitting the bank size keeps the standard eight (EP1) or four experts.
+    if local_experts is None:
+        local_experts = 8 if ep_size == 1 else 4
     expert_start = rank * local_experts
     generator = torch.Generator(device="cuda").manual_seed(71)
     x = (torch.randn(m, hidden, device="cuda", generator=generator) * 0.5).to(
@@ -246,6 +250,10 @@ _SMALL_CASES = [
     (16, 4, 0, False, 4096, 2048),
     (32, 1, 0, False, 4096, 512),
     (16, 1, 0, False, 512, 512),  # Factor-one pipeline's two-tile drain.
+    # Verify batches through 64 rows; each expert spans several 16-row blocks.
+    (63, 1, 0, False, 4096, 512),
+    (64, 1, 0, False, 4096, 512),
+    (64, 4, 3, False, 4096, 2048),
 ]
 _SPLIT_CASES = [
     (1, 4, 0, False, 4096, 2048),
@@ -253,11 +261,11 @@ _SPLIT_CASES = [
     (2, 4, 3, True, 4096, 2048),
 ]
 _LARGE_CASES = [
-    (63, 1, 0, False, 4096, 512),
-    (64, 1, 0, False, 4096, 512),
     (65, 1, 0, False, 4096, 512),
     (65, 1, 0, True, 4096, 512),
     (65, 4, 3, False, 4096, 2048),
+    (127, 1, 0, False, 4096, 512),
+    (128, 1, 0, False, 4096, 512),
 ]
 _FULL_CASES = [
     (schedule, *case)
@@ -352,3 +360,69 @@ def test_packed_fp8_moe_matches_clamped_routed_reference(
         local = (ids >= expert_start) & (ids < expert_start + packed13.shape[0])
         assert not actual[~local.any(dim=1)].any()
     _assert_numerics(actual, expected, record_property)
+
+
+@pytest.mark.usefixtures("gfx950_only")
+def test_packed_fp8_large_schedule_with_sparse_routes_matches_reference(
+    record_property: Callable[[str, float], None],
+) -> None:
+    """Cover the large schedule's streaming weight loads through dispatch.
+
+    Above 64 rows, fewer than 64 routes per expert select non-temporal weight
+    loads. With 32 local experts, 96 rows give each expert 24 routes.
+    """
+    from tokenspeed_kernel.ops.moe.gluon import _quantize_packed_activation
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8 import (
+        launch_gluon_fp8_packed_moe_gfx950,
+    )
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.moe import _packed_schedule
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.weight_preprocess import (
+        pack_fp8_weight_n16k32,
+    )
+
+    m = 96
+    assert _packed_schedule(m, 4096, 512, 8, 256, 32, 32)[0] == "large"
+    x, w13, w2, s13, s2, ids, weights = _fixture(
+        m, 1, 0, False, 4096, 512, local_experts=32
+    )
+    expected, _ = _reference(
+        x, w13, w2, s13, s2, ids, weights, 0, 7.0, quantized_activations=True
+    )
+    packed13, packed2 = pack_fp8_weight_n16k32(w13), pack_fp8_weight_n16k32(w2)
+    del w13, w2
+    actual = launch_gluon_fp8_packed_moe_gfx950(
+        x,
+        packed13,
+        packed2,
+        s13,
+        s2,
+        ids,
+        weights,
+        swiglu_limit=7.0,
+        expert_start=0,
+        num_experts_total=packed13.shape[0],
+        quantize_activation=_quantize_packed_activation,
+    )
+    _assert_numerics(actual, expected, record_property)
+
+
+@pytest.mark.parametrize(
+    ("rows", "local_experts", "expected"),
+    [
+        (33, 288, "small"),
+        (64, 288, "small"),
+        (64, 72, "small"),
+        (65, 288, "large"),
+        (65, 72, "large"),
+    ],
+)
+def test_packed_schedule_keeps_verify_batches_through_64_rows_on_small_blocks(
+    rows: int, local_experts: int, expected: str
+) -> None:
+    from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.moe import _packed_schedule
+
+    schedule, split_count = _packed_schedule(
+        rows, 4096, 512, 8, 256, local_experts, 288
+    )
+    assert schedule == expected
+    assert split_count == 1

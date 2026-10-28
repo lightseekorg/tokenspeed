@@ -22,8 +22,8 @@
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
 are dense and pin the smallest packing whose plane width covers one per-layer
-KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
-byte width so no parent is wasted.
+KDA state (12 at attn tp=8 with the default FP32 state, 6 with BF16); the state
+groups pack to match the MLA plane's byte width so no parent is wasted.
 """
 
 from __future__ import annotations
@@ -44,6 +44,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
     require_positive_int,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.kda import (
+    kda_recurrent_state_dtype,
     kda_replay_supported,
     kda_verify_workspace_bytes,
 )
@@ -226,6 +227,10 @@ class KimiK3Recipe(CacheRecipe):
             raise ValueError("Kimi-K3 cache requires a linear-attention component")
         return (linear_attn.conv_state_shape, linear_attn.temporal_state_shape)
 
+    @cached_property
+    def _recurrent_dtype(self) -> torch.dtype:
+        return kda_recurrent_state_dtype(self.server_args)
+
     @override
     def fields_for_layer(
         self, layer_id: int, group_id: str, occurrence: int
@@ -260,7 +265,7 @@ class KimiK3Recipe(CacheRecipe):
                 f"layer.{layer_id}.recurrent_state",
                 plane_id,
                 recurrent_shape,
-                cache_dtype_name(torch.float32),
+                cache_dtype_name(self._recurrent_dtype),
                 exact_page_stride=False,
             ),
         )

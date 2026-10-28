@@ -269,7 +269,7 @@ def gluon_kda_paged_decode_gfx1250(
     )
     write_offsets = value_offsets[:, None] * K + key_offsets[None, :]
     cdna5.buffer_store(
-        running,
+        running.to(state_pool.dtype.element_ty),
         state_pool + write_base,
         write_offsets.to(gl.int32),
         mask=valid_write & state_mask,
@@ -483,7 +483,7 @@ def gluon_kda_fused_paged_decode_vmajor_gfx1250(
         panel_out = prior_output + delta * key_query
         gl.store(
             state_pool + write_base + cur_off,
-            running,
+            running.to(state_pool.dtype.element_ty),
             mask=valid_write,
         )
         output_panels[panel_idx].store(panel_out)
@@ -951,6 +951,7 @@ def gluon_kda_fused_replay_gfx1250(
     stamps,
     activation_ref,
     history_ref,
+    state_ref,
     BATCH,
     qkv_stride,
     conv_stride,
@@ -988,7 +989,7 @@ def gluon_kda_fused_replay_gfx1250(
     a_log = gl.load(descriptors + descriptor_base + 6).to(gl.pointer_type(gl.float32))
     dt_bias = gl.load(descriptors + descriptor_base + 7).to(gl.pointer_type(gl.float32))
     state_pool = gl.load(descriptors + descriptor_base + 8).to(
-        gl.pointer_type(gl.float32)
+        gl.pointer_type(state_ref.dtype.element_ty)
     )
     group_idx = gl.load(group_indices + layer_idx).to(gl.int64)
     replay_steps = gl.load(accepted + sequence_idx)
@@ -1106,7 +1107,10 @@ def gluon_kda_fused_replay_gfx1250(
                 running *= decay_values[token_offset][None, :]
                 running += delta[:, None] * k_values[token_offset][None, :]
         write_base = write_idx * state_stride + head_idx * D * D
-        gl.store(state_pool + write_base + panel_offsets, running)
+        gl.store(
+            state_pool + write_base + panel_offsets,
+            running.to(state_pool.dtype.element_ty),
+        )
 
         next_idx = panel_idx + 1
         if next_idx < 8:
@@ -1268,7 +1272,7 @@ def gluon_kda_fused_decode_gfx1250(
         A_log: Per-head FP32 decay parameters with shape ``[num_heads]``.
         dt_bias: Per-head, per-channel FP32 bias with shape
             ``[num_heads * head_dim]``.
-        state_pool: Mutable FP32 recurrent state, physical shape
+        state_pool: Mutable FP32 or BF16 recurrent state, physical shape
             ``[pages, num_heads, head_dim(V), head_dim(K)]`` (V-major).
         read_indices: Source state page per batch row.
         write_indices: Destination state page per batch row.
@@ -1434,7 +1438,8 @@ def gluon_kda_fused_verify_gfx1250(
     mixed_qkv contains activation-dtype pre-convolution Q/K/V rows; raw_g and
     beta_logits are projected gate inputs. A supplied raw_g requires both
     projection inputs to be None; otherwise f_a_out and f_b_weight produce the
-    gate inline. state_pool is FP32 [page, head, V, K].
+    gate inline. state_pool is FP32 or BF16 [page, head, V, K]; verify
+    widens it to FP32.
     read_indices selects checkpoint pages; nonpositive pages are padding.
     correction is FP32 [slot, head, capacity, V]. key_gate has the same layout
     with activation-dtype unnormalized K followed by raw gate in its last axis.
@@ -1567,6 +1572,7 @@ def launch_gluon_kda_fused_replay_gfx1250(
     record_metadata: torch.Tensor | None,
     record_stamps: torch.Tensor | None,
     lower_bound: float | None,
+    state_dtype: torch.dtype,
 ) -> None:
     """Recover all layers from saved U/K/raw-g records, then commit conv history.
 
@@ -1588,7 +1594,7 @@ def launch_gluon_kda_fused_replay_gfx1250(
         conv_stride: Conv-history page stride in elements.
         correction_stride: FP32 U token stride in elements.
         key_gate_stride: K/raw-g token stride in elements.
-        state_stride: FP32 recurrent page stride in elements.
+        state_stride: Recurrent page stride in elements.
         conv_width: Convolution taps, currently 4.
         activation_dtype: Original QKV and K/raw-g storage dtype.
         conv_state_dtype: Persistent conv-history dtype, independently of inputs.
@@ -1596,6 +1602,8 @@ def launch_gluon_kda_fused_replay_gfx1250(
         record_stamps: INT64 [layers, slots, capacity, 2] position/generation.
             Both metadata tensors can be None for standalone unstamped probes.
         lower_bound: Bounded log-decay, or None for softplus.
+        state_dtype: Recurrent pool dtype, FP32 or BF16. Recovery runs in
+            FP32 either way; a BF16 pool is rounded once per stored page.
 
     Returns:
         None. Updates accepted destination states and history. Source and
@@ -1604,6 +1612,10 @@ def launch_gluon_kda_fused_replay_gfx1250(
     """
     if head_dim != 128 or conv_width != 4:
         raise ValueError("gfx1250 records commit requires D=128 and W=4")
+    if state_dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(
+            f"gfx1250 batched KDA replay does not support {state_dtype} state"
+        )
     validate_kda_records_commit(
         descriptors,
         group_indices,
@@ -1622,6 +1634,7 @@ def launch_gluon_kda_fused_replay_gfx1250(
     stamp_stride = 0 if record_stamps is None else record_stamps.stride(0)
     activation_ref = torch.empty(0, dtype=activation_dtype, device=descriptors.device)
     history_ref = torch.empty(0, dtype=conv_state_dtype, device=descriptors.device)
+    state_ref = torch.empty(0, dtype=state_dtype, device=descriptors.device)
     gluon_kda_fused_replay_gfx1250[(num_heads, batch, layers)](
         descriptors,
         group_indices,
@@ -1632,6 +1645,7 @@ def launch_gluon_kda_fused_replay_gfx1250(
         record_stamps,
         activation_ref,
         history_ref,
+        state_ref,
         batch,
         qkv_stride,
         conv_stride,
