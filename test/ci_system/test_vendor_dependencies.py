@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-VENDOR_VERSION = "3.9.10.post20261025"
+VENDOR_VERSION = "3.9.10.post20261028"
 
 
 def _read_vendor_pins(path: Path) -> dict[str, str]:
