@@ -105,10 +105,13 @@ def test_capacity_refresh_pads_unused_request_slots_with_one_scan_row(live):
     no work at all."""
     lengths = [129, 130, 131][:live]
     retained = prepare_capacity_prefill_metadata(
-        _live_metadata([100] * 4, "cuda"), 512, None
+        _live_metadata([100] * 4, "cuda"), 512, None, checkpoints=None
     )
     source = _live_metadata(lengths, "cuda")
-    assert prepare_capacity_prefill_metadata(source, 512, retained) is retained
+    assert (
+        prepare_capacity_prefill_metadata(source, 512, retained, checkpoints=None)
+        is retained
+    )
     total = sum(lengths)
     padding = 4 - live
     host = source.cu_extend_seq_lens_cpu.tolist()
@@ -123,7 +126,9 @@ def test_capacity_refresh_pads_unused_request_slots_with_one_scan_row(live):
     )
     assert retained.prefill_token_extent == 512
     with pytest.raises(ValueError, match="exceed the captured capacity"):
-        prepare_capacity_prefill_metadata(_live_metadata([510], "cuda"), 512, retained)
+        prepare_capacity_prefill_metadata(
+            _live_metadata([510], "cuda"), 512, retained, checkpoints=None
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -131,9 +136,11 @@ def test_capacity_scrub_zeroes_rows_past_the_live_total():
     """The padded rows are zeroed by a device-side bound, never a Python int
     the capture would freeze."""
     retained = prepare_capacity_prefill_metadata(
-        _live_metadata([2, 2, 2], "cuda"), 8, None
+        _live_metadata([2, 2, 2], "cuda"), 8, None, checkpoints=None
     )
-    prepare_capacity_prefill_metadata(_live_metadata([3, 2], "cuda"), 8, retained)
+    prepare_capacity_prefill_metadata(
+        _live_metadata([3, 2], "cuda"), 8, retained, checkpoints=None
+    )
     rows = torch.ones(8, 4, device="cuda")
     extra = torch.ones(8, device="cuda")
     retained.scrub_padding(rows, None, extra)
@@ -517,7 +524,7 @@ def test_outer_graph_replays_lengths_pages_and_states(batch_size, backend_name):
         # Uncaptured shapes use the same builder with transient storage. Check
         # its eager output/state too, not just eager on a retained graph buffer.
         backend.forward_metadata = prepare_capacity_prefill_metadata(
-            source, bucket, None
+            source, bucket, None, checkpoints=None
         )
         reset()
         fresh_eager = forward(compact=False)[: sum(lengths)].clone()
