@@ -1104,6 +1104,23 @@ def launch_gdn_wy(
     tree_ancestors: torch.Tensor | None,
     replay_payload: torch.Tensor | None,
 ) -> torch.Tensor:
+    """Launch GDN WY verification with cached CuTe specializations.
+
+    Tensor arguments follow ``cute_dsl_gdn_decode_mtp``. PyTorch dtypes map to
+    CuTe pointer types; absent tree masks and replay destinations use existing
+    tensors as placeholders. Return ``[B, T, HV, V]`` output with ``q.dtype``,
+    including an empty output for an empty batch, without writing the state pool.
+
+    ``_COMPILED`` caches one kernel per device, operand dtypes, model geometry,
+    execution flags and bounded launch/transport choices. Token bounds use
+    4/8/16 buckets; value tiles and accumulators follow batch/head thresholds.
+    Actual batch/token counts, strides and scale remain runtime inputs. A cache
+    miss compiles all Q/K/V and state transport combinations; ``kernel_warmup``
+    also prepares reachable launch tiers for the selected token bucket.
+
+    Warm every selected bucket/dtype/geometry before CUDA Graph capture;
+    a missing specialization during capture raises ``RuntimeError``.
+    """
     B, T, H, K = q.shape
     HV, V = v.shape[2:]
     out = q.new_empty((B, T, HV, V))
