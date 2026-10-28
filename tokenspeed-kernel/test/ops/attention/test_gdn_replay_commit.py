@@ -21,6 +21,7 @@
 """Correctness coverage for Qwen GDN ReplaySSM accepted-prefix commits."""
 
 import pytest
+import tokenspeed_kernel.ops.attention.gdn.triton as gdn_triton
 import torch
 from tokenspeed_kernel.numerics.torch.attention.gdn import (
     gdn_gate,
@@ -32,6 +33,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
     gdn_replay_commit,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import _gdn_replay_commit_kernel
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.registry import KernelRegistry
 from utils import assert_no_triton_compile
 
@@ -146,6 +148,7 @@ def _replay(
     read: torch.Tensor,
     write: torch.Tensor,
     accepted: torch.Tensor,
+    rows_aligned: bool = False,
 ) -> None:
     """Pack one layer into the same layer-major API used by the runtime."""
     batch, draft_tokens, num_k_heads, head_k_dim = k.shape
@@ -175,6 +178,7 @@ def _replay(
         geometry=(num_k_heads, num_v_heads, head_k_dim, head_v_dim),
         state_dtype=pool.dtype,
         solution="triton",
+        rows_aligned=rows_aligned,
     )
 
 
@@ -222,6 +226,52 @@ def test_gdn_replay_commit_matches_accepted_prefix_reference(
         device=device,
     )
     torch.testing.assert_close(pool[untouched], original[untouched])
+
+
+@pytest.mark.parametrize("head_v_dim", [64, 128])
+@pytest.mark.parametrize("accepted_list", [[0, 1, 3, 4], [4, 4, 4, 4], [2, 0, 1, 3]])
+def test_gdn_replay_commit_ring_matches_reference_kernel_bitwise(
+    device: str,
+    head_v_dim: int,
+    accepted_list: list[int],
+    monkeypatch,
+    require,
+):
+    require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    if not current_platform().is_nvidia:
+        pytest.skip("the pipelined replay is NVIDIA-only")
+    k, v, a, b, A_log, dt_bias, pool, read, write, _ = _inputs(
+        device, torch.bfloat16, head_k_dim=128, head_v_dim=head_v_dim
+    )
+    accepted = torch.tensor(accepted_list, device=device, dtype=torch.int32)
+    gate = gdn_triton._ring_replay_supported
+    taken = []
+
+    def recording_gate(*args):
+        taken.append(gate(*args))
+        return taken[-1]
+
+    monkeypatch.setattr(gdn_triton, "_ring_replay_supported", recording_gate)
+    pools = []
+    for rows_aligned in (False, True):
+        out = pool.clone()
+        _replay(
+            k,
+            v,
+            a,
+            b,
+            A_log,
+            dt_bias,
+            out,
+            read,
+            write,
+            accepted,
+            rows_aligned=rows_aligned,
+        )
+        pools.append(out)
+
+    assert taken == [True]
+    assert torch.equal(pools[0].view(torch.int16), pools[1].view(torch.int16))
 
 
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16, torch.float32])
