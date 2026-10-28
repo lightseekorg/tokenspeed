@@ -1620,44 +1620,7 @@ For small, fully local batches, warp-level FP32 arithmetic streams packed
 weights and remaps activation loads. Other supported batches quantize the BF16
 input into E4M3 groups and use public scaled matrix multiplication. Both paths
 perform gate/up projection, clamped activation, and down projection. The matrix
-path reuses existing route sorting and shared activation quantization. Its down
-projection adds each route's contribution to the output with atomics, so the
-route sorting launch also clears the output (see the next section).
-
-### gfx950 MoE block alignment
-
-`moe_align_block_size_device` and `moe_align_block_size_fused`
-(`moe/fp16/`) sort routes by local expert into blocks of `block_m` rows for
-the gfx950 BF16, FP8, and MXFP4 expert GEMMs.
-
-#### Contract
-
-- `topk_ids [tokens, topk]` holds global expert ids. Routes outside the
-  contiguous range that starts at `expert_start` are dropped. The device
-  aligner permits repeated experts within a token. The fused aligner requires
-  distinct experts within each token.
-- Returns sorted route ids (`slot << 24 | token`, with `tokens` marking a
-  padding row), the expert of each block (-1 after the last block), route
-  weights (0 for padding), and the valid row count. Each expert's routes fill
-  the start of its rows in arbitrary order. Output sizes are bounds bucketed
-  by route count, so graph replay and changing batch sizes reuse one compile.
-- The optional `output_to_zero` is a contiguous tensor of whole, 16-byte
-  aligned 16-byte vectors. Extra workgroups of the first launch clear it, which
-  replaces a separate fill launch for callers that accumulate with atomics.
-
-#### Algorithm
-
-The fused aligner serves at most `block_m` tokens in one workgroup. Up to 1024
-routes, one workgroup builds the expert offsets and a second launch claims
-rows with global atomics. Larger route sets use two launches over chunks of
-2048 routes. The first writes each chunk's expert histogram as one row of a
-count table, without atomics, and fills the padding. The second gives each
-chunk one workgroup. Each thread owns whole expert columns of the table, so it
-sums all chunks and the earlier chunks without cross-thread reductions. One
-prefix sum gives the padded expert offsets. Each route then claims its row
-with a shared-memory atomic, starting from its expert's offset plus the
-expert's routes in earlier chunks. The workgroups also binary-search the
-experts' block ends to write the block expert list.
+path reuses existing route sorting and shared activation quantization.
 
 ### gfx950 latent input projection
 

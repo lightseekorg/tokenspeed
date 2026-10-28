@@ -228,7 +228,6 @@ def _chunk_scatter_kernel(
     next_row.store(row_end - padded + earlier)
     block_end = gl.allocate_shared_memory(gl.int32, [BLOCK_E], shared)
     block_end.store(row_end // block_m)
-    gl.barrier()
 
     # ---- each routed slot claims the next free row of its expert ----
     # The shared-memory atomic returns the pre-add value: the claimed row.
