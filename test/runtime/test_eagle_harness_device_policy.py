@@ -38,6 +38,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+from tokenspeed_kernel.platform import current_platform
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -59,13 +60,14 @@ from tokenspeed.runtime.execution.drafter.eagle_harness.device_policy import (
 register_cuda_ci(
     est_time=30,
     suite="runtime-1gpu",
-    disabled_on_runners=["amd-*"],
-    disabled_on_runners_reason="the eagle_harness policy kernels are NVIDIA-only",
+    disabled_on_runners=["amd-mi45*"],
+    disabled_on_runners_reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.version.hip is not None,
-    reason="needs an NVIDIA GPU",
+    not torch.cuda.is_available()
+    or not (current_platform().is_nvidia or current_platform().is_cdna4),
+    reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 _DEVICE = torch.device("cuda")
