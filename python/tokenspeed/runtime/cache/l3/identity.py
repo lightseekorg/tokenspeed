@@ -75,25 +75,6 @@ _SHARDED_STATE_DEFAULT_PATTERN = "model-rank-{rank}-part-{part}.safetensors"
 _SHARDED_STATE_FIELD_RE = re.compile(r"\{(?:rank|part)(?::[^}]*)?\}")
 
 
-def resolve_l3_weight_version(requested: str | None) -> str | None:
-    """Normalize an explicit namespace without inventing a successor.
-
-    An explicit ``requested`` version always wins. ``None`` keeps the
-    current namespace. The request handler separately validates whether
-    the update may preserve or change that namespace.
-    """
-
-    if requested is not None:
-        return str(requested)
-    return None
-
-
-L3_FLUSH_REQUIRES_WEIGHT_VERSION = (
-    "L3 flushed updates require weight_version so independent replicas "
-    "cannot restore another checkpoint's objects"
-)
-
-
 def cache_layout_signature(layout: Any, *, cache_dtype: str) -> str:
     """Return a stable fingerprint of the bytes stored in one L3 page.
 

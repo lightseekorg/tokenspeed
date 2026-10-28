@@ -76,6 +76,7 @@ from tokenspeed.runtime.distributed.comm_ops import (
     all_reduce,
     all_to_all_head_scatter,
     all_to_all_transpose,
+    prepare_shard_exchange,
     token_all_gather,
     token_reduce_scatter,
 )
@@ -683,6 +684,25 @@ class DeepseekV3AttentionMLA(nn.Module):
                 "the head-TP exchange; --attn-head-tp-size > 1 is not supported "
                 "for this model"
             )
+        if self.has_head_tp and torch.distributed.is_initialized():
+            # The decode legs' even exchanges: the absorbed query in, the
+            # latent attention output back, and (TP batch invariance) the
+            # o_proj rows. Collective: every rank builds the same layers, and
+            # layers sharing a width share one prepared exchange.
+            max_rows = int(global_server_args_dict["head_tp_exchange_max_rows"])
+            widths = [
+                num_heads * (kv_lora_rank + qk_rope_head_dim),
+                num_heads * kv_lora_rank,
+            ]
+            if self.o_proj_batch_invariant:
+                widths.append(hidden_size)
+            for channels in widths:
+                prepare_shard_exchange(
+                    self.head_tp_group,
+                    channels,
+                    max_rows,
+                    torch.get_default_dtype(),
+                )
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings

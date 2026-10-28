@@ -320,3 +320,43 @@ def test_cold_reader_restores_actual_published_unaligned_checkpoint(
     assert list(plan.forward[0].extend_prefix_lens) == [5]
     assert list(plan.forward[0].input_lengths) == [suffix_tokens]
     assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
+
+
+def test_l3_preparation_with_no_free_request_slot():
+    c = config(
+        host=32, grain=2, groups=[group("full", 2, ts.AttnKind.Full, window=None)]
+    )
+    c.max_batch_size = 1
+    c.enable_mixed_prefill_decode = False
+    c.disable_prefix_cache = False
+    s = start(c)
+    s.submit_requests([_spec("resident", [100, 101])])
+    plan = s.next_execution_plan()
+    for query in storage_ops(plan):
+        done(s, query, [0] * len(query.keys), retired=True)
+    if not requests(plan):
+        plan = s.next_execution_plan()
+    assert requests(plan) == ["resident"]
+    _advance(s, "resident", [102])
+
+    waiting = _spec("waiting", list(range(8)))
+    waiting.max_cached_prefix_tokens = 6
+    s.submit_requests([waiting])
+    plan = s.next_execution_plan()
+    assert requests(plan) == ["resident"]
+    _advance(s, "resident", [103])
+    query = storage_ops(plan)[0]
+    assert query.kind == ts.StorageKind.Query
+    plan = read(s, query, [1] * len(query.keys))
+    assert requests(plan) == ["resident"]
+    _advance(s, "resident", [104])
+    plan = acknowledge_get(s, plan)
+    assert requests(plan) == ["resident"]
+    assert not any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)
+    _advance(s, "resident", [105])
+
+    _finish(s, "resident")
+    plan = s.next_execution_plan()
+    assert requests(plan) == ["waiting"]
+    assert list(plan.forward[0].extend_prefix_lens) == [6]
+    assert any(isinstance(op, ts.Cache.LoadBackOp) for op in plan.cache)

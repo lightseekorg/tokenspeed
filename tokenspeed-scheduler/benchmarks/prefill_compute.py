@@ -86,7 +86,19 @@ def complete(scheduler, request_id, finish):
 
 
 def plans(queue, compute, token_limit):
-    """Return (q, c) for each actual scheduled forward, after warming prefixes."""
+    """Build scheduler plans after warming the queue's cached prefixes.
+
+    Args:
+        queue: Ordered (cached_prefix_tokens, new_tokens) request lengths.
+        compute: PrefillComputeConfig, or None for token-only scheduling.
+        token_limit: Maximum input tokens per scheduler plan.
+
+    Returns:
+        A tuple (schedule, planning_ns). The schedule contains the
+        (query_tokens, prefix_tokens) pair for each actual scheduled forward
+        after prefix warming. planning_ns is the total scheduler planning
+        time in nanoseconds, excluding prefix warming and completion handling.
+    """
     cfg = SchedulerConfig()
     cfg.prefix_granularity = 128
     cfg.max_scheduled_tokens = token_limit

@@ -41,7 +41,6 @@ from tokenspeed.runtime.cache.l3.identity import (
     cache_layout_signature,
     l3_cache_quantization_id,
     l3_checkpoint_id,
-    resolve_l3_weight_version,
     share_l3_checkpoint_ids,
     storage_deployment_id,
 )
@@ -1329,11 +1328,6 @@ class TestStorageKeyTest:
                     draft_quantization="fp8",
                 )
             )
-
-    def test_resolve_l3_weight_version_preserves_requested_identity(self):
-        assert resolve_l3_weight_version(None) is None
-        assert resolve_l3_weight_version("explicit") == "explicit"
-        assert resolve_l3_weight_version(12) == "12"
 
     def test_layout_signature_includes_dtype_and_byte_geometry(self):
         field = SimpleNamespace(

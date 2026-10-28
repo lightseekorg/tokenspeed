@@ -42,15 +42,16 @@
 #include "utils.h"
 
 /*
-Writable types:
+Writable types include:
 1. SchedulerConfig
 2. RequestSpec
 3. ForwardEvent (ExtendResult, Finish, Abort, UpdateReserveNumTokens)
 4. PD::*Event
 5. cache::* ACKs (WriteBackDone, LoadBackDone, SnapshotDone, RestoreDone)
+6. PrefillComputeConfig
 
-All other types are produced by the scheduler and consumed by Python, so they do
-not need writable properties.
+Execution plans and other scheduler outputs expose read-only properties for
+Python consumers.
 */
 
 namespace nb = nanobind;

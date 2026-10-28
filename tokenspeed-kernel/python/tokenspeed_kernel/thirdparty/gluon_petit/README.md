@@ -83,7 +83,7 @@ Run the GFX950 helper tests and the EP8 sparse-weight numerical reference:
 pytest tokenspeed-kernel/test/amd/ops/moe/test_gluon_petit_tensor.py \
   tokenspeed-kernel/test/amd/ops/moe/test_gluon_petit_mfma.py
 torchrun --standalone --nproc-per-node=8 -m pytest --import-mode=importlib \
-  tokenspeed-kernel/test/amd/ops/moe/test_gluon_petit_distributed.py
+  tokenspeed-kernel/test/amd/gfx950/ops/moe/test_gluon_petit_distributed.py
 ```
 
 The MFMA test compares all supported tile shapes and wave counts bit for bit

@@ -25,10 +25,233 @@ Cache ownership and page compaction live in dcp.placement and dcp.metadata.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+
+
+@dataclass(frozen=True)
+class AscendPrefillOptions:
+    """A model's explicit native Prefill choice and pre-arena reservation."""
+
+    max_current_rows: int
+    reserved_workspace_bytes: int
+
+    def __post_init__(self):
+        if self.max_current_rows < 1 or self.reserved_workspace_bytes < 1:
+            raise ValueError(
+                "Native Prefill needs positive row capacity and reservation"
+            )
+
+    def check_workspace(self, *, local_rows: int, degree: int, index_width: int):
+        """Reject an undersized reservation before creating native resources."""
+        if local_rows < 1 or degree < 1 or index_width not in (0, 128):
+            raise ValueError("Invalid native Prefill workspace geometry")
+        send_rows = -(-self.max_current_rows // (degree * 128)) * 128
+        required = (
+            2 * (576 + index_width) * (degree * local_rows + (degree + 1) * send_rows)
+        )
+        if required > self.reserved_workspace_bytes:
+            raise ValueError(
+                f"Native Prefill needs {required} workspace bytes, but the cache "
+                f"recipe reserved {self.reserved_workspace_bytes}"
+            )
+        return required
+
+
+class AscendPrefillCache:
+    """Opt a model cache view into the native Prefill hooks it implements."""
+
+    def __init__(self, *, prefill_options: AscendPrefillOptions | None, **kwargs):
+        self.prefill_options = prefill_options
+        super().__init__(**kwargs)
+
+
+@dataclass(frozen=True)
+class AscendPrefillPlan:
+    """Device-derived causal spans and addresses in a fixed rank-major cache."""
+
+    row_counts: list[int]
+    row_start: int
+    row_end: int
+    page_table: torch.Tensor
+    index_table: torch.Tensor
+    query_cu: torch.Tensor
+    key_cu: torch.Tensor
+    query_seq: torch.Tensor
+    scan_count: torch.Tensor
+    current_direct: torch.Tensor
+    cold: bool
+
+    @classmethod
+    def build(
+        cls,
+        metadata,
+        placement,
+        *,
+        degree,
+        rank,
+        page_size,
+        topk,
+        local_cache_pages,
+        query_partition=None,
+    ):
+        # Scheduler lengths already exist on the host. Only the scalar row
+        # partition uses them; no page/copy plan is constructed on the CPU.
+        extends = metadata.extend_seq_lens_cpu.tolist()
+        prefixes = metadata.extend_prefix_lens_cpu.tolist()
+        if not (len(extends) == len(prefixes) == metadata.page_table.shape[0]):
+            raise ValueError("Prefill lengths must match the request page-table rows")
+        if degree < 1 or not 0 <= rank < degree or local_cache_pages <= 0:
+            raise ValueError("invalid Prefill context-parallel cache geometry")
+        if any(n < 0 for n in extends + prefixes):
+            raise ValueError("Prefill prefix and extend lengths must be nonnegative")
+        if placement is not None and placement.block_granularity % page_size:
+            raise ValueError("Prefill ownership blocks must contain whole kernel pages")
+        rows = sum(extends)
+        counts = [rows // degree + (r < rows % degree) for r in range(degree)]
+        first, count = sum(counts[:rank]), counts[rank]
+        if query_partition is not None:
+            first, count = query_partition
+            if first < 0 or count < 0 or first + count > rows:
+                raise ValueError("Prefill query partition exceeds current rows")
+        # The shared receive transport pads each rank's contribution to 128
+        # rows, including MLA readers with 64-token kernel pages.
+        send_rows = ((rows + degree * 128 - 1) // (degree * 128)) * 128
+        offset, active = 0, 0
+        for extent in extends:
+            active += offset < first + count and offset + extent > first and extent > 0
+            offset += extent
+        table = metadata.page_table
+        per_block = 1 if placement is None else placement.block_granularity // page_size
+        if table.device.type == "cpu":
+            pages = table.long()
+            block = pages // per_block
+            positive = (block - 1).clamp_min(0)
+            local = (positive // degree + 1) * per_block + pages % per_block
+            mapped = torch.where(
+                block > 0, positive % degree * local_cache_pages + local, 0
+            ).int()
+            cumulative = metadata.cum_extend_seq_lens.long()
+            prefix = metadata.extend_prefix_lens.long()
+            direct = torch.zeros(rows, dtype=torch.uint8)
+            base, extra = divmod(rows, degree)
+            for req in range(len(extends)):
+
+                def location(token):
+                    page_start = (
+                        token - (prefix[req] + token - cumulative[req]) % page_size
+                    )
+                    owner = torch.where(
+                        page_start < (base + 1) * extra,
+                        page_start // (base + 1),
+                        extra + (page_start - (base + 1) * extra) // max(base, 1),
+                    )
+                    owner_start = owner * base + owner.clamp_max(extra)
+                    owner_end = owner_start + base + (owner < extra)
+                    alias = (
+                        (page_start >= cumulative[req])
+                        & (page_start + page_size <= cumulative[req + 1])
+                        & ((page_start - owner_start) % page_size == 0)
+                        & (page_start + page_size <= owner_end)
+                    )
+                    return owner, page_start - owner_start, alias
+
+                page_token = (
+                    cumulative[req]
+                    + torch.arange(table.shape[1]) * page_size
+                    - prefix[req]
+                )
+                owner, offset, alias = location(page_token)
+                tail_page = (
+                    degree * local_cache_pages
+                    + (owner * send_rows + offset) // page_size
+                )
+                mapped[req] = torch.where(alias, tail_page, mapped[req]).int()
+                token = torch.arange(cumulative[req], cumulative[req + 1])
+                direct[cumulative[req] : cumulative[req + 1]] = location(token)[2].to(
+                    torch.uint8
+                )
+            ends = (
+                (first + count - cumulative[:-1])
+                .clamp_min(0)
+                .minimum(cumulative[1:] - cumulative[:-1])
+            )
+            qcu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int64),
+                    (cumulative[1:] - first).clamp(0, count),
+                )
+            )
+            kcu = torch.cat(
+                (torch.zeros(1, dtype=torch.int64), (prefix + ends).cumsum(0))
+            )
+            token = torch.arange(first, first + count)
+            sequence = torch.searchsorted(cumulative[1:], token, right=True)
+            scan = (prefix[sequence] + token - cumulative[sequence] + 1).clamp_max(topk)
+            sequence, scan = sequence.int(), scan.int()
+            active_mask = (
+                (cumulative[:-1] < first + count)
+                & (cumulative[1:] > first)
+                & (cumulative[1:] > cumulative[:-1])
+            )
+            mapped = mapped[active_mask]
+            sequence = (active_mask.int().cumsum(0)[sequence.long()] - 1).int()
+            qcu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int64),
+                    (torch.diff(qcu)[active_mask]).cumsum(0),
+                )
+            )
+            kcu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int64),
+                    (torch.diff(kcu)[active_mask]).cumsum(0),
+                )
+            )
+
+        else:
+            from tokenspeed_kernel.ops.attention.dsa.ascend import (
+                ascend_prefill_cache_metadata,
+            )
+
+            (
+                mapped,
+                qcu,
+                kcu,
+                sequence,
+                scan,
+                direct,
+            ) = ascend_prefill_cache_metadata(
+                table,
+                metadata.cum_extend_seq_lens,
+                metadata.extend_prefix_lens,
+                first=first,
+                rows=count,
+                total=rows,
+                per_block=per_block,
+                degree=degree,
+                local_pages=local_cache_pages,
+                send_rows=send_rows,
+                page_size=page_size,
+                topk=topk,
+                active_requests=active,
+            )
+        return cls(
+            counts,
+            first,
+            first + count,
+            mapped,
+            mapped,
+            qcu,
+            kcu,
+            sequence,
+            scan,
+            direct,
+            not any(prefixes),
+        )
 
 
 class AscendDCPContext:
@@ -109,6 +332,51 @@ class AscendDCPContext:
             .flatten(1, 2)
             .contiguous()
         )
+
+    def gather_cache_rows(
+        self,
+        cache: torch.Tensor,
+        slot_groups: Sequence[torch.Tensor],
+        *,
+        block_granularity: int,
+        virtual_block_count: int,
+    ) -> Iterator[torch.Tensor]:
+        """Gather the whole local cache plane, then select virtual-slot rows.
+
+        Each owner contributes its entire physical plane, including its null
+        block. The temporary result is rank-major; virtual block ``v`` is on
+        owner ``(v - 1) % degree`` at local block ``(v - 1) // degree + 1``.
+        Every slot group reads that same gathered plane in its original order.
+        No gathered rows are retained on the context or written back to cache.
+        """
+        if not any(slots.numel() for slots in slot_groups):
+            return
+        if block_granularity <= 0 or virtual_block_count <= 1:
+            raise ValueError("cache geometry must include usable blocks")
+        local_rows = cache.shape[0]
+        local_blocks = (virtual_block_count - 2) // self.degree + 2
+        if (
+            local_rows % block_granularity
+            or local_rows < local_blocks * block_granularity
+        ):
+            raise ValueError("local cache plane does not cover its virtual blocks")
+        # Communicate bytes, preserving BF16 values (including NaN payloads).
+        gathered = self.all_gather(
+            cache.contiguous().view(torch.uint8), auxiliary=False
+        ).view(cache.dtype)
+        for slots in slot_groups:
+            if slots.ndim != 1 or slots.dtype not in (torch.int32, torch.int64):
+                raise ValueError("cache slots must be a one-dimensional integer tensor")
+            safe = slots.to(torch.int64).clamp_min(0)
+            block = safe // block_granularity
+            positive = (block - 1).clamp_min(0)
+            owner = positive % self.degree
+            local = (
+                positive // self.degree + 1
+            ) * block_granularity + safe % block_granularity
+            valid = (slots >= block_granularity) & (block < virtual_block_count)
+            index = torch.where(valid, owner * local_rows + local, 0)
+            yield gathered.index_select(0, index)
 
     def all_to_all(self, output, input_tensor, *, auxiliary: bool):
         group = self._process_group(auxiliary=auxiliary)

@@ -119,7 +119,7 @@ def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     assert spec.capability.vendors == frozenset({"ascend"})
     assert spec.traits["expanded"] == frozenset({False, True})
     assert spec.traits["kv_format"] == frozenset({"native"})
-    assert spec.traits["store"] == frozenset({True})
+    assert spec.traits["store"] == frozenset({False, True})
 
 
 @pytest.mark.parametrize(
@@ -532,42 +532,6 @@ def test_sharded_index_write_and_read_use_local_storage(degree, block_size):
             torch.testing.assert_close(
                 cache[addresses, 0, 0], torch.tensor(expected, dtype=torch.float32)
             )
-
-
-@pytest.mark.parametrize("degree", [1, 8])
-def test_prefill_uses_global_query_visibility_before_dcp_compaction(degree):
-    records = []
-    backend = SimpleNamespace(
-        _validate_logit_cap=lambda cap: None,
-        _dcp=SimpleNamespace(degree=degree),
-        forward_prefill_metadata=SimpleNamespace(
-            cum_extend_seq_lens=torch.tensor([0, 3, 5]),
-            seq_lens=torch.tensor([130, 257]),
-            page_table=torch.tensor([[9, 2, 0], [8, 1, 10]], dtype=torch.int32),
-        ),
-        _select_indexed=lambda *args, **kw: records.append((args, kw)),
-        _run_indexed_sparse_attention=lambda *args, **kw: None,
-    )
-    ascend_dsa.AscendDSABackend.forward_extend(
-        backend,
-        torch.zeros(5, 1, 8),
-        None,
-        None,
-        SimpleNamespace(logit_cap=0),
-        torch.arange(5),
-        None,
-        2,
-        fused=False,
-    )
-    args, options = records[0]
-    assert options["context_parallel"] == (degree > 1)
-    if degree > 1:
-        assert args[5].tolist() == [1, 2, 3, 4, 5]
-        assert args[6].tolist() == [128, 129, 130, 256, 257]
-        assert args[7].tolist() == [[9, 2, 0]] * 3 + [[8, 1, 10]] * 2
-    else:
-        assert args[5].tolist() == [3, 5]
-        assert args[6].tolist() == [130, 257]
 
 
 @pytest.mark.parametrize("width", [2, 4, 8])

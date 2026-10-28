@@ -35,14 +35,31 @@ socket closed, which does not reconnect) stops the engine the same way. One
 rank is the same path with groups of one.
 
 The launcher (`entrypoints/engine.py`) starts the ranks through
-`start_rust_host`, whatever the deployment: the in-process `Engine`, the
-gRPC servicer behind `ts serve`, and `ts serve --headless` for an external
-frontend. Each rank dials the frontend's handshake socket; the in-process
-frontend is `tokenspeed_engine.Frontend` (`ts-py` over `ts-client`) under
-`AsyncLLM`. An EPD encode node's ranks run the host's encode mode instead
+`start_rust_host`, whatever the deployment: `ts serve` (SMG's gateway on its
+direct ZMQ lane, which binds the frontend sockets) and `ts serve --headless`
+for an external frontend such as Dynamo's. Each rank dials the frontend's
+handshake socket. An EPD encode node's ranks run the host's encode mode instead
 (`ts-control`'s `encode` loop over `epd/encode_host.py`): no scheduler, no
-event loop. Their first rank binds the request channel its frontend pushes
-encode requests to; headless, that is the address an engine rank would dial.
+event loop. Their first rank dials the frontend the same way and takes
+encode requests.
+
+What an engine registers with tells its frontend what it serves: the
+request types it takes (an encode server takes encode requests only), the
+field order of the positional structs on its wire, its role and, for a
+prefill or encode server, where its bootstrap server listens, and the
+checkpoint facts a frontend computes multimodal positions from. A frontend
+may name a control operation by method (a control call, as SMG's gateway
+calls every scheduler it drives); the transport turns it into the engine's
+own operation and answers it under its call id once the operation's reply
+comes back, so the loop sees only its own operations.
+
+Scheduler load travels on the same output wire, including an empty batch at
+startup and at most once per second without token outputs. Reports carry
+running and waiting counts and resident, active, and total LCM blocks. The
+native frontend timestamps receipt and exposes a complete per-rank snapshot
+set to the gateway only while every report is less than three seconds old.
+The gateway converts these allocator counts to capacity ratios; it must not
+interpret an LCM block as a fixed-size token page.
 
 ## Principle 1: the loop runs no GPU work, and cannot reach any
 
@@ -246,14 +263,18 @@ Consequences:
   through tensor indexing can stage a CPU tensor and introduce a hidden
   synchronous H2D copy, blocking further forward launches.
 
-An EPD prefill node's first stage receives each multimodal item's embedding
+An external-encoder receiver's first stage receives each multimodal item's embedding
 through the host's embedding receiver (`ts-pd`'s `epd::receiver`): it looks
 up and registers with the encode ranks, leases each item a slot of the
 receive pools and tells the encode rank where to write, and every round
 reports each staged request's state, which the replica MIN-reduces, so a
 request is admitted, or failed, on every rank in the same round. Later
 pipeline stages hold no receiver and agree with whatever the first decides;
-decode builds none. The data plane keeps the device half. It allocates the
+decode builds none. Aggregated serving opts into the same receive admission with
+--enable-external-encoder: it owns a standalone Mooncake transport and remains
+a Plain execution role, with no P/D KV peer. A PD Prefill receiver shares its
+KV peer transport. The receive pool budget uses the same capability gate as
+allocation. The data plane keeps the device half. It allocates the
 pools (one device buffer, after the cache is sized; the host registers it
 once). `epd_publish` copies the landed rows out of their slots onto the
 items before any forward of the request and, with row sharding, rebuilds
@@ -546,7 +567,7 @@ no-op while a drain is pending; it preserves that drain's admission hold
 until the owning pause or memory-release operation finishes.
 
 **The same-round gate** (`EventLoop::gate`, every round on every rank).
-Weight-update `flush_cache` and standalone `/flush_cache` first MAX-reduce
+Weight-update `flush_cache` and a standalone flush first MAX-reduce
 flush intent across attention DP so every DP rank enters the same
 collectives — the frontend sends a flush to every engine separately. The
 same reduction gates the weight operations themselves (NCCL group
@@ -568,15 +589,15 @@ round and the internal step the next — still one blocking device call per
 round. Because every EP rank is inside a gated step at once, the rebalance
 may run a collective over the EP group there (summing the load under
 all-to-all EP, broadcasting the committed placement), which the profile's
-`dump_expert_load` must not. The manual `POST /rebalance_experts` is a
-frontend operation on the first queue that starts the same internal
+`dump_expert_load` must not. The manual rebalance (`RebalanceExpertsReqInput`)
+is a frontend operation on the first queue that starts the same internal
 sequence. The loop refuses a memory release while a rebalance is in progress
 and, once drained, the release waits while chunk steps still write the
 weights. A cache clear MIN-reduces the scheduler's non-mutating
 `can_clear_cache` across the replica and then across attention DP — DP
 replicas share Mooncake objects — then MIN-reduces an error-returning L3
-namespace deletion, before any rank mutates Device/Host. The frontend ANDs
-every engine's reply. Independent TokenSpeed jobs that share a tenant are not
+namespace deletion, before any rank mutates Device/Host. The frontend
+combines every engine's reply. Independent TokenSpeed jobs that share a tenant are not
 in those groups.
 
 **The expert rebalance** (`eplb`, `--enable-eplb`). The controller counts the

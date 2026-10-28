@@ -1059,9 +1059,9 @@ layers ──group──▶ groups ──pack──▶ CacheLayout ──bind─
   by a count and yields the `CacheMemoryPlan` the arena allocates from and
   the PD wire carries.
 
-Cache-layer counts come from the recipe's existing `CacheSetup.num_target_layers`
-and `num_draft_layers`: target cache layers first, then independent draft cache
-layers. PP construction gives these values explicit `*_cache_layers` local
+Cache-layer counts come from the recipe's `layer_types` and `num_draft_layers`,
+before capacity is bound, and are published by `CacheSetup`: target cache layers
+first, then independent draft cache layers. PP construction gives these values explicit `*_cache_layers` local
 names; a drafter that shares target cache contributes no independent cache
 layers. Neither count means captured target taps or draft execution depth.
 
@@ -1094,11 +1094,12 @@ draft backends/pools, cache storage, field placement, readiness, and optional
 physical arena. The builder passes these values explicitly to PD; none are
 attached to the event loop or added to the allocation owner after construction.
 
-`CacheRecipe` (`recipes/base.py`) is a template method: `setup()` is the one
-place the four stages appear in order, and a family fills in uniformly named
+`CacheRecipe` (`recipes/base.py`) is a template method: `setup_for_layers()` is
+the one place the four stages appear in order. `setup()` delegates to it with
+the complete layer window and a standalone capacity validator. A family fills in uniformly named
 seams — `layer_types`, `group_ids`, `fields_for_layer`, `prefix_granularity`,
 `alignment`, `max_padding_fraction`, `packing`, `check_layout`,
-`num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
+`select_num_lcm_blocks`, `token_capacity`, `parents_needed`, `workspace_bytes`,
 `pool_options`, `verify_scratch_in_pool`.
 The last answers whether speculative verify stages its scratch in the bound
 pool; a CUDA-graph memory probe arena then keeps the serving concurrency.
@@ -1109,6 +1110,31 @@ whole). No family restates the order of the stages, and `_RECIPES`
 
 Automatic packing uses powers of two to avoid excessive LCM padding;
 exact page-stride constraints and explicit recipe packing take precedence.
+
+**Resident capacity before bind.** A PP owner projects the complete layout to
+the planes required by its fields. Whole retained planes, including padding
+and shared fields, determine the local bytes per parent. The runtime subtracts
+the recipe's fixed workspace, reserves the null parent, and agrees on the
+smallest parent limit across the existing world group. Only then does
+`select_num_lcm_blocks(layout, max_lcm_blocks=...)` apply model/token limits.
+Families do not recalculate memory budgets in that seam. Existing plugins
+overriding `num_lcm_blocks` must migrate; the builder rejects that override
+instead of silently ignoring it.
+
+The full layout is bound once at the final capacity, so packing, group IDs,
+global field IDs and the PD contract remain common. PP subsequently narrows
+physical allocation as before, without changing that capacity. A stage with
+fewer planes can leave memory unused because another stage limits the shared
+capacity. Fixed workspaces are charged once; they do not shrink automatically
+with the number of local layers. Offload retains its host-history and fixed
+hot-pool constraints and requires a complete field policy.
+
+The agreement callback is supplied by the runtime, keeping recipe tests free
+of process-group dependencies. A local budget error is collected before any
+rank raises, so peers do not hang in a capacity collective. Probe pools agree
+on the largest required working set, not the smallest memory-derived limit;
+zero-budget geometry probes keep their existing demand-sized behavior. Final
+rebind repeats resident sizing under the graph-adjusted budget.
 
 Ordinary recipes pin one CacheBlock per group in each parent, so a group's
 stride does not shrink with its layer count or cache dtype. For example,
@@ -1351,6 +1377,12 @@ copy of the KVP group, whose communicators are apart from the attention TP
 collectives, one window of loops ahead, so each transfer runs under the compute
 before its layer instead of queueing with those collectives. GPU DSA sparse
 prefill instead combines local sparse-attention partials.
+Ascend's generic MLA prefill gathers each layer's complete cache plane into
+an owner-major temporary view. That view is not published as persistent cache;
+its allocation and communication scale with layer capacity, including unused
+rows, rather than the batch's live prefix length. Native token-local prefill
+requires an explicit model opt-in and a cache reservation; DSA uses that same
+opt-in to prepare full-head projection weights before execution.
 Dense MLA uses FlashMLA or CuTe MLA within each backend's device/dtype support;
 KVP does not make unsupported kernels portable. Speculative decoding runs
 on sharded caches: `OrdinaryRecipe.groups()` shards a draft group like the

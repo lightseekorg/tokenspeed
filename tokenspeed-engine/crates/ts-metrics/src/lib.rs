@@ -512,7 +512,7 @@ impl EngineMetrics {
                 "Wall time from submission to the scheduler's waiting queue to first dispatch \
                  into a forward batch, observed once per request. Grammar-compile, pause-hold, \
                  and EPD embedding waits precede submission and are excluded, as are \
-                 tokenizer-manager and IPC wait.",
+                 frontend and IPC wait.",
                 names,
                 &[
                     0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0,

@@ -1251,7 +1251,8 @@ impl OutputProcessor {
         }
     }
 
-    /// The outputs due for `states` this step (`stream_output`).
+    /// The outputs due for `states` this step, each request's at its stream
+    /// interval.
     fn stream(&self, states: &mut [(String, &mut RequestState)]) -> Vec<StreamedOutput> {
         let mut outputs = Vec::new();
         for (rid, state) in states.iter_mut() {

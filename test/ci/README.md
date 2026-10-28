@@ -33,9 +33,14 @@ Currently configured task directories:
 
 Every task declares one `workflow_stage`:
 
+- `import-check` for MI350 adapter import and dispatch checks after gfx1250
+  implementation changes, and MI450 checks after gfx950 implementation changes
 - `unit-test` for kernel and runtime tests
 - `kernel-benchmark` for registration-level kernel performance tests
 - `model-test` for model evaluation and performance tests
+
+Only AMD workflows run the `import-check` stage, so its tasks must use AMD
+runner labels. Validation rejects other runner labels for that stage.
 
 The NVIDIA B200 Tests and AMD Tests workflows run unit tests before model
 tests. AMD kernel benchmarks run in the separate AMD Kernel Benchmark workflow,
@@ -275,6 +280,13 @@ its GPU matrix jobs when nothing requires that runner group. The first
 matching rule decides (`ci_path_filter.py` holds the full lists):
 
 - Markdown files require no runner group.
+- AMD sources under `tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops/gfx950/`
+  select MI350; `ops/gfx1250/` selects MI450. Tests under
+  `tokenspeed-kernel/test/amd/gfx950/` or `amd/gfx1250/`, and
+  benchmark suites under `tokenspeed-kernel/benchmarks/amd/gfx950/` or
+  `gfx1250/` (including the corresponding `.json` files), each select their
+  matching family: MI350 for gfx950 and MI450 for gfx1250.
+  MI450 simulator scripts select only MI450.
 - Vendor-owned paths (`tokenspeed-kernel-amd/`, `tokenspeed-mla/`, the
   `tokenspeed-kernel/test/<vendor>/` subtrees, and vendor-specific requirements
   and CI scripts) require only that vendor's runner groups.
@@ -283,11 +295,35 @@ matching rule decides (`ci_path_filter.py` holds the full lists):
   `gluon` is AMD. A vendor-named file whose content mentions another vendor
   stays shared.
 - `test/ci` task YAMLs require only the runner groups matching their
-  `runner.labels`.
+  `runner.labels`. Their `workflow_stage` selects full coverage or import
+  checks; adding or renaming an import-check task needs no filename registry.
+  Missing or invalid task definitions retain conservative coverage, and
+  invalid definitions in the checkout fail matrix validation.
 - Other paths under `python/`, `test/`, `tokenspeed-kernel/`, and
   `tokenspeed-scheduler/` require every runner group.
 - Each workflow's own YAML requires only its runner group; `workflow_dispatch`
   always runs.
+
+Shared AMD adapters, helpers, dependencies, packaging, and unrecognized AMD
+paths still select both families. Mixed changes take the union. Architecture
+rules use both the current and previous filenames supplied by the workflows,
+so moves between architectures retain coverage on both.
+
+AMD adapters import implementations for both architectures. A change confined
+to one architecture's Python sources therefore runs the other family's
+`import-check` tasks in place of its full unit/model suites and benchmarks.
+These reuse the existing API selection tests, which import the real adapters
+and intercept kernel execution. Test-only and benchmark-only changes need no
+cross-architecture import check. Full suites already exercise these imports.
+The MI450 tasks use the existing CPU functional simulator; they do not measure
+GPU performance. Manual runs keep full coverage, and potentially truncated
+changed-path lists (300+ files) conservatively select full coverage.
+
+MI450 simulator tasks share their ROCm and PyTorch pins through
+`test/ci_system/mi450_sim_env.sh`. Each task sources it before running the
+simulator and dependency installers in the same shell; standalone simulator
+setup loads it as well. Update that file to change the stack: its pins override
+inherited environment values. Changes to it select both MI450 tasks.
 
 PR and push diffs containing only `test/ci/**/*.yaml` run only the changed tasks,
 with existing validation and runner/trigger rules. Diffs that also, or only,
@@ -299,7 +335,13 @@ retain their existing task selection.
 `tokenspeed-kernel/test/` is laid out to feed the vendor rules. Tests whose
 module-level gate (`is_cdna4()`, `is_cdna5()`, `is_amd()`, or an import from
 `tokenspeed_kernel_amd`) skips them off AMD hardware live under
-`tokenspeed-kernel/test/amd/`. Tests that require CUDA, CuTe DSL, FlashInfer,
+`tokenspeed-kernel/test/amd/`. Tests for one AMD architecture live under its
+`gfx950/` or `gfx1250/` subdirectory; shared AMD tests stay outside those
+directories. Keep fixtures and helpers with their tests so directory-based
+coverage also applies to them. Benchmark infrastructure tests live under
+`tokenspeed-kernel/test/benchmark/`; benchmark tests specific to a vendor or
+architecture keep a `benchmark/` directory under that vendor or architecture.
+Tests that require CUDA, CuTe DSL, FlashInfer,
 DeepEP, DeepGEMM, TRT-LLM, FlashAttention 3/4, FlashMLA, Marlin, MNNVL, or
 `tokenspeed-mla` live under `tokenspeed-kernel/test/nvidia/`. Everything else
 (portable Triton kernels, registry and selection logic, tests that
@@ -541,8 +583,8 @@ and per-commit submissions.
 
 The `NVIDIA GB200 Tests` workflow runs single-node `slurm-gb200-*`
 tasks through the `slurm-dispatch` coordinator. Qwen four-GPU tasks migrated
-from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation, 35B FP8
-DeepEP GSM8K evaluation, and 122B EPD OCRBench evaluation and unit test.
+from B200 use `slurm-gb200-4gpu`: the 397B NVFP4 AIME25 evaluation and the
+35B FP8 DeepEP GSM8K evaluation.
 The migration preserves their existing commands, triggers, and score
 thresholds.
 
@@ -554,8 +596,7 @@ Slurm scan clears `TOKENSPEED_CI_EXCLUDED_RUNNER_LABELS`, so the Kubernetes
 The approved-PR and latest-main retry workflows also cover this workflow.
 
 `Slurm Dispatch` includes `slurm-gb200-4gpu` in its default bulk runners.
-Its default `eval,perf` selection covers the three migrated evaluations.
-Select `ut` explicitly to include the EPD unit test.
+Its default `eval,perf` selection covers the two migrated evaluations.
 
 The `NVIDIA GB300 Tests` workflow selects only multi-node model tasks with
 the `per-commit` trigger and submits them through the same
@@ -605,15 +646,15 @@ GB200 examples:
 ```bash
 # One existing YAML:
 test/ci/run_slurm.sh \
-  test/ci/eval/qwen3.5-122b-a10b-nvfp4-evalscope-ocr-bench.yaml \
+  test/ci/eval/qwen3.5-397b-a17b-nvfp4-evalscope-aime25.yaml \
   --follow
 
 # Every existing YAML for one exact runner label:
 test/ci/run_slurm.sh --all --runner gb200-4gpu --trigger manual
 
-# Migrated Qwen four-GPU evaluations and EPD unit test:
+# Migrated Qwen four-GPU evaluations:
 test/ci/run_slurm.sh --all --runner slurm-gb200-4gpu \
-  --type eval --type ut --trigger manual
+  --type eval --trigger manual
 
 # List Kimi eval/perf tasks from PR 795 for two runner labels:
 test/ci/run_slurm.sh \

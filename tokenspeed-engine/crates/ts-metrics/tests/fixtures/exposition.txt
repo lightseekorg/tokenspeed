@@ -10,7 +10,7 @@
 # HELP tokenspeed:num_preemptions_total Requests preempted by a capacity retraction: the scheduler suspended a resident request (its pages imaged to the Host snapshot pool; it later resumes by restore, nothing is recomputed) to free Device pages for a blocked admission. One increment per retraction victim per round, counted from the plan's snapshot-store ops; forced retractions from --debug-force-retraction-interval count too. A retraction whose victim cannot be imaged aborts it instead — see tokenspeed:num_capacity_aborted_requests.
 # HELP tokenspeed:num_requests_running Requests with scheduler-side generation state (decode path).
 # HELP tokenspeed:num_requests_waiting Requests waiting in the C++ scheduler queue.
-# HELP tokenspeed:request_queue_time_seconds Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. Grammar-compile, pause-hold, and EPD embedding waits precede submission and are excluded, as are tokenizer-manager and IPC wait.
+# HELP tokenspeed:request_queue_time_seconds Wall time from submission to the scheduler's waiting queue to first dispatch into a forward batch, observed once per request. Grammar-compile, pause-hold, and EPD embedding waits precede submission and are excluded, as are frontend and IPC wait.
 # HELP tokenspeed:spec_decode_num_accepted_tokens_total Accepted speculative draft tokens (excludes the bonus token sampled after verify).
 # HELP tokenspeed:spec_decode_num_draft_tokens_total Draft tokens proposed across verify steps.
 # HELP tokenspeed:spec_decode_num_drafts_total Number of speculative verify rounds (per request-slot).

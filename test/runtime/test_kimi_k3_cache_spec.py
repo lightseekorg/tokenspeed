@@ -103,6 +103,27 @@ def test_attention_dp_layouts_grow_the_mla_packing() -> None:
         assert len(plan.planes) == 24
 
 
+def test_bf16_kda_state_halves_the_parent_at_tp8() -> None:
+    """``--mamba-ssm-dtype bfloat16`` halves each KDA state page, so the
+    smallest MLA packing that still covers one state plane halves too."""
+    _, _, layout = kimi_tp8_layout(mamba_ssm_dtype="bfloat16")
+    plan = layout.bind(7)
+
+    assert {
+        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+    } == {
+        "full_attention": 6,
+        "linear_attention_0": 1,
+        "linear_attention_1": 1,
+        "linear_attention_2": 1,
+    }
+    assert plan.lcm_block_bytes == TP8_PAGE_SET_BYTES // 2
+    recurrent = next(
+        field for field in plan.fields if field.field_id.endswith(".recurrent_state")
+    )
+    assert recurrent.dtype == "bfloat16"
+
+
 def test_latent_stride_stays_exact_for_every_tp() -> None:
     """The MLA kernel indexes pages by an implicit payload-sized stride."""
     latent_page_bytes = 128 * 576

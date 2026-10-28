@@ -91,6 +91,11 @@ _MUSE_ROW_SCATTER_PROGRAMS = 24
 _MUSE_ROW_GATHER_PROGRAMS = 128
 _MUSE_TOPK = 8
 _MUSE_ROUTE_WIDTH = 4096
+# Most decode rows for the fused post-expert tail at TP8; it lost to the
+# replicated projection plus boundary at 16 rows in 8-rank graph replay.
+# Rows match the single-row tail bit for bit within 1-8 rows; 16 rows take
+# the replicated path.
+_MUSE_MOETAIL_MAX_ROWS = 8
 
 
 class MuseIrisState:
@@ -866,17 +871,20 @@ class MuseIrisState:
     ) -> tuple[int, int] | None:
         """Return the senders' GEMV geometry if the fused tail applies, else None."""
         reduction = self.reduction
+        # TP4 takes one row: more rows were not measured there.
+        max_rows = _MUSE_MOETAIL_MAX_ROWS if self.world_size == 8 else 1
         if (
             not current_platform().is_cdna4
             or self.world_size not in (4, 8)
-            or rows != 1
+            or not 1 <= rows <= max_rows
             or reduction.lamport_region is None
-            or _MUSE_BOUNDARY_WIDTH // self.world_size > reduction.lamport_max_numel
+            or (1 << (rows - 1).bit_length()) * _MUSE_BOUNDARY_WIDTH // self.world_size
+            > reduction.lamport_max_numel
             or weight.shape != (_MUSE_BOUNDARY_WIDTH, _MUSE_ROUTE_WIDTH)
             or weight.dtype != torch.bfloat16
             or weight.device != self.all_reduce.device
             or not weight.is_contiguous()
-            or stream.shape != (1, _MUSE_BOUNDARY_WIDTH)
+            or stream.shape != (rows, _MUSE_BOUNDARY_WIDTH)
             or stream.dtype != torch.float32
             or stream.device != weight.device
             or not stream.is_contiguous()
@@ -912,10 +920,11 @@ class MuseIrisState:
         beta: torch.Tensor,
         pre_weight: torch.Tensor | None,
     ) -> bool:
-        """Check the single-row post-expert projection, gather and boundary contract.
+        """Check the decode post-expert projection, gather and boundary contract.
 
-        ``weight`` is the replicated ``[8192, 4096]`` projection; the row is
-        gathered through the Lamport one-shot mailbox.
+        ``weight`` is the replicated ``[8192, 4096]`` projection; the rows are
+        gathered through the Lamport one-shot mailbox. TP8 takes up to
+        ``_MUSE_MOETAIL_MAX_ROWS`` rows, TP4 one.
         """
         return (
             self._moetail_geometry(
@@ -938,17 +947,18 @@ class MuseIrisState:
         pre_eps: float,
         pre_weight_offset: float,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Project this rank's columns of one row, gather the row, update the residual.
+        """Project this rank's columns of each row, gather the rows, update the residual.
 
         Returns the FP32 residual and, with ``pre_weight``, the BF16 input of
-        the next layer, as the replicated single-row projection followed by
-        the Triton boundary computes them.
+        the next layer; each row is the replicated single-row projection of
+        that row followed by the Triton boundary.
         """
         geometry = self._moetail_geometry(
             x.shape[0], weight, stream, post_weight, alpha, beta, pre_weight
         )
         assert geometry is not None
-        assert x.shape == (1, _MUSE_ROUTE_WIDTH) and x.dtype == torch.bfloat16
+        rows = x.shape[0]
+        assert x.shape == (rows, _MUSE_ROUTE_WIDTH) and x.dtype == torch.bfloat16
         assert x.is_contiguous() and x.device == weight.device
         block_k, waves = geometry
         rank = self.all_reduce.rank_in_group
@@ -960,9 +970,10 @@ class MuseIrisState:
             if pre_weight is not None
             else None
         )
-        # Sixteen-subgroup programs of 16 // waves outputs each, then the reducer.
+        # Sixteen-subgroup programs of 16 // waves outputs each, then one
+        # reducer per row.
         iris_fused_gemv_lamport_allgather_muse_moetail[
-            (local_width * waves // 16 + 1,)
+            (local_width * waves // 16 + rows,)
         ](
             x,
             weight[rank * local_width : (rank + 1) * local_width],
@@ -976,11 +987,13 @@ class MuseIrisState:
             pre_weight if pre_weight is not None else post_weight,
             out_stream,
             pre_bf16 if pre_bf16 is not None else x,
+            rows,
             RANK=rank,
             WORLD_SIZE=self.world_size,
             K=_MUSE_ROUTE_WIDTH,
             LOCAL_WIDTH=local_width,
             MAX_ELEMENTS=reduction.lamport_max_numel,
+            BLOCK_M=1 << (rows - 1).bit_length(),
             BLOCK_K=block_k,
             WAVES_PER_OUTPUT=waves,
             POST_EPS=post_eps,

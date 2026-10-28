@@ -322,35 +322,25 @@ behavioral trait (`has_norm`, `mrope`, `return_kv`, `expanded`, and the rest)
 the kernel does not implement for every value. An `override` naming a kernel
 this platform cannot run, or whose traits exclude the request, raises.
 
-## Ascend native DSA model components
+## Ascend integration
 
-`tokenspeed.runtime.layers.attention.dsa.ascend` owns `AscendDSAAttention`,
-`AscendDSAIndexer`, prepared `FusedDSADecode` and bit-preserving projection
-weight layouts. Models supply their configuration, projection dimensions and
-explicit independent-selection/separate-projection choices. The shared module
-has no dependency on model extensions.
+Shared Ascend DSA and MLA components own attention execution. Models supply
+configuration and checkpoint weights; kernel selection and weight preparation
+belong to the `attention` family in `tokenspeed-kernel`. Weight preparation
+preserves coefficients and dtype.
 
-The native decode ABI currently supports DCP8, draft8, hidden width 4096,
-64 global index heads and eight local attention heads. Its supported gathered
-row counts are 64/128/256/512. The prepared prologue owns normalization,
-optional independent MLA/indexer RoPE and BF16 cache writes;
-the existing paged backend owns sparse selection and attention. Unsupported
-execution shapes fail instead of selecting another projection path.
+Native prologues follow the normalization, rotation and cache-write contracts
+above. Owner-sharded transport may commit prepared KV rows on the prologue's
+behalf; router-provided slots, ownership masks and cache sanitization remain
+authoritative. Distributed execution preserves each request's causal visibility.
 
-The paged backend also accepts the ordinary MLA/indexer projections. A model
-adapter can use them for prefill or capture buckets outside the native shape
-contract while retaining fused decode for supported rows. Both use the same
-causal metadata and cache placement; only the projection and collective provider
-differs.
+Native Prefill is selected by an explicit model-cache capability carrying its
+pre-arena workspace reservation. Ordinary cache views retain generic Prefill
+and its prefix-history metadata without loading the native transport. Generic
+MLA history gathers are temporary, never published as cache storage; their
+allocation and communication scale with the layer's cache capacity.
 
-When a model already owns a SHMEM runtime, attach a separate DSA window to that
-owner before capture instead of initializing another runtime. The model keeps
-the attached window and registered attention outputs alive until its graphs are
-released, closes imported IPC mappings before freeing their exports, then releases
-the DSA window before the owning communication runtime.
-The model adapter supplies these prepared resources through the installed
-provider; the common runtime does not create a second resource manager.
-
-Device projection format conversion stays behind the kernel-package adapter.
-Preparing a weight allocates fresh NZ29 storage without changing coefficients
-or dtype; graph execution consumes the prepared buffers and communication state.
+Weights and communication resources are prepared before graph capture. Native
+communication reuses the existing HCCL window and validates its capacity during
+preparation. Resource owners keep buffers alive until all referencing graphs
+are destroyed and outstanding work is drained, then release them.
