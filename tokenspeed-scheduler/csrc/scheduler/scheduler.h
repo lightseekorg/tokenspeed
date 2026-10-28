@@ -258,7 +258,7 @@ private:
                                                            bool evict_blocks_past_segments);
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
-        std::span<const GroupDemand> demands, const RequestProgress& progress);
+        std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,

@@ -282,7 +282,10 @@ public:
     // once whole segments cannot fund the admission, what they passed over
     // leaves block by block, written back like any set -- for a request no
     // other one holds pages beside, which waiting would never fund
-    // (docs/design/scheduler.md §1.4).
+    // (docs/design/scheduler.md §1.4). Only the plan without the copy-in
+    // evicts so: the copy-in is dropped first. A caller that may drop part of
+    // its demand (an in-forward State checkpoint's block) passes false for
+    // the attempt with it.
     std::optional<AdmissionResult> Admit(PrefixProbe&& prefix, std::span<const GroupDemand> demands,
                                          const RequestProgress& progress,
                                          std::optional<std::uint64_t> request_access_epoch,

@@ -1212,17 +1212,23 @@ each one whole.
 When the shared pages leave the demand unmet as well, an admission whose
 request no other one holds pages beside (`Admit`'s
 `evict_blocks_past_segments`, from `Request::HoldsPages`) takes the candidates
-the segment rules passed over block by block, oldest first: a checkpoint
-leaves alone with every State group's at its hash, as a nested one does; a
-page leaves with the blocks of its boundary not in use and everything the
-Device holds under it, climbing nowhere, so the coverage stays closed (a
-boundary that keeps a block in use stays on the Device). Each such set is
-recorded and written back like a segment, a block no probe could resume from
-dropped. Waiting would never fund such an admission: the blocks in use are
-its own, as when it resumed from a checkpoint whose segment holds the pages
-under it (`scheduler.md` §1.4). Beside another page holder it waits for that
-holder's release instead, and a restore, which falls back to claiming
-nothing (below), never takes blocks this way.
+the segment rules passed over again, block by block: a checkpoint leaves
+alone with every State group's at its hash, as a nested one does — at a tail
+its eviction also takes the tail's other unpinned blocks, the KV block
+included, which the plan does not count; a page leaves with the blocks of its
+boundary that can leave (none in use, a prefix hit this admission keeps or a
+released slot of the request) and everything the Device holds under it,
+climbing nowhere, so the coverage stays closed (a boundary that keeps a block
+that cannot leave stays on the Device). Each such set is recorded and written
+back like a segment, a block no probe could resume from dropped. Only the
+last variant of an admission evicts so: what it may drop — the owner's
+copy-in (above), an in-forward State checkpoint's block (`scheduler.md` §1.2)
+— is dropped first and never pays for such an eviction. Waiting would never
+fund such an admission: the blocks in use are its own, as when it resumed
+from a checkpoint whose segment holds the pages under it (`scheduler.md`
+§1.4). Beside another page holder it waits for that holder's release instead,
+and a restore, which falls back to claiming nothing (below), never takes
+blocks this way.
 
 A restore of a retracted request (`scheduler.md` §4) protects the blocks it
 claims like prefix hits. Under segment eviction a set holding one never

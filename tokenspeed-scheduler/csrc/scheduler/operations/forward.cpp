@@ -348,7 +348,7 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admit(ExecutionPlan&
 
 std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTracking(
     ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
-    std::span<const GroupDemand> demands, const RequestProgress& progress) {
+    std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments) {
     if (progress.completed_pages) {
         registerKvEventPublication(request, cache_progress.prefix_hashes, *progress.completed_pages);
     } else {
@@ -356,12 +356,15 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
                                    static_cast<std::int32_t>(cache_progress.prefix_hashes.size()));
     }
     // Alone, the request has no release to wait for: when whole segments
-    // cannot fund it, blocks leave one by one (docs/design/scheduler.md §1.4).
+    // cannot fund it, blocks leave one by one (docs/design/scheduler.md §1.4),
+    // never for an attempt the caller drops instead (evict_blocks_past_segments
+    // false).
     const bool others_hold_pages = std::ranges::any_of(requests_, [&request](const std::unique_ptr<Request>& other) {
         return other.get() != &request && other->HoldsPages();
     });
     return admit(plan, feedback, coordinator_.ProbePrefix(std::span<const std::string>{}), demands, progress,
-                 cache_progress.access_epoch, /*evict_blocks_past_segments=*/!others_hold_pages);
+                 cache_progress.access_epoch,
+                 /*evict_blocks_past_segments=*/evict_blocks_past_segments && !others_hold_pages);
 }
 
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
@@ -482,13 +485,14 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     // admission changes nothing; one that cannot also hold the in-forward
     // checkpoint's block ends the chunk at the boundary instead, so the next
     // chunk's admission publishes its live slot there, at the cost of a
-    // round (a cache this full keeps no spare block).
+    // round (a cache this full keeps no spare block). That optional block
+    // never makes blocks leave one by one (docs/design/scheduler.md §1.4).
     std::optional<CacheCoordinator::AdmissionResult> admission;
     if (writes_checkpoint) {
         admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
                                        chunk_demands(tokens_this_round, true), RequestProgress{},
                                        /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/!others_hold_pages);
+                                       /*evict_blocks_past_segments=*/false);
         if (!admission) {
             writes_checkpoint = false;
             tokens_this_round = state_checkpoint - hit_tokens;
@@ -613,7 +617,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     if (writes_checkpoint) {
         AdmissionFeedback checkpoint_feedback;
         admission = admitWithKvEventTracking(plan, checkpoint_feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, true), progress);
+                                             chunk_demands(prefill_tokens, true), progress,
+                                             /*evict_blocks_past_segments=*/false);
         if (!admission) {
             writes_checkpoint = false;
             prefill_tokens = state_checkpoint - first_pos;
@@ -621,7 +626,8 @@ std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     }
     if (!admission) {
         admission = admitWithKvEventTracking(plan, feedback, *request, cache_progress,
-                                             chunk_demands(prefill_tokens, false), progress);
+                                             chunk_demands(prefill_tokens, false), progress,
+                                             /*evict_blocks_past_segments=*/true);
     }
     if (!admission) {
         return std::nullopt;
@@ -696,7 +702,8 @@ std::optional<fsm::ScheduleDecodeEvent> Scheduler::scheduleDecode(ExecutionPlan&
     } else {
         std::vector<GroupDemand> demands = MakeGroupDemands(
             tables, config_.cache_groups, GroupDemand{.extent = DenseGrowth{reserve_tokens}}, state_step);
-        if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress)) {
+        if (!admitWithKvEventTracking(plan, feedback, *request, cache_progress, demands, progress,
+                                      /*evict_blocks_past_segments=*/true)) {
             return std::nullopt;
         }
     }

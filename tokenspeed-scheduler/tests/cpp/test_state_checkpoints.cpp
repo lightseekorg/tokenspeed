@@ -3179,6 +3179,51 @@ TEST_F(StateCheckpointFusedHostSuite, ARequestTheSizeOfTheDeviceRunsToItsEnd) {
     EXPECT_TRUE(scheduler_->CanClearCache());
 }
 
+// The in-forward checkpoint's block is optional, and alone under write-back
+// it never makes blocks leave one by one: a chunk that could hold it only so
+// ends at the boundary instead, as in a pool with no room for it
+// (AChunkEndsAtTheBoundaryWhenTheCheckpointBlockDoesNotFit). s0's 24-token
+// session leaves its checkpoints at 20 and 24 and its end state at 25 on a
+// 14-parent Device. big sends s0's prompt and more, 46 tokens, and resumes at
+// 24; its chunks at 24 and 32 evict the checkpoint at 20 and the end state,
+// each a set of its own. The chunk at 40 spans the boundary 44, and its
+// checkpoint's blocks could only be the checkpoint at 24, whose segment holds
+// big's pages under it: the chunk ends at 44, nothing more leaves, and a
+// prompt continuing s0's still resumes at 24 on the Device.
+TEST_F(StateCheckpointFusedHostSuite, AnInForwardCheckpointNeverEvictsBlockByBlock) {
+    in_forward_ = true;
+    device_pages_ = 14;
+    Reset(/*host_cache=*/true, /*decode_width=*/1);
+    std::vector<std::int32_t> s0 = MakeTokens(24);
+    Submit(RequestWithTokens("s0", s0));
+    RunPrefill("s0", 24);
+    AckWriteBacks(PlanOnce());
+    SendForwardDone("s0", {901});
+    SendFinish("s0");
+    AckWriteBacks(PlanOnce());
+
+    Submit(RequestSpec{.request_id = "big", .tokens = MakeTokens(46), .max_new_tokens = 4});
+    const HostCacheStats before = scheduler_->GetHostCacheStats();
+    const std::vector<Chunk> chunks = RunPrefill("big", 46);
+    std::vector<std::array<std::int32_t, 3>> shapes;
+    for (const Chunk& chunk : chunks) {
+        shapes.push_back({chunk.prefix_tokens, chunk.tokens, chunk.checkpoint_len});
+    }
+    EXPECT_EQ(shapes, (std::vector<std::array<std::int32_t, 3>>{{24, 8, 0}, {32, 8, 0}, {40, 4, 0}, {44, 2, 0}}))
+        << "{prefix, tokens, checkpoint} per chunk: a cut at 44";
+    const HostCacheStats after = scheduler_->GetHostCacheStats();
+    EXPECT_EQ(after.eviction_stores.ops - before.eviction_stores.ops, 2u);
+    EXPECT_EQ(after.device_evictions.admission.blocks - before.device_evictions.admission.blocks, 7u)
+        << "the checkpoint at 20 and the end state's tail block and checkpoints";
+    SendAbortEvent("big");
+    AckWriteBacks(PlanOnce());
+
+    s0.push_back(77);
+    const Resume resumed = Probe("s0-next", s0);
+    EXPECT_EQ(resumed.prefix_tokens, 24);
+    EXPECT_EQ(resumed.load_rows, 0) << "the checkpoint at 24 stayed on the Device";
+}
+
 // A restore that evicts cache only the Device holds writes it back in its own
 // plan, the store placed ahead of the restore that reuses its pages: the
 // runtime runs a plan's stores before its loads. r is retracted by the knob

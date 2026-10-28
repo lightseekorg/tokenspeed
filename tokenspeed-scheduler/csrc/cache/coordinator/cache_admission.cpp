@@ -242,7 +242,8 @@ public:
                 // checkpoint leaves alone, every State group's at once; the
                 // page leaves with the last checkpoint boundary under it, or is
                 // tried again once the candidates run out. Block by block, every
-                // checkpoint leaves so.
+                // checkpoint leaves so; at a tail its eviction takes the tail's
+                // other unpinned blocks along (evictCachedBlock), uncounted here.
                 if (!coordinator_.GroupIsState(group_id)) {
                     (candidates_ran_out ? passed_over_ : deferred_shared_pages_).push_back(*candidate);
                     continue;
@@ -924,8 +925,9 @@ private:
     // while candidates last, oldest first: tried again once they run out.
     std::vector<VictimCandidate> deferred_shared_pages_;
     // Candidates no segment rule let leave (a set member in use or kept, or a
-    // shared page still shared once the candidates ran out), oldest first:
-    // tried again block by block once the shared pages run out too.
+    // shared page still shared once the candidates ran out), in the order
+    // they were passed over: tried again block by block once the shared pages
+    // run out too.
     std::vector<VictimCandidate> passed_over_;
     // Per tree node: how many checkpoint boundaries at or under it have every
     // Device checkpoint in a selected set, counted once the candidates run out.
@@ -1050,14 +1052,15 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
     // block private instead and publishes nothing at this point -- neither
     // the tail nor the state checkpoint keyed by it -- so a request whose
     // reserve covers its generation never waits on a block it did not
-    // reserve. Its finish publishes the frontier later.
+    // reserve. Its finish publishes the frontier later. The copies never
+    // evict block by block: only the plan without them does.
     RequestProgress effective = progress;
     const bool copies_in =
         progress.completed_pages && progress.completed_pages->owner_continues && progress.completed_pages->tail;
-    std::optional<AdmissionPlan> candidate =
-        planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_,
-                      copies_in ? PrefixProbe{prefix} : PrefixProbe{std::move(prefix)}, demands, effective,
-                      /*shapes=*/{}, /*claimed=*/{}, boundary_tree_, write_back_evictions_, evict_blocks_past_segments);
+    std::optional<AdmissionPlan> candidate = planAdmission(
+        *this, groups_, geometry_, prefix_granularity_, pool_, host_pool_,
+        copies_in ? PrefixProbe{prefix} : PrefixProbe{std::move(prefix)}, demands, effective,
+        /*shapes=*/{}, /*claimed=*/{}, boundary_tree_, write_back_evictions_, evict_blocks_past_segments && !copies_in);
     if (!candidate && copies_in) {
         effective = withoutTailPublication(progress);
         candidate = planAdmission(*this, groups_, geometry_, prefix_granularity_, pool_, host_pool_, std::move(prefix),

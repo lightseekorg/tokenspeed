@@ -457,7 +457,10 @@ evicts by whole segments, and a segment holding a block in use cannot leave
 it resumed from. So once whole segments cannot fund the admission of a
 request no other one holds pages beside, the blocks they passed over leave
 one by one (`cache-concepts.md`, `AdmissionPlanner`): alone, there is no
-release left to wait for. Beside another page holder it waits as above.
+release left to wait for. Only the admission's last variant takes them: an
+optional part of it — a copy-in (§1) or an in-forward checkpoint's block
+(§1.2) — is dropped first and never pays for such an eviction. Beside
+another page holder it waits as above.
 
 The `CapacityModel` is deliberately **config-only**: it reads every
 `SchedulerConfig` field that is known before a pool exists and no
