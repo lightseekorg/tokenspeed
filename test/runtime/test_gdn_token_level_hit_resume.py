@@ -36,6 +36,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from tokenspeed_kernel.selection import kernel_override
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -263,11 +264,7 @@ class TestGdnTokenLevelHitResumeTest:
         mamba = self.mamba
         with (
             patch.object(mamba, "gdn_chunk_prefill", self.triton_prefill),
-            patch.object(
-                mamba,
-                "gdn_decode_solution",
-                lambda *args, **kwargs: "triton",
-            ),
+            kernel_override("attention", "gdn_decode_step", "triton"),
         ):
             self._computed = {}
             scheduler = _scheduler(self.ts, self.make_config)

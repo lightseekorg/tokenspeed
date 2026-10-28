@@ -17,8 +17,11 @@ use the same execution traits and state dtype when checking for packed
 projection views. Output-only chains use this same registry entry, including
 the Triton chunked-chain candidate described below.
 
-State-writing verify and ordinary decode retain the BF16 padding-safe Triton
-policy. Read-only verify uses normal selection, including fallback kernels for
+Automatic BF16 state-writing verify and ordinary decode require the
+`padding_safe` trait, so the selected kernel preserves the reserved null page.
+The operator owns this policy; runtime code supplies no solution choice.
+Explicit solutions retain their documented padding contract. Read-only verify
+uses normal selection, including fallback kernels for
 unsupported WY geometry. It may read the reserved null page for padding, but
 never writes it; padded outputs are ignored.
 
@@ -160,9 +163,13 @@ pool is never written. The row count and the gates' layout (alignment, row
 stride) are not specialized, and the launch (value tile, key splits, warps,
 pipeline stages) follows three measured tiers of request-heads per row bucket
 (`_CHAIN_VERIFY_LAUNCH_TIERS`), so the kernel compiles once per bucket and
-tier. `gdn_decode_mtp_warm_batch_sizes` returns representatives of both the
-Triton tiers and CuTe launch buckets. The GDN backend warms the normal MTP
-entry at those sizes before capture, without importing backend tuning logic.
+tier. During the normal startup forward under
+`ops.tuning.kernel_warmup(enabled=True)`, the selected implementation compiles
+its reachable variants. CuTe prepares its launch buckets and transports;
+Triton uses JIT warmup for its launch tiers with the actual operand types,
+alignments and strides. These additional variants are compiled without
+launching on caller buffers. Runtime workspace allocation performs no
+kernel-specific warmup, and serving calls reuse the prepared kernels.
 Tests cover automatic selection, explicit overrides, exact accepted-prefix
 commit under graph replay and no compilation at serving batch sizes.
 

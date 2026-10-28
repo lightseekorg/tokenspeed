@@ -24,26 +24,22 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import torch
 from tokenspeed_kernel.ops.attention.gdn import (
     gdn_chunk_prefill_capturable,
     gdn_chunk_prefill_stores_state_checkpoints,
-    gdn_decode_mtp,
-    gdn_decode_mtp_warm_batch_sizes,
     gdn_decode_supports,
     gdn_tree_verify_needs_node_states,
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    gdn_decode_solution,
-)
 from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
     CapacityPrefillBackend,
 )
 from tokenspeed.runtime.layers.attention.configs.linear_attn import LinearAttnConfig
 
 if TYPE_CHECKING:
+    import torch
+
     from tokenspeed.runtime.layers.attention.configs.base import (
         AttnConfig,
         SoftmaxAttnConfig,
@@ -101,10 +97,6 @@ class GdnAttnBackend(CapacityPrefillBackend):
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
         ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
-        decode_solution = gdn_decode_solution(ssm_dtype, disable_state_update=False)
-        verify_solution = gdn_decode_solution(
-            ssm_dtype, disable_state_update=self.replay_ssm
-        )
         decode_traits = {"head_dim": self._head_k_dim}
         verify_traits = {
             **decode_traits,
@@ -126,7 +118,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
                 state_dtype=ssm_dtype,
                 trait="separate_output_state",
                 traits=verify_traits,
-                solution=verify_solution,
+                solution=None,
             )
         )
         self._verify_packed_qkv_views = gdn_decode_supports(
@@ -135,7 +127,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
             state_dtype=ssm_dtype,
             trait="strided_qkv",
             traits=verify_traits,
-            solution=verify_solution,
+            solution=None,
         )
         self._decode_packed_qkv_views = gdn_decode_supports(
             "gdn_decode_step",
@@ -143,50 +135,8 @@ class GdnAttnBackend(CapacityPrefillBackend):
             state_dtype=ssm_dtype,
             trait="strided_qkv",
             traits=decode_traits,
-            solution=decode_solution,
+            solution=None,
         )
-
-    def _warm_verify(self, max_bs: int, width: int) -> None:
-        """Warm the selected read-only GDN verify using all-padding launches."""
-        if not self.replay_ssm or self.draft_tree:
-            return
-        num_k_heads, num_v_heads, head_k_dim, head_v_dim = self._gdn_replay.geometry
-        _, ssm = self._state_components(self._state_layer_ids()[0])
-        sizes = gdn_decode_mtp_warm_batch_sizes(max_bs, num_v_heads, width, ssm.dtype)
-        if not sizes:
-            return
-        rows = sizes[-1] * width
-        # Dense rows, as the split writes q/k/v (the gates' layout is not specialized).
-        query = torch.zeros(
-            (rows, num_k_heads, head_k_dim), dtype=self.dtype, device=self.device
-        )
-        value = torch.zeros(
-            (rows, num_v_heads, head_v_dim), dtype=self.dtype, device=self.device
-        )
-        gates = torch.zeros((rows, num_v_heads), dtype=self.dtype, device=self.device)
-        parameters = torch.zeros(num_v_heads, dtype=torch.float32, device=self.device)
-        padding = torch.full(
-            (sizes[-1],), self.pad_slot_id, dtype=torch.int32, device=self.device
-        )
-        for bs in sizes:
-            tokens = bs * width
-            q = query[:tokens].view(bs, width, num_k_heads, head_k_dim)
-            gdn_decode_mtp(
-                q,
-                q,
-                value[:tokens].view(bs, width, num_v_heads, head_v_dim),
-                A_log=parameters,
-                a=gates[:tokens].view(bs, width, num_v_heads),
-                dt_bias=parameters,
-                b=gates[:tokens].view(bs, width, num_v_heads),
-                initial_state=ssm,
-                initial_state_indices=padding[:bs],
-                scale=None,
-                disable_state_update=True,
-                use_qk_l2norm=True,
-                tree_ancestors=None,
-                solution=gdn_decode_solution(ssm.dtype, disable_state_update=True),
-            )
 
     def _admits_capacity_prefill(self) -> bool:
         return self._prefill_capturable

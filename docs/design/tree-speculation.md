@@ -120,10 +120,13 @@ can fill the same replay payload; state ownership and replay commit stay the
 same. Chains and trees enter through `gdn_decode_mtp`; the runtime passes no
 ancestor mask for a chain. The kernel package owns selection between CuTe WY,
 the Triton chunked chain and general MTP, including any one-path mask used
-internally by the fallback. Capability queries and launch warmup use that same
-selection contract, including the pool's state dtype. Unsupported geometry or
-platforms use normal registry fallback. BF16
-state writes retain their padding-safe solution; read-only verify leaves the
+internally by the fallback. Capability queries use that same selection
+contract, including the pool's state dtype. Selected implementations prepare
+their finite compilation variants during the normal startup forward under
+`kernel_warmup`; the runtime neither dispatches a vendor solution nor builds
+special warmup launches. Unsupported geometry or platforms use normal registry
+fallback. Automatic BF16 state writes require the kernel package's
+`padding_safe` capability; read-only verify leaves the
 null page untouched and ignores padded outputs. In other trees the state of
 every branch point (a node with a child other than the next node) goes to one
 workspace shared by all layers

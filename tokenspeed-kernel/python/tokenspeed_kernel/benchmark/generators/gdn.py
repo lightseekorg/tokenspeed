@@ -158,7 +158,9 @@ def prepare_gdn_decode_step(
 
     model_profile, profile = _profile(request)
     batch = _positive(request.parameters, "batch")
-    spec = _select_registration(request, platform, {"head_dim": profile.head_dim})
+    spec = _select_registration(
+        request, platform, {"head_dim": profile.head_dim, "padding_safe": False}
+    )
     inputs = _decode_inputs(request.seed, batch, 1, profile)
     state = _state_pool(batch, profile)
     indices = torch.arange(batch, device="cuda", dtype=torch.int32)
@@ -217,6 +219,7 @@ def prepare_gdn_decode_mtp(
             "value_head_dim": profile.value_head_dim,
             "verify_tokens": tokens,
             "output_only": not per_token,
+            "padding_safe": False,
             "tree": False,
             "chunked_chain": False,  # These benchmark cases use FP32 states.
             "replay_payload": False,

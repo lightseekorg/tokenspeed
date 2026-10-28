@@ -31,6 +31,7 @@ from cutlass._mlir.dialects import llvm, vector
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from cutlass.cutlass_dsl import T, dsl_user_op
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import pdl_enabled
 
 
@@ -1034,6 +1035,9 @@ class GdnWYKernel:
 
 
 _COMPILED = {}
+_DUAL_ACCUMULATORS_MAX_HEADS = 64
+_WIDE_VALUES_MIN_HEADS = 256
+_STREAM_STATE_MAX_HEADS = 1024
 
 
 def gdn_wy_launch_config(
@@ -1050,19 +1054,38 @@ def gdn_wy_launch_config(
     Returns:
         Value tile, accumulator count, Gram rows and checkpoint key chunk.
     """
-    value_tile = 128 if batch * vheads >= 256 else 64
+    value_tile = 128 if batch * vheads >= _WIDE_VALUES_MIN_HEADS else 64
     if token_bound == 16 and state_dtype == torch.float32:
         value_tile = 64
-    accumulators = 2 if token_bound == 8 and batch * vheads <= 64 else 1
+    accumulators = (
+        2 if token_bound == 8 and batch * vheads <= _DUAL_ACCUMULATORS_MAX_HEADS else 1
+    )
     gram_rows = 8 if token_bound == 8 else 16
     key_chunk = (
         64
         if token_bound == 4
-        and 256 <= batch * vheads <= 1024
+        and _WIDE_VALUES_MIN_HEADS <= batch * vheads <= _STREAM_STATE_MAX_HEADS
         and state_dtype == torch.bfloat16
         else 128
     )
     return value_tile, accumulators, gram_rows, key_chunk
+
+
+def _warmup_launch_configs(
+    vheads: int, token_bound: int, state_dtype: torch.dtype
+) -> tuple[tuple[int, int, int, int], ...]:
+    batches = {
+        1,
+        _DUAL_ACCUMULATORS_MAX_HEADS // vheads + 1,
+        (_WIDE_VALUES_MIN_HEADS + vheads - 1) // vheads,
+        _STREAM_STATE_MAX_HEADS // vheads + 1,
+    }
+    return tuple(
+        dict.fromkeys(
+            gdn_wy_launch_config(batch, vheads, token_bound, state_dtype)
+            for batch in sorted(batches)
+        )
+    )
 
 
 def launch_gdn_wy(
@@ -1147,6 +1170,9 @@ def launch_gdn_wy(
     value_tile, accumulators, gram_rows, key_chunk = gdn_wy_launch_config(
         B, HV, token_bound, initial_state.dtype
     )
+    configs = ((value_tile, accumulators, gram_rows, key_chunk),)
+    if is_warming_up():
+        configs = _warmup_launch_configs(HV, token_bound, initial_state.dtype)
     key = (
         q.device.index,
         tuple(x.dtype for x in tensors),
@@ -1176,67 +1202,82 @@ def launch_gdn_wy(
             state_tensor,
             stream,
         )
-        compiled = _COMPILED.get(key)
-        if compiled is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise RuntimeError("GDN WY must be warmed before CUDA Graph capture")
-            # Graph replay may refresh from a contiguous input to a strided view.
-            # Warm both transport variants together before any graph capture.
-            for qkv_variant in (False, True):
-                for state_variant in (False, True):
-                    variant_key = (*key[:8], qkv_variant, state_variant, *key[10:])
-                    if variant_key in _COMPILED:
-                        continue
-                    variant_qkv, variant_state = None, None
-                    if qkv_variant:
-                        if use_tma_qkv:
-                            variant_qkv = qkv_tensors
-                        else:
-                            warm_qkv = tuple(
-                                torch.empty(
-                                    (1, token_bound, x.shape[2], 128),
-                                    device=x.device,
-                                    dtype=x.dtype,
-                                )
-                                for x in (q, k, v)
-                            )
-                            variant_qkv = tuple(
-                                from_dlpack(x, assumed_align=16).mark_layout_dynamic(
-                                    leading_dim=3
-                                )
-                                for x in warm_qkv
-                            )
-                    if state_variant:
-                        if use_tma_state:
-                            variant_state = state_tensor
-                        else:
-                            warm_state = torch.empty(
-                                (1, HV, 128, 128),
-                                device=initial_state.device,
-                                dtype=initial_state.dtype,
-                            )
-                            variant_state = from_dlpack(
-                                warm_state, assumed_align=16
-                            ).mark_layout_dynamic(leading_dim=3)
-                    variant_args = (*args[:5], variant_qkv, variant_state, stream)
-                    _COMPILED[variant_key] = cute.compile(
-                        GdnWYKernel(
-                            H,
-                            HV,
-                            use_qk_l2norm,
-                            tree_ancestors is not None,
-                            replay_payload is not None,
-                            pdl,
-                            accumulators,
-                            value_tile,
-                            token_bound,
+        for value_tile, accumulators, gram_rows, key_chunk in configs:
+            config_key = (
+                *key[:10],
+                accumulators,
+                value_tile,
+                token_bound,
+                gram_rows,
+                key_chunk,
+            )
+            compiled = _COMPILED.get(config_key)
+            if compiled is None:
+                if torch.cuda.is_current_stream_capturing():
+                    raise RuntimeError(
+                        "GDN WY must be warmed before CUDA Graph capture"
+                    )
+                # Graph replay may refresh from a contiguous input to a strided view.
+                # Warm both transport variants together before any graph capture.
+                for qkv_variant in (False, True):
+                    for state_variant in (False, True):
+                        variant_key = (
+                            *config_key[:8],
                             qkv_variant,
                             state_variant,
-                            gram_rows,
-                            key_chunk,
-                        ),
-                        *variant_args,
-                    )
-            compiled = _COMPILED[key]
-        compiled(*args)
+                            *config_key[10:],
+                        )
+                        if variant_key in _COMPILED:
+                            continue
+                        variant_qkv, variant_state = None, None
+                        if qkv_variant:
+                            if use_tma_qkv:
+                                variant_qkv = qkv_tensors
+                            else:
+                                warm_qkv = tuple(
+                                    torch.empty(
+                                        (1, token_bound, x.shape[2], 128),
+                                        device=x.device,
+                                        dtype=x.dtype,
+                                    )
+                                    for x in (q, k, v)
+                                )
+                                variant_qkv = tuple(
+                                    from_dlpack(
+                                        x, assumed_align=16
+                                    ).mark_layout_dynamic(leading_dim=3)
+                                    for x in warm_qkv
+                                )
+                        if state_variant:
+                            if use_tma_state:
+                                variant_state = state_tensor
+                            else:
+                                warm_state = torch.empty(
+                                    (1, HV, 128, 128),
+                                    device=initial_state.device,
+                                    dtype=initial_state.dtype,
+                                )
+                                variant_state = from_dlpack(
+                                    warm_state, assumed_align=16
+                                ).mark_layout_dynamic(leading_dim=3)
+                        variant_args = (*args[:5], variant_qkv, variant_state, stream)
+                        _COMPILED[variant_key] = cute.compile(
+                            GdnWYKernel(
+                                H,
+                                HV,
+                                use_qk_l2norm,
+                                tree_ancestors is not None,
+                                replay_payload is not None,
+                                pdl,
+                                accumulators,
+                                value_tile,
+                                token_bound,
+                                qkv_variant,
+                                state_variant,
+                                gram_rows,
+                                key_chunk,
+                            ),
+                            *variant_args,
+                        )
+        _COMPILED[key](*args)
     return out

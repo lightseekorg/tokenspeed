@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.attention.gdn._cute_dsl import wy
 from tokenspeed_kernel.ops.attention.gdn.cute_dsl import (
     cute_dsl_gdn_decode_mtp as run_wy,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 
 
 def make_case(*, batch, tokens, dtype, state_dtype, tree, strided, heads, vheads):
@@ -699,6 +700,132 @@ def test_mtp_selects_chain_kernel(tmp_path, state_dtype, strided, solution, expe
     assert selected[-1]["kernel_name"] == expected
     torch.testing.assert_close(actual.double(), reference(case), atol=1e-4, rtol=2**-7)
     assert torch.equal(case["initial_state"], before)
+
+
+@pytest.mark.parametrize("tokens", [4, 8])
+@pytest.mark.parametrize("solution", [None, "triton"])
+def test_verify_kernel_warmup_preserves_inputs(tokens, solution):
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp
+
+    case = make_case(
+        batch=1,
+        tokens=tokens,
+        dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        tree=False,
+        strided=False,
+        heads=4,
+        vheads=12,
+    )
+    case["initial_state"] = case["initial_state"].contiguous()
+    expected = reference(case)
+    tensors = [value for value in case.values() if isinstance(value, torch.Tensor)]
+    before = [value.clone() for value in tensors]
+    with kernel_warmup(enabled=True):
+        actual = gdn_decode_mtp(**case, solution=solution)
+    torch.testing.assert_close(actual.double(), expected, atol=1e-4, rtol=2**-7)
+    assert all(torch.equal(value, saved) for value, saved in zip(tensors, before))
+
+
+def test_general_verify_warmup_covers_larger_batches():
+    from tokenspeed_kernel.ops.attention.gdn import gdn_decode_mtp
+    from tokenspeed_kernel.ops.attention.gdn.triton import (
+        _fused_gdn_decode_update_kernel,
+        _gdn_tree_verify_chunked_kernel,
+    )
+    from utils import assert_no_triton_compile
+
+    pool = torch.randn(2, 4, 24, 32, device="cuda", dtype=torch.float32) * 0.02
+    before = pool.clone()
+
+    def inputs(batch):
+        return dict(
+            q=torch.randn(batch, 16, 2, 32, device="cuda", dtype=torch.bfloat16),
+            k=torch.randn(batch, 16, 2, 32, device="cuda", dtype=torch.bfloat16),
+            v=torch.randn(batch, 16, 4, 24, device="cuda", dtype=torch.bfloat16),
+            a=torch.zeros(batch, 16, 4, device="cuda", dtype=torch.bfloat16),
+            b=torch.zeros(batch, 16, 4, device="cuda", dtype=torch.bfloat16),
+            A_log=torch.zeros(4, device="cuda", dtype=torch.float32),
+            dt_bias=torch.zeros(4, device="cuda", dtype=torch.float32),
+            initial_state=pool,
+            initial_state_indices=torch.ones(batch, device="cuda", dtype=torch.int32),
+            scale=32**-0.5,
+            use_qk_l2norm=True,
+            disable_state_update=True,
+            tree_ancestors=None,
+        )
+
+    with kernel_warmup(enabled=True):
+        actual = gdn_decode_mtp(**inputs(1))
+    assert actual.isfinite().all()
+    # Cross both the chain-to-tree threshold and its value-tile boundary.
+    boundary = current_platform().sm_count // 4
+    with assert_no_triton_compile(
+        _fused_gdn_decode_update_kernel, _gdn_tree_verify_chunked_kernel
+    ):
+        for batch in (2, 6, max(6, boundary), max(6, boundary + 1), 64):
+            assert gdn_decode_mtp(**inputs(batch)).isfinite().all()
+    assert torch.equal(pool, before)
+
+
+@pytest.mark.parametrize("mode,tokens", [("gdn_decode_step", 1), ("gdn_decode_mtp", 4)])
+@pytest.mark.parametrize("solution", [None, "flashinfer"])
+def test_bf16_write_dispatch_preserves_padding_contract(
+    tmp_path, require, mode, tokens, solution
+):
+    from tokenspeed_kernel.ops.attention import gdn
+
+    if solution is not None:
+        require("attention", mode, solution, torch.bfloat16, "q")
+    case = make_case(
+        batch=2,
+        tokens=tokens,
+        dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        tree=False,
+        strided=False,
+        heads=2,
+        vheads=4,
+    )
+    case["initial_state"] = case["initial_state"].contiguous()
+    case["initial_state"][0].zero_()
+    case["initial_state_indices"][-1] = -1
+    before = case["initial_state"].clone()
+    expected = reference(case)
+    path = tmp_path / "dispatch.json"
+    ShapeCapture.get().clear()
+    with shape_capture(path):
+        if mode == "gdn_decode_mtp":
+            case["disable_state_update"] = False
+            actual = gdn.gdn_decode_mtp(**case, solution=solution)
+        else:
+            arguments = {
+                name: case[name]
+                for name in (
+                    "q",
+                    "k",
+                    "v",
+                    "A_log",
+                    "a",
+                    "dt_bias",
+                    "b",
+                    "initial_state",
+                    "initial_state_indices",
+                    "scale",
+                    "use_qk_l2norm",
+                )
+            }
+            actual = gdn.gdn_decode_step(**arguments, solution=solution)
+    torch.testing.assert_close(actual[0].double(), expected[0], atol=1e-4, rtol=2**-7)
+    assert not torch.equal(case["initial_state"][2], before[2])
+    if solution is None:
+        assert torch.equal(case["initial_state"][0], before[0])
+    if mode == "gdn_decode_mtp":
+        records = json.loads(path.read_text())
+        expected_kernel = (
+            "triton_gdn_decode_mtp" if solution is None else "flashinfer_gdn_decode_mtp"
+        )
+        assert records[-1]["kernel_name"] == expected_kernel
 
 
 def test_flashinfer_bf16_state_rejects_unsupported_value_dim(require):

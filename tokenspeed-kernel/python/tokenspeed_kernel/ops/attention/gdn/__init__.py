@@ -409,6 +409,14 @@ def _qkv_rows_strided(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool
     return False
 
 
+def _requires_padding_safe_decode(
+    state_dtype: torch.dtype, *, output_only: bool, solution: str | None
+) -> bool:
+    # Automatic BF16 writes must preserve the reserved null page. Explicit
+    # solutions retain their documented padding contract; overrides still win.
+    return state_dtype == torch.bfloat16 and not output_only and solution is None
+
+
 def gdn_decode_step(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -460,7 +468,12 @@ def gdn_decode_step(
     """
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
-    traits = {"head_dim": head_dim}
+    traits = {
+        "head_dim": head_dim,
+        "padding_safe": _requires_padding_safe_decode(
+            initial_state.dtype, output_only=False, solution=solution
+        ),
+    }
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
     kernel = select_kernel(
@@ -574,41 +587,6 @@ def _chunked_chain_supported(
     return gdn_chain_verify_supported(head_dim, value_head_dim, state_dtype) and (
         gdn_chain_verify_form(num_tokens, 0, state_dtype, chain_form=True)
         is GdnChainVerifyForm.CHAIN
-    )
-
-
-def gdn_decode_mtp_warm_batch_sizes(
-    max_batch_size: int,
-    num_v_heads: int,
-    num_tokens: int,
-    state_dtype: torch.dtype,
-) -> list[int]:
-    """Return batches covering the MTP implementations' bounded launch variants.
-
-    Args:
-        max_batch_size: Largest serving batch to prepare.
-        num_v_heads: Value heads on this rank.
-        num_tokens: Verify-window length.
-        state_dtype: Recurrent-state pool dtype.
-
-    Returns:
-        Sorted representative batch sizes. Call ``gdn_decode_mtp`` normally at
-        these sizes; selection, including explicit overrides, still applies.
-    """
-    if max_batch_size <= 0 or not 1 <= num_tokens <= 16:
-        return []
-    from tokenspeed_kernel.ops.attention.gdn._triton.chain_verify import (
-        gdn_chain_verify_warm_batch_sizes,
-    )
-    from tokenspeed_kernel.ops.attention.gdn.cute_dsl import (
-        gdn_wy_warm_batch_sizes,
-    )
-
-    batches = range(1, max_batch_size + 1)
-    return sorted(
-        {1, max_batch_size}
-        | set(gdn_chain_verify_warm_batch_sizes(batches, num_v_heads, num_tokens))
-        | set(gdn_wy_warm_batch_sizes(batches, num_v_heads, num_tokens, state_dtype))
     )
 
 
@@ -786,6 +764,9 @@ def gdn_decode_mtp(
         "verify_tokens": q.shape[1],
         "tree": tree_ancestors is not None,
         "output_only": output_only,
+        "padding_safe": _requires_padding_safe_decode(
+            initial_state.dtype, output_only=output_only, solution=solution
+        ),
         "chunked_chain": output_only
         and tree_ancestors is None
         and _chunked_chain_supported(
@@ -1007,8 +988,16 @@ def gdn_decode_supports(
     """
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = dict(traits)
+    traits.setdefault(
+        "padding_safe",
+        _requires_padding_safe_decode(
+            state_dtype,
+            output_only=op == "gdn_decode_mtp" and traits["output_only"],
+            solution=solution,
+        ),
+    )
     if op == "gdn_decode_mtp":
-        traits = dict(traits)
         traits.setdefault(
             "chunked_chain",
             traits["output_only"]
@@ -1240,7 +1229,6 @@ __all__ = [
     "gdn_chunk_prefill_stores_state_checkpoints",
     "gdn_decode_step",
     "gdn_decode_mtp",
-    "gdn_decode_mtp_warm_batch_sizes",
     "gdn_decode_supports",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",

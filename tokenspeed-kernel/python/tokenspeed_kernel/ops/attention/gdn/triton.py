@@ -40,6 +40,7 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import gl, gluon, libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
+    GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES,
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
     GdnChainVerifyForm,
     GdnCheckpointLayout,
@@ -74,6 +75,7 @@ from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     fused_qkv_split_gdn_prefill,
     pack_gdn_projection,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -573,7 +575,10 @@ def _launch_fused_gdn_decode_update(
         ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
     ),
     priority=Priority.PORTABLE,
-    traits={"strided_qkv": frozenset({False, True})},
+    traits={
+        "strided_qkv": frozenset({False, True}),
+        "padding_safe": frozenset({False, True}),
+    },
 )
 def triton_gdn_decode_step(
     q: torch.Tensor,
@@ -826,6 +831,7 @@ def _launch_gdn_tree_verify_chunked(
     use_qk_l2norm: bool,
     tree_ancestors: torch.Tensor,
     replay_payload: torch.Tensor | None,
+    compile_only: bool,
 ) -> torch.Tensor:
     enable_pdl = pdl_enabled()
     B, T, H, K = q.shape
@@ -849,7 +855,7 @@ def _launch_gdn_tree_verify_chunked(
     if BV >= 32 and triton.cdiv(V, BV // 2) * B * HV <= 2 * current_platform().sm_count:
         BV //= 2
     T_BLOCK = triton.next_power_of_2(GDN_TREE_VERIFY_CHUNKED_MAX_NODES)
-    _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](
+    arguments = dict(
         A_log=A_log,
         a=a,
         dt_bias=dt_bias,
@@ -892,6 +898,17 @@ def _launch_gdn_tree_verify_chunked(
             else {}
         ),
     )
+    if compile_only or is_warming_up():
+        # Include the wide and half-width tiles reachable at later batches.
+        tiles = {min(triton.next_power_of_2(V), width) for width in (64, 128)}
+        tiles |= {tile // 2 for tile in tiles if tile >= 32}
+        for tile in sorted(tiles):
+            _gdn_tree_verify_chunked_kernel.warmup(
+                **{**arguments, "BV": tile},
+                grid=(triton.cdiv(V, tile), B * HV),
+            )
+    if not compile_only:
+        _gdn_tree_verify_chunked_kernel[(triton.cdiv(V, BV), B * HV)](**arguments)
     return o
 
 
@@ -907,6 +924,7 @@ def _launch_gdn_tree_verify_chunked(
     priority=Priority.PORTABLE,
     traits={
         "tree": frozenset({False, True}),
+        "padding_safe": frozenset({False, True}),
         "separate_output_state": frozenset({False, True}),
         "strided_qkv": frozenset({False, True}),
     },
@@ -944,12 +962,40 @@ def triton_gdn_decode_mtp(
         and intermediate_states_buffer is None
         and output_state_indices is None
         and output_state is None
-        and gdn_chain_verify_form(
+    ):
+        form = gdn_chain_verify_form(
             q.shape[1], q.shape[0] * v.shape[2], initial_state.dtype, chain_form=False
         )
-        is GdnChainVerifyForm.TREE
-    ):
-        tree_ancestors = _chain_ancestors(q)
+        if (
+            is_warming_up()
+            and form is GdnChainVerifyForm.STEP
+            and gdn_chain_verify_form(
+                q.shape[1],
+                GDN_CHAIN_VERIFY_CHUNKED_MIN_STATES,
+                initial_state.dtype,
+                chain_form=False,
+            )
+            is GdnChainVerifyForm.TREE
+        ):
+            _launch_gdn_tree_verify_chunked(
+                q,
+                k,
+                v,
+                A_log=A_log,
+                a=a,
+                dt_bias=dt_bias,
+                b=b,
+                initial_state=initial_state,
+                initial_state_indices=initial_state_indices,
+                scale=scale,
+                use_qk_l2norm=use_qk_l2norm,
+                # Compile-only warmup needs the mask's pointer type, not its data.
+                tree_ancestors=torch.empty(1, dtype=torch.int64, device=q.device),
+                replay_payload=replay_payload,
+                compile_only=True,
+            )
+        if form is GdnChainVerifyForm.TREE:
+            tree_ancestors = _chain_ancestors(q)
     if (
         tree_ancestors is not None
         and output_state_indices is None
@@ -969,6 +1015,7 @@ def triton_gdn_decode_mtp(
             use_qk_l2norm=use_qk_l2norm,
             tree_ancestors=tree_ancestors,
             replay_payload=replay_payload,
+            compile_only=False,
         )
     if replay_payload is not None:
         raise ValueError("only a chunked ReplaySSM tree verify fills replay_payload")

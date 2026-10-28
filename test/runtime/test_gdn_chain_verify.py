@@ -49,6 +49,7 @@ from tokenspeed_kernel.ops.attention.gdn import (
 from tokenspeed_kernel.ops.attention.gdn._triton.chain_verify import (
     gdn_chain_verify_kernel,
 )
+from tokenspeed_kernel.ops.tuning import kernel_warmup
 from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.profiling import ShapeCapture, shape_capture
 from tokenspeed_kernel.registry import KernelRegistry
@@ -321,6 +322,16 @@ def test_warmed_selected_verify_compiles_nothing_while_serving(
         backend, pool = _backend(
             _state(capacity, seed=21), width=width, max_bs=capacity
         )
+        committed = [(conv.clone(), state.clone()) for conv, state in _committed(pool)]
+        # The same normal dummy forward the executor runs at startup owns warmup.
+        _refresh(backend, 1, width, graph_replay=False)
+        with kernel_warmup(enabled=True):
+            _forward(backend, pool, 1, width, _round_inputs(1, width, seed=21))
+        for (conv, state), (before_conv, before_state) in zip(
+            _committed(pool), committed
+        ):
+            assert torch.equal(conv, before_conv)
+            assert torch.equal(state, before_state)
     with ExitStack() as stack:
         stack.enter_context(kernel_override("attention", "gdn_decode_mtp", override))
         compiles = stack.enter_context(

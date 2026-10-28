@@ -304,6 +304,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "padding_safe": frozenset({False}),
             "strided_qkv": frozenset({False}),
         },
     )
@@ -374,6 +375,7 @@ if is_decode_available():
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({SUPPORTED_HEAD_DIM}),
+            "padding_safe": frozenset({False}),
             "value_head_dim": frozenset({SUPPORTED_HEAD_DIM}),
             "tree": frozenset({False}),
             "separate_output_state": frozenset({False}),

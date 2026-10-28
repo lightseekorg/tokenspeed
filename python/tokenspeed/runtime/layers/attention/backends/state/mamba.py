@@ -142,24 +142,6 @@ def _reject_skip_term(D: torch.Tensor | None) -> None:
         raise ValueError("the GDN/KDA recurrence has no D skip term")
 
 
-def gdn_decode_solution(
-    ssm_dtype: torch.dtype, *, disable_state_update: bool
-) -> str | None:
-    """Select a safe solution without remapping negative padding indices.
-
-    FlashInfer's FP32 kernels skip negative state rows, and the portable Triton
-    kernels guard negative reads and writes for both FP32 and BF16 state. The
-    FlashInfer BF16 path instead redirects padding to row 0 — the arena's
-    reserved null page, which must stay zero for every fresh-state read.
-    Until that kernel supports a padding mask, route BF16 state writes through
-    Triton and keep ``-1`` unchanged. Read-only verify can use normal selection:
-    padding outputs are ignored and the null page stays untouched.
-    """
-    return (
-        "triton" if ssm_dtype == torch.bfloat16 and not disable_state_update else None
-    )
-
-
 def _build_cu_extend_seq_lens_cpu(
     extend_seq_lens_cpu: torch.Tensor, expected_len: int
 ) -> torch.Tensor:
@@ -615,7 +597,6 @@ class MambaAttnBackend(AttentionBackend):
         if not self.state_paging_active or self.is_draft:
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
-        self._warm_verify(max_bs, draft_token_num)
         total = sum(
             tensor.nbytes
             for layer_scratch in self._verify_scratch.values()
@@ -628,9 +609,6 @@ class MambaAttnBackend(AttentionBackend):
         if self._tree_node_states is not None:
             total += self._tree_node_states.nbytes
         return total
-
-    def _warm_verify(self, max_bs: int, width: int) -> None:
-        """Prepare the family's verify variants before graph capture, when needed."""
 
     def _verify_copy_tables_get(self) -> dict[str, torch.Tensor | int | None]:
         """Pointer tables for the batched verify state copies and replay:
@@ -1776,7 +1754,6 @@ class MambaAttnBackend(AttentionBackend):
             # Write to the out page, not the possibly shared input page.
             output_state_indices=write_indices,
             use_qk_l2norm=True,
-            solution=gdn_decode_solution(ssm_states.dtype, disable_state_update=False),
         )
         # [B, 1, Hv, V] (pool/indices-major) -> [1, B, Hv, V], this backend's
         # decode-output convention (matches gdn_chunk_prefill's B=1-leading out).
@@ -2353,9 +2330,6 @@ class MambaAttnBackend(AttentionBackend):
             tree_ancestors=self._verify_ancestors(batch_size),
             replay_payload=replay_payload,
             disable_state_update=self.replay_ssm,
-            solution=gdn_decode_solution(
-                initial_state.dtype, disable_state_update=self.replay_ssm
-            ),
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
 
     def _prefill_scan(
