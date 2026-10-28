@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import textwrap
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -228,18 +229,83 @@ def test_iris_output_acquisition_propagates_iris_setup_failure(monkeypatch):
         backend.acquire_all_reduce_outputs(((2, 4),), like, (0, 1))
 
 
-def test_nccl_collection_uses_single_tensor_path():
-    backend = NcclBackend()
-    backend._resources[(0,)] = {
-        "pynccl_comm": None,
+@pytest.mark.parametrize("route", ["single", "torch", "torch_uncoalesced", "pynccl"])
+@pytest.mark.parametrize("paired", [False, True])
+def test_nccl_all_reduce_records_one_scope(monkeypatch, route, paired):
+    from tokenspeed_kernel.op_profile import (
+        CostRegistry,
+        ProfileSession,
+        current_op_metadata,
+    )
+    from tokenspeed_kernel.profile_costs import register_collective_costs
+
+    def reduce(tensor, op, group=None):
+        if op == torch.distributed.ReduceOp.SUM:
+            tensor.mul_(2)
+
+    class Communicator:
+        disabled = False
+        all_reduce = staticmethod(reduce)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    monkeypatch.setattr(
+        torch.distributed,
+        "_coalescing_manager",
+        None if route == "torch_uncoalesced" else lambda **kwargs: nullcontext(),
+        raising=False,
+    )
+    group = (0,) if route == "single" else (3, 7)
+    backend = NcclBackend(group_name="profile-test")
+    backend._resources[group] = {
+        "pynccl_comm": Communicator() if route == "pynccl" else None,
         "device_group": None,
-        "world_size": 1,
+        "world_size": len(group),
     }
-    tensors = (torch.empty(1), torch.empty(2), torch.empty(3))
+    tensors = (
+        (torch.ones(2, dtype=torch.bfloat16), torch.ones(3, dtype=torch.float32))
+        if paired
+        else (torch.ones(1), torch.ones(2), torch.ones(3))
+    )
 
-    outputs = backend.all_reduce(tensors, (0,))
+    def run(op=None):
+        if paired:
+            return backend.all_reduce_two(*tensors, group, op=op)
+        return backend.all_reduce(tensors, group, op=op)
 
+    session = ProfileSession(run_id="comm", model_id="test", rank=0, backend="none")
+    assert current_op_metadata() is None
+    with session.iteration(iter_id=0):
+        outputs = run()
     assert all(output is tensor for output, tensor in zip(outputs, tensors))
+    for tensor in outputs:
+        torch.testing.assert_close(
+            tensor, torch.full_like(tensor, 1 if route == "single" else 2)
+        )
+    assert len(session.ops) == 1  # One scope for tuple recursion and paired fallback.
+    assert session.ops[0].scalar_args == {
+        "ranks": group,
+        "group_name": "profile-test",
+        "is_sum": True,
+    }
+    assert current_op_metadata() is None
+    costs = CostRegistry()
+    register_collective_costs(costs, hbm_policy="logical_io_once")
+    cost = session.report(costs=costs)["analysis"]["ops"][0]["cost"]
+    total_bytes = 16 if paired else 24
+    if route == "single":
+        total_bytes = 0
+    assert cost["communication"]["total_bytes"] == total_bytes
+    assert cost["estimated_hbm_bytes"] == 2 * total_bytes
+    with session.iteration(iter_id=1):
+        run(op=torch.distributed.ReduceOp.MAX)
+    for tensor in tensors:
+        torch.testing.assert_close(
+            tensor, torch.full_like(tensor, 1 if route == "single" else 2)
+        )
+    assert (
+        "SUM only"
+        in session.report(costs=costs)["analysis"]["ops"][-1]["missing_reason"]
+    )
 
 
 def test_trtllm_collection_uses_fallback_single_tensor_path():

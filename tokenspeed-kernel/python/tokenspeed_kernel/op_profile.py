@@ -27,7 +27,7 @@ import json
 import time
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from functools import wraps
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Iterator
@@ -65,13 +65,27 @@ def _describe(value: Any, path: str, result: dict[str, TensorDescription]) -> No
     elif isinstance(value, dict):
         for key, item in value.items():
             _describe(item, f"{path}[{key!r}]", result)
+    elif is_dataclass(value) and not isinstance(value, type):
+        for item in fields(value):
+            _describe(getattr(value, item.name), f"{path}.{item.name}", result)
 
 
 @dataclass(frozen=True)
 class OpProfile:
-    """Opt in a registered function; cost_rule=None records metadata only."""
+    """Opt in a function; scalar_args retains named host values for cost rules.
+
+    Values must be JSON scalars or tuples of scalars, never device tensors.
+    Multi-valued traits automatically capture same-named host arguments.
+    integer_tensor_args explicitly snapshots small 1-D int32/int64 metadata:
+    CPU values immediately, CUDA values asynchronously through NvtxTimeline.
+    Without that collector CUDA values stay unavailable. Ordinary tensors
+    continue to record descriptions only.
+    cost_rule=None records metadata only.
+    """
 
     cost_rule: str | None
+    scalar_args: tuple[str, ...] = ()
+    integer_tensor_args: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -90,6 +104,9 @@ class OpRecord:
     error: str | None
     trace_label: str
     autocast_enabled: bool = False
+    scalar_args: dict[str, Any] = field(default_factory=dict)
+    tensor_values: dict[str, tuple[int, ...] | None] = field(default_factory=dict)
+    static_traits: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -112,7 +129,18 @@ class _Context:
 
 
 _current: ContextVar[_Context | None] = ContextVar("op_profile_context", default=None)
-_recording_op: ContextVar[bool] = ContextVar("op_profile_recording_op", default=False)
+_recording_op: ContextVar[dict[str, Any] | None] = ContextVar(
+    "op_profile_recording_op", default=None
+)
+
+
+def current_op_metadata() -> dict[str, Any] | None:
+    """Return the active op's host metadata, or None when not collecting.
+
+    Existing dispatchers may record their actual branch/group here. Write only
+    JSON scalars or tuples of scalars; never read device tensors for metadata.
+    """
+    return _recording_op.get()
 
 
 class ProfileSession:
@@ -300,7 +328,11 @@ def profiled(*, level: str) -> Callable:
 def wrap_op_for_profiling(
     fn: Callable, *, spec: KernelSpec, profile: OpProfile
 ) -> Callable:
-    """Wrap one registered synchronous function for optional host collection."""
+    """Collect an existing synchronous function without changing its dispatch.
+
+    Kernel registration uses this same wrapper. Direct bindings use spec only
+    for profiling identity and do not add entries to the kernel registry.
+    """
     if (
         not inspect.isfunction(fn)
         or inspect.iscoroutinefunction(fn)
@@ -310,17 +342,72 @@ def wrap_op_for_profiling(
             "OpProfile currently supports synchronous registered functions only"
         )
     signature = inspect.signature(fn)
+    scalar_names = profile.scalar_args + tuple(
+        name
+        for name, values in spec.traits.items()
+        if len(values) > 1
+        and name in signature.parameters
+        and name not in profile.scalar_args + profile.integer_tensor_args
+    )
+    metadata_args = scalar_names + profile.integer_tensor_args
+    if any(name not in signature.parameters for name in metadata_args):
+        raise ValueError("Profile metadata arguments must name function parameters")
+    if len(metadata_args) != len(set(metadata_args)):
+        raise ValueError("Profile metadata arguments must be distinct")
     op_name = f"{spec.family}.{spec.mode}"
+    # A singleton trait fixes the format; multiple values only describe support.
+    static_traits = {}
+    for name, values in spec.traits.items():
+        if len(values) == 1:
+            (value,) = values
+            if type(value) in (type(None), bool, int, float, str):
+                static_traits[name] = value
 
     @wraps(fn)
     def wrapped(*args: Any, **kwargs: Any) -> Any:
         context = _current.get()
-        if context is None or _recording_op.get():
+        if context is None or _recording_op.get() is not None:
             return fn(*args, **kwargs)
         session = context.session
         inputs: dict[str, TensorDescription] = {}
-        for key, value in signature.bind(*args, **kwargs).arguments.items():
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        for key, value in bound.arguments.items():
             _describe(value, key, inputs)
+        scalar_args = {}
+        tensor_values = {}
+        if metadata_args:
+            for name in scalar_names:
+                value = bound.arguments[name]
+                values = value if isinstance(value, tuple) else (value,)
+                if any(
+                    type(item) not in (type(None), bool, int, float, str)
+                    for item in values
+                ):
+                    if name in profile.scalar_args:
+                        raise TypeError(
+                            f"Profile argument {name} must contain host scalars"
+                        )
+                    continue
+                scalar_args[name] = value
+            for name in profile.integer_tensor_args:
+                value = bound.arguments[name]
+                tensor_values[name] = None
+                # These are bounded metadata vectors, never activations or
+                # weights. Unsupported arguments leave a missing-cost reason.
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim == 1
+                    and value.dtype in (torch.int32, torch.int64)
+                    and value.is_contiguous()
+                    and value.numel() <= 4096
+                ):
+                    if value.device.type == "cpu":
+                        tensor_values[name] = tuple(value.tolist())
+                    elif value.device.type == "cuda" and session._timeline is not None:
+                        session._timeline._snapshot_integer_values(
+                            value, tensor_values, name
+                        )
         counter_key = (context.iter_id, context.layer_id)
         inner_id = session._counts.get(counter_key, 0)
         session._counts[counter_key] = inner_id + 1
@@ -338,7 +425,7 @@ def wrap_op_for_profiling(
             occurrence=context.occurrence,
             inner_id=inner_id,
         )
-        token = _recording_op.set(True)
+        token = _recording_op.set(scalar_args)
         try:
             with session.record_func(label):
                 result = fn(*args, **kwargs)
@@ -366,6 +453,9 @@ def wrap_op_for_profiling(
                     error=error,
                     trace_label=label,
                     autocast_enabled=autocast_enabled,
+                    scalar_args=scalar_args,
+                    tensor_values=tensor_values,
+                    static_traits=static_traits,
                 )
             )
 

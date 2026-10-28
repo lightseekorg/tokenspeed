@@ -31,7 +31,9 @@ import os
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.op_profile import OpProfile, wrap_op_for_profiling
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.registry import KernelSpec
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
@@ -1453,6 +1455,15 @@ def set_mla_kv_buffer_triton(
         )
 
 
+set_mla_kv_buffer_triton = wrap_op_for_profiling(
+    set_mla_kv_buffer_triton,
+    spec=KernelSpec(
+        name="set_mla_kv_buffer_triton", family="kvcache", mode="mla_scatter"
+    ),
+    profile=OpProfile(cost_rule="mla_cache_scatter.v1"),
+)
+
+
 @triton.jit
 def _sanitize(x, MAX_FINITE: tl.constexpr):
     """Replace NaN with zero and infinities with the widest storable value."""
@@ -1814,6 +1825,15 @@ def get_mla_kv_buffer_triton(
             ENABLE_PDL=use_pdl,
             **extra_kwargs,
         )
+
+
+get_mla_kv_buffer_triton = wrap_op_for_profiling(
+    get_mla_kv_buffer_triton,
+    spec=KernelSpec(
+        name="get_mla_kv_buffer_triton", family="kvcache", mode="mla_gather"
+    ),
+    profile=OpProfile(cost_rule="mla_cache_gather.v1"),
+)
 
 
 # -----------------------------------------------------------------------------

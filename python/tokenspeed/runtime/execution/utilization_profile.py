@@ -32,7 +32,10 @@ from pathlib import Path
 
 import torch
 from tokenspeed_kernel.op_profile import CostRegistry, ProfileSession
-from tokenspeed_kernel.profile_costs import register_compute_costs
+from tokenspeed_kernel.profile_costs import (
+    register_collective_costs,
+    register_compute_costs,
+)
 from tokenspeed_kernel.profile_nvtx import NvtxTimeline
 from tokenspeed_kernel.profile_utilization import HardwareProfile
 
@@ -47,7 +50,7 @@ class UtilizationProfileConfig:
 
     Steps are one-based serving batches; startup warmup does not count.
     layers is a model submodule path to a ModuleList with global layer indices.
-    hardware and library are paths to the hardware JSON and prebuilt NVTX bridge.
+    hardware is a JSON/YAML profile; library is the prebuilt NVTX bridge path.
     output_dir receives rank-N.metrics.json; Nsight owns the .nsys-rep file.
     hbm_policy is 'unavailable' or the estimate 'logical_io_once'.
     """
@@ -79,8 +82,8 @@ class RuntimeUtilizationProfile:
 
     Construction reads configuration and binds identities, without GPU work.
     iteration() must run on the execution stream and the same forward thread.
-    The final selected batch writes metrics and submits native NVTX ranges before
-    returning; no shutdown handler or post-runtime trace rewrite is required.
+    The final selected batch writes costs and NVTX identities. After Nsight
+    finishes its report, profile_nsys calculates utilization from GPU timestamps.
     Metrics cover registered calls only, not the model's uninstrumented work.
     """
 
@@ -93,7 +96,7 @@ class RuntimeUtilizationProfile:
         rank: int,
     ) -> None:
         self.config = config
-        self.hardware = HardwareProfile.from_json(config.hardware)
+        self.hardware = HardwareProfile.from_file(config.hardware)
         self.library = Path(config.library).resolve(strict=True)
         self.output = Path(config.output_dir) / f"rank-{rank}.metrics.json"
         self.session = ProfileSession(
@@ -106,6 +109,7 @@ class RuntimeUtilizationProfile:
             self.session.bind_layer(layer, layer_id=layer_id)
         self.costs = CostRegistry()
         register_compute_costs(self.costs, hbm_policy=config.hbm_policy)
+        register_collective_costs(self.costs, hbm_policy=config.hbm_policy)
         self._timeline: NvtxTimeline | None = None
         self._finished = False
 
@@ -162,10 +166,7 @@ class RuntimeUtilizationProfile:
                 library=self.library,
                 output=self.output,
             )
-            # Event preparation and final readback deliberately synchronize only
-            # at the boundaries of this opt-in diagnostic window.
-            with allow_host_sync("prepare utilization timeline CUDA events"):
-                timeline.__enter__()
+            timeline.__enter__()
             self._timeline = timeline
             logger.info(f"Utilization timeline starts at serving step {step}")
         error = None
@@ -189,6 +190,6 @@ class RuntimeUtilizationProfile:
                     )
                 if error is None:
                     logger.info(
-                        f"Utilization timeline saved to {self.output}; "
+                        f"Utilization metadata saved to {self.output}; Nsight analysis pending; "
                         "cost coverage is limited to opted-in registered calls"
                     )

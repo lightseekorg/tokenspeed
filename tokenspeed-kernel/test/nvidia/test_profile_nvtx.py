@@ -26,18 +26,139 @@ import subprocess
 import sys
 import textwrap
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
 from tokenspeed_kernel.op_profile import CostRegistry, OpProfile, ProfileSession
 from tokenspeed_kernel.profile_costs import (
+    AllReduceRMSNormCost,
     AttentionMatmulCost,
     DenseMatmulCost,
+    register_collective_costs,
     register_compute_costs,
 )
+from tokenspeed_kernel.profile_nsys import finalize_nsight
 from tokenspeed_kernel.profile_nvtx import build_nvtx_bridge
 from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
+
+
+@pytest.mark.parametrize(
+    "route,partial",
+    [
+        ("ipc", False),
+        ("ipc", True),
+        ("mnnvl", False),
+        ("unfused", False),
+        ("unfused", True),
+    ],
+)
+def test_allreduce_rmsnorm_interception_without_gpu(monkeypatch, route, partial):
+    from tokenspeed_kernel.ops.communication import trtllm as comm
+
+    # Only process-group/workspace/launch facilities are substituted. Tensor
+    # arithmetic, dispatch, recording and cost analysis all execute on the CPU.
+    class Group:
+        group_name = "profile-test"
+
+        def size(self):
+            return 2
+
+    group = Group()
+    mnnvl = SimpleNamespace(resolve_use_oneshot=lambda *args: False)
+    workspace = None if route == "unfused" else mnnvl if route == "mnnvl" else object()
+    manager = SimpleNamespace(mnnvl_workspace=mnnvl if route == "mnnvl" else None)
+    monkeypatch.setattr(comm, "ensure_workspace_initialized", lambda **kwargs: True)
+    monkeypatch.setattr(comm, "_manager_for_group", lambda group: manager)
+    monkeypatch.setattr(comm, "_ar_fusion_workspace", lambda *args, **kwargs: workspace)
+    monkeypatch.setattr(comm.dist, "get_process_group_ranks", lambda group: [3, 7])
+    monkeypatch.setattr(comm.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(
+        comm.dist, "all_reduce", lambda tensor, **kwargs: tensor.mul_(2)
+    )
+
+    def cpu_launch(**kwargs):
+        summed = kwargs["allreduce_in"] * kwargs["world_size"] + kwargs["residual_in"]
+        output = summed * torch.rsqrt(
+            summed.square().mean(-1, keepdim=True) + kwargs["rms_eps"]
+        )
+        output *= kwargs["rms_gamma"]
+        kwargs["residual_out"].copy_(summed)
+        if kwargs["partial_norm_out"] is not None:
+            kwargs["partial_norm_out"].copy_(output[3:])
+        else:
+            kwargs["norm_out"].copy_(output)
+
+    monkeypatch.setattr(comm, "trtllm_allreduce_fusion", cpu_launch)
+    x = torch.arange(20, dtype=torch.float32).reshape(5, 4) / 10
+    residual, weight = torch.full_like(x, 0.125), torch.arange(1, 5, dtype=x.dtype)
+    session = ProfileSession(run_id="fusion", model_id="test", rank=7, backend="none")
+
+    def run():
+        return comm.allreduce_residual_rmsnorm(
+            x,
+            residual,
+            weight,
+            1,
+            group,
+            eps=1e-5,
+            use_oneshot=True,
+            has_partial_norm_out=partial,
+        )
+
+    with session.iteration(iter_id=0):
+        output, residual_out, scale_out, partial_out = run()
+    summed = 2 * x + residual
+    expected = torch.nn.functional.rms_norm(summed, (4,), weight, eps=1e-5)
+    if not partial or route == "unfused":
+        torch.testing.assert_close(output, expected)
+    torch.testing.assert_close(residual_out, summed)
+    assert scale_out is None
+    if partial:
+        torch.testing.assert_close(partial_out, expected[3:])
+    else:
+        assert partial_out is None
+    assert len(session.ops) == 1
+    record = session.ops[0]
+    fused = route != "unfused"
+    assert record.implementation == "trtllm_allreduce_residual_rmsnorm"
+    assert record.scalar_args["ranks"] == (3, 7)
+    assert record.scalar_args["group_name"] == group.group_name
+    assert record.scalar_args["fused"] is fused
+    costs = CostRegistry()
+    register_collective_costs(costs, hbm_policy="logical_io_once")
+    cost = session.report(costs=costs)["analysis"]["ops"][0]["cost"]
+    assert cost["useful_flops"] == 100  # Full epilogue, including two-shot.
+    assert cost["logical_read_bytes"] == 176
+    assert cost["logical_write_bytes"] == (112 if fused and partial else 160)
+    assert cost["estimated_hbm_bytes"] == ((288 if partial else 336) if fused else None)
+    assert cost["communication"]["total_bytes"] == 80
+    assert cost["communication"]["world_size"] == 2
+    assert cost["compute_type"] is None  # CPU execution has no GPU peak.
+    rule = AllReduceRMSNormCost(hbm_policy="logical_io_once")
+    gpu_metadata = replace(
+        record,
+        inputs={k: replace(v, device="cuda:0") for k, v in record.inputs.items()},
+        outputs={k: replace(v, device="cuda:0") for k, v in record.outputs.items()},
+    )
+    assert rule(gpu_metadata).compute_type == "fp32_simt"
+    for flag in ("block_quant_fp8", "residual_reduce_scattered"):
+        with pytest.raises(ValueError, match="not modeled"):
+            rule(replace(record, scalar_args={**record.scalar_args, flag: True}))
+    if fused:
+
+        def fail_launch(**kwargs):
+            raise RuntimeError("launch failed")
+
+        monkeypatch.setattr(comm, "trtllm_allreduce_fusion", fail_launch)
+        with session.iteration(iter_id=1), pytest.raises(
+            RuntimeError, match="launch failed"
+        ):
+            run()
+        assert session.ops[-1].error == "RuntimeError"
+        assert session.report(costs=costs)["analysis"]["ops"][-1]["cost"] is None
 
 
 def test_compute_type_uses_gpu_operands_not_output_dtype():
@@ -180,7 +301,12 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
     subprocess.run(
         command, env=env, check=True, capture_output=True, text=True, timeout=180
     )
-    report = json.loads((output / "metrics.json").read_text())
+    report = finalize_nsight(
+        nsys=nsys,
+        trace=output / "timeline.nsys-rep",
+        metadata=output / "metrics.json",
+        output=output / "nsight.metrics.json",
+    )
     assert {op["implementation"] for op in report["ops"]} == {"torch_mm"}
     assert {op["cost_rule"] for op in report["ops"]} == {"torch_mm.v1"}
     rows = report["device_analysis"]["scopes"]
@@ -205,7 +331,7 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
         projected = defaultdict(list)
         for r in csv.DictReader(source):
             projected[(int(r["TID"]), r["Name"].split(":", 1)[-1])].append(r)
-    labels = {row["nvtx_label"] for row in rows}
+    labels = {row["native_nvtx_label"] for row in rows}
     with sqlite3.connect(f"file:{output / 'timeline.sqlite'}?mode=ro", uri=True) as db:
         events = [
             event
@@ -220,7 +346,7 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
     assert events[0][3] % (1 << 24) == report["device_analysis"]["thread_id"]
     for row in rows:
         projection_row = projected[
-            (report["device_analysis"]["thread_id"], row["nvtx_label"])
+            (report["device_analysis"]["thread_id"], row["native_nvtx_label"])
         ].pop(0)
         assert int(projection_row["NumGPUOps"]) == (1 if row["kind"] == "op" else 2)
         assert int(projection_row["Lvl"]) == (1 if row["kind"] == "op" else 0)
@@ -230,7 +356,9 @@ def test_native_ranges_preserve_thread_nesting_and_gpu_projection(tmp_path):
             cost / (1e12 * row["gpu_duration_ns"] * 1e-9)
         )
         if row["kind"] == "op":
-            assert f"MFU={100 * row['mfu']:.2f}%" in projection_row["Name"]
+            assert row["gpu_duration_ns"] == int(
+                projection_row["Projected Duration (ns)"]
+            )
         else:
             assert row["nvtx_label"] == f"L{row['layer_id']}"
 
@@ -260,7 +388,7 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
         from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
 
         root = Path(sys.argv[1])
-        def work(a, b):
+        def work(a, b, lengths=None):
             if b is None:
                 raise ValueError("intentional workload failure")
             return a @ b
@@ -268,7 +396,7 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
         registry.register(
             KernelSpec(name="test", family="gemm", mode="mm"),
             work,
-            profile=OpProfile(cost_rule="mm"),
+            profile=OpProfile(cost_rule="mm", integer_tensor_args=("lengths",)),
         )
         mm = registry.get_impl("test")
         dense = DenseMatmulCost(lhs="a", rhs="b", output="return")
@@ -279,19 +407,24 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
         a = torch.ones(16, 16, device="cuda")
         reference = mm(a, a)
         for case in ("failed", "valid", "cpu"):
+            lengths = torch.tensor([2, 4], dtype=torch.int64 if case == "valid" else torch.int32,
+                device="cpu" if case == "cpu" else "cuda")
             session = ProfileSession(run_id=case, model_id=case, rank=0, backend="nvtx")
             timeline = NvtxTimeline(session, costs=costs, hardware=hardware,
-                stream=torch.cuda.current_stream(), max_scopes=2,
+                stream=torch.cuda.current_stream(), max_scopes=2, max_metadata_bytes=32,
                 library=root / "bridge.so", output=root / f"{case}.json")
             try:
                 with timeline:
                     with session.iteration(iter_id=0):
                         if case == "failed":
-                            mm(a, None)
+                            mm(a, None, lengths)
                         elif case == "cpu":
-                            mm(torch.ones(16, 16), torch.ones(16, 16))
+                            mm(torch.ones(16, 16), torch.ones(16, 16), lengths)
                         else:
-                            result = mm(a, a)
+                            result = mm(a, a, lengths)
+                            lengths.add_(3)
+                            result = mm(a, a, lengths)
+                            lengths.fill_(99)
                     timeline.finish()
                     before = (root / f"{case}.json").stat().st_mtime_ns
                     timeline.finish()
@@ -301,13 +434,20 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
             else:
                 assert case != "failed"
             report = json.loads((root / f"{case}.json").read_text())
-            row = report["device_analysis"]["scopes"][0]
-            assert (row["mfu"] is not None) == (case == "valid")
-            if case == "cpu":
-                assert "declared CUDA device" in row["mfu_missing_reason"]
+            assert [op["tensor_values"]["lengths"] for op in report["ops"]] == (
+                [[2, 4], [5, 7]] if case == "valid" else [[2, 4]])
+            assert report["device_analysis"]["metadata_snapshot_bytes"] == (
+                32 if case == "valid" else 8 if case == "failed" else 0)
+            assert report["device_analysis"]["timing_kind"] == "pending_nsight"
+            assert all("gpu_duration_ns" not in row for row in report["device_analysis"]["scopes"])
         torch.testing.assert_close(result, reference)
         # A call outside the context still has its original behavior.
         torch.testing.assert_close(mm(a, a), reference)
+        # CUDA metadata stays unread in the ordinary metadata-only collector.
+        plain = ProfileSession(run_id="plain", model_id="plain", rank=0, backend="none")
+        with plain.iteration(iter_id=0):
+            mm(a, a, torch.tensor([3], device="cuda", dtype=torch.int32))
+        assert plain.ops[0].tensor_values["lengths"] is None
     """))
     kernel_root = Path(__file__).resolve().parents[2]
     env = dict(os.environ, PYTHONPATH=str(kernel_root / "python"))
@@ -342,15 +482,17 @@ def test_finalize_once_and_recover_after_workload_exception(tmp_path):
         text=True,
         timeout=120,
     )
-    with sqlite3.connect(
-        f"file:{tmp_path / 'recovery.sqlite'}?mode=ro", uri=True
-    ) as db:
-        labels = [
-            r[0]
-            for r in db.execute("SELECT text FROM NVTX_EVENTS WHERE text LIKE '%MFU=%'")
-        ]
-    assert len(labels) == 3
-    assert sum("MFU=N/A" in label for label in labels) == 2
+    for case in ("valid", "failed", "cpu"):
+        report = finalize_nsight(
+            nsys=nsys,
+            trace=tmp_path / "recovery.nsys-rep",
+            metadata=tmp_path / f"{case}.json",
+            output=tmp_path / f"{case}.nsight.json",
+        )
+        row = report["device_analysis"]["scopes"][0]
+        assert (row["mfu"] is not None) == (case == "valid")
+        if case == "cpu":
+            assert "no GPU activity" in row["mfu_missing_reason"]
 
 
 def test_real_collective_busbw_in_native_timeline(tmp_path):
@@ -371,7 +513,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         import torch
         import torch.distributed as dist
         from tokenspeed_kernel.op_profile import CostRegistry, OpProfile, ProfileSession, profiled
-        from tokenspeed_kernel.profile_costs import CollectiveCost
+        from tokenspeed_kernel.profile_costs import CollectiveCost, register_collective_costs
         from tokenspeed_kernel.profile_nvtx import NvtxTimeline
         from tokenspeed_kernel.profile_utilization import HardwareProfile
         from tokenspeed_kernel.registry import KernelRegistry, KernelSpec
@@ -382,7 +524,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         dist.init_process_group("nccl", timeout=timedelta(seconds=90), device_id=torch.device("cuda", rank))
         size = dist.get_world_size()
         def reduce(x):
-            dist.all_reduce(x, op=dist.ReduceOp.SUM, async_op=True).wait()
+            dist.all_reduce(x, op=dist.ReduceOp.SUM)
             return x
         def scatter(x, out):
             dist.reduce_scatter_tensor(out, x, op=dist.ReduceOp.SUM, async_op=True).wait()
@@ -394,6 +536,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         registry = KernelRegistry()
         wrapped = {}
         costs = CostRegistry()
+        register_collective_costs(costs, hbm_policy="logical_io_once")
         for name, fn in functions.items():
             registry.register(
                 KernelSpec(name=name, family="collective", mode=name),
@@ -407,7 +550,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
                 tensor="return" if is_gather else "x",
                 tensor_source="output" if is_gather else "input",
                 world_size=size,
-                group="world:0-1",
+                group=f"nccl:{None!r}:{tuple(range(size))}",
             ))
         full = torch.full((16384,), rank + 1., device="cuda")
         shard = torch.full((16384 // size,), rank + 1., device="cuda")
@@ -426,7 +569,7 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
         torch.cuda.synchronize()
         session = ProfileSession(run_id="collectives", model_id="collective-validation", rank=rank, backend="nvtx")
         session.bind_layer(layer, layer_id=0)
-        with NvtxTimeline(session, costs=costs, hardware=HardwareProfile("test", {}, None, "bandwidth needs no peak"), stream=torch.cuda.current_stream(), max_scopes=4, library=root / "bridge.so", output=root / f"metrics.rank{rank}.json"):
+        with NvtxTimeline(session, costs=costs, hardware=HardwareProfile("test", {}, 1e12, "synthetic HBM peak for metric validation"), stream=torch.cuda.current_stream(), max_scopes=4, library=root / "bridge.so", output=root / f"metrics.rank{rank}.json"):
             with session.iteration(iter_id=0):
                 reduced = layer.forward()
         torch.testing.assert_close(reduced, torch.full_like(full, 3.), rtol=0, atol=0)
@@ -479,7 +622,13 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
             projected[(int(r["TID"]), r["Name"].split(":", 1)[-1])].append(r)
     labels = set()
     for rank in range(2):
-        report = json.loads((tmp_path / f"metrics.rank{rank}.json").read_text())
+        report = finalize_nsight(
+            nsys=nsys,
+            trace=tmp_path / "collectives.nsys-rep",
+            metadata=tmp_path / f"metrics.rank{rank}.json",
+            output=tmp_path / f"nsight.rank{rank}.json",
+        )
+        assert report["ops"][0]["implementation"] == "all_reduce_sum"
         scopes = report["device_analysis"]["scopes"]
         assert len(scopes) == 4
         for row, expected_bytes in zip(
@@ -489,15 +638,24 @@ def test_real_collective_busbw_in_native_timeline(tmp_path):
             assert row["busbw_bytes_per_second"] == pytest.approx(
                 expected_bytes / (row["gpu_duration_ns"] * 1e-9)
             )
-            assert row["mfu"] is None and row["estimated_mbu"] is None
+            assert row["mfu"] is None
+            if row["trace_label"] == report["ops"][0]["trace_label"]:
+                assert row["estimated_mbu"] == pytest.approx(
+                    2 * 65536 / (row["gpu_duration_ns"] * 1e-9) / 1e12
+                )
+            else:
+                assert row["estimated_mbu"] is None
             label = row["nvtx_label"]
-            labels.add(label)
+            labels.add(row["native_nvtx_label"])
             if row["kind"] == "op":
-                assert "Est.MBU=N/A" in label
+                assert "Est.MBU=" in label
             else:
                 assert label == f"L{row['layer_id']}"
             assert "MFU=" not in label and "busbw=" not in label
-            native = projected[(report["device_analysis"]["thread_id"], label)].pop(0)
+            native = projected[
+                (report["device_analysis"]["thread_id"], row["native_nvtx_label"])
+            ].pop(0)
+            assert row["gpu_duration_ns"] == int(native["Projected Duration (ns)"])
             assert int(native["TID"]) == report["device_analysis"]["thread_id"]
             assert int(native["NumGPUOps"]) >= 1
     with sqlite3.connect(

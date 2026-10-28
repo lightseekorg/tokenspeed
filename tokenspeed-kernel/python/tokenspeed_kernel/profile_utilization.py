@@ -51,19 +51,45 @@ class HardwareProfile:
         values = list(self.compute_flops_per_second.values())
         if self.hbm_bytes_per_second is not None:
             values.append(self.hbm_bytes_per_second)
-        if any(not math.isfinite(value) or value <= 0 for value in values):
+        if any(
+            type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+            for value in values
+        ):
             raise ValueError("Hardware peaks must be finite and positive")
 
     @classmethod
+    def from_file(cls, path: str | Path) -> HardwareProfile:
+        """Read JSON or YAML (.yaml/.yml); validate the same per-device capacities.
+
+        YAML requires the optional profiling extra. Neither format supplies
+        defaults for missing compute peaks or infers capacities from the device.
+        """
+        path = Path(path)
+        content = path.read_text()
+        if path.suffix.lower() in {".yaml", ".yml"}:
+            try:
+                from yaml import safe_load
+            except ImportError as exc:
+                raise ImportError(
+                    "YAML hardware profiles require tokenspeed-kernel[profiling]"
+                ) from exc
+            data = safe_load(content)
+        else:
+            data = json.loads(content)
+        if not isinstance(data, dict):
+            raise ValueError("Hardware profile must be a mapping")
+        return cls(**data)
+
+    @classmethod
     def from_json(cls, path: str | Path) -> HardwareProfile:
-        """Read an explicit hardware profile; return its validated capacities."""
-        return cls(**json.loads(Path(path).read_text()))
+        """Retain the existing JSON entry point through the common reader."""
+        return cls.from_file(path)
 
 
 @dataclass(frozen=True)
 class ScopeTiming:
     trace_label: str
-    # Native tool clock values, not perf_counter_ns or report-relative time.
+    # Nsight-exported CPU range timestamps; used only for nesting.
     start_timestamp: int
     end_timestamp: int
     gpu_duration_ns: float
@@ -124,7 +150,9 @@ def _metrics(
         "op_count": len(entries),
         "covered_op_count": len(costs),
         "useful_flops": None,
+        "useful_flops_per_second": None,
         "estimated_hbm_bytes": None,
+        "estimated_hbm_bytes_per_second": None,
         "mfu": None,
         "mfu_by_compute_type": {},
         "estimated_mbu": None,
@@ -155,10 +183,11 @@ def _metrics(
 
     seconds = duration_ns * 1e-9
     result["useful_flops"] = sum(cost["useful_flops"] for cost in costs)
+    result["useful_flops_per_second"] = result["useful_flops"] / seconds
     flops: dict[str, int] = {}
     for cost in costs:
         compute_type = cost.get("compute_type")
-        if cost.get("communication") is not None and cost["useful_flops"] == 0:
+        if cost["useful_flops"] == 0:
             continue
         if compute_type is None:
             result["mfu_missing_reason"] = "compute type unavailable"
@@ -173,7 +202,7 @@ def _metrics(
     if len(flops) > 1:
         result["mfu_missing_reason"] = "mixed compute types; no overall normalization"
     if not flops and result["mfu_missing_reason"] is None:
-        result["mfu_missing_reason"] = "no model compute FLOPs in collective-only scope"
+        result["mfu_missing_reason"] = "no model compute FLOPs in scope"
     if result["mfu_missing_reason"] is None and len(flops) == 1:
         result["mfu"] = next(iter(result["mfu_by_compute_type"].values()))
 
@@ -183,11 +212,14 @@ def _metrics(
         result["estimated_hbm_bytes"] = sum(
             cost["estimated_hbm_bytes"] for cost in costs
         )
+        result["estimated_hbm_bytes_per_second"] = (
+            result["estimated_hbm_bytes"] / seconds
+        )
         if hardware.hbm_bytes_per_second is None:
             result["mbu_missing_reason"] = "HBM bandwidth peak unavailable"
         else:
-            result["estimated_mbu"] = result["estimated_hbm_bytes"] / (
-                hardware.hbm_bytes_per_second * seconds
+            result["estimated_mbu"] = (
+                result["estimated_hbm_bytes_per_second"] / hardware.hbm_bytes_per_second
             )
     return result
 
@@ -195,7 +227,7 @@ def _metrics(
 def analyze_utilization(
     report: dict[str, Any], timings: list[ScopeTiming], hardware: HardwareProfile
 ) -> list[dict[str, Any]]:
-    """Aggregate unique op costs over each actual call's GPU event window.
+    """Aggregate unique op costs over each actual call's Nsight GPU projection.
 
     Nested layers include descendant ops once. Repeated calls remain separate.
     Coverage is of opted-in ops, not all device work inside a layer or model.
@@ -235,22 +267,17 @@ def analyze_utilization(
                 and by_label[label].end_timestamp <= timing.end_timestamp
             ]
         metrics = _metrics(entries, timing.gpu_duration_ns, hardware)
-        if timing.unavailable_reason is not None:
-            metrics["mfu"] = metrics["estimated_mbu"] = None
-            metrics["mfu_by_compute_type"] = {}
-            metrics["mfu_missing_reason"] = metrics["mbu_missing_reason"] = (
-                timing.unavailable_reason
-            )
-        if record["error"] is not None:
-            metrics["mfu"] = metrics["estimated_mbu"] = None
-            metrics["mfu_by_compute_type"] = {}
-            metrics["mfu_missing_reason"] = metrics["mbu_missing_reason"] = (
-                f"{kind} failed: {record['error']}"
-            )
         invalid_reason = timing.unavailable_reason
         if record["error"] is not None:
             invalid_reason = f"{kind} failed: {record['error']}"
         if invalid_reason is not None:
+            metrics["useful_flops_per_second"] = None
+            metrics["estimated_hbm_bytes_per_second"] = None
+            metrics["mfu"] = metrics["estimated_mbu"] = None
+            metrics["mfu_by_compute_type"] = {}
+            metrics["mfu_missing_reason"] = metrics["mbu_missing_reason"] = (
+                invalid_reason
+            )
             metrics["busbw_bytes_per_second"] = None
             metrics["algbw_bytes_per_second"] = None
             metrics["busbw_missing_reason"] = invalid_reason
@@ -264,6 +291,7 @@ def analyze_utilization(
         collective_only = (
             metrics["collective_count"] > 0
             and metrics["collective_count"] == metrics["op_count"]
+            and all(entry["cost"]["useful_flops"] == 0 for entry in entries)
         )
         if kind == "op":
             if collective_only:

@@ -18,13 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+from tokenspeed_kernel.op_profile import OpProfile, wrap_op_for_profiling
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.registry import KernelSpec
 
 if current_platform().is_hopper_plus:
     from flash_mla import (
         flash_mla_sparse_fwd,
         flash_mla_with_kvcache,
         get_mla_metadata,
+    )
+
+    # Preserve the vendor's signature, optional arguments and return values.
+    flash_mla_with_kvcache = wrap_op_for_profiling(
+        flash_mla_with_kvcache,
+        spec=KernelSpec(name="flashmla_decode", family="attention", mode="mla_decode"),
+        profile=OpProfile(
+            cost_rule="flashmla_decode.v1",
+            scalar_args=("head_dim_v", "causal", "is_fp8_kvcache"),
+            integer_tensor_args=("cache_seqlens",),
+        ),
     )
 
     __all__ = [

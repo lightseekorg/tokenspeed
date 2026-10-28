@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.platform import CapabilityRequirement
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
@@ -70,6 +71,7 @@ def attn_merge_state_kernel(
     "attention",
     "attn_merge_state",
     name="triton_attn_merge_state",
+    profile=OpProfile(cost_rule="attention_merge_state.v1"),
     solution="triton",
     capability=CapabilityRequirement(vendors=frozenset({"nvidia", "amd"})),
     signatures=format_signatures(

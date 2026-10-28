@@ -35,10 +35,10 @@ from pathlib import Path
 import pytest
 import torch
 from tokenspeed_kernel.op_profile import profiled
+from tokenspeed_kernel.profile_nsys import finalize_nsight
 from tokenspeed_kernel.profile_nvtx import build_nvtx_bridge
 
 from tokenspeed.runtime.distributed.mapping import Mapping
-from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.utilization_profile import RuntimeUtilizationProfile
 from tokenspeed.runtime.models.qwen3_5_moe import Qwen3_5MoeMLP
 
@@ -123,7 +123,6 @@ def _workload(root: Path) -> None:
     )
     assert profiler is not None
     assert profiler.output == root.resolve() / "rank-0.metrics.json"
-    thread = ForwardThread("cuda")
 
     def forward(step, x):
         with torch.inference_mode(), torch.cuda.stream(stream), profiler.iteration(
@@ -143,33 +142,26 @@ def _workload(root: Path) -> None:
                 x = torch.nn.functional.linear(activated, layer.down_proj.weight)
         return x
 
-    try:
-        # Warm both input shapes before the bounded serving window.
-        for _ in range(3):
-            thread.run(lambda: forward(0, prefill))
-            thread.run(lambda: forward(0, decode))
-        thread.run(lambda: forward(1, decode))
-        assert not profiler.output.exists()
-        prefill_output = thread.run(lambda: forward(2, prefill))
-        assert not profiler.output.exists()
-        decode_output = thread.run(lambda: forward(3, decode))
-        # Output is ready immediately after the final batch, before shutdown.
-        saved = profiler.output.read_bytes()
-        thread.run(lambda: forward(4, decode))
-        assert profiler.output.read_bytes() == saved
-        stream.synchronize()
-        torch.testing.assert_close(
-            prefill_output, reference(prefill), rtol=0.01, atol=2e-5
-        )
-        torch.testing.assert_close(
-            decode_output, reference(decode), rtol=0.01, atol=2e-5
-        )
-        report = json.loads(saved)
-        assert report["device_analysis"]["thread_id"] != threading.get_native_id()
-        assert {op["iter_id"] for op in report["ops"]} == {2, 3}
-        assert len(report["ops"]) == 8 and len(report["layers"]) == 4
-    finally:
-        thread.shutdown()
+    # Warm both input shapes before the bounded serving window.
+    for _ in range(3):
+        forward(0, prefill)
+        forward(0, decode)
+    forward(1, decode)
+    assert not profiler.output.exists()
+    prefill_output = forward(2, prefill)
+    assert not profiler.output.exists()
+    decode_output = forward(3, decode)
+    # Output is ready immediately after the final batch, before shutdown.
+    saved = profiler.output.read_bytes()
+    forward(4, decode)
+    assert profiler.output.read_bytes() == saved
+    stream.synchronize()
+    torch.testing.assert_close(prefill_output, reference(prefill), rtol=0.01, atol=2e-5)
+    torch.testing.assert_close(decode_output, reference(decode), rtol=0.01, atol=2e-5)
+    report = json.loads(saved)
+    assert report["device_analysis"]["thread_id"] == threading.get_native_id()
+    assert {op["iter_id"] for op in report["ops"]} == {2, 3}
+    assert len(report["ops"]) == 8 and len(report["layers"]) == 4
 
 
 def test_qwen_shared_expert_native_timeline(tmp_path):
@@ -230,7 +222,12 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
         text=True,
         timeout=240,
     )
-    report = json.loads((root / "rank-0.metrics.json").read_text())
+    report = finalize_nsight(
+        nsys=nsys,
+        trace=root / "timeline.nsys-rep",
+        metadata=root / "rank-0.metrics.json",
+        output=root / "rank-0.nsight.json",
+    )
     rows = report["device_analysis"]["scopes"]
     assert len(rows) == 12
     assert {op["implementation"] for op in report["ops"]} == {"torch_mm"}
@@ -260,7 +257,7 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
         projected = defaultdict(list)
         for row in csv.DictReader(source):
             projected[row["Name"].split(":", 1)[-1]].append(row)
-    labels = {row["nvtx_label"] for row in rows}
+    labels = {row["native_nvtx_label"] for row in rows}
     with sqlite3.connect(f"file:{root / 'timeline.sqlite'}?mode=ro", uri=True) as db:
         events = [
             event
@@ -273,11 +270,12 @@ def test_qwen_shared_expert_native_timeline(tmp_path):
         report["device_analysis"]["thread_id"]
     }
     for row in rows:
-        native = projected[row["nvtx_label"]].pop(0)
+        native = projected[row["native_nvtx_label"]].pop(0)
+        assert row["gpu_duration_ns"] == int(native["Projected Duration (ns)"])
         assert int(native["TID"]) == report["device_analysis"]["thread_id"]
         assert int(native["NumGPUOps"]) >= (1 if row["kind"] == "op" else 3)
         if row["kind"] == "op":
-            assert "Est.MBU=" in native["Name"] and "MFU=" in native["Name"]
+            assert "Est.MBU=" in row["nvtx_label"] and "MFU=" in row["nvtx_label"]
         else:
             assert row["nvtx_label"] == f"L{row['layer_id']}"
 

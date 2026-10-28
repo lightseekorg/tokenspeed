@@ -25,9 +25,14 @@ from ctypes import c_void_p
 
 import torch
 import torch.distributed as dist
+from tokenspeed_kernel.op_profile import (
+    OpProfile,
+    current_op_metadata,
+    wrap_op_for_profiling,
+)
 from tokenspeed_kernel.ops.quantization import quantize_fp8
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.registry import ErrorClass, error_fn, register_kernel
+from tokenspeed_kernel.registry import ErrorClass, KernelSpec, error_fn, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
 logger = logging.getLogger(__name__)
@@ -1066,6 +1071,13 @@ if current_platform().is_nvidia:
         # IPC has its own heuristic; only MNNVL uses the workspace's frozen cap.
         if workspace is not manager.mnnvl_workspace:
             resolved_oneshot = requested_oneshot
+        metadata = current_op_metadata()
+        if metadata is not None:
+            metadata.update(
+                ranks=tuple(dist.get_process_group_ranks(group)),
+                group_name=group.group_name,
+                fused=workspace is not None,
+            )
         if workspace is None:
             # Cross-node group, pattern/shape the mnnvl kernel cannot serve
             # (block-quant or partial-out epilogue, oversized call). Degrade to
@@ -1121,6 +1133,24 @@ if current_platform().is_nvidia:
             return quant_out, residual_out, scale_out, partial_norm_out
         else:
             return norm_out, residual_out, None, partial_norm_out
+
+    allreduce_residual_rmsnorm = wrap_op_for_profiling(
+        allreduce_residual_rmsnorm,
+        spec=KernelSpec(
+            name="trtllm_allreduce_residual_rmsnorm",
+            family="communication",
+            mode="all_reduce_residual_rmsnorm",
+        ),
+        profile=OpProfile(
+            cost_rule="all_reduce_residual_rmsnorm.v1",
+            scalar_args=(
+                "rank",
+                "block_quant_fp8",
+                "residual_reduce_scattered",
+                "has_partial_norm_out",
+            ),
+        ),
+    )
 
     def _sandwich_scale_pair(
         x_scale: float | None, residual_scale: float | None

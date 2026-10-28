@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.platform import ArchVersion, CapabilityRequirement, Platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import ScaleFormat, format_signatures
@@ -31,6 +32,7 @@ from tokenspeed_kernel.thirdparty.deepgemm import block_fp8_mm
     "gemm",
     "mm",
     name="deepgemm_mm_fp8_blockscale",
+    profile=OpProfile(cost_rule="fp8_block_mm.v1"),
     solution="deepgemm",
     capability=CapabilityRequirement(
         vendors=frozenset({"nvidia"}),

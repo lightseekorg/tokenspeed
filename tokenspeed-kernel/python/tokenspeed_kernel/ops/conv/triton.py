@@ -36,6 +36,7 @@ kernels are re-exported for the conv package entry points.
 
 import torch
 from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel.op_profile import OpProfile
 from tokenspeed_kernel.ops.attention.gdn.triton import (
     CausalConv1dPrefillMetadata,
 )
@@ -77,6 +78,7 @@ _CONV_DTYPES = {torch.bfloat16, torch.float16, torch.float32}
     solution="triton",
     signatures=format_signatures("x", "dense", _CONV_DTYPES),
     priority=Priority.PORTABLE,
+    profile=OpProfile(cost_rule="causal_conv1d_prefill.v1"),
 )
 def triton_causal_conv1d_prefill(
     x: torch.Tensor,

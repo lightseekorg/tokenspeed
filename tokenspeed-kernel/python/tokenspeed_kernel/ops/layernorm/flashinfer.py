@@ -20,8 +20,9 @@
 from functools import wraps
 from inspect import signature
 
+from tokenspeed_kernel.op_profile import OpProfile, wrap_op_for_profiling
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
-from tokenspeed_kernel.registry import error_fn
+from tokenspeed_kernel.registry import KernelSpec, error_fn
 
 fused_add_rmsnorm = error_fn
 gemma_fused_add_rmsnorm = error_fn
@@ -65,7 +66,13 @@ if current_platform().is_nvidia:
         fused_add_rmsnorm = _with_pdl_default(_fused_add_rmsnorm)
         gemma_fused_add_rmsnorm = _with_pdl_default(_gemma_fused_add_rmsnorm)
         gemma_rmsnorm = _with_pdl_default(_gemma_rmsnorm)
-        rmsnorm = _with_pdl_default(_rmsnorm)
+        rmsnorm = wrap_op_for_profiling(
+            _with_pdl_default(_rmsnorm),
+            spec=KernelSpec(
+                name="flashinfer_rmsnorm", family="layernorm", mode="rmsnorm"
+            ),
+            profile=OpProfile(cost_rule="rmsnorm.v1"),
+        )
     except ImportError:
         pass
 

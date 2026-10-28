@@ -65,6 +65,41 @@ def session_for(*layers):
     return session
 
 
+def test_selected_host_arguments_include_defaults_without_reading_tensors():
+    def add_one(x, *, ranks=(0, 1), group_name=None):
+        return x + 1
+
+    registry = KernelRegistry()
+    registry.register(
+        KernelSpec(
+            name="profile_host_args",
+            family="test",
+            mode="add",
+            traits={
+                "ranks": frozenset({(0, 1), (3, 7)}),
+                "group_name": frozenset({None, "named"}),
+            },
+        ),
+        add_one,
+        profile=OpProfile(cost_rule=None, scalar_args=("ranks",)),
+    )
+    fn = registry.get_impl("profile_host_args")
+    session = session_for()
+    with session.iteration(iter_id=0):
+        result = fn(torch.ones(2), ranks=(3, 7))
+    torch.testing.assert_close(result, torch.full((2,), 2.0))
+    assert session.ops[0].scalar_args == {"ranks": (3, 7), "group_name": None}
+    assert tuple(session.ops[0].inputs) == ("x",)
+    with session.iteration(iter_id=1):
+        fn(torch.ones(2), group_name="named")
+        # Automatic trait collection skips tensors without reading their values.
+        fn(torch.ones(2), group_name=torch.ones(2))
+        with pytest.raises(TypeError, match="host scalars"):
+            fn(torch.ones(2), ranks=torch.tensor([3, 7]))
+    assert session.ops[1].scalar_args == {"ranks": (0, 1), "group_name": "named"}
+    assert session.ops[2].scalar_args == {"ranks": (0, 1)}
+
+
 def costs():
     registry = CostRegistry()
     registry.register("dense_mm", DenseMatmulCost(lhs="a", rhs="b", output="return"))
@@ -162,6 +197,8 @@ def test_missing_cost_and_unbound_identity(mm):
 
 
 def test_noncontiguous_mixed_storage_and_output_roles(fresh_registry):
+    default_weight = torch.ones(3, 4, dtype=torch.float32)
+
     @register_kernel(
         "test",
         "cast_mm",
@@ -170,19 +207,25 @@ def test_noncontiguous_mixed_storage_and_output_roles(fresh_registry):
         signatures=frozenset(),
         profile=OpProfile(cost_rule="dense_mm"),
     )
-    def cast_mm(a, b):
+    def cast_mm(a, b=default_weight):
         return (a.float() @ b.float()).half()
 
     a = torch.ones(3, 2, dtype=torch.float16).t()
-    b = torch.ones(3, 4, dtype=torch.float32)
+    b = torch.full((3, 5), 2.0, dtype=torch.float32)
     session = session_for()
     with session.iteration(iter_id=0):
-        cast_mm(a, b)
+        default_result = cast_mm(a)
+        explicit_result = cast_mm(a, b=b)
+    torch.testing.assert_close(default_result, (a.float() @ default_weight).half())
+    torch.testing.assert_close(explicit_result, (a.float() @ b).half())
     assert session.ops[0].inputs["a"].stride == (1, 2)
-    cost = costs().analyze(session)["ops"][0]["cost"]
-    assert cost["logical_read_bytes"] == 12 + 48
-    assert cost["logical_write_bytes"] == 16
-    assert cost["estimated_hbm_bytes"] is None
+    assert [op.inputs["b"].shape for op in session.ops] == [(3, 4), (3, 5)]
+    for row, columns in zip(costs().analyze(session)["ops"], (4, 5), strict=True):
+        cost = row["cost"]
+        assert cost["useful_flops"] == 2 * 2 * 3 * columns
+        assert cost["logical_read_bytes"] == 12 + 3 * columns * 4
+        assert cost["logical_write_bytes"] == 2 * columns * 2
+        assert cost["estimated_hbm_bytes"] is None
 
 
 def test_registration_without_profile_preserves_behavior(fresh_registry):

@@ -7,5 +7,8 @@ name = "tokenspeed_kernel"
 requires-python = ">=3.11"
 dynamic = ["version", "dependencies"]
 
+[project.optional-dependencies]
+profiling = ["PyYAML>=6"]
+
 [tool.setuptools]
 license-files = ["LICENSE", "THIRDPARTYNOTICES"]

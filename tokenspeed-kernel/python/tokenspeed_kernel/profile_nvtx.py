@@ -18,26 +18,26 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Optional CUDA event timing and native NVTX submission before capture ends."""
+"""Native NVTX identities and cost metadata; Nsight owns GPU timing."""
 
 from __future__ import annotations
 
 import ctypes
 import json
+import os
 import subprocess
 import threading
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from itertools import count
 from pathlib import Path
 from typing import Iterator
 
 import torch
 from tokenspeed_kernel.op_profile import CostRegistry, ProfileSession
-from tokenspeed_kernel.profile_utilization import (
-    HardwareProfile,
-    ScopeTiming,
-    analyze_utilization,
-)
+from tokenspeed_kernel.profile_utilization import HardwareProfile
+
+_scope_ids = count(1)
 
 
 def build_nvtx_bridge(*, include_dir: Path, output: Path, compiler: str) -> Path:
@@ -72,14 +72,14 @@ class _Nvtx:
     def __init__(self, library: Path) -> None:
         self.library = ctypes.CDLL(str(library.resolve()))
         self.library.ts_nvtx_open.restype = ctypes.c_void_p
-        self.library.ts_nvtx_timestamp.restype = ctypes.c_int64
-        self.library.ts_nvtx_submit.argtypes = [
+        self.library.ts_nvtx_push.argtypes = [
             ctypes.c_void_p,
-            ctypes.c_int64,
-            ctypes.c_int64,
             ctypes.c_char_p,
+            ctypes.c_uint64,
         ]
-        self.library.ts_nvtx_submit.restype = ctypes.c_int
+        self.library.ts_nvtx_push.restype = ctypes.c_int
+        self.library.ts_nvtx_pop.argtypes = [ctypes.c_void_p]
+        self.library.ts_nvtx_pop.restype = ctypes.c_int
         self.library.ts_nvtx_close.argtypes = [ctypes.c_void_p]
         self.library.ts_nvtx_close.restype = None
         self.handle = self.library.ts_nvtx_open()
@@ -88,22 +88,13 @@ class _Nvtx:
                 "Run under Nsight Systems 2026.5+ with --trace=cuda,nvtx"
             )
 
-    def timestamp(self) -> int:
-        return self.library.ts_nvtx_timestamp()
+    def push(self, label: str, scope_id: int) -> None:
+        if self.library.ts_nvtx_push(self.handle, label.encode("utf-8"), scope_id) < 0:
+            raise RuntimeError("Could not start native NVTX range")
 
-    def submit(self, timing: ScopeTiming, label: str) -> None:
-        if (
-            self.library.ts_nvtx_submit(
-                self.handle,
-                timing.start_timestamp,
-                timing.end_timestamp,
-                label.encode("utf-8"),
-            )
-            != 0
-        ):
-            raise ValueError(
-                "Invalid NVTX time range or label exceeds 4095 UTF-8 bytes"
-            )
+    def pop(self) -> None:
+        if self.library.ts_nvtx_pop(self.handle) < 0:
+            raise RuntimeError("Could not end native NVTX range")
 
     def close(self) -> None:
         self.library.ts_nvtx_close(self.handle)
@@ -112,29 +103,34 @@ class _Nvtx:
 
 @dataclass
 class _Pending:
-    label: str
-    start: int
-    end: int
-    begin_event: torch.cuda.Event
-    end_event: torch.cuda.Event
+    trace_label: str
+    nvtx_label: str
+    nvtx_id: int
+
+
+@dataclass
+class _PendingValues:
+    target: dict[str, tuple[int, ...] | None]
+    name: str
+    host: torch.Tensor
 
 
 class NvtxTimeline:
-    """Finalize an eager session into the collecting process's native NVTX rows.
+    """Record native NVTX identities and costs without measuring GPU time.
 
-    All work must run on stream, or join stream before the op returns. The
-    caller must keep Nsight capture active through context exit. This measures
-    CUDA event windows, including stream waits and launch gaps, not kernel sums.
+    Nsight timestamps ranges and CUDA activities. After capture, profile_nsys
+    joins its GPU projection to these identities and calculates utilization.
 
     Args:
         session: An unused ProfileSession with backend='nvtx'.
         costs: Explicit implementation cost rules; missing costs remain N/A.
         hardware: Per-device peaks with matching compute types and source.
-        stream: The CUDA stream that owns or joins all scoped GPU work.
-        max_scopes: Capacity for op and layer calls together. Events are prepared
-            before collection; exhaustion raises instead of allocating mid-scope.
+        stream: The execution stream, also used for explicit metadata snapshots.
+        max_scopes: Maximum number of op and layer calls together.
         library: Prebuilt optional NVTX bridge.
-        output: Metadata, assumptions and metrics JSON accompanying nsys-rep.
+        output: Cost metadata accompanying nsys-rep; GPU metrics are pending.
+        max_metadata_bytes: Pinned-host capacity for explicitly requested integer
+            tensor snapshots, allocated before collection. Exhaustion raises.
     """
 
     def __init__(
@@ -147,11 +143,14 @@ class NvtxTimeline:
         max_scopes: int,
         library: Path,
         output: Path,
+        max_metadata_bytes: int = 1 << 20,
     ) -> None:
         if session.backend != "nvtx":
             raise ValueError("Native timeline requires backend='nvtx'")
         if max_scopes < 1:
             raise ValueError("max_scopes must be positive")
+        if type(max_metadata_bytes) is not int or max_metadata_bytes < 1:
+            raise ValueError("max_metadata_bytes must be a positive integer")
         self.session = session
         self.costs = costs
         self.hardware = hardware
@@ -159,10 +158,13 @@ class NvtxTimeline:
         self.max_scopes = max_scopes
         self.library = library
         self.output = output
+        self.max_metadata_bytes = max_metadata_bytes
         self._nvtx: _Nvtx | None = None
         self._thread: int | None = None
-        self._events: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self._pending: list[_Pending] = []
+        self._pending_values: list[_PendingValues] = []
+        self._metadata_buffer: torch.Tensor | None = None
+        self._metadata_used = 0
         self._count = 0
         self._entered = False
         self._finished = False
@@ -187,18 +189,36 @@ class NvtxTimeline:
         self._check_context()
         self._nvtx = _Nvtx(self.library)
         try:
-            for _ in range(self.max_scopes):
-                begin = torch.cuda.Event(enable_timing=True)
-                end = torch.cuda.Event(enable_timing=True)
-                begin.record(self.stream)
-                end.record(self.stream)
-                self._events.append((begin, end))
-            self.stream.synchronize()
+            self._metadata_buffer = torch.empty(
+                self.max_metadata_bytes,
+                dtype=torch.uint8,
+                device="cpu",
+                pin_memory=True,
+            )
         except BaseException:
             self._nvtx.close()
             raise
         self.session._timeline = self
         return self
+
+    def _snapshot_integer_values(
+        self, source: torch.Tensor, target: dict[str, tuple[int, ...] | None], name: str
+    ) -> None:
+        """Queue a validated integer vector before the op window; never wait here."""
+        self._check_context()
+        if self._finished or self._metadata_buffer is None:
+            raise RuntimeError("Native timeline is not collecting")
+        if source.device != self.stream.device:
+            return  # Do not copy unordered metadata from another device.
+        start = (self._metadata_used + 7) // 8 * 8
+        end = start + source.numel() * source.element_size()
+        if end > self.max_metadata_bytes:
+            raise RuntimeError("Native timeline max_metadata_bytes exhausted")
+        host = self._metadata_buffer[start:end].view(source.dtype)
+        host.copy_(source, non_blocking=True)
+        source.record_stream(self.stream)
+        self._metadata_used = end
+        self._pending_values.append(_PendingValues(target, name, host))
 
     @contextmanager
     def record_func(self, label: str) -> Iterator[None]:
@@ -208,10 +228,17 @@ class NvtxTimeline:
             raise RuntimeError("Native timeline is not collecting")
         if self._count == self.max_scopes:
             raise RuntimeError("Native timeline max_scopes exhausted")
-        begin, end = self._events[self._count]
+        # A native numeric payload joins to the full identity in the sidecar;
+        # repeated calls need no extra text on the visible timeline.
+        display = label.split(" | ", 1)[0]
+        if " | op=" in label:
+            display = label.split(" | op=", 1)[1].split(" | ", 1)[0]
+        else:
+            display = display.replace("layer=", "L", 1)
+        scope_id = next(_scope_ids)
         self._count += 1
-        start = self._nvtx.timestamp()
-        begin.record(self.stream)
+        self._nvtx.push(display, scope_id)
+        self._pending.append(_Pending(label, display, scope_id))
         error = None
         try:
             yield
@@ -220,17 +247,15 @@ class NvtxTimeline:
             raise
         finally:
             try:
-                end.record(self.stream)
-                finish = self._nvtx.timestamp()
-                self._pending.append(_Pending(label, start, finish, begin, end))
-            except BaseException as timing_error:
+                self._nvtx.pop()
+            except BaseException as close_error:
                 if error is None:
                     raise
-                error.add_note(f"Native scope timing failed: {timing_error}")
+                error.add_note(f"Native NVTX range close failed: {close_error}")
         self._check_context()
 
     def finish(self) -> None:
-        """Wait once, calculate all metrics and submit native ranges exactly once."""
+        """Resolve optional metadata snapshots and save costs exactly once."""
         if self._finished:
             return
         if (
@@ -247,54 +272,25 @@ class NvtxTimeline:
             raise RuntimeError(
                 "No op/layer scopes were recorded; native timeline is empty"
             )
-        self.stream.synchronize()
-        ops = {op.trace_label: op for op in self.session.ops}
-        timings = []
-        for pending in self._pending:
-            reason = None
-            if pending.label in ops:
-                op = ops[pending.label]
-                devices = {
-                    tensor.device
-                    for tensor in [*op.inputs.values(), *op.outputs.values()]
-                    if tensor.device.startswith("cuda:")
-                }
-                if devices != {str(self.stream.device)}:
-                    reason = "op tensor metadata does not establish work on the declared CUDA device"
-            timings.append(
-                ScopeTiming(
-                    pending.label,
-                    pending.start,
-                    pending.end,
-                    pending.begin_event.elapsed_time(pending.end_event) * 1e6,
-                    reason,
-                )
-            )
+        if self._pending_values:
+            self.stream.synchronize()
+        for pending in self._pending_values:
+            pending.target[pending.name] = tuple(pending.host.tolist())
+        self._pending_values.clear()
         report = self.session.report(costs=self.costs)
-        rows = analyze_utilization(report, timings, self.hardware)
-        by_label = {row["trace_label"]: row for row in rows}
-        if any(len(row["nvtx_label"].encode("utf-8")) >= 4096 for row in rows):
-            raise ValueError("NVTX label exceeds 4095 UTF-8 bytes")
         report["hardware"] = asdict(self.hardware)
         report["device_analysis"] = {
-            "timing_kind": "cuda_event_window",
-            "timing_includes": ["stream waits", "host launch gaps", "event overhead"],
-            "execution_contract": "single stream or work joined before scope exit",
-            "native_timestamp_unit": "nvtx_tool_clock",
+            "timing_kind": "pending_nsight",
+            "process_id": os.getpid(),
             "thread_id": self._thread,
             "device": str(self.stream.device),
             "device_name": torch.cuda.get_device_name(self.stream.device),
             "stream": self.stream.cuda_stream,
-            "scopes": rows,
+            "metadata_snapshot_bytes": self._metadata_used,
+            "scopes": [asdict(pending) for pending in self._pending],
         }
         self.output.parent.mkdir(parents=True, exist_ok=True)
         self.output.write_text(json.dumps(report, indent=2, allow_nan=False) + "\n")
-        # Validate and save first, so a file error cannot duplicate emitted ranges
-        # when finish is retried. Parent-first ordering preserves NVTX nesting.
-        for timing in sorted(
-            timings, key=lambda t: (t.start_timestamp, -t.end_timestamp)
-        ):
-            self._nvtx.submit(timing, by_label[timing.trace_label]["nvtx_label"])
         self._finished = True
 
     def __exit__(self, exc_type, exc, traceback) -> None:
@@ -306,5 +302,7 @@ class NvtxTimeline:
             exc.add_note(f"Native timeline finalization failed: {error}")
         finally:
             self.session._timeline = None
+            self._pending_values.clear()
+            self._metadata_buffer = None
             if self._nvtx is not None:
                 self._nvtx.close()
