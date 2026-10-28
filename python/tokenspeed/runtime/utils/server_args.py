@@ -44,6 +44,7 @@ from tokenspeed.runtime.configs.numerics import (
     ROUTER_TOPKS,
     SAMPLING_STREAMS,
     YARN_RAMP_MASK_DEVICES,
+    resolve_numerics_envelope,
 )
 from tokenspeed.runtime.distributed.mapping import Mapping, _resolve_parallelism_sizes
 from tokenspeed.runtime.execution.drafter.eagle_harness.config import (
@@ -1789,9 +1790,11 @@ class ServerArgs:
         Runs after ``resolve_communication`` so it can veto the fused
         all-reduce that resolver auto-enables.
         """
+        from tokenspeed.runtime.plugins import ensure_loaded
+
+        ensure_loaded()
         _require_choice("--numerics", self.numerics, NUMERICS_ENVELOPES)
-        if self.numerics != "auto":
-            self._resolve_rl_bitwise()
+        resolve_numerics_envelope(self)
         if self.batch_invariant_collectives:
             # The fused all-reduce+norm sums off the fold; some layers fuse by token count alone.
             self.enable_allreduce_fusion = False
@@ -1823,7 +1826,7 @@ class ServerArgs:
                 )
 
     def _resolve_rl_bitwise(self):
-        """The rl-bitwise block: every envelope beyond auto runs it."""
+        """Resolve the built-in RL policy; plugins provide their own resolver."""
         # Collectives: one association order per reduction. NCCL's ring
         # chunks by message size, so a plain NCCL sum is run-stable but not
         # batch-size-invariant; batch_invariant_collectives routes every
@@ -2370,6 +2373,9 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
+        from tokenspeed.runtime.plugins import ensure_loaded
+
+        ensure_loaded()
         parser.allow_abbrev = False
 
         # Model and port args
@@ -3909,7 +3915,7 @@ class ServerArgs:
             "trainer-operation-order switches (docs/design/numerics.md, "
             "alignment.trainer) so a teacher-forced pass reproduces the RL "
             "trainer's logprobs; a model serves it only once its profile "
-            "declares it verified.",
+            "declares it verified. Plugins may register additional envelopes.",
         )
         parser.add_argument(
             "--yarn-ramp-mask-device",

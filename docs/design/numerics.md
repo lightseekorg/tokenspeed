@@ -439,6 +439,19 @@ The ordinary auto envelope retains its existing dynamic selection policy.
 
 ### Explicit projection plans
 
+A model may bind an existing unquantized Linear or LM-head method to a dense
+GEMM plan without changing its weight owner or storage. The logits processor
+uses that method for a registered bitwise envelope, preserving its normal
+input dtype cast and vocabulary communication.
+
+Plugins may call `register_numerics_envelope` from the runtime registration
+surface. A policy supplies its name, bitwise classification, launch resolver
+and checkpoint validator. Plugin discovery precedes CLI choices and launch
+validation; registrations update shared containers and roll back together if
+plugin loading fails. Every policy still passes the model profile gate.
+Only `rl-bitwise` inherits the RL switches and unquantized/vocab-block limits;
+a plugin owns its own policy without changing individual execution entry points.
+
 The existing `gemm/mm` plan also accepts already quantized FP8 operands and
 canonical scales. Quantization stays in the caller's existing quantization
 hook; an online quantizer is not selected by a frozen GEMM plan. The ordinary

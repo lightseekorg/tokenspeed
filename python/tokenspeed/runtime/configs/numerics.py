@@ -28,20 +28,73 @@ harness passes for its checkpoint and kernel selection.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.configs.model_profile import ModelProfile
+    from tokenspeed.runtime.utils.server_args import ServerArgs
 
 # Every envelope name, the default first. A model always serves ``auto``.
-# ``rl-bitwise`` is the one bitwise envelope: run and batch invariance plus
+# ``rl-bitwise`` is the built-in bitwise envelope: run and batch invariance plus
 # the trainer's operation order (``docs/design/numerics.md``).
-NUMERICS_ENVELOPES = ("auto", "rl-bitwise")
+NUMERICS_ENVELOPES = ["auto", "rl-bitwise"]
 
 # Envelopes that promise the bitwise contract. Selection points that pin
 # batch-invariant leaves test membership here rather than the one name, so an
 # envelope added above it inherits every pin.
-BITWISE_ENVELOPES = frozenset({"rl-bitwise"})
+# Mutate these shared containers at registration: modules importing them must
+# see plugin additions even when they imported before plugin discovery.
+BITWISE_ENVELOPES = {"rl-bitwise"}
+_PLUGIN_ENVELOPES: dict[
+    str, tuple[Callable[[ServerArgs], None], Callable[..., None]]
+] = {}
+
+
+def register_numerics_envelope(
+    name: str,
+    *,
+    bitwise: bool,
+    resolve: Callable[[ServerArgs], None],
+    validate: Callable[..., None],
+) -> None:
+    """Register a plugin's numerical policy during its ``register()`` call.
+
+    ``resolve(server_args)`` resolves launch settings. After the common model
+    profile gate, ``validate(quantization=..., vocab_size=...)`` checks storage
+    and vocabulary requirements. A bitwise policy opts into the existing
+    batch-invariant selection points; it does not inherit RL operation order.
+    Names cannot replace an existing policy. Failed plugin loading rolls back
+    its resolver, CLI choice and bitwise membership together.
+    """
+    if not isinstance(name, str) or not name or name.strip() != name:
+        raise ValueError("A numerics envelope requires a nonempty name")
+    if name in NUMERICS_ENVELOPES:
+        raise ValueError(f"Numerics envelope {name!r} is already registered")
+    if type(bitwise) is not bool or not callable(resolve) or not callable(validate):
+        raise TypeError("A numerics envelope requires bitwise, resolve and validate")
+    _PLUGIN_ENVELOPES[name] = (resolve, validate)
+    NUMERICS_ENVELOPES.append(name)
+    if bitwise:
+        BITWISE_ENVELOPES.add(name)
+
+    def undo() -> None:
+        del _PLUGIN_ENVELOPES[name]
+        NUMERICS_ENVELOPES.remove(name)
+        BITWISE_ENVELOPES.discard(name)
+
+    from tokenspeed.runtime.plugins.registry import record_external
+
+    record_external("numerics envelope", name, undo)
+
+
+def resolve_numerics_envelope(server_args: ServerArgs) -> None:
+    """Resolve the built-in or registered policy after plugin discovery."""
+    if server_args.numerics == "rl-bitwise":
+        server_args._resolve_rl_bitwise()
+    elif server_args.numerics != "auto":
+        _PLUGIN_ENVELOPES[server_args.numerics][0](server_args)
+
 
 # Sampling backends whose greedy rows break exact logit ties toward the lowest
 # token id in every batch shape: ``greedy`` is a canonical argmax, the
@@ -119,10 +172,9 @@ def require_verified_numerics(
             logprobs fold fixed ``MEGATRON_VOCAB_BLOCK``-wide blocks of it.
 
     Raises:
-        ValueError: The envelope is not verified for this model, the
-            checkpoint is quantized (no batch-invariant quantized GEMM leaf
-            exists, so quantized linears would select shape-dependent ones),
-            or the vocabulary is not a whole number of Megatron blocks.
+        ValueError: The envelope is not verified for this model, or its
+            checkpoint validator rejects the storage or vocabulary. The RL
+            policy requires unquantized weights and whole Megatron vocab blocks.
     """
     if numerics == "auto":
         return
@@ -135,6 +187,9 @@ def require_verified_numerics(
             "logprob comparison against the trainer pass for it "
             "(docs/design/numerics.md, Acceptance)"
         )
+    if numerics != "rl-bitwise":
+        _PLUGIN_ENVELOPES[numerics][1](quantization=quantization, vocab_size=vocab_size)
+        return
     if quantization is not None:
         raise ValueError(
             f"--numerics {numerics} serves unquantized checkpoints only: "
@@ -164,4 +219,6 @@ __all__ = [
     "SAMPLING_STREAMS",
     "YARN_RAMP_MASK_DEVICES",
     "require_verified_numerics",
+    "register_numerics_envelope",
+    "resolve_numerics_envelope",
 ]
