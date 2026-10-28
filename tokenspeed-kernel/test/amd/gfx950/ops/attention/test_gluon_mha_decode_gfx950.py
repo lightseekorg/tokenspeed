@@ -142,6 +142,7 @@ def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
         q=q,
         k_cache=k_cache,
         max_seqlen_k=SEQUENCE_LENGTH,
+        max_seqlen_q=1,
         window_left=WINDOW_LEFT,
         softmax_scale=None,
     )
@@ -196,6 +197,7 @@ def test_full_decode_config_keeps_prefetch_within_vmcnt() -> None:
         q=q,
         k_cache=k_cache,
         max_seqlen_k=FULL_MAX_SEQLEN_K,
+        max_seqlen_q=1,
         window_left=-1,
         softmax_scale=None,
     )
@@ -274,6 +276,7 @@ def test_full_decode_ragged_rows_match_reference(
         q=q,
         k_cache=k_cache,
         max_seqlen_k=FULL_MAX_SEQLEN_K,
+        max_seqlen_q=1,
         window_left=-1,
         softmax_scale=None,
     )
@@ -331,28 +334,34 @@ def test_full_decode_ragged_rows_match_reference(
     torch.testing.assert_close(far[nonempty], actual[nonempty], atol=0, rtol=0)
 
 
-# One TP8 rank of Muse Spark's attention: 16 query heads over 2 KV heads.
+# One TP8 rank of Muse Spark's attention: 16 query heads over 2 KV heads,
+# verifying a DFLASH block of 8 tokens.
 VERIFY_Q_HEADS = 16
 VERIFY_KV_HEADS = 2
 VERIFY_TOKENS = 8
 
 
-@pytest.mark.parametrize("window_left", [2047, -1], ids=["sliding", "full"])
-def test_verify_block_rows_are_causal_within_the_block(window_left: int) -> None:
-    """Speculative verify: each request's last ``VERIFY_TOKENS`` cached tokens
-    are queries, and query ``i`` sees the cache up to and including itself.
+def _verify_inputs(
+    cache_lens: list[int],
+    max_seqlen_q: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    seed: int,
+) -> dict:
+    """Queries for each request's last max_seqlen_q cached tokens over a
+    shuffled paged cache.
 
-    Lengths cover a block shorter than the window, one whose window starts
-    mid-page, and one that slides past many pages.
+    Page-table entries past each request hold out-of-range page ids, so a copy
+    that reads past a request's pages faults instead of passing silently.
     """
-    cache_lens = [VERIFY_TOKENS + 3, 2048 + VERIFY_TOKENS + 37, 300 * PAGE_SIZE + 5]
-    generator = torch.Generator(device="cuda").manual_seed(20261027)
+    generator = torch.Generator(device="cuda").manual_seed(seed)
     pages = [-(-length // PAGE_SIZE) for length in cache_lens]
     k_cache = torch.randn(
         sum(pages),
         PAGE_SIZE,
-        VERIFY_KV_HEADS,
-        HEAD_DIM,
+        kv_heads,
+        head_dim,
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
@@ -364,49 +373,152 @@ def test_verify_block_rows_are_causal_within_the_block(window_left: int) -> None
         (len(cache_lens), max(pages)), 1 << 30, dtype=torch.int32, device="cuda"
     )
     physical = torch.randperm(
-        sum(pages), generator=torch.Generator().manual_seed(11)
+        sum(pages), generator=torch.Generator().manual_seed(seed)
     ).to(dtype=torch.int32, device="cuda")
     start = 0
     for row, count in enumerate(pages):
         page_table[row, :count] = physical[start : start + count]
         start += count
-    cache_seqlens = torch.tensor(cache_lens, dtype=torch.int32, device="cuda")
     q = torch.randn(
-        len(cache_lens) * VERIFY_TOKENS,
-        VERIFY_Q_HEADS,
-        HEAD_DIM,
+        len(cache_lens) * max_seqlen_q,
+        q_heads,
+        head_dim,
         dtype=torch.bfloat16,
         device="cuda",
         generator=generator,
     )
+    return {
+        "q": q,
+        "k_cache": k_cache,
+        "v_cache": v_cache,
+        "page_table": page_table,
+        "cache_seqlens": torch.tensor(cache_lens, dtype=torch.int32, device="cuda"),
+        "max_seqlen_k": FULL_MAX_SEQLEN_K,
+        "max_seqlen_q": max_seqlen_q,
+    }
 
-    actual = gluon_mha_decode_gfx950(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
+
+def _verify_reference(inputs: dict, window_left: int, sinks) -> torch.Tensor:
+    """FP32 dense attention where query i of a request sees its cache up to
+    and including itself."""
+    width = inputs["max_seqlen_q"]
+    head_dim = inputs["q"].shape[2]
+    expected = torch.empty(inputs["q"].shape, dtype=torch.float32, device="cuda")
+    for row, length in enumerate(inputs["cache_seqlens"].tolist()):
+        rows = slice(row * width, (row + 1) * width)
+        pages = inputs["page_table"][row, : -(-length // PAGE_SIZE)].long()
+        expected[rows], _ = torch_dense_attention(
+            inputs["q"][rows],
+            inputs["k_cache"][pages].flatten(0, 1)[:length],
+            inputs["v_cache"][pages].flatten(0, 1)[:length],
+            scale=head_dim**-0.5,
+            causal_offset=length - width,
+            window_left=None if window_left < 0 else window_left,
+            sinks=sinks,
+        )
+    return expected
+
+
+def _check_verify(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    # Short rows attend to few keys and reach |out| > 1, where one BF16
+    # rounding of the FP32 result is up to one BF16 ULP (2**-7) relative. P @ V
+    # takes P rounded to BF16 (2**-9 relative), which over a handful of keys
+    # cancelling to a small output leaves up to 2**-8 absolute.
+    torch.testing.assert_close(actual.float(), expected, atol=2**-8, rtol=2**-7)
+
+
+@pytest.mark.parametrize("with_sinks", [False, True], ids=["no-sinks", "sinks"])
+@pytest.mark.parametrize(
+    "window_left",
+    [-1, 2047, 255, 40],
+    ids=["full", "window-2047", "window-255", "window-40"],
+)
+@pytest.mark.parametrize(
+    "max_seqlen_q,q_heads,kv_heads,head_dim",
+    [
+        # Muse Spark: 8 tokens x 8 heads fill one 64-row, four-wave block.
+        pytest.param(VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, 64, id="muse"),
+        # 2 x 8 rows fit a single wave.
+        pytest.param(2, 16, 2, 64, id="16-rows"),
+        # 3 x 6 rows pad a two-wave block; query positions straddle waves.
+        pytest.param(3, 12, 2, 64, id="18-rows"),
+        # 16 x 8 rows take two blocks per KV head.
+        pytest.param(16, 8, 1, 64, id="128-rows"),
+        pytest.param(VERIFY_TOKENS, 8, 1, 128, id="head-dim-128"),
+    ],
+)
+def test_verify_rows_match_reference_and_replay(
+    max_seqlen_q: int,
+    q_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    window_left: int,
+    with_sinks: bool,
+) -> None:
+    """Speculative verify: each request's last ``max_seqlen_q`` cached tokens
+    are queries, and query ``i`` sees the cache up to and including itself.
+
+    Lengths cover the shortest verify (the block alone), a block whose first
+    query's keys end on a page boundary (later queries alone see the last
+    page, a split of its own under full attention), windows starting
+    mid-page, and one sliding past many pages. A 40-key window starts later
+    queries' windows a page past earlier ones'. The captured graph replays
+    new lengths and queries.
+    """
+    cache_lens = [
+        max_seqlen_q,
+        PAGE_SIZE + max_seqlen_q - 1,
+        2 * PAGE_SIZE + 37,
+        2048 + max_seqlen_q + 37,
+        300 * PAGE_SIZE + 5,
+    ]
+    inputs = _verify_inputs(cache_lens, max_seqlen_q, q_heads, kv_heads, head_dim, 5)
+    sinks = (
+        torch.randn(
+            q_heads,
+            dtype=torch.float32,
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(13),
+        )
+        if with_sinks
+        else None
+    )
+
+    def invoke() -> torch.Tensor:
+        return gluon_mha_decode_gfx950(**inputs, window_left=window_left, sinks=sinks)
+
+    _check_verify(invoke(), _verify_reference(inputs, window_left, sinks))
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = invoke()
+    # Serving refreshes the captured buffers in place. Every request keeps at
+    # least its max_seqlen_q verified tokens.
+    inputs["cache_seqlens"][1:].sub_(1)
+    inputs["q"].mul_(-0.75)
+    expected = _verify_reference(inputs, window_left, sinks)
+    graph.replay()
+    torch.cuda.synchronize()
+    _check_verify(replayed, expected)
+    _check_verify(invoke(), expected)
+
+
+def test_verify_long_splits_pipeline_page_loads() -> None:
+    """Two verifying requests leave the grid short, so each split of a long
+    context streams its pages through the four-deep pipeline, the block's
+    four waves sharing every page's copies."""
+    cache_lens = [300 * PAGE_SIZE + 5, 1000 * PAGE_SIZE + 33]
+    inputs = _verify_inputs(
+        cache_lens, VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 17
+    )
+    config = get_config(
+        q=inputs["q"],
+        k_cache=inputs["k_cache"],
         max_seqlen_k=FULL_MAX_SEQLEN_K,
         max_seqlen_q=VERIFY_TOKENS,
-        window_left=window_left,
+        window_left=-1,
+        softmax_scale=None,
     )
-    torch.cuda.synchronize()
-    for row, length in enumerate(cache_lens):
-        row_pages = page_table[row, : pages[row]].long()
-        expected, _ = torch_dense_attention(
-            q[row * VERIFY_TOKENS : (row + 1) * VERIFY_TOKENS],
-            k_cache[row_pages].flatten(0, 1)[:length],
-            v_cache[row_pages].flatten(0, 1)[:length],
-            scale=HEAD_DIM**-0.5,
-            causal_offset=length - VERIFY_TOKENS,
-            window_left=None if window_left < 0 else window_left,
-            sinks=None,
-        )
-        # Short rows attend to few keys and reach |out| > 1, where one BF16
-        # rounding of the FP32 result is up to one BF16 ULP (2**-7) relative.
-        torch.testing.assert_close(
-            actual[row * VERIFY_TOKENS : (row + 1) * VERIFY_TOKENS].float(),
-            expected.float(),
-            atol=2e-3,
-            rtol=2**-7,
-        )
+    assert (config.num_kv_splits, config.num_stages) == (64, 4)
+    actual = gluon_mha_decode_gfx950(**inputs, window_left=-1)
+    _check_verify(actual, _verify_reference(inputs, -1, None))
