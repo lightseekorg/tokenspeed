@@ -182,15 +182,16 @@ jobs:
         github.repository == 'lightseekorg/tokenspeed' ||
         github.repository == vars.TOKENSPEED_CI_REPOSITORY
       )
-    needs: [unit-test, model-test]
+    needs: [scan, unit-test, model-test]
     runs-on: ubuntu-latest
     steps:
       - name: Finish
         env:
+          SCAN_RESULT: ${{ needs.scan.result }}
           UNIT_TEST_RESULT: ${{ needs.unit-test.result }}
           MODEL_TEST_RESULT: ${{ needs.model-test.result }}
         run: |
-          for result in "$UNIT_TEST_RESULT" "$MODEL_TEST_RESULT"; do
+          for result in "$SCAN_RESULT" "$UNIT_TEST_RESULT" "$MODEL_TEST_RESULT"; do
             if [[ "$result" != "success" && "$result" != "skipped" ]]; then
               echo "PR Test did not finish successfully: dependency result=$result"
               exit 1
