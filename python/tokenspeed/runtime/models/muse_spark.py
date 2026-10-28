@@ -130,8 +130,17 @@ if TYPE_CHECKING:
     from tokenspeed_kernel.ops.communication._iris.muse_spark import MuseIrisState
 
 
+# Row limit of the generic column gather and the NVLS mailbox.
 _GATHER_WORKSPACE_ROWS = 64
-_gather_workspaces: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+# Row limit of the fused gather + RMSNorm + MXFP4 pre-expert path. It is the
+# TP4 Lamport mailbox capacity (43 * 4096 elements, i.e. 172 rows of a
+# 1024-wide shard), and TP8 uses the same limit. In measurements the fused
+# path was faster than the column gather plus a separate quantize at every
+# row count tested above 64, up to 191 rows at TP8 and 172 at TP4. Pre-expert
+# workspace rows past 64 serve only as the fused path's placeholder for the
+# gathered BF16 rows, which it returns but does not fill.
+_GATHER_MXFP4_MAX_ROWS = 172
+_gather_workspaces: dict[tuple[torch.device, torch.dtype, int, int], torch.Tensor] = {}
 
 
 def _acquire_all_reduce_output(
@@ -190,6 +199,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         layer_id: int,
         layer_count: int,
         replicate_for_owned_rows: bool,
+        workspace_rows: int,
     ) -> None:
         # Replicate pre-/post-expert weights to avoid gathers and project owned rows.
         mapping = global_server_args_dict.get("mapping")
@@ -232,10 +242,10 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         self.workspace = None
         self.multicast = None
         if tp_size > 1 and (not replicated or self.gather_column_view):
-            key = (self.weight.device, self.weight.dtype, output_size)
+            key = (self.weight.device, self.weight.dtype, workspace_rows, output_size)
             if key not in _gather_workspaces:
                 _gather_workspaces[key] = self.weight.new_zeros(
-                    _GATHER_WORKSPACE_ROWS, output_size
+                    workspace_rows, output_size
                 )
             self.workspace = _gather_workspaces[key]
             # Mailboxes pool across layers, so their scope excludes the layer index.
@@ -305,7 +315,7 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         tokens = x.shape[0]
         if self.multicast is not None and self.multicast.handles(tokens):
             return self.multicast(x, weight, output_scale=None)
-        if tokens > self.workspace.shape[0]:
+        if tokens > _GATHER_WORKSPACE_ROWS:
             return all_gather(
                 (
                     self._project(x, weight, None)
@@ -405,7 +415,9 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         weight_offset: float,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """Project, gather, normalize, and dynamically quantize to MXFP4."""
-        if self.workspace is not None and x.shape[0] <= self.workspace.shape[0]:
+        if self.workspace is not None and x.shape[0] <= min(
+            _GATHER_MXFP4_MAX_ROWS, self.workspace.shape[0]
+        ):
             tokens = x.shape[0]
             local_width = self._local_weight().shape[0]
             gathered = (
@@ -1081,6 +1093,7 @@ class MuseSparkMoE(nn.Module):
             layer_id=layer_id,
             layer_count=config.num_hidden_layers,
             replicate_for_owned_rows=True,
+            workspace_rows=_GATHER_MXFP4_MAX_ROWS,
         )
         self.pre_expert_norm = MuseSparkRMSNorm(
             hidden_size=compressed_size,
@@ -1157,6 +1170,7 @@ class MuseSparkMoE(nn.Module):
             layer_id=layer_id,
             layer_count=config.num_hidden_layers,
             replicate_for_owned_rows=False,
+            workspace_rows=_GATHER_WORKSPACE_ROWS,
         )
         # Decode-sized batches route in the top-k kernel; each token count keeps its own GEMM workspace.
         self.prepared_routing: dict[int, PreparedNvfp4Routing] = {}
