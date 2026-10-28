@@ -678,11 +678,21 @@ fn serve(args: &Args) -> Result<(), HostError> {
 }
 
 fn main() -> ExitCode {
+    // The control thread emits tracing events -- one "Decode batch." line
+    // every `--decode-log-interval` rounds (ts-control/src/batch_log.rs) --
+    // and the fmt subscriber writes each line synchronously. With stderr
+    // redirected to a distributed file system that write can block for tens
+    // to hundreds of milliseconds *on the control thread*, stalling the
+    // round; every peer rank then waits it out at the next DP barrier or
+    // graph collective. The non-blocking writer moves the write to its own
+    // thread: callers only enqueue, and a full queue drops lines instead of
+    // blocking the scheduler.
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("TS_HOST_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(log_writer)
         .init();
     let served = parse_args().and_then(|args| {
         interpreter::start(&args.python).map_err(HostError::Interpreter)?;

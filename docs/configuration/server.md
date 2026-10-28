@@ -835,6 +835,13 @@ throughput accumulated since the previous line, `avg_accept_len` /
 `accept_rate` under speculative decoding, and `#queue-req`. Every field is a
 host-side scheduler counter. The line adds no GPU synchronization.
 
+Log lines never run their write on the thread that emits them. The Rust host
+writes `tracing` events through a bounded, non-blocking appender whose
+listener thread owns stderr and drops lines when its queue is full, and the
+root Python logger hands records to a queue listener in `configure_logger`.
+A slow log target — a distributed file system, a stalled collector — costs
+log lines, not rounds: the scheduling loop only enqueues.
+
 `#queue-req` counts requests admitted to the scheduler but not yet running.
 On a PD engine that includes requests still bootstrapping with the peer —
 on the prefill role, waiting for the decode side to allocate their KV pages —

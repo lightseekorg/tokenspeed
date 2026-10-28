@@ -22,12 +22,20 @@ import contextlib
 import io
 import logging
 import sys
+import threading
+import time
 from importlib import import_module
 
 import pytest
 
 from tokenspeed._logging import suppress_noisy_third_party_logs
-from tokenspeed.runtime.utils.common import CustomFormatter, get_colorful_logger
+from tokenspeed.runtime.utils.common import (
+    CustomFormatter,
+    _stop_log_listener,
+    configure_logger,
+    get_colorful_logger,
+)
+from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 class TestColorfulLogger:
@@ -46,6 +54,52 @@ class TestColorfulLogger:
             handler.setStream(stderr)
         first.info("memory summary")
         assert (stderr.getvalue().count("memory summary")) == (1)
+
+
+class _BlockingStream(io.StringIO):
+    """A stderr replacement whose writes block until the test releases them."""
+
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, text):
+        self.entered.set()
+        self.release.wait(10)
+        return super().write(text)
+
+
+class TestAsyncRootLogger:
+    def test_configure_logger_never_blocks_the_logging_thread(self):
+        # A stalled stderr target must not stall the thread that logs: the
+        # serving loop's records (the profiler lines among them) go through a
+        # queue and a listener thread owns the write.
+        args = ServerArgs(model="x", world_size=2, ep_size=2)
+        stream = _BlockingStream()
+        try:
+            with contextlib.redirect_stderr(stream):
+                configure_logger(args, prefix=" TEST")
+                logger = logging.getLogger("tokenspeed.test_logging.async_root")
+                logger.info("first record")
+                # The listener took the record and is now stuck in write().
+                assert stream.entered.wait(5.0)
+                started = time.monotonic()
+                logger.info("second record")
+                elapsed = time.monotonic() - started
+                # The second log call only enqueues; it does not wait for the
+                # blocked write.
+                assert elapsed < 1.0
+                stream.release.set()
+                deadline = time.monotonic() + 5.0
+                while "second record" not in stream.getvalue():
+                    assert time.monotonic() < deadline, "listener did not drain"
+                    time.sleep(0.01)
+                assert "first record" in stream.getvalue()
+        finally:
+            stream.release.set()
+            _stop_log_listener()
+            logging.getLogger().handlers.clear()
 
 
 class TestThirdPartyLogging:
