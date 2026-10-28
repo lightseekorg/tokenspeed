@@ -1253,36 +1253,49 @@ attention uses its own split kernels.
 - The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
   64 or 128. FP8 queries produce a BF16 output. Sinks are supported;
   `logit_cap` and LSE output are not.
+- Each request has `max_seqlen_q` queries, its last cached tokens (1 for plain
+  decode, the verify width for speculative verify): query `i` sees the keys
+  before `cache_seqlens - (max_seqlen_q - 1 - i)`, so every length counts at
+  least the request's queries.
 - Full attention takes the split count from the base CTAs (requests x KV heads
-  x query-head groups) and `max_seqlen_k`, capped at 64 splits. The count does
-  not read device-resident lengths, so graphs pass the maximum context as
+  x row blocks) and `max_seqlen_k`, capped at 64 splits. The count does not
+  read device-resident lengths, so graphs pass the maximum context as
   `max_seqlen_k` and replay for any batch composition.
 
 #### Algorithm
 
-Each work-group is a single wave that owns one KV head, up to 16 of its query
-heads and one split of the request's pages. K/V pages are copied into LDS with
-`buffer_load_dwordx4 ... lds`. When the grid already holds enough waves to
-cover the load latency, the split loop is single-buffered: it copies a page,
-waits for it (`s_waitcnt vmcnt`) and consumes it before copying the next.
+A request's queries of one KV head form `max_seqlen_q` x group-size rows,
+ordered by query position and then by query head. Each work-group owns one KV
+head, one split of the request's pages and a block of up to 64 of those rows,
+one 16-row MFMA tile per wave. Its waves share every K/V page it loads, so an
+8-token verify over 8 query heads per KV head streams the KV once rather than
+once per token. The block covers the keys of its last query position and,
+under a sliding window, from its first one's window start; each row masks its
+own causal end and window start.
+
+K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. When the
+grid already holds enough waves to cover the load latency, the split loop is
+single-buffered: it copies a page, waits for it (`s_waitcnt vmcnt`) and
+consumes it before copying the next.
 
 When `select_kv_splits` returns its maximum of 64, even the most splits leave
-the grid below its occupancy target, so each wave streams a long split. Its
-page loads are then software-pipelined four deep: four LDS buffers, three pages
-prefetched while one is consumed, provided their copies fit the 6-bit vmcnt
-count (BF16 head dim 128 does not). Splits with fewer pages than buffers stay
-single-buffered. vmcnt retires a wave's loads in issue order, so page indices
-load two loop iterations before use; reading an index loaded after the
-prefetches would wait for all of them. Prefetches past the split repeat its
-last page rather than masking the copy, since a masked copy becomes a scalar
-branch after which the compiler waits for every outstanding load
-(`s_waitcnt vmcnt(0)`); only the split's last page is masked. `v_readfirstlane`
+the grid below its occupancy target, so each work-group streams a long split.
+Its page loads are then software-pipelined four deep: four LDS buffers, three
+pages prefetched while one is consumed, provided each wave's share of their
+copies fits the 6-bit vmcnt count (a single wave's BF16 head dim 128 pages do
+not). Splits with fewer pages than buffers stay single-buffered. vmcnt
+retires a wave's loads in issue order, so page indices load two loop
+iterations before use; reading an index loaded after the prefetches would wait
+for all of them. Prefetches past the split repeat its last page rather than
+masking the copy, since a masked copy becomes a scalar branch after which the
+compiler waits for every outstanding load (`s_waitcnt vmcnt(0)`); only pages
+crossing the split's end or a row's causal end are masked. `v_readfirstlane`
 moves each page index into an SGPR, so the copies take their page base from
 the buffer resource and reuse loop-invariant 32-bit offsets.
 
-Every split stores its partial output and LSE, with an LSE of -inf when it has
-no tokens, so the reduce merges stored partials without reading the cache
-lengths.
+Every split stores its partial output and LSE, with an LSE of -inf for rows
+without keys in it, so the reduce merges stored partials without reading the
+cache lengths.
 
 ### gfx950 MHA cached extension
 
