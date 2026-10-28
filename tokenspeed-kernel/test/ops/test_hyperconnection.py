@@ -255,75 +255,84 @@ def test_general_triton_mix_projection_storage(
     strided: bool,
     monkeypatch,
 ) -> None:
+    # pytest's monkeypatch cannot restore torch.backends.cuda.matmul settings
+    # (they never land in the instance __dict__ it records, so teardown leaks
+    # them); the legacy allow_tf32 setter keeps fp32_precision in sync.
+    old_tf32 = torch.backends.cuda.matmul.allow_tf32
     if dtype is torch.float32:
         monkeypatch.setenv("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0")
-        monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "ieee")
-    generator = torch.Generator(device="cuda").manual_seed(19)
-    wide = hc_count * hidden_size
-    normalized = torch.randn(17, wide, dtype=dtype, device="cuda", generator=generator)
-    projection = (
-        torch.randn(
-            lowrank + (hc_count if has_inject else 0),
-            wide,
-            dtype=dtype,
-            device="cuda",
-            generator=generator,
+        torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        generator = torch.Generator(device="cuda").manual_seed(19)
+        wide = hc_count * hidden_size
+        normalized = torch.randn(
+            17, wide, dtype=dtype, device="cuda", generator=generator
         )
-        * 0.01
-    )
-    if strided:
-        projection = projection.T.contiguous().T
-    projection_rows = projection.shape[0]
-    if prepared:
-        projection = pad_gated_residual_projection_weight(
-            projection, projection_rows=projection_rows
+        projection = (
+            torch.randn(
+                lowrank + (hc_count if has_inject else 0),
+                wide,
+                dtype=dtype,
+                device="cuda",
+                generator=generator,
+            )
+            * 0.01
         )
-    up = (
-        torch.randn(wide, lowrank, dtype=dtype, device="cuda", generator=generator)
-        * 0.01
-    )
-    scale = 1.0 / hc_count
-    linear = torch.nn.functional.linear
-    projection_widths = []
+        if strided:
+            projection = projection.T.contiguous().T
+        projection_rows = projection.shape[0]
+        if prepared:
+            projection = pad_gated_residual_projection_weight(
+                projection, projection_rows=projection_rows
+            )
+        up = (
+            torch.randn(wide, lowrank, dtype=dtype, device="cuda", generator=generator)
+            * 0.01
+        )
+        scale = 1.0 / hc_count
+        linear = torch.nn.functional.linear
+        projection_widths = []
 
-    def record_linear(value, weight, *args, **kwargs):
-        if not projection_widths:
-            assert weight.data_ptr() == projection.data_ptr()
-        projection_widths.append(weight.shape[0])
-        return linear(value, weight, *args, **kwargs)
+        def record_linear(value, weight, *args, **kwargs):
+            if not projection_widths:
+                assert weight.data_ptr() == projection.data_ptr()
+            projection_widths.append(weight.shape[0])
+            return linear(value, weight, *args, **kwargs)
 
-    monkeypatch.setattr(torch.nn.functional, "linear", record_linear)
-    actual = gated_residual_mix(
-        normalized,
-        projection,
-        up,
-        hc_count,
-        hidden_size,
-        lowrank,
-        projection_rows=projection_rows,
-        projection_scale=scale,
-        weights_independent=False,
-        override="triton_hyperconnection_mix",
-        solution=None,
-    )
-    assert projection_widths[0] == projection.shape[0]
-    if prepared and dtype is not torch.float32:
-        assert projection_widths[0] * projection.element_size() % 16 == 0
-    x = normalized.cpu().double()
-    projected = (x @ projection[:projection_rows].cpu().double().T) * scale
-    gate = torch.nn.functional.silu(projected[:, :lowrank]) @ up.cpu().double().T
-    mixed = (gate.sigmoid() * x).reshape(-1, hc_count, hidden_size).mean(1)
-    inject = projected[:, lowrank:] if has_inject else None
-    expected = tuple(
-        None if value is None else value.to(device="cuda", dtype=dtype)
-        for value in (mixed, inject)
-    )
-    tolerance = {
-        torch.bfloat16: 0.01,
-        torch.float16: 0.002,
-        torch.float32: 1e-5,
-    }[dtype]
-    torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+        monkeypatch.setattr(torch.nn.functional, "linear", record_linear)
+        actual = gated_residual_mix(
+            normalized,
+            projection,
+            up,
+            hc_count,
+            hidden_size,
+            lowrank,
+            projection_rows=projection_rows,
+            projection_scale=scale,
+            weights_independent=False,
+            override="triton_hyperconnection_mix",
+            solution=None,
+        )
+        assert projection_widths[0] == projection.shape[0]
+        if prepared and dtype is not torch.float32:
+            assert projection_widths[0] * projection.element_size() % 16 == 0
+        x = normalized.cpu().double()
+        projected = (x @ projection[:projection_rows].cpu().double().T) * scale
+        gate = torch.nn.functional.silu(projected[:, :lowrank]) @ up.cpu().double().T
+        mixed = (gate.sigmoid() * x).reshape(-1, hc_count, hidden_size).mean(1)
+        inject = projected[:, lowrank:] if has_inject else None
+        expected = tuple(
+            None if value is None else value.to(device="cuda", dtype=dtype)
+            for value in (mixed, inject)
+        )
+        tolerance = {
+            torch.bfloat16: 0.01,
+            torch.float16: 0.002,
+            torch.float32: 1e-5,
+        }[dtype]
+        torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = old_tf32
 
 
 @pytest.mark.parametrize("rows", [8192, 16384])
