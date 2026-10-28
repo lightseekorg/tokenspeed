@@ -70,8 +70,10 @@ Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
-tree. FlashInfer can share mutable include-directory storage across native
-modules, so a module loaded later must not redirect private kernel compilation.
+tree. FlashInfer shares one mutable include-directory store across native
+modules, so the private modules use their own: a module loaded later must not
+redirect private kernel compilation, and a private module must not redirect the
+installed module's cold compilation to patched headers.
 The installed FlashInfer package is unchanged. To switch settings, prepare a
 new callable, warm it up, and recapture graphs.
 
@@ -124,11 +126,13 @@ are preserved: after FC1 accumulation and after SwiGLU. FC2 consumes the dense
 FP8 buffer and padded scales directly. Its BF16 output uses separate workspace,
 and the input descriptor is bounded by the current invocation's capacity.
 
-With `enable_pdl=True`, the matching eight-stage FC2 can load its first weight
-tile and weight scales into shared memory before waiting for FC1. FC1 publishes
-immutable routing metadata before triggering dependents; activation and
-activation-scale reads remain after the dependency wait. `enable_pdl=False`
-keeps the grouped launches ordered and disables this first-tile prefetch.
+With `enable_pdl=True`, only the fused FC1 and its FC2 launch as programmatic
+dependents; other grouped GEMMs stay stream-ordered, as upstream. The matching
+eight-stage FC2 can load its first weight tile and weight scales into shared
+memory before waiting for FC1. FC1 triggers dependents only after its own
+dependency wait and writes neither routing metadata nor weights; activation
+and activation-scale reads remain after the dependency wait. `enable_pdl=False` keeps all grouped launches ordered and
+disables this first-tile prefetch.
 Prepare and warm the callable before graph capture. Fusion and prefetch variants
 have distinct content-keyed kernel caches, and route metadata is refreshed on
 replay. Performance depends on routing; benchmark the intended workload.

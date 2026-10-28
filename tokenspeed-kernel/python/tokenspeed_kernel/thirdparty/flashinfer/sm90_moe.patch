@@ -327,7 +327,7 @@ index d68386242f262d462a0deda4a15d7d3a129a9bb9..735dcc018a2d04823be36ea760177687
 +                         tma_a_desc, tma_b_desc, tma_scales_b_desc, tma_d_desc, fused_output,
 +                         fused_scales, int64_t(max_shape_n_padded));
 diff --git a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
-index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c902c87a2 100644
+index ae03a82216126c5554e49ca491c874484573d325..4af226025cc42d34e1556109e3e3bb49705aede9 100644
 --- a/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/deep_gemm/fp8_gemm_impl.cuh
 @@ -23,0 +24,72 @@
@@ -410,9 +410,10 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 -        const __grid_constant__ CUtensorMap tensor_map_d) {
 +        const __grid_constant__ CUtensorMap tensor_map_d,
 +        __nv_fp8_e4m3* fused_output, float* fused_scales, int64_t fused_scale_leading_dim) {
-@@ -460,0 +534,21 @@ __global__ void __launch_bounds__(
+@@ -460,0 +534,22 @@ __global__ void __launch_bounds__(
 +  // Only FC2 consuming fused FC1 may read routing metadata before its grid
-+  // dependency wait: FC1 publishes that metadata before launching dependents.
++  // dependency wait: FC1 launches dependents only after its own wait, and
++  // writes neither the routing metadata nor the weights FC2 reads early.
 +  DG_STATIC_ASSERT(!kPrefetchFirstTile || (!kFuseSwiGLUQuant && SHAPE_M == 512 &&
 +      SHAPE_K == 1024 && SHAPE_K == kNumStages * BLOCK_K && kPairedRowOffset == 0 &&
 +      kNumTMAMulticast == 1 && SchedulerType::gemm_type == GemmType::GroupedWithOffset),
@@ -432,14 +433,14 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +                        BLOCK_M == 128 and SchedulerType::gemm_type == GemmType::GroupedWithOffset),
 +                   "SwiGLU quantization needs paired 128-channel grouped tiles");
 +
-@@ -463,2 +557,4 @@ __global__ void __launch_bounds__(
+@@ -463,2 +558,4 @@ __global__ void __launch_bounds__(
 -  static constexpr uint32_t SMEM_D_SIZE = BLOCK_N * BLOCK_M * sizeof(__nv_bfloat16);
 -  static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
 +  static constexpr uint32_t SMEM_D_BLOCK_SIZE = BLOCK_N * BLOCK_M * sizeof(__nv_bfloat16);
 +  static constexpr uint32_t SMEM_D_SIZE = kNumRowBlocks * SMEM_D_BLOCK_SIZE;
 +  static constexpr uint32_t SMEM_A_BLOCK_SIZE = BLOCK_M * BLOCK_K * sizeof(__nv_fp8_e4m3);
 +  static constexpr uint32_t SMEM_A_SIZE_PER_STAGE = kNumRowBlocks * SMEM_A_BLOCK_SIZE;
-@@ -471,0 +568,9 @@ __global__ void __launch_bounds__(
+@@ -471,0 +569,9 @@ __global__ void __launch_bounds__(
 +  // The TMA thread prefetches each tile's weight scales with a bulk copy when a scale row is a
 +  // multiple of 16 bytes, into one of two buffers that alternate between tiles; otherwise the math
 +  // threads read them at the start of each tile.
@@ -449,15 +450,15 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +  // of evicting (and writing back) what earlier kernels left in L2 while this GEMM runs.
 +  static constexpr auto kWeightCacheHint = cute::TMA::CacheHintSm90::EVICT_FIRST;
 +  static constexpr uint32_t kNumScalesABuffers = kPrefetchScalesA ? 2 : 1;
-@@ -473 +578,2 @@ __global__ void __launch_bounds__(
+@@ -473 +579,2 @@ __global__ void __launch_bounds__(
 -      ceil_div<uint32_t>(SHAPE_K_SCALES * sizeof(float), sizeof(Barrier)) *
 +      ceil_div<uint32_t>(kNumScalesABuffers * kNumRowBlocks * SMEM_SCALES_A_ROW_SIZE,
 +                         sizeof(Barrier)) *
-@@ -491 +597,2 @@ __global__ void __launch_bounds__(
+@@ -491 +598,2 @@ __global__ void __launch_bounds__(
 -    cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d));
 +    if constexpr (!kFuseSwiGLUQuant)
 +      cute::prefetch_tma_descriptor(reinterpret_cast<cute::TmaDescriptor const*>(&tensor_map_d));
-@@ -548,0 +656,20 @@ __global__ void __launch_bounds__(
+@@ -548,0 +657,20 @@ __global__ void __launch_bounds__(
 +  // With programmatic dependent launch the setup above overlaps the previous kernel; wait for it
 +  // to finish before reading anything it may have written (no-op for a normal launch).
 +  if constexpr (!kPrefetchFirstTile) asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -478,7 +479,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +  }
 +#endif
 +
-@@ -550,0 +678,8 @@ __global__ void __launch_bounds__(
+@@ -550,0 +679,8 @@ __global__ void __launch_bounds__(
 +  // Let FC2 perform descriptor/barrier setup as resources become available. Its
 +  // griddepcontrol.wait still waits for all FC1 writes before reading activations.
 +  if constexpr (kFuseSwiGLUQuant) {
@@ -487,7 +488,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +      asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 +    }
 +  }
-@@ -571,0 +707,66 @@ __global__ void __launch_bounds__(
+@@ -571,0 +708,66 @@ __global__ void __launch_bounds__(
 +#ifdef MOE_MBU_PREFIX_SCHEDULER
 +  __shared__ uint32_t tile_prefix[kNumGroups + 1];
 +  __shared__ uint32_t warp_totals[kNumThreads / 32];
@@ -554,7 +555,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +  auto scheduler = SchedulerType(problem_input, tile_prefix, smem_offsets);
 +#endif
 +#else
-@@ -572,0 +774,8 @@ __global__ void __launch_bounds__(
+@@ -572,0 +775,8 @@ __global__ void __launch_bounds__(
 +#endif
 +
 +  if constexpr (kPrefetchFirstTile) {
@@ -563,7 +564,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +    if (threadIdx.x < kNumMathThreads)
 +      asm volatile("griddepcontrol.wait;" ::: "memory");
 +  }
-@@ -581,0 +791,21 @@ __global__ void __launch_bounds__(
+@@ -581,0 +792,21 @@ __global__ void __launch_bounds__(
 +        if constexpr (kPrefetchFirstTile) {
 +          if (scheduler.current_iter == 0) {
 +            const auto m_idx = scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx);
@@ -585,7 +586,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +            asm volatile("griddepcontrol.wait;" ::: "memory");
 +          }
 +        }
-@@ -596,2 +826,9 @@ __global__ void __launch_bounds__(
+@@ -596,2 +827,9 @@ __global__ void __launch_bounds__(
 -            tma_copy(&tensor_map_a, reinterpret_cast<uint64_t*>(&full_barrier), smem_a[s], k_idx,
 -                     scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx));
 +            const auto m_idx = scheduler.get_global_m_idx(SHAPE_M, BLOCK_M, m_block_idx, n_block_idx);
@@ -597,7 +598,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +                                              smem_a[s] + r * SMEM_A_BLOCK_SIZE, k_idx,
 +                                              m_idx + r * kPairedRowOffset);
 +            }
-@@ -615,0 +853,21 @@ __global__ void __launch_bounds__(
+@@ -615,0 +854,21 @@ __global__ void __launch_bounds__(
 +            // The weight scales of the whole tile arrive with its first stage
 +            uint32_t scales_a_bytes = 0;
 +            if constexpr (kPrefetchScalesA) {
@@ -619,21 +620,21 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +              }
 +            }
 +
-@@ -617 +875 @@ __global__ void __launch_bounds__(
+@@ -617 +876 @@ __global__ void __launch_bounds__(
 -                                              SMEM_SCALES_B_SIZE_PER_STAGE);
 +                                              SMEM_SCALES_B_SIZE_PER_STAGE + scales_a_bytes);
-@@ -635,0 +894,2 @@ __global__ void __launch_bounds__(
+@@ -635,0 +895,2 @@ __global__ void __launch_bounds__(
 +    if constexpr (kPrefetchFirstTile)
 +      asm volatile("griddepcontrol.wait;" ::: "memory");
-@@ -651 +911 @@ __global__ void __launch_bounds__(
+@@ -651 +912 @@ __global__ void __launch_bounds__(
 -      uint32_t num_scales_a = SHAPE_K_SCALES;
 +      uint32_t num_scales_a = kNumRowBlocks * SHAPE_K_SCALES;
-@@ -653,2 +913,2 @@ __global__ void __launch_bounds__(
+@@ -653,2 +914,2 @@ __global__ void __launch_bounds__(
 -      // Load A scales with math warp-groups (weight scales)
 -      if (threadIdx.x >= 32) {
 +      // Load A scales with math warp-groups (weight scales); row block r keeps its own scale row
 +      if (not kPrefetchScalesA and threadIdx.x >= 32) {
-@@ -660,2 +920,6 @@ __global__ void __launch_bounds__(
+@@ -660,2 +921,6 @@ __global__ void __launch_bounds__(
 -        for (uint32_t i = threadIdx.x - 32; i < num_scales_a; i += kNumMathThreads - 32)
 -          st_shared(smem_scales_a + i, __ldg(local_scales_a + i));
 +        for (uint32_t i = threadIdx.x - 32; i < num_scales_a; i += kNumMathThreads - 32) {
@@ -642,34 +643,34 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +                    __ldg(local_scales_a + r * (kPairedRowOffset / BLOCK_K) * SHAPE_K_SCALES +
 +                          i % SHAPE_K_SCALES));
 +        }
-@@ -663 +927,4 @@ __global__ void __launch_bounds__(
+@@ -663 +928,4 @@ __global__ void __launch_bounds__(
 -      cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 +      if constexpr (not kPrefetchScalesA) cutlass::arch::NamedBarrier(kNumMathThreads).sync();
 +      float const* smem_tile_scales =
 +          smem_scales_a +
 +          (kPrefetchScalesA ? (scheduler.current_iter & 1) * kNumRowBlocks * SHAPE_K_SCALES : 0);
-@@ -666 +933,2 @@ __global__ void __launch_bounds__(
+@@ -666 +934,2 @@ __global__ void __launch_bounds__(
 -      float accum[WGMMA::kNumAccum], final_accum[WGMMA::kNumAccum] = {0};
 +      float accum[kNumRowBlocks][WGMMA::kNumAccum];
 +      float final_accum[kNumRowBlocks][WGMMA::kNumAccum] = {};
-@@ -686,4 +954 @@ __global__ void __launch_bounds__(
+@@ -686,4 +955 @@ __global__ void __launch_bounds__(
 -          // Read weight scales (A scales)
 -          float scale_a_0 = ld_shared(smem_scales_a + k_iter * kNumStages + s);
 -
 -          // Wait TMA arrivals
 +          // Wait TMA arrivals (prefetched weight scales arrive with the tile's first stage)
-@@ -691,0 +957,6 @@ __global__ void __launch_bounds__(
+@@ -691,0 +958,6 @@ __global__ void __launch_bounds__(
 +          // Read weight scales (A scales)
 +          float scale_a_0[kNumRowBlocks];
 +#pragma unroll
 +          for (uint32_t r = 0; r < kNumRowBlocks; ++r)
 +            scale_a_0[r] = ld_shared(smem_tile_scales + r * SHAPE_K_SCALES + k_iter * kNumStages + s);
 +
-@@ -695 +966,2 @@ __global__ void __launch_bounds__(
+@@ -695 +967,2 @@ __global__ void __launch_bounds__(
 -          float scale_0_0[WGMMA::kNumAccum / 4], scale_0_1[WGMMA::kNumAccum / 4];
 +          float scale_0_0[kNumRowBlocks][WGMMA::kNumAccum / 4];
 +          float scale_0_1[kNumRowBlocks][WGMMA::kNumAccum / 4];
-@@ -700,2 +972,5 @@ __global__ void __launch_bounds__(
+@@ -700,2 +973,5 @@ __global__ void __launch_bounds__(
 -            scale_0_0[i] = scale_a_0 * scale_b.x;
 -            scale_0_1[i] = scale_a_0 * scale_b.y;
 +#pragma unroll
@@ -677,12 +678,12 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +              scale_0_0[r][i] = scale_a_0[r] * scale_b.x;
 +              scale_0_1[r][i] = scale_a_0[r] * scale_b.y;
 +            }
-@@ -706 +981,3 @@ __global__ void __launch_bounds__(
+@@ -706 +982,3 @@ __global__ void __launch_bounds__(
 -          for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[i]);
 +          for (uint32_t r = 0; r < kNumRowBlocks; ++r)
 +#pragma unroll
 +            for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[r][i]);
-@@ -709,5 +986,9 @@ __global__ void __launch_bounds__(
+@@ -709,5 +987,9 @@ __global__ void __launch_bounds__(
 -          for (int k = 0; k < BLOCK_K / WGMMA::K; ++k) {
 -            auto desc_a =
 -                make_smem_desc(smem_a[s] + math_wg_idx * WGMMA::M * BLOCK_K + k * WGMMA::K, 1);
@@ -697,12 +698,12 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +              auto desc_b = make_smem_desc(smem_b[s] + k * WGMMA::K, 1);
 +              WGMMA::wgmma(desc_a, desc_b, accum[r], k);
 +            }
-@@ -717 +998,3 @@ __global__ void __launch_bounds__(
+@@ -717 +999,3 @@ __global__ void __launch_bounds__(
 -          for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[i]);
 +          for (uint32_t r = 0; r < kNumRowBlocks; ++r)
 +#pragma unroll
 +            for (int i = 0; i < WGMMA::kNumAccum; ++i) warpgroup_fence_operand(accum[r][i]);
-@@ -725,5 +1008,8 @@ __global__ void __launch_bounds__(
+@@ -725,5 +1009,8 @@ __global__ void __launch_bounds__(
 -          for (int i = 0; i < WGMMA::kNumAccum / 4; ++i) {
 -            final_accum[i * 4 + 0] += scale_0_0[i] * accum[i * 4 + 0];
 -            final_accum[i * 4 + 1] += scale_0_1[i] * accum[i * 4 + 1];
@@ -716,7 +717,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +              final_accum[r][i * 4 + 2] += scale_0_0[r][i] * accum[r][i * 4 + 2];
 +              final_accum[r][i * 4 + 3] += scale_0_1[r][i] * accum[r][i * 4 + 3];
 +            }
-@@ -752,0 +1039,8 @@ __global__ void __launch_bounds__(
+@@ -752,0 +1040,8 @@ __global__ void __launch_bounds__(
 +      // Without the barrier at the start of the tile (scales are prefetched), wait here until
 +      // thread 0 has finished storing the previous tile from smem_d before overwriting it.
 +      if constexpr (kFuseSwiGLUQuant) asm volatile("" ::: "memory");
@@ -725,7 +726,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +
 +      // Row block r goes to its own smem_d block and to output columns r * kPairedRowOffset later
 +      constexpr uint32_t kSmemDBlockElems = BLOCK_N * BLOCK_M;
-@@ -754,15 +1048,19 @@ __global__ void __launch_bounds__(
+@@ -754,15 +1049,19 @@ __global__ void __launch_bounds__(
 -      for (auto i = 0; i < WGMMA::kNumAccum / 8; ++i) {
 -        SM90_U32x4_STSM_T<nv_bfloat162>::copy(
 -            __float22bfloat162_rn({final_accum[i * 8 + 0], final_accum[i * 8 + 1]}),
@@ -760,7 +761,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +              smem_d + r * kSmemDBlockElems + warp_idx * 16 +
 +                  WGMMA::kNumAccum / 8 * 16 * BLOCK_M + tid);
 +        }
-@@ -771 +1069,13 @@ __global__ void __launch_bounds__(
+@@ -771 +1070,13 @@ __global__ void __launch_bounds__(
 -      if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset) {
 +      if constexpr (kFuseSwiGLUQuant) {
 +        // STSM is a generic shared-memory store. The named barrier makes both
@@ -775,7 +776,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +            smem_d, fused_output, fused_scales, fused_scale_leading_dim, row_start,
 +            scheduler.n_boundary, padded_start, m_block_idx);
 +      } else if constexpr (SchedulerType::gemm_type == GemmType::GroupedWithOffset) {
-@@ -779,2 +1089,5 @@ __global__ void __launch_bounds__(
+@@ -779,2 +1090,5 @@ __global__ void __launch_bounds__(
 -            cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d, m_block_idx * BLOCK_M,
 -                                          n_global_idx);
 +#pragma unroll
@@ -783,7 +784,7 @@ index ae03a82216126c5554e49ca491c874484573d325..b584ae13102c9910bddc242f357c4d0c
 +              cute::SM90_TMA_STORE_2D::copy(&tensor_map_d, smem_d + r * kSmemDBlockElems,
 +                                            m_block_idx * BLOCK_M + r * kPairedRowOffset,
 +                                            n_global_idx);
-@@ -788,3 +1101,6 @@ __global__ void __launch_bounds__(
+@@ -788,3 +1102,6 @@ __global__ void __launch_bounds__(
 -          write_result_to_gmem<BLOCK_N, BLOCK_M, NUM_WARPS>(
 -              gmem_d_this_block, smem_d, n_global_idx, scheduler.n_boundary, m_block_idx * BLOCK_M,
 -              SHAPE_M, SHAPE_M);
@@ -912,16 +913,13 @@ index 173998b089af816e873dac5d67ae12f3ab1acc30..74c5957e8f88867648da03a3545b9dcd
 +}
 +
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
-index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..3b2d58254b0339340ad19dea6cffa7fb1134824e 100644
+index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..ad525a0df1932908ab7dcedd495d2d2b57cf7106 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.cu
 @@ -20,0 +21,2 @@
 +#include <limits>
 +
-@@ -56,0 +59,2 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
-+  // This runner's prequantized-input entry is used by BlockScaleFC2 for fused
-+  // FC1 output; that producer also publishes the routing metadata for PDL.
-@@ -93,0 +98,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
+@@ -93,0 +96,7 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::gemm(
 +/**
 + * @brief Run grouped FP8 expert GEMMs using the configured workspace.
 + * @param expected_m Positive uint32 token estimate for DeepGEMM configuration
@@ -929,11 +927,11 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..3b2d58254b0339340ad19dea6cffa7fb
 + * and apply only to this invocation, preserving workspace capacity and runner state.
 + * @param max_num_stages Pipeline stage upper bound, or -1 for upstream selection.
 + */
-@@ -98 +109,2 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -98 +107,2 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 -    float const* scales_b) {
 +    float const* scales_b, int64_t expected_m, int max_num_stages, bool paired_rows,
 +    bool input_quantized, void* fused_output, float* fused_scales, bool enable_pdl) {
-@@ -100 +112,20 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -100 +110,20 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 -  constexpr bool internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3>;
 +  TLLM_CHECK_WITH_INFO(
 +      expected_m == -1 || (expected_m > 0 && expected_m <= std::numeric_limits<uint32_t>::max()),
@@ -955,24 +953,24 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..3b2d58254b0339340ad19dea6cffa7fb
 +  // A per-call scheduling hint must not change the runner's legacy load estimate.
 +  int64_t const effective_m = expected_m == -1 ? expected_m_ : expected_m;
 +  bool const internal_quantize_a = !std::is_same_v<ElementA, __nv_fp8_e4m3> && !input_quantized;
-@@ -101,0 +133,4 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -101,0 +131,4 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 +  // Fused FC1 writes into this call's output buffer, not the runner's high-water
 +  // scratch. Bound TMA loads to that buffer so partial tiles zero-fill its tail.
 +  int64_t const input_capacity = input_quantized ? shape_m_ : max_shape_m_4_align_;
 +  int64_t const quant_shape_m = div_up(shape_m_, 4) * 4;
-@@ -109 +144 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -109 +142 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 -  if constexpr (internal_quantize_a || internal_quantize_b) {
 +  if (internal_quantize_a || internal_quantize_b) {
-@@ -113 +148 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -113 +146 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 -  if constexpr (internal_quantize_a) {
 +  if (internal_quantize_a) {
-@@ -122,0 +158,5 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -122,0 +156,5 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 +  // The grouped runner quantizes the BF16 source into this separate scratch
 +  // before FC1 fusion may overwrite the original BF16 source buffer.
 +  TLLM_CHECK_WITH_INFO(fused_output == nullptr || fused_output != fp8_mat_a,
 +                       "Fused output must not overwrite the GEMM FP8 input");
 +
-@@ -137,6 +177,9 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -137,6 +175,9 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 -    fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a,
 -                         per_token_per_128c_scales, reinterpret_cast<__nv_bfloat16 const*>(mat_b),
 -                         fp8_mat_b, per_block_scales, reinterpret_cast<__nv_bfloat16*>(mat_d),
@@ -988,7 +986,7 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..3b2d58254b0339340ad19dea6cffa7fb
 +        internal_quantize_a, internal_quantize_b, max_num_stages,
 +        quant_shape_m, paired_rows,
 +        reinterpret_cast<__nv_fp8_e4m3*>(fused_output), fused_scales, input_quantized, enable_pdl);
-@@ -145,5 +188,8 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -145,5 +186,8 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 -    fp8_grouped_gemm_run(reinterpret_cast<__nv_bfloat16 const*>(mat_a), fp8_mat_a,
 -                         per_token_per_128c_scales, nullptr, fp8_mat_b, per_block_scales,
 -                         reinterpret_cast<__nv_bfloat16*>(mat_d), problem_m_offsets, num_problems,
@@ -1002,27 +1000,27 @@ index 12e9d8c5b2a73b7a81c3444e1298b417078d2996..3b2d58254b0339340ad19dea6cffa7fb
 +        shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
 +        quant_shape_m, paired_rows,
 +        reinterpret_cast<__nv_fp8_e4m3*>(fused_output), fused_scales, input_quantized, enable_pdl);
-@@ -155,2 +201,4 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
+@@ -155,2 +199,4 @@ void CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::moeGemm(
 -                         expected_m_, max_shape_m_4_align_, max_shape_m_32_align_padded_, shape_n,
 -                         shape_k, stream, internal_quantize_a, internal_quantize_b);
 +                         effective_m, input_capacity, max_shape_m_32_align_padded_, shape_n,
 +                         shape_k, stream, internal_quantize_a, internal_quantize_b, max_num_stages,
 +                         quant_shape_m, paired_rows,
 +                         reinterpret_cast<__nv_fp8_e4m3*>(fused_output), fused_scales, input_quantized, enable_pdl);
-@@ -219,0 +268,4 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
+@@ -219,0 +266,4 @@ size_t CutlassFp8BlockScaleGemmRunner<ElementA, ElementB, ElementD>::getWorkspac
 +  // The workspace keeps the largest M requested so far. The grouped input quantization is
 +  // launched for this call's M instead, so a small call after a large batch keeps its small
 +  // grid and binary search; neither changes the quantized values or their layout.
 +  shape_m_ = int64_t(max_shape_m);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
-index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..3507f6d2298cc02836f843cef119ba8232ede460 100644
+index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..fb83c9f2f4ab1c148d47fcf8d65890c37b769488 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm.h
 @@ -26,0 +27,3 @@ namespace tensorrt_llm::kernels::fp8_blockscale_gemm {
 +// Includes compiler availability and the TRTLLM_DG_ENABLED runtime override.
 +bool getDeepGemmEnabled();
 +
-@@ -40,0 +44,12 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
+@@ -40,0 +44,13 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
 +  /**
 +   * @brief Execute grouped FP8 GEMMs with rows partitioned by problem_m_offsets.
 +   * @param expected_m Expected tokens per expert for DeepGEMM configuration
@@ -1030,19 +1028,20 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..3507f6d2298cc02836f843cef119ba82
 +   * @param max_num_stages Pipeline stage upper bound, or -1 for upstream selection.
 +   * @param input_quantized Interpret mat_a as FP8 and use the required scales_a without quantizing.
 +   * @param fused_output Dense FP8 SwiGLU output, or nullptr for ordinary BF16 output.
-+   * @param enable_pdl Allow programmatic dependent launch for the grouped GEMM.
++   * @param enable_pdl Allow programmatic dependent launch for the fused FC1 -> FC2 GEMMs; other
++   * grouped GEMMs stay stream-ordered.
 +   * @param fused_scales Padded per-128-channel output scales, required with fused_output.
 +   * @param paired_rows Let one decode (swapAB) tile cover weight rows r and r + shape_n / 2,
 +   * e.g. matching up and gate rows of a gated FC1.
 +   */
-@@ -43,2 +58,4 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
+@@ -43,2 +59,4 @@ class CutlassFp8BlockScaleGemmRunnerInterface {
 -                       size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
 -                       float const* scales_b = nullptr) = 0;
 +                       size_t shape_k, cudaStream_t stream, float const* scales_a,
 +                       float const* scales_b, int64_t expected_m, int max_num_stages,
 +                       bool paired_rows, bool input_quantized, void* fused_output,
 +                       float* fused_scales, bool enable_pdl) = 0;
-@@ -90,0 +108,11 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
+@@ -90,0 +109,12 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
 +  /**
 +   * @brief Run grouped FP8 expert GEMMs with optional input quantization.
 +   * @param expected_m Per-call DeepGEMM token estimate, or -1 for the stored
@@ -1050,20 +1049,21 @@ index 040a1463b919b4297d8c17b9df0fcaf3026ffb75..3507f6d2298cc02836f843cef119ba82
 +   * @param max_num_stages Pipeline stage upper bound, or -1 for upstream selection.
 +   * @param input_quantized Interpret mat_a as FP8; scales_a must be provided.
 +   * @param fused_output Dense FP8 SwiGLU output, separate from the FP8 input scratch.
-+   * @param enable_pdl Allow programmatic dependent launch for the grouped GEMM.
++   * @param enable_pdl Allow programmatic dependent launch for the fused FC1 -> FC2 GEMMs; other
++   * grouped GEMMs stay stream-ordered.
 +   * @param fused_scales Padded output scales, or nullptr together with fused_output.
 +   * @param paired_rows Pair weight rows r and r + shape_n / 2 in one decode tile; requires DeepGEMM.
 +   */
-@@ -93 +121,3 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
+@@ -93 +123,3 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
 -               float const* scales_a = nullptr, float const* scales_b = nullptr) override;
 +               float const* scales_a, float const* scales_b, int64_t expected_m,
 +               int max_num_stages, bool paired_rows, bool input_quantized, void* fused_output,
 +               float* fused_scales, bool enable_pdl) override;
-@@ -121,0 +152,2 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
+@@ -121,0 +154,2 @@ class CutlassFp8BlockScaleGemmRunner : public CutlassFp8BlockScaleGemmRunnerInte
 +  // This call's unpadded row capacity; quantization rounds its launch up separately.
 +  int64_t shape_m_ = 0;
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
-index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..ef7309c3b52d1dbfc8d07b49eaafdacc49e35765 100644
+index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..dddaddf6161129729fb072fa8075872685e52676 100644
 --- a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 +++ b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/fp8_blockscale_gemm/fp8_blockscale_gemm_kernel.cuh
 @@ -1350 +1350 @@ void gemm_dispatch(void* mat_a, int ld_a, void* mat_b, int ld_b, void* mat_d, in
@@ -1108,7 +1108,7 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..ef7309c3b52d1dbfc8d07b49eaafdacc
 +                                                    num_device_sms, false, true, max_num_stages,
 +                                                    false);
 +    }
-@@ -1489,2 +1508,10 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1489,2 +1508,15 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        deep_gemm::jit::get_best_gemm_config(shape_n, expected_m, shape_k, num_problems,
 -                                             num_device_sms, false, true);
 +        config;
@@ -1121,21 +1121,26 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..ef7309c3b52d1dbfc8d07b49eaafdacc
 +    bool const prefetch_first_tile =
 +        fused_fc1_input && enable_pdl && shape_n == 512 && shape_k == 1024 &&
 +        best_block_m == 128 && best_num_stages == 8 && best_num_tma_multicast == 1 && !paired;
-@@ -1493 +1520,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
++    // Only the fused FC1 -> FC2 chain launches as a programmatic dependent. Its predecessors (the
++    // stream-ordered input quantization, then fused FC1) never write problem_m_offsets, so offsets
++    // read before griddepcontrol.wait are already final. Other grouped GEMMs stay stream-ordered,
++    // as upstream.
++    bool const programmatic_launch = enable_pdl && (fused_output != nullptr || fused_fc1_input);
+@@ -1493 +1525,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true);
 +        best_num_tma_multicast, deep_gemm::GemmType::GroupedWithOffset, true, paired,
 +        fused_output != nullptr, prefetch_first_tile);
-@@ -1500 +1528,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
+@@ -1500 +1533,2 @@ void grouped_gemm_dispatch(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __nv_bflo
 -        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded);
 +        num_device_sms, static_cast<uint32_t>(best_smem_size), max_shape_m_padded,
-+        fused_output, fused_scales, enable_pdl);
-@@ -1509 +1538,4 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
++        fused_output, fused_scales, programmatic_launch);
+@@ -1509 +1543,4 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          bool internal_quantize_a = true, bool internal_quantize_b = true) {
 +                          bool internal_quantize_a, bool internal_quantize_b, int max_num_stages,
 +                          int64_t quant_shape_m, bool paired_rows,
 +                          __nv_fp8_e4m3* fused_output, float* fused_scales, bool fused_fc1_input,
 +                          bool enable_pdl) {
-@@ -1521,3 +1553,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1521,3 +1558,6 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -    int num_blocks = std::min(static_cast<int64_t>(kNumDeviceSMs),
 -                              div_up(max_shape_m * scales_dim_x, NumThreads / 32));
 -    // Binary search is expected to have lower complexity when max_shape_m is small
@@ -1145,18 +1150,18 @@ index 5cc4143cd1bf5df85ff4384ca8e86bf8e85f07e9..ef7309c3b52d1dbfc8d07b49eaafdacc
 +        1, std::min(static_cast<int64_t>(kNumDeviceSMs),
 +                    div_up(quant_shape_m * scales_dim_x, NumThreads / 32)));
 +    // Binary search is expected to have lower complexity when quant_shape_m is small
-@@ -1525 +1560 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1525 +1565 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -        static_cast<double>(max_shape_m) * scales_dim_x /
 +        static_cast<double>(quant_shape_m) * scales_dim_x /
-@@ -1553 +1588,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
+@@ -1553 +1593,2 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a,
 -                          stream);
 +                          stream, max_num_stages, paired_rows, fused_output, fused_scales, fused_fc1_input,
 +                          enable_pdl);
-@@ -1578 +1614,2 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1578 +1619,2 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
 -      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms);
 +      deep_gemm::jit::get_best_gemm_config(shape_m, shape_n, shape_k, num_problems, num_device_sms,
 +                                           false, false, -1, false);
-@@ -1582 +1619 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
+@@ -1582 +1624 @@ void strided_batch_gemm_dispatch(__nv_fp8_e4m3* mat_a, int ld_a, int stride_a, _
 -      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched);
 +      best_num_tma_multicast, deep_gemm::GemmType::StridedBatched, false, false, false, false);
 diff --git a/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h b/csrc/nv_internal/tensorrt_llm/kernels/cutlass_kernels/include/moe_kernels.h
