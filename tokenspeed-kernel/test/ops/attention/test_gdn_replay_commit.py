@@ -436,11 +436,16 @@ def test_gdn_replay_commit_reuses_shared_chunks_without_reading_rejected_tokens(
     [(torch.bfloat16, False), (torch.float32, False), (torch.bfloat16, True)],
 )
 def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
-    device: str, state_dtype: torch.dtype, rows_aligned: bool, require
+    device: str,
+    state_dtype: torch.dtype,
+    rows_aligned: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    require,
 ):
     require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
     if rows_aligned and not current_platform().is_nvidia:
         pytest.skip("the pipelined replay is NVIDIA-only")
+    taken = _record_ring_gate(monkeypatch)
     H, HV, K, V = 2, 4, 128, 128
     width = H * K + HV * V + 2 * HV
     # Aligned BF16 rows take the pipelined kernel, which covers up to 8 tokens.
@@ -489,15 +494,32 @@ def test_gdn_replay_commit_batch_window_and_capacity_do_not_recompile(
     with assert_no_triton_compile(kernel):
         commit(batch=4, tokens=3, capacity=13, layers=3)
         commit(batch=17, tokens=longest_window, capacity=281, layers=1)
+    # Each call took the kernel watched above.
+    assert taken == ([True] * 3 if rows_aligned else [])
 
 
 @pytest.mark.parametrize("batch", [16, 32, 64])
-@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    ("state_dtype", "rows_aligned"),
+    [(torch.bfloat16, False), (torch.float32, False), (torch.bfloat16, True)],
+)
 def test_gdn_replay_commit_tp4_graph_refresh(
-    device: str, batch: int, state_dtype: torch.dtype, require
+    device: str,
+    batch: int,
+    state_dtype: torch.dtype,
+    rows_aligned: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    require,
 ):
-    """TP4 head grouping preserves state as graph acceptance and padding change."""
+    """TP4 head grouping preserves state as graph acceptance and padding change.
+
+    With aligned BF16 rows this geometry (three value heads per key head, two
+    layers) takes the pipelined kernel, replayed from a CUDA graph.
+    """
     require("attention", "gdn_replay_commit", "triton", torch.bfloat16, "q")
+    if rows_aligned and not current_platform().is_nvidia:
+        pytest.skip("the pipelined replay is NVIDIA-only")
+    taken = _record_ring_gate(monkeypatch)
     torch.manual_seed(3109)
     layers, tokens, H, HV, K, V = 2, 4, 4, 12, 128, 128
     width = H * K + HV * V + 2 * HV
@@ -541,7 +563,7 @@ def test_gdn_replay_commit_tp4_graph_refresh(
             geometry=(H, HV, K, V),
             state_dtype=state_dtype,
             solution="triton",
-            rows_aligned=False,
+            rows_aligned=rows_aligned,
         )
 
     commit()
@@ -591,6 +613,8 @@ def test_gdn_replay_commit_tp4_graph_refresh(
             torch.testing.assert_close(
                 pool[layer, ~written], original[layer, ~written], rtol=0, atol=0
             )
+    # The eager call and the capture asked the gate; the replays reuse them.
+    assert taken == ([True] * 2 if rows_aligned else [])
 
 
 def test_gdn_replay_commit_ignores_rejected_suffix(device: str, require):
