@@ -60,6 +60,14 @@ constexpr int64_t float4_e2m1fn_code = encode_dlpack_dtype(dl_float4_e2m1fn);
 
 constexpr DLDevice cpu = DLDevice{kDLCPU, 0};
 
+// The GPU device type tensors arrive with: a hipified build (ROCm torch) sees
+// kDLROCM where the CUDA build sees kDLCUDA.
+#if defined(__HIP_PLATFORM_AMD__)
+constexpr DLDeviceType kGpuDeviceType = kDLROCM;
+#else
+constexpr DLDeviceType kGpuDeviceType = kDLCUDA;
+#endif
+
 #ifdef FLASHINFER_ENABLE_F16
 #define _DISPATCH_CASE_F16(c_type, ...) \
   case float16_code: {                  \
@@ -255,7 +263,7 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
 }
 
 #define CHECK_CUDA(x) \
-  TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCUDA) << #x " must be a CUDA tensor";
+  TVM_FFI_ICHECK_EQ(x.device().device_type, kGpuDeviceType) << #x " must be a GPU tensor";
 #define CHECK_CPU(x) \
   TVM_FFI_ICHECK_EQ(x.device().device_type, kDLCPU) << #x " must be a host tensor";
 #define CHECK_CONTIGUOUS(x) TVM_FFI_ICHECK(x.IsContiguous()) << #x " must be contiguous";
@@ -283,7 +291,7 @@ inline void check_shape(const tvm::ffi::TensorView& a, const tvm::ffi::TensorVie
 inline cudaStream_t get_current_stream() {
   int device;
   cudaGetDevice(&device);
-  return static_cast<cudaStream_t>(TVMFFIEnvGetStream(kDLCUDA, device));
+  return static_cast<cudaStream_t>(TVMFFIEnvGetStream(kGpuDeviceType, device));
 }
 
 inline cudaStream_t get_stream(DLDevice device) {

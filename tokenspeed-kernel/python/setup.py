@@ -47,7 +47,8 @@ Kernel compilation
 ==================
 
 Compiles .cu files into shared libraries (.so) loaded via tvm_ffi.load_module().
-On systems without an NVIDIA CUDA build target, the build is skipped and the
+The ROCm backend builds only HIP_KERNEL_GROUPS, hipified from the same sources.
+On systems without a CUDA or ROCm build target, the build is skipped and the
 package installs as a pure-Python stub. Cached CUDA binaries carry a toolchain
 identity, so CUDA 12/13 and architecture changes invalidate them in either
 direction. The cu129 source recipe always rebuilds its in-tree CUDA kernels.
@@ -57,6 +58,7 @@ import ctypes
 import importlib
 import json
 import os
+import re
 import shlex
 import shutil
 import site
@@ -89,6 +91,7 @@ CUDA_OBJS_DIR = THIRDPARTY_DIR / "cuda" / "objs"
 CUDA_HOME = os.environ.get("CUDA_HOME", "/usr/local/cuda")
 NVCC = os.environ.get("FLASHINFER_NVCC", f"{CUDA_HOME}/bin/nvcc")
 CXX = os.environ.get("CXX", "g++")
+ROCM_HOME = os.environ.get("ROCM_HOME", os.environ.get("ROCM_PATH", "/opt/rocm"))
 
 
 def _version_date() -> str:
@@ -1027,11 +1030,128 @@ class CudaKernelBuilder:
                 temporary.replace(identity_path)
 
 
-class BuildKernels(build_ext):
-    """Compile CUDA kernels into .so files for the CUDA backend."""
+# CUDA kernel groups (names in KERNEL_GROUPS) that the ROCm backend builds from
+# the same sources, hipified, for gfx950 only: the policy kernel's ranking
+# replays torch's reduction orders on that target (eagle_harness_policy.cu).
+HIP_KERNEL_GROUPS = ("eagle_harness_tree", "eagle_harness_policy")
+HIP_ARCHS = ("gfx950",)
+# CUDA intrinsics `__<op>(` renamed to `ts_hip_<op>(` (csrc/hip_cuda_compat.h).
+HIP_RENAMED_INTRINSICS = (
+    "shfl_sync",
+    "shfl_xor_sync",
+    "shfl_up_sync",
+    "ballot_sync",
+    "reduce_max_sync",
+    "reduce_min_sync",
+    "ldcg",
+)
+HIP_COMPAT_HEADER = CUDA_CSRC_DIR / "hip_cuda_compat.h"
+# Local headers the hipified sources include, hipified beside them.
+HIP_LOCAL_HEADERS = (CUDA_CSRC_DIR / "tvm_ffi_utils.h",)
+
+
+class HipKernelBuilder:
+    """Builds HIP_KERNEL_GROUPS with hipify-perl and hipcc into the same
+    ``objs/<name>/<name>.so`` the CUDA build writes."""
+
+    def __init__(self, group_names, verbose: bool):
+        groups = {entry[0]: entry for entry in KERNEL_GROUPS}
+        self.kernel_groups = [groups[name] for name in group_names]
+        self.verbose = verbose
+        self.hipcc = Path(ROCM_HOME) / "bin" / "hipcc"
+        self.hipify = Path(ROCM_HOME) / "bin" / "hipify-perl"
+
+    @staticmethod
+    def _hipify_text(text: str) -> str:
+        # hipify-perl maps the cub namespace but leaves its includes.
+        text = re.sub(r"#include <cub/(.*)\.cuh>", r"#include <hipcub/\1.hpp>", text)
+        renamed = "|".join(HIP_RENAMED_INTRINSICS)
+        return re.sub(rf"\b__({renamed})\(", r"ts_hip_\1(", text)
+
+    def _hipify(self, src: Path, dst: Path) -> None:
+        text = subprocess.check_output([str(self.hipify), str(src)], text=True)
+        dst.write_text(self._hipify_text(text))
+
+    def _hipcc_version(self) -> str:
+        return subprocess.check_output([str(self.hipcc), "--version"], text=True)
 
     def run(self):
-        if _selected_backend() != "cuda":
+        for tool in (self.hipcc, self.hipify):
+            if not tool.exists():
+                raise RuntimeError(f"ROCm backend selected but {tool} was not found")
+        include_dirs = []
+        try:
+            tvm_ffi = importlib.import_module("tvm_ffi")
+            include_dirs.append(str(Path(tvm_ffi.__file__).parent / "include"))
+        except ImportError:
+            pass
+        flags = [
+            "-x",
+            "hip",
+            *(f"--offload-arch={arch}" for arch in HIP_ARCHS),
+            "-std=c++17",
+            "-O3",
+            "-DNDEBUG",
+            "-fPIC",
+            "-shared",
+            "-include",
+            str(HIP_COMPAT_HEADER),
+        ]
+        identity = {
+            "format": 1,
+            "hipcc": self._hipcc_version(),
+            "compile_flags": flags,
+            "include_dirs": include_dirs,
+            "renamed_intrinsics": list(HIP_RENAMED_INTRINSICS),
+        }
+        CUDA_OBJS_DIR.mkdir(parents=True, exist_ok=True)
+        for name, sources, *_ in self.kernel_groups:
+            out_dir = CUDA_OBJS_DIR / name
+            hip_dir = out_dir / "hip"
+            hip_dir.mkdir(parents=True, exist_ok=True)
+            so_path = out_dir / f"{name}.so"
+            identity_path = out_dir / "build-identity.json"
+            inputs = [*sources, HIP_COMPAT_HEADER, *HIP_LOCAL_HEADERS]
+            if (
+                so_path.exists()
+                and CudaKernelBuilder._matches_build_identity(identity_path, identity)
+                and all(so_path.stat().st_mtime > p.stat().st_mtime for p in inputs)
+            ):
+                if self.verbose:
+                    print(f"Skipped up-to-date HIP kernel group {name}")
+                continue
+            identity_path.unlink(missing_ok=True)
+            print(f"Building HIP kernel group {name}...")
+            for header in HIP_LOCAL_HEADERS:
+                self._hipify(header, hip_dir / header.name)
+            hip_sources = []
+            for src in sources:
+                hip_sources.append(hip_dir / src.name)
+                self._hipify(src, hip_sources[-1])
+            cmd = [
+                str(self.hipcc),
+                *flags,
+                f"-I{hip_dir}",
+                *(f"-I{d}" for d in include_dirs),
+                *(str(s) for s in hip_sources),
+                "-o",
+                str(so_path),
+            ]
+            subprocess.check_call(cmd)
+            identity_path.write_text(json.dumps(identity, sort_keys=True) + "\n")
+
+
+class BuildKernels(build_ext):
+    """Compile CUDA kernels into .so files for the CUDA backend, and the
+    HIP_KERNEL_GROUPS subset for the ROCm backend."""
+
+    def run(self):
+        backend = _selected_backend()
+        verbose = bool(getattr(self, "verbose", False))
+        if backend == "rocm":
+            HipKernelBuilder(HIP_KERNEL_GROUPS, verbose=verbose).run()
+            return
+        if backend != "cuda":
             print(
                 f"CUDA backend not selected; skipping CUDA kernel build. "
                 f"{self.distribution.get_name()}"
@@ -1039,7 +1159,6 @@ class BuildKernels(build_ext):
             return
 
         _ensure_cuda_compiler()
-        verbose = bool(getattr(self, "verbose", False))
         CudaKernelBuilder(KERNEL_GROUPS, verbose=verbose).run()
 
 
@@ -1056,7 +1175,7 @@ class BuildNative(Command):
     def run(self):
         backend = _selected_backend()
         _install_backend_build_requirements(getattr(self, "verbose", False))
-        if backend != "cuda":
+        if backend not in ("cuda", "rocm"):
             print("CUDA backend not selected; skipping CUDA kernel build")
             return
 
