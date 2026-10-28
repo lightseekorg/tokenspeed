@@ -36,6 +36,7 @@ import sys
 import weakref
 from contextlib import contextmanager
 from copy import copy
+from dataclasses import replace
 from pathlib import Path
 from test.runtime.test_deepseek_v41_cache import R1, R2, _backend, _extend, _tables
 from test.runtime.test_deepseek_v41_engram import _mapping, _Tokenizer
@@ -50,7 +51,7 @@ from safetensors.torch import save_file
 from tokenspeed_kernel.numerics.torch.residual import torch_mhc_mixes
 from tokenspeed_kernel.ops.gemm import mm
 from tokenspeed_kernel.ops.moe import moe_topk
-from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from torch import nn
 
 from tokenspeed.runtime.configs.load_config import LoadConfig
@@ -2961,6 +2962,48 @@ def _mock_loader_hardware(monkeypatch, mapping):
     monkeypatch.setitem(global_server_args_dict, "mapping", mapping)
 
 
+@pytest.mark.parametrize(
+    "backend,major,expert_dtype,intermediate,expected",
+    [
+        (MoeBackend.MEGA_MOE, 10, "fp4", 2304, 2304),
+        (MoeBackend.DEEP_GEMM_MEGA_MOE, 10, "fp4", 2304, 2304),
+        (MoeBackend.MEGA_MOE, 10, "fp4", 2240, 2304),
+        (MoeBackend.MEGA_MOE, 10, "fp4", 2560, 2560),
+        (MoeBackend.MEGA_MOE, 10, "fp8", 2304, 2560),
+        (MoeBackend.MEGA_MOE, 10, None, 2304, 2560),
+        (MoeBackend.MEGA_MOE, 9, "fp4", 2304, 2560),
+        (MoeBackend.TRITON, 10, "fp4", 2304, 2304),
+        (MoeBackend.AUTO, 10, "fp4", 2304, 2304),
+    ],
+)
+def test_moe_intermediate_alignment(
+    monkeypatch, backend, major, expert_dtype, intermediate, expected
+):
+    metadata = vars(_loader_config())
+    metadata["hidden_size"] = 256
+    metadata["moe_intermediate_size"] = intermediate
+    if expert_dtype is None:
+        metadata.pop("expert_dtype")
+    else:
+        metadata["expert_dtype"] = expert_dtype
+    config = v41.DeepseekV41Config(text_config=metadata).text_config
+    mapping = _mapping(1, 1, 2)
+    _mock_loader_hardware(monkeypatch, mapping)
+    for module in (v41, v4, expert_module):
+        monkeypatch.setattr(module, "get_moe_backend", lambda: backend)
+    platform = replace(
+        current_platform(), vendor="nvidia", arch_version=ArchVersion(major, 0)
+    )
+    monkeypatch.setattr(v41, "current_platform", lambda: platform)
+    moe = v41.DeepseekV41MoE(config, mapping, _quant(), 0, "ffn", None)
+    assert moe.experts.intermediate_size == expected
+    assert moe.experts.w13_weight.shape[1] == 2 * expected
+    assert moe.shared_experts.down_proj.input_size == intermediate
+    assert moe.config is config
+    assert config.moe_intermediate_size == intermediate
+    assert config.n_shared_experts == 1
+
+
 def _loader_model(monkeypatch, config, rank, device):
     mapping = _mapping(rank, 4, 4)
     _mock_loader_hardware(monkeypatch, mapping)
@@ -3163,8 +3206,12 @@ def test_multimodal_checkpoint_load(monkeypatch, tmp_path, active, encoder_only)
     "rank,prefixed,reverse",
     [(0, False, False), (1, True, True), (2, False, True), (3, True, False)],
 )
-def test_strict_checkpoint_load_tp4_ep4(monkeypatch, rank, prefixed, reverse, tmp_path):
+@pytest.mark.parametrize("intermediate", [128, 2304])
+def test_strict_checkpoint_load_tp4_ep4(
+    monkeypatch, rank, prefixed, reverse, tmp_path, intermediate
+):
     config = _loader_config()
+    config.moe_intermediate_size = intermediate
     with set_default_torch_dtype(torch.bfloat16):
         model = _loader_model(monkeypatch, config, rank, "cpu")
     weights = _checkpoint(config)
