@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import importlib.util
+from collections.abc import Iterable
 
 import torch
 from tokenspeed_kernel.platform import (
@@ -33,10 +34,42 @@ from tokenspeed_kernel.platform import (
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
-if (
+_AVAILABLE = (
     current_platform().is_hopper_plus
     and importlib.util.find_spec("cutlass") is not None
-):
+)
+
+
+def gdn_wy_warm_batch_sizes(
+    batch_sizes: Iterable[int],
+    num_v_heads: int,
+    num_tokens: int,
+    state_dtype: torch.dtype,
+) -> list[int]:
+    """Return the first batch in each CuTe launch bucket.
+
+    Args:
+        batch_sizes: Serving batch sizes to cover, in ascending order.
+        num_v_heads: Value heads on this rank.
+        num_tokens: Verify-window length.
+        state_dtype: Recurrent-state pool dtype.
+
+    Returns:
+        Representative batches, or an empty list when CuTe is unavailable.
+    """
+    if not _AVAILABLE:
+        return []
+    from tokenspeed_kernel.ops.attention.gdn._cute_dsl.wy import gdn_wy_launch_config
+
+    token_bound = 4 if num_tokens <= 4 else 8 if num_tokens <= 8 else 16
+    first = {}
+    for batch in batch_sizes:
+        key = gdn_wy_launch_config(batch, num_v_heads, token_bound, state_dtype)
+        first.setdefault(key, batch)
+    return list(first.values())
+
+
+if _AVAILABLE:
 
     @register_kernel(
         "attention",
@@ -51,7 +84,7 @@ if (
         signatures=format_signatures(
             ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
         ),
-        priority=Priority.SPECIALIZED + 1,
+        priority=Priority.SPECIALIZED + 2,
         traits={
             "head_dim": frozenset({128}),
             "value_head_dim": frozenset({128}),

@@ -369,9 +369,17 @@ def test_verify_falls_back_for_unsupported_or_state_writing_calls(
         and KernelRegistry.get().get_by_name("flashinfer_gdn_decode_mtp") is not None
     ):
         expected = "flashinfer_gdn_decode_mtp"
+    if (
+        current_platform().is_blackwell
+        and replay
+        and not tree
+        and head_dim == value_head_dim == 64
+        and state_dtype == torch.bfloat16
+    ):
+        expected = "triton_gdn_decode_mtp_chain"
     assert selected == expected
     assert case.backend._verify_packed_qkv_views == (
-        selected == "triton_gdn_decode_mtp"
+        selected in {"triton_gdn_decode_mtp", "triton_gdn_decode_mtp_chain"}
     )
     assert case.backend._verify_reads_committed_recurrent_state == (
         not replay and selected == "triton_gdn_decode_mtp"

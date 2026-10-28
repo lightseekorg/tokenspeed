@@ -22,8 +22,10 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
@@ -42,14 +44,15 @@ if not torch.cuda.is_available():
 from test.runtime.test_gdn_state_paging import _ContractPool
 
 from tokenspeed_kernel.ops.attention.gdn import (
-    GdnChainVerifyForm,
-    gdn_chain_verify_form,
     gdn_replay_commit_supported,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.chain_verify import (
     gdn_chain_verify_kernel,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.profiling import ShapeCapture, shape_capture
+from tokenspeed_kernel.registry import KernelRegistry
+from tokenspeed_kernel.selection import kernel_override
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.attention.backends.state.gdn import GdnAttnBackend
@@ -230,17 +233,11 @@ def _capture(backend, pool, batch: int, width: int, inputs):
     return graph, outputs
 
 
-def _cuda_kernels(run) -> set[str]:
-    torch.cuda.synchronize()
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as profile:
-        run()
-        torch.cuda.synchronize()
+def _mtp_selections(path) -> set[str]:
     return {
-        event.name
-        for event in profile.events()
-        if event.device_type == torch.autograd.DeviceType.CUDA
+        record["kernel_name"]
+        for record in json.loads(path.read_text())
+        if record["mode"] == "gdn_decode_mtp"
     }
 
 
@@ -254,76 +251,104 @@ def _committed(pool) -> list[tuple[torch.Tensor, torch.Tensor]]:
     ]
 
 
-@pytest.mark.parametrize("width", [3, 4, 16])
-def test_chain_form_commits_like_the_mtp_verify(width):
-    """Graph-replayed chain-form verifies commit bitwise what ``gdn_decode_mtp`` commits."""
+@pytest.mark.parametrize("width", [3, 4, 8, 16])
+@pytest.mark.parametrize(
+    "override", ["cute_dsl_gdn_decode_mtp", "triton_gdn_decode_mtp_chain"]
+)
+def test_selected_chain_kernel_commits_like_the_mtp_verify(tmp_path, width, override):
+    """Both registered chain kernels preserve graph replay and exact state commit."""
+    if KernelRegistry.get().get_by_name(override) is None:
+        pytest.skip(f"{override} unavailable")
     batch = 64
-    assert (
-        gdn_chain_verify_form(width, batch * V_HEADS, torch.bfloat16, chain_form=True)
-        is GdnChainVerifyForm.CHAIN
-    )
     state = _state(batch, seed=width)
     gen = torch.Generator().manual_seed(width)
     accepted = torch.randint(1, width + 1, (batch,), generator=gen, dtype=torch.int32)
     accepted = accepted.to(DEV)
 
-    reference, reference_pool = _backend(
-        state, width=width, max_bs=batch, cls=MambaAttnBackend
-    )
-    _refresh(reference, batch, width, graph_replay=False)
-    reference_out = _forward(
-        reference,
-        reference_pool,
-        batch,
-        width,
-        _round_inputs(batch, width, seed=width),
-    )
-    reference.commit_verified_state(accepted, accepted_path=None)
+    with kernel_override("attention", "gdn_decode_mtp", "triton_gdn_decode_mtp"):
+        reference, reference_pool = _backend(
+            state, width=width, max_bs=batch, cls=MambaAttnBackend
+        )
+        _refresh(reference, batch, width, graph_replay=False)
+        reference_out = _forward(
+            reference,
+            reference_pool,
+            batch,
+            width,
+            _round_inputs(batch, width, seed=width),
+        )
+        reference.commit_verified_state(accepted, accepted_path=None)
 
-    chain, chain_pool = _backend(state, width=width, max_bs=batch)
-    inputs = _round_inputs(batch, width, seed=width)
-    graph, chain_out = _capture(chain, chain_pool, batch, width, inputs)
+    path = tmp_path / "capture.json"
+    with kernel_override("attention", "gdn_decode_mtp", override):
+        chain, chain_pool = _backend(state, width=width, max_bs=batch)
+        inputs = _round_inputs(batch, width, seed=width)
+        ShapeCapture.get().clear()
+        with shape_capture(path):
+            graph, chain_out = _capture(chain, chain_pool, batch, width, inputs)
+    assert _mtp_selections(path) == {override}
     # Restore the round's projection, which the capture forwards may have convolved.
     for layer, x in _round_inputs(batch, width, seed=width).items():
         inputs[layer]["projection"].copy_(x["projection"])
     _refresh(chain, batch, width, graph_replay=True)
-    replayed = _cuda_kernels(graph.replay)
+    graph.replay()
     chain.commit_verified_state(accepted, accepted_path=None)
     torch.cuda.synchronize()
 
-    assert any("gdn_chain_verify_kernel" in name for name in replayed), replayed
-    assert not any("gdn_decode_update" in name for name in replayed), replayed
-    # The conv update fills the replay payload: no q/k/v split.
-    assert not any("qkv_split" in name for name in replayed), replayed
     for (reference_conv, reference_ssm), (chain_conv, chain_ssm) in zip(
         _committed(reference_pool), _committed(chain_pool)
     ):
         assert torch.equal(reference_conv, chain_conv)
         assert torch.equal(reference_ssm, chain_ssm)
     for reference_layer, chain_layer in zip(reference_out, chain_out):
-        # The chain form rounds q and the normalized keys to bf16 for its products.
         torch.testing.assert_close(
             chain_layer.float(), reference_layer.float(), atol=1e-4, rtol=2**-7
         )
 
 
-def test_warmed_chain_verify_compiles_nothing_while_serving():
-    """After the workspace warm, eager chain-form verifies of every tier compile nothing."""
-    width, capacity = 4, 40
-    backend, pool = _backend(_state(capacity, seed=21), width=width, max_bs=capacity)
-    with patch.object(
-        gdn_chain_verify_kernel,
-        "_do_compile",
-        wraps=gdn_chain_verify_kernel._do_compile,
-    ) as compiles:
-        for batch in (1, 3, 8, 9, 31, 32, capacity):
+@pytest.mark.parametrize("width", [4, 8])
+@pytest.mark.parametrize(
+    "override", ["cute_dsl_gdn_decode_mtp", "triton_gdn_decode_mtp_chain"]
+)
+def test_warmed_selected_verify_compiles_nothing_while_serving(
+    tmp_path, width, override
+):
+    """Operator-owned warmup covers both backends and every serving launch tier."""
+    if KernelRegistry.get().get_by_name(override) is None:
+        pytest.skip(f"{override} unavailable")
+    capacity = 100
+    with kernel_override("attention", "gdn_decode_mtp", override):
+        backend, pool = _backend(
+            _state(capacity, seed=21), width=width, max_bs=capacity
+        )
+    with ExitStack() as stack:
+        stack.enter_context(kernel_override("attention", "gdn_decode_mtp", override))
+        compiles = stack.enter_context(
+            patch.object(
+                gdn_chain_verify_kernel,
+                "_do_compile",
+                wraps=gdn_chain_verify_kernel._do_compile,
+            )
+        )
+        cute_compiles = None
+        if override == "cute_dsl_gdn_decode_mtp":
+            import cutlass.cute as cute
+
+            cute_compiles = stack.enter_context(
+                patch.object(cute, "compile", wraps=cute.compile)
+            )
+        for batch in (1, 3, 5, 6, 8, 9, 21, 22, 31, 32, 85, 86, capacity):
             inputs = _round_inputs(batch, width, seed=batch)
             _refresh(backend, batch, width, graph_replay=False)
-            kernels = _cuda_kernels(
-                lambda: _forward(backend, pool, batch, width, inputs)
-            )
-            assert any("gdn_chain_verify_kernel" in name for name in kernels), kernels
+            path = tmp_path / f"serving-{batch}.json"
+            ShapeCapture.get().clear()
+            with shape_capture(path):
+                _forward(backend, pool, batch, width, inputs)
+            assert _mtp_selections(path) == {override}
+    torch.cuda.synchronize()
     assert compiles.call_count == 0
+    if cute_compiles is not None:
+        assert cute_compiles.call_count == 0
 
 
 if __name__ == "__main__":

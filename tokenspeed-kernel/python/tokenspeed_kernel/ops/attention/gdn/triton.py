@@ -41,9 +41,11 @@ import torch
 from tokenspeed_kernel._triton import gl, gluon, libdevice, tl, triton
 from tokenspeed_kernel.ops.attention.gdn import (
     GDN_TREE_VERIFY_CHUNKED_MAX_NODES,
+    GdnChainVerifyForm,
     GdnCheckpointLayout,
     GdnChunkPrefillResult,
     GdnStateCheckpoints,
+    gdn_chain_verify_form,
 )
 from tokenspeed_kernel.ops.attention.gdn._triton.causal_conv1d_metadata import (
     CAUSAL_CONV1D_BLOCK_M,
@@ -73,6 +75,7 @@ from tokenspeed_kernel.ops.attention.gdn._triton.qkv_split import (
     pack_gdn_projection,
 )
 from tokenspeed_kernel.platform import (
+    ArchVersion,
     CapabilityRequirement,
     current_platform,
     pdl_enabled,
@@ -82,6 +85,20 @@ from tokenspeed_kernel.signature import format_signatures
 
 # The payload stores take ptxas to 172 registers, a CTA per SM fewer; 168 keeps three CTAs.
 _TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
+
+
+_CHAIN_ANCESTORS: dict[tuple[torch.device, int, int], torch.Tensor] = {}
+
+
+def _chain_ancestors(q: torch.Tensor) -> torch.Tensor:
+    batch, tokens = q.shape[:2]
+    key = (q.device, batch, tokens)
+    ancestors = _CHAIN_ANCESTORS.get(key)
+    if ancestors is None:
+        steps = torch.arange(tokens, device=q.device, dtype=torch.int64)
+        ancestors = ((1 << (steps + 1)) - 1).repeat(batch, 1)
+        _CHAIN_ANCESTORS[key] = ancestors
+    return ancestors
 
 
 @register_kernel(
@@ -922,6 +939,18 @@ def triton_gdn_decode_mtp(
     ``replay_payload``, the others step by step.
     """
     if (
+        tree_ancestors is None
+        and disable_state_update
+        and intermediate_states_buffer is None
+        and output_state_indices is None
+        and output_state is None
+        and gdn_chain_verify_form(
+            q.shape[1], q.shape[0] * v.shape[2], initial_state.dtype, chain_form=False
+        )
+        is GdnChainVerifyForm.TREE
+    ):
+        tree_ancestors = _chain_ancestors(q)
+    if (
         tree_ancestors is not None
         and output_state_indices is None
         and intermediate_states_buffer is None
@@ -961,6 +990,83 @@ def triton_gdn_decode_mtp(
         intermediate_states_buffer=intermediate_states_buffer,
         per_token_output_state_indices=output_state_indices,
         tree_ancestors=tree_ancestors,
+    )
+
+
+@register_kernel(
+    "attention",
+    "gdn_decode_mtp",
+    name="triton_gdn_decode_mtp_chain",
+    solution="triton",
+    capability=CapabilityRequirement(
+        vendors=frozenset({"nvidia"}),
+        min_arch_version=ArchVersion(10, 0),
+        max_arch_version=ArchVersion(10, 7),
+    ),
+    signatures=format_signatures(
+        ("q", "k", "v"), "dense", {torch.float16, torch.bfloat16}
+    ),
+    priority=Priority.SPECIALIZED + 1,
+    traits={
+        "chunked_chain": frozenset({True}),
+        "verify_tokens": frozenset(range(2, 17)),
+        "output_only": frozenset({True}),
+        "tree": frozenset({False}),
+        "replay_payload": frozenset({False}),
+        "strided_qkv": frozenset({False, True}),
+        "separate_output_state": frozenset({False}),
+    },
+)
+def triton_gdn_decode_mtp_chain(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    scale: float | None,
+    disable_state_update: bool,
+    use_qk_l2norm: bool,
+    intermediate_states_buffer: torch.Tensor | None,
+    output_state_indices: torch.Tensor | None,
+    output_state: torch.Tensor | None,
+    tree_ancestors: torch.Tensor | None,
+    replay_payload: torch.Tensor | None,
+) -> torch.Tensor:
+    """Chunked chain candidate for the common MTP output-only contract.
+
+    Tensor arguments and scaling follow ``gdn_decode_mtp``. State updates must
+    be disabled; intermediate states, output destinations, tree masks and a
+    replay-payload destination must be absent. Returns ``[B, T, HV, V]`` in
+    the query dtype without writing the committed state.
+    """
+    if not disable_state_update or any(
+        x is not None
+        for x in (
+            intermediate_states_buffer,
+            output_state_indices,
+            output_state,
+            tree_ancestors,
+            replay_payload,
+        )
+    ):
+        raise ValueError("the chunked chain kernel requires output-only chains")
+    return launch_gdn_chain_verify(
+        q,
+        k,
+        v,
+        A_log=A_log,
+        a=a,
+        dt_bias=dt_bias,
+        b=b,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        scale=scale,
+        use_qk_l2norm=use_qk_l2norm,
     )
 
 

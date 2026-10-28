@@ -218,6 +218,8 @@ def prepare_gdn_decode_mtp(
             "verify_tokens": tokens,
             "output_only": not per_token,
             "tree": False,
+            "chunked_chain": False,  # These benchmark cases use FP32 states.
+            "replay_payload": False,
         },
     )
     inputs = _decode_inputs(request.seed, batch, tokens, profile)

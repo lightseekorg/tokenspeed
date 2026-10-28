@@ -117,7 +117,12 @@ output-only execution and tree support are selection traits shared by runtime
 capability queries and the actual verify call; the runtime does not choose a
 WY-specific solution. It computes the same operation with native TF32 MMA and
 can fill the same replay payload; state ownership and replay commit stay the
-same. Unsupported geometry or platforms use normal registry fallback. BF16
+same. Chains and trees enter through `gdn_decode_mtp`; the runtime passes no
+ancestor mask for a chain. The kernel package owns selection between CuTe WY,
+the Triton chunked chain and general MTP, including any one-path mask used
+internally by the fallback. Capability queries and launch warmup use that same
+selection contract, including the pool's state dtype. Unsupported geometry or
+platforms use normal registry fallback. BF16
 state writes retain their padding-safe solution; read-only verify leaves the
 null page untouched and ignores padded outputs. In other trees the state of
 every branch point (a node with a child other than the next node) goes to one

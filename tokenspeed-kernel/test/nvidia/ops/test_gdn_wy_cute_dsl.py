@@ -20,14 +20,18 @@
 
 """Output-only WY verify against the token recurrence, including graph replay."""
 
+import json
+
 import pytest
 import torch
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.profiling import ShapeCapture, shape_capture
 
 if not current_platform().is_hopper_plus:
     pytest.skip("CuTe GDN WY requires NVIDIA SM90+", allow_module_level=True)
 pytest.importorskip("cutlass")
 
+from tokenspeed_kernel.ops.attention.gdn._cute_dsl import wy
 from tokenspeed_kernel.ops.attention.gdn.cute_dsl import (
     cute_dsl_gdn_decode_mtp as run_wy,
 )
@@ -462,18 +466,8 @@ def test_wy_rejects_state_writes(argument):
 
 @pytest.mark.parametrize("tree", [False, True])
 @pytest.mark.parametrize("solution", [None, "cute_dsl"])
-def test_wy_registry_selection(monkeypatch, tree, solution):
+def test_wy_registry_selection(tmp_path, tree, solution):
     from tokenspeed_kernel.ops.attention import gdn
-
-    selected = []
-    select = gdn.select_kernel
-
-    def record_selection(*args, **kwargs):
-        kernel = select(*args, **kwargs)
-        selected.append(kernel.name)
-        return kernel
-
-    monkeypatch.setattr(gdn, "select_kernel", record_selection)
 
     case = make_case(
         batch=2,
@@ -486,8 +480,12 @@ def test_wy_registry_selection(monkeypatch, tree, solution):
         vheads=6,
     )
     pool = case["initial_state"].clone()
-    output = gdn.gdn_decode_mtp(**case, solution=solution)
-    assert selected == ["cute_dsl_gdn_decode_mtp"]
+    path = tmp_path / "selection.json"
+    ShapeCapture.get().clear()
+    with shape_capture(path):
+        output = gdn.gdn_decode_mtp(**case, solution=solution)
+    selected = json.loads(path.read_text())
+    assert selected[-1]["kernel_name"] == "cute_dsl_gdn_decode_mtp"
     torch.testing.assert_close(output.double(), reference(case), atol=1e-4, rtol=2**-7)
     assert torch.equal(case["initial_state"], pool)
 
@@ -605,6 +603,8 @@ def test_wy_selection_traits(
                 "verify_tokens": tokens,
                 "output_only": output_only,
                 "tree": tree,
+                "chunked_chain": False,
+                "replay_payload": False,
             },
         ).name
         == expected
@@ -654,6 +654,51 @@ def test_wy_explicit_solution_is_preserved():
     torch.testing.assert_close(actual.double(), reference(case), atol=1e-4, rtol=2**-7)
     with pytest.raises(NoKernelFoundError):
         gdn_decode_mtp(**case, solution="flashinfer")
+
+
+@pytest.mark.parametrize(
+    "state_dtype,strided,solution,expected",
+    [
+        (torch.bfloat16, False, None, "cute_dsl_gdn_decode_mtp"),
+        (torch.float32, False, None, "cute_dsl_gdn_decode_mtp"),
+        (torch.bfloat16, True, None, "cute_dsl_gdn_decode_mtp"),
+        (torch.bfloat16, False, "triton", "triton_gdn_decode_mtp_chain"),
+        (torch.float32, False, "triton", "triton_gdn_decode_mtp"),
+        (torch.bfloat16, True, "triton", "triton_gdn_decode_mtp"),
+    ],
+)
+def test_mtp_selects_chain_kernel(tmp_path, state_dtype, strided, solution, expected):
+    from tokenspeed_kernel.ops.attention import gdn
+    from tokenspeed_kernel.platform import current_platform
+
+    if (
+        not current_platform().is_blackwell
+        and expected == "triton_gdn_decode_mtp_chain"
+    ):
+        expected = "triton_gdn_decode_mtp"
+    case = make_case(
+        batch=2,
+        tokens=4,
+        dtype=torch.bfloat16,
+        state_dtype=state_dtype,
+        tree=False,
+        strided=strided,
+        heads=2,
+        vheads=6,
+    )
+    if expected == "triton_gdn_decode_mtp":
+        # The general portable fallback uses a packed state pool.
+        case["initial_state"] = case["initial_state"].contiguous()
+    before = case["initial_state"].clone()
+    path = tmp_path / "selection.json"
+    ShapeCapture.get().clear()
+    with shape_capture(path):
+        actual = gdn.gdn_decode_mtp(**case, solution=solution)
+    selected = json.loads(path.read_text())
+    assert selected[-1]["mode"] == "gdn_decode_mtp"
+    assert selected[-1]["kernel_name"] == expected
+    torch.testing.assert_close(actual.double(), reference(case), atol=1e-4, rtol=2**-7)
+    assert torch.equal(case["initial_state"], before)
 
 
 def test_flashinfer_bf16_state_rejects_unsupported_value_dim(require):
@@ -710,3 +755,95 @@ def test_wy_benchmark_preparation(tokens, state_writes):
         prepared = prepare_gdn_decode_mtp(request, current_platform())
         result = prepared.invocation.invoke()
         assert result.shape == (1, tokens, 24, 128) and result.isfinite().all()
+
+
+@pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("warm_strided", [False, True])
+@pytest.mark.parametrize("warm_unaligned", [False, True])
+def test_wy_graph_switches_transport_layout(state_dtype, warm_strided, warm_unaligned):
+    def make_inputs(*, batch, tokens, strided, unaligned):
+        case = make_case(
+            batch=batch,
+            tokens=tokens,
+            dtype=torch.bfloat16,
+            state_dtype=state_dtype,
+            tree=False,
+            strided=strided,
+            heads=2,
+            vheads=6,
+        )
+        if unaligned:
+            pool = case["initial_state"]
+            pitch = pool.shape[1] * 128 * 128 + 1
+            storage = torch.empty(
+                pool.shape[0] * pitch + 1, device=pool.device, dtype=pool.dtype
+            )
+            view = torch.as_strided(storage[1:], pool.shape, (pitch, 128 * 128, 128, 1))
+            view.copy_(pool)
+            case["initial_state"] = view
+        return case
+
+    # Start cold so an earlier test cannot accidentally warm the required path.
+    wy._COMPILED.clear()
+    warm = make_inputs(
+        batch=1, tokens=8, strided=warm_strided, unaligned=warm_unaligned
+    )
+    run_wy(**warm)
+    case = make_inputs(
+        batch=3, tokens=5, strided=not warm_strided, unaligned=not warm_unaligned
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run_wy(**case)
+    graph.replay()
+    torch.testing.assert_close(output.double(), reference(case), atol=1e-4, rtol=2**-7)
+
+    case["q"].mul_(-0.75)
+    case["initial_state_indices"][0] = -1
+    before = case["initial_state"].clone()
+    graph.replay()
+    torch.testing.assert_close(output.double(), reference(case), atol=1e-4, rtol=2**-7)
+    assert torch.equal(case["initial_state"], before)
+
+
+@pytest.mark.parametrize("tokens", [4, 8])
+@pytest.mark.parametrize("unaligned", [False, True])
+def test_wy_wide_graph_with_strong_gate_and_negative_state(tokens, unaligned):
+    case = make_case(
+        batch=12,
+        tokens=tokens,
+        dtype=torch.bfloat16,
+        state_dtype=torch.bfloat16,
+        tree=True,
+        strided=False,
+        heads=8,
+        vheads=24,
+    )
+    case["initial_state"].mul_(50)
+    if unaligned:
+        pool = case["initial_state"]
+        pitch = pool.shape[1] * 128 * 128 + 1
+        backing = torch.empty(
+            pool.shape[0] * pitch + 1, device=pool.device, dtype=pool.dtype
+        )
+        view = torch.as_strided(backing[1:], pool.shape, (pitch, 128 * 128, 128, 1))
+        view.copy_(pool)
+        case["initial_state"] = view
+    case["initial_state_indices"][-1] = -1
+    case["A_log"].zero_()
+    case["dt_bias"].zero_()
+    case["a"][:, 1] = 1e20
+    before = case["initial_state"].clone()
+    run_wy(**case)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = run_wy(**case)
+    graph.replay()
+    torch.testing.assert_close(output.double(), reference(case), atol=1e-4, rtol=2**-7)
+    initial_output = output.clone()
+    case["initial_state_indices"].copy_(case["initial_state_indices"].roll(1))
+    graph.replay()
+    torch.testing.assert_close(output.double(), reference(case), atol=1e-4, rtol=2**-7)
+    assert not torch.equal(output, initial_output)
+    assert output.isfinite().all()
+    assert torch.equal(case["initial_state"], before)

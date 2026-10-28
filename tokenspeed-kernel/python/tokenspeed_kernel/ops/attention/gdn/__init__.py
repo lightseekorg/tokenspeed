@@ -568,6 +568,60 @@ def gdn_chain_verify_form(
     return GdnChainVerifyForm.STEP
 
 
+def _chunked_chain_supported(
+    num_tokens: int, head_dim: int, value_head_dim: int, state_dtype: torch.dtype
+) -> bool:
+    return gdn_chain_verify_supported(head_dim, value_head_dim, state_dtype) and (
+        gdn_chain_verify_form(num_tokens, 0, state_dtype, chain_form=True)
+        is GdnChainVerifyForm.CHAIN
+    )
+
+
+def gdn_decode_mtp_warm_batch_sizes(
+    max_batch_size: int,
+    num_v_heads: int,
+    num_tokens: int,
+    state_dtype: torch.dtype,
+) -> list[int]:
+    """Return batches covering the MTP implementations' bounded launch variants.
+
+    Args:
+        max_batch_size: Largest serving batch to prepare.
+        num_v_heads: Value heads on this rank.
+        num_tokens: Verify-window length.
+        state_dtype: Recurrent-state pool dtype.
+
+    Returns:
+        Sorted representative batch sizes. Call ``gdn_decode_mtp`` normally at
+        these sizes; selection, including explicit overrides, still applies.
+    """
+    if max_batch_size <= 0 or not 1 <= num_tokens <= 16:
+        return []
+    from tokenspeed_kernel.ops.attention.gdn._triton.chain_verify import (
+        gdn_chain_verify_warm_batch_sizes,
+    )
+    from tokenspeed_kernel.ops.attention.gdn.cute_dsl import (
+        gdn_wy_warm_batch_sizes,
+    )
+
+    batches = range(1, max_batch_size + 1)
+    return sorted(
+        {1, max_batch_size}
+        | set(gdn_chain_verify_warm_batch_sizes(batches, num_v_heads, num_tokens))
+        | set(gdn_wy_warm_batch_sizes(batches, num_v_heads, num_tokens, state_dtype))
+    )
+
+
+def _chain_rows_dense(*tensors: torch.Tensor) -> bool:
+    """Dense heads and request-major rows, including packed-projection views."""
+    return all(
+        t.stride(-1) == 1
+        and (t.ndim != 4 or t.stride(2) == t.shape[3])
+        and (t.shape[0] <= 1 or t.stride(0) == t.shape[1] * t.stride(1))
+        for t in tensors
+    )
+
+
 def gdn_decode_mtp(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -720,15 +774,25 @@ def gdn_decode_mtp(
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
+    output_only = (
+        disable_state_update
+        and intermediate_states_buffer is None
+        and output_state_indices is None
+        and output_state is None
+    )
     traits = {
         "head_dim": head_dim,
         "value_head_dim": v.shape[-1],
         "verify_tokens": q.shape[1],
         "tree": tree_ancestors is not None,
-        "output_only": disable_state_update
-        and intermediate_states_buffer is None
-        and output_state_indices is None
-        and output_state is None,
+        "output_only": output_only,
+        "chunked_chain": output_only
+        and tree_ancestors is None
+        and _chunked_chain_supported(
+            q.shape[1], head_dim, v.shape[-1], initial_state.dtype
+        )
+        and _chain_rows_dense(q, k, v, a, b),
+        "replay_payload": replay_payload is not None,
     }
     if output_state is not None:
         traits["separate_output_state"] = True
@@ -916,6 +980,7 @@ def gdn_decode_supports(
     op: str,
     dtype: torch.dtype,
     *,
+    state_dtype: torch.dtype,
     traits: dict[str, int | bool],
     trait: str,
     solution: str | None,
@@ -926,6 +991,7 @@ def gdn_decode_supports(
     Args:
         op: ``"gdn_decode_step"`` or ``"gdn_decode_mtp"``.
         dtype: q/k/v dtype.
+        state_dtype: Recurrent-state pool dtype, also used by MTP selection.
         traits: The same geometry and execution traits as the actual decode
             call. MTP includes ``head_dim``, ``value_head_dim``,
             ``verify_tokens``, ``output_only`` and ``tree``.
@@ -941,6 +1007,20 @@ def gdn_decode_supports(
     """
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    if op == "gdn_decode_mtp":
+        traits = dict(traits)
+        traits.setdefault(
+            "chunked_chain",
+            traits["output_only"]
+            and not traits["tree"]
+            and _chunked_chain_supported(
+                traits["verify_tokens"],
+                traits["head_dim"],
+                traits["value_head_dim"],
+                state_dtype,
+            ),
+        )
+        traits.setdefault("replay_payload", False)
     try:
         default = select_kernel(
             "attention",
@@ -1160,6 +1240,7 @@ __all__ = [
     "gdn_chunk_prefill_stores_state_checkpoints",
     "gdn_decode_step",
     "gdn_decode_mtp",
+    "gdn_decode_mtp_warm_batch_sizes",
     "gdn_decode_supports",
     "gdn_replay_commit",
     "gdn_replay_commit_supported",
