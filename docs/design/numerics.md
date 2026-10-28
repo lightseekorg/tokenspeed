@@ -445,6 +445,14 @@ hook; an online quantizer is not selected by a frozen GEMM plan. The ordinary
 FP8 linear method retains its original dynamic selection and has no new plan
 field or forwarding path.
 
+The original RMSNorm module may accept a preselected callable through `kernel`.
+The caller uses the existing registry selection during initialization; forward
+invokes that callable with the ordinary weight, epsilon, residual and output
+arguments. No plan or forward-scoped override is required. The default remains
+the original platform facade, and empty inputs keep the original early return.
+A custom callable rejects fused collective/norm entry points so its arithmetic
+cannot be bypassed. Kernel-specific input validation stays in the selected leaf.
+
 ## Logprobs: one arithmetic for prompt and output
 
 A returned logprob is the launch's `--logprob-order` applied to the row --
