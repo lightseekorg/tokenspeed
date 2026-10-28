@@ -40,6 +40,7 @@ struct ForwardBatchView;
 struct TransferBatchView;
 struct SchedulerAbortView;
 struct SchedulerSizes;
+struct PrefillGateProbe;
 struct CacheGroupPages;
 struct KvEventView;
 struct StorageTickView;
@@ -48,12 +49,14 @@ struct StorageDoneView;
 struct StorageStatsView;
 
 void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const RequestSpec> specs);
-std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler);
+std::unique_ptr<tokenspeed::ExecutionPlan> next_execution_plan(tokenspeed::Scheduler& scheduler,
+                                                               bool allow_prefill);
 void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> events);
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
+PrefillGateProbe probe_prefill_gate(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
 rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);
 std::int32_t request_token_size(const tokenspeed::Scheduler& scheduler, rust::Str request_id);

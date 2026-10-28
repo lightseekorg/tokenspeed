@@ -1535,12 +1535,14 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             feedback.admission_failed = false;
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
                                                          decode_reserve, build.load_backs, build.kv_page_budget)) {
+                spdlog::debug("[Scheduler] prefill {} scheduled ({} tokens)", request->Id(), admitted->input_length);
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
                     return;
                 }
             } else if (feedback.admission_failed) {
+                spdlog::debug("[Scheduler] prefill {} blocked on capacity", request->Id());
                 feedback.NoteCapacityBlocked(request);
                 if (resident) {
                     return;
@@ -1667,19 +1669,30 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
 // mixed mode prefill work runs alone, and decodes get a round only when no
 // prefill scheduled.
 void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
-                               std::vector<WriteBackOperation>& write_back_operations) {
+                               std::vector<WriteBackOperation>& write_back_operations, bool allow_prefill) {
     maybeForceRetraction(build, candidates, write_back_operations);
 
     const bool new_prompts_sealed = scheduleReadmission(feedback, build, candidates);
     if (config_.enable_mixed_prefill_decode) {
-        const bool has_local_prefill = std::ranges::any_of(candidates, [](const Request* request) {
-            return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
-        });
+        // The decode batch's prefill reserve exists to protect a prefill that
+        // may ride beside it; with the delay gate closed no prefill can, so
+        // the decodes take the whole budget.
+        const bool has_local_prefill = allow_prefill && std::ranges::any_of(candidates, [](const Request* request) {
+                                           return request->Is<fsm::Prefilling>() || request->Is<fsm::Submitted>();
+                                       });
         build.pending_prefill_reserve = has_local_prefill ? MinPrefillChunkTokens(coordinator_) : 0;
         scheduleDecodeBatch(feedback, build, candidates);
     }
 
-    scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    if (allow_prefill) {
+        // Resident chunks are held back with the fresh prompts: a chunk that
+        // keeps extending every round would keep the whole attention-DP group
+        // out of its decode path for exactly as long, which is what batching
+        // the prefills into rounds is meant to avoid. The next open round
+        // resumes it; a prompt's chunks therefore cluster instead of
+        // scattering across rounds.
+        scheduleLocalPrefillWork(feedback, build, candidates, new_prompts_sealed, config_.decode_input_tokens);
+    }
 
     if (!config_.enable_mixed_prefill_decode && !build.pushed_prefill) {
         scheduleDecodeBatch(feedback, build, candidates);
@@ -1689,7 +1702,8 @@ void Scheduler::buildFusedPlan(AdmissionFeedback& feedback, PlanBuild& build, st
 }
 
 Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan, std::vector<Request*> candidates,
-                                                             std::vector<WriteBackOperation>& write_back_operations) {
+                                                             std::vector<WriteBackOperation>& write_back_operations,
+                                                             PlanOptions options) {
     // The candidates arrive in submission order (requests_ is the FIFO),
     // identical on every rank -- so within a phase, older requests win.
     AdmissionFeedback feedback;
@@ -1704,7 +1718,7 @@ Scheduler::BuiltOperations Scheduler::buildForwardOperations(ExecutionPlan& plan
             buildDecodeWorkerPlan(feedback, build, candidates, write_back_operations);
             break;
         case Role::kFused:
-            buildFusedPlan(feedback, build, candidates, write_back_operations);
+            buildFusedPlan(feedback, build, candidates, write_back_operations, options.allow_prefill);
             break;
     }
 

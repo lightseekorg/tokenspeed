@@ -135,7 +135,7 @@ fn a_request_runs_from_prefill_to_finish() {
     scheduler.submit_requests(&[spec("r1", (1..=10).collect())]);
     assert_eq!(scheduler.sizes().waiting, 1);
 
-    let plan = scheduler.next_execution_plan();
+    let plan = scheduler.next_execution_plan(true);
     let batches = plan.forward_batches();
     assert_eq!(batches.len(), 1);
     let prefill = &batches[0];
@@ -150,7 +150,7 @@ fn a_request_runs_from_prefill_to_finish() {
     scheduler
         .advance(&[event(ForwardEventKind::ExtendResult, "r1", vec![42])])
         .unwrap();
-    let decode = scheduler.next_execution_plan();
+    let decode = scheduler.next_execution_plan(true);
     let batches = decode.forward_batches();
     assert_eq!(
         (batches[0].num_extends, batches[0].input_lengths.clone()),
@@ -189,7 +189,7 @@ result = (list(batch.request_ids), list(batch.input_lengths), list(batch.request
         ])
         .unwrap();
     // Finishing settles once the next plan is built.
-    scheduler.next_execution_plan();
+    scheduler.next_execution_plan(true);
     let sizes = scheduler.sizes();
     assert_eq!((sizes.waiting, sizes.prefilling, sizes.decoding), (0, 0, 0));
 }
@@ -238,7 +238,7 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
     // image and runs no forward for it.
     let mut store = None;
     for token in 42..50 {
-        let plan = scheduler.next_execution_plan();
+        let plan = scheduler.next_execution_plan(true);
         let ops = plan.cache_ops();
         if let Some(op) = ops.first() {
             assert_eq!(ops.len(), 1);
@@ -269,7 +269,7 @@ fn a_forced_retraction_stores_and_restores_through_cache_events() {
     // is decoding again.
     let mut restored = false;
     for _ in 0..4 {
-        let plan = scheduler.next_execution_plan();
+        let plan = scheduler.next_execution_plan(true);
         let ops = plan.cache_ops();
         if let Some(op) = ops
             .iter()
@@ -342,7 +342,7 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
 
     // The prompt's probe runs on the storage executors: the device's cache
     // ops never count it, and the request waits for its answer.
-    let plan = scheduler.next_execution_plan();
+    let plan = scheduler.next_execution_plan(true);
     assert!(plan.cache_ops().is_empty());
     assert!(!plan.needs_device());
     let ops = plan.storage_ops();
@@ -371,7 +371,7 @@ fn storage_operations_stay_out_of_the_device_cache_ops() {
         ..tick(2)
     };
     scheduler.advance_head(&done, &[]).unwrap();
-    let plan = scheduler.next_execution_plan();
+    let plan = scheduler.next_execution_plan(true);
     assert!(plan
         .forward_batches()
         .iter()
@@ -385,7 +385,7 @@ fn a_detached_request_cancels_its_storage_operation() {
         Python::attach(|py| Scheduler::from_python(&run(py, STORAGE_SCHEDULER)).unwrap());
     scheduler.advance_head(&tick(1), &[]).unwrap();
     scheduler.submit_requests(&[spec("waiting", vec![1, 2, 3, 4])]);
-    let query = scheduler.next_execution_plan().storage_ops()[0].clone();
+    let query = scheduler.next_execution_plan(true).storage_ops()[0].clone();
 
     let detach = StorageRound {
         cancellations: vec![StorageCancellationView {
@@ -397,7 +397,7 @@ fn a_detached_request_cancels_its_storage_operation() {
     scheduler.advance_head(&detach, &[]).unwrap();
     scheduler.submit_requests(&[spec("next", vec![5, 6, 7, 8])]);
     // The cancel goes out before the next request's probe.
-    let ops = scheduler.next_execution_plan().storage_ops();
+    let ops = scheduler.next_execution_plan(true).storage_ops();
     assert_eq!(
         ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
         [StorageOpKind::Cancel, StorageOpKind::Query]
@@ -503,11 +503,11 @@ fn a_remote_prefill_carries_what_the_data_plane_reads() {
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("D"))).unwrap());
     scheduler.submit_requests(&[spec("r1", (1..=40).collect())]);
-    scheduler.next_execution_plan();
+    scheduler.next_execution_plan(true);
     scheduler
         .advance(&[event(ForwardEventKind::PdBootstrapped, "r1", Vec::new())])
         .unwrap();
-    let plan = scheduler.next_execution_plan();
+    let plan = scheduler.next_execution_plan(true);
     let rows = plan
         .remote_prefill_transfer()
         .expect("the admission's stream");
@@ -533,11 +533,11 @@ fn a_remote_decode_carries_the_first_token_and_the_prompt_blocks() {
     let mut scheduler =
         Python::attach(|py| Scheduler::from_python(&run(py, &pd_scheduler("P"))).unwrap());
     scheduler.submit_requests(&[spec("r1", (1..=20).collect())]);
-    scheduler.next_execution_plan();
+    scheduler.next_execution_plan(true);
     scheduler
         .advance(&[event(ForwardEventKind::PdBootstrapped, "r1", Vec::new())])
         .unwrap();
-    let prefill = scheduler.next_execution_plan();
+    let prefill = scheduler.next_execution_plan(true);
     let forward = prefill.forward_transfer().expect("the prompt's batch");
     assert_eq!(
         (forward.num_extends, forward.input_lengths.clone()),
@@ -550,7 +550,7 @@ fn a_remote_decode_carries_the_first_token_and_the_prompt_blocks() {
             ..event(ForwardEventKind::ExtendResult, "r1", vec![42])
         }])
         .unwrap();
-    let plan = scheduler.next_execution_plan();
+    let plan = scheduler.next_execution_plan(true);
     let rows = plan
         .remote_decode_transfer()
         .expect("the prompt's KV goes out");
