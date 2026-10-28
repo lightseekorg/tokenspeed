@@ -210,6 +210,18 @@ def _build_cu_extend_seq_lens_cpu(
     return bounds
 
 
+@dataclass(frozen=True)
+class StateScanContext:
+    """Model-layer identity for the shared post-convolution state scans.
+
+    The id is the one passed to the forward, without another cache-view
+    offset. Families can use it to select additional fields in the layer's
+    declared state group. This context owns no mutable request state.
+    """
+
+    layer_id: int
+
+
 @dataclass
 class MambaForwardMetadata:
     query_start_loc: torch.Tensor | None
@@ -1733,7 +1745,8 @@ class MambaAttnBackend(AttentionBackend):
         key = key.view(seq_len, 1, num_heads, head_k_dim)
         value = value.view(seq_len, 1, value.shape[1] // head_v_dim, head_v_dim)
 
-        return self._decode_scan(
+        return self._decode_scan_with_context(
+            StateScanContext(layer_id=layer_id),
             query,
             key,
             value,
@@ -1802,6 +1815,16 @@ class MambaAttnBackend(AttentionBackend):
             The layer output when a fused kernel ran, else None.
         """
         return None
+
+    def _decode_scan_with_context(
+        self, scan_context: StateScanContext, *args, **kwargs
+    ) -> torch.Tensor:
+        """Dispatch a shared decode scan with explicit model-layer identity.
+
+        The default forwards every argument to the existing scan override.
+        Fused decode and speculative verification retain their own entries.
+        """
+        return self._decode_scan(*args, **kwargs)
 
     def _decode_scan(
         self,
@@ -2208,7 +2231,8 @@ class MambaAttnBackend(AttentionBackend):
             scan_query_start_loc = metadata.scan_query_start_loc
             if extend_seq_lens_cpu is not None:
                 set_total_chunks_hint(extend_seq_lens_cpu, scan_query_start_loc)
-            core_attn_out, last_recurrent_state = self._prefill_scan(
+            core_attn_out, last_recurrent_state = self._prefill_scan_with_context(
+                StateScanContext(layer_id=layer_id),
                 query,
                 key,
                 value,
@@ -2486,6 +2510,16 @@ class MambaAttnBackend(AttentionBackend):
             disable_state_update=self.replay_ssm,
             solution=mtp_solution,
         ).reshape(1, seq_len, num_value_heads, head_v_dim)
+
+    def _prefill_scan_with_context(
+        self, scan_context: StateScanContext, *args, **kwargs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch a shared prefill scan with explicit model-layer identity.
+
+        The default preserves the existing scan override. The caller retains
+        convolution, padding and publication of the returned recurrent state.
+        """
+        return self._prefill_scan(*args, **kwargs)
 
     def _prefill_scan(
         self,
