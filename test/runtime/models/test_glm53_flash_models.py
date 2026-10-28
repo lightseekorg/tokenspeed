@@ -21,6 +21,7 @@ from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.attention import kpool as kpool_runtime
 from tokenspeed.runtime.layers.attention.backends.base import SparseTopKShare
 from tokenspeed.runtime.layers.attention.kpool import KPoolRuntime
+from tokenspeed.runtime.layers.dense import unquant
 from tokenspeed.runtime.layers.dense.fp8 import Fp8LinearMethod
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.quantization.fp8 import Fp8Config
@@ -485,18 +486,9 @@ def test_nextn_reuses_first_draft_selection_only_when_configured(
         forward_decode_metadata=None,
         write_locations=lambda *_args: torch.zeros(1, dtype=torch.int64),
     )
-    drafter = Eagle(
-        spec_num_tokens=6,
-        spec_num_steps=5,
-        draft_model_runner=SimpleNamespace(
-            model=model,
-            device=torch.device("cpu"),
-            mapping=mapping,
-            model_config=SimpleNamespace(requires_request_token_history=False),
-        ),
-        input_buffers=SimpleNamespace(seq_lens_buf=torch.zeros(1), max_bs=1),
-        attn_backend=backend,
-    )
+    drafter = Eagle.__new__(Eagle)
+    drafter.draft_model_runner = SimpleNamespace(model=model)
+    drafter.attn_backend = backend
     ctx = ForwardContext(
         attn_backend=backend,
         token_to_kv_pool=None,
@@ -507,21 +499,20 @@ def test_nextn_reuses_first_draft_selection_only_when_configured(
         output_layout=ForwardOutputLayout(0, 0, 1, 1),
     )
 
-    # Substitute the GPU projections, indexer, and sparse-cache kernels on CPU.
-    monkeypatch.setattr(
-        attention.fused_qkv_a_proj_with_mqa,
-        "forward",
-        lambda *_args: torch.zeros((1, 12)),
-    )
+    # Keep the real projection layers, using PyTorch for their GPU GEMM leaf.
+    monkeypatch.setattr(unquant, "kernel_mm", nn.functional.linear)
+    with torch.no_grad():
+        for parameter in attention.parameters():
+            parameter.fill_(0.25)
+        attention.o_proj.weight.copy_(torch.eye(16))
+
+    # The remaining substitutions are GPU-only normalization, indexer and cache
+    # kernels. Sparse attention exposes the selected slots in the output.
     monkeypatch.setattr(
         attention.fused_qk_layernorm,
         "forward",
         lambda **kwargs: kwargs["output_q_a"].zero_(),
     )
-    monkeypatch.setattr(
-        attention.q_b_proj, "forward", lambda _q: (torch.zeros((1, 16)), None)
-    )
-    monkeypatch.setattr(attention.o_proj, "forward", lambda out: (out, None))
     monkeypatch.setattr(
         attention.indexer,
         "forward",
@@ -533,11 +524,12 @@ def test_nextn_reuses_first_draft_selection_only_when_configured(
         ),
     )
     monkeypatch.setattr(runtime, "write_decode", lambda **_kwargs: None)
-    selections = iter([10, 20])
+    selections = []
 
     def select_topk(*_args, **_kwargs):
+        selections.append(step)
         return GlmDsaDecodeTopK(
-            topk_indices=torch.tensor([[next(selections)]], dtype=torch.int32),
+            topk_indices=torch.tensor([[10 * (step + 1)]], dtype=torch.int32),
             topk_lens=torch.ones(1, dtype=torch.int32),
         )
 
@@ -546,16 +538,21 @@ def test_nextn_reuses_first_draft_selection_only_when_configured(
 
     monkeypatch.setattr(attention, "_compute_decode_topk_indices", select_topk)
     monkeypatch.setattr(attention, "forward_absorb", sparse_attention)
-    comm = SimpleNamespace(pre_attn_comm=lambda hidden, _ctx: hidden)
     state = (None, None)
-    for step in range(2):
+    for step in range(5):
         drafter._attach_dsa_topk(state)
-        output = attention(torch.tensor([step]), torch.zeros((1, 16)), ctx, comm)
+        output = attention(
+            torch.tensor([step]),
+            torch.zeros((1, 16)),
+            ctx,
+            model.model.decoder.comm_manager,
+        )
         state = drafter._extract_dsa_topk(state)
-        expected_selection = 10 if step == 0 or share_indices else 20
+        expected_selection = 10 if share_indices else 10 * (step + 1)
         torch.testing.assert_close(
             output, torch.full((1, 16), expected_selection * 1.0)
         )
+    assert selections == ([0] if share_indices else list(range(5)))
 
 
 def test_decode_topk_workspaces_reuse_storage_and_retain_grown_buffers() -> None:
