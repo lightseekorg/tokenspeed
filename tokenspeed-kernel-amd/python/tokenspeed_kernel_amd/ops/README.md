@@ -1633,8 +1633,9 @@ the gfx950 BF16, FP8, and MXFP4 expert GEMMs.
 #### Contract
 
 - `topk_ids [tokens, topk]` holds global expert ids. Routes outside the
-  contiguous range that starts at `expert_start` are dropped. A token may
-  select one expert in several slots.
+  contiguous range that starts at `expert_start` are dropped. The device
+  aligner permits repeated experts within a token. The fused aligner requires
+  distinct experts within each token.
 - Returns sorted route ids (`slot << 24 | token`, with `tokens` marking a
   padding row), the expert of each block (-1 after the last block), route
   weights (0 for padding), and the valid row count. Each expert's routes fill

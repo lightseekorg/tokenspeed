@@ -99,7 +99,16 @@ def _zero_target(
     return output.view(-1).view(torch.int32), nbytes // 16
 
 
-@gluon.jit(do_not_specialize=("N", "em_max", "sentinel", "zero_numel"))
+def _align_launch_metadata(grid, kernel, args):
+    return {
+        "name": f"{kernel.name} (routes={args['N']}, experts={args['num_experts']})"
+    }
+
+
+@gluon.jit(
+    launch_metadata=_align_launch_metadata,
+    do_not_specialize=("N", "em_max", "sentinel", "zero_numel"),
+)
 def _chunk_count_kernel(
     exp_ptr,  # [N] int32 flat topk_ids
     N,
@@ -142,7 +151,10 @@ def _chunk_count_kernel(
     _zero_block(zero_ptr, zero_numel, pid, ZERO_BLOCK, NW)
 
 
-@gluon.jit(do_not_specialize=("N", "num_chunks", "nb_max"))
+@gluon.jit(
+    launch_metadata=_align_launch_metadata,
+    do_not_specialize=("N", "num_chunks", "nb_max"),
+)
 def _chunk_scatter_kernel(
     exp_ptr,  # [N] int32 flat topk_ids
     w_ptr,  # [N] float32 flat topk_weights
