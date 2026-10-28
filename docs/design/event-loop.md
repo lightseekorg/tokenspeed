@@ -740,10 +740,11 @@ For orientation, one `EventLoop::round`:
    page zeroing (the new owner's sanitization), then the Device-bound copies
    -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
    lands on zeroed pages and the forward reads it layer by layer behind the
-   layerwise fences (a prefill graph replay waits for the whole load before
-   its first segment, which holds no fence), so the loads start first on the
-   load stream, and every plan, with cache ops or without, points the fences
-   at its own load or at none; a restore
+   layerwise fences (a prefill graph replay waits on them before each
+   captured segment, which holds none, or, on a pool that does not declare
+   every access fenced, for the whole load instead), so the loads start first
+   on the load stream, and every plan, with cache ops or without, points
+   the fences at its own load or at none; a restore
    queues behind them, overwrites its destination blocks whole (the
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until

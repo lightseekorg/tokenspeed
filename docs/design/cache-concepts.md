@@ -367,11 +367,27 @@ overwritten by it. A pool's setters must therefore wait as its getters do. A
 draft view has its own tracker, and its layers land after all of the target's
 on either copy path, so no per-layer wait of the target forward covers a draft
 layer: the context rows a draft writes before its forward must wait themselves.
-The fences are eager calls, so a captured prefill graph segment holds none: the
-latent rows an attention prologue writes there (into a page a tail hit loads)
-and the State checkpoint an inline KDA layer reads there would race the load.
-`PrefillGraph.replay` therefore waits for the plan's whole Host load before the
-first segment; a replayed forward overlaps only its embedding with that load.
+
+A captured prefill graph segment cannot hold a fence: the latent rows an
+attention prologue writes there (into a page a tail hit loads) and the State
+checkpoint an inline KDA layer reads there would race the load. The fence call
+made during the capture instead notes its layer on the capture, and every
+replay waits, before each segment, for the highest layer that segment noted
+(the layers of a load land in order). The Host cache executor, which registers
+the load trackers the fences call, is therefore built before the graphs are
+captured. An access that no fence covers notes nothing: in a segment it would
+race the load, and in an eager break it would no longer run after the whole
+load. So a replay relies on the noted waits only on a pool whose class declares
+`layer_accesses_wait_for_load` (a subclass does not inherit it), set after
+auditing its accessors and the code that reaches them in a replay (the Kimi-K3
+pool). A replay on any other pool, or of a graph captured against another
+tracker than the pool's current one, or none, waits for the pool's whole Host
+load (its tracker's last layer) before the first segment instead, and skips the
+noted waits. A replay that relies on the noted waits has, like an eager forward,
+waited only for the layers it touched, not for a draft view's, which the
+whole-load wait covers on the Triton copy path (one kernel copies both): what
+touches a draft layer after the forward waits on the draft's tracker, as the
+context writes do.
 
 A batched post-verification commit is the one side-cache writer that issues no
 fence of its own. It moves every bound layer's fields in a single launch, so it

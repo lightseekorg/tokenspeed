@@ -140,7 +140,7 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
 
         def set_cache_pool(self, target, draft):
             self.generation += 1
-            events.append(("rebind", self.generation, target, draft))
+            events.append(("rebind", self.generation, target.name, draft))
 
         def capture_graphs(self, *, entries, observer):
             events.append(("capture", self.generation, entries))
@@ -159,7 +159,10 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         return SimpleNamespace(
             attn_backend=None,
             draft_attn_backend=None,
-            token_to_kv_pool=f"target{pool_generation[0]}",
+            token_to_kv_pool=SimpleNamespace(
+                name=f"target{pool_generation[0]}",
+                arena=SimpleNamespace(runtime_contract=None),
+            ),
             draft_token_to_kv_pool=f"draft{pool_generation[0]}",
             profiled_cache_bytes=4096,
         )
@@ -195,6 +198,12 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         lambda pool: SimpleNamespace(prefix_granularity=1),
     )
     monkeypatch.setattr(scheduler_utils, "pool_to_cache_groups", lambda pool: [])
+    # No Host cache: the boot builds its executor, if any, before the capture.
+    monkeypatch.setattr(
+        device,
+        "_retraction_pool_request",
+        lambda *args, **kwargs: SimpleNamespace(disabled=True),
+    )
     args = SimpleNamespace(
         disaggregation_mode="null",
         chunked_prefill_size=8192,
@@ -203,6 +212,8 @@ def test_dflash_rebound_stream_is_eagerly_warmed_before_final_capture(
         disable_cudagraph_memory_reserve=not reserve,
         enforce_eager=False,
         enable_memory_saver=False,
+        enable_kvstore=False,
+        spec_context_pad=0,
         device="cuda",
         speculative_algorithm=algorithm,
     )

@@ -574,7 +574,8 @@ class HostCacheExecutor:
 
         The device handle calls it on every plan, cache ops or none: it also
         points the layerwise load trackers at this plan's load, or at none,
-        which is what the forward's layers and a prefill graph replay wait on.
+        which is what the forward's layers and a prefill graph replay's
+        segments wait on.
 
         Every load-back row reads a Host L2 entry that is already there (an
         L3 prefetch, when one ran, filled and published it before the
