@@ -1,0 +1,80 @@
+api_version: ci.tokenspeed.io/v1
+# Single-request decode speed and accuracy of the gfx950 decode monokernel
+# (--decode-monokernel) with MTP, on one GPU. It runs on the 2-GPU runners,
+# whose Hugging Face cache already holds this checkpoint (about 170 GB) for
+# its GSM8K eval; the server uses the first GPU.
+#
+# Requests run one at a time, so every decode step has one request and every
+# verify launch four token rows: the monokernel serves all of them. Batched
+# model jobs (for example the GSM8K eval of this checkpoint at batch 16) run
+# more than four rows per step and keep the regular path, so they do not
+# cover these kernels.
+#
+# One server start gates both: the benchmark exits with status 1 below
+# --min-accuracy, and perf_reference gates the decode rate. Without
+# --decode-monokernel the same job decodes at 377 tok/s per request on MI350X
+# (70% of the reference), so a change that turns the monokernel off fails too.
+name: perf-qwen3.8-flash-next-mxfp4-monokernel-gsm8k-single-request-mi35x
+type: perf
+workflow_stage: model-test
+triggers:
+  - per-commit
+  - manual
+runner:
+  labels:
+    - amd-mi35x-2gpu-test
+# Non-blocking until perf_reference is set from runs on this runner.
+optional: true
+env:
+  CI: "true"
+install:
+  - bash test/ci_system/install_deps_rocm.sh
+server:
+  command: >-
+    ts serve
+    --model amd/Qwen3.8-Flash-Next-Quark-MXFP4
+    --trust-remote-code
+    --tensor-parallel-size 1
+    --decode-monokernel
+    --speculative-algorithm MTP
+    --speculative-num-steps 3
+    --speculative-eagle-topk 1
+    --speculative-num-draft-tokens 4
+    --max-model-len 10240
+    --max-num-seqs 4
+    --disable-kvstore
+    --host 127.0.0.1
+    --port 8000
+  ready:
+    url: http://127.0.0.1:8000/readiness
+    timeout: 1800
+    interval: 10
+perf:
+  install:
+    - python3 -m uv venv --seed --clear /tmp/single-request-bench && python3 -m uv pip install --python /tmp/single-request-bench/bin/python 'huggingface_hub==2.3.0' 'pyarrow==26.0.0'
+  # The first 128 questions of the GSM8K test split, greedy, reasoning effort
+  # xhigh, up to 2048 output tokens. About 2 minutes on MI350X.
+  command: >-
+    HF_HOME=${RUNNER_TEMP:-/tmp}/hf-eval-cache
+    /tmp/single-request-bench/bin/python -I test/single_request_benchmark/gsm8k_decode.py
+    --base-url http://127.0.0.1:8000
+    --model amd/Qwen3.8-Flash-Next-Quark-MXFP4
+    --config qwen3.8-flash-next-mxfp4-mtp3-monokernel
+    --num-prompts 128
+    --max-tokens 2048
+    --chat-template-kwargs '{"reasoning_effort": "xhigh"}'
+    --min-accuracy 0.88
+    --num-gpus 1
+    --timeout-s 600
+    --output .ci-artifacts/published/gsm8k-single-request/requests.jsonl
+report:
+  github_step_summary: true
+perf_threshold: 0.9
+# Values are [Latency (tps/user), Throughput (tps/gpu)].
+#
+# PROVISIONAL: a hand measurement on one MI350X (596 tok/s per request,
+# about 526 tok/s end to end, 122 / 128 correct), not on this runner. Replace
+# it with the documented convention (rounded down from the median of the three
+# most recent passing runs) once there are three, then drop `optional`.
+perf_reference:
+  1: [540, 470]
