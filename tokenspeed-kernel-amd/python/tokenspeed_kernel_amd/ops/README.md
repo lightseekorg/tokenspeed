@@ -1292,34 +1292,52 @@ attention uses its own split kernels.
 - The KV cache is paged with 64-token pages, FP16, BF16 or FP8, and head dim
   64 or 128. FP8 queries produce a BF16 output. Sinks are supported;
   `logit_cap` and LSE output are not.
+- Each request has `max_seqlen_q` queries, its last cached tokens (1 for plain
+  decode, the verify width for speculative verify): query `i` sees the keys
+  before `cache_seqlens - (max_seqlen_q - 1 - i)`, so every length counts at
+  least the request's queries.
 - Full attention takes the split count from the base CTAs (requests x KV heads
-  x query-head groups) and `max_seqlen_k`, capped at 64 splits. The count does
-  not read device-resident lengths, so graphs pass the maximum context as
+  x row blocks) and `max_seqlen_k`, capped at 64 splits. The count does not
+  read device-resident lengths, so graphs pass the maximum context as
   `max_seqlen_k` and replay for any batch composition.
 
 #### Algorithm
 
-Each workgroup is one wave that owns one KV head, up to 16 of its query heads
-and one split of the request's pages. K/V pages are copied into LDS with
-`buffer_load_dwordx4 ... lds`. When the grid holds enough waves to hide load
-latency, the loop is single-buffered: copy a page, wait for it, consume it.
+A request's queries of one KV head form `max_seqlen_q` x group-size rows,
+ordered by query position and then by query head. Each workgroup owns one KV
+head, one split of the request's pages and a block of up to 64 of those rows,
+one 16-row MFMA tile per wave. Its waves share every K/V page it loads, so an
+8-token verify over 8 query heads per KV head streams the KV once rather than
+once per token. The block covers the keys of its last query position and,
+under a sliding window, from its first one's window start; each row masks its
+own causal end and window start. A window of at most 16 pages gives four waves
+too few pages to share, so its rows take one-wave blocks of 16 and its split
+count follows the window: at least two pages per split, so a window of 3
+pages or fewer runs unsplit, and past 4 requests the splits are divided among
+the request's row blocks.
+
+K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. When the grid
+holds enough waves to hide load latency, the loop is single-buffered: copy a
+page, wait for it, consume it.
 
 When `select_kv_splits` returns its 64-split maximum, even that leaves the grid
-below its occupancy target, so each wave streams a long split through a
-four-deep pipeline: three pages in flight while one is consumed, if their copies
-fit the 6-bit vmcnt count (BF16 head dim 128 does not). Splits with fewer pages
-than buffers stay single-buffered. vmcnt retires in issue order, so page indices
-are loaded two iterations ahead, one entry per lane: as vector loads they retire
-with the copies, whereas scalar loads of the read-only (`tl.const`) table could
-only be waited on with `lgkmcnt(0)`, placed just before each copy, which then
-waits for a scalar-load round trip. The index loads are volatile so the compiler
-keeps them ahead of the copies. `v_readfirstlane` moves each index into an SGPR
-for a buffer descriptor based at that page. Prefetches past the split repeat its
-last page, since a masked copy becomes a branch followed by `s_waitcnt
-vmcnt(0)`, and the loop waits for them before the epilogue reuses their LDS.
+below its occupancy target, so each workgroup streams a long split through a
+four-deep pipeline: three pages in flight while one is consumed, if each wave's
+share of their copies fits the 6-bit vmcnt count (a single wave's BF16 head dim
+128 pages do not). Splits with fewer pages than buffers stay single-buffered.
+vmcnt retires in issue order, so page indices are loaded two iterations ahead,
+one entry per lane: as vector loads they retire with the copies, whereas scalar
+loads of the read-only (`tl.const`) table could only be waited on with
+`lgkmcnt(0)`, placed just before each copy, which then waits for a scalar-load
+round trip. The index loads are volatile so the compiler keeps them ahead of
+the copies. `v_readfirstlane` moves each index into an SGPR for a buffer
+descriptor based at that page. Prefetches past the split repeat its last page,
+since a masked copy becomes a branch followed by `s_waitcnt vmcnt(0)`; only
+pages crossing the split's end or a row's causal end are masked. The loop waits
+for the prefetches before the epilogue reuses their LDS.
 
-Every split stores its partial and LSE (-inf when empty), so the reduce does
-not read cache lengths.
+Every split stores its partial and LSE (-inf for rows without keys in it), so
+the reduce does not read cache lengths.
 
 ### gfx950 MHA cached extension
 
