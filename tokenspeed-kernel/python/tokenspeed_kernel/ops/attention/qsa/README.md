@@ -6,9 +6,9 @@
 caller-buffered entry for the SM107 TMA-gather4 sparse attention kernel.
 `cute_dsl_tma_gather_qsa_prefill` registers its unsplit, single-query tactic as
 the default for SM107 BF16 prefill with 256-wide heads, twelve query heads per
-KV head, four-token blocks and 512 selected blocks. Logical metadata must be
+KV head, four-token blocks, and 512 selected blocks. Logical metadata must be
 present, K/V must use contiguous NHD storage, and K/V descales must be absent.
-The existing registry retains other hardware, layouts, dtypes and decode/MTP.
+The existing registry retains other hardware, layouts, dtypes, and decode/MTP.
 The registered name can be overridden through the normal kernel selection API;
 no model-specific switch or direct third-party runtime import is needed.
 The solution override `cute_dsl` keeps its existing direct-slot decode kernel;
@@ -18,8 +18,8 @@ use the full registered name to force TMA prefill. Normal selection with
 The ops adapter launches each nonempty request span using the existing CPU
 `query_start_loc`. Positions are consecutive within a span; the forward layout's
 live `seq_lens` is passed through without per-request tensor arithmetic.
-This supports full, chunk and ragged prefill
-without synchronizing GPU metadata to the CPU. Query counts, lengths and page
+This supports full, chunk, and ragged prefill
+without synchronizing GPU metadata to the CPU. Query counts, lengths, and page
 table strides remain runtime inputs. The prepared plan caches only static code;
 outputs belong to each call (or capture), while lengths are views of the existing
 forward metadata, with no extra
@@ -35,7 +35,7 @@ The port owns its computational source under `thirdparty/cute_dsl/_qsa_tma_gathe
 It uses the existing CUTLASS DSL 4.8/CUDA dependencies and does not import cuDNN
 frontend. The core derives from NVIDIA's
 [`sparse_d256_f16.py`](https://github.com/NVIDIA/cudnn-frontend/blob/88561bbebb45c7459560490a1546f44ede4f6ea8/python/cudnn/sdpa/fwd/kernels/sm107/sparse_d256_f16.py).
-The local barrier, MMA and descriptor helpers derive from
+The local barrier, MMA, and descriptor helpers derive from
 [`frost/tile_dsl`](https://github.com/NVIDIA/cudnn-frontend/tree/88561bbebb45c7459560490a1546f44ede4f6ea8/python/cudnn/frost/tile_dsl)
 at the same revision, restricted to this kernel's single-CTA, unscaled BF16 path.
 The Q loader accepts its tensor map and coordinates directly. PDL uses CuTe's
@@ -49,7 +49,7 @@ The kernel constructor adapts the geometry from `make_cfg_d256_sparse` in
 `sdpa/fwd/config_sm107.py`, deriving storage sizes and
 barrier arrival counts. It checks that all MMA operands fit the 256 KiB shared
 address window used by the descriptor format. Reduction order, masked-row
-handling and CLC consumer credits stay local to this implementation.
+handling, and CLC consumer credits stay local to this implementation.
 
 The upstream frontend adapter, generic configuration factories, persistent
 compilation cache, packed-sequence path, fused output gate, and dense attention
@@ -61,10 +61,10 @@ optimized without importing the frontend's multi-purpose split combiner.
 ### Operand and lifetime contract
 
 Construct the prepared kernel outside CUDA graph capture, explicitly selecting
-`page_size`, `split_kv`, `query_group_size`, `enable_pdl` and `device`. The supported split tactics
-are 1, 4, 8 and 16. A normally imported `TmaGatherSparseAttentionKernel` owns
+`page_size`, `split_kv`, `query_group_size`, `enable_pdl`, and `device`. The supported split tactics
+are 1, 4, 8, and 16. A normally imported `TmaGatherSparseAttentionKernel` owns
 each tactic's static geometry and CuTe entry points. Compiled callables are
-cached by device, page size, split count, query group size and PDL; distinct prepared tactics
+cached by device, page size, split count, query group size, and PDL; distinct prepared tactics
 can coexist without module-global configuration. The entry takes:
 
 - BF16 Q/O in `[B,S,Hq,256]`, with positive `S` and non-overlapping BSHD rows.
@@ -80,13 +80,13 @@ can coexist without module-global configuration. The entry takes:
 - Int32 KV lengths `[B]`: query `j` is at `length-S+j`. Nonpositive lengths
   produce zero output.
 - Int32 page tables `[B,max_pages]` with contiguous columns and a runtime row
-  stride. Page zero is the null page; negative, missing and out-of-pool pages
+  stride. Page zero is the null page; negative, missing, and out-of-pool pages
   contribute neither values nor softmax weight, including the implicit tail.
 - Explicit scale, output, and workspace. `workspace_bytes` gives the required
   split scratch size; pass `None` for an unsplit kernel. Output and scratch
   must not alias inputs or each other.
 
-Lengths, shapes, strides and page-table contents are runtime operands. The
+Lengths, shapes, strides, and page-table contents are runtime operands. The
 prepared object contains compiled functions and static tactic configuration,
 not request-slot state. Callers own output/scratch storage and keep it alive
 through graph replay. A captured call reads refreshed input buffers on every
@@ -96,7 +96,7 @@ replay; there is no separate replay metadata implementation.
 
 `query_group_size=1` handles one query and one KV head per work item, with twelve
 heads in a sixteen-column MMA tile. The experimental `query_group_size=2` tactic
-uses a 32-column tile, with sixteen padded columns per query. It requires even S
+uses a 32-column tile, with sixteen padded columns per query. It requires an even `S`
 and identical 512-entry selection lists within each consecutive pair; this
 device-data precondition is the caller's responsibility. Independent lists use
 group size one. The selected prefix and the union of open tails are loaded once;
@@ -104,14 +104,14 @@ each query masks its own selected count and causal tail. A tail that becomes a
 completed block at the next position must not receive duplicate softmax weight.
 
 Both tactics use two four-warp softmax groups per query and eight shared gather
-warps, with separate MMA, Q/list-load and CLC scheduler warps. Each softmax group
+warps, with separate MMA, Q/list-load, and CLC scheduler warps. Each softmax group
 owns eight padded head columns. The paired tactic has four groups and 896
 threads per CTA; the single-query tactic has two groups and 640 threads. Stage
 and scheduler barrier counts follow the participating threads and warps. The
 K/V ring has three slots for one query and two
 for a pair; two Q/list slots and two score/probability slots keep the same
 producer/last-reader ownership. For paired queries, Q/P/KV operand storage is
-32/16/128 KiB, excluding list, reduction and synchronization storage; TMEM uses
+32/16/128 KiB, excluding list, reduction, and synchronization storage; TMEM uses
 128 columns. No extra K/V consumer or barrier arrival is added: each wider MMA
 consumes both queries. All CTA-wide synchronization precedes the spare warp's exit.
 

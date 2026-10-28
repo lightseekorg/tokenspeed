@@ -24,29 +24,18 @@ env:
   # launch coverage here. Generic tests remain covered on AMD hardware; the
   # production-sized MXFP4 MoE tests alone exceed this lane's budget, so only
   # reduced-size MXFP4 MoE cases run here.
-  MI450_SIM_TEST_ROOT: tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tile_shapes
+  MI450_SIM_TEST_ROOT: tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tile_shapes
   MI450_SIM_TESTS: |
-    # MHA prefill beyond the root's tile shapes: packed GQA, compact and
-    # non-compact ragged batches, both wide-transport variants, QK interleave,
-    # and load-bearing host selectors no other lane runs.
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[full-tiles]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[guarded-rows]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[compact-ragged]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[five-ragged]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_selected_packed_gqa[window512]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport[sim]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport_fused_tdm[sim]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_qk_interleave[sim]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_packed_gqa[2-dtype1]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tdm_warp_hint_remainder[sim]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_reverse_q_blocks_ragged[sim]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_llvm_fn_attrs
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_deep_pipeline
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_packed_gqa
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_wide_transport_rechecks_launch_preconditions
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_tdm_warp_hint
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_reverse_q_blocks
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_select_m_tile_gates
+    # Small numerical cases beyond the root's tile shapes: packed GQA,
+    # compact ragged tails, nonzero sequence bases, query scheduling, and both
+    # wide-transport transfer variants.
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_packed_gqa[2-dtype1]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_guarded_pipeline[short-tail-empty-1.0-dtype0]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_nonzero_sequence_base[dtype0]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_tdm_warp_hint_remainder[sim]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_reverse_q_blocks_ragged[sim]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport_small[separate-dtype1]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mha_prefill_gfx1250.py::test_mha_prefill_wide_transport_small[fused-dtype0]
     # MHA decode: peeled split KV plus reduce; unsplit ragged batches in BF16
     # and in FP8 with 128-dim heads.
     tokenspeed-kernel/test/ops/test_attention.py::test_mha_decode_with_kvcache_gluon_peeled_split
@@ -61,12 +50,12 @@ env:
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_decode_with_kvcache_projected_value_matches_split[1]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_extend_with_kvcache[bf16]
     tokenspeed-kernel/test/ops/test_attention_mla.py::test_mla_normalize_project_query_split_output[12]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[rows32]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[partial-block]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[k3-tp8-fp8-128-splits]
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_split_count_fills_cus
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_projected_value_composes_on_query_axis
-    tokenspeed-kernel/test/amd/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_support_on_cdna5
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[rows32]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[partial-block]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_matches_reference[k3-tp8-fp8-128-splits]
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_split_count_fills_cus
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_mla_projected_value_composes_on_query_axis
+    tokenspeed-kernel/test/amd/gfx1250/ops/attention/test_gluon_mla_decode_gfx1250.py::test_query_block_support_on_cdna5
     # MLA prefill: FP8 KV pack with a tail tile and a broadcast RoPE key,
     # causal FP8 12-head prefill over query-tile tails, and the batched value
     # projection.
@@ -141,45 +130,45 @@ env:
     tokenspeed-kernel/test/amd/ops/attention/test_gluon_dsa_amd.py::test_dsa_prefill_topk_selects_largest_values_on_ragged_rows[16384]
     # Argmax: split and non-power-of-two reductions, TDM padding masks,
     # partial tiles, NaN, graph capture, scratch ownership.
-    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_matches_torch_for_model_shapes[1-bf16-dsv4]
-    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_matches_torch_for_model_shapes[17-fp32-glm_5_3_flash]
-    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_masks_padding_with_negative_logits[16385-129-fp16]
-    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_strided_rows_and_partial_tiles[513-8192]
-    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_ignores_nan_but_preserves_valid_negative_infinity[4]
-    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_out_buffer_under_cuda_graph[16]
-    tokenspeed-kernel/test/amd/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_first_capture_does_not_cache_graph_pool_scratch
+    tokenspeed-kernel/test/amd/gfx950/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_matches_torch_for_model_shapes[1-bf16-dsv4]
+    tokenspeed-kernel/test/amd/gfx950/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_matches_torch_for_model_shapes[17-fp32-glm_5_3_flash]
+    tokenspeed-kernel/test/amd/gfx950/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_masks_padding_with_negative_logits[16385-129-fp16]
+    tokenspeed-kernel/test/amd/gfx950/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_strided_rows_and_partial_tiles[513-8192]
+    tokenspeed-kernel/test/amd/gfx950/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_ignores_nan_but_preserves_valid_negative_infinity[4]
+    tokenspeed-kernel/test/amd/gfx950/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_out_buffer_under_cuda_graph[16]
+    tokenspeed-kernel/test/amd/gfx950/ops/sampling/test_gluon_argmax_gfx950.py::test_argmax_first_capture_does_not_cache_graph_pool_scratch
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/sampling.argmax/gluon_argmax_gfx1250@mi450]
     # Kimi K3 BF16 GEMMs: M=16 add3 in Gluon and Triton, strided shared-down,
     # dense-M16 TDM through the M=17 decode GEMV, large-M o_proj, and the
     # clustered warp pipeline with a ragged M edge. QKV-gate and 512-token
     # latent projections reuse these kernels and stay on hardware.
-    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_add3_auto_fuses_matches_composed_and_captures[16]
-    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_output_contract
-    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_inputs_use_torch
-    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_add3_auto_fuses_matches_composed_and_captures[16]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_output_contract
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_shared_down_strided_inputs_use_torch
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_gfx1250_large_m_linear_o_proj_shape_matches
     tokenspeed-kernel/test/ops/gemm/test_decode_gemv.py::test_cdna5_route_admits_decode_shapes[7168-1536-17]
-    tokenspeed-kernel/test/amd/ops/test_dense_largem_gfx1250.py::test_largem_warp_pipeline_matches_torch[4097-3072-512]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_largem_gfx1250.py::test_largem_warp_pipeline_matches_torch[4097-3072-512]
     # Kimi K3 dense BF16 and AttnRes: split-K reduce, short TDM tails, batch
     # compile reuse, seven-buffer QKVFAB, AttnRes partials and entry point.
     # AttnRes tiles at four tokens: a spare row for the prefix, a power-of-two
     # tile with a delta, a block write, and the 16-row tile; token-count
     # compile reuse and a refused strided weight.
-    tokenspeed-kernel/test/amd/ops/test_dense_bf16_gfx1250.py
-    tokenspeed-kernel/test/amd/ops/test_kimi3_projection_gfx1250.py::test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures[2]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_dense_bf16_gfx1250.py
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_kimi3_projection_gfx1250.py::test_kimi3_kda_qkvfab_tdm_auto_matches_and_captures[2]
     tokenspeed-kernel/test/ops/test_gemm.py::test_linear_attnres_partials_gfx1250_matches_composition[3648]
     tokenspeed-kernel/test/ops/test_gemm.py::test_linear_attnres_partials_gfx1250_cuda_graph_replay[6288]
     tokenspeed-kernel/test/amd/ops/test_kimi3_prefill_gluon_amd.py::test_attn_res_amd_entrypoint_accepts_legacy_keywords
-    tokenspeed-kernel/test/amd/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[False-False-4-3]
-    tokenspeed-kernel/test/amd/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[True-False-4-4]
-    tokenspeed-kernel/test/amd/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[False-True-4-6]
-    tokenspeed-kernel/test/amd/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[False-False-4-11]
-    tokenspeed-kernel/test/amd/ops/test_attn_res_gfx1250.py::test_attn_res_token_counts_reuse_compilation
-    tokenspeed-kernel/test/amd/ops/test_attn_res_gfx1250.py::test_attn_res_rejects_weights_it_cannot_read_as_pairs[strided]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[False-False-4-3]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[True-False-4-4]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[False-True-4-6]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_attn_res_gfx1250.py::test_attn_res_candidate_tiles[False-False-4-11]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_attn_res_gfx1250.py::test_attn_res_token_counts_reuse_compilation
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_attn_res_gfx1250.py::test_attn_res_rejects_weights_it_cannot_read_as_pairs[strided]
     # Kimi K3 MoE front end: reduced small-batch and whole-reduction
     # latent-input decode pipelines, sigmoid-bias routing with and without
     # renormalization, fused softmax top-k.
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_small_batch_pipeline[sim]
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_nosplit_pipeline[sim]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_small_batch_pipeline[sim]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_latent_input_gfx1250.py::test_decode_nosplit_pipeline[sim]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[1.0-False]
     tokenspeed-kernel/test/amd/ops/test_kimi3_sigmoid_topk_amd.py::test_prefill_sigmoid_bias_topk_matches_torch_and_captures[2.5-True]
     tokenspeed-kernel/test/ops/moe/test_softmax_topk.py::test_triton_matches_softmax_topk[2-896-16-dtype4-True]
@@ -209,7 +198,7 @@ env:
     tokenspeed-kernel/test/amd/ops/moe/test_gluon_mxfp4_amd.py::test_gfx1250_mxfp4_activation_quantize_matches_reference[5120-300]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_gluon_mxfp4_gfx1250_apply_forwards_activation_dtype[input-mxfp4]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_dsv41_mxfp4_swiglu_tp_selection_on_cdna5
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_mxfp4_situ_gfx1250.py::test_kimi_k3_tp_situ_partial_tdm_matches_whole_warp_loads_gfx1250[65]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_mxfp4_situ_gfx1250.py::test_kimi_k3_tp_situ_partial_tdm_matches_whole_warp_loads_gfx1250[65]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kimi3_mxfp4_situ_tp_selection_on_cdna5
     # GLM-5.3-Flash routed MoE: block-FP8 experts with SiLU and clamped SwiGLU
     # over invalid ids, non-local experts under EP, token-count compile reuse,
@@ -217,92 +206,85 @@ env:
     # prefill sizes, non-power-of-two experts and top-k, BF16 weights over
     # strided rows, lowest-id ties and NaN scores, graph capture, and
     # token-count compile reuse.
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_matches_torch[silu-None-1]
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_matches_torch[swiglu-1.5-33]
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_ep_filters_nonlocal_routes
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_token_count
-    tokenspeed-kernel/test/amd/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_block_experts_launch_metadata
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_matches_torch[silu-None-1]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_matches_torch[swiglu-1.5-33]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_ep_filters_nonlocal_routes
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_moe_gfx1250_token_count
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_gluon_fp8_apply_gfx1250.py::test_gluon_fp8_block_experts_launch_metadata
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/moe.apply/gluon_fp8_block_precomputed_moe_apply_gfx1250@mi450]
-    tokenspeed-kernel/test/amd/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_matches_fp32_reference[4-256-8-dtype1-True-2.5]
-    tokenspeed-kernel/test/amd/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_matches_fp32_reference[8192-256-8-dtype2-True-2.5]
-    tokenspeed-kernel/test/amd/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_matches_fp32_reference[7-160-6-dtype4-True-2.5]
-    tokenspeed-kernel/test/amd/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_reduced_precision_weights_and_strided_rows
-    tokenspeed-kernel/test/amd/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_lowest_id_tie_break_and_nan_scores
-    tokenspeed-kernel/test/amd/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_public_entry_point_selects_and_captures
-    tokenspeed-kernel/test/amd/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_token_count_does_not_recompile
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_matches_fp32_reference[4-256-8-dtype1-True-2.5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_matches_fp32_reference[8192-256-8-dtype2-True-2.5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_matches_fp32_reference[7-160-6-dtype4-True-2.5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_reduced_precision_weights_and_strided_rows
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_lowest_id_tie_break_and_nan_scores
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_public_entry_point_selects_and_captures
+    tokenspeed-kernel/test/amd/gfx1250/ops/moe/test_sigmoid_bias_topk_gfx1250.py::test_token_count_does_not_recompile
     # Length-128 Hadamard: BF16 and FP32 against the Sylvester matrix, one
     # binary across row counts, and selection, including strided FP32 input.
-    tokenspeed-kernel/test/amd/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_matches_sylvester[dtype0-0.02-0.02]
-    tokenspeed-kernel/test/amd/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_matches_sylvester[dtype2-0.0001-0.0001]
-    tokenspeed-kernel/test/amd/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_row_count_shares_one_binary
-    tokenspeed-kernel/test/amd/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_selects_gluon_for_last_dim_128
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_matches_sylvester[dtype0-0.02-0.02]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_matches_sylvester[dtype2-0.0001-0.0001]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_row_count_shares_one_binary
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_hadamard_gfx1250.py::test_gfx1250_hadamard_selects_gluon_for_last_dim_128
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/transform.hadamard_transform/gluon_hadamard_transform_128_gfx1250/fp32-strided@mi450]
     # DeepSeek V4.1 BF16 GEMM with FP32 or BF16 output: M=6 decode tiles,
     # mid-M split-K with BF16 rounding of the reduced sum, graph replay, and
     # the dsv4_linear_fp32 and single-group grouped projection entries.
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_fp32_matches_reference[384-6]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_bf16_split_k_rounds_reduced_sum[2]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_fp32_cuda_graph_replay[6]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_dsv4_linear_fp32_dispatches_to_gfx1250_kernel[6]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_grouped_bf16_projection_single_group_uses_gfx1250_kernel[6]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_fp32_matches_reference[384-6]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_bf16_split_k_rounds_reduced_sum[2]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_mm_a16w16_fp32_cuda_graph_replay[6]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_dsv4_linear_fp32_dispatches_to_gfx1250_kernel[6]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mm_a16w16_gfx1250.py::test_grouped_bf16_projection_single_group_uses_gfx1250_kernel[6]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_kernel_api_selection[cdna5/gemm.dsv4_linear_fp32/gluon_dsv4_linear_fp32_gfx1250@mi450]
     # DeepSeek V4.1 FP8 group-32 UE8M0 quantizer, bit-exact against Triton on
     # both sides of the launch-shape switch, edge values and strided rows; mHC
     # mixes on 64- and 128-wide K tiles.
-    tokenspeed-kernel/test/amd/ops/test_quantize_fp8_gfx1250.py::test_quantize_matches_triton[5120-96]
-    tokenspeed-kernel/test/amd/ops/test_quantize_fp8_gfx1250.py::test_quantize_matches_triton[576-8192]
-    tokenspeed-kernel/test/amd/ops/test_quantize_fp8_gfx1250.py::test_quantize_edge_values_match_triton[dtype0]
-    tokenspeed-kernel/test/amd/ops/test_quantize_fp8_gfx1250.py::test_quantize_strided_rows_match_triton
-    tokenspeed-kernel/test/amd/ops/test_quantize_fp8_gfx1250.py::test_group32_ue8m0_selects_gluon_quantizer
-    tokenspeed-kernel/test/amd/ops/test_mhc_gfx1250.py::test_mhc_mixes_matches_reference[5120-1]
-    tokenspeed-kernel/test/amd/ops/test_mhc_gfx1250.py::test_mhc_mixes_matches_reference[5120-320]
-    tokenspeed-kernel/test/amd/ops/test_mhc_gfx1250.py::test_mhc_mixes_selects_gfx1250_kernel
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_quantize_matches_triton[5120-96]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_quantize_matches_triton[576-8192]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_quantize_edge_values_match_triton[dtype0]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_quantize_strided_rows_match_triton
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_quantize_fp8_gfx1250.py::test_group32_ue8m0_selects_gluon_quantizer
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_mixes_matches_reference[5120-1]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_mixes_matches_reference[5120-320]
+    tokenspeed-kernel/test/amd/gfx1250/ops/test_mhc_gfx1250.py::test_mhc_mixes_selects_gfx1250_kernel
     # MXFP8 and FP8 block-scale decode GEMV: UE8M0 and FP32 scales, split-K,
     # native WMMA pipeline, fused TDM, public mm selection. MXFP8 above 16
     # rows: short-K, split-K small-M with graph replay, split-2 and
     # two-buffer 128-row tiles. FP8 block-scale 17 to 64 rows on one 64-row
     # tile: a split-K tail, K=256 and wide N, strided output, one binary set
     # across row counts, and selection.
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_ue8m0_gemv_matches_dequantized_reference[16-256-288]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_matches_direct[ue8m0-576-5120-5]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_gfx1250_gemv_uses_native_pipeline[ue8m0-16-5120-v_wmma_scale_f32_16x16x128_f8f6f4]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[1-128-128]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[16-256-512]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_matches_direct[fp32-128-4096-2]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_gfx1250_gemv_uses_native_pipeline[fp32-128-7168-v_wmma_f32_16x16x128_fp8_fp8]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_fused_tdm_matches_single_wave
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[fp32-15-1536-4096-4]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[ue8m0-16-1792-5120-5]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_tdm_fusion_selection[fp32-16-2048-7168-1-0]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_ue8m0_gemv_matches_dequantized_reference[16-256-288]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_matches_direct[ue8m0-576-5120-5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_gfx1250_gemv_uses_native_pipeline[ue8m0-16-5120-v_wmma_scale_f32_16x16x128_f8f6f4]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[1-128-128]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[16-256-512]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_matches_direct[fp32-128-4096-2]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_gfx1250_gemv_uses_native_pipeline[fp32-128-7168-v_wmma_f32_16x16x128_fp8_fp8]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_fused_tdm_matches_single_wave
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[fp32-15-1536-4096-4]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_split_k_selection[ue8m0-16-1792-5120-5]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_mxfp8_tdm_fusion_selection[fp32-16-2048-7168-1-0]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-1-gluon_mm_mxfp8_ue8m0_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-True-1-gluon_mm_fp8_blockscale_gfx1250]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-17]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_cuda_graph_replay[24]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[1792-5120-129]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[4096-1280-129]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-129]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-2048]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-17]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_cuda_graph_replay[24]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[1792-5120-129]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[4096-1280-129]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-129]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_largem_gfx1250.py::test_mxfp8_largem_matches_dequantized_reference[5120-576-2048]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-False-32-gluon_mm_mxfp8_ue8m0_largem_gfx1250]
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[ue8m0-True-32-gluon_mm_mxfp8_ue8m0_largem_gfx1250]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[17-128-6144]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[48-6144-256]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[64-4096-2048]
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_wide_tile_preserves_strided_out
-    tokenspeed-kernel/test/amd/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_reuses_kernels_across_row_counts
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[17-128-6144]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[48-6144-256]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_gemv_matches_dequantized_reference[64-4096-2048]
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_wide_tile_preserves_strided_out
+    tokenspeed-kernel/test/amd/gfx1250/ops/gemm/test_gluon_mxfp8_gfx1250.py::test_fp8_blockscale_reuses_kernels_across_row_counts
     tokenspeed-kernel/test/test_kernel_api_selection.py::test_public_mm_selects_gfx1250_decode_kernel[fp32-False-64-gluon_mm_fp8_blockscale_gfx1250]
-  ROCM_NIGHTLY_INDEX: https://nightly.repo.amd.com/rocm/whl-next/
-  # The PyTorch nightly requires this exact ROCm SDK build.
-  ROCM_SDK_VERSION: 10.2.0a20261010
-  # The rocm-systems revision that this ROCm SDK nightly was built from, as
-  # recorded in its share/therock/therock_manifest.json.
-  ROCM_SYSTEMS_REF: d5c528019d0fcfbbc32d96b53ac2c61df6d0e67d
-  TORCH_DEVICE_PACKAGE: amd-torch-device-gfx1250==2.14.0+rocm10.2.0a20261010
-  TORCH_INDEX_URL: https://nightly.repo.amd.com/rocm/whl-next/
-  TORCH_VERSION: 2.14.0+rocm10.2.0a20261010
-  TORCHVISION_VERSION: 0.29.0+rocm10.2.0a20261010
 install:
-  - bash test/ci_system/setup_mi450_sim.sh
-  - WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
+  - |
+    set -eu
+    . test/ci_system/mi450_sim_env.sh
+    bash test/ci_system/setup_mi450_sim.sh
+    WORKSPACE="$(pwd)" bash test/ci_system/install_deps_rocm.sh
 ut:
   commands:
     - >-

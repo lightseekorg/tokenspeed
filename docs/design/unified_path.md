@@ -1252,10 +1252,11 @@ the selected top-k rows with the queries.
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
 CuTe serves supported uniform decode on SM100/SM103/SM107 and unscaled BF16
-prefill on SM107 through the TMA gather solution. The latter takes consecutive
-query positions within each request span and uses the existing logical metadata;
-its KV lengths are views of the existing forward layout, without per-layer
-reconstruction. It keeps no request state or persistent scratch. PrimTS accepts supported BF16
+prefill on SM107 through the TMA gather solution. The TMA gather prefill path takes
+consecutive query positions within each request span and uses the existing logical
+metadata. KV lengths are views of the existing forward layout, without per-layer
+reconstruction. The TMA gather prefill path keeps no request state or persistent
+scratch. PrimTS accepts supported BF16
 prefill and decode with logical block candidates on SM100/SM103; groups stay
 within each request.
 Other supported NVIDIA inputs use FA2 over equivalent physical slots.

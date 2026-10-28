@@ -129,7 +129,7 @@ def _success_result(request) -> KernelBenchmarkResult:
 
 
 def test_gfx950_suite_selects_exact_registrations():
-    suite_path = Path(__file__).parents[1] / "benchmarks" / "amd" / "gfx950.json"
+    suite_path = Path(__file__).parents[2] / "benchmarks" / "amd" / "gfx950.json"
     suite = load_suite(suite_path)
 
     assert suite.suite_id == "amd-gfx950-registration-kernels"
