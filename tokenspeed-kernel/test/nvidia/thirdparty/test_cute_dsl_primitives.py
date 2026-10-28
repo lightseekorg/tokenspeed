@@ -18,11 +18,13 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
 import pytest
 import torch
+
+cuda = pytest.importorskip("cuda.bindings.driver")
+cutlass = pytest.importorskip("cutlass")
+cute = pytest.importorskip("cutlass.cute")
+
 from cutlass.cute.runtime import from_dlpack
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.cuda import tensor_map as tmap
