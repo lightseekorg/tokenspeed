@@ -430,11 +430,10 @@ def test_write_back_leaves_the_context_parallel_rules_as_they_are(flags, refused
         )
 
 
-def test_write_back_beside_a_sliding_window_group_is_refused_at_startup():
+def test_write_back_beside_a_sliding_window_group_starts():
     # The server arguments cannot see the model's cache groups; the scheduler
-    # built from the device side's groups refuses write-back beside a
-    # sliding-window one, naming it, and takes the same groups under
-    # write-through.
+    # built from the device side's groups takes a sliding-window one under
+    # either policy.
     layer_types = ("full_attention", "sliding_attention")
     group_specs = specs_for_layers(
         layer_types=layer_types,
@@ -450,9 +449,6 @@ def test_write_back_beside_a_sliding_window_group_is_refused_at_startup():
         cache_group_config(spec, total_pages=64, cache_blocks_per_lcm_block=1)
         for spec in group_specs
     ]
-    (sliding,) = (
-        spec.group_id for spec in group_specs if spec.attn_kind == "sliding_window"
-    )
 
     def config(policy: str):
         args = prepare_server_args(
@@ -470,14 +466,7 @@ def test_write_back_beside_a_sliding_window_group_is_refused_at_startup():
         return _config(args, specs)
 
     ts.Scheduler(config("write_through"))
-    with pytest.raises(
-        ValueError,
-        match=re.escape(
-            f"'{sliding}': host_write_policy WriteBack does not support a "
-            "sliding-window group"
-        ),
-    ):
-        ts.Scheduler(config("write_back"))
+    ts.Scheduler(config("write_back"))
 
 
 @pytest.mark.parametrize(

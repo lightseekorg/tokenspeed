@@ -173,7 +173,6 @@ class _Loop:
             role,
             pages=self.rng.choice([24, 40, 64]),
             history_block=self.rng.choice([P, P // 2]),
-            # Drawn either way, so a seed keeps its other draws.
             sliding=self.rng.random() < 0.4,
             host_pages=host_pages,
             policy=policy,

@@ -2040,9 +2040,9 @@ class ServerArgs:
             # parallelism have not run write-back. Attention TP and
             # --kv-parallel-size need no refusal: a written-back segment
             # publishes once every rank of the replica has acknowledged it
-            # (docs/design/scheduler.md section 3.1). A sliding-window cache
-            # group or more than 64 cache groups is refused by
-            # SchedulerConfig.Validate, once the model's cache groups exist.
+            # (docs/design/scheduler.md section 3.1). More than 64 cache
+            # groups are refused by SchedulerConfig.Validate, once the model's
+            # cache groups exist.
             unsupported = [
                 setting
                 for setting, refused in (
@@ -2666,8 +2666,8 @@ class ServerArgs:
             "write_back is refused with --disaggregation-mode decode, "
             "--disable-kvstore, --kvstore-storage-backend, "
             "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
-            "and at startup for a model with a sliding-window cache group or "
-            "more than 64 cache groups; see docs/configuration/server.md.",
+            "and at startup for a model with more than 64 cache groups; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",
