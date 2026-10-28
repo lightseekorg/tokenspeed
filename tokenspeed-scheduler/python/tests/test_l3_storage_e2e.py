@@ -32,6 +32,7 @@ def config(*, host=32, grain=2, groups=None):
     c.num_snapshot_pages = 1
     c.num_device_pages = 64
     c.num_host_pages = host
+    c.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     c.max_scheduled_tokens = 64
     c.max_batch_size = 8
     c.enable_l3_storage = True

@@ -118,6 +118,11 @@ def _prims_case(*, lengths, prefixes, kv_heads, shared_candidates, block_size, d
         page_size,
         block_size,
         QSAWorkspace(),
+        seq_lens=torch.tensor(
+            [prefix + length for prefix, length in zip(prefixes, lengths)],
+            dtype=torch.int32,
+            device=device,
+        ),
     )
     selected = qwen4_exp_qsa_selected_slots(
         blocks,
@@ -250,7 +255,17 @@ def test_prims_qsa_startup_warms_query_groups_and_schedulers(device):
         for length in lengths:
             offsets.append(offsets[-1] + length)
         metadata = QSASparseMetadata(
-            blocks, table, requests, positions, tuple(offsets), 64, 4, workspace
+            blocks,
+            table,
+            requests,
+            positions,
+            tuple(offsets),
+            64,
+            4,
+            workspace,
+            seq_lens=torch.tensor(
+                [4096 + length for length in lengths], dtype=torch.int32, device=device
+            ),
         )
         selected = qwen4_exp_qsa_selected_slots(
             blocks,
@@ -490,6 +505,7 @@ def test_qsa_sparse_attention_rejects_ragged_metadata_for_uniform_decode() -> No
         64,
         4,
         QSAWorkspace(),
+        seq_lens=torch.tensor([1, 4], dtype=torch.int32),
     )
     q = torch.empty((4, 8, 256), dtype=torch.bfloat16)
     cache = torch.empty((64, 1, 256), dtype=q.dtype)
@@ -531,6 +547,7 @@ def test_prims_qsa_prefill_dispatch(cache_dtype, rows, topk, block_size, tensor_
         64,
         block_size,
         QSAWorkspace(),
+        seq_lens=torch.tensor([rows], dtype=torch.int32),
     )
     expected = (
         "flashinfer_prims_qsa_sparse_attention"

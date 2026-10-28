@@ -135,6 +135,7 @@ class QSAAttnBackend(MHAAttnBackend):
                     page_size=layout.full_kernel_page_size,
                     block_size=selection.block_size,
                     workspace=self._qsa_workspace,
+                    seq_lens=layout.seq_lens,
                 )
             elif ctx.draft_narrowing is None:
                 raise RuntimeError("QSA selection must have one row per query")

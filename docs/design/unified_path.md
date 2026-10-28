@@ -1251,8 +1251,14 @@ the selected top-k rows with the queries.
 
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
-Only decode may use CuTe. PrimTS accepts supported BF16 prefill and decode
-with logical block candidates on SM100/SM103; groups stay within each request.
+CuTe serves supported uniform decode on SM100/SM103/SM107 and unscaled BF16
+prefill on SM107 through the TMA gather solution. The TMA gather prefill path takes
+consecutive query positions within each request span and uses the existing logical
+metadata. KV lengths are views of the existing forward layout, without per-layer
+reconstruction. The TMA gather prefill path keeps no request state or persistent
+scratch. PrimTS accepts supported BF16
+prefill and decode with logical block candidates on SM100/SM103; groups stay
+within each request.
 Other supported NVIDIA inputs use FA2 over equivalent physical slots.
 All kernels share the cache writer and sparse-attention call. The indexer
 returns physical slots across graph breaks and keeps logical candidates
@@ -1264,8 +1270,9 @@ Calls, including graph replays, are ordered across streams. Rebinding drops
 eager plans; capture sessions retain graph plans and allocations until release.
 Scratch may grow without moving graph inputs. Each run regenerates its data.
 
-QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
-candidates from the zero-initialized slot 1 of the reserved null page.
+QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and the direct-slot
+CuTe kernel read invalid candidates from the zero-initialized slot 1 of the
+reserved null page. TMA gather masks the entire null page before scoring.
 Writers must leave that read slot untouched. The indexer retains its `-1`
 sentinel, and consumers derive their masks from the original selection.
 

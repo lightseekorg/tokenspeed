@@ -12,6 +12,7 @@ from cutlass import Float32, const_expr
 from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from tokenspeed_kernel.thirdparty.cute_dsl.conversion import cvt_f16x2_f32
 
 _MIXER_ATTRS = ("__vec_size__",)
 
@@ -529,27 +530,6 @@ def warp_prefix_sum(
         if lane >= offset:
             val += partial_sum
     return val
-
-
-@dsl_user_op
-def cvt_f16x2_f32(
-    a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None
-) -> cutlass.Int32:
-    assert to_dtype in [
-        cutlass.BFloat16,
-        cutlass.Float16,
-    ], "to_dtype must be BFloat16 or Float16"
-    return cutlass.Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [Float32(a).ir_value(loc=loc, ip=ip), Float32(b).ir_value(loc=loc, ip=ip)],
-            f"cvt.rn.{'bf16x2' if to_dtype is cutlass.BFloat16 else 'f16x2'}.f32 $0, $2, $1;",
-            "=r,f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
 
 
 @dsl_user_op

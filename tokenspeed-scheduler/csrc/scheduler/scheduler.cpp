@@ -99,7 +99,8 @@ Scheduler::Scheduler(SchedulerConfig config)
       coordinator_{MakeCoordinator(MakeSpecsFromConfig(config_), config_.prefix_granularity, block_pool_,
                                    config_.enable_l3_storage, hostPoolBlocks(config_) > 0 ? &host_pool_ : nullptr,
                                    snapshotPoolBlocks(config_) > 0 ? &snapshot_pool_ : nullptr,
-                                   config_.StreamsDeviceCacheToHost())},
+                                   config_.StreamsDeviceCacheToHost(),
+                                   config_.host_write_policy == SchedulerConfig::HostWritePolicy::kWriteBack)},
       tier_transfers_{coordinator_},
       storage_transfers_{config_.enable_l3_storage
                              ? std::make_unique<StorageTransferManager>(coordinator_, *config_.storage_config)
@@ -417,6 +418,22 @@ std::int32_t Scheduler::ActiveLcmBlocks() const {
     return coordinator_.NumActiveLcmBlocks(request_tables);
 }
 
+HostCacheStats Scheduler::GetHostCacheStats() const {
+    return HostCacheStats{
+        .prefix_hits = prefix_hit_stats_,
+        .publication_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kPublication),
+        .finish_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kFinish),
+        .retraction_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kRetraction),
+        .eviction_stores = tier_transfers_.WriteBackStatsFor(HostStoreCause::kEviction),
+        .prefix_loads = tier_transfers_.PrefixLoadStats(),
+        .restore_loads = tier_transfers_.RestoreLoadStats(),
+        .host_evictions = coordinator_.HostEvictions(),
+        .store_candidates_dropped_by_flush = coordinator_.StoreCandidatesDroppedByFlush(),
+        .dead_entries_not_written_back = coordinator_.DeadEntriesNotWrittenBack(),
+        .device_evictions = coordinator_.DeviceEvictions(),
+    };
+}
+
 std::int32_t Scheduler::CacheGroupTotalPages(const std::string& group_id) const {
     return config_.cache_groups[groupIndex(group_id)].total_pages;
 }
@@ -485,6 +502,18 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         builds_work = !built.forward.empty() || plan.remote_decode.has_value() || plan.remote_prefill.has_value();
         plan.With(ForwardBatch{std::move(built.forward)});
     }
+    // What the build's admissions and restores evicted under the write-back
+    // policy goes to the Host in this plan: their pages may already be granted
+    // again, so the copy is stream-ordered and the runtime runs it ahead of
+    // the plan's page reuse. Every eviction record is taken here, never in a
+    // later plan. A no-op with nothing recorded.
+    if (auto store = tier_transfers_.StartEvictionStores()) {
+        write_back_operations.push_back(std::move(*store));
+    }
+    // The prefix entries the build's evictions (and everything since the last
+    // plan) left dead on both tiers. Nothing is queued unless the Host
+    // write-back policy evicts by segments.
+    coordinator_.CollectDeadEntries();
     std::vector<StorageOperation> storage_operations;
     if (storage_transfers_) {
         if (storage_allowed_)
@@ -498,7 +527,8 @@ ExecutionPlan Scheduler::NextExecutionPlan() {
         // Boundary publications of live requests: their owners hold the pages,
         // and the ticket pins them until the ACK, so the copy stays off the
         // forward's critical path.
-        if (auto store = tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck)) {
+        if (auto store =
+                tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kPublication)) {
             write_back_operations.push_back(std::move(*store));
         }
     }
