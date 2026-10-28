@@ -1175,24 +1175,43 @@ class MuseIrisState:
             or self.world_size not in (4, 8)
             or local.ndim != 2
             or local.dtype != torch.bfloat16
+            or local.device != self.all_reduce.device
             or self.all_reduce.dtype != torch.bfloat16
             or not local.is_contiguous()
             or weight.shape != (local.shape[1] * self.all_reduce.world_size,)
             or weight.dtype != local.dtype
             or weight.device != local.device
             or not weight.is_contiguous()
-            or self.all_reduce.producer.data is None
-            or self.gather.ready_flags is None
         ):
             return False
-        return local.shape[0] <= self.gather.ready_flags.shape[
-            0
-        ] and all_gather_columns_can_run(
+        # The Lamport variant is limited only by mailbox capacity; the pull
+        # variant stages rows in producer storage and needs one ready flag per
+        # row.
+        if self._lamport_gathers_rmsnorm_mxfp4(local):
+            return True
+        return (
+            self.all_reduce.producer.data is not None
+            and self.gather.ready_flags is not None
+            and local.shape[0] <= self.gather.ready_flags.shape[0]
+        ) and all_gather_columns_can_run(
             world_size=self.all_reduce.world_size,
             num_tokens=local.shape[0],
             local_hidden_size=local.shape[1],
             dtype=local.dtype,
             max_bytes=self.all_reduce.producer_direct_max_numel * local.element_size(),
+        )
+
+    def _lamport_gathers_rmsnorm_mxfp4(self, local: torch.Tensor) -> bool:
+        """Whether the gather-and-quantize takes the Lamport mailbox variant."""
+        rows, local_width = local.shape
+        total_width = local_width * self.world_size
+        return (
+            self.reduction.lamport_region is not None
+            and self.reduction.lamport_epochs is not None
+            and local_width % 512 == 0
+            and triton.next_power_of_2(total_width) == total_width
+            and total_width % 1024 == 0
+            and rows * local_width <= self.reduction.lamport_max_numel
         )
 
     def all_gather_rmsnorm_mxfp4_quant(
@@ -1205,8 +1224,6 @@ class MuseIrisState:
         """Gather feature shards and return normalized MXFP4 rows."""
         if not self.can_all_gather_rmsnorm_mxfp4_quant(local, weight):
             raise RuntimeError("unsupported Iris gather-and-MXFP4 fusion")
-        assert self.all_reduce.producer.data is not None
-        assert self.gather.ready_flags is not None
         rows, local_width = local.shape
         from tokenspeed_kernel_amd.ops.gfx950.moe.mxfp4.scale_layout import (
             empty_swizzled_cdna4_mxfp4_scale,
@@ -1214,24 +1231,12 @@ class MuseIrisState:
 
         total_width = local_width * self.world_size
         packed = torch.empty(
-            (rows, total_width // 2),
-            dtype=torch.uint8,
-            device=self.all_reduce.producer.data.device,
+            (rows, total_width // 2), dtype=torch.uint8, device=local.device
         )
         scales = empty_swizzled_cdna4_mxfp4_scale(
-            rows,
-            total_width // 32,
-            device=self.all_reduce.producer.data.device,
+            rows, total_width // 32, device=local.device
         )
-        block_k = triton.next_power_of_2(total_width)
-        if (
-            self.reduction.lamport_region is not None
-            and self.reduction.lamport_epochs is not None
-            and local_width % 512 == 0
-            and block_k == total_width
-            and total_width % 1024 == 0
-            and rows * local_width <= self.reduction.lamport_max_numel
-        ):
+        if self._lamport_gathers_rmsnorm_mxfp4(local):
             if local.data_ptr() % 4:
                 # Rank-local fallback could split ranks across protocols.
                 raise ValueError(
@@ -1259,6 +1264,8 @@ class MuseIrisState:
                 num_warps=1,
             )
             return packed, scales
+        assert self.all_reduce.producer.data is not None
+        assert self.gather.ready_flags is not None
         iris_fused_pull_allgather_rmsnorm_mxfp4[(rows,)](
             local,
             self.all_reduce.producer.data,
@@ -1274,7 +1281,7 @@ class MuseIrisState:
             weight_offset=weight_offset,
             scale_stride_linear=scales.stride(0),
             scale_stride_mblock=scales.stride(1),
-            block_k=block_k,
+            block_k=triton.next_power_of_2(total_width),
             input_published=(
                 rows == 1
                 and local.data_ptr()
