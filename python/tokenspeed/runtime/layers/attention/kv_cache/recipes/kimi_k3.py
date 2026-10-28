@@ -22,8 +22,8 @@
 
 The MLA layers and the KDA state layers live in one arena at P=128. MLA pages
 are dense and pin the smallest packing whose plane width covers one per-layer
-KDA state (12 at attn tp=8); the state groups pack to match the MLA plane's
-byte width so no parent is wasted.
+KDA state (12 at attn tp=8 with the default FP32 state, 6 with BF16); the state
+groups pack to match the MLA plane's byte width so no parent is wasted.
 """
 
 from __future__ import annotations

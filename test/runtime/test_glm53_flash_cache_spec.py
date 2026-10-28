@@ -213,6 +213,13 @@ def test_bf16_kda_state_halves_the_parent_at_tp8() -> None:
     assert recurrent.dtype == "bfloat16"
 
 
+def test_bf16_kda_state_rejects_tp8_with_a_bf16_mla_cache() -> None:
+    """Half of the FP32-state packing is too narrow for TP8 with a BF16 MLA
+    cache, so that shape raises instead of mis-packing the layout."""
+    with pytest.raises(NotImplementedError, match="no verified LCM packing"):
+        _layout(tp_size=8, mla_cache_dtype=torch.bfloat16, mamba_ssm_dtype="bfloat16")
+
+
 def test_mtp_layout_reserves_a_separate_index_plane() -> None:
     layout = _layout(
         tp_size=4,

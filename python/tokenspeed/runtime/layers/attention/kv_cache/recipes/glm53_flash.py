@@ -146,7 +146,8 @@ def glm53_flash_packing_counts(
     except KeyError:
         raise NotImplementedError(
             f"GLM-5.3-Flash has no verified LCM packing for tp_size={tp_size} "
-            f"with a {mla_element_size}-byte MLA cache; supported shapes are "
+            f"with a {mla_element_size}-byte MLA cache and a "
+            f"{recurrent_state_dtype} KDA recurrent state; supported shapes are "
             f"{sorted(table)}"
         ) from None
     packing = {FULL_ATTENTION: full}
