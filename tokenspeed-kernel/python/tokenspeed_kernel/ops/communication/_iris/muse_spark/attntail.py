@@ -28,7 +28,6 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sanitize_lamport_bf16x2,
     _iris_subgroup_any,
 )
-from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 
 
 @gluon.jit
@@ -128,7 +127,7 @@ def iris_fused_pull_allgather_muse_attntail(
         + 1
     )
     # Attention scatter uses write-through stores; no cache writeback is needed at entry.
-    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     layout: gl.constexpr = gl.BlockedLayout(
@@ -171,7 +170,7 @@ def iris_fused_pull_allgather_muse_attntail(
                 False,
             )
     # Every rank consumed these rows before the next producer reuses its shard.
-    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,

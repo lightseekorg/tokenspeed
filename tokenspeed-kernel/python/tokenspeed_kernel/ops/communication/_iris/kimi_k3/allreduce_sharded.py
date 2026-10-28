@@ -29,7 +29,6 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     ProducerPull,
     iris_arch_policy,
 )
-from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 from tokenspeed_kernel.platform import current_platform
 
 REDUCE_PROGRAMS = 24
@@ -48,7 +47,7 @@ def _row_partition_store_completion(
     WAIT_STORES: gl.constexpr,
 ):
     """Complete local stores, update ready flags, and wait for peer completion."""
-    iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.barrier()
     layout: gl.constexpr = gl.BlockedLayout([1], [64], [NUM_WARPS], [0])
     peers = gl.arange(0, 8, layout=layout)

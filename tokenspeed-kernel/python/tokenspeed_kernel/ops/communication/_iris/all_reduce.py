@@ -22,11 +22,17 @@
 
 import dataclasses
 import math
+from collections.abc import Callable
 
 import torch
 from tokenspeed_kernel._triton import gl, gluon, tl, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes, iris
-from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
+from tokenspeed_kernel.ops.communication._iris.synchronization import (
+    wait_loads,
+    wait_loads_stores,
+    wait_stores,
+    wait_vmem,
+)
 from tokenspeed_kernel.ops.communication.iris import (
     _PACKED_WORD_BYTES,
     _PRODUCER_DIRECT_GL_DTYPES,
@@ -58,14 +64,13 @@ class IrisArchPolicy:
         peer_signal_store: Store into a peer's memory that the peer polls,
             such as a barrier epoch or a Lamport mailbox; empty selects the
             default.
-        wait_vmem: Instruction completing the subgroup's vector loads and
-            stores; does not cover async or tensor copies to LDS.
-        wait_loads: Instruction completing the subgroup's vector loads.
-        wait_stores: Instruction completing the subgroup's vector stores.
+        wait_vmem: Subgroup completion of vector loads and stores; does not
+            cover async or tensor copies to LDS.
+        wait_loads: Subgroup completion of vector loads.
+        wait_stores: Subgroup completion of vector stores.
 
-    States select this policy once at construction and pass its wait
-    instructions as Gluon constexpr arguments, alongside the cache modifiers;
-    kernels issue them with ``iris_wait``. Keep full waits
+    States select this policy once at construction and pass its wait functions
+    as Gluon constexpr arguments, alongside the cache modifiers. Keep full waits
     at read-completion and acquire boundaries, including entry epoch updates.
     Use store-only waits for payload publication and mailbox reset completion.
     Workgroup barriers and system-scope ordering remain the caller's responsibility.
@@ -73,19 +78,18 @@ class IrisArchPolicy:
 
     peer_payload_load: str
     peer_signal_store: str
-    wait_vmem: str
-    wait_loads: str
-    wait_stores: str
+    wait_vmem: Callable
+    wait_loads: Callable
+    wait_stores: Callable
 
 
 _IRIS_ARCH_POLICIES = {
     ArchVersion(9, 5): IrisArchPolicy(
         peer_payload_load=".cg",
         peer_signal_store=".wt",
-        # One counter (VMcnt) covers vector loads and stores.
-        wait_vmem="s_waitcnt vmcnt(0)",
-        wait_loads="s_waitcnt vmcnt(0)",
-        wait_stores="s_waitcnt vmcnt(0)",
+        wait_vmem=wait_vmem,
+        wait_loads=wait_vmem,
+        wait_stores=wait_vmem,
     ),
     # On gfx1250 a ".cg" load lowers to a non-temporal load that refetches every
     # partially read sector over the fabric, and ".wt" peer stores are an order
@@ -93,10 +97,9 @@ _IRIS_ARCH_POLICIES = {
     ArchVersion(12, 5): IrisArchPolicy(
         peer_payload_load="",
         peer_signal_store="",
-        # Loads and stores have separate counters (LOADcnt and STOREcnt).
-        wait_vmem="s_wait_loadcnt 0x0\n\ts_wait_storecnt 0x0",
-        wait_loads="s_wait_loadcnt 0x0",
-        wait_stores="s_wait_storecnt 0x0",
+        wait_vmem=wait_loads_stores,
+        wait_loads=wait_loads,
+        wait_stores=wait_stores,
     ),
 }
 
@@ -1008,7 +1011,7 @@ def _iris_sync_rank_token(
         sem="acquire",
         scope="sys",
     )
-    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     # The acquire is subgroup-local. Keep every subgroup at the protocol
     # boundary until all of them have observed the peer ready flags; the
     # caller consumes the peer inbox immediately after this helper returns.
@@ -2356,7 +2359,7 @@ def iris_push_twoshot_allreduce(
                 mask,
                 cache=".wt",
             )
-    iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch - 1, RANK, NUM_SUBGROUPS, False)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):
@@ -2382,7 +2385,7 @@ def iris_push_twoshot_allreduce(
                 cache=".wt",
             )
     # Finish inbox reads and output stores before peers can reuse the inbox.
-    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
     gl.store(epochs + block, epoch)
@@ -2433,7 +2436,7 @@ def iris_pull_twoshot_allreduce(
             result += (values[4] + values[5]) + (values[6] + values[7])
         result = result.to(gl.bfloat16)
         gl.amd.cdna4.buffer_store(result, scratch_ptr, index, mask, cache=".wt")
-    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(flags, heaps, block, epoch, RANK, NUM_SUBGROUPS, False)
     for tile in range(block, gl.cdiv(part, BLOCK), gl.num_programs(0)):

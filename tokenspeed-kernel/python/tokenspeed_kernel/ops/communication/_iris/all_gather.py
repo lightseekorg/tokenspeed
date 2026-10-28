@@ -36,7 +36,6 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_sync_rank_epoch,
     iris_arch_policy,
 )
-from tokenspeed_kernel.ops.communication._iris.synchronization import iris_wait
 from tokenspeed_kernel.ops.communication.iris import _PRODUCER_DIRECT_GL_DTYPES
 from tokenspeed_kernel.platform import current_platform
 
@@ -343,7 +342,7 @@ def iris_pull_allgather_rows(
         + 1
     )
     if PRODUCER_WRITES_THROUGH:
-        iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
+        WAIT_VMEM(args=[], constraints="=r,~{memory}")
         gl.barrier()
         _iris_rendezvous(ready_flags, heaps, program, epoch, RANK, NUM_WARPS, False)
     else:
@@ -362,7 +361,7 @@ def iris_pull_allgather_rows(
             )
             gl.amd.cdna4.buffer_store(values, output, destination, mask)
     # The next producer may reuse the owner scratch.
-    iris_wait(WAIT_VMEM, args=[], constraints="=r,~{memory}")
+    WAIT_VMEM(args=[], constraints="=r,~{memory}")
     gl.barrier()
     _iris_rendezvous(
         ready_flags + FLAG_ROWS * WORLD_SIZE,
@@ -665,6 +664,6 @@ def iris_fused_lamport_allgather_rmsnorm_mxfp4(
         )
 
     # Finish clearing the consumed packs before advancing the row's stages.
-    iris_wait(WAIT_STORES, args=[], constraints="=r,~{memory}")
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
     for tile in gl.static_range(TILES):
         gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))
