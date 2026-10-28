@@ -249,6 +249,24 @@ def test_rmsnorm_reads_strided_rows_in_place(device: str) -> None:
     )
 
 
+def test_rmsnorm_writes_strided_rows_in_place(device: str) -> None:
+    # EAGLE-3/4 fc_norm: each aux hidden state's norm lands in its column slice
+    # of one concatenated buffer, leaving the other columns untouched.
+    x = torch.randn(9, 3 * 512, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(512, device=device, dtype=torch.float32)
+    out = torch.randn_like(x)
+    untouched = out.clone()
+    rmsnorm(x[:, 512:1024], weight, 1e-6, out=out[:, 512:1024])
+    torch.testing.assert_close(
+        out[:, 512:1024],
+        rmsnorm(x[:, 512:1024].contiguous(), weight, 1e-6),
+        rtol=0,
+        atol=0,
+    )
+    assert torch.equal(out[:, :512], untouched[:, :512])
+    assert torch.equal(out[:, 1024:], untouched[:, 1024:])
+
+
 def test_rmsnorm_inplace(device: str) -> None:
     num_tokens = 7
     hidden_size = 128
