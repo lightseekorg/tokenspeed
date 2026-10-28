@@ -22,12 +22,13 @@
 
 from __future__ import annotations
 
+import builtins
 import math
 from typing import NamedTuple
 
 import torch
 from tokenspeed_kernel_amd._scheduling import sched_compile_options, wave_uniform_i32
-from tokenspeed_kernel_amd._triton import gl, gluon, tl
+from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
     _INV_LN2_VALUE,
@@ -44,9 +45,10 @@ buffer = cdna4.buffer
 cdiv = gl.cdiv
 _GFX950_SM_COUNT = 256
 # Pipeline depth of the full-attention decode K/V page loads: LDS buffers per
-# wave, so NUM_STAGES - 1 pages are prefetched while one is consumed. At BF16
-# head dim 64 the three prefetched pages are 48 outstanding buffer_load ... lds
-# copies. The loop is either this deep or single-buffered.
+# work-group, so NUM_STAGES - 1 pages are prefetched while one is consumed. At
+# BF16 head dim 64 the three prefetched pages are 48 buffer_load ... lds copies
+# for a one-wave work-group; with more waves, each wave issues its share. The
+# loop is either this deep or single-buffered.
 _FULL_DECODE_STAGES = 4
 # s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
 # 63 of its outstanding vector memory loads.
@@ -55,6 +57,11 @@ _GFX950_MAX_VMCNT = 63
 # the runtime-reduce bound MAX_KV_SPLITS. Above 64, the split reduce and the
 # per-split prologue outweigh the extra waves.
 _FULL_DECODE_MAX_SPLITS = 64
+# Rows of a decode work-group: four waves of one 16-row MFMA tile each.
+_DECODE_MAX_BLOCK_M = 64
+# Sliding windows, or contexts, of at most this many pages are short: their
+# rows take one-wave work-groups, and their split counts follow the pages.
+_SHORT_WINDOW_PAGES = 16
 _SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
@@ -75,11 +82,13 @@ class AttentionConfig:
     HEAD_DIM: gl.constexpr
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
+    NUM_WARPS: gl.constexpr
     IS_SLIDING: gl.constexpr
     WINDOW_LEFT: gl.constexpr
     IS_FP8: gl.constexpr
     GROUP_SIZE: gl.constexpr
-    NUM_GROUPS: gl.constexpr
+    ROWS: gl.constexpr
+    NUM_ROW_BLOCKS: gl.constexpr
     q_strides: InputStrides
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -106,6 +115,7 @@ class AttentionConfig:
         HEAD_DIM,
         BLOCK_M,
         BLOCK_N,
+        NUM_WARPS,
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
@@ -115,12 +125,14 @@ class AttentionConfig:
         assert NUM_Q_HEADS % NUM_KV_HEADS == 0
         assert HEAD_DIM in (64, 128)
         assert BLOCK_N == PAGE_SIZE
+        # The waves split the rows into whole 16-row MFMA tiles.
+        assert BLOCK_M % (16 * NUM_WARPS) == 0
         if IS_SLIDING:
             assert WINDOW_LEFT >= 0
         else:
             assert WINDOW_LEFT == -1
 
-        # Decode uses a [16, 16, 32] MFMA with 1-warp tiling.
+        # Decode uses a [16, 16, 32] MFMA, the waves tiling the rows.
         (
             qk_layout,
             pv_layout,
@@ -137,7 +149,7 @@ class AttentionConfig:
             BLOCK_N,
             IS_FP8,
             KV_DTYPE,
-            num_warps=1,
+            num_warps=NUM_WARPS,
             instr_shape=[16, 16, 32],
         )
         reduce_layout = gl.BlockedLayout([1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0])
@@ -152,11 +164,16 @@ class AttentionConfig:
         self.HEAD_DIM = gl.constexpr(HEAD_DIM)
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
+        self.NUM_WARPS = gl.constexpr(NUM_WARPS)
         self.IS_SLIDING = gl.constexpr(IS_SLIDING)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
         self.IS_FP8 = gl.constexpr(IS_FP8)
         self.GROUP_SIZE = gl.constexpr(NUM_Q_HEADS // NUM_KV_HEADS)
-        self.NUM_GROUPS = gl.constexpr((self.GROUP_SIZE + BLOCK_M - 1) // BLOCK_M)
+        # A request's queries for one KV head form MAX_SEQLEN_Q * GROUP_SIZE
+        # rows, ordered by query position and then by query head, tiled into
+        # BLOCK_M-row blocks.
+        self.ROWS = gl.constexpr(MAX_SEQLEN_Q * self.GROUP_SIZE)
+        self.NUM_ROW_BLOCKS = gl.constexpr((self.ROWS + BLOCK_M - 1) // BLOCK_M)
         self.q_strides = q_strides
         self.qk_layout = gl.constexpr(qk_layout)
         self.pv_layout = gl.constexpr(pv_layout)
@@ -186,15 +203,16 @@ class AttentionProgram:
     cache_seqlens_ptr: gl.tensor
     mid_o_ptr: gl.tensor
     mid_lse_ptr: gl.tensor
-    q_index: gl.tensor
     batch: gl.tensor
     kv_head: gl.tensor
-    group_start: gl.tensor
+    row_start: gl.tensor
     split_id: gl.tensor
+    seq_len: gl.tensor
     cache_len: gl.tensor
     kv_start: gl.tensor
     split_start: gl.tensor
     split_end: gl.tensor
+    mask_start: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -207,15 +225,16 @@ class AttentionProgram:
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
-        q_index,
         batch,
         kv_head,
-        group_start,
+        row_start,
         split_id,
+        seq_len,
         cache_len,
         kv_start,
         split_start,
         split_end,
+        mask_start,
     ):
         self.cfg = gl.constexpr(cfg)
         self.q_ptr = q_ptr
@@ -225,15 +244,16 @@ class AttentionProgram:
         self.cache_seqlens_ptr = cache_seqlens_ptr
         self.mid_o_ptr = mid_o_ptr
         self.mid_lse_ptr = mid_lse_ptr
-        self.q_index = q_index
         self.batch = batch
         self.kv_head = kv_head
-        self.group_start = group_start
+        self.row_start = row_start
         self.split_id = split_id
+        self.seq_len = seq_len
         self.cache_len = cache_len
         self.kv_start = kv_start
         self.split_start = split_start
         self.split_end = split_end
+        self.mask_start = mask_start
 
     @gluon.jit
     def create(
@@ -246,17 +266,29 @@ class AttentionProgram:
         mid_o_ptr,
         mid_lse_ptr,
     ):
-        q_index = gl.program_id(0)
-        batch = q_index // cfg.MAX_SEQLEN_Q
-        q_pos = q_index - batch * cfg.MAX_SEQLEN_Q
+        """Locate this program's request, KV head, row block and split.
+
+        The rows of a block share one pass over the union of the keys they
+        see: up to its last row's causal end and, under a sliding window, from
+        its first row's window start. A request's cache length counts all of
+        its MAX_SEQLEN_Q query tokens, so query position p sees the keys
+        before seq_len - (MAX_SEQLEN_Q - 1 - p).
+        """
+        batch = gl.program_id(0)
         head_block = gl.program_id(1)
-        kv_head = head_block // cfg.NUM_GROUPS
-        group_block = head_block - kv_head * cfg.NUM_GROUPS
-        group_start = group_block * cfg.BLOCK_M
+        kv_head = head_block // cfg.NUM_ROW_BLOCKS
+        row_start = (head_block - kv_head * cfg.NUM_ROW_BLOCKS) * cfg.BLOCK_M
         split_id = gl.program_id(2)
-        cache_len = gl.load(cache_seqlens_ptr + batch)
-        cache_len = cache_len - (cfg.MAX_SEQLEN_Q - 1 - q_pos)
-        cache_len = maximum(cache_len, 0)
+        seq_len = gl.load(cache_seqlens_ptr + batch)
+        if cfg.MAX_SEQLEN_Q == 1:
+            first_end = maximum(seq_len, 0)
+            cache_len = first_end
+        else:
+            last_row = min(row_start + cfg.BLOCK_M, cfg.ROWS) - 1
+            first_pos = row_start // cfg.GROUP_SIZE
+            first_end = maximum(seq_len - (cfg.MAX_SEQLEN_Q - 1 - first_pos), 0)
+            last_pos = last_row // cfg.GROUP_SIZE
+            cache_len = maximum(seq_len - (cfg.MAX_SEQLEN_Q - 1 - last_pos), 0)
         if cfg.IS_SLIDING:
             # WINDOW_LEFT is defined as exclusive (keys strictly to the left, not
             # counting the current token), so the window is WINDOW_LEFT + 1 keys
@@ -264,7 +296,7 @@ class AttentionProgram:
             # WINDOW_LEFT = 127 and cache_len = 500 (current token at index 499),
             # kv_start = 500 - (127 + 1) = 372 keeps keys [372, 499] = 128 keys.
             # Without the + 1, kv_start = 373 would drop the leftmost key.
-            kv_start = cache_len - min(cache_len, cfg.WINDOW_LEFT + 1)
+            kv_start = first_end - min(first_end, cfg.WINDOW_LEFT + 1)
         else:
             kv_start = cache_len - cache_len
         first_page = kv_start // cfg.PAGE_SIZE
@@ -275,6 +307,10 @@ class AttentionProgram:
         split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
         split_end = min(split_end_page * cfg.PAGE_SIZE, cache_len)
+        # Under full attention, every row of the block sees the split's keys
+        # before mask_start; the pipelined path that skips their mask is
+        # full-attention only.
+        mask_start = min(split_end, first_end)
         return AttentionProgram(
             gl.constexpr(cfg),
             q_ptr,
@@ -284,33 +320,68 @@ class AttentionProgram:
             cache_seqlens_ptr,
             mid_o_ptr,
             mid_lse_ptr,
-            q_index,
             batch,
             kv_head,
-            group_start,
+            row_start,
             split_id,
+            seq_len,
             cache_len,
             kv_start,
             split_start,
             split_end,
+            mask_start,
         )
+
+    @gluon.jit
+    def row_query_pos(self, offs_m):
+        """Query position within the request of each row of the block."""
+        cfg = self.cfg
+        if cfg.MAX_SEQLEN_Q == 1:
+            query_pos = offs_m * 0
+        else:
+            # Padding rows past ROWS clamp onto the last query position.
+            query_pos = gl.minimum(
+                (self.row_start + offs_m) // cfg.GROUP_SIZE, cfg.MAX_SEQLEN_Q - 1
+            )
+        return query_pos
+
+    @gluon.jit
+    def row_tokens(self, offs_m):
+        """Query token (row of q and the output) of each row of the block."""
+        return self.batch * self.cfg.MAX_SEQLEN_Q + self.row_query_pos(offs_m)
+
+    @gluon.jit
+    def row_heads(self, offs_m):
+        """Query head of each row of the block."""
+        cfg = self.cfg
+        rows = self.row_start + offs_m
+        if cfg.MAX_SEQLEN_Q > 1:
+            rows = rows % cfg.GROUP_SIZE
+        return self.kv_head * cfg.GROUP_SIZE + rows
+
+    @gluon.jit
+    def row_valid(self, offs_m):
+        return (self.row_start + offs_m) < self.cfg.ROWS
 
     @gluon.jit
     def load_q(self):
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.q_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.q_layout))
-        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
-        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
-        offsets = cfg.q_strides.offsets(self.q_index, q_heads[:, None], offs_d[None, :])
+        offsets = cfg.q_strides.offsets(
+            self.row_tokens(offs_m)[:, None],
+            self.row_heads(offs_m)[:, None],
+            offs_d[None, :],
+        )
+        valid = self.row_valid(offs_m)
         return cdna4.buffer_load(self.q_ptr, offsets, mask=valid[:, None], other=0.0)
 
     @gluon.jit
     def init_state(self, sink_ptr, has_sink: gl.constexpr):
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.pv_layout))
-        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
-        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
+        q_heads = self.row_heads(offs_m)
+        valid = self.row_valid(offs_m)
         if has_sink:
             sink_log2 = (
                 gl.load(sink_ptr + q_heads, mask=valid, other=0.0).to(gl.float32)
@@ -365,12 +436,13 @@ class AttentionProgram:
 
         Pages past the split repeat its last page (an L2 hit): a masked copy
         becomes a branch after which the compiler waits for every outstanding
-        load (s_waitcnt vmcnt(0)). An empty split reads the row's first entry;
-        select_page maps a row without cached tokens to page 0. vmcnt retires
-        in issue order, so the caller loads indices well before reading them.
+        load (s_waitcnt vmcnt(0)). An empty split reads the request's first
+        entry; select_page maps a block without visible keys to page 0. vmcnt
+        retires in issue order, so the caller loads indices well before reading
+        them.
         """
         cfg = self.cfg
-        layout: gl.constexpr = gl.BlockedLayout([1], [64], [1], [0])
+        layout: gl.constexpr = gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
         offs = gl.arange(0, count, layout=layout)
         last_page = gl.where(
             self.split_start < self.split_end, (self.split_end - 1) // cfg.PAGE_SIZE, 0
@@ -395,7 +467,7 @@ class AttentionProgram:
 
         Each lane holds entry lane % count; masking the others to 0 and
         max-reducing across lanes leaves the entry in every lane, still in a
-        VGPR. A row without cached tokens maps to page 0.
+        VGPR. A block without visible keys maps to page 0.
         """
         offs = gl.arange(0, pages.shape[0], layout=pages.type.layout)
         page = max(gl.where(offs == index, pages, 0), axis=0)
@@ -474,6 +546,15 @@ class AttentionProgram:
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
         tokens = start_n + offs_n[None, :]
         mask = (tokens >= self.kv_start) & (tokens < self.split_end)
+        if cfg.MAX_SEQLEN_Q > 1:
+            # Each query position ends its keys, and starts its sliding window,
+            # at its own offset within the block's range.
+            offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
+            query_pos = self.row_query_pos(offs_m)
+            row_end = self.seq_len - (cfg.MAX_SEQLEN_Q - 1 - query_pos)
+            mask &= tokens < row_end[:, None]
+            if cfg.IS_SLIDING:
+                mask &= tokens >= (row_end - (cfg.WINDOW_LEFT + 1))[:, None]
         return gl.where(mask, qk, -float("inf"))
 
     @gluon.jit
@@ -483,9 +564,19 @@ class AttentionProgram:
         row_max = gl.convert_layout(row_max, gl.SliceLayout(1, cfg.pv_layout))
         m_new = maximum(m_i, row_max)
         m_new_scaled = m_new * cfg.SM_SCALE
+        if cfg.MAX_SEQLEN_Q > 1:
+            # A row can meet a page without any of its keys before one with
+            # them: a later query position's window starts past the block's
+            # first pages, and an earlier one's causal end can precede a whole
+            # split. Keep -inf - -inf from turning its state into NaN. With
+            # one query position every row sees the same keys, so no row does.
+            invalid = m_new == -float("inf")
+            m_new_scaled = gl.where(invalid, 0.0, m_new_scaled)
         qk_shifted = qk * cfg.SM_SCALE - m_new_scaled[:, None]
         p = gl.exp2(qk_shifted)
         m_diff = m_i * cfg.SM_SCALE - m_new_scaled
+        if cfg.MAX_SEQLEN_Q > 1:
+            m_diff = gl.where(invalid, 0.0, m_diff)
         alpha = gl.exp2(m_diff)
         l_ij = gl.sum(p, axis=1)
         l_i = l_i * alpha + l_ij
@@ -503,25 +594,29 @@ class AttentionProgram:
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
-        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
-        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
-        split_active = self.split_start < self.split_end
+        tokens = self.row_tokens(offs_m)
+        q_heads = self.row_heads(offs_m)
+        valid = self.row_valid(offs_m)
         acc = gl.convert_layout(acc, cfg.store_layout)
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
         m_i = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.store_layout))
+        # A row without keys in this split (an empty split, or one past the
+        # row's causal end or before its window) stores a zero partial with
+        # lse = -inf, which the merge ignores.
+        has_kv = l_i > 0.0
         recip_l_i = 1.0 / l_i
-        part_o = gl.where(split_active, acc * recip_l_i[:, None], 0.0)
+        part_o = gl.where(has_kv[:, None], acc * recip_l_i[:, None], 0.0)
         part_lse = gl.where(
-            split_active,
+            has_kv,
             m_i * cfg.SM_SCALE + gl.log2(l_i),
             -float("inf"),
         )
         mid_o_offsets = (
-            (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.NUM_KV_SPLITS
+            (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.NUM_KV_SPLITS
             + self.split_id
         ) * cfg.HEAD_DIM + offs_d[None, :]
         mid_lse_offsets = (
-            self.q_index * cfg.NUM_Q_HEADS + q_heads
+            tokens * cfg.NUM_Q_HEADS + q_heads
         ) * cfg.NUM_KV_SPLITS + self.split_id
         cdna4.buffer_store(part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None])
         cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
@@ -531,25 +626,46 @@ class AttentionProgram:
         cfg = self.cfg
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
-        q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
-        valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
+        tokens = self.row_tokens(offs_m)
+        q_heads = self.row_heads(offs_m)
+        valid = self.row_valid(offs_m)
         acc = gl.convert_layout(acc, cfg.store_layout)
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
         output = acc * (1.0 / l_i)[:, None]
         output = output.to(self.mid_o_ptr.dtype.element_ty)
-        offsets = (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
+        offsets = (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.HEAD_DIM
         offsets += offs_d[None, :]
         cdna4.buffer_store(output, self.mid_o_ptr, offsets, mask=valid[:, None])
 
     @gluon.jit
     def finalize_splits(self, out_ptr, sink_ptr, counters_ptr, has_sink: gl.constexpr):
-        """Let the last arriving split merge this head block and reset its counter."""
+        """Let the last arriving split merge this row block and reset its counter."""
         cfg = self.cfg
         counter_offset = (
-            self.q_index * (cfg.NUM_KV_HEADS * cfg.NUM_GROUPS)
-            + self.kv_head * cfg.NUM_GROUPS
-            + self.group_start // cfg.BLOCK_M
+            self.batch * (cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS)
+            + self.kv_head * cfg.NUM_ROW_BLOCKS
+            + self.row_start // cfg.BLOCK_M
         )
+        if cfg.NUM_WARPS > 1:
+            # One thread performs the increment, and its release waits only
+            # for its own wave's stores. So every wave runs s_waitcnt
+            # vmcnt(0), which waits until its stores have reached L2 (CDNA4
+            # ISA 4.4); S_BARRIER waits on no counter, so the barrier the
+            # compiler places before the acq_rel atomic then orders every
+            # wave's stores before the increment. The release then writes
+            # back the L2 cache (BUFFER_WBL2), which makes all of those stores
+            # visible to the other L2 caches.
+            offs_m = gl.arange(
+                0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout)
+            )
+            gl.inline_asm_elementwise(
+                asm="s_waitcnt vmcnt(0)",
+                constraints="=v,0",
+                args=[offs_m],
+                dtype=gl.int32,
+                is_pure=False,
+                pack=1,
+            )
         old = gl.atomic_add(
             counters_ptr + counter_offset,
             1,
@@ -563,8 +679,9 @@ class AttentionProgram:
             offs_d = gl.arange(
                 0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout)
             )
-            q_heads = self.kv_head * cfg.GROUP_SIZE + self.group_start + offs_m
-            valid = (self.group_start + offs_m) < cfg.GROUP_SIZE
+            tokens = self.row_tokens(offs_m)
+            q_heads = self.row_heads(offs_m)
+            valid = self.row_valid(offs_m)
             final_m = gl.full(
                 [cfg.BLOCK_M],
                 value=-float("inf"),
@@ -581,13 +698,18 @@ class AttentionProgram:
                 dtype=gl.float32,
                 layout=cfg.store_layout,
             )
-            # Each split stored its partial before its acq_rel increment, so
-            # this split's increment orders the partial loads after all of
-            # them, and the loads can be ordinary cached loads; volatile loads
-            # would bypass the caches and slow the merge.
+            # Each split's waves stored their partials before its acq_rel
+            # increment, so this split's increment orders the partial loads
+            # after all of them, and the loads can be ordinary cached loads;
+            # volatile loads would bypass the caches and slow the merge. Only
+            # the incrementing wave acquires, but its BUFFER_INV invalidates
+            # the CU's whole vector L1 cache, which all of the work-group's
+            # waves share, and the L2's non-coherently cached lines (CDNA4
+            # ISA 9.1.10.2, Table 52), and the barrier that
+            # broadcasts the old count orders their loads after it.
             for split in range(0, cfg.NUM_KV_SPLITS):
                 base = (
-                    (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None])
+                    (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None])
                     * cfg.NUM_KV_SPLITS
                     + split
                 ) * cfg.HEAD_DIM + offs_d[None, :]
@@ -597,7 +719,7 @@ class AttentionProgram:
                     other=0.0,
                 ).to(gl.float32)
                 lse_offset = (
-                    self.q_index * cfg.NUM_Q_HEADS + q_heads
+                    tokens * cfg.NUM_Q_HEADS + q_heads
                 ) * cfg.NUM_KV_SPLITS + split
                 part_lse = gl.load(
                     self.mid_lse_ptr + lse_offset,
@@ -605,8 +727,15 @@ class AttentionProgram:
                     other=-float("inf"),
                 ).to(gl.float32)
                 next_m = maximum(final_m, part_lse)
-                alpha = gl.exp2(final_m - next_m)
-                beta = gl.exp2(part_lse - next_m)
+                if cfg.MAX_SEQLEN_Q > 1:
+                    # A later query position's first splits can all precede
+                    # its window, leaving -inf - -inf.
+                    next_m_safe = gl.where(next_m == -float("inf"), 0.0, next_m)
+                    alpha = gl.exp2(final_m - next_m_safe)
+                    beta = gl.exp2(part_lse - next_m_safe)
+                else:
+                    alpha = gl.exp2(final_m - next_m)
+                    beta = gl.exp2(part_lse - next_m)
                 final_acc = final_acc * alpha[:, None] + part_o * beta[:, None]
                 final_l = final_l * alpha + beta
                 final_m = next_m
@@ -622,7 +751,7 @@ class AttentionProgram:
                 final_l = final_l * alpha + beta
             output = (final_acc / final_l[:, None]).to(out_ptr.dtype.element_ty)
             out_offsets = (
-                self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None]
+                tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]
             ) * cfg.HEAD_DIM + offs_d[None, :]
             cdna4.buffer_store(output, out_ptr, out_offsets, mask=valid[:, None])
             gl.store(counters_ptr + counter_offset, 0)
@@ -727,8 +856,9 @@ def _stream_split_pipelined(
             async_copy.wait_group(NUM_STAGES - 1)
             k = program.shared_load_k(k_smem.index(stage))
             qk = program.compute_qk(q, k)
-            # Full attention starts at token 0; only a split's last page is partial.
-            if start_n + cfg.BLOCK_N > program.split_end:
+            # Full attention starts at token 0; only pages reaching past the
+            # split's end or the block's first causal end need a mask.
+            if start_n + cfg.BLOCK_N > program.mask_start:
                 qk = program.apply_kv_mask(qk, start_n)
             p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc)
             v = program.shared_load_v(v_smem.index(stage))
@@ -765,6 +895,7 @@ def gluon_mha_decode_gfx950(
     HEAD_DIM: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
@@ -781,6 +912,7 @@ def gluon_mha_decode_gfx950(
         HEAD_DIM,
         BLOCK_M,
         BLOCK_N,
+        NUM_WARPS,
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
@@ -837,6 +969,7 @@ def gluon_mha_decode_sliding_gfx950(
     HEAD_DIM: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
     IS_SLIDING: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
@@ -853,6 +986,7 @@ def gluon_mha_decode_sliding_gfx950(
         HEAD_DIM,
         BLOCK_M,
         BLOCK_N,
+        NUM_WARPS,
         IS_SLIDING,
         WINDOW_LEFT,
         IS_FP8,
@@ -922,6 +1056,7 @@ def _mha_decode_sliding_split_atomic(
     HEAD_DIM: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
+    NUM_WARPS: gl.constexpr,
     WINDOW_LEFT: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
@@ -937,6 +1072,7 @@ def _mha_decode_sliding_split_atomic(
         HEAD_DIM,
         BLOCK_M,
         BLOCK_N,
+        NUM_WARPS,
         True,
         WINDOW_LEFT,
         IS_FP8,
@@ -1001,11 +1137,12 @@ def gluon_mha_decode_reduce_gfx950(
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
-    BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
 ):
+    # One wave merges one (query token, head); the attention row tiling does
+    # not apply, so the config takes a single-wave tile.
     cfg = AttentionConfig(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
@@ -1015,8 +1152,9 @@ def gluon_mha_decode_reduce_gfx950(
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
-        BLOCK_M,
+        16,  # BLOCK_M
         BLOCK_N,
+        1,  # NUM_WARPS
         False,  # IS_SLIDING
         -1,  # WINDOW_LEFT
         IS_FP8,
@@ -1059,13 +1197,15 @@ def gluon_mha_decode_reduce_gfx950(
 class LaunchConfig(NamedTuple):
     num_q_heads: int
     num_kv_heads: int
-    num_groups: int
+    num_requests: int
+    num_row_blocks: int
     head_dim: int
     page_size: int
     num_kv_splits: int
     num_stages: int
     block_m: int
     block_n: int
+    num_warps: int
     sm_scale: float
     is_sliding: bool
     window_left: int
@@ -1073,7 +1213,7 @@ class LaunchConfig(NamedTuple):
 
 def _sliding_split_counters(
     q: torch.Tensor,
-    total_q: int,
+    num_requests: int,
     head_blocks: int,
 ) -> torch.Tensor:
     """Return stream-local counters reset by each fused split reduction.
@@ -1088,11 +1228,11 @@ def _sliding_split_counters(
     if device_index is None:
         device_index = torch.cuda.current_device()
     stream_id = int(torch.cuda.current_stream(device_index).cuda_stream)
-    key = (device_index, stream_id, total_q, head_blocks)
+    key = (device_index, stream_id, num_requests, head_blocks)
     counters = _SLIDING_SPLIT_COUNTERS.get(key)
     if counters is None:
         counters = torch.zeros(
-            (total_q, head_blocks),
+            (num_requests, head_blocks),
             device=q.device,
             dtype=torch.int32,
         )
@@ -1101,23 +1241,39 @@ def _sliding_split_counters(
 
 
 def _full_decode_stages(
-    num_kv_splits: int, page_size: int, head_dim: int, element_size: int
+    num_kv_splits: int,
+    page_size: int,
+    head_dim: int,
+    element_size: int,
+    num_warps: int,
 ) -> int:
     """Pipeline the K/V page loads only when select_kv_splits returned its
     maximum, _FULL_DECODE_MAX_SPLITS: even the most splits leave the grid below
-    its occupancy target, so each wave streams a long split.
+    its occupancy target, so each work-group streams a long split.
 
     With fewer splits the grid already holds enough waves to cover the load
     latency, and the pipeline's LDS buffers would lower occupancy.
     """
     if num_kv_splits < _FULL_DECODE_MAX_SPLITS:
         return 1
-    # A wave copies one KV head's K and V page tiles, 16 bytes per lane per
-    # buffer_load_dwordx4.
-    copies_per_page = 2 * page_size * head_dim * element_size // (64 * 16)
+    # The waves of a work-group share the copies of one KV head's K and V page
+    # tiles, 16 bytes per lane per buffer_load_dwordx4.
+    copies_per_page = 2 * page_size * head_dim * element_size // (64 * 16 * num_warps)
     if (_FULL_DECODE_STAGES - 1) * copies_per_page > _GFX950_MAX_VMCNT:
         return 1
     return _FULL_DECODE_STAGES
+
+
+def _row_tile(max_seqlen_q: int, group_size: int) -> tuple[int, int]:
+    """Return (BLOCK_M, NUM_WARPS) for a request's rows of one KV head.
+
+    Those max_seqlen_q * group_size rows share the KV head's keys, so one
+    work-group takes up to 64 of them, one 16-row MFMA tile per wave, and
+    every K/V page it loads into LDS serves them all.
+    """
+    rows = max_seqlen_q * group_size
+    block_m = builtins.max(16, min(_DECODE_MAX_BLOCK_M, triton.next_power_of_2(rows)))
+    return block_m, block_m // 16
 
 
 def get_config(
@@ -1125,44 +1281,66 @@ def get_config(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     max_seqlen_k: int,
+    max_seqlen_q: int,
     window_left: int,
     softmax_scale: float | None,
 ) -> LaunchConfig:
     head_dim = q.shape[2]
     page_size = k_cache.shape[1]
-    block_m = 16
     block_n = 64
-    group_size = q.shape[1] // k_cache.shape[2]
-    num_groups = math.ceil(group_size / block_m)
+    num_kv_heads = k_cache.shape[2]
+    group_size = q.shape[1] // num_kv_heads
+    num_requests = q.shape[0] // max_seqlen_q
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
     num_pages = (effective_seqlen_k + page_size - 1) // page_size
-    num_kv_splits = select_kv_splits(
-        base_ctas=q.shape[0] * k_cache.shape[2] * num_groups,
-        num_pages=num_pages,
-        sm_count=_GFX950_SM_COUNT,
-        max_splits=_FULL_DECODE_MAX_SPLITS,
-    )
-    if is_sliding:
-        target_splits = 8 if q.shape[0] <= 4 else 4
-        num_kv_splits = min(target_splits, num_pages)
-        if num_kv_splits < 1:
-            num_kv_splits = 1
+    short_window = is_sliding and num_pages <= _SHORT_WINDOW_PAGES
+    if short_window:
+        # A short window (or a shorter context) gives a four-wave work-group
+        # too few pages to share, so the rows take one-wave work-groups of 16
+        # and more of them load the pages side by side.
+        block_m, num_warps = 16, 1
+    else:
+        block_m, num_warps = _row_tile(max_seqlen_q, group_size)
+    num_row_blocks = math.ceil(max_seqlen_q * group_size / block_m)
+    if short_window:
+        # Each split work-group merges its partial through an atomic counter,
+        # which costs about as much as streaming two pages, so a split covers
+        # at least two pages and a window of 3 pages or fewer runs unsplit.
+        # Past 4 requests the grid is busier, so divide the splits by the
+        # request's row blocks, keeping its work-group count near the
+        # 4-request one.
+        num_kv_splits = num_pages // 2
+        if num_requests > 4:
+            num_kv_splits //= num_row_blocks
+        num_kv_splits = builtins.max(1, min(8, num_kv_splits))
+    elif is_sliding:
+        target_splits = 8 if num_requests <= 4 else 4
+        num_kv_splits = builtins.max(1, min(target_splits, num_pages))
+    else:
+        num_kv_splits = select_kv_splits(
+            base_ctas=num_requests * num_kv_heads * num_row_blocks,
+            num_pages=num_pages,
+            sm_count=_GFX950_SM_COUNT,
+            max_splits=_FULL_DECODE_MAX_SPLITS,
+        )
     return LaunchConfig(
         num_q_heads=q.shape[1],
-        num_kv_heads=k_cache.shape[2],
-        num_groups=num_groups,
+        num_kv_heads=num_kv_heads,
+        num_requests=num_requests,
+        num_row_blocks=num_row_blocks,
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=num_kv_splits,
         num_stages=_full_decode_stages(
-            num_kv_splits, page_size, head_dim, k_cache.element_size()
+            num_kv_splits, page_size, head_dim, k_cache.element_size(), num_warps
         ),
         block_m=block_m,
         block_n=block_n,
+        num_warps=num_warps,
         sm_scale=softmax_scale * _INV_LN2_VALUE,
         is_sliding=is_sliding,
         window_left=window_left,
@@ -1194,6 +1372,7 @@ def launch_gluon_mha_decode_gfx950(
         q=q,
         k_cache=k_cache,
         max_seqlen_k=max_seqlen_k,
+        max_seqlen_q=max_seqlen_q,
         window_left=window_left,
         softmax_scale=softmax_scale,
     )
@@ -1201,9 +1380,11 @@ def launch_gluon_mha_decode_gfx950(
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     out_dtype = torch.bfloat16 if is_fp8 else q.dtype
     output = torch.empty(q.shape, device=q.device, dtype=out_dtype)
+    # One work-group per request, KV head, row block and split.
+    head_blocks = config.num_kv_heads * config.num_row_blocks
 
     if config.is_sliding and config.num_kv_splits == 1:
-        grid = (total_q, config.num_kv_heads * config.num_groups, 1)
+        grid = (config.num_requests, head_blocks, 1)
         gluon_mha_decode_sliding_gfx950[grid](
             q,
             k_cache,
@@ -1224,11 +1405,12 @@ def launch_gluon_mha_decode_gfx950(
             config.head_dim,
             config.block_m,
             config.block_n,
+            config.num_warps,
             config.is_sliding,
             config.window_left,
             has_sink,
             is_fp8,
-            num_warps=1,
+            num_warps=config.num_warps,
         )
     elif config.is_sliding:
         mid_o = torch.empty(
@@ -1241,16 +1423,8 @@ def launch_gluon_mha_decode_gfx950(
             device=q.device,
             dtype=torch.float32,
         )
-        counters = _sliding_split_counters(
-            q,
-            total_q,
-            config.num_kv_heads * config.num_groups,
-        )
-        grid = (
-            total_q,
-            config.num_kv_heads * config.num_groups,
-            config.num_kv_splits,
-        )
+        counters = _sliding_split_counters(q, config.num_requests, head_blocks)
+        grid = (config.num_requests, head_blocks, config.num_kv_splits)
         _mha_decode_sliding_split_atomic[grid](
             q,
             k_cache,
@@ -1275,10 +1449,11 @@ def launch_gluon_mha_decode_gfx950(
             config.head_dim,
             config.block_m,
             config.block_n,
+            config.num_warps,
             config.window_left,
             has_sink,
             is_fp8,
-            num_warps=1,
+            num_warps=config.num_warps,
         )
     else:
         # Always use split-k for full attention
@@ -1293,11 +1468,7 @@ def launch_gluon_mha_decode_gfx950(
             dtype=torch.float32,
         )
 
-        grid = (
-            total_q,
-            config.num_kv_heads * config.num_groups,
-            config.num_kv_splits,
-        )
+        grid = (config.num_requests, head_blocks, config.num_kv_splits)
         gluon_mha_decode_gfx950[grid](
             q,
             k_cache,
@@ -1319,11 +1490,12 @@ def launch_gluon_mha_decode_gfx950(
             config.head_dim,
             config.block_m,
             config.block_n,
+            config.num_warps,
             config.is_sliding,
             config.window_left,
             is_fp8,
             config.num_stages,
-            num_warps=1,
+            num_warps=config.num_warps,
             **sched_compile_options(),
         )
 
@@ -1344,7 +1516,6 @@ def launch_gluon_mha_decode_gfx950(
             config.num_q_heads,
             config.num_kv_heads,
             config.head_dim,
-            config.block_m,
             config.block_n,
             has_sink,
             is_fp8,
