@@ -80,12 +80,17 @@ def _tf32(t: torch.Tensor) -> torch.Tensor:
     + [(5, 1000, 100), (20, 4608, 80)],
 )
 def test_tf32_router_rounds_like_cublas_where_cublas_uses_tf32(
-    device: str, monkeypatch: pytest.MonkeyPatch, rows: int, hidden: int, columns: int
+    device: str,
+    monkeypatch: pytest.MonkeyPatch,
+    set_matmul_precision,
+    rows: int,
+    hidden: int,
+    columns: int,
 ) -> None:
     """Three to 32 rows run on tensor cores when cuBLAS would use TF32 anyway."""
     if not current_platform().is_nvidia:
         pytest.skip("the TF32 tensor-core path is NVIDIA-only")
-    monkeypatch.setattr(torch.backends.cuda.matmul, "fp32_precision", "tf32")
+    set_matmul_precision("tf32")
     monkeypatch.delenv("NVIDIA_TF32_OVERRIDE", raising=False)
     torch.manual_seed(29)
     x = torch.randn(rows, hidden, dtype=torch.float32, device=device)
