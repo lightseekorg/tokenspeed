@@ -453,6 +453,14 @@ the original platform facade, and empty inputs keep the original early return.
 A custom callable rejects fused collective/norm entry points so its arithmetic
 cannot be bypassed. Kernel-specific input validation stays in the selected leaf.
 
+`MoELayer` retains the usual `moe/apply` selection and its existing scoped
+`kernel_override` mechanism; no model-specific solution or feature arguments
+are added. An optional input dtype describes the actual activation for that
+selection without changing the global default dtype. A live-row mask is
+forwarded only to a kernel declaring that capability; unsupported masks fail
+rather than being ignored. Weight allocation and checkpoint loading stay on
+the original MoE layer for both precomputed and in-kernel routing.
+
 ## Logprobs: one arithmetic for prompt and output
 
 A returned logprob is the launch's `--logprob-order` applied to the row --
