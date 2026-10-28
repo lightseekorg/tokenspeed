@@ -581,6 +581,10 @@ class AttentionProgram:
                 dtype=gl.float32,
                 layout=cfg.store_layout,
             )
+            # Each split stored its partial before its acq_rel increment, so
+            # this split's increment orders the partial loads after all of
+            # them, and the loads can be ordinary cached loads; volatile loads
+            # would bypass the caches and slow the merge.
             for split in range(0, cfg.NUM_KV_SPLITS):
                 base = (
                     (self.q_index * cfg.NUM_Q_HEADS + q_heads[:, None])
@@ -591,7 +595,6 @@ class AttentionProgram:
                     self.mid_o_ptr + base,
                     mask=valid[:, None],
                     other=0.0,
-                    volatile=True,
                 ).to(gl.float32)
                 lse_offset = (
                     self.q_index * cfg.NUM_Q_HEADS + q_heads
@@ -600,7 +603,6 @@ class AttentionProgram:
                     self.mid_lse_ptr + lse_offset,
                     mask=valid,
                     other=-float("inf"),
-                    volatile=True,
                 ).to(gl.float32)
                 next_m = maximum(final_m, part_lse)
                 alpha = gl.exp2(final_m - next_m)
