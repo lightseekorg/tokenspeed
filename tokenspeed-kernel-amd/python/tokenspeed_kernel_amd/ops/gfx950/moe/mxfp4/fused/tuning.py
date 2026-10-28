@@ -71,6 +71,65 @@ _GROUPED_MOE_CONFIGS = {
 }
 
 
+class _RouteTileConfig(NamedTuple):
+    """Route-tiled A4W4 expert schedule (deferred, token/slot-order outputs).
+
+    ``route_capacity`` is the per-expert route-list length. 16 selects the
+    single-program descriptor build (rows <= 16); larger values select the
+    per-expert pack plus tile split and must be at least the call's row
+    count: a token's top-k expert IDs are distinct, so an expert gets at most
+    one route per row. It is a compile-time bound, so it is bucketed to powers
+    of two.
+    """
+
+    route_capacity: int
+    stage2_block_n: int
+    stage2_block_k: int
+
+
+# Key: hidden width, intermediate width, local experts, global experts, top-k.
+# Entries: inclusive row bounds and the route-tile schedule. Rows outside every
+# entry fall through to the grouped (staged package) path, which produces
+# bitwise-identical results.
+_ROUTE_TILE_CONFIGS = {
+    (4096, 4096, local_experts, 256, 8): (
+        (4, 8, _RouteTileConfig(16, 16, 256)),
+        (9, 16, _RouteTileConfig(16, 16, 128)),
+        (17, 48, _RouteTileConfig(64, 16, 128)),
+    )
+    for local_experts in (32, 64)
+}
+assert all(
+    config.route_capacity & (config.route_capacity - 1) == 0
+    and (config.route_capacity == 16 or config.route_capacity >= max_rows)
+    for entries in _ROUTE_TILE_CONFIGS.values()
+    for _, max_rows, config in entries
+)
+
+# Largest row count any route-tile entry serves; callers that do not want
+# route tiles pass 0 instead.
+_ROUTE_TILE_MAX_M = max(
+    max_rows for entries in _ROUTE_TILE_CONFIGS.values() for _, max_rows, _ in entries
+)
+
+
+def _select_route_tile_config(
+    num_tokens: int,
+    *,
+    hidden_dim: int,
+    inter_dim: int,
+    num_local_experts: int,
+    num_experts: int,
+    top_k: int,
+) -> _RouteTileConfig | None:
+    """Return the route-tile schedule for this shape and row count, if any."""
+    shape = (hidden_dim, inter_dim, num_local_experts, num_experts, top_k)
+    for min_rows, max_rows, config in _ROUTE_TILE_CONFIGS.get(shape, ()):
+        if min_rows <= num_tokens <= max_rows:
+            return config
+    return None
+
+
 def _select_grouped_moe_block_m(
     num_tokens: int,
     top_k: int,
