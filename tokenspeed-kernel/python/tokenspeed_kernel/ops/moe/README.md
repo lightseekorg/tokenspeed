@@ -123,6 +123,9 @@ guard entry are not part of this initialization contract.
 retaining the private runner for the small-batch tactic policy described
 later. Warmup must finish before graph capture.
 
+Prepared routing gates PDL with the caller's `enable_pdl` and FlashInfer's public
+`utils.device_support_pdl` check, matching the upstream fused entry points.
+
 Regression coverage includes live and padded mapping entries, local expert
 partitions, PDL on/off, changing routing within one captured shape, graph replay
 after workspace corruption, untouched allocation slack/guard, and output
@@ -414,3 +417,11 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## Kimi-K3 router
+
+On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
+over 896 experts. It consumes contiguous FP32 logits and bias and writes
+normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
+The routing-only kernel has no expert-plan workspace or 8,192-token limit.
+Other contracts retain their existing routers.
