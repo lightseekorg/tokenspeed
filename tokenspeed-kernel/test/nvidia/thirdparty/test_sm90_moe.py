@@ -29,7 +29,17 @@ from pathlib import Path
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
-from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import _apply_patch
+from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import (
+    _apply_patch,
+    _patched_files,
+)
+
+
+def test_private_patch_matches_installed_sources():
+    flashinfer = pytest.importorskip("flashinfer")
+    from flashinfer.jit import env as jit_env
+
+    _patched_files(Path(flashinfer.__file__).parent, jit_env.FLASHINFER_CSRC_DIR)
 
 
 @pytest.mark.parametrize("context", (0, 3))

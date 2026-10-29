@@ -599,8 +599,6 @@ something the idle refresh cannot express:
 * **FlashMLA** (leaf): installs the keepalive tile-schedule object whose
   schedule-build the graph records (flash_mla freezes its schedule on the
   first kernel call against a sched-meta);
-* **DeepseekV4**: the packed `tokens_per_req` row machinery and its bespoke
-  multi-group metadata build;
 * **Mamba** (`MambaAttnBackend`): the warmup kernels need the arange
   query-start-loc, which the idle refresh deliberately zeroes;
 * **Inkling**: conv-state seeding (paged conv reads `pos = seq_len - 1`, so
@@ -1107,16 +1105,14 @@ replays pay one bool check). The snapshot has no exemption list: every
 tensor a slot reaches is an address the refresh must keep. Per-step-mutable
 objects a kernel owns (FlashMLA's tile schedule, which the kernel builds and
 freezes on first use) therefore live on the backend, outside the slots, not
-on the views — and so do the two per-forward memos the models' layers
-share: V4's write-slot mappings (`DeepseekV4AttentionBackend.slot_mappings`:
-SWA, compressor state / compressed per ratio, indexer state) and the sparse
-indexer's selection (`AttentionBackend.sparse_topk`, a `SparseTopKShare`:
-GLM DSA's `"shared"` layers and the DSA / QSA MTP heads reuse the last
-indexer layer's top-k; QSA also keeps its layer-invariant row geometry in
-that share so the fused preparation runs once per forward). Every
-runner-facing node clears both when it builds a forward's metadata (the router's
-extend init / decode refresh / capture seeding, V4's three slot publishers), so
-the first layer computes, the rest reuse, and nothing outlives its forward; the
+on the views — and so does the per-forward memo the models' layers
+share: the sparse indexer's selection (`AttentionBackend.sparse_topk`, a
+`SparseTopKShare`: GLM DSA's `"shared"` layers and the DSA / QSA MTP heads
+reuse the last indexer layer's top-k; QSA also keeps its layer-invariant
+row geometry in that share so the fused preparation runs once per forward).
+Every runner-facing node clears it when it builds a forward's metadata (the
+router's extend init / decode refresh / capture seeding), so the first layer
+computes, the rest reuse, and nothing outlives its forward; the
 drafter's in-loop seq_lens edits are not a new forward and leave the share
 alone — the drafter itself
 hands each draft step the top-k it reuses (or clears it) through the draft
@@ -2148,10 +2144,6 @@ mapping remains a separate consumer of the shared mapping helpers
   refresh leaves it alone, eager refresh and every drafter seq_lens edit
   bind a fresh one, in-graph edits keep theirs alive); leaf capture/refresh
   signature conformance.
-* `test/runtime/test_deepseek_v4_config.py` — a V4 replay refresh leaves
-  every address the capture recorded in place under the guard, the `cache`
-  slot's group tables included, for the target's packed views and the
-  draft's borrowed step views.
 * `test/runtime/execution/test_draft_target_wiring.py` — the drafter's
   target-forward hook: DFLASH arms its capture sink on the context only
   under its overlap gate (not on mixed rounds, not in graph warmup), the
@@ -2193,10 +2185,9 @@ mapping remains a separate consumer of the shared mapping helpers
   `ctx.draft_narrowing.publish_accepted_prefix()`, never computed in a model
   (`test/runtime/test_draft_advance_seqlens.py`).
 * `grep -rn "ctx.dsa_\|dsa_swa_slot_mapping\|dsa_compressor_slot_cache"
-  python/` must stay empty — the layer-shared sparse top-k and V4 slot
-  mappings are backend scratch (`sparse_topk`, `slot_mappings`), cleared by
-  every metadata build (`test_cache_group_router.py`,
-  `test_deepseek_v4_slot_mappings.py`, `test_deepseek_v4_config.py`).
+  python/` must stay empty — the layer-shared sparse top-k is backend
+  scratch (`sparse_topk`), cleared by every metadata build
+  (`test_cache_group_router.py`).
 * `grep -rnE '^\s+extend_(seq|prefix|replay|prompt)_lens(_cpu)?: torch\.Tensor \| None,|
   extend_with_prefix: bool = False' python/tokenspeed/runtime/layers/attention/backends/`
   must stay empty — no `init_forward_metadata` parameter in the extend

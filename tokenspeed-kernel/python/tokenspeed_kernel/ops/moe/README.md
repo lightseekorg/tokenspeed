@@ -414,3 +414,11 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## Kimi-K3 router
+
+On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
+over 896 experts. It consumes contiguous FP32 logits and bias and writes
+normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
+The routing-only kernel has no expert-plan workspace or 8,192-token limit.
+Other contracts retain their existing routers.
