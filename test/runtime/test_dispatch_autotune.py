@@ -325,7 +325,7 @@ def test_a_query_sharding_engine_tunes_on_the_shards_rows(monkeypatch):
     and the target forward sees this rank's rows of the span -- ids,
     positions and the per-row model inputs -- as a real sharded extend does."""
     plan = QueryShardPlan.from_forward(
-        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2
+        total_tokens=16, input_lengths=[4, 4, 4, 4], size=4, rank=2, device="cpu"
     )
     # Every request is four rows, one per zigzag segment of the first four:
     # rank 2 computes the third row of each.

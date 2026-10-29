@@ -37,7 +37,11 @@ def test_row_payloads_survive_sharding_and_selected_row_gathers(size, lengths):
     total = sum(lengths)
     plans = [
         QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=size, rank=rank
+            total_tokens=total,
+            input_lengths=lengths,
+            size=size,
+            rank=rank,
+            device="cpu",
         )
         for rank in range(size)
     ]
@@ -77,7 +81,11 @@ def test_equal_segments_balance_causal_visible_key_work_per_request(size):
     per_rank = []
     for rank in range(size):
         plan = QueryShardPlan.from_forward(
-            total_tokens=sum(lengths), input_lengths=lengths, size=size, rank=rank
+            total_tokens=sum(lengths),
+            input_lengths=lengths,
+            size=size,
+            rank=rank,
+            device="cpu",
         )
         per_rank.append(costs[plan.local_row_ids].sum().item())
     assert len(set(per_rank)) == 1

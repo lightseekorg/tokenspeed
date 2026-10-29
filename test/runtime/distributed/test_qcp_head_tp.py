@@ -260,7 +260,11 @@ def _worker(rank: int, rendezvous: str, tp_batch_invariant: str, lengths: list[i
         weights = attention_weights(HIDDEN)
         total = sum(lengths)
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank
+            total_tokens=total,
+            input_lengths=lengths,
+            size=WORLD,
+            rank=rank,
+            device="cpu",
         )
         gen = torch.Generator().manual_seed(4)
         hidden_full = torch.randn(total, HIDDEN, generator=gen)
@@ -400,7 +404,7 @@ def test_head_tp_row_counts_follow_the_layout():
         rank=2, world_size=4, attn_tp_size=4, attn_qcp_size=4, attn_head_tp_size=4
     )
     plan = QueryShardPlan.from_forward(
-        total_tokens=7, input_lengths=[4, 3], size=4, rank=2
+        total_tokens=7, input_lengths=[4, 3], size=4, rank=2, device="cpu"
     )
     sharded = SimpleNamespace(
         global_num_tokens=None,

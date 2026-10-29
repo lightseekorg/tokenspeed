@@ -144,7 +144,7 @@ def test_executor_stages_a_shards_rows_of_the_plan(monkeypatch):
     for rank in range(4):
         executor = _staging_executor(monkeypatch, shifted_ids=shifted, vocab_size=200)
         shard = QueryShardPlan.from_forward(
-            total_tokens=10, input_lengths=[4, 6], size=4, rank=rank
+            total_tokens=10, input_lengths=[4, 6], size=4, rank=rank, device="cpu"
         )
         plan = InputLogprobPlan(
             row_starts=(1, 4), counts=(3, 4), position_starts=(1, 0)

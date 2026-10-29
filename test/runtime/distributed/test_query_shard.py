@@ -44,7 +44,11 @@ RUNTIME = (
 def _plans(total: int, lengths: list[int], size: int) -> list[QueryShardPlan]:
     return [
         QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=size, rank=rank
+            total_tokens=total,
+            input_lengths=lengths,
+            size=size,
+            rank=rank,
+            device="cpu",
         )
         for rank in range(size)
     ]
@@ -243,10 +247,12 @@ def test_rows_for_collective_names_the_shard_or_the_sampled_rows():
 def test_plan_rejects_inconsistent_inputs():
     with pytest.raises(ValueError, match="sum to"):
         QueryShardPlan.from_forward(
-            total_tokens=5, input_lengths=[2, 2], size=2, rank=0
+            total_tokens=5, input_lengths=[2, 2], size=2, rank=0, device="cpu"
         )
     with pytest.raises(ValueError, match="outside"):
-        QueryShardPlan.from_forward(total_tokens=2, input_lengths=[2], size=2, rank=2)
+        QueryShardPlan.from_forward(
+            total_tokens=2, input_lengths=[2], size=2, rank=2, device="cpu"
+        )
 
 
 def test_mapping_exposes_the_query_shard_group():
@@ -308,7 +314,7 @@ def test_the_model_exit_hands_the_processor_the_shard_and_its_plan():
 
     lengths = [4, 1, 5]
     plan = QueryShardPlan.from_forward(
-        total_tokens=10, input_lengths=lengths, size=4, rank=1
+        total_tokens=10, input_lengths=lengths, size=4, rank=1, device="cpu"
     )
     shard = torch.arange(plan.local_rows * 2, dtype=torch.float32).reshape(-1, 2)
     seen = {}
@@ -364,7 +370,7 @@ def test_the_executor_hands_the_model_its_shard_of_the_row_inputs():
         request_token_history_view=lambda **kw: views.update(kw) or "view",
     )
     plan = QueryShardPlan.from_forward(
-        total_tokens=10, input_lengths=[4, 1, 5], size=2, rank=1
+        total_tokens=10, input_lengths=[4, 1, 5], size=2, rank=1, device="cpu"
     )
     kwargs = executor._model_input_kwargs(10, 3, plan.local_row_ids)
     assert torch.equal(kwargs["engram_hash_ids"], history[plan.local_row_ids])
@@ -405,7 +411,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     hidden = torch.arange(total, dtype=torch.float32).unsqueeze(1)
     plans = [
         QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         for rank in range(4)
     ]
@@ -417,7 +423,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     gathered_by_rank = {}
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         draft_input = SimpleNamespace(
             num_extends=3,
@@ -456,7 +462,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
     # A shard's slice must not be handed in as the full layout.
     with pytest.raises(ValueError, match="full layout"):
         QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=1
+            total_tokens=total, input_lengths=lengths, size=4, rank=1, device="cpu"
         ).local_sampled_ids(torch.tensor([0, 1]))
 
 
@@ -542,7 +548,7 @@ def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
     contributions = {}
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         forwards = []
         drafter = make_drafter(plan)

@@ -835,7 +835,7 @@ class TestDummyGroupTablesTest:
         )
         plan = seen["ctx"].query_shard
         expected = QueryShardPlan.from_forward(
-            total_tokens=1737, input_lengths=[869, 868], size=4, rank=3
+            total_tokens=1737, input_lengths=[869, 868], size=4, rank=3, device="cpu"
         )
         assert plan.rank == 3 and plan.row_counts == expected.row_counts
         assert torch.equal(plan.local_row_ids, expected.local_row_ids)

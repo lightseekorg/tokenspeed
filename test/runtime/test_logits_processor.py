@@ -1524,7 +1524,7 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
     plan_targets = torch.tensor([3, 1, 7, 4, 2, 2, 5])
     plans = [
         QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         for rank in range(4)
     ]
@@ -1570,7 +1570,7 @@ def test_a_sharded_forward_gathers_the_planned_rows_then_the_sampled_rows(
 
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         proc = _sharded_processor(monkeypatch, 4, rank)
         split = plan.split_rows(plan_rows)
@@ -1651,7 +1651,7 @@ def test_a_last_capture_under_a_shard_is_the_gathered_sampled_rows(monkeypatch, 
     modes = (CaptureHiddenMode.LAST, CaptureHiddenMode.FULL, CaptureHiddenMode.NULL)
     for rank in range(4):
         plan = QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=rank
+            total_tokens=total, input_lengths=lengths, size=4, rank=rank, device="cpu"
         )
         current["plan"] = plan
         shard = hidden[plan.local_row_ids]
@@ -1704,7 +1704,7 @@ def test_a_shard_refuses_pre_selected_rows_and_a_mismatched_head(monkeypatch):
     from tokenspeed.runtime.execution.query_shard import QueryShardPlan
 
     plan = QueryShardPlan.from_forward(
-        total_tokens=4, input_lengths=[4], size=2, rank=0
+        total_tokens=4, input_lengths=[4], size=2, rank=0, device="cpu"
     )
     lm_head = SimpleNamespace(weight=torch.randn(8, 2))
     rows = _input_logprob_rows(

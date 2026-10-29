@@ -1874,6 +1874,12 @@ the exit — puts them in span order first (`plan.to_span_order`, or the
 sizing (`CommManager`, `models/base/comm_ops.py`) reads them, a model reads
 its rows from its tensors or `ctx.query_shard`.
 
+Plugin API 4 replaces the contiguous query-shard contract with per-request
+zigzag rows. Plugins must declare support for API 4 after migrating their
+row-layout and request-history consumers; API 3 adapters are incompatible.
+`QueryShardPlan.from_forward` requires an explicit `device` for its row
+indices (use `device="cpu"` for host-only plans).
+
 Adapter migration: a query shard no longer exposes a contiguous range
 (`local_slice`, `local_start`, `local_end`). Use `local_row_ids` for device
 row selection and `local_row_ids_cpu` for host planning. Consumers of

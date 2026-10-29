@@ -124,7 +124,11 @@ def _page_table() -> torch.Tensor:
 
 def _plan(rank: int) -> QueryShardPlan:
     return QueryShardPlan.from_forward(
-        total_tokens=sum(EXTEND), input_lengths=EXTEND, size=WORLD, rank=rank
+        total_tokens=sum(EXTEND),
+        input_lengths=EXTEND,
+        size=WORLD,
+        rank=rank,
+        device="cpu",
     )
 
 

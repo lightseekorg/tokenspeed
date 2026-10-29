@@ -99,7 +99,7 @@ def _forward(
 
     total = sum(lengths)
     shard = QueryShardPlan.from_forward(
-        total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank
+        total_tokens=total, input_lengths=lengths, size=WORLD, rank=rank, device="cpu"
     )
     gather_ids = torch.cumsum(torch.tensor(lengths), 0) - 1
     vocab = weight.shape[0]

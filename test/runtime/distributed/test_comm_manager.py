@@ -288,6 +288,7 @@ def _qcp_plan(rank: int) -> QueryShardPlan:
         input_lengths=QCP_LENGTHS,
         size=QCP_WORLD,
         rank=rank,
+        device="cpu",
     )
 
 

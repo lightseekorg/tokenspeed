@@ -175,7 +175,7 @@ class QueryShardPlan:
         input_lengths: Sequence[int],
         size: int,
         rank: int,
-        device: torch.device | str = "cpu",
+        device: torch.device | str,
     ) -> QueryShardPlan:
         """Plan the shard of a forward from its per-request input lengths.
 
@@ -184,7 +184,7 @@ class QueryShardPlan:
             input_lengths: New-token count of every request, request order.
             size: Ranks of the query-context-parallel group.
             rank: This rank's position in the group.
-            device: Where the row-index tensors live (the forward's device);
+            device: Explicit target for row-index tensors (the forward's device);
                 they are staged with one non-blocking copy.
 
         Returns:
