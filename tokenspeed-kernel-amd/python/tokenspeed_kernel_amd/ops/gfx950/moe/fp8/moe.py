@@ -25,6 +25,14 @@ from collections.abc import Callable
 import torch
 from tokenspeed_kernel_amd._triton import triton
 
+# Stage 1 leaves instruction order to LLVM. Unbounded SLP vectorizer
+# scheduling regroups its scale and epilogue math into long live ranges and
+# pushes it past 256 registers, halving occupancy. 1000 was the fastest bound
+# measured; 3000 already loses the occupancy again.
+_PACKED_LARGE_STAGE1_LLVM_CL_OPTS = "slp-schedule-budget=1000"
+# Under the bound, iterative-ilp schedules stage 1 best.
+_PACKED_LARGE_STAGE1_LLVM_FN_ATTRS = (("amdgpu-sched-strategy", "iterative-ilp"),)
+
 
 def _packed_schedule(
     num_tokens: int,
@@ -227,7 +235,12 @@ def launch_gluon_fp8_packed_moe_gfx950(
             )
 
             stage1 = gluon_fp8_packed_large_stage1_gfx950
-            stage1_options = {"USE_NT": use_nt, "num_stages": 1}
+            stage1_options = {
+                "USE_NT": use_nt,
+                "num_stages": 1,
+                "llvm_cl_opts": _PACKED_LARGE_STAGE1_LLVM_CL_OPTS,
+                "llvm_fn_attrs": _PACKED_LARGE_STAGE1_LLVM_FN_ATTRS,
+            }
         else:
             from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (
                 gluon_fp8_packed_small_stage1_gfx950,
@@ -262,7 +275,10 @@ def launch_gluon_fp8_packed_moe_gfx950(
         )
 
         stage2 = gluon_fp8_packed_large_stage2_gfx950
-        stage2_options = {"USE_NT": use_nt, "num_stages": 1}
+        stage2_options = {
+            "USE_NT": use_nt,
+            "num_stages": 1,
+        }
     else:
         from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.packed_small import (
             gluon_fp8_packed_small_stage2_gfx950,
