@@ -1291,19 +1291,6 @@ def build_device_side(
     if communication_first:
         prepare_multimodal()
 
-    if current_platform().is_npu:
-        from tokenspeed.runtime.configs.model_config import AttentionArch
-
-        if model_config.attention_arch in (AttentionArch.MLA, AttentionArch.DSA):
-            from tokenspeed.runtime.execution.workspace import workspace_pool
-
-            # Native MLA/DSA commit slots use main-stream scratch. Materialize
-            # its peak before KV profiling, so the driver free-memory query
-            # includes the shared pool rather than charging the cache recipe.
-            workspace_pool(torch.device(server_args.device, gpu_id)).allocate(
-                ((server_args.max_prefill_tokens,), torch.int64)
-            )
-
     post_profile_bytes = recv_pool_bytes(server_args, model_config.is_multimodal_active)
     if post_profile_bytes:
         logger.info(

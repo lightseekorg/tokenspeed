@@ -166,8 +166,9 @@ class CPUOwnerCommit:
         block_rows,
         virtual_blocks,
     ):
-        slots_workspace.copy_(slots)
-        slots = slots_workspace
+        committed = slots_workspace[: slots.numel()]
+        committed.copy_(slots)
+        slots = committed
         live = (slots >= block_rows) & (slots < virtual_blocks * block_rows)
         self.cache.index_copy_(0, slots[live].long(), self.current[live])
 
@@ -197,6 +198,12 @@ def test_prefill_commits_router_slots_across_request_and_page_boundaries(
     cache = torch.full((7 * page, 576), -1, dtype=torch.int32)
     backend = object.__new__(AscendMLABackend)
     backend._prefill_runtime = CPUOwnerCommit(current, cache)
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    backend._prefill_workspace, buffers = AscendPrefillOptions(
+        total, 1 << 30, -(-total // page)
+    ).allocate_workspace(local_rows=7 * page, degree=1, index_width=0, device="cpu")
+    backend._prefill_slots = buffers[3]
     backend._placement = CachePlacement(page, 7, (0,), 0)
     backend._prefill_plan = AscendPrefillPlan.build(
         RequestMetadata(torch.tensor(extends), torch.tensor(prefixes), table),
@@ -554,6 +561,8 @@ def test_ordinary_mla_cache_keeps_prefix_history_without_native_library(
     pool, backend = _prefill_cache_and_backend(monkeypatch, options=None)
     backend.set_cache_pool(pool)
     assert backend.prepare_prefill_workspace() == 0
+    assert backend._prefill_workspace is None
+    assert backend._prefill_slots is None
     rows = pool.get_key_buffer(0).view(-1, 576)
     rows[128:255].fill_(7)
     backend._init_prefill_metadata(
@@ -587,10 +596,49 @@ def test_native_prefill_requires_its_reserved_budget_before_loading_library(
 
     monkeypatch.delenv("TOKENSPEED_DSA_CP_LIBRARY", raising=False)
     pool, backend = _prefill_cache_and_backend(
-        monkeypatch, options=AscendPrefillOptions(129, 1)
+        monkeypatch, options=AscendPrefillOptions(129, 1, 4)
     )
     with pytest.raises(ValueError, match="cache recipe reserved"):
         backend.set_cache_pool(pool)
+
+
+def test_native_mla_backend_owns_commit_slots_until_transport_closes(
+    monkeypatch, tmp_path
+):
+    import os
+
+    import torch.distributed as dist
+
+    import tokenspeed.runtime.distributed.process_group_manager as groups
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    options = AscendPrefillOptions(129, 1 << 30, 4, 128)
+    pool, backend = _prefill_cache_and_backend(monkeypatch, options=options)
+    if not os.environ.get("TOKENSPEED_DSA_CP_LIBRARY"):
+        pytest.skip("requires the native Prefill transport library")
+    manager = groups.ProcessGroupManager()
+    monkeypatch.setattr(groups, "process_group_manager", manager)
+    manager.init_emulated_rank_zero(
+        f"file://{tmp_path}/bootstrap", "gloo", timeout=60, device_id=None
+    )
+    manager.init_process_group((0,), "gloo")
+    try:
+        backend.set_cache_pool(pool)
+        expected = options.required_workspace(
+            local_rows=pool.get_key_buffer(0).numel() // 576, degree=1, index_width=0
+        )
+        assert backend.prepare_prefill_workspace() == expected
+        assert backend._prefill_workspace.frozen
+        assert backend._prefill_slots.numel() >= options.max_current_rows
+        backend._prefill_slots.fill_(42)
+        # Repeated preparation reuses the same allocation and slot contents.
+        assert backend.prepare_prefill_workspace() == expected
+        assert torch.all(backend._prefill_slots == 42)
+    finally:
+        backend.close_prefill()
+        dist.destroy_process_group()
+    assert backend._prefill_workspace is None
+    assert backend._prefill_slots is None
 
 
 @pytest.mark.parametrize("degree", [1, 8, 16])
@@ -600,17 +648,25 @@ def test_native_workspace_reservation_includes_history_current_and_send(
 ):
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
-    # Slot scratch belongs to the shared WorkspacePool, outside cache storage.
-    size = (degree * 128 * 2 + 128) * (576 + index_width) * 2
-    exact = AscendPrefillOptions(1, size)
+    # The backend's pool includes aligned int64 commit slots beside transport.
+    size = (4 * 128 + (degree + 1) * 128) * (576 + index_width) * 2 + 256
+    exact = AscendPrefillOptions(1, size, 1)
     assert (
         exact.check_workspace(local_rows=128, degree=degree, index_width=index_width)
         == size
     )
     with pytest.raises(ValueError, match="cache recipe reserved"):
-        AscendPrefillOptions(1, size - 1).check_workspace(
+        AscendPrefillOptions(1, size - 1, 1).check_workspace(
             local_rows=128, degree=degree, index_width=index_width
         )
+
+
+@pytest.mark.parametrize("pages,rows", [(0, 1), (-1, 1), (1, 129)])
+def test_native_workspace_rejects_unbounded_or_oversized_current_rows(pages, rows):
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    with pytest.raises(ValueError, match="page limit"):
+        AscendPrefillOptions(rows, 1 << 30, pages, 128)
 
 
 @pytest.mark.parametrize("degree", [1, 8])
@@ -670,12 +726,12 @@ def test_bounded_workspace_size_does_not_follow_cache_capacity():
     options = AscendPrefillOptions(16384, 1 << 30, 1024, 128)
     small = options.check_workspace(local_rows=128, degree=8, index_width=128)
     large = options.check_workspace(local_rows=1 << 20, degree=8, index_width=128)
-    assert small == large == 2 * 704 * (2 * 1025 * 128 + 9 * 2048)
+    assert small == large == 2 * 704 * (2 * 1025 * 128 + 9 * 2048) + 16384 * 8
 
 
 @pytest.mark.parametrize("degree", [1, 2, 8])
 @pytest.mark.parametrize("index_width", [0, 128])
-@pytest.mark.parametrize("max_pages", [0, 32])
+@pytest.mark.parametrize("max_pages", [2, 32])
 def test_prefill_workspace_owns_buffers_apart_from_main_stream_scratch(
     degree, index_width, max_pages
 ):

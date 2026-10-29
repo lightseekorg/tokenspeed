@@ -26,34 +26,33 @@ Native Prefill reuses scheduler placement and page tables.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_cp_metadata
 
-from tokenspeed.runtime.execution.workspace import WorkspacePool, workspace_pool
+from tokenspeed.runtime.execution.workspace import WorkspacePool
 from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
     CachePoolWorkspace,
     CachePoolWorkspacePlan,
 )
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
 
 
 def _prefill_workspace_sizes(
-    *, max_current_rows, history_capacity_rows, local_rows, degree, index_width
+    *, max_current_rows, history_capacity_rows, degree, index_width
 ):
-    if local_rows < 0 or degree < 1 or index_width not in (0, 128):
+    if history_capacity_rows < 1 or degree < 1 or index_width not in (0, 128):
         raise ValueError("Invalid native Prefill workspace geometry")
     send_rows = -(-max_current_rows // (degree * 128)) * 128
-    history_rows = history_capacity_rows or degree * local_rows
+    history_rows = history_capacity_rows
     width = 576 + index_width
     return (
         (history_rows + degree * send_rows) * width,
         send_rows * width,
-        history_rows * width if history_capacity_rows else 0,
+        history_rows * width,
     )
 
 
@@ -63,40 +62,46 @@ class AscendPrefillOptions:
 
     max_current_rows: int
     reserved_workspace_bytes: int
-    max_kv_page_num: int = 0
+    max_kv_page_num: int
     kv_page_size: int = 128
 
     def __post_init__(self):
         if (
             self.max_current_rows < 1
             or self.reserved_workspace_bytes < 1
-            or self.max_kv_page_num < 0
+            or self.max_kv_page_num < 1
             or self.kv_page_size < 1
+            or self.max_current_rows > self.max_kv_page_num * self.kv_page_size
         ):
             raise ValueError(
-                "Native Prefill needs positive row capacity and reservation"
+                "Native Prefill needs a positive page limit and reservation, "
+                "with current rows bounded by the page limit"
             )
 
     @property
     def history_capacity_rows(self):
         # One null page precedes the compact per-batch pages.
-        return (
-            (self.max_kv_page_num + 1) * self.kv_page_size
-            if self.max_kv_page_num
-            else 0
-        )
+        return (self.max_kv_page_num + 1) * self.kv_page_size
 
     def required_workspace(self, *, local_rows: int, degree: int, index_width: int):
-        """Transport receive/send bytes; main-stream slot scratch is separate."""
-        return 2 * sum(
-            _prefill_workspace_sizes(
-                max_current_rows=self.max_current_rows,
-                history_capacity_rows=self.history_capacity_rows,
-                local_rows=local_rows,
-                degree=degree,
-                index_width=index_width,
+        """Transport buffers and commit slots, including pool alignment."""
+        return (
+            2
+            * sum(
+                _prefill_workspace_sizes(
+                    max_current_rows=self.max_current_rows,
+                    history_capacity_rows=self.history_capacity_rows,
+                    degree=degree,
+                    index_width=index_width,
+                )
             )
+            + self.slot_workspace_rows * torch.int64.itemsize
         )
+
+    @property
+    def slot_workspace_rows(self):
+        # WorkspacePool aligns each view to 256 bytes (32 int64 slots).
+        return -(-self.max_current_rows // 32) * 32
 
     def check_workspace(self, *, local_rows: int, degree: int, index_width: int):
         """Reject an undersized reservation before creating native resources."""
@@ -113,19 +118,21 @@ class AscendPrefillOptions:
         return required
 
     def allocate_workspace(self, *, local_rows, degree, index_width, device):
-        """Own side-stream buffers in one pool, isolated from main-stream scratch."""
+        """Own transport and commit views together, disjoint across streams."""
         required = self.check_workspace(
             local_rows=local_rows, degree=degree, index_width=index_width
         )
         sizes = _prefill_workspace_sizes(
             max_current_rows=self.max_current_rows,
             history_capacity_rows=self.history_capacity_rows,
-            local_rows=local_rows,
             degree=degree,
             index_width=index_width,
         )
         pool = WorkspacePool(device, initial_nbytes=required)
-        buffers = pool.allocate(*(((size,), torch.bfloat16) for size in sizes))
+        buffers = pool.allocate(
+            *(((size,), torch.bfloat16) for size in sizes),
+            ((self.slot_workspace_rows,), torch.int64),
+        )
         pool.freeze()
         return pool, tuple(buffers)
 
@@ -134,42 +141,48 @@ class AscendPrefillWorkspace(CachePoolWorkspace):
     """Model opt-in; TS derives the transport budget from runtime geometry."""
 
     def plan_workspace(self, layout, *, server_args, attn_config):
-        page_size = layout.prefix_granularity
         limit = server_args.chunk_prefill_kv_size
-        max_pages = 0 if limit is None else -(-limit // page_size)
+        if limit is None:
+            # No KV limit: retain serial collectives without native resources.
+            return CachePoolWorkspacePlan(0, 0, bind_options=lambda blocks: None)
+        page_size = layout.prefix_granularity
+        max_pages = -(-limit // page_size)
         dsa = attn_config.component(DSAConfig)
         index_width = 0 if dsa is None else dsa.index_head_dim
         degree = attn_config.kvp_size
-        fixed = 2 * sum(
-            _prefill_workspace_sizes(
-                max_current_rows=server_args.max_prefill_tokens,
-                history_capacity_rows=(max_pages + 1) * page_size if max_pages else 0,
-                local_rows=0 if limit is not None else page_size,
-                degree=degree,
-                index_width=index_width,
+        max_current_rows = min(
+            max_pages * page_size,
+            max(
+                (
+                    server_args.chunked_prefill_size
+                    if server_args.chunked_prefill_size > 0
+                    else server_args.max_prefill_tokens + attn_config.context_len
+                ),
+                attn_config.max_bs * attn_config.speculative_num_draft_tokens,
+            ),
+        )
+        fixed = (
+            2
+            * sum(
+                _prefill_workspace_sizes(
+                    max_current_rows=max_current_rows,
+                    history_capacity_rows=(max_pages + 1) * page_size,
+                    degree=degree,
+                    index_width=index_width,
+                )
             )
+            + -(-max_current_rows // 32) * 256
         )
         options = AscendPrefillOptions(
-            max_current_rows=server_args.max_prefill_tokens,
+            max_current_rows=max_current_rows,
             reserved_workspace_bytes=fixed,
             max_kv_page_num=max_pages,
             kv_page_size=page_size,
         )
-        per_block = (
-            0
-            if limit is not None
-            else degree
-            * page_size
-            * (576 + index_width)
-            * 2
-            * dict(layout.group_packing)[FULL_ATTENTION]
-        )
         return CachePoolWorkspacePlan(
             fixed_bytes=fixed,
-            bytes_per_lcm_block=per_block,
-            bind_options=lambda blocks: replace(
-                options, reserved_workspace_bytes=fixed + blocks * per_block
-            ),
+            bytes_per_lcm_block=0,
+            bind_options=lambda blocks: options,
         )
 
 
@@ -282,20 +295,23 @@ class AscendPrefillPlan:
     gather: AscendPrefillGatherPlan | None = None
     patch_slots: torch.Tensor | None = None
 
-    def patch(self, runtime, layer_id, slots, *, width, block_rows, virtual_blocks):
-        """Commit on the compute stream using the runtime's shared scratch.
-
-        Re-fetch the view for every commit: another main-stream operation may
-        have reused or grown the pool since the preceding layer or plane.
-        """
-        (slot_workspace,) = workspace_pool(slots.device).allocate(
-            ((slots.numel(),), torch.int64)
-        )
+    def patch(
+        self,
+        runtime,
+        layer_id,
+        slots,
+        *,
+        slots_workspace,
+        width,
+        block_rows,
+        virtual_blocks,
+    ):
+        """Commit on the compute stream using the backend's reserved slots."""
         return runtime.patch(
             layer_id,
             slots,
             self.current_direct,
-            slots_workspace=slot_workspace,
+            slots_workspace=slots_workspace,
             mapped_slots=self.patch_slots,
             width=width,
             block_rows=block_rows,

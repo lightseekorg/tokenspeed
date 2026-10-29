@@ -186,6 +186,7 @@ class AscendDSABackend(DSABackend):
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_runtime = None
         self._prefill_workspace = None
+        self._prefill_slots: torch.Tensor | None = None
         self._prefill_options = None
 
     @property
@@ -194,7 +195,7 @@ class AscendDSABackend(DSABackend):
 
     @property
     def prefill_needs_host_page_table(self):
-        return self.native_prefill_enabled and self._prefill_options.max_kv_page_num > 0
+        return self.native_prefill_enabled
 
     def _publish_cache_pool(self, cache_pool: CachePool) -> None:
         self.close_prefill()
@@ -217,7 +218,7 @@ class AscendDSABackend(DSABackend):
         if not self.native_prefill_enabled:
             return 0
         if self._prefill_runtime is not None:
-            return self._prefill_runtime.workspace_bytes
+            return self._prefill_workspace.capacity_bytes
         if self.cache_pool is None:
             raise RuntimeError("Bind the DSA cache before preparing Prefill workspace")
         from tokenspeed.runtime.distributed.process_group_manager import (
@@ -234,21 +235,18 @@ class AscendDSABackend(DSABackend):
             index_width=128,
             device=kv.device,
         )
+        self._prefill_slots = buffers[3]
         self._prefill_runtime = self._indexer_kernels.prepare_prefill(
             kv,
             index,
             ranks=self._dcp.ranks,
             bootstrap_group=group,
             max_current_rows=self._prefill_options.max_current_rows,
-            workspace=buffers,
+            workspace=buffers[:3],
             max_history_rows=self._prefill_options.history_capacity_rows,
-            history_null_rows=(
-                self._prefill_options.kv_page_size
-                if self._prefill_options.max_kv_page_num
-                else 0
-            ),
+            history_null_rows=self._prefill_options.kv_page_size,
         )
-        return self._prefill_runtime.workspace_bytes
+        return self._prefill_workspace.capacity_bytes
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         """Start the next DSA layer while preceding KDA layers compute."""
@@ -282,6 +280,7 @@ class AscendDSABackend(DSABackend):
             self._prefill_runtime.close()
             self._prefill_runtime = None
         self._prefill_workspace = None
+        self._prefill_slots = None
 
     def cache_placement(self, layer) -> CachePlacement | None:
         if self._ascend_placement is None:
@@ -906,6 +905,7 @@ class AscendDSABackend(DSABackend):
             runtime,
             layer.layer_id,
             out_cache_loc,
+            slots_workspace=self._prefill_slots,
             width=spec.index_head_dim,
             block_rows=block_rows,
             virtual_blocks=virtual_blocks,
@@ -933,6 +933,7 @@ class AscendDSABackend(DSABackend):
             runtime,
             layer.layer_id,
             out_cache_loc,
+            slots_workspace=self._prefill_slots,
             width=spec.kv_cache_dim,
             block_rows=block_rows,
             virtual_blocks=virtual_blocks,

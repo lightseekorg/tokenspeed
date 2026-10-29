@@ -77,7 +77,9 @@ def bounded_transport(rank, degree, scratch_pool):
     results = []
     for has_index in (False, True):
         capacity = AscendPrefillOptions(
-            16384, 1 << 30, max_kv_page_num=32 if degree == 2 else 16
+            4096 if degree == 2 else 2048,
+            1 << 30,
+            max_kv_page_num=32 if degree == 2 else 16,
         )
         local_rows = 4096 if degree == 2 else 2048
         cache = torch.empty((local_rows, 576), dtype=torch.bfloat16, device="npu")
@@ -100,9 +102,9 @@ def bounded_transport(rank, degree, scratch_pool):
             max_current_rows=capacity.max_current_rows,
             max_history_rows=capacity.history_capacity_rows,
             history_null_rows=capacity.kv_page_size,
-            workspace=workspace,
+            workspace=workspace[:3],
         )
-        assert runtime.workspace_bytes == capacity.required_workspace(
+        assert pool_owner.capacity_bytes == capacity.required_workspace(
             local_rows=local_rows,
             degree=degree,
             index_width=128 if has_index else 0,
@@ -224,6 +226,7 @@ def bounded_transport(rank, degree, scratch_pool):
                     runtime,
                     case,
                     slots.to(device="npu", dtype=torch.int32),
+                    slots_workspace=workspace[3],
                     width=width,
                     block_rows=128,
                     virtual_blocks=degree * 31 + 1,

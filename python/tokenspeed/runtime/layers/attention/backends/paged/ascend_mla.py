@@ -126,6 +126,7 @@ class AscendMLABackend(MLAAttnBackend):
         self._current_local = None
         self._prefill_runtime = None
         self._prefill_workspace = None
+        self._prefill_slots: torch.Tensor | None = None
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
         self._prefill_pages: torch.Tensor | None = None
@@ -138,7 +139,7 @@ class AscendMLABackend(MLAAttnBackend):
 
     @property
     def prefill_needs_host_page_table(self):
-        return self.native_prefill_enabled and self._prefill_options.max_kv_page_num > 0
+        return self.native_prefill_enabled
 
     def init_forward_metadata(self, *args, page_table_cpu=None, **kwargs):
         self._prefill_cpu_table = page_table_cpu
@@ -168,7 +169,7 @@ class AscendMLABackend(MLAAttnBackend):
         if not self.native_prefill_enabled:
             return 0
         if self._prefill_runtime is not None:
-            return self._prefill_runtime.workspace_bytes
+            return self._prefill_workspace.capacity_bytes
         if self.cache_pool is None:
             raise RuntimeError("Bind the MLA cache before preparing Prefill")
         from tokenspeed.runtime.distributed.process_group_manager import (
@@ -183,6 +184,7 @@ class AscendMLABackend(MLAAttnBackend):
             index_width=0,
             device=kv.device,
         )
+        self._prefill_slots = buffers[3]
         self._prefill_runtime = prepare_ascend_mla_prefill(
             kv,
             ranks=self._dcp.ranks,
@@ -190,15 +192,11 @@ class AscendMLABackend(MLAAttnBackend):
                 "gloo", self._dcp.ranks
             ),
             max_current_rows=self._prefill_options.max_current_rows,
-            workspace=buffers,
+            workspace=buffers[:3],
             max_history_rows=self._prefill_options.history_capacity_rows,
-            history_null_rows=(
-                self._prefill_options.kv_page_size
-                if self._prefill_options.max_kv_page_num
-                else 0
-            ),
+            history_null_rows=self._prefill_options.kv_page_size,
         )
-        return self._prefill_runtime.workspace_bytes
+        return self._prefill_workspace.capacity_bytes
 
     def _init_prefill_metadata(self, **kwargs):
         if not self.native_prefill_enabled:
@@ -278,6 +276,7 @@ class AscendMLABackend(MLAAttnBackend):
             self._prefill_runtime,
             layer_id,
             slots,
+            slots_workspace=self._prefill_slots,
             width=576,
             block_rows=self._placement.block_granularity,
             virtual_blocks=self._placement.virtual_block_count,
@@ -302,6 +301,7 @@ class AscendMLABackend(MLAAttnBackend):
             self._prefill_runtime.close()
             self._prefill_runtime = None
         self._prefill_workspace = None
+        self._prefill_slots = None
 
     def configure_runtime(
         self, *, block_granularity, virtual_block_count, shard_count, **kwargs
