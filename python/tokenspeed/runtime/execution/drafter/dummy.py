@@ -29,18 +29,16 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 
 
 class DummyDrafter(BaseDrafter):
-    """Generate synthetic candidates from the selected token and absolute position.
+    """Generate synthetic candidates from the selected token and window column.
 
-    Pool slots only locate position metadata: relocation, batch order and rank
-    do not change a request's proposed window. These are not target predictions.
+    Pool placement, cached-prefix length, batch order and rank do not change a
+    selected token's proposed window. These are not target predictions.
     """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         if self.spec_num_tokens <= 1:
             raise ValueError("DUMMY drafting requires at least two verify tokens")
-        if self.runtime_states is None or self.input_buffers is None:
-            raise ValueError("DUMMY drafting requires runtime and input buffers")
         if self.vocab_size is None or self.vocab_size <= 0:
             raise ValueError("DUMMY drafting requires a positive vocabulary size")
         if self.draft_model_runner is not None:
@@ -87,25 +85,20 @@ class DummyDrafter(BaseDrafter):
     def _candidate_window(
         self,
         selected: torch.Tensor,
-        req_pool_indices: torch.Tensor,
     ) -> torch.Tensor:
         bs = selected.shape[0]
         window = torch.empty(
             (bs, self.spec_num_tokens), dtype=torch.int32, device=selected.device
         )
         window[:, 0].copy_(selected)
-        slots = req_pool_indices[:bs].to(torch.int64)
-        cache_lengths = self.runtime_states.valid_cache_lengths.index_select(0, slots)
         columns = torch.arange(
             1, self.spec_num_tokens, dtype=torch.int64, device=selected.device
         )
-        # No slot or rank enters this formula: the same prefix has one window.
-        # Live inputs also avoid freezing random candidates into a captured graph.
-        base = (
-            selected.to(torch.int64) * 1_000_003
-            + cache_lengths.to(torch.int64) * 65_537
-            + 17
-        )
+        # Drafting precedes the accepted-frontier update, so a prefill's cached
+        # prefix length is not its completed prompt position. Keep this synthetic
+        # window independent of that execution metadata and read live tokens in
+        # both eager execution and CUDA graph replay.
+        base = selected.to(torch.int64) * 1_000_003 + 17
         candidates = torch.remainder(
             base[:, None] + columns[None, :] * 104_729,
             int(self.vocab_size),
@@ -123,10 +116,7 @@ class DummyDrafter(BaseDrafter):
     ) -> torch.Tensor:
         del logits_output
         selected = self._selected_tokens(base_ctx, output_tokens, accept_lengths)
-        return self._candidate_window(
-            selected,
-            self.input_buffers.req_pool_indices_buf[: base_ctx.bs],
-        )
+        return self._candidate_window(selected)
 
     @override
     def draft(self, *args, **kwargs) -> torch.Tensor | None:
