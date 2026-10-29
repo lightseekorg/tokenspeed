@@ -102,7 +102,10 @@ class MuseIrisState:
     """Compose prepared generic collectives and the model's boundary storage.
 
     All layers reuse these buffers in stream order. Reductions and gathers can
-    return borrowed activations; a consumer must finish before the next write.
+    return borrowed activations. No borrowed producer-buffer or pull-scratch
+    view, nor the ready flags guarding it, may be live across an ordinary
+    reduction on the group, including one the backend runs for another
+    caller through ProducerAllReduce.reduce_ordinary.
     The generic all-reduce retains its independent-output contract.
     Expert TP and EP use the same owned-row token cutoffs; each owner
     holds ceil(global rows / world size) rows, with padding masked.
@@ -240,7 +243,14 @@ class MuseIrisState:
         )
 
     def reduce(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy."""
+        """Reduce an ordinary tensor in place using the prepared TP4/TP8 policy.
+
+        The policy is ProducerAllReduce.reduce_ordinary, the same one the
+        backend uses for ordinary all-reduces on this group. Payloads past the
+        producer buffer are reduced in capacity-sized chunks. Views of this
+        state's symmetric storage, and unaligned views, which it declines,
+        take run directly.
+        """
         numel = tensor.numel()
         assert tensor.dtype == self.all_reduce.dtype and tensor.is_contiguous()
         capacity = self.all_reduce.producer_direct_max_numel
@@ -250,6 +260,9 @@ class MuseIrisState:
         flat = tensor.view(-1)
         for begin in range(0, numel, capacity):
             chunk = flat[begin : begin + capacity]
+            if self.reduction.can_reduce_ordinary(chunk, rccl_fallback=False):
+                self.reduction.reduce_ordinary(chunk)
+                continue
             reduced = self.reduction.run(chunk, chunk, chunk.numel())
             if reduced.data_ptr() != chunk.data_ptr():
                 chunk.copy_(reduced[: chunk.numel()])
