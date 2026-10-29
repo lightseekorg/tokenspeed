@@ -562,8 +562,6 @@ class AscendDSABackend(DSABackend):
                 index_slots = torch.where(owned, local_slots, -1)
         if not kwargs.get("index_cache_written", False):
             kernels.scatter(kwargs["index_key"].contiguous(), index_cache, index_slots)
-        if self.step_counter is not None:
-            self.step_counter.record_cache()
         if not context_parallel or self._dcp.degree == 1:
             indices, valid_chunks = kernels.index(
                 kwargs["index_query"],
@@ -814,27 +812,56 @@ class AscendDSABackend(DSABackend):
             )
             table = table[requests]
             q_ends = torch.arange(1, q.shape[0] + 1, device=q.device, dtype=torch.int32)
-        selection = self._select_indexed(
-            q,
-            k,
-            layer,
-            out_cache_loc,
-            token_to_kv_pool,
-            q_ends,
-            kv_lengths,
-            table,
-            kwargs,
-            fused=fused,
-            query_group_size=1,
-            context_parallel=context_parallel,
-            query_width=1,
-        )
-        return self._run_indexed_sparse_attention(
-            selection,
-            layer,
-            token_to_kv_pool,
-            head_major_output=head_major_output,
-            is_prefill=True,
+        # CP represents each causal query as an indexer sequence. Its native
+        # sequence-count limit is 1024, independent of the Prefill token budget.
+        chunk_rows = min(q.shape[0], 1024) if context_parallel else q.shape[0]
+        outputs = []
+        for start in range(0, q.shape[0], chunk_rows):
+            end = min(start + chunk_rows, q.shape[0])
+            inputs = kwargs
+            ends, lengths, pages, slots = q_ends, kv_lengths, table, out_cache_loc
+            if context_parallel:
+                inputs = {
+                    **kwargs,
+                    **{
+                        name: kwargs[name][start:end]
+                        for name in ("index_query", "index_key", "index_weights")
+                    },
+                }
+                ends = q_ends[: end - start]
+                lengths, pages = kv_lengths[start:end], table[start:end]
+                slots = out_cache_loc[start:end]
+            selection = self._select_indexed(
+                q[start:end],
+                k,
+                layer,
+                slots,
+                token_to_kv_pool,
+                ends,
+                lengths,
+                pages,
+                inputs,
+                fused=fused,
+                query_group_size=1,
+                context_parallel=context_parallel,
+                query_width=1,
+            )
+            # PD arms one step per layer, after KV and every Index-K chunk.
+            if end == q.shape[0] and self.step_counter is not None:
+                self.step_counter.record_cache()
+            outputs.append(
+                self._run_indexed_sparse_attention(
+                    selection,
+                    layer,
+                    token_to_kv_pool,
+                    head_major_output=head_major_output,
+                    is_prefill=True,
+                )
+            )
+        return (
+            outputs[0]
+            if len(outputs) == 1
+            else torch.cat(outputs, dim=1 if head_major_output else 0)
         )
 
     def forward_extend(
@@ -1030,6 +1057,8 @@ class AscendDSABackend(DSABackend):
             context_parallel=self._dcp.degree > 1,
             query_width=tokens_per_request,
         )
+        if self.step_counter is not None:
+            self.step_counter.record_cache()
         return self._run_indexed_sparse_attention(
             selection,
             layer,
