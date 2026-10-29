@@ -490,6 +490,13 @@ preloads the all-gathered residual before its wait, so that collective must
 not trigger early. FlashInfer adapters preserve the upstream CuTe body and
 keep PDL compilation caches separate.
 
+The Rubin GDN decode adapter skips a CTA when either state index is negative,
+before entering the upstream body that would otherwise redirect padding to
+row 0. Its PDL wait precedes the index reads and padding CTAs still signal.
+Automatic GDN kernel selection includes the bound state dtype so the generic
+FlashInfer BF16 path cannot overwrite the arena's null state. Recurrent state
+remains in the shared cache arena; kernel selection adds no state pool.
+
 Gated residual projection weights separate logical rows from stored rows.
 Model loading extends BF16/FP16 down/inject storage for GEMM output alignment;
 later shards and reloads write into the same parameter storage. Forward passes

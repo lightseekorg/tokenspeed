@@ -66,7 +66,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.2 and compile isolated modules, operators, and tuning caches. They require
+0.7.2.post1 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -111,7 +111,7 @@ and fills the lookup table per expert instead of searching per tile.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.2) initializes unused rows inside active
+The pinned FlashInfer version (0.7.2.post1) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -192,6 +192,8 @@ tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. If FlashInfer removes
 either tuning hook, changes the cache-key builder signature, or moves runner
 construction outside the cloned entry points, the adapter raises an error.
+When FlashInfer splits its module factory and runner-namespace builder, both
+are rebound so the operator closures keep the same private tactic policy.
 
 The cache-key builder derives the policy tag from the target profile.
 During autotuning, this is the profile that `p.get_opt_shapes()` selects; during

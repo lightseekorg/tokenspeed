@@ -1019,3 +1019,42 @@ def test_dspark_block_greedy_rejects_mismatched_workspaces(device: str) -> None:
         dspark_block_greedy_step(
             base, 1, anchors, single, embedding, projection, 0, vocab, single[0], out
         )
+
+
+def test_gumbel_generic_keeps_the_top_k_across_vocab_blocks(device: str) -> None:
+    # The kernel scans the vocab in 2048-wide blocks and inserts only a row's
+    # top-k candidates per block: the top-k spread over several blocks, with
+    # ties, must still be the set it samples from.
+    rows, vocab_size = 4, 3 * 2048 + 5
+    logits = torch.zeros((rows, vocab_size), dtype=torch.float32, device=device)
+    peaks = (100, 2100, 4200, 6146)  # one per block, the last in the tail
+    logits[:, list(peaks)] = 20.0
+    logits[:, 4300] = 20.0  # ties the third block's peak
+    req_pool_indices = torch.arange(rows, dtype=torch.int32, device=device)
+    top_k_pool = torch.tensor([1, 2, 3, 5], dtype=torch.int32, device=device)
+    temperature_pool = torch.ones(rows, dtype=torch.float32, device=device)
+    top_p_pool = torch.ones(rows, dtype=torch.float32, device=device)
+    seed_pool = torch.arange(11, 11 + rows, dtype=torch.int64, device=device)
+    offsets_pool = torch.zeros(rows, dtype=torch.int64, device=device)
+    out = torch.empty((rows,), dtype=torch.int32, device=device)
+
+    allowed = (
+        {100},  # greedy: the lowest id among the tied maxima
+        {100, 2100},
+        {100, 2100, 4200},
+        {100, 2100, 4200, 4300, 6146},
+    )
+    for offset in range(8):
+        offsets_pool.fill_(offset)
+        tokens = gumbel_sample_from_pools_generic(
+            logits,
+            req_pool_indices,
+            temperature_pool,
+            top_k_pool,
+            top_p_pool,
+            seed_pool,
+            offsets_pool,
+            out,
+        ).tolist()
+        for row, token in enumerate(tokens):
+            assert token in allowed[row], (row, token)
