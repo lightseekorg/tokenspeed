@@ -114,6 +114,30 @@ def test_both_dsa_modules_are_imported():
     assert _BACKEND_REGISTRY["dsa"][1] is expected
 
 
+@pytest.mark.skipif(not current_platform().is_npu, reason="Ascend RMSNorm kernel")
+@pytest.mark.parametrize("epsilon", [1e-5, 3e-4])
+def test_index_key_normalization_uses_checkpoint_epsilon(epsilon):
+    from transformers import PretrainedConfig
+
+    from tokenspeed.runtime.layers.attention.dsa.ascend import AscendDSAIndexer
+
+    config = PretrainedConfig(
+        index_n_heads=8,
+        index_head_dim=128,
+        index_use_rope=False,
+        rms_norm_eps=epsilon,
+    )
+    indexer = AscendDSAIndexer(config, hidden_size=64, q_lora_rank=32)
+    norm = indexer.k_norm.to(device="npu", dtype=torch.bfloat16)
+    # Small keys make epsilon material, so a hardcoded default cannot pass.
+    key = torch.linspace(-0.003, 0.003, 4 * 128).reshape(4, 128).bfloat16()
+    expected = torch.nn.functional.rms_norm(
+        key.float(), (128,), torch.ones(128), eps=epsilon
+    ).bfloat16()
+    actual = norm(key.npu()).cpu()
+    torch.testing.assert_close(actual, expected, rtol=2**-7, atol=2**-14)
+
+
 def test_ascend_mla_prologue_supports_native_prefill_and_decode():
     spec = KernelRegistry.get().get_by_name("ascend_composite_mla_prologue")
     assert spec is not None

@@ -47,6 +47,9 @@ existing Decode operators. Prefill keeps token-local queries and all heads;
 there is no query/output AllToAll or TopK/LSE exchange. Persistent KV remains
 owner-sharded.
 
+Index-K RMS normalization uses the checkpoint's `rms_norm_eps` in both the
+composed path and the fused Decode prologue.
+
 The CANN 9.0/A2 CP runtime additionally loads ABI 2
 `libdsa_cp_prefill.so`, built from the operator repository's standalone
 `cann-flash-ops/src/dsa_cp_prefill` CMake project. Set
