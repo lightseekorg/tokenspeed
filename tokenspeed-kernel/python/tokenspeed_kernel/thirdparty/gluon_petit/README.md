@@ -24,14 +24,6 @@ and kernel registration names. The serving options are `--moe-backend gluon_peti
 and `--all2all-backend gluon_petit`; the runtime maps the MoE backend to `gluon`
 when selecting a kernel plan.
 
-## Integration status
-
-The runtime keeps the upstream LDS layout. `tokenspeed-triton` has no LDS pointer
-address space and requires power-of-two shared allocations. The vendored kernels
-therefore keep LDS addresses in ordinary pointers and access LDS through native
-load and store helpers in `lib/gemm/rocm/intrinsics.py`. They allocate shared
-memory as a two-dimensional shape with a four-word inner dimension.
-
 ## Runtime contract
 
 Select the backend with both `--moe-backend gluon_petit` and
