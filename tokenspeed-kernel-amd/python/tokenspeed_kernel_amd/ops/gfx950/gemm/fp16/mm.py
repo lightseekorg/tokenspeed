@@ -1580,9 +1580,11 @@ def launch_gluon_mm_a16w16_medium_gfx950(
 # uses the config of the smallest bucket covering its M, so M stays a runtime
 # argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
 # WARPS_N, NUM_BUFFERS, SPLIT_K, NUM_XCDS); NUM_BUFFERS above three holds every
-# K tile of a program. Only buckets that beat torch.mm by at least 4% are
-# listed; the rest keep the torch path.
-DECODE_M_BUCKETS = (4, 8, 16, 32, 64)
+# K tile of a program. Only buckets that beat torch.mm by at least 4% at the
+# row counts their model sends are listed, except where an entry notes
+# otherwise; the rest keep the torch path. The 128 and 256 buckets were swept
+# inside capture_session, as serving captures.
+DECODE_M_BUCKETS = (4, 8, 16, 32, 64, 128, 256)
 _DECODE_CONFIGS: dict[
     tuple[int, int], dict[int, tuple[int, int, int, int, int, int, int, int]]
 ] = {
@@ -1610,13 +1612,19 @@ _DECODE_CONFIGS: dict[
         64: (64, 32, 256, 2, 2, 3, 1, 1),
     },
     # Muse TP8 pre-expert projection. Split K four ways to occupy the CUs, and
-    # eight ways with 32-row tiles from 17 rows.
+    # eight ways with 32-row tiles from 17 rows; past 64 rows the extra row
+    # tiles fill the CUs, so K splits four ways again. The 128 and 256 buckets
+    # serve speculative verify batches of up to 21 requests (172 rows). The 256
+    # bucket is break-even (+1-2%) at 129-136 rows, of which verify sends only
+    # 136 (17 requests of 8 rows), and 18-25% faster from 144 rows.
     (512, 8192): {
         4: (16, 16, 512, 2, 2, 4, 4, 8),
         8: (16, 16, 512, 2, 2, 4, 4, 8),
         16: (16, 16, 512, 2, 2, 4, 4, 8),
         32: (32, 16, 256, 2, 2, 4, 8, 1),
         64: (32, 32, 256, 2, 2, 4, 8, 8),
+        128: (32, 32, 256, 2, 2, 3, 4, 1),
+        256: (64, 32, 256, 2, 2, 3, 4, 1),
     },
     # o_proj
     (7168, 1536): {
@@ -1870,7 +1878,7 @@ def launch_gluon_mm_a16w16_decode_gfx950(
     return C
 
 
-_GROUPED_M_BUCKETS = DECODE_M_BUCKETS + (128,)
+_GROUPED_M_BUCKETS = (4, 8, 16, 32, 64, 128)
 # Grouped decode GEMMs keyed by (groups, N, K), then M bucket; same tuple
 # layout as _DECODE_CONFIGS. Swept under graph replay on MI350X.
 _GROUPED_DECODE_CONFIGS: dict[
