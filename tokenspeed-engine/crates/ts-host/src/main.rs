@@ -24,7 +24,7 @@
 //! half; `TOKENSPEED_HOST_BINARY` overrides the installed binary):
 //!
 //! ```text
-//! ts-host --python <the launcher's sys.executable> --control-fd <fd>
+//! ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>
 //! ```
 //!
 //! The rank's arguments arrive on `--control-fd`, and readiness goes back
@@ -37,6 +37,7 @@
 mod data_plane;
 mod encode;
 mod interpreter;
+mod logging;
 mod pd;
 
 use std::{
@@ -50,7 +51,6 @@ use std::{
 };
 
 use pyo3::{prelude::*, types::PyBytes};
-use tracing_subscriber::EnvFilter;
 use ts_collective::{Group, Listener, Mesh};
 use ts_control::{
     batch_log::BatchLogConfig,
@@ -84,7 +84,9 @@ const EP_GROUP: u32 = 3;
 
 #[derive(Debug, thiserror::Error)]
 enum HostError {
-    #[error("usage: ts-host --python <executable> --control-fd <fd>: {0}")]
+    #[error(
+        "usage: ts-host --python <executable> --control-fd <fd> --enable-async-logging <bool>: {0}"
+    )]
     Usage(String),
     #[error("{0}")]
     Interpreter(String),
@@ -121,12 +123,13 @@ fn python_error(py: Python<'_>, error: PyErr) -> HostError {
 struct Args {
     python: String,
     control_fd: i32,
+    enable_async_logging: bool,
 }
 
-fn parse_args() -> Result<Args, HostError> {
+fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, HostError> {
     let mut python = None;
     let mut control_fd = None;
-    let mut args = std::env::args().skip(1);
+    let mut enable_async_logging = None;
     while let Some(flag) = args.next() {
         let value = args
             .next()
@@ -140,6 +143,13 @@ fn parse_args() -> Result<Args, HostError> {
                         .map_err(|_| HostError::Usage(format!("bad --control-fd {value}")))?,
                 )
             }
+            "--enable-async-logging" => {
+                enable_async_logging = Some(value.parse().map_err(|_| {
+                    HostError::Usage(format!(
+                        "bad --enable-async-logging {value}: use true or false"
+                    ))
+                })?);
+            }
             _ => return Err(HostError::Usage(format!("unknown argument {flag}"))),
         }
     }
@@ -147,6 +157,8 @@ fn parse_args() -> Result<Args, HostError> {
         python: python.ok_or_else(|| HostError::Usage("--python is required".to_owned()))?,
         control_fd: control_fd
             .ok_or_else(|| HostError::Usage("--control-fd is required".to_owned()))?,
+        enable_async_logging: enable_async_logging
+            .ok_or_else(|| HostError::Usage("--enable-async-logging is required".to_owned()))?,
     })
 }
 
@@ -678,25 +690,22 @@ fn serve(args: &Args) -> Result<(), HostError> {
 }
 
 fn main() -> ExitCode {
-    // The control thread emits tracing events -- one "Decode batch." line
-    // every `--decode-log-interval` rounds (ts-control/src/batch_log.rs) --
-    // and the fmt subscriber writes each line synchronously. With stderr
-    // redirected to a distributed file system that write can block for tens
-    // to hundreds of milliseconds *on the control thread*, stalling the
-    // round; every peer rank then waits it out at the next DP barrier or
-    // graph collective. The non-blocking writer moves the write to its own
-    // thread: callers only enqueue, and a full queue drops lines instead of
-    // blocking the scheduler.
-    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stderr());
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_env("TS_HOST_LOG").unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(log_writer)
-        .init();
-    let served = parse_args().and_then(|args| {
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _log_guard = logging::init(args.enable_async_logging);
+    let served = (|| {
         interpreter::start(&args.python).map_err(HostError::Interpreter)?;
-        let served = serve(&args);
+        let served = {
+            // The host does not finalize Python. Drain its logger on success,
+            // error and unwind, before failure notification can kill the rank.
+            let _python_logs = logging::PythonLogGuard;
+            serve(&args)
+        };
         if served.is_err() {
             // As `run_event_loop` does: the launcher then stops the other
             // ranks.
@@ -710,12 +719,37 @@ fn main() -> ExitCode {
             }
         }
         served
-    });
+    })();
     match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("{error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_args;
+
+    #[test]
+    fn logging_mode_is_explicit_and_validated() {
+        let args = |mode: &str| {
+            [
+                "--python",
+                "python3",
+                "--control-fd",
+                "3",
+                "--enable-async-logging",
+                mode,
+            ]
+            .map(str::to_owned)
+            .into_iter()
+        };
+        assert!(parse_args(args("true")).unwrap().enable_async_logging);
+        assert!(!parse_args(args("false")).unwrap().enable_async_logging);
+        assert!(parse_args(args("yes")).is_err());
+        assert!(parse_args(args("true").take(4)).is_err());
     }
 }

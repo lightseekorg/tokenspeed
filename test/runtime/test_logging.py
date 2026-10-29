@@ -28,10 +28,9 @@ from importlib import import_module
 
 import pytest
 
-from tokenspeed._logging import suppress_noisy_third_party_logs
+from tokenspeed._logging import stop_async_logging, suppress_noisy_third_party_logs
 from tokenspeed.runtime.utils.common import (
     CustomFormatter,
-    _stop_log_listener,
     configure_logger,
     get_colorful_logger,
 )
@@ -75,7 +74,7 @@ class TestAsyncRootLogger:
         # A stalled stderr target must not stall the thread that logs: the
         # serving loop's records (the profiler lines among them) go through a
         # queue and a listener thread owns the write.
-        args = ServerArgs(model="x", world_size=2, ep_size=2)
+        args = ServerArgs(model="x", world_size=2, ep_size=2, enable_async_logging=True)
         stream = _BlockingStream()
         try:
             with contextlib.redirect_stderr(stream):
@@ -98,7 +97,7 @@ class TestAsyncRootLogger:
                 assert "first record" in stream.getvalue()
         finally:
             stream.release.set()
-            _stop_log_listener()
+            stop_async_logging()
             logging.getLogger().handlers.clear()
 
 
