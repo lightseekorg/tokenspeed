@@ -27,6 +27,9 @@ are all insufficient: drivers report fabric-handle *support* and multicast
 support on hosts where the IMEX stack is absent and the allocation itself fails
 with CUDA_ERROR_NOT_PERMITTED. Every MNNVL consumer therefore has to probe the
 allocation, so the probe lives here instead of being duplicated per consumer.
+
+On gfx1250 the same initialization instead records whether the whole world is
+in one GPU fabric domain, which an Iris heap across hosts requires.
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ __all__ = [
     "gather_fabric_map",
     "group_has_fabric",
     "group_host_span",
+    "world_in_one_fabric_domain",
 ]
 
 logger = logging.getLogger(__name__)
@@ -60,6 +64,7 @@ _CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
 _probe_cache: dict[int, bool] = {}
 _fabric_map: list[bool] | None = None
 _host_map: list[int] | None = None
+_one_fabric_domain = False
 
 
 class _CUmemLocation(ctypes.Structure):
@@ -213,7 +218,9 @@ def gather_fabric_map() -> list[bool]:
     """Gather and cache every world rank's fabric-allocation verdict and host.
 
     Fabric handles are an NVIDIA concept, so off NVIDIA the answer is no for
-    every rank and is filled in without a collective. Deciding that here rather
+    every rank and is filled in without a collective. On gfx1250 a job across
+    hosts instead runs Iris's topology discovery, a world collective, to record
+    whether every GPU is in one fabric domain. Deciding that here rather
     than at the call site keeps the collective out of a lazy path: a caller
     that skipped this on the wrong platform would otherwise trigger the gather
     from a gate, which is the dispatch-time collective this map exists to
@@ -225,7 +232,7 @@ def gather_fabric_map() -> list[bool]:
     the ones that entered would wait out the NCCL timeout. The caller it
     replaced read a server argument, which was uniform; this reads the machine.
     """
-    global _fabric_map, _host_map
+    global _fabric_map, _host_map, _one_fabric_domain
 
     if _fabric_map is not None:
         return _fabric_map
@@ -235,6 +242,11 @@ def gather_fabric_map() -> list[bool]:
         # No fabric to map, so every rank is its own host and every span declines.
         _fabric_map = [False] * world_size
         _host_map = list(range(world_size))
+        if current_platform().is_cdna5:
+            from tokenspeed_kernel.ops.communication import _iris
+
+            _one_fabric_domain = _iris.world_in_one_fabric_domain()
+            logger.info(f"world in one fabric domain: {_one_fabric_domain!s}")
         return _fabric_map
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -270,6 +282,15 @@ def group_has_fabric(ranks: Sequence[int]) -> bool:
             "distributed initialization before any reachability gate"
         )
     return all(_fabric_map[rank] for rank in ranks)
+
+
+def world_in_one_fabric_domain() -> bool:
+    """Whether every world rank's GPU is in one fabric domain.
+
+    Only gfx1250 records this, at ``gather_fabric_map``; elsewhere, or before
+    the map is gathered, the answer is no.
+    """
+    return _one_fabric_domain
 
 
 def group_host_span(ranks: Sequence[int]) -> int | None:

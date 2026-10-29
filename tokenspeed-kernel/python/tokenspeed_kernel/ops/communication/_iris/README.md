@@ -59,9 +59,11 @@ configure_iris(heap_size=None, allocator_type="torch")
 ```
 
 `heap_size=None` sizes the heap automatically. `allocator_type=None` picks
-`vmem_chunked` when the job spans hosts and Iris's `torch` default otherwise.
-Names pass through to Iris; `IRIS_ALLOCATOR` takes precedence. Iris refuses an
-allocator that cannot reach every host. A live context cannot be reconfigured.
+`vmem_chunked` when a gfx1250 job spans hosts and Iris's `torch` default
+otherwise. Names pass through to Iris; `IRIS_ALLOCATOR` takes precedence. Iris
+refuses an allocator that cannot reach every host. A live context cannot be
+reconfigured. Groups spanning hosts use Iris only on gfx1250, and only when
+`gather_fabric_map()` found every GPU in the world in one fabric domain.
 
 The heap is built on the caller's current GPU, not on Iris's rank % visible
 GPUs, so ranks may start past GPU 0.

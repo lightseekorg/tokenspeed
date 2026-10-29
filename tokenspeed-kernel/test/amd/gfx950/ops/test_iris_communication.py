@@ -25,6 +25,7 @@ import os
 import socket
 import time
 import traceback
+from types import SimpleNamespace
 from typing import List, Tuple
 
 import pytest
@@ -143,18 +144,26 @@ def test_plain_two_stage_is_independent_of_producer_thresholds(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("configured", "spans_hosts", "expected"),
-    [(None, False, None), (None, True, "vmem_chunked"), ("vmem", True, "vmem")],
-    ids=["one-host", "across-hosts", "configured"],
+    ("configured", "cdna5", "spans_hosts", "expected"),
+    [
+        (None, True, False, None),
+        (None, True, True, "vmem_chunked"),
+        (None, False, True, None),
+        ("vmem", True, True, "vmem"),
+    ],
+    ids=["one-host", "gfx1250-across-hosts", "gfx950-across-hosts", "configured"],
 )
-def test_context_picks_vmem_chunked_only_across_hosts(
-    monkeypatch, configured, spans_hosts, expected
+def test_context_picks_vmem_chunked_only_for_gfx1250_across_hosts(
+    monkeypatch, configured, cdna5, spans_hosts, expected
 ):
     from tokenspeed_kernel.ops.communication import _iris
 
     created = []
     monkeypatch.setattr(_iris, "_context", None)
     monkeypatch.setattr(_iris, "_allocator_type", configured)
+    monkeypatch.setattr(
+        _iris, "current_platform", lambda: SimpleNamespace(is_cdna5=cdna5)
+    )
     monkeypatch.setattr(_iris, "_job_spans_hosts", lambda: spans_hosts)
     monkeypatch.setattr(
         _iris,
@@ -982,8 +991,9 @@ def _vmem_placement_worker_fn(rank, world_size, port, error_dict):
             rank=rank,
             world_size=world_size,
         )
-        torch.cuda.set_device(1)
-        with pytest.raises(RuntimeError, match="cannot place rank 0 on GPU 1"):
+        # Only rank 1 is misplaced, but both ranks must fail rather than hang.
+        torch.cuda.set_device((0, 2)[rank])
+        with pytest.raises(RuntimeError, match="cannot place rank 1 on GPU 2"):
             get_or_create_context(heap_size=1 << 20)
     except BaseException:
         error_dict[rank] = traceback.format_exc()
@@ -993,13 +1003,13 @@ def _vmem_placement_worker_fn(rank, world_size, port, error_dict):
 
 
 def test_iris_vmem_refuses_a_gpu_past_the_rank_index():
-    """Without ``device=``, Iris's vmem heap would fault on GPU 1 for rank 0."""
-    _skip_if_unsupported(2, "Iris vmem placement tests")
+    """Without ``device=``, Iris's vmem heap would fault on GPU 2 for rank 1."""
+    _skip_if_unsupported(3, "Iris vmem placement tests")
     from tokenspeed_kernel.ops.communication._iris import iris
 
     if "device" in inspect.signature(iris.iris).parameters:
         pytest.skip("this Iris places the heap itself")
-    _spawn_and_collect(_vmem_placement_worker_fn, (1, _get_open_port()), 1)
+    _spawn_and_collect(_vmem_placement_worker_fn, (2, _get_open_port()), 2)
 
 
 # ---------------------------------------------------------------------------

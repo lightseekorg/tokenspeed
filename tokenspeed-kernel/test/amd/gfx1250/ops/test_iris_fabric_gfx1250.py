@@ -50,6 +50,10 @@ def test_iris_all_reduce_across_two_hosts():
             test_iris_fabric_gfx1250.py
     """
     from tokenspeed_kernel.ops.communication._iris import get_or_create_context
+    from tokenspeed_kernel.ops.communication.fabric import (
+        gather_fabric_map,
+        world_in_one_fabric_domain,
+    )
     from tokenspeed_kernel.ops.communication.iris import (
         create_iris_state,
         iris_all_reduce,
@@ -63,6 +67,8 @@ def test_iris_all_reduce_across_two_hosts():
     torch.cuda.set_device(device)
     dist.init_process_group(backend="gloo")
     try:
+        gather_fabric_map()
+        assert world_in_one_fabric_domain(), "the trays are not in one fabric domain"
         state = create_iris_state(
             group=dist.group.WORLD,
             rank_in_group=rank,
