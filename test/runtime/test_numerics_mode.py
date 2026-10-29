@@ -159,6 +159,12 @@ class TestNumericsMode:
         with pytest.raises((ValueError), match=("--dsa-slot-order")):
             ServerArgs(model="x", dsa_slot_order="shuffled")
 
+    @pytest.mark.parametrize("order", ["sorted", "selection"])
+    def test_rl_bitwise_preserves_explicit_trainer_slot_order(self, order):
+        args = ServerArgs(model="x", numerics="rl-bitwise", dsa_slot_order=order)
+        assert args.dsa_slot_order == order
+        assert args.batch_invariant_collectives and args.disable_autotune
+
     def test_rl_bitwise_combines_moe_slots_in_the_leaf(self):
         assert (ServerArgs(model="x").moe_combine_order) == ("rank")
         assert (ServerArgs(model="x", numerics="rl-bitwise").moe_combine_order) == (
@@ -201,12 +207,18 @@ class TestNumericsMode:
         # The normal dispatch reads its receive counts on the host, so no
         # decode graph can capture it; the low-latency legs keep the graphs.
         normal = ServerArgs(
-            model="x", world_size=2, ep_size=2, all2all_backend="deepep",
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
             deepep_mode="normal",
         )
         assert normal.enforce_eager
         low_latency = ServerArgs(
-            model="x", world_size=2, ep_size=2, all2all_backend="deepep",
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
             deepep_mode="low_latency",
         )
         assert not low_latency.enforce_eager

@@ -148,7 +148,7 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               batch_invariant=True); the tuned top-k
 │   │                               kernels switch algorithm and CTA split
 │   │                               with the row count, which moves ties
-│   ├── position-order reduction    dsa_slot_order=sorted: a token's selected
+│   ├── explicit reduction order    dsa_slot_order=sorted by default: selected
 │   │                               KV rows are reduced in ascending POSITION
 │   │                               order, not in the top-k leaf's tie order
 │   │                               and never in physical slot order (a
@@ -159,8 +159,10 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               emits that order (dsa_decode_topk /
 │   │                               dsa_prefill_topk slot_order trait) and the
 │   │                               sparse core keeps it (dsa_decode /
-│   │                               dsa_prefill slot_order trait); silent
-│   │                               kernels are refused rather than assumed
+│   │                               dsa_prefill slot_order trait). Explicit
+│   │                               selection retains the selector's order;
+│   │                               both require batch-invariant leaves.
+│   │                               Silent kernels are refused, not assumed
 │   └── per-row GEMMs               fixed-order GEMM leaves (see plans below)
 ├── logprob.topology-invariant      (deferred) TP-invariant projection
 │                                   layouts on top of the vocab-block
@@ -183,6 +185,12 @@ BITWISE_ENVELOPES`, never the one name, so an envelope added above
 rl-bitwise would inherit every pin.
 
 ## alignment.trainer
+
+Trainer operation order is explicit where trainers differ. `--dsa-slot-order`
+defaults to `sorted` under `rl-bitwise` and `selection` under `auto`, but an
+explicit choice is preserved. Strict DSA plans still require batch-invariant
+selection and attention leaves for either order. `selection` keeps the
+selector's stable layout; it never sorts physical cache addresses.
 
 For `deepseek_yarn`, `rope_scaling.frequency_device` optionally specifies the
 device used for powers, divisions and interpolation independently of

@@ -50,7 +50,8 @@ global_server_args_dict: dict = {
     "router_topk": ServerArgs.router_topk,
     "logprob_order": ServerArgs.logprob_order,
     "moe_combine_order": ServerArgs.moe_combine_order,
-    "dsa_slot_order": ServerArgs.dsa_slot_order,
+    # Before a launch is resolved, the module defaults describe auto mode.
+    "dsa_slot_order": "selection",
     "tp_batch_invariant": ServerArgs.tp_batch_invariant,
     "head_tp_exchange_max_rows": ServerArgs.head_tp_exchange_max_rows,
     "low_latency_max_num_tokens_per_gpu": ServerArgs.low_latency_max_num_tokens_per_gpu,

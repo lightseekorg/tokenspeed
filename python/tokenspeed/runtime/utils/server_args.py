@@ -687,7 +687,9 @@ class ServerArgs:
     # The order the sparse attention cores reduce a token's selected KV slots
     # in: as the top-k leaf emitted them (selection), or ascending (sorted,
     # batch-invariant whenever the selected set is).
-    dsa_slot_order: str = "selection"
+    # Omission uses the envelope's order; an explicit order names the
+    # trainer's contract. Strict plans still require batch-invariant leaves.
+    dsa_slot_order: str | None = None
     low_latency_max_num_tokens_per_gpu: int = 256
     max_cudagraph_capture_size: int | None = None
     disable_prefill_graph: bool | None = False
@@ -979,6 +981,8 @@ class ServerArgs:
                 self.max_num_seqs = 160
 
     def resolve_kernel_backends(self):
+        if self.dsa_slot_order is None:
+            self.dsa_slot_order = "selection" if self.numerics == "auto" else "sorted"
         _require_choice(
             "--dense-gemm-backend",
             self.dense_gemm_backend,
@@ -1855,10 +1859,9 @@ class ServerArgs:
                 f"{self.sampling_backend} resolves exact ties in reduction order"
             )
         self.sampling_stream = "per-request"
-        # Sparse attention: the tuned top-k kernels' tie order moves with the
-        # batch shape, so the cores reduce the selected slots sorted; the
-        # batch-invariant cores the envelope pins declare the trait.
-        self.dsa_slot_order = "sorted"
+        # Sparse attention defaults to sorted positions. An explicit selection
+        # order is also valid when both the top-k and attention plans require
+        # batch-invariant leaves; some trainers reduce in that order.
         # Trainer alignment: the training framework's operation order wherever
         # the two engines are known to differ. Each switch is documented in
         # ``docs/design/numerics.md`` under "alignment.trainer".
@@ -3967,11 +3970,12 @@ class ServerArgs:
             default=ServerArgs.dsa_slot_order,
             help="The order the sparse (DSA) attention cores reduce a token's "
             "selected KV slots in. 'selection': as the top-k leaf emitted "
-            "them (every core). 'sorted': ascending slot order, so the "
+            "them (every core). 'sorted': ascending token position, so the "
             "reduction is batch-invariant whenever the selected set is; "
             "served only by cores declaring the slot_order trait (the "
-            "registered batch-invariant leaves). Folded to sorted by --numerics "
-            "rl-bitwise.",
+            "registered batch-invariant leaves). Defaults to sorted under "
+            "--numerics rl-bitwise and selection otherwise. Explicit choices "
+            "are preserved; rl-bitwise still requires invariant top-k and cores.",
         )
         parser.add_argument(
             "--disable-sampling-tp-sync",

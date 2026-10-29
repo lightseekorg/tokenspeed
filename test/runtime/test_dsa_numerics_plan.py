@@ -42,12 +42,12 @@ from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.utils.env import global_server_args_dict
 
 
-@pytest.fixture
-def registry(monkeypatch):
+@pytest.fixture(params=["sorted", "selection"])
+def registry(monkeypatch, request):
     registry = KernelRegistry()
     monkeypatch.setattr(KernelRegistry, "_instance", registry)
     monkeypatch.setitem(global_server_args_dict, "numerics", "rl-bitwise")
-    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", "sorted")
+    monkeypatch.setitem(global_server_args_dict, "dsa_slot_order", request.param)
     return registry
 
 
@@ -75,7 +75,7 @@ def _register(registry, invariant, *, graph):
                 features=(frozenset({"batch_invariant"}) if invariant else frozenset())
                 | (frozenset({"cuda_graph"}) if graph else frozenset()),
                 traits={
-                    "slot_order": frozenset({"sorted"}),
+                    "slot_order": frozenset({"sorted", "selection"}),
                     "q_len": frozenset({1, 2}),
                 },
             ),
@@ -153,7 +153,7 @@ def test_sparse_plans_keep_their_provider_across_batches_and_registry_changes(re
         qk_rope_head_dim=64,
         softmax_scale=192**-0.5,
         page_size=64,
-        slot_order="sorted",
+        slot_order=global_server_args_dict["dsa_slot_order"],
     )
     expected = dsa_prefill(
         q,
