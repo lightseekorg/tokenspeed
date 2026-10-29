@@ -18,7 +18,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Subprocess supervision helpers for ``ts serve``."""
+"""Subprocess supervision helpers for ``ts serve``.
+
+``ts serve`` runs SMG's gateway in front of a headless engine on SMG's direct
+ZMQ lane: the gateway binds the engine's sockets and the engine ranks dial
+in. The gateway derives every socket from the worker's URL: for an ``ipc://``
+URL the data plane under its path and the TCP handshake on a loopback port
+hashed from it (``zmq_handshake_port``); for a ``tcp://`` URL, which serves
+ranks on other nodes, the handshake at the URL itself. Either way the engine
+only needs the handshake's address.
+"""
 
 from __future__ import annotations
 
@@ -32,32 +41,62 @@ import time
 logger = logging.getLogger(__name__)
 
 _GATEWAY_MODULE = "smg"
-_ENGINE_MODULE_DEFAULT = "smg_grpc_servicer.tokenspeed"
+_ENGINE_MODULE_DEFAULT = "tokenspeed.runtime.entrypoints.engine"
 _PIPE_LINE_LIMIT = 64 * 1024 * 1024
+# The loopback host of SMG's direct lane: its handshake listens there.
+ZMQ_LOOPBACK_HOST = "127.0.0.1"
 
 
-def engine_argv(args: list[str], *, host: str, port: int) -> list[str]:
-    """Build the command line that runs the engine module.
+def zmq_socket_dir() -> str:
+    """The directory of the workers' ``ipc://`` sockets: SMG's own default,
+    per user (``SMG_ZMQ_SOCKET_DIR`` overrides it, for SMG as for us)."""
+    return os.environ.get("SMG_ZMQ_SOCKET_DIR", f"/tmp/smg-zmq-{os.getuid()}")
+
+
+def zmq_handshake_port(worker_url: str) -> int:
+    """The TCP handshake port SMG derives from an ``ipc://`` worker URL.
+
+    Mirrors SMG's ``derive_handshake_port``: FNV-1a over the path after
+    ``ipc://``, folded into 20000..29999.
+    """
+    path = worker_url.removeprefix("ipc://")
+    digest = 0xCBF29CE484222325
+    for byte in path.encode():
+        digest ^= byte
+        digest = (digest * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return 20000 + digest % 10000
+
+
+def engine_argv(
+    args: list[str], *, host: str, port: int, handshake: tuple[str, int] | None
+) -> list[str]:
+    """Build the command line that runs the headless engine.
 
     Args:
         args: Engine-side arguments to forward verbatim.
-        host: Address the engine binds.
-        port: Port the engine binds.
+        host: The engine's ``--host``.
+        port: The engine's ``--port``, which seeds its derived ports.
+        handshake: The gateway's handshake address ``(host, port)``; None on
+            a follower node none of whose ranks registers with the gateway.
 
     Returns:
         An ``argv`` list whose first element is the Python interpreter.
     """
     module = os.environ.get("TS_SERVE_ENGINE_MODULE", _ENGINE_MODULE_DEFAULT)
-    return [
-        sys.executable,
-        "-m",
-        module,
-        "--host",
-        host,
-        "--port",
-        str(port),
-        *args,
-    ]
+    argv = [sys.executable, "-m", module, "--host", host, "--port", str(port), *args]
+    if handshake is not None:
+        handshake_host, handshake_port = handshake
+        # Last, so they win over anything in ``args``: the gateway owns the
+        # handshake, and its engine identities count from 0.
+        argv += [
+            "--data-parallel-address",
+            handshake_host,
+            "--data-parallel-rpc-port",
+            str(handshake_port),
+            "--zmq-engine-index",
+            "0",
+        ]
+    return argv
 
 
 async def spawn_engine(
@@ -65,9 +104,11 @@ async def spawn_engine(
     *,
     host: str,
     port: int,
+    handshake: tuple[str, int],
 ) -> asyncio.subprocess.Process:
-    """Spawn the engine subprocess with PIPE stdio."""
-    cmd = engine_argv(args, host=host, port=port)
+    """Spawn the headless engine with PIPE stdio, its ranks dialing the
+    gateway's ``handshake`` ``(host, port)``."""
+    cmd = engine_argv(args, host=host, port=port, handshake=handshake)
     logger.info(f"spawn engine: {' '.join(cmd)}")
     return await asyncio.create_subprocess_exec(
         *cmd,
@@ -80,68 +121,35 @@ async def spawn_engine(
 async def spawn_gateway(
     args: list[str],
     *,
-    engine_host: str,
-    engine_port: int,
+    worker_url: str,
+    engine_count: int,
 ) -> asyncio.subprocess.Process:
-    """Spawn ``python -m smg launch`` with PIPE stdio."""
+    """Spawn ``python -m smg launch`` with PIPE stdio, fronting one TokenSpeed
+    engine at ``worker_url`` with ``engine_count`` attention-DP ranks."""
     cmd = [
         sys.executable,
         "-m",
         _GATEWAY_MODULE,
         "launch",
         "--worker-urls",
-        f"grpc://{engine_host}:{engine_port}",
+        worker_url,
+        # The handshake is shared across runtimes: the gateway cannot probe
+        # which wire the engine speaks.
+        "--backend",
+        "tokenspeed",
         "--disable-retries",
         "--disable-circuit-breaker",
-        *args,
     ]
+    if engine_count > 1:
+        # Every attention-DP rank registers on the worker's one socket set.
+        cmd += ["--zmq-engine-count", str(engine_count)]
+    cmd += args
     logger.info(f"spawn gateway: {' '.join(cmd)}")
     return await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         limit=_PIPE_LINE_LIMIT,
-    )
-
-
-async def wait_grpc_serving(
-    target: str,
-    *,
-    timeout: float,
-    poll_interval: float = 1.0,
-) -> None:
-    """Poll ``grpc.health.v1.Health.Check`` on ``target`` until SERVING."""
-    import grpc
-    from grpc_health.v1 import health_pb2, health_pb2_grpc
-
-    deadline = time.monotonic() + timeout
-    last_err: Exception | None = None
-    # This channel starts before the engine binds. Keep reconnects near the
-    # polling cadence rather than inheriting serving-channel backoff, which
-    # can delay noticing an already-ready engine by over a minute.
-    async with grpc.aio.insecure_channel(
-        target,
-        options=[
-            ("grpc.initial_reconnect_backoff_ms", 1000),
-            ("grpc.min_reconnect_backoff_ms", 1000),
-            ("grpc.max_reconnect_backoff_ms", 1000),
-        ],
-    ) as channel:
-        stub = health_pb2_grpc.HealthStub(channel)
-        while time.monotonic() < deadline:
-            try:
-                resp = await stub.Check(
-                    health_pb2.HealthCheckRequest(service=""),
-                    timeout=2.0,
-                )
-                if resp.status == health_pb2.HealthCheckResponse.SERVING:
-                    return
-            except Exception as exc:  # noqa: BLE001
-                last_err = exc
-            await asyncio.sleep(poll_interval)
-    detail = f" (last error: {last_err!r})" if last_err is not None else ""
-    raise TimeoutError(
-        f"engine never reached SERVING on {target} within {timeout:.0f}s{detail}"
     )
 
 
@@ -168,9 +176,7 @@ async def wait_http_ready(
                 last_err = exc
             await asyncio.sleep(poll_interval)
     detail = f" (last error: {last_err!r})" if last_err is not None else ""
-    raise TimeoutError(
-        f"gateway never reached 200 on {url} within {timeout:.0f}s{detail}"
-    )
+    raise TimeoutError(f"{url} never answered 200 within {timeout:.0f}s{detail}")
 
 
 async def terminate_then_kill(proc, *, drain_timeout: float) -> None:

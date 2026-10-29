@@ -648,8 +648,7 @@ def _kpool_prefill_topk_impl(
 
     Short selections of at most 2048 pools require ordered head accumulation
     when they fit in one normalized scoring window. Longer or split selections
-    let the scorer pick its fastest head reduction: balanced on gfx950, while
-    gfx1250 always accumulates heads in order.
+    let the scorer use its faster balanced head reduction.
     """
     return _kpool_prefill_topk_fp8(
         q,

@@ -939,7 +939,18 @@ def _moe_sigmoid_bias_topk(
         solution = "torch"
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
-    traits = {"tokens": tokens, "experts": experts, "topk": topk}
+    traits = {
+        "tokens": tokens,
+        "experts": experts,
+        "topk": topk,
+        "bias_dtype": correction_bias.dtype,
+        "inputs_contiguous": router_logits.is_contiguous()
+        and correction_bias.is_contiguous(),
+        "normalize_topk_weights": normalize_topk_weights,
+        "routed_scaling_factor": routed_scaling_factor,
+        "weights_dtype": out[0].dtype if out is not None else weights_dtype,
+        "ids_dtype": out[1].dtype if out is not None else torch.int32,
+    }
     if logical_to_physical_map is not None and (
         (override is not None and override.endswith("_mapped"))
         or (
@@ -1949,6 +1960,9 @@ def moe_plan(
     the selected apply kernel, then pinned by callable in the returned plan so load
     time does not rerun selection or conflict resolution. The plan carries
     ``combine_order`` and ``process_group`` for the apply kernel to read.
+    Unquantized CUTLASS plans use fused expert reduction by default.
+    Set ``plan["cutlass_fused_finalize"] = False`` before warmup to use
+    a separate reduction instead of floating-point atomics.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
@@ -2077,6 +2091,7 @@ def moe_plan(
         "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
         "fast_math": fast_math,
         "combine_order": combine_order,
+        "cutlass_fused_finalize": True,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,

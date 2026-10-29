@@ -20,9 +20,8 @@
 
 """The headless launcher: KV bootstrap hosting and scheduler supervision.
 
-Without an in-process frontend there is no ``AsyncLLM`` to start a prefill
-engine's KV bootstrap server, so the launcher does; and with nothing above it
-to clean up, the launcher must not wait forever on a scheduler that ignores
+The launcher starts a prefill engine's KV bootstrap server; and with nothing
+above it to clean up, it must not wait forever on a scheduler that ignores
 its termination.
 """
 
@@ -47,7 +46,6 @@ register_cuda_ci(est_time=10, suite="runtime-1gpu")
 from tokenspeed.runtime.entrypoints.engine import (  # noqa: E402
     _start_kv_bootstrap_server,
     _supervise_schedulers,
-    headless_encode_channel,
 )
 from tokenspeed.runtime.utils.network import get_free_port  # noqa: E402
 from tokenspeed.runtime.utils.server_args import ServerArgs  # noqa: E402
@@ -91,22 +89,15 @@ def test_other_launchers_start_none(mode, node_rank):
     )
 
 
-@pytest.mark.parametrize(
-    ("address", "channel"),
-    [("10.0.0.2", "tcp://10.0.0.2:31000"), ("::1", "tcp://[::1]:31000")],
-)
-def test_a_headless_encode_server_takes_requests_at_the_frontend_address(
-    address, channel
-):
-    # The frontend pushes encode requests where an engine rank would dial it.
+def test_a_headless_encode_server_hosts_its_own_bootstrap_server():
+    # Its first encode rank dials the frontend and hosts the EPD bootstrap
+    # server; the launcher starts none.
     server_args = ServerArgs(
         model="x",
         disaggregation_mode="encode",
-        data_parallel_address=address,
+        data_parallel_address="10.0.0.2",
         data_parallel_rpc_port=31000,
     )
-    assert headless_encode_channel(server_args) == channel
-    # The encode ranks host their bootstrap server; the launcher starts none.
     assert _start_kv_bootstrap_server(server_args) is None
 
 

@@ -57,7 +57,10 @@ export default defineConfig({
       },
       {
         text: "Serving",
-        items: [{ text: "Parallelism", link: "/serving/parallelism" }]
+        items: [
+          { text: "Parallelism", link: "/serving/parallelism" },
+          { text: "Disaggregated Serving", link: "/serving/disaggregation" }
+        ]
       }
     ],
     search: {

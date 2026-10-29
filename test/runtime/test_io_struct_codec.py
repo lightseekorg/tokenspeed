@@ -30,39 +30,27 @@ from __future__ import annotations
 
 import msgspec
 import pytest
-import zmq
 
-from tokenspeed.runtime.engine import io_struct
 from tokenspeed.runtime.engine.io_struct import (
     CUSTOM_TYPE_RAW_VIEW,
     AbortReq,
-    BatchEmbeddingOut,
-    BatchStrOut,
-    BatchTokenIDOut,
-    CloseSessionReqInput,
-    ConfigureLoggingReq,
+    BatchTokenIDOutSlim,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     FlushCacheReqInput,
     FlushCacheReqOutput,
     GetInternalStateReq,
     GetInternalStateReqOutput,
-    GetLoadReqOutput,
-    GetWeightsByNameReqInput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
-    IpcReceiver,
-    IpcSender,
     IsSchedulerPausedReqInput,
     IsSchedulerPausedReqOutput,
     IsSleepingReqInput,
     IsSleepingReqOutput,
     MsgpackDecoder,
     MsgpackEncoder,
-    OpenSessionReqInput,
     PauseSchedulerReqInput,
     PauseSchedulerReqOutput,
-    PickleWrapper,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -75,7 +63,6 @@ from tokenspeed.runtime.engine.io_struct import (
     SessionParams,
     SetInternalStateReq,
     SetInternalStateReqOutput,
-    TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
@@ -85,7 +72,6 @@ from tokenspeed.runtime.engine.io_struct import (
     UpdateWeightsFromMooncakeReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
-    ipc_message_union,
 )
 from tokenspeed.runtime.sampling.sampling_params import (
     _TOP_K_DISABLED,
@@ -103,46 +89,26 @@ from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle  # noqa:
 
 
 def _roundtrip(obj):
-    enc = MsgpackEncoder()
-    dec = MsgpackDecoder(ipc_message_union())
-    return dec.decode(enc.encode(obj))
+    # Decoding into the message's own type also checks its tag.
+    return MsgpackDecoder(type(obj)).decode(MsgpackEncoder().encode(obj))
 
 
-def _batch_token_id_out(**overrides) -> BatchTokenIDOut:
+def _batch_token_id_out(**overrides) -> BatchTokenIDOutSlim:
     fields = dict(
         rids=["a", "b"],
-        finished_reasons=[None, {"type": "stop", "matched": 7}],
-        decoded_texts=["", "x"],
-        decode_ids=[[1, 2], [3]],
-        read_offsets=[0, 0],
         output_ids=[[1, 2], [3]],
-        output_multi_ids=[[], []],
-        skip_special_tokens=[True, True],
-        spaces_between_special_tokens=[True, False],
-        no_stop_trim=[False, False],
+        finished_reasons=["", "stop"],
         prompt_tokens=[4, 5],
         completion_tokens=[2, 1],
         cached_tokens=[0, 3],
-        spec_verify_ct=[0, 0],
-        input_token_logprobs_val=[],
-        input_token_logprobs_idx=[],
         output_token_logprobs_val=[[-0.5, -0.25], []],
         output_token_logprobs_idx=[[1, 2], []],
-        input_top_logprobs_val=[],
-        input_top_logprobs_idx=[],
-        output_top_logprobs_val=[],
-        output_top_logprobs_idx=[],
-        input_token_ids_logprobs_val=[],
-        input_token_ids_logprobs_idx=[],
-        output_token_ids_logprobs_val=[],
-        output_token_ids_logprobs_idx=[],
-        output_hidden_states=[],
-        batch_accept_draft_tokens=[],
-        output_extra_infos=[{"decode_prefix_len": 4}, {}],
-        generated_time=12.5,
+        finish_reason_details=[None, {"type": "stop", "matched": 7}],
+        spec_verify_ct=[0, 0],
+        accept_draft_tokens=[None, None],
     )
     fields.update(overrides)
-    return BatchTokenIDOut(**fields)
+    return BatchTokenIDOutSlim(**fields)
 
 
 # --------------------------------------------------------------------------
@@ -152,9 +118,6 @@ def _batch_token_id_out(**overrides) -> BatchTokenIDOut:
 _MESSAGES = [
     TokenizedGenerateReqInput(
         rid="r", input_ids=[1, 2], sampling_params=SamplingParams(), stream=True
-    ),
-    TokenizedEmbeddingReqInput(
-        rid="r", input_text="t", input_ids=[1], sampling_params=SamplingParams()
     ),
     AbortReq(rid="r"),
     FlushCacheReqInput(),
@@ -188,7 +151,6 @@ _MESSAGES = [
     DestroyWeightsUpdateGroupReqOutput(success=True, message=""),
     UpdateWeightsFromMooncakeReqInput(version=7, flush_cache=True, weight_version="7"),
     UpdateWeightsFromMooncakeReqOutput(success=True, message=""),
-    GetWeightsByNameReqInput(name="w"),
     ReleaseMemoryOccupationReqInput(tags=["weights"]),
     ReleaseMemoryOccupationReqOutput(),
     ResumeMemoryOccupationReqInput(),
@@ -201,43 +163,7 @@ _MESSAGES = [
     SetInternalStateReqOutput(updated=False, server_args={}),
     ProfileReq(type=ProfileReqType.START_PROFILE, activities=["CPU"]),
     ProfileReqOutput(success=True, message="ok"),
-    ConfigureLoggingReq(log_requests=True),
-    OpenSessionReqInput(capacity_of_str_len=8),
-    CloseSessionReqInput(session_id="s"),
-    GetLoadReqOutput(
-        dp_rank=1, num_reqs=2, num_waiting_reqs=1, num_pages=3, num_total_pages=12
-    ),
     _batch_token_id_out(),
-    BatchStrOut(
-        rids=["a"],
-        finished_reasons=[{"type": "length"}],
-        output_strs=["hi"],
-        output_ids=[1],
-        prompt_tokens=[1],
-        completion_tokens=[1],
-        cached_tokens=[0],
-        spec_verify_ct=[0],
-        input_token_logprobs_val=[],
-        input_token_logprobs_idx=[],
-        output_token_logprobs_val=[],
-        output_token_logprobs_idx=[],
-        input_top_logprobs_val=[],
-        input_top_logprobs_idx=[],
-        output_top_logprobs_val=[],
-        output_top_logprobs_idx=[],
-        input_token_ids_logprobs_val=[],
-        input_token_ids_logprobs_idx=[],
-        output_token_ids_logprobs_val=[],
-        output_token_ids_logprobs_idx=[],
-        output_hidden_states=[],
-        batch_accept_draft_tokens=[],
-        output_extra_infos=[{}],
-        generated_time=1.0,
-    ),
-    BatchEmbeddingOut(
-        rids=["a"], finished_reasons=[None], embeddings=[[0.5, 0.5]], prompt_tokens=[3]
-    ),
-    PickleWrapper.wrap({"arbitrary": object}),
 ]
 
 
@@ -245,9 +171,7 @@ _MESSAGES = [
 def test_tagged_union_roundtrip(msg):
     rt = _roundtrip(msg)
     assert type(rt) is type(msg)
-    # Structs with tensor-free fields must roundtrip exactly.
-    if type(msg) is not PickleWrapper:
-        assert msgspec.structs.asdict(rt).keys() == msgspec.structs.asdict(msg).keys()
+    assert msgspec.structs.asdict(rt) == msgspec.structs.asdict(msg)
 
 
 def test_every_message_tag_is_the_class_name():
@@ -260,27 +184,20 @@ def test_every_message_tag_is_the_class_name():
 def test_batch_token_id_out_field_values_roundtrip():
     rt = _roundtrip(_batch_token_id_out())
     assert rt.rids == ["a", "b"]
-    assert rt.finished_reasons == [None, {"type": "stop", "matched": 7}]
+    assert rt.finished_reasons == ["", "stop"]
+    assert rt.finish_reason_details == [None, {"type": "stop", "matched": 7}]
     assert rt.output_ids == [[1, 2], [3]]
     assert rt.output_token_logprobs_val[0] == [
         pytest.approx(-0.5),
         pytest.approx(-0.25),
     ]
-    assert rt.output_extra_infos == [{"decode_prefix_len": 4}, {}]
-    assert rt.generated_time == pytest.approx(12.5)
 
 
 def test_accept_draft_tokens_none_mid_stream_roundtrips():
     # Speculative decoding reports acceptance only when a request finishes;
     # mid-stream entries are None and must survive the typed wire.
-    rt = _roundtrip(_batch_token_id_out(batch_accept_draft_tokens=[None, 2.5]))
-    assert rt.batch_accept_draft_tokens == [None, pytest.approx(2.5)]
-
-
-def test_pickle_wrapper_roundtrip():
-    rt = _roundtrip(PickleWrapper.wrap({"a": (1, 2)}))
-    assert rt.unwrap() == {"a": (1, 2)}
-    assert PickleWrapper.wrap(None) is None
+    rt = _roundtrip(_batch_token_id_out(accept_draft_tokens=[None, 2.5]))
+    assert rt.accept_draft_tokens == [None, pytest.approx(2.5)]
 
 
 def test_session_params_nested():
@@ -300,7 +217,7 @@ def test_opaque_object_is_rejected_loudly():
         pass
 
     req = SetInternalStateReq(server_args={"bad": Opaque()})
-    with pytest.raises(TypeError, match="PickleWrapper"):
+    with pytest.raises(TypeError, match="Cannot msgpack-encode"):
         MsgpackEncoder().encode(req)
 
 
@@ -353,7 +270,7 @@ def test_large_tensor_rides_out_of_band_aux_frame():
     assert shape == [4, 256]
     assert data == 1  # one-based aux frame index (frame 0 = primary buffer)
 
-    rt = MsgpackDecoder(ipc_message_union()).decode(frames)
+    rt = MsgpackDecoder(TokenizedGenerateReqInput).decode(frames)
     item = rt.multimodal_inputs.mm_items[0]
     assert item.feature.dtype == torch.bfloat16
     assert torch.equal(item.feature, feature)
@@ -475,92 +392,17 @@ def test_sampling_params_dict_construction_accepts_n():
 
 
 # --------------------------------------------------------------------------
-# Socket wrappers + pickle fallback flag
+# EPD: an encode server's request
 # --------------------------------------------------------------------------
 
 
-class _LoopbackSocket:
-    """Minimal in-memory socket honoring the multipart + pyobj surfaces."""
-
-    def __init__(self):
-        self.queue = []
-        self.pickled = 0
-
-    def send(self, data, flags=0):
-        self.queue.append(bytes(data))
-
-    def send_multipart(self, frames, flags=0, copy=True):
-        self.queue.append([bytes(f) for f in frames])
-
-    def recv_multipart(self, flags=0):
-        if not self.queue:
-            raise zmq.Again()
-        return self.queue.pop(0)
-
-    def send_pyobj(self, obj, flags=0):
-        import pickle
-
-        self.pickled += 1
-        self.queue.append(pickle.dumps(obj))
-
-    def recv_pyobj(self, flags=0):
-        import pickle
-
-        self.pickled += 1
-        return pickle.loads(self.queue.pop(0))
-
-    def close(self, linger=None):
-        pass
-
-
-def test_ipc_sender_receiver_msgpack_loopback():
-    sock = _LoopbackSocket()
-    sender, receiver = IpcSender(sock), IpcReceiver(sock)
-    sender.send_pyobj(AbortReq(rid="z"))
-    rt = receiver.recv_pyobj()
-    assert isinstance(rt, AbortReq) and rt.rid == "z"
-    assert sock.pickled == 0
-    with pytest.raises(zmq.Again):
-        receiver.recv_pyobj(zmq.NOBLOCK)
-
-
-def test_ipc_wrappers_pickle_fallback_flag(monkeypatch):
-    monkeypatch.setattr(io_struct, "USE_PICKLE_IPC", True)
-    sock = _LoopbackSocket()
-    IpcSender(sock).send_pyobj(AbortReq(rid="p"))
-    rt = IpcReceiver(sock).recv_pyobj()
-    assert isinstance(rt, AbortReq) and rt.rid == "p"
-    assert sock.pickled == 2
-
-
-def test_encode_request_joins_the_tagged_union():
-    # Defined in the EPD module, registered by subclassing BaseReq; a decoder
-    # built after the import must accept it over the shared channel.
+def test_encode_request_roundtrips_with_its_feature_out_of_band():
+    # The struct an EPD frontend pushes to an encode server's ranks, with a
+    # feature tensor large enough to ride an out-of-band aux frame.
     from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 
+    feature = torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128)
     req = EncodeRequest(
-        request_id="e1",
-        bootstrap_host="h",
-        bootstrap_port=1,
-        bootstrap_room=2,
-        items=[
-            MultimodalDataItem(
-                modality=Modality.IMAGE, hash=5, feature=torch.ones(2, 2)
-            )
-        ],
-    )
-    rt = _roundtrip(req)
-    assert type(rt) is EncodeRequest
-    assert rt.request_id == "e1"
-    assert torch.equal(rt.items[0].feature, torch.ones(2, 2))
-
-
-def _gateway_encode_request():
-    """The real struct crossing the gateway->encode ZMQ hop, with a feature
-    tensor large enough to exercise the out-of-band aux-frame path."""
-    from tokenspeed.runtime.epd.encode_worker import EncodeRequest
-
-    return EncodeRequest(
         request_id="e2",
         bootstrap_host="h",
         bootstrap_port=7,
@@ -571,27 +413,13 @@ def _gateway_encode_request():
                 hash=9,
                 pad_value=3,
                 offsets=[(0, 4)],
-                feature=torch.arange(128 * 128, dtype=torch.float32).reshape(128, 128),
+                feature=feature,
             )
         ],
     )
-
-
-def test_prepickled_send_transcodes_onto_the_msgpack_wire():
-    # Gateway->encode hop regression: the encode servicer serializes the
-    # EncodeRequest off-thread (pickle) and pushes the raw bytes via ``send``,
-    # while the encode loop decodes with the tagged-union msgpack decoder.
-    # Without transcoding, pickle's PROTO byte (0x80) reads as a msgpack map
-    # and the receiver dies with "Expected `array`, got `object`".
-    import pickle
-
-    from tokenspeed.runtime.epd.encode_worker import EncodeRequest
-
-    req = _gateway_encode_request()
-    sock = _LoopbackSocket()
-    IpcSender(sock).send(pickle.dumps(req, protocol=pickle.DEFAULT_PROTOCOL))
-    rt = IpcReceiver(sock).recv_pyobj()
-    assert type(rt) is EncodeRequest
+    frames = MsgpackEncoder().encode(req)
+    assert len(frames) == 2
+    rt = MsgpackDecoder(EncodeRequest).decode(frames)
     assert (rt.request_id, rt.bootstrap_host, rt.bootstrap_port, rt.bootstrap_room) == (
         "e2",
         "h",
@@ -601,18 +429,4 @@ def test_prepickled_send_transcodes_onto_the_msgpack_wire():
     item = rt.items[0]
     assert item.modality == Modality.IMAGE
     assert (item.hash, item.pad_value, item.offsets) == (9, 3, [(0, 4)])
-    assert torch.equal(item.feature, req.items[0].feature)
-    assert sock.pickled == 0  # the wire itself stayed msgpack
-
-
-def test_prepickled_send_passes_through_under_pickle_flag(monkeypatch):
-    import pickle
-
-    from tokenspeed.runtime.epd.encode_worker import EncodeRequest
-
-    monkeypatch.setattr(io_struct, "USE_PICKLE_IPC", True)
-    req = _gateway_encode_request()
-    sock = _LoopbackSocket()
-    IpcSender(sock).send(pickle.dumps(req, protocol=pickle.DEFAULT_PROTOCOL))
-    rt = IpcReceiver(sock).recv_pyobj()
-    assert type(rt) is EncodeRequest and rt.bootstrap_room == 11
+    assert torch.equal(item.feature, feature)

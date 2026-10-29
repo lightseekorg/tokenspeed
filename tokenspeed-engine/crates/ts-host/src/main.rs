@@ -57,7 +57,7 @@ use ts_control::{
     control::ControlConfig,
     eplb::{Algorithm, Controller, EplbConfig, EplbSpecs, COMMIT_DELAY_FORWARDS},
     event_loop::{EventLoop, LoopConfig, LoopError, Ranks, Subsystems},
-    grammar::{GrammarConfig, Grammars},
+    grammar::{GrammarConfig, Grammars, ReasoningGrammar},
     ingress::{IngressLimits, LogprobServability},
     kv_events::{KvEventPublisher, KvEventsConfig},
     output::{FinishLog, OutputProcessor, Role},
@@ -182,7 +182,7 @@ struct HostConfig {
     eplb: Option<Eplb>,
     /// An EPD prefill node: it receives image embeddings from encode
     /// workers.
-    epd_prefill: bool,
+    epd_receive_enabled: bool,
     /// Grammar-constrained decoding's settings, if it is on.
     grammar: Option<GrammarConfig>,
     /// The data plane fills bitmasks from the matchers' committed state.
@@ -232,6 +232,24 @@ impl Eplb {
             ep_ranks: (ep_ranks.len() > 1).then_some(ep_ranks),
         }))
     }
+}
+
+/// The grammar settings' `reasoning` (`rust_host.GrammarSettings`), if
+/// grammars are on and it is set.
+fn reasoning_grammar(grammar: &Bound<'_, PyAny>) -> PyResult<Option<ReasoningGrammar>> {
+    if grammar.is_none() {
+        return Ok(None);
+    }
+    let reasoning = grammar.getattr("reasoning")?;
+    if reasoning.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(ReasoningGrammar {
+        continues: reasoning.getattr("continues")?.extract()?,
+        may_open: reasoning.getattr("may_open")?.extract()?,
+        schema_slot: reasoning.getattr("schema_slot")?.extract()?,
+        markers: reasoning.getattr("markers")?.extract()?,
+    }))
 }
 
 /// Which metrics this rank exports, and where (`rust_host.HostConfig`'s
@@ -337,6 +355,7 @@ impl HostConfig {
                 requires_bootstrap,
                 multimodal: config.getattr("multimodal")?.extract()?,
                 grammar: !config.getattr("grammar")?.is_none(),
+                reasoning: reasoning_grammar(&config.getattr("grammar")?)?,
                 logprobs: {
                     let servability = config.getattr("logprob_servability")?;
                     LogprobServability {
@@ -371,7 +390,7 @@ impl HostConfig {
             },
             l3,
             eplb: Eplb::from_python(&config.getattr("eplb")?)?,
-            epd_prefill: config.getattr("epd_prefill")?.extract()?,
+            epd_receive_enabled: config.getattr("epd_receive_enabled")?.extract()?,
             grammar: {
                 let grammar = config.getattr("grammar")?;
                 if grammar.is_none() {
@@ -548,7 +567,8 @@ fn serve(args: &Args) -> Result<(), HostError> {
 
     // The replica's first member speaks for it.
     let transport = if ranks.replica.index() == 0 {
-        let ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+        let mut ready: EngineCoreReadyResponse = ts_wire::decode_bytes(&config.ready_response)?;
+        ready.declare_scheduler();
         Some(EngineTransport::connect(
             &config.handshake_address,
             config.engine_index,
@@ -597,7 +617,7 @@ fn serve(args: &Args) -> Result<(), HostError> {
         controls: config.controls.clone(),
         batch_log: config.batch_log.clone(),
         kv_events: config.kv_events,
-        epd_prefill: config.epd_prefill,
+        epd_receive_enabled: config.epd_receive_enabled,
         eager_grammar: config.eager_grammar,
     };
     tracing::info!(

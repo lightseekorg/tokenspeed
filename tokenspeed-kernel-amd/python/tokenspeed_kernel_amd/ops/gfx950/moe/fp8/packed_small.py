@@ -27,7 +27,7 @@ All schedules share N16/K32 weights, the K256 pipeline and BF16 route outputs.
 
 from __future__ import annotations
 
-from tokenspeed_kernel_amd._triton import gl, gluon
+from tokenspeed_kernel_amd._triton import gl, gluon, tl
 from tokenspeed_kernel_amd.ops.gfx950.moe.fp8.intermediate_quant import (
     quantize_intermediate_tile,
 )
@@ -238,7 +238,7 @@ def gluon_fp8_packed_small_stage1_gfx950(
     inter_ptr,
     inter_scale_ptr,
     sorted_ids_ptr,
-    sorted_experts_ptr,
+    sorted_experts_ptr: tl.const,
     num_valid_ptr,
     num_tokens,
     em,
@@ -685,7 +685,7 @@ def gluon_fp8_packed_small_stage2_gfx950(
     w_scale_ptr,
     out_ptr,
     sorted_ids_ptr,
-    sorted_experts_ptr,
+    sorted_experts_ptr: tl.const,
     sorted_weights_ptr,
     num_valid_ptr,
     num_tokens,

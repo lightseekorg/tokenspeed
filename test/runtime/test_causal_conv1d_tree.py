@@ -22,6 +22,7 @@
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.attention.gdn.triton import fused_qkv_split_gdn_prefill
 from tokenspeed_kernel.ops.conv import (
     PAD_SLOT_ID,
     causal_conv1d_update,
@@ -299,6 +300,132 @@ def test_decode_update_compiles_once_across_batch_sizes():
         )
         assert torch.equal(out[-1:], alone)
         assert torch.equal(conv_state[bs], alone_state[bs])
+
+    run(5)
+    with patch.object(
+        _causal_conv1d_update_kernel,
+        "_do_compile",
+        wraps=_causal_conv1d_update_kernel._do_compile,
+    ) as compiles:
+        for bs in (1, 16, 17, 32, 63):
+            run(bs)
+    assert compiles.call_count == 0
+
+
+@pytest.mark.parametrize("width", [1, 3, 4, 16])
+@pytest.mark.parametrize("batch", [1, 7, 300])
+def test_chain_update_writes_the_split_payload(batch, width):
+    """The chain update writes bitwise the in-place output and the split's payload."""
+    torch.manual_seed(batch * 17 + width)
+    # One TP4 rank of Qwen3.8-27B: [q | k | v | z | b | a] projection rows.
+    heads, head_dim, key = 12, 128, 512
+    value = heads * head_dim
+    dim = 2 * key + value
+    rows = batch * width
+    projection = torch.randn(
+        rows, dim + value + 2 * heads, device="cuda", dtype=torch.bfloat16
+    )
+    original = projection.clone()
+    weight = torch.randn(dim, 4, device="cuda", dtype=torch.bfloat16)
+    conv_state = torch.randn(
+        1 + batch * (width + 1), dim, 3, device="cuda", dtype=torch.bfloat16
+    )
+    base = torch.arange(batch, device="cuda", dtype=torch.int32) * (width + 1) + 1
+    out_rows = base[:, None] + 1 + torch.arange(width, device="cuda").int()
+
+    def views(source):
+        x = source[:, :dim]
+        b = source[:, dim + value : dim + value + heads]
+        a = source[:, dim + value + heads :]
+        return x, a, b
+
+    def update(x, state, **outputs):
+        return causal_conv1d_update(
+            x.view(batch, width, dim).transpose(1, 2),
+            state,
+            weight,
+            None,
+            activation="silu",
+            conv_state_indices=base,
+            output_state_indices=out_rows,
+            parent_indices=None,
+            **outputs,
+        )
+
+    # The in-place update and the split, as a step-form verify runs them.
+    in_place = projection.clone()
+    expected_x, expected_a, expected_b = views(in_place)
+    expected_state = conv_state.clone()
+    update(expected_x, expected_state)
+    expected_payload = torch.empty(
+        rows, dim - key + 2 * heads, device="cuda", dtype=torch.bfloat16
+    )
+    fused_qkv_split_gdn_prefill(
+        expected_x,
+        num_q_heads=key // head_dim,
+        num_k_heads=key // head_dim,
+        num_v_heads=heads,
+        head_q=head_dim,
+        head_k=head_dim,
+        head_v=head_dim,
+        replay=(expected_payload, expected_a, expected_b),
+    )
+
+    x, a, b = views(projection)
+    state = conv_state.clone()
+    out = torch.full((rows, dim), float("nan"), device="cuda", dtype=torch.bfloat16)
+    payload = torch.full_like(expected_payload, float("nan"))
+    update(
+        x,
+        state,
+        out=out.view(batch, width, dim).transpose(1, 2),
+        replay_payload=(payload, a, b),
+    )
+    assert torch.equal(out, expected_x)
+    assert torch.equal(payload, expected_payload)
+    assert torch.equal(state, expected_state)
+    assert torch.equal(projection, original)
+
+
+def test_chain_update_with_payload_compiles_once_across_batch_sizes():
+    """The payload-writing chain update compiles once per window width, never per batch size."""
+    from unittest.mock import patch
+
+    from tokenspeed_kernel.ops.conv.triton import _causal_conv1d_update_kernel
+
+    torch.manual_seed(1)
+    heads, dim, width = 4, 256, 3
+    projection = torch.randn(
+        64 * width, dim + 2 * heads + 8, device="cuda", dtype=torch.bfloat16
+    )
+    weight = torch.randn(dim, 4, device="cuda", dtype=torch.bfloat16)
+    conv_state = torch.randn(1 + 64, dim, 3, device="cuda", dtype=torch.bfloat16)
+    payload = torch.empty(
+        64 * width, 192 + 2 * heads, device="cuda", dtype=torch.bfloat16
+    )
+
+    def run(bs):
+        rows = bs * width
+        x = projection[:rows, :dim].view(bs, width, dim).transpose(1, 2)
+        causal_conv1d_update(
+            x,
+            conv_state,
+            weight,
+            None,
+            activation="silu",
+            conv_state_indices=torch.arange(
+                1, bs + 1, dtype=torch.int32, device="cuda"
+            ),
+            parent_indices=None,
+            out=torch.empty_like(projection[:rows, :dim])
+            .view(bs, width, dim)
+            .transpose(1, 2),
+            replay_payload=(
+                payload[:rows],
+                projection[:rows, dim : dim + heads],
+                projection[:rows, dim + heads : dim + 2 * heads],
+            ),
+        )
 
     run(5)
     with patch.object(

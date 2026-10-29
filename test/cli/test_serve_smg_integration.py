@@ -18,11 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Integration: orchestrator + real ``smg launch`` + fake_engine."""
+"""Integration: orchestrator + real ``smg launch`` + the fake ZMQ engine."""
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import signal
 import socket
@@ -33,7 +34,7 @@ import time
 import pytest
 
 pytest.importorskip("smg")
-pytest.importorskip("smg_grpc_proto")
+pytest.importorskip("zmq")
 import aiohttp  # noqa: E402,F401
 
 
@@ -58,8 +59,26 @@ def _wait_http_200(url: str, deadline: float) -> bool:
     return False
 
 
-def test_orchestrator_runs_against_fake_engine():
+# What ``ts serve`` reads before it starts the engine: the engine's parallel
+# layout, resolved from the checkpoint config.
+_LLAMA_CONFIG = {
+    "model_type": "llama",
+    "architectures": ["LlamaForCausalLM"],
+    "dtype": "bfloat16",
+    "vocab_size": 32000,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "num_hidden_layers": 2,
+    "num_attention_heads": 4,
+    "num_key_value_heads": 2,
+    "head_dim": 16,
+    "max_position_embeddings": 512,
+}
+
+
+def test_orchestrator_runs_against_fake_engine(tmp_path):
     user_port = _free_port()
+    (tmp_path / "config.json").write_text(json.dumps(_LLAMA_CONFIG))
 
     env = os.environ.copy()
     env["TS_SERVE_ENGINE_MODULE"] = "test.cli._fixtures.fake_engine"
@@ -73,7 +92,7 @@ def test_orchestrator_runs_against_fake_engine():
             "tokenspeed.cli",
             "serve",
             "--model",
-            "/fake",
+            str(tmp_path),
             "--host",
             "127.0.0.1",
             "--port",
@@ -84,10 +103,9 @@ def test_orchestrator_runs_against_fake_engine():
             "30",
             "--drain-timeout",
             "5",
-            # The fake engine serves a placeholder model id (/fake) with no real
-            # tokenizer and no GetTokenizer RPC. Newer smg gates gateway
-            # readiness on tokenizer registration, so skip autoload here — this
-            # test exercises orchestration/teardown, not tokenizer loading.
+            # The model has no tokenizer. Newer smg gates gateway readiness
+            # on tokenizer registration, so skip autoload here — this test
+            # exercises orchestration/teardown, not tokenizer loading.
             "--disable-tokenizer-autoload",
         ],
         env=env,

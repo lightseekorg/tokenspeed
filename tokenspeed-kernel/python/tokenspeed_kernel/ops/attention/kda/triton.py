@@ -584,6 +584,7 @@ def triton_nvidia_kda_batched_replay_commit(
     lower_bound: float | None,
     record_metadata: torch.Tensor,
     record_stamps: torch.Tensor,
+    state_dtype: torch.dtype,
 ) -> None:
     """Recover every KDA layer from FP32 U and saved K/raw-gate records.
 
@@ -605,6 +606,10 @@ def triton_nvidia_kda_batched_replay_commit(
         state_stride: Page stride of the recurrent state.
         conv_width: Width of the depthwise convolution kernel.
         lower_bound: Bound used to transform saved raw gates during commit.
+        record_metadata: Per-request RecoverSSM record metadata.
+        record_stamps: Per-layer RecoverSSM record stamps.
+        state_dtype: Element type of every described recurrent-state pool
+            (FP32 or BF16); the replay itself accumulates in FP32.
 
     Returns:
         None.
@@ -633,6 +638,7 @@ def triton_nvidia_kda_batched_replay_commit(
         record_metadata=record_metadata,
         record_stamps=record_stamps,
         lower_bound=lower_bound,
+        state_dtype=state_dtype,
     )
 
 

@@ -18,42 +18,62 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""GDN chain verification selects chunking only within its supported geometry."""
+"""GDN chain verification picks its form within the measured geometry."""
 
 import os
 import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 from tokenspeed_kernel.ops.attention import gdn
+from tokenspeed_kernel.ops.attention.gdn import GdnChainVerifyForm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=1, suite="runtime-1gpu")
 
+STEP, TREE, CHAIN = (
+    GdnChainVerifyForm.STEP,
+    GdnChainVerifyForm.TREE,
+    GdnChainVerifyForm.CHAIN,
+)
+
 
 @pytest.mark.parametrize("is_blackwell", [False, True])
 @pytest.mark.parametrize(
-    "num_tokens,num_states,in_chunked_range",
+    "num_tokens,num_states,state_dtype,chain_form,form",
     [
-        (3, 8, False),
-        (12, 24, False),
-        (13, 23, False),
-        (13, 24, True),
-        (16, 24, True),
-        (17, 24, False),
+        # bf16 state where the caller runs the chain form: 2 to 16 tokens.
+        (1, 12, torch.bfloat16, True, STEP),
+        (2, 12, torch.bfloat16, True, CHAIN),
+        (4, 6144, torch.bfloat16, True, CHAIN),
+        (13, 24, torch.bfloat16, True, CHAIN),
+        (16, 384, torch.bfloat16, True, CHAIN),
+        (17, 6144, torch.bfloat16, True, STEP),
+        # Without the chain form (or with fp32 state) the tree form keeps its range.
+        (3, 6144, torch.bfloat16, False, STEP),
+        (12, 24, torch.bfloat16, False, STEP),
+        (13, 23, torch.bfloat16, False, STEP),
+        (13, 24, torch.bfloat16, False, TREE),
+        (16, 6144, torch.bfloat16, False, TREE),
+        (3, 6144, torch.float16, True, STEP),
+        (3, 6144, torch.float32, True, STEP),
+        (13, 24, torch.float32, True, TREE),
+        (17, 24, torch.float32, True, STEP),
     ],
 )
 def test_gdn_chain_verify_policy(
-    monkeypatch, is_blackwell, num_tokens, num_states, in_chunked_range
+    monkeypatch, is_blackwell, num_tokens, num_states, state_dtype, chain_form, form
 ):
     monkeypatch.setattr(
         gdn, "current_platform", lambda: SimpleNamespace(is_blackwell=is_blackwell)
     )
-    assert gdn.gdn_chain_verify_is_chunked(num_tokens, num_states) == (
-        is_blackwell and in_chunked_range
+    picked = gdn.gdn_chain_verify_form(
+        num_tokens, num_states, state_dtype, chain_form=chain_form
     )
+    assert picked is (form if is_blackwell else STEP)
 
 
 if __name__ == "__main__":

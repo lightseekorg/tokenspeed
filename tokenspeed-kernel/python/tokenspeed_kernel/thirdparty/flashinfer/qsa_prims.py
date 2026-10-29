@@ -166,6 +166,7 @@ class _PrimTSQSARunner:
         positions = torch.zeros(
             rows, dtype=metadata.query_positions.dtype, device=self._device
         )
+        seq_lens = torch.ones(rows, dtype=torch.int32, device=self._device)
         # Keep scratch plans and their workspace out of serving/graph state.
         scratch_runner = _PrimTSQSARunner(self._device)
         scratch_workspace = QSAWorkspace()
@@ -180,6 +181,7 @@ class _PrimTSQSARunner:
                     metadata.page_size,
                     metadata.block_size,
                     scratch_workspace,
+                    seq_lens=seq_lens[:routes],
                 )
                 scratch_runner._run(
                     scratch_q[:routes],

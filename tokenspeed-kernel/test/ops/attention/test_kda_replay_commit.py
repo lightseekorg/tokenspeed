@@ -214,6 +214,7 @@ def _records_commit(xs, groups, reads, writes, accepted, t, *, corrupt=False):
             lower_bound=LOWER_BOUND,
             record_metadata=x["metadata"],
             record_stamps=stamps,
+            state_dtype=x["h_pool"].dtype,
         )
 
     commit()
@@ -545,6 +546,45 @@ def test_gluon_batched_replay_uneven_groups_match_per_layer_launches(t, graph):
             torch.testing.assert_close(
                 actual["key_gate"], projected["key_gate"], atol=0, rtol=0
             )
+
+
+@pytest.mark.skipif(
+    resolve_kda_batched_replay_commit(num_heads=12, head_dim=K) is None,
+    reason="no batched KDA replay kernel on this platform",
+)
+def test_batched_replay_bf16_state_rounds_the_fp32_replay_once():
+    """A BF16 pool verifies and replays in FP32 and is rounded once on store.
+
+    The load dtype can change the kernels' reduction order, so states agree
+    with the FP32-pool run to within one BF16 ulp, plus FP32 rounding noise
+    for values near zero, rather than bit for bit.
+    """
+    layers, n, t, pages, num_heads = 3, 2, 4, 10, 12
+    source = [
+        _window(n, t, pages=pages, seed=800 + layer, num_heads=num_heads)
+        for layer in range(layers)
+    ]
+    for layer in source:
+        # Start from values a BF16 pool holds exactly.
+        layer["h_pool"] = layer["h_pool"].to(torch.bfloat16).float()
+    fp32 = [{name: value.clone() for name, value in x.items()} for x in source]
+    bf16 = [{name: value.clone() for name, value in x.items()} for x in source]
+    for layer in bf16:
+        layer["h_pool"] = layer["h_pool"].to(torch.bfloat16)
+    reads = torch.tensor([[1, 2]], device=DEV, dtype=torch.int32)
+    writes = torch.tensor([[5, 6]], device=DEV, dtype=torch.int32)
+    accepted = torch.tensor([1, t], device=DEV, dtype=torch.int32)
+
+    for xs in (fp32, bf16):
+        _records_commit(xs, [0] * layers, reads, writes, accepted, t)
+
+    for wide, narrow in zip(fp32, bf16, strict=True):
+        torch.testing.assert_close(
+            narrow["conv_pool"], wide["conv_pool"], atol=0.0, rtol=0.0
+        )
+        torch.testing.assert_close(
+            narrow["h_pool"], wide["h_pool"].to(torch.bfloat16), atol=1e-6, rtol=2**-7
+        )
 
 
 @pytest.mark.parametrize(

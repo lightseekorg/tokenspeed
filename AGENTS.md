@@ -213,6 +213,29 @@ Inside the root `tokenspeed-kernel/` directory:
   Triton compilation after startup and names a parameter that keeps taking
   new values. CI serves with `TOKENSPEED_JIT_COMPILE_CHECK=error`, so such a
   parameter fails the model tests.
+* Integer offsets into global memory must not overflow int32. Compute in
+  int64 every offset whose bound grows with a runtime count: a token,
+  request, page, slot, or expert index times a stride, or a product of sizes
+  such as `num_tokens * vocab_size`. Cast a factor before multiplying
+  (`pid.to(tl.int64) * stride`, `Int64(page) * stride`); casting the product
+  is too late. Byte and bit counts reach 2^31 sooner than element counts.
+  Do not rely on argument types: Triton passes an integer argument as i32
+  while its value fits, so the product of two fitting values still wraps;
+  `tl.program_id`, `tl.arange`, CuTe DSL `Int32` values, and layout sizes
+  such as `cute.cosize` are 32-bit as well. Offsets bounded by model
+  dimensions, such as those inside a tile or row, stay int32: advance the
+  base pointer once per program in int64, then add int32 tile offsets. This
+  keeps 64-bit integer math out of inner loops and matches AMD buffer loads,
+  which take 32-bit offsets from a 64-bit base. A kernel that keeps a
+  runtime-scaled offset in int32 for speed must assert the bound on the host
+  where the tensor is sized, with a comment saying why. Kernels indexed by
+  runtime counts should have a test whose largest offset exceeds 2^31 in the
+  unit the kernel computes, touching only the far end (such as the last
+  pages of a large pool) to stay cheap. Reviews should check every new or
+  changed offset computation for this. To debug an illegal memory access in
+  a Triton or Gluon kernel, rerun it with `TRITON_DEBUG=1`, which asserts on
+  int32 overflow in `+`, `-`, and `*`. This rule applies to every kernel
+  package in the repository, including `tokenspeed-mla/`.
 
 ## tokenspeed-kernel-amd
 
@@ -222,8 +245,8 @@ Inside the root `tokenspeed-kernel-amd/` directory:
 * Add JIT `launch_metadata` for Proton use alongside the Triton/Gluon kernels.
 * AMD Gluon kernel tests should live in `tokenspeed-kernel/test/amd/` to reuse
   common platform utilities and reference computations.
-* The compile-time parameter rule in the `tokenspeed-kernel` section applies
-  to these kernels too.
+* The compile-time parameter rule and the int32 offset overflow rule in the
+  `tokenspeed-kernel` section apply to these kernels too.
 * Put per-kernel contract and algorithm details in
   `python/tokenspeed_kernel_amd/ops/README.md`.
 * For Triton/Gluon kernels, one name should thread the whole stack: the

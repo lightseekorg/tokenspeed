@@ -77,15 +77,21 @@ QUALITY_CHECKS = [
 
 
 def _wait_for_server(proc: subprocess.Popen, port: int, timeout: int) -> bool:
-    url = f"http://127.0.0.1:{port}/v1/models"
+    base = f"http://127.0.0.1:{port}"
     deadline = time.time() + timeout
     while time.time() < deadline:
         if proc.poll() is not None:
             return False
         try:
-            resp = requests.get(url, timeout=5)
-            # Require a real model list so a port squatter cannot fake readiness.
-            if resp.status_code == 200 and "data" in resp.json():
+            # Ready once every engine registered with the gateway; require a
+            # real model list too, so a port squatter cannot fake readiness.
+            ready = requests.get(f"{base}/readiness", timeout=5)
+            models = requests.get(f"{base}/v1/models", timeout=5)
+            if (
+                ready.status_code == 200
+                and models.status_code == 200
+                and "data" in models.json()
+            ):
                 return True
         except Exception:
             pass

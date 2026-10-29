@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 import yaml
-from pipeline import is_amd_runner, is_npu_runner, is_nvidia_arm_runner, load_yaml
+from pipeline import is_amd_runner, is_npu_runner, is_nvidia_arm_runner, normalize_task
 
 RUNNER_GROUPS = (
     "amd-mi350",
@@ -27,6 +27,11 @@ RUNNER_GROUP_VENDORS = {
     "nvidia-gb300-slurm": "nvidia",
     "nvidia-x86": "nvidia",
 }
+
+AMD_ARCH_RUNNER_GROUPS = {"gfx950": "amd-mi350", "gfx1250": "amd-mi450"}
+AMD_KERNEL_OPS = "tokenspeed-kernel-amd/python/tokenspeed_kernel_amd/ops"
+AMD_KERNEL_TESTS = "tokenspeed-kernel/test/amd"
+AMD_BENCHMARKS = "tokenspeed-kernel/benchmarks/amd"
 
 SHARED_DIRECTORIES = (
     "python",
@@ -57,11 +62,6 @@ VENDOR_PATHS = {
         "test/ci_system/install_deps_rocm.sh",
         "test/ci_system/install_kernel_benchmark_rocm.sh",
         "test/ci_system/kernel_benchmark_ci.py",
-        "test/ci_system/mi450_rocjitsu_worker_python.sh",
-        "test/ci_system/mi450_sim_report_digest.py",
-        "test/ci_system/run_mi450_rocjitsu.sh",
-        "test/ci_system/run_mi450_rocjitsu_parallel.sh",
-        "test/ci_system/setup_mi450_sim.sh",
         "tokenspeed-kernel-amd",
         "tokenspeed-kernel/benchmarks/amd",
         "tokenspeed-kernel/python/requirements/rocm.txt",
@@ -90,6 +90,17 @@ VENDOR_PATHS = {
 # Paths used by only some runner groups' workflows. DeepSWE runs only from its
 # manual B300 workflow, so it requires no per-commit group.
 RUNNER_GROUP_PATHS = {
+    **{
+        f"test/ci_system/{name}": frozenset({"amd-mi450"})
+        for name in (
+            "mi450_rocjitsu_worker_python.sh",
+            "mi450_sim_env.sh",
+            "mi450_sim_report_digest.py",
+            "run_mi450_rocjitsu.sh",
+            "run_mi450_rocjitsu_parallel.sh",
+            "setup_mi450_sim.sh",
+        )
+    },
     "test/ci/deepswe": frozenset(),
     "test/ci/run_slurm.sh": frozenset({"nvidia-gb200-slurm", "nvidia-gb300-slurm"}),
     "test/ci_system/slurm_submit.py": frozenset(
@@ -231,6 +242,20 @@ def path_vendor(path: str, repo_root: Path) -> str | None:
     return None
 
 
+def amd_arch_runner_group(path: str) -> str | None:
+    """Recognize explicit architecture ownership; unknown AMD paths stay shared."""
+    for arch, group in AMD_ARCH_RUNNER_GROUPS.items():
+        if is_in_directory(path, f"{AMD_KERNEL_OPS}/{arch}"):
+            return group
+        if is_in_directory(path, f"{AMD_BENCHMARKS}/{arch}") or path == (
+            f"{AMD_BENCHMARKS}/{arch}.json"
+        ):
+            return group
+        if is_in_directory(path, f"{AMD_KERNEL_TESTS}/{arch}"):
+            return group
+    return None
+
+
 def runner_label_in_group(label: str, runner_group: str) -> bool:
     """Whether ``runner_group``'s workflow schedules tasks on ``label``.
 
@@ -258,41 +283,40 @@ def runner_label_in_group(label: str, runner_group: str) -> bool:
     raise ValueError(f"unsupported runner group: {runner_group!r}")
 
 
-def task_runner_labels(path: str, repo_root: Path) -> list[str] | None:
-    """Return the runner labels of a checked-out CI task YAML.
+def task_config(path: str, repo_root: Path) -> dict | None:
+    """Read a task using the same validation as matrix construction.
 
-    Returns ``None`` for anything that is not a readable task declaration,
-    including deleted files, so the caller falls back to the shared rule.
+    Missing or invalid definitions keep conservative coverage. Matrix
+    construction reports any invalid definitions still in the checkout.
     """
     if not is_in_directory(path, TASK_DIRECTORY) or not path.endswith(".yaml"):
         return None
     try:
-        data = load_yaml(repo_root / path)
-    except (FileNotFoundError, IsADirectoryError, ValueError, yaml.YAMLError):
+        return normalize_task(repo_root / path, repo_root)
+    except (OSError, ValueError, yaml.YAMLError):
         return None
-    runner = data.get("runner")
-    labels = runner.get("labels") if isinstance(runner, dict) else None
-    if (
-        not isinstance(labels, list)
-        or not labels
-        or not all(isinstance(label, str) and label for label in labels)
-    ):
-        return None
-    return labels
 
 
 def path_requires_group(path: str, runner_group: str, repo_root: Path) -> bool:
     if path.endswith(DOCUMENTATION_SUFFIXES):
         return False
+    arch_group = amd_arch_runner_group(path)
+    if arch_group is not None:
+        return runner_group == arch_group
     vendor = path_vendor(path, repo_root)
     if vendor is not None:
         return vendor == RUNNER_GROUP_VENDORS[runner_group]
     for group_path, runner_groups in RUNNER_GROUP_PATHS.items():
         if is_in_directory(path, group_path):
             return runner_group in runner_groups
-    labels = task_runner_labels(path, repo_root)
-    if labels is not None:
-        return any(runner_label_in_group(label, runner_group) for label in labels)
+    task = task_config(path, repo_root)
+    if task is not None:
+        if task.get("workflow_stage") == "import-check":
+            return False
+        return any(
+            runner_label_in_group(label, runner_group)
+            for label in task["runner"]["labels"]
+        )
     if path in SHARED_FILES:
         return True
     if any(is_in_directory(path, directory) for directory in SHARED_DIRECTORIES):
@@ -303,9 +327,48 @@ def path_requires_group(path: str, runner_group: str, repo_root: Path) -> bool:
 def should_run(
     paths: set[str], runner_group: str, event_name: str, repo_root: Path
 ) -> bool:
-    if event_name == "workflow_dispatch":
+    # A compare response can be truncated at 300 files. Do not narrow coverage
+    # when the changed-path list might omit a shared file.
+    if event_name in {"workflow_dispatch", "schedule"} or len(paths) >= 300:
         return True
     return any(path_requires_group(path, runner_group, repo_root) for path in paths)
+
+
+def should_run_import_check(
+    paths: set[str], runner_group: str, event_name: str, repo_root: Path
+) -> bool:
+    """Keep adapter imports covered on the other AMD family's software stack."""
+    if runner_group not in AMD_ARCH_RUNNER_GROUPS.values():
+        return False
+    if event_name in {"workflow_dispatch", "schedule"}:
+        return True
+    # Both MI450 tasks consume the shared stack independently.
+    if runner_group == "amd-mi450" and "test/ci_system/mi450_sim_env.sh" in paths:
+        return True
+    for path in paths:
+        if not is_in_directory(path, TASK_DIRECTORY) or not path.endswith(".yaml"):
+            continue
+        task = task_config(path, repo_root)
+        # A deleted or unreadable task might have been an import check.
+        if task is None:
+            if path_requires_group(path, runner_group, repo_root):
+                return True
+            continue
+        if task.get("workflow_stage") == "import-check" and any(
+            runner_label_in_group(label, runner_group)
+            for label in task["runner"]["labels"]
+        ):
+            return True
+    if should_run(paths, runner_group, event_name, repo_root):
+        return False
+    # AMD adapters import implementations for both architectures. Tests, suite
+    # definitions and simulator scripts do not affect those runtime imports.
+    return any(
+        is_in_directory(path, AMD_KERNEL_OPS)
+        and path.endswith(".py")
+        and amd_arch_runner_group(path) is not None
+        for path in paths
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -347,11 +410,15 @@ def main() -> None:
     run_vendor_tests = should_run(
         paths, args.runner_group, args.event_name, args.repo_root
     )
+    run_import_check = should_run_import_check(
+        paths, args.runner_group, args.event_name, args.repo_root
+    )
     install_mla = args.runner_group.startswith("nvidia") and touches_directory(
         paths, "tokenspeed-mla"
     )
 
     print(f"should_run={str(run_vendor_tests).lower()}")
+    print(f"should_run_import_check={str(run_import_check).lower()}")
     print(f"install_tokenspeed_mla_from_source={int(install_mla)}")
 
     if run_vendor_tests:
@@ -362,6 +429,11 @@ def main() -> None:
         for path in sorted(paths):
             if path_requires_group(path, args.runner_group, args.repo_root):
                 print(f"  {path}", file=sys.stderr)
+    elif run_import_check:
+        print(
+            f"Changed paths require only {args.runner_group} adapter import checks.",
+            file=sys.stderr,
+        )
     else:
         print(
             f"Changed paths do not require {args.runner_group} GPU tests.",

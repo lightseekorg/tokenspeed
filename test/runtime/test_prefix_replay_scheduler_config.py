@@ -30,6 +30,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         role="fused",
         num_snapshot_pages=1,
         max_retracted_requests=0,
+        host_write_policy="write_through",
         storage_config=None,
         **kwargs,
     )
@@ -145,6 +146,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         role="fused",
         num_snapshot_pages=1,
         max_retracted_requests=0,
+        host_write_policy="write_through",
         storage_config=(
             StorageRuntimeConfig.from_extra_config(
                 None, host_blocks=7, prefix_granularity=2

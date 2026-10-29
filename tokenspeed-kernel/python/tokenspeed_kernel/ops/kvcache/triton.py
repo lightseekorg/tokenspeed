@@ -780,7 +780,14 @@ def copy_state_rows(
         )
 
 
-@triton.jit(do_not_specialize=["num_rows", "state_width"])
+@triton.jit(
+    do_not_specialize=["num_rows", "state_width"],
+    **(
+        {"do_not_specialize_on_alignment": ["blocks"]}
+        if current_platform().is_npu
+        else {}
+    ),
+)
 def _store_state_rows_kernel(
     states,
     slab,
@@ -857,7 +864,7 @@ def store_state_rows(
         blocks.numel() > 1 and blocks.stride(0) != 1
     ):
         raise ValueError("blocks must be a unit-stride int32/int64 vector")
-    if not states.is_cuda:
+    if states.device.type not in ("cuda", "npu"):
         live = blocks >= 0
         slab.index_copy_(0, blocks[live].to(torch.int64), states[live].to(slab.dtype))
         return
