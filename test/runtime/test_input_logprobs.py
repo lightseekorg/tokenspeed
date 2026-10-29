@@ -232,6 +232,7 @@ def test_prompt_top_k_rides_the_chunk_loop_of_the_prompt_logprobs(chunk_tokens):
                 num_input_rows=5,
                 chunk_tokens=chunk_tokens,
                 rows_per_rank=None,
+                gathered_to_rows=None,
                 top_k=top_k,
             ),
         )
@@ -295,6 +296,7 @@ def test_prompt_rows_and_sampled_rows_take_the_same_top_k_of_the_same_logits():
                 num_input_rows=num_rows,
                 chunk_tokens=2,
                 rows_per_rank=None,
+                gathered_to_rows=None,
                 top_k=k,
             ),
         ),
