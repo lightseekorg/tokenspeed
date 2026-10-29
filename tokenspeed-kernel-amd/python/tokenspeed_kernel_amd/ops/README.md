@@ -146,25 +146,39 @@ recomputes its normalized, gated input in every program.
 ### gfx950 FP32 router GEMV
 
 `gluon_fp32_router_gemv_gfx950` (`gemm/fp32/router_gemv.py`) computes
-`(x @ w.T) * multiplier` in FP32 for router decode batches, `1 <= M <= 16`,
-with one program per output. `gemm.fp32_router_gemv_plan` selects it on
-gfx950 and transposes the router weight once to `[N, K]`.
+`(x @ w.T) * multiplier` in FP32 for router batches, with a GEMV (one program
+per output, `1 <= M <= 16`) or the split-K MFMA GEMM
+`gluon_fp32_router_gemv_splitk_gfx950`. `gemm.fp32_router_gemv_plan` selects
+it on gfx950 and transposes the router weight once to `[N, K]`.
 
 #### Contract
 
 - `x` is a contiguous FP32 `[M, K]` matrix and `w` a contiguous FP32 `[N, K]`
-  matrix. `M > 16` or `K > 16384` takes `torch.addmm` with `multiplier` as
-  alpha.
-- A row's logits are bitwise the same at every `M` the kernel serves.
-- One binary per (shape, multiplier, power-of-two M bucket); `M` is a runtime
-  argument.
+  matrix.
+- The split-K GEMM runs only the `(N, K)` shapes and M buckets in
+  `_PREFERRED_SPLITK_CONFIGS`, where it beat the GEMV or hipBLASLt by at
+  least 4% in cold-weight graph sweeps (Muse Spark's 8192 x 256 router at
+  9-96 rows). Other batches with `M <= 16` and `K <= 16384` run the GEMV; the
+  rest take `torch.addmm` with `multiplier` as alpha.
+- GEMV: a row's logits are bitwise the same at every `M` it serves. Split-K: a
+  row's logits depend only on the M bucket, and repeat calls are bitwise
+  stable.
+- One binary per (shape, multiplier, M bucket): power-of-two buckets up to 16,
+  then one per split-K config. `M` is a runtime argument.
 
 #### Algorithm
 
-A program stages its weight row in LDS with asynchronous `.cg` copies and
+GEMV: a program stages its weight row in LDS with asynchronous `.cg` copies and
 keeps one FP32 FMA partial per row of `x`; one reduction across lanes and
 waves finishes the output. Every weight element is read once for all rows,
 and the summation order depends only on `K`.
+
+Split-K: `SPLIT_K` programs share each `BLOCK_M x BLOCK_N` output tile, and
+each wave of a program owns one contiguous K slice. A wave loads its slice of
+both operands along K into registers, issues every load before the first
+`V_MFMA_F32_16X16X4_F32`, and the waves' tiles are summed. Each program stores
+its partial and bumps the tile's arrival counter; the last to arrive sums the
+partials in split order, scales, writes the tile and resets the counter.
 
 ### gfx950 dense BF16 decode GEMV
 
