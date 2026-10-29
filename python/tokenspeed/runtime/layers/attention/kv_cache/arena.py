@@ -28,6 +28,7 @@ import numpy as np
 import torch
 from tokenspeed_kernel.ops.kvcache import zero_byte_ranges
 from tokenspeed_kernel.ops.kvcache.triton import copy_page_fields, zero_page_fields
+from tokenspeed_kernel.warmup import compile_triton_kernels
 
 from tokenspeed.runtime.layers.attention.kv_cache.offload import SparseKVOffload
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.cache_runtime import (
@@ -448,6 +449,22 @@ class CacheArena:
         for start, ids in zip(spans, arrays, strict=True):
             host[start : start + ids.size] = ids.reshape(-1)
         return staging.to(self.buffer.device, non_blocking=True), spans
+
+    def warmup_block_operations(self) -> None:
+        """Compile block clearing and copying for this arena before serving."""
+        if torch.device(self.device).type != "cuda" or not self.storage_plan.monolithic:
+            return
+        pages = torch.zeros(1, dtype=torch.int32, device=self.device)
+        pairs = torch.tensor([[0, 1]], dtype=torch.int32, device=self.device)
+        with compile_triton_kernels():
+            for page_count, fields, max_field_bytes in self._zero_field_tables.values():
+                zero_page_fields(
+                    self.buffer, pages, fields, max_field_bytes=max_field_bytes
+                )
+                if page_count > 1:
+                    copy_page_fields(
+                        self.buffer, pairs, fields, max_field_bytes=max_field_bytes
+                    )
 
     def zero_blocks(self, block_ids_by_group: Mapping[str, np.ndarray]) -> None:
         """Clear local physical blocks after validating every group's IDs.

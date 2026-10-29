@@ -71,6 +71,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     store_state_rows,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.warmup import compile_triton_kernels
 
 from tokenspeed.runtime.execution.breakable_cuda_graph import (
     scrub_padding_tail,
@@ -632,6 +633,7 @@ class MambaAttnBackend(AttentionBackend):
             return 0
         self._ensure_verify_scratch(max_bs, draft_token_num)
         self._warm_chain_verify(max_bs, draft_token_num)
+        self._warm_verify_commit(draft_token_num)
         total = sum(
             tensor.nbytes
             for layer_scratch in self._verify_scratch.values()
@@ -644,6 +646,26 @@ class MambaAttnBackend(AttentionBackend):
         if self._tree_node_states is not None:
             total += self._tree_node_states.nbytes
         return total
+
+    def _warm_verify_commit(self, width: int) -> None:
+        """Compile post-acceptance kernels that dummy forwards do not reach."""
+        if torch.device(self.device).type != "cuda":
+            return
+        table = torch.zeros((1, 2), dtype=torch.int32, device=self.device)
+        pages = torch.zeros(1, dtype=torch.int32, device=self.device)
+        accepted = torch.ones_like(pages)
+        tables = {group_id: table for group_id in self._state_groups()}
+        reads = {group_id: pages for group_id in self._state_groups()}
+        context = self._verify_commit_ctx
+        try:
+            with compile_triton_kernels():
+                self._verify_state_blocks(
+                    1, tables, pages_out=reads, live_pages_out=reads
+                )
+                self._verify_commit_ctx = (tables, width, reads)
+                self.commit_verified_state(accepted, accepted_path=None)
+        finally:
+            self._verify_commit_ctx = context
 
     def _warm_chain_verify(self, max_bs: int, width: int) -> None:
         """Compile the chain verify's launch tiers up to ``max_bs`` (all-padding launches)."""

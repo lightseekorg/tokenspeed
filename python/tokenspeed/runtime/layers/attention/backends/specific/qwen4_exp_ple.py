@@ -35,6 +35,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     copy_state_rows,
     state_verify_commit_rows,
 )
+from tokenspeed_kernel.warmup import compile_triton_kernels
 
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.execution.query_shard import QueryShardPlan
@@ -341,6 +342,16 @@ class Qwen4ExpPLEBackend(AttentionBackend):
                 device=self.device,
             )
             self._ple_verify_tables = self._build_verify_tables()
+            if torch.device(self.device).type == "cuda":
+                table = torch.zeros((1, 2), dtype=torch.int32, device=self.device)
+                accepted = torch.ones(1, dtype=torch.int32, device=self.device)
+                context = self._verify_commit_ctx
+                try:
+                    with compile_triton_kernels():
+                        self._verify_commit_ctx = (table, 1, draft_token_num)
+                        self.commit_verified_state(accepted)
+                finally:
+                    self._verify_commit_ctx = context
         return (
             sum(tensor.nbytes for tensor in self._ple_verify_scratch.values())
             + self._ple_commit_rows.nbytes

@@ -29,6 +29,7 @@ from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.ops.attention.dsa.triton import (
     triton_topk_from_logits,
 )
+from tokenspeed_kernel.ops.tuning import is_warming_up
 from tokenspeed_kernel.platform import (
     CapabilityRequirement,
     current_platform,
@@ -36,6 +37,11 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
+from tokenspeed_kernel.warmup import (
+    TensorVariant,
+    kernel_launcher,
+    register_triton_warmup,
+)
 
 _is_nvidia = current_platform().is_nvidia
 _SCORE_MAX_WAVES = 3
@@ -223,7 +229,7 @@ def qwen4_exp_qsa_prepare_metadata(
         draft_arg = draft_logical_positions
         stride_dlp_r = draft_logical_positions.stride(0)
         stride_dlp_s = draft_logical_positions.stride(1)
-    _qwen4_exp_qsa_prepare_metadata_kernel[(batch,)](
+    kernel_launcher(_qwen4_exp_qsa_prepare_metadata_kernel, (batch,))(
         seq_lens,
         lengths_arg,
         qsa_page_table,
@@ -898,7 +904,7 @@ def qwen4_exp_qsa_compress_and_store(
     # kernel reads it through its strides directly, and index tensors are
     # cast in-kernel, so no host-side copy/cast kernel is launched.
     use_pdl = _is_nvidia and enable_pdl
-    _qwen4_exp_qsa_compress_and_store_kernel[(rows,)](
+    kernel_launcher(_qwen4_exp_qsa_compress_and_store_kernel, (rows,))(
         token_k,
         query,
         query_norm_weight,
@@ -1127,7 +1133,7 @@ def qwen4_exp_qsa_recent_write(
     if write_mask is None:
         write_mask = recent_locs
     use_pdl = _is_nvidia and enable_pdl
-    _qwen4_exp_qsa_recent_write_kernel[(rows,)](
+    kernel_launcher(_qwen4_exp_qsa_recent_write_kernel, (rows,))(
         token_k,
         logical_positions,
         request_indices,
@@ -1345,7 +1351,7 @@ def qwen4_exp_qsa_commit_verify_layers(
             "QSA batched verify commit needs one shared row per staged row"
         )
 
-    _qwen4_exp_qsa_commit_verify_layers_kernel[(rows, num_layers)](
+    kernel_launcher(_qwen4_exp_qsa_commit_verify_layers_kernel, (rows, num_layers))(
         raw_addresses,
         position_addresses,
         staged_k,
@@ -1782,8 +1788,11 @@ def triton_qsa_block_scores(
     # four-row dot to mma.sync's 16-row instruction. Small/ragged batches keep
     # their latency-oriented grouping; every group stays within one request.
     max_query_group = max(1, min(4, 16 // block_h))
-    if _is_nvidia and rows >= 1024 and block_h == 4 and query.shape[2] == 128:
-        max_query_group = 32
+    warm_query_group = (
+        32 if _is_nvidia and block_h == 4 and query.shape[2] == 128 else max_query_group
+    )
+    if rows >= 1024:
+        max_query_group = warm_query_group
     query_group_size = math.gcd(queries_per_request or 1, max_query_group)
     # The old 512-block tile used 129 KiB shared memory for 4x128 BF16 heads,
     # limiting a B300 SM to one CTA. 128 blocks leave room for concurrent CTAs.
@@ -1820,6 +1829,31 @@ def triton_qsa_block_scores(
         "LOOP_QUERY_GROUPS": query_groups > _SCORE_MAX_WAVES * sm_count,
         "ENABLE_PDL": use_pdl,
     }
+    if is_warming_up():
+        # Grouping sets arange/reshape tile dimensions and stays constexpr.
+        # Runtime integers also key on 1, divisible-by-16, or other values.
+        # Keep those alignment hints and compile every reachable class before
+        # live table widths and request-run lengths select another variant.
+        warm_args = list(args)
+        for columns in (1, 16, 17):
+            warm_args[8] = warm_args[-1] = columns * page_size
+            for table_stride in (1, 16, 17):
+                warm_args[-2] = table_stride
+                for power in range(warm_query_group.bit_length()):
+                    for loop_groups in (False, True):
+                        variant = _qwen4_exp_qsa_score_blocks_kernel.warmup(
+                            *warm_args,
+                            **{
+                                **constants,
+                                "QUERY_GROUP_SIZE": 1 << power,
+                                "LOOP_QUERY_GROUPS": loop_groups,
+                            },
+                            grid=(1,),
+                            num_warps=4,
+                            num_stages=2,
+                            **pdl_kwargs,
+                        )
+                        max_active_ctas(variant)
     # Warmup performs the usual JIT cache lookup without launching. Launch the
     # same compiled kernel after sizing the grid; no device lengths are read.
     kernel = _qwen4_exp_qsa_score_blocks_kernel.warmup(
@@ -2322,3 +2356,33 @@ __all__ = [
     "triton_qsa_block_topk_stream",
     "triton_qsa_sparse_attention",
 ]
+
+register_triton_warmup(
+    _qwen4_exp_qsa_prepare_metadata_kernel,
+    variants=(
+        {
+            "RESET_DRAFT_TAGS": (False, True),
+            "stride_dlp_r": (1, 16, 17),
+            "stride_dlp_s": (1, 16, 17),
+        },
+    ),
+)
+register_triton_warmup(
+    _qwen4_exp_qsa_compress_and_store_kernel,
+    variants=({"stage_verify_start": (1, 16, 17)},),
+)
+register_triton_warmup(
+    _qwen4_exp_qsa_recent_write_kernel,
+    variants=({"rows": (1, 16, 17)},),
+)
+register_triton_warmup(
+    _qwen4_exp_qsa_commit_verify_layers_kernel,
+    variants=(
+        {
+            "accepted_lengths": (
+                TensorVariant(torch.int32, True),
+                TensorVariant(torch.int32, False),
+            )
+        },
+    ),
+)

@@ -35,6 +35,7 @@ import torch
 from tokenspeed_kernel.ops.attention.qsa.triton import (
     qwen4_exp_qsa_commit_verify_layers,
 )
+from tokenspeed_kernel.warmup import compile_triton_kernels
 
 from tokenspeed.runtime.layers.attention.kv_cache.qwen4_exp import (
     QWEN4_EXP_QSA_RECENT_CACHE_GROUP,
@@ -159,6 +160,15 @@ class QSAVerifyState:
             raw_cache=raw,
             position_cache=positions,
         )
+        if torch.device(self.device).type == "cuda":
+            accepted = torch.ones(1, dtype=torch.int32, device=self.device)
+            staged = self._verify_staged
+            try:
+                with compile_triton_kernels():
+                    self._verify_staged = True
+                    self.commit_after_mtp_verify(accepted, num_extends=0)
+            finally:
+                self._verify_staged = staged
         return self._verify_workspace.nbytes
 
     def verify_staging_buffers(

@@ -39,6 +39,7 @@ from tokenspeed_kernel.ops.kvcache.triton import (
     wait_layer_ready as _wait_layer_ready_triton,
 )
 from tokenspeed_kernel.platform import current_platform
+from tokenspeed_kernel.warmup import compile_triton_kernels
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +341,62 @@ class HostTransferWorkspace:
         self._num_layer_ready = 0
         self._backend_key = None
         self._mode: HostTransferMode | None = None
+
+    def warmup(self, geometry: HostTransferGeometry) -> None:
+        """Compile transfer directions and layer waits for a prepared binding.
+
+        Args:
+            geometry: The immutable Device-bound geometry this workspace uses.
+
+        Returns:
+            None. No payload is copied, and no completion flag is waited on.
+        """
+        if self._mode is None:
+            raise RuntimeError("prepare_backend must precede transfer warmup")
+        if not self._mode.uses_device_tables:
+            return
+        if geometry.device_rows is None or geometry.device_layer_slices is None:
+            raise ValueError("transfer warmup requires Device-bound geometry")
+        device = geometry.device_rows.device
+        pairs = torch.zeros((1, 2), dtype=torch.int64, device=device)
+        offsets = torch.zeros(geometry.num_groups + 1, dtype=torch.int64, device=device)
+        num_layers = len(geometry.layer_slices)
+        flags = torch.zeros(num_layers, dtype=torch.int32, device=device)
+        counts = torch.zeros_like(flags)
+        common = {
+            "geometry_offset": 0,
+            "num_geometry_rows": geometry.num_field_rows,
+            "host_lcm_block_bytes": geometry.host_lcm_block_bytes,
+            "work_items": 1,
+            "num_device_buffers": self._address_table.numel() - 1,
+            "grid_cap": None,
+        }
+        with compile_triton_kernels():
+            for direction in (0, 1):
+                _transfer_cache_blocks_triton(
+                    self._address_table,
+                    geometry.device_rows,
+                    pairs,
+                    offsets,
+                    direction,
+                    layer_ready_flags=None,
+                    layer_slices=None,
+                    layer_cta_counts=None,
+                    **common,
+                )
+            if num_layers and layer_ready_ptx_supported():
+                _transfer_cache_blocks_triton(
+                    self._address_table,
+                    geometry.device_rows,
+                    pairs,
+                    offsets,
+                    1,
+                    layer_ready_flags=flags,
+                    layer_slices=geometry.device_layer_slices,
+                    layer_cta_counts=counts,
+                    **common,
+                )
+                _wait_layer_ready_triton(flags, 0)
 
     def prepare_backend(
         self,

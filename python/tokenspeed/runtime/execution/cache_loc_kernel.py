@@ -25,6 +25,7 @@ Triton kernels for computing cache locations and updating page tables.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 from tokenspeed.runtime.utils import get_colorful_logger
 from tokenspeed.runtime.utils.triton import tl, triton
@@ -187,7 +188,7 @@ def fused_decode_input_prep(
     batch_size = req_pool_indices.shape[0]
     BLOCK_SIZE = 128
     grid = (batch_size,)
-    fused_decode_input_prep_kernel[grid](
+    kernel_launcher(fused_decode_input_prep_kernel, grid)(
         req_pool_indices,
         valid_cache_lengths,
         positions_ptr,
@@ -302,3 +303,9 @@ def compute_out_cache_loc_uniform(
         max_pages=max_pages,
         BLOCK_SIZE=BLOCK_SIZE,
     )
+
+
+register_triton_warmup(
+    fused_decode_input_prep_kernel,
+    variants=({"uniform_input_length": (1, 16, 17)},),
+)

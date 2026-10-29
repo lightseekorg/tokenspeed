@@ -31,6 +31,11 @@ from __future__ import annotations
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.warmup import (
+    TensorVariant,
+    kernel_launcher,
+    register_triton_warmup,
+)
 
 __all__ = ["advance_accepted_frontier"]
 
@@ -142,7 +147,9 @@ def advance_accepted_frontier(
         )
         return
 
-    _advance_accepted_frontier_kernel[(triton.cdiv(batch_size, _BLOCK),)](
+    kernel_launcher(
+        _advance_accepted_frontier_kernel, (triton.cdiv(batch_size, _BLOCK),)
+    )(
         req_pool_indices,
         input_lengths,
         accept_lengths,
@@ -153,3 +160,21 @@ def advance_accepted_frontier(
         BLOCK=_BLOCK,
         num_warps=4,
     )
+
+
+register_triton_warmup(
+    _advance_accepted_frontier_kernel,
+    variants=(
+        {
+            "input_lengths_ptr": (
+                TensorVariant(torch.int32, True),
+                TensorVariant(torch.int64, True),
+            ),
+            "accept_lengths_ptr": tuple(
+                TensorVariant(dtype, aligned)
+                for dtype in (torch.int32, torch.int64)
+                for aligned in (True, False)
+            ),
+        },
+    ),
+)

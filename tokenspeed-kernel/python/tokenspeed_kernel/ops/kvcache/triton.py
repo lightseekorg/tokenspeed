@@ -32,6 +32,11 @@ import os
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import current_platform, pdl_enabled
+from tokenspeed_kernel.warmup import (
+    TensorVariant,
+    kernel_launcher,
+    register_triton_warmup,
+)
 
 _PER_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_GRID_CAP", "64"))
 _ALL_LAYER_GRID_CAP = int(os.environ.get("TOKENSPEED_KV_ALL_LAYER_GRID_CAP", "32"))
@@ -292,7 +297,9 @@ def wait_layer_ready(flags: torch.Tensor, layer_index: int) -> None:
         raise ValueError("flags must be a 1-D int32 tensor")
     if not 0 <= int(layer_index) < flags.numel():
         raise IndexError(f"layer_index {layer_index} outside [0, {flags.numel()})")
-    _wait_layer_ready_kernel[(1,)](flags, int(layer_index), num_warps=1)
+    kernel_launcher(_wait_layer_ready_kernel, (1,))(
+        flags, int(layer_index), num_warps=1
+    )
 
 
 def transfer_cache_blocks(
@@ -359,7 +366,7 @@ def transfer_cache_blocks(
         raise ValueError("grid_cap must be positive")
     grid = (max(1, min(cap, work_items if work_items > 0 else 1)),)
     unused = geometry_table
-    _transfer_cache_blocks_kernel[grid](
+    kernel_launcher(_transfer_cache_blocks_kernel, grid)(
         address_table,
         geometry_table,
         block_pairs,
@@ -529,7 +536,7 @@ def zero_page_fields(
     # leaves at least one program in the first dimension.
     if backing.device.type == "npu":
         grid = (min(grid[0], 65535 // grid[1]), grid[1])
-    _zero_page_fields_kernel[grid](
+    kernel_launcher(_zero_page_fields_kernel, grid)(
         backing,
         pages,
         fields,
@@ -624,7 +631,7 @@ def copy_page_fields(
         num_ranges,
         min(tiles_per_range, triton.cdiv(max_field_bytes, block_size)),
     )
-    _copy_page_fields_kernel[grid](
+    kernel_launcher(_copy_page_fields_kernel, grid)(
         backing,
         pairs,
         fields,
@@ -764,7 +771,9 @@ def copy_state_rows(
     if rows_per_launch == 0:
         raise ValueError("one state row exceeds the NPU kernel launch grid limit")
     for start in range(0, total, rows_per_launch):
-        _copy_state_rows_kernel[(min(total - start, rows_per_launch), chunks)](
+        kernel_launcher(
+            _copy_state_rows_kernel, (min(total - start, rows_per_launch), chunks)
+        )(
             src_addresses,
             dst_addresses,
             src_row_strides,
@@ -1020,7 +1029,9 @@ def state_verify_commit_rows(
     if any(t.ndim != 1 or not t.is_contiguous() for t in (src_rows, dst_rows)):
         raise ValueError("row id outputs must be contiguous one-dimensional tensors")
 
-    _state_verify_commit_rows_kernel[(triton.cdiv(batch_size, 256), num_layers)](
+    kernel_launcher(
+        _state_verify_commit_rows_kernel, (triton.cdiv(batch_size, 256), num_layers)
+    )(
         accepted_lengths,
         destination_pages,
         group_indices,
@@ -3179,3 +3190,50 @@ def compact_window_rows(
         ROW_I32=row_bytes // 4,
         BLOCK_I32=1024,
     )
+
+
+# Counts and pointer views can change on the first cache operation. Keep their
+# alignment optimizations and prepare the finite classes during startup.
+register_triton_warmup(
+    _transfer_cache_blocks_kernel,
+    variants=({"num_geometry_rows": (1, 16, 17), "geometry_offset": (1, 16, 17)},),
+)
+register_triton_warmup(
+    _wait_layer_ready_kernel, variants=({"layer_index": (1, 16, 17)},)
+)
+register_triton_warmup(_zero_page_fields_kernel, variants=({},))
+register_triton_warmup(_copy_page_fields_kernel, variants=({},))
+register_triton_warmup(
+    _copy_state_rows_kernel,
+    variants=(
+        {
+            "src_rows_ptr": tuple(
+                TensorVariant(dtype, aligned)
+                for dtype in (torch.int32, torch.int64)
+                for aligned in (True, False)
+            ),
+            "dst_rows_ptr": tuple(
+                TensorVariant(dtype, aligned)
+                for dtype in (torch.int32, torch.int64)
+                for aligned in (True, False)
+            ),
+        },
+    ),
+)
+register_triton_warmup(
+    _state_verify_commit_rows_kernel,
+    variants=tuple(
+        {
+            "accepted_ptr": (
+                TensorVariant(torch.int32, True),
+                TensorVariant(torch.int32, False),
+            ),
+            "src_rows_ptr": (TensorVariant(dtype, True),),
+            "dst_rows_ptr": (TensorVariant(dtype, True), TensorVariant(dtype, False)),
+            "group_indices_ptr": (
+                (None,) if dtype == torch.int64 else (TensorVariant(torch.int64, True),)
+            ),
+        }
+        for dtype in (torch.int32, torch.int64)
+    ),
+)
