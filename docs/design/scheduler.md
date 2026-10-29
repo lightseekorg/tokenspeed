@@ -314,8 +314,9 @@ the runtime stores every State group's state at that position into it. The
 request holds the block in `CacheProgress` until its next publication point --
 the next chunk's or first decode's admission, a finish or a retraction --
 which publishes it under the boundary's page hash, like a natural checkpoint,
-with the sliding window behind it as an endpoint's even at a chunk end, never
-as an unproven boundary eviction takes first (`cache-concepts.md`).
+with the sliding window behind it as the endpoint's window, even at a chunk
+end, never as an unproven boundary that eviction takes first
+(`cache-concepts.md`).
 A boundary a chunk ends on needs none (the chunk end's slot 1 is published
 there, as at a junction). The scan emits states only whole pages from a
 forward's start, and the budget a batch's decodes leave rarely ends on a page,
@@ -448,8 +449,8 @@ prompt end, at its first decode and at the same epoch: that one and the end
 state still rank level, since which of them the next turn resumes at depends
 on whether the client sends the reply back as it was generated. A finish that
 publishes no end state (`drop_dead_state_checkpoints`, above) marks the input
-all the same: the prompt end or the pre-tail checkpoint the next turn resumes
-at instead was published, or found cached, before it.
+all the same: the prompt end, or the pre-tail checkpoint the next turn
+resumes at instead, was published or found cached earlier.
 
 **Aligned state checkpoints.** A State group can declare
 `checkpoint_granularity`, a multiple of the prefix-hash grain. Its published

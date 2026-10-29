@@ -135,12 +135,12 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     // resumed from (MarkSupersededStateInput). With
     // drop_dead_state_checkpoints, a finish publishes no end state, like a
     // chunk end, whether or not it completes a page, and marks the input all
-    // the same: the prompt end or pre-tail checkpoint the next turn resumes at
-    // instead was published, or found cached, before it. Marked at the finish only: a
-    // request that fails earlier (a failed PD transfer) publishes and marks
-    // nothing, and an end state that is the input itself (a D request that
-    // claimed its prompt-end checkpoint and leaves before any decode)
-    // supersedes nothing.
+    // the same: the prompt end, or the pre-tail checkpoint the next turn
+    // resumes at instead, was published or found cached earlier. Marked at the
+    // finish only: a request that fails earlier (a failed PD transfer)
+    // publishes and marks nothing, and an end state that is the input itself
+    // (a D request that claimed its prompt-end checkpoint and leaves before
+    // any decode) supersedes nothing.
     if (progress.resumed_tail_hash && !(completed.completed_pages && completed.completed_pages->tail &&
                                         completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
         coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
