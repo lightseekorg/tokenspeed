@@ -58,9 +58,7 @@ def test_row_payloads_survive_sharding_and_selected_row_gathers(size, lengths):
     splits = [p.split_rows(selected) for p in plans]
     selected_gather = torch.cat([x[s.local_ids] for x, s in zip(local, splits)])
     sampled = torch.cumsum(torch.tensor(lengths, dtype=torch.int64), 0) - 1
-    sampled_gather = torch.cat(
-        [x[p.local_sampled_ids(sampled)] for x, p in zip(local, plans)]
-    )
+    sampled_gather = torch.cat([x[p.local_sampled_index] for x, p in zip(local, plans)])
     for p, split in zip(plans, splits):
         assert torch.equal(p.to_span_order(gathered), span)
         assert torch.equal(p.to_gather_order(span), gathered)

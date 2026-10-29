@@ -1641,7 +1641,7 @@ def test_a_last_capture_under_a_shard_is_the_gathered_sampled_rows(monkeypatch, 
         # hands back every rank's, rank by rank (rows 4, 3, 9).
         source = (hidden, *aux)[len(gathered)]
         plan = current["plan"]
-        local = source[plan.local_row_ids][plan.local_sampled_ids(gather_ids)]
+        local = source[plan.local_row_ids][plan.local_sampled_index]
         assert torch.equal(tensor, local)
         gathered.append(tensor)
         return source[torch.tensor([4, 3, 9])]

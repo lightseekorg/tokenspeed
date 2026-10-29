@@ -818,11 +818,11 @@ class LogitsProcessor(nn.Module):
                     aux_pruned_states = list(aux_hidden_states)
             elif shard is not None:
                 pruned_states = gather_sampled_rows(
-                    hidden_states, shard, gather_ids, group=self.tp_group
+                    hidden_states, shard, group=self.tp_group
                 )
                 if select_aux:
                     aux_pruned_states = [
-                        gather_sampled_rows(h, shard, gather_ids, group=self.tp_group)
+                        gather_sampled_rows(h, shard, group=self.tp_group)
                         for h in aux_hidden_states
                     ]
             else:

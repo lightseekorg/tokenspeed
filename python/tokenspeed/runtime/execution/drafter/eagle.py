@@ -300,8 +300,8 @@ class Eagle(BaseDrafter):
         under EXTEND, ``base_model_output`` directly under DECODE. Under a
         query shard the ids are the shard's rows of the shifted prefill
         ids (``QueryShardPlan.local_row_ids``) while ``gather_ids`` keep the batch's full layout, as on the
-        target's forward: the draft model's exit cuts them to its shard
-        through ``QueryShardPlan.local_sampled_ids`` when it gathers the
+        target's forward: the draft model's exit selects the shard's rows
+        with ``QueryShardPlan.local_sampled_index`` when it gathers the
         sampled rows across the group.
         """
         num_extends = draft_input.num_extends

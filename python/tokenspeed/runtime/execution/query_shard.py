@@ -132,7 +132,9 @@ class QueryShardPlan:
         local_index_of_row: ``[total_rows]`` int64 on the device: a span
             row's index among this rank's rows, ``-1`` on another rank.
         local_sampled_index: ``[local_sampled_rows]`` int64 on the device:
-            this rank's sampled rows as indices into its shard rows.
+            this rank's sampled rows as indices into its shard rows, derived
+            from the last row of each request. QCP consumers select these
+            directly instead of indexing the shard with full-layout gather ids.
         sampled_to_request: ``[sampled_rows_total]`` int64 on the device: puts
             the gathered sampled rows (gather order) in request order.
     """
@@ -297,31 +299,6 @@ class QueryShardPlan:
     @property
     def local_sampled_rows(self) -> int:
         return self.sampled_rows_per_rank[self.rank]
-
-    def local_sampled_ids(self, gather_ids: torch.Tensor) -> torch.Tensor:
-        """This rank's sampled rows as indices into its shard.
-
-        ``gather_ids`` are the batch's full-layout sampled rows -- the last
-        row of every request, which the plan was built from: ``ForwardContext``
-        carries the full layout on every forward, the target's and the
-        drafter's step 0 alike, and whoever selects local rows -- the logits
-        processor's ``gather_sampled_rows``, a draft that narrows to live
-        rows -- goes through here. The gathered rows come back in gather
-        order; ``sampled_to_request`` puts them in request order.
-
-        Args:
-            gather_ids: ``[bs]`` batch-global sampled rows (``ctx.gather_ids``).
-
-        Returns:
-            ``[sampled_rows_per_rank[rank]]`` indices into this rank's rows.
-        """
-        if gather_ids.shape[0] != self.sampled_rows_total:
-            raise ValueError(
-                f"query shard: {gather_ids.shape[0]} gather ids for a plan of "
-                f"{self.sampled_rows_total} sampled rows; pass the batch's full "
-                "layout, not a shard's slice"
-            )
-        return self.local_sampled_index
 
     def split_rows(self, rows: torch.Tensor) -> RowSplit:
         """Where each of ``rows`` lives: the split a collective over them needs.

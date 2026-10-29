@@ -2037,8 +2037,9 @@ The contract a model (in tree or a plugin) implements:
   multi-depth `Mtp` drafter read the shard's rows of the shifted prefill
   ids and positions, chain the shard's hidden rows, and carry the plan on
   their context; `Mtp` sums its cross-chunk stash of target hiddens over
-  the group, one owner per row): `QueryShardPlan.local_sampled_ids(
-  ctx.gather_ids)` is the one place that cuts them to the shard, used by
+  the group, one owner per row). The plan derives `local_sampled_index`
+  from each request's last row; QCP consumers read it directly instead of
+  passing full-layout gather ids into a shard-local selector. It is used by
   `gather_sampled_rows` and by any model that narrows to its live rows
   itself. A draft model's FULL capture under a shard is the shard's rows,
   which is what the next depth consumes.

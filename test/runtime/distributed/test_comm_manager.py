@@ -408,13 +408,11 @@ def _qcp_main(rank: int, port: int) -> None:
     # gather is byte-preserving, so fp32 rows of an odd width travel too.
     from tokenspeed.runtime.distributed.comm_manager import gather_sampled_rows
 
-    sampled = gather_sampled_rows(
-        mine, plan, ctx.gather_ids, group=mapping.attn.tp_group
-    )
+    sampled = gather_sampled_rows(mine, plan, group=mapping.attn.tp_group)
     torch.testing.assert_close(sampled, full[ctx.gather_ids], rtol=0, atol=0)
     narrow = full[:, :3].contiguous()  # 12-byte fp32 rows
     sampled = gather_sampled_rows(
-        narrow[plan.local_row_ids], plan, ctx.gather_ids, group=mapping.attn.tp_group
+        narrow[plan.local_row_ids], plan, group=mapping.attn.tp_group
     )
     torch.testing.assert_close(sampled, narrow[ctx.gather_ids], rtol=0, atol=0)
     if rank in (1, 2):

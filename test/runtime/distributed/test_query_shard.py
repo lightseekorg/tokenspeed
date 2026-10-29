@@ -162,16 +162,13 @@ def test_the_sampled_rows_gather_back_in_request_order(lengths, size):
     gathered = []
     for plan in plans:
         assert plan.sampled_rows_per_rank == counts
-        local = plan.local_sampled_ids(torch.tensor(sampled))
+        local = plan.local_sampled_index
         mine = plan.local_row_ids[local].tolist()
         assert mine == [row for row in sampled if owner[row] == plan.rank]
         gathered += mine
     for plan in plans:
         restored = torch.tensor(gathered).index_select(0, plan.sampled_to_request)
         assert restored.tolist() == sampled
-    # A shard's rows must not be handed in as the full layout.
-    with pytest.raises(ValueError, match="full layout"):
-        plans[0].local_sampled_ids(torch.zeros(len(sampled) + 1, dtype=torch.int64))
 
 
 def test_zero_row_ranks_join_with_empty_shards():
@@ -438,7 +435,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
         assert torch.equal(ids, patched[plan.local_row_ids])
         assert gather_ids.tolist() == rows  # full layout, not re-based
         # The exit selects this rank's sampled rows from its shard.
-        local = plan.local_sampled_ids(gather_ids)
+        local = plan.local_sampled_index
         owned = [r for r in rows if r in plan.local_row_ids.tolist()]
         assert plan.local_row_ids[local].tolist() == owned
         assert len(owned) == plan.local_sampled_rows == [1, 0, 0, 2][rank]
@@ -451,7 +448,7 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
             and gathered,
         )
         out = comm_manager.gather_sampled_rows(
-            hidden[plan.local_row_ids], plan, gather_ids, group=(0, 1, 2, 3)
+            hidden[plan.local_row_ids], plan, group=(0, 1, 2, 3)
         )
         contributed, counts = gathered_by_rank[rank]
         assert counts == [1, 0, 0, 2]
@@ -459,11 +456,6 @@ def test_the_drafters_first_step_reads_its_shard_and_keeps_full_gather_ids(
         assert contributed.flatten().tolist() == owned
         # Put back in request order on every rank.
         assert out.flatten().tolist() == rows
-    # A shard's slice must not be handed in as the full layout.
-    with pytest.raises(ValueError, match="full layout"):
-        QueryShardPlan.from_forward(
-            total_tokens=total, input_lengths=lengths, size=4, rank=1, device="cpu"
-        ).local_sampled_ids(torch.tensor([0, 1]))
 
 
 def test_the_mtp_extend_depths_run_the_target_shard(monkeypatch):
