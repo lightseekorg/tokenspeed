@@ -1272,10 +1272,10 @@ attention uses its own split kernels.
   decode, the verify width for speculative verify): query `i` sees the keys
   before `cache_seqlens - (max_seqlen_q - 1 - i)`, so every length counts at
   least the request's queries.
-- Full attention takes the split count from the base CTAs (requests x KV heads
-  x row blocks) and `max_seqlen_k`, capped at 64 splits. The count does not
-  read device-resident lengths, so graphs pass the maximum context as
-  `max_seqlen_k` and replay for any batch composition.
+- Full attention sizes its splits from `cache_seqlens` when the kernel runs,
+  not from `max_seqlen_k` or the batch size, so a captured graph replays any
+  batch composition with splits fitted to its lengths and compiles nothing
+  per batch.
 
 #### Algorithm
 
@@ -1288,21 +1288,27 @@ once per token. The block covers the keys of its last query position and,
 under a sliding window, from its first one's window start; each row masks its
 own causal end and window start.
 
-K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. When the
-grid already holds enough waves to cover the load latency, the split loop is
-single-buffered: it copies a page, waits for it (`s_waitcnt vmcnt`) and
-consumes it before copying the next.
+Full attention runs one round of at most 512 work items, two per CU. Each
+work-group reads the lengths and derives the same schedule: every split
+covers the same number of pages, chosen so the batch's items fill the round,
+a padding request takes one split per row block, and a request takes at most
+128. Items follow request order, so the grid has one work-group per possible
+item and the ones past the last item exit. The decode kernel records each row
+block's first item and split count for the reduce, and stores a row's
+partials next to each other so the reduce reads them with 16-byte loads.
 
-When `select_kv_splits` returns its maximum of 64, even the most splits leave
-the grid below its occupancy target, so each work-group streams a long split.
-Its page loads are then software-pipelined four deep: four LDS buffers, three
-pages prefetched while one is consumed, provided each wave's share of their
-copies fits the 6-bit vmcnt count (a single wave's BF16 head dim 128 pages do
-not). Splits with fewer pages than buffers stay single-buffered. vmcnt
-retires a wave's loads in issue order, so page indices load two loop
-iterations before use; reading an index loaded after the prefetches would wait
-for all of them. The index loads are volatile: the page table is read-only
-(`tl.const`), so the compiler could otherwise move them below the prefetches.
+K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. A split's
+page loads are software-pipelined two deep: two LDS buffers, one page
+prefetched while one is consumed. A one-wave work-group computes every page
+itself, so it pipelines only while the items leave each CU at most one
+work-group or its split spans 32 pages or more; otherwise, and for splits
+shorter than the two buffers, the loop
+is single-buffered: it copies a page, waits for it (`s_waitcnt vmcnt`) and
+consumes it before copying the next. vmcnt retires a wave's loads in issue
+order, so page indices load two loop iterations before use; reading an index
+loaded after the prefetches would wait for all of them. The index loads are
+volatile: the page table is read-only (`tl.const`), so the compiler could
+otherwise move them below the prefetches.
 Volatile also makes them skip the CU and L2 caches (`sc0 sc1`); loading two
 iterations ahead hides the extra latency.
 Prefetches past the split repeat its last page rather than masking the copy,

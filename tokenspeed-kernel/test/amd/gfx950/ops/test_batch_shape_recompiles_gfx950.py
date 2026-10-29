@@ -257,6 +257,62 @@ def test_mha_extend_startup_warmup_covers_every_variant(window):
             run(queries, 300)
 
 
+def test_mha_decode_batch_size():
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import decode
+
+    width, heads, kv_heads, dim, page = 8, 16, 2, 64, 64
+    generator = torch.Generator(device=DEVICE).manual_seed(5)
+    k_cache = torch.randn(
+        200,
+        page,
+        kv_heads,
+        dim,
+        device=DEVICE,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    v_cache = torch.randn_like(k_cache)
+    # A fixed table width keeps the table stride out of the sweep.
+    table_width = 64
+
+    def run(batch):
+        # The split schedule follows the batch's lengths when the kernel runs,
+        # so no batch-derived value reaches the compiled kernels.
+        decode.launch_gluon_mha_decode_gfx950(
+            q=torch.randn(
+                batch * width, heads, dim, device=DEVICE, dtype=torch.bfloat16
+            ),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=torch.randint(
+                1,
+                200,
+                (batch, table_width),
+                dtype=torch.int32,
+                device=DEVICE,
+                generator=generator,
+            ),
+            cache_seqlens=torch.randint(
+                width,
+                table_width * page,
+                (batch,),
+                dtype=torch.int32,
+                device=DEVICE,
+                generator=generator,
+            ),
+            max_seqlen_k=1 << 20,
+            max_seqlen_q=width,
+        )
+
+    run(1)
+    run(16)
+    with assert_no_triton_compile(
+        decode.gluon_mha_decode_gfx950, decode.gluon_mha_decode_reduce_gfx950
+    ):
+        for batch in (3, 5, 7, 12, 24, 40, 70):
+            run(batch)
+
+
 def test_mxfp8_gemm_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
 

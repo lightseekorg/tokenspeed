@@ -187,52 +187,33 @@ FULL_KV_HEADS = 2
 FULL_MAX_SEQLEN_K = 1 << 20
 
 
-def test_full_decode_config_keeps_prefetch_within_vmcnt() -> None:
-    """BF16 head dim 128 would prefetch more copies than s_waitcnt vmcnt counts."""
-    q = torch.empty(1, FULL_Q_HEADS, 128, dtype=torch.bfloat16)
-    k_cache = torch.empty(1, PAGE_SIZE, FULL_KV_HEADS, 128, dtype=torch.bfloat16)
-    config = decode.get_config(
-        q=q,
-        k_cache=k_cache,
-        max_seqlen_k=FULL_MAX_SEQLEN_K,
-        max_seqlen_q=1,
-        window_left=-1,
-        softmax_scale=None,
-    )
-    assert (config.num_kv_splits, config.num_stages) == (64, 1)
-
-
 @pytest.mark.parametrize(
-    "cache_lens,num_stages",
+    "cache_lens",
     [
         # 0: a padded graph row; 1: one token; 129: a partial third page;
         # 5 * 64 and 7 * 64 + 1 straddle loop iterations; 300 * 64 + 17 spans
-        # many splits. Six rows fill enough of the grid for the single buffer.
+        # many splits. The batch's 318 pages make two-page splits, one
+        # pipeline iteration each; the one-page rows take the single buffer.
         pytest.param(
             [0, 1, 129, 5 * PAGE_SIZE, 7 * PAGE_SIZE + 1, 300 * PAGE_SIZE + 17],
-            1,
-            id="single-buffer",
+            id="short-splits",
         ),
-        # Four rows leave the grid short, so long splits pipeline their page
-        # loads: 256 pages give each split exactly one loop iteration of
-        # pages, 301 pages repeat the last page in prefetches past the split,
-        # and 1000 * 64 + 33 ends in a partial page.
+        # 1558 pages make eight-page splits that pipeline their page loads
+        # over several iterations, repeating the split's last page in a
+        # prefetch past it; 1000 * 64 + 33 ends in a partial page.
         pytest.param(
             [0, 256 * PAGE_SIZE, 300 * PAGE_SIZE + 17, 1000 * PAGE_SIZE + 33],
-            4,
-            id="pipelined",
+            id="long-splits",
         ),
     ],
 )
-def test_full_decode_ragged_rows_match_reference(
-    cache_lens: list[int], num_stages: int
-) -> None:
+def test_full_decode_ragged_rows_match_reference(cache_lens: list[int]) -> None:
     """Full-attention decode over empty, short, unaligned and long rows.
 
     Page-table entries past each request hold out-of-range page ids, so a copy
     that reads past a request's pages faults instead of passing silently.
     """
-    generator = torch.Generator(device="cuda").manual_seed(20261025 + num_stages)
+    generator = torch.Generator(device="cuda").manual_seed(20261025 + len(cache_lens))
     pages = [-(-length // PAGE_SIZE) for length in cache_lens]
     table_width = max(pages)
     total_pages = sum(pages) + 1
@@ -269,16 +250,6 @@ def test_full_decode_ragged_rows_match_reference(
         device="cuda",
         generator=generator,
     )
-
-    config = decode.get_config(
-        q=q,
-        k_cache=k_cache,
-        max_seqlen_k=FULL_MAX_SEQLEN_K,
-        max_seqlen_q=1,
-        window_left=-1,
-        softmax_scale=None,
-    )
-    assert config.num_stages == num_stages
 
     def invoke() -> torch.Tensor:
         return gluon_mha_decode_gfx950(
@@ -502,52 +473,85 @@ def test_verify_rows_match_reference_and_replay(
 
 
 def test_verify_long_splits_pipeline_page_loads() -> None:
-    """Two verifying requests leave the grid short, so each split of a long
-    context streams its pages through the four-deep pipeline, the block's
-    four waves sharing every page's copies."""
+    """Two verifying requests take most of the scheduled work-groups, so each
+    split of a long context streams its pages through the pipelined loads,
+    the block's four waves sharing every page's copies."""
     cache_lens = [300 * PAGE_SIZE + 5, 1000 * PAGE_SIZE + 33]
     inputs = _verify_inputs(
         cache_lens, VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 17
     )
-    config = decode.get_config(
-        q=inputs["q"],
-        k_cache=inputs["k_cache"],
-        max_seqlen_k=FULL_MAX_SEQLEN_K,
-        max_seqlen_q=VERIFY_TOKENS,
-        window_left=-1,
-        softmax_scale=None,
-    )
-    assert (config.num_kv_splits, config.num_stages) == (64, 4)
     actual = gluon_mha_decode_gfx950(**inputs, window_left=-1)
     _check_verify(actual, _verify_reference(inputs, -1, None))
 
 
-def test_pipelined_split_waits_for_prefetches_before_epilogue(monkeypatch) -> None:
+def test_verify_splits_follow_replayed_lengths() -> None:
+    """A graph captured at 16 requests sizes its splits from each replay's
+    lengths: long requests take most work-groups and padding requests, at the
+    verify floor, one per KV head. The replays move the long requests between
+    slots, so the split counts the decode kernel and the reduce agree on
+    change while the graph stays the same."""
+    floor = VERIFY_TOKENS
+    replays = [
+        # Three long requests and 13 padding requests.
+        [1000 * PAGE_SIZE + 33, 640 * PAGE_SIZE + 7, 300 * PAGE_SIZE + 5]
+        + [floor] * 13,
+        # Twelve mid-length requests of different lengths, three padding
+        # requests, and one long request in the last slot.
+        [(97 + 23 * slot) * PAGE_SIZE + slot for slot in range(12)]
+        + [floor] * 3
+        + [1000 * PAGE_SIZE + 1],
+    ]
+    capacity = [max(lengths) for lengths in zip(*replays)]
+    inputs = _verify_inputs(
+        capacity, VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 23
+    )
+    inputs["cache_seqlens"].fill_(floor)
+
+    def invoke() -> torch.Tensor:
+        return gluon_mha_decode_gfx950(**inputs, window_left=-1)
+
+    invoke()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        replayed = invoke()
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    for lengths in replays:
+        inputs["cache_seqlens"].copy_(torch.tensor(lengths, dtype=torch.int32))
+        inputs["q"].copy_(
+            torch.randn(inputs["q"].shape, generator=generator, device="cuda")
+        )
+        graph.replay()
+        torch.cuda.synchronize()
+        _check_verify(replayed, _verify_reference(inputs, -1, None))
+        # Eager decode of the same lengths runs the same schedule.
+        torch.testing.assert_close(invoke(), replayed, atol=0, rtol=0)
+
+
+def test_full_decode_batch_past_one_schedule_chunk() -> None:
+    """The split schedule reads the lengths 64 requests at a time; 80
+    requests of mixed lengths take two chunks."""
+    cache_lens = [1 + (slot * 997) % 4000 for slot in range(79)] + [500 * PAGE_SIZE]
+    inputs = _verify_inputs(
+        cache_lens, 1, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 31
+    )
+    actual = gluon_mha_decode_gfx950(**inputs, window_left=-1)
+    _check_verify(actual, _verify_reference(inputs, -1, None))
+
+
+def test_pipelined_split_waits_for_prefetches_before_epilogue() -> None:
     """The pipelined page loop ends with prefetched pages still copying into
     LDS, which the epilogue reuses for its layout conversions. A two-deep
     pipeline issues its last prefetch just before the final page's compute,
-    so without a wait at loop exit the copy lands in the middle of the
-    epilogue and corrupts rows (every run of this shape did). The shipped
-    kernel selects four stages, where the race did not reproduce; two stages
-    exposes it."""
-    monkeypatch.setattr(decode, "_FULL_DECODE_STAGES", 2)
+    so without a wait at loop exit the copy can land in the middle of the
+    epilogue and corrupt rows. Verify blocks of four waves always pipeline."""
     inputs = _verify_inputs(
         [190000, 120000, 64000, 30000],
-        1,
+        VERIFY_TOKENS,
         VERIFY_Q_HEADS,
         VERIFY_KV_HEADS,
         HEAD_DIM,
         41,
     )
-    config = decode.get_config(
-        q=inputs["q"],
-        k_cache=inputs["k_cache"],
-        max_seqlen_k=FULL_MAX_SEQLEN_K,
-        max_seqlen_q=1,
-        window_left=-1,
-        softmax_scale=None,
-    )
-    assert (config.num_kv_splits, config.num_stages) == (64, 2)
     expected = _verify_reference(inputs, -1, None)
     for _ in range(10):
         _check_verify(gluon_mha_decode_gfx950(**inputs, window_left=-1), expected)

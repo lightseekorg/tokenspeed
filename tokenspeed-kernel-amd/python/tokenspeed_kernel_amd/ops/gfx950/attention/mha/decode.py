@@ -36,7 +36,6 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     attention_layouts,
     max,
     maximum,
-    select_kv_splits,
 )
 
 cdna4 = gl.amd.cdna4
@@ -45,18 +44,24 @@ buffer = cdna4.buffer
 cdiv = gl.cdiv
 _GFX950_SM_COUNT = 256
 # Pipeline depth of the full-attention decode K/V page loads: LDS buffers per
-# work-group, so NUM_STAGES - 1 pages are prefetched while one is consumed. At
-# BF16 head dim 64 the three prefetched pages are 48 buffer_load ... lds copies
-# for a one-wave work-group; with more waves, each wave issues its share. The
-# loop is either this deep or single-buffered.
-_FULL_DECODE_STAGES = 4
-# s_waitcnt vmcnt(N) takes a 6-bit count: a wave can wait for all but at most
-# 63 of its outstanding vector memory loads.
-_GFX950_MAX_VMCNT = 63
-# Full-attention decode takes its split count as a constexpr, so it is not held to
-# the runtime-reduce bound MAX_KV_SPLITS. Above 64, the split reduce and the
-# per-split prologue outweigh the extra waves.
-_FULL_DECODE_MAX_SPLITS = 64
+# work-group, so NUM_STAGES - 1 pages are prefetched while one is consumed.
+# With the split schedule's one round of work-groups, two buffers measured
+# best: deeper pipelines did not help while address translation dominated the
+# load latency, and with fast translation they lost a little. One prefetched
+# BF16 head-dim-128 page is 32 buffer_load ... lds copies for a one-wave
+# work-group, well within the 63 loads s_waitcnt vmcnt can leave outstanding.
+_FULL_DECODE_STAGES = 2
+# Full-attention decode splits each request's keys in proportion to its share of
+# the batch's pages, read from cache_seqlens when the kernel runs (see Split
+# Schedule), into at most _FULL_DECODE_TARGET_PROGRAMS work items: as many
+# work-groups as the GPU runs at once with two per CU. A split reads at least
+# _FULL_DECODE_MIN_SPLIT_PAGES pages, and a request takes at most
+# _FULL_DECODE_MAX_SPLITS splits per row block.
+_FULL_DECODE_TARGET_PROGRAMS = 2 * _GFX950_SM_COUNT
+_FULL_DECODE_MIN_SPLIT_PAGES = 2
+_FULL_DECODE_MAX_SPLITS = 128
+# Requests whose lengths one vector load reads while scheduling the splits.
+_SCHEDULE_CHUNK = gl.constexpr(64)
 # Rows of a decode work-group: four waves of one 16-row MFMA tile each.
 _DECODE_MAX_BLOCK_M = 64
 _SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
@@ -149,7 +154,10 @@ class AttentionConfig:
             num_warps=NUM_WARPS,
             instr_shape=[16, 16, 32],
         )
-        reduce_layout = gl.BlockedLayout([1, HEAD_DIM // 64], [1, 64], [1, 1], [1, 0])
+        # The split reduce loads four partial values per lane (16 bytes).
+        reduce_layout = gl.BlockedLayout(
+            [1, 4], [256 // HEAD_DIM, HEAD_DIM // 4], [1, 1], [1, 0]
+        )
 
         self.SM_SCALE = gl.constexpr(SM_SCALE)
         self.PAGE_TABLE_STRIDE = gl.constexpr(PAGE_TABLE_STRIDE)
@@ -186,6 +194,138 @@ class AttentionConfig:
 
 
 # ===-----------------------------------------------------------------------===#
+# Split Schedule
+# ===-----------------------------------------------------------------------===#
+#
+# Full-attention decode sizes its splits from the lengths in cache_seqlens when
+# it runs, so a captured graph adapts to every replay: a padding request (one
+# page) gets one split per row block, and the requests with keys share the
+# rest of the TARGET work items in proportion to their pages. With
+# row_blocks (KV head, row block) pairs per request, every split reads
+# split_pages pages, except a request's last one:
+#
+#   split_pages = max(cdiv(row_blocks * sum(pages), TARGET - row_blocks * num_requests),
+#                     MIN_SPLIT_PAGES)
+#   splits(r)   = clamp(cdiv(pages(r), split_pages), 1, MAX_SPLITS)
+#
+# Rounding each request's splits up adds at most one per row block, so the
+# work items number at most TARGET, or row_blocks * num_requests when the
+# batch alone exceeds it. A request's items are its row blocks times its
+# splits, row block major, and the items of all requests follow in request
+# order. The decode kernel records each row block's first item and split
+# count, from which the split reduce finds its partials.
+
+
+@gluon.jit
+def _load_lengths(cache_seqlens_ptr, start, end, layout: gl.constexpr):
+    """Lengths of requests [start, start + _SCHEDULE_CHUNK) before ``end``, 0
+    past it."""
+    index = start + gl.arange(0, _SCHEDULE_CHUNK, layout=layout)
+    return gl.load(cache_seqlens_ptr + index, mask=index < end, other=0)
+
+
+@gluon.jit
+def _request_splits(
+    seq_lens, split_pages, PAGE_SIZE: gl.constexpr, MAX_SPLITS: gl.constexpr
+):
+    pages = cdiv(gl.maximum(seq_lens, 0), PAGE_SIZE)
+    return gl.minimum(gl.maximum(cdiv(pages, split_pages), 1), MAX_SPLITS)
+
+
+@gluon.jit
+def _split_pages(
+    cache_seqlens_ptr,
+    num_requests,
+    first_lens,
+    ROW_BLOCKS: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    TARGET_PROGRAMS: gl.constexpr,
+    MIN_SPLIT_PAGES: gl.constexpr,
+    PAGE_ALIGN: gl.constexpr,
+    layout: gl.constexpr,
+):
+    """Pages per split, from the lengths of the first _SCHEDULE_CHUNK requests
+    (``first_lens``) and of the rest, loaded here."""
+    total = gl.sum(cdiv(gl.maximum(first_lens, 0), PAGE_SIZE), axis=0)
+    for start in range(_SCHEDULE_CHUNK, num_requests, _SCHEDULE_CHUNK):
+        seq_lens = _load_lengths(cache_seqlens_ptr, start, num_requests, layout)
+        total += gl.sum(cdiv(gl.maximum(seq_lens, 0), PAGE_SIZE), axis=0)
+    # Items left once every (request, row block) has its first split.
+    spare = gl.maximum(TARGET_PROGRAMS - ROW_BLOCKS * num_requests, 1)
+    split_pages = gl.maximum(cdiv(total * ROW_BLOCKS, spare), MIN_SPLIT_PAGES)
+    # The pipelined loop consumes PAGE_ALIGN pages per iteration, so a longer
+    # split takes a whole number of iterations instead of computing on pages
+    # past its end.
+    return gl.where(
+        split_pages > PAGE_ALIGN,
+        cdiv(split_pages, PAGE_ALIGN) * PAGE_ALIGN,
+        split_pages,
+    )
+
+
+@gluon.jit
+def _find_item(
+    cache_seqlens_ptr,
+    num_requests,
+    item,
+    ROW_BLOCKS: gl.constexpr,
+    PAGE_SIZE: gl.constexpr,
+    MAX_SPLITS: gl.constexpr,
+    TARGET_PROGRAMS: gl.constexpr,
+    MIN_SPLIT_PAGES: gl.constexpr,
+    PAGE_ALIGN: gl.constexpr,
+    layout: gl.constexpr,
+):
+    """Return the request holding work item ``item``, its length, its first
+    item, its split count, the pages per split, and the batch's item count.
+    The request is num_requests past the last item."""
+    # One load covers batches of up to _SCHEDULE_CHUNK requests; larger ones
+    # load the rest a chunk at a time.
+    seq_lens = _load_lengths(cache_seqlens_ptr, 0, num_requests, layout)
+    split_pages = _split_pages(
+        cache_seqlens_ptr,
+        num_requests,
+        seq_lens,
+        ROW_BLOCKS,
+        PAGE_SIZE,
+        TARGET_PROGRAMS,
+        MIN_SPLIT_PAGES,
+        PAGE_ALIGN,
+        layout,
+    )
+    offs = gl.arange(0, _SCHEDULE_CHUNK, layout=layout)
+    chunk_first = num_requests * 0
+    request = num_requests
+    seq_len = chunk_first
+    first_item = chunk_first
+    splits = chunk_first + 1
+    for start in range(0, num_requests, _SCHEDULE_CHUNK):
+        if start > 0:
+            seq_lens = _load_lengths(cache_seqlens_ptr, start, num_requests, layout)
+        valid = start + offs < num_requests
+        request_splits = _request_splits(seq_lens, split_pages, PAGE_SIZE, MAX_SPLITS)
+        items = gl.where(valid, request_splits * ROW_BLOCKS, 0)
+        ends = chunk_first + gl.cumsum(items, axis=0)
+        # Requests of this chunk whose items all precede ``item``. Lanes past
+        # the batch end where the chunk ends, so they count only when
+        # ``item`` lies past the chunk as well.
+        before = gl.sum((ends <= item).to(gl.int32), axis=0)
+        found = (start + before < num_requests) & (before < _SCHEDULE_CHUNK)
+        found = found & (request == num_requests)
+        lane = offs == before
+        request = gl.where(found, start + before, request)
+        seq_len = gl.where(found, gl.sum(gl.where(lane, seq_lens, 0), axis=0), seq_len)
+        first_item = gl.where(
+            found, gl.sum(gl.where(lane, ends - items, 0), axis=0), first_item
+        )
+        splits = gl.where(
+            found, gl.sum(gl.where(lane, request_splits, 0), axis=0), splits
+        )
+        chunk_first += gl.sum(items, axis=0)
+    return request, seq_len, first_item, splits, split_pages, chunk_first
+
+
+# ===-----------------------------------------------------------------------===#
 # Kernel Program
 # ===-----------------------------------------------------------------------===#
 
@@ -210,6 +350,7 @@ class AttentionProgram:
     split_start: gl.tensor
     split_end: gl.tensor
     mask_start: gl.tensor
+    item: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -232,6 +373,7 @@ class AttentionProgram:
         split_start,
         split_end,
         mask_start,
+        item,
     ):
         self.cfg = gl.constexpr(cfg)
         self.q_ptr = q_ptr
@@ -251,6 +393,7 @@ class AttentionProgram:
         self.split_start = split_start
         self.split_end = split_end
         self.mask_start = mask_start
+        self.item = item
 
     @gluon.jit
     def create(
@@ -263,7 +406,104 @@ class AttentionProgram:
         mid_o_ptr,
         mid_lse_ptr,
     ):
-        """Locate this program's request, KV head, row block and split.
+        """Locate this program's request, KV head, row block and split from its
+        position in a (request, row block, split) grid."""
+        batch = gl.program_id(0)
+        return AttentionProgram.locate(
+            cfg,
+            q_ptr,
+            k_cache_ptr,
+            v_cache_ptr,
+            page_table_ptr,
+            cache_seqlens_ptr,
+            mid_o_ptr,
+            mid_lse_ptr,
+            batch,
+            gl.load(cache_seqlens_ptr + batch),
+            gl.program_id(1),
+            gl.program_id(2),
+            cfg.NUM_KV_SPLITS,
+            1,
+            gl.program_id(2),
+        )
+
+    @gluon.jit
+    def create_scheduled(
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+        num_requests,
+        TARGET_PROGRAMS: gl.constexpr,
+        MIN_SPLIT_PAGES: gl.constexpr,
+        PAGE_ALIGN: gl.constexpr,
+    ):
+        """Locate this program's work item in a one-dimensional grid.
+
+        The items are each request's row blocks times its splits, in request
+        order (see _find_item). Returns the program, whether the grid
+        position holds an item (positions past the last item have no work),
+        the batch's item count, and the request's split count.
+        """
+        layout: gl.constexpr = gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
+        item = gl.program_id(0)
+        request, seq_len, first_item, splits, split_pages, num_items = _find_item(
+            cache_seqlens_ptr,
+            num_requests,
+            item,
+            cfg.NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS,
+            cfg.PAGE_SIZE,
+            cfg.NUM_KV_SPLITS,
+            TARGET_PROGRAMS,
+            MIN_SPLIT_PAGES,
+            PAGE_ALIGN,
+            layout,
+        )
+        has_work = request < num_requests
+        head_block = (item - first_item) // splits
+        split_id = item - first_item - head_block * splits
+        program = AttentionProgram.locate(
+            cfg,
+            q_ptr,
+            k_cache_ptr,
+            v_cache_ptr,
+            page_table_ptr,
+            cache_seqlens_ptr,
+            mid_o_ptr,
+            mid_lse_ptr,
+            gl.minimum(request, num_requests - 1),
+            seq_len,
+            head_block,
+            split_id,
+            splits,
+            split_pages,
+            item,
+        )
+        return program, has_work, num_items, splits
+
+    @gluon.jit
+    def locate(
+        cfg,
+        q_ptr,
+        k_cache_ptr,
+        v_cache_ptr,
+        page_table_ptr,
+        cache_seqlens_ptr,
+        mid_o_ptr,
+        mid_lse_ptr,
+        batch,
+        seq_len,
+        head_block,
+        split_id,
+        num_splits,
+        min_split_pages,
+        item,
+    ):
+        """Bound the keys of one request's row block and split.
 
         The rows of a block share one pass over the union of the keys they
         see: up to its last row's causal end and, under a sliding window, from
@@ -271,12 +511,8 @@ class AttentionProgram:
         its MAX_SEQLEN_Q query tokens, so query position p sees the keys
         before seq_len - (MAX_SEQLEN_Q - 1 - p).
         """
-        batch = gl.program_id(0)
-        head_block = gl.program_id(1)
         kv_head = head_block // cfg.NUM_ROW_BLOCKS
         row_start = (head_block - kv_head * cfg.NUM_ROW_BLOCKS) * cfg.BLOCK_M
-        split_id = gl.program_id(2)
-        seq_len = gl.load(cache_seqlens_ptr + batch)
         if cfg.MAX_SEQLEN_Q == 1:
             first_end = maximum(seq_len, 0)
             cache_len = first_end
@@ -299,7 +535,7 @@ class AttentionProgram:
         first_page = kv_start // cfg.PAGE_SIZE
         end_page = cdiv(cache_len, cfg.PAGE_SIZE)
         num_pages = end_page - first_page
-        pages_per_split = cdiv(num_pages, cfg.NUM_KV_SPLITS)
+        pages_per_split = gl.maximum(cdiv(num_pages, num_splits), min_split_pages)
         split_start_page = first_page + split_id * pages_per_split
         split_end_page = min(split_start_page + pages_per_split, end_page)
         split_start = split_start_page * cfg.PAGE_SIZE
@@ -327,6 +563,7 @@ class AttentionProgram:
             split_start,
             split_end,
             mask_start,
+            item,
         )
 
     @gluon.jit
@@ -590,19 +827,18 @@ class AttentionProgram:
         return cdna4.mfma(p, v, acc)
 
     @gluon.jit
-    def store_split(self, acc, l_i, m_i):
+    def split_partial(self, acc, l_i, m_i):
+        """This split's normalized output and log2-sum-exp per row, in the
+        store layout.
+
+        A row without keys in this split (an empty split, or one past the
+        row's causal end or before its window) gets a zero partial with
+        lse = -inf, which the merge ignores.
+        """
         cfg = self.cfg
-        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
-        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
-        tokens = self.row_tokens(offs_m)
-        q_heads = self.row_heads(offs_m)
-        valid = self.row_valid(offs_m)
         acc = gl.convert_layout(acc, cfg.store_layout)
         l_i = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.store_layout))
         m_i = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.store_layout))
-        # A row without keys in this split (an empty split, or one past the
-        # row's causal end or before its window) stores a zero partial with
-        # lse = -inf, which the merge ignores.
         has_kv = l_i > 0.0
         recip_l_i = 1.0 / l_i
         part_o = gl.where(has_kv[:, None], acc * recip_l_i[:, None], 0.0)
@@ -611,6 +847,18 @@ class AttentionProgram:
             m_i * cfg.SM_SCALE + gl.log2(l_i),
             -float("inf"),
         )
+        return part_o, part_lse
+
+    @gluon.jit
+    def store_split(self, acc, l_i, m_i):
+        """Store the partial at [token, head, split] of a split grid."""
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        tokens = self.row_tokens(offs_m)
+        q_heads = self.row_heads(offs_m)
+        valid = self.row_valid(offs_m)
+        part_o, part_lse = self.split_partial(acc, l_i, m_i)
         mid_o_offsets = (
             (tokens[:, None] * cfg.NUM_Q_HEADS + q_heads[:, None]) * cfg.NUM_KV_SPLITS
             + self.split_id
@@ -620,6 +868,28 @@ class AttentionProgram:
         ) * cfg.NUM_KV_SPLITS + self.split_id
         cdna4.buffer_store(part_o, self.mid_o_ptr, mid_o_offsets, mask=valid[:, None])
         cdna4.buffer_store(part_lse, self.mid_lse_ptr, mid_lse_offsets, mask=valid)
+
+    @gluon.jit
+    def store_item(self, acc, l_i, m_i, splits):
+        """Store the partial of a scheduled grid's work item.
+
+        A row block's items hold BLOCK_M x splits partials, row major, so the
+        split reduce reads each row's partials from one contiguous range.
+        """
+        cfg = self.cfg
+        offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.store_layout))
+        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.store_layout))
+        valid = self.row_valid(offs_m)
+        part_o, part_lse = self.split_partial(acc, l_i, m_i)
+        first = (self.item - self.split_id) * cfg.BLOCK_M
+        rows = first + offs_m * splits + self.split_id
+        cdna4.buffer_store(
+            part_o,
+            self.mid_o_ptr,
+            rows[:, None] * cfg.HEAD_DIM + offs_d[None, :],
+            mask=valid[:, None],
+        )
+        cdna4.buffer_store(part_lse, self.mid_lse_ptr, rows, mask=valid)
 
     @gluon.jit
     def store_output(self, acc, l_i):
@@ -791,7 +1061,15 @@ def _stream_split_single_buffer(program, q, m_i, l_i, acc, k_smem, v_smem):
 
 @gluon.jit
 def _stream_split_pipelined(
-    program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES: gl.constexpr
+    program,
+    q,
+    m_i,
+    l_i,
+    acc,
+    k_cache_ptr,
+    v_cache_ptr,
+    pipeline,
+    NUM_STAGES: gl.constexpr,
 ):
     cfg = program.cfg
     # Software-pipelined K/V page loads, NUM_STAGES deep: page p + NUM_STAGES - 1
@@ -814,8 +1092,9 @@ def _stream_split_pipelined(
 
     iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
     # A split with fewer pages than buffers would spend more on the pipeline
-    # prologue than it hides.
-    if program.split_end - program.split_start < iteration_tokens:
+    # prologue than it hides; ``pipeline`` false takes the single buffer too.
+    short = program.split_end - program.split_start < iteration_tokens
+    if short | (pipeline == 0):
         return _stream_split_single_buffer(
             program, q, m_i, l_i, acc, k_smem.index(0), v_smem.index(0)
         )
@@ -878,6 +1157,24 @@ def _stream_split_pipelined(
 
 
 @gluon.jit
+def _decode_item(
+    program,
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    pipeline,
+    splits,
+    NUM_STAGES: gl.constexpr,
+):
+    q = program.load_q()
+    m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
+    m_i, l_i, acc = _stream_split_pipelined(
+        program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, pipeline, NUM_STAGES
+    )
+    program.store_item(acc, l_i, m_i, splits)
+
+
+@gluon.jit(do_not_specialize=("num_requests",))
 def gluon_mha_decode_gfx950(
     q_ptr,
     k_cache_ptr,
@@ -886,13 +1183,15 @@ def gluon_mha_decode_gfx950(
     cache_seqlens_ptr,
     mid_o_ptr,
     mid_lse_ptr,
+    block_items_ptr,
+    num_requests,
     Q_STRIDE_B: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
-    NUM_KV_SPLITS: gl.constexpr,
+    MAX_SPLITS: gl.constexpr,
     MAX_SEQLEN_Q: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
@@ -900,16 +1199,18 @@ def gluon_mha_decode_gfx950(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    IS_SLIDING: gl.constexpr,
-    WINDOW_LEFT: gl.constexpr,
     IS_FP8: gl.constexpr,
     NUM_STAGES: gl.constexpr,
+    TARGET_PROGRAMS: gl.constexpr,
+    MIN_SPLIT_PAGES: gl.constexpr,
 ):
+    """Full-attention split of one work item of the split schedule; the grid
+    has one program per possible item, and the ones past the last item exit."""
     cfg = AttentionConfig(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
-        NUM_KV_SPLITS,
+        MAX_SPLITS,
         MAX_SEQLEN_Q,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
@@ -917,13 +1218,13 @@ def gluon_mha_decode_gfx950(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        IS_SLIDING,
-        WINDOW_LEFT,
+        False,  # IS_SLIDING
+        -1,  # WINDOW_LEFT
         IS_FP8,
         k_cache_ptr.dtype.element_ty,
         InputStrides(Q_STRIDE_B, Q_STRIDE_H, Q_STRIDE_D),
     )
-    program = AttentionProgram.create(
+    program, has_work, num_items, splits = AttentionProgram.create_scheduled(
         cfg,
         q_ptr,
         k_cache_ptr,
@@ -932,24 +1233,36 @@ def gluon_mha_decode_gfx950(
         cache_seqlens_ptr,
         mid_o_ptr,
         mid_lse_ptr,
+        num_requests,
+        TARGET_PROGRAMS,
+        MIN_SPLIT_PAGES,
+        NUM_STAGES,
     )
-    q = program.load_q()
-    m_i, l_i, acc, sink_log2 = program.init_state(q_ptr, False)
-    if NUM_STAGES == 1:
-        k_smem = gl.allocate_shared_memory(
-            k_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.k_smem_layout
-        )
-        v_smem = gl.allocate_shared_memory(
-            v_cache_ptr.dtype.element_ty, [cfg.BLOCK_N, cfg.HEAD_DIM], cfg.v_smem_layout
-        )
-        m_i, l_i, acc = _stream_split_single_buffer(
-            program, q, m_i, l_i, acc, k_smem, v_smem
-        )
+    if NUM_WARPS == 1:
+        # A one-wave work-group computes every page itself, and the pipeline's
+        # extra per-page instructions cost more than the latency they hide
+        # once two work-groups per CU stream the KV. Pipeline only while the
+        # work items leave CUs with at most one work-group, or for splits of
+        # 32 pages or more, which spend longest waiting on loads.
+        long_split = program.split_end - program.split_start >= 32 * PAGE_SIZE
+        pipeline = (num_items * 2 <= TARGET_PROGRAMS) | long_split
     else:
-        m_i, l_i, acc = _stream_split_pipelined(
-            program, q, m_i, l_i, acc, k_cache_ptr, v_cache_ptr, NUM_STAGES
+        # Every multi-wave work-group pipelines.
+        pipeline = num_items >= 0
+    if has_work:
+        if program.split_id == 0:
+            # The reduce finds a row block's partials from its first item and
+            # split count, so it does not evaluate the schedule again.
+            block = (
+                program.batch * (NUM_KV_HEADS * cfg.NUM_ROW_BLOCKS)
+                + program.kv_head * cfg.NUM_ROW_BLOCKS
+                + program.row_start // BLOCK_M
+            )
+            gl.store(block_items_ptr + 2 * block, program.item)
+            gl.store(block_items_ptr + 2 * block + 1, splits)
+        _decode_item(
+            program, q_ptr, k_cache_ptr, v_cache_ptr, pipeline, splits, NUM_STAGES
         )
-    program.store_split(acc, l_i, m_i)
 
 
 @gluon.jit
@@ -1133,30 +1446,35 @@ def gluon_mha_decode_reduce_gfx950(
     out_ptr,
     sink_ptr,
     k_cache_ptr,  # unused for loads; only its dtype feeds the shared config
+    block_items_ptr,
     SM_SCALE: gl.constexpr,
     PAGE_TABLE_STRIDE: gl.constexpr,
-    NUM_KV_SPLITS: gl.constexpr,
+    MAX_SPLITS: gl.constexpr,
     MAX_SEQLEN_Q: gl.constexpr,
     PAGE_SIZE: gl.constexpr,
     NUM_Q_HEADS: gl.constexpr,
     NUM_KV_HEADS: gl.constexpr,
     HEAD_DIM: gl.constexpr,
+    BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     HAS_SINK: gl.constexpr,
     IS_FP8: gl.constexpr,
 ):
-    # One wave merges one (query token, head); the attention row tiling does
-    # not apply, so the config takes a single-wave tile.
+    """Merge the split partials of one (query token, head).
+
+    One wave merges one row; the config keeps the decode's BLOCK_M to locate
+    the row's work items, with a single wave.
+    """
     cfg = AttentionConfig(
         SM_SCALE,
         PAGE_TABLE_STRIDE,
         PAGE_SIZE,
-        NUM_KV_SPLITS,
+        MAX_SPLITS,
         MAX_SEQLEN_Q,
         NUM_Q_HEADS,
         NUM_KV_HEADS,
         HEAD_DIM,
-        16,  # BLOCK_M
+        BLOCK_M,
         BLOCK_N,
         1,  # NUM_WARPS
         False,  # IS_SLIDING
@@ -1167,31 +1485,62 @@ def gluon_mha_decode_reduce_gfx950(
     )
     q_index = gl.program_id(0)
     q_head = gl.program_id(1)
+    # The decode kernel's row block and row of this (query token, head):
+    # rows run over query positions, then over the KV head's query heads.
+    request = q_index // cfg.MAX_SEQLEN_Q
+    kv_head = q_head // cfg.GROUP_SIZE
+    row = (q_index - request * cfg.MAX_SEQLEN_Q) * cfg.GROUP_SIZE + (
+        q_head - kv_head * cfg.GROUP_SIZE
+    )
+    row_block = row // cfg.BLOCK_M
+    # The row block's first work item and split count, from the decode kernel.
+    block = (request * cfg.NUM_KV_HEADS + kv_head) * cfg.NUM_ROW_BLOCKS + row_block
+    first_item = gl.load(block_items_ptr + 2 * block)
+    splits = gl.load(block_items_ptr + 2 * block + 1)
+    # The row's partials follow one another from first_row on.
+    first_row = first_item * cfg.BLOCK_M + (row - row_block * cfg.BLOCK_M) * splits
 
-    # SPLIT_TILE pads NUM_KV_SPLITS up to a power of 2.
-    SPLIT_TILE: gl.constexpr = 1 << (NUM_KV_SPLITS - 1).bit_length()
-    offs_s = gl.arange(0, SPLIT_TILE, layout=gl.SliceLayout(1, cfg.reduce_layout))
-    offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.reduce_layout))
-    # Every split stores its partial, with lse = -inf when it has no tokens, so
-    # the loads need not wait on cache_seqlens; only the padding tail is masked.
-    split_valid = offs_s < cfg.NUM_KV_SPLITS
-    base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.NUM_KV_SPLITS + offs_s
-    part_lse = gl.load(mid_lse_ptr + base, mask=split_valid, other=-float("inf"))
-    o_off = base[:, None] * cfg.HEAD_DIM + offs_d[None, :]
-    part_o = cdna4.buffer_load(mid_o_ptr, o_off, mask=split_valid[:, None], other=0.0)
-
-    # Global softmax max over all splits (folding in the sink).
-    m_i = max(part_lse, axis=0)
+    # A chunk holds 64 values per lane, so splits up to 64 (head dim 64) or
+    # 32 (head dim 128) load at once.
+    SPLIT_CHUNK: gl.constexpr = 4096 // HEAD_DIM
+    offs_s = gl.arange(0, SPLIT_CHUNK, layout=gl.SliceLayout(1, cfg.reduce_layout))
+    offs_d = gl.arange(0, HEAD_DIM, layout=gl.SliceLayout(0, cfg.reduce_layout))
+    no_splits = gl.full(
+        [SPLIT_CHUNK], -float("inf"), gl.float32, gl.SliceLayout(1, cfg.reduce_layout)
+    )
+    m_i = max(no_splits, axis=0)
+    l_i = gl.sum(gl.exp2(no_splits), axis=0)
+    acc = gl.zeros(
+        [HEAD_DIM], dtype=gl.float32, layout=gl.SliceLayout(0, cfg.reduce_layout)
+    )
+    # Every split of the row stored its partial, with lse = -inf when it had
+    # no keys. Splits past the row's count reread its last partial and get
+    # lse = -inf: unlike masked loads, which the compiler waits on a few at a
+    # time to select their fill value, these loads all issue at once.
+    for split_start in range(0, splits, SPLIT_CHUNK):
+        split = split_start + offs_s
+        rows = first_row + gl.minimum(split, splits - 1)
+        part_lse = gl.load(mid_lse_ptr + rows)
+        part_o = cdna4.buffer_load(
+            mid_o_ptr, rows[:, None] * HEAD_DIM + offs_d[None, :]
+        )
+        part_lse = gl.where(split < splits, part_lse, -float("inf"))
+        next_m = maximum(m_i, max(part_lse, axis=0))
+        # A chunk can hold only rows without keys (lse = -inf) while m_i is
+        # still -inf; shift by 0 then to keep -inf - -inf from making NaN.
+        shift = gl.where(next_m == -float("inf"), 0.0, next_m)
+        alpha = gl.exp2(m_i - shift)
+        beta = gl.exp2(part_lse - shift)
+        l_i = l_i * alpha + gl.sum(beta, axis=0)
+        acc = acc * alpha + gl.sum(part_o * beta[:, None], axis=0)
+        m_i = next_m
     if HAS_SINK:
+        # The sink is one more softmax entry, merged once for the row.
         sink = gl.load(sink_ptr + q_head).to(gl.float32) * _INV_LN2
-        m_i = maximum(m_i, sink)
-    # Weighted sum of the split partials, normalized by the total softmax mass.
-    beta = gl.exp2(part_lse - m_i)
-    l_i = gl.sum(beta, axis=0)
-    if HAS_SINK:
-        l_i = l_i + gl.exp2(sink - m_i)
-    acc = gl.sum(part_o * beta[:, None], axis=0)
-
+        next_m = maximum(m_i, sink)
+        alpha = gl.exp2(m_i - next_m)
+        l_i = l_i * alpha + gl.exp2(sink - next_m)
+        acc = acc * alpha
     out_base = (q_index * cfg.NUM_Q_HEADS + q_head) * cfg.HEAD_DIM
     output = acc * (1.0 / l_i)
     output = output.to(out_ptr.dtype.element_ty)
@@ -1205,7 +1554,11 @@ class LaunchConfig(NamedTuple):
     num_row_blocks: int
     head_dim: int
     page_size: int
+    # Sliding window: splits of every request. Full attention: the most
+    # splits a request's row block can take (the schedule sets each count).
     num_kv_splits: int
+    # Full attention: the scheduled grid, the most work items of any batch.
+    num_programs: int
     num_stages: int
     block_m: int
     block_n: int
@@ -1244,30 +1597,6 @@ def _sliding_split_counters(
     return counters
 
 
-def _full_decode_stages(
-    num_kv_splits: int,
-    page_size: int,
-    head_dim: int,
-    element_size: int,
-    num_warps: int,
-) -> int:
-    """Pipeline the K/V page loads only when select_kv_splits returned its
-    maximum, _FULL_DECODE_MAX_SPLITS: even the most splits leave the grid below
-    its occupancy target, so each work-group streams a long split.
-
-    With fewer splits the grid already holds enough waves to cover the load
-    latency, and the pipeline's LDS buffers would lower occupancy.
-    """
-    if num_kv_splits < _FULL_DECODE_MAX_SPLITS:
-        return 1
-    # The waves of a work-group share the copies of one KV head's K and V page
-    # tiles, 16 bytes per lane per buffer_load_dwordx4.
-    copies_per_page = 2 * page_size * head_dim * element_size // (64 * 16 * num_warps)
-    if (_FULL_DECODE_STAGES - 1) * copies_per_page > _GFX950_MAX_VMCNT:
-        return 1
-    return _FULL_DECODE_STAGES
-
-
 def _row_tile(max_seqlen_q: int, group_size: int) -> tuple[int, int]:
     """Return (BLOCK_M, NUM_WARPS) for a request's rows of one KV head.
 
@@ -1301,19 +1630,20 @@ def get_config(
     window_left = window_left if is_sliding else -1
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
-    effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
-    num_pages = (effective_seqlen_k + page_size - 1) // page_size
-    num_kv_splits = select_kv_splits(
-        base_ctas=num_requests * num_kv_heads * num_row_blocks,
-        num_pages=num_pages,
-        sm_count=_GFX950_SM_COUNT,
-        max_splits=_FULL_DECODE_MAX_SPLITS,
-    )
+    head_blocks = num_kv_heads * num_row_blocks
     if is_sliding:
+        effective_seqlen_k = min(max_seqlen_k, window_left)
+        num_pages = (effective_seqlen_k + page_size - 1) // page_size
         target_splits = 8 if num_requests <= 4 else 4
-        num_kv_splits = min(target_splits, num_pages)
-        if num_kv_splits < 1:
-            num_kv_splits = 1
+        num_kv_splits = builtins.max(1, min(target_splits, num_pages))
+        num_programs = num_requests * head_blocks * num_kv_splits
+    else:
+        # The schedule reads the lengths when the kernel runs; max_seqlen_k
+        # (the model's context limit under graph capture) does not size it.
+        num_kv_splits = _FULL_DECODE_MAX_SPLITS
+        num_programs = builtins.max(
+            _FULL_DECODE_TARGET_PROGRAMS, num_requests * head_blocks
+        )
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=num_kv_heads,
@@ -1322,9 +1652,8 @@ def get_config(
         head_dim=head_dim,
         page_size=page_size,
         num_kv_splits=num_kv_splits,
-        num_stages=_full_decode_stages(
-            num_kv_splits, page_size, head_dim, k_cache.element_size(), num_warps
-        ),
+        num_programs=num_programs,
+        num_stages=_FULL_DECODE_STAGES,
         block_m=block_m,
         block_n=block_n,
         num_warps=num_warps,
@@ -1442,21 +1771,24 @@ def launch_gluon_mha_decode_gfx950(
             is_fp8,
             num_warps=config.num_warps,
         )
-    else:
-        # Always use split-k for full attention
+    elif config.num_requests > 0:
+        # Full attention always splits the keys, by the schedule in
+        # _find_item; one partial of BLOCK_M rows per work item.
         mid_o = torch.empty(
-            (total_q, config.num_q_heads, config.num_kv_splits, config.head_dim),
+            (config.num_programs, config.block_m, config.head_dim),
             device=q.device,
             dtype=torch.float32,
         )
         mid_lse = torch.empty(
-            (total_q, config.num_q_heads, config.num_kv_splits),
+            (config.num_programs, config.block_m),
             device=q.device,
             dtype=torch.float32,
         )
-
-        grid = (config.num_requests, head_blocks, config.num_kv_splits)
-        gluon_mha_decode_gfx950[grid](
+        # Each row block's first work item and split count.
+        block_items = torch.empty(
+            (config.num_requests, head_blocks, 2), device=q.device, dtype=torch.int32
+        )
+        gluon_mha_decode_gfx950[(config.num_programs,)](
             q,
             k_cache,
             v_cache,
@@ -1464,6 +1796,8 @@ def launch_gluon_mha_decode_gfx950(
             cache_seqlens,
             mid_o,
             mid_lse,
+            block_items,
+            config.num_requests,
             q.stride(0),
             q.stride(1),
             q.stride(2),
@@ -1478,10 +1812,10 @@ def launch_gluon_mha_decode_gfx950(
             config.block_m,
             config.block_n,
             config.num_warps,
-            config.is_sliding,
-            config.window_left,
             is_fp8,
             config.num_stages,
+            _FULL_DECODE_TARGET_PROGRAMS,
+            _FULL_DECODE_MIN_SPLIT_PAGES,
             num_warps=config.num_warps,
             **sched_compile_options(),
         )
@@ -1495,6 +1829,7 @@ def launch_gluon_mha_decode_gfx950(
             output,
             sink_arg,
             k_cache,
+            block_items,
             config.sm_scale,
             page_table.stride(0),
             config.num_kv_splits,
@@ -1503,6 +1838,7 @@ def launch_gluon_mha_decode_gfx950(
             config.num_q_heads,
             config.num_kv_heads,
             config.head_dim,
+            config.block_m,
             config.block_n,
             has_sink,
             is_fp8,
