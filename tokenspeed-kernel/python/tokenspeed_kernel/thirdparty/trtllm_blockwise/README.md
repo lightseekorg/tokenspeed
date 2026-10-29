@@ -24,18 +24,25 @@ TRT-LLM's `CuteDSLFp8BlackwellRunner` at the source commit above: MMA tiles
 M/N dimensions are 1, 2 or 4. The upstream `can_implement` check filters invalid
 combinations. The kernel source itself is unchanged.
 
-The runner uses TokenSpeed's shared FlashInfer autotuner. It measures the
-adapter, including scale-layout copies, with CUDA graphs and a cold L2 cache.
-M uses powers-of-two buckets rounded down; N/K and the scale contract remain
-in the cache key. Activation scales and output rows follow each M bucket.
+The runner uses TokenSpeed's shared FlashInfer autotuner. Its default CUDA-event
+profiler measures the adapter, including scale-layout copies, with CUDA graphs
+while rotating independent input/output buffers, without an explicit L2 flush.
+For each shape, the number of groups is the L2 cache size divided by the size
+of one group, rounded up. Each timed graph uses every group the same number of
+times and has at least the originally configured number of profiling calls.
+These buffers are temporary and released after tuning. M uses powers-of-two
+buckets rounded down; N/K, the scale contract and profiling strategy remain in
+the cache key. Activation scales and output rows follow each M bucket.
+Entries from earlier profiling strategies are not reused.
 The normal startup cache save/load path persists the selected configurations.
 FlashInfer's preparation phase compiles the valid dynamic-shape variants only
 when a tuning-cache miss needs profiling. Cache hits skip that phase and
 prepare the fixed fallback tiles and encountered winners during eager warmup.
 
-Outside the tuning context, calls use the cached choice. Without a matching
-entry, the previous rule applies: M <= 64 uses tile 64x128, M <= 128 uses
-128x128, and larger M uses 256x128 with 2-CTA instructions. `--disable-autotune`
+Outside the tuning context, calls use FlashInfer's cached choice. If the M bucket
+is missing, the default serving path searches cached buckets for the closest M
+with the same N/K, scale contract and device; ties use the smaller M. If no
+compatible entry exists, the previous fixed-tile rule applies. `--disable-autotune`
 skips new searches; an existing loaded cache can still be used. The first eager
 launch prepares all three fallback configurations. Loaded non-default winners
 must be warmed eagerly for their capture buckets; TokenSpeed's graph capture
