@@ -948,6 +948,13 @@ across nodes. Logits all-gather and distributed argmax use the same
 cross-node fallback. Layouts such as attention DP with dense TP or MoE EP
 spanning nodes need this fallback.
 
+On NVIDIA, Triton RSAG reserves four signal-pad bytes per rank per CTA, up
+to its 32-CTA grid limit. When PyTorch exposes `set_signal_pad_size`, RSAG
+grows the pad before allocating its communication buffer and preserves any
+larger reservation. PyTorch 2.9 uses a fixed pad instead; RSAG checks its
+capacity through the rendezvous handle and fails during initialization if
+it is too small.
+
 Under `--numerics rl-bitwise` (`--batch-invariant-collectives`) every
 reduction takes NCCL data movement plus a rank-ordered fp32 fold, and the
 gathers stay on the multicast kernels; the in-switch reduction's order moves
