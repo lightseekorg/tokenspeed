@@ -22,19 +22,18 @@
 
 import pytest
 import torch
-from flashinfer.autotuner import AutoTuner
-from flashinfer.autotuner import autotune as native_autotune
-from flashinfer.jit.core import logger as jit_logger
 from tokenspeed_kernel.ops.gemm import mm, prepare_nvfp4_a16_weights
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     get_autotune_max_num_tokens,
     set_autotune_max_num_tokens,
 )
+from tokenspeed_kernel.platform import current_platform
 from tokenspeed_kernel.thirdparty.msa.cute.quantize import swizzle_nvfp4_scale_to_128x4
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available()
+    not current_platform().is_nvidia
+    or not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="capacity regressions require FlashInfer SM100/103 GEMMs",
 )
@@ -120,6 +119,9 @@ def _rows(tuner, op):
 
 @pytest.fixture
 def isolated_tuner(monkeypatch, caplog):
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.jit.core import logger as jit_logger
+
     tuner = AutoTuner()
     monkeypatch.setattr(AutoTuner, "_instance", tuner)
     previous = get_autotune_max_num_tokens()
@@ -175,6 +177,8 @@ def test_gemm_capacity(isolated_tuner, tmp_path, caplog, kind, op):
 
 
 def test_tuning_controls_and_cleanup(isolated_tuner):
+    from flashinfer.autotuner import autotune as native_autotune
+
     tuner = isolated_tuner
     with autotune(tune_mode=False, tuning_buckets=None, round_up=None):
         _run("fp8", 1)

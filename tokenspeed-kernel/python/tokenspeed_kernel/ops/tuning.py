@@ -105,6 +105,7 @@ def is_warming_up() -> bool:
 
 @functools.cache
 def _gemm_tuning_config(config, num_tokens: int):
+    """Cover num_tokens with generated buckets; preserve explicit buckets."""
     (spec,) = config.dynamic_tensor_specs
     if not callable(spec.gen_tuning_buckets):
         # Explicit native buckets (including an enclosing TS scope) own
