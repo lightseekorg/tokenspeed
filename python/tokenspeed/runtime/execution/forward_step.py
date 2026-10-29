@@ -587,6 +587,11 @@ class ForwardStepRunner:
                 if self.runtime_states is not None
                 else None
             ),
+            draft_q=(
+                self.runtime_states.future_draft_q
+                if self.runtime_states is not None
+                else None
+            ),
             vocab_size=self.vocab_size,
             device=self.device,
         )
@@ -764,6 +769,11 @@ class ForwardStepRunner:
                     ),
                     draft_probs=(
                         self.runtime_states.draft_probs
+                        if self.runtime_states is not None
+                        else None
+                    ),
+                    draft_q=(
+                        self.runtime_states.future_draft_q
                         if self.runtime_states is not None
                         else None
                     ),
