@@ -1349,6 +1349,14 @@ the partials by LSE.
 - The split count comes from the query blocks and `max_seqlen_k`, not from
   device-resident lengths, so graphs replay for any batch composition.
   Sliding-window attention does not split.
+- The request count is an unspecialized runtime argument. The tile (64 or
+  128 rows), the pipeline depth (1 or 4), the grid (ragged or per request)
+  and whether the split count is a multiple of 16 also follow the batch but
+  compile into the kernels: the tile and depth size the LDS buffers, and
+  as runtime values the other two cost 6-9% on short extends (1.5% on
+  sliding-window layers).
+  `warmup_gluon_mha_extend_gfx950` compiles every variant without running,
+  for startup.
 
 #### Algorithm
 
