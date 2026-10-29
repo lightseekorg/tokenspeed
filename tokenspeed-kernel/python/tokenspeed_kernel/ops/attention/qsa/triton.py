@@ -37,11 +37,7 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import dense_tensor_format, format_signature
-from tokenspeed_kernel.warmup import (
-    TensorVariant,
-    kernel_launcher,
-    register_triton_warmup,
-)
+from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _is_nvidia = current_platform().is_nvidia
 _SCORE_MAX_WAVES = 3
@@ -1351,7 +1347,7 @@ def qwen4_exp_qsa_commit_verify_layers(
             "QSA batched verify commit needs one shared row per staged row"
         )
 
-    kernel_launcher(_qwen4_exp_qsa_commit_verify_layers_kernel, (rows, num_layers))(
+    _qwen4_exp_qsa_commit_verify_layers_kernel[(rows, num_layers)](
         raw_addresses,
         position_addresses,
         staged_k,
@@ -1835,7 +1831,9 @@ def triton_qsa_block_scores(
         # Keep those alignment hints and compile every reachable class before
         # live table widths and request-run lengths select another variant.
         warm_args = list(args)
-        for columns in (1, 16, 17):
+        # Whole pages already align both block counts and logits row strides.
+        column_classes = (1,) if page_size % 16 == 0 else (1, 16, 17)
+        for columns in column_classes:
             warm_args[8] = warm_args[-1] = columns * page_size
             for table_stride in (1, 16, 17):
                 warm_args[-2] = table_stride
@@ -2374,15 +2372,4 @@ register_triton_warmup(
 register_triton_warmup(
     _qwen4_exp_qsa_recent_write_kernel,
     variants=({"rows": (1, 16, 17)},),
-)
-register_triton_warmup(
-    _qwen4_exp_qsa_commit_verify_layers_kernel,
-    variants=(
-        {
-            "accepted_lengths": (
-                TensorVariant(torch.int32, True),
-                TensorVariant(torch.int32, False),
-            )
-        },
-    ),
 )

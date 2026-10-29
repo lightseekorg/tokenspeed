@@ -25,7 +25,6 @@ from __future__ import annotations
 from enum import IntEnum, auto
 
 import torch
-from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 from tokenspeed.runtime.utils.triton import tl, triton
 
@@ -109,7 +108,7 @@ def compute_position_triton(
     )
     has_prefix = extend_prefix_lens.shape[0] == batch_size
     # Launch kernel
-    kernel_launcher(compute_position_kernel, (batch_size,))(
+    compute_position_kernel[(batch_size,)](
         positions, extend_start_loc, extend_prefix_lens, extend_seq_lens, has_prefix
     )
 
@@ -144,8 +143,3 @@ def compute_position_kernel(
             mask=offset < seq_len,
         )
     tl.store(extend_start_loc + pid, cumsum_start)
-
-
-register_triton_warmup(
-    compute_position_kernel, variants=({"has_prefix": (False, True)},)
-)

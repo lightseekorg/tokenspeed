@@ -35,11 +35,6 @@ from __future__ import annotations
 import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
-from tokenspeed_kernel.warmup import (
-    TensorVariant,
-    kernel_launcher,
-    register_triton_warmup,
-)
 
 STATE_INPUT_SLOT = 0
 STATE_LIVE_SLOT = 1
@@ -131,7 +126,7 @@ def verify_state_blocks(
         return _torch_verify_state_blocks(table, batch_size, pages_out, live_pages_out)
 
     block = 256
-    kernel_launcher(_verify_state_blocks_kernel, (triton.cdiv(batch_size, block),))(
+    _verify_state_blocks_kernel[(triton.cdiv(batch_size, block),)](
         table,
         pages_out,
         live_pages_out,
@@ -244,7 +239,7 @@ def commit_state_pages(
         )
 
     block = 256
-    kernel_launcher(_commit_state_pages_kernel, (triton.cdiv(batch_size, block),))(
+    _commit_state_pages_kernel[(triton.cdiv(batch_size, block),)](
         accepted_length,
         table,
         pages_out,
@@ -379,38 +374,3 @@ def commit_state_groups(
         pages_out.stride(0),
         BLOCK=256,
     )
-
-
-# Mixed batches slice the bridge tables and accepted lengths. Compile the
-# aligned and offset views before those slices appear on the forward thread.
-register_triton_warmup(
-    _verify_state_blocks_kernel,
-    variants=(
-        {
-            "table": (
-                TensorVariant(torch.int32, True),
-                TensorVariant(torch.int32, False),
-            ),
-            "live_pages_out": (None, TensorVariant(torch.int32, True)),
-        },
-    ),
-)
-register_triton_warmup(
-    _commit_state_pages_kernel,
-    variants=(
-        {
-            "accepted": (
-                TensorVariant(torch.int32, True),
-                TensorVariant(torch.int32, False),
-            ),
-            "table": (
-                TensorVariant(torch.int32, True),
-                TensorVariant(torch.int32, False),
-            ),
-            "steps_out": (
-                TensorVariant(torch.int32, True),
-                TensorVariant(torch.int32, False),
-            ),
-        },
-    ),
-)

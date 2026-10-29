@@ -451,10 +451,9 @@ class HostCacheExecutor:
 
         # Resolve each buffer binding on its eventual copy stream at startup,
         # so the first serving transfer only uploads its per-operation rows.
-        for storage, geometry, write_workspaces, load_workspaces in (
+        for storage, write_workspaces, load_workspaces in (
             (
                 self.host_storage,
-                self._transfer_geometry,
                 (
                     self._ordered_write_lane.workspace,
                     self._pinned_write_lane.workspace,
@@ -463,7 +462,6 @@ class HostCacheExecutor:
             ),
             (
                 self.snapshot_storage,
-                self._snapshot_geometry,
                 (self._snapshot_write_lane.workspace,),
                 (self._restore_pool_lane.workspace,),
             ),
@@ -481,9 +479,6 @@ class HostCacheExecutor:
                             storage.host_buffer,
                             backend=self.transfer_backend,
                         )
-            if io_backend == "kernel":
-                with device_module.stream(self.write_stream):
-                    write_workspaces[0].warmup(geometry)
         self.write_stream.synchronize()
         self.load_stream.synchronize()
 

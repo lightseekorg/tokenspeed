@@ -503,15 +503,6 @@ prepare CuTe QSA, streaming top-k and gated residual configurations. It follows
 normal dispatch overrides and scratch budgets, independently of optional
 FlashInfer tactic profiling. Pipeline parallelism skips this traversal.
 
-Input preparation and verify-workspace owners also prepare kernels used only
-before or after a forward, including accepted-state commits. Arena and Host
-transfer owners prepare block clearing, copying, transfer directions and layer
-waits before serving. Their compile-only calls use normal launch arguments and
-never write live cache data or wait on an unsignaled flag. After a graph-memory
-probe rebinds the final arena, startup repeats the ordinary traversal against
-that geometry: a probe's cache capacity is not the serving capacity. Existing
-FlashInfer tactics are reused.
-
 CuTe QSA keeps query rows and selected-slot row strides dynamic; model
 geometry, selection budgets and launch configurations stay static. Warmup
 covers encountered static signatures, including aligned and partial stream

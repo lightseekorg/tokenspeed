@@ -24,9 +24,8 @@ from itertools import accumulate
 from typing import TYPE_CHECKING
 
 import torch
-from tokenspeed_kernel.ops.metadata import PrepTape, Reg, advance_accepted_frontier
+from tokenspeed_kernel.ops.metadata import PrepTape, Reg
 from tokenspeed_kernel.ops.metadata.ngram import NGramHashParams, prepare_ngram_inputs
-from tokenspeed_kernel.warmup import compile_triton_kernels
 
 from tokenspeed.runtime.execution.cache_loc_kernel import fused_decode_input_prep
 from tokenspeed.runtime.execution.forward_batch_info import compute_position_triton
@@ -131,35 +130,6 @@ class InputBuffers:
         # State checkpoint, 0 for none.
         self.extend_state_checkpoint_lens_cpu = torch.zeros(max_bs, dtype=torch.int32)
         self._pad_tape = self._record_pad_tape()
-        self._warmup_preparation()
-
-    def _warmup_preparation(self) -> None:
-        """Prepare first-request input kernels without changing the buffers."""
-        if self._pad_tape is None:
-            return
-        with compile_triton_kernels():
-            self._pad_tape.run({Reg.TOKENS: 0, Reg.BS: 0})
-            compute_position_triton(
-                self.extend_prefix_lens_buf[:1],
-                self.extend_seq_lens_buf[:1],
-                1,
-                out=self.positions_buf,
-            )
-            fused_decode_input_prep(
-                self.positions_buf,
-                self.seq_lens_buf,
-                self.req_pool_indices_buf[:1],
-                self.seq_lens_buf,
-                1,
-            )
-            advance_accepted_frontier(
-                self.req_pool_indices_buf[:1],
-                self.input_lengths_buf[:1],
-                self.input_lengths_buf[:1],
-                self.seq_lens_buf,
-                0,
-                self.state_write_padding_pool_index,
-            )
 
     def prepare_request_token_history_inputs(
         self,

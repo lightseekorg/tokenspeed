@@ -232,13 +232,12 @@ Operators can prepare compilation variants during ordinary execution with
 profiling uses a separate `autotune` context.
 
 Triton operators can register finite launch variants with
-`warmup.register_triton_warmup`: scalar alignment classes, pointer views and
-the operator's bounded tile choices. The ordinary startup call supplies the
-model geometry and compiler options. Component owners use
-`warmup.compile_triton_kernels` with `kernel_launcher` for in-place operations
-that dummy forwards do not reach. This compiles and loads their binaries
-without executing cache writes or waits; outputs from that scope are discarded.
-It does not replace the rule that per-request sizes must be runtime arguments.
+`warmup.register_triton_warmup` for scalar alignment classes and bounded tile
+choices that vary with request shapes. `warmup.kernel_launcher` prepares these
+variants during ordinary startup execution, then launches the original call.
+Fixed-geometry cache management operations retain lazy compilation on first
+use; they need no synthetic startup writes, transfers or waits. Per-request
+sizes must still be runtime arguments, even when their variants are warmed.
 
 ### JIT compilation while serving
 

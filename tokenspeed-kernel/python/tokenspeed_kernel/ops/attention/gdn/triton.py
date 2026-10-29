@@ -79,11 +79,6 @@ from tokenspeed_kernel.platform import (
 )
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-from tokenspeed_kernel.warmup import (
-    TensorVariant,
-    kernel_launcher,
-    register_triton_warmup,
-)
 
 # The payload stores take ptxas to 172 registers, a CTA per SM fewer; 168 keeps three CTAs.
 _TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
@@ -1342,9 +1337,7 @@ def triton_gdn_replay_commit(
     NK, NV = triton.cdiv(head_k_dim, BK), triton.cdiv(head_v_dim, BV)
     if NK != 1:
         raise ValueError("GDN replay does not support head dimensions above one tile")
-    kernel_launcher(
-        _gdn_replay_commit_kernel, (batch_size * num_v_heads * NV, num_layers)
-    )(
+    _gdn_replay_commit_kernel[(batch_size * num_v_heads * NV, num_layers)](
         payload=payload,
         parameters=parameters,
         state_addresses=state_addresses,
@@ -1376,16 +1369,3 @@ def triton_gdn_replay_commit(
         **({"launch_pdl": True} if enable_pdl else {}),
         **({"maxnreg": 128, "sched4reg": True} if wide_state else {}),
     )
-
-
-register_triton_warmup(
-    _gdn_replay_commit_kernel,
-    variants=(
-        {
-            "write_indices": (
-                TensorVariant(torch.int32, True),
-                TensorVariant(torch.int32, False),
-            )
-        },
-    ),
-)

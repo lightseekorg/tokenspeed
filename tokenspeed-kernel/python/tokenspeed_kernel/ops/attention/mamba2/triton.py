@@ -28,11 +28,6 @@ from tokenspeed_kernel.ops.attention.mamba2 import Mamba2ChunkMetadata
 from tokenspeed_kernel.platform import CapabilityRequirement, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
-from tokenspeed_kernel.warmup import (
-    TensorVariant,
-    kernel_launcher,
-    register_triton_warmup,
-)
 
 _SIGNATURES = format_signatures(("x",), "dense", {torch.bfloat16})
 # Small tiles keep more states in flight in the latency-bound verify and replay loops.
@@ -973,7 +968,7 @@ def triton_mamba2_replay_commit(
     enable_pdl = pdl_enabled()
     # Layers x requests x heads exceeds the 65535 cap of grid axes 1 and 2.
     grid = (num_layers * batch_size * heads, triton.cdiv(head_dim, block_m))
-    kernel_launcher(_mamba2_replay_commit_kernel, grid)(
+    _mamba2_replay_commit_kernel[grid](
         payload,
         parameters,
         state_addresses,
@@ -998,16 +993,3 @@ def triton_mamba2_replay_commit(
         num_warps=num_warps,
         **({"launch_pdl": True} if enable_pdl else {}),
     )
-
-
-register_triton_warmup(
-    _mamba2_replay_commit_kernel,
-    variants=(
-        {
-            "write_indices": (
-                TensorVariant(torch.int32, True),
-                TensorVariant(torch.int32, False),
-            )
-        },
-    ),
-)

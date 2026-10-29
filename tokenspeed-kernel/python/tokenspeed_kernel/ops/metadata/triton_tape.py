@@ -29,7 +29,6 @@ vendor tokenspeed-triton targets.
 from __future__ import annotations
 
 from tokenspeed_kernel._triton import tl, triton
-from tokenspeed_kernel.warmup import kernel_launcher, register_triton_warmup
 
 _REG_FLAG = 1 << 62
 
@@ -111,7 +110,4 @@ def run_tape(descs, regs) -> None:
     n_ops = descs.shape[0]
     if n_ops == 0:
         return
-    kernel_launcher(_prep_tape_kernel, (n_ops,))(descs, regs, BLOCK=128, num_warps=1)
-
-
-register_triton_warmup(_prep_tape_kernel, variants=({},))
+    _prep_tape_kernel[(n_ops,)](descs, regs, BLOCK=128, num_warps=1)

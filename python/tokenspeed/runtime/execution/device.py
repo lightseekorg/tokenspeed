@@ -1391,7 +1391,6 @@ def build_device_side(
         startup_phase("kernels.autotune"),
         current_platform().restore_stack_limit(),
     ):
-        views.token_to_kv_pool.arena.warmup_block_operations()
         executor.autotune()
     if probing:
         # Consumers above keep the probe's: they read only block-count-invariant fields.
@@ -1405,14 +1404,6 @@ def build_device_side(
                 requested_backends,
                 startup_resident_bytes=sum(startup_memory.samples.get("startup", ())),
             )
-        # The probe used a small arena. Revisit the same operators with the
-        # final cache geometry, reusing the tactics discovered above.
-        with (
-            startup_phase("kernels.final_cache_warmup"),
-            current_platform().restore_stack_limit(),
-        ):
-            views.token_to_kv_pool.arena.warmup_block_operations()
-            executor.autotune()
         if (
             draft is not None
             and server_args.speculative_algorithm == "DFLASH"
