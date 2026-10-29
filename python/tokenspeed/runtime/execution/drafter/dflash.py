@@ -1017,10 +1017,15 @@ class DFlash(BaseDrafter):
         with the target: the target hands each captured tap to
         :meth:`on_target_capture` as it is produced, so the draft's KV is
         written under the target's remaining layers and ``run`` finds it done.
-        Everything the sink needs is fixed here, for this forward only.
+        Everything the sink needs is fixed here, for this forward only. An
+        idle forward produces no taps, so it is not armed.
         """
         self._incremental_kv_write_done = False
-        if not (self._incremental_proj_enabled and self._overlap_allowed(ctx)):
+        if not (
+            self._incremental_proj_enabled
+            and self._overlap_allowed(ctx)
+            and not ctx.forward_mode.is_idle()
+        ):
             return
         num_tokens = ctx.input_num_tokens
         self._incr_num_tokens = num_tokens

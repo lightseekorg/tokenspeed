@@ -40,8 +40,12 @@ from tokenspeed.runtime.execution.drafter.dflash import DFlash  # noqa: E402
 from tokenspeed.runtime.execution.drafter.dspark import DSpark  # noqa: E402
 from tokenspeed.runtime.execution.drafter.eagle import Eagle  # noqa: E402
 from tokenspeed.runtime.execution.drafter.mtp import Mtp  # noqa: E402
-from tokenspeed.runtime.execution.forward_batch_info import ForwardMode  # noqa: E402
+from tokenspeed.runtime.execution.forward_batch_info import (  # noqa: E402
+    CaptureHiddenMode,
+    ForwardMode,
+)
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+from tokenspeed.runtime.layers.logits_processor import LogitsMetadata  # noqa: E402
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
     TargetCaptureConfigurator,
 )
@@ -958,6 +962,29 @@ def test_dflash_leaves_the_context_alone_when_it_will_not_overlap(
     # a round that did not arm.
     assert drafter._incremental_kv_write_done is False
     assert torch.equal(drafter._incr_acc_buf, torch.ones(16, 3))
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_an_armed_forward_returns_no_hidden_capture_and_an_idle_one_keeps_it(idle):
+    """A decode forward (captured or eager alike) arms the sink, which takes
+    every tap, so the logits exit stores no capture. An idle forward produces
+    no taps: it is not armed and keeps its capture for the drafter's write."""
+    drafter = _incremental_dflash(enabled=True)
+    ctx = _target_ctx(num_extends=0, num_tokens=0 if idle else 4)
+    ctx.capture_hidden_mode = CaptureHiddenMode.FULL
+    if idle:
+        ctx.forward_mode = ForwardMode.IDLE
+
+    drafter.prepare_target_forward(ctx)
+    metadata = LogitsMetadata.from_forward_context(ctx)
+
+    assert drafter._incremental_kv_write_done is False
+    if idle:
+        assert ctx.target_capture_sink is None
+        assert metadata.capture_hidden_mode == CaptureHiddenMode.FULL
+    else:
+        assert ctx.target_capture_sink is drafter
+        assert metadata.capture_hidden_mode == CaptureHiddenMode.NULL
 
 
 def test_dflash_rejects_a_capture_of_the_wrong_width():
