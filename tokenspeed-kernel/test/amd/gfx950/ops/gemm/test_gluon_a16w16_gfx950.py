@@ -412,9 +412,11 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
 
 
-def test_decode_gemm_row_count_does_not_recompile() -> None:
+# Kimi K3 shared gate/up, and the Muse TP8 pre-expert projection, whose
+# 64-row bucket splits K.
+@pytest.mark.parametrize("n,k", [(1536, 7168), (512, 8192)])
+def test_decode_gemm_row_count_does_not_recompile(n: int, k: int) -> None:
     torch.manual_seed(0)
-    n, k = 1536, 7168
     a = torch.randn((64, k), device="cuda", dtype=torch.bfloat16) * 0.25
     b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
 
@@ -525,7 +527,8 @@ _DECODE_SHAPES = [(8192, 1024), (512, 8192)]
 
 
 @pytest.mark.parametrize("n,k", _DECODE_SHAPES)
-@pytest.mark.parametrize("m", [2, 3, 7, 16])
+# 24-64 rows are speculative verify batches of 3-8 requests.
+@pytest.mark.parametrize("m", [2, 3, 7, 16, 24, 33, 40, 64])
 def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -> None:
     torch.manual_seed(0)
     assert supports_gluon_mm_a16w16_decode_gfx950(m, n, k)

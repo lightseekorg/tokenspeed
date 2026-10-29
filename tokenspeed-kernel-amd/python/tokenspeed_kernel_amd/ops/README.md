@@ -69,7 +69,7 @@ Qwen3.8-Flash-Next decode batches.
   or FP32 (the MoE router). It runs only `(N, K)` and M buckets
   (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
   entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
-  Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 shapes.
+  Kimi K3 TP8, Muse Spark TP4/TP8 and Qwen3.8-Flash-Next TP2 shapes.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets

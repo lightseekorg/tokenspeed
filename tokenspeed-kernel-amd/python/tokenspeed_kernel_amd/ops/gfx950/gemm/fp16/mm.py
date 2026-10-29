@@ -1575,7 +1575,7 @@ def launch_gluon_mm_a16w16_medium_gfx950(
     return C
 
 
-# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4 and Qwen3.8-Flash-Next TP2
+# Cold-cache sweeps on gfx950 at Kimi K3 TP8, Muse TP4/TP8 and Qwen3.8-Flash-Next TP2
 # decode shapes in HIP-graph replays, keyed by (N, K) and then by M bucket: a call
 # uses the config of the smallest bucket covering its M, so M stays a runtime
 # argument within a bucket. A config is (BLOCK_M, BLOCK_N, BLOCK_K, WARPS_M,
@@ -1600,17 +1600,23 @@ _DECODE_CONFIGS: dict[
         16: (32, 32, 256, 2, 2, 3, 1, 8),
         32: (32, 32, 256, 2, 2, 3, 1, 8),
     },
-    # All K tiles in flight per output tile.
+    # Muse TP8 attention output. All K tiles in flight per output tile; from 17
+    # rows (speculative verify) one tile covers every row of a bucket.
     (8192, 1024): {
         4: (16, 32, 256, 2, 2, 4, 1, 8),
         8: (16, 32, 256, 2, 2, 4, 1, 8),
         16: (16, 32, 256, 2, 2, 4, 1, 8),
+        32: (32, 32, 256, 2, 2, 4, 1, 1),
+        64: (64, 32, 256, 2, 2, 3, 1, 1),
     },
-    # Split K four ways to occupy the CUs.
+    # Muse TP8 pre-expert projection. Split K four ways to occupy the CUs, and
+    # eight ways with 32-row tiles from 17 rows.
     (512, 8192): {
         4: (16, 16, 512, 2, 2, 4, 4, 8),
         8: (16, 16, 512, 2, 2, 4, 4, 8),
         16: (16, 16, 512, 2, 2, 4, 4, 8),
+        32: (32, 16, 256, 2, 2, 4, 8, 1),
+        64: (32, 32, 256, 2, 2, 4, 8, 8),
     },
     # o_proj
     (7168, 1536): {
