@@ -932,6 +932,10 @@ Its responsibilities:
   replacement, its own parents are omitted: the initial allocation pass
   exhausted the requested buckets' holes, so each such parent has a compatible
   child no newer than its newest child and cannot beat single-child eviction.
+  For a history group in this case, an ordered cursor collects only enough
+  children for each unresolved bucket, then stops after that epoch. The cursor
+  is destroyed before eviction mutates the index. Donor groups, State groups,
+  and batches with multiple replacement groups retain full candidate scans.
   Cross-group reuse must free a whole parent, ranked by its most recently
   accessed child, so a cold sibling cannot cause newer data to be discarded.
   Equal epochs prefer

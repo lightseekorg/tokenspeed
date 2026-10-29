@@ -534,6 +534,8 @@ public:
         std::size_t unallocated{0};
         // Prefix-index enumerations, including groups that can donate capacity.
         std::size_t group_scans{0};
+        // Unpinned entries visited while collecting replacement candidates.
+        std::size_t block_candidates{0};
         // Distinct touched parents checked for whole-parent reclamation.
         std::size_t parent_candidates{0};
     };

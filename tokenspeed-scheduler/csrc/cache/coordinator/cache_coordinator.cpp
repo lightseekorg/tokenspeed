@@ -1311,8 +1311,36 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         if (needs_replacement[group_id]) {
             children[group_id].resize(static_cast<std::size_t>(allocator.ShardCount()));
         }
+        if (!needs_parent && !GroupIsState(group_id)) {
+            // No parent from this group can be donated. Its oldest children,
+            // bounded by demand per bucket, suffice for the global comparison.
+            std::vector<std::size_t> needed(allocator.ShardCount(), 0);
+            std::size_t remaining = 0;
+            for (std::size_t i = 0; i < group_ids.size(); ++i) {
+                if (group_ids[i] == group_id && !batch.blocks[i]) {
+                    ++needed[buckets[i]];
+                    ++remaining;
+                }
+            }
+            PrefixCacheIndex::EvictionCursor cursor;
+            std::vector<PrefixCacheIndex::EvictionCandidate> epoch;
+            while (remaining > 0 && groups_[group_id].Index().NextEvictionEpoch(*host_pool_, cursor, epoch)) {
+                batch.stats.block_candidates += epoch.size();
+                for (auto& candidate : epoch) {
+                    const std::int32_t bucket = allocator.BucketOf(candidate.location);
+                    if (needed[bucket] > 0) {
+                        children[group_id][bucket].entries.push_back(std::move(candidate));
+                        --needed[bucket];
+                        --remaining;
+                    }
+                }
+                epoch.clear();
+            }
+            continue;
+        }
         std::vector<PrefixCacheIndex::EvictionCandidate> entries =
             groups_[group_id].Index().EvictableCandidates(*host_pool_);
+        batch.stats.block_candidates += entries.size();
         if (needs_parent && !entries.empty() && parents.empty()) {
             parents.resize(static_cast<std::size_t>(host_pool_->NumLcmBlocks()) + 1);
         }
