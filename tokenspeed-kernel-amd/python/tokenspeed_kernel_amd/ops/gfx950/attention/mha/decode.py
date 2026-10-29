@@ -869,6 +869,11 @@ def _stream_split_pipelined(
         pages = next_pages
         next_pages = later_pages
 
+    # The loop exits with NUM_STAGES - 1 prefetched pages still copying into
+    # LDS, and the layout conversions after it reuse that LDS. Wait for this
+    # wave's copies: buffer loads to LDS count in vmcnt (CDNA4 ISA 4.4, 9.1.9).
+    # The barrier the compiler emits after the wait then covers the other waves.
+    async_copy.wait_group(0)
     return m_i, l_i, acc
 
 
