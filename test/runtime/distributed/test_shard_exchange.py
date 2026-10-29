@@ -95,30 +95,32 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
         def round_trip(rows: list[int], seed: int) -> None:
             shard = _bits(sum(rows), width, seed + rank, device)
             own = all_to_all_transpose(shard, group, input_split_sizes=rows)
-            _same_bits(
-                own, all_to_all_transpose(shard, group, rows, backend=nccl)
-            )
+            _same_bits(own, all_to_all_transpose(shard, group, rows, backend=nccl))
             heads = own.view(-1, degree * _HEADS_LOCAL, _DIM)
             back = all_to_all_head_scatter(heads, group, output_split_sizes=rows)
-            _same_bits(
-                back, all_to_all_head_scatter(heads, group, rows, backend=nccl)
-            )
+            _same_bits(back, all_to_all_head_scatter(heads, group, rows, backend=nccl))
             _same_bits(back.view(-1, width), shard)
 
         # Even splits take the prepared exchange (the backend serves them) ...
         even = [5] * degree
-        assert backend.try_shard_exchange(
-            _bits(5, channels, 1, device), group, inverse=False
-        ) is not None
+        assert (
+            backend.try_shard_exchange(
+                _bits(5, channels, 1, device), group, inverse=False
+            )
+            is not None
+        )
         round_trip(even, seed=10)
         round_trip([1] * degree, seed=20)
         round_trip([_MAX_ROWS] * degree, seed=30)
         # ... uneven splits, oversized splits and unprepared widths do not.
         round_trip([3] + [7] * (degree - 1), seed=40)
         round_trip([_MAX_ROWS + 1] * degree, seed=50)
-        assert backend.try_shard_exchange(
-            _bits(5, channels + 2 * degree, 2, device), group, inverse=False
-        ) is None
+        assert (
+            backend.try_shard_exchange(
+                _bits(5, channels + 2 * degree, 2, device), group, inverse=False
+            )
+            is None
+        )
 
         # CUDA graph replay of the prepared exchange with new inputs.
         shard = torch.empty(sum(even), width, dtype=torch.bfloat16, device=device)
@@ -134,9 +136,7 @@ def _worker(rank: int, degree: int, rendezvous: str) -> None:
             dist.barrier()
             graph.replay()
             torch.cuda.synchronize()
-            _same_bits(
-                captured, all_to_all_transpose(shard, group, even, backend=nccl)
-            )
+            _same_bits(captured, all_to_all_transpose(shard, group, even, backend=nccl))
         del warm
         dist.barrier()
     finally:
