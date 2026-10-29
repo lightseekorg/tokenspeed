@@ -89,6 +89,8 @@ from tokenspeed_kernel.signature import format_signatures
 _TREE_VERIFY_REPLAY_MAX_REGISTERS = 168
 
 
+# Process-wide cache of the constant chain ancestor bitmasks, keyed by device
+# and batch geometry, so they are built once instead of on every verify call.
 _CHAIN_ANCESTORS: dict[tuple[torch.device, int, int], torch.Tensor] = {}
 
 

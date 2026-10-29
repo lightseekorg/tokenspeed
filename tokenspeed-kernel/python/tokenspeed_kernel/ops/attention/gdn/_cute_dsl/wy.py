@@ -20,6 +20,8 @@
 
 """Output-only GDN WY verification using warp-level TF32 MMA."""
 
+from __future__ import annotations
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute

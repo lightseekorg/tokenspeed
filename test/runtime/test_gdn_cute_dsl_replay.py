@@ -20,6 +20,8 @@
 
 """NVIDIA CuTe ReplaySSM dispatch, state ownership and accepted-path replay."""
 
+from __future__ import annotations
+
 import json
 import sys
 from dataclasses import dataclass, replace
