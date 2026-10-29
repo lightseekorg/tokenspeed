@@ -1,10 +1,115 @@
 # GDN kernels
 
+## CuTe DSL WY verification
+
+`gdn_decode_mtp` selects the output-only TF32 MMA kernel for ReplaySSM through
+the normal registry. It accepts BF16/FP16 Q/K/V with K=V=128, grouped value
+heads, BF16/FP16/FP32 K-last initial states, and 1–16 tokens. Chains and trees
+share the same WY computation; the facade's existing tree workspace contract
+restricts its output-only trees to 8–16 nodes.
+
+The registration constrains platform, dtype, head dimensions, token count and
+output-only execution; its specialized priority wins over general recurrence
+on supported NVIDIA geometry, for both BF16 and FP32 state. Tree support is a
+trait, so chain-only kernels are excluded without forcing a solution. Explicit
+`solution` and `override` requests still apply. Cache-pool capability queries
+use the same execution traits and state dtype when checking for packed
+projection views. Output-only chains use this same registry entry, including
+the Triton chunked-chain candidate described below.
+
+Automatic BF16 state-writing verify and ordinary decode require the
+`padding_safe` trait, so the selected kernel preserves the reserved null page.
+The operator owns this policy; runtime code supplies no solution choice.
+Explicit solutions retain their documented padding contract. Read-only verify
+uses normal selection, including fallback kernels for
+unsupported WY geometry. It may read the reserved null page for padding, but
+never writes it; padded outputs are ignored.
+
+The leaf reads the committed state once per value tile, forms the small WY
+output transform and computes every token's output without writing the state
+pool or materializing node states. An optional payload receives exact raw
+`[k | v | a | b]` rows for the existing replay commit. State-writing options
+are rejected. Q/K/V and gates may be strided; state-pool rows may have padding.
+
+Products use native `mma.sync.m16n8k8` with FP32 accumulation. FP32 operands
+round to TF32; expanded BF16/FP16 state values already fit TF32 exactly and
+preserve their bits. Normalization uses native FP32 reciprocal square root,
+and gates and WY coefficients stay FP32. For four tokens, backward query propagation
+produces the same initial-state coefficient
+and value weights without forming Gram matrices or running a triangular solve.
+Tests compare against an independent FP64 token recurrence at atol=1e-4,
+rtol=2^-7, including strong path gates and unit-scale states. This leaf makes
+no bitwise-numerics claim.
+
+Token bounds are bucketed to 4/8/16; MMA reductions use at least eight elements.
+Short windows transpose the products to put values along the 16-row MMA axis.
+Their Q/K/V workspaces store eight token rows. Eight-token windows form the
+two 8-by-8 Gram matrices together as `[K; Q] @ K.T` in one warp, while two
+other warps compute segment decays. Their coefficient workspaces contain only
+the eight useful rows; larger windows retain 16-row workspaces.
+Value tiles use 64 or 128 columns according to window length, state dtype and
+the coarse number of request/head pairs. Eight-token windows with at most 64
+request/head pairs interleave two FP32 accumulators within each 128-element
+TF32 reduction. Other shapes retain one accumulator. This bounded choice is
+part of the compilation key; batch and token counts themselves are runtime.
+Actual batch size, token count, strides and scale remain runtime arguments.
+Warm each selected bucket/dtype/model geometry before CUDA Graph capture;
+replays consume updated inputs, parameters, state rows and ancestor masks.
+The kernel supports PDL and keeps PDL compilation variants separate.
+
+Aligned Q/K/V tiles load through TMA into raw shared-memory buffers before
+FP32 normalization and value staging. This requires unit inner strides,
+16-byte-aligned base addresses and outer byte strides divisible by 16.
+Other layouts retain four-element vector reads when each physical row has
+unit inner stride and eight-byte alignment, with scalar reads otherwise.
+Normalization and raw payload stores reuse the loaded values. Four-token
+64-value tiles issue gate and parameter reads before Q/K normalization.
+
+Checkpoint tiles retain their source dtype and padded K-last shared layout.
+Aligned pools with a 16-byte-aligned physical row stride use TMA. The transfer
+box includes the row padding beyond K=128, which TMA zero-fills without
+reading past a global row. Odd pool strides and unaligned bases retain the
+per-row 16-byte asynchronous or scalar copies. Negative indices zero-fill
+the tile in either transport. Checkpoint completion is independent of Q/K/V
+completion, so coefficient preparation overlaps the state transfer.
+
+BF16 four-token windows with 256–1024 request/head pairs stream the checkpoint
+through one shared buffer in two 64-key stages. This reduces shared-memory
+use without shrinking the 128-value output tile. The second transfer overlaps
+the value product, and the second state product continues the first stage's
+accumulator. A CTA barrier protects buffer reuse, and each transfer has its
+own completion phase. TMA row padding rereads eight keys in the first stage
+and zero-fills beyond the final stage; other tiers stage all 128 keys at once.
+
+Warmup compiles all four combinations of Q/K/V and checkpoint transport.
+Graph capture can therefore refresh to a different supported alignment or
+stride without compiling inside capture. Descriptor extents and strides stay
+runtime values; the transport choices are bounded compilation variants.
+Host descriptor construction and warmup are outside the GPU kernel timing.
+
+TF32 products share one accumulation loop for both one- and two-accumulator
+variants, preserving their reduction order. Four-token windows allocate only
+the backward-propagation workspace; larger windows initialize the Gram tiles
+directly through MMA.
+
+Performance validation on SM103 compares the output-only leaf with the
+chunked Triton chain leaf for Qwen3.8-Flash-Next TP1 (H/HV=16/48) and
+Qwen3.8-27B TP4 (H/HV=4/12), with BF16 inputs/state, B=1–512 and T=3/4/8.
+The 64 conditions cover warm/cold state pools and PDL on/off. CUDA Graph
+measurements exclude host descriptor construction, convolution and replay
+commit; they measure the leaf rather than end-to-end model latency.
+
 ## FlashInfer PDL adapters
 
 The FlashInfer adapter retains the upstream launch geometry and runtime ABI,
 while wrapping device bodies with PDL synchronization. Adapted functions and
 in-memory compilation caches live in private namespaces.
+
+The MTP registration declares K=V=128, the geometry supported by both its BF16
+and FP32 state paths. Other value widths use portable verification. Direct
+BF16-state calls outside that geometry are rejected before the FP32-only
+adapter. Runtime tests cover non-square states, padding and accepted-prefix
+commit; WY tests cover 4/8/16-token wide value tiles with BF16 and FP16 state.
 
 Decode and prefill explicitly select FlashInfer's CuTe backend. FlashInfer
 0.7.0's automatic backend selection can use Cake GDN for supported shapes,
@@ -24,15 +129,24 @@ for decode, MTP, BF16 state, and prefill.
 
 ## Chain verification
 
-A ReplaySSM chain verify reads the committed state and writes none, so it may
-run in any of three forms (`gdn_chain_verify_form`), all on Blackwell only:
+A ReplaySSM chain verify reads the committed state and writes none. The runtime
+always calls `gdn_decode_mtp`, passing `tree_ancestors=None` for a chain and the
+actual ancestor masks for a tree. `select_kernel` ranks CuTe WY, Triton's
+chunked-chain candidate and the general MTP kernels under that one contract.
+Explicit `solution` and `override` requests use the same selection.
 
-- the chain form, `gdn_chain_verify` (`_triton/chain_verify.py`), for 2 to 16
-  tokens of bf16 state (the dtype it was measured for) with equal power-of-two
-  key and value head dims;
-- else the tree form, `gdn_decode_mtp` with a one-path ancestor mask, for 13–16
-  tokens and at least 24 states;
-- else step by step, as on other shapes and platforms.
+The `chunked_chain` trait describes the Triton candidate's supported input:
+an output-only 2–16-token Blackwell chain, BF16 state, equal power-of-two head
+dimensions from 64, contiguous heads and request-major rows. Packed projection
+views satisfy that layout; arbitrary inner strides do not. A replay payload
+destination excludes this candidate. CuTe WY has higher priority for its
+supported 128-by-128 geometry; unsupported inputs retain normal fallback.
+State-writing and tree verifies never select the chain candidate.
+
+The general Triton fallback may use its tree computation with a cached
+one-path mask for 13–16-token chains with at least 24 states. This policy and
+the constant masks belong to the kernel package. The direct `gdn_chain_verify`
+API remains available for callers explicitly requesting its chain contract.
 
 The chain form computes a request's whole window from the committed state in
 one program per (value tile, request, value head), without materializing a
@@ -49,10 +163,17 @@ pool is never written. The row count and the gates' layout (alignment, row
 stride) are not specialized, and the launch (value tile, key splits, warps,
 pipeline stages) follows three measured tiers of request-heads per row bucket
 (`_CHAIN_VERIFY_LAUNCH_TIERS`), so the kernel compiles once per bucket and
-tier; the GDN backend runs it once per tier its batch sizes reach when it
-preallocates its verify workspace, before serving.
-`test/runtime/test_gdn_verify_policy.py` checks the selection and its
-boundaries without launching device kernels.
+tier. During the normal startup forward under
+`ops.tuning.kernel_warmup(enabled=True)`, the selected implementation compiles
+its reachable variants. CuTe prepares its launch buckets and transports;
+Triton uses JIT warmup for its launch tiers with the actual operand types,
+alignments and strides. The general fallback prepares both step and tree forms
+when a chain can cross their batch-size threshold, including when startup warms
+only the largest batch. These additional variants are compiled without
+launching on caller buffers. Runtime workspace allocation performs no
+kernel-specific warmup, and serving calls reuse the prepared kernels.
+Tests cover automatic selection, explicit overrides, exact accepted-prefix
+commit under graph replay and no compilation at serving batch sizes.
 
 ## Variable prefill lengths
 
