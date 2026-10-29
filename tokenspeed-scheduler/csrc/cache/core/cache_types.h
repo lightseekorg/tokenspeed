@@ -221,7 +221,7 @@ struct CompletedPages {
     // boundary prefix_hashes[state_checkpoint_pages - 1]: every State group
     // publishes its block from state_checkpoint_blocks (indexed by group, null
     // elsewhere) under that page's chain hash, and a sliding window published
-    // behind that boundary is an endpoint's whatever boundary_kind says. Zero
+    // behind that boundary is an endpoint's regardless of boundary_kind. Zero
     // pages means none.
     std::int32_t state_checkpoint_pages{0};
     std::span<CacheBlockRef> state_checkpoint_blocks{};

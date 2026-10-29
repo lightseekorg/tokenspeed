@@ -251,7 +251,7 @@ CacheCoordinator::BoundaryResidency CacheCoordinator::DeviceBoundaryResidency(co
     return cached == total ? BoundaryResidency::kComplete : BoundaryResidency::kPartial;
 }
 
-bool CacheCoordinator::HoldsStateCheckpoint(const std::string& content_hash) const {
+bool CacheCoordinator::HoldsStateCheckpoint(const ContentHash& content_hash) const {
     // A probe takes each State group's checkpoint from whichever tier holds
     // it (probeHostSuffix), so every State group must hold one on either.
     bool any_state_group = false;

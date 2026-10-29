@@ -778,7 +778,7 @@ public:
     // chain hash content_hash, on the Device or the Host, as the probe takes
     // each from whichever tier holds it (false for a model without State
     // groups).
-    bool HoldsStateCheckpoint(const std::string& content_hash) const;
+    bool HoldsStateCheckpoint(const ContentHash& content_hash) const;
     // The cache keys one boundary holds in each group that publishes it:
     // BlocksPerBoundary of them for a chain hash (tail_tokens 0), a tail's
     // blocks from FirstTailBlockNeeded on (tail_tokens = T mod P), one for a
