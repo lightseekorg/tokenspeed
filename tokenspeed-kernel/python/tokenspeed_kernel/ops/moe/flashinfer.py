@@ -3566,8 +3566,7 @@ if platform.is_nvidia:
             local_expert_offset=spec.ep_rank * spec.num_local_experts,
             routed_scaling_factor=None,
             routing_method_type=0,
-            enable_pdl=enable_pdl
-            and _fi_core._device_support_moe_pdl(w.g1_alphas.device),
+            enable_pdl=enable_pdl and _fi_core.device_support_pdl(w.g1_alphas.device),
             do_finalize=False,
             activation_type=activation_type,
             num_fused_shared_experts=0,
