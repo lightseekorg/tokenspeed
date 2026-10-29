@@ -1170,13 +1170,24 @@ fused role,
 Every rank of a node pins its Host buffers at the same point of startup, so
 each rank checks the Host L2 and the retraction snapshot pool against an
 equal share of the Host memory its node has available, less a 10 GiB
-headroom per rank. Each buffer counts at the size it pins: PyTorch's pinned
-allocator rounds every allocation up to a power of two, so a 140 GB L2
-takes 274.88 GB. A ratio size larger than that share is capped to the
-largest L2 every rank's share holds beside its snapshot pool -- the whole
-LCM blocks in the largest power of two that fits, and one size on every
-rank, since the ranks' schedulers mirror each other -- and each rank logs a
-warning with the requested and the capped size. An explicit
+headroom per rank. Each buffer counts at the size its configured pinned
+allocator reserves. On CUDA/ROCm, the launcher defaults
+`pinned_max_round_threshold_mb:1024` before starting the ranks: allocations
+up to 1 GiB round to a power of two; larger buffers use their requested size.
+This avoids reserving 274.88 GB for a 140 GB L2 buffer. Explicit thresholds
+and other allocator options are preserved. To override the default, set
+`PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:<MiB>` before launch;
+the legacy `PYTORCH_CUDA_ALLOC_CONF` and `PYTORCH_HIP_ALLOC_CONF` variables
+take precedence, in that order. The check reads the effective allocator
+settings. A `pinned_max_cached_size_mb` limit also disables rounding above
+its threshold and releases those blocks when unused; it limits individual
+block size, not total cached bytes. Device backends without allocator
+snapshots retain the conservative power-of-two estimate.
+
+A ratio size larger than a rank's share is capped to the largest whole-LCM
+buffer that fits under those allocator settings beside its snapshot pool,
+with one size agreed across ranks. Each rank logs the requested and capped
+size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
 startup, as is a share without room for a single LCM block. Every rank
 must also resolve the same page counts: startup compares them across the
