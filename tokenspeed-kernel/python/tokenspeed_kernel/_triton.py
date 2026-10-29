@@ -41,9 +41,6 @@ if _IS_NPU:
     aggregate = None
     TensorDescriptor = None
     gl = None
-    gluon_builtin = None
-    gluon_distributed_type = None
-    gluon_unwrap_if_constexpr = None
 
     class _UnavailableGluonKernel:
         def __init__(self, fn, options):
@@ -75,15 +72,6 @@ else:
     import tokenspeed_triton.experimental.gluon.language as gl
     from tokenspeed_triton import language as tl
     from tokenspeed_triton.experimental import gluon
-    from tokenspeed_triton.experimental.gluon.language._core import (
-        _unwrap_if_constexpr as gluon_unwrap_if_constexpr,
-    )
-    from tokenspeed_triton.experimental.gluon.language._core import (
-        builtin as gluon_builtin,
-    )
-    from tokenspeed_triton.experimental.gluon.language._core import (
-        distributed_type as gluon_distributed_type,
-    )
     from tokenspeed_triton.language.core import _aggregate as aggregate
     from tokenspeed_triton.language.extra import libdevice
     from tokenspeed_triton.tools.tensor_descriptor import TensorDescriptor
@@ -99,9 +87,6 @@ __all__ = [
     "get_hip_runtime_path",
     "gl",
     "gluon",
-    "gluon_builtin",
-    "gluon_distributed_type",
-    "gluon_unwrap_if_constexpr",
     "libdevice",
     "proton",
     "redirect_triton_to_tokenspeed_triton",

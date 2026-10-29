@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from lib.tal.tensor.stride import crd2idx
 from tokenspeed_kernel._triton import gl as l
 from tokenspeed_kernel._triton import gluon as g
-from tokenspeed_kernel._triton import gluon_builtin as builtin
-from tokenspeed_kernel._triton import gluon_unwrap_if_constexpr as _unwrap_if_constexpr
+from tokenspeed_kernel._triton import tl
+
+builtin = tl.core.builtin
+_unwrap_if_constexpr = tl.core._unwrap_if_constexpr
 
 
 @g.constexpr_function

@@ -41,8 +41,9 @@ from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.host_device import host_device
 from tokenspeed_kernel._triton import gl as l
 from tokenspeed_kernel._triton import gluon as g
-from tokenspeed_kernel._triton import gluon_builtin as builtin
-from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel._triton import tl, triton
+
+builtin = tl.core.builtin
 
 
 class MoeArchitecture(IntEnum):

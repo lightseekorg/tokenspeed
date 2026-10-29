@@ -36,11 +36,11 @@ from typing import NamedTuple
 
 from tokenspeed_kernel._triton import gl as l
 from tokenspeed_kernel._triton import gluon as g
-from tokenspeed_kernel._triton import gluon_builtin as builtin
-from tokenspeed_kernel._triton import gluon_distributed_type as distributed_type
-from tokenspeed_kernel._triton import gluon_unwrap_if_constexpr as _unwrap_if_constexpr
-from tokenspeed_kernel._triton import triton
+from tokenspeed_kernel._triton import tl, triton
 
+builtin = tl.core.builtin
+distributed_type = l.distributed_type
+_unwrap_if_constexpr = tl.core._unwrap_if_constexpr
 libdevice = l.extra.libdevice
 get_cache_manager = triton.runtime.cache.get_cache_manager
 

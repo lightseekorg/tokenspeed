@@ -6,7 +6,9 @@ Gluon JIT body, with the layout/configuration object as a constexpr argument.
 
 from tokenspeed_kernel._triton import gl as l
 from tokenspeed_kernel._triton import gluon as g
-from tokenspeed_kernel._triton import gluon_unwrap_if_constexpr as _unwrap_if_constexpr
+from tokenspeed_kernel._triton import tl
+
+_unwrap_if_constexpr = tl.core._unwrap_if_constexpr
 
 
 class host_device:
