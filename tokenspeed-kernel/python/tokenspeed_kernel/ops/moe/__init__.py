@@ -907,7 +907,18 @@ def _moe_sigmoid_bias_topk(
         solution = "torch"
 
     signature = format_signature(router_logits=dense_tensor_format(router_logits.dtype))
-    traits = {"tokens": tokens, "experts": experts, "topk": topk}
+    traits = {
+        "tokens": tokens,
+        "experts": experts,
+        "topk": topk,
+        "bias_dtype": correction_bias.dtype,
+        "inputs_contiguous": router_logits.is_contiguous()
+        and correction_bias.is_contiguous(),
+        "normalize_topk_weights": normalize_topk_weights,
+        "routed_scaling_factor": routed_scaling_factor,
+        "weights_dtype": out[0].dtype if out is not None else weights_dtype,
+        "ids_dtype": out[1].dtype if out is not None else torch.int32,
+    }
     if logical_to_physical_map is not None and (
         (override is not None and override.endswith("_mapped"))
         or (
