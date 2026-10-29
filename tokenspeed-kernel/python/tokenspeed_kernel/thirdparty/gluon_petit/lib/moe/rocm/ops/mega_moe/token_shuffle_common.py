@@ -1,6 +1,6 @@
 """Routing-counter initialization and cleanup for direct push."""
 
-from lib.gemm.rocm.intrinsics import BufferResource
+from lib.gemm.rocm.intrinsics import BufferResource, lds_store_masked
 from lib.moe.rocm.comm.barrier import system_fence_release
 from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
 from lib.tal.device import DeviceTemplate, device_method
@@ -22,7 +22,7 @@ class TokenShuffleCommon(DeviceTemplate):
         ) // self.kThreads
         for i in l.static_range(kIterations):
             expert = tid + i * self.kThreads
-            l.store(expert_count + expert, 0, mask=expert < self.kNumExperts)
+            lds_store_masked(expert_count + expert, 0, expert < self.kNumExperts)
         l.barrier()
 
     @device_method

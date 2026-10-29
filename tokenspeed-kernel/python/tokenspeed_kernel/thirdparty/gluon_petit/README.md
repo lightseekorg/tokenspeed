@@ -26,7 +26,11 @@ when selecting a kernel plan.
 
 ## Integration status
 
-The runtime retains the upstream LDS memory contract. The pinned `tokenspeed-triton` compiler rejects two constructs used by that contract: numeric LDS pointer address space `3` and the 8196-word shared allocation used by MegaMoE. Until the vendored kernels or the compiler are adapted, Gluon Petit kernels fail to compile with `tokenspeed-triton`.
+The runtime keeps the upstream LDS layout. `tokenspeed-triton` has no LDS pointer
+address space and requires power-of-two shared allocations. The vendored kernels
+therefore keep LDS addresses in ordinary pointers and access LDS through native
+load and store helpers in `lib/gemm/rocm/intrinsics.py`. They allocate shared
+memory as a two-dimensional shape with a four-word inner dimension.
 
 ## Runtime contract
 

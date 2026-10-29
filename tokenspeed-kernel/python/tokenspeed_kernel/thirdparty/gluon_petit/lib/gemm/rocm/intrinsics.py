@@ -39,9 +39,7 @@ from tokenspeed_kernel._triton import gluon as g
 from tokenspeed_kernel._triton import gluon_builtin as builtin
 from tokenspeed_kernel._triton import gluon_distributed_type as distributed_type
 from tokenspeed_kernel._triton import gluon_unwrap_if_constexpr as _unwrap_if_constexpr
-from tokenspeed_kernel._triton import (
-    triton,
-)
+from tokenspeed_kernel._triton import triton
 
 libdevice = l.extra.libdevice
 get_cache_manager = triton.runtime.cache.get_cache_manager
@@ -651,7 +649,7 @@ def _native_load_vector4(ptr, _semantic):
     return _native_call(
         "memory.load." + code,
         code,
-        ("p" + str(_unwrap_if_constexpr(ptr.dtype.address_space)),),
+        ("p3",),
         (ptr,),
         False,
         _semantic=_semantic,
@@ -668,8 +666,75 @@ def _native_store_vector4(ptr, value, _semantic):
     return _native_call(
         "memory.store." + code,
         "void",
-        ("p" + str(_unwrap_if_constexpr(ptr.dtype.address_space)), code),
+        ("p3", code),
         (ptr, value),
+        False,
+        _semantic=_semantic,
+    )
+
+
+def _lds_code(ptr):
+    dtype = ptr.dtype.element_ty
+    return ("f" if dtype.is_floating() else "i") + str(dtype.primitive_bitwidth)
+
+
+@builtin
+def lds_load(ptr, _semantic):
+    """Native LDS load through a pointer holding an LDS byte address."""
+    code = _lds_code(ptr)
+    return _native_call(
+        "memory.load." + code, code, ("p3",), (ptr,), False, _semantic=_semantic
+    )
+
+
+@builtin
+def lds_load_vector(ptr, code, _semantic):
+    """Native LDS load of a vector (for example v2i32) at its natural alignment."""
+    code = _unwrap_if_constexpr(code)
+    return _native_call(
+        "memory.load." + code, code, ("p3",), (ptr,), False, _semantic=_semantic
+    )
+
+
+@builtin
+def lds_load_masked(ptr, mask, _semantic):
+    """Native LDS load that returns zero for lanes where mask is false."""
+    code = _lds_code(ptr)
+    return _native_call(
+        "when:memory.load." + code,
+        code,
+        ("p3", "i1"),
+        (ptr, mask),
+        False,
+        _semantic=_semantic,
+    )
+
+
+@builtin
+def lds_store(ptr, value, _semantic):
+    """Native LDS store through a pointer holding an LDS byte address."""
+    code = _lds_code(ptr)
+    value = _semantic.cast(_semantic.to_tensor(value), ptr.dtype.element_ty)
+    return _native_call(
+        "memory.store." + code,
+        "void",
+        ("p3", code),
+        (ptr, value),
+        False,
+        _semantic=_semantic,
+    )
+
+
+@builtin
+def lds_store_masked(ptr, value, mask, _semantic):
+    """Native LDS store that is skipped for lanes where mask is false."""
+    code = _lds_code(ptr)
+    value = _semantic.cast(_semantic.to_tensor(value), ptr.dtype.element_ty)
+    return _native_call(
+        "when:memory.store." + code,
+        "void",
+        ("p3", code, "i1"),
+        (ptr, value, mask),
         False,
         _semantic=_semantic,
     )
@@ -693,9 +758,9 @@ def _native_store_ushort_component(array, index, value, component: l.constexpr):
 
 
 def _install_native_library_linker():
-    """Honor per-operation LLVM libraries through Triton 3.8's pipeline hook.
+    """Honor per-operation LLVM libraries through Triton's pipeline hook.
 
-    AMD 3.8 only links libraries from launch options, ignoring an extern op's
+    AMD Triton only links libraries from launch options, ignoring an extern op's
     libpath. Specializations are created during JIT, after those options exist.
     Merge only our content-addressed libraries before LLVM lowering. The hook's
     cache key includes this source; no installed Triton files are changed.

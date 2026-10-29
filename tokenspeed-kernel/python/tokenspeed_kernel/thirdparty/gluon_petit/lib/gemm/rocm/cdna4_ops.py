@@ -91,7 +91,7 @@ def _tile_operand(fragments, operand: l.constexpr, parent: l.constexpr):
 @g.constexpr_function
 def _tile_scale_layout(warps, rows):
     # CDNA4 packs K repeats before row repeats. Keep the wave batch explicit;
-    # Triton 3.8's scale-layout factory only handles unbatched matrices.
+    # Triton's scale-layout factory only handles unbatched matrices.
     return l.DistributedLinearLayout(
         reg_bases=[[0, 0, 4], [0, 16, 0]]
         + [[0, 32 << i, 0] for i in range((rows // 32).bit_length() - 1)],
