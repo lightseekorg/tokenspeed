@@ -29,7 +29,11 @@ from tokenspeed.runtime.execution.drafter.base import BaseDrafter
 
 
 class DummyDrafter(BaseDrafter):
-    """Generate a repeatable candidate window without draft weights or cache."""
+    """Generate synthetic candidates from the selected token and absolute position.
+
+    Pool slots only locate position metadata: relocation, batch order and rank
+    do not change a request's proposed window. These are not target predictions.
+    """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -95,11 +99,10 @@ class DummyDrafter(BaseDrafter):
         columns = torch.arange(
             1, self.spec_num_tokens, dtype=torch.int64, device=selected.device
         )
-        # No rank enters this formula: every TP rank proposes the same window.
+        # No slot or rank enters this formula: the same prefix has one window.
         # Live inputs also avoid freezing random candidates into a captured graph.
         base = (
             selected.to(torch.int64) * 1_000_003
-            + slots * 97_409
             + cache_lengths.to(torch.int64) * 65_537
             + 17
         )
