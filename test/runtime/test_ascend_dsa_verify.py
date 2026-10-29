@@ -584,6 +584,7 @@ def test_dcp_verify_batches_query_rows_with_causal_lengths(width):
             pass
 
         def __init__(self):
+            self.step_counter = None
             self._dcp = FakeDcp()
             self._dense_backend = SimpleNamespace(
                 refresh_decode_metadata=lambda *args, **kwargs: None
@@ -789,6 +790,7 @@ def test_single_token_mixed_decode_selects_request_shaped_query_metadata():
         forward_decode_metadata = metadata
 
         def __init__(self):
+            self.step_counter = None
             self._dcp = FakeDcp()
 
         def _validate_logit_cap(self, value):
@@ -1293,6 +1295,405 @@ def test_public_attention_provider_hook_selects_stage(monkeypatch, is_prefill):
     torch.testing.assert_close(
         result, torch.full((1, 8 * 512), 2 if is_prefill else 3, dtype=torch.float32)
     )
+
+
+class _CacheStepPool:
+    def __init__(self, layers):
+        self.index = {layer: torch.zeros(33, 128, 1, 2) for layer in range(layers)}
+        self.kv = {layer: torch.zeros(33, 128, 1, 3) for layer in range(layers)}
+
+    def get_component(self, layer_id, name):
+        assert name == "dsa_index_k"
+        return self.index[layer_id]
+
+    def get_key_buffer(self, layer_id):
+        return self.kv[layer_id]
+
+
+class _CacheStepConsumer:
+    """Read the real host completion word and snapshot the announced cache."""
+
+    def __init__(self, counter, pool):
+        self.counter = counter
+        self.pool = pool
+        self.layer_id = 0
+        self.last_step = 0
+        self.notifications = []
+
+    def poll(self):
+        step = int(self.counter.h_ready_cache_step)
+        if step != self.last_step:
+            self.notifications.append(
+                (step, self.layer_id, self.pool.index[self.layer_id].clone())
+            )
+            self.last_step = step
+
+
+class _CacheStepKernels:
+    """CPU cache writes and attention in place of unavailable device kernels."""
+
+    def __init__(self, consumer):
+        self.consumer = consumer
+        self.fail_on_short_chunk = False
+
+    def require_fused_context_parallel(self, *, rank_size, num_heads):
+        pass
+
+    def scatter(self, rows, cache, locations):
+        self.consumer.poll()
+        if self.fail_on_short_chunk and rows.shape[0] < 1024:
+            raise RuntimeError("device index-cache write failed")
+        owned = locations >= 0
+        cache.view(-1, rows.shape[-1])[locations[owned].long()] = rows[owned]
+
+    def index(self, query, cache, weights, *metadata):
+        self.consumer.poll()
+        return (
+            torch.zeros(query.shape[0], 1, 2, dtype=torch.int32),
+            torch.ones(query.shape[0], dtype=torch.int32),
+        )
+
+    def index_partial(self, query, cache, weights, *metadata, **kwargs):
+        self.consumer.poll()
+        indices, _ = self.index(query, cache, weights)
+        return indices, torch.zeros_like(indices, dtype=torch.float32)
+
+    def select_local(self, indices, positions, rank):
+        return indices, torch.ones(indices.shape[0], dtype=torch.int32)
+
+    def attention(self, query, *args):
+        self.consumer.poll()
+        return query.clone()
+
+    def attention_partial(self, query, *args, **kwargs):
+        self.consumer.poll()
+        degree, rows, heads, width = query.shape
+        output = query.permute(0, 2, 1, 3).reshape(degree * heads, rows, width)[..., :2]
+        maximum = torch.zeros(1, rows, degree * heads)
+        return output, maximum, torch.ones_like(maximum)
+
+    def merge_partials(self, output, lse):
+        return output[0]
+
+
+class _CacheStepCollectives:
+    """Identical CPU peers replace the unavailable device process group."""
+
+    def __init__(self, degree):
+        self.degree = degree
+        self.ready = True
+
+    def all_to_all(self, output, values, *, auxiliary):
+        output.copy_(values)
+
+    def all_gather(self, values, *, auxiliary):
+        return torch.cat([values] * self.degree)
+
+    def combine(self, output, lse, *, merge):
+        return output[:, : output.shape[1] // self.degree]
+
+
+class _CacheStepBackend(ascend_dsa.AscendDSABackend):
+    def __init__(self, config, spec, *, kernel_page_size):
+        super().__init__(config, spec, kernel_page_size=kernel_page_size)
+        self.prefill_metadata = None
+        self.decode_metadata = None
+
+    @property
+    def forward_prefill_metadata(self):
+        return self.prefill_metadata
+
+    @property
+    def forward_decode_metadata(self):
+        return self.decode_metadata
+
+
+def _cache_step_backend(monkeypatch, *, degree, layers):
+    from tokenspeed.runtime.pd.utils import StepCounter as DeviceStepCounter
+
+    # Only device allocation is substituted: record_cache and its modulo
+    # arithmetic/published host Tensor remain the production implementation.
+    tensor = torch.tensor
+    with monkeypatch.context() as device:
+        device.setattr(torch.Tensor, "cuda", lambda self, gpu_id: self)
+        device.setattr(
+            torch,
+            "tensor",
+            lambda *a, **k: tensor(
+                *a, **{n: v for n, v in k.items() if n != "pin_memory"}
+            ),
+        )
+        counter = DeviceStepCounter(device="cpu", gpu_id=0)
+    pool = _CacheStepPool(layers)
+    consumer = _CacheStepConsumer(counter, pool)
+    kernels = _CacheStepKernels(consumer)
+
+    def initialize_base(self, config, spec, *, kernel_page_size):
+        # The dense leaf constructor needs model/device kernels; none of the
+        # Ascend selection, chunking or cache completion methods is replaced.
+        self.is_draft = False
+        self.spec_num_tokens = 8
+        self.num_local_heads = spec.num_attention_heads // spec.attn_tp_size
+        self.step_counter = None
+        self.kernel_page_size = kernel_page_size
+
+    monkeypatch.setattr(DSABackend, "__init__", initialize_base)
+    monkeypatch.setattr(ascend_dsa, "ascend_dsa_kernels", lambda: kernels)
+    # Compact model weights keep this device-free lifecycle test inexpensive.
+    config = SimpleNamespace(
+        kv_cache_dtype=torch.bfloat16,
+        kv_cache_quant_method=None,
+        kvp_size=degree,
+        kvp_rank=0,
+        kvp_group=tuple(range(degree)),
+    )
+    spec = SimpleNamespace(
+        is_dsa=True,
+        index_k_format="bf16",
+        attn_tp_size=degree,
+        num_attention_heads=degree,
+        index_head_dim=2,
+        index_topk=2,
+        kv_cache_dim=3,
+        kv_lora_rank=2,
+        qk_rope_head_dim=1,
+    )
+    backend = _CacheStepBackend(config, spec, kernel_page_size=128)
+    backend.step_counter = counter
+    backend._dcp.bind_virtual_block_count(33)
+    backend._collective_context = _CacheStepCollectives(degree)
+    placement = CachePlacement(128, 33, tuple(range(degree)), 0)
+    monkeypatch.setattr(
+        backend, "cache_placement", lambda layer: placement if degree > 1 else None
+    )
+    return backend, pool, consumer
+
+
+def _cache_step_inputs(backend, pool, consumer, *, rows, layer_id, batch):
+    from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+        MLAPrefillMetadata,
+    )
+
+    consumer.layer_id = layer_id
+    extends = torch.tensor([rows], dtype=torch.int32)
+    zero = torch.zeros(1, dtype=torch.int32)
+    table = torch.arange(1, 33, dtype=torch.int32)[None]
+    backend.prefill_metadata = MLAPrefillMetadata(
+        seq_lens=extends,
+        extend_prefix_lens=zero,
+        extend_seq_lens=extends,
+        cum_extend_seq_lens=torch.tensor([0, rows], dtype=torch.int32),
+        cum_seq_lens_kv=None,
+        page_table=table,
+        extend_prefix_lens_cpu=zero,
+        extend_seq_lens_cpu=extends,
+        max_extend_seq_len=rows,
+        max_extend_prefix_len=0,
+        use_absorbed_cached_extend=False,
+        chunked_loop_num=0,
+        chunk_kv_indices_list=[],
+        chunked_seq_len=torch.empty(0),
+        cu_chunked_seq_len=torch.empty(0),
+        max_chunk_len_per_loop=[],
+    )
+    positions = torch.arange(rows, dtype=torch.float32)
+    query = positions[:, None, None].expand(-1, 1, 3).contiguous()
+    index_key = torch.stack(
+        (positions + batch * 10000 + layer_id * 5000 + 1, positions + 1), dim=1
+    )
+    slots = torch.arange(128, 128 + rows, dtype=torch.int64)
+    placement = backend.cache_placement(None)
+    if placement is None:
+        local, owned = slots, torch.ones(rows, dtype=torch.bool)
+    else:
+        local, owned = resolve_cache_slots(slots, placement)
+    expected = pool.index[layer_id].clone()
+    expected.view(-1, 2)[local[owned].long()] = index_key[owned]
+    # The real MLA prologue owns KV. Its CPU stand-in lands before attention,
+    # while the real Ascend backend writes the index cache a chunk at a time.
+    pool.kv[layer_id].fill_(batch + layer_id + 1)
+    inputs = dict(
+        index_query=torch.zeros(rows, 1, 2),
+        index_key=index_key,
+        index_weights=torch.ones(rows, 1),
+        index_init_tokens=0,
+        index_local_tokens=0,
+    )
+    return query, slots, inputs, expected
+
+
+@pytest.mark.parametrize("degree,rows", [(2, 1024), (2, 1025), (2, 2049), (1, 2049)])
+def test_prefill_cache_counter_announces_completed_layers_across_batches(
+    monkeypatch, degree, rows
+):
+    backend, pool, consumer = _cache_step_backend(monkeypatch, degree=degree, layers=3)
+    completed = 0
+    for batch in range(3):
+        for layer_id in range(3):
+            query, slots, inputs, expected = _cache_step_inputs(
+                backend, pool, consumer, rows=rows, layer_id=layer_id, batch=batch
+            )
+            layer = SimpleNamespace(layer_id=layer_id, scaling=1.0, logit_cap=0)
+            backend.forward_extend(
+                query, None, None, layer, slots, pool, 1, fused=False, **inputs
+            )
+            consumer.poll()
+            completed += 1
+            assert int(backend.step_counter.h_ready_cache_step) == completed
+            assert int(backend.step_counter.d_ready_cache_step) == completed
+            assert len(consumer.notifications) == completed
+            step, announced_layer, cache = consumer.notifications[-1]
+            assert (step, announced_layer) == (completed, layer_id)
+            torch.testing.assert_close(cache, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("degree", [1, 2])
+def test_decode_cache_counter_still_announces_one_completed_layer(monkeypatch, degree):
+    from tokenspeed.runtime.layers.attention.backends.paged.mla import MLADecodeMetadata
+
+    backend, pool, consumer = _cache_step_backend(monkeypatch, degree=degree, layers=2)
+    for batch in range(3):
+        for layer_id in range(2):
+            query, slots, inputs, expected = _cache_step_inputs(
+                backend, pool, consumer, rows=1, layer_id=layer_id, batch=batch
+            )
+            backend.decode_metadata = MLADecodeMetadata(
+                num_extends=0,
+                page_table=torch.arange(1, 33, dtype=torch.int32)[None],
+                seq_lens=torch.tensor([129], dtype=torch.int32),
+            )
+            layer = SimpleNamespace(layer_id=layer_id, scaling=1.0, logit_cap=0)
+            backend.forward_decode(
+                query, None, None, layer, slots, pool, 1, fused=False, **inputs
+            )
+            consumer.poll()
+            expected_step = batch * 2 + layer_id + 1
+            assert int(backend.step_counter.h_ready_cache_step) == expected_step
+            assert len(consumer.notifications) == expected_step
+            torch.testing.assert_close(
+                consumer.notifications[-1][2], expected, rtol=0, atol=0
+            )
+
+
+def test_incomplete_prefill_cache_write_does_not_publish_layer_completion(monkeypatch):
+    backend, pool, consumer = _cache_step_backend(monkeypatch, degree=2, layers=1)
+    query, slots, inputs, _ = _cache_step_inputs(
+        backend, pool, consumer, rows=2049, layer_id=0, batch=0
+    )
+    backend._indexer_kernels.fail_on_short_chunk = True
+    layer = SimpleNamespace(layer_id=0, scaling=1.0, logit_cap=0)
+    with pytest.raises(RuntimeError, match="index-cache write failed"):
+        backend.forward_extend(
+            query, None, None, layer, slots, pool, 1, fused=False, **inputs
+        )
+    consumer.poll()
+    assert int(backend.step_counter.h_ready_cache_step) == 0
+    assert not consumer.notifications
+
+
+@pytest.mark.parametrize("rows", [1024, 1025, 2049])
+@pytest.mark.parametrize("head_major", [False, True])
+def test_collective_prefill_keeps_causal_rows_across_indexer_batch_limit(
+    rows, head_major
+):
+    from tokenspeed.runtime.layers.attention.backends.paged.mla import (
+        MLAPrefillMetadata,
+    )
+
+    extends = torch.tensor([1000, rows - 1000], dtype=torch.int32)
+    prefixes = torch.tensor([13, 257], dtype=torch.int32)
+    cumulative = torch.cat((torch.zeros(1, dtype=torch.int32), extends.cumsum(0).int()))
+    metadata = MLAPrefillMetadata(
+        seq_lens=prefixes + extends,
+        extend_prefix_lens=prefixes,
+        extend_seq_lens=extends,
+        cum_extend_seq_lens=cumulative,
+        cum_seq_lens_kv=None,
+        page_table=torch.tensor([[5, 7], [9, 2]], dtype=torch.int32),
+        extend_prefix_lens_cpu=prefixes,
+        extend_seq_lens_cpu=extends,
+        max_extend_seq_len=int(extends.max()),
+        max_extend_prefix_len=257,
+        use_absorbed_cached_extend=False,
+        chunked_loop_num=0,
+        chunk_kv_indices_list=[],
+        chunked_seq_len=torch.empty(0),
+        cu_chunked_seq_len=torch.empty(0),
+        max_chunk_len_per_loop=[],
+    )
+
+    class CpuCollectiveBackend(ascend_dsa.AscendDSABackend):
+        def __init__(self):
+            self.step_counter = None
+            self._dcp = ascend_dcp.AscendDCPMetadata(
+                degree=8, rank=0, ranks=tuple(range(8)), virtual_block_count=32
+            )
+
+        @property
+        def forward_prefill_metadata(self):
+            return metadata
+
+        def _select_indexed(
+            self, q, k, layer, slots, pool, ends, lengths, table, inputs, **kwargs
+        ):
+            # The device indexer is unavailable; inspect the causal rows sent
+            # to it and use real tensor arithmetic as a row-order fingerprint.
+            assert len(q) <= 1024
+            torch.testing.assert_close(
+                ends, torch.arange(1, len(q) + 1, dtype=torch.int32)
+            )
+            positions = q[:, 0, 0].int()
+            request = (positions >= 1000).long()
+            expected = prefixes[request] + positions - cumulative[request] + 1
+            torch.testing.assert_close(lengths, expected)
+            torch.testing.assert_close(table, metadata.page_table[request])
+            torch.testing.assert_close(slots, positions + 17)
+            for name, offset in (
+                ("index_query", 7),
+                ("index_key", 11),
+                ("index_weights", 13),
+            ):
+                torch.testing.assert_close(
+                    inputs[name].reshape(-1), positions.float() + offset
+                )
+            return q * 3 + lengths[:, None, None] + inputs["index_key"]
+
+        def _run_indexed_sparse_attention(
+            self, selection, layer, pool, *, head_major_output, is_prefill
+        ):
+            assert is_prefill
+            return (
+                selection.transpose(0, 1).contiguous()
+                if head_major_output
+                else selection.flatten(1)
+            )
+
+    positions = torch.arange(rows, dtype=torch.float32)
+    query = positions[:, None, None].expand(-1, 2, 1).contiguous()
+    output = CpuCollectiveBackend()._forward_collective_extend(
+        query,
+        None,
+        None,
+        SimpleNamespace(logit_cap=0),
+        positions.int() + 17,
+        None,
+        2,
+        fused=False,
+        head_major_output=head_major,
+        index_query=(positions + 7)[:, None, None],
+        index_key=(positions + 11)[:, None, None],
+        index_weights=(positions + 13)[:, None],
+    )
+    request = (positions >= 1000).long()
+    expected = (
+        query * 3
+        + (prefixes[request] + positions - cumulative[request] + 1)[:, None, None]
+        + (positions + 11)[:, None, None]
+    )
+    expected = (
+        expected.transpose(0, 1).contiguous() if head_major else expected.flatten(1)
+    )
+    torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
 def test_fused_selection_rejects_missing_prolog_query(monkeypatch):
