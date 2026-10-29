@@ -488,6 +488,8 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
+    kvstore_write_policy: str = "write_through"
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -2022,6 +2024,45 @@ class ServerArgs:
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
                 )
+        _require_choice(
+            "--kvstore-write-policy",
+            self.kvstore_write_policy,
+            ("write_through", "write_back"),
+        )
+        if self.kvstore_write_policy == "write_back":
+            # Decode's Host holds retraction images only, and L3 staging would
+            # split what is written back; pipeline stages and query context
+            # parallelism have not run write-back. Attention TP and
+            # --kv-parallel-size need no refusal: a written-back segment
+            # publishes once every rank of the replica has acknowledged it
+            # (docs/design/scheduler.md section 3.1). More than 64 cache
+            # groups are refused by SchedulerConfig.Validate, once the model's
+            # cache groups exist.
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                    (
+                        "--disaggregation-mode decode",
+                        self.disaggregation_mode == "decode",
+                    ),
+                    (
+                        "--kvstore-storage-backend",
+                        self.kvstore_storage_backend is not None,
+                    ),
+                    (
+                        "--query-context-parallel-size > 1",
+                        self.query_context_parallel_size > 1,
+                    ),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    "--kvstore-write-policy write_back does not support "
+                    f"{', '.join(unsupported)}"
+                )
 
     def validate_model_update_options(self):
         """Require the Model Updater SDK flags together, or none of them.
@@ -2591,7 +2632,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kvstore_size,
             help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set. "
-            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available.",
+            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available, "
+            "or if the ranks resolve it to different page counts, as pipeline stages may (use --kvstore-ratio there).",
         )
         parser.add_argument(
             "--kvstore-io-backend",
@@ -2599,6 +2641,23 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
+        )
+        parser.add_argument(
+            "--kvstore-write-policy",
+            type=str,
+            choices=["write_through", "write_back"],
+            default=ServerArgs.kvstore_write_policy,
+            help="What feeds Host L2 (the KVStore) from the GPU prefix cache. "
+            "'write_through' (the default) copies every page the fused or "
+            "prefill role caches. "
+            "'write_back' copies only the pages the GPU evicts, in the "
+            "scheduling step that evicts them (that step's forward waits for "
+            "the copy), so the two tiers hold mostly different pages. "
+            "write_back is refused with --disaggregation-mode decode, "
+            "--disable-kvstore, --kvstore-storage-backend, "
+            "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
+            "and at startup for a model with more than 64 cache groups; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",

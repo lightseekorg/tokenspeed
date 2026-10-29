@@ -2164,8 +2164,14 @@ Sinkhorn divisions use the hardware reciprocal (about one ulp).
 
 The post and collapse kernels move eight contiguous BF16 values per lane.
 Post runs one token per CTA so its twenty coefficients are scalar loads that
-never wait behind the vector stores. The collapse runs one token per CTA so
-the optional RMSNorm reduces the whole row once.
+never wait behind the vector stores. Large post calls (prefill chunks) stream
+far more than the caches hold, so above 2048 tokens adjacent CTAs take
+adjacent hidden blocks of one token and all vector accesses are non-temporal:
+the CTAs in flight cover contiguous rows, and the post neither caches its dead
+inputs nor evicts the dirty lines earlier kernels left behind. Smaller calls
+keep ordinary caching so the next pre-mapping can read the new streams from
+cache. The collapse runs one token per CTA so the optional RMSNorm reduces the
+whole row once.
 
 ### gfx950 Qwen4 hyper-connection mix
 

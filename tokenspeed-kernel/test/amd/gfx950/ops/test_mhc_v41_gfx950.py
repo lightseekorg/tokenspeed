@@ -130,7 +130,8 @@ def _assert_bf16_rounding_equivalent(actual, expected, reference, magnitude) -> 
     assert ((actual.double() - reference).abs() <= bound).all()
 
 
-@pytest.mark.parametrize("tokens", [1, 6, 192, 641])
+# Above 2048 tokens the post kernel streams with non-temporal accesses.
+@pytest.mark.parametrize("tokens", [1, 6, 192, 641, 2049, 8197])
 @pytest.mark.parametrize("hidden", [16, 4096, 5120, 7168])
 def test_gluon_mhc_post_matches_triton_bitwise(tokens: int, hidden: int) -> None:
     hidden_states, residual, post, comb = _post_args(tokens, hidden, seed=tokens)
@@ -166,8 +167,8 @@ def test_gluon_mhc_apply_pre_matches_triton(tokens: int) -> None:
 
 
 def test_gluon_mhc_streams_no_recompile_across_batches() -> None:
-    hidden_states, residual, post, comb = _post_args(300, 5120, seed=1)
-    pre = torch.rand(300, 4, device=DEVICE)
+    hidden_states, residual, post, comb = _post_args(4100, 5120, seed=1)
+    pre = torch.rand(4100, 4, device=DEVICE)
     weight = torch.rand(5120, device=DEVICE, dtype=torch.bfloat16)
 
     def run(tokens: int) -> None:
@@ -183,9 +184,11 @@ def test_gluon_mhc_streams_no_recompile_across_batches() -> None:
                 quantize=False,
             )
 
+    # Warm the cached and the streaming post variants.
     run(1)
+    run(2049)
     with assert_no_triton_compile(
         mhc.gluon_mhc_post_gfx950, mhc.gluon_mhc_apply_pre_gfx950
     ):
-        for tokens in (2, 6, 16, 48, 129, 192, 300):
+        for tokens in (2, 6, 16, 48, 129, 192, 300, 2048, 2050, 4100):
             run(tokens)

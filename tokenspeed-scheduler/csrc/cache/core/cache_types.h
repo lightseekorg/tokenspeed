@@ -43,6 +43,9 @@ namespace tokenspeed {
 // ranks the kinds: a block republished at a later point keeps the higher one.
 enum class CacheBoundaryKind { kChunk, kEndpoint };
 
+// The tiers a prefix cache entry lives on: Device L1 and Host L2.
+enum class CacheTier { kDevice, kHost };
+
 using CacheNamespaceId = std::uint32_t;
 using ContentHash = std::string;
 
