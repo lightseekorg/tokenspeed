@@ -163,7 +163,6 @@ class AscendMLABackend(MLAAttnBackend):
         self._prefill_plan = None
         self._prefill_pages = None
         self._prefill_spans = ()
-        self.prepare_prefill_workspace()
 
     def prepare_prefill_workspace(self):
         if not self.native_prefill_enabled:
@@ -178,14 +177,13 @@ class AscendMLABackend(MLAAttnBackend):
 
         layer_id = min(self.cache_pool.history_group_by_layer())
         kv = self.cache_pool.get_key_buffer(layer_id)
-        self._prefill_workspace, buffers = self._prefill_options.allocate_workspace(
+        workspace, buffers = self._prefill_options.allocate_workspace(
             local_rows=kv.numel() // 576,
             degree=self._dcp.degree,
             index_width=0,
             device=kv.device,
         )
-        self._prefill_slots = buffers[3]
-        self._prefill_runtime = prepare_ascend_mla_prefill(
+        runtime = prepare_ascend_mla_prefill(
             kv,
             ranks=self._dcp.ranks,
             bootstrap_group=process_group_manager.get_process_group(
@@ -196,6 +194,9 @@ class AscendMLABackend(MLAAttnBackend):
             max_history_rows=self._prefill_options.history_capacity_rows,
             history_null_rows=self._prefill_options.kv_page_size,
         )
+        self._prefill_workspace = workspace
+        self._prefill_slots = buffers[3]
+        self._prefill_runtime = runtime
         return self._prefill_workspace.capacity_bytes
 
     def _init_prefill_metadata(self, **kwargs):
@@ -220,8 +221,10 @@ class AscendMLABackend(MLAAttnBackend):
             cu_chunked_seq_len=cumulative[:0],
             max_chunk_len_per_loop=[],
         )
-        if self._prefill_runtime is None or self._placement is None:
+        if self.cache_pool is None or self._placement is None:
             raise RuntimeError("Prepare MLA Prefill cache and geometry before metadata")
+        layer_id = min(self.cache_pool.history_group_by_layer())
+        local_rows = self.cache_pool.get_key_buffer(layer_id).numel() // 576
         plan = AscendPrefillPlan.build(
             metadata,
             self._placement,
@@ -229,7 +232,7 @@ class AscendMLABackend(MLAAttnBackend):
             rank=self._dcp.rank,
             page_size=self.kernel_page_size,
             topk=1,
-            local_cache_pages=self._prefill_runtime.local_rows // self.kernel_page_size,
+            local_cache_pages=local_rows // self.kernel_page_size,
             query_partition=(0, sum(extends)),
             page_table_cpu=self._prefill_cpu_table,
             options=self._prefill_options,
@@ -243,8 +246,10 @@ class AscendMLABackend(MLAAttnBackend):
         self.chunked_prefill_metadata = metadata
 
     def prefetch_prefill_layer(self, layer_id):
-        if self._prefill_runtime is None or self._prefill_plan is None:
-            raise RuntimeError("Prepare MLA Prefill workspace and metadata first")
+        if not self.native_prefill_enabled or self._prefill_plan is None:
+            raise RuntimeError("Prepare native MLA Prefill metadata first")
+        if self._prefill_runtime is None:
+            self.prepare_prefill_workspace()
         self._prefill_runtime.prefetch(
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),

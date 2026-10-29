@@ -78,7 +78,6 @@ def bounded_transport(rank, degree, scratch_pool):
     for has_index in (False, True):
         capacity = AscendPrefillOptions(
             4096 if degree == 2 else 2048,
-            1 << 30,
             max_kv_page_num=32 if degree == 2 else 16,
         )
         local_rows = 4096 if degree == 2 else 2048

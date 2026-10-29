@@ -207,12 +207,12 @@ class AscendDSABackend(DSABackend):
             if isinstance(cache_pool, AscendPrefillCache)
             else None
         )
+        self._prefill_plan = None
         if self._dcp.degree > 1:
             counts = cache_pool.arena.runtime_contract.virtual_block_counts
             if FULL_ATTENTION not in counts:
                 raise ValueError("DSA CP requires a full-attention cache group")
             self._dcp.bind_virtual_block_count(counts[FULL_ATTENTION])
-        self.prepare_prefill_workspace()
 
     def prepare_prefill_workspace(self) -> int:
         if not self.native_prefill_enabled:
@@ -229,14 +229,13 @@ class AscendDSABackend(DSABackend):
         kv = self.cache_pool.get_key_buffer(layer_id)
         index = self.cache_pool.get_component(layer_id, "dsa_index_k")
         group = process_group_manager.get_process_group("gloo", self._dcp.ranks)
-        self._prefill_workspace, buffers = self._prefill_options.allocate_workspace(
+        workspace, buffers = self._prefill_options.allocate_workspace(
             local_rows=kv.numel() // 576,
             degree=self._dcp.degree,
             index_width=128,
             device=kv.device,
         )
-        self._prefill_slots = buffers[3]
-        self._prefill_runtime = self._indexer_kernels.prepare_prefill(
+        runtime = self._indexer_kernels.prepare_prefill(
             kv,
             index,
             ranks=self._dcp.ranks,
@@ -246,15 +245,18 @@ class AscendDSABackend(DSABackend):
             max_history_rows=self._prefill_options.history_capacity_rows,
             history_null_rows=self._prefill_options.kv_page_size,
         )
+        self._prefill_workspace = workspace
+        self._prefill_slots = buffers[3]
+        self._prefill_runtime = runtime
         return self._prefill_workspace.capacity_bytes
 
     def prefetch_prefill_layer(self, layer_id: int) -> None:
         """Start the next DSA layer while preceding KDA layers compute."""
-        if self._prefill_runtime is None or self.cache_pool is None:
-            raise RuntimeError("DSA Prefill workspace must be prepared before forward")
         plan = self._prefill_plan
-        if plan is None:
-            raise RuntimeError("DSA Prefill device metadata was not prepared")
+        if not self.native_prefill_enabled or plan is None:
+            raise RuntimeError("Prepare native DSA Prefill metadata first")
+        if self._prefill_runtime is None:
+            self.prepare_prefill_workspace()
         self._prefill_runtime.prefetch(
             layer_id,
             self.cache_pool.get_key_buffer(layer_id),
@@ -366,7 +368,10 @@ class AscendDSABackend(DSABackend):
             if cmeta is not None:
                 self._prefill_page_table = page_table[:num_extends]
                 cmeta.page_table = self._prefill_page_table
-        if num_extends > 0 and self._prefill_runtime is not None:
+        self._prefill_plan = None
+        if num_extends > 0 and self.native_prefill_enabled:
+            layer_id = min(self.cache_pool.history_group_by_layer())
+            local_rows = self.cache_pool.get_key_buffer(layer_id).numel() // 576
             self._prefill_plan = AscendPrefillPlan.build(
                 self.forward_prefill_metadata,
                 self.cache_placement(None),
@@ -374,8 +379,7 @@ class AscendDSABackend(DSABackend):
                 rank=self._dcp.rank,
                 page_size=self.kernel_page_size,
                 topk=self._indexer_spec.index_topk,
-                local_cache_pages=self._prefill_runtime.local_rows
-                // self.kernel_page_size,
+                local_cache_pages=local_rows // self.kernel_page_size,
                 page_table_cpu=kwargs.get("page_table_cpu"),
                 options=self._prefill_options,
             )

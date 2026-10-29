@@ -33,12 +33,7 @@ import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_cp_metadata
 
 from tokenspeed.runtime.execution.workspace import WorkspacePool
-from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
-from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CachePoolWorkspace,
-    CachePoolWorkspacePlan,
-)
 
 
 def _prefill_workspace_sizes(
@@ -58,23 +53,21 @@ def _prefill_workspace_sizes(
 
 @dataclass(frozen=True)
 class AscendPrefillOptions:
-    """A model's explicit native Prefill choice and pre-arena reservation."""
+    """A model's explicit native Prefill choice and bounded runtime capacity."""
 
     max_current_rows: int
-    reserved_workspace_bytes: int
     max_kv_page_num: int
     kv_page_size: int = 128
 
     def __post_init__(self):
         if (
             self.max_current_rows < 1
-            or self.reserved_workspace_bytes < 1
             or self.max_kv_page_num < 1
             or self.kv_page_size < 1
             or self.max_current_rows > self.max_kv_page_num * self.kv_page_size
         ):
             raise ValueError(
-                "Native Prefill needs a positive page limit and reservation, "
+                "Native Prefill needs a positive page limit, "
                 "with current rows bounded by the page limit"
             )
 
@@ -85,6 +78,8 @@ class AscendPrefillOptions:
 
     def required_workspace(self, *, local_rows: int, degree: int, index_width: int):
         """Transport buffers and commit slots, including pool alignment."""
+        if local_rows < 1 or degree < 1 or index_width not in (0, 128):
+            raise ValueError("Invalid native Prefill workspace geometry")
         return (
             2
             * sum(
@@ -103,23 +98,9 @@ class AscendPrefillOptions:
         # WorkspacePool aligns each view to 256 bytes (32 int64 slots).
         return -(-self.max_current_rows // 32) * 32
 
-    def check_workspace(self, *, local_rows: int, degree: int, index_width: int):
-        """Reject an undersized reservation before creating native resources."""
-        if local_rows < 1 or degree < 1 or index_width not in (0, 128):
-            raise ValueError("Invalid native Prefill workspace geometry")
-        required = self.required_workspace(
-            local_rows=local_rows, degree=degree, index_width=index_width
-        )
-        if required > self.reserved_workspace_bytes:
-            raise ValueError(
-                f"Native Prefill needs {required} workspace bytes, but the cache "
-                f"recipe reserved {self.reserved_workspace_bytes}"
-            )
-        return required
-
     def allocate_workspace(self, *, local_rows, degree, index_width, device):
         """Own transport and commit views together, disjoint across streams."""
-        required = self.check_workspace(
+        required = self.required_workspace(
             local_rows=local_rows, degree=degree, index_width=index_width
         )
         sizes = _prefill_workspace_sizes(
@@ -136,20 +117,14 @@ class AscendPrefillOptions:
         pool.freeze()
         return pool, tuple(buffers)
 
-
-class AscendPrefillWorkspace(CachePoolWorkspace):
-    """Model opt-in; TS derives the transport budget from runtime geometry."""
-
-    def plan_workspace(self, layout, *, server_args, attn_config):
+    @classmethod
+    def from_config(cls, *, server_args, attn_config):
+        """Resolve the page limit without allocating or reserving cache memory."""
         limit = server_args.chunk_prefill_kv_size
         if limit is None:
-            # No KV limit: retain serial collectives without native resources.
-            return CachePoolWorkspacePlan(0, 0, bind_options=lambda blocks: None)
-        page_size = layout.prefix_granularity
+            return None
+        page_size = attn_config.prefix_granularity
         max_pages = -(-limit // page_size)
-        dsa = attn_config.component(DSAConfig)
-        index_width = 0 if dsa is None else dsa.index_head_dim
-        degree = attn_config.kvp_size
         max_current_rows = min(
             max_pages * page_size,
             max(
@@ -161,28 +136,10 @@ class AscendPrefillWorkspace(CachePoolWorkspace):
                 attn_config.max_bs * attn_config.speculative_num_draft_tokens,
             ),
         )
-        fixed = (
-            2
-            * sum(
-                _prefill_workspace_sizes(
-                    max_current_rows=max_current_rows,
-                    history_capacity_rows=(max_pages + 1) * page_size,
-                    degree=degree,
-                    index_width=index_width,
-                )
-            )
-            + -(-max_current_rows // 32) * 256
-        )
-        options = AscendPrefillOptions(
+        return cls(
             max_current_rows=max_current_rows,
-            reserved_workspace_bytes=fixed,
             max_kv_page_num=max_pages,
             kv_page_size=page_size,
-        )
-        return CachePoolWorkspacePlan(
-            fixed_bytes=fixed,
-            bytes_per_lcm_block=0,
-            bind_options=lambda blocks: options,
         )
 
 
@@ -306,7 +263,7 @@ class AscendPrefillPlan:
         block_rows,
         virtual_blocks,
     ):
-        """Commit on the compute stream using the backend's reserved slots."""
+        """Commit on the compute stream using the backend-owned slots."""
         return runtime.patch(
             layer_id,
             slots,

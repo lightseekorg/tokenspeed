@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar
 
@@ -63,28 +62,6 @@ if TYPE_CHECKING:
         CacheModelFamily,
         CacheSetup,
     )
-
-
-@dataclass(frozen=True)
-class CachePoolWorkspacePlan:
-    """A pool's extra workspace cost, including any reserved null rows."""
-
-    fixed_bytes: int
-    bytes_per_lcm_block: int
-    bind_options: Callable[[int], object]
-
-    def bytes_for(self, blocks: int) -> int:
-        return self.fixed_bytes + blocks * self.bytes_per_lcm_block
-
-
-class CachePoolWorkspace(ABC):
-    """Explicit pool opt-in whose workspace is priced by the runtime."""
-
-    @abstractmethod
-    def plan_workspace(
-        self, layout, *, server_args, attn_config
-    ) -> CachePoolWorkspacePlan:
-        raise NotImplementedError
 
 
 class CacheRecipe(ABC):
@@ -204,25 +181,9 @@ class CacheRecipe(ABC):
         )
         unit = layout.bind(1).narrow_to_layers(*resident_cache_window)
         workspace_bytes = self.workspace_bytes()
-        pool_options = self.pool_options()
-        pool_workspace = (
-            pool_options.plan_workspace(
-                layout, server_args=self.server_args, attn_config=self.attn_config
-            )
-            if isinstance(pool_options, CachePoolWorkspace)
-            else None
-        )
-        pool_fixed = 0 if pool_workspace is None else pool_workspace.fixed_bytes
-        pool_per_block = (
-            0 if pool_workspace is None else pool_workspace.bytes_per_lcm_block
-        )
         local_limit, error = 0, None
         try:
             if offload is not None:
-                if pool_workspace is not None:
-                    raise ValueError(
-                        "native pool workspaces do not support KV offloading"
-                    )
                 # Offload policies currently bind complete model field sets.
                 # A partial stage must not price full-model hot/history pools
                 # as if they were resident-only allocations.
@@ -245,11 +206,8 @@ class CacheRecipe(ABC):
             else:
                 local_limit = min(
                     self._budgeted_parents(
-                        self.cache_budget_bytes
-                        - workspace_bytes
-                        - pool_fixed
-                        + pool_per_block,
-                        unit.resident_block_bytes + pool_per_block,
+                        self.cache_budget_bytes - workspace_bytes,
+                        unit.resident_block_bytes,
                     ),
                     self.parent_id_limit(layout),
                 )
@@ -264,20 +222,13 @@ class CacheRecipe(ABC):
         if not 1 <= num_lcm_blocks <= capacity:
             raise ValueError("recipe capacity must fit the agreed parent limit")
         memory_plan = layout.bind(num_lcm_blocks)
-        pool_workspace_bytes = (
-            0 if pool_workspace is None else pool_workspace.bytes_for(num_lcm_blocks)
-        )
-        if pool_workspace is not None:
-            pool_options = pool_workspace.bind_options(num_lcm_blocks)
         storage_plan = plan_cache_storage(memory_plan, specs, offload=offload)
         resident_storage = plan_cache_storage(
             memory_plan.narrow_to_layers(*resident_cache_window), specs, offload=offload
         )
         if (
             self.probe_batch_rows is None
-            and resident_storage.device_budget_bytes
-            + workspace_bytes
-            + pool_workspace_bytes
+            and resident_storage.device_budget_bytes + workspace_bytes
             > self.cache_budget_bytes
         ):
             raise ValueError("resident cache storage exceeds the planned budget")
@@ -291,16 +242,14 @@ class CacheRecipe(ABC):
                 cache_group_specs=tuple(spec for spec, _ in groups),
                 token_capacity=self.token_capacity(layout, num_lcm_blocks),
                 layer_kv_head_counts=self.layer_kv_head_counts,
-                pool_options=pool_options,
+                pool_options=self.pool_options(),
                 storage_plan=storage_plan,
             ),
             num_draft_layers=self.num_draft_layers,
             cache_budget_bytes=(
-                self.cache_budget_bytes - pool_workspace_bytes
+                self.cache_budget_bytes
                 if self.probe_batch_rows is None
-                else workspace_bytes
-                + pool_workspace_bytes
-                + resident_storage.device_budget_bytes
+                else workspace_bytes + resident_storage.device_budget_bytes
             ),
             fixed_workspace_bytes=workspace_bytes,
             local_parent_limit=local_limit,
