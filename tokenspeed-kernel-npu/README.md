@@ -60,10 +60,21 @@ One device metadata launch prepares the compact page table shared by Indexer
 and sparse attention, cumulative lengths, causal scans and current-page aliases.
 Complete aligned pages are read directly at their receive address; only
 boundary pages are stitched. The DSA copy kernel also commits persistent owner
-rows. No CPU page plan, unique-page scan, count readback or full receive-plane
-repacking is used. Reserve history/current receive planes and bounded uneven-row
-send padding before sizing the cache arena. Decode and the shared cache writer
-keep their existing contracts.
+rows. The unbounded configuration gathers the full cache without a CPU page
+plan. With `--chunk-prefill-kv-size`, the scheduler limits the sum of per-request
+KV page counts, including each cached prefix. Native Prefill reuses the host
+page table to compact referenced owner pages once per batch and gathers unequal
+contributions with HCCL AllGatherV; no device count readback is needed. This
+requires the library's `DsaCpAllGatherV` and `DsaCpPatchMapped` exports. Reserve
+the bounded history send/receive planes, a null page and current-row padding
+before sizing the cache arena. Decode and the shared cache writer keep their
+existing contracts.
+The scheduler wheel and `ts-host` must both be rebuilt when adding this
+scheduler option, since the host embeds its own copy of the scheduler.
+Native commits borrow int64 write-slot scratch from the runtime's main-stream
+`WorkspacePool`. Startup warms its peak before KV memory profiling; cache
+recipes reserve only the separate communication planes. Every commit obtains
+a fresh view, and the pool retains its backing allocation through execution.
 
 Ascend dense MLA Prefill reuses this ABI with only the 576-wide KV plane;
 it allocates no Index-K plane and retains the original head-sharded weights.

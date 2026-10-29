@@ -125,6 +125,7 @@ def make_config(
     enable_mixed_prefill_decode: bool = False,
     prefix_replay_tokens: int = 0,
     state_checkpoint_in_forward: bool = False,
+    max_kv_page_num: int = 0,
 ) -> SchedulerConfig:
     """Build the C++ scheduler's configuration.
 
@@ -196,6 +197,8 @@ def make_config(
     cfg = SchedulerConfig()
     cfg.num_device_pages = num_device_pages
     cfg.max_scheduled_tokens = max_scheduled_tokens
+    if max_kv_page_num:
+        cfg.max_kv_page_num = max_kv_page_num
     cfg.max_batch_size = max_batch_size
     cfg.prefix_granularity = prefix_granularity
 

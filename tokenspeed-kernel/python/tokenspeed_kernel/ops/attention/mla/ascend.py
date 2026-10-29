@@ -22,6 +22,7 @@
 
 import torch
 import torch.distributed as dist
+
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
@@ -36,7 +37,15 @@ def ascend_mla_dcp_kernels():
     return mla_dcp
 
 
-def prepare_ascend_mla_prefill(cache, *, ranks, bootstrap_group, max_current_rows):
+def prepare_ascend_mla_prefill(
+    cache,
+    *,
+    ranks,
+    bootstrap_group,
+    max_current_rows,
+    max_history_rows=0,
+    history_null_rows=0,
+):
     """Reuse the DSA AICPU gather/owner-commit transport with no Index-K plane."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAPrefill
 
@@ -46,6 +55,8 @@ def prepare_ascend_mla_prefill(cache, *, ranks, bootstrap_group, max_current_row
         ranks=ranks,
         bootstrap_group=bootstrap_group,
         max_current_rows=max_current_rows,
+        max_history_rows=max_history_rows,
+        history_null_rows=history_null_rows,
     )
 
 
@@ -161,11 +172,8 @@ def ascend_mla_prolog(
 def ascend_mla_attention(query, *, cache, table, lengths, scale, out, lse):
     """Run packed FIA into FP32 storage using the existing graph length binding."""
     tokens, heads, _ = query.shape
-    q = query[..., :512].reshape(tokens, 1, heads * 512).contiguous()
-    qr = query[..., 512:].reshape(tokens, 1, heads * 64).contiguous()
-    output, statistics = torch.ops.tokenspeed_npu.dcp_mla.out(
-        q,
-        qr,
+    output, statistics = torch.ops.tokenspeed_npu.dcp_mla_query.out(
+        query,
         cache.view(cache.shape[0], cache.shape[1], 576),
         table,
         lengths.key,
@@ -178,10 +186,15 @@ def ascend_mla_attention(query, *, cache, table, lengths, scale, out, lse):
     return output.view(tokens, heads, 512), statistics.view(tokens, heads)
 
 
-def ascend_mla_merge(output, *, maximum, total, peers, group):
-    """Use the existing direct LSE merge with normalized MLA partials."""
+def ascend_mla_merge(
+    output, *, lse, visible, active, producer, maximum, total, peers, group
+):
+    """Pack normalized FIA partials once, then reuse DSA's direct LSE merge."""
+    from tokenspeed_kernel_npu.ops.mla_dcp import prepare_mla_partials
+
+    prepare_mla_partials(output, lse, visible, active, producer, maximum)
     return torch.ops.custom.npu_dsa_merge_lse_direct(
-        output, maximum, total, peers, group, 8, 0
+        producer, maximum, total, peers, group, 8, 0
     )
 
 

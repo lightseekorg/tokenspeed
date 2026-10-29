@@ -768,7 +768,9 @@ class HostDataPlane:
             ),
         )
 
-    def complete(self, dispatched: _Dispatched) -> tuple[
+    def complete(
+        self, dispatched: _Dispatched
+    ) -> tuple[
         list[int],
         list[int],
         list[float] | None,
@@ -1130,6 +1132,14 @@ class HostBootstrap:
             )
             self._max_total_num_tokens = geometry.token_capacity
             self._max_model_len = max_model_len
+            if (
+                server_args.chunk_prefill_kv_size is not None
+                and server_args.disaggregation_mode != "decode"
+            ):
+                max_req_input_len = min(
+                    max_req_input_len,
+                    scheduler_config.max_kv_page_num * geometry.prefix_granularity,
+                )
             self._max_req_input_len = max_req_input_len
             self._multimodal_encoder_dtype = specs.multimodal_encoder_dtype
             self._cache_storage = specs.cache_storage

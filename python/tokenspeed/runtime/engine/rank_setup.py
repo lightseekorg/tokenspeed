@@ -223,6 +223,12 @@ def scheduler_config_from_args(
     return make_config(
         num_device_pages=geometry.num_device_pages,
         max_scheduled_tokens=max_scheduled_tokens,
+        max_kv_page_num=(
+            0
+            if server_args.chunk_prefill_kv_size is None
+            else (server_args.chunk_prefill_kv_size + geometry.prefix_granularity - 1)
+            // geometry.prefix_granularity
+        ),
         max_batch_size=max_batch_size,
         prefix_granularity=geometry.prefix_granularity,
         num_host_pages=specs.num_host_pages,

@@ -53,6 +53,9 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
 
 void SchedulerConfig::Validate() const {
     ValidateCapacityInputs();
+    if (max_kv_page_num < 0) {
+        throw std::invalid_argument("Scheduler: max_kv_page_num must be >= 0");
+    }
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }

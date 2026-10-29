@@ -24,7 +24,6 @@ from dataclasses import dataclass
 
 import pytest
 import torch
-
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
     mla_prefill_spans,
@@ -154,7 +153,20 @@ class CPUOwnerCommit:
     current: torch.Tensor
     cache: torch.Tensor
 
-    def patch(self, layer_id, slots, direct, *, width, block_rows, virtual_blocks):
+    def patch(
+        self,
+        layer_id,
+        slots,
+        direct,
+        *,
+        slots_workspace,
+        mapped_slots,
+        width,
+        block_rows,
+        virtual_blocks,
+    ):
+        slots_workspace.copy_(slots)
+        slots = slots_workspace
         live = (slots >= block_rows) & (slots < virtual_blocks * block_rows)
         self.cache.index_copy_(0, slots[live].long(), self.current[live])
 
@@ -485,16 +497,16 @@ def _prefill_cache_and_backend(monkeypatch, *, options):
         max_padding_fraction=float("inf"),
     )
     arena = CacheArena(layout.bind(3), "npu", cache_group_specs=(group,))
-    kwargs = dict(
-        arena=arena,
-        dtype=torch.bfloat16,
-        model_dtype=torch.bfloat16,
-        quant_method="none",
-        kv_lora_rank=512,
-        qk_rope_head_dim=64,
-        layer_num=1,
-        rank=0,
-    )
+    kwargs = {
+        "arena": arena,
+        "dtype": torch.bfloat16,
+        "model_dtype": torch.bfloat16,
+        "quant_method": "none",
+        "kv_lora_rank": 512,
+        "qk_rope_head_dim": 64,
+        "layer_num": 1,
+        "rank": 0,
+    }
     if options is None:
         pool = MLATokenToKVPool(**kwargs)
     else:
@@ -587,7 +599,7 @@ def test_native_workspace_reservation_includes_history_current_and_send(
 ):
     from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
 
-    # One history page per owner, one current page per owner and one send page.
+    # Slot scratch belongs to the shared WorkspacePool, outside cache storage.
     size = (degree * 128 * 2 + 128) * (576 + index_width) * 2
     exact = AscendPrefillOptions(1, size)
     assert (
@@ -598,3 +610,63 @@ def test_native_workspace_reservation_includes_history_current_and_send(
         AscendPrefillOptions(1, size - 1).check_workspace(
             local_rows=128, degree=degree, index_width=index_width
         )
+
+
+@pytest.mark.parametrize("degree", [1, 8])
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_bounded_prefill_counts_all_requests_and_compacts_owner_pages(
+    degree, page_size
+):
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    table = torch.tensor([[2, 3, 4, 5], [2, 3, 6, 7]], dtype=torch.int32)
+    metadata = RequestMetadata(torch.tensor([3, 17]), torch.tensor([127, 63]), table)
+    # Each request rounds to a 128-token scheduler page separately: 2 + 1.
+    options = AscendPrefillOptions(20, 1 << 30, max_kv_page_num=3, kv_page_size=128)
+    placement = CachePlacement(128, 33, tuple(range(degree)), 0)
+    plans = [
+        AscendPrefillPlan.build(
+            metadata,
+            placement,
+            degree=degree,
+            rank=rank,
+            page_size=page_size,
+            topk=1,
+            local_cache_pages=64,
+            query_partition=(0, 20),
+            options=options,
+        )
+        for rank in range(degree)
+    ]
+    for plan in plans:
+        assert plan.gather is not None
+        assert sum(plan.gather.row_counts) <= 3 * 128
+        assert plan.gather.table[0, 0] == plan.gather.table[1, 0]
+        expected = []
+        for req, (prefix, count) in enumerate([(127, 3), (63, 17)]):
+            expected.extend(
+                int(plan.gather.table[req, pos // page_size]) * page_size
+                + pos % page_size
+                for pos in range(prefix, prefix + count)
+            )
+        assert plan.patch_slots.tolist() == expected
+    with pytest.raises(ValueError, match="needs 3 KV pages, limit is 2"):
+        AscendPrefillPlan.build(
+            metadata,
+            placement,
+            degree=degree,
+            rank=0,
+            page_size=page_size,
+            topk=1,
+            local_cache_pages=64,
+            options=AscendPrefillOptions(20, 1 << 30, 2, 128),
+        )
+
+
+def test_bounded_workspace_size_does_not_follow_cache_capacity():
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    options = AscendPrefillOptions(16384, 1 << 30, 1024, 128)
+    small = options.check_workspace(local_rows=128, degree=8, index_width=128)
+    large = options.check_workspace(local_rows=1 << 20, degree=8, index_width=128)
+    assert small == large == 2 * 704 * (2 * 1025 * 128 + 9 * 2048)
