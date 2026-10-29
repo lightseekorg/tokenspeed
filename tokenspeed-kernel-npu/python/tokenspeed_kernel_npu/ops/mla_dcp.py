@@ -204,7 +204,7 @@ def merge_dcp_partials(output, lse):
     return torch.ops.custom.npu_kvp_attention_merge(output.float(), lse)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _prepare_mla_partials(
     Partial,
     Lse,
@@ -212,10 +212,11 @@ def _prepare_mla_partials(
     Active,
     Producer,
     Maximum,
-    ROWS: tl.constexpr,
+    rows,
     HEADS: tl.constexpr,
 ):
-    first, head = tl.program_id(0) * 4, tl.program_id(1) * 8
+    first = tl.program_id(0).to(tl.int64) * 4
+    head = tl.program_id(1).to(tl.int64) * 8
     # Anchor each tile before forming its block pointer. Both GM transfers
     # then remain burst copies, including the noncontiguous head-major plane.
     source = tl.make_block_ptr(
@@ -227,9 +228,9 @@ def _prepare_mla_partials(
         (2, 1, 0),
     )
     target = tl.make_block_ptr(
-        Producer + head * ROWS * 512 + first * 512,
+        Producer + head * rows * 512 + first * 512,
         (8, 4, 512),
-        (ROWS * 512, 512, 1),
+        (rows * 512, 512, 1),
         (0, 0, 0),
         (8, 4, 512),
         (2, 1, 0),

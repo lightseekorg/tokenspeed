@@ -18,6 +18,9 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import importlib.util
+from pathlib import Path
+
 import pytest
 import torch
 
@@ -81,7 +84,10 @@ def test_mla_cache_mask_graph(tokens: int, masked: bool):
 def test_fused_mla_layout_masks_and_value_projection_graph(heads, rows):
     """Poisoned empty shards, fused layout and changed-input Graph replay."""
     from tokenspeed_kernel_npu.ops.mla import mla_project_value
-    from tokenspeed_kernel_npu.ops.mla_dcp import prepare_mla_partials
+    from tokenspeed_kernel_npu.ops.mla_dcp import (
+        _prepare_mla_partials,
+        prepare_mla_partials,
+    )
 
     torch.npu.set_device(0)
     torch.manual_seed(173 + heads + rows)
@@ -106,6 +112,28 @@ def test_fused_mla_layout_masks_and_value_projection_graph(heads, rows):
 
     run()
     check()
+    helper_spec = importlib.util.spec_from_file_location(
+        "mla_kernel_test_utils",
+        Path(__file__).resolve().parents[2] / "tokenspeed-kernel/test/utils.py",
+    )
+    helper = importlib.util.module_from_spec(helper_spec)
+    helper_spec.loader.exec_module(helper)
+    with helper.assert_no_triton_compile(_prepare_mla_partials):
+        for count in (4, 12, 36):
+            values = torch.randn(count, heads, 512, device="npu")
+            statistics = torch.randn(count, heads, device="npu")
+            packed = torch.empty(heads, count, 512, device="npu")
+            maxima = torch.empty(1, count, heads, device="npu")
+            prepare_mla_partials(
+                values,
+                statistics,
+                torch.ones(count, dtype=torch.int32, device="npu"),
+                torch.ones(count, dtype=torch.bool, device="npu"),
+                packed,
+                maxima,
+            )
+            torch.testing.assert_close(packed, values.transpose(0, 1), atol=0, rtol=0)
+            torch.testing.assert_close(maxima[0], statistics, atol=0, rtol=0)
     stream = torch.npu.Stream()
     stream.wait_stream(torch.npu.current_stream())
     with torch.npu.stream(stream):

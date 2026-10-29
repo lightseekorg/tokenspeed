@@ -94,6 +94,9 @@ the output ReduceScatter. No additional LSE merge or complete-weight copy is
 needed. Causal attention with a cached prefix uses bottom-right alignment;
 CPU scheduler lengths are passed directly, without a device length readback.
 
+MLA decode partial packing reuses its compiled kernel across changing batch
+sizes and preserves empty-shard masks during Graph replay.
+
 Run the operator correctness suite on a visible NPU with:
 
 ```bash
