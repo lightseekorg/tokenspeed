@@ -38,6 +38,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     fp8_probability_shift,
     max,
     maximum,
+    reject_block_scales,
     select_kv_splits,
 )
 
@@ -1367,6 +1368,9 @@ def launch_gluon_mha_decode_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    reject_block_scales(
+        "gluon_mha_decode_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
     total_q = q.shape[0]
 
     has_sink = sinks is not None
