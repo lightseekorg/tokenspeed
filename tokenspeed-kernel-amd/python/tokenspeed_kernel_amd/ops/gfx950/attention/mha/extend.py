@@ -47,6 +47,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     fp8_probability_shift,
     max,
     maximum,
+    reject_block_scales,
     select_kv_splits,
 )
 
@@ -1182,6 +1183,9 @@ def launch_gluon_mha_extend_gfx950(
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    reject_block_scales(
+        "gluon_mha_extend_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
     return _extend(
         q,
         cu_seqlens_q,
@@ -1230,6 +1234,9 @@ def warmup_gluon_mha_extend_gfx950(
     server can compile them at startup. The batch shape of the arguments
     (lengths, request count) does not matter.
     """
+    reject_block_scales(
+        "gluon_mha_extend_gfx950", q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
+    )
     _extend(
         q,
         cu_seqlens_q,

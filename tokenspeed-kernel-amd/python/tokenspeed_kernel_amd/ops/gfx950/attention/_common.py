@@ -64,6 +64,17 @@ def _mfma_unscaled_fp8(a, b, acc, *, _semantic):
     return gl.tensor(output.handle, acc.type)
 
 
+def reject_block_scales(kernel: str, **scales) -> None:
+    """Raise if block scales reach a kernel that reads FP8 at unit scale.
+
+    The registry never routes a block-scaled cache to these kernels; this
+    keeps a direct caller from having its scales ignored.
+    """
+    names = [name for name, scale in scales.items() if scale is not None]
+    if names:
+        raise ValueError(f"{kernel} reads FP8 at unit scale, got {', '.join(names)}")
+
+
 def select_kv_splits(
     *, base_ctas: int, num_pages: int, sm_count: int, max_splits: int = MAX_KV_SPLITS
 ) -> int:
