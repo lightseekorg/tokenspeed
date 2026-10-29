@@ -799,6 +799,11 @@ def _split_count(
     return num_splits, slot
 
 
+def _prefill_launch_metadata(grid, kernel, args):
+    """Describe the launch without reading device-resident sequence lengths."""
+    return {"name": f"{kernel.name}[D={args['HEAD_DIM']},H={args['N_HEADS']}]"}
+
+
 _SPLIT_ARGS = [
     "num_seqs",
     "num_q_blocks",
@@ -808,7 +813,7 @@ _SPLIT_ARGS = [
 ]
 
 
-@gluon.jit(do_not_specialize=_SPLIT_ARGS)
+@gluon.jit(do_not_specialize=_SPLIT_ARGS, launch_metadata=_prefill_launch_metadata)
 def gluon_mla_prefill_gfx1250(
     q_ptr,
     k_ptr,
@@ -939,7 +944,7 @@ def gluon_mla_prefill_gfx1250(
             store_empty_query_block(program)
 
 
-@gluon.jit(do_not_specialize=_SPLIT_ARGS)
+@gluon.jit(do_not_specialize=_SPLIT_ARGS, launch_metadata=_prefill_launch_metadata)
 def gluon_mla_prefill_merge_gfx1250(
     output_ptr,
     lse_ptr,
