@@ -316,8 +316,8 @@ class QueryShardPlan:
             restores the given order after the gather.
 
         Raises:
-            ValueError: ``rows`` are not a 1-D host tensor, or name a row past
-                the span.
+            ValueError: ``rows`` are not a 1-D host tensor, contain duplicate
+                rows, or name a row past the span.
         """
         return _split(
             rows,
@@ -402,7 +402,9 @@ def _split(
     rows_per_rank = torch.bincount(owner, minlength=size)
     # A gather of these rows concatenates every rank's rows rank by rank,
     # each rank's in its own (ascending) order: the rows sorted by position.
-    by_position = torch.sort(position, stable=True).indices
+    sorted_position, by_position = torch.sort(position, stable=True)
+    if bool((sorted_position[1:] == sorted_position[:-1]).any()):
+        raise ValueError("query shard: rows must be distinct")
     mine = by_position[owner[by_position] == rank]
     return RowSplit(
         rows_per_rank=tuple(int(count) for count in rows_per_rank),

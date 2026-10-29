@@ -220,6 +220,15 @@ def test_split_rows_refuses_rows_past_the_span_and_device_rows():
         plan.split_rows(torch.tensor([[1, 2]]))
 
 
+@pytest.mark.parametrize("rows", [[0, 0], [5, 0, 5], [3, 1, 3, 1]])
+def test_split_rows_refuses_duplicate_rows_on_every_rank(rows):
+    # Duplicates can be nonadjacent and owned by a different rank. Reject
+    # them before any rank contributes to a collective.
+    for plan in _plans(10, [4, 6], 4):
+        with pytest.raises(ValueError, match="rows must be distinct"):
+            plan.split_rows(torch.tensor(rows))
+
+
 def test_the_sampled_rows_take_the_same_split_as_any_rows():
     """``sampled_rows_per_rank`` is ``split_rows`` over the sampled rows: one
     split, so the sampled-row gather and the prompt-row gather can never
