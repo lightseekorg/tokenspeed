@@ -1561,7 +1561,8 @@ def test_attention_output_preserves_dense_projection(
 
 
 @requires_gpu
-@pytest.mark.parametrize("tokens", [2, 16])
+# 2 and 16 rows take the GEMV; 32 and 64 (four and eight verify blocks) take the GEMM.
+@pytest.mark.parametrize("tokens", [2, 16, 32, 64])
 def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     bf16_default_dtype, tokens: int
 ) -> None:
@@ -1569,7 +1570,7 @@ def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     from tokenspeed_kernel.ops.gemm import mm
 
     if not current_platform().is_cdna4:
-        pytest.skip("the direct gather-slice projection is the CDNA4 path")
+        pytest.skip("measured and validated on gfx950 only")
     torch.manual_seed(5)
     with torch.device("cuda"):
         linear = _shard_linear(512, 8192, tp_rank=0, tp_size=1)
