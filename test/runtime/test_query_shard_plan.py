@@ -18,7 +18,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CPU behavior of the row layout, independent of distributed execution."""
+"""Row layout behavior, independent of distributed execution."""
 
 import sys
 
@@ -67,6 +67,49 @@ def test_row_payloads_survive_sharding_and_selected_row_gathers(size, lengths):
         assert torch.equal(selected_gather[split.to_rows_order], span[selected])
         assert torch.equal(sampled_gather[p.sampled_to_request], span[sampled])
         assert split.rows_per_rank == splits[0].rows_per_rank
+
+
+@pytest.mark.parametrize("size", [2, 4, 8])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(), reason="CUDA is unavailable"
+            ),
+        ),
+    ],
+)
+def test_successive_row_selections_keep_their_gather_order(size, device):
+    lengths = [5, 1, 9]
+    plans = [
+        QueryShardPlan.from_forward(
+            total_tokens=sum(lengths),
+            input_lengths=lengths,
+            size=size,
+            rank=rank,
+            device=device,
+        )
+        for rank in range(size)
+    ]
+    span = torch.arange(sum(lengths) * 3, device=device).reshape(-1, 3)
+    local = [span[p.local_row_ids] for p in plans]
+    selections = [
+        torch.tensor(rows, dtype=torch.int64)
+        for rows in ([14, 0, 6, 2], [], [1, 8, 13])
+    ]
+    # Keep the earlier results alive while the same plans split other rows.
+    splits = [[p.split_rows(rows) for p in plans] for rows in selections]
+    for rows, selection_splits in zip(selections, splits):
+        gathered = torch.cat(
+            [shard[s.local_ids.to(device)] for shard, s in zip(local, selection_splits)]
+        )
+        for split in selection_splits:
+            assert torch.equal(
+                gathered[split.to_rows_order.to(device)], span[rows.to(device)]
+            )
 
 
 @pytest.mark.parametrize("size", [2, 3, 4, 8])

@@ -115,6 +115,9 @@ class QueryShardPlan:
         row_counts: Rows every rank owns.
         rank_major_rows: ``[total_rows]`` host int64: the span rows in gather
             order, every rank's rows (ascending) concatenated rank by rank.
+        gather_to_span_cpu: ``[total_rows]`` host int64: the inverse of
+            ``rank_major_rows``, retained for ``split_rows`` to reuse without
+            rebuilding it or reading the device copy back.
         local_rows_per_request: This rank's rows of every request.
         sampled_rows_per_rank: How many of the forward's sampled rows (the
             last row of every request, ``cumsum(input_lengths) - 1``) every
@@ -138,6 +141,7 @@ class QueryShardPlan:
     rank: int
     row_counts: tuple[int, ...]
     rank_major_rows: torch.Tensor
+    gather_to_span_cpu: torch.Tensor
     local_rows_per_request: tuple[int, ...]
     sampled_rows_per_rank: tuple[int, ...]
     local_row_ids: torch.Tensor
@@ -259,6 +263,7 @@ class QueryShardPlan:
             rank=rank,
             row_counts=tuple(int(count) for count in row_counts),
             rank_major_rows=rank_major_rows,
+            gather_to_span_cpu=gather_to_span,
             local_rows_per_request=tuple(
                 int(count) for count in per_rank_lens[:, rank].sum(dim=1)
             ),
@@ -339,7 +344,7 @@ class QueryShardPlan:
         """
         return _split(
             rows,
-            gather_to_span=_inverse(self.rank_major_rows),
+            gather_to_span=self.gather_to_span_cpu,
             row_counts=torch.tensor(self.row_counts, dtype=torch.int64),
             rank=self.rank,
         )
