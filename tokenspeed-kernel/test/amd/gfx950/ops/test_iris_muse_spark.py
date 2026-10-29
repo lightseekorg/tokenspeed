@@ -880,6 +880,7 @@ def _muse_owned_qkvg_worker(rank, world_size, device):
                     else None
                 ),
                 cache=cache,
+                query_dtype=q.dtype,
                 return_kv=True,
                 solution="triton",
                 override=None,
