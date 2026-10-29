@@ -2355,11 +2355,20 @@ __all__ = [
     "triton_qsa_sparse_attention",
 ]
 
+
+def _recent_write_warmup_variants(args):
+    variants = {"rows": (1, 16, 17)}
+    if args["HAS_LIMIT"]:
+        variants["request_limit"] = (1, 16, 17)
+    return (variants,)
+
+
 register_triton_warmup(
     _qwen4_exp_qsa_prepare_metadata_kernel,
     variants=(
         {
             "RESET_DRAFT_TAGS": (False, True),
+            "stride_qsa_pt_b": (1, 16, 17),
             "stride_dlp_r": (1, 16, 17),
             "stride_dlp_s": (1, 16, 17),
         },
@@ -2371,5 +2380,5 @@ register_triton_warmup(
 )
 register_triton_warmup(
     _qwen4_exp_qsa_recent_write_kernel,
-    variants=({"rows": (1, 16, 17)},),
+    variants=_recent_write_warmup_variants,
 )

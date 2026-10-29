@@ -144,6 +144,13 @@ rounding can change logits after later layers even when individual attention
 outputs meet their mathematical tolerance. Default selection does not imply
 bitwise equivalence with FA2 or a model-level quality acceptance result.
 
+## Metadata and recent writes
+
+Startup metadata preparation covers integer alignment classes for compressed
+page-table row strides. Recent-cache writes cover these classes for row count
+and, when request limiting is enabled, the exclusive request-id bound. Changed
+table widths and mixed-prefill request counts can then reuse startup binaries.
+
 ## Materialized Triton scoring
 
 The `logits` path materializes FP32 block scores before top-k selection.
