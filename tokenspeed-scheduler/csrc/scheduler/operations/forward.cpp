@@ -371,11 +371,6 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
                                                                   Request* request, std::int32_t remaining,
                                                                   std::int32_t decode_input_tokens,
                                                                   std::int64_t kv_token_limit) {
-    // A D-role admission always needs a request slot. Avoid hashing/probing
-    // queued prompts when no slot can admit them; preserve P/fused admission.
-    if (config_.role == Role::kD && req_pool_allocator_.AvailableSlots() == 0) {
-        return FirstChunkOutcome{};
-    }
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
