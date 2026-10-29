@@ -258,6 +258,34 @@ def test_shard_local_topk_picks_what_a_whole_vocabulary_topk_would(
     assert calls == [(rows, 2 * top_k)]
 
 
+def test_a_later_rank_packs_global_ids_beside_its_values(monkeypatch) -> None:
+    """Rank 1 ships its shard-local winners as global token ids in fp32."""
+    torch.manual_seed(5)
+    rows, hidden, shard, top_k = 3, 6, 20, 4
+    weight = torch.randn(shard, hidden)
+    hidden_states = torch.randn(rows, hidden)
+    head = SimpleNamespace(
+        weight=weight,
+        quant_method=None,
+        shard_indices=SimpleNamespace(
+            num_org_elements=shard, org_vocab_start_index=shard
+        ),
+    )
+    selector = _selector(head, 2, top_k, rows, 2 * shard)
+    sent = []
+
+    def fake_all_gather(out, src, group):
+        sent.append(src.clone())
+        out.zero_()
+
+    monkeypatch.setattr(topk_module, "all_gather_single", fake_all_gather)
+    selector(hidden_states)
+
+    values, ids = torch.topk(hidden_states @ weight.T, top_k, dim=-1, sorted=False)
+    assert torch.equal(sent[0][:, :top_k], values)
+    assert torch.equal(sent[0][:, top_k:], (ids + shard).float())
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_radix_shard_topk_picks_the_same_candidates_as_torch() -> None:
     """The shard top-k on the vendored single-pass radix kernel.
