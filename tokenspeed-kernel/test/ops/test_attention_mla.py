@@ -127,6 +127,115 @@ def test_mla_prefill(
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
 
 
+def _gfx1250_fp8_prefill_inputs(device, q_lens, kv_lens, num_heads=12):
+    init = dict(device=device, dtype=torch.bfloat16)
+    q = torch.randn(sum(q_lens), num_heads, 192, **init).to(torch.float8_e4m3fn)
+    k = torch.randn(sum(kv_lens), num_heads, 192, **init).to(torch.float8_e4m3fn)
+    v = torch.randn(sum(kv_lens), num_heads, 128, **init).to(torch.float8_e4m3fn)
+    cu_seqlens_q = torch.tensor([0, *accumulate(q_lens)], device=device).int()
+    cu_seqlens_kv = torch.tensor([0, *accumulate(kv_lens)], device=device).int()
+    return q, k, v, cu_seqlens_q, cu_seqlens_kv
+
+
+def _run_gfx1250_prefill(device, q_lens, kv_lens, is_causal):
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla import prefill
+
+    q, k, v, cu_seqlens_q, cu_seqlens_kv = _gfx1250_fp8_prefill_inputs(
+        device, q_lens, kv_lens
+    )
+    out, lse = prefill.launch_gluon_mla_prefill_gfx1250(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_kv,
+        max(q_lens),
+        max(kv_lens),
+        1.0 / math.sqrt(192),
+        is_causal=is_causal,
+        return_lse=True,
+    )
+    return q, k, v, out, lse
+
+
+@pytest.mark.parametrize(
+    "q_lens,kv_lens,is_causal",
+    [
+        pytest.param((300,), (5000,), False, id="prefix"),
+        pytest.param((200, 700), (3000, 0), False, id="prefix-and-new-sequence"),
+        pytest.param((2048,), (2048,), True, id="causal-self"),
+        pytest.param((1000,), (3000,), True, id="causal-with-prefix"),
+    ],
+)
+def test_gfx1250_mla_prefill_kv_splits(
+    device: str, q_lens: tuple[int, ...], kv_lens: tuple[int, ...], is_causal: bool
+) -> None:
+    """Underfilled FP8 launches split each block's keys and merge the splits."""
+    if not current_platform().is_cdna5:
+        pytest.skip("KV-split MLA prefill targets CDNA5")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla import prefill
+
+    q, k, v, out, lse = _run_gfx1250_prefill(device, q_lens, kv_lens, is_causal)
+    config = prefill.get_config(
+        q=q,
+        k=k,
+        cu_seqlens_q=torch.zeros(len(q_lens) + 1),
+        max_seqlen_q=max(q_lens),
+        max_seqlen_kv=max(kv_lens),
+        softmax_scale=1.0,
+        is_causal=is_causal,
+    )
+    assert config.split_kv
+
+    q_offset = 0
+    kv_offset = 0
+    for q_len, kv_len in zip(q_lens, kv_lens, strict=True):
+        rows = slice(q_offset, q_offset + q_len)
+        if kv_len == 0:
+            assert torch.all(out[rows] == 0)
+            assert torch.all(lse[rows] == -math.inf)
+        else:
+            ref, ref_lse = torch_dense_attention(
+                q[rows].float(),
+                k[kv_offset : kv_offset + kv_len].float(),
+                v[kv_offset : kv_offset + kv_len].float(),
+                scale=1.0 / math.sqrt(192),
+                causal_offset=kv_len - q_len if is_causal else None,
+                window_left=None,
+                sinks=None,
+            )
+            torch.testing.assert_close(out[rows].float(), ref, rtol=2e-1, atol=2e-1)
+            torch.testing.assert_close(lse[rows], ref_lse, rtol=8e-2, atol=8e-2)
+        q_offset += q_len
+        kv_offset += kv_len
+
+
+def test_gfx1250_mla_prefill_kv_splits_reuse_compiles(device: str) -> None:
+    """Split counts and sequence counts are runtime values, not constexprs."""
+    if not current_platform().is_cdna5:
+        pytest.skip("KV-split MLA prefill targets CDNA5")
+    from tokenspeed_kernel_amd.ops.gfx1250.attention.mla import prefill
+    from utils import assert_no_triton_compile
+
+    # Warm both kernels of each mode with and without splits.
+    for is_causal in (False, True):
+        _run_gfx1250_prefill(device, (853, 1045), (853, 1045), is_causal)
+        _run_gfx1250_prefill(device, (300,), (5000,), is_causal)
+    with assert_no_triton_compile(
+        prefill.gluon_mla_prefill_gfx1250, prefill.gluon_mla_prefill_merge_gfx1250
+    ):
+        for q_lens, kv_lens in (
+            ((848,), (32768,)),
+            ((848, 7344), (16384, 0)),
+            ((8192,), (16384,)),
+            ((257, 31, 1000), (4097, 65, 12000)),
+        ):
+            _run_gfx1250_prefill(device, q_lens, kv_lens, False)
+        for q_lens in ((848,), (2048,), (5376,), (8192,)):
+            _run_gfx1250_prefill(device, q_lens, q_lens, True)
+    torch.cuda.synchronize()
+
+
 @pytest.mark.parametrize(
     "solution,q_dtype,kv_dtype,num_heads,kv_lora_rank,qk_rope_head_dim,batch_size,page_size",
     [

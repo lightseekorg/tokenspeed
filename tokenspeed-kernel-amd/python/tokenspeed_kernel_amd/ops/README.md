@@ -1386,8 +1386,11 @@ as the gfx950 kernels, with WMMA and TDM.
 - The output is BF16 unless the caller passes a buffer, which may be any
   floating dtype with a contiguous last dimension. The optional log-sum-exp
   is FP32 in natural-log units.
-- The grid is one workgroup per sequence, head, and 128-row query block.
-  `max_seqlen_kv` and `seq_lens_kv` are ignored.
+- The grid is one workgroup per head, 128-row query block and key split,
+  and sequence. `max_seqlen_kv` bounds the split count; `seq_lens_kv` is
+  ignored.
+- Split FP8 launches add a merge kernel and a transient workspace of one BF16
+  output tile and one FP32 LSE row per split.
 
 #### Algorithm
 
@@ -1400,10 +1403,35 @@ row's causal limit skip masking.
 the causal limit mask the scores and zero the value rows past the key tail.
 
 FP8 inputs stage Q in LDS, split the NoPE QK into two 64-wide WMMAs, and run
-three waves per SIMD. Fully visible tiles run in their own loop without mask
+three waves per SIMD. Every FP8 product has a depth of 64, so it uses the
+64-deep FP8 WMMA instruction; the 128-deep one would pad half of each
+operand with zeros. Fully visible tiles run in their own loop without mask
 code, and the boundary tiles mask keys only, since rows past `q_len` are
 never stored. V is not masked: TDM zero-fills tile rows past `kv_len`, and
 those keys score `-inf`.
+
+FP8 launches that would leave resident workgroup slots idle split each query
+block's keys into equal tile ranges, run one workgroup per range, and merge:
+
+- Non-causal launches of up to 16 sequences split every block that has keys
+  the same way, into as many ranges (at most 8, of at least 16 tiles) as fill
+  three workgroups per CU. Prefix chunks of one short query, or of a batch
+  whose other sequences have no prefix, otherwise run a few dozen workgroups.
+  The device derives the split from `cu_seqlens`; the host bounds it.
+- Causal single-sequence launches cut blocks longer than about 1.5 pieces per
+  resident slot of the total work into pieces of that size, and dispatch the
+  latest, heaviest blocks first, so the triangular tail no longer waits on
+  one workgroup that walks every key.
+- A split block's workgroups each publish their normalized output (BF16) and
+  base-2 LSE, and `gluon_mla_prefill_merge_gfx1250` combines them with the
+  usual max-shifted weights. Blocks that are not split store directly. The
+  merge is a separate launch: any side-effecting operation after the tile
+  loop, such as a completion counter, makes register allocation spill the
+  accumulator inside the loop.
+
+Sequences are the slowest grid axis, so one sequence's blocks are dispatched
+together. Interleaved with the blocks of sequences that have no keys, as in a
+prefix chunk next to new requests, a long sequence ran about 1.7x slower.
 
 ### gfx950 GDN decode and MTP verify
 
