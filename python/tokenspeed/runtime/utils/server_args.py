@@ -477,7 +477,7 @@ class ServerArgs:
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
     # GEMM2 atomic expert combine for unquantized FlashInfer CUTLASS MoE.
-    moe_cutlass_fused_finalize: bool = False
+    moe_cutlass_fused_finalize: bool = True
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
@@ -2950,8 +2950,8 @@ class ServerArgs:
             action=argparse.BooleanOptionalAction,
             default=ServerArgs.moe_cutlass_fused_finalize,
             help="Enable GEMM2 atomic expert combine for unquantized FP16/BF16 "
-            "MoE on flashinfer_cutlass, for target and draft models. Off by "
-            "default; enabling it loses run-to-run reproducibility. Forced "
+            "MoE on flashinfer_cutlass, for target and draft models. On by "
+            "default; the fused reduction is not run-to-run reproducible. Forced "
             "off by --numerics rl-bitwise.",
         )
         parser.add_argument(

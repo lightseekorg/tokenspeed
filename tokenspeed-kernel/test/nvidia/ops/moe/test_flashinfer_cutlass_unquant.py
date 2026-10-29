@@ -230,7 +230,7 @@ def test_ep_rank_with_repeated_placeholder_experts(ep_rank: int) -> None:
         features=frozenset(),
         solution="flashinfer_cutlass",
     )
-    assert plan["cutlass_fused_finalize"] is False
+    assert plan["cutlass_fused_finalize"] is True
     reference_w13 = w13.clone()
     layer = SimpleNamespace(
         w13_weight=torch.nn.Parameter(w13, requires_grad=False),
@@ -302,8 +302,8 @@ def test_ep_partial_finalize_matches_reference(
         features=frozenset(),
         solution="flashinfer_cutlass",
     )
-    if fused_finalize:
-        plan["cutlass_fused_finalize"] = True
+    if not fused_finalize:
+        plan["cutlass_fused_finalize"] = False
     reference_w13 = w13.clone()
     layer = _MoEWeights(w13, w2, ep_size, ep_rank)
     kernel_moe_process_weights(plan, layer)
