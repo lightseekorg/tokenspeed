@@ -410,6 +410,10 @@ def test_decode_gemm_supports_only_measured_buckets() -> None:
     # the next bucket's config: dense gate/up is measured only for 9..32.
     assert not supports_gluon_mm_a16w16_decode_gfx950(8, 8448, 7168)
     assert supports_gluon_mm_a16w16_decode_gfx950(9, 8448, 7168)
+    # Only the Muse TP8 pre-expert projection is measured past 64 rows.
+    assert supports_gluon_mm_a16w16_decode_gfx950(256, 512, 8192)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(65, 8192, 1024)
+    assert not supports_gluon_mm_a16w16_decode_gfx950(257, 512, 8192)
 
 
 # Kimi K3 shared gate/up, and the Muse TP8 pre-expert projection, whose
@@ -539,6 +543,29 @@ def test_decode_gemm_is_selected_and_matches_reference(m: int, n: int, k: int) -
         torch.testing.assert_close(out, torch.mm(a, b.T), atol=1e-4, rtol=_RTOL)
         # gemm.mm hands the rows to the same kernel.
         assert torch.equal(mm(a, b), out)
+
+
+def test_decode_gemm_serves_muse_pre_expert_verify_rows() -> None:
+    # Speculative verify sends 65-172 rows (9-21 requests of eight) through the
+    # Muse TP8 pre-expert projection; the 128- and 256-row buckets take them,
+    # with rows a runtime argument inside each bucket.
+    torch.manual_seed(0)
+    n, k = 512, 8192
+    a = torch.randn((256, k), device="cuda", dtype=torch.bfloat16) * 0.25
+    b = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * 0.25
+
+    def run(rows):
+        assert supports_gluon_mm_a16w16_decode_gfx950(rows, n, k)
+        out = _decode(a[:rows], b, torch.bfloat16)
+        torch.testing.assert_close(out, torch.mm(a[:rows], b.T), atol=1e-4, rtol=_RTOL)
+        assert torch.equal(mm(a[:rows], b), out)
+
+    # Warm both integer classes (divisible by 16 or not) of each bucket.
+    for rows in (65, 128, 129, 256):
+        run(rows)
+    with assert_no_triton_compile(gluon_mm_a16w16_medium_gfx950):
+        for rows in (72, 100, 172, 200):
+            run(rows)
 
 
 def test_medium_coalesced_store_masks_strided_out() -> None:
