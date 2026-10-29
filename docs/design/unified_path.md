@@ -1862,7 +1862,7 @@ the model's rows are `input_ids_buf[plan.local_row_ids]`,
 `positions_buf[plan.local_row_ids]` and the same rows of every per-row
 input; per-request inputs keep the whole batch; a pipeline stage's boundary
 bundle carries shard rows. The collectives over the shard group concatenate
-the ranks' rows rank by rank (*gather order*, `plan.rank_major_rows`), with
+the ranks' rows rank by rank (*gather order*, `plan.span_to_gather_cpu`), with
 the per-rank counts `plan.row_counts` as the `CommManager` row tables: a leg
 that only moves or sums rows (the dense and MoE legs, the head exchanges,
 the embedding's id gather and row reduce-scatter) works in that order
@@ -1879,6 +1879,8 @@ zigzag rows. Plugins must declare support for API 4 after migrating their
 row-layout and request-history consumers; API 3 adapters are incompatible.
 `QueryShardPlan.from_forward` requires an explicit `device` for its row
 indices (use `device="cpu"` for host-only plans).
+The CPU permutation tables are `span_to_gather_cpu` and `gather_to_span_cpu`;
+their target-device copies are `span_to_gather` and `gather_to_span`.
 
 Adapter migration: a query shard no longer exposes a contiguous range
 (`local_slice`, `local_start`, `local_end`). Use `local_row_ids` for device

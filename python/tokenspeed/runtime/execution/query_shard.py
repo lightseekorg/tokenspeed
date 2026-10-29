@@ -36,7 +36,7 @@ batch-global rows (the "span" is the scheduler's packed extend rows in
 request order) but not one contiguous range. The collectives over the shard
 group (all-gather, reduce-scatter, all-to-all with the per-rank counts
 ``row_counts``) concatenate the ranks' rows rank by rank: the *gather
-order* of the span (``rank_major_rows``). Every collective that only moves
+order* of the span (``span_to_gather_cpu``). Every collective that only moves
 or sums rows works in that order unchanged; whoever reads gathered rows by
 their batch-global position (a KV write by slot, the n-gram hash, the sampled
 rows of the model exit) puts them back into span order first
@@ -113,10 +113,10 @@ class QueryShardPlan:
         size: Ranks of the query-context-parallel group.
         rank: This rank's position in that group.
         row_counts: Rows every rank owns.
-        rank_major_rows: ``[total_rows]`` host int64: the span rows in gather
+        span_to_gather_cpu: ``[total_rows]`` host int64: the span rows in gather
             order, every rank's rows (ascending) concatenated rank by rank.
         gather_to_span_cpu: ``[total_rows]`` host int64: the inverse of
-            ``rank_major_rows``, retained for ``split_rows`` to reuse without
+            ``span_to_gather_cpu``, retained for ``split_rows`` to reuse without
             rebuilding it or reading the device copy back.
         local_rows_per_request: This rank's rows of every request.
         sampled_rows_per_rank: How many of the forward's sampled rows (the
@@ -128,7 +128,7 @@ class QueryShardPlan:
         gather_to_span: ``[total_rows]`` int64 on the device: puts rows in
             gather order back in span order (``to_span_order``).
         span_to_gather: ``[total_rows]`` int64 on the device:
-            ``rank_major_rows`` (``to_gather_order``).
+            ``span_to_gather_cpu`` (``to_gather_order``).
         local_index_of_row: ``[total_rows]`` int64 on the device: a span
             row's index among this rank's rows, ``-1`` on another rank.
         local_sampled_index: ``[local_sampled_rows]`` int64 on the device:
@@ -140,7 +140,7 @@ class QueryShardPlan:
     size: int
     rank: int
     row_counts: tuple[int, ...]
-    rank_major_rows: torch.Tensor
+    span_to_gather_cpu: torch.Tensor
     gather_to_span_cpu: torch.Tensor
     local_rows_per_request: tuple[int, ...]
     sampled_rows_per_rank: tuple[int, ...]
@@ -164,8 +164,8 @@ class QueryShardPlan:
             count < 0 for count in self.sampled_rows_per_rank
         ):
             raise ValueError("query shard row counts are non-negative")
-        if self.rank_major_rows.shape != (sum(self.row_counts),):
-            raise ValueError("query shard rank_major_rows must name every span row")
+        if self.span_to_gather_cpu.shape != (sum(self.row_counts),):
+            raise ValueError("query shard span_to_gather_cpu must name every span row")
         if sum(self.local_rows_per_request) != self.row_counts[self.rank]:
             raise ValueError(
                 "query shard local_rows_per_request must sum to this rank's rows"
@@ -262,7 +262,7 @@ class QueryShardPlan:
             size=size,
             rank=rank,
             row_counts=tuple(int(count) for count in row_counts),
-            rank_major_rows=rank_major_rows,
+            span_to_gather_cpu=rank_major_rows,
             gather_to_span_cpu=gather_to_span,
             local_rows_per_request=tuple(
                 int(count) for count in per_rank_lens[:, rank].sum(dim=1)
@@ -288,7 +288,7 @@ class QueryShardPlan:
     def local_row_ids_cpu(self) -> torch.Tensor:
         """This rank's span rows, ascending, on the host."""
         first = sum(self.row_counts[: self.rank])
-        return self.rank_major_rows[first : first + self.local_rows]
+        return self.span_to_gather_cpu[first : first + self.local_rows]
 
     @property
     def sampled_rows_total(self) -> int:

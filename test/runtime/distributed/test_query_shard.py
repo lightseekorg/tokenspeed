@@ -117,7 +117,7 @@ def test_the_shards_are_every_requests_zigzag_segments(lengths, size):
         assert plan.row_counts == tuple(len(rows) for rows in expected)
         assert plan.local_rows == len(expected[plan.rank])
         # Gather order: every rank's rows, rank by rank.
-        assert plan.rank_major_rows.tolist() == sum(expected, [])
+        assert plan.span_to_gather_cpu.tolist() == sum(expected, [])
         # A rank's rows are in request order, counted per request.
         starts = [sum(lengths[:b]) for b in range(len(lengths))]
         assert plan.local_rows_per_request == tuple(
