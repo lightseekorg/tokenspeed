@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
     from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
+    from tokenspeed.runtime.sampling.backends.base import SamplingBackend
 
 logger = get_colorful_logger(__name__)
 
@@ -181,6 +182,35 @@ class DFlash(BaseDrafter):
         self._greedy_gather_cap = 0
         self._init_fused_kv_helper()
         self._init_incremental_proj()
+
+    @override
+    def bind_sampling_backend(self, sampling_backend: SamplingBackend) -> None:
+        """Refuse --enable-speculative-sampling unless the drafter samples its block.
+
+        A block drafter records no dense draft distribution, so the base
+        ``draft_probs`` gate never fires for it; the verifier's config says
+        whether the flag is on. Only DFlash2 (the candidate selector)
+        samples its walk and overrides this; base DFLASH proposes the
+        argmax of every block row.
+
+        Args:
+            sampling_backend: The executor's verifier.
+
+        Raises:
+            ValueError: The flag is on and this drafter proposes greedily.
+        """
+        # No super(): the base binds a per-step DraftProposalSampler and dense
+        # draft_probs, which a block drafter never uses.
+        if (
+            sampling_backend.config.enable_speculative_sampling
+            and not self.supports_speculative_sampling
+        ):
+            raise ValueError(
+                "--enable-speculative-sampling with DFLASH needs a DFlash2 draft "
+                "(candidate selector weights) whose walk samples each step from "
+                f"its own distribution; {type(self).__name__} proposes a whole "
+                "block greedily"
+            )
 
     @override
     def idle_forward_global_num_tokens(

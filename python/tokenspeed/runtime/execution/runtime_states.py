@@ -434,6 +434,13 @@ class RuntimeStates:
         # the rows, so a (re)admitted request verifies its first chain against
         # the sentinel and never a previous occupant's distributions.
         self.reset_draft_probs(extend_request_pool_indices)
+        if self.future_draft_q is not None:
+            # The sparse draft q (sampled trees, the DFlash2 chain) the same
+            # way: slot -1 on every node is "no proposal", so the first verify
+            # checks the drafts against the target's own draw (target-only
+            # rule) instead of a previous occupant's q. A PD landing resets
+            # here too, before its shipped candidates arrive without q.
+            self.future_draft_q.slot.index_fill_(0, extend_request_pool_indices, -1)
         if self.ngram_accepted_tokens is not None:
             assert self.ngram_needs_seed is not None
             self.ngram_accepted_tokens.index_fill_(0, extend_request_pool_indices, -1)
@@ -574,4 +581,6 @@ class RuntimeStates:
         # The candidates come without their draft distribution; the row's
         # draft_probs still hold the sentinel reset_states wrote when the
         # remote cache length was seeded, so the first local verify rejects
-        # them at column 1 and samples token 0 from the full target.
+        # them at column 1 and samples token 0 from the full target. A sparse
+        # draft q (future_draft_q) row holds slot -1 from the same reset, so
+        # there the first verify checks them by the target-only rule.
