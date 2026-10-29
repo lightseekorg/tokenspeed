@@ -91,7 +91,12 @@ from tokenspeed_kernel.ops.gemm import (
     mm,
     prepare_mxfp8_weight_scales,
 )
-from tokenspeed_kernel.ops.moe import moe_topk
+from tokenspeed_kernel.ops.moe import (
+    moe_clear_shared_expert_weights,
+    moe_process_shared_expert_weights,
+    moe_supports_shared_expert_fusion,
+    moe_topk,
+)
 from tokenspeed_kernel.ops.quantization import (
     quantize_fp8,
     rmsnorm_quantize_fp8_group32,
@@ -1320,6 +1325,56 @@ class DeepseekV41MoE(DeepseekV4MoE):
                     reduce_results=False,
                     is_shared_expert=False,
                 )
+
+    @torch.no_grad()
+    def prepare_shared_expert_fusion(self) -> None:
+        """Prepare owned native shared weights after the complete checkpoint load.
+
+        Fusion uses ordinary native shared-expert arithmetic in automatic
+        numerics. Canonical parameters remain available for checkpoint reloads
+        and unsupported execution policies. Enabling or disabling the prepared
+        path is a startup operation and requires recapturing existing graphs.
+        """
+        shared = self.shared_experts
+        eligible = (
+            self.use_mega_moe
+            and self.mapping.dense.tp_size == 1
+            and self.mapping.moe.tp_size == 1
+            and self.n_shared_experts == 1
+            and self.config.swiglu_limit == 10.0
+            and global_server_args_dict["numerics"] == "auto"
+            and self.experts.plan["input_dtype"] == torch.bfloat16
+            and shared is not None
+            and shared.tp_size == 1
+            and shared.swiglu_limit == 10.0
+            and isinstance(shared.act_fn, SiluAndMul)
+        )
+        if eligible:
+            gate_up = shared.gate_up_proj
+            down = shared.down_proj
+            eligible = all(
+                isinstance(layer.quant_method, _ReferenceFp8LinearMethod)
+                and not layer.quant_method.load_as_bf16
+                and layer.quant_method.prepared_weight_scales is not None
+                and layer.bias is None
+                and layer.weight.is_cuda
+                and layer.weight.dtype == torch.float8_e4m3fn
+                and layer.weight_scale_inv is not None
+                and layer.weight_scale_inv.dtype == torch.uint8
+                for layer in (gate_up, down)
+            )
+        if not eligible or not moe_supports_shared_expert_fusion(self.experts.plan):
+            moe_clear_shared_expert_weights(self.experts.plan, self.experts)
+            return
+        if not self.experts._weights_processed:
+            raise RuntimeError("Routed weights must be processed before shared weights")
+        moe_process_shared_expert_weights(
+            self.experts.plan,
+            self.experts,
+            (gate_up.weight, gate_up.weight_scale_inv),
+            (down.weight, down.weight_scale_inv),
+            intermediate_size=self.config.moe_intermediate_size,
+        )
 
     def _renormalize_routing_weights(self) -> bool:
         return self.config.norm_topk_prob and self.config.num_experts_per_tok > 1
@@ -2887,6 +2942,11 @@ class DeepseekV41ForCausalLM(BaseCausalLM):
                 # The target and DSpark share this hook. Refresh in place after
                 # a complete weight update; captured graphs retain the buffer.
                 module.quant_method.prepare_weight_scales(module)
+        # Shared preparation depends on both routed and dense postprocessing.
+        # Repeated loads refresh owned derived tensors without changing pointers.
+        for module in self.modules():
+            if isinstance(module, DeepseekV41MoE):
+                module.prepare_shared_expert_fusion()
 
     def post_quant_warmup(self) -> None:
         # Every loader calls this once the loaded state is final. The sharded
