@@ -515,6 +515,17 @@ class MambaAttnBackend(AttentionBackend):
         """Whether target decode publishes state after acceptance."""
         return not self.is_draft and self.spec_num_tokens > 1
 
+    @property
+    def verify_recurrent_state_scratch(self) -> bool:
+        """Whether shared verify needs a dense state for every candidate.
+
+        A family with its own scan and accepted-state commit may disable this
+        allocation without enabling the host's numerical replay algorithm.
+        Shared convolution candidates remain allocated and seeded. This
+        deployment choice must be fixed before verify workspace allocation.
+        """
+        return not self.replay_ssm
+
     def _prepare_verify_records(
         self, bs: int, seq_lens: torch.Tensor, draft_token_num: int
     ) -> None:
@@ -577,7 +588,7 @@ class MambaAttnBackend(AttentionBackend):
                 ),
                 (
                     None
-                    if self.replay_ssm
+                    if not self.verify_recurrent_state_scratch
                     else torch.zeros(
                         (rows_needed, *ssm.shape[1:]),
                         dtype=ssm.dtype,
@@ -738,7 +749,7 @@ class MambaAttnBackend(AttentionBackend):
             ssm_src.append(ssm.data_ptr())
             ssm_src_st.append(row_stride_i32(ssm))
             ssm_element_st.append(ssm.stride(0))
-            if not self.replay_ssm:
+            if self.verify_recurrent_state_scratch:
                 ssm_dst.append(ssm_scratch.data_ptr())
                 ssm_dst_st.append(row_stride_i32(ssm_scratch))
             group_sel.append(group_index[self._state_group_for(layer_id)])
@@ -756,10 +767,14 @@ class MambaAttnBackend(AttentionBackend):
             "conv_scratch_stride": _i64(conv_dst_st),
             "conv_bytes": conv_bytes,
             "ssm_comp": _u64(ssm_src),
-            "ssm_scratch": None if self.replay_ssm else _u64(ssm_dst),
+            "ssm_scratch": (
+                _u64(ssm_dst) if self.verify_recurrent_state_scratch else None
+            ),
             "ssm_comp_stride": _i64(ssm_src_st),
             "ssm_element_stride": _i64(ssm_element_st),
-            "ssm_scratch_stride": None if self.replay_ssm else _i64(ssm_dst_st),
+            "ssm_scratch_stride": (
+                _i64(ssm_dst_st) if self.verify_recurrent_state_scratch else None
+            ),
             "ssm_bytes": ssm_bytes,
             "group_sel": _i64(group_sel),
             "num_layers": len(layer_ids),
@@ -800,7 +815,10 @@ class MambaAttnBackend(AttentionBackend):
             src_row_strides=tables["conv_comp_stride"],
             dst_row_strides=tables["conv_scratch_stride"],
         )
-        if not self.replay_ssm and not self._verify_reads_committed_recurrent_state:
+        if (
+            self.verify_recurrent_state_scratch
+            and not self._verify_reads_committed_recurrent_state
+        ):
             copy_state_rows(
                 tables["ssm_comp"],
                 tables["ssm_scratch"],
@@ -945,6 +963,10 @@ class MambaAttnBackend(AttentionBackend):
         ctx = self._verify_commit_ctx
         if ctx is None:
             return
+        if not self.replay_ssm and not self.verify_recurrent_state_scratch:
+            raise RuntimeError(
+                "Verify without recurrent-state scratch requires a family commit"
+            )
         _, draft_token_num, read_pages_by_group = ctx
         bs = accepted_length.shape[0]
         group_ids = self._state_groups()
@@ -2203,7 +2225,8 @@ class MambaAttnBackend(AttentionBackend):
             )
 
         if is_target_verify:
-            core_attn_out = self._verify_scan(
+            core_attn_out = self._verify_scan_with_context(
+                StateScanContext(layer_id=layer_id),
                 query,
                 key,
                 value,
@@ -2308,7 +2331,7 @@ class MambaAttnBackend(AttentionBackend):
         conv_comp: torch.Tensor,
         conv_scratch: torch.Tensor,
         ssm_comp: torch.Tensor,
-        ssm_scratch: torch.Tensor,
+        ssm_scratch: torch.Tensor | None,
         state_in_blocks: torch.Tensor,
         output_indices: torch.Tensor,
         *,
@@ -2365,6 +2388,17 @@ class MambaAttnBackend(AttentionBackend):
             The layer output when a fused kernel ran, else None.
         """
         return None
+
+    def _verify_scan_with_context(
+        self, scan_context: StateScanContext, *args, **kwargs
+    ) -> torch.Tensor:
+        """Dispatch a shared verify scan with explicit model-layer identity.
+
+        The default forwards every argument to the existing scan override.
+        The caller retains convolution and candidate-state scratch; acceptance
+        still publishes the selected state through the existing commit hook.
+        """
+        return self._verify_scan(*args, **kwargs)
 
     def _verify_scan(
         self,
@@ -2427,6 +2461,10 @@ class MambaAttnBackend(AttentionBackend):
         Returns:
             ``[1, seq_len, Hv, V]`` layer output.
         """
+        if not self.replay_ssm and ssm_scratch is None:
+            raise RuntimeError(
+                "Verify without recurrent-state scratch requires a family scan"
+            )
         _reject_skip_term(D)
         num_heads = query.shape[2]
         head_k_dim = query.shape[3]
