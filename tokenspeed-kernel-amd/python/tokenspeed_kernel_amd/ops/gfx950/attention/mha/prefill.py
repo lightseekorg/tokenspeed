@@ -714,7 +714,13 @@ class ProgramScheduler:
             query_block_dec = q_cycle * self.q_slots + (self.q_slots - 1 - self.q_slot)
             query_block = gl.where(q_cycle % 2 == 0, query_block_inc, query_block_dec)
             batch = batch_group * self.batch_slots + self.batch_slot
-            valid = self.slot_valid & (query_block < self.num_q_blocks)
+            # With more requests than batch slots, the last batch group can
+            # be partly empty: its slots past the last request have no work.
+            valid = (
+                self.slot_valid
+                & (query_block < self.num_q_blocks)
+                & (batch < cfg.BATCH_SIZE)
+            )
 
             safe_batch = gl.where(valid, batch, 0)
             seq_base = gl.load(cu_seqlens_ptr + safe_batch)
