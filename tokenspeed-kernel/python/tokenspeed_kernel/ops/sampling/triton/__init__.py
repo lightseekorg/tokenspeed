@@ -31,9 +31,20 @@ from tokenspeed_kernel.ops.sampling.triton.dspark_block import (
     dspark_block_greedy_step,
 )
 from tokenspeed_kernel.ops.sampling.triton.logprob_topk import logprob_topk
+from tokenspeed_kernel.ops.sampling.triton.rejection import (
+    COIN_OFFSET_SALT,
+    DRAFT_SAMPLE_OFFSET_SALT,
+    verify_rows_no_filter_from_pools,
+    verify_rows_no_filter_scratch_shape,
+)
+from tokenspeed_kernel.ops.sampling.triton.spec_path import dflash2_sample_path
 from tokenspeed_kernel.ops.sampling.triton.tree_verify import verify_tree
+from tokenspeed_kernel.ops.sampling.triton.verify import (
+    verify_chain_row_decisions,
+    verify_chain_target_sampled,
+)
 
-from .common import gather_and_expand_scalars
+from .common import TOP_K_DISABLED, check_draft_q_inputs, gather_and_expand_scalars
 from .generic import gumbel_sample_from_pools_generic
 from .gumbel import (
     gumbel_sample_from_pools,
@@ -47,14 +58,13 @@ from .min_p import (
 )
 from .penalties import accumulate_counts_inplace, apply_penalties_logit_bias_inplace
 from .probability import min_p_renorm_prob
-from .spec_path import dflash2_greedy_path
 from .topk_topp import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
     gumbel_sample_top_k_top_p_from_pools,
     gumbel_sample_top_k_top_p_qrita_from_pools,
+    verify_rows_top_k_top_p_from_pools,
 )
 from .topp import gumbel_sample_top_p_parallel_from_pools
-from .verify import verify_chain_target_sampled
 
 __all__ = [
     "_QRITA_PERCENTILE_TO_STD_TABLE",
@@ -68,7 +78,11 @@ __all__ = [
     "gumbel_sample_top_p_parallel_from_pools",
     "gumbel_sample_top_k_top_p_from_pools",
     "gumbel_sample_top_k_top_p_qrita_from_pools",
-    "dflash2_greedy_path",
+    "COIN_OFFSET_SALT",
+    "TOP_K_DISABLED",
+    "check_draft_q_inputs",
+    "DRAFT_SAMPLE_OFFSET_SALT",
+    "dflash2_sample_path",
     "dspark_block_candidate_tiles",
     "dspark_block_greedy_resolve",
     "dspark_block_greedy_step",
@@ -76,7 +90,11 @@ __all__ = [
     "apply_penalties_logit_bias_inplace",
     "accumulate_counts_inplace",
     "selected_token_logprobs",
+    "verify_chain_row_decisions",
     "verify_chain_target_sampled",
+    "verify_rows_no_filter_from_pools",
+    "verify_rows_no_filter_scratch_shape",
+    "verify_rows_top_k_top_p_from_pools",
     "draft_tree_expand",
     "draft_tree_finalize",
     "logprob_topk",

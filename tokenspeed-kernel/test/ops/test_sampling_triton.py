@@ -23,13 +23,11 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.sampling import (
-    torch_dflash2_greedy_path,
     torch_dspark_block_greedy,
     torch_top_k_top_p_support,
 )
 from tokenspeed_kernel.ops.sampling.triton import (
     _QRITA_PERCENTILE_TO_STD_TABLE,
-    dflash2_greedy_path,
     dspark_block_candidate_tiles,
     dspark_block_greedy_resolve,
     dspark_block_greedy_step,
@@ -769,58 +767,6 @@ def test_gumbel_min_p_samples_allowed_set(
         probs = torch.softmax(scaled, dim=-1)
         threshold = float(min_p_pool[pool_idx].item()) * probs.max()
         assert probs[token_id] >= threshold
-
-
-def _lattice(batch: int, steps: int, top_k: int, device: str, seed: int = 0):
-    """A random block-drafter lattice plus the int32 destination it fills."""
-    vocab = 64
-    generator = torch.Generator(device="cpu").manual_seed(seed)
-    candidate_ids = (
-        torch.rand(batch, steps, vocab, generator=generator).topk(top_k).indices
-    ).to(device)
-    scores = torch.randn(batch, steps, top_k, top_k, generator=generator).to(device)
-    # Step 0 has a single predecessor, so the checkpoint emits equal rows.
-    scores[:, 0] = scores[:, 0, :1].expand(-1, top_k, -1)
-    anchors = torch.randint(vocab, (batch,), generator=generator).to(device)
-    out = torch.empty(batch, steps + 1, dtype=torch.int32, device=device)
-    return candidate_ids, scores, anchors, out
-
-
-@pytest.mark.parametrize(("steps", "top_k"), ((1, 4), (7, 16), (5, 6)))
-def test_dflash2_greedy_path_matches_the_step_local_walk(
-    steps: int, top_k: int, device: str
-) -> None:
-    candidate_ids, scores, anchors, out = _lattice(3, steps, top_k, device, seed=steps)
-
-    dflash2_greedy_path(candidate_ids, scores, anchors, out)
-
-    assert out[:, 0].tolist() == anchors.to(torch.int32).tolist()
-    expected = torch_dflash2_greedy_path(candidate_ids, scores, anchors)
-    assert out.tolist() == expected.tolist()
-
-
-def test_dflash2_greedy_path_follows_the_selected_predecessor(device: str) -> None:
-    """Step 1's row is chosen by step 0's pick, not by its own best edge."""
-    candidate_ids = torch.tensor([[[10, 11], [20, 21]]], device=device)
-    scores = torch.zeros(1, 2, 2, 2, device=device)
-    scores[0, 0, :, 1] = 3.0
-    scores[0, 1, 0, 1] = 9.0
-    scores[0, 1, 1, 0] = 4.0
-    anchors = torch.tensor([7], device=device)
-    out = torch.empty(1, 3, dtype=torch.int32, device=device)
-
-    dflash2_greedy_path(candidate_ids, scores, anchors, out)
-
-    assert out[0].tolist() == [7, 11, 20]
-
-
-def test_dflash2_greedy_path_rejects_a_lattice_it_cannot_read(device: str) -> None:
-    candidate_ids, scores, anchors, out = _lattice(2, 3, 4, device)
-
-    with pytest.raises(ValueError, match="scores shape"):
-        dflash2_greedy_path(candidate_ids, scores[:, :, :, :2], anchors, out)
-    with pytest.raises(ValueError, match="out must be int32"):
-        dflash2_greedy_path(candidate_ids, scores, anchors, out.long())
 
 
 def _dspark_block_on_shards(base, anchors, embedding, projection, tp):
