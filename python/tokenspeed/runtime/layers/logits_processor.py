@@ -272,7 +272,13 @@ class LogitsMetadata:
     def from_forward_context(cls, ctx: ForwardContext):
         return cls(
             forward_mode=ctx.forward_mode,
-            capture_hidden_mode=ctx.capture_hidden_mode,
+            # A drafter whose sink took every tap as the target produced it
+            # reads no hidden capture, so none is concatenated or stored.
+            capture_hidden_mode=(
+                CaptureHiddenMode.NULL
+                if ctx.target_capture_sink is not None
+                else ctx.capture_hidden_mode
+            ),
             gather_ids=ctx.gather_ids,
             logits_rows_selected=ctx.logits_rows_selected,
             input_logprob_rows=ctx.input_logprob_rows,

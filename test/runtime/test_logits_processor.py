@@ -845,6 +845,55 @@ def test_scaled_softcapped_tp_logits_match_scaling_before_the_gather(
     assert torch.equal(fused, expected)
 
 
+@pytest.mark.parametrize("sink_armed", [False, True])
+def test_a_forward_whose_taps_went_to_the_sink_returns_no_capture(
+    nvidia_logits, sink_armed
+):
+    """With the drafter's sink attached, the drafter already has every tap:
+    the processor neither concatenates them nor stores a hidden capture."""
+    from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import CaptureHiddenMode
+    from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
+
+    processor = LogitsProcessor(
+        config=SimpleNamespace(model_type="test", vocab_size=4),
+        skip_all_gather=True,
+        do_argmax=False,
+        logit_scale=None,
+        tp_rank=0,
+        tp_size=1,
+        tp_group=(0,),
+        dp_lm_head_tp=False,
+    )
+    ctx = ForwardContext(
+        attn_backend=None,
+        token_to_kv_pool=None,
+        bs=1,
+        num_extends=0,
+        output_layout=ForwardOutputLayout(0, 0, 1, 3),
+        input_num_tokens=3,
+        forward_mode=ForwardMode.DECODE,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        target_capture_sink=object() if sink_armed else None,
+    )
+    hidden = torch.randn(3, 2)
+    taps = [torch.randn(3, 2), torch.randn(3, 2)]
+
+    output = processor(
+        None,
+        hidden,
+        SimpleNamespace(weight=torch.randn(4, 2)),
+        LogitsMetadata.from_forward_context(ctx),
+        taps,
+    )
+
+    assert output.next_token_logits.shape == (3, 4)
+    if sink_armed:
+        assert output.hidden_states is None
+    else:
+        assert torch.equal(output.hidden_states, torch.cat(taps, dim=-1))
+
+
 def test_argmax_routes_sharded_to_kernel(monkeypatch):
     """Sharded logits (tp shards reconstruct vocab) hit the fused kernel."""
     proc = LogitsProcessor(
