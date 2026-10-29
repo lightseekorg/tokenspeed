@@ -23,24 +23,36 @@
 import numpy as np
 import pytest
 import torch
-from tokenspeed_kernel.platform import current_platform
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness import (
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
     eagle_harness_draft_depth_update,
     eagle_harness_publish_draft_q,
     eagle_harness_residual_sample,
     eagle_harness_sample_children,
+    eagle_harness_sampled_trees_available,
     eagle_harness_stable_topk_desc,
     eagle_harness_tree_reject_sample,
     eagle_harness_work_deltas,
     eagle_harness_write_verify_tree,
 )
+from tokenspeed_kernel.ops.sampling.eagle_harness import triton as eh_triton
+from tokenspeed_kernel.ops.sampling.eagle_harness._triton import tree as eh_tree
+from tokenspeed_kernel.platform import current_platform
+from utils import assert_no_triton_compile
 
+# The CUDA build serves NVIDIA, the Triton build AMD (ops/sampling/eagle_harness).
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or not current_platform().is_nvidia,
-    reason="eagle_harness CUDA kernels are NVIDIA-only",
+    not torch.cuda.is_available()
+    or not (current_platform().is_nvidia or current_platform().is_cdna4),
+    reason="the eagle_harness kernels are built for NVIDIA and gfx950 only",
 )
 
 _DEVICE = "cuda"
+
+# The sampled-tree ops exist only in the CUDA build.
+_sampled_trees = pytest.mark.skipif(
+    not torch.cuda.is_available() or not eagle_harness_sampled_trees_available(),
+    reason="the platform has no sampled-tree kernels",
+)
 
 
 def _count(value: int) -> torch.Tensor:
@@ -358,6 +370,7 @@ def test_draft_depth_update_matches_the_unfused_sequence(
             _assert_bitwise_equal(fused[name], expected, f"{name} at depth {depth}")
 
 
+@_sampled_trees
 def test_sample_children_reads_strided_rows() -> None:
     """Each request's first R of K lane rows, read in place (and the head's
     row-strided candidate ids), draw exactly what packed copies draw."""
@@ -534,6 +547,7 @@ def _sampled_round(target_rows, draft_logits, cand, topk, generator):
 
 
 # K = 1: a sampled chain.
+@_sampled_trees
 @pytest.mark.parametrize("topk", [3, 1])
 def test_sampled_tree_emits_the_target_distribution(topk: int) -> None:
     """Children drawn from the draft, recursive rejection and the residual bonus
@@ -579,6 +593,7 @@ def test_sampled_tree_emits_the_target_distribution(topk: int) -> None:
             )
 
 
+@_sampled_trees
 def test_deterministic_children_emit_the_target_distribution() -> None:
     """Children without a draft q are accepted by p'(child) over the mass their
     rejected siblings left: with the residual bonus the first token's law is
@@ -668,6 +683,7 @@ def _sample_root_children(logits, cand, tokens, *, top_k, top_p, vocab, seed):
     return tables
 
 
+@_sampled_trees
 def test_exhausted_residual_accepts_the_target_argmax() -> None:
     """q one-hot on the target's one-hot token (a logit gap past fp32 exp): the
     drawn child is accepted for every coin, even one just below 1."""
@@ -698,6 +714,7 @@ def test_exhausted_residual_accepts_the_target_argmax() -> None:
     assert (accept_length == 2).all() and (predicts[:, 0] == 5).all()
 
 
+@_sampled_trees
 @pytest.mark.parametrize("top_k,top_p", [(3, 1.0), (1 << 30, 0.5)])
 def test_sampled_children_respect_top_k_and_top_p(top_k: int, top_p: float) -> None:
     """A request draws only from the draft's ``top_k`` best candidates and,
@@ -722,6 +739,7 @@ def test_sampled_children_respect_top_k_and_top_p(top_k: int, top_p: float) -> N
     assert first <= allowed and len(first) > 1
 
 
+@_sampled_trees
 def test_publish_marks_slots_past_the_verify_width_deterministic() -> None:
     bs, nodes, nc = 4, 8, 16
     ranked = torch.arange(nodes, device=_DEVICE).repeat(bs, 1)
@@ -744,6 +762,7 @@ def test_publish_marks_slots_past_the_verify_width_deterministic() -> None:
     torch.testing.assert_close(q_tab[1:], q_store, rtol=0, atol=0)
 
 
+@_sampled_trees
 def test_vanished_residual_takes_the_rows_first_argmax() -> None:
     """A sampled row whose residual vanishes takes torch.argmax of its target
     row as the bonus, although the rejection already lowered that entry: the
@@ -774,6 +793,7 @@ def test_vanished_residual_takes_the_rows_first_argmax() -> None:
     assert (probas[0::2, 20] == 1.0).all() and (probas[0::2, 50] < 1e-6).all()
 
 
+@_sampled_trees
 @pytest.mark.parametrize("vocab", [151936, 40001])
 def test_residual_bonus_inverts_the_cdf_of_a_wide_row(vocab: int) -> None:
     """Wide rows stage each thread's segment in several runs: the bonus is the
@@ -799,3 +819,53 @@ def test_residual_bonus_inverts_the_cdf_of_a_wide_row(vocab: int) -> None:
         torch.full((bs,), n, dtype=torch.int32, device=_DEVICE), predicts, n,
     )  # fmt: skip
     assert torch.equal(predicts.view(bs, n)[:, -1].cpu().long(), expected)
+
+
+def _triton_tree_round(rows: int, depth: int, k: int = 2) -> None:
+    """One depth of the Triton build's tree kernels at ``rows`` live rows."""
+    hidden_size, nodes, verify, num_slots = 64, 1024, 64, 64
+
+    def zeros(*shape, dtype=torch.int64):
+        return torch.zeros(shape, dtype=dtype, device=_DEVICE)
+
+    def scores(*shape):
+        return torch.rand(shape, device=_DEVICE)
+
+    pool_tokens, pool_prev = zeros(rows, nodes), zeros(rows, nodes)
+    pool_scores = scores(rows, nodes)
+    work, sort = scores(rows, verify + k), scores(rows, verify)
+    eh_triton.triton_eagle_harness_draft_depth_update(
+        scores(rows, k, k), zeros(rows, k, k), zeros(rows, k),
+        torch.randn((rows, k, hidden_size), device=_DEVICE).to(torch.bfloat16),
+        zeros(rows, k), scores(rows, k),
+        zeros(rows, k, hidden_size, dtype=torch.bfloat16), zeros(rows, k),
+        pool_tokens, pool_scores, pool_prev, work, sort, zeros(rows, k), zeros(rows),
+        zeros(rows, k, 1), _count(k), depth, _count(1 + k), _count(16), num_slots,
+    )  # fmt: skip
+    eh_triton.triton_eagle_harness_update_node_data(
+        pool_scores, pool_tokens, work, sort, scores(rows, k),
+        zeros(rows, k, dtype=torch.int32),
+    )  # fmt: skip
+    values, indices = scores(rows, k + 2), zeros(rows, k + 2)
+    eh_triton.triton_eagle_harness_stable_topk_desc(
+        work, _count(rows), _count(verify), _count(k), values, indices
+    )
+    eh_triton.triton_eagle_harness_write_verify_tree(
+        indices, pool_tokens, pool_prev, zeros(rows, verify),
+        zeros(rows, 16, dtype=torch.int32), zeros(rows, 16, dtype=torch.int32),
+        _count(rows), _count(16),
+    )  # fmt: skip
+
+
+def test_triton_tree_kernels_do_not_recompile_across_rounds() -> None:
+    """Row counts and depths are runtime arguments of the Triton build: rounds
+    at new batch sizes and depths reuse the compiled kernels."""
+    _triton_tree_round(rows=5, depth=2)
+    with assert_no_triton_compile(
+        eh_tree._draft_depth_update_kernel,
+        eh_tree._update_node_data_kernel,
+        eh_tree._stable_topk_desc_kernel,
+        eh_tree._write_verify_tree_kernel,
+    ):
+        for rows, depth in ((1, 1), (16, 16), (17, 31), (32, 3)):
+            _triton_tree_round(rows=rows, depth=depth)
