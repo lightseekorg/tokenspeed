@@ -34,7 +34,7 @@ from __future__ import annotations
 import math
 
 import torch
-from tokenspeed_kernel_amd._triton import gl, gluon, triton
+from tokenspeed_kernel_amd._triton import gl, gluon, tl, triton
 from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _INV_LN2,
     _INV_LN2_VALUE,
@@ -49,6 +49,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
 
 cdna4 = gl.amd.cdna4
 async_copy = cdna4.async_copy
+buffer = cdna4.buffer
 
 # The reduce kernel reads all split LSEs at once, one per lane of its single
 # wave, so the split count must fit in a wave.
@@ -370,32 +371,30 @@ class ExtendProgram:
         )
 
     @gluon.jit
-    def issue_load_k(self, physical_page, k_smem):
+    def issue_load_page(self, cache_ptr, physical_page, smem):
         cfg = self.cfg
+        # One page holds BLOCK_N tokens. A descriptor based at the page keeps
+        # the 64-bit page address in SGPRs, so each lane needs only its int32
+        # offset within the page, which stays the same for every page.
+        page_elems: gl.constexpr = cfg.PAGE_SIZE * cfg.N_KV_HEADS * cfg.HEAD_DIM
+        elem_bytes: gl.constexpr = cache_ptr.dtype.element_ty.primitive_bitwidth // 8
+        page = buffer.make_buffer_descriptor(
+            cache_ptr + physical_page.to(gl.int64) * page_elems,
+            page_elems * elem_bytes,
+        )
         offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
         offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
-        offsets = (
-            token_loc[:, None] * cfg.N_KV_HEADS * cfg.HEAD_DIM
-            + self.kv_head * cfg.HEAD_DIM
-            + offs_d[None, :]
-        )
-        async_copy.global_load_to_shared(k_smem, self.k_cache_ptr + offsets)
+        offsets = offs_n[:, None] * (cfg.N_KV_HEADS * cfg.HEAD_DIM) + offs_d[None, :]
+        buffer.load_to_shared(smem, page, offsets, soffset=self.kv_head * cfg.HEAD_DIM)
         async_copy.commit_group()
 
     @gluon.jit
+    def issue_load_k(self, physical_page, k_smem):
+        self.issue_load_page(self.k_cache_ptr, physical_page, k_smem)
+
+    @gluon.jit
     def issue_load_v(self, physical_page, v_smem):
-        cfg = self.cfg
-        offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(1, cfg.load_layout))
-        offs_d = gl.arange(0, cfg.HEAD_DIM, layout=gl.SliceLayout(0, cfg.load_layout))
-        token_loc = physical_page.to(gl.int64) * cfg.PAGE_SIZE + offs_n.to(gl.int64)
-        offsets = (
-            token_loc[:, None] * cfg.N_KV_HEADS * cfg.HEAD_DIM
-            + self.kv_head * cfg.HEAD_DIM
-            + offs_d[None, :]
-        )
-        async_copy.global_load_to_shared(v_smem, self.v_cache_ptr + offsets)
-        async_copy.commit_group()
+        self.issue_load_page(self.v_cache_ptr, physical_page, v_smem)
 
     @gluon.jit
     def shared_load_k(self, k_smem):
@@ -573,7 +572,7 @@ def gluon_mha_extend_gfx950(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
-    page_table_ptr,
+    page_table_ptr: tl.const,
     output_ptr,
     lse_ptr,
     sink_ptr,
@@ -739,7 +738,7 @@ def gluon_mha_extend_split_gfx950(
     q_ptr,
     k_cache_ptr,
     v_cache_ptr,
-    page_table_ptr,
+    page_table_ptr: tl.const,
     mid_o_ptr,
     mid_lse_ptr,
     sink_ptr,
