@@ -9,6 +9,11 @@ execution also returns a map from each original route to its output row, with
 `-1` for remote experts. Consumers normalize each route before weighting and
 summation. Combining routes before normalization changes the operation.
 
+`gather_moe_routes` restores token/route order from a deferred output map and
+zeros absent routes. A kernel declaring `deferred_output_is_token_order` writes
+each route it owns to row `token * topk + slot`; with EP > 1 the other rows are
+stale, so `gather_moe_routes` still zeros them.
+
 The solution modules register these operations. Shared Triton helpers live in
 `_triton/`, and the CuTe DSL routed reduction lives in `_cute_dsl/`. They use
 the same registry and public dispatchers as the other MoE operations.
@@ -93,6 +98,17 @@ Regression tests compare eager and graph outputs with upstream at
 `atol=rtol=0`. Performance depends on shape and routing; the mean hint alone
 can regress on concentrated routes, so benchmark the intended settings.
 
+Both private modes also change how the SwapAB grouped GEMM moves data, without
+changing its accumulation order. When a weight-scale row is a multiple of 16
+bytes, the TMA thread prefetches each tile's weight scales with the tile's first
+pipeline stage, so the math warps no longer load scales and synchronize at every
+tile boundary. Weight loads carry an L2 evict-first hint: weights are read once
+per call, and evicting them first keeps the GEMM from evicting, and writing
+back, data that earlier kernels left in L2, which would otherwise fill the
+pipeline gaps the prefetch removes. With prefix/lookup scheduling, each block
+reads the expert offsets once into shared memory while its barriers are set up,
+and fills the lookup table per expert instead of searching per tile.
+
 ### NVFP4 routing-map padding
 
 The pinned FlashInfer version (0.7.2.post1) initializes unused rows inside active
@@ -176,6 +192,8 @@ tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. If FlashInfer removes
 either tuning hook, changes the cache-key builder signature, or moves runner
 construction outside the cloned entry points, the adapter raises an error.
+When FlashInfer splits its module factory and runner-namespace builder, both
+are rebound so the operator closures keep the same private tactic policy.
 
 The cache-key builder derives the policy tag from the target profile.
 During autotuning, this is the profile that `p.get_opt_shapes()` selects; during
@@ -213,6 +231,17 @@ be wrong here. The kernel test checks non-unit input scales against a
 dequantized reference, and checks in-kernel sigmoid-plus-bias routing with 512
 experts and top-22.
 
+### Packed FP8 expert intermediate
+
+The matrix-based routed-expert path converts the clamped gate/up result into
+E4M3 inputs for the down projection, with one FP32 scale per 128 activations.
+It preserves BF16 intermediate rounding and clipping before conversion.
+Unsplit projections
+fuse conversion into the activation producer; split projections combine their
+partial results before the nonlinear activation and conversion. Only FP8 values
+and scales are materialized. The first BF16 input conversion still uses the
+shared quantizer rather than an upstream model operation.
+
 ### Unquantized CUTLASS MoE workspace
 
 `flashinfer_cutlass_unquant_moe_apply` hands `cutlass_fused_moe` one
@@ -227,6 +256,15 @@ consecutive MoE layers through their activations, so one buffer per device
 is never in use by two calls at once; a model that overlapped two MoE calls on
 separate streams would need one buffer per stream. PDL stays off in this
 chain for the race described in the BF16 CUTLASS section of `flashinfer.py`.
+
+FP16/BF16 unquantized CUTLASS plans default to fused finalize. Fusing
+the top-k expert reduction into the GEMM2 epilogue uses floating-point
+atomics and does not preserve the reduction order across calls. The plan's
+`cutlass_fused_finalize` value is passed explicitly to both the workspace
+size query and the MoE call. Set it to `False` for a separate reduction.
+Choose the value before warmup and CUDA graph capture; changing it after
+capture does not update recorded kernels. This controls
+one reduction, rather than the complete deployment's determinism contract.
 
 ### FP8 per-channel experts
 

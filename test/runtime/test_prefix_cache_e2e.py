@@ -1,8 +1,8 @@
 """End-to-end tests for --disable-prefix-caching.
 
 Validates that the ``--disable-prefix-caching`` flag actually disables
-prefix caching at runtime, by checking the ``cached_tokens`` field in
-``Engine.generate()`` response ``meta_info``.
+prefix caching at runtime, by checking the ``cached_tokens`` an engine
+reports with a request's outputs (driven over its wire, ``WireDriver``).
 
 Runs against two models: ``openai/gpt-oss-20b`` and
 ``txn545/Qwen3.5-35B-A3B-NVFP4``.  Override via the ``ONLY_RUN`` environment
@@ -19,6 +19,7 @@ Environment (all optional):
 """
 
 import dataclasses
+import functools
 import os
 import sys
 
@@ -38,7 +39,11 @@ from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
 register_cuda_ci(est_time=300, suite="runtime-prefix-cache-e2e")
 
-from tokenspeed.runtime.entrypoints.engine import Engine  # noqa: E402
+from tokenspeed.runtime.entrypoints.wire_driver import (  # noqa: E402
+    Completion,
+    WireDriver,
+    generate_request,
+)
 
 _TORCH_DTYPE = torch.bfloat16
 
@@ -48,7 +53,8 @@ _ONLY_RUN = os.environ.get("ONLY_RUN", "")
 @dataclasses.dataclass
 class ModelCase:
     model_path: str
-    extra_kwargs: dict = dataclasses.field(default_factory=dict)
+    # More of the engine's command line.
+    extra_args: list[str] = dataclasses.field(default_factory=list)
     # Whether the model is a thinking model (e.g. Qwen3.5) that needs
     # chat-template rendering with enable_thinking=False to suppress
     # reasoning output.
@@ -61,18 +67,18 @@ class ModelCase:
 _MODEL_CASES = [
     ModelCase(
         "openai/gpt-oss-20b",
-        extra_kwargs={
-            "moe_backend": "flashinfer_trtllm",
-            "disable_prefill_graph": True,
-        },
+        extra_args=["--moe-backend", "flashinfer_trtllm", "--disable-prefill-graph"],
     ),
     ModelCase(
         "txn545/Qwen3.5-35B-A3B-NVFP4",
-        extra_kwargs={
-            "attention_backend": "trtllm",
-            "moe_backend": "flashinfer_trtllm",
-            "quantization": "nvfp4",
-        },
+        extra_args=[
+            "--attention-backend",
+            "trtllm",
+            "--moe-backend",
+            "flashinfer_trtllm",
+            "--quantization",
+            "nvfp4",
+        ],
         is_thinking_model=True,
         has_state_groups=True,
     ),
@@ -110,9 +116,7 @@ def _render_prompt(case: ModelCase, user_msg: str) -> str:
     reasoning section.  For other models, use a plain text format.
     """
     if case.is_thinking_model:
-        from transformers import AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained(case.model_path, trust_remote_code=True)
+        tok = _tokenizer(case)
         messages = [
             {"role": "system", "content": _SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
@@ -129,9 +133,7 @@ def _render_prompt(case: ModelCase, user_msg: str) -> str:
 def _render_simple_prompt(case: ModelCase, user_msg: str) -> str:
     """Render a simple (no system prompt) prompt for quality checks."""
     if case.is_thinking_model:
-        from transformers import AutoTokenizer
-
-        tok = AutoTokenizer.from_pretrained(case.model_path, trust_remote_code=True)
+        tok = _tokenizer(case)
         messages = [{"role": "user", "content": user_msg}]
         return tok.apply_chat_template(
             messages,
@@ -142,23 +144,60 @@ def _render_simple_prompt(case: ModelCase, user_msg: str) -> str:
     return user_msg
 
 
-def _make_engine(case: ModelCase, enable_prefix_caching: bool, **overrides) -> Engine:
-    kwargs = {
-        "model": case.model_path,
-        "dtype": get_dtype_str(_TORCH_DTYPE),
-        "seed": 42,
-        "enable_prefix_caching": enable_prefix_caching,
-        "max_model_len": 8192,
-        "max_num_seqs": 4,
-        "max_prefill_tokens": 1024,
-        "chunked_prefill_size": 1024,
-        "gpu_memory_utilization": 0.7,
-        "disable_kvstore": True,
-        "disable_autotune": True,
-    }
-    kwargs.update(case.extra_kwargs)
-    kwargs.update(overrides)
-    return Engine(**kwargs)
+@functools.cache
+def _tokenizer_of(model_path: str):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
+
+def _tokenizer(case: ModelCase):
+    return _tokenizer_of(case.model_path)
+
+
+def _make_engine(
+    case: ModelCase, enable_prefix_caching: bool, extra_args: list[str]
+) -> WireDriver:
+    argv = [
+        "--model",
+        case.model_path,
+        "--dtype",
+        get_dtype_str(_TORCH_DTYPE),
+        "--seed",
+        "42",
+        (
+            "--enable-prefix-caching"
+            if enable_prefix_caching
+            else "--disable-prefix-caching"
+        ),
+        "--max-model-len",
+        "8192",
+        "--max-num-seqs",
+        "4",
+        "--max-prefill-tokens",
+        "1024",
+        "--chunked-prefill-size",
+        "1024",
+        "--gpu-memory-utilization",
+        "0.7",
+        "--disable-kvstore",
+        "--disable-autotune",
+        *case.extra_args,
+        # Last, so a case's own value of a flag above gives way to these.
+        *extra_args,
+    ]
+    return WireDriver(
+        argv, num_engines=1, routing="round_robin", startup_timeout_s=3600
+    )
+
+
+def _generate(
+    engine: WireDriver, case: ModelCase, prompt: str, sampling: dict
+) -> Completion:
+    [completion] = engine.generate(
+        [generate_request(_tokenizer(case).encode(prompt), sampling)]
+    )
+    return completion
 
 
 class TestPrefixCacheDisabled:
@@ -167,28 +206,29 @@ class TestPrefixCacheDisabled:
     def test_prefix_cache_disabled_no_cached_tokens(self, subtests):
         for case in _ACTIVE_MODELS:
             with subtests.test(model=case.model_path):
-                engine = _make_engine(case, enable_prefix_caching=False)
+                engine = _make_engine(case, enable_prefix_caching=False, extra_args=[])
                 try:
                     sampling = {"max_new_tokens": 8, "temperature": 0}
 
                     # First request: primes the system prompt in KV cache.
-                    engine.generate(
-                        prompt=_render_prompt(
+                    _generate(
+                        engine,
+                        case,
+                        _render_prompt(
                             case, "What is 1+1? Reply with just the number."
                         ),
-                        sampling_params=sampling,
-                        stream=False,
+                        sampling,
                     )
 
                     # Second request: shares the same system prefix.
-                    resp = engine.generate(
-                        prompt=_render_prompt(
+                    cached = _generate(
+                        engine,
+                        case,
+                        _render_prompt(
                             case, "What is 2+2? Reply with just the number."
                         ),
-                        sampling_params=sampling,
-                        stream=False,
-                    )
-                    cached = resp["meta_info"].get("cached_tokens", 0)
+                        sampling,
+                    ).cached_tokens
                     _pytest_first_1 = cached
                     _pytest_second_2 = 0
                     _pytest_msg_3 = (
@@ -206,7 +246,7 @@ class TestPrefixCacheEnabled:
     def test_prefix_cache_enabled_has_cached_tokens(self, subtests):
         for case in _ACTIVE_MODELS:
             with subtests.test(model=case.model_path):
-                engine = _make_engine(case, enable_prefix_caching=True)
+                engine = _make_engine(case, enable_prefix_caching=True, extra_args=[])
                 try:
                     sampling = {"max_new_tokens": 8, "temperature": 0}
 
@@ -215,28 +255,23 @@ class TestPrefixCacheEnabled:
                     # hits its hash-complete pages and, under the junction
                     # cut, ends its first chunk at the shared boundary so the
                     # third request hits the converged cross-group prefix.
-                    engine.generate(
-                        prompt=_render_prompt(
-                            case, "What is 1+1? Reply with just the number."
-                        ),
-                        sampling_params=sampling,
-                        stream=False,
-                    )
-                    engine.generate(
-                        prompt=_render_prompt(
-                            case, "What is 2+2? Reply with just the number."
-                        ),
-                        sampling_params=sampling,
-                        stream=False,
-                    )
-                    resp = engine.generate(
-                        prompt=_render_prompt(
+                    for question in ("1+1", "2+2"):
+                        _generate(
+                            engine,
+                            case,
+                            _render_prompt(
+                                case, f"What is {question}? Reply with just the number."
+                            ),
+                            sampling,
+                        )
+                    cached = _generate(
+                        engine,
+                        case,
+                        _render_prompt(
                             case, "What is 3+3? Reply with just the number."
                         ),
-                        sampling_params=sampling,
-                        stream=False,
-                    )
-                    cached = resp["meta_info"].get("cached_tokens", 0)
+                        sampling,
+                    ).cached_tokens
                     _pytest_a_4 = cached
                     _pytest_b_5 = 0
                     _pytest_msg_6 = (
@@ -249,14 +284,13 @@ class TestPrefixCacheEnabled:
 
 
 def _prompt_ids(case: ModelCase, user_msg: str) -> list[int]:
-    from transformers import AutoTokenizer
-
-    tok = AutoTokenizer.from_pretrained(case.model_path, trust_remote_code=True)
-    return tok(_render_prompt(case, user_msg), add_special_tokens=False)["input_ids"]
+    return _tokenizer(case)(_render_prompt(case, user_msg), add_special_tokens=False)[
+        "input_ids"
+    ]
 
 
 def _greedy_ids(
-    engine: Engine, input_ids: list[int], max_new_tokens: int, *, bypass_cache: bool
+    engine: WireDriver, input_ids: list[int], max_new_tokens: int, *, bypass_cache: bool
 ):
     """Greedy continuation and the prefix-cache hit the request got.
 
@@ -266,14 +300,17 @@ def _greedy_ids(
     per-request cache bound the API exposes). Its forwards are the same
     layer computations; only the LM head additionally scores the prompt rows.
     """
-    resp = engine.generate(
-        input_ids=input_ids,
-        sampling_params={"max_new_tokens": max_new_tokens, "temperature": 0},
-        return_logprob=bypass_cache,
-        logprob_start_len=0 if bypass_cache else None,
-        stream=False,
+    [completion] = engine.generate(
+        [
+            generate_request(
+                input_ids,
+                {"max_new_tokens": max_new_tokens, "temperature": 0},
+                return_logprob=bypass_cache,
+                logprob_start_len=0 if bypass_cache else -1,
+            )
+        ]
     )
-    return list(resp["output_ids"]), int(resp["meta_info"].get("cached_tokens", 0))
+    return completion.output_ids, completion.cached_tokens
 
 
 class TestTokenLevelPrefixHits:
@@ -323,9 +360,12 @@ class TestTokenLevelPrefixHits:
                 engine = _make_engine(
                     case,
                     enable_prefix_caching=True,
-                    chunked_prefill_size=len(prefix) - 1,
-                    # The reference asks for prompt logprobs (its cache bypass).
-                    enable_output_logprobs=True,
+                    extra_args=[
+                        "--chunked-prefill-size",
+                        str(len(prefix) - 1),
+                        # The reference asks for prompt logprobs (its cache bypass).
+                        "--enable-output-logprobs",
+                    ],
                 )
                 try:
                     # X[:-1] first: one cold forward over [0, |X|-1), the
@@ -394,16 +434,21 @@ class TestPrefixCacheDisabledOutputQuality:
     def test_prefix_cache_disabled_correct_output(self, subtests):
         for case in _ACTIVE_MODELS:
             with subtests.test(model=case.model_path):
-                engine = _make_engine(case, enable_prefix_caching=False)
+                engine = _make_engine(case, enable_prefix_caching=False, extra_args=[])
                 try:
-                    resp = engine.generate(
-                        prompt=_render_simple_prompt(
+                    completion = _generate(
+                        engine,
+                        case,
+                        _render_simple_prompt(
                             case, "What is 2+2? Reply with just the number."
                         ),
-                        sampling_params={"max_new_tokens": 32, "temperature": 0},
-                        stream=False,
+                        {"max_new_tokens": 32, "temperature": 0},
                     )
-                    text = resp["text"].strip()
+                    text = (
+                        _tokenizer(case)
+                        .decode(completion.output_ids, skip_special_tokens=True)
+                        .strip()
+                    )
                     _pytest_member_7 = "4"
                     _pytest_container_8 = text
                     _pytest_msg_9 = (

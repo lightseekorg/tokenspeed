@@ -279,3 +279,70 @@ def test_upstream_dispatch_and_caches_are_unchanged():
     if factory is not None:
         assert isinstance(factory, functools._lru_cache_wrapper)
         assert factory is not core._get_trtllm_moe_sm100_module_impl
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_private_fp4_dispatch_matches_upstream_output():
+    """Factory/builder splits must retain working operators and their arguments."""
+    from tokenspeed_kernel.platform import current_platform
+    from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
+        trtllm_fp4_block_scale_routed_moe,
+    )
+
+    if not current_platform().is_nvidia or current_platform().arch_version.major != 10:
+        pytest.skip("requires Blackwell or Rubin")
+    core = pytest.importorskip("flashinfer.fused_moe.core")
+    from flashinfer import fp4_quantize
+
+    torch.manual_seed(6604)
+    batch, experts, hidden, intermediate, top_k = 8, 16, 256, 256, 2
+
+    def codes(*shape):
+        return torch.randint(0, 256, shape, device="cuda", dtype=torch.uint8)
+
+    def scales(*shape):
+        return torch.full(shape, 0.015625, device="cuda").to(torch.float8_e4m3fn)
+
+    ids = torch.arange(batch * top_k, device="cuda", dtype=torch.int32)
+    ids = ids.reshape(batch, top_k) % experts
+    hidden_states, hidden_states_scale = fp4_quantize(
+        torch.randn(batch, hidden, device="cuda", dtype=torch.bfloat16) * 0.1,
+        torch.ones(1, device="cuda"),
+        is_sf_swizzled_layout=False,
+    )
+    kwargs = dict(
+        topk_ids=(
+            ids,
+            torch.full((batch, top_k), 0.5, device="cuda", dtype=torch.bfloat16),
+        ),
+        routing_bias=None,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale.view(torch.float8_e4m3fn),
+        gemm1_weights=codes(experts, 2 * intermediate, hidden // 2),
+        gemm1_weights_scale=scales(experts, 2 * intermediate, hidden // 16),
+        gemm1_bias=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=codes(experts, hidden, intermediate // 2),
+        gemm2_weights_scale=scales(experts, hidden, intermediate // 16),
+        gemm2_bias=None,
+        output1_scale_scalar=torch.ones(experts, device="cuda"),
+        output1_scale_gate_scalar=torch.ones(experts, device="cuda"),
+        output2_scale_scalar=torch.ones(experts, device="cuda"),
+        num_experts=experts,
+        top_k=top_k,
+        n_group=None,
+        topk_group=None,
+        intermediate_size=intermediate,
+        local_expert_offset=0,
+        local_num_experts=experts,
+        routed_scaling_factor=1.0,
+        routing_method_type=0,
+        do_finalize=True,
+        enable_pdl=False,
+    )
+    expected = core.trtllm_fp4_block_scale_routed_moe(**kwargs)[0].clone()
+    actual = trtllm_fp4_block_scale_routed_moe(**kwargs)[0]
+    assert torch.isfinite(actual).all() and torch.count_nonzero(actual) > 0
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

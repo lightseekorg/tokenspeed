@@ -34,6 +34,7 @@ protected:
         cfg.decode_input_tokens = 0;
         cfg.device_allocator.total_pages = 5;
         cfg.host_allocator.total_pages = 32;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
         cfg.enable_l3_storage = false;
         return cfg;
     }

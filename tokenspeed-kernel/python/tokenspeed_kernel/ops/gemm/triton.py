@@ -95,7 +95,10 @@ _MXFP8_FORMAT_SIGNATURES = (
         vendors=frozenset({"amd", "nvidia"}),
     ),
     signatures=_MXFP8_FORMAT_SIGNATURES,
-    traits={},
+    traits={
+        "a_contiguous": frozenset({True}),
+        "b_contiguous": frozenset({True}),
+    },
     priority=Priority.PERFORMANT + 3,
 )
 def triton_mm_fp8_blockscale(

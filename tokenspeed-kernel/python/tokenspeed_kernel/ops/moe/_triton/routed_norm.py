@@ -32,6 +32,94 @@ _FLOAT_DTYPES = {torch.float16, torch.bfloat16, torch.float32}
 
 
 @triton.jit
+def _gather_moe_routes_kernel(
+    routes_ptr,
+    map_ptr,
+    output_ptr,
+    numel,
+    row_stride,
+    width: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    valid = offsets < numel
+    row = tl.load(map_ptr + offsets // width, mask=valid, other=-1)
+    source = tl.maximum(row, 0).to(tl.int64) * row_stride + offsets % width
+    values = tl.load(routes_ptr + source, mask=valid & (row >= 0), other=0.0)
+    tl.store(output_ptr + offsets, values, mask=valid)
+
+
+@register_kernel(
+    "moe",
+    "gather_moe_routes",
+    name="triton_gather_moe_routes",
+    solution="triton",
+    signatures=format_signatures("routes", "dense", _FLOAT_DTYPES),
+    priority=Priority.PORTABLE,
+)
+def triton_gather_moe_routes(
+    routes: torch.Tensor,
+    route_map: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+    hidden_size: int,
+    output: torch.Tensor | None,
+) -> torch.Tensor:
+    """Triton kernel of :func:`tokenspeed_kernel.ops.moe.gather_moe_routes`."""
+    if routes.ndim != 2 or routes.shape[1] < hidden_size or routes.stride(1) != 1:
+        raise ValueError(
+            "routes must have shape [rows, padded_width] with contiguous columns"
+        )
+    if route_map.shape != (num_tokens * topk,) or not route_map.is_contiguous():
+        raise ValueError("route_map must be contiguous with shape [tokens * topk]")
+    if not routes.is_cuda or route_map.device != routes.device:
+        raise ValueError("routes and route_map must be colocated GPU tensors")
+    if num_tokens < 0 or topk <= 0 or hidden_size <= 0:
+        raise ValueError("tokens must be nonnegative and topk and hidden_size positive")
+    shape = (num_tokens, topk, hidden_size)
+    if output is None:
+        output = torch.empty(shape, device=routes.device, dtype=routes.dtype)
+    elif (
+        output.shape != shape
+        or output.dtype != routes.dtype
+        or output.device != routes.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "output must be contiguous [tokens, topk, hidden_size] matching routes"
+        )
+    if output.numel():
+        output_end = output.data_ptr() + output.numel() * output.element_size()
+        if routes.numel():
+            source_end = (
+                routes.data_ptr()
+                + ((routes.shape[0] - 1) * routes.stride(0) + routes.shape[1])
+                * routes.element_size()
+            )
+            if routes.data_ptr() < output_end and output.data_ptr() < source_end:
+                raise ValueError("output must not overlap routes")
+        map_end = route_map.data_ptr() + route_map.numel() * route_map.element_size()
+        if route_map.data_ptr() < output_end and output.data_ptr() < map_end:
+            raise ValueError("output must not overlap route_map")
+    if output.numel() >= 2**31:
+        raise ValueError(
+            f"triton_gather_moe_routes uses 32-bit offsets; got {output.numel()} "
+            "output elements"
+        )
+    if output.numel():
+        _gather_moe_routes_kernel[(triton.cdiv(output.numel(), 1024),)](
+            routes,
+            route_map,
+            output,
+            output.numel(),
+            routes.stride(0),
+            hidden_size,
+            1024,
+        )
+    return output
+
+
+@triton.jit
 def _centered_bf16(weight, offset: tl.constexpr):
     """Add the checkpoint weight center with BF16 rounding semantics."""
     return (weight.to(tl.float32) + offset).to(tl.bfloat16).to(tl.float32)
@@ -157,6 +245,7 @@ def triton_routed_input_scale_rmsnorm_sum(
     eps: float,
     weight_offset: float,
     enable_pdl: bool,
+    output: torch.Tensor | None,
 ) -> torch.Tensor:
     """Triton kernel of :func:`tokenspeed_kernel.ops.moe.routed_input_scale_rmsnorm_sum`."""
     if routes.ndim != 3:
@@ -171,7 +260,25 @@ def triton_routed_input_scale_rmsnorm_sum(
     block = _routed_sum_block(routes, num_tokens, topk, route_weights, norm_weight)
     routes_values = routes.contiguous()
     weights_values = route_weights.contiguous()
-    output = torch.empty((num_tokens, width), dtype=routes.dtype, device=routes.device)
+    if output is None:
+        output = torch.empty(
+            (num_tokens, width), dtype=routes.dtype, device=routes.device
+        )
+    elif (
+        output.shape != (num_tokens, width)
+        or output.dtype != routes.dtype
+        or output.device != routes.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            "output must be contiguous [tokens, width] matching routes' dtype"
+        )
+    elif output.numel():
+        output_end = output.data_ptr() + output.numel() * output.element_size()
+        for source in (routes_values, weights_values):
+            source_end = source.data_ptr() + source.numel() * source.element_size()
+            if source.data_ptr() < output_end and output.data_ptr() < source_end:
+                raise ValueError("output must not overlap routes or route weights")
     if num_tokens == 0:
         return output
     _launch_routed_input_scale_sum(

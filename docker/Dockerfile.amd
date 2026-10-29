@@ -37,6 +37,7 @@ RUN MAX_JOBS=${MAX_JOBS} \
     TOKENSPEED_KERNEL_BACKEND=rocm \
     python3 -m pip install tokenspeed-kernel/python/ --no-build-isolation && \
     python3 -m pip install tokenspeed-scheduler/ && \
+    WORKSPACE=/workspace bash test/ci_system/install_tokenspeed_engine.sh && \
     python3 -m pip install ./python --no-build-isolation
 
 CMD ["/bin/bash"]

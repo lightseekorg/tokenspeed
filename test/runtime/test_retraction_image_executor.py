@@ -43,8 +43,6 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
-from tokenspeed.runtime.engine.scheduler_utils import cache_ops_from_plan
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci  # noqa: E402
 
@@ -72,12 +70,7 @@ from tokenspeed.runtime.cache.transfer.ops import (  # noqa: E402
 from tokenspeed.runtime.cache.transfer.ownership import (  # noqa: E402
     BlockOwnerTranslation,
 )
-from tokenspeed.runtime.engine import (  # noqa: E402
-    scheduler_utils as scheduler_utils_module,
-)
-from tokenspeed.runtime.engine.cache_hooks import CacheOpHooks  # noqa: E402
 from tokenspeed.runtime.engine.scheduler_utils import (  # noqa: E402
-    cache_event_from_payload,
     cache_event_to_payload,
 )
 from tokenspeed.runtime.execution.slot_state import (  # noqa: E402
@@ -353,9 +346,7 @@ def test_op_dataclasses_carry_the_wire_fields():
     for kind, op_id in (("SnapshotDoneEvent", 3), ("RestoreDoneEvent", 4)):
         event = getattr(executor_module.Cache, kind)()
         event.op_id = op_id
-        payload = cache_event_to_payload(event)
-        assert payload == {"kind": kind, "op_id": op_id}
-        assert _acks([cache_event_from_payload(payload)]) == [(kind, op_id)]
+        assert cache_event_to_payload(event) == {"kind": kind, "op_id": op_id}
 
 
 def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
@@ -401,57 +392,6 @@ def test_constructor_requires_a_tier_and_resolves_the_pool_against_the_layout():
     executor, _, _ = _build(layout=layout, shard_counts=[1], l2_tier=False)
     assert (executor.num_host_pages, executor.num_snapshot_pages) == (0, 4)
     assert executor.host_storage is None and executor._load_trackers == []
-
-
-def test_count_plan_ops_counts_each_request_of_a_snapshot_or_restore_batch():
-    hooks = CacheOpHooks(
-        SimpleNamespace(),
-        speculative_algorithm=None,
-        attn_tp_rank=0,
-        attn_tp_size=1,
-        attn_tp_cpu_group=None,
-        pp_size=1,
-        pp_cpu_group=None,
-        global_rank=0,
-    )
-
-    class _SnapshotBatch:
-        op_ids = [1, 2]
-        request_ids = ["a", "b"]
-        request_pool_indices = [1, 2]
-        snapshot_slots = [0, 1]
-        group_ids = [[0], []]
-        src_pages = [[1], []]
-        dst_pages = [[1], []]
-
-    class _RestoreBatch:
-        op_ids = [3]
-        request_ids = ["c"]
-        request_pool_indices = [4]
-        snapshot_slots = [2]
-        group_ids = [[0]]
-        src_pages = [[1]]
-        dst_pages = [[1]]
-        content_hashes = [["h"]]
-        page_offsets = [[0]]
-        source_tiers = [[0]]
-
-    plan = SimpleNamespace(cache=[_SnapshotBatch(), _RestoreBatch()])
-    with patch.object(
-        scheduler_utils_module,
-        "Cache",
-        SimpleNamespace(
-            WriteBackOp=(),
-            LoadBackOp=(),
-            SnapshotOp=_SnapshotBatch,
-            RestoreOp=_RestoreBatch,
-        ),
-    ):
-        num_retracted = hooks.count_ops(cache_ops_from_plan(plan).device)
-    assert hooks._num_inflight == 3
-    # The return counts retraction victims only: one per snapshot-store
-    # request, restores excluded — it feeds the preemption counter.
-    assert num_retracted == 2
 
 
 # ----------------------------------------------------------------------

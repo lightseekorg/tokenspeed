@@ -231,19 +231,6 @@ def test_nan_and_oov_map_to_original_decode_rows():
     assert guard.flags.tolist() == [1, 0, 0]
 
 
-class Matcher:
-    finished = False
-
-    def __init__(self):
-        self.tokens = []
-
-    def is_terminated(self):
-        return False
-
-    def accept_token(self, token):
-        self.tokens.append(token)
-
-
 def test_dspark_anchors_do_not_read_or_write_incomplete_prefill():
     anchors = load_symbol(
         "tokenspeed-kernel/python/tokenspeed_kernel/ops/attention/dsv41/__init__.py",
@@ -546,65 +533,6 @@ def test_idle_graph_grammar_adds_an_identity_batch():
             output_layout=ForwardOutputLayout(0, 0, 1, 1),
         )
     ]
-
-
-@pytest.mark.parametrize("prefill_outputs", [1, 2])
-def test_grammar_mask_producer_walks_only_original_decode_candidates(
-    prefill_outputs, monkeypatch
-):
-    class MaskMatcher(Matcher):
-        def __init__(self, tag):
-            super().__init__()
-            self.tag = tag
-
-        def fill_vocab_mask(self, mask, row):
-            mask[row, 0] = self.tag + sum(self.tokens)
-
-        def try_accept_token(self, token):
-            self.tokens.append(token)
-            return True
-
-        def rollback(self, count):
-            del self.tokens[-count:]
-
-    grammars = [MaskMatcher(100), MaskMatcher(200), MaskMatcher(300)]
-    layout = ForwardOutputLayout(2, prefill_outputs, 1, 3)
-    masks = torch.empty(9, 1, dtype=torch.int32)
-    candidates = torch.full((3, 3), -99, dtype=torch.int32)
-    fill = load_symbol(RUNTIME + "grammar/capturable_grammar.py", "_fill_eager_bitmask")
-    monkeypatch.setattr(
-        torch.cuda,
-        "Event",
-        lambda: SimpleNamespace(record=lambda: None, synchronize=lambda: None),
-    )
-    buffers = SimpleNamespace(
-        candidates_cpu_buf=candidates,
-        vocab_mask_spec_cpu_buf=masks,
-        vocab_mask_spec_buf=torch.empty_like(masks),
-    )
-    fill(
-        grammars,
-        3,
-        buffers,
-        3,
-        True,
-        torch.tensor([1, 2, 3, 4, 5, 20, 21, 22]),
-        layout,
-    )
-    torch.testing.assert_close(buffers.vocab_mask_spec_buf, masks)
-    assert candidates[2].tolist() == [20, 21, 22]
-    assert masks[:, 0].tolist() == [
-        100,
-        -1,
-        -1,
-        200 if prefill_outputs == 2 else -1,
-        -1,
-        -1,
-        300,
-        321,
-        343,
-    ]
-    assert [g.tokens for g in grammars] == [[], [], []]
 
 
 def test_drafter_future_inputs_keep_original_request_rows():

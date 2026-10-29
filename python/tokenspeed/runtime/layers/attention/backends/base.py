@@ -706,14 +706,14 @@ class AttentionBackend(CachePoolBinding, ABC):
     def register_step_counter(self, step_counter: StepCounter) -> None:
         self.step_counter = step_counter
 
-    def commit_speculative_state_after_verify(
+    def commit_state_after_acceptance(
         self,
         accepted_lengths: torch.Tensor,
         *,
         num_extends: int,
         accepted_path: torch.Tensor | None,
     ) -> None:
-        """Commit live acceptance after drafted decode/mixed execution or replay.
+        """Commit live acceptance after decode/mixed execution or replay.
 
         ``num_extends == 0`` identifies pure decode; otherwise extend requests
         lead the mixed batch. ``accepted_path`` is the ``[bs, N]`` accepted

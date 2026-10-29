@@ -31,6 +31,8 @@ from tokenspeed_kernel.ops.communication._iris.all_reduce import (
     _iris_heap_base,
     _iris_peer_pointers,
     _iris_rendezvous,
+    _iris_sanitize_lamport_bf16x2,
+    _iris_subgroup_any,
     _iris_sync_peers,
     _iris_sync_rank_epoch,
     iris_cache_policy,
@@ -491,3 +493,176 @@ def iris_fused_pull_allgather_rmsnorm_mxfp4(
 
     done_epoch = gl.atomic_add(epoch_ptr, 1, sem="release", scope="sys") + 1
     _iris_sync_peers(ready_flags, row, done_epoch, heaps, rank, num_warps)
+
+
+@gluon.jit
+def _iris_tile_stage(stages, tile):
+    """Select each lane's stage from the row's per-tile stages."""
+    stage = gl.full(tile.shape, 0, gl.uint32, tile.type.layout) + stages[0]
+    for index in gl.static_range(1, len(stages)):
+        stage = gl.where(tile == index, stages[index], stage)
+    return stage
+
+
+@gluon.jit
+def iris_fused_lamport_allgather_rmsnorm_mxfp4(
+    local_input,
+    weight,
+    packed_output,
+    scale_output,
+    region,
+    epochs,
+    regions,
+    rank: gl.constexpr,
+    local_width: gl.constexpr,
+    total_width: gl.constexpr,
+    eps: gl.constexpr,
+    weight_offset: gl.constexpr,
+    scale_stride_linear,
+    scale_stride_mblock,
+    max_elements: gl.constexpr,
+    PEER_SIGNAL_STORE_CACHE: gl.constexpr,
+):
+    """Gather BF16 row shards through Lamport mailboxes, then RMSNorm + MXFP4.
+
+    Launch one single-subgroup program per row. Uses ``ProducerAllReduce``'s
+    Lamport mailbox and per-512-element stage counters. Negative zero is sent as
+    zero; otherwise outputs match ``iris_fused_pull_allgather_rmsnorm_mxfp4``.
+    """
+    WORLD_SIZE: gl.constexpr = len(regions)
+    REPS: gl.constexpr = total_width // 1024
+    TILES: gl.constexpr = local_width // 512
+    gl.static_assert(local_width % 512 == 0)
+    # The mailbox layout (512-element tiles) must match
+    # iris_lamport_bf16_allreduce word for word.
+    gl.static_assert(max_elements % 512 == 0)
+    gl.static_assert(total_width == local_width * WORLD_SIZE)
+    # The eight-subgroup layout covers 1024 columns per repetition.
+    gl.static_assert(total_width % 1024 == 0)
+    gl.static_assert((total_width & (total_width - 1)) == 0)
+    row = gl.program_id(0)
+    stages = ()
+    for tile in gl.static_range(TILES):
+        stages += (gl.load(epochs + row * TILES + tile).to(gl.uint32) % 3,)
+    stage_words: gl.constexpr = WORLD_SIZE * max_elements // 2
+    peer_words: gl.constexpr = max_elements // 2
+    row_words = row * (local_width // 2)
+    local_words = tl.cast(local_input, gl.pointer_type(gl.uint32)) + row_words
+    quant_layout: gl.constexpr = gl.BlockedLayout([1, 16], [1, 64], [1, 1], [1, 0])
+    quant_columns = gl.arange(0, 1024, layout=gl.SliceLayout(0, quant_layout))
+    norm_weights = ()
+    for rep in gl.static_range(REPS):
+        norm_weights += (gl.load(weight + rep * 1024 + quant_columns).to(gl.float32),)
+
+    # Lanes split this rank's shard into 16-byte packs and push each to every peer.
+    push_layout: gl.constexpr = gl.BlockedLayout([1, 4], [64, 1], [1, 1], [1, 0])
+    pack = gl.arange(0, local_width // 8, layout=gl.SliceLayout(1, push_layout))
+    pack_word = gl.arange(0, 4, layout=gl.SliceLayout(0, push_layout))
+    push_words = (pack * 4)[:, None] + pack_word[None, :]
+    push_stage = _iris_tile_stage(stages, pack * 8 // 512)
+    shard = _iris_sanitize_lamport_bf16x2(gl.load(local_words + push_words))
+    push_offsets = (
+        (push_stage * stage_words).to(gl.int32)[:, None]
+        + rank * peer_words
+        + row_words
+        + push_words
+    )
+    for delta in gl.static_range(1, WORLD_SIZE):
+        peer = (rank + delta) % WORLD_SIZE
+        destination = _iris_group_heap_base(peer, regions)
+        gl.amd.cdna4.buffer_store(
+            shard,
+            gl.multiple_of(destination.to(gl.pointer_type(gl.uint32)), 16),
+            push_offsets,
+            cache=PEER_SIGNAL_STORE_CACHE,
+        )
+
+    # Lane L holds columns 1024k + 16L + [0, 16) for every repetition k.
+    layout: gl.constexpr = gl.BlockedLayout([1, 1, 8], [1, 64, 1], [1, 1, 1], [2, 1, 0])
+    rep_index = gl.arange(0, REPS, layout=gl.SliceLayout(1, gl.SliceLayout(2, layout)))
+    lane = gl.arange(0, 64, layout=gl.SliceLayout(0, gl.SliceLayout(2, layout)))
+    word = gl.arange(0, 8, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout)))
+    column = rep_index[:, None] * 1024 + lane[None, :] * 16
+    owner = column // local_width
+    within = column % local_width
+    shard_words = (within // 2)[:, :, None] + word[None, None, :]
+    remote = owner != rank
+    mailbox_offsets = (
+        (_iris_tile_stage(stages, within // 512) * stage_words).to(gl.int32)
+        + owner * peer_words
+        + row_words
+    )[:, :, None] + shard_words
+    # Every lane's address lies in this row's shard; only own columns use it.
+    own = _iris_sanitize_lamport_bf16x2(gl.load(local_words + shard_words))
+    mailbox = tl.cast(region, gl.pointer_type(gl.uint32))
+    # Issue all reads before checking any; arrived packs stay unchanged until
+    # this rank clears them, so retries reread them all. Payload high halves are
+    # never 0x8000, so those words are unwritten.
+    incoming = gl.amd.cdna4.buffer_load(
+        mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
+    )
+    missing = remote & (gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0)
+    while _iris_subgroup_any(gl.max(missing.to(gl.int32), 0)):
+        incoming = gl.amd.cdna4.buffer_load(
+            mailbox, mailbox_offsets, mask=remote[:, :, None], other=0, cache=".cv"
+        )
+        missing = remote & (gl.max(((incoming >> 16) == 0x8000).to(gl.int32), 2) != 0)
+    gl.amd.cdna4.buffer_store(
+        gl.full_like(incoming, 0x80000000),
+        mailbox,
+        mailbox_offsets,
+        mask=remote[:, :, None],
+        cache=".wt",
+    )
+
+    words = gl.where(remote[:, :, None], incoming, own)
+    low = (words & 0xFFFF).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    high = (words >> 16).to(gl.uint16).to(gl.bfloat16, bitcast=True)
+    values = gl.join(low, high).reshape([REPS, 64, 16]).to(gl.float32)
+    # Sum each lane's registers in (k, column) order, then over n, then over w,
+    # as the eight-subgroup reduction does.
+    squares = gl.permute(values * values, (1, 0, 2)).reshape([8, 8, REPS * 16])
+    variance = gl.sum(gl.sum(gl.sum(squares, 2), 1), 0) / total_width
+    inv_rms = gl.rsqrt(variance + eps)
+
+    value_rep = gl.arange(
+        0, REPS, layout=gl.SliceLayout(1, gl.SliceLayout(2, values.type.layout))
+    )
+    for rep in gl.static_range(REPS):
+        # Adding zeros from the other repetitions is exact.
+        selected = gl.sum(gl.where((value_rep == rep)[:, None, None], values, 0.0), 0)
+        normalized = gl.convert_layout(selected.reshape([1, 1024]), quant_layout)
+        normalized *= inv_rms
+        normalized *= (
+            (norm_weights[rep] + weight_offset).to(gl.bfloat16).to(gl.float32)[None, :]
+        )
+        packed, scale_byte = _mxfp4_quantize_tile_in_layout(normalized)
+        packed_columns = gl.arange(0, 512, layout=gl.SliceLayout(0, packed.type.layout))
+        packed_rows = gl.arange(0, 1, layout=gl.SliceLayout(1, packed.type.layout))
+        gl.store(
+            packed_output
+            + (row + packed_rows[:, None]) * (total_width // 2)
+            + rep * 512
+            + packed_columns[None, :],
+            packed,
+        )
+        scale_groups = gl.arange(
+            0, 32, layout=gl.SliceLayout(0, scale_byte.type.layout)
+        )
+        scale_rows = gl.arange(0, 1, layout=gl.SliceLayout(1, scale_byte.type.layout))
+        _mxfp4_store_cdna4_scale(
+            scale_output,
+            scale_byte,
+            row + scale_rows[:, None],
+            rep * 32 + scale_groups[None, :],
+            scale_stride_linear,
+            scale_stride_mblock,
+            scale_groups[None, :] >= 0,
+            M_SWIZZLE=32,
+            K_SWIZZLE=8,
+        )
+
+    # Finish clearing the consumed packs before advancing the row's stages.
+    _iris_drain_subgroup_vmem()
+    for tile in gl.static_range(TILES):
+        gl.store(epochs + row * TILES + tile, ((stages[tile] + 1) % 3).to(gl.int32))

@@ -34,6 +34,7 @@ from tokenspeed_kernel.ops.moe import moe_apply as kernel_moe_apply
 from tokenspeed_kernel.ops.tuning import (
     autotune,
     autotune_cache_path,
+    kernel_warmup,
     load_autotune_cache,
     save_autotune_cache,
     set_autotune_max_num_tokens,
@@ -64,7 +65,6 @@ from tokenspeed.runtime.execution.forward_batch_info import (
     ForwardMode,
 )
 from tokenspeed.runtime.execution.forward_step import ForwardStepRunner
-from tokenspeed.runtime.execution.forward_thread import ForwardThread
 from tokenspeed.runtime.execution.input_buffer import InputBuffers
 from tokenspeed.runtime.execution.memory_delta import MemoryDeltaObserver
 from tokenspeed.runtime.execution.model_runner import ModelRunner
@@ -787,17 +787,6 @@ class ModelExecutor:
         # themselves.
         self.default_stream = self.device_module.default_stream(self.device)
         self.execution_stream = self.device_module.Stream()
-        # The data plane: every CUDA-touching operation after startup is
-        # submitted here and runs in FIFO order on one thread. The event loop
-        # (control plane) never waits on the GPU along the per-round path —
-        # dispatch submits and moves on, only commit joins — so a round stays
-        # microseconds and its cross-rank gloo collectives always find every
-        # rank promptly regardless of GPU depth. (A few low-rate paths do
-        # block on purpose: the DP idle forward, the PD receive and landing,
-        # the post-wake KV repair, RL weight updates. See DeviceHandle.)
-        self.forward_thread = ForwardThread(
-            self.device, settle=self.complete_pending_drafting
-        )
         # Throttles the mm_timing line inside execute_forward_op; the
         # per-round batch lines have their own counter on the control plane.
         self.log_step = 0
@@ -1047,7 +1036,7 @@ class ModelExecutor:
         )
 
     def autotune(self) -> None:
-        """Tune missing prefill/decode configs and persist the shared cache."""
+        """Warm encountered kernels and optionally tune missing FlashInfer tactics."""
 
         per_rank_max_batch = max(
             1,
@@ -1092,81 +1081,87 @@ class ModelExecutor:
 
         if self.config.pp_size > 1:
             # These dummy forwards do not perform pipeline stage transfers.
-            logger.info("Kernel tuning skipped under pipeline parallelism")
+            logger.info("Kernel warmup and tuning skipped under pipeline parallelism")
             return
-        if self.config.disable_autotune:
-            logger.info("Kernel tuning disabled (--disable-autotune)")
-            return
+        tune_mode = not self.config.disable_autotune
+        if not tune_mode:
+            logger.info("Kernel tactic profiling disabled (--disable-autotune)")
 
-        # One traversal discovers each operator. Its dispatch exposes the
-        # tunable branches; FI enumerates native buckets independently of the
-        # graph ladder. Prefill stays inside the actual buffer/request limits.
+        # One traversal discovers each operator. Its dispatch warms finite
+        # compile variants independently of FI, which may also profile tactics.
+        # Prefill stays inside the actual buffer/request limits.
         logger.info(
-            f"Kernel startup tuning with {num_tokens} "
+            f"Kernel startup warmup with {num_tokens} "
             f"{'decode' if decode_only else 'prefill'} tokens"
         )
 
         tic = time.time()
         set_autotune_process_group(cpu_group)
-        # Capture later refreshes the metadata created here in place.
-        with torch.no_grad(), autotune(
-            tune_mode=True, tuning_buckets=None, round_up=None
-        ):
-            # Dummy forwards must not borrow live Engram history or masks.
-            ib.fill_dummy_decode_buffers(
-                batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
-            )
-            if decode_only:
-                # No extend forward exists on this layout; the decode step
-                # reaches the target and, through the speculative forward,
-                # the draft.
-                if self.drafter is not None:
-                    self._autotune_draft_experts(num_tokens)
-                self.forward_step.warmup_decode_path(
-                    batch_sizes=(self.forward_step.max_decode_bs,), graph_phase=False
+        try:
+            # Capture later refreshes the metadata created here in place.
+            with (
+                torch.no_grad(),
+                kernel_warmup(enabled=True),
+                autotune(tune_mode=tune_mode, tuning_buckets=None, round_up=None),
+            ):
+                # Dummy forwards must not borrow live Engram history or masks.
+                ib.fill_dummy_decode_buffers(
+                    batch_size=ib.max_bs, total_tokens=ib.max_num_tokens
                 )
-            else:
-                bs = dummy_batch_size(num_tokens, self.config.context_len)
-                ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
-                # The model's rows: the span, or this rank's query shard of
-                # it, as on a real extend (_run_target_forward).
-                rows = (
-                    slice(0, num_tokens)
-                    if ctx.query_shard is None
-                    else ctx.query_shard.local_slice
-                )
-                positions = (
-                    ib.mrope_positions_buf[:, rows]
-                    if self.config.model_is_mrope
-                    else ib.positions_buf[rows]
-                )
-                with active_forward(ctx):
-                    self.model_runner.forward(
-                        ctx=ctx,
-                        input_ids=ib.input_ids_buf[rows],
-                        positions=positions,
-                        **self._model_input_kwargs(num_tokens, ctx.bs, rows),
-                    )
-                if self.drafter is not None:
-                    self._autotune_draft_experts(num_tokens)
-                if self.drafter is not None and not self.config.prefill_only:
-                    # Prefill-only roles do not allocate decode/verify scratch.
-                    # The draft model is reached through the shared speculative
-                    # forward, not model_runner.forward above. One request
-                    # exposes its operators; FI still owns their bucket
-                    # enumeration.
+                if decode_only:
+                    # No extend forward exists on this layout; the decode step
+                    # reaches the target and, through the speculative forward,
+                    # the draft.
+                    if self.drafter is not None:
+                        self._autotune_draft_experts(num_tokens)
                     self.forward_step.warmup_decode_path(
-                        batch_sizes=(1,), graph_phase=False
+                        batch_sizes=(self.forward_step.max_decode_bs,),
+                        graph_phase=False,
                     )
-        set_autotune_process_group(None)
+                else:
+                    bs = dummy_batch_size(num_tokens, self.config.context_len)
+                    ctx = self.prefill_graph.make_dummy_batch(num_tokens, bs)
+                    # The model's rows: the span, or this rank's query shard of
+                    # it, as on a real extend (_run_target_forward).
+                    rows = (
+                        slice(0, num_tokens)
+                        if ctx.query_shard is None
+                        else ctx.query_shard.local_slice
+                    )
+                    positions = (
+                        ib.mrope_positions_buf[:, rows]
+                        if self.config.model_is_mrope
+                        else ib.positions_buf[rows]
+                    )
+                    with active_forward(ctx):
+                        self.model_runner.forward(
+                            ctx=ctx,
+                            input_ids=ib.input_ids_buf[rows],
+                            positions=positions,
+                            **self._model_input_kwargs(num_tokens, ctx.bs, rows),
+                        )
+                    if self.drafter is not None:
+                        self._autotune_draft_experts(num_tokens)
+                    if self.drafter is not None and not self.config.prefill_only:
+                        # Prefill-only roles do not allocate decode/verify scratch.
+                        # The draft model is reached through the shared speculative
+                        # forward, not model_runner.forward above. One request
+                        # exposes its operators; FI still owns their bucket
+                        # enumeration.
+                        self.forward_step.warmup_decode_path(
+                            batch_sizes=(1,), graph_phase=False
+                        )
+        finally:
+            set_autotune_process_group(None)
 
         torch.get_device_module(self.device).synchronize()
-        save_autotune_cache(cache_path, cpu_group, owner_rank)
+        if tune_mode:
+            save_autotune_cache(cache_path, cpu_group, owner_rank)
 
-        logger.info(f"Kernel startup tuning finished in {time.time() - tic:.1f}s")
+        logger.info(f"Kernel startup warmup finished in {time.time() - tic:.1f}s")
 
     def _autotune_draft_experts(self, num_tokens: int) -> None:
-        """Tune the draft model's routed-expert kernels inside the tuning window.
+        """Warm the draft model's routed-expert kernels inside the startup window.
 
         The dummy prefill drives the target model only. A draft with its own
         expert geometry (DSpark's 128-expert MoE) is keyed separately by the
@@ -1229,7 +1224,7 @@ class ModelExecutor:
                     num_tokens_global=num_tokens,
                 )
             logger.info(
-                f"Kernel tuning covered draft experts {layer.prefix!s} "
+                f"Kernel warmup covered draft experts {layer.prefix!s} "
                 f"({layer.plan['apply_kernel_name']!s}, {layer.num_experts:d} experts)"
             )
 
@@ -1906,7 +1901,7 @@ class ModelExecutor:
     def execute_idle_forward(self, dp_metadata: DpForwardMetadata):
         """Run a zero-token forward so this rank participates in NCCL collectives.
 
-        Called by the EventLoop when this DP rank has no work but other
+        Called by the control plane when this DP rank has no work but other
         ranks do. The MoE all-to-all is a collective that requires ALL
         ranks to participate.
         """
@@ -2371,7 +2366,6 @@ class ModelExecutor:
                         sampling_info=sampling_info,
                         bs=bs,
                         is_spec_decode=self.drafter is not None and num_extends < bs,
-                        spec_num_tokens=self.config.spec_num_tokens or 1,
                         grammar_inputs=grammar_inputs,
                         grammar_runtime=self.grammar_runtime,
                         input_ids_buf=self.input_buffers.input_ids_buf[:total_tokens],
@@ -2627,9 +2621,8 @@ class ModelExecutor:
                 # Defensive clamp into the valid vocab range (kept from the
                 # pre-pack path). An out-of-range token id -- e.g. a stale/corrupt
                 # value surfaced by the intermittent spec-decode decode-state race
-                # -- would otherwise reach the detokenizer, whose HF
-                # tokenizer.decode raises a fatal OverflowError on ids outside
-                # [0, vocab) and tears down the whole server process tree.
+                # -- would otherwise reach the frontend's detokenizer as a
+                # token outside the vocabulary.
                 # It must run on-GPU *before* the non_blocking D2H: clamping the
                 # CPU result afterwards would race the in-flight copy. In-place
                 # (clamp_) so output_tokens keeps aliasing _output_pack_buf and

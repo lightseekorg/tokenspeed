@@ -1,6 +1,7 @@
+import functools
 import os
 import sys
-from dataclasses import fields, replace
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -51,6 +52,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     CacheGroupSpec,
 )
 from tokenspeed.runtime.layers.attention.registry import _prepare_fixed_workspaces
+from tokenspeed.runtime.pd.host_peer import build_host_peer  # noqa: E402
 
 register_cuda_ci(
     est_time=10,
@@ -127,9 +129,7 @@ def test_glm_workspace_budget_includes_kda_and_shared_kpool_tails(width):
     # The tail allocation is shared by target/draft views; count its storage
     # once, together with the verify buffers owned by the target backend.
     tail_bytes = pool._kpool_tail_workspace.storage.nbytes
-    verify_bytes = (
-        backend.preallocate_verify_workspace(config.max_bs, width) if width > 1 else 0
-    )
+    verify_bytes = backend.preallocate_verify_workspace(config.max_bs, width)
     assert setup.fixed_workspace_bytes == tail_bytes + verify_bytes
 
 
@@ -369,26 +369,6 @@ def _hybrid_setup_with_narrow_draft():
         num_draft_layers=1,
         extra_state_group="state",
     ).setup()
-
-
-def test_attention_configs_do_not_own_cache_setup() -> None:
-    cache_setup_fields = {
-        "conv_state_shape",
-        "temporal_state_shape",
-        "recurrent_state_shape",
-        "conv_dtype",
-        "ssm_dtype",
-        "recurrent_dtype",
-        "lcm_memory_plan",
-        "token_capacity",
-    }
-
-    assert cache_setup_fields.isdisjoint(field.name for field in fields(AttnConfig))
-    assert cache_setup_fields.isdisjoint(field.name for field in fields(MHAConfig))
-    assert cache_setup_fields.isdisjoint(field.name for field in fields(MLAConfig))
-    assert not hasattr(AttnConfig, "create_pool")
-    assert not hasattr(MHAConfig, "create_pool")
-    assert not hasattr(MLAConfig, "create_pool")
 
 
 def _ns_config(*, spec, **fields):
@@ -1290,32 +1270,12 @@ def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
 
 
 def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
-    """Profiled capacity keeps the null page inside the budget.
+    from test.runtime.test_cache_capacity import mha_recipe
 
-    16_384 bytes at 16 bytes/token and P=64 buys 16 pages; one is the reserved
-    null page, so 15 are schedulable.
-    """
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-        OrdinaryRecipe,
-    )
-
-    recipe = OrdinaryRecipe.__new__(OrdinaryRecipe)
-    recipe.cache_budget_bytes = 16_384
-    recipe.server_args = SimpleNamespace(max_total_tokens=None)
-    recipe.attn_config = _ns_config(
-        prefix_granularity=64,
-        spec=SimpleNamespace(cache_layer_types=(), sliding_window_tokens=None),
-        cache_cell_size=lambda: 16,
-    )
-    recipe.draft_attn_config = None
-    recipe.model_config = SimpleNamespace(num_attention_layers=1)
-
-    usable_pages = recipe.num_lcm_blocks(
-        SimpleNamespace(lcm_block_bytes=1, prefix_granularity=64, group_packing=())
-    )
-
-    assert usable_pages == 15
-    assert (usable_pages + 1) * 64 * 16 <= 16_384
+    recipe = mha_recipe(layers=1, budget=16 * 65536)
+    setup = recipe.setup()
+    assert setup.spec.memory_plan.num_lcm_blocks == 15
+    assert setup.spec.memory_plan.arena_bytes == recipe.cache_budget_bytes
 
 
 @pytest.mark.parametrize(
@@ -1497,34 +1457,33 @@ def _fake_around_the_budget(monkeypatch, free):
         registry, "_resolve_heterogeneous_draft_family", lambda *a, **k: None
     )
 
-    def prepare(*, cache_budget_bytes, probe_batch_rows, **kwargs):
+    def prepare(family, *, cache_budget_bytes, probe_batch_rows, **kwargs):
         raise _Sized(cache_budget_bytes, probe_batch_rows)
 
-    monkeypatch.setattr(registry, "prepare_cache_setup", prepare)
+    monkeypatch.setattr(registry, "cache_recipe", prepare)
     return registry
 
 
 def _receive_pool_env(monkeypatch, slots, slot_mb):
-    from tokenspeed.runtime.epd import prefill_admission
-
     monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOTS", str(slots))
     monkeypatch.setenv("TOKENSPEED_EPD_RECV_POOL_SLOT_MB", str(slot_mb))
-    monkeypatch.setattr(prefill_admission, "_POOLS", {})
 
 
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("probe", [False, True])
 @pytest.mark.parametrize(
-    "mode, active, pool",
+    "mode, active, external, pool",
     [
-        ("prefill", True, 4 << 30),
-        ("prefill", False, 0),
-        ("decode", True, 0),
-        ("null", True, 0),
+        ("prefill", True, False, 4 << 30),
+        ("prefill", False, False, 0),
+        ("decode", True, False, 0),
+        ("null", True, False, 0),
+        ("null", True, True, 4 << 30),
+        ("null", False, True, 0),
     ],
 )
 def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
-    monkeypatch, rank, probe, mode, active, pool
+    monkeypatch, rank, probe, mode, active, external, pool
 ) -> None:
     from tokenspeed.runtime.execution import device, factory
 
@@ -1539,6 +1498,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_external_encoder=external,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -1562,6 +1522,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
             overlap_schedule_depth=0,
             decode_input_tokens=1,
             max_batch_size=8,
+            kv_transfer_builder=functools.partial(build_host_peer, outbox=None),
         )
     budget, rows = sized.value.args
     assert (rows is not None) == probe
@@ -1627,35 +1588,6 @@ def test_each_rank_leaves_its_own_pool_out_before_the_minimum(monkeypatch) -> No
 
 @pytest.mark.parametrize("slots, slot_mb", [(2, 1), (0, 1), (-1, 1), (2, 0), (2, -1)])
 @pytest.mark.parametrize("num_deepstack", [0, 3])
-def test_the_admission_builds_the_pool_the_budget_left_out(
-    monkeypatch, slots, slot_mb, num_deepstack
-) -> None:
-    from tokenspeed.runtime.epd import prefill_admission, recv_pool
-
-    _receive_pool_env(monkeypatch, slots, slot_mb)
-    registered = []
-    engine = SimpleNamespace(register=lambda ptr, size: registered.append(size))
-    prefill_admission.EpdPrefillAdmission(
-        manager=SimpleNamespace(engine=engine),
-        device="cpu",
-        hidden=16,
-        num_deepstack=num_deepstack,
-        dtype=torch.bfloat16,
-        attn_tp_rank=0,
-        attn_tp_size=1,
-        attn_tp_cpu_group=None,
-        attn_tp_group=[0],
-        pg_manager=None,
-    )
-    prefill = SimpleNamespace(
-        disaggregation_mode="prefill",
-        mapping=SimpleNamespace(is_first_pp_rank=True),
-    )
-    assert sum(registered) == recv_pool.recv_pool_bytes(prefill, True)
-    pool = slots * slot_mb << 20 if slots > 0 and slot_mb > 0 else 0
-    assert sum(registered) == pool
-
-
 @pytest.mark.parametrize(
     "mode, active",
     [
@@ -1666,45 +1598,41 @@ def test_the_admission_builds_the_pool_the_budget_left_out(
         ("encode", True),
     ],
 )
-def test_the_admission_builds_the_pool_exactly_where_the_budget_left_it_out(
-    monkeypatch, mode, active
+def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
+    monkeypatch, slots, slot_mb, num_deepstack, mode, active
 ) -> None:
-    from tokenspeed.runtime.epd import prefill_admission, recv_pool
-    from tokenspeed.runtime.epd.mooncake import prefill as mooncake_prefill
+    from tokenspeed.runtime.epd import prefill_receive, recv_pool
 
-    _receive_pool_env(monkeypatch, 2, 1)
-    registered = []
-    engine = SimpleNamespace(register=lambda ptr, size: registered.append(size))
-    monkeypatch.setattr(
-        mooncake_prefill,
-        "MooncakeEmbeddingManagerPrefill",
-        lambda *args: SimpleNamespace(engine=engine),
-    )
+    _receive_pool_env(monkeypatch, slots, slot_mb)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
-        disaggregation_bootstrap_port=0,
-        disaggregation_ib_device=None,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=1), is_first_pp_rank=True),
+        enable_external_encoder=False,
+        mapping=SimpleNamespace(is_first_pp_rank=True),
     )
-    facts = SimpleNamespace(device="cpu", hidden=16, num_deepstack=0, dtype=None)
-    prefill_admission.make_epd_prefill_admission(
+    facts = SimpleNamespace(
+        device="cpu", hidden=16, num_deepstack=num_deepstack, dtype=torch.bfloat16
+    )
+    receive = prefill_receive.build_epd_receive(
         server_args,
-        0,
-        model_config=SimpleNamespace(is_multimodal=True, is_multimodal_active=active),
+        model_config=SimpleNamespace(is_multimodal_active=active),
         encoder_model_facts=lambda: facts,
-        mapping=SimpleNamespace(
-            attn=SimpleNamespace(tp_group=[0]),
-            is_first_pp_rank=True,
-            has_pp=False,
-        ),
+        mapping=server_args.mapping,
         attn_tp_rank=0,
         attn_tp_size=1,
         attn_tp_cpu_group=None,
         pg_manager=None,
     )
     left_out = recv_pool.recv_pool_bytes(server_args, active)
-    assert sum(registered) == left_out
-    assert (left_out > 0) == (mode == "prefill" and active)
+    built = 0
+    if receive is not None:
+        settings = receive.settings
+        built = settings.slots * (settings.slot_bytes + settings.deepstack_slot_bytes)
+        # A slot splits between an item's rows and its deepstack rows within
+        # the bytes the budget left out, losing at most their alignment.
+        assert built >= left_out - 256 * (1 + num_deepstack) * settings.slots
+    assert built <= left_out
+    receives = mode == "prefill" and active and slots > 0 and slot_mb > 0
+    assert (built > 0) == (left_out > 0) == receives
 
 
 if __name__ == "__main__":

@@ -230,6 +230,16 @@ def main() -> None:
             ],
             PYPI,
         )
+    subprocess.run(
+        ["bash", str(Path(__file__).resolve().parent / "install_tokenspeed_engine.sh")],
+        env={
+            **os.environ,
+            "WORKSPACE": str(workspace),
+            "PYTHON": sys.executable,
+            "PIP_INDEX_URL": PYPI,
+        },
+        check=True,
+    )
     pip_install(["--no-build-isolation", "-e", str(workspace / "python")], PYPI)
     subprocess.run([sys.executable, "-m", "pip", "check"], check=True)
 

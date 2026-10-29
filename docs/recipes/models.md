@@ -13,11 +13,10 @@ runs on the shared model path: vendor-neutral Triton kernels
 with capability-gated NVIDIA fast paths that keep the same numerics. The
 checkpoint must expose the model type `muse_spark` and the architecture
 `MuseSparkForConditionalGeneration`; the runtime reads the sliding-attention
-and no-RoPE schedule from that configuration. Expert parallelism spans the
-attention TP ranks with MoE TP1. The gateway loads the checkpoint's
-`chat_template.jinja`; pass `--chat-template` only to override it. The
-residual stream, the layer boundaries, and the final norm run in FP32; the
-attention and MoE branch outputs and the final-norm output are BF16.
+and no-RoPE schedule from that configuration. The gateway loads the
+checkpoint's `chat_template.jinja`; pass `--chat-template` only to override
+it. The residual stream, the layer boundaries, and the final norm run in FP32;
+the attention and MoE branch outputs and the final-norm output are BF16.
 
 `ts serve` selects the `muse` reasoning and tool parsers: the `self` channel
 becomes `reasoning_content`, `user` and `commentary` stay visible, `<|eom|>`
@@ -42,26 +41,34 @@ the checkpoint's vision tower. Audio uses the `<audio>` anchor: one `<|audio|>`
 token per 1,920 samples of mono 24 kHz, encoded by the checkpoint's audio
 tower. SMG performs the preprocessing and anchor expansion.
 
-### MI350X BF16
+### MI355X MXFP4, MoE TP8
 
-The BF16 model and vision tower run on eight GPUs with attention TP8, vision
-TP8, and expert parallelism over all eight ranks:
+The
+[AMD Quark MXFP4](https://huggingface.co/amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4)
+checkpoint quantizes the routed-expert weights and activations of all but the
+first and last layers to MXFP4 and keeps everything else in BF16. On eight
+MI355X GPUs (gfx950), MoE TP8 with EP1 shards every expert over its
+intermediate dimension, so each GPU holds all 256 experts and no tokens are
+dispatched between GPUs:
 
 ```bash
 ts serve \
-    --model meta-models/Muse-Spark-Open-816B-A42B \
+    --model amd/Muse-Spark-Open-816B-A42B-Quark-MXFP4 \
     --served-model-name muse-spark \
     --tp 8 \
-    --ep-size 8 \
+    --moe-tp-size 8 \
+    --ep-size 1 \
     --dtype bfloat16 \
-    --max-model-len 65536 \
-    --max-num-seqs 16 \
-    --max-total-tokens 524288 \
-    --gpu-memory-utilization 0.92 \
-    --cudagraph-capture-sizes 1 2 4 8 16 \
-    --max-cudagraph-capture-size 16 \
+    --quantization mxfp4 \
+    --moe-backend gluon \
+    --max-model-len 1048576 \
+    --max-num-seqs 64 \
+    --max-prefill-tokens 8192 \
+    --chunked-prefill-size 8192 \
+    --cudagraph-capture-sizes 1 2 4 8 16 32 64 \
+    --max-cudagraph-capture-size 64 \
     --disable-prefill-graph \
-    --disable-overlap-schedule \
+    --gpu-memory-utilization 0.92 \
     --sampling-backend triton \
     --disable-kvstore \
     --kvstore-ratio 0.0 \
@@ -69,7 +76,11 @@ ts serve \
     --port 8000
 ```
 
-Prefill stays eager and overlap scheduling is off.
+`--max-model-len 1048576` keeps the checkpoint's native context, which agentic
+workloads with long cached prefixes need; prefix caching is on by default.
+Compared with `--ep-size 8 --moe-tp-size 1` on the same checkpoint, this
+layout decodes faster at low concurrency but has a higher time-to-first-token;
+prefer EP8 for prefill-heavy traffic.
 
 ### Blackwell NVFP4
 
@@ -384,8 +395,11 @@ Notes:
 - K3 uses the cache-group scheduler and KDA state groups.
 - On Blackwell, `--dense-gemm-backend trtllm_cutedsl` opts the
   block-FP8 attention projections into TRT-LLM CuTe-DSL: KDA fused QKV/gates and output,
-  and MLA fused QKV-a/gate, Q-b, and output. Omit it (or use `auto`) to keep
-  the existing backend selection. This shared option applies across models
+  and MLA fused QKV-a/gate, Q-b, and output. With `auto`, compatible GEMMs prefer
+  CuTe-DSL at M > 16 rows and FlashInfer at M <= 16. Unsupported CuTe-DSL inputs
+  retain compatible fallback selection. M is the actual GEMM row count,
+  not necessarily request concurrency. Explicit `trtllm_cutedsl` also selects
+  CuTe-DSL for smaller M. This shared option applies across models
   to standard 128x128 block-FP8 dense linears. BF16/NVFP4 linears, MXFP8,
   per-tensor FP8, specialized grouped projections, and routed experts are
   unchanged. It does not change tensor-parallel mapping.
@@ -487,10 +501,58 @@ Blackwell GPU (B200/B300). On other NVIDIA platforms, use
 
 ### AMD
 
-The standard AMD path on 8x gfx950 uses the `mla` backend, which selects MLA
-kernels automatically. Use `gluon` to require Gluon MLA kernels for both the
-target and, when speculative decoding is enabled, its MLA drafter. For TP8/EP8,
-automatic MoE selection uses the specialized Gluon SiTU kernels:
+On 8x MI350X/MI355X (gfx950), serve with the Eagle3 draft at TP8 and expert
+parallelism disabled. This is the configuration of the per-commit MI35x
+50K-input/500-output perf job. Against the speculator-free TP8/EP8 launch
+below, TP8/EP1 cuts prefill latency enough to improve end-to-end latency at
+concurrency 16, despite a higher per-token decode latency.
+
+```bash
+tokenspeed serve moonshotai/Kimi-K3 \
+  --served-model-name kimi-k3 \
+  --trust-remote-code \
+  --max-model-len 65536 \
+  --kv-cache-dtype fp8 \
+  --tensor-parallel-size 8 \
+  --ep-size 1 \
+  --mm-encoder-tp-mode data \
+  --speculative-algorithm EAGLE3 \
+  --speculative-draft-model-path lightseekorg/kimi-k3-eagle3-mla \
+  --speculative-num-steps 3 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-eagle-topk 1 \
+  --speculative-draft-model-quantization unquant \
+  --eagle3-layers-to-capture 2,46,90 \
+  --attention-backend gluon \
+  --drafter-attention-backend gluon \
+  --moe-backend auto \
+  --max-num-seqs 16 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --max-cudagraph-capture-size 16 \
+  --cudagraph-capture-sizes 1 2 4 8 16 \
+  --disable-prefill-graph \
+  --gpu-memory-utilization 0.92 \
+  --disable-kvstore \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+- `gluon` requires Gluon MLA kernels for both the target and its MLA drafter.
+  The explicit policy fails fast when the current GPU, dtype, or attention shape
+  has no registered Gluon kernel, instead of silently selecting another
+  solution. `--attention-backend mla --drafter-attention-backend mla` lets
+  TokenSpeed select the MLA kernels automatically.
+- `--disable-prefill-graph` skips prefill CUDA graphs, which need 40 buckets on
+  top of the decode ones and run out of memory at this memory fraction.
+  Speculative decoding runs on the decode graphs.
+- To raise `--max-num-seqs`, extend `--cudagraph-capture-sizes` and
+  `--max-cudagraph-capture-size` with it.
+- AMD defaults to greedy sampling, which ignores per-request `temperature`,
+  `top_p`, and `top_k`.
+
+Without speculative decoding, use TP8/EP8. Automatic MoE selection then uses
+the specialized Gluon SiTU kernels:
 
 ```bash
 tokenspeed serve moonshotai/Kimi-K3 \
@@ -508,17 +570,6 @@ tokenspeed serve moonshotai/Kimi-K3 \
   --host 0.0.0.0 \
   --port 8000
 ```
-
-To force Gluon attention for an Eagle3 launch, replace the attention option
-above and add the drafter option:
-
-```bash
-  --attention-backend gluon \
-  --drafter-attention-backend gluon
-```
-
-The explicit policy fails fast when the current GPU, dtype, or attention shape
-has no registered Gluon kernel instead of silently selecting another solution.
 
 On gfx950, the replicated 7168↔3584 latent projections automatically select
 among a one-token Triton GEMV, tuned Gluon GEMMs, and the vendor GEMM according
@@ -632,12 +683,23 @@ ts serve \
   --trust-remote-code \
   --attn-tp-size 4 \
   --ep-size 1 \
+  --kv-cache-dtype fp8 \
+  --max-model-len 65536 \
+  --max-num-seqs 16 \
+  --max-total-tokens 1048576 \
+  --chunked-prefill-size 8192 \
+  --max-prefill-tokens 8192 \
+  --max-cudagraph-capture-size 16 \
+  --cudagraph-capture-sizes 1 2 4 8 16 \
   --sampling-backend triton \
   --speculative-algorithm MTP \
   --speculative-num-steps 3 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 4
 ```
+
+`--max-total-tokens 1048576` holds sixteen concurrent 50K-token requests in the
+KV cache on four GPUs; a 524288-token budget queues some of them.
 
 ## Qwen3 dense / Qwen3 30B-A3B
 
@@ -1346,12 +1408,13 @@ select its YAML in **Slurm Dispatch**, choose cluster `gb300`, and optionally
 provide a pull request number.
 
 The launcher uses `PD_SLURM=1` to assign one role per node and clears Slurm
-topology discovery only inside each worker process. Share the launcher's
-job-and-step-scoped artifact directory between nodes. It publishes role
-readiness atomically and verifies cross-node gRPC health before starting the
-gateway.
-Worker logs remain separate as `prefill.log`, `decode.log`, and `lb.log`.
-When you need an explicit RDMA device selection, set
+topology discovery only inside each worker process. Node 0 starts the gateway
+with the prefill worker on a same-host socket and the decode worker on
+`tcp://<node 0>:DECODE_HANDSHAKE_PORT` (18348), then publishes its address in
+the launcher's job-and-step-scoped artifact directory, which both nodes share;
+node 1's decode engine dials it there. The gateway is ready once both engines
+registered. Worker logs remain separate as `prefill.log`, `decode.log`, and
+`lb.log`. When you need an explicit RDMA device selection, set
 `DISAGGREGATION_IB_DEVICE`. The GB300 task selects
 `mlx5_0,mlx5_1,mlx5_2,mlx5_3` to keep transfers on the InfiniBand fabric.
 Automatic discovery also includes Ethernet RNICs, which can
@@ -1412,6 +1475,14 @@ path, with no flag. Use these supported Hub revisions:
 | BF16 | `f40a3a29` |
 | FP8 | `21052137` |
 | NVFP4 | `81a5ab6b` |
+
+For FP8 decode, eligible MNNVL sandwich all-reduce boundaries also write
+per-token E4M3 activations and FP32 scales for the following Q/K/V/gate or
+dense gate/up projection. This reuses the BF16-rounded norm output and its
+existing quantizer contract. The consumer accepts at most 64 rows; other
+shapes and checkpoint formats retain their existing path. No extra flag is
+required. If the fused collective declines, the second norm fills the same
+buffers before the projection consumes them.
 
 The command below runs one TP8 replica over two 4-GPU nodes, as in the
 recipe's GB200 measurements. Run it on both nodes, changing only

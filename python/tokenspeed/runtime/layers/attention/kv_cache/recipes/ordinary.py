@@ -55,7 +55,6 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
     MXFP8_KV_SCALE_TILE_TOKENS,
     CacheGroupDeclaration,
-    hybrid_slab_group_size,
     layer_group_ids,
 )
 
@@ -191,30 +190,13 @@ class OrdinaryRecipe(CacheRecipe):
             occurrence=occurrence,
         )
 
-    # ---- capacity: profiled bytes per token, not parent size ----
+    # ---- capacity: logical token caps after resident storage sizing ----
 
     @override
-    def num_lcm_blocks(self, layout: CacheLayout) -> int:
-        bytes_per_token = self.attn_config.cache_cell_size() * _storage_layers(
-            self.attn_config, self.num_target_layers
-        )
-        if self.draft_attn_config is not None:
-            bytes_per_token += (
-                self.draft_attn_config.cache_cell_size()
-                * _storage_layers(self.draft_attn_config, self.num_draft_layers)
-            )
-        if bytes_per_token <= 0:
-            raise ValueError(
-                f"KV cache cell size must be positive, got {bytes_per_token}"
-            )
-        # Every group packs one CacheBlock per parent, so a parent spans the
-        # identity grain and profiled bytes/token size it directly.
+    def select_num_lcm_blocks(self, layout: CacheLayout, *, max_lcm_blocks: int) -> int:
         parent_tokens = self.prefix_granularity
-        budgeted = self._budgeted_parents(
-            self.cache_budget_bytes, bytes_per_token * parent_tokens
-        )
         if self.token_limit is None:
-            return budgeted
+            return max_lcm_blocks
         # The KVP shard count, not layout packing: a layout that packs more
         # than one CacheBlock per parent without sharding must keep the
         # unsharded floor semantics of _capped_parents.
@@ -225,17 +207,8 @@ class OrdinaryRecipe(CacheRecipe):
                 raise ValueError(
                     "The configured token limit must hold at least one cache page"
                 )
-            return min(budgeted, (logical_pages + shard_count - 1) // shard_count)
-        return self._capped_parents(budgeted, parent_tokens=parent_tokens)
-
-
-def _storage_layers(config, num_layers: int) -> int:
-    spec = config.component(SoftmaxAttnConfig)
-    group_size = hybrid_slab_group_size(
-        spec.cache_layer_types,
-        sliding_window_tokens=spec.sliding_window_tokens,
-    )
-    return group_size if group_size is not None else num_layers
+            return min(max_lcm_blocks, (logical_pages + shard_count - 1) // shard_count)
+        return self._capped_parents(max_lcm_blocks, parent_tokens=parent_tokens)
 
 
 def _config_group_ids(config, num_layers: int) -> tuple[str, ...]:

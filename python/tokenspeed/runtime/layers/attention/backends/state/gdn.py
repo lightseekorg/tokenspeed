@@ -31,9 +31,6 @@ from tokenspeed_kernel.ops.attention.gdn import (
 )
 from tokenspeed_kernel.ops.attention.gdn.triton import pack_gdn_projection
 
-from tokenspeed.runtime.layers.attention.backends.state.mamba import (
-    gdn_decode_solution,
-)
 from tokenspeed.runtime.layers.attention.backends.state.prefill_capacity import (
     CapacityPrefillBackend,
 )
@@ -60,6 +57,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
     # The scan reads its bounds on device, so packing would only add work to eager forwards.
     _capacity_layout_when_uncaptured = False
     _verify_scan_writes_replay = True
+    _verify_scan_runs_chain_form = True
 
     def __init__(self, config: AttnConfig, spec: SoftmaxAttnConfig) -> None:
         super().__init__(config, spec)
@@ -85,6 +83,7 @@ class GdnAttnBackend(CapacityPrefillBackend):
         )
 
         self._head_k_dim = linear_attn.head_k_dim
+        self._head_v_dim = linear_attn.head_v_dim
         # Resolved when a pool binds (its state dtype picks the verify kernel).
         self._verify_reads_committed_recurrent_state = False
         self._verify_packed_qkv_views = False
@@ -98,15 +97,16 @@ class GdnAttnBackend(CapacityPrefillBackend):
         # q/k/v (and a/b), it reads the projection views as handed over
         # instead of a packed copy.
         ssm_dtype = self._state_components(self._state_layer_ids()[0])[1].dtype
-        solution = gdn_decode_solution(ssm_dtype)
 
         def supports(op: str, trait: str) -> bool:
             return gdn_decode_supports(
                 op,
                 self.dtype,
                 head_dim=self._head_k_dim,
+                value_head_dim=self._head_v_dim,
+                state_dtype=ssm_dtype,
                 trait=trait,
-                solution=solution,
+                solution=None,
             )
 
         self._verify_reads_committed_recurrent_state = not self.replay_ssm and supports(

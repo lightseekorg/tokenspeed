@@ -39,6 +39,8 @@ from tokenspeed_kernel.signature import (
 
 __all__ = [
     "bf16_moe_routes",
+    "bf16_moe_routes_warmup",
+    "gather_moe_routes",
     "COMBINE_ORDERS",
     "ExpertDispatch",
     "dispatch_topk_ids",
@@ -986,6 +988,9 @@ def _moe_sigmoid_bias_topk(
 # Routing and expert APIs
 # ===-----------------------------------------------------------------------===#
 
+from tokenspeed_kernel.ops.moe._triton.bf16 import (  # noqa: E402
+    _check_route_tensors as _check_bf16_route_tensors,
+)
 from tokenspeed_kernel.ops.moe._triton.sigmoid_topk_routing import (  # noqa: E402
     MAX_TOKENS as FUSED_ROUTING_MAX_TOKENS,
 )
@@ -994,6 +999,7 @@ from tokenspeed_kernel.ops.moe.flashinfer import (  # noqa: E402
     prepare_nvfp4_routing,
 )
 from tokenspeed_kernel.ops.moe.routed_norm import (  # noqa: E402
+    gather_moe_routes,
     routed_input_scale_rmsnorm_sum,
     routed_input_scale_rmsnorm_sum_gathered,
 )
@@ -1599,8 +1605,14 @@ def bf16_moe_routes(
     w2: torch.Tensor,
     topk_ids: torch.Tensor,
     expert_start: int,
+    output: torch.Tensor | None = None,
+    *,
+    batch_invariant: bool,
 ) -> torch.Tensor:
-    """Return unweighted BF16 SwiGLU outputs for every selected local expert.
+    """Return the unweighted BF16 output of every selected local expert.
+
+    Each route row is the expert's down projection of its SwiGLU intermediate,
+    before the routing weight is applied.
 
     Args:
         x: Contiguous BF16 hidden states ``[tokens, hidden]``.
@@ -1608,12 +1620,183 @@ def bf16_moe_routes(
         w2: Local down weights ``[experts, hidden, I]``.
         topk_ids: Global selected expert ids ``[tokens, topk]``.
         expert_start: First global expert represented by ``w13`` and ``w2``.
+        output: Optional caller-owned contiguous destination of
+            ``tokens * topk * hidden`` elements with ``x``'s dtype that overlaps
+            no input; every route row is overwritten.
+        batch_invariant: Require a provider declaring the ``batch_invariant``
+            feature, as bitwise numerics envelopes do.
 
     Returns:
-        Route outputs ``[tokens, topk, hidden]``; routes to other ranks' experts are zero.
+        Route outputs ``[tokens, topk, hidden]`` (a view of ``output`` when
+        given); routes to other ranks' experts are zero.
     """
-    kernel = select_kernel("moe", "routes", dense_format_signature(("x",), (x.dtype,)))
-    return kernel(x, w13, w2, topk_ids, expert_start)
+    _check_bf16_route_tensors(x, w13, w2, topk_ids)
+    if expert_start < 0:
+        raise ValueError("expert_start must be non-negative")
+    if output is not None:
+        _check_bf16_route_destination(x, w13, w2, topk_ids, output)
+        output = output.view(topk_ids.numel(), x.shape[1])
+    num_tokens, hidden = x.shape
+    top_k = topk_ids.shape[1]
+    intermediate_size = w2.shape[2]
+    kernel = _select_bf16_routes_kernel(
+        x.dtype,
+        hidden,
+        intermediate_size,
+        top_k,
+        buffer_offsets_fit_int32=_bf16_route_offsets_fit_int32(
+            num_tokens, top_k, hidden, intermediate_size, x.element_size()
+        ),
+        batch_invariant=batch_invariant,
+    )
+    return kernel(x, w13, w2, topk_ids, expert_start, output=output)
+
+
+def _select_bf16_routes_kernel(
+    dtype: torch.dtype,
+    hidden: int,
+    intermediate_size: int,
+    top_k: int,
+    *,
+    buffer_offsets_fit_int32: bool,
+    batch_invariant: bool,
+) -> Callable[..., torch.Tensor]:
+    return select_kernel(
+        "moe",
+        "routes",
+        dense_format_signature(("x",), (dtype,)),
+        features=frozenset({"batch_invariant"}) if batch_invariant else frozenset(),
+        traits={
+            "buffer_offsets_fit_int32": buffer_offsets_fit_int32,
+            "hidden": hidden,
+            "ispp": intermediate_size,
+            "topk": top_k,
+        },
+    )
+
+
+def _bf16_route_offsets_fit_int32(
+    num_tokens: int,
+    top_k: int,
+    hidden: int,
+    intermediate_size: int,
+    element_size: int,
+) -> bool:
+    """Return whether every route buffer and expert weight stays under 2 GiB.
+
+    Buffer loads and stores take 32-bit byte offsets. The largest route buffer
+    is the output or the intermediate (``x`` is smaller than the output);
+    weights are addressed from each expert's base, so one expert's gate/up
+    projection bounds them.
+    """
+    route_elements = num_tokens * top_k * max(hidden, intermediate_size)
+    expert_elements = 2 * intermediate_size * hidden
+    return max(route_elements, expert_elements) * element_size < 2**31
+
+
+def _check_bf16_route_destination(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    topk_ids: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Reject a route destination that is ill-shaped or overlaps a route input."""
+    if (
+        output.dtype != x.dtype
+        or output.device != x.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("route destination must be contiguous and match x")
+    if output.numel() != topk_ids.numel() * x.shape[1]:
+        raise ValueError("route destination must hold tokens * topk * hidden values")
+    start = output.data_ptr()
+    end = start + output.numel() * output.element_size()
+    for tensor in (x, w13, w2, topk_ids):
+        # Each kernel streams these inputs while it writes routes.
+        first = tensor.data_ptr()
+        if (
+            output.numel()
+            and tensor.numel()
+            and first < end
+            and start < first + tensor.numel() * tensor.element_size()
+        ):
+            raise ValueError("route destination must not overlap the route inputs")
+
+
+# Token counts that compile the binaries a layer launches. The Gluon kernels
+# take every batch-varying integer at runtime, so one count on each side of
+# their 16-token decode/prefill switch would do. The rest is for the Triton
+# fallback (unsupported widths or top-k), whose integer arguments do
+# specialize: 1, multiples of 16 and other values on both sides of its own
+# 16-token tile switch, with odd and even route counts. Its program count is
+# also a constexpr, so small decode batches that do not fill the GPU may
+# still compile once. On NVIDIA the deep-pipeline tile switch sits at 32
+# routes per local expert instead, past these counts, so the first larger
+# prefill batch there compiles once too.
+_BF16_ROUTES_WARMUP_TOKENS = (1, 2, 16, 17, 18, 32)
+
+
+def bf16_moe_routes_warmup(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    top_k: int,
+    expert_start: int,
+    *,
+    max_num_tokens: int,
+    batch_invariant: bool,
+) -> None:
+    """Compile the route kernels a layer can launch, before graph capture.
+
+    Args:
+        w13: Local gate/up weights ``[experts, 2I, hidden]``.
+        w2: Local down weights ``[experts, hidden, I]``.
+        top_k: Routes per token.
+        expert_start: First global expert represented by the weights.
+        max_num_tokens: Largest token count the layer routes.
+        batch_invariant: Passed to :func:`bf16_moe_routes`.
+    """
+    num_experts, _, hidden = w13.shape
+    intermediate_size = w2.shape[2]
+    # Batches past the 2 GiB offset bound select another kernel. Its binaries
+    # depend only on token classes the counts below already cover above 16
+    # tokens, so compile it on those counts too.
+    large_batch_kernel = None
+    if not _bf16_route_offsets_fit_int32(
+        max_num_tokens, top_k, hidden, intermediate_size, w13.element_size()
+    ):
+        large_batch_kernel = _select_bf16_routes_kernel(
+            w13.dtype,
+            hidden,
+            intermediate_size,
+            top_k,
+            buffer_offsets_fit_int32=False,
+            batch_invariant=batch_invariant,
+        )
+        small_batch_kernel = _select_bf16_routes_kernel(
+            w13.dtype,
+            hidden,
+            intermediate_size,
+            top_k,
+            buffer_offsets_fit_int32=True,
+            batch_invariant=batch_invariant,
+        )
+        if large_batch_kernel.name == small_batch_kernel.name:
+            large_batch_kernel = None
+    for num_tokens in _BF16_ROUTES_WARMUP_TOKENS:
+        if num_tokens > max_num_tokens:
+            break
+        topk_ids = (
+            torch.arange(num_tokens * top_k, dtype=torch.int32, device=w13.device)
+            % num_experts
+            + expert_start
+        ).view(num_tokens, top_k)
+        x = torch.zeros((num_tokens, hidden), dtype=w13.dtype, device=w13.device)
+        bf16_moe_routes(
+            x, w13, w2, topk_ids, expert_start, batch_invariant=batch_invariant
+        )
+        if large_batch_kernel is not None:
+            large_batch_kernel(x, w13, w2, topk_ids, expert_start, output=None)
 
 
 def moe_plan(
@@ -1733,6 +1916,9 @@ def moe_plan(
     the selected apply kernel, then pinned by callable in the returned plan so load
     time does not rerun selection or conflict resolution. The plan carries
     ``combine_order`` and ``process_group`` for the apply kernel to read.
+    Unquantized CUTLASS plans use fused expert reduction by default.
+    Set ``plan["cutlass_fused_finalize"] = False`` before warmup to use
+    a separate reduction instead of floating-point atomics.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
@@ -1817,6 +2003,12 @@ def moe_plan(
     supports_deferred_finalize = True in apply_spec.traits.get(
         "supports_deferred_finalize", frozenset({False})
     )
+    deferred_output_is_token_order = True in apply_spec.traits.get(
+        "deferred_output_is_token_order", frozenset({False})
+    )
+    supports_deferred_out = True in apply_spec.traits.get(
+        "supports_deferred_out", frozenset({False})
+    )
     topk_weights_dtypes = apply_spec.traits.get(
         "topk_weights_dtype", frozenset({torch.float32})
     )
@@ -1855,9 +2047,12 @@ def moe_plan(
         "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
         "fast_math": fast_math,
         "combine_order": combine_order,
+        "cutlass_fused_finalize": True,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,
+        "deferred_output_is_token_order": deferred_output_is_token_order,
+        "supports_deferred_out": supports_deferred_out,
         "topk_weights_dtype": topk_weights_dtype,
         "supports_prequantized_input": supports_prequantized_input,
         # All-to-all EP (DeepEP, Petit): each rank runs its own tokens'
@@ -1943,6 +2138,7 @@ def moe_apply(
     shared_out: torch.Tensor | None = None,
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None = None,
     routing_prepared: object | None = None,
+    deferred_out: torch.Tensor | None = None,
 ):
     """Apply a planned MoE kernel.
 
@@ -1989,9 +2185,13 @@ def moe_apply(
         routing_prepared: Routing metadata the top-k kernel filled ahead of
             this call, so the kernel skips its routing launch. Only forwarded
             when given; kernels that cannot consume it reject it.
+        deferred_out: Optional caller-owned route destination for
+            ``do_finalize=False``; requires ``supports_deferred_out``.
 
     Solutions may use precomputed top-k tensors or route from logits directly.
     """
+    if deferred_out is not None and (do_finalize or not plan["supports_deferred_out"]):
+        raise ValueError("selected MoE plan cannot write the supplied deferred output")
     data = x[0] if isinstance(x, tuple) else x
     kernel = plan["apply_kernel"]
     if "batch_invariant" in plan["features"] and data.dtype != plan["input_dtype"]:
@@ -2023,6 +2223,7 @@ def moe_apply(
     quantized_kwargs = {"x_quantized": x_quantized} if x_quantized is not None else {}
     if routing_prepared is not None:
         quantized_kwargs["routing_prepared"] = routing_prepared
+    output_kwargs = {"deferred_out": deferred_out} if deferred_out is not None else {}
     return kernel(
         plan=plan,
         x=x,
@@ -2037,6 +2238,7 @@ def moe_apply(
         **a2a_kwargs,
         **shared_kwargs,
         **quantized_kwargs,
+        **output_kwargs,
     )
 
 

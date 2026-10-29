@@ -137,6 +137,55 @@ def _mxfp4_input_metadata(
     return (*hidden_states.shape, hidden_states.device, hidden_states.dtype)
 
 
+def _validate_deferred_out(
+    output: torch.Tensor,
+    *,
+    tokens: int,
+    topk: int,
+    width: int,
+    device: torch.device,
+    inputs: tuple[torch.Tensor | None, ...],
+) -> None:
+    """Check a caller-owned ``[tokens * topk, width]`` BF16 route destination."""
+    if (
+        output.shape != (tokens * topk, width)
+        or output.dtype != torch.bfloat16
+        or output.device != device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("deferred output must be contiguous colocated BF16 routes")
+    if not output.numel():
+        return
+    start = output.data_ptr()
+    end = start + output.numel() * output.element_size()
+    for tensor in inputs:
+        if tensor is None or not tensor.numel():
+            continue
+        # Cheap common case: the whole input allocation is disjoint. Eager
+        # small-M prefill is host bound, so avoid the span walk below.
+        storage = tensor.untyped_storage()
+        base = storage.data_ptr()
+        if base + storage.nbytes() <= start or end <= base:
+            continue
+        if tensor.device != device:
+            continue
+        # Disjoint views of one symmetric heap are valid. Include the full
+        # addressed span of strided inputs, including gaps between rows.
+        offsets = [
+            (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+        ]
+        first = (
+            tensor.data_ptr()
+            + sum(min(0, offset) for offset in offsets) * tensor.element_size()
+        )
+        last = (
+            tensor.data_ptr()
+            + (1 + sum(max(0, offset) for offset in offsets)) * tensor.element_size()
+        )
+        if first < end and start < last:
+            raise ValueError("deferred output must not overlap an input")
+
+
 def _resolve_mxfp4_activation(
     hidden_states: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
     x_quantized: tuple[torch.Tensor, torch.Tensor] | None,
@@ -1565,6 +1614,7 @@ def _maybe_gluon_package_mxfp4_prefill(
     expert_start: int = 0,
     global_num_experts: int | None = None,
     out: torch.Tensor | None = None,
+    deferred_out: torch.Tensor | None = None,
     force_reduce: bool | None = None,
     activation_format: str = "e2m1",
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor] | None:
@@ -1846,6 +1896,7 @@ def _maybe_gluon_package_mxfp4_prefill(
         do_finalize,
         # Deferred E2M1 consumers use expanded_idx to mask nonlocal routes.
         initialize_unowned_routes=do_finalize or activation_format != "e2m1",
+        deferred_out=deferred_out,
         w2_scale=package_w2_scale.view(torch.uint8),
         a2_scale=stage2_scale,
         sorted_weights=s2_sorted_weights,
@@ -2076,6 +2127,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     swiglu_limit: float = 7.0,
     swiglu_beta: float = 1.0,
     out: torch.Tensor | None = None,
+    deferred_out: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, None, torch.Tensor]:
     """Dispatch precomputed routes through dynamic A4W4 gfx950 experts.
 
@@ -2084,8 +2136,15 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     are defined; consumers must not read routes marked ``-1``.
     Deferred mode returns one canonical row per route so
     the shared model epilogue can normalize, weight, and reduce across ranks.
+    ``out`` is the finalized ``[tokens, hidden]`` destination; with
+    ``do_finalize=False``, ``deferred_out`` may be a contiguous BF16
+    ``[tokens * top_k, hidden]`` route destination that overlaps no input.
     """
-    rows, hidden_dim, device, input_dtype = _mxfp4_input_metadata(hidden_states)
+    if do_finalize and deferred_out is not None:
+        raise ValueError("deferred_out requires do_finalize=False")
+    if not do_finalize and out is not None:
+        raise ValueError("deferred routes take deferred_out, not out")
+    rows, hidden_dim, device, _ = _mxfp4_input_metadata(hidden_states)
     if isinstance(hidden_states, tuple):
         _resolve_mxfp4_activation(hidden_states, x_quantized)
     if topk_ids.ndim != 2:
@@ -2109,11 +2168,45 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
     n_tokens, top_k = topk_ids.shape
     if n_tokens != rows:
         raise ValueError("input and top-k must have the same token count")
+    if deferred_out is not None:
+        if out_dtype != torch.bfloat16:
+            raise ValueError("deferred output requires BF16 output dtype")
+        _validate_deferred_out(
+            deferred_out,
+            tokens=n_tokens,
+            topk=top_k,
+            width=hidden_dim,
+            device=device,
+            inputs=(
+                *(
+                    hidden_states
+                    if isinstance(hidden_states, tuple)
+                    else (hidden_states,)
+                ),
+                *(x_quantized if x_quantized is not None else ()),
+                topk_weights,
+                topk_ids,
+                w13_raw,
+                _extract_gluon_raw_w(w13_weight),
+                _extract_gluon_raw_w_unshuffled(w2_weight),
+                _extract_gluon_raw_w(w2_weight),
+                _extract_gluon_raw_s(w13_mx_scale),
+                _extract_gluon_raw_s(w2_mx_scale),
+                w13_bias,
+                w2_bias,
+            ),
+        )
     if n_tokens == 0:
+        destination = out if do_finalize else deferred_out
+        empty = (
+            destination
+            if destination is not None
+            else torch.empty((0, hidden_dim), dtype=out_dtype, device=device)
+        )
         if do_finalize:
-            return torch.empty((0, hidden_dim), dtype=input_dtype, device=device)
+            return empty
         return (
-            torch.empty((0, hidden_dim), dtype=input_dtype, device=device),
+            empty,
             None,
             torch.empty((0,), dtype=torch.int32, device=device),
         )
@@ -2140,7 +2233,7 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         global_num_experts=global_num_experts,
         do_finalize=do_finalize,
         x_quantized=x_quantized,
-        out=out if do_finalize else None,
+        out=out if do_finalize else deferred_out,
     )
     if direct_out is not None:
         return direct_out
@@ -2169,7 +2262,8 @@ def gluon_mxfp_precomputed_mxfp4_fused_moe(
         x_quantized=x_quantized,
         expert_start=expert_start,
         global_num_experts=global_num_experts,
-        out=out if do_finalize else None,
+        out=out,
+        deferred_out=deferred_out,
     )
     if package_out is not None:
         return package_out

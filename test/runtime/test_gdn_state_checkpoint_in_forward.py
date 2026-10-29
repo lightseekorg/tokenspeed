@@ -81,6 +81,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             role="fused",
             num_snapshot_pages=1,
             max_retracted_requests=0,
+            host_write_policy="write_through",
             storage_config=None,
             cache_groups=groups,
             state_checkpoint_in_forward=in_forward,
@@ -97,16 +98,17 @@ class TestGdnStateCheckpointInForward:
 
     def setup_method(self):
         try:
+            from test.runtime.scheduler_driver import (
+                advance_scheduler,
+                make_extend_result_event,
+            )
+
             import tokenspeed_scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn import (
                 gdn_chunk_prefill_stores_state_checkpoints,
             )
 
-            from tokenspeed.runtime.engine.scheduler_utils import (
-                advance_scheduler,
-                make_config,
-                make_extend_result_event,
-            )
+            from tokenspeed.runtime.engine.scheduler_utils import make_config
             from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
             from tokenspeed.runtime.layers.attention.backends.state.gdn import (
                 GdnAttnBackend,

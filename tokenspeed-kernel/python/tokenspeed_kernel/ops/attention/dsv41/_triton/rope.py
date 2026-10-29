@@ -85,7 +85,7 @@ def _normalized_index_keys(
     return result
 
 
-@triton.jit(do_not_specialize=["N"], do_not_specialize_on_alignment=["N"])
+@triton.jit(do_not_specialize=["N"])
 def _index_key_norm_rope(
     X,
     W,
@@ -528,7 +528,7 @@ def triton_dsv41_index_query_rope_quant(
     return (data, scales), weights
 
 
-@triton.jit(do_not_specialize=["NP"], do_not_specialize_on_alignment=["NP"])
+@triton.jit(do_not_specialize=["NP"])
 def _global_rope_scatter(
     X,
     POS,

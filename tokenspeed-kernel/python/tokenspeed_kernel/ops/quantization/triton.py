@@ -19,6 +19,7 @@ from typing import Optional
 
 import torch
 from tokenspeed_kernel._triton import tl, triton
+from tokenspeed_kernel.compile_monitor import is_serving
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -345,33 +346,65 @@ def fp8_quantize_per_token(
     return codes, scales
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["groups"])
 def _fp8_token_group_quantize_kernel(
     x_ptr,
     out_ptr,
     scale_ptr,
+    groups,
     group_size,
     eps,
     bit8_min,
     bit8_max,
     BLOCK: tl.constexpr,
+    GROUPS_PER_PROGRAM: tl.constexpr,
+    USE_RECIPROCAL: tl.constexpr,
 ):
-    group_id = tl.program_id(0)
+    # Each program quantizes GROUPS_PER_PROGRAM consecutive groups, one per
+    # tile row; every group's arithmetic is independent of the tiling.
+    group_ids = tl.program_id(0).to(tl.int64) * GROUPS_PER_PROGRAM + tl.arange(
+        0, GROUPS_PER_PROGRAM
+    )
     cols = tl.arange(0, BLOCK)
-    mask = cols < group_size
-    offsets = group_id.to(tl.int64) * group_size + cols
+    mask = (cols < group_size)[None, :]
+    # Only a multi-group tile can run past the last group.
+    group_mask = None
+    if GROUPS_PER_PROGRAM > 1:
+        group_mask = group_ids < groups
+        mask = mask & group_mask[:, None]
+    offsets = group_ids[:, None] * group_size + cols[None, :]
 
     x = tl.load(x_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    scale = tl.maximum(tl.max(tl.abs(x), axis=0), eps) / bit8_max
-    out = tl.clamp(x / scale, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=1), eps) / bit8_max
+    if USE_RECIPROCAL:
+        inverse_scale = 1.0 / scale
+        normalized = x * inverse_scale[:, None]
+    else:
+        normalized = x / scale[:, None]
+    out = tl.clamp(normalized, bit8_min, bit8_max).to(out_ptr.dtype.element_ty)
 
     tl.store(out_ptr + offsets, out, mask=mask)
-    tl.store(scale_ptr + group_id, scale)
+    tl.store(scale_ptr + group_ids, scale, mask=group_mask)
+
+
+def _fp8_token_group_groups_per_cta(
+    x: torch.Tensor, group_size: int, groups: int
+) -> int | None:
+    # The grouped launch was measured on gfx950 with 256 compute units. Its
+    # crossover keeps at least two workgroups per compute unit on that device.
+    if group_size != 128 or x.device.type != "cuda" or torch.version.hip is None:
+        return None
+    device_properties = torch.cuda.get_device_properties(x.device)
+    if (
+        not current_platform().is_cdna4
+        or device_properties.multi_processor_count != 256
+    ):
+        return None
+    return 16 if groups >= 32 * device_properties.multi_processor_count else 1
 
 
 def _fp8_token_group_quantize(
-    x: torch.Tensor,
-    group_size: int,
+    x: torch.Tensor, group_size: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if x.shape[-1] % group_size != 0:
         raise ValueError(
@@ -390,21 +423,63 @@ def _fp8_token_group_quantize(
     )
 
     groups = x.numel() // group_size
+    groups_per_cta = _fp8_token_group_groups_per_cta(x, group_size, groups)
     block = triton.next_power_of_2(group_size)
-    num_warps = min(max(block // 256, 1), 8)
+    # Tile by input size, measured on GB300: one group per program below
+    # 16 Ki padded elements, then tiles of consecutive groups, 1024 elements
+    # below 1.75 Mi (7 << 18) padded elements and 8192 from there. Groups of
+    # 1024 or more stay one per program. A program gets a warp per 256 tile
+    # elements, up to 8. The group count is a runtime argument; of the input
+    # size, only the tile is a compile-time choice.
+    padded_elements = groups * block
+    if padded_elements < 1 << 14 or block >= 1024:
+        groups_per_program = 1
+    elif padded_elements < 7 << 18:
+        groups_per_program = 1024 // block
+    else:
+        groups_per_program = 8192 // block
+    if groups_per_cta == 16:
+        groups_per_program = groups_per_cta
     fp8_finfo = torch.finfo(out_dtype)
-
-    _fp8_token_group_quantize_kernel[(groups,)](
-        x,
-        out,
-        scales,
-        group_size,
-        1e-10,
-        bit8_min=fp8_finfo.min,
-        bit8_max=fp8_finfo.max,
-        BLOCK=block,
-        num_warps=num_warps,
-        num_stages=1,
+    args = (x, out, scales, groups, group_size, 1e-10)
+    options = {
+        "bit8_min": fp8_finfo.min,
+        "bit8_max": fp8_finfo.max,
+        "BLOCK": block,
+        "num_stages": 1,
+    }
+    # Startup compiles every tile for this call's signature, so that a later
+    # input of another size and the same signature compiles nothing while
+    # serving.
+    if not is_serving() and block < 1024:
+        tiles = (
+            (1, 8, 16)
+            if groups_per_cta is not None
+            else (1, 1024 // block, 8192 // block)
+        )
+        for tile in tiles:
+            _fp8_token_group_quantize_kernel.warmup(
+                *args,
+                **options,
+                GROUPS_PER_PROGRAM=tile,
+                USE_RECIPROCAL=groups_per_cta is not None and tile == 16,
+                num_warps=(
+                    1
+                    if groups_per_cta is not None and tile == 16
+                    else min(max(tile * block // 256, 1), 8)
+                ),
+                grid=(1,),
+            )
+    _fp8_token_group_quantize_kernel[(triton.cdiv(groups, groups_per_program),)](
+        *args,
+        **options,
+        GROUPS_PER_PROGRAM=groups_per_program,
+        USE_RECIPROCAL=groups_per_cta == 16,
+        num_warps=(
+            1
+            if groups_per_cta == 16
+            else min(max(groups_per_program * block // 256, 1), 8)
+        ),
     )
     return out, scales
 
@@ -1708,7 +1783,6 @@ def _fp8_swizzled_scale_offset(row, column, K_TILES: tl.constexpr):
 
 @triton.jit(
     do_not_specialize=["M", "X0"],
-    do_not_specialize_on_alignment=["M", "X0"],
 )
 def _fp8_group32_ue8m0_quantize_swizzled(
     X,

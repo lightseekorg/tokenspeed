@@ -37,8 +37,10 @@ its own per-step CPU tensor produced by ``.to('cpu')`` in
 execute_forward_op, so step N+1 overwriting pinned does not race with
 commit(N).
 
-The host node is C++ that calls the xgrammar matchers without the GIL.
+The host node is C++ that calls the engine host's matchers without the GIL.
 ``add_batch`` adds one batch per replay and each execution pops one.
+Without a host node, ``EagerGrammarBuffers`` runs the same C++ fill before
+the forward, and the commit advances the matchers.
 """
 
 from __future__ import annotations
@@ -120,8 +122,8 @@ def create_grammar_runtime(
     CUDA gets :class:`CapturableGrammarExecutor` (cudaLaunchHostFunc on a side
     stream so the xgrammar fill + H2D overlap with the forward, and is also
     CUDA-graph-capturable); everything else gets :class:`EagerGrammarBuffers`
-    (synchronous fallback). ``disable_capturable`` forces the eager path on
-    CUDA too, for parity-testing.
+    (the same fill, before the forward). ``disable_capturable`` forces the
+    eager path on CUDA too, for parity-testing.
 
     Args:
         grammar_backend: Backend name from server args; ``"none"`` disables
@@ -193,18 +195,16 @@ class CapturableGrammarExecutor:
 
         self.accept_lengths = torch.zeros((max_bs,), dtype=torch.int32, pin_memory=True)
 
-        # Imported here, so only processes that build this executor load xgrammar.
-        from tokenspeed.runtime.grammar.xgrammar_backend import matcher_method_handles
-
-        self.host = load_grammar_host_ext().Host(
-            matcher_method_handles(),
+        ext = load_grammar_host_ext()
+        filler = ext.Filler(
             self.host_bitmask.data_ptr(),
             max_bs,
             n,
             vocab_size,
             self.candidates.data_ptr(),
-            self.output_tokens.data_ptr(),
-            self.accept_lengths.data_ptr(),
+        )
+        self.host = ext.Host(
+            filler, self.output_tokens.data_ptr(), self.accept_lengths.data_ptr()
         )
         _LIVE_HOSTS.append(
             (
@@ -236,7 +236,7 @@ class CapturableGrammarExecutor:
 
         ``advance_mask[i] == False`` disables matcher advance for slot
         i at this step — set it for intermediate chunked-prefill chunks
-        whose sampled tokens are discarded by output_processor.
+        whose sampled tokens the host's output processor discards.
         ``None`` defaults to all-True.
         """
         if advance_mask is None:
@@ -250,13 +250,8 @@ class CapturableGrammarExecutor:
             if len(advance_list) != bs:
                 raise ValueError(f"advance_mask length {len(advance_list)} != bs {bs}")
 
-        matchers = [
-            None if grammar is None or grammar.finished else grammar.native_matcher()
-            for grammar in grammars
-        ]
-
         batch = self.host.add(
-            matchers,
+            _matchers(grammars),
             advance_list,
             has_candidates,
             output_layout.num_extends,
@@ -323,14 +318,22 @@ class CapturableGrammarExecutor:
         self.accept_lengths[:m].copy_(accept_lengths, non_blocking=True)
 
 
-class EagerGrammarBuffers:
-    """GPU + pinned-CPU buffers for the non-CUDA grammar fallback path.
+def _matchers(grammars: list) -> list:
+    """Each request's matcher for the C++ fill, or None without a live grammar."""
+    return [
+        None if grammar is None or grammar.finished else grammar.native_matcher()
+        for grammar in grammars
+    ]
 
-    ``CapturableGrammarExecutor`` uses ``cudaLaunchHostFunc`` for its
-    side-stream fill, which is CUDA-only. On HIP / CPU we fall back to a
-    synchronous D2H + CPU xgrammar fill + H2D, which needs its own
-    pre-allocated buffers (kept off ``InputBuffers`` so model-input state
-    isn't muddled with grammar state).
+
+class EagerGrammarBuffers:
+    """The grammar runtime without a host node: fills masks before the forward.
+
+    ``cudaLaunchHostFunc`` is CUDA-only, so on HIP / NPU the forward runs the
+    host node's C++ fill on the calling thread (for verify it first syncs on
+    the drafts) and copies the masks to the device. The commit advances the
+    matchers; the engine does not overlap a grammar batch with a pending
+    forward, so the fill reads matchers that have advanced.
     """
 
     def __init__(
@@ -342,43 +345,56 @@ class EagerGrammarBuffers:
     ) -> None:
 
         self.max_bs = max_bs
-        self.vocab_bitmask_width = (vocab_size + 31) // 32
         self.max_tokens_per_req = max(1, max_tokens_per_req)
+        n = self.max_tokens_per_req
+        width = (vocab_size + 31) // 32
 
         with torch.device(device):
-            self.vocab_mask_buf = torch.full(
-                (max_bs, self.vocab_bitmask_width), -1, dtype=torch.int32
-            )
-            # Spec-verify grammar bitmask: flat [max_bs * n, width] to match
-            # the apply kernel's expected shape.
-            if self.max_tokens_per_req > 1:
-                self.vocab_mask_spec_buf = torch.full(
-                    (max_bs * self.max_tokens_per_req, self.vocab_bitmask_width),
-                    -1,
-                    dtype=torch.int32,
-                )
+            self.bitmask = torch.full((max_bs * n, width), -1, dtype=torch.int32)
 
-        # Pinned staging for the H2D copy.
-        self.vocab_mask_cpu_buf = torch.full(
-            (max_bs, self.vocab_bitmask_width),
-            -1,
-            dtype=torch.int32,
-            pin_memory=True,
+        # The fill writes this; the forward copies it to ``bitmask``.
+        self.host_bitmask = torch.full(
+            (max_bs * n, width), -1, dtype=torch.int32, pin_memory=True
         )
-        if self.max_tokens_per_req > 1:
-            self.vocab_mask_spec_cpu_buf = torch.full(
-                (max_bs * self.max_tokens_per_req, self.vocab_bitmask_width),
-                -1,
-                dtype=torch.int32,
-                pin_memory=True,
+        # Draft tokens for spec verify; col 0 is unused for non-spec.
+        self.candidates = torch.zeros((max_bs, n), dtype=torch.int32, pin_memory=True)
+
+        self.filler = load_grammar_host_ext().Filler(
+            self.host_bitmask.data_ptr(),
+            max_bs,
+            n,
+            vocab_size,
+            self.candidates.data_ptr(),
+        )
+
+    def fill(
+        self,
+        grammars: list,
+        has_candidates: bool,
+        input_ids_buf: torch.Tensor,
+        *,
+        output_layout: ForwardOutputLayout,
+    ) -> None:
+        """Fill this forward's masks and copy them to the device."""
+        n = self.max_tokens_per_req
+        if has_candidates and output_layout.num_decodes:
+            # Verify candidates: the decode rows' tokens at the tail of the input.
+            first = output_layout.num_extends
+            count = output_layout.num_decodes
+            self.candidates[first : first + count].copy_(
+                input_ids_buf[-count * n :].view(count, n), non_blocking=True
             )
-            # Draft candidates D2H'd per step so the CPU grammar fill can
-            # walk the draft chain position-by-position.
-            self.candidates_cpu_buf = torch.zeros(
-                (max_bs, self.max_tokens_per_req),
-                dtype=torch.int32,
-                pin_memory=True,
-            )
+            torch.get_device_module(input_ids_buf.device).current_stream().synchronize()
+        self.filler.fill(
+            _matchers(grammars),
+            has_candidates,
+            output_layout.num_extends,
+            output_layout.num_prefill_outputs,
+            output_layout.num_decodes,
+            output_layout.decode_width,
+        )
+        rows = len(grammars) * n if has_candidates else len(grammars)
+        self.bitmask[:rows].copy_(self.host_bitmask[:rows], non_blocking=True)
 
 
 def bind_grammar_mask_buf(
@@ -397,79 +413,17 @@ def bind_grammar_mask_buf(
     is a no-op. When no buffer is allocated (grammar disabled) this is a
     no-op and sampling skips the mask entirely.
     """
-    if capturable is None and eager_buffers is None:
+    runtime = capturable if capturable is not None else eager_buffers
+    if runtime is None:
         return
 
     from tokenspeed.runtime.grammar.base_grammar_backend import (
         get_apply_vocab_mask_func,
     )
 
-    if capturable is not None:
-        n = capturable.max_tokens_per_req
-        info.vocab_mask = (
-            capturable.bitmask[: bs * n] if spec else capturable.bitmask[:bs]
-        )
-    elif spec and eager_buffers.max_tokens_per_req > 1:
-        info.vocab_mask = eager_buffers.vocab_mask_spec_buf[
-            : bs * eager_buffers.max_tokens_per_req
-        ]
-    else:
-        info.vocab_mask = eager_buffers.vocab_mask_buf[:bs]
+    n = runtime.max_tokens_per_req
+    info.vocab_mask = runtime.bitmask[: bs * n] if spec else runtime.bitmask[:bs]
     info.apply_vocab_mask = get_apply_vocab_mask_func(grammar_backend)
-
-
-def _fill_eager_bitmask(
-    grammars: list,
-    bs: int,
-    eager_buffers: EagerGrammarBuffers,
-    spec_num_tokens: int,
-    is_spec_decode: bool,
-    input_ids_buf,
-    output_layout: ForwardOutputLayout,
-) -> None:
-    """Sync, walk grammars on host, H2D the bitmask. Non-CUDA path only."""
-    if is_spec_decode:
-        first = output_layout.num_extends
-        count = bs - first
-        candidates = input_ids_buf[-count * spec_num_tokens :]
-        eager_buffers.candidates_cpu_buf[first:bs].copy_(
-            candidates.view(count, spec_num_tokens), non_blocking=True
-        )
-        sync_ev = torch.cuda.Event()
-        sync_ev.record()
-        sync_ev.synchronize()
-        cand_cpu = eager_buffers.candidates_cpu_buf
-        active = bs * spec_num_tokens
-        cpu_buf = eager_buffers.vocab_mask_spec_cpu_buf
-        gpu_buf = eager_buffers.vocab_mask_spec_buf
-        cpu_buf[:active].fill_(-1)
-        for i, grammar in enumerate(grammars):
-            if grammar is None or grammar.finished or grammar.is_terminated():
-                continue
-            row_base = i * spec_num_tokens
-            advanced = 0
-            positions = output_layout.output_width(i)
-            for pos in range(positions):
-                if grammar.is_terminated():
-                    break
-                grammar.fill_vocab_mask(cpu_buf, row_base + pos)
-                if pos + 1 == positions:
-                    break
-                next_tok = int(cand_cpu[i, pos + 1].item())
-                if not grammar.try_accept_token(next_tok):
-                    break
-                advanced += 1
-            if advanced:
-                grammar.rollback(advanced)
-        gpu_buf[:active].copy_(cpu_buf[:active], non_blocking=True)
-    else:
-        cpu_buf = eager_buffers.vocab_mask_cpu_buf
-        gpu_buf = eager_buffers.vocab_mask_buf
-        cpu_buf[:bs].fill_(-1)
-        for i, grammar in enumerate(grammars):
-            if grammar and not grammar.finished and not grammar.is_terminated():
-                grammar.fill_vocab_mask(cpu_buf, i)
-        gpu_buf[:bs].copy_(cpu_buf[:bs], non_blocking=True)
 
 
 GrammarRuntime = CapturableGrammarExecutor | EagerGrammarBuffers
@@ -480,7 +434,6 @@ def setup_grammar_step(
     sampling_info,
     bs: int,
     is_spec_decode: bool,
-    spec_num_tokens: int,
     grammar_inputs: GrammarStepInputs | None,
     grammar_runtime: GrammarRuntime | None,
     input_ids_buf,
@@ -491,10 +444,11 @@ def setup_grammar_step(
 
     ``grammar_runtime`` is one of:
       - ``CapturableGrammarExecutor`` (CUDA): enqueues an ``add_batch`` so
-        the side-stream hostfunc fills the bitmask in parallel with the
+        the side-stream host node fills the bitmask in parallel with the
         forward. Returns the per-step ``GrammarStepCompletion``.
-      - ``EagerGrammarBuffers`` (non-CUDA fallback): syncs, runs the
-        xgrammar fill on host, H2Ds the bitmask. Returns ``None``.
+      - ``EagerGrammarBuffers`` (non-CUDA fallback): runs the same fill on
+        the host (syncing on verify drafts), H2Ds the bitmask. Returns
+        ``None``: the commit advances the matchers.
       - ``None``: grammar disabled, no-op.
     """
     if grammar_runtime is None:
@@ -531,22 +485,34 @@ def setup_grammar_step(
             output_layout=output_layout,
         )
 
-    # Fill the bound buffer every step. When no request has a grammar we
-    # still need to write all-ones (-1) to clear any leftover bits from a
-    # prior grammar-batch — the captured graph reads from this same memory
-    # whether or not we filled it this step.
     if any(grammars):
-        _fill_eager_bitmask(
-            grammars,
-            bs,
-            eager_buffers,
-            spec_num_tokens,
-            is_spec_decode,
-            input_ids_buf,
-            output_layout,
+        eager_buffers.fill(
+            grammars, is_spec_decode, input_ids_buf, output_layout=output_layout
         )
-    elif is_spec_decode and eager_buffers.max_tokens_per_req > 1:
-        eager_buffers.vocab_mask_spec_buf[: bs * spec_num_tokens].fill_(-1)
-    else:
-        eager_buffers.vocab_mask_buf[:bs].fill_(-1)
+        return None
+    # The captured graph reads this memory whether or not it was filled:
+    # clear what a grammar batch left.
+    rows = bs * eager_buffers.max_tokens_per_req if is_spec_decode else bs
+    eager_buffers.bitmask[:rows].fill_(-1)
     return None
+
+
+def resolve_grammar_completion(model_execution_results) -> list[int] | None:
+    """Where the data plane advanced a forward's grammar matchers (the
+    capturable path), each row's index of the kept token that ended its
+    grammar, or -1; None when the commit advances them.
+
+    The next forward's host node normally advances the matchers; this waits
+    briefly for it and otherwise advances them on the host (no next forward
+    may come: the last live request finished). Exactly one of the two
+    advances: a host advance that loses waits for the host node.
+    """
+    completion = model_execution_results.grammar_completion
+    if completion is None:
+        return None
+    if not completion.wait(timeout=0.005):
+        completion.advance_on_host(
+            model_execution_results.output_tokens.tolist(),
+            model_execution_results.output_lengths.tolist(),
+        )
+    return completion.terminated_at()

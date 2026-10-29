@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult
+from tokenspeed_kernel.ops.attention.kda import KdaPrefillResult, KdaReplayRecords
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -83,8 +83,6 @@ if current_platform().is_amd:
     )
     def gluon_kda_paged_prefill_gfx950(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx950 KDA prefill with V-major state."""
-        # Host-boundary hint is consumed only by the CuteDSL wrapper.
-        kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 
@@ -107,8 +105,6 @@ if current_platform().is_amd:
     )
     def gluon_kda_paged_prefill_gfx1250(**kwargs) -> KdaPrefillResult:
         """Run specialized gfx1250 KDA prefill with V-major state."""
-        # Host-boundary hint is consumed only by the CuteDSL wrapper.
-        kwargs.pop("cu_seqlens_cpu", None)
         output, final_state = _kda_prefill_gfx1250_impl(**kwargs)
         return KdaPrefillResult(out=output, final_state=final_state)
 
@@ -217,32 +213,34 @@ if current_platform().is_amd:
         head_dim: int,
         draft_token_num: int,
         lower_bound: float | None,
-        replay_mixed_qkv: torch.Tensor | None = None,
-        replay_gate: torch.Tensor | None = None,
-        replay_beta: torch.Tensor | None = None,
+        replay_records: KdaReplayRecords,
+        g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run target verify, decay projection included, with optional capture."""
+        """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
+        if replay_records is None:
+            raise ValueError("AMD no-store verify requires recovery records")
         return _kda_fused_verify_impl(
             mixed_qkv=mixed_qkv,
+            original_qkv=replay_records.original_qkv,
             conv_weights=conv_weights,
             conv_pool=conv_states,
-            conv_scratch=conv_scratch,
-            f_a_out=f_a_out,
-            f_b_weight=f_b_weight,
+            raw_g=g_raw,
+            f_a_out=f_a_out if g_raw is None else None,
+            f_b_weight=f_b_weight if g_raw is None else None,
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,
             state_pool=state_pool,
-            state_scratch=state_scratch,
             read_indices=read_indices,
-            write_indices=write_indices,
+            correction=replay_records.correction,
+            key_gate=replay_records.key_gate,
+            record_metadata=replay_records.metadata,
+            record_stamps=replay_records.stamps,
+            query_start_loc=replay_records.query_start_loc,
             num_heads=num_heads,
             head_dim=head_dim,
             draft_token_num=draft_token_num,
             lower_bound=lower_bound,
-            replay_mixed_qkv=replay_mixed_qkv,
-            replay_gate=replay_gate,
-            replay_beta=replay_beta,
         )
 
     @register_kernel(
@@ -262,6 +260,7 @@ if current_platform().is_amd:
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
             "store_states": frozenset({False}),
+            "split_producers": frozenset({False}),
         },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx950(*args, **kwargs):
@@ -284,7 +283,6 @@ if current_platform().is_amd:
             "batched_layers": frozenset({True}),
             "flat_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
-            "replay_raw_gate": frozenset({True}),
         },
     )
     def gluon_kda_fused_replay_gfx950(
@@ -294,38 +292,44 @@ if current_platform().is_amd:
         read_indices: torch.Tensor,
         write_indices: torch.Tensor,
         accepted_length: torch.Tensor,
+        activation_dtype: torch.dtype,
+        conv_state_dtype: torch.dtype,
         draft_token_num: int,
         num_heads: int,
         head_dim: int,
-        f_a_dim: int,
         qkv_stride: int,
         conv_stride: int,
-        f_a_stride: int,
-        beta_stride: int,
+        correction_stride: int,
+        key_gate_stride: int,
         state_stride: int,
-        gate_stride: int,
         conv_width: int,
-        lower_bound: float,
+        lower_bound: float | None,
+        record_metadata: torch.Tensor | None,
+        record_stamps: torch.Tensor | None,
+        state_dtype: torch.dtype,
     ) -> None:
-        """Replay all gfx950 layers from persistent BF16 raw-g descriptors."""
+        """Recover accepted prefixes from FP32 U and activation-dtype K/raw-g records."""
         _kda_fused_replay_impl(
             descriptors,
             group_indices,
             read_indices,
             write_indices,
             accepted_length,
+            activation_dtype=activation_dtype,
+            conv_state_dtype=conv_state_dtype,
             draft_token_num=draft_token_num,
             num_heads=num_heads,
             head_dim=head_dim,
-            f_a_dim=f_a_dim,
             qkv_stride=qkv_stride,
             conv_stride=conv_stride,
-            f_a_stride=f_a_stride,
-            beta_stride=beta_stride,
+            correction_stride=correction_stride,
+            key_gate_stride=key_gate_stride,
             state_stride=state_stride,
-            gate_stride=gate_stride,
             conv_width=conv_width,
             lower_bound=lower_bound,
+            record_metadata=record_metadata,
+            record_stamps=record_stamps,
+            state_dtype=state_dtype,
         )
 
     @register_kernel(
@@ -433,32 +437,34 @@ if current_platform().is_amd:
         head_dim: int,
         draft_token_num: int,
         lower_bound: float | None,
-        replay_mixed_qkv: torch.Tensor | None = None,
-        replay_gate: torch.Tensor | None = None,
-        replay_beta: torch.Tensor | None = None,
+        replay_records: KdaReplayRecords,
+        g_raw: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Run target verify, decay projection included, with optional capture."""
+        """Fuse gate, convolution and verify; a supplied raw gate takes precedence."""
+        if replay_records is None:
+            raise ValueError("AMD no-store verify requires recovery records")
         return _kda_fused_verify_gfx1250_impl(
             mixed_qkv=mixed_qkv,
+            original_qkv=replay_records.original_qkv,
             conv_weights=conv_weights,
             conv_pool=conv_states,
-            conv_scratch=conv_scratch,
-            f_a_out=f_a_out,
-            f_b_weight=f_b_weight,
+            raw_g=g_raw,
+            f_a_out=f_a_out if g_raw is None else None,
+            f_b_weight=f_b_weight if g_raw is None else None,
             beta_logits=beta_logits,
             A_log=A_log,
             dt_bias=dt_bias,
             state_pool=state_pool,
-            state_scratch=state_scratch,
             read_indices=read_indices,
-            write_indices=write_indices,
+            correction=replay_records.correction,
+            key_gate=replay_records.key_gate,
+            record_metadata=replay_records.metadata,
+            record_stamps=replay_records.stamps,
+            query_start_loc=replay_records.query_start_loc,
             num_heads=num_heads,
             head_dim=head_dim,
             draft_token_num=draft_token_num,
             lower_bound=lower_bound,
-            replay_mixed_qkv=replay_mixed_qkv,
-            replay_gate=replay_gate,
-            replay_beta=replay_beta,
         )
 
     @register_kernel(
@@ -478,6 +484,7 @@ if current_platform().is_amd:
             "paged_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
             "store_states": frozenset({False}),
+            "split_producers": frozenset({False}),
         },
     )
     def gluon_kda_fused_paged_verify_nostore_vmajor_gfx1250(*args, **kwargs):
@@ -500,7 +507,6 @@ if current_platform().is_amd:
             "batched_layers": frozenset({True}),
             "flat_state": frozenset({True}),
             "recurrent_layout": frozenset({"v_major"}),
-            "replay_raw_gate": frozenset({True}),
         },
     )
     def gluon_kda_fused_replay_gfx1250(
@@ -510,36 +516,42 @@ if current_platform().is_amd:
         read_indices: torch.Tensor,
         write_indices: torch.Tensor,
         accepted_length: torch.Tensor,
+        activation_dtype: torch.dtype,
+        conv_state_dtype: torch.dtype,
         draft_token_num: int,
         num_heads: int,
         head_dim: int,
-        f_a_dim: int,
         qkv_stride: int,
         conv_stride: int,
-        f_a_stride: int,
-        beta_stride: int,
+        correction_stride: int,
+        key_gate_stride: int,
         state_stride: int,
-        gate_stride: int,
         conv_width: int,
-        lower_bound: float,
+        lower_bound: float | None,
+        record_metadata: torch.Tensor | None,
+        record_stamps: torch.Tensor | None,
+        state_dtype: torch.dtype,
     ) -> None:
-        """Replay all gfx1250 layers from persistent BF16 raw-g descriptors."""
+        """Recover accepted prefixes from FP32 U and activation-dtype K/raw-g records."""
         _kda_fused_replay_gfx1250_impl(
             descriptors,
             group_indices,
             read_indices,
             write_indices,
             accepted_length,
+            activation_dtype=activation_dtype,
+            conv_state_dtype=conv_state_dtype,
             draft_token_num=draft_token_num,
             num_heads=num_heads,
             head_dim=head_dim,
-            f_a_dim=f_a_dim,
             qkv_stride=qkv_stride,
             conv_stride=conv_stride,
-            f_a_stride=f_a_stride,
-            beta_stride=beta_stride,
+            correction_stride=correction_stride,
+            key_gate_stride=key_gate_stride,
             state_stride=state_stride,
-            gate_stride=gate_stride,
             conv_width=conv_width,
             lower_bound=lower_bound,
+            record_metadata=record_metadata,
+            record_stamps=record_stamps,
+            state_dtype=state_dtype,
         )

@@ -28,6 +28,57 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 class TestNumericsMode:
+    def test_moe_cutlass_fused_finalize_defaults_on(self):
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        assert ServerArgs(model="x").moe_cutlass_fused_finalize
+        assert prepare_server_args(["--model", "x"]).moe_cutlass_fused_finalize
+        assert prepare_server_args(
+            ["--model", "x", "--moe-cutlass-fused-finalize"]
+        ).moe_cutlass_fused_finalize
+        assert not prepare_server_args(
+            ["--model", "x", "--no-moe-cutlass-fused-finalize"]
+        ).moe_cutlass_fused_finalize
+        assert ServerArgs(
+            model="x", moe_cutlass_fused_finalize=True
+        ).moe_cutlass_fused_finalize
+        assert not ServerArgs(
+            model="x", moe_cutlass_fused_finalize=False
+        ).moe_cutlass_fused_finalize
+
+    @pytest.mark.parametrize("fused_finalize", [False, True])
+    def test_moe_cutlass_fused_finalize_reaches_global_server_args(
+        self, fused_finalize
+    ):
+        from tokenspeed_kernel.platform import pdl_enabled
+
+        from tokenspeed.runtime.utils.env import (
+            global_server_args_dict,
+            global_server_args_dict_update,
+        )
+
+        original = global_server_args_dict.copy()
+        original_pdl = pdl_enabled()
+        try:
+            args = ServerArgs(model="x", moe_cutlass_fused_finalize=fused_finalize)
+            global_server_args_dict_update(args)
+            assert (
+                global_server_args_dict["moe_cutlass_fused_finalize"] is fused_finalize
+            )
+        finally:
+            pdl_enabled(original_pdl)
+            global_server_args_dict.clear()
+            global_server_args_dict.update(original)
+
+    @pytest.mark.parametrize("fused_finalize", [False, True])
+    def test_rl_bitwise_disables_moe_cutlass_fused_finalize(self, fused_finalize):
+        args = ServerArgs(
+            model="x",
+            numerics="rl-bitwise",
+            moe_cutlass_fused_finalize=fused_finalize,
+        )
+        assert not args.moe_cutlass_fused_finalize
+
     def test_auto_keeps_performance_defaults(self):
         args = ServerArgs(model="x")
         assert (args.numerics) == ("auto")
@@ -37,6 +88,7 @@ class TestNumericsMode:
 
     def test_rl_bitwise_tightens_every_switch(self):
         args = ServerArgs(model="x", numerics="rl-bitwise")
+        assert not args.moe_cutlass_fused_finalize
         # The envelope routes reductions itself (batch_invariant_collectives);
         # the NCCL-only knob stays the user's.
         assert not (args.force_deterministic_rsag)
@@ -84,6 +136,16 @@ class TestNumericsMode:
         args = ServerArgs(model="x", numerics="rl-bitwise", world_size=1)
         assert not (args.enable_allreduce_fusion)
 
+    def test_batch_invariant_collectives_vetoes_the_fused_all_reduce_norm(self):
+        args = ServerArgs(model="x", enable_allreduce_fusion=True)
+        assert args.enable_allreduce_fusion and args.comm_fusion_max_num_tokens > 0
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
+        args = ServerArgs(
+            model="x", batch_invariant_collectives=True, enable_allreduce_fusion=True
+        )
+        assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
+
     def test_unknown_mode_is_rejected(self):
         with pytest.raises((ValueError), match=("rl-bitwise")):
             ServerArgs(model="x", numerics="bitwise")
@@ -118,11 +180,12 @@ class TestNumericsMode:
         assert (ServerArgs(model="x", numerics="rl-bitwise").layer_boundary_norm) == (
             "unfused"
         )
-        # On its own, under auto, it still vetoes the fused all-reduce+norm.
+        # On its own, under auto, it vetoes both the flag and the token-count gate.
         args = ServerArgs(
             model="x", layer_boundary_norm="unfused", enable_allreduce_fusion=True
         )
         assert not (args.enable_allreduce_fusion)
+        assert (args.comm_fusion_max_num_tokens) == (-1)
         with pytest.raises((ValueError), match=("--layer-boundary-norm")):
             ServerArgs(model="x", layer_boundary_norm="half")
 
@@ -164,24 +227,47 @@ class TestNumericsMode:
 
     def test_slot_combine_is_validated_against_the_launch_at_startup(self):
         # The slot fold runs over the EP group inside the leaf: a K-split down
-        # projection would need a second fold, and DeepEP owns the exchange.
+        # projection would need a second fold.
         ServerArgs(model="x", moe_combine_order="slot", world_size=2, ep_size=2)
         # MoE TP defaults to the stage world over EP, so world_size=2 alone
         # is MoE TP 2.
         with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", moe_combine_order="slot", world_size=2)
-        with pytest.raises((ValueError), match=("--all2all-backend deepep")):
-            ServerArgs(
-                model="x",
-                moe_combine_order="slot",
-                world_size=2,
-                ep_size=2,
-                all2all_backend="deepep",
-            )
+        # Under DeepEP the leaf owns the exchange; whether one declares both
+        # traits is the MoE plan's question, not the launch's.
+        args = ServerArgs(
+            model="x",
+            moe_combine_order="slot",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="auto",
+        )
+        assert not args.enforce_eager
         # The envelope inherits both refusals: rl-bitwise needs MoE TP 1.
         with pytest.raises((ValueError), match=("needs MoE TP 1")):
             ServerArgs(model="x", numerics="rl-bitwise", world_size=2)
         ServerArgs(model="x", numerics="rl-bitwise", world_size=2, ep_size=2)
+
+    def test_deepep_normal_mode_runs_eager(self):
+        # The normal dispatch reads its receive counts on the host, so no
+        # decode graph can capture it; the low-latency legs keep the graphs.
+        normal = ServerArgs(
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="normal",
+        )
+        assert normal.enforce_eager
+        low_latency = ServerArgs(
+            model="x",
+            world_size=2,
+            ep_size=2,
+            all2all_backend="deepep",
+            deepep_mode="low_latency",
+        )
+        assert not low_latency.enforce_eager
 
     def test_rl_bitwise_is_the_one_bitwise_envelope(self):
         from tokenspeed.runtime.configs.numerics import NUMERICS_ENVELOPES

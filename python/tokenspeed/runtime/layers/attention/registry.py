@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 from collections.abc import Callable
+from functools import partial
 from typing import TYPE_CHECKING
 
 from tokenspeed_kernel.platform import current_platform
@@ -70,7 +71,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.ownership import (
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.setup import (
     CacheModelFamily,
     CachePoolSpec,
-    prepare_cache_setup,
+    cache_recipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
     FULL_ATTENTION,
@@ -1306,8 +1307,8 @@ def create_attn_components(
             world_group=server_args.mapping.world_group,
         )
     cache_memory = reserve_cache_budget(profiled_cache_bytes, graph_reserve_bytes)
-    cache_setup = prepare_cache_setup(
-        family=cache_family,
+    recipe = cache_recipe(
+        cache_family,
         server_args=server_args,
         model_config=model_config,
         attn_config=config,
@@ -1318,13 +1319,8 @@ def create_attn_components(
         overlap_schedule_depth=overlap_schedule_depth,
         probe_batch_rows=probe_batch_rows,
     )
-    if probe_batch_rows is not None:
-        check_probe_cache_fits(cache_setup.cache_budget_bytes, profiled_cache_bytes)
-    spec = cache_setup.spec
-    if config.kvp_size > 1 and target.is_hybrid_linear:
-        _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)
-    num_target_cache_layers = cache_setup.num_target_layers
-    num_draft_cache_layers = cache_setup.num_draft_layers
+    num_draft_cache_layers = recipe.num_draft_layers
+    num_target_cache_layers = len(recipe.layer_types) - num_draft_cache_layers
     if server_args.mapping.has_pp:
         from tokenspeed.runtime.distributed.pp_stage import (
             pp_stage_cache_windows,
@@ -1356,6 +1352,31 @@ def create_attn_components(
         target_cache_windows,
     )
     layer_ownership = owners[server_args.mapping.pp_rank]
+    from tokenspeed.runtime.distributed.process_group_manager import (
+        process_group_manager as pg_manager,
+    )
+    from tokenspeed.runtime.layers.attention.kv_cache.recipes.capacity import (
+        agree_cache_capacity,
+    )
+
+    capacity_group = (
+        pg_manager.get_process_group("gloo", server_args.mapping.world_group)
+        if server_args.mapping.world_size > 1
+        else None
+    )
+    cache_setup = recipe.setup_for_layers(
+        resident_cache_window=layer_ownership.resident_cache_window,
+        synchronize_capacity=partial(
+            agree_cache_capacity,
+            cpu_group=capacity_group,
+            probe=probe_batch_rows is not None,
+        ),
+    )
+    if probe_batch_rows is not None:
+        check_probe_cache_fits(cache_setup.cache_budget_bytes, profiled_cache_bytes)
+    spec = cache_setup.spec
+    if config.kvp_size > 1 and target.is_hybrid_linear:
+        _validate_hybrid_kvp_cache(spec, kvp_size=config.kvp_size)
     cache_fields_by_stage, stage_schedules = cache_field_placement(
         spec.memory_plan, owners
     )
@@ -1407,6 +1428,18 @@ def create_attn_components(
             draft_view_spec = dataclasses.replace(
                 draft_view_spec, memory_plan=spec.memory_plan
             )
+    logger.log(
+        logging.DEBUG if probe_batch_rows is not None else logging.INFO,
+        f"Cache resident: pp_rank={server_args.mapping.pp_rank}, "
+        f"window={layer_ownership.resident_cache_window}, "
+        f"parent_bytes={spec.memory_plan.arena_bytes // (spec.memory_plan.num_lcm_blocks + 1)}, "
+        f"parents={spec.memory_plan.num_lcm_blocks}, "
+        f"local_limit={cache_setup.local_parent_limit}, "
+        f"agreed_limit={cache_setup.agreed_parent_limit}, "
+        f"arena_bytes={spec.memory_plan.arena_bytes}, "
+        f"fixed_workspace_bytes={fixed_workspace_bytes}, "
+        f"budget_bytes={cache_budget_bytes}",
+    )
     arena = create_cache_arena(
         spec,
         device=config.device,

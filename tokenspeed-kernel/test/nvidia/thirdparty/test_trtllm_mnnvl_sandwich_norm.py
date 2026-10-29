@@ -30,6 +30,11 @@ change of the two sums of squares; its mismatch and RMS limits hold for the
 calls of one hidden size and input kind together. The fused rows do not depend
 on the batch around them, the strategy or the rank.
 
+The per-token FP8 launch (``token_fp8_out``) writes the BF16 launch's outputs
+bit for bit and, as codes and scales, ``fp8_quantize_per_token`` of its BF16
+output (codes and scales must match bit for bit); without the BF16 output it writes
+the same codes, scales and residual.
+
 Normal one-GPU pytest runs skip this file. Exercise it with:
 ``torchrun --standalone --nproc-per-node=4 -m pytest -q <this file>``;
 ``SANDWICH_NORM_HIDDENS=a,b,...`` replaces the hidden sizes.
@@ -116,6 +121,12 @@ def _inputs(rank, dev, tokens, hidden, kind, seed=0):
     shared = torch.Generator(device=dev)
     shared.manual_seed(7 + seed + hidden)
     residual = torch.randn(tokens, hidden, generator=shared, device=dev) * 4
+    if kind == "zero":
+        x.zero_()
+        residual.zero_()
+    elif kind == "tiny":
+        x *= 1e-30
+        residual *= 1e-30
     post = 1 + 0.1 * torch.randn(hidden, generator=shared, device=dev)
     weight = (1 + 0.3 * torch.randn(hidden, generator=shared, device=dev)).abs()
     return tuple(t.to(torch.bfloat16).contiguous() for t in (x, residual, post, weight))
@@ -130,6 +141,8 @@ def _fused(x, residual, post, weight, rank, pair, **kwargs):
     from tokenspeed_kernel.ops.communication import allreduce_sandwich_rmsnorm, trtllm
 
     fused = trtllm.allreduce_sandwich_rmsnorm if kwargs else allreduce_sandwich_rmsnorm
+    if kwargs:
+        kwargs["norm_out_bf16"] = True
     return fused(
         x,
         residual,
@@ -266,7 +279,7 @@ def test_fused_boundary_within_the_module_bounds(hidden, kind):
     elements = 0
     mismatches = {"unfused": [0, 0], "staged": [0, 0]}
     sse = {"res": [0.0, 0.0], "out": [0.0, 0.0]}  # fused, unfused vs FP64
-    for tokens in (1, 3, 8, 64, 257, 1024):
+    for tokens in (1, 2, 3, 4, 8, 16, 32, 64, 65, 128, 257, 1024):
         x, residual, post, weight = _inputs(rank, dev, tokens, hidden, kind)
         for pair in ((None, None), *SCALE_PAIRS):
             case = (tokens, pair)
@@ -388,3 +401,137 @@ def test_calls_the_kernel_cannot_serve_return_none():
     assert _fused(x, residual, post, weight, rank, (None, None)) is None
     x, residual, post, weight = _inputs(rank, dev, MAX_TOKENS + 1, 2048, "normal")
     assert _fused(x, residual, post, weight, rank, (None, None)) is None
+
+
+# --------------------------------------------------------- per-token FP8 output
+
+
+def _fused_fp8(x, residual, post, weight, rank, pair, *, bf16_out=True, **kwargs):
+    from tokenspeed_kernel.ops.communication import trtllm
+
+    tokens, hidden = x.shape
+    codes = torch.empty(tokens, hidden, dtype=torch.float8_e4m3fn, device=x.device)
+    scales = torch.empty(tokens, 1, dtype=torch.float32, device=x.device)
+    out = trtllm.allreduce_sandwich_rmsnorm(
+        x,
+        residual,
+        post,
+        weight,
+        rank,
+        dist.group.WORLD,
+        eps=EPS,
+        x_scale=pair[0],
+        residual_scale=pair[1],
+        max_token_num=MAX_TOKENS,
+        token_fp8_out=(codes, scales),
+        norm_out_bf16=bf16_out,
+        **kwargs,
+    )
+    assert out is not None
+    return out[0], out[1], codes, scales
+
+
+def _e4m3_steps(a, b):
+    """|a - b| in E4M3 steps (codes ordered by value; +0 and -0 equal)."""
+
+    def ordinal(c):
+        bits = c.view(torch.uint8).to(torch.int32)
+        mag = bits & 0x7F
+        return torch.where(bits >= 0x80, -mag, mag)
+
+    return (ordinal(a) - ordinal(b)).abs()
+
+
+def _compare_codes(codes, scales, ref_codes, ref_scales):
+    """(differing codes, largest step); scales must be equal."""
+    assert torch.equal(scales.view(torch.int32), ref_scales.view(torch.int32))
+    steps = _e4m3_steps(codes, ref_codes)
+    return int(
+        (codes.view(torch.uint8) != ref_codes.view(torch.uint8)).sum().item()
+    ), int(steps.max().item())
+
+
+@pytest.mark.parametrize("hidden", HIDDENS)
+@pytest.mark.parametrize(
+    "kind", ["normal", "large", "heavy", "outlier", "zero", "tiny"]
+)
+def test_token_fp8_output_is_the_quantizer_of_the_bf16_output(hidden, kind):
+    from tokenspeed_kernel.ops.quantization.triton import fp8_quantize_per_token
+
+    rank, dev = _armed()
+    elements = differing = worst = 0
+    for tokens in (1, 2, 3, 4, 8, 16, 32, 64, 65, 128, 257, 1024):
+        x, residual, post, weight = _inputs(rank, dev, tokens, hidden, kind)
+        for pair in ((None, None), (0.5, None), (None, 0.75), *SCALE_PAIRS):
+            case = (tokens, pair)
+            out, res = _fused(x, residual, post, weight, rank, pair)
+            f_out, f_res, codes, scales = _fused_fp8(
+                x, residual, post, weight, rank, pair
+            )
+            n_res, n_codes, n_scales = _fused_fp8(
+                x, residual, post, weight, rank, pair, bf16_out=False
+            )[1:]
+            ref_codes, ref_scales = fp8_quantize_per_token(f_out)
+            torch.cuda.synchronize()
+            # The BF16 outputs are the BF16 launch's.
+            assert torch.equal(f_out, out) and torch.equal(f_res, res), case
+            assert torch.equal(n_res, res), case
+            # Without the BF16 output: the same codes and scales.
+            assert torch.equal(n_codes.view(torch.uint8), codes.view(torch.uint8)), case
+            assert torch.equal(n_scales, scales), case
+            count, step = _compare_codes(codes, scales, ref_codes, ref_scales)
+            assert count == 0 and step == 0, (case, count, step)
+            elements += codes.numel()
+            differing += count
+            worst = max(worst, step)
+            # Every rank holds the same codes and scales.
+            for t in (codes.view(torch.uint8), scales):
+                gathered = [torch.empty_like(t) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered, t)
+                assert all(torch.equal(g, t) for g in gathered), case
+    if rank == 0:
+        print(
+            f"token fp8 hidden {hidden} {kind}: {differing} of {elements} codes "
+            f"differ from fp8_quantize_per_token (largest {worst} step)"
+        )
+    assert differing == 0, (differing, elements)
+
+
+def test_token_fp8_graph_replays_and_early_release_match_eager():
+    """The per-token FP8 launch under CUDA graph replay, and with the PDL
+    release after the inputs are loaded, gives the eager launch's bits."""
+    rank, dev = _armed()
+    hidden, tokens = HIDDENS[0], 8
+    x, residual, post, weight = _inputs(rank, dev, tokens, hidden, "heavy", seed=5)
+    eager = _fused_fp8(x, residual, post, weight, rank, SCALE_PAIRS[0])
+    static_x, static_r = x.clone(), residual.clone()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _fused_fp8(static_x, static_r, post, weight, rank, SCALE_PAIRS[0])
+    for seed in range(5):
+        nx, nr, _, _ = _inputs(rank, dev, tokens, hidden, "heavy", seed=20 + seed)
+        static_x.copy_(nx)
+        static_r.copy_(nr)
+        graph.replay()
+        ref = _fused_fp8(nx, nr, post, weight, rank, SCALE_PAIRS[0])
+        torch.cuda.synchronize()
+        for a, b in zip(captured, ref):
+            assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+    static_x.copy_(x)
+    static_r.copy_(residual)
+    graph.replay()
+    early = _fused_fp8(
+        x,
+        residual,
+        post,
+        weight,
+        rank,
+        SCALE_PAIRS[0],
+        launch_with_pdl=True,
+        trigger_completion_at_end=False,
+    )
+    torch.cuda.synchronize()
+    for c, e, ref in zip(captured, early, eager):
+        assert torch.equal(c.view(torch.uint8), ref.view(torch.uint8))
+        assert torch.equal(e.view(torch.uint8), ref.view(torch.uint8))

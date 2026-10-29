@@ -86,7 +86,7 @@ def eagle_harness_policy_begin_round(
     """Start a round of ``live_rows[0]`` requests (int32; 0 runs no round)
     whose cached lengths are the first ``live_rows[0]`` entries of
     ``frontier`` (int64 ``[rows >= live_rows[0]]``, summed in the kernel) and
-    which draw their children when ``sampled`` (bool; trees only):
+    which draw their children when ``sampled`` (bool):
     increments ``seq`` (int64 ``[1]``), clears the round's scalars of
     ``state`` and the ``[4, depth + 1]`` int32 ``slots`` (width, cumu_start,
     work_size, go per depth), writes depth 0's slots, takes depth 0's
@@ -151,8 +151,9 @@ def eagle_harness_policy_decide_tree(
     stopped, only clears that go flag. ``round_f64`` holds the round's cost
     row (``eagle_harness_policy_begin_round``). A stopping decision also
     writes the round's ranked node count, ``min(verify_num, pool size,
-    max(2 * past verify width, min_verify_count))``, and its flatness (a
-    chain's: every ranked node, ``verify_num`` at most, verified)."""
+    max(2 * past verify width, min_verify_count))``, its flatness (a
+    chain's: every ranked node, ``verify_num`` at most, verified) and, in a
+    sampled round, the next sampled round's planned stop depth."""
     _module().eagle_harness_policy_decide_tree(
         state,
         seq,

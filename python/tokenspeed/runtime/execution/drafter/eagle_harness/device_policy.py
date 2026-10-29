@@ -52,7 +52,8 @@ A round, on one stream (every launch graph-capturable, sizes on the device):
    ``d`` (``widths[d]`` lanes, children from ``cumu_starts[d]``) and queue
    its work deltas when ``work_sizes[d]`` (that node count). The work deltas
    of every depth take ``past_verify_num`` as their verify width. The
-   decision that stops the round also writes ``verify_count`` and ``flat``.
+   decision that stops the round also writes ``verify_count`` and ``flat``
+   and, in a sampled round, the next sampled round's planned stop depth.
 4. Rank the pool's best ``verify_count`` of ``cumu_count`` nodes;
    ``select_verify`` on their scores (which size the next round's verify,
    averaged over the batch unless ``flat``); verify ``verify_num`` nodes.
@@ -679,13 +680,14 @@ class DevicePolicy:
 
         state = [0] * _NUM_STATE
         state[_SAMPLED_SEEN] = -1
+        # The first sampled round plans the deepest stop.
+        state[_SAMPLED_NEXT] = self.tree_depth - 1
         if self.chain:
             # Chains keep no verify history.
             hist = torch.zeros((max_bs, 0), dtype=torch.int32)
             recent = torch.zeros((0,), dtype=torch.int32)
         else:
-            # Tier small, the deepest sampled plan.
-            state[_SAMPLED_NEXT] = self.tree_depth - 1
+            # Trees start at tier small (zero) with a full-width verify history.
             hist = torch.full((max_bs, _PAST_VERIFY_ROUNDS), verify_num)
             recent = torch.arange(-_RECENT_VERIFY_ROUNDS, 0)
         self._state = torch.tensor(state, dtype=torch.int32, device=device)
@@ -801,7 +803,8 @@ class DevicePolicy:
         before depth ``depth`` drafts with depth ``depth - 1``'s work deltas
         (fp32 ``[node_top_k + 1]``) in ``work_deltas``: writes depth
         ``depth + 1``'s slots, or stops the round (``verify_count`` and
-        ``flat``, and a chain's ``verify_num``)."""
+        ``flat``, a chain's ``verify_num``, and in a sampled round the next
+        sampled round's planned stop depth)."""
         if self.chain:
             eagle_harness_policy_decide_chain(
                 self._state,

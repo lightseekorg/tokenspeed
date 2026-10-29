@@ -52,16 +52,29 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │                                   missing implementation fails at startup
 │                                   instead of silently falling back
 ├── collectives.deterministic       one association order per reduction
-│   ├── no fused AR+norm            enable_allreduce_fusion=False (the fused
-│   │                               kernels make no bitwise claim)
+│   ├── no fused AR+norm            enable_allreduce_fusion=False and
+│   │                               comm_fusion_max_num_tokens=-1, also set
+│   │                               by batch_invariant_collectives or
+│   │                               layer_boundary_norm=unfused alone (the
+│   │                               fused kernels make no bitwise claim)
 │   ├── NCCL_ALGO=Ring,             the algorithm/protocol switch by message
 │   │   NCCL_PROTO=Simple           size changes association order
 │   ├── batch_invariant_collectives AutoBackend.route, one decision for every
-│   │                               collective: every reduction is NCCL data
+│   │                               collective: every reduction is data
 │   │                               movement plus a fixed-rank-order fp32
 │   │                               fold (all-reduce = all-gather + fold at
-│   │                               world_size x traffic, reduce-scatter =
-│   │                               all-to-all + fold at no extra traffic).
+│   │                               world_size x traffic, its gather on the
+│   │                               multicast kernels where they reach, or
+│   │                               trtllm workspace kernels with fp32
+│   │                               accumulation where a workspace is armed
+│   │                               (one call, or chunks of the rows it
+│   │                               holds; armed through a prefill chunk
+│   │                               up to 2048 rows): they fold ranks
+│   │                               0..W-1 the same way on one-shot and
+│   │                               two-shot, bit for bit, -0.0 sums
+│   │                               included as +0.0;
+│   │                               reduce-scatter = all-to-all + fold at no
+│   │                               extra traffic).
 │   │                               A ring reduction chunks by message size,
 │   │                               so its per-element order is run-stable
 │   │                               but not batch-size-invariant; the NVLS
@@ -73,7 +86,14 @@ numerics.mode                       --numerics {auto, rl-bitwise}
 │   │                               kernels. The route reads only static
 │   │                               properties of the call site, never the
 │   │                               row count, so a site cannot change route
-│   │                               with the batch
+│   │                               with the batch. Inside the all-reduce
+│   │                               fold the row count does pick the kernel
+│   │                               (workspace one-shot or two-shot, or the
+│   │                               gather where no armed workspace serves
+│   │                               the shape); all give the same bits,
+│   │                               except values below 1.2e-38, which the
+│   │                               workspace kernels (built with fast
+│   │                               math) flush to zero
 │   ├── data movement               all-gather, token all-gather, all-to-all
 │   │                               (even or uneven, the transposes of the
 │   │                               decode TP layouts) move bytes without
@@ -162,6 +182,11 @@ Every selection point that pins a batch-invariant leaf tests `numerics in
 BITWISE_ENVELOPES`, never the one name, so an envelope added above
 rl-bitwise would inherit every pin.
 
+Unquantized FP16/BF16 MoE on `flashinfer_cutlass` defaults to GEMM2 atomic
+expert combine. `--no-moe-cutlass-fused-finalize` selects a separate finalize
+reduction for both target and draft; `rl-bitwise` forces fusion off. The
+setting is fixed in each expert plan before warmup and CUDA graph capture.
+
 ## alignment.trainer
 
 The invariance layers make a deployment agree with itself. Trainer alignment
@@ -181,7 +206,7 @@ and only the reported log-probabilities change.
 | `--layer-boundary-norm unfused` | The norm that opens each physical layer and the final norm read a bf16 `hidden + residual` materialized first (`residual = hidden`), then a standalone RMSNorm, instead of the fused add+norm kernel whose sum stays fp32; all-reduce+norm fusion is vetoed with it | forward values |
 | `--router-topk torch` | The correction-bias router runs fp32 `torch.softmax`, `torch.topk(probs + bias, sorted=True)` (PyTorch tie order), weights = unbiased probs x `routed_scaling_factor`, zero experts (`id >= num_real`) become `-1` and keep their weight for the identity residual | forward values (expert selection at near-ties, weights) |
 | `--logprob-order megatron` | Selected-token logprobs follow Megatron's vocab-parallel cross-entropy: row max, shift, target gather, `sum_exp` over fixed 32768-wide vocab blocks (the in-block tree is the registered `sampling.block_sumexp` leaf's; the fold across blocks is a rank-ordered fp32 left fold), `logp = -(log(sum_exp) - target)`, for output and prompt (input) logprobs alike | logprobs only |
-| `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 and no DeepEP all-to-all (both refused by `resolve_numerics`) and a kernel declaring `combine_order` with `slot`. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
+| `--moe-combine-order slot` | The MoE leaf folds a token's top-k routed outputs in fp32 in slot order across the EP group itself and adds the identity zero-expert residual in the same fold, as the trainer's grouped MLP does (`moe_plan(combine_order="slot")`, `plan["process_group"]` = the EP group); the host hands it the raw top-k (zero-expert ids intact, weights kept), adds no residual and runs no MoE all-reduce / reduce-scatter: `CommManager.post_moe_comm`, the one MoE reduction point every model goes through, reads the switch and only takes back this rank's rows in the RSAG layout; all-reduce+norm fusion is vetoed (`CommManager.should_fuse` re-derives the veto, so it holds wherever the fused kernel is relied upon). Needs MoE TP 1 (refused by `resolve_numerics` otherwise) and a kernel declaring `combine_order` with `slot`; under `--all2all-backend deepep` that kernel must also own the exchange (`supports_all_to_all_ep`) and returns the complete output of the rows this rank owns. Under `rank` the kernel returns a per-rank partial, the host reduces rank by rank and LongCat's residual enters exactly one partial (`adds_zero_expert_residual`, tp_ep_rank 0) | forward values |
 
 These are the switches the host can mirror with no new vendor dependency.
 The rest of the trainer's form lives in kernel leaves and model code the host

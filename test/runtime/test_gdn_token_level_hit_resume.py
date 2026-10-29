@@ -81,6 +81,7 @@ def _scheduler(ts, make_config):
             role="fused",
             num_snapshot_pages=1,
             max_retracted_requests=0,
+            host_write_policy="write_through",
             storage_config=None,
             cache_groups=groups,
         )
@@ -95,17 +96,18 @@ class TestGdnTokenLevelHitResumeTest:
 
     def setup_method(self):
         try:
+            from test.runtime.scheduler_driver import (
+                advance_scheduler,
+                make_extend_result_event,
+            )
+
             import tokenspeed_scheduler as ts
             from tokenspeed_kernel.ops.attention.gdn.triton import (
                 triton_gdn_chunk_prefill,
             )
 
             import tokenspeed.runtime.layers.attention.backends.state.mamba as mamba
-            from tokenspeed.runtime.engine.scheduler_utils import (
-                advance_scheduler,
-                make_config,
-                make_extend_result_event,
-            )
+            from tokenspeed.runtime.engine.scheduler_utils import make_config
             from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
         except (ImportError, ModuleNotFoundError) as exc:
             pytest.skip(f"needs tokenspeed_scheduler + tokenspeed_kernel: {exc}")
@@ -260,14 +262,11 @@ class TestGdnTokenLevelHitResumeTest:
 
     def test_the_repeat_resumes_from_the_published_prefill_state(self):
         mamba = self.mamba
-        decode_path = mamba._prepare_gdn_decode_state_path
+        from tokenspeed_kernel.selection import kernel_override
+
         with (
             patch.object(mamba, "gdn_chunk_prefill", self.triton_prefill),
-            patch.object(
-                mamba,
-                "_prepare_gdn_decode_state_path",
-                lambda *args: (*decode_path(*args)[:2], "triton"),
-            ),
+            kernel_override("attention", "gdn_decode_step", "triton"),
         ):
             self._computed = {}
             scheduler = _scheduler(self.ts, self.make_config)

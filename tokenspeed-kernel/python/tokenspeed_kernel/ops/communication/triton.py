@@ -110,6 +110,7 @@ __all__ = [
     "dp_sampling_gather",
     "dp_sampling_swap",
     "multicast_publish",
+    "rank_ordered_fold",
 ]
 
 
@@ -2225,3 +2226,61 @@ def multicast_publish(block: torch.Tensor, destination: torch.Tensor) -> None:
         BLOCK=_PUBLISH_BLOCK,
         num_warps=4,
     )
+
+
+@triton.jit(do_not_specialize=["cols", "stride_world", "stride_row", "stride_out"])
+def _rank_ordered_fold_kernel(
+    parts_ptr,
+    out_ptr,
+    cols,
+    stride_world,
+    stride_row,
+    stride_out,
+    WORLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = col < cols
+    source = parts_ptr + row * stride_row + col
+    acc = tl.load(source, mask=mask).to(tl.float32)
+    for rank in tl.static_range(1, WORLD):
+        acc = acc + tl.load(source + rank * stride_world, mask=mask).to(tl.float32)
+    # A -0.0 sum leaves as +0.0, as the lamport all-reduce kernels send it.
+    acc = acc + 0.0
+    tl.store(out_ptr + row * stride_out + col, acc.to(out_ptr.dtype.element_ty), mask)
+
+
+def rank_ordered_fold(parts: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Fold ``[world, rows, cols]`` partials left to right in fp32 into ``out``.
+
+    Every element starts from rank 0 and adds ranks 1..world-1 in order, with
+    one final rounding to ``out``'s dtype, so its value depends only on the
+    rank axis. A zero sum is stored as +0.0. ``parts`` may be any strided
+    view whose last axis is contiguous, such as a last-dim all-gather viewed
+    as ``[rows, world, cols]`` and transposed.
+
+    Args:
+        parts: ``[world, rows, cols]`` partials.
+        out: ``[rows, cols]`` destination with a contiguous last axis.
+
+    Returns:
+        ``out``.
+    """
+    world, rows, cols = parts.shape
+    if parts.stride(-1) != 1 or out.stride(-1) != 1 or out.shape != (rows, cols):
+        raise ValueError("rank_ordered_fold needs [world, rows, cols] partials")
+    if rows and cols:
+        block = 1024
+        _rank_ordered_fold_kernel[(rows, triton.cdiv(cols, block))](
+            parts,
+            out,
+            cols,
+            parts.stride(0),
+            parts.stride(1),
+            out.stride(0),
+            WORLD=world,
+            BLOCK=block,
+            num_warps=4,
+        )
+    return out

@@ -203,7 +203,7 @@ _BATCH_SCALARS = ["total", "capacity", "bs", "uniform_length", "check_history"]
 
 @triton.jit(
     do_not_specialize=_BATCH_SCALARS,
-    do_not_specialize_on_alignment=_SEED_VIEWS + _BATCH_SCALARS,
+    do_not_specialize_on_alignment=_SEED_VIEWS,
 )
 def _prepare_ngram_hash(
     snapshots,
