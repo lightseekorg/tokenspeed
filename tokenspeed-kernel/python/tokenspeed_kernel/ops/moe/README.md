@@ -425,3 +425,16 @@ over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
 The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
+
+## DeepGEMM shared-expert fusion
+
+Blackwell MXFP4 MegaMoE can fuse one complete FP8 shared expert per rank. Check
+`moe_supports_shared_expert_fusion`, then call `moe_process_shared_expert_weights`
+after routed and dense weight processing, before warmup and graph capture.
+When `moe_output_includes_shared_expert` is true, the output already includes
+shared; skip the standalone shared MLP and final addition. Use
+`moe_clear_shared_expert_weights` to disable fusion. Changing fusion state
+requires warmup and graph recapture.
+
+Staging reuses routed FP8 codes and writes `shared_l1_acts_sf` in MN-major
+scale pages using the native `block_m`.
