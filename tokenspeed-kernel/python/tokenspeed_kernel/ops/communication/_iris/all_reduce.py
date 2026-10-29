@@ -1788,7 +1788,11 @@ class ProducerAllReduce:
     # The one-shot sends every peer the whole payload; from this size the
     # two-shot was faster in 8-rank MI355X graph replay. TP4 keeps push.
     LAMPORT_TWO_SHOT_MIN_ELEMENTS = 48 * 1024
-    LAMPORT_TWO_SHOT_MAX_ELEMENTS = 128 * 8192
+    # Covers 172 rows of 8192, the most rows a speculative verify step
+    # reduces; from 129 to 172 rows the two-shot took 11.7-14.7 us against
+    # 22.1-25.5 us for the producer pull. Its three-stage mailboxes cost
+    # 16.1 MiB of symmetric heap per rank, 4.1 MiB more than at 128 rows.
+    LAMPORT_TWO_SHOT_MAX_ELEMENTS = 172 * 8192
     # iris_lamport_twoshot_bf16_allreduce reduces one 128-element tile of every
     # shard per program.
     LAMPORT_TWO_SHOT_TILE = 128

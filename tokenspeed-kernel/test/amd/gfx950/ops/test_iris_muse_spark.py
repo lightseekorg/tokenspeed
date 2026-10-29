@@ -372,7 +372,7 @@ def _muse_boundary_worker(rank, world_size, device, sharded):
             outputs.append(boundary(values, stream, weight))
             if sharded:
                 # Alternate Lamport and pull reductions over the boundary's scratch.
-                n = 129 * 8192 if index % 2 else 43 * 4096
+                n = 173 * 8192 if index % 2 else 43 * 4096
                 generic = state.all_reduce.acquire_outputs(((n,),))[0]
                 generic.fill_(rank + 1)
                 state.reduce_outputs((generic,))
@@ -454,6 +454,8 @@ def _muse_collective_policy_worker(rank, world_size, device):
         27 * 8192,
         128 * 8192,
         129 * 8192,
+        172 * 8192,
+        173 * 8192,
         8191 * 8192,
         8192 * 8192,
         32,
@@ -2621,7 +2623,8 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
         dist.all_reduce(expected)
         return values, expected
 
-    # Lamport one-shot and (TP8) two-shot windows, the TP4 push window, the
+    # Lamport one-shot and (TP8) two-shot windows, the two-shot's largest
+    # payload (172 rows) and one row past it, the TP4 push window, the
     # producer pull, a width outside the Lamport windows (the one-shot pull
     # at TP4, staging at TP8), and the largest payload served.
     limit_rows = ProducerAllReduce.ORDINARY_MAX_BYTES[world_size] // (8192 * 2)
@@ -2635,6 +2638,7 @@ def _muse_ordinary_all_reduce_worker(rank, world_size, device):
         (128, 8192),
         (129, 8192),
         (172, 8192),
+        (173, 8192),
         (limit_rows, 8192),
         (5, 4096),
         (1, 768),
