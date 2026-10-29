@@ -18,7 +18,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Loader boundary for the unchanged vendored Gluon Petit source."""
+"""Loader boundary for the unchanged vendored Gluon Petit source.
+
+Petit binds ``triton`` at import time. The loader redirects those imports to
+``tokenspeed_triton`` so Petit compiles with the same Triton as the rest of
+tokenspeed-kernel.
+"""
 
 from __future__ import annotations
 
@@ -26,6 +31,8 @@ import importlib
 import sys
 from pathlib import Path
 from types import ModuleType
+
+from tokenspeed_kernel._triton import redirect_triton_to_tokenspeed_triton
 
 
 def _is_below(path: str, root: Path) -> bool:
@@ -52,7 +59,8 @@ def load_petit_kernel() -> ModuleType:
     if vendor_path not in sys.path:
         sys.path.insert(0, vendor_path)
     importlib.invalidate_caches()
-    return importlib.import_module("petit_kernel")
+    with redirect_triton_to_tokenspeed_triton():
+        return importlib.import_module("petit_kernel")
 
 
 petit_kernel = load_petit_kernel()
