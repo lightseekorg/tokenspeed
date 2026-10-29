@@ -347,6 +347,27 @@ def warn_past_rope_table(
         )
 
 
+def drafter_accept_lengths(
+    accept_lengths: torch.Tensor, decode_requests: slice
+) -> torch.Tensor:
+    """The accepted lengths the drafter continues from.
+
+    A stopped request keeps no token and its drafts are discarded, but the
+    drafter still indexes the last accepted position, so each decode
+    request's length is at least 1. ``accept_lengths`` is left unchanged.
+
+    Args:
+        accept_lengths: ``[bs]`` accepted tokens per request.
+        decode_requests: The decode requests' rows.
+
+    Returns:
+        A new ``[bs]`` tensor.
+    """
+    lengths = accept_lengths.clone()
+    lengths[decode_requests].clamp_(min=1)
+    return lengths
+
+
 @dataclass
 class ModelExecutorConfig:
     """
@@ -1786,13 +1807,8 @@ class ModelExecutor:
         if self.drafter is not None:
             draft_accept_lengths = accept_lengths
             if ctx.output_layout.num_decodes:
-                # A stopped request keeps no token; its drafts are discarded,
-                # but the drafter indexes the last accepted position.
-                draft_accept_lengths = accept_lengths.clone()
-                draft_accept_lengths[ctx.output_layout.decode_request_slice] = (
-                    draft_accept_lengths[ctx.output_layout.decode_request_slice].clamp(
-                        min=1
-                    )
+                draft_accept_lengths = drafter_accept_lengths(
+                    accept_lengths, ctx.output_layout.decode_request_slice
                 )
             next_round_input_ids = self.drafter.run(
                 base_ctx=ctx,

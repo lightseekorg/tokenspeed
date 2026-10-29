@@ -44,6 +44,9 @@ from tokenspeed.runtime.execution.forward_batch_info import (  # noqa: E402
     CaptureHiddenMode,
     ForwardMode,
 )
+from tokenspeed.runtime.execution.model_executor import (  # noqa: E402
+    drafter_accept_lengths,
+)
 from tokenspeed.runtime.execution.output_layout import ForwardOutputLayout
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata  # noqa: E402
 from tokenspeed.runtime.models.target_capture import (  # noqa: E402
@@ -1344,6 +1347,17 @@ def test_unsupported_stream_fails_before_installing_capture(dflash_model):
     with pytest.raises(ValueError, match="only supply 'prefix'"):
         dflash_model.configure_target(target, None)
     setter.assert_not_called()
+
+
+def test_the_drafter_continues_each_decode_request_from_at_least_one_token():
+    """A stopped decode request (0 accepted) still hands the drafter its last
+    position; prefill rows and the reported lengths are left alone."""
+    accept_lengths = torch.tensor([0, 3, 0, 2], dtype=torch.int32)
+
+    lengths = drafter_accept_lengths(accept_lengths, slice(1, 4))
+
+    assert lengths.tolist() == [0, 3, 1, 2]
+    assert accept_lengths.tolist() == [0, 3, 0, 2]
 
 
 if __name__ == "__main__":
