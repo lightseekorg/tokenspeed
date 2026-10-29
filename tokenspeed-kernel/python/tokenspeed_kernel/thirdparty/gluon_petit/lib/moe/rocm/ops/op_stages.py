@@ -2,7 +2,6 @@
 
 from typing import NamedTuple
 
-import triton.experimental.gluon as g
 from lib.gemm.rocm.intrinsics import (
     _native_call,
     _native_store_ushort_component,
@@ -15,7 +14,8 @@ from lib.gemm.rocm.intrinsics import (
 from lib.moe.rocm.fused_moe import ClearMat, HotLoopScheduler
 from lib.moe.rocm.ops.schedule_tiles import InputShm, MxFp4Tile
 from lib.tal.device import DeviceTemplate, device_method
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 class W13State(NamedTuple):

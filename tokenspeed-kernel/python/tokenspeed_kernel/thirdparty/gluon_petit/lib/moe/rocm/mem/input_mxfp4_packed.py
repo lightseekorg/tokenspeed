@@ -10,7 +10,7 @@ from lib.gemm.rocm.intrinsics import (
 from lib.moe.rocm.memory_ops import _load_vector4, _register_array_get
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.tensor_ops import transpose_packed_bytes
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
 
 
 class PackedInputState(NamedTuple):

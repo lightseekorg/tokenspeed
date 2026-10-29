@@ -1,7 +1,5 @@
 """Native three-launch MegaMoE: dispatch/stage one, stage two, and combine."""
 
-import triton.experimental.gluon as g
-import triton.language as tl
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
     _native_call,
@@ -36,7 +34,9 @@ from lib.tal.tensor_ops import (
     store_words,
     wave_id,
 )
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import tl
 
 
 class MegaMoETwoStageCommComputeKernel(DeviceTemplate):

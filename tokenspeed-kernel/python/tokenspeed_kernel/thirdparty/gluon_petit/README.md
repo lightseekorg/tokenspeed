@@ -9,8 +9,8 @@ license is reproduced in `LICENSE.txt`.
 TokenSpeed's package boundary adds the vendor root to Python's module search
 path so the upstream `lib` and `petit_kernel` imports resolve unchanged. The
 vendored runtime retains only the supported MegaMoE execution path.
-The package imports `triton` at module load. The loader redirects those imports
-to `tokenspeed_triton`, so no separate Triton package is installed.
+The vendored sources import Triton through `tokenspeed_kernel._triton`, so they
+use `tokenspeed-triton` and no separate Triton package is installed.
 
 The retained runtime supports the registered GFX950 MegaMoE configurations,
 including GPT-OSS 120B (EP8, 128 experts, top-4, 2880x3072, biased OpenAI

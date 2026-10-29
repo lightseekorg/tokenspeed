@@ -4,9 +4,9 @@ Host calls evaluate Python integers. Device calls inline the same function's
 Gluon JIT body, with the layout/configuration object as a constexpr argument.
 """
 
-import triton.experimental.gluon as g
-from triton.experimental.gluon import language as l
-from triton.experimental.gluon.language._core import _unwrap_if_constexpr
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import gluon_unwrap_if_constexpr as _unwrap_if_constexpr
 
 
 class host_device:

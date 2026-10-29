@@ -25,8 +25,6 @@
 from enum import IntEnum
 from typing import NamedTuple
 
-import triton
-import triton.experimental.gluon as g
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
     BufferResourceFields,
@@ -39,8 +37,10 @@ from lib.gemm.rocm.intrinsics import (
 )
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.host_device import host_device
-from triton.experimental.gluon import language as l
-from triton.experimental.gluon.language._core import builtin
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import gluon_builtin as builtin
+from tokenspeed_kernel._triton import triton
 
 
 class MoeArchitecture(IntEnum):

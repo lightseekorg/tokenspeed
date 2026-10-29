@@ -34,16 +34,17 @@ from hashlib import sha256
 from pathlib import Path
 from typing import NamedTuple
 
-import triton
-import triton.experimental.gluon as g
-from triton.experimental.gluon import language as l
-from triton.experimental.gluon.language._core import (
-    _unwrap_if_constexpr,
-    builtin,
-    distributed_type,
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+from tokenspeed_kernel._triton import gluon_builtin as builtin
+from tokenspeed_kernel._triton import gluon_distributed_type as distributed_type
+from tokenspeed_kernel._triton import gluon_unwrap_if_constexpr as _unwrap_if_constexpr
+from tokenspeed_kernel._triton import (
+    triton,
 )
-from triton.experimental.gluon.language.extra import libdevice
-from triton.runtime.cache import get_cache_manager
+
+libdevice = l.extra.libdevice
+get_cache_manager = triton.runtime.cache.get_cache_manager
 
 # This port targets gfx950. Match the native device-compilation capability flags.
 HAS_AMD_SCHED_BARRIER = l.constexpr(True)

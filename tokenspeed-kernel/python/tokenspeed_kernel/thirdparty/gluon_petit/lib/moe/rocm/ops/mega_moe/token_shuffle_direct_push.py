@@ -2,7 +2,6 @@
 
 from typing import NamedTuple
 
-import triton.language as tl
 from lib.gemm.rocm.intrinsics import (
     BufferResource,
     _native_call,
@@ -29,7 +28,8 @@ from lib.tal.tensor_ops import (
     wave_id,
     wave_inclusive_sum,
 )
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import tl
 
 
 class Shm(NamedTuple):

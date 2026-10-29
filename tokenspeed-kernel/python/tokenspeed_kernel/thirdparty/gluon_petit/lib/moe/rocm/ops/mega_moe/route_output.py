@@ -12,7 +12,7 @@ from lib.moe.rocm.mega_moe.workspace import MegaMoEWorkspace
 from lib.moe.rocm.ops.op_stages import TwoStageStage2Epilogue
 from lib.tal.device import DeviceTemplate, device_method
 from lib.tal.tensor_ops import load_words, store_vector4
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
 
 
 class Context(NamedTuple):

@@ -22,9 +22,10 @@
 
 """CDNA4 operations with Petit's existing per-lane register views."""
 
-import triton.experimental.gluon as g
-from triton.experimental.gluon import language as l
-from triton.experimental.gluon.language.amd import cdna4
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+
+cdna4 = l.amd.cdna4
 
 
 @g.jit
