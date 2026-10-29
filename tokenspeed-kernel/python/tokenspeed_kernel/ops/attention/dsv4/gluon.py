@@ -190,7 +190,8 @@ if current_platform().is_amd:
         priority=Priority.SPECIALIZED,
         traits={
             "head_dim": frozenset({512}),
-            "selected_width": frozenset({128, 384, 512, 640, 768, 1024, 1152}),
+            # 133: DSpark draft attention, a 128-row window plus the 5-row block.
+            "selected_width": frozenset({128, 133, 384, 512, 640, 768, 1024, 1152}),
             "cache_layout": frozenset({"dense_workspace"}),
             "metadata_dtypes": frozenset({torch.int32}),
             "sinks": frozenset({True}),
