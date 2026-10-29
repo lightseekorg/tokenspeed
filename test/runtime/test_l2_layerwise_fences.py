@@ -195,6 +195,34 @@ def host_cache(request, io_backend):
         from test.runtime.test_glm53_flash_cache_spec import _recipe
 
         recipe = _recipe(tp_size=8, mla_cache_dtype=torch.bfloat16, draft_layers=1)
+    elif family == "inkling":
+        from tokenspeed.runtime.configs.inkling_config import InklingModelConfig
+
+        text_config = InklingModelConfig(num_hidden_layers=2, use_sconv=True)
+        attn_config = AttnConfig(
+            kv_cache_dtype=torch.bfloat16,
+            prefix_granularity=128,
+            kernel_page_size=128,
+            components=(
+                MHAConfig(
+                    backend_name="mha",
+                    num_attention_heads=text_config.num_attention_heads,
+                    num_kv_heads=text_config.num_key_value_heads,
+                    head_dim=text_config.head_dim,
+                    attn_tp_size=1,
+                    cache_layer_types=tuple(text_config.cache_layer_types),
+                ),
+            ),
+            **model_wide,
+        )
+        recipe = cache_recipe(
+            "inkling",
+            model_config=SimpleNamespace(num_attention_layers=2, hf_config=text_config),
+            attn_config=attn_config,
+            draft_model_config=None,
+            draft_attn_config=None,
+            **recipe_args,
+        )
     # A probe-sized arena: a few blocks per group, pages 1-3 below.
     recipe.cache_budget_bytes = 0
     recipe.probe_batch_rows = 4
@@ -599,6 +627,87 @@ def test_a_kpool_write_lands_after_its_tail_page_load(host_cache):
     assert torch.equal(scales[page, :hit].view(torch.int32), host_rows[1])
     assert torch.equal(values[page, hit:].view(torch.uint8), expected[0])
     assert torch.equal(scales[page, hit:].view(torch.int32), expected[1])
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache", [("inkling", "kvconv")], ids=["inkling"], indirect=True
+)
+def test_the_kv_short_conv_reads_its_checkpoint_after_the_load(host_cache):
+    """Inkling's K/V short conv reads the chunk's input checkpoint
+    (``kvconv_checkpoint_buffers``) before the attention prologue, the layer's
+    first layerwise wait. A Host hit loads that checkpoint; the read sees what
+    the slot held before unless it waits."""
+    cache = host_cache
+    pool = cache.pool
+    page_size = cache.arena.prefix_granularity
+    page, layer = 2, 0
+    slots = torch.arange(page * page_size, (page + 1) * page_size, device="cuda")
+    host_rows = [
+        buffer[1].clone().view(torch.uint8)
+        for buffer in pool.kvconv_checkpoint_buffers(layer)
+    ]
+    # Load destinations are never zeroed: give the slot other bytes.
+    cache.arena.zero_blocks({"kvconv": np.asarray([page])})
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    seen = [buffer[page].clone() for buffer in pool.kvconv_checkpoint_buffers(layer)]
+    pool.kv_write_target(layer, slots, None)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    for rows, host in zip(seen, host_rows):
+        assert torch.equal(rows.view(torch.uint8), host)
+
+
+@pytest.mark.parametrize("io_backend", ["direct"])
+@pytest.mark.parametrize(
+    "host_cache", [("inkling", "kvconv")], ids=["inkling"], indirect=True
+)
+def test_a_later_layer_reads_its_checkpoint_after_its_own_load(host_cache):
+    """The read waits for the layer it reads, not for an earlier one. In a
+    load whose earlier layers land at once and whose copy of the last layer's
+    checkpoint is held back, a read of that checkpoint sees what the copy
+    brings."""
+    from tokenspeed.runtime.cache.l2.layerwise_load import LayerwiseLoadTracker
+
+    cache = host_cache
+    pool = cache.pool
+    page, layer = 2, pool.layer_num - 1
+    assert layer > 0
+    tracker = LayerwiseLoadTracker(pool.layer_num)
+    pool.register_layerwise_load_tracker(tracker)
+    buffers = pool.kvconv_checkpoint_buffers(layer)
+    host_rows = [buffer[1].clone().view(torch.uint8) for buffer in buffers]
+    # Load destinations are never zeroed: give the slot other bytes.
+    cache.arena.zero_blocks({"kvconv": np.asarray([page])})
+
+    # The load, on a stream of its own: the layer events record in layer
+    # order, as the load stream records them, and only the last layer's copy
+    # is held back, so a wait for an earlier layer returns before it lands.
+    load = tracker.begin_load()
+    events = tracker.event_sets[load]
+    load_stream = torch.cuda.Stream()
+    load_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(load_stream):
+        for earlier in range(layer):
+            events.layer_done_events[earlier].record()
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+        for buffer in buffers:
+            buffer[page].copy_(buffer[1])
+        events.layer_done_events[layer].record()
+    tracker.set_consumers(load)
+    seen = [buffer[page].clone() for buffer in pool.kvconv_checkpoint_buffers(layer)]
+    assert not load_stream.query()
+    torch.cuda.synchronize()
+    for rows, host in zip(seen, host_rows):
+        assert torch.equal(rows.view(torch.uint8), host)
 
 
 if __name__ == "__main__":
