@@ -1916,6 +1916,9 @@ def moe_plan(
     the selected apply kernel, then pinned by callable in the returned plan so load
     time does not rerun selection or conflict resolution. The plan carries
     ``combine_order`` and ``process_group`` for the apply kernel to read.
+    Unquantized CUTLASS plans use fused expert reduction by default.
+    Set ``plan["cutlass_fused_finalize"] = False`` before warmup to use
+    a separate reduction instead of floating-point atomics.
     """
     weight_dtype = _normalize_weight_dtype(weight_dtype)
     _validate_a2a_backend(a2a_backend)
@@ -2044,6 +2047,7 @@ def moe_plan(
         "persistent_max_num_tokens_per_gpu": persistent_max_num_tokens_per_gpu,
         "fast_math": fast_math,
         "combine_order": combine_order,
+        "cutlass_fused_finalize": True,
         "support_routing": support_routing,
         "supports_precomputed_topk": supports_precomputed_topk,
         "supports_deferred_finalize": supports_deferred_finalize,

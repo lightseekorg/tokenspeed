@@ -255,6 +255,15 @@ is never in use by two calls at once; a model that overlapped two MoE calls on
 separate streams would need one buffer per stream. PDL stays off in this
 chain for the race described in the BF16 CUTLASS section of `flashinfer.py`.
 
+FP16/BF16 unquantized CUTLASS plans default to fused finalize. Fusing
+the top-k expert reduction into the GEMM2 epilogue uses floating-point
+atomics and does not preserve the reduction order across calls. The plan's
+`cutlass_fused_finalize` value is passed explicitly to both the workspace
+size query and the MoE call. Set it to `False` for a separate reduction.
+Choose the value before warmup and CUDA graph capture; changing it after
+capture does not update recorded kernels. This controls
+one reduction, rather than the complete deployment's determinism contract.
+
 ### FP8 per-channel experts
 
 The FP8 per-channel TRT-LLM section of `flashinfer.py` runs `fp8_channel`

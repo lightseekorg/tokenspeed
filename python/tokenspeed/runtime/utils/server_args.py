@@ -476,6 +476,8 @@ class ServerArgs:
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # GEMM2 atomic expert combine for unquantized FlashInfer CUTLASS MoE.
+    moe_cutlass_fused_finalize: bool = True
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
@@ -522,6 +524,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = None
+    min_kv_split: int | None = None
     kda_backend: str = "auto"
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
@@ -1528,6 +1531,17 @@ class ServerArgs:
                 "or accuracy evaluation."
             )
 
+        if self.min_kv_split is not None:
+            if type(self.min_kv_split) is not int or not 1 <= self.min_kv_split <= 256:
+                raise ValueError("min_kv_split must be an integer in [1, 256]")
+            if self.attention_backend != "tokenspeed_mla" or (
+                self.speculative_algorithm is not None
+                and self.drafter_attention_backend not in (None, "tokenspeed_mla")
+            ):
+                raise ValueError(
+                    "--min-kv-split requires tokenspeed_mla for target and draft attention"
+                )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -1825,6 +1839,7 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
+        self.moe_cutlass_fused_finalize = False
         # MoE keeps auto or the user's provider restriction. The expert
         # plan checks the batch_invariant feature against actual layer geometry.
         # Sampling: greedy rows must break exact logit ties canonically, and
@@ -3002,6 +3017,15 @@ class ServerArgs:
             "rl-bitwise the selected kernel must declare batch invariance.",
         )
         parser.add_argument(
+            "--moe-cutlass-fused-finalize",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.moe_cutlass_fused_finalize,
+            help="Enable GEMM2 atomic expert combine for unquantized FP16/BF16 "
+            "MoE on flashinfer_cutlass, for target and draft models. On by "
+            "default; the fused reduction is not run-to-run reproducible. Forced "
+            "off by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
             "--moe-mxfp4-fp8-activation",
             action="store_true",
             help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
@@ -3085,6 +3109,14 @@ class ServerArgs:
             f"{attention_backend_names}, or a name a plugin registers. 'mha' "
             "selects compatible registered MHA kernels; 'gluon' forces "
             "registered Gluon MLA kernels.",
+        )
+        parser.add_argument(
+            "--min-kv-split",
+            type=int,
+            default=None,
+            help="Minimum decode KV splits for tokenspeed_mla target and draft attention "
+            "(1–256). Omit to retain automatic selection. Larger values can improve "
+            "long-context decoding at the cost of workspace and short-context latency.",
         )
         parser.add_argument(
             "--kda-backend",
