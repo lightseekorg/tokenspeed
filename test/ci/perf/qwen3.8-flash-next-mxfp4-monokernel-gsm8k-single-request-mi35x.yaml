@@ -12,8 +12,9 @@ api_version: ci.tokenspeed.io/v1
 #
 # One server start gates both: the benchmark exits with status 1 below
 # --min-accuracy, and perf_reference gates the decode rate. Without
-# --decode-monokernel the same job decodes at 377 tok/s per request on MI350X
-# (70% of the reference), so a change that turns the monokernel off fails too.
+# --decode-monokernel the same job decodes at 377 tok/s per request on an
+# MI350X where the monokernel decodes at 580, so a change that turns the
+# monokernel off fails too.
 name: perf-qwen3.8-flash-next-mxfp4-monokernel-gsm8k-single-request-mi35x
 type: perf
 workflow_stage: model-test
@@ -23,7 +24,7 @@ triggers:
 runner:
   labels:
     - amd-mi35x-2gpu-test
-# Non-blocking until perf_reference is set from runs on this runner.
+# Non-blocking until later runs confirm perf_reference.
 optional: true
 env:
   CI: "true"
@@ -72,9 +73,7 @@ report:
 perf_threshold: 0.9
 # Values are [Latency (tps/user), Throughput (tps/gpu)].
 #
-# PROVISIONAL: a hand measurement on one MI350X (596 tok/s per request,
-# about 526 tok/s end to end, 122 / 128 correct), not on this runner. Replace
-# it with the documented convention (rounded down from the median of the three
-# most recent passing runs) once there are three, then drop `optional`.
+# Rounded down from the median of three runs on this runner (443.0 tok/s per
+# request, 401.7 tok/s per GPU, 122 / 128 correct).
 perf_reference:
-  1: [540, 470]
+  1: [440, 400]
