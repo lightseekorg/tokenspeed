@@ -487,12 +487,10 @@ class TestRoutingFlash:
     TOPK = 12
     SCALE = 6.0
 
-    def _make_inputs(self, num_tokens=16, seed=42):
+    def _make_inputs(self, num_experts, num_tokens=16, seed=42):
         torch.manual_seed(seed)
-        inp = torch.randn(
-            num_tokens, self.NUM_EXPERTS, device="cuda", dtype=torch.float32
-        )
-        bias = torch.randn(self.NUM_EXPERTS, device="cuda", dtype=torch.float32)
+        inp = torch.randn(num_tokens, num_experts, device="cuda", dtype=torch.float32)
+        bias = torch.randn(num_experts, device="cuda", dtype=torch.float32)
         idx = torch.empty(num_tokens, self.TOPK, device="cuda", dtype=torch.int32)
         wts = torch.empty(num_tokens, self.TOPK, device="cuda", dtype=torch.float32)
         return inp, bias, idx, wts
@@ -512,16 +510,17 @@ class TestRoutingFlash:
         """Produces correct shape."""
         from tokenspeed_kernel.thirdparty.cuda import routing_flash as tk_route
 
-        inp, bias, idx, wts = self._make_inputs()
+        inp, bias, idx, wts = self._make_inputs(self.NUM_EXPERTS)
         tk_route(inp, bias, idx, wts, self.NUM_REAL_EXPERTS, self.SCALE, False)
         assert idx.shape == (16, self.TOPK)
         assert wts.shape == (16, self.TOPK)
 
-    def test_correctness(self):
-        """Matches torch reference."""
+    @pytest.mark.parametrize("num_experts", [384, 576])
+    def test_correctness(self, num_experts):
+        """Matches torch reference for single-warp and block-wide softmax."""
         from tokenspeed_kernel.thirdparty.cuda import routing_flash as tk_route
 
-        inp, bias, idx, wts = self._make_inputs()
+        inp, bias, idx, wts = self._make_inputs(num_experts)
         inp_clone = inp.clone()
         ref_idx, ref_wts = self._torch_ref(inp_clone, bias, 16)
         tk_route(inp, bias, idx, wts, self.NUM_REAL_EXPERTS, self.SCALE, False)
