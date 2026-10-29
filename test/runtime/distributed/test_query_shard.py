@@ -86,13 +86,46 @@ def test_scatter_count_matches_the_rsag_split():
     assert scatter_count(0, 3) == [0, 0, 0]
 
 
+@pytest.mark.parametrize(
+    "length,size,expected",
+    [
+        (0, 2, [0, 0, 0, 0]),
+        (1, 2, [1, 0, 0, 0]),
+        (7, 2, [2, 2, 2, 1]),
+        (8, 2, [2, 2, 2, 2]),
+        (9, 2, [3, 2, 2, 2]),
+        (10, 2, [3, 3, 2, 2]),
+        (3, 4, [1, 1, 1, 0, 0, 0, 0, 0]),
+        (5, 1, [3, 2]),
+    ],
+)
+def test_zigzag_segment_lengths_put_remainders_first(length, size, expected):
+    assert zigzag_segment_lengths(length, size) == expected
+
+
 def test_a_request_is_cut_into_two_segments_per_rank():
-    # The first segments take the remainder.
-    assert zigzag_segment_lengths(10, 2) == [3, 3, 2, 2]
-    assert zigzag_segment_lengths(3, 4) == [1, 1, 1, 0, 0, 0, 0, 0]
     # Rank r computes segments r and 2N - 1 - r: an early and a late part.
     plan = _plans(16, [16], 4)[1]
     assert plan.local_row_ids.tolist() == [2, 3, 12, 13]
+
+
+@pytest.mark.parametrize(
+    "lengths,size,expected",
+    [
+        ([10], 2, [[0, 1, 2, 8, 9], [3, 4, 5, 6, 7]]),
+        ([1, 1, 1], 4, [[0, 1, 2], [], [], []]),
+        (
+            [5, 3, 7],
+            4,
+            [[0, 5, 8], [1, 6, 9, 14], [2, 7, 10, 13], [3, 4, 11, 12]],
+        ),
+        ([], 2, [[], []]),
+    ],
+)
+def test_zigzag_rows_match_explicit_layouts(lengths, size, expected):
+    # Keep an oracle independent of the shared segment calculation.
+    plans = _plans(sum(lengths), lengths, size)
+    assert [plan.local_row_ids.tolist() for plan in plans] == expected
 
 
 @pytest.mark.parametrize(

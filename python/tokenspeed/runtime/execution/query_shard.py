@@ -72,14 +72,24 @@ def scatter_count(num_tokens: int, size: int) -> list[int]:
     return [base + 1] * remainder + [base] * (size - remainder)
 
 
+def _segment_lengths(lengths: torch.Tensor, segments: int) -> torch.Tensor:
+    """Remainder-first segment lengths for a batch: ``[bs, segments]`` on CPU."""
+    base, remainder = lengths // segments, lengths % segments
+    return base.unsqueeze(1) + (
+        torch.arange(segments).unsqueeze(0) < remainder.unsqueeze(1)
+    ).to(torch.int64)
+
+
 def zigzag_segment_lengths(length: int, size: int) -> list[int]:
     """Cut one request's ``length`` new rows into ``2 * size`` segments.
 
     The first segments are one row longer when ``length`` does not divide
     evenly; segment ``j`` belongs to rank ``j`` for ``j < size`` and to rank
-    ``2 * size - 1 - j`` otherwise.
+    ``2 * size - 1 - j`` otherwise. Uses the same CPU segment calculation
+    as ``QueryShardPlan.from_forward``, for a single request.
     """
-    return scatter_count(length, 2 * size)
+    lengths = torch.tensor([length], dtype=torch.int64)
+    return _segment_lengths(lengths, 2 * size)[0].tolist()
 
 
 @dataclass(frozen=True)
@@ -208,11 +218,7 @@ class QueryShardPlan:
             raise ValueError(f"query shard rank {rank} is outside a group of {size}")
         bs = lengths.shape[0]
         segments = 2 * size
-        # [bs, 2N] segment lengths, the zigzag_segment_lengths of every request.
-        base, remainder = lengths // segments, lengths % segments
-        seg_lens = base.unsqueeze(1) + (
-            torch.arange(segments).unsqueeze(0) < remainder.unsqueeze(1)
-        ).to(torch.int64)
+        seg_lens = _segment_lengths(lengths, segments)  # [bs, 2N]
         seg_starts = (_exclusive_cumsum(lengths).unsqueeze(1)) + (
             torch.cumsum(seg_lens, dim=1) - seg_lens
         )
