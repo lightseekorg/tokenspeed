@@ -610,6 +610,17 @@ class ExtendProgram:
 
 
 @gluon.jit
+def _needs_mask(cfg, start_n, window_end, mask_start):
+    # Whether the page starting at key start_n holds a key that some row of
+    # the tile must not see (see _stream_kv). The operands are the same for
+    # every lane of the work-group, so all its waves take the same branch.
+    needs = start_n + cfg.BLOCK_N > mask_start
+    if cfg.WINDOW_LEFT >= 0:
+        needs = needs | (start_n < window_end)
+    return needs
+
+
+@gluon.jit
 def _stream_kv(
     program,
     q,
@@ -641,14 +652,23 @@ def _stream_kv(
         [NUM_STAGES, cfg.BLOCK_N, cfg.HEAD_DIM],
         cfg.v_smem_layout,
     )
-    # Keys before mask_start are visible to every row of the tile, so pages
-    # that end by it need no mask.
-    if cfg.WINDOW_LEFT >= 0:
-        mask_start = kv_start
-    elif cfg.IS_CAUSAL:
+    # Keys in [window_end, mask_start) are visible to every row of the tile,
+    # so pages inside that range need no mask. The causal diagonal and the
+    # cache end only cut pages that end past mask_start (the first row's
+    # position when causal, else the cache end). A sliding window only cuts
+    # pages that start before window_end, the window's lower edge for the
+    # tile's last row: a long window spans many pages, and only the pages
+    # that hold some row's window edge need the mask.
+    if cfg.IS_CAUSAL:
         mask_start = min(program.prefix + program.q_pos_base, kv_end)
     else:
         mask_start = kv_end
+    if cfg.WINDOW_LEFT >= 0:
+        window_end = (
+            program.prefix + program.q_pos_base + cfg.BLOCK_Q - 1 - cfg.WINDOW_LEFT
+        )
+    else:
+        window_end = kv_start
     last_page = (kv_end - 1) // cfg.PAGE_SIZE
     tile_offsets = program.page_tile_offsets()
     iteration_tokens: gl.constexpr = NUM_STAGES * cfg.BLOCK_N
@@ -665,7 +685,7 @@ def _stream_kv(
             async_copy.wait_group(1)
             k = program.shared_load_k(k_smem.index(0))
             qk = program.compute_qk(q, k)
-            if start_n + cfg.BLOCK_N > mask_start:
+            if _needs_mask(cfg, start_n, window_end, mask_start):
                 qk = program.mask_kv(qk, start_n, kv_end)
             p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc, ALLOW_INVALID)
             async_copy.wait_group(0)
@@ -711,7 +731,7 @@ def _stream_kv(
                 async_copy.wait_group(2 * NUM_STAGES - 1)
                 k = program.shared_load_k(k_smem.index(stage))
                 qk = program.compute_qk(q, k)
-                if start_n + cfg.BLOCK_N > mask_start:
+                if _needs_mask(cfg, start_n, window_end, mask_start):
                     qk = program.mask_kv(qk, start_n, kv_end)
                 p, m_i, l_i, acc = program.softmax(qk, m_i, l_i, acc, ALLOW_INVALID)
                 async_copy.wait_group(2 * NUM_STAGES - 2)

@@ -192,10 +192,14 @@ def assert_reference(case: PagedCase):
         expected, expected_lse = reference(case)
         actual, actual_lse = case.invoke("gluon", return_lse=True)
         ordinary = case.invoke("gluon", return_lse=False)
-        # The public MHA LSE tests use these existing output/LSE tolerances.
+        # The output goes through BF16 probabilities and keeps the public MHA
+        # tolerance. The LSE is summed in FP32 from FP32 scores and stays
+        # within 2e-4 of the FP32 oracle even over 50k keys; a page of keys
+        # wrongly in or out of a window of up to a few thousand keys moves it
+        # further.
         torch.testing.assert_close(actual.float(), expected, rtol=8e-2, atol=8e-2)
         torch.testing.assert_close(ordinary.float(), expected, rtol=8e-2, atol=8e-2)
-        torch.testing.assert_close(actual_lse, expected_lse, rtol=8e-2, atol=8e-2)
+        torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=2e-4)
         assert torch.isfinite(actual).all() and torch.isfinite(actual_lse).all()
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
@@ -297,6 +301,35 @@ def test_kv_stream(queries, prefixes, window):
         window=window,
         causal=True,
         sinks=window >= 0,
+        head_dim=64,
+    )
+    assert_reference(case)
+
+
+@pytest.mark.parametrize(
+    "queries,prefixes",
+    [
+        # 63 tiles of 16 positions: the K/V page loads are pipelined.
+        pytest.param([1000], [5000 + 13], id="pipelined"),
+        # 768 work-groups: the page loads are single-buffered.
+        pytest.param([6144], [3000 + 7], id="single-buffer"),
+        # A tile straddling the prefix end, and windows longer than the context.
+        pytest.param([37, 300], [9, 700], id="short-context"),
+    ],
+)
+@pytest.mark.parametrize("window", [100, 511, 2047])
+@pytest.mark.usefixtures("require_gfx950")
+def test_sliding_window_sees_exactly_its_keys(queries, prefixes, window):
+    # Only the pages that hold some row's window edge or its causal diagonal
+    # are masked; the pages between are visible to every row of a tile.
+    case = make_case(
+        queries,
+        prefixes,
+        heads=16,
+        kv_heads=2,
+        window=window,
+        causal=True,
+        sinks=False,
         head_dim=64,
     )
     assert_reference(case)
