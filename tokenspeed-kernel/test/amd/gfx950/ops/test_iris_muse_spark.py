@@ -2582,6 +2582,207 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
     dist.barrier()
 
 
+def _muse_ordinary_all_reduce_worker(rank, world_size, device):
+    """Ordinary all-reduces on Muse's group, such as a draft model's per-layer
+    reductions, use its prepared reduction: they match RCCL bit for bit, stay
+    in caller storage across later collectives and another stream's reads,
+    replay from a graph interleaved with Muse's own reductions, and hand
+    payloads past the limit, views of state storage and MAX to RCCL or
+    staging. Muse's own ordinary reduce takes the same policy."""
+    torch.set_grad_enabled(False)
+    from tokenspeed_kernel.ops.communication._iris.all_reduce import (
+        ProducerAllReduce,
+        iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
+        iris_pull_oneshot,
+        iris_pull_twoshot,
+        iris_push_twoshot_allreduce,
+    )
+    from utils import assert_no_triton_compile
+
+    from tokenspeed.runtime.distributed.comm_backend.registry import (
+        get_global_backend,
+    )
+    from tokenspeed.runtime.distributed.comm_ops import all_reduce
+
+    group, state = _prepare_muse_backend(world_size, None, None, expert_tp_size=1)
+    iris = get_global_backend().iris
+    generator = torch.Generator(device=device).manual_seed(rank)
+
+    def operands(rows, width=8192):
+        # Small integers sum exactly in any order, so every protocol must
+        # match RCCL bit for bit. Negative zeros look like the Lamport empty
+        # marker and must still be reduced as zeros.
+        values = torch.randint(
+            -16, 17, (rows, width), generator=generator, device=device
+        ).bfloat16()
+        values[:, rank::7] = -0.0
+        expected = values.clone()
+        dist.all_reduce(expected)
+        return values, expected
+
+    # Lamport one-shot and (TP8) two-shot windows, the TP4 push window, the
+    # producer pull, a width outside the Lamport windows (the one-shot pull
+    # at TP4, staging at TP8), and the largest payload served.
+    limit_rows = ProducerAllReduce.ORDINARY_MAX_BYTES[world_size] // (8192 * 2)
+    for rows, width in (
+        (1, 8192),
+        (8, 8192),
+        (21, 8192),
+        (22, 8192),
+        (33, 8192),
+        (64, 8192),
+        (128, 8192),
+        (129, 8192),
+        (172, 8192),
+        (limit_rows, 8192),
+        (5, 4096),
+        (1, 768),
+    ):
+        values, expected = operands(rows, width)
+        assert iris.can_run(values, group)
+        result = all_reduce(values, group)
+        assert result.data_ptr() == values.data_ptr()
+        torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    values, expected = operands(limit_rows + 1)
+    assert not state.reduction.can_reduce_ordinary(values, rccl_fallback=True)
+    assert not iris.can_run(values, group)
+    torch.testing.assert_close(all_reduce(values, group), expected, atol=0, rtol=0)
+    # Muse's own reduce has no RCCL fallback and serves it through the policy.
+    values, expected = operands(limit_rows + 1)
+    torch.testing.assert_close(state.reduce(values), expected, atol=0, rtol=0)
+    values, expected = operands(64)
+    torch.testing.assert_close(state.reduce(values), expected, atol=0, rtol=0)
+
+    values, _ = operands(8)
+    maximum = values.clone()
+    dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+    assert not iris.can_run(values, group, op=dist.ReduceOp.MAX)
+    torch.testing.assert_close(
+        all_reduce(values, group, op=dist.ReduceOp.MAX), maximum, atol=0, rtol=0
+    )
+
+    # A reduce-scatter result lives in pull scratch; reducing it in place
+    # through the pull would overwrite it, so the policy declines it.
+    full, _ = operands(192)
+    owned = state.reduce_scatter_owned_rows(full)
+    # Refill the view with small integers so the reduction stays exact.
+    values, expected = operands(owned.shape[0])
+    owned.copy_(values)
+    assert not state.reduction.can_reduce_ordinary(owned, rccl_fallback=True)
+    torch.testing.assert_close(all_reduce(owned, group), expected, atol=0, rtol=0)
+
+    # Reduce Lamport-sized and pull-sized payloads, then keep the model's
+    # own reduction and more ordinary ones running on the main stream while
+    # another stream, delayed, copies the first two results. A result that
+    # borrowed state storage would be overwritten by then.
+    aux = torch.cuda.Stream(device)
+    # The last two sizes take the Lamport one-shot over 48 tiles, while
+    # Muse's 5-row reduction between them uses 80 tiles of the same mailbox.
+    shapes = ((64, 8192), (172, 8192), (8, 8192), (3, 8192))
+    sources = [
+        torch.empty(shape, dtype=torch.bfloat16, device=device) for shape in shapes
+    ]
+    reduced = [torch.empty_like(source) for source in sources]
+    copies = [torch.empty_like(source) for source in sources[:2]]
+    target_source = torch.empty((26, 8192), dtype=torch.bfloat16, device=device)
+    fork = torch.cuda.Event()
+    join = torch.cuda.Event()
+
+    def step():
+        first = all_reduce(reduced[0], group)
+        fork.record()
+        with torch.cuda.stream(aux):
+            aux.wait_event(fork)
+            torch.cuda._sleep(50000)
+            copies[0].copy_(first)
+        second = all_reduce(reduced[1], group)
+        branch = state.all_reduce.acquire_outputs(((26, 8192),))[0]
+        branch.copy_(target_source)
+        target = state.reduce_outputs((branch,))[0].clone()
+        all_reduce(reduced[2], group)
+        small = state.all_reduce.acquire_outputs(((5, 8192),))[0]
+        small.copy_(target_source[:5])
+        small_target = state.reduce_outputs((small,))[0].clone()
+        all_reduce(reduced[3], group)
+        fork.record()
+        with torch.cuda.stream(aux):
+            aux.wait_event(fork)
+            copies[1].copy_(second)
+            join.record()
+        torch.cuda.current_stream().wait_event(join)
+        return target, small_target
+
+    def load(step_index):
+        expected = []
+        for source, destination in zip(sources, reduced):
+            values, total = operands(source.shape[0])
+            source.copy_(values)
+            destination.copy_(values)
+            expected.append(total)
+        target_source.fill_((rank + 1) * (step_index + 1))
+        return expected
+
+    def check(expected, targets, step_index):
+        for actual, total in zip(reduced, expected):
+            torch.testing.assert_close(actual, total, atol=0, rtol=0)
+        for actual, total in zip(copies, expected):
+            torch.testing.assert_close(actual, total, atol=0, rtol=0)
+        for target in targets:
+            torch.testing.assert_close(
+                target,
+                torch.full_like(
+                    target, world_size * (world_size + 1) // 2 * (step_index + 1)
+                ),
+                atol=0,
+                rtol=0,
+            )
+
+    expected = load(0)
+    check(expected, step(), 0)
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        targets = step()
+    for step_index in range(6):
+        expected = load(step_index)
+        torch.cuda.synchronize()
+        if rank == step_index % world_size:
+            torch.cuda._sleep(20000)
+        graph.replay()
+        check(expected, targets, step_index)
+
+    # Sizes between and around the ones above reuse the compiled kernels: the
+    # pulls take their workgroup and tile counts unspecialized.
+    with assert_no_triton_compile(
+        iris_lamport_bf16_allreduce,
+        iris_lamport_twoshot_bf16_allreduce,
+        iris_pull_oneshot,
+        iris_pull_twoshot,
+        iris_push_twoshot_allreduce,
+    ):
+        for rows, width in (
+            (3, 8192),
+            (17, 8192),
+            (40, 8192),
+            (80, 8192),
+            (100, 8192),
+            (136, 8192),
+            (150, 8192),
+            (200, 8192),
+            (300, 8192),
+            (3, 768),
+        ):
+            values, expected = operands(rows, width)
+            torch.testing.assert_close(
+                all_reduce(values, group), expected, atol=0, rtol=0
+            )
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
 @pytest.mark.parametrize(
     "check,backend",
     [
@@ -2605,6 +2806,9 @@ def _muse_owned_stream_tap_worker(rank, world_size, device):
         pytest.param(_muse_lamport_payload_worker, "nccl", id="lamport_payloads"),
         pytest.param(_muse_owned_routed_wt_worker, "nccl", id="owned_routed_wt"),
         pytest.param(_muse_owned_stream_tap_worker, "nccl", id="owned_stream_taps"),
+        pytest.param(
+            _muse_ordinary_all_reduce_worker, "nccl", id="ordinary_all_reduce"
+        ),
         pytest.param(_muse_tp_routes_worker, "nccl", id="tp_routes"),
         pytest.param(
             partial(_muse_tp_owned_forward_worker, quantized=False),

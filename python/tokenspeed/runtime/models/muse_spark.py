@@ -2467,6 +2467,11 @@ class MuseSparkForConditionalGeneration(BaseCausalLM):
             backend.iris.install(group, state.all_reduce)
             backend.iris.install_all_gather(group, state.gather)
             backend.iris.install_broadcast(group, state.broadcast)
+            # Ordinary all-reduces on this group use Muse's prepared Lamport
+            # mailboxes and pull: the token embedding's, the vision tower's
+            # MLP and projection reductions when it runs at attention TP, and
+            # a draft model's (DFlash2) per-layer reductions.
+            backend.iris.install_ordinary_all_reduce(group, state.reduction)
         elif (
             state.all_reduce.producer_direct_max_numel < capacity
             or state.owned_route_max_rows < owned_route_max_rows
