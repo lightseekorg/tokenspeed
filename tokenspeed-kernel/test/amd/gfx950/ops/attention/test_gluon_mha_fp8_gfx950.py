@@ -234,3 +234,38 @@ def test_prefill_keeps_small_fp8_probabilities(
     _check(out[tail], expected[tail], has_sink)
     if not has_sink:
         torch.testing.assert_close(lse, expected_lse, atol=1e-4, rtol=0)
+
+
+@pytest.mark.parametrize("scale", ["q_scale", "k_scale", "v_scale"])
+def test_decode_and_extend_reject_block_scales(scale):
+    k, v = _keys_and_values(PAGE_SIZE, 0.0)
+    k_cache, v_cache, page_table = _paged(k, v)
+    q = _queries(1)
+    lengths = torch.tensor([PAGE_SIZE], dtype=torch.int32, device="cuda")
+    block_scales = {scale: torch.ones(1, dtype=torch.uint8, device="cuda")}
+    with pytest.raises(ValueError, match=f"unit scale, got {scale}"):
+        launch_gluon_mha_decode_gfx950(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=lengths,
+            max_seqlen_k=PAGE_SIZE,
+            **block_scales,
+        )
+    with pytest.raises(ValueError, match=f"unit scale, got {scale}"):
+        launch_gluon_mha_extend_gfx950(
+            q=q,
+            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
+            cu_seqlens_kv=torch.tensor(
+                [0, PAGE_SIZE], dtype=torch.int32, device="cuda"
+            ),
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=lengths,
+            is_causal=True,
+            max_seqlen_q=1,
+            max_seqlen_k=PAGE_SIZE,
+            **block_scales,
+        )
