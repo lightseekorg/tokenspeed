@@ -70,6 +70,7 @@ def host_cache(request, io_backend):
     from tokenspeed.runtime.execution.device import DeviceHandle
     from tokenspeed.runtime.execution.model_executor import ModelExecutor
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.factory import (
         create_cache_arena,
@@ -152,6 +153,41 @@ def host_cache(request, io_backend):
             attn_config=attn_config,
             draft_model_config=SimpleNamespace(num_attention_layers=1),
             draft_attn_config=replace(attn_config, is_draft=True),
+            **recipe_args,
+        )
+    elif family == "dsa":
+        # GLM-5 / DeepSeek-V3.2: MLA latent plus an FP8 index-K plane.
+        attn_config = AttnConfig(
+            kv_cache_dtype=torch.bfloat16,
+            prefix_granularity=64,
+            kernel_page_size=64,
+            components=(
+                DSAConfig(
+                    backend_name="dsa",
+                    num_attention_heads=64,
+                    num_kv_heads=64,
+                    head_dim=192,
+                    attn_tp_size=1,
+                    kv_lora_rank=512,
+                    qk_nope_head_dim=128,
+                    qk_rope_head_dim=64,
+                    v_head_dim=128,
+                    scaling=1.0,
+                    kv_cache_dim=576,
+                    index_topk=1,
+                    index_head_dim=128,
+                    index_n_heads=1,
+                    index_k_format="fp8_scaled",
+                ),
+            ),
+            **model_wide,
+        )
+        recipe = cache_recipe(
+            "dsa",
+            model_config=SimpleNamespace(num_attention_layers=3),
+            attn_config=attn_config,
+            draft_model_config=None,
+            draft_attn_config=None,
             **recipe_args,
         )
     # A probe-sized arena: a few blocks per group, pages 1-3 below.
@@ -388,6 +424,57 @@ def test_a_gqa_draft_context_write_lands_after_its_tail_page_load(host_cache):
     for rows, host, written in zip((k_rows, v_rows), host_rows, expected):
         assert torch.equal(rows[start : start + hit].view(torch.uint8), host)
         assert torch.equal(rows[slots].view(torch.uint8), written)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache", [("dsa", "full_attention")], ids=["dsa"], indirect=True
+)
+def test_an_index_k_write_lands_after_its_tail_page_load(host_cache):
+    """GLM-5 / DeepSeek-V3.2 write the round's index keys
+    (``set_index_k_buffer``) before the layer's first layerwise wait, the
+    top-k's ``get_index_k_buffer``. On a Host tail hit they land in the loaded
+    tail block."""
+    cache = host_cache
+    pool = cache.pool
+    page_size = cache.arena.prefix_granularity
+    page, hit, layer = 2, page_size // 2, 0
+    slots = torch.arange(page * page_size + hit, (page + 1) * page_size, device="cuda")
+    keys = torch.randn(
+        page_size - hit, pool.index_head_dim, dtype=torch.bfloat16, device="cuda"
+    )
+    # The rows the write leaves, from the same write into page 3.
+    pool.set_index_k_buffer(layer, slots + page_size, keys, write_mask=None)
+    torch.cuda.synchronize()
+    expected = pool.gather_index_k_rows(
+        layer, slots + page_size, index_k_format="fp8_scaled"
+    )
+    hit_slots = torch.arange(hit, device="cuda")
+    host_rows = pool.gather_index_k_rows(
+        layer, page_size + hit_slots, index_k_format="fp8_scaled"
+    )
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    pool.set_index_k_buffer(layer, slots, keys, write_mask=None)
+    pool.get_index_k_buffer(layer)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    assert torch.equal(
+        pool.gather_index_k_rows(
+            layer, page * page_size + hit_slots, index_k_format="fp8_scaled"
+        ),
+        host_rows,
+    )
+    assert torch.equal(
+        pool.gather_index_k_rows(layer, slots, index_k_format="fp8_scaled"), expected
+    )
 
 
 if __name__ == "__main__":
