@@ -66,11 +66,12 @@ Qwen3.8-Flash-Next decode batches.
   in `_PREFILL_SHAPES` when its workgroups, one 256x256 output block per CU,
   keep most CUs busy. Long reductions past two rounds of workgroups also need
   nearly every CU busy.
-- The decode kernel takes contiguous inputs with `2 <= M <= 64` and writes BF16
+- The decode kernel takes contiguous inputs with `2 <= M <= 256` and writes BF16
   or FP32 (the MoE router). It runs only `(N, K)` and M buckets
-  (`4, 8, 16, 32, 64`) with a measured config in `_DECODE_CONFIGS`; each
-  entry beat `torch.mm` (hipBLASLt) by at least 4% in cold-cache sweeps at
-  Kimi K3 TP8 and Qwen3.8-Flash-Next TP2 shapes.
+  (`4, 8, 16, 32, 64, 128, 256`) with a measured config in `_DECODE_CONFIGS`; each
+  entry beat `torch.mm` (hipBLASLt) by at least 4%, at the row counts its
+  model sends, in cold-cache sweeps at Kimi K3 TP8, Muse Spark TP4/TP8 and
+  Qwen3.8-Flash-Next TP2 shapes; table comments note the exceptions.
 - `launch_gluon_mm_a16w16_decode_add3_gfx950` computes `A @ B.T + X + Y` in
   one launch, adding both BF16 addends to the FP32 accumulator before the
   single rounding. It reuses the decode tile for `M` and accepts only buckets

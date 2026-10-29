@@ -1561,8 +1561,9 @@ def test_attention_output_preserves_dense_projection(
 
 
 @requires_gpu
-# 2 and 16 rows take the GEMV; 32 and 64 (four and eight verify blocks) take the GEMM.
-@pytest.mark.parametrize("tokens", [2, 16, 32, 64])
+# 2-64 rows (up to eight verify blocks) take the decode GEMV or GEMM; 96 rows
+# take the general GEMM.
+@pytest.mark.parametrize("tokens", [2, 16, 32, 64, 96])
 def test_gathered_projection_writes_decode_rows_into_the_caller_buffer(
     bf16_default_dtype, tokens: int
 ) -> None:
