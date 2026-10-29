@@ -66,7 +66,7 @@ expert_apply = prepare_sm90_fp8_moe(
 ```
 
 Private modes apply `sm90_moe.patch` to a cached source copy of FlashInfer
-0.7.2 and compile isolated modules, operators, and tuning caches. They require
+0.7.2.post1 and compile isolated modules, operators, and tuning caches. They require
 matching upstream sources, JIT enabled, and both CUDA toolkit and runtime
 12.8 or newer. Initialization reports unsupported sources or build settings.
 Private cold JIT compilations bind their include path to that versioned source
@@ -111,7 +111,7 @@ and fills the lookup table per expert instead of searching per tile.
 
 ### NVFP4 routing-map padding
 
-The pinned FlashInfer version (0.7.2) initializes unused rows inside active
+The pinned FlashInfer version (0.7.2.post1) initializes unused rows inside active
 expert tiles of `permuted_idx_to_token_idx` to `-1` in its routing producers.
 This prevents unnecessary activation loads in the first GEMM without a separate
 fill-kernel launch. Routing refreshes live mappings and tile padding on every
@@ -192,6 +192,8 @@ tuning-cache key, so a previously cached tile-8 choice cannot bypass this
 policy without forcing unrelated shapes to retune. If FlashInfer removes
 either tuning hook, changes the cache-key builder signature, or moves runner
 construction outside the cloned entry points, the adapter raises an error.
+When FlashInfer splits its module factory and runner-namespace builder, both
+are rebound so the operator closures keep the same private tactic policy.
 
 The cache-key builder derives the policy tag from the target profile.
 During autotuning, this is the profile that `p.get_opt_shapes()` selects; during
@@ -254,6 +256,15 @@ consecutive MoE layers through their activations, so one buffer per device
 is never in use by two calls at once; a model that overlapped two MoE calls on
 separate streams would need one buffer per stream. PDL stays off in this
 chain for the race described in the BF16 CUTLASS section of `flashinfer.py`.
+
+FP16/BF16 unquantized CUTLASS plans default to fused finalize. Fusing
+the top-k expert reduction into the GEMM2 epilogue uses floating-point
+atomics and does not preserve the reduction order across calls. The plan's
+`cutlass_fused_finalize` value is passed explicitly to both the workspace
+size query and the MoE call. Set it to `False` for a separate reduction.
+Choose the value before warmup and CUDA graph capture; changing it after
+capture does not update recorded kernels. This controls
+one reduction, rather than the complete deployment's determinism contract.
 
 ### FP8 per-channel experts
 
@@ -403,3 +414,11 @@ hidden width. Some kernels (Triton MXFP4) return no weights; `MoELayer` then
 returns the precomputed route weights it passed in. FP16 inputs, ROCm builds
 without the fused finalizer, and kernels without deferred finalize keep the
 kernel's own finalized output.
+
+## Kimi-K3 router
+
+On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
+over 896 experts. It consumes contiguous FP32 logits and bias and writes
+normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
+The routing-only kernel has no expert-plan workspace or 8,192-token limit.
+Other contracts retain their existing routers.

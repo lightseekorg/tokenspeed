@@ -1184,6 +1184,9 @@ def launch_gluon_mla_extend_gfx950(
         SPLIT=split,
         num_warps=_NUM_WARPS,
         **sched_compile_options(),
+        # At 512 registers and one wave, iterative-minreg schedules this best;
+        # the default strategy is ~10% slower on long cached prefixes.
+        llvm_fn_attrs=(("amdgpu-sched-strategy", "iterative-minreg"),),
     )
     if split:
         gluon_mla_extend_reduce_gfx950[(total_q, num_heads)](

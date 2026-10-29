@@ -182,6 +182,11 @@ Every selection point that pins a batch-invariant leaf tests `numerics in
 BITWISE_ENVELOPES`, never the one name, so an envelope added above
 rl-bitwise would inherit every pin.
 
+Unquantized FP16/BF16 MoE on `flashinfer_cutlass` defaults to GEMM2 atomic
+expert combine. `--no-moe-cutlass-fused-finalize` selects a separate finalize
+reduction for both target and draft; `rl-bitwise` forces fusion off. The
+setting is fixed in each expert plan before warmup and CUDA graph capture.
+
 ## alignment.trainer
 
 The invariance layers make a deployment agree with itself. Trainer alignment

@@ -167,6 +167,8 @@ struct ForwardBatch {
 
     bool empty() const { return request_ids.empty(); }
     std::size_t NumExtends() const { return extend_prefix_lens.size(); }
+
+    bool operator==(const ForwardBatch&) const = default;
 };
 
 }  // namespace tokenspeed
