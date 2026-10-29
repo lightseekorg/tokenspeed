@@ -159,18 +159,24 @@ def _rank_args(rank: int) -> tuple[ServerArgs, PortArgs]:
     return server_args, PortArgs.init_new(server_args)
 
 
-def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(tmp_path):
+@pytest.mark.parametrize("enable_async_logging", [False, True])
+def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(
+    tmp_path, enable_async_logging
+):
     binary = _fake_host(
         tmp_path,
         """
         server_args, port_args, relay = connection.recv()
         connection.send({"status": "ready", "rank": server_args.mapping.rank,
-                         "python": python, "relay": relay})
+                         "python": python, "relay": relay,
+                         "async_logging": args["--enable-async-logging"]})
         time.sleep(600)
         """,
     )
+    server_args, port_args = _rank_args(3)
+    server_args.enable_async_logging = enable_async_logging
     proc, reader = start_rust_host(
-        binary, *_rank_args(3), nullcontext(), "ipc:///tmp/relay", False
+        binary, server_args, port_args, nullcontext(), "ipc:///tmp/relay", False
     )
     try:
         (ready,) = receive_ready_messages([reader], [proc])
@@ -179,6 +185,7 @@ def test_the_launcher_hands_a_host_its_rank_and_hears_it_ready(tmp_path):
             "rank": 3,
             "python": sys.executable,
             "relay": "ipc:///tmp/relay",
+            "async_logging": str(enable_async_logging).lower(),
         }
         assert proc.is_alive() and proc.exitcode is None
     finally:

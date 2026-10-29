@@ -22,20 +22,19 @@
 
 from __future__ import annotations
 
-import atexit
 import dataclasses
 import functools
 import io
 import json
 import logging
-import logging.handlers
+import logging.config
 import os
 import pickle
-import queue
 import random
 import re
 import resource
 import subprocess
+import sys
 import tempfile
 import threading
 from collections import OrderedDict
@@ -283,50 +282,6 @@ def prepare_model_and_tokenizer(model_path: str, tokenizer_path: str):
     return model_path, tokenizer_path
 
 
-_LOG_QUEUE: queue.Queue | None = None
-_LOG_LISTENER: logging.handlers.QueueListener | None = None
-
-
-def _log_queue() -> queue.Queue:
-    """The per-process queue the root logger hands its records to."""
-    global _LOG_QUEUE
-    if _LOG_QUEUE is None:
-        _LOG_QUEUE = queue.Queue()
-    return _LOG_QUEUE
-
-
-def _stop_log_listener() -> None:
-    """Drain the queue and stop the listener thread, if it is running."""
-    global _LOG_LISTENER
-    if _LOG_LISTENER is not None:
-        _LOG_LISTENER.stop()
-        _LOG_LISTENER = None
-
-
-def _start_log_listener(sink: logging.Handler) -> None:
-    """Write root-logger records on a listener thread, not the caller's.
-
-    ``logging.StreamHandler.emit`` flushes after every record. When stderr is
-    redirected to a distributed file system, that flush can block for tens to
-    hundreds of milliseconds; when the record comes from the serving loop, the
-    round stalls and every peer rank waits it out at the next collective. The
-    listener thread owns the write (and its stall); a logging thread only
-    enqueues.
-
-    Args:
-        sink: Formats and writes the records, on the listener thread.
-    """
-    global _LOG_LISTENER
-    _stop_log_listener()
-    _LOG_LISTENER = logging.handlers.QueueListener(
-        _log_queue(), sink, respect_handler_level=True
-    )
-    _LOG_LISTENER.start()
-
-
-atexit.register(_stop_log_listener)
-
-
 def configure_logger(server_args, prefix: str = ""):
     global LOG_PREFIX
     LOG_PREFIX = prefix
@@ -334,12 +289,22 @@ def configure_logger(server_args, prefix: str = ""):
     global LOG_LEVEL
     LOG_LEVEL = server_args.log_level.upper()
 
-    from tokenspeed._logging import suppress_noisy_third_party_logs
+    from tokenspeed._logging import (
+        configure_root_logger,
+        stop_async_logging,
+        suppress_noisy_third_party_logs,
+    )
     from tokenspeed.runtime.utils.env import envs
 
     suppress_noisy_third_party_logs()
 
     if TOKENSPEED_LOGGING_CONFIG_PATH := envs.TOKENSPEED_LOGGING_CONFIG_PATH.get():
+        if server_args.enable_async_logging:
+            raise ValueError(
+                "--enable-async-logging cannot be combined with "
+                "TOKENSPEED_LOGGING_CONFIG_PATH; configure async handlers in "
+                "the custom file or use the default logging configuration"
+            )
         if not os.path.exists(TOKENSPEED_LOGGING_CONFIG_PATH):
             raise FileNotFoundError(
                 "Setting TOKENSPEED_LOGGING_CONFIG_PATH from env with "
@@ -347,23 +312,19 @@ def configure_logger(server_args, prefix: str = ""):
             )
         with open(TOKENSPEED_LOGGING_CONFIG_PATH, encoding="utf-8") as file:
             custom_config = json.loads(file.read())
+        stop_async_logging()
         logging.config.dictConfig(custom_config)
         suppress_noisy_third_party_logs()
         return
     format = f"[%(asctime)s{prefix}] %(message)s"
     log_level = getattr(logging, server_args.log_level.upper())
-    # Root-logger records -- the serving loop's profiler lines among them --
-    # ride a queue to a listener thread: the per-record flush, and the stall a
-    # slow stderr target can put on it, never run on the logging thread.
-    sink = logging.StreamHandler()
-    sink.setLevel(log_level)
-    sink.setFormatter(logging.Formatter(format, datefmt="%Y-%m-%d %H:%M:%S"))
-    logging.basicConfig(
+    configure_root_logger(
         level=log_level,
-        handlers=[logging.handlers.QueueHandler(_log_queue())],
-        force=True,
+        log_format=format,
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stderr,
+        enable_async_logging=server_args.enable_async_logging,
     )
-    _start_log_listener(sink)
 
     # Only set specified log level for tokenspeed-related loggers
     for logger_name in logging.Logger.manager.loggerDict:

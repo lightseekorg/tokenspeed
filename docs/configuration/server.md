@@ -818,6 +818,7 @@ which keeps it when recreating a session after a memory resume.
 | Parameter | Purpose |
 | --- | --- |
 | `--log-level` | Runtime log level. |
+| `--enable-async-logging` | Write Rust host and default Python root logs on background threads. Defaults to off; `--no-enable-async-logging` explicitly selects synchronous output. |
 | `--enable-log-request-stats` | Log a one-line per-request performance summary on finish/abort (see below). |
 | `--enable-metrics` | Enable the selected metrics reporters. |
 | `--metrics-reporters` | Select `prometheus` or an installed metric output; repeat for multiple. Defaults to `prometheus`. |
@@ -835,12 +836,24 @@ throughput accumulated since the previous line, `avg_accept_len` /
 `accept_rate` under speculative decoding, and `#queue-req`. Every field is a
 host-side scheduler counter. The line adds no GPU synchronization.
 
-Log lines never run their write on the thread that emits them. The Rust host
-writes `tracing` events through a bounded, non-blocking appender whose
-listener thread owns stderr and drops lines when its queue is full, and the
-root Python logger hands records to a queue listener in `configure_logger`.
-A slow log target — a distributed file system, a stalled collector — costs
-log lines, not rounds: the scheduling loop only enqueues.
+Logging is synchronous by default. With `--enable-async-logging`, the Rust
+host's `tracing` output and the default Python root logger each use a queue
+of at most 8,192 records. A background thread owns writes and flushes, so
+an occasional slow write to a distributed file system or collector does
+not hold the thread emitting the log. When a queue fills, new records are
+dropped without writing a synchronous overflow warning. This removes output
+stalls from the serving thread; it does not increase the sink's throughput.
+
+The host explicitly drains Python logs on both normal and error returns,
+before notifying the launcher of a failure; it does not rely on Python
+interpreter finalization. Python cleanup waits up to five seconds, and the
+Rust appender also performs a bounded, best-effort drain on exit. A sink
+that remains blocked through shutdown can lose pending records.
+
+Colorful Python loggers retain their direct handlers. Custom handlers remain
+under `TOKENSPEED_LOGGING_CONFIG_PATH` control: combining that variable with
+`--enable-async-logging` is rejected. Configure asynchronous handlers in the
+custom file, or use the default configuration with this flag.
 
 `#queue-req` counts requests admitted to the scheduler but not yet running.
 On a PD engine that includes requests still bootstrapping with the peer —

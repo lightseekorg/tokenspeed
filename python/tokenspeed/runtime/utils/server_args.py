@@ -403,6 +403,7 @@ class ServerArgs:
 
     # Logging
     log_level: str = "info"
+    enable_async_logging: bool = False
     enable_log_request_stats: bool = False
     enable_metrics: bool = False
     decode_log_interval: int = 40
@@ -2809,6 +2810,16 @@ class ServerArgs:
         )
 
         # Logging
+        parser.add_argument(
+            "--enable-async-logging",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.enable_async_logging,
+            help=(
+                "Write Rust host and default Python root logs on background "
+                "threads. Bounded queues drop new records when full. Disabled "
+                "by default; incompatible with TOKENSPEED_LOGGING_CONFIG_PATH."
+            ),
+        )
         parser.add_argument(
             "--log-level",
             type=str,
