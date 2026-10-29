@@ -18,16 +18,18 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Non-power-of-two GQA groups, speculative rows and live paged metadata."""
+"""Non-power-of-two GQA groups, speculative rows, live paged metadata and large
+KV pools."""
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
 import pytest
 import torch
-from utils import is_amd
+from utils import is_amd, move_pages_past_int32
 
 
 @pytest.fixture
@@ -340,3 +342,23 @@ def test_initial_prefill_groups(query_rows, window):
         torch.testing.assert_close(actual.float(), expected, rtol=8e-2, atol=8e-2)
     finally:
         torch.backends.cuda.matmul.allow_tf32 = previous
+
+
+@pytest.mark.parametrize(
+    "queries,prefixes", [([64, 48], [200, 300]), ([16], [50000])], ids=["short", "long"]
+)
+# Full attention may take the split-K kernel; a window takes the single pass.
+@pytest.mark.parametrize("window", [-1, 511])
+@pytest.mark.usefixtures("require_gfx950")
+def test_extend_reads_pages_past_int32_range(queries, prefixes, window):
+    # Each KV page base is computed in 64-bit. Pages past 2**31 elements must
+    # read exactly what the same pages read at the start of a small pool.
+    case = make_case(
+        queries, prefixes, heads=8, kv_heads=2, window=window, causal=True, sinks=False
+    )
+    expected = case.invoke("gluon", return_lse=False)
+    (k_far, v_far), far_table = move_pages_past_int32((case.k, case.v), case.table)
+    far_case = dataclasses.replace(case, k=k_far, v=v_far, table=far_table)
+    actual = far_case.invoke("gluon", return_lse=False)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
