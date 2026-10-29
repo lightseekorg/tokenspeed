@@ -1460,6 +1460,9 @@ def launch_gluon_mhc_mixes_gfx950(
         BLOCK_K=_MIXES_BLOCK_K,
         NUM_WARPS=num_warps,
         num_warps=num_warps,
+        # Interleaving the four-wave tile's MFMAs with the next K tile's loads
+        # makes it faster from 65 to 1024 tokens.
+        **({"schedule_hint": "mfma-schedule"} if num_warps == 4 else {}),
     )
     # Splits sit in registers for prefill, and also spread over lanes (and
     # waves when there are few tokens) as the split count grows.
