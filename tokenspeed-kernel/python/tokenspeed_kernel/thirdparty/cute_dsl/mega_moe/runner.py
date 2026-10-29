@@ -176,7 +176,7 @@ class MegaMoEWorkspace:
             offset += size
         self.x, self.scales, self.topk_weights, self.shared = regions
         self.topk_ids = torch.full(
-            (capacity, top_k), -1, dtype=torch.int64, device=device
+            (capacity, top_k), -1, dtype=torch.int32, device=device
         )
         self.local = torch.zeros(sizes["local"], dtype=torch.uint8, device=device)
         self.output = torch.empty(
