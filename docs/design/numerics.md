@@ -41,10 +41,10 @@ trainer's log-softmax folds fixed blocks).
 ```
 numerics.mode                       --numerics {auto, rl-bitwise}
 ├── kernels.deterministic           fixed-reduction-order compute
-│   ├── no host autotune            disable_autotune (tactic choice is shape-
+│   ├── no autotune                 disable_autotune (tactic choice is shape-
 │   │                               and machine-dependent state); no
 │   │                               persistent tactic cache is loaded
-│   ├── no implicit GEMM TF32       disable_tf32 + NVIDIA_TF32_OVERRIDE=0
+│   ├── no TF32                     disable_tf32 + NVIDIA_TF32_OVERRIDE=0
 │   ├── no PDL                      disable_pdl (serialize kernel chains)
 │   └── batch-invariant leaves      kernel registry: leaves declaring the
 │                                   "batch_invariant" feature; a caller in
@@ -169,7 +169,7 @@ numerics.mode                       --numerics {auto, rl-bitwise}
                                     below); rl-bitwise folds every switch
 ```
 
-Precedence for framework selections: the envelope only ever tightens. It sets every switch it governs
+Precedence: the envelope only ever tightens. It sets every switch it governs
 to its tight value, and it refuses an explicit choice it cannot tighten — a
 named MoE backend other than the batch-invariant one, a sampling backend
 without canonical greedy ties — rather than keeping it and silently voiding
@@ -181,23 +181,6 @@ routing) is checked when that module is constructed, never per forward.
 Every selection point that pins a batch-invariant leaf tests `numerics in
 BITWISE_ENVELOPES`, never the one name, so an envelope added above
 rl-bitwise would inherit every pin.
-
-### Explicit numerical programs in extension kernels
-
-The framework precision and tuning switches are defaults, not a proof of
-invariance for an external library. A registered extension may preserve an
-explicit precision such as TF32 as part of its documented numerical program;
-fixed TF32 arithmetic does not inherently depend on batch composition. Support
-still requires per-row, cross-phase and cache/acceptance validation, and does
-not establish trainer alignment or unchanged historical bits.
-
-If configuration selection runs during startup, its inputs and tuning keys
-must not depend on the first live request. The resulting tactics become fixed
-deployment parameters shared by every execution phase. Record them with the
-source version, reject configuration drift during serving, and compare runs
-only under the same selected program. Independently retuned programs are not
-a cross-run invariance claim. An extension must document this scope and reject
-unsupported configurations rather than silently bypassing a numerical contract.
 
 ## alignment.trainer
 
