@@ -2,7 +2,7 @@
 
 QSA scores compressed index keys, selects logical blocks, expands them to
 full-cache slots, and attends to those slots. The block selector takes an
-explicit `auto`, `stream` or `logits` path. Backend selection and overrides
+explicit `auto`, `stream`, or `logits` path. Backend selection and overrides
 preserve the requested path.
 
 ## TMA gather sparse attention
@@ -156,15 +156,15 @@ counts can then reuse startup binaries.
 ## Materialized Triton scoring
 
 The `logits` path materializes FP32 block scores before top-k selection.
-Query-group count, table capacity, tensor strides and per-row frontiers are
+Query-group count, table capacity, tensor strides, and per-row frontiers are
 runtime inputs. Request count is represented by page-table rows and the
 per-query request indices. The group count opts out of scalar specialization;
 other integer inputs retain Triton's finite alignment classes for optimization.
 
-`BLOCK_N`, `BLOCK_H` and `BLOCK_D` set static tile dimensions. Query grouping
+`BLOCK_N`, `BLOCK_H`, and `BLOCK_D` set static tile dimensions. Query grouping
 also sets `arange` and `reshape` dimensions and remains compile-time; a
 bounded flag selects whether the query-group loop is needed. Model dimensions,
-tensor formats, PDL and launch tuning stay fixed for a warmed configuration.
+tensor formats, PDL, and launch tuning stay fixed for a warmed configuration.
 
 During `kernel_warmup`, scoring compiles and loads every power-of-two group
 allowed by the model geometry and both loop variants, without launching the
@@ -173,6 +173,6 @@ unused variants. Four index heads of width 128 on NVIDIA have six groups,
 classes: one, divisible by 16, and other integers. With 64-block pages, capacity
 and logits strides stay divisible by 16; the three page-table stride classes
 give at most 36 binaries for one fixed tensor-format/PDL configuration.
-Later query-count, request-count and table-width changes reuse these binaries
+Later query-count, request-count, and table-width changes reuse these binaries
 while refreshing the launch grid. Grouping and occupancy policies are the same
-during prefill, decode and CUDA graphs.
+during prefill, decode, and CUDA graphs.

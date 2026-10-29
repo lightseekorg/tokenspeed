@@ -24,13 +24,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 from itertools import product
-from typing import Any
+from typing import Any, TypeAlias
 
 from tokenspeed_kernel._triton import _IS_NPU
 from tokenspeed_kernel.ops.tuning import is_warming_up
 
-_VariantSets = tuple[Mapping[str, tuple[Any, ...]], ...]
-_Variants = _VariantSets | Callable[[Mapping[str, Any]], _VariantSets]
+_VariantSets: TypeAlias = tuple[Mapping[str, tuple[Any, ...]], ...]
+_Variants: TypeAlias = _VariantSets | Callable[[Mapping[str, Any]], _VariantSets]
 _warmup_variants: dict[Any, _Variants] = {}
 
 

@@ -236,7 +236,7 @@ Triton operators can register finite launch variants with
 choices that vary with request shapes. `warmup.kernel_launcher` prepares these
 variants during ordinary startup execution, then launches the original call.
 Fixed-geometry cache management operations retain lazy compilation on first
-use; they need no synthetic startup writes, transfers or waits. Per-request
+use; they need no synthetic startup writes, transfers, or waits. Per-request
 sizes must still be runtime arguments, even when their variants are warmed.
 
 ### JIT compilation while serving
