@@ -663,8 +663,11 @@ a prefill engine (with or without a query shard) and a decode engine (with
 `--decode-context-parallel-size`) each shard their cache independently; a
 transfer edge copies the pages its prefill rank and decode rank both own.
 Works with the Host KVStore, the retraction snapshot pool and L3 storage.
-L3 reuse requires the same CP layout; see
-[Host L2 and Mooncake Store L3](../configuration/server.md#host-l2-and-mooncake-store-l3).
+The Host KVStore takes either `--kvstore-write-policy`; `write_back` only on
+an aggregated or prefill engine, without a query shard or L3 storage. L3 reuse
+requires the same CP layout; see
+[Host L2 and Mooncake Store L3](../configuration/server.md#host-l2-and-mooncake-store-l3),
+which also lists every `write_back` requirement.
 
 For non-PD MLA serving, use a DCP-capable backend, for example:
 
@@ -711,7 +714,8 @@ movement, so a row's bits do not depend on which rank computes it
 Requirements: `--disaggregation-mode prefill` with `--kv-parallel-size N`
 (the query shard is a layout over the sharded pages; the engine keeps the
 Host KVStore, the retraction snapshot pool and L3 storage, as every
-KVP engine does), `N == --attn-tp-size`, attention DP 1, no
+KVP engine does, but not yet `--kvstore-write-policy write_back`),
+`N == --attn-tp-size`, attention DP 1, no
 `--enable-mixed-batch`, GPU DSA attention with a bf16 KV cache (checked where
 the attention config is built), and `--dense-tp-size` and the MoE TP×EP group
 each 1 or `N` (attention returns complete rows, so the drafter's replicated

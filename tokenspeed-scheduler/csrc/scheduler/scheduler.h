@@ -48,6 +48,40 @@
 
 namespace tokenspeed {
 
+// The first admission's prefix hit by tier, per admitted request.
+// device_hit + host_hit is the hit: host_hit is the KV the Host loads (the
+// hit less the Device's prefix -- its full pages, and its KV tail when the
+// Device holds the tail), host_gain is what the Host adds over the Device-only
+// hit (PrefixProbe::device_only_hit_tokens). unresumable_kv is the KV cached
+// beyond the hit (the junction).
+struct PrefixHitStats {
+    std::uint64_t prompt_tokens{0};
+    std::uint64_t device_hit_tokens{0};
+    std::uint64_t host_hit_tokens{0};
+    std::uint64_t host_gain_tokens{0};
+    std::uint64_t unresumable_kv_tokens{0};
+};
+
+// Host L2 counters, and the Device evictions they are read against:
+// cumulative since start and never reset. Accounting only, for tests and
+// inspection: no scheduling decision reads them and the runtime exports none.
+struct HostCacheStats {
+    PrefixHitStats prefix_hits;
+    TierTransferManager::WriteBackStats publication_stores;
+    TierTransferManager::WriteBackStats finish_stores;
+    TierTransferManager::WriteBackStats retraction_stores;
+    TierTransferManager::WriteBackStats eviction_stores;
+    TierTransferManager::LoadBackStats prefix_loads;
+    TierTransferManager::LoadBackStats restore_loads;
+    CacheCoordinator::HostEvictionStats host_evictions;
+    std::uint64_t store_candidates_dropped_by_flush{0};
+    // What admissions and restores evicted under write-back and dropped at
+    // once, no probe being able to resume from it on the Host (dead entries,
+    // never written back).
+    std::uint64_t dead_entries_not_written_back{0};
+    CacheCoordinator::DeviceEvictionStats device_evictions;
+};
+
 class Scheduler {
 public:
     explicit Scheduler(SchedulerConfig config);
@@ -114,7 +148,10 @@ public:
     bool PdTransferPinned(const std::string& request_id) const;
     std::int32_t HostPoolCachedBlocks() const { return coordinator_.NumHostCachedBlocks(); }
     std::int32_t HostPoolFreeBlocks() const { return coordinator_.NumFreeHostLcmBlocks(); }
+    // Host pool parents, empty or not (0 without a Host pool).
+    std::int32_t HostPoolTotalBlocks() const { return host_pool_.NumLcmBlocks(); }
     std::int32_t HostPoolPinnedBlocks() const { return coordinator_.NumPinnedHostCachedBlocks(); }
+    HostCacheStats GetHostCacheStats() const;
     // Published tail boundaries the probe can enumerate, and how many the
     // per-prior cap has dropped since start.
     std::size_t TailEntries() const { return coordinator_.NumTailEntries(); }
@@ -167,7 +204,8 @@ private:
         Request* capacity_blocker{nullptr};
         // Every candidate whose admission failed for capacity this round, in
         // phase order (the blocker first). When the victim turns out to be
-        // the blocker itself, the next of these is who its pages serve.
+        // the blocker itself, the next of these, if any, is who its pages
+        // serve first (maybeRetractForCapacity lists the rest).
         std::vector<Request*> capacity_blocked;
 
         void NoteCapacityBlocked(Request* request) {
@@ -218,10 +256,11 @@ private:
                                                            CacheCoordinator::PrefixProbe&& prefix,
                                                            std::span<const GroupDemand> demands,
                                                            const RequestProgress& progress,
-                                                           std::optional<std::uint64_t> request_access_epoch);
+                                                           std::optional<std::uint64_t> request_access_epoch,
+                                                           bool evict_blocks_past_segments);
     std::optional<CacheCoordinator::AdmissionResult> admitWithKvEventTracking(
         ExecutionPlan& plan, AdmissionFeedback& feedback, Request& request, const fsm::CacheProgress& cache_progress,
-        std::span<const GroupDemand> demands, const RequestProgress& progress);
+        std::span<const GroupDemand> demands, const RequestProgress& progress, bool evict_blocks_past_segments);
     void registerKvEventPrefixPages(const Request& request, std::span<const std::string> prefix_hashes,
                                     std::int32_t first_page);
     // The descriptors a publication mutates: its newly hashed full pages and,
@@ -372,44 +411,38 @@ private:
     void maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& build, std::span<Request* const> candidates,
                                  std::vector<WriteBackOperation>& write_back_operations);
     // Who gives way, and whether it can be imaged. `victim` is nullptr when
-    // nobody can (every resident is exempt or there is no resident); with
-    // image_fits false it is the newest retractable resident, to be aborted
-    // because no candidate's image fits the host budgets.
+    // nobody can (every resident is exempt or there is no resident); with a
+    // shortfall it is the newest retractable resident, to be aborted because
+    // no candidate's image fits the host budgets, and the shortfall is its.
     struct VictimChoice {
         Request* victim{nullptr};
-        bool image_fits{false};
+        std::optional<ImageShortfall> shortfall;
     };
     // `ignore_exemption`: the empty-round retraction (docs/design/scheduler.md §2).
     VictimChoice chooseVictim(std::span<Request* const> candidates, bool ignore_exemption) const;
     // The first half of a retraction: publishes the pages the victim completed
     // since its last admission (see forward.cpp).
     void publishCompletedPrefix(Request& victim);
-    // Whether the host budgets hold the request's image right now: a blob
-    // slot is free and the snapshot pool holds everything the L2 leg would
-    // not carry once the retraction has published the request's completed
-    // pages (projected, nothing mutated). An L2 allocation shortfall can still
-    // send published slots to the pool at retraction time, where the image can
-    // then turn out not to fit.
-    bool imageFits(const Request& request) const;
-    // Why a victim could not be imaged: no snapshot pool at all (the null
-    // page alone is configured, so nothing is ever imaged), no blob slot
-    // free, or a pool too small for the image.
-    enum class ImageShortfall { kNoPool, kBlobSlot, kSnapshotPool };
-    // Images the victim (Host L2 for its published pages, the snapshot pool
-    // for the rest), issues both store legs and suspends it. Returns the
-    // shortfall -- with nothing changed but Host entries evicted for the
-    // attempt -- when the image cannot be held or no blob slot is free.
+    // Why the host budgets cannot hold the request's image right now
+    // (projected, nothing mutated), unset when they can (see forward.cpp).
+    std::optional<ImageShortfall> imageShortfall(const Request& request) const;
+    // Images the victim and suspends it, or returns the shortfall before
+    // anything is acquired or evicted for the image; past the blob-slot check
+    // its completed pages stay published (see forward.cpp).
     std::optional<ImageShortfall> retractVictim(Request& victim, PlanBuild& build,
                                                 std::vector<WriteBackOperation>& write_back_operations);
     // The one site of the last-resort policy: a capacity retraction whose
     // victim cannot be imaged aborts that victim instead -- its pages and
     // slot return in this very round and the blocked grant proceeds as after
     // a retraction -- and records it on the plan for the runtime to fail the
-    // request toward its client.
+    // request toward its client. A forced victim refused after its
+    // publication is aborted here too.
     void onImageDoesNotFit(Request& victim, ImageShortfall shortfall, PlanBuild& build);
     // The debug_force_retraction_interval knob: arms the oldest Decoding
     // (N > 0) or Prefilling (N < 0) request every |N| plans, keeps it out of
-    // the batch until it is quiescent, then retracts it.
+    // the batch until it is quiescent, then retracts it. A victim whose image
+    // does not fit (imageShortfall) runs on with nothing published; one
+    // refused only after its publication is aborted.
     void maybeForceRetraction(PlanBuild& build, std::span<Request* const> candidates,
                               std::vector<WriteBackOperation>& write_back_operations);
 
@@ -455,6 +488,8 @@ private:
     std::vector<WriteBackOperation> pending_write_back_operations_;
     std::vector<std::string> cache_group_ids_;
     std::int32_t max_single_request_tokens_{0};
+    // Accounting only (schedulePrefillFirstChunk); no decision reads it.
+    PrefixHitStats prefix_hit_stats_;
 
     // Stamped onto each retraction; the readmission order lives on the
     // Retracted states themselves (rankedReadmissions).

@@ -81,6 +81,7 @@ def _scheduler(ts, make_config, *, in_forward: bool):
             role="fused",
             num_snapshot_pages=1,
             max_retracted_requests=0,
+            host_write_policy="write_through",
             storage_config=None,
             prefill_compute_budget=None,
             cache_groups=groups,

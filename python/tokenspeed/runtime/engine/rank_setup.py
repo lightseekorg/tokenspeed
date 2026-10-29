@@ -233,6 +233,7 @@ def scheduler_config_from_args(
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
         prefill_compute_budget=server_args.prefill_compute_budget,
+        host_write_policy=server_args.kvstore_write_policy,
         debug_force_retraction_interval=server_args.debug_force_retraction_interval,
         enable_kv_cache_events=enable_kv_cache_events,
         decode_input_tokens=decode_input_tokens,

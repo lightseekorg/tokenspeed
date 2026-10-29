@@ -105,6 +105,19 @@ def _policy(line):
     return " ".join(re.findall(r"\b(?:sc0|sc1|nt|th:\w+|scope:\w+)\b", line))
 
 
+def _seeds_atomic_expansion(lines, index):
+    """Return whether the load at ``index`` seeds an expanded atomic.
+
+    LLVM may expand an atomic RMW into a compare-and-swap loop, which opens
+    with a plain load of the current value; that load falls through into the
+    loop header LLVM names ``%atomicrmw.start``.
+    """
+    for line in lines[index + 1 :]:
+        if re.match(r"^\.LBB\w+:", line):
+            return "%atomicrmw.start" in line
+    return False
+
+
 def _backedge_cycles(lines):
     """Return the line spans that a backward branch closes."""
     labels = {
@@ -155,7 +168,7 @@ def test_iris_cache_policy_codegen(arch, tmp_path):
     loads = [
         (index, match[1])
         for index, line in enumerate(lines)
-        if (match := _LOAD.search(line))
+        if (match := _LOAD.search(line)) and not _seeds_atomic_expansion(lines, index)
     ]
     polls = [index for index, width in loads if width in _FLAG_WIDTHS]
     payload = [lines[index] for index, width in loads if width not in _FLAG_WIDTHS]

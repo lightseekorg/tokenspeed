@@ -58,6 +58,11 @@ _CACHE_EVENT_TYPES = {
     "SnapshotDoneEvent": Cache.SnapshotDoneEvent,
     "RestoreDoneEvent": Cache.RestoreDoneEvent,
 }
+# make_config's host_write_policy names; ServerArgs validates the flag.
+_HOST_WRITE_POLICIES = {
+    "write_through": SchedulerConfig.HostWritePolicy.WriteThrough,
+    "write_back": SchedulerConfig.HostWritePolicy.WriteBack,
+}
 
 
 def engram_context_len(text_config) -> int:
@@ -111,6 +116,7 @@ def make_config(
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
     prefill_compute_budget: list[float] | None,
+    host_write_policy: str,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -148,6 +154,13 @@ def make_config(
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
         prefill_compute_budget: Optional [budget_ms, token_ns, pair_ns, request_ns]
             calibration for rank-local prefill work; None uses only the token limit.
+        host_write_policy: ``--kvstore-write-policy``: ``"write_through"``
+            streams published entries to Host (at chunk ends, the prompt end
+            and finish); ``"write_back"`` writes back what an admission or a
+            restore evicts, in the same plan (``SchedulerConfig::Validate``
+            refuses it where it cannot run). Required on every role; without a
+            Host tier write_through has no effect, and the decode role's Host
+            tier holds retraction images only.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -220,6 +233,7 @@ def make_config(
         # ignored.
         cfg.state_checkpoint_in_forward = True
     cfg.disable_l2_cache = disable_l2_cache
+    cfg.host_write_policy = _HOST_WRITE_POLICIES[host_write_policy]
 
     cfg.enable_mixed_prefill_decode = enable_mixed_prefill_decode
     if cache_groups:

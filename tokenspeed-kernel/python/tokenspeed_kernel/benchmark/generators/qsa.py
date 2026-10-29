@@ -222,6 +222,7 @@ def prepare_qsa_sparse_attention(
         page_size=profile.page_size,
         block_size=profile.block_size,
         workspace=QSAWorkspace(),
+        seq_lens=torch.full((batch,), context, dtype=torch.int32, device="cuda"),
     )
     selected = qwen4_exp_qsa_selected_slots(
         blocks,

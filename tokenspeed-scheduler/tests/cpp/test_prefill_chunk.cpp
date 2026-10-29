@@ -79,7 +79,7 @@ std::vector<CacheGroupSpec> FullOnlySpecs() {
 TEST(CoordinatorReplayTest, WindowIsTheLargestDeclaredAndAHitReplaysAtMostAWindow) {
     BlockPool pool(16, {1, 1, 1});
     const CacheCoordinator coord = MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
-                                                   /*snapshot_pool=*/nullptr, false);
+                                                   /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
     EXPECT_EQ(coord.ReplayWindowTokens(), 8);
     EXPECT_EQ(coord.ReplayTokens(0), 0);
     EXPECT_EQ(coord.ReplayTokens(5), 5);
@@ -88,7 +88,7 @@ TEST(CoordinatorReplayTest, WindowIsTheLargestDeclaredAndAHitReplaysAtMostAWindo
 
     BlockPool plain_pool(16, {1});
     const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr,
-                                                   /*snapshot_pool=*/nullptr, false);
+                                                   /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
     EXPECT_EQ(plain.ReplayWindowTokens(), 0);
     EXPECT_EQ(plain.ReplayTokens(64), 0);
 }
@@ -96,7 +96,7 @@ TEST(CoordinatorReplayTest, WindowIsTheLargestDeclaredAndAHitReplaysAtMostAWindo
 TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     BlockPool pool(64, {1, 1, 1});
     const CacheCoordinator coord = MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
-                                                   /*snapshot_pool=*/nullptr, false);
+                                                   /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
     // A hit at 16 re-feeds 8 tokens first: 40 of budget leave 32 for new
     // tokens; a hit shorter than the window re-feeds only itself.
     EXPECT_EQ(PrefillChunkTokens(coord, /*first_pos=*/16, /*resumes_hit=*/true, 100, 40, 0, std::nullopt, 0), 32);
@@ -128,7 +128,7 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
     // at a pending junction.
     BlockPool plain_pool(16, {1});
     const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr,
-                                                   /*snapshot_pool=*/nullptr, false);
+                                                   /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 100, 40, 0, std::nullopt, 0), 40);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, true, 30, 40, 0, std::nullopt, 0), 30);
     EXPECT_EQ(PrefillChunkTokens(plain, 16, false, 100, 40, /*junction=*/21, std::nullopt, 0), 5);
@@ -144,7 +144,7 @@ TEST(PrefillChunkTokensTest, DebitsTheHitReplayAndKeepsTheFinalWindow) {
                        .block_granularity = 0},
     };
     const CacheCoordinator hybrid = MakeCoordinator(with_state, 4, state_pool, /*enable_l3_storage=*/false, nullptr,
-                                                    /*snapshot_pool=*/nullptr, false);
+                                                    /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false);
     EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 100, 7, 0, std::nullopt, 0), 7);
     EXPECT_EQ(PrefillChunkTokens(hybrid, 3, false, 5, 7, 0, std::nullopt, 0), 5);
 }
@@ -154,7 +154,8 @@ TEST(PrefillStateCheckpointTest, LongPromptsLeaveAReusablePageBeforeTheirReplayT
     specs.push_back(
         CacheGroupSpec{.attn_kind = AttnKind::kState, .cache_blocks_per_lcm_block = 1, .block_granularity = 0});
     BlockPool pool(64, {1, 1});
-    const CacheCoordinator hybrid = MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false);
+    const CacheCoordinator hybrid =
+        MakeCoordinator(specs, 4, pool, false, nullptr, nullptr, false, /*write_back_evictions=*/false);
     EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 26, 8, 0), 24);
     EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 24, 8, 0), 20) << "leave the last logits token";
     EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 8, 8, 0), 0) << "a prompt within one budget needs none";
@@ -162,13 +163,15 @@ TEST(PrefillStateCheckpointTest, LongPromptsLeaveAReusablePageBeforeTheirReplayT
     EXPECT_EQ(PrefillStateCheckpointTokens(hybrid, 4, 2, 8), 0) << "no positive checkpoint fits";
 
     BlockPool plain_pool(64, {1});
-    const CacheCoordinator plain = MakeCoordinator(FullOnlySpecs(), 4, plain_pool, false, nullptr, nullptr, false);
+    const CacheCoordinator plain =
+        MakeCoordinator(FullOnlySpecs(), 4, plain_pool, false, nullptr, nullptr, false, /*write_back_evictions=*/false);
     EXPECT_EQ(PrefillStateCheckpointTokens(plain, 26, 8, 0), 0) << "no State group, no checkpoint";
 
     auto replay_specs = ReplayableSpecs();
     replay_specs.push_back(specs.back());
     BlockPool replay_pool(64, {1, 1, 1, 1});
-    const CacheCoordinator replay = MakeCoordinator(replay_specs, 4, replay_pool, false, nullptr, nullptr, false);
+    const CacheCoordinator replay =
+        MakeCoordinator(replay_specs, 4, replay_pool, false, nullptr, nullptr, false, /*write_back_evictions=*/false);
     EXPECT_EQ(PrefillStateCheckpointTokens(replay, 30, 16, 0), 20) << "leave the largest replayable window";
 }
 
@@ -176,17 +179,19 @@ TEST(MinPrefillChunkTokensTest, ReservesReplayPlusAWindowOrPage) {
     BlockPool pool(16, {1, 1, 1});
     // W = 8 > P = 4: replay plus another window.
     EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(ReplayableSpecs(), 4, pool, /*enable_l3_storage=*/false, nullptr,
-                                                    /*snapshot_pool=*/nullptr, false)),
+                                                    /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false)),
               16);
     // W = 8 < P = 16: replay plus one prefix page, so an aligned chunk fits.
     BlockPool wide_pool(16, {1, 1, 1});
-    EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(ReplayableSpecs(), 16, wide_pool, /*enable_l3_storage=*/false,
-                                                    nullptr, /*snapshot_pool=*/nullptr, false)),
-              24);
+    EXPECT_EQ(
+        MinPrefillChunkTokens(MakeCoordinator(ReplayableSpecs(), 16, wide_pool, /*enable_l3_storage=*/false, nullptr,
+                                              /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false)),
+        24);
     BlockPool plain_pool(16, {1});
-    EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false,
-                                                    nullptr, /*snapshot_pool=*/nullptr, false)),
-              0);
+    EXPECT_EQ(
+        MinPrefillChunkTokens(MakeCoordinator(FullOnlySpecs(), 4, plain_pool, /*enable_l3_storage=*/false, nullptr,
+                                              /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false)),
+        0);
     // A State group reserves nothing: its chunks are cut by budget alone.
     BlockPool state_pool(16, {1, 1});
     const std::vector<CacheGroupSpec> with_state = {
@@ -197,7 +202,7 @@ TEST(MinPrefillChunkTokensTest, ReservesReplayPlusAWindowOrPage) {
                        .block_granularity = 0},
     };
     EXPECT_EQ(MinPrefillChunkTokens(MakeCoordinator(with_state, 4, state_pool, /*enable_l3_storage=*/false, nullptr,
-                                                    /*snapshot_pool=*/nullptr, false)),
+                                                    /*snapshot_pool=*/nullptr, false, /*write_back_evictions=*/false)),
               0);
 }
 

@@ -135,6 +135,7 @@ TEST(CapacityModelTest, L3SizingDoesNotRequireHostPagesBeforeAllocation) {
     SchedulerConfig sized = SizedConfig(sizing, 8);
     EXPECT_THROW(sized.Validate(), std::invalid_argument);
     sized.host_allocator.total_pages = 9;
+    sized.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     sized.storage_config = StorageConfig{8, 64, 4, 16, 64, 4, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};
     EXPECT_EQ(Scheduler{sized}.MaxSingleRequestTokens(), model.MaxSingleRequestTokens(8));
 }

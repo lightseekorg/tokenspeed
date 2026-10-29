@@ -460,7 +460,11 @@ def gdn_decode_step(
     """
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
-    traits = {"head_dim": head_dim}
+    traits = {"head_dim": head_dim, "value_head_dim": v.shape[-1]}
+    if solution != "flashinfer":
+        # Only the legacy FlashInfer solution retains its old padding contract.
+        # Other named solutions must still accept the actual state dtype.
+        traits["state_dtype"] = initial_state.dtype
     if _qkv_rows_strided(q, k, v):
         traits["strided_qkv"] = True
     kernel = select_kernel(
@@ -724,7 +728,9 @@ def gdn_decode_mtp(
 
     head_dim = q.shape[-1]
     signature = _attention_format_signature(q=q, k=k, v=v)
-    traits = {"head_dim": head_dim}
+    traits = {"head_dim": head_dim, "value_head_dim": v.shape[-1]}
+    if solution != "flashinfer":
+        traits["state_dtype"] = initial_state.dtype
     if output_state is not None:
         traits["separate_output_state"] = True
     if _qkv_rows_strided(q, k, v):
@@ -899,6 +905,8 @@ def gdn_decode_supports(
     dtype: torch.dtype,
     *,
     head_dim: int,
+    value_head_dim: int,
+    state_dtype: torch.dtype,
     trait: str,
     solution: str | None,
 ) -> bool:
@@ -909,6 +917,8 @@ def gdn_decode_supports(
         op: ``"gdn_decode_step"`` or ``"gdn_decode_mtp"``.
         dtype: q/k/v dtype.
         head_dim: Key head dimension.
+        value_head_dim: Value head dimension.
+        state_dtype: Bound recurrent pool's dtype, used for safe padding selection.
         trait: ``"separate_output_state"`` (an ``output_state`` pool) or
             ``"strided_qkv"`` (q/k/v rows spaced wider than one packed
             ``q | k | v`` row, with contiguous heads; such kernels read a/b by
@@ -921,19 +931,22 @@ def gdn_decode_supports(
     """
     probe = torch.empty(0, dtype=dtype, device="meta")
     signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {"head_dim": head_dim, "value_head_dim": value_head_dim}
+    if solution != "flashinfer":
+        traits["state_dtype"] = state_dtype
     try:
         default = select_kernel(
             "attention",
             op,
             signature,
-            traits={"head_dim": head_dim},
+            traits=traits,
             solution=solution,
         )
         featured = select_kernel(
             "attention",
             op,
             signature,
-            traits={"head_dim": head_dim, trait: True},
+            traits={**traits, trait: True},
             solution=solution,
         )
     except NoKernelFoundError:

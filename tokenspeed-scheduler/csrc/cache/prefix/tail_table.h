@@ -41,9 +41,11 @@ namespace tokenspeed {
 // accelerator over the prefix indexes, not a tier of its own: an offset whose
 // entries were evicted is a stale hint that costs one hash and a miss, so
 // pruning is lazy (the coordinator removes a hash when its last Device entry
-// leaves and no Host entry remains). Per prior at most kMaxTailsPerPrior
-// tails are kept in least-recently-used order: a publication or a hit moves
-// a tail to the back, the cap drops the front.
+// leaves, no Host entry remains and no eviction write-back is bringing one to
+// the Host: a hint the cap dropped meanwhile cancels that publication
+// instead). Per prior at most kMaxTailsPerPrior tails are kept in
+// least-recently-used order: a publication or a hit moves a tail to the back,
+// the cap drops the front.
 class TailTable {
 public:
     static constexpr std::int32_t kMaxTailsPerPrior = 8;

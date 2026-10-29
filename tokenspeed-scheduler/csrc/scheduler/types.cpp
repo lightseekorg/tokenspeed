@@ -79,6 +79,31 @@ void SchedulerConfig::Validate() const {
     if (enable_l3_storage && !HasHostCache()) {
         throw std::invalid_argument("Scheduler: L3 storage requires Host L2 cache");
     }
+    if (HasHostCache() && host_write_policy == HostWritePolicy::kUnspecified) {
+        throw std::invalid_argument("Scheduler: a Host L2 cache requires an explicit host_write_policy");
+    }
+    // Write-back needs no KV-parallel check: each Host block takes its Device
+    // block's bucket (docs/design/scheduler.md §5).
+    //
+    // Device copies read their sources before any copy in the plan overwrites
+    // those bytes, including when another group reuses the same LCM block.
+    if (host_write_policy == HostWritePolicy::kWriteBack) {
+        if (!HasHostCache()) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack requires a Host L2 cache");
+        }
+        if (role == Role::kD) {
+            throw std::invalid_argument(
+                "Scheduler: host_write_policy WriteBack is not available on the D role: its Host holds retraction "
+                "images only and remote admission probes the Device alone");
+        }
+        if (enable_l3_storage) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack excludes L3 storage");
+        }
+        // BoundaryTree::Node::written_back_group_bits keeps one bit per group.
+        if (cache_groups.size() > 64) {
+            throw std::invalid_argument("Scheduler: host_write_policy WriteBack supports at most 64 cache groups");
+        }
+    }
     // The snapshot pool is stated explicitly on every role: the null page
     // alone (and no slots) says "never retract", anything more needs slots.
     // The messages name the binding field and the server arg that sets it,

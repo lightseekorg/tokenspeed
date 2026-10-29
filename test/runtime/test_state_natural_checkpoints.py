@@ -61,6 +61,7 @@ def _scheduler(*, token_budget: int, with_state: bool, disable_prefix_cache: boo
         role="fused",
         num_snapshot_pages=1,
         max_retracted_requests=0,
+        host_write_policy="write_through",
         storage_config=None,
         prefill_compute_budget=None,
         enable_kv_cache_events=False,
