@@ -27,6 +27,7 @@ from unittest import mock
 
 import pytest
 import torch
+from tokenspeed_kernel.ops.sampling.triton import dflash2_sample_path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from ci_system.ci_register import register_cuda_ci
@@ -36,11 +37,7 @@ register_cuda_ci(est_time=30, suite="runtime-1gpu")
 from tokenspeed.runtime.configs.model_config import _is_dflash2_mla
 from tokenspeed.runtime.execution.drafter import get_drafter_impl
 from tokenspeed.runtime.execution.drafter.dflash import DFlash
-from tokenspeed.runtime.execution.drafter.dflash2 import (
-    DFlash2,
-    _greedy_path_torch,
-    _walk_greedy_path,
-)
+from tokenspeed.runtime.execution.drafter.dflash2 import DFlash2
 
 # Imported for its register_backend() side effects on _BACKEND_REGISTRY.
 from tokenspeed.runtime.layers.attention import backends  # noqa: F401
@@ -368,31 +365,69 @@ def test_candidate_selector_edges_match_the_official_equation() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+class _GreedyWalk:
+    """The walk as DFlash2 runs it with --enable-speculative-sampling off:
+    every row reads row 0 of one greedy (top_k 1) pool."""
+
+    def __init__(self, batch_size: int, num_steps: int, top_k: int) -> None:
+        device = torch.device("cuda")
+        self.pool_indices = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.temperature = torch.ones(1, dtype=torch.float32, device=device)
+        self.top_k = torch.ones(1, dtype=torch.int32, device=device)
+        self.top_p = torch.ones(1, dtype=torch.float32, device=device)
+        self.seed = torch.zeros(1, dtype=torch.int64, device=device)
+        self.offsets = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        self.q = torch.empty(batch_size, num_steps, top_k, device=device)
+        self.q_ids = torch.empty(
+            batch_size, num_steps, top_k, dtype=torch.int32, device=device
+        )
+        self.pos = torch.empty(
+            batch_size, num_steps + 1, dtype=torch.int32, device=device
+        )
+        self.slot = torch.empty(
+            batch_size, num_steps + 1, dtype=torch.int32, device=device
+        )
+
+    def __call__(
+        self,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        dflash2_sample_path(
+            candidate_ids,
+            scores,
+            anchor_token_ids,
+            self.pool_indices,
+            self.temperature,
+            self.top_k,
+            self.top_p,
+            self.seed,
+            self.offsets,
+            out,
+            self.q,
+            self.q_ids,
+            self.pos,
+            self.slot,
+        )
+        return out
+
+
+@_CUDA_ONLY
 def test_greedy_path_follows_the_selected_predecessor() -> None:
-    candidate_ids = torch.tensor([[[10, 11], [20, 21], [30, 31]]])
-    scores = torch.zeros(1, 3, 2, 2)
+    candidate_ids = torch.tensor([[[10, 11], [20, 21], [30, 31]]], device="cuda")
+    scores = torch.zeros(1, 3, 2, 2, device="cuda")
     scores[0, 0, 0, 1] = 3
     scores[0, 1, 1, 0] = 4
     scores[0, 2, 0, 1] = 5
-    out = torch.empty(1, 4, dtype=torch.int32)
-    _walk_greedy_path(candidate_ids, scores, torch.tensor([7]), out)
+    out = torch.empty(1, 4, dtype=torch.int32, device="cuda")
+    walk = _GreedyWalk(1, 3, 2)
+    walk(candidate_ids, scores, torch.tensor([7], device="cuda"), out)
     assert out.tolist() == [[7, 11, 20, 31]]
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_the_path_kernel_reproduces_the_torch_walk() -> None:
-    torch.manual_seed(5)
-    candidate_ids = torch.rand(4, 7, 128).topk(16).indices.cuda()
-    scores = torch.randn(4, 7, 16, 16, device="cuda")
-    scores[:, 0] = scores[:, 0, :1].expand(-1, 16, -1)
-    anchors = torch.randint(128, (4,), device="cuda")
-    kernel_out = torch.empty(4, 8, dtype=torch.int32, device="cuda")
-    torch_out = torch.empty(4, 8, dtype=torch.int32, device="cuda")
-
-    _walk_greedy_path(candidate_ids, scores, anchors, kernel_out)
-    _greedy_path_torch(candidate_ids, scores, anchors, torch_out)
-
-    torch.testing.assert_close(kernel_out, torch_out)
+    # A greedy walk proposes nothing to rejection-sample against.
+    assert walk.slot.tolist() == [[-1, -1, -1, -1]]
+    assert walk.pos.tolist() == [[0, 1, 0, 1]]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -409,6 +444,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
     static_unary = torch.randn(1, 7, 4, device=device)
     static_anchor = torch.tensor([3], device=device)
     static_out = torch.empty(1, 8, dtype=torch.int32, device=device)
+    walk = _GreedyWalk(1, 7, 4)
 
     for _ in range(3):
         prepared, coefficients = conv.prepare(static_hidden)
@@ -416,7 +452,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
         scores = selector(
             static_candidates, static_unary, finished[1:].unsqueeze(0), static_anchor
         )
-        _walk_greedy_path(static_candidates, scores, static_anchor, static_out)
+        walk(static_candidates, scores, static_anchor, static_out)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
@@ -426,7 +462,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
         scores = selector(
             static_candidates, static_unary, finished[1:].unsqueeze(0), static_anchor
         )
-        _walk_greedy_path(static_candidates, scores, static_anchor, static_out)
+        walk(static_candidates, scores, static_anchor, static_out)
 
     new_hidden = torch.randn_like(static_hidden)
     static_hidden.copy_(new_hidden)
@@ -441,7 +477,7 @@ def test_official_nodes_capture_and_replay_in_one_cuda_graph() -> None:
     )
     assert torch.isfinite(eager_scores).all()
     expected = torch.empty_like(static_out)
-    _walk_greedy_path(static_candidates, eager_scores, static_anchor, expected)
+    walk(static_candidates, eager_scores, static_anchor, expected)
     torch.testing.assert_close(replayed, expected)
 
 

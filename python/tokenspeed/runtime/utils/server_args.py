@@ -72,10 +72,14 @@ from tokenspeed.runtime.utils.spec_block_geometry import (
 logger = get_colorful_logger(__name__)
 
 # Sampling backends whose verify runs the draft-prob chain kernel
-# (--enable-speculative-sampling). greedy verifies by exact match and the
-# Triton backends by target-sampled exact match; the drafter's recorded
-# distribution never enters either.
+# (--enable-speculative-sampling) for the step drafters (EAGLE3, MTP).
+# greedy verifies by exact match and the Triton backends by target-sampled
+# exact match; the step drafters' dense recorded distribution never enters
+# either.
 SPECULATIVE_SAMPLING_BACKENDS = frozenset({"flashinfer", "flashinfer_full"})
+# The one backend whose verify reads the DFlash2 candidate selector's sparse
+# draft q (RuntimeStates.future_draft_q): DFLASH under the flag needs it.
+DFLASH_SPECULATIVE_SAMPLING_BACKEND = "triton"
 
 # Usable range of --spec-reject-draft-prob-threshold. The sentinel rows are
 # written as threshold + 1.0 in fp32 and detected by ``draft_prob > threshold``:
@@ -1649,17 +1653,22 @@ class ServerArgs:
 
         The accept test needs a proposal drawn from the recorded draft
         distribution q, so the drafter must propose one token per step from
-        its own logits (the Eagle family and the multi-depth MTP drafter;
-        block drafters propose a whole block greedily), and the verifier must
-        be a backend that runs the draft-prob chain kernel: ``greedy`` verifies
-        by exact match and ``triton`` by a target-sampled exact match, so q
-        never enters either. The prefill role of a disaggregated deployment
-        never verifies a chain of its own and its drafted candidates ship to
-        the decode node without q, so there the flag would only allocate the
-        per-slot distribution buffer; it is refused. The sentinel threshold
-        is validated here once for every layer below: at least 1.0 so no
-        real probability reads as the sentinel, and at most 2**20 so the
-        fp32 sentinel ``threshold + 1.0`` stays distinguishable from it.
+        its own logits (the Eagle family and the multi-depth MTP drafter) and
+        the verifier must be a backend that runs the draft-prob chain kernel:
+        ``greedy`` verifies by exact match and ``triton`` by a target-sampled
+        exact match, so a dense q never enters either. The one block drafter
+        served is DFLASH with the DFlash2 candidate selector: its walk samples
+        each step from the selector's q over its top-K candidates, which only
+        the ``triton`` backend verifies (sparse q); base DFLASH without the
+        selector is refused when the drafter binds the verifier, since only
+        the loaded checkpoint tells the two apart. The prefill role of a
+        disaggregated deployment never verifies a chain of its own and its
+        drafted candidates ship to the decode node without q, so there the
+        flag would only allocate the per-slot distribution buffer; it is
+        refused. The sentinel threshold is validated here once for every
+        layer below: at least 1.0 so no real probability reads as the
+        sentinel, and at most 2**20 so the fp32 sentinel ``threshold + 1.0``
+        stays distinguishable from it.
         """
         if self.disaggregation_mode == "prefill":
             raise ValueError(
@@ -1672,9 +1681,13 @@ class ServerArgs:
         if self.speculative_algorithm is None:
             raise ValueError(
                 "--enable-speculative-sampling needs speculative decoding: pass "
-                "--speculative-algorithm EAGLE3 or MTP"
+                "--speculative-algorithm EAGLE3 or MTP, or DFLASH with a DFlash2 "
+                "draft and --sampling-backend triton"
             )
-        if self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS:
+        if (
+            self.speculative_algorithm in BLOCK_SPEC_ALGORITHMS
+            and self.speculative_algorithm != "DFLASH"
+        ):
             raise ValueError(
                 "--enable-speculative-sampling needs a chain drafter that samples "
                 "one token per step from its own distribution; "
@@ -1686,13 +1699,22 @@ class ServerArgs:
                 "--enable-speculative-sampling supports only the topk=1 chain: "
                 f"{self.speculative_eagle_topk=}"
             )
-        if self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS:
+        if self.speculative_algorithm == "DFLASH":
+            if self.sampling_backend != DFLASH_SPECULATIVE_SAMPLING_BACKEND:
+                raise ValueError(
+                    "--enable-speculative-sampling with DFLASH needs --sampling-backend "
+                    f"{DFLASH_SPECULATIVE_SAMPLING_BACKEND}, the one verifier that reads "
+                    "the DFlash2 selector's sparse draft distribution; got "
+                    f"--sampling-backend {self.sampling_backend}"
+                )
+        elif self.sampling_backend not in SPECULATIVE_SAMPLING_BACKENDS:
             if self.sampling_backend == "greedy":
                 why = "verifies by exact match, so the draft distribution never enters"
             elif self.sampling_backend in ("triton", "triton_full"):
                 why = (
-                    "verifies by target-sampled exact match and has no draft-prob "
-                    "rejection kernel"
+                    "verifies by target-sampled exact match and has no dense "
+                    "draft-prob rejection kernel (triton reads only the DFlash2 "
+                    "selector's sparse q, under DFLASH)"
                 )
             else:
                 why = "has no draft-prob rejection kernel"
@@ -3429,11 +3451,12 @@ class ServerArgs:
             "temperature; greedy rows stay argmax) and verify accepts with "
             "coin * q(x) < p(x) instead of the target-only rule. Needs EAGLE3 "
             "or MTP with --speculative-eagle-topk 1 and the flashinfer or "
-            "flashinfer_full sampling backend, or EAGLE4 on EAGLE-Harness "
+            "flashinfer_full sampling backend, EAGLE4 on EAGLE-Harness "
             "(--speculative-exec-mode 0 or 1, trees or chains) and the "
-            "flashinfer backend; refused on the prefill role of "
-            "a disaggregated deployment. Costs a per-request fp32 draft "
-            "distribution buffer; see docs/configuration/server.md.",
+            "flashinfer backend, or DFLASH with a DFlash2 (candidate selector) "
+            "draft and the triton backend; refused on the prefill role of "
+            "a disaggregated deployment. EAGLE3/MTP cost a per-request fp32 "
+            "draft distribution buffer; see docs/configuration/server.md.",
         )
         parser.add_argument(
             "--spec-reject-draft-prob-threshold",

@@ -204,6 +204,17 @@ The flashinfer backend instead accepts every tree by recursive rejection
 sampling (`TreeRejectionSampler`), against the draft q that drew a sampled
 node's children (`RuntimeStates.future_draft_q`), exact in distribution rather
 than the plain-decoding draw.
+The triton backend's chain verify (DFLASH with a DFlash2 draft under
+`--enable-speculative-sampling`) gives up the plain-decoding draw the same way
+for rows that carry a recorded q (`future_draft_q`, chain layout: node `i`
+reads slot `i - 1`): it accepts by rejection sampling against the filtered
+target and resamples from the residual, so the accepted token is an exact
+sample from the same distribution but not the token plain decoding draws there.
+Its random streams stay disjoint: the residual and bonus draws reuse the plain
+stream's position keys, while the walk's draft noise and the accept coins
+use their own salted offsets. Greedy rows, rows without a q (slot `-1`) and
+routes without an exact filtered distribution (top-p only, mixed batches)
+keep the plain-decoding draw.
 Backends that can do neither keep `supports_tree_verify = False` and the
 executor refuses tree drafting with them at startup.
 

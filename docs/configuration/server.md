@@ -562,8 +562,8 @@ parser option keeps its existing behavior.
 | `--speculative-num-draft-tokens` | Number of draft tokens. Defaults to `--speculative-num-steps + 1`; required for draft trees. |
 | `--synthetic-acceptance-length` | Benchmark-only mean emitted tokens per speculative verification, including the guaranteed target token. Unset disables it. |
 | `--speculative-eagle-topk` | Children each draft node expands to per step. Defaults to `1` (a chain); above 1 the draft is a tree. |
-| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters and EAGLE-Harness trees and chains (see below). Off by default. |
-| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. |
+| `--enable-speculative-sampling` | Draft-prob rejection sampling for the chain drafters, EAGLE-Harness trees and chains, and `DFLASH` with a DFlash2 draft (see below). Off by default. |
+| `--spec-reject-draft-prob-threshold` | With `--enable-speculative-sampling`, recorded draft probabilities above this value mark a request with no proposal yet and always reject. Defaults to `2.0`; must lie within `[1.0, 2**20]`. No effect on `DFLASH`. |
 | `--eagle3-layers-to-capture` | Target layers whose hidden states feed an `EAGLE3` or `EAGLE4` draft. |
 | `--speculative-exec-mode` | `EAGLE4` drafting (see below): `-1` (default) static chains and trees, `0` EAGLE-Harness dynamic chains and trees, `1` the same for evaluation runs, `2` measures the EAGLE-Harness cost data. |
 | `--speculative-data-path` | EAGLE-Harness run directory: the cost data exec modes 0 and 1 read, which exec mode 2 writes. |
@@ -716,11 +716,11 @@ prefill`): that role never verifies a chain and its candidates ship without
 `q`, so it would only allocate the distribution buffer. Pass it to the decode
 role only.
 
-Requirements: `--speculative-algorithm EAGLE3` or `MTP` (block drafters
-`DFLASH`/`DSPARK` propose a whole block greedily), `--speculative-eagle-topk 1`,
+Requirements: `--speculative-algorithm EAGLE3` or `MTP` (`DSPARK` proposes a
+whole block greedily; `DFLASH` is covered below), `--speculative-eagle-topk 1`,
 and `--sampling-backend flashinfer` or `flashinfer_full` (`greedy` verifies by
 exact match, the Triton backends by target-sampled exact match; neither reads
-`q`). The drafter switches its draft model's fused TP-sharded argmax off so
+the dense `q`). The drafter switches its draft model's fused TP-sharded argmax off so
 the full-vocab logits reach it, which adds the logits all-gather to every
 draft step under tensor parallelism.
 
@@ -742,6 +742,46 @@ vocabulary cost about 330 MB in total. On CUDA, when the CUDA-graph memory
 reserve is on, the runtime charges both to it as startup residue, out of the
 KV-cache budget. Otherwise they come out of the `--gpu-memory-utilization`
 headroom.
+
+#### DFLASH with a DFlash2 draft
+
+`DFLASH` takes the flag with a DFlash2 draft (a checkpoint with candidate
+selector weights) and `--sampling-backend triton` only; `DFLASH` with any other
+backend is refused at startup, and a base DFlash draft (no selector) is refused
+when the server loads it. The DFlash2 walk picks one of the selector's `K`
+candidates per draft step. Under the flag a sampling request draws that
+candidate from `q = softmax(scores / T)` over the `K` edges out of the
+previous pick, with noise keyed by the request's seed, the round and the drawn
+token id, so every TP rank draws the same token. Greedy requests keep the best
+edge. Requests with top-k disabled and `top_p < 1` also keep it (see the
+routes below), as does a step whose scores are not finite. None of these
+three records a proposal. The walk records `q` and the candidate ids per step,
+which is `K` entries instead of a vocabulary row. Verify accepts draft `x` with
+probability `min(1, p'(x) / q(x))` and on rejection samples from
+`norm(max(p' - q, 0))`, where `p'` is the target distribution after the
+request's temperature, top-k and top-p, the one the triton backend serves.
+
+- Memory: `q` reuses the draft-tree q tables (`RuntimeStates.future_draft_q`),
+  `(max_num_seqs + 2) x (num_draft_tokens - 1) x K x 8` bytes plus two int32
+  rows of `num_draft_tokens` per slot. That is under 1 MB at 512 slots, 8
+  draft tokens and `K = 16`. No dense per-vocab rows, no gather buffer, and
+  the draft head keeps its shard-local top-K.
+- No proposal: a fresh admission, a PD landing and a forced single-token
+  verify record no `q`. Their drafts are checked by the target-only rule,
+  which keeps a draft exactly when it equals the target's own draw at that
+  position. So a landed request's first verify can still accept drafts,
+  unlike the step drafters' sentinel, which always rejects.
+  `--spec-reject-draft-prob-threshold` has no effect here.
+- Routes: the triton backend picks one sampling route per batch. The
+  rejection rule runs on batches with no filter (top-k disabled, `top_p = 1`)
+  and on batches where every request has a finite top-k, with any `top_p`.
+  Under the flag those top-k batches always use the two-stage top-k kernel,
+  at every row count. Batches with top-p only (top-k disabled, `top_p < 1`)
+  and mixed batches (for example greedy next to no-filter requests) have no
+  exact `p'` and verify every row by the target-only rule. There a sampled
+  draft is kept with probability `sum(p * q)`, which can be below the greedy
+  draft's `p(argmax q)`. Keep sampling parameters uniform across a batch for
+  the best acceptance.
 
 `DFLASH` and `DSPARK` are block drafters: one draft forward proposes a whole
 block instead of one token per step, so their two token counts are coupled.

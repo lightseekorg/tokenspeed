@@ -26,6 +26,8 @@ from collections.abc import Callable
 
 import torch
 
+from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
+
 
 @dataclasses.dataclass
 class SamplingBatchInfo:
@@ -67,6 +69,14 @@ class SamplingBatchInfo:
     # gathers its rows by `req_pool_indices` inside the captured graph and
     # runs the draft-prob accept rule; None selects the target-only rule.
     draft_probs: torch.Tensor | None = None
+
+    # RuntimeStates.future_draft_q, read-only reference: the sparse draft q
+    # the DFlash2 walk records per pool slot under --enable-speculative-sampling
+    # (and EAGLE-Harness sampled trees, whose verify reads it through
+    # TreeVerifyBatch instead). The triton backend's chain verify reads it by
+    # `req_pool_indices` inside the captured graph and runs the rejection rule
+    # on the rows that have a proposal; None selects the target-only rule.
+    draft_q: DraftTreeQ | None = None
 
     # First batch row this info covers, relative to the step's full batch.
     # Per-step row-indexed backend buffers (the coin buffers a mixed round's

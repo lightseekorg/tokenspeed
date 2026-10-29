@@ -48,6 +48,7 @@ import torch
 from tokenspeed_kernel.ops.sampling import argmax as sampling_argmax
 from tokenspeed_kernel.ops.sampling.flashinfer import softmax
 from tokenspeed_kernel.ops.sampling.triton import (
+    DRAFT_SAMPLE_OFFSET_SALT,
     gumbel_sample_from_pools,
     gumbel_scratch_shape,
 )
@@ -56,13 +57,6 @@ if TYPE_CHECKING:
     from tokenspeed.runtime.execution.input_buffer import InputBuffers
     from tokenspeed.runtime.execution.runtime_states import RuntimeStates
     from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
-
-# Philox offset salt for the draft proposal stream. sample() keys the
-# request's stream by (seed, valid_cache_length); the draft stream keys by
-# (seed, SALT + valid_cache_length * N + step), far above any context length,
-# so the two never share a draw and no two (round, step) pairs of one request
-# do either (valid_cache_length grows every round).
-DRAFT_SAMPLE_OFFSET_SALT = 1 << 40
 
 
 class DraftProposalSampler:
