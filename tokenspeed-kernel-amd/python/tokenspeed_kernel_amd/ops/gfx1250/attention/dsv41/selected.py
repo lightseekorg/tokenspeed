@@ -1051,25 +1051,118 @@ def gluon_dsv41_selected_attention_gfx1250(
             )
 
 
-@gluon.jit
-def _split_state(part_stats, part_count, rows, heads, num_heads, valid, active):
-    """Per-split (max, sum) [splits, heads]; zero-query heads use frame 0, count.
+@gluon.constexpr_function
+def _reduce_layout(dim_block):
+    """[splits, heads, dims] layout of the split reduce: 4 waves over heads."""
+    return gl.BlockedLayout(
+        [1, 1, 4], [1, 32 // (dim_block // 4), dim_block // 4], [1, 4, 1], [2, 1, 0]
+    )
 
-    rows and heads must be in range; entries outside valid read as empty.
+
+@gluon.jit
+def _merge_partials(
+    part_stats,
+    part_acc,
+    attn_sink,
+    num_heads,
+    num_splits,
+    token_idx,
+    group_idx,
+    dim_base,
+    BLOCK_H: gl.constexpr,
+    SPLIT_BLOCK: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    DIM_BLOCK: gl.constexpr,
+):
+    """BF16 [heads, dims] merge of 16 heads' split partials and their sink.
+
+    All splits (at most SPLIT_BLOCK, a power of two) load at once, unmasked,
+    at clamped splits and heads: splits and heads sit in registers, and a
+    mask uniform per register would become a branch and a full wait around
+    every load. A clamped split's weight is zero; clamped heads are not stored.
     """
-    if active:
-        stats = (
-            part_stats + (rows[:, None].to(tl.int64) * num_heads + heads[None, :]) * 2
-        )
-        split_max = gl.where(valid, gl.load(stats), -float("inf"))
-        split_sum = gl.where(valid, gl.load(stats + 1), 0.0)
-    else:
-        count = gl.where(
-            valid, gl.load(part_count + rows[:, None] + heads[None, :] * 0), 0
-        )
-        split_max = gl.where(count > 0, 0.0, -float("inf"))
-        split_sum = count.to(gl.float32)
-    return split_max, split_sum
+    layout: gl.constexpr = _reduce_layout(DIM_BLOCK)
+    stat_layout: gl.constexpr = gl.SliceLayout(2, layout)
+    out_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    heads = group_idx * BLOCK_H + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(0, stat_layout)
+    )
+    valid_head = heads < num_heads
+    heads = gl.minimum(heads, num_heads - 1)
+    sink = gl.where(valid_head, gl.load(attn_sink + heads).to(gl.float32), 0.0)
+    splits = gl.arange(0, SPLIT_BLOCK, layout=gl.SliceLayout(1, stat_layout))
+    valid = (splits < num_splits)[:, None] & valid_head[None, :]
+    rows = token_idx * num_splits + gl.minimum(splits, num_splits - 1)
+    stats = part_stats + (rows[:, None].to(tl.int64) * num_heads + heads[None, :]) * 2
+    split_max = gl.where(valid, gl.load(stats), -float("inf"))
+    split_sum = gl.where(valid, gl.load(stats + 1), 0.0)
+    frame = gl.maximum(gl.max(split_max, axis=0), sink)
+    frame = gl.where(frame > -float("inf"), frame, 0.0)
+    weight = gl.exp(split_max - frame[None, :])
+    total = gl.exp(sink - frame) + gl.sum(split_sum * weight, axis=0)
+    value_dims = dim_base + gl.arange(
+        0, DIM_BLOCK, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout))
+    )
+    values = gl.load(
+        part_acc
+        + (rows[:, None, None].to(tl.int64) * num_heads + heads[None, :, None])
+        * HEAD_DIM
+        + value_dims[None, None, :]
+    )
+    merged = gl.sum(values * weight[:, :, None], axis=0)
+    scale = gl.convert_layout(
+        gl.where(total > 0.0, 1.0 / total, 0.0), gl.SliceLayout(1, out_layout)
+    )
+    return (merged * scale[:, None]).to(gl.bfloat16)
+
+
+@gluon.jit
+def _merge_zero_query(
+    part_row_sum,
+    part_count,
+    attn_sink,
+    num_heads,
+    num_splits,
+    token_idx,
+    group_idx,
+    dim_base,
+    BLOCK_H: gl.constexpr,
+    SPLIT_BLOCK: gl.constexpr,
+    HEAD_DIM: gl.constexpr,
+    DIM_BLOCK: gl.constexpr,
+):
+    """BF16 [heads, dims] output of 16 zero-query heads.
+
+    Every split scores its rows exactly zero, so the merged output is the
+    single-split form row_sum * e^-m / (count * e^-m + e^(sink - m)),
+    m = max(sink, 0), over the row sum and count of all splits. The heads
+    share both, so each split's row sum loads once rather than per head.
+    """
+    layout: gl.constexpr = gl.SliceLayout(1, _reduce_layout(DIM_BLOCK))
+    out_layout: gl.constexpr = gl.SliceLayout(0, _reduce_layout(DIM_BLOCK))
+    splits = gl.arange(0, SPLIT_BLOCK, layout=gl.SliceLayout(1, layout))
+    valid = splits < num_splits
+    rows = token_idx * num_splits + gl.minimum(splits, num_splits - 1)
+    value_dims = dim_base + gl.arange(0, DIM_BLOCK, layout=gl.SliceLayout(0, layout))
+    sums = gl.load(
+        part_row_sum + rows[:, None].to(tl.int64) * HEAD_DIM + value_dims[None, :]
+    )
+    row_sum = gl.sum(gl.where(valid[:, None], sums, 0.0), axis=0)
+    count = gl.sum(gl.where(valid, gl.load(part_count + rows), 0), axis=0)
+    heads = group_idx * BLOCK_H + gl.arange(
+        0, BLOCK_H, layout=gl.SliceLayout(1, out_layout)
+    )
+    sink = gl.where(
+        heads < num_heads,
+        gl.load(attn_sink + gl.minimum(heads, num_heads - 1)).to(gl.float32),
+        0.0,
+    )
+    frame = gl.maximum(sink, 0.0)
+    weight = gl.exp(-frame)
+    total = count.to(gl.float32) * weight + gl.exp(sink - frame)
+    coefficient = gl.where(total > 0.0, weight / total, 0.0)
+    row_sum = gl.convert_layout(row_sum, gl.SliceLayout(0, out_layout))
+    return (row_sum[None, :] * coefficient[:, None]).to(gl.bfloat16)
 
 
 @gluon.jit(launch_metadata=_selected_attention_reduce_metadata)
@@ -1098,68 +1191,51 @@ def gluon_dsv41_selected_attention_reduce_gfx1250(
 ):
     """Merge one token's split partials, adding the sink once.
 
-    Each program covers 16 heads and ``DIM_BLOCK`` dims. Zero-query heads use
-    frame 0, weight ``count`` and value ``row_sum`` for every split, which is
-    exactly their all-zero-score softmax state. All splits (at most
-    ``SPLIT_BLOCK``, a power of two) load at once, unmasked, at
-    clamped splits and heads: splits and heads sit in registers, and a mask
-    uniform per register would become a branch and a full wait around every
-    load. A clamped split's weight is zero; clamped heads are not stored.
+    Each program covers 16 heads and ``DIM_BLOCK`` dims. Groups with a nonzero
+    query merge their per-head partials; zero-query groups only need the
+    shared per-split row sums and counts.
     """
-    layout: gl.constexpr = gl.BlockedLayout(
-        [1, 1, 4], [1, 32 // (DIM_BLOCK // 4), DIM_BLOCK // 4], [1, 4, 1], [2, 1, 0]
-    )
-    stat_layout: gl.constexpr = gl.SliceLayout(2, layout)
-    out_layout: gl.constexpr = gl.SliceLayout(0, layout)
+    out_layout: gl.constexpr = gl.SliceLayout(0, _reduce_layout(DIM_BLOCK))
     token_idx = gl.program_id(axis=0)
     group_idx = gl.program_id(axis=1)
     dim_base = gl.program_id(axis=2) * DIM_BLOCK
-    heads = group_idx * BLOCK_H + gl.arange(
-        0, BLOCK_H, layout=gl.SliceLayout(0, stat_layout)
-    )
-    valid_head = heads < num_heads
-    heads = gl.minimum(heads, num_heads - 1)
     active_bits = gl.load(
         part_active + token_idx * head_blocks + group_idx // HEAD_GROUPS
     )
-    active = ((active_bits >> (group_idx % HEAD_GROUPS)) & 1) != 0
-    sink = gl.where(valid_head, gl.load(attn_sink + heads).to(gl.float32), 0.0)
-    splits = gl.arange(0, SPLIT_BLOCK, layout=gl.SliceLayout(1, stat_layout))
-    valid = (splits < num_splits)[:, None] & valid_head[None, :]
-    rows = token_idx * num_splits + gl.minimum(splits, num_splits - 1)
-    split_max, split_sum = _split_state(
-        part_stats, part_count, rows, heads, num_heads, valid, active
-    )
-    frame = gl.maximum(gl.max(split_max, axis=0), sink)
-    frame = gl.where(frame > -float("inf"), frame, 0.0)
-    weight = gl.exp(split_max - frame[None, :])
-    total = gl.exp(sink - frame) + gl.sum(split_sum * weight, axis=0)
+    if ((active_bits >> (group_idx % HEAD_GROUPS)) & 1) != 0:
+        result = _merge_partials(
+            part_stats,
+            part_acc,
+            attn_sink,
+            num_heads,
+            num_splits,
+            token_idx,
+            group_idx,
+            dim_base,
+            BLOCK_H,
+            SPLIT_BLOCK,
+            HEAD_DIM,
+            DIM_BLOCK,
+        )
+    else:
+        result = _merge_zero_query(
+            part_row_sum,
+            part_count,
+            attn_sink,
+            num_heads,
+            num_splits,
+            token_idx,
+            group_idx,
+            dim_base,
+            BLOCK_H,
+            SPLIT_BLOCK,
+            HEAD_DIM,
+            DIM_BLOCK,
+        )
     out_heads = group_idx * BLOCK_H + gl.arange(
         0, BLOCK_H, layout=gl.SliceLayout(1, out_layout)
     )
     dims = dim_base + gl.arange(0, DIM_BLOCK, layout=gl.SliceLayout(0, out_layout))
-    value_dims = dim_base + gl.arange(
-        0, DIM_BLOCK, layout=gl.SliceLayout(0, gl.SliceLayout(1, layout))
-    )
-    if active:
-        values = gl.load(
-            part_acc
-            + (rows[:, None, None].to(tl.int64) * num_heads + heads[None, :, None])
-            * HEAD_DIM
-            + value_dims[None, None, :]
-        )
-    else:
-        values = gl.load(
-            part_row_sum
-            + rows[:, None, None].to(tl.int64) * HEAD_DIM
-            + value_dims[None, None, :]
-            + heads[None, :, None] * 0
-        )
-    merged = gl.sum(values * weight[:, :, None], axis=0)
-    scale = gl.convert_layout(
-        gl.where(total > 0.0, 1.0 / total, 0.0), gl.SliceLayout(1, out_layout)
-    )
-    result = (merged * scale[:, None]).to(gl.bfloat16)
     if ROPE_DIM > 0:
         if dim_base + DIM_BLOCK > HEAD_DIM - ROPE_DIM:
             rope_row = (
