@@ -76,6 +76,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             role="fused",
             num_snapshot_pages=1,
             max_retracted_requests=0,
+            host_write_policy="write_through",
             storage_config=None,
             cache_groups=groups,
         )

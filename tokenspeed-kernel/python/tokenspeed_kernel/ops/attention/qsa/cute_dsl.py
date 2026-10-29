@@ -18,11 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""CuTe DSL registration for Blackwell QSA selection and sparse attention."""
+"""CuTe DSL registration for QSA selection and sparse attention."""
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
+from tokenspeed_kernel.ops.attention.qsa.metadata import QSASparseMetadata
 from tokenspeed_kernel.platform import (
     ArchVersion,
     CapabilityRequirement,
@@ -54,6 +57,160 @@ if _IS_NVIDIA_BLACKWELL:
 
 _HEAD_DIM = 256
 _SELECTED_WIDTH = 2051
+
+
+def can_use_cute_dsl_tma_gather_qsa(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    metadata: QSASparseMetadata,
+) -> bool:
+    """Check the TMA operand layout without reading device metadata values.
+
+    Args:
+        q: Rank-three queries accepted by the QSA facade.
+        k: Rank-three key cache.
+        v: Rank-three value cache.
+        metadata: Logical metadata whose row geometry has been validated.
+
+    Returns:
+        Whether these tensors satisfy the SM107 TMA layout contract. Dtypes,
+        head/block geometry, prefill versus decode and descales are separate
+        registry constraints.
+    """
+    if not _PLATFORM.is_nvidia or _PLATFORM.arch_version != ArchVersion(10, 7):
+        return False
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_tma_gather import (
+        tma_gather_layout_error,
+    )
+
+    return (
+        tma_gather_layout_error(
+            q,
+            k,
+            v,
+            metadata.selected_blocks,
+            metadata.seq_lens,
+            metadata.block_table,
+            metadata.page_size,
+        )
+        is None
+    )
+
+
+@lru_cache(maxsize=None)
+def _tma_gather_plan(device: torch.device, page_size: int, enable_pdl: bool):
+    from tokenspeed_kernel.thirdparty.cute_dsl.qsa_tma_gather import (
+        TmaGatherSparseAttention,
+    )
+
+    # These plans hold only compiled code and static geometry, no request buffers.
+    return TmaGatherSparseAttention(
+        page_size=page_size,
+        split_kv=1,
+        query_group_size=1,
+        enable_pdl=enable_pdl,
+        device=device,
+    )
+
+
+def cute_dsl_tma_gather_qsa_prefill(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    scale: float,
+    max_seqlen_q: int | None,
+    metadata_capacity_rows: int | None,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+    sparse_metadata: QSASparseMetadata | None,
+) -> torch.Tensor:
+    """Run SM107 TMA gather attention over request-local prefill spans.
+
+    Args:
+        q: BF16 queries [tokens, query_heads, 256], twelve heads per KV head.
+        k_cache: Contiguous BF16 keys [slots, kv_heads, 256].
+        v_cache: Contiguous BF16 values with the same shape as the keys.
+        selected_slots: Equivalent physical candidates for fallback kernels.
+        scale: QK softmax scale.
+        max_seqlen_q: Must be None; uniform decode retains its existing kernel.
+        metadata_capacity_rows: Fallback reservation, unused without scratch.
+        k_scale: Must be None for this unscaled BF16 implementation.
+        v_scale: Must be None for this unscaled BF16 implementation.
+        sparse_metadata: Logical four-token blocks, page table and consecutive
+            positions and live KV lengths for each request's prefill span.
+            Empty spans are legal.
+
+    Returns:
+        BF16 output with q's shape. A warm call prepares static code before
+        CUDA graph capture; captured calls read live metadata on every replay.
+    """
+    if max_seqlen_q is not None or sparse_metadata is None:
+        raise ValueError("TMA gather QSA requires prefill with logical metadata")
+    if k_scale is not None or v_scale is not None:
+        raise ValueError("TMA gather QSA does not support K/V descales")
+    del selected_slots, metadata_capacity_rows
+    metadata = sparse_metadata
+    plan = _tma_gather_plan(q.device, metadata.page_size, pdl_enabled())
+    output = torch.empty_like(q)
+    # Each launch has uniform S. Ragged batches retain their CPU request spans;
+    # lengths and selected lists stay on device, including in graphs.
+    for request, (start, end) in enumerate(
+        zip(metadata.query_start_loc, metadata.query_start_loc[1:])
+    ):
+        if start == end:
+            continue
+        plan.execute(
+            q[start:end].unsqueeze(0),
+            k_cache,
+            v_cache,
+            metadata.selected_blocks[start:end].unsqueeze(0),
+            metadata.seq_lens[request : request + 1],
+            metadata.block_table[request : request + 1],
+            scale=scale,
+            output=output[start:end].unsqueeze(0),
+            workspace=None,
+        )
+    return output
+
+
+if _PLATFORM.is_nvidia and _PLATFORM.arch_version == ArchVersion(10, 7):
+    register_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        name="cute_dsl_tma_gather_qsa_prefill",
+        solution="cute_dsl",
+        capability=CapabilityRequirement(
+            min_arch_version=ArchVersion(10, 7),
+            max_arch_version=ArchVersion(10, 7),
+            vendors=frozenset({"nvidia"}),
+        ),
+        signatures=frozenset(
+            {
+                format_signature(
+                    q=dense_tensor_format(torch.bfloat16),
+                    k_cache=dense_tensor_format(torch.bfloat16),
+                    v_cache=dense_tensor_format(torch.bfloat16),
+                ),
+            }
+        ),
+        traits={
+            "is_decode": frozenset({False}),
+            "head_dim": frozenset({_HEAD_DIM}),
+            "value_head_dim": frozenset({_HEAD_DIM}),
+            "equal_head_dims": frozenset({True}),
+            "q_heads_per_kv": frozenset({12}),
+            "block_size": frozenset({4}),
+            "block_topk": frozenset({512}),
+            "supported_tma_gather_layout": frozenset({True}),
+            "unscaled_kv": frozenset({True}),
+        },
+        # Solution overrides skip traits: keep the existing decode kernel first.
+        priority=Priority.SPECIALIZED + 1,
+        features=frozenset({"qsa_sparse_metadata"}),
+    )(cute_dsl_tma_gather_qsa_prefill)
 
 
 def _supported_stream_topk_tensors(
@@ -414,6 +571,8 @@ if _IS_NVIDIA_BLACKWELL:
         priority=Priority.SPECIALIZED + 2,
     )(cute_dsl_blackwell_qsa_sparse_attention)
     __all__ = [
+        "can_use_cute_dsl_tma_gather_qsa",
+        "cute_dsl_tma_gather_qsa_prefill",
         "can_use_cute_dsl_qwen4_exp_qsa_block_topk",
         "cute_dsl_qwen4_exp_qsa_block_topk",
         "cute_dsl_blackwell_qsa_sparse_attention",

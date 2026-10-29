@@ -18,14 +18,14 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Numerics and graph replay for split-K sliding MHA decode on gfx950."""
+"""Numerics, graph replay and large KV pools for MHA decode on gfx950."""
 
 from __future__ import annotations
 
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
-from utils import is_cdna4
+from utils import is_cdna4, move_pages_past_int32
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -70,9 +70,8 @@ def _reference(
     return torch.stack(outputs).to(torch.bfloat16)
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
-def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
-    generator = torch.Generator(device="cuda").manual_seed(20260915 + batch)
+def _make_inputs(batch: int, seed: int):
+    generator = torch.Generator(device="cuda").manual_seed(seed)
     pages_per_request = SEQUENCE_LENGTH // PAGE_SIZE
     q = torch.randn(
         batch,
@@ -111,6 +110,34 @@ def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
     sinks = torch.randn(
         Q_HEADS, dtype=torch.float32, device="cuda", generator=generator
     )
+    return q, k_cache, v_cache, page_table, cache_seqlens, sinks
+
+
+def _decode(q, k_cache, v_cache, page_table, cache_seqlens, sinks, window_left):
+    return gluon_mha_decode_gfx950(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=SEQUENCE_LENGTH,
+        max_seqlen_q=1,
+        window_left=window_left,
+        logit_cap=0.0,
+        sinks=sinks,
+        return_lse=False,
+        softmax_scale=None,
+        q_scale=None,
+        k_scale=None,
+        v_scale=None,
+    )
+
+
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16])
+def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
+    q, k_cache, v_cache, page_table, cache_seqlens, sinks = _make_inputs(
+        batch, 20260915 + batch
+    )
     config = get_config(
         q=q,
         k_cache=k_cache,
@@ -122,22 +149,8 @@ def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
     assert config.num_kv_splits == expected_splits
 
     def invoke() -> torch.Tensor:
-        return gluon_mha_decode_gfx950(
-            q=q,
-            k_cache=k_cache,
-            v_cache=v_cache,
-            page_table=page_table,
-            cache_seqlens=cache_seqlens,
-            max_seqlen_k=SEQUENCE_LENGTH,
-            max_seqlen_q=1,
-            window_left=WINDOW_LEFT,
-            logit_cap=0.0,
-            sinks=sinks,
-            return_lse=False,
-            softmax_scale=None,
-            q_scale=None,
-            k_scale=None,
-            v_scale=None,
+        return _decode(
+            q, k_cache, v_cache, page_table, cache_seqlens, sinks, WINDOW_LEFT
         )
 
     expected = _reference(q, k_cache, v_cache, sinks)
@@ -152,3 +165,17 @@ def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(replayed, actual, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("window_left", [-1, WINDOW_LEFT])
+def test_decode_reads_pages_past_int32_range(window_left: int) -> None:
+    # Each KV page base is computed in 64-bit. Pages past 2**31 elements must
+    # read exactly what the same pages read at the start of a small pool.
+    q, k_cache, v_cache, page_table, cache_seqlens, sinks = _make_inputs(2, 20261029)
+    expected = _decode(
+        q, k_cache, v_cache, page_table, cache_seqlens, sinks, window_left
+    )
+    (k_far, v_far), far_table = move_pages_past_int32((k_cache, v_cache), page_table)
+    actual = _decode(q, k_far, v_far, far_table, cache_seqlens, sinks, window_left)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)

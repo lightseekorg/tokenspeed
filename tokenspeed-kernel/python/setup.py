@@ -1099,6 +1099,7 @@ setup(
         ],
         "tokenspeed_kernel.thirdparty.cuda": [
             "objs/**/*.so",
+            "csrc/kimi3_router.cu",
             # Vendored Lamport protocol and FFI headers for the optional JIT extension.
             "csrc/tvm_ffi_utils.h",
             "csrc/include/**/*.h",

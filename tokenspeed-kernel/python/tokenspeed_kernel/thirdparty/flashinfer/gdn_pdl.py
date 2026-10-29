@@ -137,7 +137,7 @@ def _build_and_load_pdl_kernel(
         extra_key_files=(
             *extra_key_files,
             __file__,
-            str(Path(__file__).with_name("adapter.py")),
+            str(Path(__file__).parents[2] / "ops/attention/gdn/_flashinfer/adapter.py"),
         ),
     )
 

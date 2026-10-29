@@ -490,6 +490,13 @@ preloads the all-gathered residual before its wait, so that collective must
 not trigger early. FlashInfer adapters preserve the upstream CuTe body and
 keep PDL compilation caches separate.
 
+The Rubin GDN decode adapter skips a CTA when either state index is negative,
+before entering the upstream body that would otherwise redirect padding to
+row 0. Its PDL wait precedes the index reads and padding CTAs still signal.
+Automatic GDN kernel selection includes the bound state dtype so the generic
+FlashInfer BF16 path cannot overwrite the arena's null state. Recurrent state
+remains in the shared cache arena; kernel selection adds no state pool.
+
 Gated residual projection weights separate logical rows from stored rows.
 Model loading extends BF16/FP16 down/inject storage for GEMM output alignment;
 later shards and reloads write into the same parameter storage. Forward passes
@@ -592,8 +599,6 @@ something the idle refresh cannot express:
 * **FlashMLA** (leaf): installs the keepalive tile-schedule object whose
   schedule-build the graph records (flash_mla freezes its schedule on the
   first kernel call against a sched-meta);
-* **DeepseekV4**: the packed `tokens_per_req` row machinery and its bespoke
-  multi-group metadata build;
 * **Mamba** (`MambaAttnBackend`): the warmup kernels need the arange
   query-start-loc, which the idle refresh deliberately zeroes;
 * **Inkling**: conv-state seeding (paged conv reads `pos = seq_len - 1`, so
@@ -1100,16 +1105,14 @@ replays pay one bool check). The snapshot has no exemption list: every
 tensor a slot reaches is an address the refresh must keep. Per-step-mutable
 objects a kernel owns (FlashMLA's tile schedule, which the kernel builds and
 freezes on first use) therefore live on the backend, outside the slots, not
-on the views — and so do the two per-forward memos the models' layers
-share: V4's write-slot mappings (`DeepseekV4AttentionBackend.slot_mappings`:
-SWA, compressor state / compressed per ratio, indexer state) and the sparse
-indexer's selection (`AttentionBackend.sparse_topk`, a `SparseTopKShare`:
-GLM DSA's `"shared"` layers and the DSA / QSA MTP heads reuse the last
-indexer layer's top-k; QSA also keeps its layer-invariant row geometry in
-that share so the fused preparation runs once per forward). Every
-runner-facing node clears both when it builds a forward's metadata (the router's
-extend init / decode refresh / capture seeding, V4's three slot publishers), so
-the first layer computes, the rest reuse, and nothing outlives its forward; the
+on the views — and so does the per-forward memo the models' layers
+share: the sparse indexer's selection (`AttentionBackend.sparse_topk`, a
+`SparseTopKShare`: GLM DSA's `"shared"` layers and the DSA / QSA MTP heads
+reuse the last indexer layer's top-k; QSA also keeps its layer-invariant
+row geometry in that share so the fused preparation runs once per forward).
+Every runner-facing node clears it when it builds a forward's metadata (the
+router's extend init / decode refresh / capture seeding), so the first layer
+computes, the rest reuse, and nothing outlives its forward; the
 drafter's in-loop seq_lens edits are not a new forward and leave the share
 alone — the drafter itself
 hands each draft step the top-k it reuses (or clears it) through the draft
@@ -1251,8 +1254,14 @@ the selected top-k rows with the queries.
 
 QSA uses positive `decode_query_lengths` for uniform decode/verification and
 `None` for prefill or mixed/ragged queries, including one-token prefill.
-Only decode may use CuTe. PrimTS accepts supported BF16 prefill and decode
-with logical block candidates on SM100/SM103; groups stay within each request.
+CuTe serves supported uniform decode on SM100/SM103/SM107 and unscaled BF16
+prefill on SM107 through the TMA gather solution. The TMA gather prefill path takes
+consecutive query positions within each request span and uses the existing logical
+metadata. KV lengths are views of the existing forward layout, without per-layer
+reconstruction. The TMA gather prefill path keeps no request state or persistent
+scratch. PrimTS accepts supported BF16
+prefill and decode with logical block candidates on SM100/SM103; groups stay
+within each request.
 Other supported NVIDIA inputs use FA2 over equivalent physical slots.
 All kernels share the cache writer and sparse-attention call. The indexer
 returns physical slots across graph breaks and keeps logical candidates
@@ -1264,8 +1273,9 @@ Calls, including graph replays, are ordered across streams. Rebinding drops
 eager plans; capture sessions retain graph plans and allocations until release.
 Scratch may grow without moving graph inputs. Each run regenerates its data.
 
-QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and CuTe read invalid
-candidates from the zero-initialized slot 1 of the reserved null page.
+QSA padding writes land in slot 0 and may contain NaN/Inf. FA2 and the direct-slot
+CuTe kernel read invalid candidates from the zero-initialized slot 1 of the
+reserved null page. TMA gather masks the entire null page before scoring.
 Writers must leave that read slot untouched. The indexer retains its `-1`
 sentinel, and consumers derive their masks from the original selection.
 
@@ -2167,10 +2177,6 @@ mapping remains a separate consumer of the shared mapping helpers
   refresh leaves it alone, eager refresh and every drafter seq_lens edit
   bind a fresh one, in-graph edits keep theirs alive); leaf capture/refresh
   signature conformance.
-* `test/runtime/test_deepseek_v4_config.py` — a V4 replay refresh leaves
-  every address the capture recorded in place under the guard, the `cache`
-  slot's group tables included, for the target's packed views and the
-  draft's borrowed step views.
 * `test/runtime/execution/test_draft_target_wiring.py` — the drafter's
   target-forward hook: DFLASH arms its capture sink on the context only
   under its overlap gate (not on mixed rounds, not in graph warmup), the
@@ -2212,10 +2218,9 @@ mapping remains a separate consumer of the shared mapping helpers
   `ctx.draft_narrowing.publish_accepted_prefix()`, never computed in a model
   (`test/runtime/test_draft_advance_seqlens.py`).
 * `grep -rn "ctx.dsa_\|dsa_swa_slot_mapping\|dsa_compressor_slot_cache"
-  python/` must stay empty — the layer-shared sparse top-k and V4 slot
-  mappings are backend scratch (`sparse_topk`, `slot_mappings`), cleared by
-  every metadata build (`test_cache_group_router.py`,
-  `test_deepseek_v4_slot_mappings.py`, `test_deepseek_v4_config.py`).
+  python/` must stay empty — the layer-shared sparse top-k is backend
+  scratch (`sparse_topk`), cleared by every metadata build
+  (`test_cache_group_router.py`).
 * `grep -rnE '^\s+extend_(seq|prefix|replay|prompt)_lens(_cpu)?: torch\.Tensor \| None,|
   extend_with_prefix: bool = False' python/tokenspeed/runtime/layers/attention/backends/`
   must stay empty — no `init_forward_metadata` parameter in the extend
