@@ -156,6 +156,13 @@ class CachePoolBinding:
         was written at (``PagedAttention.fp8_kv_scales``)."""
         return False
 
+    def query_dtype(
+        self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
+    ) -> torch.dtype:
+        """The dtype ``layer``'s attention reads its query in this forward,
+        which the GQA prologue returns it in so no separate cast runs."""
+        return activation
+
     # ------------------------------------------------------------------
     # Slot-state image (SlotStateExporter)
     # ------------------------------------------------------------------

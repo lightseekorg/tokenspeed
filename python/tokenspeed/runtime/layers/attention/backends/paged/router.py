@@ -992,6 +992,9 @@ class CacheGroupRouter(AttentionBackend):
     def reads_fp8_kv_scales(self, layer):
         return self._leaf_for(layer).reads_fp8_kv_scales(layer)
 
+    def query_dtype(self, layer, forward_mode, activation):
+        return self._leaf_for(layer).query_dtype(layer, forward_mode, activation)
+
     @break_point
     def forward(
         self,

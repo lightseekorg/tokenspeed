@@ -1143,6 +1143,7 @@ def test_owned_attention_stores_prepared_rows_once(
         attn_backend=SimpleNamespace(
             padded_write_locations=lambda *args: positions,
             cache_placement=lambda layer: None,
+            query_dtype=lambda layer, mode, activation: activation,
             forward=attend,
         ),
         token_to_kv_pool=SimpleNamespace(

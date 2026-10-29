@@ -164,6 +164,15 @@ class MHAAttnBackend(PagedAttentionBackend):
         # Both reads hand them to the kernel (_fp8_scale_kwargs).
         return True
 
+    def query_dtype(
+        self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
+    ) -> torch.dtype:
+        # Decode reads an FP8 cache with FP8 queries. A fresh prefill attends
+        # the activation-dtype K/V rows instead, so extend converts its own.
+        if self.is_fp8 and forward_mode.is_decode():
+            return self.kv_cache_dtype
+        return activation
+
     # ------------------------------------------------------------------
     # Metadata
     # ------------------------------------------------------------------
@@ -337,6 +346,7 @@ class MHAAttnBackend(PagedAttentionBackend):
             k_sf, v_sf = token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
             scale_kwargs = dict(q_scale=q_sf, k_scale=k_sf, v_scale=v_sf)
         elif self.is_fp8:
+            # A no-op on the prologue's decode query (see query_dtype).
             q = q.to(self.kv_cache_dtype)
             scale_kwargs = _fp8_scale_kwargs(layer)
 

@@ -47,6 +47,7 @@ from tokenspeed.runtime.layers.attention.registry import register_backend
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.execution.context import ForwardContext
+    from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
     from tokenspeed.runtime.layers.attention.configs.base import AttnConfig
     from tokenspeed.runtime.layers.attention.configs.mha import MHAConfig
     from tokenspeed.runtime.layers.attention.kv_cache.base import CachePool
@@ -82,6 +83,12 @@ class QSAAttnBackend(MHAAttnBackend):
     def reads_fp8_kv_scales(self, layer: PagedAttention) -> bool:
         # The sparse kernel reads an FP8 cache at unit scale.
         return False
+
+    def query_dtype(
+        self, layer: PagedAttention, forward_mode: ForwardMode, activation: torch.dtype
+    ) -> torch.dtype:
+        # The sparse kernel reads activation-dtype queries.
+        return activation
 
     def _sparse_attention(
         self,
