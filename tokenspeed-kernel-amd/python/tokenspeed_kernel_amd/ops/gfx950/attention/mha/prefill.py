@@ -55,7 +55,6 @@ class AttentionConfig:
     BLOCK_M: gl.constexpr
     BLOCK_N: gl.constexpr
     NUM_WARPS: gl.constexpr
-    BATCH_SIZE: gl.constexpr
     HAS_SINK: gl.constexpr
     HAS_LSE: gl.constexpr
     WINDOW_LEFT: gl.constexpr
@@ -89,7 +88,6 @@ class AttentionConfig:
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
@@ -132,7 +130,6 @@ class AttentionConfig:
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_N = gl.constexpr(BLOCK_N)
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        self.BATCH_SIZE = gl.constexpr(BATCH_SIZE)
         self.HAS_SINK = gl.constexpr(HAS_SINK)
         self.HAS_LSE = gl.constexpr(HAS_LSE)
         self.WINDOW_LEFT = gl.constexpr(WINDOW_LEFT)
@@ -479,6 +476,7 @@ class ProgramScheduler:
     swizzled_order: gl.constexpr
     work: gl.tensor
     total_work: gl.tensor
+    batch_size: gl.tensor
     num_q_blocks: gl.tensor
     slot_valid: gl.tensor
     batch_slot: gl.tensor
@@ -486,8 +484,8 @@ class ProgramScheduler:
     q_slot: gl.tensor
     q_cycles_per_batch_group: gl.tensor
     counter_ptr: gl.tensor
-    batch_slots: gl.constexpr
-    q_slots: gl.constexpr
+    batch_slots: gl.tensor
+    q_slots: gl.tensor
 
     @gluon.constexpr_function
     def __init__(
@@ -496,6 +494,7 @@ class ProgramScheduler:
         swizzled_order,
         work,
         total_work,
+        batch_size,
         num_q_blocks,
         slot_valid,
         batch_slot,
@@ -510,6 +509,7 @@ class ProgramScheduler:
         self.swizzled_order = gl.constexpr(swizzled_order)
         self.work = work
         self.total_work = total_work
+        self.batch_size = batch_size
         self.num_q_blocks = num_q_blocks
         self.slot_valid = slot_valid
         self.batch_slot = batch_slot
@@ -517,8 +517,8 @@ class ProgramScheduler:
         self.q_slot = q_slot
         self.q_cycles_per_batch_group = q_cycles_per_batch_group
         self.counter_ptr = counter_ptr
-        self.batch_slots = gl.constexpr(batch_slots)
-        self.q_slots = gl.constexpr(q_slots)
+        self.batch_slots = batch_slots
+        self.q_slots = q_slots
 
     @gluon.jit
     def create(
@@ -533,19 +533,19 @@ class ProgramScheduler:
         logical_pid = xcd * pids_per_xcd + local_pid
 
         if swizzled_order:
+            # The slot split follows the request count, a kernel argument, so
+            # each work-group works it out once at start instead of having it
+            # compiled in.
             max_batch_slots: gl.constexpr = cfg.NUM_BLOCKS // cfg.N_HEADS
-            if cfg.BATCH_SIZE < max_batch_slots:
-                batch_slots: gl.constexpr = cfg.BATCH_SIZE
-            else:
-                batch_slots: gl.constexpr = max_batch_slots
-            q_slots: gl.constexpr = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
+            batch_slots = gl.where(
+                batch_size < max_batch_slots, batch_size, max_batch_slots
+            )
+            q_slots = cfg.NUM_BLOCKS // (batch_slots * cfg.N_HEADS)
 
             q_cycles_per_batch_group = (num_q_blocks + q_slots - 1) // q_slots
-            num_batch_groups: gl.constexpr = (
-                cfg.BATCH_SIZE + batch_slots - 1
-            ) // batch_slots
+            num_batch_groups = (batch_size + batch_slots - 1) // batch_slots
 
-            active_slots: gl.constexpr = batch_slots * cfg.N_HEADS * q_slots
+            active_slots = batch_slots * cfg.N_HEADS * q_slots
 
             # DYNAMIC_SCHED replaces the static slot assignment with a global
             # ticket counter, so a workgroup drawing cheap items keeps drawing
@@ -554,9 +554,7 @@ class ProgramScheduler:
                 # Padded up to a whole number of head groups, so the tail group
                 # decodes past the real heads and get_program drops those.
                 group_size: gl.constexpr = cfg.DYNAMIC_SCHED
-                n_groups: gl.constexpr = (
-                    cfg.BATCH_SIZE * cfg.N_HEADS + group_size - 1
-                ) // group_size
+                n_groups = (batch_size * cfg.N_HEADS + group_size - 1) // group_size
                 total_work = n_groups * group_size * num_q_blocks
                 work = gl.atomic_add(counter_ptr, 1, sem="relaxed", scope="gpu")
                 slot_valid = logical_pid >= 0
@@ -574,8 +572,8 @@ class ProgramScheduler:
         else:
             total_work = batch_size * cfg.N_HEADS * num_q_blocks
             zero = logical_pid - logical_pid
-            batch_slots: gl.constexpr = 1
-            q_slots: gl.constexpr = 1
+            batch_slots = zero + 1
+            q_slots = zero + 1
             slot_valid = logical_pid >= 0
             batch_slot = zero
             q_head = zero
@@ -588,6 +586,7 @@ class ProgramScheduler:
             swizzled_order,
             work,
             total_work,
+            batch_size,
             num_q_blocks,
             slot_valid,
             batch_slot,
@@ -622,6 +621,7 @@ class ProgramScheduler:
             self.swizzled_order,
             next_work,
             self.total_work,
+            self.batch_size,
             self.num_q_blocks,
             self.slot_valid,
             self.batch_slot,
@@ -672,7 +672,7 @@ class ProgramScheduler:
             q_head = flat_head % cfg.N_HEADS
             batch = flat_head // cfg.N_HEADS
             valid = (
-                (flat_head < cfg.BATCH_SIZE * cfg.N_HEADS)
+                (flat_head < self.batch_size * cfg.N_HEADS)
                 & (query_block >= 0)
                 & (query_block < self.num_q_blocks)
             )
@@ -719,7 +719,7 @@ class ProgramScheduler:
             valid = (
                 self.slot_valid
                 & (query_block < self.num_q_blocks)
-                & (batch < cfg.BATCH_SIZE)
+                & (batch < self.batch_size)
             )
 
             safe_batch = gl.where(valid, batch, 0)
@@ -984,8 +984,13 @@ def process_sliding_attention_tile(
 # Entry Point
 # ===-----------------------------------------------------------------------===#
 
+# The request count and the longest request change from batch to batch.
+# Without do_not_specialize, Triton would compile separate binaries for a
+# value of 1 and for multiples of 16.
+_PER_BATCH_ARGS = ("batch_size", "max_seqlen_q")
 
-@gluon.jit
+
+@gluon.jit(do_not_specialize=_PER_BATCH_ARGS)
 def gluon_mha_prefill_gfx950(
     q_ptr,
     k_ptr,
@@ -1011,7 +1016,7 @@ def gluon_mha_prefill_gfx950(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    BATCH_SIZE: gl.constexpr,
+    batch_size,
     max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
@@ -1030,7 +1035,6 @@ def gluon_mha_prefill_gfx950(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
         -1,
@@ -1055,7 +1059,7 @@ def gluon_mha_prefill_gfx950(
     )
 
     scheduler = ProgramScheduler.create(
-        cfg, BATCH_SIZE, max_seqlen_q, sched_counter_ptr, True
+        cfg, batch_size, max_seqlen_q, sched_counter_ptr, True
     )
     mask_offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, cfg.qk_layout))
     mask_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(0, cfg.qk_layout))
@@ -1084,7 +1088,7 @@ def gluon_mha_prefill_gfx950(
         scheduler = scheduler.advance()
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=_PER_BATCH_ARGS)
 def gluon_mha_prefill_sliding_gfx950(
     q_ptr,
     k_ptr,
@@ -1110,7 +1114,7 @@ def gluon_mha_prefill_sliding_gfx950(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     NUM_WARPS: gl.constexpr,
-    BATCH_SIZE: gl.constexpr,
+    batch_size,
     max_seqlen_q,
     HAS_SINK: gl.constexpr,
     HAS_LSE: gl.constexpr,
@@ -1129,7 +1133,6 @@ def gluon_mha_prefill_sliding_gfx950(
         BLOCK_M,
         BLOCK_N,
         NUM_WARPS,
-        BATCH_SIZE,
         HAS_SINK,
         HAS_LSE,
         WINDOW_LEFT,
@@ -1154,7 +1157,7 @@ def gluon_mha_prefill_sliding_gfx950(
     )
 
     scheduler = ProgramScheduler.create(
-        cfg, BATCH_SIZE, max_seqlen_q, sched_counter_ptr, False
+        cfg, batch_size, max_seqlen_q, sched_counter_ptr, False
     )
     while scheduler.has_work():
         program, active = scheduler.get_program(
@@ -1269,6 +1272,12 @@ def launch_gluon_mha_prefill_gfx950(
         ``(output, lse)`` when ``return_lse`` is set.
     """
     total_tokens, n_heads, _ = q.shape
+    # The strides are compiled into the kernels, which lets K and V share
+    # their load offsets when their rows have the same layout. A caller's
+    # rows may arrive as views or as compact copies (a packed QKV projection
+    # may yield views on some batches and copies on others), so compact the
+    # views here: one binary serves both, at the cost of copying the views.
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     config = get_config(
         q=q,
         k=k,
