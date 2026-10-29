@@ -435,7 +435,13 @@ def test_gdn_backend_resolves_verify_state_path_from_the_kernel():
 
     def supports(op, trait):
         return gdn_decode_supports(
-            op, torch.bfloat16, head_dim=HEAD_K_DIM, trait=trait, solution=None
+            op,
+            torch.bfloat16,
+            head_dim=HEAD_K_DIM,
+            value_head_dim=recurrent.shape[-2],
+            state_dtype=recurrent.dtype,
+            trait=trait,
+            solution=None,
         )
 
     assert backend._verify_reads_committed_recurrent_state == supports(

@@ -35,6 +35,13 @@ from flashinfer.gdn_kernels.gdn_decode_mtp import (
 from flashinfer.gdn_prefill import chunk_gated_delta_rule as _original_prefill
 
 
+def is_rubin_prefill_available() -> bool:
+    """Whether FlashInfer includes the SM107 prefill implementation."""
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn_compat import compatibility_error
+
+    return compatibility_error("prefill") is None
+
+
 def gated_delta_rule_mtp(
     *,
     q: torch.Tensor,
@@ -172,7 +179,7 @@ def _mtp_runner(enable_pdl: bool):
     if not enable_pdl:
         return gdn_decode_mtp.run_mtp_decode
 
-    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import _adapt_module
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn_pdl import _adapt_module
 
     return _adapt_module(
         gdn_decode_mtp,
@@ -191,7 +198,7 @@ def _bf16_runners(enable_pdl: bool):
     if not enable_pdl:
         return vars(gdn_decode_bf16_state)
 
-    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import _adapt_module
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn_pdl import _adapt_module
 
     return _adapt_module(
         gdn_decode_bf16_state,
@@ -223,7 +230,7 @@ def _decode_runner(enable_pdl: bool):
 
     from flashinfer import gdn_decode
     from flashinfer.gdn_kernels import gdn_decode_pretranspose
-    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import (
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn_pdl import (
         _adapt_module,
         _clone_function,
     )
@@ -249,17 +256,26 @@ def _decode_runner(enable_pdl: bool):
             _gated_delta_rule_bf16_state=bf16["gated_delta_rule"],
             _gated_delta_rule_bf16_state_mtp=bf16["gated_delta_rule_mtp"],
         )
-    return _clone_function(_original_decode, {**vars(gdn_decode), **overrides})
+    return gdn_decode.flashinfer_api(trace=gdn_decode.gated_delta_rule_decode_trace)(
+        _clone_function(_original_decode, {**vars(gdn_decode), **overrides})
+    )
 
 
 @functools.cache
 def _prefill_runner(enable_pdl: bool):
+    from tokenspeed_kernel.platform import ArchVersion, current_platform
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn_compat import compatibility_error
+
+    if current_platform().arch_version == ArchVersion(10, 7):
+        reason = compatibility_error("prefill")
+        if reason is not None:
+            raise RuntimeError(reason)
     if not enable_pdl:
         return _original_prefill
 
     from flashinfer import gdn_prefill
     from flashinfer.gdn_kernels.blackwell import gdn_prefill as sm100
-    from tokenspeed_kernel.ops.attention.gdn._flashinfer.pdl import (
+    from tokenspeed_kernel.thirdparty.flashinfer.gdn_pdl import (
         _adapt_module,
         _clone_function,
         _PdlKernel,
@@ -268,21 +284,38 @@ def _prefill_runner(enable_pdl: bool):
     class PdlGatedDeltaNetChunkedKernel(sm100.GatedDeltaNetChunkedKernel):
         kernel = _PdlKernel(sm100.GatedDeltaNetChunkedKernel.kernel)
 
+    overrides = {"GatedDeltaNetChunkedKernel": PdlGatedDeltaNetChunkedKernel}
+    if "_PREFILL_KERNEL_CLASSES" in vars(sm100):
+        # New FlashInfer selects a device body through this table. Rebinding
+        # only the old class name would silently bypass PDL on both variants.
+        overrides["_PREFILL_KERNEL_CLASSES"] = {
+            variant: type(
+                f"Pdl{kernel_class.__name__}",
+                (kernel_class,),
+                {"kernel": _PdlKernel(kernel_class.kernel)},
+            )
+            for variant, kernel_class in sm100._PREFILL_KERNEL_CLASSES.items()
+        }
+
     adapted = _adapt_module(
         sm100,
         kernels=(),
         launchers=(),
         entrypoints=("chunk_gated_delta_rule_sm100",),
         caches=("_get_compiled_cache",),
-        overrides={"GatedDeltaNetChunkedKernel": PdlGatedDeltaNetChunkedKernel},
+        overrides=overrides,
     )
-    return _clone_function(
+    rebound = _clone_function(
         _original_prefill,
         {
             **vars(gdn_prefill),
             "chunk_gated_delta_rule_sm100": adapted["chunk_gated_delta_rule_sm100"],
         },
     )
+
+    # Preserve the public API's logging, tensor dumps and trace template. Only
+    # the host dispatch globals change; the API body keeps its input checks.
+    return gdn_prefill.flashinfer_api(trace=gdn_prefill.gdn_prefill_trace)(rebound)
 
 
 def gated_delta_rule_decode_pretranspose(*, enable_pdl: bool, **kwargs):
