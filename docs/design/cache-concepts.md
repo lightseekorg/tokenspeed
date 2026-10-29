@@ -404,6 +404,12 @@ blocks, the transfer boundary validates the loaded block count and returns
 before mapping Host pointers or touching the accelerator runtime. Flagged
 loads still publish readiness for empty consumers.
 
+Mapped Host field copies use word accesses when both byte addresses and the
+payload size are 16-byte aligned. Other fields retain byte accesses, including
+packed children whose offsets lose that alignment. Masked copies preserve
+field padding, and per-layer readiness is published only after either copy
+has completed. The same geometry and completion protocol serve both cases.
+
 Every L2 copy is ordered after the prerequisite stream the caller names per
 submission: the stream whose completed work the copy must observe. Writeback
 runs on the executor's write stream, ordered after the model executor's
