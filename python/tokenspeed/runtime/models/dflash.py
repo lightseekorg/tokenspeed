@@ -28,16 +28,16 @@ import torch.nn.functional as F
 from tokenspeed_kernel.ops.embedding import apply_k_rope as _apply_k_rope
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import all_reduce
+from tokenspeed.runtime.distributed.comm_ops import all_gather, all_reduce
 from tokenspeed.runtime.distributed.mapping import Mapping
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.layers.activation import SiluAndMul
 from tokenspeed.runtime.layers.dense.unquant import UnquantizedLinearMethod
 from tokenspeed.runtime.layers.layernorm import RMSNorm
 from tokenspeed.runtime.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
-    ReplicatedLinear,
     RowParallelLinear,
 )
 from tokenspeed.runtime.layers.logits_processor import LogitsProcessorOutput
@@ -383,19 +383,60 @@ class DFlashDraftModel(nn.Module, TargetCaptureConfigurator):
             "target_layer_ids"
         ) or (getattr(config, "target_layer_ids", None) or [])
         self.num_context_features = len(target_layer_ids)
-        self.fc = ReplicatedLinear(
+        # Each attention-TP rank holds the fc rows of its own output columns,
+        # so a projection reads 1/TP of the weight; gathering the columns
+        # completes the rows the draft's attention reads.
+        self.fc = ColumnParallelLinear(
             self.num_context_features * int(config.hidden_size),
             int(config.hidden_size),
             bias=False,
+            gather_output=False,
             prefix=add_prefix("fc", prefix),
+            tp_rank=mapping.attn.tp_rank,
+            tp_size=mapping.attn.tp_size,
+            tp_group=mapping.attn.tp_group,
         )
         self.hidden_norm = RMSNorm(int(config.hidden_size), eps=eps)
         # Name the DFlash drafter reads off the draft model.
         self.block_size = read_checkpoint_block_size(config)
         self._residual_buffer: torch.Tensor | None = None
 
-    def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
-        return self.hidden_norm(self.fc(target_hidden)[0])
+    def project_target_hidden(
+        self, target_hidden: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Project the concatenated target taps to normalized context rows.
+
+        Runs a collective over the attention TP group, so call it on the
+        stream that orders the group's other collectives.
+
+        Args:
+            target_hidden: ``[num_tokens, context_in_features]`` taps.
+            out: Optional ``[num_tokens, hidden]`` destination of the norm.
+
+        Returns:
+            The ``[num_tokens, hidden]`` context rows (``out`` if given).
+        """
+        columns = self.fc(target_hidden)[0]
+        return self.hidden_norm(self.gather_context_columns(columns), out=out)
+
+    def gather_context_columns(self, columns: torch.Tensor) -> torch.Tensor:
+        """Concatenate every attention-TP rank's ``fc`` output columns.
+
+        Args:
+            columns: ``[num_tokens, hidden / attn_tp_size]`` rows of this
+                rank's columns, identical row count on every rank.
+
+        Returns:
+            ``[num_tokens, hidden]``; may borrow collective storage that the
+            group's next collective reuses, so consume it right away.
+        """
+        # Every rank of the group holds the same rows, so skipping an empty
+        # gather is uniform across the group.
+        if columns.shape[0] == 0:
+            return columns.new_empty((0, self.fc.output_size))
+        if self.fc.tp_size == 1:
+            return columns
+        return all_gather(columns, self.fc.tp_group, dim=-1)
 
     # ------------------------------------------------------------------
     # Context-injection contract

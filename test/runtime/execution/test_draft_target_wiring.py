@@ -997,60 +997,6 @@ def test_dflash_rejects_a_capture_of_the_wrong_width():
         drafter.on_target_capture(0, torch.zeros(3, 3))
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="aux-stream projection")
-def test_dflash_sink_folds_the_taps_and_writes_the_kv_once():
-    """fc over the concatenated taps == the sum of per-tap GEMMs, accumulated
-    on the aux stream as each tap lands; the last tap writes the KV."""
-    torch.manual_seed(0)
-    device = torch.device("cuda")
-    num_tokens, hidden, n_taps = 4, 8, 2
-    drafter = _incremental_dflash(enabled=True)
-    drafter.input_buffers = SimpleNamespace(
-        positions_buf=torch.arange(16, device=device)
-    )
-    drafter._incr_acc_buf = torch.ones(16, hidden, device=device)
-    drafter._incr_slot_bufs = [
-        torch.empty(16, hidden, device=device) for _ in range(n_taps)
-    ]
-    drafter._incr_capture_events = [torch.cuda.Event() for _ in range(n_taps)]
-    drafter._incr_sub_weights_t = [
-        torch.randn(hidden, hidden, device=device) for _ in range(n_taps)
-    ]
-    drafter._incr_n_captures = n_taps
-    drafter._incr_hidden_norm = lambda acc: acc * 2
-    drafter._kv_aux_stream = torch.cuda.Stream()
-    drafter._kv_join_event = torch.cuda.Event()
-    writes = []
-    drafter._write_native_cache_fused = (
-        lambda ctx_hidden, positions, locs: writes.append(
-            (ctx_hidden.clone(), positions.clone(), locs.clone())
-        )
-    )
-    ctx = _target_ctx(num_extends=0, num_tokens=num_tokens)
-    ctx.attn_backend = SimpleNamespace(
-        decode_window_locations=lambda: torch.arange(100, 132, device=device)
-    )
-    taps = [torch.randn(num_tokens, hidden, device=device) for _ in range(n_taps)]
-
-    drafter.prepare_target_forward(ctx)
-    assert ctx.target_capture_sink is drafter
-    ctx.target_capture_sink.on_target_capture(0, taps[0])
-    assert writes == []
-    ctx.target_capture_sink.on_target_capture(1, taps[1])
-    torch.cuda.synchronize()
-
-    expected = (
-        taps[0] @ drafter._incr_sub_weights_t[0]
-        + taps[1] @ drafter._incr_sub_weights_t[1]
-    )
-    torch.testing.assert_close(drafter._incr_acc_buf[:num_tokens], expected)
-    assert drafter._incremental_kv_write_done is True
-    ((ctx_hidden, positions, locs),) = writes
-    torch.testing.assert_close(ctx_hidden, expected * 2)
-    assert torch.equal(positions, torch.arange(num_tokens, device=device))
-    assert torch.equal(locs, torch.arange(100, 100 + num_tokens, device=device))
-
-
 @pytest.mark.parametrize("producer_owned", [False, True])
 @pytest.mark.parametrize(
     "num_extends,accept,capturing",

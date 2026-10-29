@@ -1652,7 +1652,10 @@ DFLASH is the one user: its incremental projection attaches
 `ctx.target_capture_sink`, the target hands each captured tap to
 `on_target_capture` as it is produced, and the sink accumulates the
 draft's `fc` projection on the aux stream so the draft KV is written under
-the target's remaining layers. The arming gate is the same
+the target's remaining layers. `fc` is split by output columns across
+attention TP, so each tap reads 1/TP of its weight; the gather that
+completes the rows is a collective, so it runs on the main stream at the
+last tap, in order with the target's own collectives. The arming gate is the same
 `_overlap_allowed` the drafter's `run` decides the overlap path by, so a
 round can never be armed on one side and drained on the other. These hooks
 consume the target's capture configuration; they do not change the tap

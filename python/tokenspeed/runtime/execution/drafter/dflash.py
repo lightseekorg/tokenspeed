@@ -639,6 +639,20 @@ class DFlash(BaseDrafter):
         target_cache_locs: torch.Tensor,
         decode_only: bool = False,
     ) -> None:
+        self._write_context(
+            self._project_context(target_hidden),
+            target_positions,
+            target_cache_locs,
+            decode_only,
+        )
+
+    def _project_context(
+        self, target_hidden: torch.Tensor, out: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Project the concatenated target taps to the draft's context rows.
+
+        Gathers across the attention TP group: call it on the main stream.
+        """
         model = self.draft_model_runner.model
         target_hidden = target_hidden.to(device=self.device, dtype=model.context_dtype)
         expected_width = model.context_in_features
@@ -650,7 +664,18 @@ class DFlash(BaseDrafter):
                 "Check dflash_config.target_layer_ids against the target model."
             )
         with torch.inference_mode():
-            ctx_hidden = model.project_target_hidden(target_hidden)
+            return model.project_target_hidden(target_hidden, out=out)
+
+    def _write_context(
+        self,
+        ctx_hidden: torch.Tensor,
+        target_positions: torch.Tensor,
+        target_cache_locs: torch.Tensor,
+        decode_only: bool,
+    ) -> None:
+        """Write projected context rows into every draft layer's KV cache."""
+        model = self.draft_model_runner.model
+        with torch.inference_mode():
             if decode_only and self._fused_kv_enabled:
                 self._write_native_cache_fused(
                     ctx_hidden, target_positions, target_cache_locs
@@ -681,6 +706,10 @@ class DFlash(BaseDrafter):
         self._fused_kv_workspace_capacity = 0
         self._fused_kv_workspace_dtype = None
         self._fused_kv_proj_workspace = None
+        # The projected context rows a fused write reads on the aux stream:
+        # persistent, since the projection's own output may borrow collective
+        # storage or be freed back to the main stream's allocator.
+        self._fused_ctx_rows: torch.Tensor | None = None
         # torch.mm(out=...) is always used; workspace pre-allocated at warmup.
         self._fused_kv_k_buffers = []
         self._fused_kv_v_buffers = []
@@ -797,6 +826,9 @@ class DFlash(BaseDrafter):
             )
             self._fused_kv_workspace_capacity = max_total_ctx
             self._fused_kv_workspace_dtype = ws_dtype
+            self._fused_ctx_rows = torch.empty(
+                (max_total_ctx, self.hidden_size), dtype=ws_dtype, device=self.device
+            )
 
             logger.info(
                 "DFLASH fused KV materialization enabled. "
@@ -902,6 +934,9 @@ class DFlash(BaseDrafter):
         )
         self._fused_kv_workspace_capacity = max_total_ctx
         self._fused_kv_workspace_dtype = ws_dtype
+        self._fused_ctx_rows = torch.empty(
+            (max_total_ctx, self.hidden_size), dtype=ws_dtype, device=self.device
+        )
         self._fused_kv_is_mla = True
         self._fused_kv_enabled = True
         logger.info(
@@ -951,10 +986,10 @@ class DFlash(BaseDrafter):
             )
             return
         try:
-            fc = self.draft_model_runner.model.fc
-            hidden_norm = self.draft_model_runner.model.hidden_norm
-            fc_weight = fc.weight.data
-            hidden_size = fc_weight.shape[0]
+            model = self.draft_model_runner.model
+            # This rank's output columns of fc: [hidden / attn_tp, taps * hidden].
+            fc_weight = model.fc.weight.data
+            hidden_size = self.hidden_size
             n_captures = len(self.target_layer_ids)
             in_features = fc_weight.shape[1]
             if in_features != n_captures * hidden_size:
@@ -967,14 +1002,17 @@ class DFlash(BaseDrafter):
             ws_dtype = fc_weight.dtype
             max_tokens = self.input_buffers.max_bs * (self.spec_num_tokens + 1)
             self._incr_n_captures = n_captures
-            self._incr_hidden_norm = hidden_norm
+            self._incr_model = model
+            # With fc split across ranks, the column gather after the last
+            # tap is a collective and runs on the main stream.
+            self._incr_columns_sharded = model.fc.tp_size > 1
             self._incr_sub_weights_t = []
             for i in range(n_captures):
                 sub_w = fc_weight[:, i * hidden_size : (i + 1) * hidden_size]
                 self._incr_sub_weights_t.append(sub_w.t().contiguous())
 
             self._incr_acc_buf = torch.zeros(
-                (max_tokens, hidden_size), dtype=ws_dtype, device=self.device
+                (max_tokens, fc_weight.shape[0]), dtype=ws_dtype, device=self.device
             )
             self._incr_slot_bufs = [
                 torch.empty(
@@ -983,12 +1021,14 @@ class DFlash(BaseDrafter):
                 for _ in range(n_captures)
             ]
             self._incr_capture_events = [torch.cuda.Event() for _ in range(n_captures)]
+            self._incr_folded_event = torch.cuda.Event()
+            self._incr_rows_event = torch.cuda.Event()
             self._incr_num_tokens = 0
             self._incremental_proj_enabled = True
             logger.info(
                 "DFLASH incremental projection enabled. "
-                f"n_captures={n_captures:d}, hidden_size={hidden_size:d}, max_tokens="
-                f"{max_tokens:d}",
+                f"n_captures={n_captures:d}, hidden_size={hidden_size:d}, "
+                f"fc_columns={fc_weight.shape[0]:d}, max_tokens={max_tokens:d}",
             )
         except Exception as e:
             logger.warning(f"DFLASH incremental projection init failed: {e!s}")
@@ -1035,10 +1075,11 @@ class DFlash(BaseDrafter):
         ctx.target_capture_sink = self
 
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
-        """Fold tap ``capture_idx`` into the draft's projection on the aux
-        stream (``fc`` over the concatenated taps is the sum of per-tap
-        GEMMs); the last tap completes the KV write and records the join
-        event the draft forward waits on."""
+        """Fold tap ``capture_idx`` into the draft's projection (``fc`` over
+        the concatenated taps is the sum of per-tap GEMMs, each over this
+        rank's ``fc`` columns) on the aux stream; the last tap completes the
+        rows and the KV write, and records the join event the draft forward
+        waits on."""
         num_tokens = hidden.shape[0]
         if num_tokens != self._incr_num_tokens:
             raise RuntimeError(
@@ -1046,31 +1087,44 @@ class DFlash(BaseDrafter):
                 f"but this forward was armed for {self._incr_num_tokens}"
             )
         # Own the rows before the aux stream reads them: the target frees or
-        # rewrites its activation as its layers proceed.
+        # rewrites its activation as its layers proceed. The copy also
+        # rounds a wider target residual (FP32) to the projection's dtype.
+        main_stream = torch.cuda.current_stream()
+        aux_stream = self._kv_aux_stream
         slot = self._incr_slot_bufs[capture_idx][:num_tokens]
         slot.copy_(hidden)
-        event = self._incr_capture_events[capture_idx]
-        event.record(torch.cuda.current_stream())
-
-        with torch.cuda.stream(self._kv_aux_stream):
-            self._kv_aux_stream.wait_event(event)
-            acc = self._incr_acc_buf[:num_tokens]
-            torch.addmm(
-                acc,
-                slot,
-                self._incr_sub_weights_t[capture_idx],
-                beta=1.0,
-                alpha=1.0,
-                out=acc,
+        acc = self._incr_acc_buf[:num_tokens]
+        weight = self._incr_sub_weights_t[capture_idx]
+        model = self._incr_model
+        rows = self._fused_ctx_rows[:num_tokens]
+        last = capture_idx == self._incr_n_captures - 1
+        if last and self._incr_columns_sharded:
+            # The column gather is a collective, so it takes its place among
+            # the target's collectives on the main stream; the last fold
+            # feeds it there, after the aux stream's earlier folds.
+            self._incr_folded_event.record(aux_stream)
+            main_stream.wait_event(self._incr_folded_event)
+            torch.addmm(acc, slot, weight, beta=1.0, alpha=1.0, out=acc)
+            model.hidden_norm(model.gather_context_columns(acc), out=rows)
+            self._incr_rows_event.record(main_stream)
+        else:
+            event = self._incr_capture_events[capture_idx]
+            event.record(main_stream)
+            with torch.cuda.stream(aux_stream):
+                aux_stream.wait_event(event)
+                torch.addmm(acc, slot, weight, beta=1.0, alpha=1.0, out=acc)
+        if not last:
+            return
+        with torch.cuda.stream(aux_stream):
+            if self._incr_columns_sharded:
+                aux_stream.wait_event(self._incr_rows_event)
+            else:
+                model.hidden_norm(acc, out=rows)
+            self._write_native_cache_fused(
+                rows, self._incr_positions, self._incr_cache_locs
             )
-
-            if capture_idx == self._incr_n_captures - 1:
-                ctx_hidden = self._incr_hidden_norm(acc)
-                self._write_native_cache_fused(
-                    ctx_hidden, self._incr_positions, self._incr_cache_locs
-                )
-                self._incremental_kv_write_done = True
-                self._kv_join_event.record(self._kv_aux_stream)
+            self._incremental_kv_write_done = True
+            self._kv_join_event.record(aux_stream)
 
     def _ensure_fused_workspace(self, total_ctx: int, dtype: torch.dtype) -> None:
         """Ensure the projection workspace is large enough.
@@ -1369,20 +1423,21 @@ class DFlash(BaseDrafter):
         )
 
         if not self._incremental_kv_write_done:
-            # Fork: aux stream runs full KV write (project + fused GEMM + scatter)
-            positions = self.input_buffers.positions_buf[: base_ctx.input_num_tokens]
+            num_tokens = base_ctx.input_num_tokens
+            positions = self.input_buffers.positions_buf[:num_tokens]
             # Decode-only path (see can_overlap): the target router's verify
             # window is the round's full write vector.
-            cache_locs = base_ctx.attn_backend.decode_window_locations()[
-                : base_ctx.input_num_tokens
-            ]
+            cache_locs = base_ctx.attn_backend.decode_window_locations()[:num_tokens]
+            # The projection gathers across attention TP, so it runs here on
+            # the main stream; the aux stream runs the fused KV GEMM + scatter.
+            ctx_rows = self._fused_ctx_rows[:num_tokens]
+            self._project_context(hidden, out=ctx_rows)
             main_stream = torch.cuda.current_stream()
             self._kv_fork_event.record(main_stream)
 
             if not (
                 torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
             ):
-                hidden.record_stream(self._kv_aux_stream)
                 positions.record_stream(self._kv_aux_stream)
                 cache_locs.record_stream(self._kv_aux_stream)
                 if self._fused_kv_proj_workspace is not None:
@@ -1390,9 +1445,7 @@ class DFlash(BaseDrafter):
 
             with torch.cuda.stream(self._kv_aux_stream):
                 self._kv_aux_stream.wait_event(self._kv_fork_event)
-                self._write_native_cache(
-                    hidden, positions, cache_locs, decode_only=True
-                )
+                self._write_context(ctx_rows, positions, cache_locs, decode_only=True)
                 self._kv_join_event.record(self._kv_aux_stream)
 
         # Main stream: draft forward overlaps with aux KV write

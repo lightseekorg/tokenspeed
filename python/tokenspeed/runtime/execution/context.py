@@ -52,7 +52,9 @@ class TargetCaptureSink(Protocol):
     def on_target_capture(self, capture_idx: int, hidden: torch.Tensor) -> None:
         """Consume capture ``capture_idx`` (the draft's positional tap index)
         for the forward's ``[num_tokens, hidden]`` rows, gathered across
-        attention TP."""
+        attention TP. The rows may be wider than the draft's dtype (a target
+        with an FP32 residual hands it over as is) and are valid only in
+        stream order at this call: the sink copies what it keeps."""
 
 
 class DraftNarrowing(Protocol):

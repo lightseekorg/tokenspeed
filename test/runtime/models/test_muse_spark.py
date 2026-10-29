@@ -296,11 +296,20 @@ def test_config_rejects_a_rope_schedule_the_windows_contradict() -> None:
 
 
 class _AddLayer(torch.nn.Module):
-    def __init__(self, value: float) -> None:
+    def __init__(self, value: float, scattered: bool = False) -> None:
         super().__init__()
         self.value = value
         self.input_layernorm = f"norm{value}"
-        self.comm_manager = SimpleNamespace(gather_residual=lambda rows, ctx: rows)
+        self.gathered_dtypes: list[torch.dtype] = []
+
+        def gather_residual(rows, ctx):
+            self.gathered_dtypes.append(rows.dtype)
+            return rows
+
+        self.comm_manager = SimpleNamespace(
+            gather_residual=gather_residual,
+            needs_pre_attn_all_gather=lambda: scattered,
+        )
 
     def forward(
         self,
@@ -351,10 +360,12 @@ class _CaptureSink:
         self.captures.append((capture_idx, hidden))
 
 
-def _tapping_model(taps: list[int]):
+def _tapping_model(taps: list[int], scattered: bool = False):
     """Three constant-adding layers and a draft capturing the layers in ``taps``."""
     model = _stub(MuseSparkForConditionalGeneration.model_cls)
-    model.layers = torch.nn.ModuleList(_AddLayer(float(i + 1)) for i in range(3))
+    model.layers = torch.nn.ModuleList(
+        _AddLayer(float(i + 1), scattered) for i in range(3)
+    )
     model._embed_hidden = lambda input_ids, input_embeds: input_embeds
     model.embed_tokens = SimpleNamespace(weight=torch.empty(0, dtype=torch.bfloat16))
     model.norm = lambda value, out_dtype: -value.to(out_dtype)
@@ -376,16 +387,36 @@ def test_forward_taps_the_residual_stream_after_each_draft_target_layer() -> Non
 
     out, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
 
-    after_layer_0 = (hidden + 1.0).to(torch.bfloat16)
-    final_stream = (hidden + 1.0 + 2.0 + 3.0).to(torch.bfloat16)
+    # The sink rounds as it copies, so it receives the FP32 stream itself.
+    after_layer_0 = hidden + 1.0
+    final_stream = hidden + 1.0 + 2.0 + 3.0
     assert len(aux) == 2
     torch.testing.assert_close(aux[0], after_layer_0, rtol=0, atol=0)
     # The final capture is the stream before the output norm.
     torch.testing.assert_close(aux[1], final_stream, rtol=0, atol=0)
-    torch.testing.assert_close(out, -final_stream)
+    torch.testing.assert_close(out, -final_stream.to(torch.bfloat16))
     # The sink receives each capture in draft order as soon as it is produced.
     assert [index for index, _ in sink.captures] == [0, 1]
     assert sink.captures[0][1] is aux[0] and sink.captures[1][1] is aux[1]
+
+
+@pytest.mark.parametrize("sink_armed, scattered", [(False, False), (True, True)])
+def test_forward_rounds_taps_to_bf16_unless_a_sink_copies_full_rows(
+    sink_armed, scattered
+) -> None:
+    # Without a sink the forward keeps the taps; scattered rows are rounded
+    # before the gather, so it moves BF16.
+    model, _, ctx = _tapping_model([0], scattered=scattered)
+    if not sink_armed:
+        ctx.target_capture_sink = None
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+
+    _, aux = model.forward(torch.tensor([0, 1]), torch.tensor([0, 1]), ctx, hidden)
+
+    expected = (hidden + 1.0).to(torch.bfloat16)
+    torch.testing.assert_close(aux[0], expected, rtol=0, atol=0)
+    # Tap 0 is the stream entering layer 1, gathered like that layer.
+    assert model.layers[1].gathered_dtypes == [torch.bfloat16]
 
 
 def test_idle_forward_taps_nothing() -> None:
