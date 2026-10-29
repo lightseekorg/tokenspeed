@@ -36,6 +36,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import pytest
 import torch
 
@@ -190,6 +191,10 @@ def host_cache(request, io_backend):
             draft_attn_config=None,
             **recipe_args,
         )
+    elif family == "glm53_flash":
+        from test.runtime.test_glm53_flash_cache_spec import _recipe
+
+        recipe = _recipe(tp_size=8, mla_cache_dtype=torch.bfloat16, draft_layers=1)
     # A probe-sized arena: a few blocks per group, pages 1-3 below.
     recipe.cache_budget_bytes = 0
     recipe.probe_batch_rows = 4
@@ -475,6 +480,125 @@ def test_an_index_k_write_lands_after_its_tail_page_load(host_cache):
     assert torch.equal(
         pool.gather_index_k_rows(layer, slots, index_k_format="fp8_scaled"), expected
     )
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize("model", ["target", "draft"])
+@pytest.mark.parametrize(
+    "host_cache",
+    [("glm53_flash", "full_attention")],
+    ids=["glm53_flash"],
+    indirect=True,
+)
+def test_the_kpool_top_k_reads_index_pages_after_their_load(host_cache, model):
+    """GLM-5.3-Flash's KPool prefill top-k reads every prefix index page
+    through ``get_kpool_buffers`` before the layer's first layerwise wait (the
+    latent prologue). Any Host hit loads those pages; the read sees what the
+    page held before unless it waits."""
+    from test.runtime.conftest import mla_layer_id
+
+    cache = host_cache
+    view = cache.pool if model == "target" else cache.draft_pool
+    layer = mla_layer_id(view)
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    slots = torch.arange(page * page_size, (page + 1) * page_size, device="cuda")
+    host_index = view.get_kpool_buffers(layer)[0][1].clone()
+    # Load destinations are never zeroed: give the page other bytes.
+    cache.arena.zero_blocks({"full_attention": np.asarray([page])})
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    seen = view.get_kpool_buffers(layer)[0][page].clone()
+    view.kv_write_target(layer, slots, None)
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    assert torch.equal(seen, host_index)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache",
+    [("glm53_flash", "full_attention")],
+    ids=["glm53_flash"],
+    indirect=True,
+)
+def test_a_kpool_write_lands_after_its_tail_page_load(host_cache):
+    """GLM-5.3-Flash writes the chunk's completed pools into the index pages
+    (``kpool_prefill_write`` through ``get_kpool_buffers``) before the layer's
+    first layerwise wait. On a Host tail hit they land in the loaded tail
+    block."""
+    from test.runtime.conftest import mla_layer_id
+
+    from tokenspeed_kernel.ops.attention.kpool import kpool_prefill_write
+
+    from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
+
+    cache = host_cache
+    pool = cache.pool
+    layer = mla_layer_id(pool)
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    index = pool.get_kpool_buffers(layer)[0]
+    values, scales = pool.index_k_block_views(index)
+    rows_per_page = index.shape[1]
+    hit = rows_per_page // 2
+    write_slots = torch.arange(
+        page * rows_per_page + hit, (page + 1) * rows_per_page, device="cuda"
+    )
+    kpool = cache.recipe.attn_config.component(DSAConfig).index_kpool
+    generator = torch.Generator(device="cuda").manual_seed(7)
+    keys, gates = (
+        torch.randn(
+            rows_per_page - hit,
+            kpool,
+            pool.index_head_dim,
+            dtype=torch.bfloat16,
+            device="cuda",
+            generator=generator,
+        )
+        for _ in range(2)
+    )
+    ape = torch.randn(kpool, pool.index_head_dim, device="cuda", generator=generator)
+    # The rows the write leaves, from the same write into page 3.
+    kpool_prefill_write(keys, gates, write_slots + rows_per_page, values, scales, ape)
+    torch.cuda.synchronize()
+    expected = (
+        values[page + 1, hit:].view(torch.uint8).clone(),
+        scales[page + 1, hit:].view(torch.int32).clone(),
+    )
+    host_rows = (
+        values[1, :hit].view(torch.uint8).clone(),
+        scales[1, :hit].view(torch.int32).clone(),
+    )
+
+    with torch.cuda.stream(cache.executor.load_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    index = pool.get_kpool_buffers(layer)[0]
+    kpool_prefill_write(keys, gates, write_slots, *pool.index_k_block_views(index), ape)
+    pool.kv_write_target(
+        layer,
+        torch.arange(page * page_size, (page + 1) * page_size, device="cuda"),
+        None,
+    )
+    assert not cache.executor.load_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    assert torch.equal(values[page, :hit].view(torch.uint8), host_rows[0])
+    assert torch.equal(scales[page, :hit].view(torch.int32), host_rows[1])
+    assert torch.equal(values[page, hit:].view(torch.uint8), expected[0])
+    assert torch.equal(scales[page, hit:].view(torch.int32), expected[1])
 
 
 if __name__ == "__main__":
