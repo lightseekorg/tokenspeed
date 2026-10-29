@@ -23,6 +23,7 @@
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel.ops.sampling.triton.common import TOP_K_DISABLED
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
 
@@ -131,38 +132,249 @@ def torch_topk_topp_renorm(
     return out
 
 
+# The distance from 1 within which top-p means "no top-p cutoff".
+_TOP_P_ONE_EPS = 1.0e-6
+
+
 @register_kernel(
     "sampling",
-    "dflash2_greedy_path",
-    name="torch_dflash2_greedy_path",
+    "dflash2_sample_path",
+    name="torch_dflash2_sample_path",
     solution="torch",
     signatures=format_signatures(
         "scores", "dense", {torch.float32, torch.bfloat16, torch.float16}
     ),
     priority=Priority.REFERENCE,
 )
-def torch_dflash2_greedy_path(
+def torch_dflash2_sample_path(
     candidate_ids: torch.Tensor,
     scores: torch.Tensor,
     anchor_token_ids: torch.Tensor,
-) -> torch.Tensor:
-    """Walk the lattice one locally best edge at a time.
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    gumbel: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Walk the lattice, sampling each step's lane or taking the best one.
 
-    Step 0 takes the best edge out of lane 0; each later step the best edge
-    out of the previous step's pick.
+    Step ``l`` reads the scores out of the previous step's lane (lane 0 for
+    step 0). A sampled request picks ``argmax(scores / T + gumbel)`` (exact
+    ties toward the lowest token id) and records ``q = softmax(scores / T)``.
+    Greedy requests (``top_k == 1`` or ``T == 0``), requests with top-p but
+    no top-k, and requests that meet a non-finite score row take the lowest
+    best lane, record a one-hot ``q`` for such steps, and report no proposal.
+
+    Args:
+        candidate_ids: ``[bs, L, K]`` candidate token ids.
+        scores: ``[bs, L, K, K]`` predecessor-conditioned edge weights.
+        anchor_token_ids: ``[bs]`` token each walk starts from.
+        temperature: ``[bs]`` fp32 temperature of each request.
+        top_k: ``[bs]`` top-k of each request (``1 << 30`` when disabled).
+        top_p: ``[bs]`` top-p of each request.
+        gumbel: ``[bs, L, K]`` fp32 Gumbel noise of each step's lanes.
 
     Returns:
-        ``[batch, num_steps + 1]`` int32: the anchor, then each step's token.
+        ``(tokens [bs, L + 1] int32, q [bs, L, K] fp32, lanes [bs, L] int32,
+        has_proposal [bs] int32)`` on ``candidate_ids``' device.
     """
-    batch, num_steps, _ = candidate_ids.shape
-    out = torch.empty(batch, num_steps + 1, dtype=torch.int32)
-    out[:, 0] = anchor_token_ids.cpu().to(torch.int32)
+    batch, num_steps, num_lanes = candidate_ids.shape
+    device = candidate_ids.device
+    candidate_ids = candidate_ids.cpu()
+    scores = scores.cpu().float()
+    gumbel = gumbel.cpu().float()
+    temperature = temperature.cpu().float()
+    tokens = torch.empty(batch, num_steps + 1, dtype=torch.int32)
+    tokens[:, 0] = anchor_token_ids.cpu().to(torch.int32)
+    q = torch.empty(batch, num_steps, num_lanes, dtype=torch.float32)
+    lanes = torch.empty(batch, num_steps, dtype=torch.int32)
+    has_proposal = torch.empty(batch, dtype=torch.int32)
     for request in range(batch):
+        k = int(top_k[request])
+        sampled = k != 1 and float(temperature[request]) > 0.0
+        sampled &= not (
+            k == TOP_K_DISABLED and float(top_p[request]) < 1.0 - _TOP_P_ONE_EPS
+        )
+        proposal = sampled
+        t = temperature[request].clamp_min(1.0e-20)
         previous = 0
         for step in range(num_steps):
-            previous = int(torch.argmax(scores[request, step, previous]))
-            out[request, step + 1] = int(candidate_ids[request, step, previous])
-    return out.to(candidate_ids.device)
+            row = scores[request, step, previous]
+            ids = candidate_ids[request, step]
+            row_max = row.max()
+            finite = bool(torch.isfinite(row_max)) and not bool(row.isnan().any())
+            best = (row == row_max).nonzero()
+            best_lane = int(best[0]) if best.numel() else 0
+            if sampled and finite:
+                scaled = row / t
+                noisy = scaled + gumbel[request, step]
+                ties = (noisy == noisy.max()).nonzero().flatten()
+                lane = int(ties[torch.argmin(ids[ties])])
+                q[request, step] = torch.softmax(scaled, dim=0)
+            else:
+                lane = best_lane
+                q[request, step] = 0.0
+                q[request, step, lane] = 1.0
+            proposal &= finite
+            lanes[request, step] = lane
+            tokens[request, step + 1] = int(ids[lane])
+            previous = lane
+        has_proposal[request] = int(proposal)
+    return (
+        tokens.to(device),
+        q.to(device),
+        lanes.to(device),
+        has_proposal.to(device),
+    )
+
+
+def _kept_tokens(
+    logits: torch.Tensor,
+    scaled: torch.Tensor,
+    top_k: int,
+    top_p: float,
+    top_k_pad: int | None,
+) -> torch.Tensor:
+    """Boolean mask of the tokens a top-k / top-p sampler of one row keeps."""
+    vocab = logits.numel()
+    if top_k == TOP_K_DISABLED:
+        k = vocab
+    else:
+        k = min(max(top_k, 1), vocab, vocab if top_k_pad is None else top_k_pad)
+    keep = torch.zeros(vocab, dtype=torch.bool)
+    if k == vocab and top_p >= 1.0 - _TOP_P_ONE_EPS:
+        keep[:] = True
+        return keep
+    # Best logits first, ties toward the lower id (the kernels' order).
+    order = torch.sort(logits, descending=True, stable=True).indices[:k]
+    top = scaled[order]
+    weights = torch.exp(top - top.max())
+    probs = weights / weights.sum().clamp_min(1.0e-20)
+    keep[order[torch.cumsum(probs, 0) - probs < top_p]] = True
+    return keep
+
+
+def _argmax_lowest(values: torch.Tensor, ids: torch.Tensor) -> int:
+    ties = (values == values.max()).nonzero().flatten()
+    return int(ids[ties].min())
+
+
+@register_kernel(
+    "sampling",
+    "verify_rows",
+    name="torch_verify_rows",
+    solution="torch",
+    signatures=format_signatures(
+        "logits", "dense", {torch.float32, torch.float64, torch.bfloat16}
+    ),
+    priority=Priority.REFERENCE,
+)
+def torch_verify_rows(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    q: torch.Tensor,
+    q_ids: torch.Tensor,
+    has_q: torch.Tensor,
+    draft_lane: torch.Tensor,
+    draft_tokens: torch.Tensor,
+    coins: torch.Tensor,
+    gumbels: torch.Tensor,
+    *,
+    top_k_pad: int | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-row rejection-sampling verify of a sampled draft, given its noise.
+
+    The target distribution ``p`` of a row is the softmax of ``logits / T``
+    over its kept tokens (the ``min(top_k, top_k_pad)`` best after the top-p
+    cut; every token without top-k or top-p), normalized over the kept set. A
+    row with a recorded ``q`` accepts draft ``x`` (at lane ``draft_lane``)
+    when ``coin * q(x) < p(x)`` and otherwise emits ``argmax(residual + G)``,
+    where a kept candidate scores ``log(max(p - q, 0)) + LSE`` and a kept
+    non-candidate ``logit / T``; with no finite score it emits the mode of
+    ``p``. Greedy rows (``top_k == 1``), rows without ``q`` and rows whose
+    lane ``draft_lane`` does not hold ``x`` emit the plain
+    draw ``argmax over kept of logit / T + G`` and accept ``x`` when it equals
+    the draw. Exact ties go to the lowest token id.
+
+    Args:
+        logits: ``[rows, V]`` target logits; fp64 for exact enumeration.
+        temperature: ``[rows]`` temperature.
+        top_k: ``[rows]`` top-k (``1 << 30`` when disabled).
+        top_p: ``[rows]`` top-p.
+        q: ``[rows, K]`` recorded draft probabilities.
+        q_ids: ``[rows, K]`` their token ids.
+        has_q: ``[rows]`` bool, whether the row has a recorded ``q``.
+        draft_lane: ``[rows]`` lane of the draft in ``q``.
+        draft_tokens: ``[rows]`` the draft token; ``-1`` for none (last row).
+        coins: ``[rows]`` uniform accept coins in ``[0, 1)``.
+        gumbels: ``[rows, V]`` the plain stream's Gumbel noise per token.
+        top_k_pad: Cap on the top-k support (the kernel's pad), or None.
+
+    Returns:
+        ``(row_accept [rows] int32, row_token [rows] int32, residual
+        [rows, V])``: the accept decisions, the tokens emitted when the chain
+        stops at each row, and each row's noiseless residual scores
+        (``-inf`` everywhere for rows that emit the plain draw).
+    """
+    dtype = logits.dtype if logits.dtype == torch.float64 else torch.float32
+    logits = logits.cpu().to(dtype)
+    rows, vocab = logits.shape
+    scaled = logits / temperature.cpu().to(dtype).clamp_min(1.0e-20)[:, None]
+    q = q.cpu().to(dtype)
+    gumbels = gumbels.cpu().to(dtype)
+    token_ids = torch.arange(vocab)
+    row_accept = torch.zeros(rows, dtype=torch.int32)
+    row_token = torch.zeros(rows, dtype=torch.int32)
+    residual = torch.full((rows, vocab), float("-inf"), dtype=dtype)
+    for row in range(rows):
+        k = int(top_k[row])
+        keep = _kept_tokens(logits[row], scaled[row], k, float(top_p[row]), top_k_pad)
+        kept_scaled = torch.where(keep, scaled[row], float("-inf"))
+        draft = int(draft_tokens[row])
+        plain = _argmax_lowest(kept_scaled + gumbels[row], token_ids)
+        lane = int(draft_lane[row])
+        # A draft outside the vocabulary or not at its recorded lane did not
+        # come from this q.
+        lane_holds_draft = (
+            0 <= draft < vocab
+            and 0 <= lane < q.shape[1]
+            and int(q_ids[row, lane]) == draft
+        )
+        if k == 1 or not bool(has_q[row]) or not lane_holds_draft:
+            row_token[row] = plain
+            row_accept[row] = int(plain == draft)
+            continue
+        kept_max = kept_scaled.max()
+        lse = kept_max + torch.log(torch.exp(kept_scaled - kept_max).sum())
+        p = torch.where(keep, torch.exp(scaled[row] - lse), 0.0)
+        zero = torch.zeros((), dtype=dtype)
+        q_draft = q[row, lane]
+        p_draft = p[draft] if 0 <= draft < vocab else zero
+        # In the logits' precision, like the kernels.
+        coin = coins[row].cpu().to(dtype)
+        row_accept[row] = int(bool(q_draft > 0) and bool(coin * q_draft < p_draft))
+
+        support_q = torch.zeros(vocab, dtype=dtype)
+        is_candidate = torch.zeros(vocab, dtype=torch.bool)
+        for c in range(q.shape[1]):
+            cid = int(q_ids[row, c])
+            if 0 <= cid < vocab:
+                support_q[cid] = torch.maximum(support_q[cid], q[row, c])
+                is_candidate[cid] = True
+        diff = p - support_q
+        candidate_scores = torch.where(
+            diff > 0, torch.log(diff.clamp_min(0.0)) + lse, float("-inf")
+        )
+        scores = torch.where(is_candidate, candidate_scores, scaled[row])
+        scores = torch.where(keep, scores, float("-inf"))
+        residual[row] = scores
+        noisy = scores + gumbels[row]
+        if bool(torch.isinf(noisy).all()):
+            row_token[row] = _argmax_lowest(kept_scaled, token_ids)
+        else:
+            row_token[row] = _argmax_lowest(noisy, token_ids)
+    return row_accept, row_token, residual
 
 
 @register_kernel(
