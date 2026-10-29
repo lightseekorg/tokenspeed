@@ -42,6 +42,7 @@ from tokenspeed_kernel_amd.ops.gfx950.attention._common import (
     _LN2,
     MAX_KV_SPLITS,
     InputStrides,
+    _mfma_unscaled_fp8,
     attention_layouts,
     fp8_lse_shift,
     fp8_probability_shift,
@@ -200,7 +201,8 @@ class ExtendConfig:
         padded_group_size = triton.next_power_of_2(N_HEADS // N_KV_HEADS)
         assert BLOCK_M == BLOCK_Q * padded_group_size
 
-        # Extend uses a [32, 32, 16] MFMA with NUM_WARPS warp tiling.
+        # Extend uses a 32x32 MFMA with NUM_WARPS warp tiling: depth 16 for
+        # BF16, depth 64 (F8F6F4, twice the rate) for FP8.
         (
             qk_layout,
             pv_layout,
@@ -218,7 +220,7 @@ class ExtendConfig:
             IS_FP8,
             KV_DTYPE,
             num_warps=NUM_WARPS,
-            instr_shape=[32, 32, 16],
+            instr_shape=[32, 32, 64] if IS_FP8 else [32, 32, 16],
         )
 
         self.N_HEADS = gl.constexpr(N_HEADS)
@@ -453,10 +455,14 @@ class ExtendProgram:
         qk = gl.zeros(
             [cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.qk_layout
         )
+        if cfg.IS_FP8:
+            return _mfma_unscaled_fp8(q, k, qk)
         return cdna4.mfma(q, k, qk)
 
     @gluon.jit
     def compute_pv(self, p, v, acc):
+        if self.cfg.IS_FP8:
+            return _mfma_unscaled_fp8(p, v, acc)
         return cdna4.mfma(p, v, acc)
 
     @gluon.jit

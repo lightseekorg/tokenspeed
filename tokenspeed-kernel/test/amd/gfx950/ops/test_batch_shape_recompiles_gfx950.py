@@ -170,8 +170,10 @@ def test_mha_prefill_token_stride_and_request_count(window):
         run([1], views=False)
 
 
+# FP8 caches run the products on the F8F6F4 MFMA, a separate set of variants.
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("window", [-1, 127])
-def test_mha_extend_startup_warmup_covers_every_variant(window):
+def test_mha_extend_startup_warmup_covers_every_variant(window, dtype):
     from tokenspeed_kernel.numerics.torch.attention.mha import (
         gather_pages,
         torch_dense_attention,
@@ -181,13 +183,12 @@ def test_mha_extend_startup_warmup_covers_every_variant(window):
     from tokenspeed_kernel_amd.ops.gfx950.attention.mha import extend
 
     heads, kv_heads, dim, page, width, slots = 16, 2, 64, 64, 32, 80
-    k_cache = torch.randn(
-        1 + slots * width, page, kv_heads, dim, device=DEVICE, dtype=torch.bfloat16
-    )
-    v_cache = torch.randn_like(k_cache)
+    k_cache = torch.randn(1 + slots * width, page, kv_heads, dim, device=DEVICE)
+    v_cache = torch.randn_like(k_cache).to(dtype)
+    k_cache = k_cache.to(dtype)
     tables = 1 + torch.arange(slots * width, dtype=torch.int32, device=DEVICE)
     tables = tables.view(slots, width)
-    queries_pool = torch.randn(8192, heads, dim, device=DEVICE, dtype=torch.bfloat16)
+    queries_pool = torch.randn(8192, heads, dim, device=DEVICE).to(dtype)
 
     def run(queries, prefix):
         lengths = [query + prefix for query in queries]

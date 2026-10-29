@@ -1350,7 +1350,8 @@ slots, which take that request's query blocks in alternating directions so
 the long late blocks spread out. More requests take further rounds; in the
 last round, slots past the last request are skipped. With skip-softmax, a
 shared ticket counter hands out blocks instead. The sliding-window kernel
-walks (request, head, query block) items in order, 512 apart.
+walks (request, head, query block) items in order, 512 apart. FP8 runs both
+products on `V_MFMA_F32_32X32X64_F8F6F4`, as in extend.
 
 ### gfx950 MHA cached extension
 
@@ -1384,6 +1385,9 @@ the partials by LSE.
 Each work-group owns one KV head and packs its query-head group with up to 16
 query positions into the MFMA rows: 128-row tiles on four waves, or 64 rows on
 two when no request has more than 64 queries. Unused head lanes are masked.
+Both products run on 32x32 MFMAs: depth 16 for BF16, and
+`V_MFMA_F32_32X32X64_F8F6F4` for FP8, four times the depth in twice the cycles
+(CDNA4 ISA, Table 28).
 
 K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. The copies are
 software-pipelined four deep: four LDS buffers, three pages prefetched per wave

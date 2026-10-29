@@ -53,7 +53,8 @@ from tokenspeed_kernel_amd.ops.gfx950.attention.mha.prefill import (  # noqa: E4
 )
 
 FP8 = torch.float8_e4m3fn
-HEAD_DIM = 64
+# The head dims extend and prefill accept.
+HEAD_DIMS = [64, 128]
 Q_HEADS = 16
 KV_HEADS = 2
 PAGE_SIZE = 64
@@ -65,18 +66,20 @@ SHORT_OTHER_LOGIT = 6.0
 SOFTMAX_SCALE = math.log(2.0)
 
 
-def _keys_and_values(num_keys: int, other_logit: float) -> tuple[torch.Tensor, ...]:
-    """[num_keys, KV_HEADS, HEAD_DIM] K and V: key 0 scores 12, the rest other_logit."""
-    k = torch.zeros(num_keys, KV_HEADS, HEAD_DIM, device="cuda")
+def _keys_and_values(
+    num_keys: int, other_logit: float, head_dim: int
+) -> tuple[torch.Tensor, ...]:
+    """[num_keys, KV_HEADS, head_dim] K and V: key 0 scores 12, the rest other_logit."""
+    k = torch.zeros(num_keys, KV_HEADS, head_dim, device="cuda")
     k[:, :, 0] = other_logit
     k[0, :, 0] = FIRST_LOGIT
-    v = torch.ones(num_keys, KV_HEADS, HEAD_DIM, device="cuda")
+    v = torch.ones(num_keys, KV_HEADS, head_dim, device="cuda")
     v[0] = 0.0
     return k.to(FP8), v.to(FP8)
 
 
-def _queries(rows: int) -> torch.Tensor:
-    q = torch.zeros(rows, Q_HEADS, HEAD_DIM, device="cuda")
+def _queries(rows: int, head_dim: int) -> torch.Tensor:
+    q = torch.zeros(rows, Q_HEADS, head_dim, device="cuda")
     q[:, :, 0] = 1.0
     return q.to(FP8)
 
@@ -95,7 +98,7 @@ def _paged(k: torch.Tensor, v: torch.Tensor) -> tuple[torch.Tensor, ...]:
 
     def to_pages(x):
         x = torch.cat([x, x.new_zeros(pad, *x.shape[1:])]).view(
-            pages, PAGE_SIZE, KV_HEADS, HEAD_DIM
+            pages, PAGE_SIZE, KV_HEADS, x.shape[-1]
         )
         return x.flip(0).contiguous()
 
@@ -129,9 +132,9 @@ def test_decode_keeps_small_fp8_probabilities(
     window_left, others, other_logit, max_seqlen_q, has_sink
 ):
     num_keys = 1 + others
-    k, v = _keys_and_values(num_keys, other_logit)
+    k, v = _keys_and_values(num_keys, other_logit, 64)
     k_cache, v_cache, page_table = _paged(k, v)
-    q = _queries(max_seqlen_q)
+    q = _queries(max_seqlen_q, 64)
     sinks = _sinks(has_sink)
     out = launch_gluon_mha_decode_gfx950(
         q=q,
@@ -157,14 +160,15 @@ def test_decode_keeps_small_fp8_probabilities(
     _check(out, expected, has_sink)
 
 
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("has_sink", [False, True])
 @pytest.mark.parametrize("window_left", [-1, OTHER_KEYS + 64])
-def test_extend_keeps_small_fp8_probabilities(window_left, has_sink):
+def test_extend_keeps_small_fp8_probabilities(window_left, has_sink, head_dim):
     rows = 32
     num_keys = 1 + OTHER_KEYS + rows
-    k, v = _keys_and_values(num_keys, 0.0)
+    k, v = _keys_and_values(num_keys, 0.0, head_dim)
     k_cache, v_cache, page_table = _paged(k, v)
-    q = _queries(rows)
+    q = _queries(rows, head_dim)
     sinks = _sinks(has_sink)
     out, lse = launch_gluon_mha_extend_gfx950(
         q=q,
@@ -206,14 +210,15 @@ PREFILL_CASES = [
 ]
 
 
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
 @pytest.mark.parametrize("has_sink", [False, True])
 @pytest.mark.parametrize("others,other_logit,first_checked_row", PREFILL_CASES)
 def test_prefill_keeps_small_fp8_probabilities(
-    others, other_logit, first_checked_row, has_sink
+    others, other_logit, first_checked_row, has_sink, head_dim
 ):
     num_keys = 1 + others
-    k, v = _keys_and_values(num_keys, other_logit)
-    q = _queries(num_keys)
+    k, v = _keys_and_values(num_keys, other_logit, head_dim)
+    q = _queries(num_keys, head_dim)
     sinks = _sinks(has_sink)
     out, lse = launch_gluon_mha_prefill_gfx950(
         q=q,
@@ -236,11 +241,90 @@ def test_prefill_keeps_small_fp8_probabilities(
         torch.testing.assert_close(lse, expected_lse, atol=1e-4, rtol=0)
 
 
+def _rel_l2(out: torch.Tensor, expected: torch.Tensor) -> float:
+    return float((out.float() - expected).norm() / expected.norm())
+
+
+# Bound on the relative L2 error of an FP8 kernel against FP32 attention over
+# the same FP8 inputs: the probabilities' 3-bit FP8 rounding costs about 1%.
+# Random keys use every head channel, so a wrong MFMA operand layout fails it;
+# the dominant-key cases above load only channel 0.
+RANDOM_INPUT_REL_L2 = 2e-2
+
+
+def _random_fp8(*shape: int, scale: float, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(*shape, device="cuda", generator=generator) * scale
+    return x.to(FP8)
+
+
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("window_left", [-1, 255])
+@pytest.mark.parametrize("prefix,rows", [(0, 1024), (2048, 32), (2048, 1024)])
+def test_extend_matches_reference_on_random_fp8(prefix, rows, window_left, head_dim):
+    num_keys = prefix + rows
+    k = _random_fp8(num_keys, KV_HEADS, head_dim, scale=1.0, seed=1)
+    v = _random_fp8(num_keys, KV_HEADS, head_dim, scale=1.0, seed=2)
+    q = _random_fp8(rows, Q_HEADS, head_dim, scale=2.0, seed=3)
+    k_cache, v_cache, page_table = _paged(k, v)
+    out = launch_gluon_mha_extend_gfx950(
+        q=q,
+        cu_seqlens_q=torch.tensor([0, rows], dtype=torch.int32, device="cuda"),
+        cu_seqlens_kv=torch.tensor([0, num_keys], dtype=torch.int32, device="cuda"),
+        k_cache=k_cache,
+        v_cache=v_cache,
+        page_table=page_table,
+        cache_seqlens=torch.tensor([num_keys], dtype=torch.int32, device="cuda"),
+        is_causal=True,
+        window_left=window_left,
+        max_seqlen_q=rows,
+        max_seqlen_k=num_keys,
+    )
+    expected, _ = torch_dense_attention(
+        q,
+        k,
+        v,
+        scale=head_dim**-0.5,
+        causal_offset=prefix,
+        window_left=None if window_left < 0 else window_left,
+        sinks=None,
+    )
+    assert _rel_l2(out, expected) < RANDOM_INPUT_REL_L2
+
+
+@pytest.mark.parametrize("head_dim", HEAD_DIMS)
+@pytest.mark.parametrize("window_left", [-1, 255])
+def test_prefill_matches_reference_on_random_fp8(window_left, head_dim):
+    num_keys = 2048
+    k = _random_fp8(num_keys, KV_HEADS, head_dim, scale=1.0, seed=1)
+    v = _random_fp8(num_keys, KV_HEADS, head_dim, scale=1.0, seed=2)
+    q = _random_fp8(num_keys, Q_HEADS, head_dim, scale=2.0, seed=3)
+    out = launch_gluon_mha_prefill_gfx950(
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens=torch.tensor([0, num_keys], dtype=torch.int32, device="cuda"),
+        cu_seqlens_cpu=[0, num_keys],
+        max_seqlen=num_keys,
+        window_left=window_left,
+    )
+    expected, _ = torch_dense_attention(
+        q,
+        k,
+        v,
+        scale=head_dim**-0.5,
+        causal_offset=0,
+        window_left=None if window_left < 0 else window_left,
+        sinks=None,
+    )
+    assert _rel_l2(out, expected) < RANDOM_INPUT_REL_L2
+
+
 @pytest.mark.parametrize("scale", ["q_scale", "k_scale", "v_scale"])
 def test_decode_and_extend_reject_block_scales(scale):
-    k, v = _keys_and_values(PAGE_SIZE, 0.0)
+    k, v = _keys_and_values(PAGE_SIZE, 0.0, 64)
     k_cache, v_cache, page_table = _paged(k, v)
-    q = _queries(1)
+    q = _queries(1, 64)
     lengths = torch.tensor([PAGE_SIZE], dtype=torch.int32, device="cuda")
     block_scales = {scale: torch.ones(1, dtype=torch.uint8, device="cuda")}
     with pytest.raises(ValueError, match=f"unit scale, got {scale}"):
