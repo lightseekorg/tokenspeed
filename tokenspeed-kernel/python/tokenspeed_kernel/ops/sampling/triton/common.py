@@ -26,6 +26,10 @@ import torch
 from tokenspeed_kernel._triton import tl, triton
 from tokenspeed_kernel.platform import pdl_enabled
 
+# Top-k value meaning "no top-k cutoff", as the sampling pools store it. The
+# runtime's sampling parameters rewrite top_k = -1 to this value.
+TOP_K_DISABLED = 1 << 30
+
 
 @triton.jit
 def _gather_and_expand_scalars_kernel(
@@ -179,3 +183,100 @@ def gather_and_expand_scalars(
     )
 
     return out_temperature, out_top_k, out_top_p, out_min_p, out_seed, out_offsets
+
+
+def check_draft_q_inputs(
+    *,
+    fn_name: str,
+    rows: int,
+    num_tokens_per_req: int,
+    req_pool_indices: torch.Tensor,
+    candidates: torch.Tensor,
+    q: torch.Tensor,
+    q_ids: torch.Tensor,
+    slot: torch.Tensor,
+    pos: torch.Tensor,
+    row_accept: torch.Tensor,
+    row_token: torch.Tensor,
+) -> int:
+    """Validate the draft-q and per-row output arguments of a verify kernel.
+
+    Args:
+        fn_name: The calling kernel's name, for error messages.
+        rows: Verify rows of the call (requests times window width).
+        num_tokens_per_req: Verify window width ``N``.
+        req_pool_indices: ``[bs]`` int32 pool slot of each request.
+        candidates: ``[bs, N]`` int32 verify window.
+        q: ``[pool, S, K]`` fp32 recorded draft probabilities.
+        q_ids: ``[pool, S, K]`` int32 their token ids.
+        slot: ``[pool, >= N]`` int32 q row of each window node.
+        pos: ``[pool, >= N]`` int32 lane of each window node in that row.
+        row_accept: ``[rows]`` int32 output.
+        row_token: ``[rows]`` int32 output.
+
+    Returns:
+        The number of candidates per recorded q row.
+
+    Raises:
+        ValueError: An argument has the wrong shape, dtype, layout or device.
+    """
+    if candidates.ndim != 2:
+        raise ValueError(f"{fn_name}: candidates must be 2D, got {candidates.ndim}D")
+    bs = candidates.shape[0]
+    if num_tokens_per_req < 1 or candidates.shape[1] != num_tokens_per_req:
+        raise ValueError(
+            f"{fn_name}: candidates width {candidates.shape[1]} must equal "
+            f"num_tokens_per_req {num_tokens_per_req} >= 1"
+        )
+    if rows != bs * num_tokens_per_req:
+        raise ValueError(
+            f"{fn_name}: logits rows {rows} must be {bs} requests x "
+            f"{num_tokens_per_req} tokens"
+        )
+    if req_pool_indices.shape != (bs,):
+        raise ValueError(
+            f"{fn_name}: req_pool_indices shape {tuple(req_pool_indices.shape)} "
+            f"must be {(bs,)}"
+        )
+    if q.ndim != 3 or q_ids.shape != q.shape:
+        raise ValueError(
+            f"{fn_name}: q and q_ids must be matching [pool, S, K] tensors, got "
+            f"{tuple(q.shape)} and {tuple(q_ids.shape)}"
+        )
+    if q.stride() != q_ids.stride() or q.stride(2) != 1:
+        raise ValueError(
+            f"{fn_name}: q and q_ids need equal strides and a contiguous "
+            "candidate dimension"
+        )
+    if (
+        slot.ndim != 2
+        or slot.shape[1] < num_tokens_per_req
+        or pos.shape != slot.shape
+        or pos.stride() != slot.stride()
+        or slot.stride(1) != 1
+    ):
+        raise ValueError(
+            f"{fn_name}: slot and pos must be matching [pool, >= "
+            f"{num_tokens_per_req}] tensors with contiguous rows, got "
+            f"{tuple(slot.shape)} and {tuple(pos.shape)}"
+        )
+    if row_accept.shape != (rows,) or row_token.shape != (rows,):
+        raise ValueError(
+            f"{fn_name}: row_accept and row_token must be [{rows}], got "
+            f"{tuple(row_accept.shape)} and {tuple(row_token.shape)}"
+        )
+    for name, tensor, dtype in (
+        ("req_pool_indices", req_pool_indices, torch.int32),
+        ("candidates", candidates, torch.int32),
+        ("q", q, torch.float32),
+        ("q_ids", q_ids, torch.int32),
+        ("slot", slot, torch.int32),
+        ("pos", pos, torch.int32),
+        ("row_accept", row_accept, torch.int32),
+        ("row_token", row_token, torch.int32),
+    ):
+        if tensor.dtype != dtype:
+            raise ValueError(f"{fn_name}: {name} must be {dtype}, got {tensor.dtype}")
+        if tensor.device.type != "cuda":
+            raise ValueError(f"{fn_name}: {name} must be CUDA")
+    return q.shape[2]
