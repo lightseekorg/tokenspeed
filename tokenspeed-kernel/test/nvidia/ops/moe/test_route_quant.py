@@ -243,8 +243,8 @@ def native_input_consumer():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper")
     flashinfer = pytest.importorskip("flashinfer")
-    if flashinfer.__version__ != "0.7.2":
-        pytest.skip("The SM90 source patch requires FlashInfer 0.7.2")
+    if flashinfer.__version__ != "0.7.2.post1":
+        pytest.skip("The SM90 source patch requires FlashInfer 0.7.2.post1")
     from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
 
     return prepare_sm90_fp8_moe(

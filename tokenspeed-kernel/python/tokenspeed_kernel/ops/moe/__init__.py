@@ -160,7 +160,7 @@ def prepare_sm90_fp8_moe(
         skips their input preparation; retain its storage through all consumers.
         Callers compute the hint from their own
         routing layout. Initialize before warmup and CUDA graph capture;
-        private modes require FlashInfer 0.7.2, Hopper, and a working JIT compiler.
+        private modes require FlashInfer 0.7.2.post1, Hopper, and a working JIT compiler.
     """
     from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import make_cutlass_fused_moe
 
