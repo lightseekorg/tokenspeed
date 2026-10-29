@@ -350,6 +350,7 @@ def make_config(
     num_snapshot_pages: int,
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
+    decode_allocation_policy: str | None,
     debug_force_retraction_interval: int = 0,
     enable_kv_cache_events: bool = False,
     decode_input_tokens: int = 1,
@@ -385,6 +386,8 @@ def make_config(
             A victim whose image does not fit the Host (L2 pins, pool, rows)
             is aborted by the scheduler instead of imaged.
         storage_config: Explicit asynchronous L3 budgets, or None without L3.
+        decode_allocation_policy: Explicit early/independent prefill admission choice,
+            or None for decode and fused serving.
         debug_force_retraction_interval: ``--debug-force-retraction-interval``:
             0 is off; every ``|N|`` plans the scheduler retracts the oldest
             quiescent Decoding (``N > 0``) or Prefilling (``N < 0``) request
@@ -435,6 +438,20 @@ def make_config(
     cfg.enable_kv_cache_events = enable_kv_cache_events
 
     cfg.role = scheduler_role(role)
+    if cfg.role != SchedulerConfig.Role.P:
+        if decode_allocation_policy is not None:
+            raise ValueError("Decode allocation policy is only valid for prefill")
+        cfg.decode_allocation_policy = None
+    else:
+        policies = {
+            "early": SchedulerConfig.DecodeAllocationPolicy.Early,
+            "independent": SchedulerConfig.DecodeAllocationPolicy.Independent,
+        }
+        if decode_allocation_policy not in policies:
+            raise ValueError(
+                "Prefill scheduling requires an explicit decode allocation policy"
+            )
+        cfg.decode_allocation_policy = policies[decode_allocation_policy]
     cfg.decode_input_tokens = decode_input_tokens
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.disable_prefix_cache = disable_prefix_cache

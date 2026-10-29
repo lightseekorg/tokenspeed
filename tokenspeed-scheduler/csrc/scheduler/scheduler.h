@@ -85,6 +85,8 @@ public:
     std::size_t WaitingSize() const;
     std::size_t DecodingSize() const;
     std::size_t PrefillSize() const;
+    std::size_t AwaitingDestinationSize() const;
+    std::int32_t AwaitingDestinationLcmBlocks() const;
     // Device pool parents that are empty or hold only unpinned cache entries.
     // Scans the pool and every prefix index: a leak check for tests and
     // diagnostics, not a per-step gauge.
@@ -102,6 +104,7 @@ public:
     // Only fused, page-less requests can finish without the normal forward/PD
     // completion fence. This is a read-only check for the head event channel.
     bool CanAbortBeforeAdmission(const std::string& id) const;
+    bool CanAbortAwaitingDestination(const std::string& id) const;
     // Maximum logical request extent that one request can reserve in an
     // otherwise reclaimable device pool. The runtime must enforce this limit
     // before submitting requests.
@@ -259,6 +262,7 @@ private:
     void handleEvent(const cache::SnapshotDone& event);
     void handleEvent(const cache::RestoreDone& event);
     void handleEvent(const pd::BootstrappedEvent& event);
+    void handleEvent(const pd::DestinationReadyEvent& event);
     void handleEvent(const pd::FailedEvent& event);
     void handleEvent(const pd::SucceededEvent& event);
     void handleEvent(const pd::RemotePrefillDoneEvent& event);

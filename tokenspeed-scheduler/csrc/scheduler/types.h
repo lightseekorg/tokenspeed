@@ -85,6 +85,7 @@ struct SchedulerConfig {
     // (transfer pins, destination layouts, transfer_policy validation) keys
     // on the role directly.
     Role role{Role::kFused};
+    std::optional<DecodeAllocationPolicy> decode_allocation_policy;
 
     bool disable_prefix_cache{false};
     // Minimum prompt tail that must be recomputed after a prefix-cache hit.

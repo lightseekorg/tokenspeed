@@ -70,7 +70,12 @@ class TestServerArgs:
         with pytest.raises(ValueError, match="disaggregation-mode decode"):
             ServerArgs(**DP8, attn_head_tp_size=8)
         with pytest.raises(ValueError, match="disaggregation-mode decode"):
-            ServerArgs(**DP8, attn_head_tp_size=8, disaggregation_mode="prefill")
+            ServerArgs(
+                **DP8,
+                attn_head_tp_size=8,
+                disaggregation_mode="prefill",
+                disaggregation_decode_allocation_policy="early",
+            )
 
     def test_head_tp_needs_attention_tp_1(self):
         with pytest.raises(ValueError, match="attention TP 1"):

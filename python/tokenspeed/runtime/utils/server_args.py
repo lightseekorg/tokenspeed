@@ -735,6 +735,7 @@ class ServerArgs:
 
     # For PD/EPD disaggregation: "null", "prefill", "decode", or "encode" (vision-tower-only).
     disaggregation_mode: str = "null"
+    disaggregation_decode_allocation_policy: str | None = None
     disaggregation_bootstrap_port: int = 8998
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_ib_device: str | None = None
@@ -1922,6 +1923,30 @@ class ServerArgs:
             )
 
     def resolve_disaggregation(self):
+        policy = self.disaggregation_decode_allocation_policy
+        if self.disaggregation_mode == "prefill":
+            if policy not in ("early", "independent"):
+                raise ValueError(
+                    "Prefill serving requires explicit "
+                    "--disaggregation-decode-allocation-policy early or independent"
+                )
+        elif policy is not None:
+            raise ValueError("Decode allocation policy is only valid for prefill")
+        if policy == "independent":
+            if (
+                self.mapping.attn.tp_size != 1
+                or self.mapping.attn.kvp_size != 1
+                or self.mapping.has_pp
+                or self.disaggregation_transfer_backend != "mooncake"
+            ):
+                raise ValueError(
+                    "Independent P/D admission requires attention TP1/KVP1, PP1 and Mooncake"
+                )
+            if self.disaggregation_layerwise_interval != 0:
+                raise ValueError(
+                    "Independent P/D admission requires explicit "
+                    "--disaggregation-layerwise-interval 0"
+                )
         # Pipeline parallelism is a prefill-node-only capability: the chunk
         # pipeline needs the P role's structural guarantees (no decode token
         # feedback, non-overlap loop).
@@ -4078,6 +4103,13 @@ class ServerArgs:
             "--enable-allreduce-fusion",
             action="store_true",
             help="Enable allreduce fusion for improved decode performance. Auto-enabled on supported single-node TP configurations, and for Beam on any number of nodes (its boundaries fuse where an MNNVL workspace serves them).",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-allocation-policy",
+            type=str,
+            choices=["early", "independent"],
+            default=None,
+            help="Required on prefill servers: early waits for decode allocation before prefill; independent gates only KV transfer. Decode allocation starts on request arrival in both cases.",
         )
         parser.add_argument(
             "--disaggregation-bootstrap-port",

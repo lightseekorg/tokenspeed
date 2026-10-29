@@ -104,12 +104,18 @@ def create_kv_transfer(
     args: KVManagerArgs,
     kv_args: KVArgs,
     gloo_group,
+    *,
+    prefill_admission_policy: str | None,
 ):
     if backend not in (TransferBackend.MOONCAKE, TransferBackend.MOONCAKE.value):
         raise NotImplementedError("CachePD supports only the Mooncake backend")
     if mode == "prefill":
-        return DisaggPrefillExecutor(args, kv_args, gloo_group)
+        return DisaggPrefillExecutor(
+            args, kv_args, gloo_group, admission_policy=prefill_admission_policy
+        )
     elif mode == "decode":
+        if prefill_admission_policy is not None:
+            raise ValueError("Decode does not select prefill admission policy")
         return DisaggDecodeExecutor(args, kv_args, gloo_group)
     else:
         raise NotImplementedError(f"Unsupported disaggregation mode: {mode}")

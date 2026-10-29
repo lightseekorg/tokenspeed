@@ -129,7 +129,12 @@ def test_non_retracting_roles_resolve_to_no_pool_with_a_log(role, caplog, monkey
     monkeypatch.setattr(logging.getLogger(ServerArgs.__module__), "propagate", True)
     with caplog.at_level(logging.INFO):
         args = ServerArgs(
-            model="x", disaggregation_mode=role, retraction_snapshot_host_gb=2.0
+            model="x",
+            disaggregation_mode=role,
+            disaggregation_decode_allocation_policy=(
+                "early" if role == "prefill" else None
+            ),
+            retraction_snapshot_host_gb=2.0,
         )
     assert args.retraction_snapshot_pool_disabled
     assert (args.retraction_snapshot_host_gb, args.retraction_snapshot_ratio) == (
@@ -143,7 +148,12 @@ def test_non_retracting_roles_resolve_to_no_pool_with_a_log(role, caplog, monkey
     caplog.clear()
     with caplog.at_level(logging.INFO):
         args = ServerArgs(
-            model="x", disaggregation_mode=role, debug_force_retraction_interval=3
+            model="x",
+            disaggregation_mode=role,
+            disaggregation_decode_allocation_policy=(
+                "early" if role == "prefill" else None
+            ),
+            debug_force_retraction_interval=3,
         )
     assert args.debug_force_retraction_interval == 0
     assert any(
@@ -154,7 +164,13 @@ def test_non_retracting_roles_resolve_to_no_pool_with_a_log(role, caplog, monkey
     # Nothing to say when nothing was asked for.
     caplog.clear()
     with caplog.at_level(logging.INFO):
-        args = ServerArgs(model="x", disaggregation_mode=role)
+        args = ServerArgs(
+            model="x",
+            disaggregation_mode=role,
+            disaggregation_decode_allocation_policy=(
+                "early" if role == "prefill" else None
+            ),
+        )
     assert args.retraction_snapshot_pool_disabled
     assert not any("never retracts" in record.message for record in caplog.records)
 
@@ -194,6 +210,9 @@ def test_l3_accepts_kvp_in_every_serving_role(role, dcp_size):
         model="x",
         world_size=2,
         disaggregation_mode=role,
+        disaggregation_decode_allocation_policy=(
+            "early" if role == "prefill" else None
+        ),
         kv_parallel_size=2,
         decode_context_parallel_size=dcp_size,
         kvstore_storage_backend="mooncake",

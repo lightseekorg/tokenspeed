@@ -1838,6 +1838,7 @@ def _build_kv_transfer(
             logical_plan=logical_plan,
         ),
         gloo_group=sync_group,
+        prefill_admission_policy=server_args.disaggregation_decode_allocation_policy,
     )
     interval = server_args.disaggregation_layerwise_interval
     if isinstance(kv_transfer, DisaggPrefillExecutor) and interval > 0:

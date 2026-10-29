@@ -45,15 +45,24 @@ _BOOTSTRAP_STALL_SECONDS = 10.0
 
 
 class DisaggPrefillExecutor:
-    def __init__(self, args, kv_args, gloo_group):
+    def __init__(self, args, kv_args, gloo_group, *, admission_policy: str):
+        if admission_policy not in ("early", "independent"):
+            raise ValueError("Prefill requires an explicit admission policy")
+        self._admission_policy = admission_policy
         self.cache_layout = kv_args.cache_layout
         self.senders: dict[str, MooncakeKVSender] = {}
         self.kv_manager = MooncakeKVManagerPrefill(args, kv_args)
         self.gloo_group = gloo_group
         self._local_states = {}
+        self._destination_ready: set[str] = set()
+        self.pending_cancellations: dict[str, str] = {}
         self._layerwise_enabled = False
         self._layerwise_interval = 1
         self._bootstrap_stall_logged_at: float | None = None
+
+    @property
+    def independent_admission(self) -> bool:
+        return self._admission_policy == "independent"
 
     def has_inflight_transfers(self) -> bool:
         """Whether a KV send is still registered (bootstrapping or sending)."""
@@ -100,6 +109,8 @@ class DisaggPrefillExecutor:
             sender.clear()
             self.kv_manager.discard_room(sender.bootstrap_room)
         self._local_states.pop(req_id, None)
+        self._destination_ready.discard(req_id)
+        self.pending_cancellations.pop(req_id, None)
 
     def prepare_prefill(self, op) -> None:
         if not self._layerwise_enabled or op.num_extends() == 0:
@@ -366,6 +377,8 @@ class DisaggPrefillExecutor:
         Bootstrapping is waiting for another rank's pre-allocation; that rank
         never receives it when the decode side lost the room.
         """
+        if self._admission_policy == "independent":
+            return
         now = time.time()
         stalled = [
             f"{req_id}(room={sender.bootstrap_room}, age={now - sender.init_time:.0f}s)"
@@ -388,28 +401,62 @@ class DisaggPrefillExecutor:
             stalled[:8],
         )
 
+    def cancel_awaiting_destination(self, request_id: str, reason: str) -> None:
+        self.pending_cancellations.pop(request_id, None)
+        sender = self.senders.get(request_id)
+        if sender is not None:
+            self.kv_manager.cancel_before_transfer(sender.bootstrap_room, reason)
+
+    def _readiness_events(self, request_ids, polls):
+        independent = self._admission_policy == "independent"
+        events = []
+        for request_id, poll in zip(request_ids, polls, strict=True):
+            if poll in (TransferPoll.Failed, TransferPoll.Success):
+                continue
+            if self._local_states[request_id] == TransferPoll.Bootstrapping and (
+                independent or poll == TransferPoll.Bootstrapped
+            ):
+                events.append(PD.BootstrappedEvent(request_id))
+                self._local_states[request_id] = TransferPoll.Bootstrapped
+                logger.debug(
+                    f"[prefill][generate_events] rid={request_id!s} -> BootstrappedEvent"
+                )
+            if (
+                independent
+                and poll == TransferPoll.Bootstrapped
+                and request_id not in self._destination_ready
+            ):
+                self._destination_ready.add(request_id)
+                events.append(PD.DestinationReadyEvent(request_id))
+        return events
+
+    def generate_admission_events(self):
+        if self._admission_policy != "independent":
+            return []
+        request_ids = [
+            request_id
+            for request_id in self.senders
+            if request_id not in self._destination_ready
+        ]
+        if not request_ids:
+            return []
+        polls = poll_and_all_reduce(
+            [self.senders[request_id] for request_id in request_ids], self.gloo_group
+        )
+        return self._readiness_events(request_ids, polls)
+
     def generate_events(self):
         if not self.senders:
             return []
         request_ids = list(self.senders)
         polls = poll_and_all_reduce(self.senders.values(), self.gloo_group)
         self._log_bootstrap_stalls(request_ids, polls)
-
-        events = []
+        events = self._readiness_events(request_ids, polls)
         to_remove = []
-        for req_id, poll in zip(request_ids, polls):
-            if (
-                self._local_states[req_id] == TransferPoll.Bootstrapping
-                and poll == TransferPoll.Bootstrapped
-            ):
-                logger.debug(
-                    f"[prefill][generate_events] rid={req_id!s} -> BootstrappedEvent",
-                )
-                events.append(PD.BootstrappedEvent(req_id))
-                self._local_states[req_id] = TransferPoll.Bootstrapped
-            elif poll == TransferPoll.Failed:
+        for req_id, poll in zip(request_ids, polls, strict=True):
+            if poll == TransferPoll.Failed:
                 logger.warning(
-                    f"[prefill][generate_events] rid={req_id!s} -> FailedEvent",
+                    f"[prefill][generate_events] rid={req_id!s} -> FailedEvent"
                 )
                 events.append(PD.FailedEvent(req_id))
                 to_remove.append(req_id)
@@ -419,13 +466,10 @@ class DisaggPrefillExecutor:
             ):
                 self._local_states[req_id] = TransferPoll.Success
                 logger.debug(
-                    f"[prefill][generate_events] rid={req_id!s} -> SucceededEvent",
+                    f"[prefill][generate_events] rid={req_id!s} -> SucceededEvent"
                 )
                 events.append(PD.SucceededEvent(req_id))
                 to_remove.append(req_id)
-            else:
-                pass
         for req_id in to_remove:
             self._drop_request_state(req_id)
-
         return events

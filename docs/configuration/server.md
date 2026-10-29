@@ -529,6 +529,17 @@ Use `--tensor-parallel-size` for simple launches. When attention, dense,
 and MoE layers need different process groups, use the TokenSpeed-specific
 split knobs.
 
+### P/D admission
+
+Prefill servers explicitly select `--disaggregation-decode-allocation-policy`.
+Decode servers leave it unset and use their existing allocation path.
+Both `early` and `independent` start decode KV allocation on request arrival.
+`early` waits for that allocation before admitting prefill. `independent` lets
+prefill schedule immediately and requires both a completed prefill and a ready
+destination only when sending KV. A destination grant is retained if it arrives
+before prefill finishes. Independent admission currently requires Mooncake,
+attention TP1/KVP1, PP1, and `--disaggregation-layerwise-interval 0`.
+
 ### Mixed prefill/decode placement
 
 Prefill and decode instances can occupy disjoint GPUs on the same hosts. Each

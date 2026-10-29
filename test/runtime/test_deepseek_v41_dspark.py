@@ -1081,7 +1081,13 @@ def test_tp1_ep2_draft_checkpoint_and_idle_schedule(monkeypatch, rank, mode):
     # The runner's GPU initialization is outside this CPU checkpoint test.
     runner = Mock(spec=ModelRunner)
     runner.model, runner.mapping, runner.device = adapter, mapping, "cpu"
-    runner.server_args = ServerArgs(model="unused", disaggregation_mode=mode)
+    runner.server_args = ServerArgs(
+        model="unused",
+        disaggregation_mode=mode,
+        disaggregation_decode_allocation_policy=(
+            "early" if mode == "prefill" else None
+        ),
+    )
     kwargs = dict(
         spec_num_tokens=6,
         spec_num_steps=5,

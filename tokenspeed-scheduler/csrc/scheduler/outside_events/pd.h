@@ -32,6 +32,11 @@ struct BootstrappedEvent {
     explicit BootstrappedEvent(std::string id) : request_id(std::move(id)) {}
 };
 
+struct DestinationReadyEvent {
+    std::string request_id;
+    explicit DestinationReadyEvent(std::string id) : request_id(std::move(id)) {}
+};
+
 struct FailedEvent {
     std::string request_id;
     explicit FailedEvent(std::string id) : request_id(std::move(id)) {}
@@ -51,6 +56,7 @@ struct RemotePrefillDoneEvent {
 
 }  // namespace pd
 
-using PDEvent = std::variant<pd::BootstrappedEvent, pd::FailedEvent, pd::SucceededEvent, pd::RemotePrefillDoneEvent>;
+using PDEvent = std::variant<pd::BootstrappedEvent, pd::DestinationReadyEvent, pd::FailedEvent, pd::SucceededEvent,
+                             pd::RemotePrefillDoneEvent>;
 
 }  // namespace tokenspeed

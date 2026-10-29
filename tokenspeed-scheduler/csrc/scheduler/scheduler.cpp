@@ -401,8 +401,22 @@ std::size_t Scheduler::DecodingSize() const {
 
 std::size_t Scheduler::PrefillSize() const {
     return static_cast<std::size_t>(std::ranges::count_if(requests_, [](const std::unique_ptr<Request>& request) {
-        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult, fsm::PrefillDone>();
+        return request->IsAnyOf<fsm::Prefilling, fsm::RemotePrefilling, fsm::PrefillAwaitingResult,
+                                fsm::PrefillAwaitingDestination, fsm::PrefillDone>();
     }));
+}
+
+std::size_t Scheduler::AwaitingDestinationSize() const {
+    return static_cast<std::size_t>(std::ranges::count_if(
+        requests_, [](const auto& request) { return request->template Is<fsm::PrefillAwaitingDestination>(); }));
+}
+
+std::int32_t Scheduler::AwaitingDestinationLcmBlocks() const {
+    std::vector<std::span<const BlockTable>> tables;
+    for (const auto& request : requests_) {
+        if (request->Is<fsm::PrefillAwaitingDestination>()) tables.emplace_back(request->BlockTablesRef());
+    }
+    return coordinator_.NumActiveLcmBlocks(tables);
 }
 
 std::size_t Scheduler::RemotePrefillSize() const {
@@ -456,6 +470,12 @@ bool Scheduler::CanAbortBeforeAdmission(const std::string& id) const {
     const auto it = requests_by_id_.find(id);
     return config_.role == Role::kFused && it != requests_by_id_.end() &&
            it->second->IsAnyOf<fsm::Submitted, fsm::Prefetching>();
+}
+
+bool Scheduler::CanAbortAwaitingDestination(const std::string& id) const {
+    const auto it = requests_by_id_.find(id);
+    return it != requests_by_id_.end() && it->second->ResultsInFlight() == 0 &&
+           it->second->Is<fsm::PrefillAwaitingDestination>();
 }
 
 ExecutionPlan Scheduler::NextExecutionPlan() {

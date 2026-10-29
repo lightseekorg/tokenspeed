@@ -95,6 +95,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .value("D", tokenspeed::Role::kD)
         .value("Fused", tokenspeed::Role::kFused);
 
+    nb::enum_<tokenspeed::DecodeAllocationPolicy>(scheduler_config, "DecodeAllocationPolicy")
+        .value("Early", tokenspeed::DecodeAllocationPolicy::kEarly)
+        .value("Independent", tokenspeed::DecodeAllocationPolicy::kIndependent);
+
     nb::enum_<tokenspeed::AttnKind>(m, "AttnKind")
         .value("Full", tokenspeed::AttnKind::kFull)
         .value("SlidingWindow", tokenspeed::AttnKind::kSlidingWindow)
@@ -141,6 +145,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)
         .def_rw("role", &tokenspeed::SchedulerConfig::role)
+        .def_rw("decode_allocation_policy", &tokenspeed::SchedulerConfig::decode_allocation_policy)
         .def_prop_rw(
             "num_device_pages", [](const tokenspeed::SchedulerConfig& c) { return c.device_allocator.total_pages; },
             [](tokenspeed::SchedulerConfig& c, std::int32_t v) { c.device_allocator.total_pages = v; })
@@ -340,6 +345,10 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::pd::BootstrappedEvent>(pd, "BootstrappedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
         .def_ro("request_id", &tokenspeed::pd::BootstrappedEvent::request_id);
+
+    nb::class_<tokenspeed::pd::DestinationReadyEvent>(pd, "DestinationReadyEvent")
+        .def(nb::init<std::string>(), nb::arg("request_id"))
+        .def_ro("request_id", &tokenspeed::pd::DestinationReadyEvent::request_id);
 
     nb::class_<tokenspeed::pd::FailedEvent>(pd, "FailedEvent")
         .def(nb::init<std::string>(), nb::arg("request_id"))
@@ -570,6 +579,8 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("decoding_size", &tokenspeed::Scheduler::DecodingSize, "Count requests in the Decoding FSM state.")
         .def("prefilling_size", &tokenspeed::Scheduler::PrefillSize,
              "Count local/remote prefills, PrefillAwaitingResult, and PrefillDone requests.")
+        .def("awaiting_destination_size", &tokenspeed::Scheduler::AwaitingDestinationSize)
+        .def("awaiting_destination_lcm_blocks", &tokenspeed::Scheduler::AwaitingDestinationLcmBlocks)
         .def("remote_prefilling_size", &tokenspeed::Scheduler::RemotePrefillSize,
              "Count RemotePrefilling requests; these are also included in prefilling_size().")
         .def("pd_transfer_size", &tokenspeed::Scheduler::PdTransferSize,
@@ -587,6 +598,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
         .def("tail_cap_evictions", &tokenspeed::Scheduler::TailCapEvictions,
              "Tails dropped because more than eight were published under one prior page.")
         .def("can_abort_before_admission", &tokenspeed::Scheduler::CanAbortBeforeAdmission, nb::arg("id"))
+        .def("can_abort_awaiting_destination", &tokenspeed::Scheduler::CanAbortAwaitingDestination, nb::arg("id"))
         .def("request_token_size", &tokenspeed::Scheduler::RequestTokenSize, nb::arg("id"))
         .def("max_single_request_tokens", &tokenspeed::Scheduler::MaxSingleRequestTokens)
         .def("clear_l1_cache", &tokenspeed::Scheduler::ClearL1Cache)

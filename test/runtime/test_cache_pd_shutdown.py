@@ -150,7 +150,8 @@ class _EventLoopHarness:
             count_ops=lambda _plan: self.trace.append("count_cache"),
         )
         self._pd_hooks = SimpleNamespace(
-            poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1]
+            poll_admission_events=lambda: [],
+            poll_transfer_events=lambda: (self.trace.append("poll_pd"), [])[1],
         )
         self._eplb_hooks = SimpleNamespace(
             note_round=lambda *, forwarded: self.trace.append("eplb_round"),
@@ -237,6 +238,7 @@ def test_abort_uses_the_output_marker() -> None:
     )
     loop = SimpleNamespace(
         output_processor=output,
+        _pd_hooks=SimpleNamespace(cancel_request=lambda _request_id, _reason: False),
         _l3_hooks=L3CacheHooks(
             None,
             None,

@@ -44,6 +44,21 @@ void Scheduler::handleEvent(const pd::BootstrappedEvent& event) {
     }
 }
 
+void Scheduler::handleEvent(const pd::DestinationReadyEvent& event) {
+    Request* request = findRequest(event.request_id);
+    if (request == nullptr || request->IsAnyOf<fsm::PrefillDone, fsm::Decoding, fsm::Finishing, fsm::Finished>()) {
+        return;
+    }
+    if (config_.role == Role::kP && config_.decode_allocation_policy == DecodeAllocationPolicy::kIndependent) {
+        request->MarkDestinationReady();
+        if (request->Is<fsm::PrefillAwaitingDestination>()) {
+            request->Apply(fsm::DestinationReadyEvent{});
+        }
+        return;
+    }
+    throw std::logic_error("Destination grant requires independent prefill admission");
+}
+
 void Scheduler::handleEvent(const pd::FailedEvent& event) {
     Request* request = findRequest(event.request_id);
     if (request == nullptr || request->Is<fsm::Finished>()) {
@@ -147,7 +162,10 @@ void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
 void Scheduler::handleEvent(const forward::ExtendResult& event) {
     if (Request* request = findRequest(event.request_id)) {
         request->NoteResultLanded();
-        request->Apply(fsm::ExtendResultEvent{event.tokens});
+        request->Apply(fsm::ExtendResultEvent{
+            event.tokens, config_.role == Role::kP &&
+                              config_.decode_allocation_policy == DecodeAllocationPolicy::kIndependent &&
+                              !request->DestinationReady()});
         if (!event.spec_candidate_ids.empty()) {
             request->StoreSpecCandidates(event.spec_candidate_ids);
         }

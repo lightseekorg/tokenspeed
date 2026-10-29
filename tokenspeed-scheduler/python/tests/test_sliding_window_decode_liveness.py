@@ -60,6 +60,9 @@ def _config(
     cfg.decode_input_tokens = 1
     cfg.overlap_schedule_depth = overlap_schedule_depth
     cfg.role = ts.SchedulerConfig.Role.Fused
+    cfg.decode_allocation_policy = (
+        type(cfg).DecodeAllocationPolicy.Early if cfg.role == type(cfg).Role.P else None
+    )
     cfg.disable_prefix_cache = not prefix_cache
     cfg.cache_groups = [
         ts.CacheGroupConfig(

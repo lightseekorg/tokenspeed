@@ -126,6 +126,7 @@ def test_prefill_role_reserves_the_decode_window_on_the_completing_chunk():
     like a decoding role; intermediate chunks hold only their own tokens."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = type(cfg).DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 2
     cfg.max_scheduled_tokens = 4
     cfg.max_batch_size = 1
@@ -165,6 +166,7 @@ def test_prefill_role_hands_off_without_the_draft_window():
     verify window: a pool sized for the prompt and that window still hands off."""
     cfg = SchedulerConfig()
     cfg.role = SchedulerConfig.Role.P
+    cfg.decode_allocation_policy = type(cfg).DecodeAllocationPolicy.Early
     cfg.prefix_granularity = 1
     cfg.max_scheduled_tokens = 8
     cfg.max_batch_size = 1

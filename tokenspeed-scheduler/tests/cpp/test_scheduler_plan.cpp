@@ -472,6 +472,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = SchedulerKvCacheEventTestSuite::MakeConfig();
         cfg.role = Role::kP;
+        cfg.decode_allocation_policy = DecodeAllocationPolicy::kEarly;
         cfg.max_scheduled_tokens = 9;
         cfg.device_allocator.total_pages = 8;
         cfg.cache_groups.front().total_pages = cfg.device_allocator.total_pages;

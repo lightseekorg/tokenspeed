@@ -142,6 +142,7 @@ def test_prefill_abort_room_records_failure() -> None:
     manager.request_status = {}
     manager.failure_records = {}
     manager.failure_lock = threading.Lock()
+    manager.bootstrap_token_cond = threading.Condition()
     manager.transfer_infos = {}
 
     manager.abort_room(9, "mooncake transfer ret=-1")
@@ -163,6 +164,7 @@ def test_prefill_abort_room_counts_once_per_room() -> None:
     manager.request_status = {}
     manager.failure_records = {}
     manager.failure_lock = threading.Lock()
+    manager.bootstrap_token_cond = threading.Condition()
     manager.transfer_infos = {}
 
     # Later chunks of the same room funnel back into abort_room after the

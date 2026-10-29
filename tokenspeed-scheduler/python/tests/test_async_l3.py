@@ -28,6 +28,9 @@ from conftest import _advance, _spec, storage_ops
 def scheduler(*, role, groups=1, host=32, timeout=100):
     cfg = ts.SchedulerConfig()
     cfg.role = role
+    cfg.decode_allocation_policy = (
+        type(cfg).DecodeAllocationPolicy.Early if cfg.role == type(cfg).Role.P else None
+    )
     cfg.prefix_granularity = 2
     cfg.num_snapshot_pages = 1
     cfg.num_device_pages = 64
@@ -427,6 +430,9 @@ def test_prefill_storage_preparation_survives_bootstrap(bootstrap_before_get):
 def mixed_replay_scheduler():
     cfg = ts.SchedulerConfig()
     cfg.role = ts.SchedulerConfig.Role.Fused
+    cfg.decode_allocation_policy = (
+        type(cfg).DecodeAllocationPolicy.Early if cfg.role == type(cfg).Role.P else None
+    )
     cfg.prefix_granularity = 2
     cfg.num_device_pages = 64
     cfg.num_host_pages = 32

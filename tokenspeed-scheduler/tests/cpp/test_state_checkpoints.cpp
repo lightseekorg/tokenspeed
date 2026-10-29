@@ -421,6 +421,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = StateCheckpointInForwardSuite::MakeConfig();
         cfg.role = Role::kP;
+        cfg.decode_allocation_policy = DecodeAllocationPolicy::kEarly;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot
                                                                         : CacheTransferPolicy::FullSuffix;

@@ -60,6 +60,9 @@ def _config(
     cfg.decode_input_tokens = 1
     cfg.overlap_schedule_depth = 1
     cfg.role = role
+    cfg.decode_allocation_policy = (
+        type(cfg).DecodeAllocationPolicy.Early if cfg.role == type(cfg).Role.P else None
+    )
     groups = [
         ts.CacheGroupConfig(
             group_id=HISTORY,

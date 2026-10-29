@@ -236,6 +236,8 @@ def test_prepare_cache_prefill_preflights_batch_and_reserves_once() -> None:
         block_tables_arrays=lambda: tables,
     )
     executor = object.__new__(DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor.cache_layout = layout
     executor.senders = {"request-0": _Sender(9), "request-1": _Sender(10)}
     executor.kv_manager = manager
@@ -289,6 +291,8 @@ def test_first_layerwise_chunk_includes_deeper_prefill_cache_hit() -> None:
         "state-b": np.asarray([[11, 12, 13, 14, 15]], dtype=np.int32),
     }
     executor = object.__new__(DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor.cache_layout = layout
     executor.senders = {"request-0": sender}
     executor.kv_manager = manager

@@ -67,7 +67,10 @@ def test_decode_role_accepts_the_flag_and_the_prefill_role_refuses_it():
     args = _args(disaggregation_mode="decode")
     assert args.enable_speculative_sampling
     with pytest.raises(ValueError, match="prefill role"):
-        _args(disaggregation_mode="prefill")
+        _args(
+            disaggregation_mode="prefill",
+            disaggregation_decode_allocation_policy="early",
+        )
 
 
 def test_rl_bitwise_accepts_the_flag_with_a_flashinfer_verifier():

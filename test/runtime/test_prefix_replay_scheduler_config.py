@@ -28,6 +28,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         disable_l2_cache=True,
         enable_l3_storage=False,
         role="fused",
+        decode_allocation_policy=None,
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=None,
@@ -143,6 +144,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         disable_l2_cache=False,
         enable_l3_storage=enable_l3_storage,
         role="fused",
+        decode_allocation_policy=None,
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=(

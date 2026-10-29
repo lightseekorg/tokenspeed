@@ -84,7 +84,7 @@ KV-pool device memory over RDMA rather than through a CUDA kernel, but it
 needs the same ordering against forwards and page zeroing — so its execution
 face lives behind the handle too, attached once at startup. Its control face
 (bootstrap register/abort, event polling, `pop_*`) stays on the control
-plane, where it feeds Principle 3's tail advance.
+plane, where it feeds Principle 3's explicit feedback points.
 
 Consequences:
 
@@ -332,7 +332,12 @@ There are exactly two call sites, each with a documented reason:
 * **Head of the round** — completed Host cache-op events
   (`_cache_hooks.poll_ready_events()`: `WriteBackDone`, `LoadBackDone`,
   `SnapshotDone`, `RestoreDone`, each replica-intersected), together with
-  the L3 hooks' agreed storage facts.
+  the L3 hooks' agreed storage facts and local prefill readiness under
+  `independent` P/D admission. This includes destination-ready grants, which
+  the native request remembers independently of its prefill state. Local P
+  readiness does not depend on D allocation and must be visible to the first
+  batch planned after arrival. Transfer completions retain their tail feedback
+  point, where grants arriving during the forward are also processed.
   These must advance *before* `next_execution_plan`; otherwise, cache-gated
   admissions -- a prefetched request's admission, a suspended request's
   restore, which waits for both of its store ACKs, then its own -- are

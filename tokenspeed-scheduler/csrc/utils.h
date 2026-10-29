@@ -147,6 +147,11 @@ template <typename T>
 concept CanExtendTokenContainer =
     requires(T& state, std::vector<std::int32_t> tokens) { state.ExtendResultTokens(tokens); };
 
+enum class DecodeAllocationPolicy {
+    kEarly,
+    kIndependent,
+};
+
 enum class Role {
     kP,
     kD,

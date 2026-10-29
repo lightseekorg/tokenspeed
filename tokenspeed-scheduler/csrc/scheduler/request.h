@@ -47,6 +47,8 @@ public:
     Request(const RequestSpec& spec, std::int32_t prefix_granularity, Role role);
 
     const std::string& Id() const { return id_; }
+    bool DestinationReady() const { return destination_ready_; }
+    void MarkDestinationReady() { destination_ready_ = true; }
 
     // Decode headroom an admission must secure before the prefill starts:
     // one safe-step window up front, plus one more per retraction suffered
@@ -283,6 +285,9 @@ public:
             Overloaded{
                 [](const fsm::PrefillDone& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [](const fsm::PrefillAwaitingResult& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
+                [](const fsm::PrefillAwaitingDestination& state) {
+                    return state.ReserveNumTokensInNextScheduleEvent();
+                },
                 [](const fsm::Decoding& state) { return state.ReserveNumTokensInNextScheduleEvent(); },
                 [this](const auto&) -> std::int32_t {
                     throw std::logic_error(
@@ -294,27 +299,30 @@ public:
     }
 
     std::string StateName() const {
-        return std::visit(Overloaded{
-                              [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
-                              [](const fsm::Submitted&) -> std::string { return "Submitted"; },
-                              [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
-                              [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
-                              [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
-                              [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
-                              [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
-                              [](const fsm::Decoding&) -> std::string { return "Decoding"; },
-                              [](const fsm::Retracted&) -> std::string { return "Retracted"; },
-                              [](const fsm::Restoring&) -> std::string { return "Restoring"; },
-                              [](const fsm::Finishing&) -> std::string { return "Finishing"; },
-                              [](const fsm::Finished&) -> std::string { return "Finished"; },
-                          },
-                          state_);
+        return std::visit(
+            Overloaded{
+                [](const fsm::Bootstrapping&) -> std::string { return "Bootstrapping"; },
+                [](const fsm::Submitted&) -> std::string { return "Submitted"; },
+                [](const fsm::Prefetching&) -> std::string { return "Prefetching"; },
+                [](const fsm::Prefilling&) -> std::string { return "Prefilling"; },
+                [](const fsm::RemotePrefilling&) -> std::string { return "RemotePrefilling"; },
+                [](const fsm::PrefillAwaitingResult&) -> std::string { return "PrefillAwaitingResult"; },
+                [](const fsm::PrefillAwaitingDestination&) -> std::string { return "PrefillAwaitingDestination"; },
+                [](const fsm::PrefillDone&) -> std::string { return "PrefillDone"; },
+                [](const fsm::Decoding&) -> std::string { return "Decoding"; },
+                [](const fsm::Retracted&) -> std::string { return "Retracted"; },
+                [](const fsm::Restoring&) -> std::string { return "Restoring"; },
+                [](const fsm::Finishing&) -> std::string { return "Finishing"; },
+                [](const fsm::Finished&) -> std::string { return "Finished"; },
+            },
+            state_);
     }
 
 private:
     fsm::ForwardResources& forwardResources(const char* operation);
     const fsm::ForwardResources& forwardResources(const char* operation) const;
 
+    bool destination_ready_{false};
     std::string id_;
     TokenContainer token_container_;
     std::int32_t submitted_prompt_size_{0};

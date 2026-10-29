@@ -656,6 +656,7 @@ TEST(SchedulerConfigValidateTest, ReplayNeedsBudgetForAWindowOnEveryRole) {
     for (const Role role : {Role::kP, Role::kD}) {
         SchedulerConfig pd = config;
         pd.role = role;
+        pd.decode_allocation_policy = role == Role::kP ? std::optional{DecodeAllocationPolicy::kEarly} : std::nullopt;
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -681,6 +682,7 @@ TEST(SchedulerConfigValidateTest, StateCheckpointInForwardRequiresPrefixCaching)
     for (const Role role : {Role::kP, Role::kD}) {
         SchedulerConfig pd = MakeValidConfig();
         pd.role = role;
+        pd.decode_allocation_policy = role == Role::kP ? std::optional{DecodeAllocationPolicy::kEarly} : std::nullopt;
         for (CacheGroupConfig& group : pd.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -717,6 +719,7 @@ TEST(SchedulerConfigValidateTest, SnapshotPoolAndRetractedSlotsAreStatedTogether
 
     config.max_retracted_requests = 4;
     config.role = Role::kP;
+    config.decode_allocation_policy = DecodeAllocationPolicy::kEarly;
     config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
     EXPECT_THROW(config.Validate(), std::invalid_argument) << "the P role never retracts";
     config.snapshot_allocator.total_pages = 1;

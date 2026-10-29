@@ -1318,6 +1318,8 @@ def test_prefill_usage_hook_records_committed_totals_and_skips_retired_requests(
     recorded = []
     logprobs = []
     transfer = object.__new__(DisaggPrefillExecutor)
+    transfer._destination_ready = set()
+    transfer.pending_cancellations = {}
     transfer.senders = {"hit": SimpleNamespace(bootstrap_room=9)}
     transfer.kv_manager = SimpleNamespace(
         record_cached_tokens=lambda room, count: recorded.append((room, count)),

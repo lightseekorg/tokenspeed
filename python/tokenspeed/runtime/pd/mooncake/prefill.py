@@ -230,12 +230,20 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 self.bootstrap_logprobs[room] = logprob
 
     def begin_room(self, room: int) -> None:
-        """Reset request metadata before publishing a room."""
+        """Register the local attempt before making it eligible for prefill."""
         with self.bootstrap_token_cond:
             self.prefill_metadata.pop(room, None)
             self.cached_tokens.pop(room, None)
             self.bootstrap_logprobs.pop(room, None)
-        self.update_status(room, TransferPoll.Bootstrapping)
+            self.update_status(room, TransferPoll.Bootstrapping)
+
+    def cancel_before_transfer(self, room: int, reason: str) -> None:
+        with self.bootstrap_token_cond:
+            if self.request_status.get(room) in (None, TransferPoll.Success):
+                return
+            # Intentional cancellation uses terminal notification without a transfer-failure sample.
+            self.update_status(room, TransferPoll.Failed)
+        self.abort_room(room, reason)
 
     def discard_room(self, room: int) -> None:
         """Drop all Prefill-manager state owned by one terminal request."""
@@ -243,9 +251,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
         # chunk (Success) do: a thread that finds no destinations for a room
         # reads its status (room_status) to tell an ended room from missing
         # metadata.
-        self.request_status.pop(room, None)
-        self.transfer_infos.pop(room, None)
         with self.bootstrap_token_cond:
+            self.request_status.pop(room, None)
+            self.transfer_infos.pop(room, None)
             self.prefill_metadata.pop(room, None)
             self.cached_tokens.pop(room, None)
             self.bootstrap_logprobs.pop(room, None)
@@ -930,8 +938,9 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 already_counted = room in self.failure_records
         if not already_counted:
             self.kv_transfer_metrics.record_kv_transfer_failure()
-        self.record_failure(room, reason)
-        self.update_status(room, TransferPoll.Failed)
+        with self.bootstrap_token_cond:
+            self.record_failure(room, reason)
+            self.update_status(room, TransferPoll.Failed)
         for req in list(self.transfer_infos.get(room, {}).values()):
             if not req.is_dummy:
                 try:
@@ -1201,12 +1210,13 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 )
             return
 
-        self.transfer_infos[parsed_room] = candidate_infos
-        # A transfer worker can fail and remove the room after the precheck but
-        # before this bootstrap-thread commit.  Do not let that interleaving
-        # resurrect destination state for a sticky-Failed room.
-        if self.request_status.get(parsed_room) == TransferPoll.Failed:
-            self.transfer_infos.pop(parsed_room, None)
+        with self.bootstrap_token_cond:
+            rejected = self.request_status.get(parsed_room) == TransferPoll.Failed
+            if not rejected:
+                self.transfer_infos[parsed_room] = candidate_infos
+                if len(candidate_infos) == expected_fanout:
+                    self.update_status(parsed_room, TransferPoll.Bootstrapped)
+        if rejected:
             self.sync_status_to_decode_endpoint(
                 registration.endpoint,
                 registration.dst_port,
@@ -1214,10 +1224,6 @@ class MooncakeKVManagerPrefill(MooncakeKVManagerBase):
                 TransferPoll.Failed,
                 self._status_prefill_rank,
             )
-            return
-        complete = len(candidate_infos) == expected_fanout
-        if complete:
-            self.update_status(parsed_room, TransferPoll.Bootstrapped)
 
     def start_prefill_thread(self):
         self.bind_server_socket(get_local_ip_by_remote())

@@ -110,6 +110,9 @@ def test_pd_roles_configure_their_pools_as_resolved(role):
         model="x",
         max_num_seqs=8,
         disaggregation_mode=role,
+        disaggregation_decode_allocation_policy=(
+            "early" if role == "prefill" else None
+        ),
         debug_force_retraction_interval=3,
         disaggregation_transfer_backend="mooncake",
     )

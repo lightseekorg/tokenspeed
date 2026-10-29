@@ -477,6 +477,7 @@ def test_failed_room_fanout_never_restores_state(
         9: (TransferPoll.WaitingForInput if fail_during_commit else TransferPoll.Failed)
     }
     manager.topology = _topology()
+    manager.bootstrap_token_cond = threading.Condition()
     if fail_during_commit:
         manager._validate_cache_room_fanout = lambda _requests: (
             manager.request_status.__setitem__(9, TransferPoll.Failed)
@@ -694,6 +695,8 @@ def test_prefill_submits_manifest_through_contract_sender() -> None:
     calls = []
 
     executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor._layerwise_enabled = False
     executor.cache_layout = layout
     executor.senders = {"request-0": _RecordingSender(calls)}
@@ -718,6 +721,8 @@ def test_idle_prefill_rank_submits_final_dummy_rendezvous() -> None:
     calls = []
 
     executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor._layerwise_enabled = False
     executor.senders = {"request-0": _RecordingSender(calls)}
     executor.kv_manager = SimpleNamespace(
@@ -741,6 +746,8 @@ def test_idle_layerwise_prefill_rank_submits_final_dummy_rendezvous() -> None:
     calls = []
 
     executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor._layerwise_enabled = True
     executor.senders = {"request-0": _RecordingSender(calls)}
     executor.kv_manager = SimpleNamespace(
@@ -763,6 +770,8 @@ def test_layerwise_final_preserves_speculative_candidates() -> None:
 
     metadata_calls = []
     executor = object.__new__(prefill_module.DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor._layerwise_enabled = True
     executor.senders = {"request-0": _FinalLayerwiseSender([])}
     executor.kv_manager = SimpleNamespace(
@@ -795,6 +804,8 @@ def test_submission_skips_a_room_aborted_while_queued(layerwise: bool) -> None:
     manager.transfer_queues = [FastQueue()]
     manager.step_counter = None
     executor = object.__new__(DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor.cache_layout = _layout()
     executor.kv_manager = manager
     executor._layerwise_enabled = layerwise
@@ -883,6 +894,8 @@ def test_submitting_a_live_room_without_destinations_raises(layerwise: bool) -> 
     manager.request_status = {9: TransferPoll.Bootstrapped}
     manager.transfer_infos = {}
     executor = object.__new__(DisaggPrefillExecutor)
+    executor._destination_ready = set()
+    executor.pending_cancellations = {}
     executor._layerwise_enabled = layerwise
     executor.senders = {"request-0": _RecordingSender([])}
     executor.kv_manager = manager

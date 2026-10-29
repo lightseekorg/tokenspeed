@@ -72,6 +72,7 @@ SchedulerConfig SizingConfig(Role role, std::int32_t prefix_granularity, std::in
                              std::vector<CacheGroupConfig> groups) {
     SchedulerConfig cfg{};
     cfg.role = role;
+    cfg.decode_allocation_policy = role == Role::kP ? std::optional{DecodeAllocationPolicy::kEarly} : std::nullopt;
     cfg.prefix_granularity = prefix_granularity;
     cfg.max_scheduled_tokens = chunk_tokens;
     cfg.max_batch_size = 1;
@@ -200,6 +201,7 @@ TEST(CapacityModelTest, ConcurrentDemandByKind) {
     // role.
     SchedulerConfig prefill = cfg;
     prefill.role = Role::kP;
+    prefill.decode_allocation_policy = DecodeAllocationPolicy::kEarly;
     for (CacheGroupConfig& group : prefill.cache_groups) {
         group.transfer_policy =
             group.attn_kind == AttnKind::kState ? CacheTransferPolicy::LatestSnapshot : CacheTransferPolicy::FullSuffix;

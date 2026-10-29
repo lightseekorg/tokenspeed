@@ -53,6 +53,9 @@ void validateGroupCapacityInputs(const SchedulerConfig& config, const CacheGroup
 
 void SchedulerConfig::Validate() const {
     ValidateCapacityInputs();
+    if ((role == Role::kP) != decode_allocation_policy.has_value()) {
+        throw std::invalid_argument("Decode allocation policy is required only for prefill");
+    }
     if (device_allocator.total_pages <= 1) {
         throw std::invalid_argument("Scheduler: device cache must contain a null page and usable capacity");
     }

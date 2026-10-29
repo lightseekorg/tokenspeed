@@ -73,6 +73,7 @@ def _scheduler(*, with_state: bool = False) -> ts.Scheduler:
             disable_l2_cache=True,
             enable_l3_storage=False,
             role="fused",
+            decode_allocation_policy=None,
             num_snapshot_pages=1,
             max_retracted_requests=0,
             storage_config=None,

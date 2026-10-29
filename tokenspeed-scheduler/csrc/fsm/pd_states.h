@@ -82,5 +82,24 @@ private:
     std::int32_t reserve_num_tokens_in_next_schedule_event_{};
 };
 
+// Completed P KV stays pinned until the peer grants destination memory.
+struct PrefillAwaitingDestination {
+    PrefillAwaitingDestination(ForwardResources resources, TokenContainer::Window window,
+                               std::int32_t reserve_num_tokens_in_next_schedule_event)
+        : resources{std::move(resources)},
+          window{window},
+          reserve_num_tokens_in_next_schedule_event_{reserve_num_tokens_in_next_schedule_event} {}
+
+    PrefillInfo CurrentPrefillInfo() const { return MakePrefillInfo(resources, window); }
+    std::int32_t ReserveNumTokensInNextScheduleEvent() const { return reserve_num_tokens_in_next_schedule_event_; }
+    void ExtendResultTokens(const std::vector<std::int32_t>& result_tokens) { resources.ExtendTokens(result_tokens); }
+
+    ForwardResources resources;
+    TokenContainer::Window window{};
+
+private:
+    std::int32_t reserve_num_tokens_in_next_schedule_event_{};
+};
+
 }  // namespace fsm
 }  // namespace tokenspeed

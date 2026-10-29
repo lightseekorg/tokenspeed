@@ -31,6 +31,12 @@ namespace fsm {
 struct Bootstrapping;
 struct RemotePrefilling;
 struct Prefetching;
+struct PrefillAwaitingDestination;
+
+struct DestinationReadyEvent : InvalidTransitionHandler<DestinationReadyEvent> {
+    using InvalidTransitionHandler<DestinationReadyEvent>::operator();
+    PrefillDone operator()(PrefillAwaitingDestination&& state);
+};
 
 struct BootstrappedEvent : InvalidTransitionHandler<BootstrappedEvent> {
     using InvalidTransitionHandler<BootstrappedEvent>::operator();

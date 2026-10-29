@@ -46,6 +46,20 @@ class PdTransferHooks:
         # Injected, not reached through the loop — see PauseHooks.
         self._device = device
 
+    def cancel_request(self, request_id: str, reason: str) -> bool:
+        transfer = self._loop.kv_transfer
+        if (
+            not isinstance(transfer, DisaggPrefillExecutor)
+            or not transfer.independent_admission
+            or request_id not in transfer.senders
+        ):
+            return False
+        transfer.pending_cancellations[request_id] = reason
+        if not self._loop.scheduler.can_abort_awaiting_destination(request_id):
+            return False
+        transfer.cancel_awaiting_destination(request_id, reason)
+        return True
+
     def record_prefill_usage(self, request_ids: list[str]) -> None:
         """Forward committed host-side usage before remote-decode dispatch.
 
@@ -66,6 +80,19 @@ class PdTransferHooks:
                 loop.kv_transfer.record_bootstrap_logprob(
                     request_id, state.output_token_logprobs_val[0]
                 )
+
+    def poll_admission_events(self) -> list:
+        transfer = self._loop.kv_transfer
+        if self._loop._pause.forward_blocked or not isinstance(
+            transfer, DisaggPrefillExecutor
+        ):
+            return []
+        for request_id, reason in list(transfer.pending_cancellations.items()):
+            if self._loop.scheduler.request_token_size(request_id) < 0:
+                transfer.pending_cancellations.pop(request_id)
+            elif self._loop.scheduler.can_abort_awaiting_destination(request_id):
+                transfer.cancel_awaiting_destination(request_id, reason)
+        return transfer.generate_admission_events()
 
     def poll_transfer_events(self) -> list:
         """Poll the KV transfer executor, act on its events, and return the

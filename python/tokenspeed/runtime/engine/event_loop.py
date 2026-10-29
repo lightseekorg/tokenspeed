@@ -198,6 +198,7 @@ def scheduler_config_from_args(
         disable_l2_cache=not server_args.enable_kvstore,
         enable_l3_storage=has_l3,
         role=server_args.disaggregation_mode,
+        decode_allocation_policy=server_args.disaggregation_decode_allocation_policy,
         num_snapshot_pages=specs.num_snapshot_pages,
         max_retracted_requests=specs.max_retracted_requests,
         storage_config=storage_config,
@@ -849,6 +850,8 @@ class EventLoop:
             self.output_processor.mark_abort(request_id, notify_client=True)
         else:
             self.output_processor.mark_abort(request_id)
+        if self._pd_hooks.cancel_request(request_id, _reason):
+            return
         if self._l3_hooks.cancel_request(request_id):
             state = self.output_processor.rid_to_state.get(request_id)
             if state is not None:
@@ -1201,8 +1204,8 @@ class EventLoop:
 
         Scheduler feedback is only ever an explicit ``advance_scheduler`` call
         in this loop body — helpers return events, never advance. Two calls:
-        cache-op completions at the head of the round (so this round's plan
-        sees them) and forward results at the tail (they only exist after
+        admission readiness at the head of the round (so this round's plan
+        sees it) and forward results at the tail (they only exist after
         dispatch); everything else funnels into ``request_changes``.
         """
         in_flight: deque = deque()
@@ -1217,17 +1220,16 @@ class EventLoop:
                 # rank-identical every cycle. A no-op without an EPD admission
                 # controller (every non-EPD deployment).
                 self._epd_hooks.drain_ready_embeddings()
-                cache_events = self._l3_hooks.poll_ready_events(
+                ready_events = self._l3_hooks.poll_ready_events(
                     allow_forward=not self._pause.forward_blocked,
                     allow_storage=not self._pause.forward_blocked,
                 )
-                cache_events.extend(self._cache_hooks.poll_ready_events())
-                if cache_events:
-                    # Advanced at the HEAD of the round (not funneled into the
-                    # tail advance) so completed cache ops are visible to this
-                    # round's next_execution_plan — deferring them would delay
-                    # cache-gated admissions by a full round.
-                    advance_scheduler(self.scheduler, cache_events)
+                ready_events.extend(self._cache_hooks.poll_ready_events())
+                ready_events.extend(self._pd_hooks.poll_admission_events())
+                if ready_events:
+                    # Apply admission readiness before planning so ready
+                    # requests can join this round's batch.
+                    advance_scheduler(self.scheduler, ready_events)
                 self._l3_hooks.record_metrics()
 
                 # Every path in this round appends its committed results here;

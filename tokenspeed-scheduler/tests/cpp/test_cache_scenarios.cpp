@@ -3015,10 +3015,10 @@ TEST(ExtendResultEvent, AwaitingResultAbsorbsEmptyIntermediateResults) {
                                                       /*awaits_result=*/true});
     ASSERT_TRUE(request.Is<fsm::PrefillAwaitingResult>());
 
-    request.Apply(fsm::ExtendResultEvent{{}});  // an older intermediate chunk's empty result
+    request.Apply(fsm::ExtendResultEvent{{}, false});  // an older intermediate chunk's empty result
     EXPECT_TRUE(request.Is<fsm::PrefillAwaitingResult>()) << "an empty result must not end the wait";
 
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token
+    request.Apply(fsm::ExtendResultEvent{{42}, false});  // the final chunk's token
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.LastToken(), 42);
 }
@@ -3059,12 +3059,12 @@ TEST(ExtendResultEvent, AwaitingResultCarriesForwardsInFlightIntoPrefillDone) {
     ASSERT_EQ(request.ResultsInFlight(), 2);
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{42}});  // the final chunk's token, ahead of chunk 1's result
+    request.Apply(fsm::ExtendResultEvent{{42}, false});  // the final chunk's token, ahead of chunk 1's result
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 1) << "chunk 1's forward is still out against these pages";
 
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // chunk 1's empty result, late
+    request.Apply(fsm::ExtendResultEvent{{}, false});  // chunk 1's empty result, late
     EXPECT_TRUE(request.Is<fsm::PrefillDone>());
     EXPECT_EQ(request.ResultsInFlight(), 0);
 }
@@ -3098,7 +3098,7 @@ TEST(SnapshotRetractEvent, StampsResumePriorityAndKeepsTheResumePoint) {
     ASSERT_TRUE(request.Is<fsm::Prefilling>());
     request.TrackScheduledForward();
     request.NoteResultLanded();
-    request.Apply(fsm::ExtendResultEvent{{}});  // the first chunk landed
+    request.Apply(fsm::ExtendResultEvent{{}, false});  // the first chunk landed
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     const auto* retracted = request.GetIf<fsm::Retracted>();
@@ -3164,9 +3164,9 @@ TEST(RetractionHeadroom, ReservesOnlyTheRemainingGenerationBudget) {
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(999, 7), false});
     ASSERT_EQ(request.GeneratedTokens(), 1000);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -3224,9 +3224,9 @@ TEST(RetractionHeadroom, SpendingTheWindowNeverMakesItCoverTheRemainder) {
                                                       fsm::PrefillSource::kLocal, &coordinator, std::move(tables),
                                                       /*hit_tokens=*/0, fsm::CacheProgress{},
                                                       /*load_pairs=*/{}, /*awaits_result=*/false});
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, false});
     request.Apply(fsm::ScheduleDecodeEvent{/*decode_input_tokens=*/1});
-    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7)});
+    request.Apply(fsm::ExtendResultEvent{std::vector<std::int32_t>(4096, 7), false});
     ASSERT_EQ(request.GeneratedTokens(), 4097);
 
     constexpr std::int32_t kSafeSteps = 4096;
@@ -3275,6 +3275,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = RetractSuite::MakeConfig();
         cfg.role = Role::kP;
+        cfg.decode_allocation_policy = DecodeAllocationPolicy::kEarly;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }
@@ -3967,7 +3968,7 @@ TEST(SnapshotRetractEvent, APrefillDoneVictimResumesAsPrefillDone) {
     ASSERT_LT(pool.NumEmptyLcmBlocks(), 8);
 
     // The last chunk's ExtendResult lands while still PrefillDone.
-    request.Apply(fsm::ExtendResultEvent{{42}});
+    request.Apply(fsm::ExtendResultEvent{{42}, false});
 
     RetractForTest(request, coordinator, slots, /*epoch=*/1);
     EXPECT_TRUE(request.Is<fsm::Retracted>());
@@ -6367,6 +6368,7 @@ protected:
     SchedulerConfig MakeConfig() override {
         SchedulerConfig cfg = BoundedReplaySuite::MakeConfig();
         cfg.role = RoleUnderTest();
+        if (cfg.role == Role::kP) cfg.decode_allocation_policy = DecodeAllocationPolicy::kEarly;
         for (CacheGroupConfig& group : cfg.cache_groups) {
             group.transfer_policy = CacheTransferPolicy::FullSuffix;
         }

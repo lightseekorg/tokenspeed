@@ -744,6 +744,26 @@ outcomes but never compose the batch.
 
 ### 3.1 P — prefill worker
 
+Prefill workers select an explicit `decode_allocation_policy`: `early` or
+`independent`; decode and fused engines leave it unset. Both start normal D KV
+allocation when the request arrives. Early allocation gates P admission on the
+destination manifest. Independent admission makes P eligible before batch
+planning using only its own cache capacity, while D admits the request in parallel.
+
+A `DestinationReadyEvent` is remembered on the native request even while P is
+queued or computing. After the final P result commits, a ready destination makes
+the request `PrefillDone` immediately. Otherwise, `PrefillAwaitingDestination`
+retains its normal ForwardResources until the grant arrives. Only `PrefillDone`
+can enter `remote_decode`, so sending KV requires both completed computation and
+an allocated destination. The runtime polls readiness before planning and with
+forward completion, allowing a grant received during a forward to release that
+forward's completed prompt without another model iteration. A cancelled request
+waiting for its destination uses the existing transfer-failure event to release
+its resources. The prefill executor remembers cancellations received during a
+forward so they can take effect if the request enters this waiting state. Other
+request states retain their existing cancellation behavior.
+Duplicate or late grants do not revive finished requests.
+
 **Phases:** completed prompts out on `plan.remote_decode` (their pages stay
 pinned until the transfer finishes, so releasing them outranks feeding more
 prompt work), then the shared local-prefill phases
@@ -766,8 +786,10 @@ prompt whose KV is mid-transfer would strand the decode side.
 
 The PD pin is not recorded anywhere; it is a function of the FSM
 (`Scheduler::pdTransferInFlight`). On this role every page-holding state is
-pinned — the peer's decode reads the pages from the first scheduled chunk until
-the PD ACK finishes or aborts the request. On the D role the pin is exactly
+pinned from the first scheduled chunk until the PD ACK finishes or aborts the
+request. Early allocation may transfer chunks before prefill completes;
+independent admission waits for the final result and destination grant.
+On the D role the pin is exactly
 `RemotePrefilling`: the peer's prefill is writing the destination pages, and
 `RemotePrefillDone` ends it by leaving that state. A fused engine never
 transfers. Because the pin is the state, no event handler can forget to clear
