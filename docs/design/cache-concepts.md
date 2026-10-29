@@ -1864,6 +1864,12 @@ including QSA's full-KV, compressed, and recent cache groups. Verify-state layer
 ownership and cache addresses come from the bound plan's layer window,
 including under PP and target/draft sharing. Cache recipes reserve verify
 workspace before sizing the arena.
+Pool-specific communication workspaces are declared by the model family but
+priced and reserved by the runtime before capacity agreement. Their cost may
+be fixed or scale with physical cache capacity. The bound options carry the
+agreed budget to the backend; the model does not alter the cache budget itself.
+Side-stream allocations retain their own workspace owner through execution,
+separate from scratch that main-stream operations can overwrite.
 A Qwen4 PD prefill role retains the target/draft cache layout for transfer,
 but reserves no speculative verify workspace: only the decode role verifies.
 

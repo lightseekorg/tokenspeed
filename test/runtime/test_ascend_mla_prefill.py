@@ -24,6 +24,7 @@ from dataclasses import dataclass
 
 import pytest
 import torch
+
 from tokenspeed.runtime.layers.attention.backends.paged.ascend_mla import (
     AscendMLABackend,
     mla_prefill_spans,
@@ -670,3 +671,41 @@ def test_bounded_workspace_size_does_not_follow_cache_capacity():
     small = options.check_workspace(local_rows=128, degree=8, index_width=128)
     large = options.check_workspace(local_rows=1 << 20, degree=8, index_width=128)
     assert small == large == 2 * 704 * (2 * 1025 * 128 + 9 * 2048)
+
+
+@pytest.mark.parametrize("degree", [1, 2, 8])
+@pytest.mark.parametrize("index_width", [0, 128])
+@pytest.mark.parametrize("max_pages", [0, 32])
+def test_prefill_workspace_owns_buffers_apart_from_main_stream_scratch(
+    degree, index_width, max_pages
+):
+    from tokenspeed.runtime.execution.workspace import WorkspacePool
+    from tokenspeed.runtime.layers.attention.dcp.ascend import AscendPrefillOptions
+
+    options = AscendPrefillOptions(
+        129, 1 << 30, max_kv_page_num=max_pages, kv_page_size=128
+    )
+    pool, buffers = options.allocate_workspace(
+        local_rows=2048, degree=degree, index_width=index_width, device="cpu"
+    )
+    required = options.required_workspace(
+        local_rows=2048, degree=degree, index_width=index_width
+    )
+    assert pool.frozen
+    assert (
+        pool.capacity_bytes
+        == sum(x.numel() * x.element_size() for x in buffers)
+        == required
+    )
+    addresses = [x.data_ptr() for x in buffers if x.numel()]
+    assert len(set(addresses)) == len(addresses)
+    for index, value in enumerate(buffers):
+        value.fill_(index + 1)
+    scratch = WorkspacePool("cpu", initial_nbytes=0)
+    scratch.allocate(((129,), torch.int64))[0].fill_(-1)
+    for index, value in enumerate(buffers):
+        assert torch.all(value == index + 1)
+    # The owner outlives the local views even if the allocator reuses scratch.
+    del buffers
+    with pytest.raises(RuntimeError, match="frozen"):
+        pool.allocate(((required + 256,), torch.uint8))

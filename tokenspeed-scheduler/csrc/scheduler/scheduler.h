@@ -362,9 +362,10 @@ private:
         if constexpr (std::is_same_v<Operation, PrefillOperation>) {
             build.token_budget -= operation.input_length;
             if (config_.max_kv_page_num > 0) {
-                const std::int64_t end = static_cast<std::int64_t>(operation.extend_prefix_len) + operation.input_length;
-                build.kv_page_budget -= static_cast<std::int32_t>(
-                    (end + config_.prefix_granularity - 1) / config_.prefix_granularity);
+                const std::int64_t end =
+                    static_cast<std::int64_t>(operation.extend_prefix_len) + operation.input_length;
+                build.kv_page_budget -=
+                    static_cast<std::int32_t>((end + config_.prefix_granularity - 1) / config_.prefix_granularity);
             }
             build.pushed_prefill = true;
         } else if (config_.role != Role::kD) {

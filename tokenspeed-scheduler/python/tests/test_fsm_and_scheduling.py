@@ -83,7 +83,9 @@ def submit(scheduler: Scheduler, request_id: str, tokens: list[int]) -> None:
     scheduler.submit_requests([make_spec(request_id, tokens)])
 
 
-def advance_forward(scheduler: Scheduler, request_id: str, tokens: list[int] = (), finish: bool = False) -> None:
+def advance_forward(
+    scheduler: Scheduler, request_id: str, tokens: list[int] = (), finish: bool = False
+) -> None:
     ec = ExecutionEvent()
     if tokens:
         ev = ForwardEvent.ExtendResult()
@@ -131,7 +133,13 @@ class TestPrefillKvPageBudget:
         batch = scheduler.next_execution_plan().forward[0]
         assert batch.request_ids == ["first", "second"]
         assert batch.input_lengths == [17, 16]
-        assert sum((p + n + 15) // 16 for p, n in zip(batch.extend_prefix_lens, batch.input_lengths)) == 3
+        assert (
+            sum(
+                (p + n + 15) // 16
+                for p, n in zip(batch.extend_prefix_lens, batch.input_lengths)
+            )
+            == 3
+        )
 
     def test_continued_chunk_counts_its_history_again(self):
         cfg = make_config(prefix_granularity=16, max_scheduled_tokens=16)
@@ -212,7 +220,9 @@ class TestFSMTransitions:
         s = Scheduler(make_config(max_scheduled_tokens=512))
         submit(s, "r0", list(range(8)))
 
-        prefill_plan = s.next_execution_plan()  # Submitted → PrefillDone (8 tokens, all fit)
+        prefill_plan = (
+            s.next_execution_plan()
+        )  # Submitted → PrefillDone (8 tokens, all fit)
         assert s.decoding_size() == 0
         assert s.prefilling_size() == 1
         assert len(prefill_plan.forward) == 1
@@ -239,7 +249,9 @@ class TestFSMTransitions:
         assert s.decoding_size() == 1
         assert decode_plan.forward[0].num_extends() == 0
 
-        advance_forward(s, "r0", finish=True)  # decided on 101; the decode above is in flight
+        advance_forward(
+            s, "r0", finish=True
+        )  # decided on 101; the decode above is in flight
         s.next_execution_plan()  # nothing settles: a forward of r0 is still out
         assert s.decoding_size() == 0
         assert s.request_token_size("r0") == 6
@@ -360,7 +372,11 @@ class TestPrefillFirst:
                 make_spec("r1", list(range(4, 8))),
             ]
         )
-        s.advance(ExecutionEvent().add_event(PD.BootstrappedEvent("r0")).add_event(PD.BootstrappedEvent("r1")))
+        s.advance(
+            ExecutionEvent()
+            .add_event(PD.BootstrappedEvent("r0"))
+            .add_event(PD.BootstrappedEvent("r1"))
+        )
 
         first_prefill = s.next_execution_plan()
         assert first_prefill.forward[0].request_ids == ["r0", "r1"]
@@ -425,7 +441,9 @@ class TestPrefillFirst:
         assert op.num_extends() == 1
         assert len(op.input_ids) == sum(op.input_lengths[: op.num_extends()])
         assert len(op.input_ids) + len(op.decode_input_ids) == sum(op.input_lengths)
-        assert [first_group_page_count(op, request_id) for request_id in op.request_ids] == [1, 1]
+        assert [
+            first_group_page_count(op, request_id) for request_id in op.request_ids
+        ] == [1, 1]
 
     def test_mixed_prefill_decode_decode_not_starved_by_long_prefill(self):
         """Decode-first priority: active decode is scheduled even when a long prefill would consume the full budget."""
@@ -526,11 +544,15 @@ class TestDecodeBatch:
     def test_decode_step_appends_token(self):
         """Each decode advance appends one output token."""
         s = Scheduler(make_config(max_scheduled_tokens=512))
-        self._get_to_decoding(s, "r0", list(range(4)))  # prompt, the prefill's token, one decode's
+        self._get_to_decoding(
+            s, "r0", list(range(4))
+        )  # prompt, the prefill's token, one decode's
         assert s.request_token_size("r0") == 6
 
         for step in range(3):
-            send_reserve_num_tokens(s, "r0", 0)  # must set reserve before each decode plan
+            send_reserve_num_tokens(
+                s, "r0", 0
+            )  # must set reserve before each decode plan
             plan = s.next_execution_plan()
             assert plan.forward[0].num_extends() == 0
             advance_forward(s, "r0", tokens=[100 + step])
@@ -627,11 +649,15 @@ class TestPrefillInputIds:
 # ---------------------------------------------------------------------------
 
 
-def make_update_reserve_event(request_id: str, reserve_num_tokens_in_next_schedule_event: int) -> ExecutionEvent:
+def make_update_reserve_event(
+    request_id: str, reserve_num_tokens_in_next_schedule_event: int
+) -> ExecutionEvent:
     ec = ExecutionEvent()
     ev = ForwardEvent.UpdateReserveNumTokens()
     ev.request_id = request_id
-    ev.reserve_num_tokens_in_next_schedule_event = reserve_num_tokens_in_next_schedule_event
+    ev.reserve_num_tokens_in_next_schedule_event = (
+        reserve_num_tokens_in_next_schedule_event
+    )
     ec.add_event(ev)
     return ec
 
@@ -669,7 +695,9 @@ class TestUpdateReserveNumTokens:
         # Now r0 is Decoding. Set reserve=16 before next decode plan.
         s.advance(make_update_reserve_event("r0", 16))
 
-        decode_plan = s.next_execution_plan()  # Decoding: allocates 1 extra page for reserve=16
+        decode_plan = (
+            s.next_execution_plan()
+        )  # Decoding: allocates 1 extra page for reserve=16
         op = decode_plan.forward[0]
         assert op.num_extends() == 0
         assert first_group_page_count(op, "r0") == 2
@@ -756,7 +784,9 @@ class TestUpdateReserveNumTokens:
 
     def test_reserve_independent_per_request(self):
         """Reserve settings on one request do not affect another in the same batch."""
-        s = Scheduler(make_config(prefix_granularity=16, num_device_pages=1024, max_batch_size=8))
+        s = Scheduler(
+            make_config(prefix_granularity=16, num_device_pages=1024, max_batch_size=8)
+        )
         # Submit both together so they are both Submitted at the first plan → both become PrefillDone.
         submit(s, "r0", list(range(8)))
         submit(s, "r1", list(range(8)))
@@ -796,7 +826,9 @@ class TestDecodeInputIds:
 
     def test_mixed_batch_decode_input_ids_length(self):
         """decode_input_ids has one entry per decode request; all -1 for normal decodes."""
-        cfg = make_config(prefix_granularity=16, num_device_pages=1024, max_batch_size=8)
+        cfg = make_config(
+            prefix_granularity=16, num_device_pages=1024, max_batch_size=8
+        )
         cfg.enable_mixed_prefill_decode = True
         s = Scheduler(cfg)
         # Bring r0 to Decoding.

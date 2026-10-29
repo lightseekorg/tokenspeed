@@ -339,7 +339,8 @@ void Scheduler::SubmitRequests(const std::vector<RequestSpec>& request_specs) {
         }
         if (config_.role != Role::kD && config_.max_kv_page_num > 0 &&
             (static_cast<std::int64_t>(spec.tokens.size()) + config_.prefix_granularity - 1) /
-                    config_.prefix_granularity > config_.max_kv_page_num) {
+                    config_.prefix_granularity >
+                config_.max_kv_page_num) {
             throw std::invalid_argument("Scheduler: prompt exceeds max_kv_page_num");
         }
         if (requests_by_id_.contains(spec.request_id) || !request_ids.insert(spec.request_id).second) {

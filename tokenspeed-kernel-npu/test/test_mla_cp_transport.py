@@ -28,8 +28,9 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 import torch_npu  # noqa: F401
-from tokenspeed.runtime.execution.workspace import workspace_pool
 from tokenspeed_kernel_npu.ops.dsa import AscendDSAPrefill
+
+from tokenspeed.runtime.execution.workspace import workspace_pool
 
 
 def bits(rows, seed):
@@ -75,13 +76,21 @@ def bounded_transport(rank, degree, scratch_pool):
 
     results = []
     for has_index in (False, True):
-        capacity = AscendPrefillOptions(16384, 1 << 30, max_kv_page_num=16)
-        local_rows = 2048
+        capacity = AscendPrefillOptions(
+            16384, 1 << 30, max_kv_page_num=32 if degree == 2 else 16
+        )
+        local_rows = 4096 if degree == 2 else 2048
         cache = torch.empty((local_rows, 576), dtype=torch.bfloat16, device="npu")
         index = (
             torch.empty((local_rows, 128), dtype=torch.bfloat16, device="npu")
             if has_index
             else None
+        )
+        pool_owner, workspace = capacity.allocate_workspace(
+            local_rows=local_rows,
+            degree=degree,
+            index_width=128 if has_index else 0,
+            device=cache.device,
         )
         runtime = AscendDSAPrefill(
             cache,
@@ -91,6 +100,7 @@ def bounded_transport(rank, degree, scratch_pool):
             max_current_rows=capacity.max_current_rows,
             max_history_rows=capacity.history_capacity_rows,
             history_null_rows=capacity.kv_page_size,
+            workspace=workspace,
         )
         assert runtime.workspace_bytes == capacity.required_workspace(
             local_rows=local_rows,
@@ -98,7 +108,7 @@ def bounded_transport(rank, degree, scratch_pool):
             index_width=128 if has_index else 0,
         )
         pending = []
-        for case in range(16):
+        for case in range(17 if degree == 2 else 16):
             page = (64, 128)[case % 2]
             base = 2 * (1 + case % 5)
             table = torch.tensor(
@@ -116,10 +126,24 @@ def bounded_transport(rank, degree, scratch_pool):
                 table[1, 0] = base + 3
             else:
                 extends, prefixes = [page + 5, 19, 3], [page + 7, page + 11, 0]
+            if case == 16:
+                # One request: ten pages on rank 0, twenty on rank 1. Physical
+                # pages are fragmented; the receiver must contain just 30.
+                page = 128
+                table = torch.tensor(
+                    [
+                        [
+                            *(1 + 2 * i for i in range(10)),
+                            *(2 + 2 * i for i in range(20)),
+                        ]
+                    ],
+                    dtype=torch.int32,
+                )
+                extends, prefixes = [1], [30 * page - 1]
             rows = sum(extends)
             lengths = torch.tensor(extends)
             past = torch.tensor(prefixes)
-            placement = CachePlacement(128, degree * 15 + 1, tuple(range(degree)), rank)
+            placement = CachePlacement(128, degree * 31 + 1, tuple(range(degree)), rank)
             kwargs = {
                 "degree": degree,
                 "rank": rank,
@@ -132,6 +156,8 @@ def bounded_transport(rank, degree, scratch_pool):
             cpu_plan = AscendPrefillPlan.build(
                 PrefillMetadata(lengths, past, table), placement, **kwargs
             )
+            if case == 16:
+                assert cpu_plan.gather.row_counts == (10 * page, 20 * page)
             plan = AscendPrefillPlan.build(
                 PrefillMetadata(lengths, past, table.npu()),
                 placement,
@@ -200,7 +226,7 @@ def bounded_transport(rank, degree, scratch_pool):
                     slots.to(device="npu", dtype=torch.int32),
                     width=width,
                     block_rows=128,
-                    virtual_blocks=degree * 15 + 1,
+                    virtual_blocks=degree * 31 + 1,
                 )
                 # Every logical row must resolve to the original prefix or its
                 # current producer. Shared prefix pages are transported once.
@@ -245,6 +271,7 @@ def bounded_transport(rank, degree, scratch_pool):
         for actual, expected in pending:
             exact(actual, expected)
         runtime.close()
+        assert pool_owner.frozen
     return results
 
 

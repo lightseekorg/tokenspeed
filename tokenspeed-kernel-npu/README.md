@@ -72,9 +72,14 @@ existing contracts.
 The scheduler wheel and `ts-host` must both be rebuilt when adding this
 scheduler option, since the host embeds its own copy of the scheduler.
 Native commits borrow int64 write-slot scratch from the runtime's main-stream
-`WorkspacePool`. Startup warms its peak before KV memory profiling; cache
-recipes reserve only the separate communication planes. Every commit obtains
-a fresh view, and the pool retains its backing allocation through execution.
+`WorkspacePool`. Startup warms its peak before KV memory profiling. The model
+recipe only declares `AscendPrefillWorkspace`; TS derives and deducts the
+communication budget before agreeing on cache capacity. Each attention backend
+allocates its communication planes together through a frozen `WorkspacePool`
+and retains that owner across layers. Those side-stream buffers stay separate
+from main-stream scratch. The native transport borrows the supplied views.
+Every commit obtains a fresh scratch view, so another main-stream user cannot
+invalidate its slot allocation.
 
 Ascend dense MLA Prefill reuses this ABI with only the 576-wide KV plane;
 it allocates no Index-K plane and retains the original head-sharded weights.

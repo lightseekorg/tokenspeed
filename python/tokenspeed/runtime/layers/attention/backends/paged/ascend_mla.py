@@ -125,6 +125,7 @@ class AscendMLABackend(MLAAttnBackend):
         self._current_active: torch.Tensor | None = None
         self._current_local = None
         self._prefill_runtime = None
+        self._prefill_workspace = None
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_spans: tuple[tuple[int, int, int], ...] = ()
         self._prefill_pages: torch.Tensor | None = None
@@ -176,8 +177,11 @@ class AscendMLABackend(MLAAttnBackend):
 
         layer_id = min(self.cache_pool.history_group_by_layer())
         kv = self.cache_pool.get_key_buffer(layer_id)
-        self._prefill_options.check_workspace(
-            local_rows=kv.numel() // 576, degree=self._dcp.degree, index_width=0
+        self._prefill_workspace, buffers = self._prefill_options.allocate_workspace(
+            local_rows=kv.numel() // 576,
+            degree=self._dcp.degree,
+            index_width=0,
+            device=kv.device,
         )
         self._prefill_runtime = prepare_ascend_mla_prefill(
             kv,
@@ -186,10 +190,13 @@ class AscendMLABackend(MLAAttnBackend):
                 "gloo", self._dcp.ranks
             ),
             max_current_rows=self._prefill_options.max_current_rows,
+            workspace=buffers,
             max_history_rows=self._prefill_options.history_capacity_rows,
-            history_null_rows=self._prefill_options.kv_page_size
-            if self._prefill_options.max_kv_page_num
-            else 0,
+            history_null_rows=(
+                self._prefill_options.kv_page_size
+                if self._prefill_options.max_kv_page_num
+                else 0
+            ),
         )
         return self._prefill_runtime.workspace_bytes
 
@@ -245,12 +252,16 @@ class AscendMLABackend(MLAAttnBackend):
             self.cache_pool.get_key_buffer(layer_id),
             None,
             has_history=not self._prefill_plan.cold,
-            history_slots=None
-            if self._prefill_plan.gather is None
-            else self._prefill_plan.gather.send_slots,
-            history_counts=None
-            if self._prefill_plan.gather is None
-            else self._prefill_plan.gather.row_counts,
+            history_slots=(
+                None
+                if self._prefill_plan.gather is None
+                else self._prefill_plan.gather.send_slots
+            ),
+            history_counts=(
+                None
+                if self._prefill_plan.gather is None
+                else self._prefill_plan.gather.row_counts
+            ),
         )
 
     def start_prefill_kv(self, layer_id, latent):
@@ -290,6 +301,7 @@ class AscendMLABackend(MLAAttnBackend):
         if self._prefill_runtime is not None:
             self._prefill_runtime.close()
             self._prefill_runtime = None
+        self._prefill_workspace = None
 
     def configure_runtime(
         self, *, block_granularity, virtual_block_count, shard_count, **kwargs

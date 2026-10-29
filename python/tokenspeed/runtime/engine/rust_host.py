@@ -768,9 +768,7 @@ class HostDataPlane:
             ),
         )
 
-    def complete(
-        self, dispatched: _Dispatched
-    ) -> tuple[
+    def complete(self, dispatched: _Dispatched) -> tuple[
         list[int],
         list[int],
         list[float] | None,

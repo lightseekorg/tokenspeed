@@ -22,7 +22,6 @@
 
 import torch
 import torch.distributed as dist
-
 from tokenspeed_kernel.platform import CapabilityRequirement, current_platform
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signature, format_signatures
@@ -45,6 +44,7 @@ def prepare_ascend_mla_prefill(
     max_current_rows,
     max_history_rows=0,
     history_null_rows=0,
+    workspace=None,
 ):
     """Reuse the DSA AICPU gather/owner-commit transport with no Index-K plane."""
     from tokenspeed_kernel_npu.ops.dsa import AscendDSAPrefill
@@ -57,6 +57,7 @@ def prepare_ascend_mla_prefill(
         max_current_rows=max_current_rows,
         max_history_rows=max_history_rows,
         history_null_rows=history_null_rows,
+        workspace=workspace,
     )
 
 

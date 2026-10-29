@@ -131,6 +131,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
     cfg = make_config(**fields, host_write_policy="write_back")
     assert cfg.host_write_policy == policy.WriteBack
 
+
 @pytest.mark.parametrize("tokens,pages", [(None, 0), (1, 1), (16, 1), (17, 2)])
 def test_prefill_kv_budget_is_translated_to_scheduler_pages(tokens, pages):
     flags = [] if tokens is None else ["--chunk-prefill-kv-size", str(tokens)]

@@ -185,6 +185,7 @@ class AscendDSABackend(DSABackend):
         self._dcp = dcp
         self._prefill_plan: AscendPrefillPlan | None = None
         self._prefill_runtime = None
+        self._prefill_workspace = None
         self._prefill_options = None
 
     @property
@@ -227,8 +228,11 @@ class AscendDSABackend(DSABackend):
         kv = self.cache_pool.get_key_buffer(layer_id)
         index = self.cache_pool.get_component(layer_id, "dsa_index_k")
         group = process_group_manager.get_process_group("gloo", self._dcp.ranks)
-        self._prefill_options.check_workspace(
-            local_rows=kv.numel() // 576, degree=self._dcp.degree, index_width=128
+        self._prefill_workspace, buffers = self._prefill_options.allocate_workspace(
+            local_rows=kv.numel() // 576,
+            degree=self._dcp.degree,
+            index_width=128,
+            device=kv.device,
         )
         self._prefill_runtime = self._indexer_kernels.prepare_prefill(
             kv,
@@ -236,10 +240,13 @@ class AscendDSABackend(DSABackend):
             ranks=self._dcp.ranks,
             bootstrap_group=group,
             max_current_rows=self._prefill_options.max_current_rows,
+            workspace=buffers,
             max_history_rows=self._prefill_options.history_capacity_rows,
-            history_null_rows=self._prefill_options.kv_page_size
-            if self._prefill_options.max_kv_page_num
-            else 0,
+            history_null_rows=(
+                self._prefill_options.kv_page_size
+                if self._prefill_options.max_kv_page_num
+                else 0
+            ),
         )
         return self._prefill_runtime.workspace_bytes
 
@@ -274,6 +281,7 @@ class AscendDSABackend(DSABackend):
         if self._prefill_runtime is not None:
             self._prefill_runtime.close()
             self._prefill_runtime = None
+        self._prefill_workspace = None
 
     def cache_placement(self, layer) -> CachePlacement | None:
         if self._ascend_placement is None:

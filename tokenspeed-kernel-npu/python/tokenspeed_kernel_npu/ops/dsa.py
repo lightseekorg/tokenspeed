@@ -27,7 +27,6 @@ import os
 
 import torch
 import torch_npu
-
 from tokenspeed_kernel_npu._triton import tl, triton
 
 
@@ -288,6 +287,7 @@ class AscendDSAKernels:
         max_current_rows,
         max_history_rows=0,
         history_null_rows=0,
+        workspace=None,
     ):
         return AscendDSAPrefill(
             kv_cache,
@@ -297,6 +297,7 @@ class AscendDSAKernels:
             max_current_rows=max_current_rows,
             max_history_rows=max_history_rows,
             history_null_rows=history_null_rows,
+            workspace=workspace,
         )
 
     @staticmethod
@@ -860,6 +861,7 @@ class AscendDSAPrefill:
         max_current_rows,
         max_history_rows=0,
         history_null_rows=0,
+        workspace=None,
     ):
         import torch.distributed as dist
 
@@ -951,31 +953,34 @@ class AscendDSAPrefill:
         self._bounded_history = max_history_rows > 0
         rows = self.history_rows + self.send_capacity * self.degree
         index_width = 128 if self._has_index else 0
-        self.storage = torch.empty(
-            rows * (576 + index_width), dtype=torch.bfloat16, device=self.device
+        sizes = (
+            rows * (576 + index_width),
+            self.send_capacity * (576 + index_width),
+            self.history_rows * (576 + index_width) if self._bounded_history else 0,
         )
+        if workspace is None:
+            workspace = tuple(
+                torch.empty(n, dtype=torch.bfloat16, device=self.device) for n in sizes
+            )
+        if len(workspace) != 3 or any(
+            value.dtype != torch.bfloat16
+            or value.device != self.device
+            or not value.is_contiguous()
+            or value.ndim != 1
+            or value.numel() != n
+            for value, n in zip(workspace, sizes, strict=True)
+        ):
+            raise ValueError("Prefill requires matching caller-owned workspace buffers")
+        self.storage, self.send_storage, history_send = workspace
         self.index = self.storage[: rows * index_width].view(rows, index_width)
         self.kv = self.storage[rows * index_width :].view(rows, 576)
-        self.send_storage = torch.empty(
-            self.send_capacity * (576 + index_width),
-            dtype=torch.bfloat16,
-            device=self.device,
-        )
         self.send_index = self.send_storage[: self.send_capacity * index_width].view(
             self.send_capacity, index_width
         )
         self.send_kv = self.send_storage[self.send_capacity * index_width :].view(
             -1, 576
         )
-        self.history_send = (
-            torch.empty(
-                self.history_rows * (576 + index_width),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            if self._bounded_history
-            else None
-        )
+        self.history_send = history_send if self._bounded_history else None
         if self._bounded_history:
             self.index[:history_null_rows].zero_()
             self.kv[:history_null_rows].zero_()

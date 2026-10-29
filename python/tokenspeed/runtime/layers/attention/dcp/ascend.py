@@ -26,14 +26,35 @@ Native Prefill reuses scheduler placement and page tables.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.distributed as dist
 from tokenspeed_kernel.ops.attention.dsa.ascend import ascend_dsa_cp_metadata
 
-from tokenspeed.runtime.execution.workspace import workspace_pool
+from tokenspeed.runtime.execution.workspace import WorkspacePool, workspace_pool
+from tokenspeed.runtime.layers.attention.configs.dsa import DSAConfig
 from tokenspeed.runtime.layers.attention.dcp.placement import resolve_cache_slots
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
+    CachePoolWorkspace,
+    CachePoolWorkspacePlan,
+)
+from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import FULL_ATTENTION
+
+
+def _prefill_workspace_sizes(
+    *, max_current_rows, history_capacity_rows, local_rows, degree, index_width
+):
+    if local_rows < 0 or degree < 1 or index_width not in (0, 128):
+        raise ValueError("Invalid native Prefill workspace geometry")
+    send_rows = -(-max_current_rows // (degree * 128)) * 128
+    history_rows = history_capacity_rows or degree * local_rows
+    width = 576 + index_width
+    return (
+        (history_rows + degree * send_rows) * width,
+        send_rows * width,
+        history_rows * width if history_capacity_rows else 0,
+    )
 
 
 @dataclass(frozen=True)
@@ -66,16 +87,16 @@ class AscendPrefillOptions:
         )
 
     def required_workspace(self, *, local_rows: int, degree: int, index_width: int):
-        """Native-owned receive/send bytes; main-stream slot scratch is separate."""
-        if local_rows < 0 or degree < 1 or index_width not in (0, 128):
-            raise ValueError("Invalid native Prefill workspace geometry")
-        send_rows = -(-self.max_current_rows // (degree * 128)) * 128
-        history_rows = (
-            2 * self.history_capacity_rows
-            if self.max_kv_page_num
-            else degree * local_rows
+        """Transport receive/send bytes; main-stream slot scratch is separate."""
+        return 2 * sum(
+            _prefill_workspace_sizes(
+                max_current_rows=self.max_current_rows,
+                history_capacity_rows=self.history_capacity_rows,
+                local_rows=local_rows,
+                degree=degree,
+                index_width=index_width,
+            )
         )
-        return 2 * (576 + index_width) * (history_rows + (degree + 1) * send_rows)
 
     def check_workspace(self, *, local_rows: int, degree: int, index_width: int):
         """Reject an undersized reservation before creating native resources."""
@@ -90,6 +111,66 @@ class AscendPrefillOptions:
                 f"recipe reserved {self.reserved_workspace_bytes}"
             )
         return required
+
+    def allocate_workspace(self, *, local_rows, degree, index_width, device):
+        """Own side-stream buffers in one pool, isolated from main-stream scratch."""
+        required = self.check_workspace(
+            local_rows=local_rows, degree=degree, index_width=index_width
+        )
+        sizes = _prefill_workspace_sizes(
+            max_current_rows=self.max_current_rows,
+            history_capacity_rows=self.history_capacity_rows,
+            local_rows=local_rows,
+            degree=degree,
+            index_width=index_width,
+        )
+        pool = WorkspacePool(device, initial_nbytes=required)
+        buffers = pool.allocate(*(((size,), torch.bfloat16) for size in sizes))
+        pool.freeze()
+        return pool, tuple(buffers)
+
+
+class AscendPrefillWorkspace(CachePoolWorkspace):
+    """Model opt-in; TS derives the transport budget from runtime geometry."""
+
+    def plan_workspace(self, layout, *, server_args, attn_config):
+        page_size = layout.prefix_granularity
+        limit = server_args.chunk_prefill_kv_size
+        max_pages = 0 if limit is None else -(-limit // page_size)
+        dsa = attn_config.component(DSAConfig)
+        index_width = 0 if dsa is None else dsa.index_head_dim
+        degree = attn_config.kvp_size
+        fixed = 2 * sum(
+            _prefill_workspace_sizes(
+                max_current_rows=server_args.max_prefill_tokens,
+                history_capacity_rows=(max_pages + 1) * page_size if max_pages else 0,
+                local_rows=0 if limit is not None else page_size,
+                degree=degree,
+                index_width=index_width,
+            )
+        )
+        options = AscendPrefillOptions(
+            max_current_rows=server_args.max_prefill_tokens,
+            reserved_workspace_bytes=fixed,
+            max_kv_page_num=max_pages,
+            kv_page_size=page_size,
+        )
+        per_block = (
+            0
+            if limit is not None
+            else degree
+            * page_size
+            * (576 + index_width)
+            * 2
+            * dict(layout.group_packing)[FULL_ATTENTION]
+        )
+        return CachePoolWorkspacePlan(
+            fixed_bytes=fixed,
+            bytes_per_lcm_block=per_block,
+            bind_options=lambda blocks: replace(
+                options, reserved_workspace_bytes=fixed + blocks * per_block
+            ),
+        )
 
 
 class AscendPrefillCache:
