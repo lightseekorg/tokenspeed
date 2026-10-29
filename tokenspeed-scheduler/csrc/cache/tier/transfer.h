@@ -67,8 +67,10 @@ enum class StoreSourceGuard : std::uint8_t {
     kPinnedUntilAck,
     // The Device block is released -- and may be re-granted -- the moment the
     // store issues; the runtime must order the copy on the forward thread's
-    // stream ahead of the plan's page reuse. A retraction's snapshot: the
-    // victim's pages are granted away in the same round.
+    // stream ahead of the plan's page reuse. A retraction's snapshot (the
+    // victim's pages are granted away in the same round) and an eviction
+    // write-back (the evicted pages fund the admissions and restores of the
+    // same plan).
     kStreamOrdered,
 };
 
@@ -124,6 +126,8 @@ struct WriteBackBatch {
             source_pinned.push_back(op.source_pinned);
         }
     }
+
+    bool operator==(const WriteBackBatch&) const = default;
 };
 
 struct LoadBackOperation {
@@ -167,6 +171,8 @@ struct LoadBackBatch {
             page_offsets.push_back(std::move(operation_offsets));
         }
     }
+
+    bool operator==(const LoadBackBatch&) const = default;
 };
 
 // Which Host buffer a restore row reads: the Host L2 prefix tier or the
@@ -254,6 +260,8 @@ struct SnapshotStoreBatch {
             dst_pages.push_back(std::move(operation_destinations));
         }
     }
+
+    bool operator==(const SnapshotStoreBatch&) const = default;
 };
 
 struct SnapshotRestoreBatch {
@@ -301,6 +309,8 @@ struct SnapshotRestoreBatch {
             source_tiers.push_back(std::move(operation_tiers));
         }
     }
+
+    bool operator==(const SnapshotRestoreBatch&) const = default;
 };
 
 using CacheOperation =

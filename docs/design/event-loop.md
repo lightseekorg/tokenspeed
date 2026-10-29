@@ -619,6 +619,13 @@ every gather, even when its own part is empty. The poll runs these
 collectives only while a cache op is open: every rank counts the same plans
 and advances the same intersections, so the open count is the same
 everywhere and an idle replica polls nothing.
+The data plane acknowledges each op exactly once, one ACK per op of a batch,
+and the counts rely on it: `acknowledged` takes each polled ACK off the
+in-flight count before it deduplicates, so a repeated ACK breaks the counts.
+A poll then fails with `CacheOpError::Unaccounted` (at once, or once the
+remaining ops land), or the open count reaches zero while another op is in
+flight, and the loop stops polling before that op lands. Only the C++
+scheduler tolerates a repeated ACK.
 
 **L3** (`l3`, `--kvstore-storage-backend`). The C++ scheduler owns each
 request's storage transaction: it plans QUERY, GET, PUT and CANCEL
@@ -712,24 +719,31 @@ For orientation, one `EventLoop::round`:
    `DeviceHandle.execute(plan, planned, cache_ops=...)`, which submits in an
    order that is itself a correctness contract for same-round page reuse:
    the Host-bound stores first --
-   `WriteBackOp` and `SnapshotOp`, a retraction image's two legs (the
-   stream-ordered L2 write-back of the victim's hash-complete pages and the
-   snapshot store of its tail pages and slot state) must read the reused
-   pages' old bytes, so they ride the write stream consecutively and ONE
-   completion event fences the forward thread's default stream here, before
-   anything else of the plan is enqueued; an ordinary store's sources are
-   pinned by the scheduler until the ACK, so its copy rides the write stream
-   and fences nothing -- then the plan's Device-to-Device block copies
+   `WriteBackOp` and `SnapshotOp`; the stream-ordered ones, a retraction
+   image's two legs (the L2 write-back of the victim's hash-complete pages
+   and the snapshot store of its tail pages and slot state) and, under the
+   Host write-back policy (`--kvstore-write-policy write_back`), the L2
+   write-back of what the plan's admissions and restores evicted, must
+   read the reused pages' old bytes, so they ride the write stream
+   consecutively and ONE completion event fences the forward thread's
+   default stream here, before anything else of the plan is enqueued; an
+   ordinary store's sources (a write-through publication's) are pinned by
+   the scheduler until the ACK, so its copy rides the write stream and
+   fences nothing -- then the plan's Device-to-Device block copies
    (`pages_to_copy`: a prefix hit's private copy of the block holding its
    boundary, an owner's move off the block it published at its prompt end;
    the copy waits on the execution stream and precedes the zeroing because
    a source may be re-granted and zeroed by this very plan -- or re-granted
-   as another copy's destination, which the arena then writes only after the
-   pairs reading it; a destination is never zeroed; no op id, no ACK), then
+   as another group's copy destination, which the arena writes only after
+   every pair reading those byte ranges; a destination is never zeroed;
+   no op id, no ACK), then
    page zeroing (the new owner's sanitization), then the Device-bound copies
    -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
    lands on zeroed pages and the forward reads it layer by layer behind the
-   layerwise fences, so the loads start first on the load stream; a restore
+   layerwise fences (a prefill graph replay waits for the whole load before
+   its first segment, which holds no fence), so the loads start first on the
+   load stream, and every plan, with cache ops or without, points the fences
+   at its own load or at none; a restore
    queues behind them, overwrites its destination blocks whole (the
    scheduler lists none of them for zeroing), reads both Host tiers under one
    event and arms no layerwise fence, its request being unschedulable until

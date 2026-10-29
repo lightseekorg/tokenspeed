@@ -56,7 +56,7 @@ CacheCoordinator MakeTwoGroup(BlockPool& pool) {
     };
     return MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
                            /*snapshot_pool=*/nullptr,
-                           /*stream_device_cache_to_host=*/false);
+                           /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
 }
 
 TEST(ForwardCacheOpsFree, ReturnsAllPagesToPool) {
@@ -94,9 +94,10 @@ TEST(ForwardCacheOpsPrefill, FirstChunkClaimsHitThenAcquiresOnlyRemainder) {
                        .cache_blocks_per_lcm_block = 1,
                        .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
     // r1: 8 tokens -> 4 pages/group; freed blocks keep their hashes (prefix-hittable).
     std::vector<std::string> hashes8(4);
     for (std::size_t i = 0; i < hashes8.size(); ++i) {
@@ -307,9 +308,10 @@ TEST(ForwardCacheOpsDecode, DecodeStepRegistersFilledPages) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
 
     // 8 tokens -> 4 full pages; pages 0-1 registered at prefill time.
@@ -769,6 +771,7 @@ TEST(SchedulerConfigValidateTest, RetractionDiagnosticsNameTheServerArgs) {
 TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     SchedulerConfig config = MakeValidConfig();
     config.host_allocator.total_pages = 32;
+    config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
     config.enable_l3_storage = true;
     config.storage_config = StorageConfig{
         8, 32, 4, 32, 16, 2, 100, 100, StoragePressure{8, 1048576, 1000}, StoragePressure{4, 524288, 500}};
@@ -777,6 +780,107 @@ TEST(SchedulerConfigValidateTest, L3StorageAcceptsCyclicOwnerGroups) {
     EXPECT_NO_THROW(config.Validate());
     config.cache_groups[0].shard_count = 1;
     EXPECT_NO_THROW(config.Validate());
+}
+
+TEST(SchedulerConfigValidateTest, AHostCacheRequiresAnExplicitWritePolicy) {
+    // What feeds Host L2 is a cache policy, so a Host tier states it on every
+    // role; without a Host tier (the null page alone, or disabled) there is
+    // nothing to feed and the policy may stay unspecified.
+    for (const Role role : {Role::kFused, Role::kP, Role::kD}) {
+        SCOPED_TRACE(static_cast<int>(role));
+        SchedulerConfig config = MakeValidConfig();
+        config.role = role;
+        if (role != Role::kFused) {
+            config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+        }
+        SetTestSnapshotPool(config);
+        config.host_allocator.total_pages = 1;
+        EXPECT_NO_THROW(config.Validate());
+        config.host_allocator.total_pages = 2;
+        ExpectRejectedNamingGroup(config, "explicit host_write_policy");
+        config.disable_l2_cache = true;
+        EXPECT_NO_THROW(config.Validate());
+        config.disable_l2_cache = false;
+        config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        EXPECT_NO_THROW(config.Validate());
+    }
+}
+
+// Write-back runs on every role but D (which parallel layouts run it is the
+// runtime's to decide): it needs a Host tier, takes a sharded group and the
+// fused role's snapshot pool, and supports cached and replayable windows.
+// It refuses the D role, L3 and more groups than the 64 bits that mark a
+// hash's written-back groups.
+TEST(SchedulerConfigValidateTest, WriteBackOnEveryRoleButTheDecodeRole) {
+    const auto prefill = [] {
+        SchedulerConfig config = MakeValidConfig();
+        config.role = Role::kP;
+        config.cache_groups[0].transfer_policy = CacheTransferPolicy::FullSuffix;
+        SetTestSnapshotPool(config);
+        config.host_allocator.total_pages = 2;
+        config.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        return config;
+    };
+    EXPECT_NO_THROW(prefill().Validate());
+    SchedulerConfig no_host = prefill();
+    no_host.host_allocator.total_pages = 1;
+    ExpectRejectedNamingGroup(no_host, "requires a Host L2 cache");
+    SchedulerConfig disabled_host = prefill();
+    disabled_host.disable_l2_cache = true;
+    ExpectRejectedNamingGroup(disabled_host, "requires a Host L2 cache");
+    SchedulerConfig fused = prefill();
+    fused.role = Role::kFused;
+    SetTestSnapshotPool(fused);
+    ASSERT_TRUE(fused.HasSnapshotPool());
+    EXPECT_NO_THROW(fused.Validate());
+    EXPECT_NO_THROW(Scheduler{fused});
+    SchedulerConfig decode = prefill();
+    decode.role = Role::kD;
+    SetTestSnapshotPool(decode);
+    ExpectRejectedNamingGroup(decode, "not available on the D role");
+    SchedulerConfig l3 = prefill();
+    l3.enable_l3_storage = true;
+    l3.storage_config = StorageConfig{4, 16, 1, 16, 32, 2, 100, 100, {8, 1048576, 1000}, {4, 524288, 500}};
+    ExpectRejectedNamingGroup(l3, "excludes L3 storage");
+    SchedulerConfig sharded = prefill();
+    sharded.cache_groups[0].cache_blocks_per_lcm_block = 2;
+    sharded.cache_groups[0].shard_count = 2;
+    EXPECT_NO_THROW(sharded.Validate());
+    EXPECT_NO_THROW(Scheduler{sharded});
+
+    // Both cached and replayable sliding windows share the write-back path.
+    for (const bool replayable : {false, true}) {
+        SCOPED_TRACE(replayable);
+        SchedulerConfig sliding = prefill();
+        CacheGroupConfig swa = sliding.cache_groups[0];
+        swa.group_id = "swa";
+        swa.attn_kind = AttnKind::kSlidingWindow;
+        swa.sliding_window_tokens = 128;
+        swa.replayable = replayable;
+        sliding.cache_groups.push_back(swa);
+        sliding.max_scheduled_tokens = 256;
+        sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+        EXPECT_NO_THROW(sliding.Validate()) << "write-through takes it";
+        sliding.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        EXPECT_NO_THROW(Scheduler{sliding});
+    }
+
+    // 64 groups construct a write-back scheduler; a 65th is refused before
+    // any pool or the cache coordinator is built.
+    SchedulerConfig wide = prefill();
+    for (std::int32_t i = 1; i < 64; ++i) {
+        CacheGroupConfig group = wide.cache_groups[0];
+        group.group_id = "full" + std::to_string(i);
+        wide.cache_groups.push_back(group);
+    }
+    EXPECT_NO_THROW(Scheduler{wide});
+    CacheGroupConfig last = wide.cache_groups[0];
+    last.group_id = "full64";
+    wide.cache_groups.push_back(last);
+    ExpectRejectedNamingGroup(wide, "at most 64 cache groups");
+    EXPECT_THROW(Scheduler{wide}, std::invalid_argument);
+    wide.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteThrough;
+    EXPECT_NO_THROW(wide.Validate()) << "write-through keeps no bit per group";
 }
 
 TEST(SchedulerConfigValidateTest, CacheGroupConfigRejectsNonPositivePacking) {
@@ -855,9 +959,10 @@ TEST(ForwardCacheOpsBuildBlockTables, SingleGroupRowMatchesSource) {
         CacheGroupSpec{
             .attn_kind = AttnKind::kFull, .sliding_window = 0, .cache_blocks_per_lcm_block = 1, .block_granularity = 2},
     };
-    CacheCoordinator coordinator = MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
-                                                   /*snapshot_pool=*/nullptr,
-                                                   /*stream_device_cache_to_host=*/false);
+    CacheCoordinator coordinator =
+        MakeCoordinator(specs, 2, pool, /*enable_l3_storage=*/false, /*host_pool=*/nullptr,
+                        /*snapshot_pool=*/nullptr,
+                        /*stream_device_cache_to_host=*/false, /*write_back_evictions=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));  // 2 pages
 
@@ -894,7 +999,8 @@ TEST(ForwardCacheOpsBuildBlockTables, ChildSlotsWithinOneParentHaveDistinctKerne
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 
@@ -916,7 +1022,8 @@ TEST(ForwardCacheOpsBuildBlockTables, ResolvesEachGroupsPackingRecipe) {
     };
     CacheCoordinator coordinator =
         MakeCoordinator(specs, /*prefix_granularity=*/2, pool, /*enable_l3_storage=*/false,
-                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false);
+                        /*host_pool=*/nullptr, /*snapshot_pool=*/nullptr, /*stream_device_cache_to_host=*/false,
+                        /*write_back_evictions=*/false);
     std::vector<BlockTable> tables(coordinator.NumGroups());
     ASSERT_TRUE(AdmitForTest(coordinator, tables, /*num_tokens=*/4));
 

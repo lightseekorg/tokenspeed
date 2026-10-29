@@ -404,8 +404,9 @@ def test_packed_large_row_views_reuse_warmed_capacity_buckets() -> None:
         )
 
     # Changed tensor-view sizes cross explicit capacity buckets: M64 has 512
-    # routes, while M65 rounds to 1024.
-    # Warm those two buckets and both cache policies, not every checked size.
+    # routes, while M65 rounds to 1024. They also cross the schedule switch:
+    # through M64 runs 16-row blocks and M65 the 64-row blocks.
+    # Warm those two buckets and both schedules, not every checked size.
     run(62)
     run(64)
     run(66)

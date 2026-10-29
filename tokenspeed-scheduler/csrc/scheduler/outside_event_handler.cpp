@@ -126,6 +126,16 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
         if (completed.completed_pages->tail) {
             store_hashes.push_back(completed.completed_pages->tail->hash);
         }
+        // This end state supersedes the checkpoint the turn resumed from
+        // (MarkSupersededStateInput). Marked at the finish only: a request
+        // that fails earlier (a failed PD transfer) publishes and marks
+        // nothing, and an end state that is the input itself (a D request
+        // that claimed its prompt-end checkpoint and leaves before any
+        // decode) supersedes nothing.
+        if (progress.resumed_tail_hash && !(completed.completed_pages->tail &&
+                                            completed.completed_pages->tail->hash == *progress.resumed_tail_hash)) {
+            coordinator_.MarkSupersededStateInput(*progress.resumed_tail_hash, progress.access_epoch);
+        }
     }
     if (!config_.StreamsDeviceCacheToHost()) {
         return std::nullopt;
@@ -135,7 +145,7 @@ std::optional<WriteBackOperation> Scheduler::publishCompletedPages(Request& requ
     coordinator_.QueueCachedBlocksForStore(store_hashes);
     // The request's pages are released right after this (ReleaseEvent); the
     // pinned ticket keeps them cached and unevictable until the copy ACKs.
-    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck);
+    return tier_transfers_.StartPendingStores(StoreSourceGuard::kPinnedUntilAck, HostStoreCause::kFinish);
 }
 
 void Scheduler::handleEvent(const forward::UpdateReserveNumTokens& event) {
