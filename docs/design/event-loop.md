@@ -738,8 +738,10 @@ For orientation, one `EventLoop::round`:
    every pair reading those byte ranges; a destination is never zeroed;
    no op id, no ACK), then
    page zeroing (the new owner's sanitization), then the Device-bound copies
-   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing: a load-back
-   lands on zeroed pages and the forward reads it layer by layer behind the
+   -- `LoadBackOp` and `RestoreOp`, ordered behind the zeroing and the
+   forwards in flight, which may still write a block an abort freed and this
+   plan granted (load-back destinations are never zeroed): the forward reads
+   a load-back layer by layer behind the
    layerwise fences (a prefill graph replay waits on them before each
    captured segment, which holds none, or, on a pool that does not declare
    every access fenced, for the whole load instead), so the loads start first

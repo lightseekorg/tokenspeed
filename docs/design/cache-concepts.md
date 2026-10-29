@@ -430,8 +430,12 @@ forwards and RDMA triggers behind it inherit the fence (the forward by
 waiting on the default stream in its prologue; that wait is one-way, the
 zeroing's and the writeback's own waits are what order the default and write
 streams behind the forwards). A load-back's prerequisite stream is the
-default stream that zeroed its destinations; its start event is recorded
-there rather than on whatever stream is current. Every stream the Host
+default stream, where its start event is recorded rather than on whatever
+stream is current. Load-back destinations are never zeroed, and an abort
+frees its request's blocks while that request's forward may still be in
+flight, so the device handle orders the default stream behind the
+execution stream before every plan's loads and restores: the zeroing and
+the block copies, which wait there too, are absent from many plans. Every stream the Host
 cache executor orders against is an argument, never ambient thread state.
 Each submission kind uses its own staging lane (`cache/transfer/lanes.py`:
 the stream-ordered and pinned write-backs, the snapshot store, and the

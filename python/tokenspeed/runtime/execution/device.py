@@ -453,8 +453,9 @@ class DeviceHandle:
         source may be re-granted by this very plan, so the copy precedes the
         zeroing), then page zeroing (the new owner's
         sanitization), then the Device-bound copies (``LoadBackOp`` and
-        ``RestoreOp``, ordered behind the zeroing: a load-back lands on
-        zeroed pages, a restore overwrites its destinations whole), the
+        ``RestoreOp``, ordered behind the zeroing and the forwards in flight,
+        which may still write a block freed by an abort and granted here;
+        both overwrite their destinations whole), the
         transfer peer's remote streams, and finally the ``ForwardBatch``. The
         loop hands the round over and does not branch on it.
 
@@ -541,9 +542,17 @@ class DeviceHandle:
             executor.copy_cache_pages(copies)
         zero_event = executor.zero_cache_pages(pages) if pages else None
         if l2 is not None:
-            # Behind the zeroing: the loads' destinations were zeroed on the
-            # default stream, so that is the prerequisite they order after.
-            # Every plan makes the call, with a load or not: it points the
+            if cache_ops:
+                # A load's or restore's destination may be a block that a
+                # forward still in flight writes: an abort frees its request's
+                # blocks at once, and this plan may grant one to a Host hit.
+                # The copies and the zeroing wait for those forwards, but a
+                # plan may have neither (a hit whose new tokens fit its tail
+                # block), so the loads wait for them here.
+                executor.default_stream.wait_stream(executor.execution_stream)
+            # Behind the store fence, the zeroing and the forwards in flight,
+            # all on the default stream, the prerequisite the loads order
+            # after. Every plan makes the call, with a load or not: it points the
             # layerwise load waits at this plan's load or at none, so neither
             # an eager layer nor a prefill graph replay of this plan waits on
             # an earlier plan's load. Without cache ops it enqueues nothing,

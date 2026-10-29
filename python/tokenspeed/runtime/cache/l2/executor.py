@@ -388,8 +388,9 @@ class HostCacheExecutor:
                 self._load_trackers.append((tracker, len(layout.consumers)))
         # Every copy runs on its own stream, ordered after the prerequisite
         # stream the caller names per submission: for a store the one the
-        # forwards wrote the source pages on, for a load the one that zeroed
-        # the destination pages. What differs per store is who waits on the
+        # forwards wrote the source pages on, for a load the one the plan's
+        # zeroing ran on, behind the forwards in flight (a load's destination
+        # pages are not zeroed). What differs per store is who waits on the
         # copy: a stream-ordered op (a retraction image's L2 leg, every
         # snapshot store, and under the Host write-back policy the store of
         # what the plan's admissions and restores evicted: sources this very
@@ -592,9 +593,9 @@ class HostCacheExecutor:
                 batches and the per-request ``RestoreOp`` entries are read
                 here.
             prerequisite_stream: The stream whose completed work every copy
-                must observe -- the one the plan's page zeroing ran on (behind
-                the store fence), so the loads land on zeroed destination
-                pages and nothing reads a restored page before its image.
+                must observe -- the one the plan's page zeroing ran on, behind
+                the store fence and the forwards in flight, so no earlier
+                write to a destination lands after its copy.
         """
         op_ids: list[int] = []
         transfers: list[tuple[int, int, int]] = []
@@ -890,7 +891,8 @@ class HostCacheExecutor:
         tracker is not armed. A row overwrites its whole destination block,
         so the scheduler lists no restore destination for zeroing; the copies
         still order behind the stream the caller names, which carries the
-        plan's store fence and its zeroing of other pages. The ops were
+        plan's store fence, the forwards in flight and its zeroing of other
+        pages. The ops were
         validated at collection; an op with no rows restores its slot state
         alone.
         """
@@ -903,7 +905,8 @@ class HostCacheExecutor:
                 f"[snapshot] restore started: operations={len(ops):d} "
                 f"l2_blocks={len(l2_rows):d} pool_blocks={len(pool_rows):d}",
             )
-        # Behind the plan's zeroing and store fence on the stream the caller named.
+        # Behind the plan's zeroing, store fence and forwards in flight on the
+        # stream the caller named.
         self.load_stream.wait_stream(prerequisite_stream)
         if l2_rows:
             self._restore_l2_lane.start_h2d(
@@ -1010,10 +1013,10 @@ class HostCacheExecutor:
                 f"{len(transfers):d}",
             )
 
-        # The device handle zeroes the plan's freshly allocated Device blocks
-        # (``pages_to_zero``) on the prerequisite stream before submitting
-        # the load. Recording the start event there
-        # makes the H2D copy wait for that zeroing; per-layer ready flags
+        # The device handle orders the prerequisite stream behind the
+        # forwards in flight and the plan's zeroing before submitting the
+        # load. Recording the start event there makes the H2D copy wait for
+        # both; per-layer ready flags
         # (Triton) or events (DMA) then keep model consumers from reading
         # partially restored cache state.
         load_index = None

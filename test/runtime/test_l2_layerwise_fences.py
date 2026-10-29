@@ -27,7 +27,8 @@ the forward appends its new tokens to it), must first wait for that layer's
 copy: otherwise the forward reads what the block held before, or the late copy
 overwrites the rows it wrote. Each test holds the copy back on the load stream,
 runs one model's accessor sequence on a real pool and checks, once the copy has
-landed, the bytes the model saw or kept.
+landed, the bytes the model saw or kept. The last test holds back a forward
+instead and checks that the copy lands after it.
 """
 
 import os
@@ -323,6 +324,7 @@ def host_cache(request, io_backend):
                 draft_pool=draft_pool,
                 executor=executor,
                 handle=handle,
+                execution_stream=model_executor.execution_stream,
                 group=group,
                 LoadBackOp=LoadBackOp,
             )
@@ -708,6 +710,37 @@ def test_a_later_layer_reads_its_checkpoint_after_its_own_load(host_cache):
     torch.cuda.synchronize()
     for rows, host in zip(seen, host_rows):
         assert torch.equal(rows.view(torch.uint8), host)
+
+
+@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
+@pytest.mark.parametrize(
+    "host_cache", [("mha", "full_attention")], ids=["mha"], indirect=True
+)
+def test_a_load_lands_after_the_forwards_in_flight(host_cache):
+    """The reverse order: a load can target a block that a forward in flight
+    still writes, since an abort frees its request's blocks at once and the
+    next plan may grant one to a Host hit. A plan that zeroes and copies no
+    page (a pure-attention hit whose new tokens fit its tail block) has
+    nothing else that waits for that forward, so the load must."""
+    cache = host_cache
+    page_size = cache.arena.prefix_granularity
+    page = 2
+    k_rows, _ = cache.pool.get_kv_buffer(0)
+    host_rows = k_rows[page_size : 2 * page_size].view(torch.uint8).clone()
+    # The aborted request's forward, still writing one row of the block.
+    with torch.cuda.stream(cache.execution_stream):
+        torch.cuda._sleep(_HOLD_BACK_CYCLES)
+        k_rows[page * page_size].view(torch.uint8).fill_(0x5A)
+    cache.handle.execute(
+        cache.ts.ExecutionPlan(),
+        None,
+        cache_ops=[cache.LoadBackOp(3, [cache.group], 1, page)],
+    )
+    assert not cache.execution_stream.query()
+    torch.cuda.synchronize()
+    assert [int(ack.op_id) for ack in cache.handle.poll_cache_results()] == [3]
+    loaded = k_rows[page * page_size : (page + 1) * page_size].view(torch.uint8)
+    assert torch.equal(loaded, host_rows)
 
 
 if __name__ == "__main__":
