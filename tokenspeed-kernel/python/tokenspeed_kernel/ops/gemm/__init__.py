@@ -97,6 +97,8 @@ __all__ = [
     "grouped_bf16_projection_quantize_fp8",
     # MV: small-M dense projection
     "mv",
+    "mv_weightless_rmsnorm_gated_sigmoid",
+    "mv_weightless_rmsnorm_gated_sigmoid_supported",
     # Linear AttnRes partials
     "fp32_router_gemv",
     "fp32_router_gemv_counters",
@@ -1942,6 +1944,124 @@ def mv_weight_split(weight: torch.Tensor) -> torch.Tensor | None:
     ):
         return None
     return split_fp32_weight_bf16x3(weight)
+
+
+def _select_mv_weightless_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> SelectedKernel | None:
+    """Select the one-launch gated GEMV for this row, or None."""
+    if (
+        not x.is_cuda
+        or x.ndim != 2
+        or x.shape[1] != num_heads * head_dim
+        or not x.is_contiguous()
+        or gate.shape != x.shape
+        or gate.stride(1) != 1
+        or weight.ndim != 2
+        or weight.shape[1] != x.shape[1]
+        or not weight.is_contiguous()
+        or gate.device != x.device
+        or weight.device != x.device
+        or resolve_kernel_override("gemm", "mm", None) is not None
+    ):
+        return None
+    m, (n, k) = x.shape[0], weight.shape
+    try:
+        kernel = select_kernel(
+            "gemm",
+            "mv_weightless_rmsnorm_gated_sigmoid",
+            dense_format_signature(
+                ("x", "gate", "weight"), (x.dtype, gate.dtype, weight.dtype)
+            ),
+            traits={"m": m, "n": n, "k": k, "head_dim": head_dim},
+        )
+    except NoKernelFoundError:
+        return None
+    # The launch reproduces the gated norm and GEMV it replaces bit for bit, so
+    # it only stands in where those two calls select the kernels it copies.
+    norm = select_kernel(
+        "layernorm",
+        "weightless_rmsnorm_gated_sigmoid",
+        dense_format_signature(("x", "gate"), (x.dtype, gate.dtype)),
+    )
+    gemv = _select_mv(m, n, k, True, x.dtype, weight.dtype, False)
+    if (
+        norm.name != "triton_weightless_rmsnorm_gated_sigmoid"
+        or gemv is not KernelRegistry.get().get_impl("gluon_rowcta_bf16_gemv_gfx950")
+    ):
+        return None
+    return kernel
+
+
+def mv_weightless_rmsnorm_gated_sigmoid_supported(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Return whether :func:`mv_weightless_rmsnorm_gated_sigmoid` serves this row.
+
+    A registered kernel must take the shape, and the separate gated norm and
+    ``mv`` must select the kernels it reproduces.
+
+    Args:
+        x: Attention row ``[1, num_heads * head_dim]``.
+        gate: Gate logits with ``x``'s shape.
+        weight: Output projection weight ``[N, num_heads * head_dim]``.
+        num_heads: Heads in ``x``.
+        head_dim: Width of each head.
+
+    Returns:
+        ``True`` when one launch can replace the gated norm followed by ``mv``.
+    """
+    return (
+        _select_mv_weightless_rmsnorm_gated_sigmoid(
+            x, gate, weight, num_heads, head_dim
+        )
+        is not None
+    )
+
+
+def mv_weightless_rmsnorm_gated_sigmoid(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    weight: torch.Tensor,
+    num_heads: int,
+    eps: float,
+    out: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize, gate and project one row in one launch.
+
+    Computes ``mv(weightless_rmsnorm_gated_sigmoid(x, gate, ...), weight,
+    out)`` where :func:`mv_weightless_rmsnorm_gated_sigmoid_supported` holds.
+
+    Args:
+        x: Contiguous BF16 row ``[1, num_heads * head_dim]``.
+        gate: Gate logits with ``x``'s shape and a unit inner stride.
+        weight: ``[N, K]`` weight.
+        num_heads: Heads in ``x``.
+        eps: Epsilon added to each per-head variance.
+        out: ``[1, N]`` destination.
+
+    Returns:
+        ``out``.
+    """
+    head_dim = x.shape[-1] // max(num_heads, 1)
+    kernel = _select_mv_weightless_rmsnorm_gated_sigmoid(
+        x, gate, weight, num_heads, head_dim
+    )
+    if kernel is None:
+        raise ValueError(
+            "mv_weightless_rmsnorm_gated_sigmoid needs a supported gated row "
+            f"(see mv_weightless_rmsnorm_gated_sigmoid_supported), got x "
+            f"{tuple(x.shape)}, weight {tuple(weight.shape)}, {num_heads} heads"
+        )
+    return kernel(x, gate, weight, out, num_heads, eps)
 
 
 # ===-----------------------------------------------------------------------===#

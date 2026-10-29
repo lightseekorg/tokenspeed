@@ -7,11 +7,10 @@ exercise exactly that engine surface:
 * Unit: InklingAudioTower / InklingHMLPPatchEncoder parity against hand-rolled torch
   references on shared weights, plan_out_scales schedules, MM config flags,
   and the M-RoPE no-op gate.
-* E2E: an in-process Engine on the released config (layer-truncated,
-  experts shrunk, dummy weights; towers are on in the real config), fed
-  ``GenerateReqInput(input_ids=..., precomputed_multimodal_inputs=
-  MultimodalInputs(...))`` through ``engine.llm.generate`` — the same
-  low-level API the SMG gRPC servicer uses (``_build_generate_req``).
+* E2E: an engine on the released config (layer-truncated, experts shrunk,
+  dummy weights; towers are on in the real config), driven over its wire
+  (``WireDriver``) with requests carrying ``MultimodalInputs`` the way a
+  frontend that preprocesses media sends them.
 
 The e2e needs a Blackwell GPU (FA4); unit tests need any CUDA GPU (runtime
 RMSNorm kernels are GPU-only).
@@ -166,9 +165,8 @@ class TestInklingMultimodalConfig:
             InklingMMConfig(image_placeholder_token_id=-1)
 
     def test_mrope_is_noop_for_tml(self):
-        """The precomputed-MM input path calls compute_mrope_positions
-        unconditionally; Inkling is not an M-RoPE architecture, so it must
-        no-op (input_processor then skips all mrope_* fields)."""
+        """Inkling is not an M-RoPE architecture: compute_mrope_positions
+        gives it no positions, so its requests carry no mrope_* fields."""
         from tokenspeed.runtime.multimodal.inputs import Modality, MultimodalDataItem
         from tokenspeed.runtime.multimodal.mrope import compute_mrope_positions
 
@@ -339,9 +337,8 @@ class TestInklingHMLPPatchEncoder:
 class TestInklingMultimodalE2E:
     """Engine-only e2e with synthetic features (no gateway).
 
-    Mirrors the SMG servicer's precomputed-multimodal entry point:
-    ``GenerateReqInput(input_ids=..., precomputed_multimodal_inputs=...)``
-    submitted through the ``LLM`` facade over ``AsyncLLM.generate_request``.
+    Requests carry their items as a preprocessing frontend sends them: each
+    item's pad value over its placeholder run, the original ids beside.
     """
 
     IMAGE_TOKENS = 8  # one token per patch (hMLP folds patch interior)
@@ -349,28 +346,41 @@ class TestInklingMultimodalE2E:
 
     @classmethod
     def setup_class(cls):
-        from tokenspeed.runtime.entrypoints.engine import Engine
+        from tokenspeed.runtime.entrypoints.wire_driver import WireDriver
 
         # Released config (towers on), layer-truncated + expert-shrunk via
         # hf_overrides; dummy weights.
         cls.text = load_inkling_config().get_text_config()
         cls.vision = load_inkling_config().vision_config
         cls.audio = load_inkling_config().audio_config
-        cls.engine = Engine(
-            disable_autotune=True,
-            model=INKLING_BF16,
-            hf_overrides=truncation_hf_overrides(),
-            load_format="dummy",
-            attention_backend="fa4",
-            enable_prefix_caching=False,
-            disable_kvstore=True,
-            enforce_eager=False,
-            dtype="bfloat16",
-            gpu_memory_utilization=0.3,
-            max_model_len=2048,
-            max_num_seqs=8,
-            enable_output_logprobs=True,
-            log_level="warning",
+        cls.engine = WireDriver(
+            [
+                "--disable-autotune",
+                "--model",
+                INKLING_BF16,
+                "--hf-overrides",
+                truncation_hf_overrides(),
+                "--load-format",
+                "dummy",
+                "--attention-backend",
+                "fa4",
+                "--disable-prefix-caching",
+                "--disable-kvstore",
+                "--dtype",
+                "bfloat16",
+                "--gpu-memory-utilization",
+                "0.3",
+                "--max-model-len",
+                "2048",
+                "--max-num-seqs",
+                "8",
+                "--enable-output-logprobs",
+                "--log-level",
+                "warning",
+            ],
+            num_engines=1,
+            routing="round_robin",
+            startup_timeout_s=3600,
         )
 
     @classmethod
@@ -403,25 +413,34 @@ class TestInklingMultimodalE2E:
         return ids, len(prefix)
 
     def _generate(self, input_ids, mm_items=None, max_new_tokens=8):
-        """Submit one request the way the SMG servicer does and return
+        """Submit one request as a preprocessing frontend does and return
         ``(output_ids, output_logprobs)``."""
-        from tokenspeed.runtime.engine.io_struct import GenerateReqInput
+        from tokenspeed.runtime.entrypoints.wire_driver import generate_request
+        from tokenspeed.runtime.multimodal.embedder import pad_input_tokens
         from tokenspeed.runtime.multimodal.inputs import MultimodalInputs
 
-        precomputed = (
-            MultimodalInputs(mm_items=mm_items) if mm_items is not None else None
+        fields = {}
+        if mm_items is not None:
+            mm_inputs = MultimodalInputs(mm_items=mm_items)
+            mm_inputs.ensure_pad_values()
+            fields = {
+                "multimodal_inputs": mm_inputs,
+                "input_ids_unpadded": list(input_ids),
+            }
+            input_ids = pad_input_tokens(list(input_ids), mm_inputs)
+        [completion] = self.engine.generate(
+            [
+                generate_request(
+                    input_ids,
+                    {"temperature": 0.0, "max_new_tokens": max_new_tokens},
+                    return_logprob=True,
+                    **fields,
+                )
+            ]
         )
-        obj = GenerateReqInput(
-            input_ids=list(input_ids),
-            sampling_params={"temperature": 0.0, "max_new_tokens": max_new_tokens},
-            return_logprob=True,
-            precomputed_multimodal_inputs=precomputed,
-        )
-        out = self.engine.llm.generate(obj)
-        meta = out["meta_info"]
-        assert (meta["completion_tokens"]) == (max_new_tokens)
-        logprobs = [pair[0] for pair in meta["output_token_logprobs"]]
-        output_ids = [pair[1] for pair in meta["output_token_logprobs"]]
+        assert (completion.completion_tokens) == (max_new_tokens)
+        logprobs = completion.output_token_logprobs
+        output_ids = completion.output_ids
         for token_id in output_ids:
             # padded-vocab mask still active
             assert (token_id) < (self.text.unpadded_vocab_size)
@@ -539,14 +558,10 @@ class TestInklingMultimodalE2E:
         ), "changing the trailing audio feature did not change the output"
 
     def test_text_only_prompt_still_works(self):
-        # Plain text through the same engine (no precomputed mm): the
-        # text-only fast path must keep working alongside mm requests.
-        out = self.engine.generate(
-            prompt="the quick brown fox",
-            sampling_params={"temperature": 0.0, "max_new_tokens": 8},
-        )
-        result = out if isinstance(out, dict) else out[0]
-        assert (result["meta_info"]["completion_tokens"]) == (8)
+        # Plain text through the same engine (no mm items): the text-only
+        # fast path must keep working alongside mm requests.
+        output_ids, _ = self._generate([11, 45, 260, 132])
+        assert (len(output_ids)) == (8)
 
 
 if __name__ == "__main__":

@@ -1270,32 +1270,12 @@ def test_qwen_mtp_draft_layer_fills_state_segments() -> None:
 
 
 def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
-    """Profiled capacity keeps the null page inside the budget.
+    from test.runtime.test_cache_capacity import mha_recipe
 
-    16_384 bytes at 16 bytes/token and P=64 buys 16 pages; one is the reserved
-    null page, so 15 are schedulable.
-    """
-    from tokenspeed.runtime.layers.attention.kv_cache.recipes.ordinary import (
-        OrdinaryRecipe,
-    )
-
-    recipe = OrdinaryRecipe.__new__(OrdinaryRecipe)
-    recipe.cache_budget_bytes = 16_384
-    recipe.server_args = SimpleNamespace(max_total_tokens=None)
-    recipe.attn_config = _ns_config(
-        prefix_granularity=64,
-        spec=SimpleNamespace(cache_layer_types=(), sliding_window_tokens=None),
-        cache_cell_size=lambda: 16,
-    )
-    recipe.draft_attn_config = None
-    recipe.model_config = SimpleNamespace(num_attention_layers=1)
-
-    usable_pages = recipe.num_lcm_blocks(
-        SimpleNamespace(lcm_block_bytes=1, prefix_granularity=64, group_packing=())
-    )
-
-    assert usable_pages == 15
-    assert (usable_pages + 1) * 64 * 16 <= 16_384
+    recipe = mha_recipe(layers=1, budget=16 * 65536)
+    setup = recipe.setup()
+    assert setup.spec.memory_plan.num_lcm_blocks == 15
+    assert setup.spec.memory_plan.arena_bytes == recipe.cache_budget_bytes
 
 
 @pytest.mark.parametrize(
@@ -1477,10 +1457,10 @@ def _fake_around_the_budget(monkeypatch, free):
         registry, "_resolve_heterogeneous_draft_family", lambda *a, **k: None
     )
 
-    def prepare(*, cache_budget_bytes, probe_batch_rows, **kwargs):
+    def prepare(family, *, cache_budget_bytes, probe_batch_rows, **kwargs):
         raise _Sized(cache_budget_bytes, probe_batch_rows)
 
-    monkeypatch.setattr(registry, "prepare_cache_setup", prepare)
+    monkeypatch.setattr(registry, "cache_recipe", prepare)
     return registry
 
 
@@ -1492,16 +1472,18 @@ def _receive_pool_env(monkeypatch, slots, slot_mb):
 @pytest.mark.parametrize("rank", [0, 1])
 @pytest.mark.parametrize("probe", [False, True])
 @pytest.mark.parametrize(
-    "mode, active, pool",
+    "mode, active, external, pool",
     [
-        ("prefill", True, 4 << 30),
-        ("prefill", False, 0),
-        ("decode", True, 0),
-        ("null", True, 0),
+        ("prefill", True, False, 4 << 30),
+        ("prefill", False, False, 0),
+        ("decode", True, False, 0),
+        ("null", True, False, 0),
+        ("null", True, True, 4 << 30),
+        ("null", False, True, 0),
     ],
 )
 def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
-    monkeypatch, rank, probe, mode, active, pool
+    monkeypatch, rank, probe, mode, active, external, pool
 ) -> None:
     from tokenspeed.runtime.execution import device, factory
 
@@ -1516,6 +1498,7 @@ def test_every_boot_leaves_the_receive_pool_out_of_the_cache_budget(
     monkeypatch.setattr(device, "probe_arena_floor", lambda *a, **k: 8)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_external_encoder=external,
         chunked_prefill_size=8192,
         attention_backend=None,
         drafter_attention_backend=None,
@@ -1623,6 +1606,7 @@ def test_the_receive_builds_the_pool_exactly_where_the_budget_left_it_out(
     _receive_pool_env(monkeypatch, slots, slot_mb)
     server_args = SimpleNamespace(
         disaggregation_mode=mode,
+        enable_external_encoder=False,
         mapping=SimpleNamespace(is_first_pp_rank=True),
     )
     facts = SimpleNamespace(

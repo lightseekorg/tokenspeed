@@ -174,11 +174,11 @@ faster iteration.
 - Runtime shape capture feeds replay and tuning workflows. `kernel_scope`
   scopes are visible in Proton/Chrome traces. The joint BF16 `mm` fast path
   records the same shape metadata and scopes as registry-selected kernels.
-- End-to-end serving: POST `/start_profile` with
-  `{"activities": ["PROTON"]}`, run the workload, then POST `/stop_profile`.
-  Each scheduler process — the process where
-  kernels actually launch — runs its own Proton session and finalizes it on
-  `/stop_profile`, writing
+- End-to-end serving: start a profile with the `PROTON` activity (the
+  engine's `ProfileReq` control operation, which the frontend driving the
+  engine sends), run the workload, then stop it. Each scheduler process — the
+  process where kernels actually launch — runs its own Proton session and
+  finalizes it when the profile stops, writing
   `<output_dir>/<profile_id>[-DP<rank>]-TP<rank>.proton.<fmt>`
   per rank. `PROTON` composes only with host-side activities (`CPU`, `MEM`,
   `VIZTRACER`). To see Python activity and Proton's kernel lanes on one

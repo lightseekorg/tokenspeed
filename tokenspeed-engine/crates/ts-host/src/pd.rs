@@ -248,14 +248,30 @@ pub fn start(
     let refuse_epd =
         || PyRuntimeError::new_err("EPD embeddings are received only on a PD Prefill node");
     if peer.is_none() {
-        if !epd.is_none() {
-            return Err(refuse_epd());
-        }
+        let embeddings = if epd.is_none() {
+            None
+        } else {
+            let settings = epd.getattr("transport")?;
+            let peer = PeerConfig {
+                library: PathBuf::from(settings.getattr("library")?.extract::<String>()?),
+                local_ip: settings.getattr("local_ip")?.extract()?,
+                protocol: settings.getattr("protocol")?.extract()?,
+                ib_device: settings.getattr("ib_device")?.extract()?,
+                regions: settings.getattr("regions")?.extract()?,
+                engine_rank: settings.getattr("engine_rank")?.extract()?,
+                metrics,
+            };
+            let config = receiver_config(&epd)?;
+            let receiver = py
+                .detach(|| ts_pd::epd::receiver::Receiver::start_standalone(config, peer))
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            Some(Box::new(receiver) as Box<dyn EmbeddingReceiver + Send>)
+        };
         return Ok(Peers {
             role: Role::Plain,
             transfer: None,
             streams: None,
-            embeddings: None,
+            embeddings,
         });
     }
     let settings = peer.getattr("settings")?;

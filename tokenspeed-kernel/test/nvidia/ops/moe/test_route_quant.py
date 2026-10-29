@@ -488,7 +488,9 @@ class PlannedRouteWeights(torch.nn.Module):
         self._moe_backend_state = None
 
 
-def exercise_planned_moe(native, matrices, tokens, topk, ep_size, ep_rank):
+def exercise_planned_moe(
+    native, matrices, tokens, topk, ep_size, ep_rank, *, use_fused_finalize
+):
     from flashinfer import ActivationType
     from tokenspeed_kernel.ops.moe import moe_apply, moe_plan, moe_process_weights
     from tokenspeed_kernel.ops.tuning import get_autotune_max_num_tokens
@@ -520,6 +522,7 @@ def exercise_planned_moe(native, matrices, tokens, topk, ep_size, ep_rank):
         features=frozenset(),
         solution="cute_dsl",
     )
+    plan["cutlass_fused_finalize"] = use_fused_finalize
     moe_process_weights(plan, w)
     x = torch.randn((tokens, hidden), device="cuda", dtype=torch.bfloat16) * 0.1
     ids = (
@@ -552,6 +555,7 @@ def exercise_planned_moe(native, matrices, tokens, topk, ep_size, ep_rank):
             output_dtype=x.dtype,
             quant_scales=[w.w13_weight_scale_inv, w.w2_weight_scale_inv],
             use_deepseek_fp8_block_scale=True,
+            use_fused_finalize=use_fused_finalize,
             ep_size=ep_size,
             ep_rank=ep_rank,
             tp_size=1,
@@ -612,8 +616,48 @@ def test_registered_moe_input_path(
     native_input_consumer, native_input_weights, tokens, ep_size, ep_rank
 ):
     exercise_planned_moe(
-        native_input_consumer, native_input_weights, tokens, 5, ep_size, ep_rank
+        native_input_consumer,
+        native_input_weights,
+        tokens,
+        5,
+        ep_size,
+        ep_rank,
+        use_fused_finalize=True,
     )
+
+
+def test_registered_moe_preserves_finalize_configuration(
+    native_input_consumer, native_input_weights
+):
+    import inspect
+
+    from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import _private_entrypoint
+
+    entrypoint = inspect.unwrap(_private_entrypoint(True, 4, -1))
+    module = entrypoint.__globals__["get_cutlass_fused_moe_module"](
+        "90", enable_sm90_moe_optimizations=True
+    )
+    runners = module.MoERunner.runner_dict
+    saved_runners = runners.copy()
+    try:
+        runners.clear()
+        for count, fused in enumerate((False, True), start=1):
+            exercise_planned_moe(
+                native_input_consumer,
+                native_input_weights,
+                8,
+                5,
+                1,
+                0,
+                use_fused_finalize=fused,
+            )
+            # The reference and registered path must select the same policy.
+            # Equal block-FP8 outputs alone do not detect a dropped plan setting.
+            assert len(runners) == count
+    finally:
+        torch.cuda.synchronize()
+        runners.clear()
+        runners.update(saved_runners)
 
 
 @pytest.mark.parametrize("hidden", (128, 256, 768, 1024, 2048))

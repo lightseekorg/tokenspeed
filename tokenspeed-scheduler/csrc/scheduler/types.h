@@ -62,10 +62,22 @@ struct SchedulerConfig {
     bool HasHostCache() const { return !disable_l2_cache && host_allocator.total_pages > 1; }
     bool HasSnapshotPool() const { return snapshot_allocator.total_pages > 1; }
 
+    // What feeds Host L2 from ordinary Device prefix entries; required with a
+    // Host tier (Validate says where kWriteBack may run).
+    //   kWriteThrough  published entries stream to Host at chunk ends, the
+    //                  prompt end and finish.
+    //   kWriteBack     nothing streams at publication: what an admission
+    //                  or a restore evicts is written back to Host in the
+    //                  same plan, by whole segments.
+    enum class HostWritePolicy : std::uint8_t { kUnspecified, kWriteThrough, kWriteBack };
+    HostWritePolicy host_write_policy{HostWritePolicy::kUnspecified};
+
     // The D role streams no ordinary Device cache entry to Host; its Host
     // cache holds only the published pages of retracted requests (the image's
     // L2 leg) until they are restored.
-    bool StreamsDeviceCacheToHost() const { return HasHostCache() && role != Role::kD; }
+    bool StreamsDeviceCacheToHost() const {
+        return HasHostCache() && role != Role::kD && host_write_policy == HostWritePolicy::kWriteThrough;
+    }
 
     std::int32_t max_scheduled_tokens{};
     std::int32_t max_batch_size{};

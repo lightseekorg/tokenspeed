@@ -193,6 +193,7 @@ def cute_dsl_fp8_moe_apply(
         tune_max_num_tokens=get_autotune_max_num_tokens(),
         activation_type=ActivationType.Swiglu,
         use_deepseek_fp8_block_scale=True,
+        use_fused_finalize=plan["cutlass_fused_finalize"],
         enable_pdl=enable_pdl,
         expected_m=None,
         prepared_input=prepared,

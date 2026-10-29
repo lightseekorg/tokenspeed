@@ -32,6 +32,7 @@ def scheduler(*, role, groups=1, host=32, timeout=100):
     cfg.num_snapshot_pages = 1
     cfg.num_device_pages = 64
     cfg.num_host_pages = host
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
     cfg.enable_l3_storage = True
@@ -430,6 +431,7 @@ def mixed_replay_scheduler():
     cfg.prefix_granularity = 2
     cfg.num_device_pages = 64
     cfg.num_host_pages = 32
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 1
     cfg.max_scheduled_tokens = 4
     cfg.max_batch_size = 8

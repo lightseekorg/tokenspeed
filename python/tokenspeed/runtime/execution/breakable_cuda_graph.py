@@ -34,9 +34,11 @@ structure + the ``set_forward_context``/``get_forward_context`` ambient pattern 
 mirror in :func:`active_forward`/:func:`current_forward_ctx`) and SGLang's
 breakable prefill graph (the eager-copy output handoff at each break). Unlike a
 full prefill graph, attention and request-shaped state updates stay eager, so
-live lengths and cache addresses never enter a captured segment. Keeping all
-KV-cache reads/writes in eager breaks also makes them honor the per-layer
-transfer consumer index naturally.
+live lengths and cache addresses never enter a captured segment. A KV-cache
+read or write in an eager break waits for its layer's Host load there; one a
+captured segment makes (an attention prologue's KV write, an inline KDA
+layer's state read) holds no such wait, so ``PrefillGraph.replay`` waits for
+the plan's whole Host load before the first segment.
 
 Address-stability contract (the load-bearing invariant):
 

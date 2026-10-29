@@ -310,6 +310,8 @@ pub struct Load {
     pub kv_active_pages: i64,
     /// Usable cache pages.
     pub kv_total_pages: i64,
+    /// Resident cache blocks, including reclaimable prefix-cache entries.
+    pub kv_used_pages: i64,
 }
 
 /// The frontend: requests in, outputs out.
@@ -413,7 +415,7 @@ pub struct LoopConfig {
     /// waits for the embeddings before it is scheduled. Its first stage
     /// receives them ([`Subsystems::embeddings`]); a later stage follows the
     /// first's decisions.
-    pub epd_prefill: bool,
+    pub epd_receive_enabled: bool,
     /// The data plane fills grammar bitmasks before a forward from the
     /// matchers' state, which only a commit advances: a grammar batch
     /// cannot overlap a pending forward (`uses_eager_grammar`).
@@ -482,6 +484,8 @@ pub struct EventLoop<D: DataPlane, F: Frontend> {
     /// Without L3, the forward permission the scheduler last received; it
     /// starts allowed. With L3 every round's tick carries it.
     forward_allowed: bool,
+    /// Last load report on the output wire, including idle heartbeats.
+    last_load_report: Option<Instant>,
 }
 
 /// What a round starts from, the same on every replica member.
@@ -534,6 +538,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             staged: Vec::new(),
             dp_idle: true,
             forward_allowed: true,
+            last_load_report: None,
         }
     }
 
@@ -659,15 +664,22 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         if !released.is_empty() {
             self.data_plane.release(&released)?;
         }
-        if !outputs.is_empty() && self.owns_frontend() {
+        if self.owns_frontend()
+            && (!outputs.is_empty()
+                || self
+                    .last_load_report
+                    .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)))
+        {
             let sizes = self.scheduler.sizes();
             let load = Load {
                 num_running: self.outputs.num_running() as i64,
                 num_waiting: sizes.waiting as i64,
                 kv_active_pages: i64::from(sizes.active_lcm_blocks),
                 kv_total_pages: self.config.kv_total_pages,
+                kv_used_pages: self.config.kv_total_pages - i64::from(sizes.empty_lcm_blocks),
             };
             self.frontend.send(outputs, load);
+            self.last_load_report = Some(Instant::now());
         }
         // A deferred pause or release resolves once the scheduler drained.
         self.finish_drain()?;
@@ -1120,9 +1132,10 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         } else {
             submissions
         };
-        let (staged, submissions): (Vec<_>, Vec<_>) = submissions
-            .into_iter()
-            .partition(|submission| self.config.epd_prefill && !submission.embeddings.is_empty());
+        let (staged, submissions): (Vec<_>, Vec<_>) =
+            submissions.into_iter().partition(|submission| {
+                self.config.epd_receive_enabled && !submission.embeddings.is_empty()
+            });
         if !staged.is_empty() {
             // Its transfer registers only once it reaches the scheduler: a
             // transfer event for a request the scheduler does not know is a
@@ -1476,7 +1489,7 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
         Ok(())
     }
 
-    /// `POST /rebalance_experts`: take the snapshot now, if no rebalance runs.
+    /// `RebalanceExpertsReqInput`: take the snapshot now, if no rebalance runs.
     fn begin_manual_rebalance(&mut self) -> Result<(bool, String), LoopError> {
         let Some(controller) = self.eplb.as_mut() else {
             return Ok((
@@ -2013,6 +2026,11 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
                 EngineRequest::Control(request) => {
                     self.register(std::mem::take(&mut admissions), outputs, released)?;
                     self.control(*request)?;
+                }
+                // The transport turns calls into operations and drops encode
+                // requests; a frontend that passes them on has nothing here.
+                EngineRequest::Call(_) | EngineRequest::Encode(_) => {
+                    tracing::warn!("dropping a message the scheduler does not take")
                 }
             }
         }

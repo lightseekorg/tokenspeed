@@ -198,7 +198,8 @@ def kda_paged_prefill(
         v: Values ``[1, total_tokens, heads, value_dim]``.
         beta_logits: Raw beta logits ``[1, total_tokens, heads]``.
         A_log/dt_bias: FP32 gate parameters.
-        initial_state: One backend-owned recurrent state per sequence.
+        initial_state: One backend-owned recurrent state per sequence, FP32
+            or BF16.
         cu_seqlens: Device sequence boundaries ``[num_sequences + 1]``.
         cu_seqlens_cpu: REQUIRED host int64 copy of ``cu_seqlens`` with equal
             contents. Every solution plans its chunk indices from it on the
@@ -215,11 +216,15 @@ def kda_paged_prefill(
             platform default when omitted.
 
     Returns:
-        Packed output and final state, in the caller's ``recurrent_layout``.
+        Packed output and FP32 final state, in the caller's
+        ``recurrent_layout``.
     """
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if q.ndim != 4 or q.shape[0] != 1:
         raise ValueError("KDA q must be [1, total_tokens, heads, key_dim]")
+    # Prefill scans take and return FP32 state. A BF16 state pool is widened
+    # here, and the caller narrows the final state when writing it back.
+    initial_state = initial_state.float()
     if k.shape != q.shape or g_raw.shape != q.shape:
         raise ValueError("KDA q, k, and g_raw must have identical shapes")
     if v.ndim != 4 or v.shape[:3] != q.shape[:3]:

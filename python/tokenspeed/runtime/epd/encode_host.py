@@ -54,6 +54,7 @@ from tokenspeed.runtime.cache.embedding_cache import (
     EmbeddingCache,
     TieredEmbeddingCache,
 )
+from tokenspeed.runtime.engine import zmq_wire
 from tokenspeed.runtime.engine.io_struct import MsgpackDecoder
 from tokenspeed.runtime.epd.encode_worker import EncodeRequest
 from tokenspeed.runtime.multimodal.embedder import _item_token_count
@@ -218,8 +219,11 @@ class EncodeSettings:
             the frontend's requests and hosts the bootstrap server.
         collective_bind_host: Where the rank listens for the other ranks'
             collective connections.
-        intake: On the first rank, where the frontend pushes encode requests
-            (``scheduler_input_ipc_name``); else None.
+        handshake_address: On the first rank, the frontend's handshake
+            endpoint it dials to take encode requests; else None.
+        engine_index: The engine identity the first rank registers as.
+        ready_response: On the first rank, the msgpack-encoded
+            ``WireEngineCoreReadyResponse`` it registers with; else None.
         bootstrap_port: On the first rank, the bootstrap server's port; else
             None.
         bootstrap_url: The bootstrap server's ``/route``, which every rank
@@ -244,7 +248,9 @@ class EncodeSettings:
     rank: int
     tp_ranks: tuple[int, ...]
     collective_bind_host: str
-    intake: str | None
+    handshake_address: str | None
+    engine_index: int
+    ready_response: bytes | None
     bootstrap_port: int | None
     bootstrap_url: str
     library: str
@@ -531,12 +537,20 @@ class EncodeBootstrap:
         )
         first = attn_tp_rank == 0
         regions = ring.regions()
+        ready_response = zmq_wire.encode_ready_response(
+            server_args=server_args,
+            hf_config=model_config.hf_config,
+            dtype=self._multimodal_encoder_dtype or model_config.dtype,
+            bootstrap=(bootstrap_host, server_args.disaggregation_bootstrap_port),
+        )
         #: What the host starts from.
         self.config = EncodeSettings(
             rank=global_rank,
             tp_ranks=tp_ranks,
             collective_bind_host=self._collective_host,
-            intake=port_args.scheduler_input_ipc_name if first else None,
+            handshake_address=(server_args.zmq_handshake_endpoint() if first else None),
+            engine_index=server_args.zmq_engine_index,
+            ready_response=zmq_wire.encode(ready_response) if first else None,
             bootstrap_port=server_args.disaggregation_bootstrap_port if first else None,
             bootstrap_url=(
                 f"http://{join_host_port(bootstrap_host, server_args.disaggregation_bootstrap_port)}"

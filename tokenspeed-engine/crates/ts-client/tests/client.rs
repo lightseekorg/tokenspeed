@@ -24,14 +24,15 @@ mod common;
 
 use std::time::Duration;
 
-use common::{ipc_address, start, FakeEngine};
+use common::{ipc_address, start, FakeEngine, Role};
 use ts_client::{
     ClientConfig, ClientListener, EngineClient, Error, LoadBalance, OutputChunk, RequestStream,
     Routing, StreamError,
 };
 use ts_wire::{
     control::{FlushCacheReqInput, IsSchedulerPausedReqInput},
-    ControlOutput, ControlRequest, EngineRequest, SamplingParams, TokenizedGenerateReqInput,
+    ControlOutput, ControlRequest, EncodeRequest, EngineRequest, SamplingParams,
+    TokenizedGenerateReqInput,
 };
 
 fn config(handshake_address: &str, num_engines: u16, routing: Routing) -> ClientConfig {
@@ -102,6 +103,7 @@ fn tokens(chunks: &[OutputChunk]) -> Vec<i32> {
 async fn streams_tokens_until_finished() {
     let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
     assert_eq!(client.engines()[0].ready.max_model_len, 4096);
+    assert!(client.fresh_loads(Duration::from_secs(3)).is_empty());
 
     let chunks = collect(client.generate(request("r1", Some(3))).await.unwrap()).await;
     assert_eq!(tokens(&chunks), [1, 2, 3]);
@@ -111,6 +113,12 @@ async fn streams_tokens_until_finished() {
     assert!(chunks[..2].iter().all(|c| c.finish_reason.is_none()));
     assert_eq!(client.in_flight(), [0]);
     assert_eq!(client.loads()[0].kv_total_pages, 100);
+    let snapshots = client.fresh_loads(Duration::from_secs(3));
+    assert_eq!(snapshots.len(), 1);
+    assert_eq!(snapshots[0].0, 0);
+    assert_eq!(snapshots[0].1.kv_used_pages, 7);
+    assert_eq!(snapshots[0].1.kv_active_pages, 0);
+    assert!(client.fresh_loads(Duration::ZERO).is_empty());
 }
 
 #[tokio::test]
@@ -123,6 +131,7 @@ async fn pinned_requests_go_to_their_rank() {
         };
         let chunks = collect(client.generate(pinned).await.unwrap()).await;
         assert_eq!(tokens(&chunks), [1001]);
+        assert!(client.fresh_loads(Duration::from_secs(3)).is_empty());
     }
     let out_of_range = TokenizedGenerateReqInput {
         data_parallel_rank: Some(2),
@@ -386,4 +395,62 @@ async fn a_control_operation_fails_when_an_engine_dies() {
         client.control(flush).await,
         Err(Error::Unavailable(StreamError::EngineDead))
     ));
+}
+
+fn encode_request(request_id: &str) -> EncodeRequest {
+    EncodeRequest {
+        rid: None,
+        http_worker_ipc: None,
+        request_id: request_id.to_owned(),
+        bootstrap_host: "10.0.0.9".to_owned(),
+        bootstrap_port: 8998,
+        bootstrap_room: 41,
+        items: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn an_encode_server_takes_encode_requests_and_nothing_else() {
+    let handshake = ipc_address("encode-hs");
+    let listener = ClientListener::bind(config(
+        &handshake,
+        1,
+        Routing::Aggregated(LoadBalance::RoundRobin),
+    ))
+    .await
+    .unwrap();
+    let mut engine = common::start_as(&handshake, 0, 0, 1, Role::Encoder);
+    let client = listener.accept().await.unwrap();
+
+    client.encode(encode_request("item-0")).await.unwrap();
+    assert_eq!(
+        engine.next_received().await,
+        EngineRequest::Encode(Box::new(encode_request("item-0")))
+    );
+    let Err(error) = client.generate(request("r0", Some(1))).await else {
+        panic!("an encode server takes no generate request");
+    };
+    assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
+    // Nor a control operation, which it would never answer: the call is
+    // refused at once instead of waiting for a reply.
+    let control = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.control(ControlRequest::FlushCache(FlushCacheReqInput {
+            rid: None,
+            http_worker_ipc: None,
+        })),
+    )
+    .await
+    .expect("refused before any wait");
+    assert!(
+        matches!(control, Err(Error::InvalidRequest(_))),
+        "{control:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_scheduler_takes_no_encode_requests() {
+    let (client, _engines) = connect(1, Routing::Aggregated(LoadBalance::RoundRobin)).await;
+    let error = client.encode(encode_request("item-0")).await.unwrap_err();
+    assert!(matches!(error, Error::InvalidRequest(_)), "{error}");
 }

@@ -23,7 +23,7 @@ from __future__ import annotations
 import bisect
 import gc
 from collections.abc import Callable
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING
 
 import torch
@@ -163,16 +163,23 @@ class DeepEPCudaGraphRunnerAdapter:
         cls.set_dispatch_mode_as_low_latency()
 
     def replay(self):
-        """Call before every ``graph.replay()``; restores dispatch mode
-        and resets RDMA workspace so stale sync state doesn't corrupt
-        the combine kernel across replays."""
+        """Call before every ``graph.replay()``; restores the low-latency
+        dispatch mode.
+
+        The low-latency workspace is cleaned only on a real normal ->
+        low-latency transition (``set_dispatch_mode_as_low_latency``): a
+        normal-mode forward reuses the RDMA buffer the low-latency kernels
+        signal through. Between consecutive low-latency forwards each
+        dispatch / combine already clears the other half of its double
+        buffer for the next call, so cleaning before every replay only adds
+        a full-workspace kernel to every decode step.
+        """
         if not self._active:
             return
         cls = self._get_buffer_cls()
         if cls is None or cls._buffer is None:
             return
         cls.set_dispatch_mode_as_low_latency()
-        cls.clean_buffer()
 
 
 class ForwardStepRunner:
@@ -1179,11 +1186,13 @@ class ForwardStepRunner:
             if self._graph_debug:
                 self._verify_graph_metadata(graph_key)
             if self.device == "npu":
-                graph.update(
-                    cpu_update_input=[
-                        {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
-                    ]
-                )
+                # Update callbacks write the inference tensors created at capture.
+                with torch.inference_mode():
+                    graph.update(
+                        cpu_update_input=[
+                            {"actual_seq_lengths_kv": seq_lens.to("cpu").tolist()}
+                        ]
+                    )
             if self._expert_load_rows is not None:
                 # Every rank replays the same padded batch; the live rows are
                 # the DP-gathered live counts (this rank's own without DP).
@@ -1196,7 +1205,9 @@ class ForwardStepRunner:
                         else [ctx.input_num_tokens] * self.world_size
                     ),
                 )
-            with nvtx_range("graph_replay", color="red"):
+            with (
+                torch.inference_mode() if self.device == "npu" else nullcontext()
+            ), nvtx_range("graph_replay", color="red"):
                 if self.drafter is not None:
                     self.drafter.replay_decode_graph(graph, bs=bs, graph_bs=padded_bs)
                 else:

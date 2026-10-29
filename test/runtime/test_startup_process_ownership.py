@@ -18,15 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-"""Launcher cleanup after real worker failures and termination signals."""
+"""Launcher cleanup after real worker failures and termination signals.
+
+The headless launcher (``launch_scheduler_headless``) owns its ranks'
+process tree. These tests replace only the ranks it starts with real child
+processes and check that a rank's failure signal, repeated signals, and a
+normal exit each leave nothing running behind it.
+"""
 
 import contextlib
+import json
 import multiprocessing as mp
 import os
 import signal
 import sys
 import threading
-import time
 
 import psutil
 import pytest
@@ -63,47 +69,77 @@ def _spawn_start_method():
         mp.set_start_method(previous, force=True)
 
 
-def _wait_for_termination(writer):
+def _wait_for_termination(ready, writer):
     writer.send({"status": "ready"})
+    ready.set()
     threading.Event().wait(_TIMEOUT_S * 10)
 
 
-def _engine_startup_failure(signum, writer):
+def _report_and_exit(writer):
+    writer.send({"status": "ready"})
+
+
+def _fail_after_ready(signals, peer_ready, writer):
+    """A rank that reports ready and, once its peer has too, fails the way
+    ``ts-host`` does: it signals its launcher (SIGUSR1; SIGQUIT from its
+    process-tree cleanup)."""
+    writer.send({"status": "ready"})
+    peer_ready.wait(_TIMEOUT_S)
+    for sig in signals:
+        os.kill(os.getppid(), sig)
+    threading.Event().wait(_TIMEOUT_S * 10)
+
+
+def _run_launcher(workers, server_args, path, writer):
+    """Run the headless launcher with its ranks replaced by ``workers``
+    (``(target, args)`` each), with ``path`` first on ``sys.path``, and
+    report how it ended and what of them it left running."""
+    # Spawned processes inherit this path, so they load what it holds.
+    sys.path[:0] = path
     from tokenspeed.runtime.entrypoints import engine as engine_module
     from tokenspeed.runtime.utils.server_args import ServerArgs
 
     started = []
 
-    def launch_without_model(server_args, port_args):
-        # Replace GPU/model loading only; Engine's constructor, failure handler,
-        # signal callbacks and process-tree shutdown are the real implementation.
-        register_child_failure_signals()
-        for _ in range(2):
-            proc, reader = start_process_with_ready_pipe(
-                _wait_for_termination, (), contextlib.nullcontext()
+    def start_without_model(server_args, port_args, metrics_relay, parent_death_signal):
+        # Replace GPU/model loading only: the launcher's supervision, signal
+        # handlers and process-tree shutdown are the real implementation.
+        for target, args in workers:
+            started.append(
+                start_process_with_ready_pipe(target, args, contextlib.nullcontext())
             )
-            started.append((proc, reader))
-            assert reader.poll(_TIMEOUT_S)
-            assert reader.recv() == {"status": "ready"}
-        os.kill(os.getpid(), signum)
-        raise AssertionError("child-failure signal did not unwind startup")
+        return [proc for proc, _ in started], [reader for _, reader in started]
 
-    args = ServerArgs(model="unused", device="cpu", world_size=1, nprocs_per_node=1)
     try:
         with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(engine_module, "_launch_subprocesses", launch_without_model)
+            patch.setattr(engine_module, "_start_ranks", start_without_model)
+            status = 0
             try:
-                engine_module.Engine(server_args=args)
-            except SystemExit as exc:
-                for proc, _ in started:
-                    proc.join(_TIMEOUT_S)
-                writer.send(
-                    {
-                        "status": exc.code,
-                        "exitcodes": [proc.exitcode for proc, _ in started],
-                        "alive": [proc.is_alive() for proc, _ in started],
-                    }
+                engine_module.launch_scheduler_headless(
+                    ServerArgs(
+                        model="unused",
+                        device="cpu",
+                        world_size=1,
+                        nprocs_per_node=1,
+                        **server_args,
+                    )
                 )
+            except SystemExit as exc:
+                status = exc.code
+            except RuntimeError:
+                # A failure the launcher sees before it has read every
+                # rank's readiness unwinds it this way; its process exits
+                # with 1.
+                status = 1
+        for proc, _ in started:
+            proc.join(_TIMEOUT_S)
+        writer.send(
+            {
+                "status": status,
+                "alive": [proc.is_alive() for proc, _ in started],
+                "exitcodes": [proc.exitcode for proc, _ in started],
+            }
+        )
     finally:
         for proc, reader in started:
             if proc.is_alive():
@@ -113,130 +149,80 @@ def _engine_startup_failure(signum, writer):
         writer.close()
 
 
-def _notify_failure(start, notified, signum, writer):
-    parent_pid = os.getppid()
-    writer.send({"status": "ready"})
-    assert start.wait(_TIMEOUT_S)
-    for sig in (signum, signal.SIGUSR1, signal.SIGQUIT):
-        os.kill(parent_pid, sig)
-    notified.set()
-    threading.Event().wait(_TIMEOUT_S * 10)
-
-
-@contextlib.contextmanager
-def _failure_signals_on_thread(trigger, pending_failure):
-    """Route worker signals away from the blocked main thread."""
-    failures = {signal.SIGUSR1, signal.SIGQUIT}
-    ready = threading.Event()
-    stop = threading.Event()
-
-    def receive_signals():
-        signal.pthread_sigmask(signal.SIG_UNBLOCK, failures)
-        ready.set()
-        # The owner holds this condition until wait() releases it. Its native
-        # wait must therefore start before the worker can send the first signal.
-        with pending_failure:
-            trigger.set()
-        stop.wait(_TIMEOUT_S * 10)
-
-    receiver = threading.Thread(target=receive_signals)
-    receiver.start()
+def _launch(workers, server_args=None, path=()):
+    """The launcher's report, from a child process that runs it."""
+    proc, reader = start_process_with_ready_pipe(
+        _run_launcher,
+        (workers, server_args or {}, list(path)),
+        contextlib.nullcontext(),
+    )
     try:
-        assert ready.wait(_TIMEOUT_S), "signal receiver did not start"
-        previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, failures)
-        try:
-            yield
-        finally:
-            signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+        # The child imports the engine stack and waits on its workers with
+        # their own _TIMEOUT_S budgets.
+        assert reader.poll(_TIMEOUT_S * 3), "the launcher did not finish"
+        result = reader.recv()
+        proc.join(_TIMEOUT_S)
+        assert proc.exitcode == 0
+        return result
     finally:
-        stop.set()
-        receiver.join(_TIMEOUT_S)
-        assert not receiver.is_alive(), "signal receiver did not stop"
+        _stop_supervisor(proc)
+        reader.close()
 
 
-def _repeated_failure_cleanup(signal_on_thread, writer):
-    from tokenspeed.runtime.entrypoints.engine import Engine
+def _stop_supervisor(proc):
+    if proc.is_alive():
+        # Test-only fallback must stop descendants if the regression hangs.
+        try:
+            for child in psutil.Process(proc.pid).children(recursive=True):
+                try:
+                    child.kill()
+                except psutil.NoSuchProcess:
+                    pass
+        except psutil.NoSuchProcess:
+            pass
+        proc.kill()
+    proc.join(_TIMEOUT_S)
 
-    # A launcher installed after a failed instance must receive its own first
-    # failure, even after an earlier launcher latched the shutdown state.
-    lifecycle_exitcodes = []
+
+@pytest.mark.parametrize("sig", [signal.SIGUSR1, signal.SIGQUIT])
+def test_a_rank_failure_signal_takes_every_rank_down(sig):
+    peer_ready = mp.Event()
+    result = _launch(
+        [
+            (_fail_after_ready, ((sig,), peer_ready)),
+            (_wait_for_termination, (peer_ready,)),
+        ]
+    )
+    assert result["status"] == 1
+    assert result["alive"] == [False, False]
+
+
+def test_repeated_failure_signals_cannot_interrupt_cleanup():
+    # Both kinds, twice: the first unwinds the launcher; none of the others
+    # may cut its cleanup short.
+    signals = (signal.SIGUSR1, signal.SIGQUIT, signal.SIGUSR1, signal.SIGQUIT)
+    peer_ready = mp.Event()
+    result = _launch(
+        [
+            (_fail_after_ready, (signals, peer_ready)),
+            (_wait_for_termination, (peer_ready,)),
+        ]
+    )
+    assert result["status"] == 1
+    assert result["alive"] == [False, False]
+
+
+def test_a_launcher_installed_after_a_failure_receives_its_own():
+    # A launcher started after a failed one in the same process must receive
+    # its own first failure, even after the earlier one latched the shutdown.
+    exitcodes = []
     for _ in range(2):
         register_child_failure_signals()
         try:
             os.kill(os.getpid(), signal.SIGUSR1)
         except SystemExit as exc:
-            lifecycle_exitcodes.append(exc.code)
-
-    register_child_failure_signals()
-    triggers = [mp.Event(), mp.Event()]
-    notified = [mp.Event(), mp.Event()]
-    started = [
-        start_process_with_ready_pipe(
-            _notify_failure,
-            (trigger, sent, sig),
-            contextlib.nullcontext(),
-        )
-        for trigger, sent, sig in zip(
-            triggers, notified, (signal.SIGUSR1, signal.SIGQUIT)
-        )
-    ]
-    engine = Engine.__new__(Engine)
-    engine.llm = None
-    engine.tokenizer_manager = None
-    finished_cleanup = False
-    outcome = "failure signal was not delivered"
-    try:
-        for _, reader in started:
-            assert reader.poll(_TIMEOUT_S)
-            assert reader.recv() == {"status": "ready"}
-        try:
-            pending_failure = threading.Condition()
-            with pending_failure:
-                signal_context = (
-                    _failure_signals_on_thread(triggers[0], pending_failure)
-                    if signal_on_thread
-                    else contextlib.nullcontext()
-                )
-                with signal_context:
-                    if not signal_on_thread:
-                        triggers[0].set()
-                    # A native library thread may receive the OS signal while
-                    # Python's handler stays pending until the main thread runs
-                    # again. Return to Python before the second worker times out.
-                    deadline = time.monotonic() + _TIMEOUT_S
-                    while time.monotonic() < deadline:
-                        pending_failure.wait(0.1)
-        except SystemExit as exc:
-            outcome = exc.code
-        finally:
-            # The second real worker reports only after the owner is already
-            # unwinding. Its notifications must not bypass actual Engine cleanup.
-            triggers[1].set()
-            assert all(event.wait(_TIMEOUT_S) for event in notified)
-            engine.shutdown()
-            finished_cleanup = True
-    except SystemExit:
-        # Record the failed behavior before fallback cleanup can hide survivors.
-        outcome = "cleanup interrupted"
-    finally:
-        if finished_cleanup:
-            for proc, _ in started:
-                proc.join(_TIMEOUT_S)
-        writer.send(
-            {
-                "lifecycle_exitcodes": lifecycle_exitcodes,
-                "outcome": outcome,
-                "finished_cleanup": finished_cleanup,
-                "alive": [proc.is_alive() for proc, _ in started],
-                "exitcodes": [proc.exitcode for proc, _ in started],
-            }
-        )
-        for proc, reader in started:
-            if proc.is_alive():
-                proc.kill()
-            proc.join(_TIMEOUT_S)
-            reader.close()
-        writer.close()
+            exitcodes.append(exc.code)
+    assert exitcodes == [1, 1]
 
 
 # A metric reporter plugin whose sink records that it was closed.
@@ -281,103 +267,24 @@ def _install_relay_probe(directory):
     )
 
 
-def _engine_shutdown_with_relay(directory, marker, writer):
-    # The relay's spawned process inherits this path, so it loads the probe.
-    sys.path.insert(0, directory)
-    from tokenspeed.runtime.engine.async_llm import AsyncLLM
-    from tokenspeed.runtime.entrypoints.engine import Engine
-    from tokenspeed.runtime.metrics.relay import MetricsRelay
-
-    relay = MetricsRelay({"relay-probe": {"path": marker}})
-    # Bypass model and network construction only: the relay and the shutdown
-    # are the real implementation.
-    tokenizer_manager = AsyncLLM.__new__(AsyncLLM)
-    tokenizer_manager.bootstrap_server = None
-    tokenizer_manager.metrics_relay = relay
-    engine = Engine.__new__(Engine)
-    engine.llm = None
-    engine.tokenizer_manager = tokenizer_manager
-    engine.shutdown()
-    writer.send(open(marker).read() if os.path.exists(marker) else None)
-
-
-def _stop_supervisor(proc):
-    if proc.is_alive():
-        # Test-only fallback must stop descendants if the regression hangs.
-        try:
-            for child in psutil.Process(proc.pid).children(recursive=True):
-                try:
-                    child.kill()
-                except psutil.NoSuchProcess:
-                    pass
-        except psutil.NoSuchProcess:
-            pass
-        proc.kill()
-    proc.join(_TIMEOUT_S)
-
-
-def test_engine_startup_signal_owns_worker_cleanup():
-    # SIGUSR1 and SIGQUIT share one handler; the repeated-signal test below
-    # delivers both.
-    proc, reader = start_process_with_ready_pipe(
-        _engine_startup_failure, (signal.SIGUSR1,), contextlib.nullcontext()
-    )
-    try:
-        assert reader.poll(_TIMEOUT_S), "Engine did not finish startup cleanup"
-        result = reader.recv()
-        assert result["status"] == 1
-        assert result["alive"] == [False, False]
-        assert result["exitcodes"] == [-signal.SIGKILL, -signal.SIGKILL]
-        proc.join(_TIMEOUT_S)
-        assert proc.exitcode == 0
-    finally:
-        _stop_supervisor(proc)
-        reader.close()
-
-
-@pytest.mark.parametrize("signal_on_thread", [False, True], ids=["main", "thread"])
-def test_repeated_failure_signals_cannot_interrupt_owner_cleanup(signal_on_thread):
-    proc, reader = start_process_with_ready_pipe(
-        _repeated_failure_cleanup, (signal_on_thread,), contextlib.nullcontext()
-    )
-    try:
-        # The child imports the engine stack and waits on two spawned workers
-        # with their own _TIMEOUT_S budgets, so its worst case exceeds a
-        # single _TIMEOUT_S on a busy runner.
-        assert reader.poll(
-            _TIMEOUT_S * 3
-        ), "owner did not finish repeated-signal cleanup"
-        result = reader.recv()
-        assert result["lifecycle_exitcodes"] == [1, 1]
-        assert result["outcome"] == 1
-        assert result["finished_cleanup"]
-        assert result["alive"] == [False, False]
-        assert result["exitcodes"] == [-signal.SIGKILL, -signal.SIGKILL]
-        proc.join(_TIMEOUT_S)
-        assert proc.exitcode == 0
-    finally:
-        _stop_supervisor(proc)
-        reader.close()
-
-
-def test_engine_shutdown_lets_the_metrics_relay_flush(tmp_path):
+def test_the_launcher_lets_the_metrics_relay_flush(tmp_path):
     # The relay closes its sinks on a stop; killed with the process tree, it
     # would drop what they still buffer.
     _install_relay_probe(tmp_path)
     marker = tmp_path / "closed"
-    proc, reader = start_process_with_ready_pipe(
-        _engine_shutdown_with_relay,
-        (str(tmp_path), str(marker)),
-        contextlib.nullcontext(),
+    config = tmp_path / "reporters.json"
+    config.write_text(json.dumps({"relay-probe": {"path": str(marker)}}))
+    result = _launch(
+        [(_report_and_exit, ())],
+        {
+            "enable_metrics": True,
+            "metrics_reporters": ["relay-probe"],
+            "metrics_reporter_config": str(config),
+        },
+        path=[str(tmp_path)],
     )
-    try:
-        assert reader.poll(_TIMEOUT_S), "Engine did not finish its shutdown"
-        assert reader.recv() == "closed"
-        proc.join(_TIMEOUT_S)
-        assert proc.exitcode == 0
-    finally:
-        _stop_supervisor(proc)
-        reader.close()
+    assert result["status"] == 0
+    assert marker.read_text() == "closed"
 
 
 if __name__ == "__main__":

@@ -790,10 +790,10 @@ index 173998b089af816e873dac5d67ae12f3ab1acc30..74c5957e8f88867648da03a3545b9dcd
 +}
 +
 diff --git a/flashinfer/fused_moe/core.py b/flashinfer/fused_moe/core.py
-index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd464150b97b00 100644
+index 70e0fa9a3e25c61d9232cbc831efedb15b0be1e4..7eb6b1fb6c229d3a819b3895b1d38984b70d652d 100644
 --- a/flashinfer/fused_moe/core.py
 +++ b/flashinfer/fused_moe/core.py
-@@ -647,0 +648,23 @@
+@@ -627,0 +628,23 @@
 +def _validate_cutlass_moe_expected_m(
 +    expected_m: Optional[int],
 +    *,
@@ -817,7 +817,7 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd4641
 +        )
 +
 +
-@@ -649 +672,9 @@
+@@ -629 +652,9 @@
 -def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = False):
 +def get_cutlass_fused_moe_module(
 +    backend: str = "100",
@@ -828,27 +828,27 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd4641
 +    """Build and cache CUTLASS MoE operations and their workspace-size query."""
 +    if enable_sm90_moe_optimizations and backend != "90":
 +        raise ValueError("SM90 MoE optimizations require the SM90 backend")
-@@ -657 +688,4 @@
+@@ -637 +668,4 @@
 -        module = gen_cutlass_fused_moe_sm90_module(use_fast_build).build_and_load()
 +        module = gen_cutlass_fused_moe_sm90_module(
 +            use_fast_build,
 +            enable_sm90_moe_optimizations=enable_sm90_moe_optimizations,
 +        ).build_and_load()
-@@ -800 +834 @@
+@@ -780 +814 @@
 -            )
 +            ) + (("sm90_grouped_optimized",) if enable_sm90_moe_optimizations else ())
-@@ -981,0 +1016,4 @@
+@@ -961,0 +996,4 @@
 +    op_name = "flashinfer::cutlass_fused_moe"
 +    if enable_sm90_moe_optimizations:
 +        op_name += "_sm90_grouped_optimized"
 +
-@@ -983 +1021 @@
+@@ -963 +1001 @@
 -        "flashinfer::cutlass_fused_moe",
 +        op_name,
-@@ -1023,0 +1062,2 @@
+@@ -1003,0 +1042,2 @@
 +        expected_m: Optional[int] = None,
 +        prepared_input: Optional[List[torch.Tensor]] = None,
-@@ -1024,0 +1065,12 @@
+@@ -1004,0 +1045,12 @@
 +        """Execute CUTLASS MoE with the selected tactics and workspace.
 +
 +        Forward expected_m to both DeepSeek FP8 block-scale expert GEMMs for
@@ -861,29 +861,29 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd4641
 +                min_latency_mode=min_latency_mode,
 +                backend="cutlass",
 +            )
-@@ -1151,0 +1204,5 @@
+@@ -1131,0 +1184,5 @@
 +            *(
 +                []
 +                if min_latency_mode
 +                else [expected_m if expected_m is not None else -1, prepared_input]
 +            ),
-@@ -1165 +1222 @@
+@@ -1145 +1202 @@
 -    @register_fake_op("flashinfer::cutlass_fused_moe")
 +    @register_fake_op(op_name)
-@@ -1203,0 +1261,2 @@
+@@ -1183,0 +1241,2 @@
 +        expected_m: Optional[int] = None,
 +        prepared_input: Optional[List[torch.Tensor]] = None,
-@@ -1204,0 +1264,5 @@
+@@ -1184,0 +1244,5 @@
 +        """Infer output tensors for fake execution of the CUTLASS MoE operation.
 +
 +        Minimum-latency mode also returns expert-routing metadata. The
 +        expected_m scheduling hint does not affect output shapes or dtypes.
 +        """
-@@ -1336,0 +1401,3 @@
+@@ -1316,0 +1381,3 @@
 +    expected_m: Optional[int] = None,
 +    enable_sm90_moe_optimizations: bool = False,
 +    prepared_input: Optional[List[torch.Tensor]] = None,
-@@ -1522,0 +1590,18 @@
+@@ -1502,0 +1570,18 @@
 +    expected_m : Optional[int]
 +        Expected number of tokens per local expert for DeepGEMM configuration selection.
 +        Supported only by CUTLASS DeepSeek FP8 block-scale MoE on SM90 with DeepGEMM
@@ -902,7 +902,7 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd4641
 +        Choose this option before warmup and CUDA graph capture. Modules, native
 +        kernel caches and tuning keys are separate for the two configurations.
 +
-@@ -1542,0 +1628,15 @@
+@@ -1522,0 +1608,15 @@
 +    if type(enable_sm90_moe_optimizations) is not bool:
 +        raise TypeError("enable_sm90_moe_optimizations must be a bool")
 +    if enable_sm90_moe_optimizations and (
@@ -918,11 +918,11 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd4641
 +            min_latency_mode=min_latency_mode,
 +            backend=backend,
 +        )
-@@ -1623,0 +1724,3 @@
+@@ -1603,0 +1704,3 @@
 +    if prepared_input is not None:
 +        if not use_deepseek_fp8_block_scale or min_latency_mode or enable_alltoall or tp_size != 1:
 +            raise ValueError("Prepared input requires SM90 block-FP8 without TP/all-to-all")
-@@ -1634 +1737,7 @@
+@@ -1614 +1717,7 @@
 -        return get_cutlass_fused_moe_module(device_arch).cutlass_fused_moe(
 +        if enable_sm90_moe_optimizations:
 +            module = get_cutlass_fused_moe_module(
@@ -931,6 +931,6 @@ index 68a9c34e8971c153c8c4961789c8047b1b1f76e0..5ac1cfe43028ccd4c7085adfb8cd4641
 +        else:
 +            module = get_cutlass_fused_moe_module(device_arch)
 +        return module.cutlass_fused_moe(
-@@ -1671,0 +1781,2 @@
+@@ -1651,0 +1761,2 @@
 +            expected_m=expected_m,
 +            prepared_input=prepared_input,
