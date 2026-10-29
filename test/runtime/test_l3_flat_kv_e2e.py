@@ -200,7 +200,11 @@ class TestL3FlatKvRoundTripTest:
                 )
                 stack.callback(executor.shutdown)
                 ownership = BlockOwnerTranslation.for_host_pool(
-                    layout, contract, num_host_lcm_blocks=8, rank=rank
+                    layout,
+                    contract,
+                    num_host_lcm_blocks=8,
+                    rank=rank,
+                    host_group_packing=executor.host_storage.group_packing,
                 )
                 # Both ranks' executors share the process's in-memory store.
                 l3 = host_storage_executor(

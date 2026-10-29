@@ -237,7 +237,7 @@ PrefillOperation applyPrefillEvent(Request& request, Event& event, const CacheCo
         for (std::size_t i = 0; i < group_ids.size(); ++i) {
             if (const CacheBlockRef& block = cache_progress.state_checkpoint_blocks[i]) {
                 operation.block_tables[group_ids[i]].push_back(
-                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(block->Location()));
+                    coordinator.Allocator(static_cast<std::int32_t>(i)).ResolveCacheBlockId(*block));
             }
         }
     }

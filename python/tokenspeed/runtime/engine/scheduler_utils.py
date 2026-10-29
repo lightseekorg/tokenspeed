@@ -113,6 +113,7 @@ def make_config(
     role: str,
     *,
     num_snapshot_pages: int,
+    host_group_packing: Sequence[int],
     max_retracted_requests: int,
     storage_config: StorageConfig | None,
     host_write_policy: str,
@@ -141,6 +142,8 @@ def make_config(
         role: ``server_args.disaggregation_mode``.
         num_snapshot_pages: The retraction snapshot pool's LCM blocks
             including the null page (``DeviceSpecs.num_snapshot_pages``).
+        host_group_packing: Virtual children per compact Host parent in
+            scheduler group order; empty when both Host pools are absent.
             Required on every role: 1 -- the null page alone -- means no
             image can be taken, so a capacity-blocked round aborts the newest
             resident instead of suspending anyone; more enables suspend and
@@ -201,6 +204,7 @@ def make_config(
 
     cfg.num_host_pages = num_host_pages
     cfg.num_snapshot_pages = num_snapshot_pages
+    cfg.host_group_packing = list(host_group_packing)
     cfg.max_retracted_requests = max_retracted_requests
     cfg.debug_force_retraction_interval = debug_force_retraction_interval
     cfg.storage_config = storage_config

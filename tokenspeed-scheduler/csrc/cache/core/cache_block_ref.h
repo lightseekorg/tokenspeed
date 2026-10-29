@@ -54,6 +54,7 @@ public:
     ~CacheBlock() noexcept;
 
     CacheBlockLocation Location() const noexcept { return location_; }
+    const BlockPool& OwnerPool() const noexcept { return *pool_; }
     bool IsOwnedBy(const BlockPool& pool) const noexcept { return pool_ == &pool; }
 
 private:

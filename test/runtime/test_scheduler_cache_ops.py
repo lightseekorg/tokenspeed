@@ -201,6 +201,7 @@ def _config(**overrides):
         enable_l3_storage=False,
         role="fused",
         num_snapshot_pages=1,
+        host_group_packing=(),
         max_retracted_requests=0,
         host_write_policy="write_through",
         storage_config=None,
@@ -244,6 +245,7 @@ def test_make_config_requires_storage_limits_exactly_with_l3():
         _config(num_host_pages=8, disable_l2_cache=False, enable_l3_storage=True)
     config = _config(
         num_host_pages=8,
+        host_group_packing=(1,),
         disable_l2_cache=False,
         enable_l3_storage=True,
         storage_config=limits,

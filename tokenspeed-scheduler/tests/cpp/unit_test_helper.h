@@ -26,7 +26,21 @@
 
 #include <gtest/gtest.h>
 
+#include "scheduler/types.h"
+
 namespace tokenspeed::test {
+
+// Existing scheduling scenarios explicitly choose the same physical packing
+// on every tier. Tests for compact Host geometry construct their config directly.
+inline SchedulerConfig WithHostPackingFromDevice(SchedulerConfig config) {
+    config.host_group_packing.clear();
+    if (config.HasHostCache() || config.HasSnapshotPool()) {
+        for (const CacheGroupConfig& group : config.cache_groups) {
+            config.host_group_packing.push_back(group.cache_blocks_per_lcm_block);
+        }
+    }
+    return config;
+}
 
 // Generate a consecutive token sequence for test inputs.
 inline std::vector<std::int32_t> MakeTokens(int32_t count, std::int32_t start = 1) {

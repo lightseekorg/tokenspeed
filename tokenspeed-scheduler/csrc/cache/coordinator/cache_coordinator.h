@@ -527,6 +527,9 @@ public:
         HostEvictionCounts tail_cap;
         // ClearCache, after the Device clear, so never device_resident.
         HostEvictionCounts flush;
+        // A segment plan reclaimed a prefix-closed KV copy independently of
+        // the boundary's checkpoints, while the Device still held its key.
+        HostEvictionCounts duplicate_kv;
     };
     struct HostAllocationStats {
         std::size_t requested{0};
@@ -581,19 +584,25 @@ public:
     // holds a checkpoint there; one missing another group's is dead) with the
     // Host pages above it that only it depends on, up to one in use, and the
     // Host pages under them, or only its checkpoints while deeper Host
-    // checkpoint boundaries still read its page; a Host page no Host checkpoint
-    // boundary depends on (without State groups: a page no Host page continues,
-    // a Host leaf) goes with the Host pages under it. One member in use passes
-    // the whole victim over, as does a parent page an eviction write-back is
-    // bringing to the Host (it would arrive with nothing under it). Victims go
+    // checkpoint boundaries still read its page, or if a history pin blocks
+    // the segment while every State group at the boundary is unpinned; a Host
+    // page no Host checkpoint boundary depends on (without State groups: a
+    // page no Host page continues, a Host leaf) goes with the Host pages under
+    // it. Chosen victims never contain a member in use. A pending write-back
+    // of the parent page also blocks the victim: the page would otherwise
+    // arrive with nothing under it. Victims go
     // by class: dead entries (a checkpoint boundary missing a State group's
     // checkpoint, a tail no probe enumerates, a page no Host checkpoint
     // boundary depends on -- even one with a Device checkpoint boundary under
     // it, which CollectDeadEntries, counting both tiers, would keep) first;
     // then duplicates of a boundary the Device resumes and checkpoint
     // boundaries a deeper Device checkpoint boundary on their chain
-    // supersedes, the newest Device copy first; then Host-only cache, least
-    // recently used first. Once a victim took every Host page under the page
+    // supersedes (both aligned boundaries and tails need a shared State access epoch proving the
+    // continuation), the newest Device copy first; then Host-only cache, least
+    // recently used first. With State groups, an unheld Device KV copy's Host
+    // duplicate joins that LRU rank at its Device access epoch, winning ties.
+    // A held Device KV copy's duplicate stays ahead of Host-only State.
+    // Once a victim took every Host page under the page
     // above it, that page is a candidate too. The restore pass then returns,
     // newest first, each victim the placed segments can do without and whose
     // parent page stays. A dropped segment's rows hold empty references. A
@@ -830,6 +839,9 @@ private:
         std::size_t num_placed{0};
         std::vector<Victim> victims;
     };
+    // Unpinned Host KV copies backed by a contiguous Device KV prefix,
+    // excluding pages a sliding group can force into a Host suffix.
+    std::vector<HostPlacementPlan::Victim> hostKvDuplicateCandidates() const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
@@ -1007,6 +1019,9 @@ private:
     // it), and a node no prefix-closed group holds on either tier and no store
     // is bringing (a gap).
     void syncTreeNode(const ContentHash& hash);
+    // Refresh the closed-group coverage and duplicate membership after a
+    // publication, restore, or link gives an existing hash its parent.
+    void syncKvCoverage(BoundaryTree::Node& node);
     // Whether an imaged slot belongs to the page the computed frontier ends
     // inside: the restored request writes and later republishes those blocks,
     // so they are copied, never claimed. Every slot below is immutable.

@@ -276,6 +276,8 @@ class DeviceSpecs:
             (``cache/l2/sizing.py``); 1 (the null page alone) without a
             pool, when nothing can be imaged and a capacity-blocked round
             aborts a resident instead.
+        host_group_packing: Virtual children per compact Host parent, for
+            both Host tiers; independent of Device kernel strides.
         max_retracted_requests: Slot-state image rows of the snapshot pool,
             i.e. how many requests may be retracted at once; 0 without a
             pool.
@@ -297,6 +299,7 @@ class DeviceSpecs:
     cache_state_group_ids: tuple[str, ...]
     num_host_pages: int
     num_snapshot_pages: int
+    host_group_packing: tuple[int, ...]
     max_retracted_requests: int
     expert_rebalance: ExpertRebalanceSpecs | None
 
@@ -1141,6 +1144,7 @@ def _retraction_pool_request(
     server_args,
     contract,
     *,
+    host_group_packing,
     max_batch_size: int,
     max_context_len: int,
     decode_input_tokens: int,
@@ -1169,7 +1173,7 @@ def _retraction_pool_request(
         model = capacity_model(
             contract.group_specs,
             prefix_granularity=contract.prefix_granularity,
-            virtual_packing=contract.virtual_packing,
+            virtual_packing=host_group_packing,
             limits=SchedulerLimits(
                 role=scheduler_role(server_args.disaggregation_mode),
                 max_live_requests=max_batch_size,
@@ -1443,9 +1447,34 @@ def build_device_side(
     # executor lists, so it is built after it.
     host_cache_executor = None
     host_cache = None
+    host_tail_packing = {}
+    if server_args.enable_kvstore:
+        from tokenspeed.runtime.cache.host_storage import compute_host_group_packing
+        from tokenspeed.runtime.cache.transfer.layout import (
+            combine_cache_transfer_layouts,
+        )
+
+        contract = views.token_to_kv_pool.arena.runtime_contract
+        layout = combine_cache_transfer_layouts(
+            views.token_to_kv_pool.cache_transfer_layout(),
+            (
+                views.draft_token_to_kv_pool.cache_transfer_layout()
+                if views.draft_token_to_kv_pool is not None
+                else None
+            ),
+            group_ids=tuple(spec.group_id for spec in contract.group_specs),
+        )
+        shards = {spec.group_id: spec.shard_count for spec in contract.group_specs}
+        host_tail_packing = {
+            group.group_id: packing * shards[group.group_id]
+            for group, packing in zip(
+                layout.groups, compute_host_group_packing(layout), strict=True
+            )
+        }
     snapshot_pool = _retraction_pool_request(
         server_args,
         views.token_to_kv_pool.arena.runtime_contract,
+        host_group_packing=host_tail_packing,
         max_batch_size=max_batch_size,
         max_context_len=model_config.context_len + server_args.spec_context_pad,
         decode_input_tokens=decode_input_tokens,
@@ -1539,6 +1568,11 @@ def build_device_side(
             host_cache_executor.num_snapshot_pages
             if host_cache_executor is not None
             else 1
+        ),
+        host_group_packing=(
+            host_cache_executor.host_group_packing
+            if host_cache_executor is not None
+            else ()
         ),
         max_retracted_requests=(
             host_cache_executor.max_retracted_requests

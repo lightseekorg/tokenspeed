@@ -1145,10 +1145,9 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                                     std::int32_t available_tokens) {
         GroupAllocator& allocator = groups_[i].Allocator();
         const CacheBlockRef replaced = allocator.SwapInFreshBlock(pool_, table, slot, available_tokens);
-        const std::int32_t destination =
-            allocator.ResolveCacheBlockId(table.Blocks()[static_cast<std::size_t>(slot)]->Location());
+        const std::int32_t destination = allocator.ResolveCacheBlockId(*table.Blocks()[static_cast<std::size_t>(slot)]);
         if (replaced) {
-            result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(replaced->Location()), destination);
+            result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*replaced), destination);
         } else {
             result.new_page_ids[i].push_back(destination);
         }
@@ -1288,17 +1287,16 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
             // blocks from its first admission on.
             if (step.kind == StateStep::Kind::kRotate && shaped_now[i] && !table.Blocks()[0]) {
                 FatalCheck(allocator.AcquireStateInput(pool_, table), "admission plan no longer fits the block pool");
-                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(table.Blocks()[0]->Location()));
+                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*table.Blocks()[0]));
             }
             if (step.kind == StateStep::Kind::kRotate || step.kind == StateStep::Kind::kLand) {
                 FatalCheck(allocator.AcquireStateLive(pool_, table), "admission plan no longer fits the block pool");
-                const std::int32_t live = allocator.ResolveCacheBlockId(table.Blocks()[1]->Location());
+                const std::int32_t live = allocator.ResolveCacheBlockId(*table.Blocks()[1]);
                 if (step.kind == StateStep::Kind::kLand && state_prefix_cached) {
                     // The peer omits this state transfer. A bootstrap token
                     // can finish the request before any decode writes live.
                     _assert(static_cast<bool>(table.Blocks()[0]), "an exact state hit must have an input checkpoint");
-                    result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(table.Blocks()[0]->Location()),
-                                                         live);
+                    result.pages_to_copy[i].emplace_back(allocator.ResolveCacheBlockId(*table.Blocks()[0]), live);
                 } else {
                     result.new_page_ids[i].push_back(live);
                 }
@@ -1307,7 +1305,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 _assert(step.kind == StateStep::Kind::kRotate, "an in-forward checkpoint rides a prefill chunk");
                 CacheBlockRef checkpoint = allocator.AcquireStateCheckpoint(pool_, table);
                 FatalCheck(static_cast<bool>(checkpoint), "admission plan no longer fits the block pool");
-                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(checkpoint->Location()));
+                result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*checkpoint));
                 result.state_checkpoint_blocks[i] = std::move(checkpoint);
             }
             continue;
@@ -1332,7 +1330,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Admit(
                 continue;
             }
             result.new_page_ids[i].push_back(
-                groups_[i].Allocator().ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
+                groups_[i].Allocator().ResolveCacheBlockId(*blocks[static_cast<std::size_t>(block)]));
         }
     }
     return result;
@@ -1482,8 +1480,7 @@ std::optional<CacheCoordinator::AdmissionResult> CacheCoordinator::Restore(const
                    "restore plan no longer fits the block pool");
         const std::span<const CacheBlockRef> blocks = table.Blocks();
         for (std::int32_t block = first_new_block; block < table.NumBlocks(); ++block) {
-            result.new_page_ids[i].push_back(
-                allocator.ResolveCacheBlockId(blocks[static_cast<std::size_t>(block)]->Location()));
+            result.new_page_ids[i].push_back(allocator.ResolveCacheBlockId(*blocks[static_cast<std::size_t>(block)]));
         }
     }
     return result;
