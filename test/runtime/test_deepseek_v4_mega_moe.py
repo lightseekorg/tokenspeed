@@ -14,6 +14,7 @@
 
 import os
 import sys
+from dataclasses import replace
 
 import pytest
 import torch
@@ -108,9 +109,17 @@ def _mapping(*, dense_tp: int, moe_tp: int):
 @pytest.fixture
 def shared_moe(monkeypatch):
     from tokenspeed_kernel.ops.moe import deep_gemm
+    from tokenspeed_kernel.platform import ArchVersion, Platform, current_platform
 
     from tokenspeed.runtime.configs.deepseek_v41_config import DeepseekV41TextConfig
     from tokenspeed.runtime.layers.moe import expert, utils
+
+    # These CPU model checks must select the CPU router on GPU CI hosts too.
+    monkeypatch.setattr(
+        Platform,
+        "_instance",
+        replace(current_platform(), vendor="cpu", arch_version=ArchVersion(0, 0)),
+    )
 
     def cpu_plan(weight_dtype, **kwargs):
         # Selecting a native MegaMoE kernel requires GPU capability discovery.

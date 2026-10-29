@@ -2946,6 +2946,8 @@ def _mock_loader_hardware(monkeypatch, mapping):
         expert_module,
         "kernel_moe_plan",
         lambda *args, **kwargs: {
+            **kwargs,
+            "apply_kernel_name": "deep_gemm_mxfp4_mega_moe_apply",
             "solution": "mega_moe",
             "support_routing": False,
             "supports_precomputed_topk": True,

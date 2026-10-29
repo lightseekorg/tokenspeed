@@ -28,6 +28,7 @@ import torch
 from tokenspeed_kernel.ops.moe import deep_gemm as mega_backend
 from tokenspeed_kernel.ops.moe import moe_supports_shared_expert_fusion
 from tokenspeed_kernel.ops.moe._deep_gemm.mega_moe_stage import (
+    _stage_mxfp4_mega_moe_inputs_kernel,
     mega_moe_shared_sf_row,
     stage_mxfp4_mega_moe_inputs,
 )
@@ -36,6 +37,7 @@ from tokenspeed_kernel.ops.moe.deep_gemm import (
     _DeepGemmMegaMoEState,
 )
 from tokenspeed_kernel.selection import kernel_override
+from utils import assert_no_triton_compile
 
 _HIDDEN_SIZE = 256
 _SHARED_WIDTH = 2304
@@ -349,3 +351,55 @@ def test_shared_scale_store_handles_offsets_beyond_int32():
     finally:
         del shared_sf
         torch.cuda.empty_cache()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires NVIDIA GPU",
+)
+def test_shared_staging_reuses_warmed_native_tiles():
+    import deep_gemm
+
+    max_tokens, hidden, top_k = 4096, 256, 6
+
+    def block_m(tokens):
+        return deep_gemm.get_block_m_for_mega_moe(
+            4, 384, max_tokens, tokens, top_k, "fp8xfp4"
+        )
+
+    x = torch.zeros((max_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+    ids = torch.zeros((max_tokens, top_k), dtype=torch.int64, device="cuda")
+    weights = torch.ones((max_tokens, top_k), dtype=torch.float32, device="cuda")
+    x_fp8 = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    x_sf = torch.empty((max_tokens, hidden // 128), dtype=torch.int32, device="cuda")
+    ids_out, weights_out = torch.empty_like(ids), torch.empty_like(weights)
+    # Reserve enough 128-row scale pages for every tile size in the sweep.
+    shared_sf = torch.empty(
+        (hidden // 128, max_tokens * 128), dtype=torch.int32, device="cuda"
+    ).t()
+
+    def stage(tokens, tile):
+        stage_mxfp4_mega_moe_inputs(
+            x[:tokens],
+            weights[:tokens],
+            ids[:tokens],
+            x_fp8[:tokens],
+            x_sf[:tokens],
+            ids_out[:tokens],
+            weights_out[:tokens],
+            shared_l1_acts_sf=shared_sf,
+            shared_block_m=tile,
+        )
+
+    # Warm exactly the buckets reached by the production warmup schedule.
+    warmups = {}
+    for tokens in mega_backend._warmup_m_values(max_tokens):
+        if tokens:
+            warmups.setdefault(block_m(tokens), tokens)
+    for tile, tokens in warmups.items():
+        stage(tokens, tile)
+
+    with assert_no_triton_compile(_stage_mxfp4_mega_moe_inputs_kernel):
+        for tokens in range(max_tokens + 1):
+            stage(tokens, block_m(tokens))
+    torch.cuda.synchronize()

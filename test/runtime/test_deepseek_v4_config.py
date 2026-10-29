@@ -653,11 +653,17 @@ class TestDeepseekV4Config:
             assert (tuple(router_logits.shape)) == ((states.shape[0], 4))
             return object()
 
-        def routed_experts(**kwargs):
-            calls.append("routed")
-            assert (kwargs["hidden_states"]) is (hidden_states)
-            assert (kwargs["topk_output"]) is not None
-            return hidden_states + 1
+        class RoutedExperts(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.plan = {"apply_kernel_name": "deep_gemm_mxfp4_mega_moe_apply"}
+                self._moe_backend_state = None
+
+            def forward(self, **kwargs):
+                calls.append("routed")
+                assert kwargs["hidden_states"] is hidden_states
+                assert kwargs["topk_output"] is not None
+                return hidden_states + 1
 
         moe = SimpleNamespace(
             use_mega_moe=True,
@@ -666,7 +672,7 @@ class TestDeepseekV4Config:
             shared_experts=shared_experts,
             stream_fork=StreamFork(None),
             routed_scaling_factor=1.0,
-            experts=routed_experts,
+            experts=RoutedExperts(),
             topk=topk,
             _routing_inputs=routing_inputs,
         )
