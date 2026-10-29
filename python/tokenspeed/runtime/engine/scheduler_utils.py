@@ -175,6 +175,10 @@ def make_config(
             spans a long prompt's last prefix-page boundary before its replay
             tail also writes the State checkpoint there. Requires prefix
             caching.
+        max_kv_page_num: Per-local-prefill-batch budget for the sum of
+            ``ceil((cached prefix + current chunk) / prefix_granularity)``
+            across requests. 0 leaves the budget unbounded. Derived from
+            ``--chunk-prefill-kv-size``.
     """
     if not 0 <= prefix_replay_tokens <= (1 << 31) - 1:
         raise ValueError(
