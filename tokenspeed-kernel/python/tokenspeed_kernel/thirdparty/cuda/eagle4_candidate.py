@@ -20,18 +20,15 @@
 
 """EAGLE-4 low-rank candidate head kernels (SM90+, thread-block clusters); see
 ``csrc/eagle4_candidate.cu``. Both reproduce the torch ops they replace bit for
-bit; ``eagle4_candidate_supports`` says which heads they cover, and a launch
-outside it raises."""
+bit. ``tokenspeed_kernel.ops.sampling.eagle4_candidate_supports`` says which
+heads they cover, and a launch outside it raises."""
 
 import functools
 from pathlib import Path
 
 import torch
 
-__all__ = ["eagle4_candidate_supports", "eagle4_candidate_tail", "eagle4_shard_topk"]
-
-# The shard top-k's widest launch: 8-CTA clusters of 1024 threads x 32 elements.
-_MAX_SHARD_VOCAB = 8 * 1024 * 32
+__all__ = ["eagle4_candidate_tail", "eagle4_shard_topk"]
 
 
 @functools.cache
@@ -47,21 +44,6 @@ def _module():
             "Run: pip install -e tokenspeed_kernel/python/"
         )
     return tvm_ffi.load_module(str(so_path))
-
-
-def eagle4_candidate_supports(
-    dtype: torch.dtype, shard_vocab: int, num_candidates: int, ranks: int
-) -> bool:
-    """Whether both kernels cover a candidate head: bf16 logits, ``ranks``
-    vocab shards of ``shard_vocab`` (at most 262144) tokens, and
-    ``num_candidates`` in 32, 64, 128 or 256 with ``ranks * num_candidates <=
-    1024``. The tail also takes a draft top-k of at most 32."""
-    return (
-        dtype == torch.bfloat16
-        and num_candidates <= shard_vocab <= _MAX_SHARD_VOCAB
-        and num_candidates in (32, 64, 128, 256)
-        and ranks * num_candidates <= 1024
-    )
 
 
 def eagle4_shard_topk(

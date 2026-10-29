@@ -40,7 +40,7 @@ CUDA error); the drafter refuses such a round on the host before launching it.
 from __future__ import annotations
 
 import torch
-from tokenspeed_kernel.thirdparty.cuda.eagle_harness_chain import (
+from tokenspeed_kernel.ops.sampling.eagle_harness import (
     eagle_harness_chain_destroy,
     eagle_harness_chain_instantiate,
     eagle_harness_chain_load,

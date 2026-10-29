@@ -62,7 +62,7 @@ register_cuda_ci(
     est_time=5,
     suite="runtime-1gpu",
     disabled_on_runners=["amd-*"],
-    disabled_on_runners_reason="the EAGLE-4 candidate head kernels are NVIDIA-only",
+    disabled_on_runners_reason="no AMD MoE kernel for the latent MoE's relu2 experts",
 )
 
 _HIDDEN = 32

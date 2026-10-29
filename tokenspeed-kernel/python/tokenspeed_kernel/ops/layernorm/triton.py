@@ -57,6 +57,7 @@ def _rmsnorm_kernel(
     x_scale,
     residual_scale,
     x_row_stride,
+    out_row_stride,
     n_cols: tl.constexpr,
     eps: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -99,7 +100,9 @@ def _rmsnorm_kernel(
     variance = tl.sum(x * x, axis=0) / n_cols
     x *= tl.rsqrt(variance + eps)
     weight = tl.load(weight_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
-    tl.store(out_ptr + row_offsets, x * weight, mask=mask)
+    tl.store(
+        out_ptr + row.to(tl.int64) * out_row_stride + offsets, x * weight, mask=mask
+    )
     if TOKEN_FP8_OUT:
         # The stored row quantized per token (as fp8_quantize_per_token
         # quantizes it): FP8 E4M3 codes and one FP32 dequant scale.
@@ -313,8 +316,9 @@ def rmsnorm(
             f"residual shape {tuple(residual.shape)} does not match input shape {tuple(x.shape)}"
         )
 
-    # Without a residual the kernel reads strided rows (e.g. a column slice of
-    # a fused projection) in place; other layouts are made contiguous.
+    # Without a residual the kernel reads and writes strided rows (e.g. a
+    # column slice of a fused projection) in place; other layouts are made
+    # contiguous.
     strided_rows = residual is None and x.ndim == 2 and x.stride(-1) == 1
     if not x.is_contiguous() and not strided_rows:
         x = x.contiguous()
@@ -326,9 +330,10 @@ def rmsnorm(
     hidden_size = x.shape[-1]
     x_2d = x if strided_rows else x.view(-1, hidden_size)
     out = torch.empty(x.shape, dtype=x.dtype, device=x.device) if out is None else out
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    out_2d = out.view(-1, hidden_size)
+    strided_out = residual is None and out.ndim == 2 and out.stride(-1) == 1
+    if not out.is_contiguous() and not strided_out:
+        raise ValueError("out must be contiguous or 2-D rows with unit column stride")
+    out_2d = out if strided_out else out.view(-1, hidden_size)
 
     residual_out = torch.empty_like(x) if residual is not None else None
     if token_fp8_out is not None:
@@ -363,6 +368,7 @@ def rmsnorm(
         x_scale,
         residual_scale,
         x_2d.stride(0),
+        out_2d.stride(0),
         hidden_size,
         eps,
         BLOCK=block,

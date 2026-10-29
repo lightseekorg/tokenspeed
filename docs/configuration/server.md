@@ -681,6 +681,9 @@ run on the draft-tree path and share its requirements, with these limits:
 - `--enable-speculative-sampling` samples harness trees and chains (not
   when measuring) and needs `--sampling-backend flashinfer`, which accepts
   them by tree rejection sampling. Static `EAGLE4` drafts do not take it.
+  Its sampling kernels are NVIDIA-only: elsewhere (AMD) harness rounds
+  draft greedy trees and chains, and the drafter refuses sampling at
+  startup.
 
 ### Draft-prob rejection sampling
 
