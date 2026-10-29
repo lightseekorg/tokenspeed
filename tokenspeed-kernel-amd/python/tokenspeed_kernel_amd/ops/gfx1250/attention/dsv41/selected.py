@@ -533,14 +533,14 @@ def _selected_attention_metadata(grid, kernel, args):
 
     Device lengths are not read, so the counts are a capacity bound: every
     selected slot is valid and every head is computed. Split launches store
-    FP32 ``[heads, 512]`` partials instead of the BF16 output.
+    one FP16 ``[heads, 512]`` partial per split instead of the output.
     """
     tokens = args["q"].shape[0]
     heads = args["num_heads"]
     splits = grid[1]
     swa_width = args["swa_width"]
     global_width = args["global_width"] if args["HAS_GLOBAL"] else 0
-    output_bytes = heads * _HEAD_DIM * (2 if splits == 1 else 4 * splits)
+    output_bytes = heads * _HEAD_DIM * 2 * splits
     return {
         "name": kernel.name,
         "flops16": 4 * tokens * heads * (swa_width + global_width) * _HEAD_DIM,
@@ -556,11 +556,11 @@ def _selected_attention_metadata(grid, kernel, args):
 
 def _selected_attention_reduce_metadata(grid, kernel, args):
     """Report the split reduce's DRAM bytes: per token and head, it reads
-    ``num_splits`` FP32 partial rows and writes one BF16 output row."""
+    ``num_splits`` FP16 partial rows and writes one BF16 output row."""
     tokens, heads = grid[0], args["num_heads"]
     return {
         "name": kernel.name,
-        "bytes": tokens * heads * _HEAD_DIM * (4 * args["num_splits"] + 2),
+        "bytes": tokens * heads * _HEAD_DIM * 2 * (args["num_splits"] + 1),
     }
 
 
@@ -982,13 +982,13 @@ def gluon_dsv41_selected_attention_gfx1250(
             gl.amd.cdna5.async_copy.wait_group(0)
 
             if active:
+                normalize = gl.where(denominator > 0.0, 1.0 / denominator, 0.0)
                 if single:
-                    scale = gl.where(denominator > 0.0, 1.0 / denominator, 0.0)
                     gl.store(
                         out_row
                         + score_heads[:, None].to(tl.int64) * stride_o_h
                         + acc_dims[None, :],
-                        (accumulator * scale[:, None]).to(gl.bfloat16),
+                        (accumulator * normalize[:, None]).to(gl.bfloat16),
                         mask=valid_heads[:, None],
                     )
                 else:
@@ -999,7 +999,7 @@ def gluon_dsv41_selected_attention_gfx1250(
                         part_acc
                         + (part_row * num_heads + score_heads[:, None]) * HEAD_DIM
                         + acc_dims[None, :],
-                        accumulator,
+                        (accumulator * normalize[:, None]).to(gl.float16),
                         mask=valid_heads[:, None],
                     )
 
@@ -1076,7 +1076,8 @@ def _merge_partials(
 ):
     """BF16 [heads, dims] merge of 16 heads' split partials and their sink.
 
-    All splits (at most SPLIT_BLOCK, a power of two) load at once, unmasked,
+    Partials are FP16 and normalized by their split's denominator, so each
+    split weighs in with its denominator times its max rescale. All splits (at most SPLIT_BLOCK, a power of two) load at once, unmasked,
     at clamped splits and heads: splits and heads sit in registers, and a
     mask uniform per register would become a branch and a full wait around
     every load. A clamped split's weight is zero; clamped heads are not stored.
@@ -1108,8 +1109,8 @@ def _merge_partials(
         + (rows[:, None, None].to(tl.int64) * num_heads + heads[None, :, None])
         * HEAD_DIM
         + value_dims[None, None, :]
-    )
-    merged = gl.sum(values * weight[:, :, None], axis=0)
+    ).to(gl.float32)
+    merged = gl.sum(values * (split_sum * weight)[:, :, None], axis=0)
     scale = gl.convert_layout(
         gl.where(total > 0.0, 1.0 / total, 0.0), gl.SliceLayout(1, out_layout)
     )
@@ -1528,8 +1529,10 @@ def launch_gluon_dsv41_selected_attention_gfx1250(
         part_stats = torch.empty(
             (tokens, splits, heads, 2), dtype=torch.float32, device=q.device
         )
+        # Normalized by its split's denominator, a partial is bounded by the
+        # largest value row, so FP16 holds it without overflow.
         part_acc = torch.empty(
-            (tokens, splits, heads, _HEAD_DIM), dtype=torch.float32, device=q.device
+            (tokens, splits, heads, _HEAD_DIM), dtype=torch.float16, device=q.device
         )
         part_row_sum = torch.empty(
             (tokens, splits, _HEAD_DIM), dtype=torch.float32, device=q.device
