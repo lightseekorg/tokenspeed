@@ -1298,10 +1298,12 @@ iterations ahead hides the extra latency.
 Prefetches past the split repeat its last page rather than masking the copy,
 since a masked copy becomes a scalar branch after which the compiler waits for
 every outstanding load (`s_waitcnt vmcnt(0)`); only pages crossing the split's
-end or a row's causal end are masked. `v_readfirstlane` moves each page index
-into an SGPR, so each copy takes its 64-bit page address
-from a buffer descriptor based at that page, the KV head from the scalar
-offset, and reuses loop-invariant 32-bit lane offsets within the page.
+end or a row's causal end are masked. The loop waits for those prefetches
+before the epilogue, whose layout conversions reuse the page buffers' LDS.
+`v_readfirstlane` moves each page index into an SGPR, so each copy takes its
+64-bit page address from a buffer descriptor based at that page, the KV head
+from the scalar offset, and reuses loop-invariant 32-bit lane offsets within
+the page.
 
 Every split stores its partial output and LSE, with an LSE of -inf for rows
 without keys in it, so the reduce merges stored partials without reading the

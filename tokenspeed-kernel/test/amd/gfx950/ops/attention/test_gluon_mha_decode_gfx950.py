@@ -30,9 +30,7 @@ from utils import assert_no_triton_compile, is_cdna4, move_pages_past_int32
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
 
-from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (
-    get_config,
-)
+from tokenspeed_kernel_amd.ops.gfx950.attention.mha import decode
 from tokenspeed_kernel_amd.ops.gfx950.attention.mha.decode import (  # noqa: E402
     launch_gluon_mha_decode_gfx950 as gluon_mha_decode_gfx950,
 )
@@ -183,7 +181,7 @@ def test_full_decode_config_keeps_prefetch_within_vmcnt() -> None:
     """BF16 head dim 128 would prefetch more copies than s_waitcnt vmcnt counts."""
     q = torch.empty(1, FULL_Q_HEADS, 128, dtype=torch.bfloat16)
     k_cache = torch.empty(1, PAGE_SIZE, FULL_KV_HEADS, 128, dtype=torch.bfloat16)
-    config = get_config(
+    config = decode.get_config(
         q=q,
         k_cache=k_cache,
         max_seqlen_k=FULL_MAX_SEQLEN_K,
@@ -262,7 +260,7 @@ def test_full_decode_ragged_rows_match_reference(
         generator=generator,
     )
 
-    config = get_config(
+    config = decode.get_config(
         q=q,
         k_cache=k_cache,
         max_seqlen_k=FULL_MAX_SEQLEN_K,
@@ -527,7 +525,7 @@ def test_verify_long_splits_pipeline_page_loads() -> None:
     inputs = _verify_inputs(
         cache_lens, VERIFY_TOKENS, VERIFY_Q_HEADS, VERIFY_KV_HEADS, HEAD_DIM, 17
     )
-    config = get_config(
+    config = decode.get_config(
         q=inputs["q"],
         k_cache=inputs["k_cache"],
         max_seqlen_k=FULL_MAX_SEQLEN_K,
@@ -538,3 +536,34 @@ def test_verify_long_splits_pipeline_page_loads() -> None:
     assert (config.num_kv_splits, config.num_stages) == (64, 4)
     actual = gluon_mha_decode_gfx950(**inputs, window_left=-1)
     _check_verify(actual, _verify_reference(inputs, -1, None))
+
+
+def test_pipelined_split_waits_for_prefetches_before_epilogue(monkeypatch) -> None:
+    """The pipelined page loop ends with prefetched pages still copying into
+    LDS, which the epilogue reuses for its layout conversions. A two-deep
+    pipeline issues its last prefetch just before the final page's compute,
+    so without a wait at loop exit the copy lands in the middle of the
+    epilogue and corrupts rows (every run of this shape did). The shipped
+    kernel selects four stages, where the race did not reproduce; two stages
+    exposes it."""
+    monkeypatch.setattr(decode, "_FULL_DECODE_STAGES", 2)
+    inputs = _verify_inputs(
+        [190000, 120000, 64000, 30000],
+        1,
+        VERIFY_Q_HEADS,
+        VERIFY_KV_HEADS,
+        HEAD_DIM,
+        41,
+    )
+    config = decode.get_config(
+        q=inputs["q"],
+        k_cache=inputs["k_cache"],
+        max_seqlen_k=FULL_MAX_SEQLEN_K,
+        max_seqlen_q=1,
+        window_left=-1,
+        softmax_scale=None,
+    )
+    assert (config.num_kv_splits, config.num_stages) == (64, 2)
+    expected = _verify_reference(inputs, -1, None)
+    for _ in range(10):
+        _check_verify(gluon_mha_decode_gfx950(**inputs, window_left=-1), expected)
