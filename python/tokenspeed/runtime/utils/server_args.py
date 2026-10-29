@@ -2779,7 +2779,9 @@ class ServerArgs:
             help=(
                 "Prefill batch KV capacity in tokens, including cached prefixes. "
                 "Converted to a page budget; each request is rounded up separately "
-                "before summing. Omit to keep the existing unbounded batch policy."
+                "before summing. Its page-aligned capacity must exceed the maximum "
+                "prompt length; an undersized budget fails startup. Omit to keep "
+                "the existing unbounded batch policy."
             ),
         )
         # Other runtime options
