@@ -1286,6 +1286,33 @@ for the prefetches before the epilogue reuses their LDS.
 Every split stores its partial and LSE (-inf for rows without keys in it), so
 the reduce does not read cache lengths.
 
+### gfx950 MHA prefill
+
+`gluon_mha_prefill_gfx950` computes causal MHA over packed sequences without a
+KV cache, and `gluon_mha_prefill_sliding_gfx950` the sliding-window variant.
+
+#### Contract
+
+- Q, K and V are `[tokens, heads, head_dim]`. The kernels compile in their
+  strides, which lets K and V share load offsets, so the launcher makes
+  views (such as V inside a packed QKV projection) contiguous first. A
+  model whose rows arrive as views on some batches and as copies on others
+  then still uses one binary, at the cost of a copy of the views.
+- The request count and `max_seqlen` are unspecialized runtime arguments:
+  one binary serves every batch.
+
+#### Algorithm
+
+Both kernels launch a persistent grid of 512 work-groups, each owning one
+128-row query block of one head at a time. The causal kernel gives every
+work-group a fixed batch slot, head and query slot: up to 512 / heads
+requests share a round, and the work-groups left per request become query
+slots, which take that request's query blocks in alternating directions so
+the long late blocks spread out. More requests take further rounds; in the
+last round, slots past the last request are skipped. With skip-softmax, a
+shared ticket counter hands out blocks instead. The sliding-window kernel
+walks (request, head, query block) items in order, 512 apart.
+
 ### gfx950 MHA cached extension
 
 `gluon_mha_extend_gfx950` computes paged MHA attention for multi-token queries

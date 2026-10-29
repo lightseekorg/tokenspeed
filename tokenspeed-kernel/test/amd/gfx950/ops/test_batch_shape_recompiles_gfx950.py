@@ -106,6 +106,70 @@ def test_mha_extend_split_count():
             run(pages * page - 5)
 
 
+@pytest.mark.parametrize("window", [-1, 127])
+def test_mha_prefill_token_stride_and_request_count(window):
+    from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
+    from tokenspeed_kernel_amd.ops.gfx950.attention.mha import prefill
+
+    heads, kv_heads, dim = 16, 2, 64
+    q_width, kv_width = heads * dim, kv_heads * dim
+    # One projection row holds Q, K, V and the output gate, so views into it
+    # step over the whole row while copies step over their own heads only.
+    packed = torch.randn(
+        1600, 2 * q_width + 2 * kv_width, device=DEVICE, dtype=torch.bfloat16
+    )
+    q_rows, k_rows, v_rows, _ = packed.split(
+        (q_width, kv_width, kv_width, q_width), dim=-1
+    )
+
+    def run(seqlens, views):
+        tokens = sum(seqlens)
+        q = q_rows[:tokens].view(tokens, heads, dim)
+        k = k_rows[:tokens].view(tokens, kv_heads, dim)
+        v = v_rows[:tokens].view(tokens, kv_heads, dim)
+        if not views:
+            q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+        cu = [0]
+        for length in seqlens:
+            cu.append(cu[-1] + length)
+        out = prefill.launch_gluon_mha_prefill_gfx950(
+            q,
+            k,
+            v,
+            torch.tensor(cu, dtype=torch.int32, device=DEVICE),
+            cu,
+            max(seqlens),
+            window_left=window,
+        )
+        for start, end in zip(cu, cu[1:]):
+            expected, _ = torch_dense_attention(
+                q[start:end],
+                k[start:end],
+                v[start:end],
+                scale=dim**-0.5,
+                causal_offset=0,
+                window_left=window if window >= 0 else None,
+                sinks=None,
+            )
+            torch.testing.assert_close(
+                out[start:end].float(), expected, rtol=2e-2, atol=2e-2
+            )
+
+    run([300], views=False)
+    with assert_no_triton_compile(
+        prefill.gluon_mha_prefill_gfx950, prefill.gluon_mha_prefill_sliding_gfx950
+    ):
+        # The packed views of a short prompt next to the copies of a long one
+        # are what a server sees from one model; then request counts of 6,
+        # 16 and 40 (past the 32 requests a full grid holds per round) and
+        # longest requests on and off multiples of 16.
+        run([300], views=True)
+        run([17, 250, 64, 5, 100, 33], views=True)
+        run([32] * 16, views=False)
+        run([40, 1] * 20, views=True)
+        run([1], views=False)
+
+
 def test_mxfp8_gemm_row_count():
     from tokenspeed_kernel_amd.ops.gfx950.gemm.mxfp8 import mm
 
