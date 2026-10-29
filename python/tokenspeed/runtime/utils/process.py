@@ -22,25 +22,19 @@
 
 from __future__ import annotations
 
-import contextlib
 import ctypes
-import logging
 import multiprocessing as mp
 import os
 import signal
 import sys
 import threading
-import time
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
 from multiprocessing import connection
 from multiprocessing.connection import Connection
-from multiprocessing.process import BaseProcess
 from typing import Any
 
 import psutil
-
-logger = logging.getLogger(__name__)
 
 _process_shutdown_started = False
 
@@ -139,38 +133,6 @@ def run_with_parent_death_signal(parent_pid: int, target: Callable, *args):
     """
     set_parent_death_signal(parent_pid)
     return target(*args)
-
-
-def stop_processes(processes: Sequence[BaseProcess], timeout: float) -> None:
-    """Stop child ``processes`` and everything they started.
-
-    Each live one gets SIGTERM, and together they get ``timeout`` seconds to
-    exit. Then the ones still running, and every process that was below any
-    of them when this was called, get SIGKILL, and the killed ones get
-    ``timeout`` seconds more to be gone. Listing descendants first matters:
-    one whose parent exits in the meantime is no longer found below it.
-    """
-    processes = [process for process in processes if process.is_alive()]
-    descendants = []
-    for process in processes:
-        with contextlib.suppress(psutil.NoSuchProcess):
-            descendants += psutil.Process(process.pid).children(recursive=True)
-        process.terminate()
-
-    def join(waiting):
-        deadline = time.monotonic() + timeout
-        for process in waiting:
-            process.join(max(0.0, deadline - time.monotonic()))
-
-    join(processes)
-    stuck = [process for process in processes if process.exitcode is None]
-    for process in stuck:
-        logger.warning(f"Process {process.pid!s} still running after {timeout!s} s")
-        process.kill()
-    for descendant in descendants:
-        with contextlib.suppress(psutil.NoSuchProcess):
-            descendant.kill()
-    join(stuck)
 
 
 def start_process_with_ready_pipe(

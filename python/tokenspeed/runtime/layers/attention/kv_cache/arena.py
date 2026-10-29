@@ -47,26 +47,65 @@ from tokenspeed.runtime.utils.torch_memory_saver_adapter import TorchMemorySaver
 logger = get_colorful_logger(__name__)
 
 
-def _copy_waves(pairs: np.ndarray) -> list[np.ndarray]:
-    """Order ``(source, destination)`` pairs so a block is read before it is
-    overwritten: a pair runs in the wave after every pair that still reads
-    its destination. A destination is a block granted fresh this plan and a
-    source one published before it, so the pairs never form a cycle.
+def _copy_waves(
+    pairs_by_group: Mapping[str, np.ndarray],
+    field_layouts: Mapping[str, Sequence[tuple[int, int, int]]],
+) -> list[dict[str, np.ndarray]]:
+    """Read each source before any group overwrites its field byte ranges.
+
+    Groups can reuse the same LCM parent with different packing. Block ids
+    alone cannot express that aliasing, while ordering whole parents would
+    invent dependencies between disjoint child blocks. Use the plan's field
+    ranges, which also retain their identity when storage is split into
+    separate Host and Device regions.
 
     Raises:
         ValueError: The pairs copy blocks in a cycle.
     """
-    waves: list[np.ndarray] = []
-    remaining = pairs
-    while remaining.shape[0]:
-        ready = ~np.isin(remaining[:, 1], remaining[:, 0])
-        if not ready.any():
+    waves: list[dict[str, np.ndarray]] = []
+    remaining = {group: pairs for group, pairs in pairs_by_group.items() if len(pairs)}
+    sources: dict[str, np.ndarray] = {}
+    destinations: dict[str, np.ndarray] = {}
+    for group, pairs in remaining.items():
+        fields = np.asarray(field_layouts[group], dtype=np.int64)
+        ids = pairs.astype(np.int64, copy=False)
+        source_start = fields[:, 0] + ids[:, :1] * fields[:, 1]
+        destination_start = fields[:, 0] + ids[:, 1:] * fields[:, 1]
+        sources[group] = np.stack((source_start, source_start + fields[:, 2]), axis=-1)
+        destinations[group] = np.stack(
+            (destination_start, destination_start + fields[:, 2]), axis=-1
+        )
+    while remaining:
+        reads = np.concatenate([ranges.reshape(-1, 2) for ranges in sources.values()])
+        order = np.argsort(reads[:, 0])
+        starts = reads[order, 0]
+        # For a destination [a, b), a source overlaps iff a source starting
+        # before b ends after a. Prefix maxima answer all fields together
+        # without constructing a quadratic matrix of copy dependencies.
+        past_ends = np.maximum.accumulate(reads[order, 1])
+        wave: dict[str, np.ndarray] = {}
+        for group, pairs in tuple(remaining.items()):
+            writes = destinations[group]
+            last = np.searchsorted(starts, writes[..., 1], side="left") - 1
+            overlaps = (last >= 0) & (past_ends[np.maximum(last, 0)] > writes[..., 0])
+            ready = ~overlaps.any(axis=1)
+            if ready.any():
+                wave[group] = pairs[ready]
+            if ready.all():
+                del remaining[group], sources[group], destinations[group]
+            else:
+                remaining[group] = pairs[~ready]
+                sources[group] = sources[group][~ready]
+                destinations[group] = writes[~ready]
+        if not wave:
+            remaining_pairs = {
+                group: pairs.tolist() for group, pairs in remaining.items()
+            }
             raise ValueError(
-                f"block pairs copy in a cycle: {remaining.tolist()}; no order "
-                "reads every block before it is overwritten"
+                f"block pairs copy in a cycle: {remaining_pairs}; "
+                "no order reads every byte range before it is overwritten"
             )
-        waves.append(remaining[ready])
-        remaining = remaining[~ready]
+        waves.append(wave)
     return waves
 
 
@@ -459,13 +498,11 @@ class CacheArena:
     def copy_blocks(self, block_pairs_by_group: Mapping[str, np.ndarray]) -> None:
         """Copy local physical blocks whole onto other blocks of their group.
 
-        The same O(pages) path as :meth:`zero_blocks`: one pinned upload of
-        the ``(source, destination)`` pairs, one page x field expansion per
-        group and wave in the kernel. Every source is read as it was before
-        any of the plan's copies: a block the plan both reads and overwrites
-        (a published tail some hitter copies, evicted and re-granted as a
-        copy-in's destination in the same plan) is read in an earlier wave
-        than it is written. Pairs of one wave copy in parallel.
+        One pinned upload of the ``(source, destination)`` pairs, one page x
+        field expansion per group and wave in the kernel. Waves order all
+        groups by their source and destination byte ranges: a published
+        block evicted and re-granted to another group is read before the
+        new owner's copy overwrites it. Pairs of one wave copy in parallel.
 
         Args:
             block_pairs_by_group: Local ``[n, 2]`` integer arrays per group of
@@ -475,11 +512,10 @@ class CacheArena:
         Raises:
             IndexError: A block ID is outside its group's physical range.
             TypeError: A group's pairs are not an ``[n, 2]`` integer array.
-            ValueError: A pair copies a block onto itself or two pairs share
-                a destination.
+            ValueError: A pair copies a block onto itself, two pairs share a
+                destination, or the byte ranges form a copy cycle.
         """
-        groups: list[str] = []
-        arrays: list[np.ndarray] = []
+        validated: dict[str, np.ndarray] = {}
         for group_id, pairs in block_pairs_by_group.items():
             if not self._validate_block_ids(group_id, pairs, expected_ndim=2):
                 continue
@@ -497,11 +533,19 @@ class CacheArena:
                     f"block pairs for group {group_id!r} write one destination "
                     "twice; the copies of a wave run in parallel"
                 )
-            for wave in _copy_waves(pairs):
-                groups.append(group_id)
-                arrays.append(wave)
-        if not arrays:
+            validated[group_id] = pairs
+        if not validated:
             return
+        waves = _copy_waves(
+            validated,
+            {group: self.plan.page_field_layout(group)[1] for group in validated},
+        )
+        groups: list[str] = []
+        arrays: list[np.ndarray] = []
+        for wave in waves:
+            for group_id, pairs in wave.items():
+                groups.append(group_id)
+                arrays.append(pairs)
         if not self.storage_plan.monolithic:
             self._copy_block_byte_ranges(groups, arrays)
             return

@@ -490,8 +490,9 @@ impl EngineMetrics {
                 exporter,
                 "tokenspeed:num_capacity_aborted_requests",
                 "Requests the scheduler aborted because a capacity retraction could not image its \
-                 victim (retraction snapshot pool or image rows exhausted); clients may resubmit \
-                 them.",
+                 victim (retraction snapshot pool, image rows or Host L2 exhausted); clients may \
+                 resubmit them. Forced retractions from --debug-force-retraction-interval aborted \
+                 the same way count too.",
                 names,
             ),
             num_preemptions: Metric::counter(
@@ -512,7 +513,7 @@ impl EngineMetrics {
                 "Wall time from submission to the scheduler's waiting queue to first dispatch \
                  into a forward batch, observed once per request. Grammar-compile, pause-hold, \
                  and EPD embedding waits precede submission and are excluded, as are \
-                 tokenizer-manager and IPC wait.",
+                 frontend and IPC wait.",
                 names,
                 &[
                     0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0,

@@ -437,15 +437,17 @@ class DeviceHandle:
 
         The whole plan, explicitly ordered streams, in an order
         that IS the correctness argument for same-round page reuse: the
-        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: a
-        retraction image's two legs -- the stream-ordered L2 write-back of
-        the victim's hash-complete pages and the snapshot store of its tail
-        pages and slot state -- read pages this plan re-grants, so they ride
-        the write stream consecutively and ONE completion event fences the
-        forward thread's default stream before anything else of the plan is
-        enqueued; a pinned write-back -- an ordinary publication, whose
-        sources the scheduler holds until the ACK -- rides the write stream
-        and fences nothing), then the Device-to-Device block copies
+        Host-bound stores first (``WriteBackOp`` and ``SnapshotOp``: the
+        stream-ordered ones -- a retraction image's two legs (the L2
+        write-back of the victim's hash-complete pages, the snapshot store of
+        its tail pages and slot state) and, under ``--kvstore-write-policy
+        write_back``, the L2 write-back of what the plan's admissions and
+        restores evicted -- read pages this plan re-grants, so they ride the
+        write stream consecutively and ONE completion event fences the forward
+        thread's default stream before anything else of the plan is enqueued;
+        a pinned write-back -- an ordinary publication under write-through,
+        whose sources the scheduler holds until the ACK -- rides the write
+        stream and fences nothing), then the Device-to-Device block copies
         (``pages_to_copy``: a prefix hit's private copy of the block holding
         its boundary, an owner's move off the block it just published; the
         source may be re-granted by this very plan, so the copy precedes the
@@ -519,8 +521,8 @@ class DeviceHandle:
             # The round's tasks besides its forward run behind a pending
             # draft round.
             self.settle()
-        l2 = self._l2 if cache_ops else None
-        if l2 is not None:
+        l2 = self._l2
+        if l2 is not None and cache_ops:
             # Ahead of the zeroing: a stream-ordered store's sources may be
             # this very plan's pages_to_zero, and its fence lands on the
             # default stream the zeroing runs on, before the zeroing is
@@ -541,6 +543,12 @@ class DeviceHandle:
         if l2 is not None:
             # Behind the zeroing: the loads' destinations were zeroed on the
             # default stream, so that is the prerequisite they order after.
+            # Every plan makes the call, with a load or not: it points the
+            # layerwise load waits at this plan's load or at none, so neither
+            # an eager layer nor a prefill graph replay of this plan waits on
+            # an earlier plan's load. Without cache ops it enqueues nothing,
+            # and a draft round still pending from the previous forward began
+            # in that forward, behind the waits for that plan's load.
             l2.submit_load_backs(cache_ops, prerequisite_stream=executor.default_stream)
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,

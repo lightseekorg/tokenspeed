@@ -49,7 +49,10 @@ from tokenspeed_kernel.ops.attention.prologue import (
 )
 from torch import nn
 
-from tokenspeed.runtime.distributed.comm_ops import token_all_gather
+from tokenspeed.runtime.distributed.comm_ops import (
+    token_all_gather,
+    token_all_gather_rows,
+)
 from tokenspeed.runtime.execution.breakable_cuda_graph import break_point
 from tokenspeed.runtime.execution.context import ForwardContext
 from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
@@ -474,6 +477,85 @@ class PagedAttention(nn.Module):
             cache=self._local_target(slots, ctx),
         )
         return out
+
+    def latent_prologue_with_rows(
+        self,
+        query: torch.Tensor,
+        q_pe: torch.Tensor,
+        latent_cache: torch.Tensor,
+        positions: torch.Tensor,
+        ctx: ForwardContext,
+        *,
+        slots: torch.Tensor,
+        key_rows: QueryShardGather,
+        extra_rows: torch.Tensor,
+    ) -> tuple[MLAPrologueOutput, torch.Tensor]:
+        """A query shard's prologue with extra rows riding its gather.
+
+        ``extra_rows`` (``[local_rows, width]``, the latent's dtype) are
+        concatenated after the rotated latent columns and all-gathered in the
+        same collective as the shard's latent rows; they come back in span
+        order. ``width`` must keep the latent half of the payload 16-byte
+        aligned (a multiple of 8 fp16/bf16 elements), which the latent store
+        slices require. The latent is rotated and stored exactly as
+        :meth:`latent_prologue` does -- only the wiring differs, so the store
+        writes the same bytes. Returns the prologue output and the gathered
+        extra rows (``[total_rows, width]``).
+        """
+        plan = key_rows.plan
+        if latent_cache.shape[0] != plan.local_rows:
+            raise ValueError(
+                f"query shard rank {plan.rank} rotates {plan.local_rows} rows, "
+                f"got {latent_cache.shape[0]}"
+            )
+        if slots.numel() != plan.total_rows:
+            raise ValueError(
+                f"a sharded latent store takes the whole span of {plan.total_rows} "
+                f"slots, got {slots.numel()}"
+            )
+        if (
+            extra_rows.dim() != 2
+            or extra_rows.shape[0] != plan.local_rows
+            or extra_rows.dtype != latent_cache.dtype
+        ):
+            raise ValueError(
+                "extra rows must be a [local_rows, width] tensor of the latent's "
+                f"dtype: got {tuple(extra_rows.shape)} {extra_rows.dtype} for "
+                f"{plan.local_rows} rows of {latent_cache.dtype}"
+            )
+        if extra_rows.shape[1] * extra_rows.element_size() % 16:
+            raise ValueError(
+                "extra rows must keep the gathered latent half 16-byte aligned: "
+                f"got {extra_rows.shape[1]} elements of "
+                f"{extra_rows.element_size()} bytes, which is not a multiple of 16"
+            )
+        rotary = (
+            None if self.rotary_emb is None else self.rotary_emb.as_rotary(positions)
+        )
+        if plan.local_rows > 0:
+            out = mla_prologue(
+                query,
+                q_pe,
+                latent_cache,
+                expanded=None,
+                rotary=rotary,
+                cache=None,
+                solution=None,
+                override=None,
+            )
+        else:
+            out = MLAPrologueOutput(
+                query=query, key=None, value=None, latent=latent_cache
+            )
+        width = extra_rows.shape[1]
+        payload = torch.cat((extra_rows, out.latent), dim=1).contiguous()
+        gathered = token_all_gather_rows(payload, key_rows.group, list(plan.row_counts))
+        latent_store(
+            gathered[:, width:],
+            kv_lora_rank=out.latent.shape[-1] - q_pe.shape[-1],
+            cache=self._local_target(slots, ctx),
+        )
+        return out, gathered[:, :width].contiguous()
 
 
 class _CacheGroupSpecLike(Protocol):

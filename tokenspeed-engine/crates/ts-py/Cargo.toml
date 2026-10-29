@@ -1,6 +1,6 @@
 [package]
 name = "tokenspeed-py"
-description = "Python bindings: the frontend of the Python Engine API over ts-client, the L3 executor and the disaggregation bootstrap server"
+description = "Python bindings: a ts-client frontend for tests and tools that drive an engine, the L3 executor and the disaggregation bootstrap server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -18,23 +18,23 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-//! `tokenspeed_engine._native`: the Python frontend's connection to
-//! TokenSpeed engines, over [`ts_client`].
+//! `tokenspeed_engine._native`: Python's connection to TokenSpeed engines,
+//! over [`ts_client`], for tests and tools that drive an engine
+//! (`tokenspeed.runtime.entrypoints.wire_driver`).
 //!
-//! The Python frontend (`AsyncLLM`, under the `Engine` API and the gRPC
-//! servicer) tokenizes, detokenizes and matches stop strings; this module
-//! submits its tokenized requests to the engines and hands back their
-//! outputs. The client's sockets and streams run on the Tokio runtime
+//! This module submits token-id requests to the engines and hands back
+//! their outputs; tokenizing, detokenizing and stop strings are the
+//! caller's. The client's sockets and streams run on the Tokio runtime
 //! `pyo3-async-runtimes` owns, so a Python thread waiting on them does not
 //! hold the GIL.
 //!
-//! Every request's outputs land in one queue, which the frontend drains a
+//! Every request's outputs land in one queue, which the caller drains a
 //! batch at a time ([`Frontend::next_outputs`]): one Python wakeup per step
 //! of the engines, not one per request.
 //!
 //! Requests and control operations cross as their wire frames
 //! (`zmq_wire`'s encoding of the `io_struct` messages), so the Python
-//! structs stay the frontend's representation; control replies come back the
+//! structs stay the caller's representation; control replies come back the
 //! same way.
 
 mod bootstrap;
@@ -209,6 +209,17 @@ impl PendingFrontend {
 /// One output of one request: its chunk, or why its stream ended early.
 type Delivery = (String, Result<OutputChunk, StreamError>);
 
+/// The gateway's load snapshot view, in native LCM allocator blocks.
+#[pyclass(frozen, get_all, module = "tokenspeed_engine._native")]
+struct LoadSnapshot {
+    dp_rank: i64,
+    num_running_reqs: i64,
+    num_waiting_reqs: i64,
+    num_used_pages: i64,
+    num_active_pages: i64,
+    max_total_pages: i64,
+}
+
 /// The connected engines.
 #[pyclass(frozen, module = "tokenspeed_engine._native")]
 struct Frontend {
@@ -221,15 +232,22 @@ struct Frontend {
 #[pymethods]
 impl Frontend {
     /// The engines, in index order: each one's index and the configuration
-    /// it registered with (`max_model_len`, `data_parallel_rank`, ...).
+    /// it registered with (`max_model_len`, `data_parallel_rank`,
+    /// `request_types`, `disaggregation_mode`, ...).
     fn engines<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let engines = PyList::empty(py);
         for engine in self.client.engines() {
+            let ready = &engine.ready;
             let info = PyDict::new(py);
             info.set_item("index", engine.index)?;
-            info.set_item("max_model_len", engine.ready.max_model_len)?;
-            info.set_item("data_parallel_rank", engine.ready.data_parallel_rank)?;
-            info.set_item("data_parallel_size", engine.ready.data_parallel_size)?;
+            info.set_item("max_model_len", ready.max_model_len)?;
+            info.set_item("data_parallel_rank", ready.data_parallel_rank)?;
+            info.set_item("data_parallel_size", ready.data_parallel_size)?;
+            info.set_item("kv_cache_size_tokens", ready.kv_cache_size_tokens)?;
+            info.set_item("request_types", ready.request_types.clone())?;
+            info.set_item("disaggregation_mode", ready.disaggregation_mode.clone())?;
+            info.set_item("bootstrap_host", ready.bootstrap_host.clone())?;
+            info.set_item("bootstrap_port", ready.bootstrap_port)?;
             engines.append(info)?;
         }
         Ok(engines)
@@ -248,6 +266,23 @@ impl Frontend {
                     load.kv_active_pages,
                     load.kv_total_pages,
                 )
+            })
+            .collect()
+    }
+
+    /// Current native reports for every rank, or no snapshots while any
+    /// rank lacks capacity or has missed three one-second load heartbeats.
+    fn fresh_snapshots(&self) -> Vec<LoadSnapshot> {
+        self.client
+            .fresh_loads(Duration::from_secs(3))
+            .into_iter()
+            .map(|(dp_rank, load)| LoadSnapshot {
+                dp_rank,
+                num_running_reqs: load.num_running,
+                num_waiting_reqs: load.num_waiting,
+                num_used_pages: load.kv_used_pages,
+                num_active_pages: load.kv_active_pages,
+                max_total_pages: load.kv_total_pages,
             })
             .collect()
     }

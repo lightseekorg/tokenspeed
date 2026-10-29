@@ -22,9 +22,10 @@
 
 """CDNA4 operations with Petit's existing per-lane register views."""
 
-import triton.experimental.gluon as g
-from triton.experimental.gluon import language as l
-from triton.experimental.gluon.language.amd import cdna4
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
+
+cdna4 = l.amd.cdna4
 
 
 @g.jit
@@ -90,7 +91,7 @@ def _tile_operand(fragments, operand: l.constexpr, parent: l.constexpr):
 @g.constexpr_function
 def _tile_scale_layout(warps, rows):
     # CDNA4 packs K repeats before row repeats. Keep the wave batch explicit;
-    # Triton 3.8's scale-layout factory only handles unbatched matrices.
+    # Triton's scale-layout factory only handles unbatched matrices.
     return l.DistributedLinearLayout(
         reg_bases=[[0, 0, 4], [0, 16, 0]]
         + [[0, 32 << i, 0] for i in range((rows // 32).bit_length() - 1)],

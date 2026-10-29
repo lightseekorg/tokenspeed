@@ -956,7 +956,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # User-domain inputs (peer-mapped on the symmetric heap).
         activation: cute.Tensor,  # (T, hidden) NVFP4
         activation_sf: cute.Tensor,  # (T, round_up(hidden, sf_atom_block_k)) FP8
-        topk_idx: cute.Tensor,  # (T, num_topk) Int64
+        topk_idx: cute.Tensor,  # (T, num_topk) Int32
         topk_weights: cute.Tensor,  # (T, num_topk) Float32
         # Per-rank model weights (local-only; not in workspace).
         fc1_weight: cute.Tensor,

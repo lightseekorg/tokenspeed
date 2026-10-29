@@ -18,21 +18,21 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""The structural tags the engine defers a request's JSON schema with: the
+templates ``reasoning_grammar`` gives the host, with the schema in the slot
+the host fills and the template it picks for the prompt."""
+
 from __future__ import annotations
 
-import asyncio
 import json
-from types import SimpleNamespace
 
 import pytest
 from transformers import AutoTokenizer
 
-from tokenspeed.runtime.engine.input_processor import InputProcessor
-from tokenspeed.runtime.engine.io_struct import GenerateReqInput
 from tokenspeed.runtime.grammar.reasoning_structural_tag import (
-    prompt_ends_in_reasoning,
+    ReasoningGrammar,
     reasoning_block_markers,
-    structural_tag_for_reasoning_json_schema,
+    reasoning_grammar,
 )
 
 xgrammar = pytest.importorskip("xgrammar")
@@ -49,20 +49,34 @@ _ANSWER = '{"answer": "Paris"}'
 _WRONG_ANSWER = '{"answer": 1}'
 
 
+class _NoTokenizer:
+    """A tokenizer with no marker tokens: ``reasoning_grammar``'s markers are
+    then None."""
+
+    def convert_tokens_to_ids(self, token):
+        return None
+
+
+def _host_tag(grammar: ReasoningGrammar, prompt_ids: list[int]) -> str:
+    """The tag the host admits a request with ``_SCHEMA`` under (the
+    ingress's ``ReasoningGrammar::defer_schema``): the continuing one when
+    the last block marker in the prompt is the opener, or without markers."""
+    opened = True
+    if grammar.markers is not None:
+        opened = False
+        for token_id in reversed(prompt_ids):
+            if token_id in grammar.markers:
+                opened = token_id == grammar.markers[0]
+                break
+    tag = grammar.continues if opened else grammar.may_open
+    return tag.replace(grammar.schema_slot, json.dumps(_SCHEMA), 1)
+
+
 @pytest.mark.parametrize("parser", ["deepseek_v31", "deepseek_v41"])
 def test_deepseek_reasoning_parser_wraps_json_schema_after_thinking(parser):
-    schema = {
-        "type": "object",
-        "properties": {"answer": {"type": "string"}},
-        "required": ["answer"],
-    }
+    grammar = reasoning_grammar(parser, _NoTokenizer())
 
-    structural_tag = structural_tag_for_reasoning_json_schema(
-        parser, schema, prompt_opens_reasoning=True
-    )
-
-    assert structural_tag is not None
-    payload = json.loads(structural_tag)
+    payload = json.loads(_host_tag(grammar, []))
     elements = payload["format"]["elements"]
     assert payload["type"] == "structural_tag"
     assert payload["format"]["type"] == "sequence"
@@ -70,39 +84,25 @@ def test_deepseek_reasoning_parser_wraps_json_schema_after_thinking(parser):
     assert elements[0]["begin"] in ("", "<think>")
     assert elements[0]["end"] == "</think>"
     assert elements[-1]["type"] == "json_schema"
-    assert elements[-1]["json_schema"] == schema
+    assert elements[-1]["json_schema"] == _SCHEMA
 
 
 def test_qwen3_reasoning_parser_uses_xgrammar_0_2_builtin_name():
-    schema = {
-        "type": "object",
-        "properties": {"answer": {"type": "string"}},
-        "required": ["answer"],
-    }
+    grammar = reasoning_grammar("qwen3", _NoTokenizer())
 
-    structural_tag = structural_tag_for_reasoning_json_schema(
-        "qwen3", schema, prompt_opens_reasoning=True
-    )
-
-    assert structural_tag is not None
-    payload = json.loads(structural_tag)
+    payload = json.loads(_host_tag(grammar, []))
     elements = payload["format"]["elements"]
     assert payload["format"]["type"] == "sequence"
     assert elements[-1]["type"] == "json_schema"
-    assert elements[-1]["json_schema"] == schema
+    assert elements[-1]["json_schema"] == _SCHEMA
 
 
 def test_inkling_reasoning_parser_wraps_json_schema_in_content_text_block():
-    schema = {
-        "type": "object",
-        "properties": {"answer": {"type": "string"}},
-        "required": ["answer"],
-    }
+    grammar = reasoning_grammar("inkling", _NoTokenizer())
 
-    structural_tag = structural_tag_for_reasoning_json_schema("inkling", schema)
-
-    assert structural_tag is not None
-    payload = json.loads(structural_tag)
+    # One layout whatever the prompt: the prompt never opens a block.
+    assert grammar.continues == grammar.may_open
+    payload = json.loads(_host_tag(grammar, []))
     elements = payload["format"]["elements"]
     assert payload["type"] == "structural_tag"
     assert payload["format"]["type"] == "sequence"
@@ -114,26 +114,12 @@ def test_inkling_reasoning_parser_wraps_json_schema_in_content_text_block():
     assert elements[1]["type"] == "tag"
     assert elements[1]["begin"] == "<|content_text|>"
     assert elements[1]["content"]["type"] == "json_schema"
-    assert elements[1]["content"]["json_schema"] == schema
+    assert elements[1]["content"]["json_schema"] == _SCHEMA
     assert elements[1]["end"] == "<|end_message|>"
 
 
-_OPEN, _CLOSE = 7, 8
-
-
-@pytest.mark.parametrize(
-    "prompt_ids, expected",
-    [
-        ([1, 2, _OPEN], True),
-        ([1, _OPEN, 3, 4], True),
-        ([1, _OPEN, 3, _CLOSE, 5], False),
-        ([1, _OPEN, _CLOSE, 4, _OPEN, 6], True),
-        ([1, 2, 3], False),
-        ([], False),
-    ],
-)
-def test_prompt_ends_in_reasoning(prompt_ids, expected):
-    assert prompt_ends_in_reasoning(prompt_ids, _OPEN, _CLOSE) is expected
+def test_a_parser_without_a_template_defers_nothing():
+    assert reasoning_grammar("passthrough", _NoTokenizer()) is None
 
 
 @pytest.mark.parametrize(
@@ -154,13 +140,6 @@ def test_reasoning_block_markers(parser):
     assert reasoning_block_markers(parser) == ("<think>", "</think>")
 
 
-def test_wrap_needs_the_prompt():
-    # The gRPC servicer calls the wrap before the prompt is known. It must
-    # keep json_schema, which InputProcessor then wraps with the prompt.
-    assert structural_tag_for_reasoning_json_schema("qwen3", _SCHEMA) is None
-    assert structural_tag_for_reasoning_json_schema("inkling", _SCHEMA) is not None
-
-
 def _accepts(structural_tag: str, reply: str) -> bool:
     compiler = xgrammar.GrammarCompiler(xgrammar.TokenizerInfo([]), cache_enabled=False)
     matcher = xgrammar.GrammarMatcher(
@@ -168,27 +147,6 @@ def _accepts(structural_tag: str, reply: str) -> bool:
         terminate_without_stop_token=True,
     )
     return matcher.accept_string(reply) and matcher.is_terminated()
-
-
-def _wrap_json_schema(tokenizer, reasoning_parser: str, prompt_ids: list[int]) -> str:
-    engine = SimpleNamespace(
-        context_len=len(prompt_ids) + 64,
-        max_req_input_len=len(prompt_ids) + 63,
-        is_generation=True,
-        tokenizer=tokenizer,
-        logger=SimpleNamespace(warning=lambda *a, **k: None),
-        server_args=SimpleNamespace(
-            reasoning_parser=reasoning_parser, enable_prefix_caching=False
-        ),
-        model_config=SimpleNamespace(vocab_size=len(tokenizer)),
-    )
-    obj = GenerateReqInput(
-        input_ids=prompt_ids, sampling_params={"json_schema": json.dumps(_SCHEMA)}
-    )
-    obj.normalize_batch_and_arguments()
-    out = asyncio.run(InputProcessor(engine).tokenize_one_request(obj))
-    assert out.sampling_params.json_schema is None
-    return out.sampling_params.structural_tag
 
 
 # (model, reasoning parser, chat template options, accepted replies, refused
@@ -254,7 +212,11 @@ def test_json_schema_wrap_follows_the_prompt(model, parser, options, accepted, r
     )
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
 
-    structural_tag = _wrap_json_schema(tokenizer, parser, prompt_ids)
+    grammar = reasoning_grammar(parser, tokenizer)
+    assert grammar.markers == tuple(
+        tokenizer.convert_tokens_to_ids(["<think>", "</think>"])
+    )
+    structural_tag = _host_tag(grammar, prompt_ids)
 
     for reply in accepted:
         assert _accepts(structural_tag, reply), reply
@@ -268,7 +230,9 @@ def test_json_schema_wrap_assumes_open_reasoning_without_marker_tokens():
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
     prompt_ids = tokenizer.encode("Q: capital of France?\nA: <think>\n")
 
-    structural_tag = _wrap_json_schema(tokenizer, "qwen3", prompt_ids)
+    grammar = reasoning_grammar("qwen3", tokenizer)
+    assert grammar.markers is None
+    structural_tag = _host_tag(grammar, prompt_ids)
 
     assert _accepts(structural_tag, "Paris.\n</think>\n\n" + _ANSWER)
     assert not _accepts(structural_tag, _ANSWER)

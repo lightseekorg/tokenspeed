@@ -22,7 +22,7 @@ import importlib
 
 import pytest
 import torch
-import triton.experimental.gluon as g
+from tokenspeed_kernel._triton import gluon as g
 from tokenspeed_kernel.thirdparty.gluon_petit import load_petit_kernel
 
 petit_kernel = load_petit_kernel()
@@ -31,6 +31,8 @@ from lib.gemm.rocm.intrinsics import (
     BufferResource,
     amdgcn_cvt_scalef32_pk_fp4_f32,
     amdgcn_s_waitcnt_barrier,
+    lds_load_masked,
+    lds_store_masked,
 )
 from lib.moe.rocm.mem.input_mxfp4_packed import PackedInputState
 from lib.moe.rocm.memory_ops import MakeBufferResource
@@ -44,7 +46,7 @@ from lib.tal.tensor_ops import (
     transpose_packed_bytes,
     wave_inclusive_sum,
 )
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
 from utils import assert_no_triton_compile
 
 pytestmark = pytest.mark.skipif(
@@ -215,13 +217,13 @@ def _scale_load(source, out, Input: l.constexpr):
     WORDS: l.constexpr = Input.kShmStageWords * 2
     tid = l.arange(0, THREADS, layout=l.BlockedLayout([1], [64], [l.num_warps()], [0]))
     storage = l.allocate_shared_memory(
-        l.uint32, [Input.kShmStageWords * 2], l.SwizzledSharedLayout(1, 1, 1, [0])
+        l.uint32, [(WORDS + 3) // 4, 4], l.SwizzledSharedLayout(1, 1, 1, [0])
     )
-    shm = l.full((), 0, l.uint64).to(l.pointer_type(l.uint32, 3))
+    shm = l.full((), 0, l.uint64).to(l.pointer_type(l.uint32))
     # Guard the activation region and unused scale lanes against stray writes.
     for start in l.static_range(0, WORDS, THREADS):
         index = start + tid
-        l.store(shm + index, 0xDEADBEEF, index < Input.kShmStageWords * 2)
+        lds_store_masked(shm + index, 0xDEADBEEF, index < Input.kShmStageWords * 2)
     l.barrier()
     resource = MakeBufferResource(source, Input.kGroupM * Input.kRowStride)
     state = PackedInputState(resource, 0, Input.kGroupM, 0, 0)
@@ -229,7 +231,7 @@ def _scale_load(source, out, Input: l.constexpr):
     amdgcn_s_waitcnt_barrier(0)
     for start in l.static_range(0, WORDS, THREADS):
         index = start + tid
-        value = l.load(shm + index, index < Input.kShmStageWords * 2, other=0)
+        value = lds_load_masked(shm + index, index < Input.kShmStageWords * 2)
         l.store(out + index, value, index < Input.kShmStageWords * 2)
     storage._keep_alive()
 

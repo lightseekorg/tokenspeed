@@ -142,22 +142,6 @@ class Metric:
             self._prometheus_metric.observe(value)
         self._emit(value, weight=1)
 
-    def observe_batched(self, interval: float, num_new_tokens: int) -> None:
-        """Record a per-token interval with its token count as weight."""
-        self._check_operation("observe")
-        if num_new_tokens <= 0:
-            return
-        value = interval / num_new_tokens
-        histogram = self._prometheus_metric
-        if histogram is not None:
-            # Retain the original total interval without multiply-back rounding.
-            histogram._sum.inc(interval)
-            for index, bound in enumerate(histogram._upper_bounds):
-                if value <= bound:
-                    histogram._buckets[index].inc(num_new_tokens)
-                    break
-        self._emit(value, weight=num_new_tokens)
-
 
 class MetricFactory:
     """Create metric bindings without importing unused reporters."""

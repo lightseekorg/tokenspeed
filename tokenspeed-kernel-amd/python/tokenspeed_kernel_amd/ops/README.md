@@ -825,13 +825,15 @@ CSA2 picks, for each query, the KV rows its sparse attention reads. The
 preparation, validation and tiling, and runs two steps per query tile: a
 scorer writes one row of FP32 logits per query, one per candidate column, and
 a selector turns each row into that query's sorted list of logical KV row ids.
-gfx950 runs both steps in Gluon (`gluon_dsv41_index_topk_gfx950`, then
-`gluon_dsv41_index_topk_select_gfx950`), and gfx1250 does the same
-(`gluon_dsv41_index_topk_gfx1250`, then
-`gluon_dsv41_index_topk_select_gfx1250`). Both select candidate blocks with
-the portable Triton radix select (`tokenspeed_kernel` `index_block_select`),
-and both scorers take queries packed as MXFP4 values with one E8M0 scale per
-32 values.
+gfx950 runs both steps in Gluon (`gluon_dsv41_index_qtile_gfx950` when all
+queries of a tile share one page-table row, otherwise
+`gluon_dsv41_index_topk_gfx950`, then `gluon_dsv41_index_topk_select_gfx950`),
+and gfx1250 does the same (`gluon_dsv41_index_topk_gfx1250`, then
+`gluon_dsv41_index_topk_select_gfx1250`). gfx950 selects candidate blocks with
+`gluon_dsv41_index_block_max_gfx950` followed by its row selector; gfx1250
+uses the portable Triton radix select (`tokenspeed_kernel`
+`index_block_select`). Both scorers take queries packed as MXFP4 values with
+one E8M0 scale per 32 values; the adapter packs a call's queries once.
 
 #### Contract
 
@@ -839,8 +841,12 @@ Visible lengths are bounded by the block table's row capacity in each consumer,
 before narrowing int64 inputs to int32. The adapter passes dense raw lengths
 without a separate clamp launch. Candidate-block selection uses the same table
 bound, including when compact candidate logits have a smaller width, so forcing
-the newest visible block preserves its logical position. Logit and histogram
-scratch initialization remains necessary for unscored columns and atomic sums.
+the newest visible block preserves its logical position. The gfx950 scorers
+write every column the selections read, -inf where no row is scored: each
+query's columns through the end of its last visible 8-row block (block
+selection reads whole blocks), and every candidate column. Their logits are
+therefore not pre-filled; the gfx1250 launcher fills its logits with -inf.
+Histogram scratch is zeroed before its atomic sums.
 The gfx950 and gfx1250 row selectors read live-width strides directly, including
 broadcast limits and strided single-row tail tiles. Such tails retain their stride
 after PyTorch `contiguous()`, so selection cannot require a unit limit stride.
@@ -869,7 +875,11 @@ model-fixed selection capacities retain the existing launch policy.
   reading device lengths on the host. The query tile shrinks with that width
   to keep FP32 logits within 32 MiB (at most 256 queries at 32K rows, 64 at
   128K, and 8 at 1M). Score CTAs honor the caller's row-chunk bound up to the
-  256-row tuned maximum.
+  256-row tuned maximum. The gfx950 per-query scorer uses at most 64 columns
+  per chunk (64 or fewer queries) or 128; in Full mode the chunk is a
+  multiple of 32 or a divisor of 64, so a chunk never straddles a 64-row
+  page. Its grid is bounded, and each CTA strides over the chunks of a
+  capacity-wide row.
 - Full selection writes finite logits only for each query's visible rows, so
   row selection reads just that prefix of the capacity-wide row (the
   per-query visible length, read on device).
@@ -881,33 +891,52 @@ model-fixed selection capacities retain the existing launch policy.
 
 #### Algorithm
 
-The gfx950 scorer runs one program per query and chunk of up to 256 columns.
-The 32 padded heads form two 16-head MFMA groups. For each 32-column tile it
-maps columns to pages through the candidate ids and page table, loads the
-MXFP4 key rows, and scores them with E2M1 scaled MFMA against the E8M0
-scales, then applies ReLU and the weighted head sum. A chunk bound that is
-not a multiple of 32 masks its last tile. The gfx1250 scorer follows the
+The gfx950 scorers score 32-column key tiles: the 32 padded heads form two
+16-head MFMA groups that share one loaded tile of MXFP4 key rows and scales,
+scored with E2M1 scaled MFMA, then ReLU and the weighted head sum. Both are
+compiled without FP contraction, so they produce the same bits.
+
+- The shared-table scorer runs one program per four queries and chunk of up
+  to 256 columns. A 32-row tile never crosses a 64-row page, so each tile
+  needs one scalar page lookup, and the next tile loads before the current
+  tile's MFMAs.
+- The per-query scorer runs one program per query and grid split. In Full
+  mode each tile also takes one scalar page lookup; with candidates it maps
+  columns to pages through the candidate ids and page table. Two tiles are in
+  flight. A chunk bound that is not a multiple of 32 masks its last tile.
+
+The gfx1250 scorer follows the
 same steps with E2M1 scaled wave32 WMMA: all 32 heads form one WMMA tile, and
 its four warps split each 64-column key tile, so no warp loads another's keys.
 
-The gfx950 selector runs one workgroup per query in a single launch,
-replacing `torch.topk`, a sort and about ten elementwise kernels. A
-three-pass MSD radix select (11+11+10 key bits, LDS-atomic histograms) finds
-the order key of the K-th largest logit. One column-order compaction pass,
-with a single packed scan per chunk, keeps every larger key plus the first
-ties and maps candidate columns to logical rows. The picks are already
-ascending without candidates and with ascending candidate lists; otherwise an
-all-pairs rank sorts them. LDS atomics cost about one wave instruction per 64
-lanes regardless of conflicts, so the radix passes dominate on wide rows.
+The gfx950 selector runs one 16-warp workgroup per query in a single launch
+and reads the row twice:
+
+1. A histogram of the top 11 key bits finds the pivot digit of the K-th
+   largest logit.
+2. Each warp scans its own contiguous columns and appends, in column order,
+   every key at or above the pivot digit to its LDS region.
+
+The regions in warp order are in column order, so the exact threshold (one or
+two more digits, from LDS), the lowest-column boundary ties, and the output
+order follow without another row read or a sort. If a region overflows, each
+warp's exact count gives contiguous column-ordered offsets and a third pass
+rewrites the keys; if the pivot digit alone is too large, a second histogram
+pass first refines it to 22 bits. Only when the 22-bit boundary bin still
+does not fit does the selector fall back to a three-pass MSD radix select and
+a column-order compaction. Candidate columns map to logical rows; their picks
+are ranked when the candidate list is not ascending.
 
 The gfx1250 selector runs the same passes on sixteen 32-lane waves, so each
 workgroup keeps 512 lanes and the 2048-bin histograms.
 
 Block selection takes the maximum logit of each 8-row block, forces the
 newest visible block to `+inf`, and keeps the top blocks in ascending order.
-The portable Triton block select runs one program per query: it reads only
-the visible blocks, runs a four-pass MSD radix select (8 key bits per pass),
-and emits the picks in block order, so no sort is needed.
+On gfx950 one kernel writes the visible block maxima and the gfx950 row
+selector picks up to 2048 blocks. The portable Triton block select runs one
+program per query: it reads only the visible blocks, runs a four-pass MSD
+radix select (8 key bits per pass), and emits the picks in block order, so no
+sort is needed.
 
 ### gfx950 DeepSeek V4.1 selected attention
 
@@ -1264,6 +1293,55 @@ When the grid leaves CUs idle, the launcher splits the KV stream and
 most one wave of CTAs and stream at least four pages each, since every split
 pays a fixed prologue and an FP32 partial store.
 
+### gfx1250 MHA prefill
+
+The kernel computes causal attention over packed sequences with equal or ragged
+lengths. It supports BF16, FP16, and FP8, head dimensions 64 and 128, grouped
+query heads, sliding windows, sinks, and natural-log LSE output.
+
+BF16/FP16 use finite tile and wave-count buckets. Compatible GQA groups pack
+query heads into matrix rows so they share K/V loads. Short sequences use one-
+or two-key-tile schedules with TDM query loads and fused K/V transfers. Short
+eight-wave tiles preserve wave ownership through the output store. Long
+sequences overlap K/V transfers with QK, softmax, and PV through a double
+buffer; selected layouts defer probability reductions to reduce loop work.
+
+Strongly imbalanced ragged batches compact live query tiles onto the grid.
+Partial query tiles remain masked and can use smaller matrices while reusing
+resident K/V. Request counts, uniform lengths, and tail lengths are runtime
+values; changing them within a tile/feature bucket does not recompile kernels.
+The launch policy and its thresholds live in `mha/prefill.py`.
+
+QK and PV accumulate in FP32. The denominator uses probabilities before rounding
+them to the input dtype for PV. Dot products must be finite in FP32. Online
+softmax subtracts the maximum before scaling, preserving large finite scores.
+Sink-derived initial references are capped at the FP32 maximum to prevent
+positive overflow when converting to unscaled score units.
+The fixed-shift schedule changes probability rounding, so its results are
+numerically equivalent within tolerance, rather than bitwise identical.
+
+The normalization modes have these prerequisites and numerical bounds:
+
+| Mode | Eligibility | Numerical contract |
+| --- | --- | --- |
+| Online softmax | General path, including FP8 and windows | Keep the maximum in unscaled score units; update it and rescale FP32 state for each key tile. |
+| Single-tile normalization | Short BF16/FP16, D128, 256 query rows, 128 keys, eight waves, no sinks/LSE | Subtract the tile maximum, accumulate the FP32 denominator, then round probabilities for PV. A finite maximum seed gives masked rows zero probability. |
+| Fixed first-tile shift | BF16/FP16, four waves, D64/D128, 64/128-key tiles, no window, at least three key tiles | Keep the first tile's shift. Require an absolute base-2 shift at most 64, denominator in `(0, 1e30)`, and finite normalized output within the output dtype's range. |
+| Online retry | Any valid row fails a fixed-shift guard | Recompute the workgroup with subtract-before-scale online softmax in the same launch and buffers, overwriting provisional output and LSE. |
+
+The shift bound limits cancellation; NaN-propagating reductions detect invalid
+output, and the denominator bound prevents reciprocal underflow. Masked rows do
+not participate in retry decisions. Guards evaluate current tensor values on
+every graph replay; high-range inputs can pay for both passes.
+
+LSE describes key logits and excludes sinks. When both are requested, the kernel
+writes key-only LSE before adding sinks to output normalization with stable
+rescaling. For BF16, values and the final denominator share a power-of-two
+downscale based on sequence length, bounding the online value sum before sink
+rescaling without changing probability rounding or key-only LSE. Tests cover
+this contract with independent FP64 attention, changing graph inputs, storage
+offsets, ragged boundaries, and bounded JIT specialization.
+
 ### gfx1250 MLA prefill
 
 `gluon_mla_prefill_gfx1250` computes the same dense, non-absorbed attention
@@ -1325,6 +1403,49 @@ and scaled), beta-scaled v, beta and decay into LDS once, so the serial steps
 wait only on LDS rather than one global round trip per token. The kernel is
 HBM bound: it reads the state once and writes it once per destination.
 
+### KDA chunked prefill (gfx950 / gfx1250)
+
+`gluon_kda_paged_prefill_gfx950` and `gluon_kda_paged_prefill_gfx1250` run
+KDA prefill over packed variable-length sequences, from and into the V-major
+state layout of the decode pool.
+
+#### Contract
+
+- q, k and raw g are `[1, T, H, K]`, v is `[1, T, H, V]` and beta logits are
+  `[1, T, H]`, in FP16 or BF16, with `K = V = 128`. A_log is `[H]` and
+  dt_bias `[H, K]`. An optional `lower_bound` selects the safe decay gate.
+- `cu_seqlens` (`[N + 1]`) delimits the sequences, which may be empty. The
+  initial and final states are FP32 `[N, H, V, K]`.
+- `cu_seqlens_cpu`, the host copy of the bounds, lets the chunk schedule be
+  planned on the host without a device read-back. The plan is reused by
+  tensor identity across the layers of a forward. Without it, `cu_seqlens`
+  is read back on each call.
+- Token, sequence, chunk and time-group counts are runtime values. Row
+  blocks and warp counts come from a fixed menu.
+
+#### Algorithm
+
+Sequences are cut into 64-token chunks that never cross a sequence boundary.
+One prepare program per (chunk, head) computes the gated, L2-normalized q and
+k, the chunk's cumulative decay, Aqk, and W and U through the FP32 inverse of
+`I + Akk`: its 16-token diagonal blocks by repeated squaring and the
+off-diagonal blocks from band-shifted products, with beta folded into its
+columns. It writes W, U, Qg, Kg, Aqk and exp2 of each chunk's last decay.
+
+A state walk then carries the state across the chunks. Each warp keeps 16
+state rows in registers, W, U, Kg, Qg and Aqk stream through a two-slot LDS
+ring, and the chunk output is written in the same pass. When too few
+sequences would leave CUs idle, each sequence is split into up to 32 time
+groups. Every group but the last is summarized as `S_out = S_in M + B`, a
+chain kernel turns the summaries into each group's entry state, and all
+groups then walk at once; the last one writes the final state.
+
+gfx1250 loads every tile with TDM, picks WMMA layouts whose results feed the
+next product without leaving registers, walks with the `coexec` scheduler
+(which the backend otherwise applies only up to four warps), and prefetches
+M and B three groups ahead in the chain. gfx950 uses MFMA and schedules its
+prepare kernel with `max-ilp`.
+
 ### KDA records verify and commit (gfx950 / gfx1250)
 
 Standard target decode is a one-token verify window. Both standard and
@@ -1332,8 +1453,8 @@ speculative decode follow verify, acceptance, and commit. Verify retains
 the Gluon fused convolution, LDS vectors and batched value-split selection.
 GFX950 uses 32-row state panels for one-token windows with a bounded gate
 and no value split. Other cases use 16-row panels. Verify preserves committed
-FP32 state. It saves correction U in FP32, and unnormalized K and raw gate in
-the activation dtype.
+FP32 or BF16 state and widens it to FP32. It saves correction U in FP32,
+and unnormalized K and raw gate in the activation dtype.
 Convolution values round to that dtype before recurrence so recovery uses
 the same K as verify. The current AMD registration supports BF16. Verify can
 also retain original QKV in a separate caller-owned buffer, which commit
@@ -1361,9 +1482,9 @@ instrumentation. Interval and generation guards remain active; invalid
 records are skipped without device assertions.
 
 Batched descriptors use the shared ten-column table: original QKV (0), conv
-history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 state (8).
-The remaining columns are reserved. Recovery retains one program per head,
-request and layer. It stages accepted
+history (2), U (3), K/raw-g (5), A_log (6), dt_bias (7), and FP32 or BF16
+state (8). The remaining columns are reserved. Recovery retains one program
+per head, request and layer. It stages accepted
 U, K and raw gate once in LDS, then applies the same updates per value panel.
 It commits each head's convolution history after loading all old taps,
 including when source and destination alias. History retains its bound pool
@@ -2043,8 +2164,14 @@ Sinkhorn divisions use the hardware reciprocal (about one ulp).
 
 The post and collapse kernels move eight contiguous BF16 values per lane.
 Post runs one token per CTA so its twenty coefficients are scalar loads that
-never wait behind the vector stores. The collapse runs one token per CTA so
-the optional RMSNorm reduces the whole row once.
+never wait behind the vector stores. Large post calls (prefill chunks) stream
+far more than the caches hold, so above 2048 tokens adjacent CTAs take
+adjacent hidden blocks of one token and all vector accesses are non-temporal:
+the CTAs in flight cover contiguous rows, and the post neither caches its dead
+inputs nor evicts the dirty lines earlier kernels left behind. Smaller calls
+keep ordinary caching so the next pre-mapping can read the new streams from
+cache. The collapse runs one token per CTA so the optional RMSNorm reduces the
+whole row once.
 
 ### gfx950 Qwen4 hyper-connection mix
 
