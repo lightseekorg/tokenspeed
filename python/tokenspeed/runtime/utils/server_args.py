@@ -476,6 +476,8 @@ class ServerArgs:
     # MoE backend
     moe_backend: str = "auto"
     draft_moe_backend: str | None = None
+    # GEMM2 atomic expert combine for unquantized FlashInfer CUTLASS MoE.
+    moe_cutlass_fused_finalize: bool = True
     # Opt-in: run MXFP4 routed experts with FP8 activations (FlashInfer cutlass
     # W4A8 on Hopper). Off keeps the checkpoint's BF16 activation contract.
     moe_mxfp4_fp8_activation: bool = False
@@ -488,6 +490,8 @@ class ServerArgs:
     kvstore_ratio: float = 2.0
     kvstore_size: int = 0
     kvstore_io_backend: str = "kernel"
+    # When Device prefix-cache pages are copied to Host L2 (--kvstore-write-policy).
+    kvstore_write_policy: str = "write_through"
     # Optional L3 storage beneath the compact Host cache.
     kvstore_storage_backend: str | None = None
     kvstore_storage_backend_extra_config: str | None = None
@@ -520,6 +524,7 @@ class ServerArgs:
 
     # Kernel backend
     attention_backend: str | None = None
+    min_kv_split: int | None = None
     kda_backend: str = "auto"
     drafter_attention_backend: str | None = None
     # BLASST skip-softmax sparsity, gluon MHA prefill only (gfx950). 0.0
@@ -1526,6 +1531,17 @@ class ServerArgs:
                 "or accuracy evaluation."
             )
 
+        if self.min_kv_split is not None:
+            if type(self.min_kv_split) is not int or not 1 <= self.min_kv_split <= 256:
+                raise ValueError("min_kv_split must be an integer in [1, 256]")
+            if self.attention_backend != "tokenspeed_mla" or (
+                self.speculative_algorithm is not None
+                and self.drafter_attention_backend not in (None, "tokenspeed_mla")
+            ):
+                raise ValueError(
+                    "--min-kv-split requires tokenspeed_mla for target and draft attention"
+                )
+
         # Keep drafter backend consistent with the main model unless explicitly set.
         if (
             self.speculative_algorithm is not None
@@ -1823,6 +1839,7 @@ class ServerArgs:
         self.disable_autotune = True
         self.disable_tf32 = True
         self.disable_pdl = True
+        self.moe_cutlass_fused_finalize = False
         # MoE keeps auto or the user's provider restriction. The expert
         # plan checks the batch_invariant feature against actual layer geometry.
         # Sampling: greedy rows must break exact logit ties canonically, and
@@ -2021,6 +2038,45 @@ class ServerArgs:
                 raise ValueError(
                     "--enable-state-checkpoint-in-forward writes a checkpoint only "
                     "the prefix cache can reuse; it requires prefix caching"
+                )
+        _require_choice(
+            "--kvstore-write-policy",
+            self.kvstore_write_policy,
+            ("write_through", "write_back"),
+        )
+        if self.kvstore_write_policy == "write_back":
+            # Decode's Host holds retraction images only, and L3 staging would
+            # split what is written back; pipeline stages and query context
+            # parallelism have not run write-back. Attention TP and
+            # --kv-parallel-size need no refusal: a written-back segment
+            # publishes once every rank of the replica has acknowledged it
+            # (docs/design/scheduler.md section 3.1). More than 64 cache
+            # groups are refused by SchedulerConfig.Validate, once the model's
+            # cache groups exist.
+            unsupported = [
+                setting
+                for setting, refused in (
+                    ("--disable-kvstore (no Host L2)", not self.enable_kvstore),
+                    (
+                        "--disaggregation-mode decode",
+                        self.disaggregation_mode == "decode",
+                    ),
+                    (
+                        "--kvstore-storage-backend",
+                        self.kvstore_storage_backend is not None,
+                    ),
+                    (
+                        "--query-context-parallel-size > 1",
+                        self.query_context_parallel_size > 1,
+                    ),
+                    ("--pipeline-parallel-size > 1", self.mapping.has_pp),
+                )
+                if refused
+            ]
+            if unsupported:
+                raise ValueError(
+                    "--kvstore-write-policy write_back does not support "
+                    f"{', '.join(unsupported)}"
                 )
 
     def validate_model_update_options(self):
@@ -2591,7 +2647,8 @@ class ServerArgs:
             type=int,
             default=ServerArgs.kvstore_size,
             help="The size of the KVStore host memory pool in gigabytes, which will override kvstore_ratio if set. "
-            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available.",
+            "Refused at startup if it does not fit in this rank's share of the Host memory its node has available, "
+            "or if the ranks resolve it to different page counts, as pipeline stages may (use --kvstore-ratio there).",
         )
         parser.add_argument(
             "--kvstore-io-backend",
@@ -2599,6 +2656,23 @@ class ServerArgs:
             choices=["direct", "kernel"],
             default=ServerArgs.kvstore_io_backend,
             help="The IO backend for KVStore transfer between CPU and GPU.",
+        )
+        parser.add_argument(
+            "--kvstore-write-policy",
+            type=str,
+            choices=["write_through", "write_back"],
+            default=ServerArgs.kvstore_write_policy,
+            help="What feeds Host L2 (the KVStore) from the GPU prefix cache. "
+            "'write_through' (the default) copies every page the fused or "
+            "prefill role caches. "
+            "'write_back' copies only the pages the GPU evicts, in the "
+            "scheduling step that evicts them (that step's forward waits for "
+            "the copy), so the two tiers hold mostly different pages. "
+            "write_back is refused with --disaggregation-mode decode, "
+            "--disable-kvstore, --kvstore-storage-backend, "
+            "--pipeline-parallel-size > 1 or --query-context-parallel-size > 1, "
+            "and at startup for a model with more than 64 cache groups; see "
+            "docs/configuration/server.md.",
         )
         parser.add_argument(
             "--kvstore-storage-backend",
@@ -2679,7 +2753,9 @@ class ServerArgs:
             type=str,
             default=ServerArgs.mamba_ssm_dtype,
             choices=["float32", "bfloat16"],
-            help="It is used to tune mamba ssm dtype",
+            help="Dtype of the stored linear-attention recurrent state (GDN "
+            "and KDA SSM state). Scans accumulate in float32 either way; "
+            "bfloat16 halves the state memory.",
         )
         parser.add_argument(
             "--max-prefill-tokens",
@@ -2941,6 +3017,15 @@ class ServerArgs:
             "rl-bitwise the selected kernel must declare batch invariance.",
         )
         parser.add_argument(
+            "--moe-cutlass-fused-finalize",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.moe_cutlass_fused_finalize,
+            help="Enable GEMM2 atomic expert combine for unquantized FP16/BF16 "
+            "MoE on flashinfer_cutlass, for target and draft models. On by "
+            "default; the fused reduction is not run-to-run reproducible. Forced "
+            "off by --numerics rl-bitwise.",
+        )
+        parser.add_argument(
             "--moe-mxfp4-fp8-activation",
             action="store_true",
             help="Run MXFP4 routed experts with FP8 activations (on Hopper the "
@@ -3024,6 +3109,14 @@ class ServerArgs:
             f"{attention_backend_names}, or a name a plugin registers. 'mha' "
             "selects compatible registered MHA kernels; 'gluon' forces "
             "registered Gluon MLA kernels.",
+        )
+        parser.add_argument(
+            "--min-kv-split",
+            type=int,
+            default=None,
+            help="Minimum decode KV splits for tokenspeed_mla target and draft attention "
+            "(1–256). Omit to retain automatic selection. Larger values can improve "
+            "long-context decoding at the cost of workspace and short-context latency.",
         )
         parser.add_argument(
             "--kda-backend",

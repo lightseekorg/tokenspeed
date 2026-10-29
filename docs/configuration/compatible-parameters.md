@@ -54,6 +54,7 @@ TokenSpeed-specific behavior explicitly.
 | `--attention-backend` | `--attention-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 | `--moe-backend` | `--moe-backend` | Name is aligned; available backend values are TokenSpeed-specific. |
 | `--quantization-param-path` | `--quantization-param-path` | KV caches run unscaled: under an FP8 KV cache the file is accepted only when every factor is 1.0 (other KV dtypes do not read it), and checkpoint KV-cache scales other than 1.0 are rejected at load. |
+| `--mamba-ssm-cache-dtype` | `--mamba-ssm-dtype` | Accepts `float32` (default) or `bfloat16`; there is no `auto` that follows the checkpoint. |
 
 ## Recipe translation notes
 

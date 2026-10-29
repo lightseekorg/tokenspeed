@@ -76,6 +76,7 @@ its request partition is invalidated before another PD owner uses it.
 | `--dtype` | Model weight and activation dtype. `auto` follows model metadata. |
 | `--kv-cache-dtype` | KV cache dtype. Lower precision reduces KV memory. |
 | `--kv-cache-quant-method` | KV cache quantization method. |
+| `--mamba-ssm-dtype` | Stored linear-attention recurrent state dtype (GDN and KDA): `float32` (default) or `bfloat16`. Scans still accumulate in FP32; `bfloat16` halves state memory. |
 | `--quantization` | Weight quantization mode such as `fp8`, `nvfp4`, `w8a8_fp8`, or `compressed-tensors`. |
 | `--quantization-param-path` | JSON file of FP8 KV cache scaling factors, read only under an FP8 KV cache. KV caches run unscaled, so every factor must be 1.0, as must any KV-cache scale the checkpoint carries. |
 
@@ -87,7 +88,7 @@ switch an envelope folds is also available individually under `auto`.
 
 | Parameter | Purpose |
 | --- | --- |
-| `--numerics {auto,rl-bitwise}` | `auto` keeps every performance default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
+| `--numerics {auto,rl-bitwise}` | `auto` uses each option's default. `rl-bitwise` folds the determinism switches (`--batch-invariant-collectives`, `--disable-autotune`, `--disable-tf32`, `--disable-pdl`, no fused all-reduce, batch-invariant MoE planning, `--sampling-stream per-request`, `--dsa-slot-order sorted`) so tokens and logprobs are bitwise identical across runs and batch compositions, and the trainer-operation-order switches below so a teacher-forced pass reproduces the RL trainer's logprobs. Needs MoE TP 1 and a vocabulary that is a multiple of 32768; a model serves it only once its profile lists it. |
 | `--disable-autotune` | Disable startup FlashInfer tactic profiling. Matching caches still load; CuTe warmup continues except under pipeline parallelism. PrimTS skips extra group enumeration. |
 | `--batch-invariant-collectives` | One association order per reduction, independent of the batch: every reduction runs as NCCL data movement plus a fixed-rank-order fp32 fold (an all-reduce costs world_size x the traffic); gathers keep the multicast kernels. Folded in by `rl-bitwise`. |
 | `--force-deterministic-rsag` | NCCL and the fold only: no symmetric-memory path (multicast gathers, the trtllm/Triton all-reduce tiers, distributed argmax). Not folded in by `rl-bitwise`, under which it only moves the gathers to NCCL. |
@@ -501,6 +502,7 @@ for the online variant.
 | `--attention-backend` | Attention kernel backend. Common values include `mha`, `fa3`, `fa4`, `triton`, `flashinfer`, `trtllm_mla`, and `tokenspeed_mla`. Names are checked against the backend registry at startup, after plugins load, so an installed plugin's backends are accepted too. On SM103 (B300/GB300), `fa4` ranks below every other attention kernel: naming it here or in `--drafter-attention-backend` selects it, and the default selection is unchanged. |
 | `--drafter-attention-backend` | Attention backend for the speculative decoding drafter model; accepts the same names as `--attention-backend`. |
 | `--moe-backend` | MoE backend. |
+| `--moe-cutlass-fused-finalize` / `--no-moe-cutlass-fused-finalize` | GEMM2 atomic expert combine for unquantized FP16/BF16 MoE on `flashinfer_cutlass`, for both target and draft models. On by default and forced off by `--numerics rl-bitwise`. The fused reduction order is nondeterministic. |
 | `--moe-mxfp4-fp8-activation` | Opt-in: run MXFP4 routed experts with FP8 activations. On Hopper this is the FlashInfer cutlass W4A8 MoE (faster than the default W4A16 kernel, a few percent of extra error on expert outputs). Applies to every MXFP4 expert layer, target and draft; startup fails where the selected MoE backend has no FP8-activation kernel for a layer, when a model's routed experts are not MXFP4, when the model pins another activation precision (Kimi-K3 on Hopper Marlin), or when the layer's SwiGLU is unclamped (the W4A8 FC2 scale relies on the clamp). |
 | `--draft-moe-backend` | MoE backend for the speculative decoding draft model. |
 | `--all2all-backend` | MoE all-to-all backend. |
@@ -902,7 +904,9 @@ nothing is recomputed) to free Device pages for a blocked admission. One
 increment per retraction victim, counted from the plan's snapshot-store ops;
 forced retractions from `--debug-force-retraction-interval` count too. A
 retraction whose victim cannot be imaged aborts it instead — those are
-`tokenspeed:num_capacity_aborted_requests`, never preemptions.
+`tokenspeed:num_capacity_aborted_requests`, never preemptions. A forced
+retraction's victim refused after its pages were published is aborted and
+counts there too.
 
 ### Per-request stats
 
@@ -938,6 +942,10 @@ C++ scheduler path. This initial stream does not publish Host/L2 loadback
 events. The scheduler caches block hash lineage on prefix-cache nodes, so
 publishing a stored block uses the parent node's cached hash instead of
 rebuilding the full ancestor prefix.
+
+Host L2 entries publish no events. Under `--kvstore-write-policy write_back`,
+a block the GPU evicts is reported `BlockRemoved` even when it is written
+back to the Host.
 
 Example:
 
@@ -1050,24 +1058,29 @@ roles never retract: their pool arguments are ignored with a log.
 admission gate charges a request's worst-case image -- and retraction never
 waits on Host capacity or falls back to recomputation. The capacity policy
 ranks only victims whose image fits (a free slot-state row and pool room for
-the tail; hash-complete pages ride Host L2, whose shortfall falls back to
-the pool). When no resident fits, the scheduler **aborts the newest
+the tail and for the hash-complete pages Host L2 does not take: which ones
+it takes is planned before anything is evicted for the image, under either
+write policy). When no resident fits, the scheduler **aborts the newest
 retractable resident** in the same round and grants its pages to the
 blocked request. The client sees the finish `{"type": "abort", "err_type":
 524, "message": "Request aborted by the scheduler: <detail>"}`
 (`ABORT_CODE.CapacityAbort`; the detail names the shortfall -- "snapshot
-pool cannot hold the image" or "no blob slot free
-(max_retracted_requests=N)" -- and the argument to raise), distinguishable from
-a NaN abort (523) or a transfer failure (521), so a caller that can retry --
-an RL rollout, a batch job -- resubmits; the engine counts them in
-`tokenspeed:num_capacity_aborted_requests`. The two arguments therefore size how
-much work may be suspended at once, and exceeding them costs an abort of
-one request, never latency for everyone else. With no pool
+pool cannot hold the image", "Host L2 cache cannot take the image's
+published pages" or "no blob slot free (max_retracted_requests=N)" -- and
+the argument to raise), distinguishable from a NaN abort (523) or a transfer
+failure (521), so a caller that can retry -- an RL rollout, a batch job --
+resubmits; the engine counts them in
+`tokenspeed:num_capacity_aborted_requests`. The two arguments therefore size
+how much work may be suspended at once (with Host L2, so does
+`--kvstore-size`, which takes the hash-complete pages), and exceeding them
+costs an abort of one request, never latency for everyone else. With no pool
 (`--retraction-snapshot-ratio 0`) nothing can be imaged, so a
 capacity-blocked round aborts the newest resident instead of imaging
-anyone. `--debug-force-retraction-interval` never aborts: a forced
-retraction whose image does not fit is refused and logged. The scheduler's
-victim choice is in `docs/design/scheduler.md` section 2.
+anyone. A forced retraction (`--debug-force-retraction-interval`) whose
+image does not fit is refused and logged, and the request runs on; only a
+request whose image is refused after its pages were published is aborted as
+above. The scheduler's victim choice is in `docs/design/scheduler.md` section
+2.
 
 The ops ride the round's `DeviceHandle.execute` with the L2 write-backs and
 load-backs (`docs/design/event-loop.md`), their ACKs the same cache poll, and
@@ -1094,6 +1107,64 @@ Host pinned buffer (L2 / flat KV)
 Mooncake Store (L3)
 ```
 
+**Write policy.** `--kvstore-write-policy` chooses when pages of the GPU
+prefix cache are copied to Host L2:
+
+- `write_through` (the default): on the fused and prefill roles, every page
+  the GPU caches is also copied to the Host, which keeps it after the GPU
+  evicts the page. The decode role's Host L2 holds retraction images only.
+- `write_back`: nothing is copied when a page is cached. When the GPU
+  evicts cached pages to make room for a request, or to resume a retracted
+  one, it copies them to the Host in the same scheduling step, and they can
+  be reused from there once the copy completes.
+
+`write_back` lets the two tiers cache more together: the GPU and the Host
+hold mostly different pages, up to about the sum of their capacities less
+pages in use or in transit, where under `write_through` the Host spends its
+room on a copy of what the GPU holds. Eviction trims a conversation from its
+end, so the GPU keeps its beginning and the Host the rest, and a later
+prompt resumes from both. The cost: a step that evicts must finish copying
+the evicted pages to the Host before its forward pass can write over them,
+so the copy adds to that step's time.
+
+`write_back` runs on the fused and prefill roles, not with
+`--disaggregation-mode decode`. Both cached and replayable sliding-window
+groups are supported. It requires Host L2,
+`--pipeline-parallel-size 1`, `--query-context-parallel-size 1` and no
+`--kvstore-storage-backend`, and a model with at most 64 cache groups;
+startup refuses it otherwise, the group limit once the model's cache groups are
+built.
+
+Under `write_back`:
+
+- Clearing only the GPU cache, as `POST /release_memory_occupation` does
+  when it releases `kv_cache`, loses what only the GPU holds. The Host pages
+  that continue a prefix only the GPU held stay in Host L2: they serve hits
+  again once a request recomputes that prefix on the GPU, and otherwise leave
+  only through Host LRU eviction. `/flush_cache` clears both tiers under
+  either policy.
+- Not everything the GPU evicts reaches the Host: what a request releases
+  itself, what nothing can resume from any more, and pages evicted together
+  that the Host cannot fit as a whole are dropped.
+- [KV cache events](#kv-cache-events) keep describing the GPU cache only,
+  so a router reading them does not see the Host's share of the reusable
+  cache, which `write_back` makes larger.
+- Under attention TP, every rank copies its own part of what the engine
+  evicts to its own Host L2 (under `--kv-parallel-size`, the pages it owns),
+  and an evicted page can be reused from the Host once every rank's copy has
+  completed. Where every rank holds whole pages (an MLA cache without
+  `--kv-parallel-size`), the ranks copy the same bytes: attention TP then
+  multiplies the copy traffic without letting the Host hold more pages.
+
+Elsewhere on this page, "write-back" means any copy from the GPU to Host L2,
+whichever policy is set, not only the copies `write_back` makes. How the
+scheduler implements the two policies is in
+[cache concepts](../design/cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
+and, for `write_back`,
+[scheduler §3.1](../design/scheduler.md#31-p--prefill-worker) and, on the
+fused role,
+[§3.3](../design/scheduler.md#33-fused--one-engine-everything-local).
+
 **Sizing.** `--kvstore-size` (gigabytes per rank) wins over
 `--kvstore-ratio` (a multiple of this rank's Device KV, 2 by default).
 Every rank of a node pins its Host buffers at the same point of startup, so
@@ -1107,7 +1178,13 @@ LCM blocks in the largest power of two that fits, and one size on every
 rank, since the ranks' schedulers mirror each other -- and each rank logs a
 warning with the requested and the capped size. An explicit
 `--kvstore-size` is never shrunk: one that does not fit is refused at
-startup, as is a share without room for a single LCM block.
+startup, as is a share without room for a single LCM block. Every rank
+must also resolve the same page counts: startup compares them across the
+ranks and refuses a difference on every rank. A size in gigabytes is a
+different page count wherever the ranks' LCM blocks differ in bytes, as
+they usually do on pipeline stages, which store different layers, so with
+`--pipeline-parallel-size > 1` size Host L2 with `--kvstore-ratio` rather
+than `--kvstore-size`.
 
 **Requirements and deployment.** L3 requires Host L2 (omit
 `--disable-kvstore`) and currently supports PP=1. Cyclic KV-page sharding

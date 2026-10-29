@@ -41,6 +41,7 @@ def kimi_recipe(
     speculative_algorithm: str | None = None,
     speculative_num_draft_tokens: int = 1,
     kv_cache_dtype: torch.dtype = torch.float8_e4m3fn,
+    mamba_ssm_dtype: str = "float32",
 ):
     """A Kimi-K3 recipe over the reference config, with tiny scheduler limits."""
     import dataclasses
@@ -111,6 +112,7 @@ def kimi_recipe(
             enable_prefix_caching=True,
             speculative_algorithm=speculative_algorithm,
             speculative_num_draft_tokens=speculative_num_draft_tokens,
+            mamba_ssm_dtype=mamba_ssm_dtype,
         ),
         model_config=SimpleNamespace(hf_text_config=text_config),
         attn_config=attn_config,

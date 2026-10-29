@@ -2,7 +2,6 @@
 
 from typing import NamedTuple
 
-import triton.experimental.gluon as g
 from lib.gemm.rocm.intrinsics import (
     _native_call,
     _native_store_ushort_component,
@@ -11,11 +10,14 @@ from lib.gemm.rocm.intrinsics import (
     amdgcn_cvt_pk_bf16_f32,
     amdgcn_pk_mul_f32,
     amdgcn_s_waitcnt_barrier,
+    lds_load,
+    lds_store,
 )
 from lib.moe.rocm.fused_moe import ClearMat, HotLoopScheduler
 from lib.moe.rocm.ops.schedule_tiles import InputShm, MxFp4Tile
 from lib.tal.device import DeviceTemplate, device_method
-from triton.experimental.gluon import language as l
+from tokenspeed_kernel._triton import gl as l
+from tokenspeed_kernel._triton import gluon as g
 
 
 class W13State(NamedTuple):
@@ -312,28 +314,28 @@ class TwoStageStage2Epilogue(DeviceTemplate):
     @device_method
     def StoreOutputRowOffset(self, shm, row, offset):
         if row < self.kTileRows:
-            l.store(shm + self.kOutputWords + row, offset)
+            lds_store(shm + self.kOutputWords + row, offset)
 
     @device_method
     def StoreRouteWeight(self, shm, row, weight):
         if row < self.kTileRows:
             route_weights = (shm + self.kOutputWords + self.kTileRows).to(
-                l.pointer_type(l.float32, 3)
+                l.pointer_type(l.float32)
             )
-            l.store(route_weights + row, weight.to(l.float32, bitcast=True))
+            lds_store(route_weights + row, weight.to(l.float32, bitcast=True))
 
     @device_method
     def LoadRouteWeights(self, shm, wtid):
         row = wtid % 16
         weights = (shm + self.kOutputWords + self.kTileRows).to(
-            l.pointer_type(l.float32, 3)
+            l.pointer_type(l.float32)
         )
-        return l.load(weights + row), l.load(weights + row + 16)
+        return lds_load(weights + row), lds_load(weights + row + 16)
 
     @device_method
     def WriteShm(self, shm, accum, wid, wtid):
         q, r = wtid // 16, wtid % 16
-        output = shm.to(l.pointer_type(l.uint16, 3))
+        output = shm.to(l.pointer_type(l.uint16))
         for mi in l.static_range(2):
             for ni in l.static_range(self.kAccumFragments // 2):
                 fragment: l.constexpr
@@ -356,9 +358,11 @@ class TwoStageStage2Epilogue(DeviceTemplate):
         output = shm
         base = m_lane * (self.kTileCols // 2) + n_lane
         for mr in l.static_range(4):
-            output_row_offset = l.load(shm + self.kOutputWords + m_lane + mr * 8)
+            output_row_offset = lds_load(shm + self.kOutputWords + m_lane + mr * 8)
             for nr in l.static_range(4):
-                value = l.load(output + base + mr * 8 * (self.kTileCols // 2) + nr * 32)
+                value = lds_load(
+                    output + base + mr * 8 * (self.kTileCols // 2) + nr * 32
+                )
                 col = tile_col + nr * 64 + n_lane * 2
                 vo = output_row_offset + col * 2
                 BufferAtomicWriteBf16x2(out, vo, value)

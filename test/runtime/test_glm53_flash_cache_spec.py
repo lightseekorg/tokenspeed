@@ -48,6 +48,7 @@ def _recipe(
     linear_tp_size: int | None = None,
     pd_disaggregation_enabled: bool = False,
     index_k_format: str = "fp8_scaled",
+    mamba_ssm_dtype: str = "float32",
 ) -> Glm53FlashRecipe:
     linear_tp_size = linear_tp_size or tp_size
     dsa = DSAConfig(
@@ -109,6 +110,7 @@ def _recipe(
             enable_prefix_caching=True,
             speculative_algorithm="MTP" if draft_layers else None,
             speculative_num_draft_tokens=3,
+            mamba_ssm_dtype=mamba_ssm_dtype,
         ),
         model_config=SimpleNamespace(num_attention_layers=_NUM_LAYERS),
         attn_config=attn_config,
@@ -129,12 +131,14 @@ def _layout(
     mla_cache_dtype: torch.dtype,
     draft_layers: int = 0,
     linear_tp_size: int | None = None,
+    mamba_ssm_dtype: str = "float32",
 ) -> CacheLayout:
     recipe = _recipe(
         tp_size=tp_size,
         linear_tp_size=linear_tp_size,
         mla_cache_dtype=mla_cache_dtype,
         draft_layers=draft_layers,
+        mamba_ssm_dtype=mamba_ssm_dtype,
     )
     groups = recipe.groups()
     return pack(
@@ -187,6 +191,35 @@ def test_lcm_reference_geometry_is_exact() -> None:
     }
 
 
+def test_bf16_kda_state_halves_the_parent_at_tp8() -> None:
+    """``--mamba-ssm-dtype bfloat16`` halves the KDA page, so the MLA packing
+    that covers one page halves too and so does the parent."""
+    plan = _layout(
+        tp_size=8, mla_cache_dtype=torch.float8_e4m3fn, mamba_ssm_dtype="bfloat16"
+    ).bind(7)
+
+    assert {
+        group.group_id: group.cache_blocks_per_lcm_block for group in plan.groups
+    } == {
+        "full_attention": 9,
+        "linear_attention_0": 1,
+        "linear_attention_1": 1,
+        "linear_attention_2": 1,
+    }
+    assert plan.lcm_block_bytes == 7_077_888 // 2
+    recurrent = next(
+        field for field in plan.fields if field.field_id.endswith(".recurrent_state")
+    )
+    assert recurrent.dtype == "bfloat16"
+
+
+def test_bf16_kda_state_rejects_tp8_with_a_bf16_mla_cache() -> None:
+    """Half of the FP32-state packing is too narrow for TP8 with a BF16 MLA
+    cache, so that shape raises instead of mis-packing the layout."""
+    with pytest.raises(NotImplementedError, match="no verified LCM packing"):
+        _layout(tp_size=8, mla_cache_dtype=torch.bfloat16, mamba_ssm_dtype="bfloat16")
+
+
 def test_mtp_layout_reserves_a_separate_index_plane() -> None:
     layout = _layout(
         tp_size=4,
@@ -203,6 +236,7 @@ def test_mtp_layout_reserves_a_separate_index_plane() -> None:
     )
 
 
+@pytest.mark.parametrize("mamba_ssm_dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize(
     ("tp_size", "mla_cache_dtype", "draft_layers"),
     [
@@ -213,11 +247,17 @@ def test_mtp_layout_reserves_a_separate_index_plane() -> None:
     ],
 )
 def test_kda_layers_share_one_page_stride(
-    tp_size: int, mla_cache_dtype: torch.dtype, draft_layers: int
+    tp_size: int,
+    mla_cache_dtype: torch.dtype,
+    draft_layers: int,
+    mamba_ssm_dtype: str,
 ) -> None:
     # Batched KDA replay addresses every layer's state pages with one stride.
     layout = _layout(
-        tp_size=tp_size, mla_cache_dtype=mla_cache_dtype, draft_layers=draft_layers
+        tp_size=tp_size,
+        mla_cache_dtype=mla_cache_dtype,
+        draft_layers=draft_layers,
+        mamba_ssm_dtype=mamba_ssm_dtype,
     )
     strides = {
         field.page_stride_bytes

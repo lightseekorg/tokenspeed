@@ -36,6 +36,7 @@ def _make_config() -> ts.SchedulerConfig:
     cfg.prefix_granularity = 2
     cfg.num_device_pages = 32
     cfg.num_host_pages = 32
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8
@@ -623,6 +624,7 @@ def _make_replay_config() -> ts.SchedulerConfig:
     cfg.prefix_granularity = 8
     cfg.num_device_pages = 256
     cfg.num_host_pages = 256
+    cfg.host_write_policy = ts.SchedulerConfig.HostWritePolicy.WriteThrough
     cfg.num_snapshot_pages = 1  # never retracts
     cfg.max_scheduled_tokens = 64
     cfg.max_batch_size = 8

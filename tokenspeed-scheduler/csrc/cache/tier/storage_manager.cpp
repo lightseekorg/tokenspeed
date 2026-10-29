@@ -186,7 +186,7 @@ void StorageTransferManager::Complete(const cache::StorageDone& event) {
                 rememberNegative(ticket.keys[i]);
             }
             if (event.retired && !ticket.detached && ticket.success[i]) {
-                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i]);
+                coordinator_.CacheHostBlock(ticket.blocks[i], ticket.keys[i], /*inherited_metadata=*/std::nullopt);
             }
         }
         if (event.retired && !ticket.detached && ticket.tail) {

@@ -532,6 +532,9 @@ class MoELayer(torch.nn.Module):
             combine_order=combine_order,
             fp32_correction_bias=self._fp32_correction_bias,
         )
+        self.plan["cutlass_fused_finalize"] = global_server_args_dict[
+            "moe_cutlass_fused_finalize"
+        ]
         if precision_policy == "bf16_route_accum_fp32":
             if self.plan["apply_kernel_name"] != "triton_bf16_precomputed_moe_apply":
                 raise ValueError(

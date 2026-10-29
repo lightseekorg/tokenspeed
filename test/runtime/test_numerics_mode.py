@@ -28,6 +28,57 @@ from tokenspeed.runtime.utils.server_args import ServerArgs
 
 
 class TestNumericsMode:
+    def test_moe_cutlass_fused_finalize_defaults_on(self):
+        from tokenspeed.runtime.utils.server_args import prepare_server_args
+
+        assert ServerArgs(model="x").moe_cutlass_fused_finalize
+        assert prepare_server_args(["--model", "x"]).moe_cutlass_fused_finalize
+        assert prepare_server_args(
+            ["--model", "x", "--moe-cutlass-fused-finalize"]
+        ).moe_cutlass_fused_finalize
+        assert not prepare_server_args(
+            ["--model", "x", "--no-moe-cutlass-fused-finalize"]
+        ).moe_cutlass_fused_finalize
+        assert ServerArgs(
+            model="x", moe_cutlass_fused_finalize=True
+        ).moe_cutlass_fused_finalize
+        assert not ServerArgs(
+            model="x", moe_cutlass_fused_finalize=False
+        ).moe_cutlass_fused_finalize
+
+    @pytest.mark.parametrize("fused_finalize", [False, True])
+    def test_moe_cutlass_fused_finalize_reaches_global_server_args(
+        self, fused_finalize
+    ):
+        from tokenspeed_kernel.platform import pdl_enabled
+
+        from tokenspeed.runtime.utils.env import (
+            global_server_args_dict,
+            global_server_args_dict_update,
+        )
+
+        original = global_server_args_dict.copy()
+        original_pdl = pdl_enabled()
+        try:
+            args = ServerArgs(model="x", moe_cutlass_fused_finalize=fused_finalize)
+            global_server_args_dict_update(args)
+            assert (
+                global_server_args_dict["moe_cutlass_fused_finalize"] is fused_finalize
+            )
+        finally:
+            pdl_enabled(original_pdl)
+            global_server_args_dict.clear()
+            global_server_args_dict.update(original)
+
+    @pytest.mark.parametrize("fused_finalize", [False, True])
+    def test_rl_bitwise_disables_moe_cutlass_fused_finalize(self, fused_finalize):
+        args = ServerArgs(
+            model="x",
+            numerics="rl-bitwise",
+            moe_cutlass_fused_finalize=fused_finalize,
+        )
+        assert not args.moe_cutlass_fused_finalize
+
     def test_auto_keeps_performance_defaults(self):
         args = ServerArgs(model="x")
         assert (args.numerics) == ("auto")
@@ -37,6 +88,7 @@ class TestNumericsMode:
 
     def test_rl_bitwise_tightens_every_switch(self):
         args = ServerArgs(model="x", numerics="rl-bitwise")
+        assert not args.moe_cutlass_fused_finalize
         # The envelope routes reductions itself (batch_invariant_collectives);
         # the NCCL-only knob stays the user's.
         assert not (args.force_deterministic_rsag)

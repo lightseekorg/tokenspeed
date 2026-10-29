@@ -85,6 +85,10 @@ Apache License, Version 2.0
 
 Copyright contributors to the FlashInfer project
 
+The Kimi-K3 CUDA router derives from FlashInfer v0.7.2
+(d84335d8c54e0c8f9f7e22faa15c7e34a58abf94), Copyright (c) 2026 NVIDIA CORPORATION.
+It retains the routing computation and omits the expert-aligned plan.
+
 Licensed under the Apache License, Version 2.0, whose full license text is available below.
 
 Notice for fla-org/flash-linear-attention
