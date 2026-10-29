@@ -2356,13 +2356,6 @@ __all__ = [
 ]
 
 
-def _recent_write_warmup_variants(args):
-    variants = {"rows": (1, 16, 17)}
-    if args["HAS_LIMIT"]:
-        variants["request_limit"] = (1, 16, 17)
-    return (variants,)
-
-
 register_triton_warmup(
     _qwen4_exp_qsa_prepare_metadata_kernel,
     variants=(
@@ -2380,5 +2373,14 @@ register_triton_warmup(
 )
 register_triton_warmup(
     _qwen4_exp_qsa_recent_write_kernel,
-    variants=_recent_write_warmup_variants,
+    variants=(
+        {"rows": (1, 16, 17)},
+        # Startup prefill is unlimited; pure target verify skips this writer.
+        # Prepare limited mixed-batch variants from that ordinary prefill call.
+        {
+            "rows": (1, 16, 17),
+            "HAS_LIMIT": (True,),
+            "request_limit": (1, 16, 17),
+        },
+    ),
 )

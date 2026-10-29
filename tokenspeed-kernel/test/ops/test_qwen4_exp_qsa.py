@@ -2093,8 +2093,10 @@ def test_qsa_recent_write_warmup_covers_request_limits(
         torch.testing.assert_close(raw, expected_raw)
         torch.testing.assert_close(position_cache, expected_positions)
 
+    # Startup prefill reaches the unlimited writer. Pure target verification
+    # returns before this operator when request_limit == 0.
     with kernel_warmup(enabled=True):
-        run(0)
+        run(None)
     with assert_no_triton_compile(kernel):
-        for limit in (1, 17, 16, 0, 2, 31, 32, 33):
+        for limit in (1, 17, 16, 0, 2, 31, 32, 33, None):
             run(limit)

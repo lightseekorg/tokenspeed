@@ -148,8 +148,10 @@ bitwise equivalence with FA2 or a model-level quality acceptance result.
 
 Startup metadata preparation covers integer alignment classes for compressed
 page-table row strides. Recent-cache writes cover these classes for row count
-and, when request limiting is enabled, the exclusive request-id bound. Changed
-table widths and mixed-prefill request counts can then reuse startup binaries.
+and the exclusive request-id bound. The ordinary unlimited prefill call also
+prepares request-limited variants: pure target verification skips the writer
+when there are no extends. Changed table widths and mixed-prefill request
+counts can then reuse startup binaries.
 
 ## Materialized Triton scoring
 
