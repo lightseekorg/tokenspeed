@@ -685,7 +685,7 @@ def gluon_fp8_packed_small_stage2_gfx950(
     w_scale_ptr,
     out_ptr,
     sorted_ids_ptr,
-    sorted_experts_ptr,
+    sorted_experts_ptr: tl.const,
     sorted_weights_ptr,
     num_valid_ptr,
     num_tokens,
