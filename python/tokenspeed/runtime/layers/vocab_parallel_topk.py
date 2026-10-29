@@ -294,5 +294,5 @@ class VocabParallelTopK:
         # Everything downstream indexes codebooks with these.
         candidate_ids = torch.gather(planes[:, 1], 1, lanes).to(torch.int64)
         if self.softcapping:
-            fused_softcap_generic(values, self.softcapping)
+            fused_softcap_generic(values, self.softcapping, 1.0)
         return candidate_ids, values
