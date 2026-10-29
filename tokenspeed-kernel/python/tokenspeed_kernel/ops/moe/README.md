@@ -415,8 +415,8 @@ kernel's own finalized output.
 
 ## Kimi-K3 router
 
-On SM100/SM103, batches from 2560 tokens use a vendored CUDA top-16 router
+On SM100/SM103, batches from 2,560 tokens use a vendored CUDA top-16 router
 over 896 experts. It consumes contiguous FP32 logits and bias and writes
 normalized FP32 weights (scale 1) and INT32 IDs into caller-owned buffers.
-The routing-only kernel has no expert-plan workspace or 8192-token limit.
+The routing-only kernel has no expert-plan workspace or 8,192-token limit.
 Other contracts retain their existing routers.
