@@ -163,6 +163,7 @@ def _run_gfx1250_prefill(device, q_lens, kv_lens, is_causal):
     [
         pytest.param((300,), (5000,), False, id="prefix"),
         pytest.param((200, 700), (3000, 0), False, id="prefix-and-new-sequence"),
+        pytest.param((128, 128), (32768, 2048), False, id="prefix-unequal-splits"),
         pytest.param((2048,), (2048,), True, id="causal-self"),
         pytest.param((1000,), (3000,), True, id="causal-with-prefix"),
     ],

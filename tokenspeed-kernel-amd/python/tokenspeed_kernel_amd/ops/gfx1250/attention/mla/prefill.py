@@ -787,11 +787,12 @@ def _split_count(
             rank += gl.where(seq < batch, blocks, 0)
             prev_q = next_q
             prev_kv = next_kv
-        num_splits = split_programs // (active * N_HEADS)
-        num_splits = gl.minimum(num_splits, max_splits)
-        num_splits = gl.minimum(num_splits, num_tiles // split_tiles)
+        # Slots are strided by the launch-wide split count, before the
+        # per-block clamp, so blocks of different key lengths never overlap.
+        stride = gl.minimum(split_programs // (active * N_HEADS), max_splits)
+        num_splits = gl.minimum(stride, num_tiles // split_tiles)
         num_splits = gl.maximum(num_splits, 1)
-        slot = ((rank + q_block) * N_HEADS + q_head) * num_splits
+        slot = ((rank + q_block) * N_HEADS + q_head) * stride
     # Drop empty trailing splits.
     tiles_per_split = (num_tiles + num_splits - 1) // num_splits
     num_splits = (num_tiles + tiles_per_split - 1) // tiles_per_split
