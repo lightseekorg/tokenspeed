@@ -164,6 +164,8 @@ protected:
         SchedulerConfig cfg = StateCheckpointSuite::MakeConfig();
         cfg.prefix_granularity = 128;
         cfg.max_scheduled_tokens = 16384;
+        // An aligned grain requires the consumer that writes the checkpoint block.
+        cfg.state_checkpoint_in_forward = true;
         for (auto& group : cfg.cache_groups) {
             if (group.attn_kind == AttnKind::kState) {
                 group.checkpoint_granularity = 4096;

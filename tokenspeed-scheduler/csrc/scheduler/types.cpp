@@ -64,6 +64,12 @@ void SchedulerConfig::Validate() const {
     }
     for (const CacheGroupConfig& group : cache_groups) {
         group.Validate();
+        // A grain only shapes where the checkpoint lands; the capability to write it stays a hard requirement, so
+        // an aligned group never schedules a checkpoint its consumer cannot fill.
+        if (role != Role::kD && group.checkpoint_granularity > 1 && !state_checkpoint_in_forward) {
+            throw std::invalid_argument(
+                "Scheduler: a State group with checkpoint_granularity > 1 requires state_checkpoint_in_forward");
+        }
     }
     if (prefix_replay_tokens < 0) {
         throw std::invalid_argument("Scheduler: prefix_replay_tokens must be >= 0");
