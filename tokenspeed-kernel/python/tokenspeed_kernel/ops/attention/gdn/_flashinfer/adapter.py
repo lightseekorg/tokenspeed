@@ -288,12 +288,13 @@ def _prefill_runner(enable_pdl: bool):
     if "_PREFILL_KERNEL_CLASSES" in vars(sm100):
         # New FlashInfer selects a device body through this table. Rebinding
         # only the old class name would silently bypass PDL on both variants.
-        class PdlRubinGatedDeltaNetChunkedKernel(sm100.RubinGatedDeltaNetChunkedKernel):
-            kernel = _PdlKernel(sm100.RubinGatedDeltaNetChunkedKernel.kernel)
-
         overrides["_PREFILL_KERNEL_CLASSES"] = {
-            "sm100": PdlGatedDeltaNetChunkedKernel,
-            "sm107": PdlRubinGatedDeltaNetChunkedKernel,
+            variant: type(
+                f"Pdl{kernel_class.__name__}",
+                (kernel_class,),
+                {"kernel": _PdlKernel(kernel_class.kernel)},
+            )
+            for variant, kernel_class in sm100._PREFILL_KERNEL_CLASSES.items()
         }
 
     adapted = _adapt_module(

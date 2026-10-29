@@ -71,6 +71,14 @@ and `TOKENSPEED_KERNEL_OVERRIDE_ATTENTION_GDN_DECODE_STEP=triton_gdn_decode_step
 select the portable baseline. Choose `flashinfer_gdn_chunk_prefill` and
 `flashinfer_rubin_gdn_decode_step` respectively to force the Rubin pair.
 
+The decode and MTP benchmark generators require an explicit `state_dtype`
+(`float32` or `bfloat16`) alongside the BF16 input `dtype`. The selected state
+dtype is used for dispatch, pool allocation, and the recorded parameters; use
+the same value for both sides of a comparison. Rubin T=1 decode requires
+`state_dtype="bfloat16"`; requesting FP32 with `solution="flashinfer_rubin"`
+is rejected as not applicable during preparation. Prefill benchmarks retain
+their FP32 state contract.
+
 Prefill implementations have different intermediate rounding. Both normalize
 Q/K through the same FP32 reduction and round them to their input dtype before
 the scan. Triton applies the output scale after the intra-chunk product;

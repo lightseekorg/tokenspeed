@@ -22,8 +22,16 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
+from tokenspeed_kernel.benchmark.generators.gdn import prepare_gdn_decode_step
+from tokenspeed_kernel.benchmark.harness import (
+    BenchmarkCaseError,
+    BenchmarkRequest,
+    BenchmarkStatus,
+)
 from tokenspeed_kernel.numerics.torch.attention.gdn import (
     gdn_gate,
     gdn_l2norm,
@@ -40,12 +48,60 @@ from tokenspeed_kernel.ops.attention.gdn import (
 from tokenspeed_kernel.ops.attention.gdn.flashinfer import (
     is_rubin_decode_available as is_available,
 )
-from tokenspeed_kernel.platform import pdl_enabled
+from tokenspeed_kernel.platform import current_platform, pdl_enabled
 from tokenspeed_kernel.selection import NoKernelFoundError
 
 pytestmark = pytest.mark.skipif(
     not is_available(), reason="SM107 and FlashInfer PR6604 are required"
 )
+
+
+def test_rubin_decode_benchmark_prepares_and_invokes():
+    request = BenchmarkRequest(
+        family="attention",
+        mode="gdn_decode_step",
+        parameters={
+            "model_profile": "qwen38_flash_tp2",
+            "batch": 4,
+            "dtype": "bfloat16",
+            "state_dtype": "bfloat16",
+        },
+        solution="flashinfer_rubin",
+        registration=None,
+        cold_cache=True,
+        seed=6604,
+    )
+    candidate = prepare_gdn_decode_step(request, current_platform())
+    reference = prepare_gdn_decode_step(
+        replace(request, solution="triton"), current_platform()
+    )
+    # Both preparations generate identical inputs. Repeated calls also read
+    # the state written by the preceding invocation.
+    for _ in range(2):
+        actual = candidate.invocation.invoke()
+        expected = reference.invocation.invoke()
+        torch.testing.assert_close(actual, expected, atol=0.002, rtol=0.02)
+    assert candidate.parameters["state_dtype"] == "bfloat16"
+
+
+def test_rubin_decode_benchmark_rejects_fp32_before_invocation():
+    request = BenchmarkRequest(
+        family="attention",
+        mode="gdn_decode_step",
+        parameters={
+            "model_profile": "qwen38_flash_tp2",
+            "batch": 4,
+            "dtype": "bfloat16",
+            "state_dtype": "float32",
+        },
+        solution="flashinfer_rubin",
+        registration=None,
+        cold_cache=True,
+        seed=6604,
+    )
+    with pytest.raises(BenchmarkCaseError) as error:
+        prepare_gdn_decode_step(request, current_platform())
+    assert error.value.status == BenchmarkStatus.NOT_APPLICABLE
 
 
 @pytest.fixture(params=[False, True])

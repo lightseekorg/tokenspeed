@@ -146,13 +146,15 @@ def test_incompatible_package_falls_back_and_explicit_adapter_rejects(
     )
 
 
-def test_prefill_preserves_logging_dumps_trace_and_validation(tmp_path):
+@pytest.mark.parametrize("variant", ["sm100", "sm107"])
+def test_prefill_preserves_logging_dumps_trace_and_validation(tmp_path, variant):
     env = dict(
         os.environ,
         FLASHINFER_LOGLEVEL="10",
         FLASHINFER_LOGDEST=str(tmp_path / "api.log"),
         FLASHINFER_DUMP_DIR=str(tmp_path / "dumps"),
         FLASHINFER_DUMP_INCLUDE="chunk_gated_delta_rule",
+        FLASHINFER_GDN_SM107_PREFILL_KERNEL=variant,
     )
     _run(
         """
