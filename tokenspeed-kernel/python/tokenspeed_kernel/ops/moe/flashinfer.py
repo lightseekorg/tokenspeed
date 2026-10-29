@@ -3260,6 +3260,7 @@ if platform.is_nvidia:
     )
     from flashinfer.fused_moe.da_moe import DABody
     from flashinfer.tllm_enums import ActivationType
+    from flashinfer.utils import device_support_pdl
     from tokenspeed_kernel.thirdparty.flashinfer.trtllm_moe import (
         trtllm_fp4_block_scale_moe as tokenspeed_trtllm_fp4_block_scale_moe,
     )
@@ -3566,8 +3567,7 @@ if platform.is_nvidia:
             local_expert_offset=spec.ep_rank * spec.num_local_experts,
             routed_scaling_factor=None,
             routing_method_type=0,
-            enable_pdl=enable_pdl
-            and _fi_core._device_support_moe_pdl(w.g1_alphas.device),
+            enable_pdl=enable_pdl and device_support_pdl(w.g1_alphas.device),
             do_finalize=False,
             activation_type=activation_type,
             num_fused_shared_experts=0,
