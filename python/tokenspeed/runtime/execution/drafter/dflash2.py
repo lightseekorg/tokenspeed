@@ -43,11 +43,11 @@ from tokenspeed.runtime.execution.forward_batch_info import ForwardMode
 from tokenspeed.runtime.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from tokenspeed.runtime.layers.vocab_parallel_topk import VocabParallelTopK
 from tokenspeed.runtime.sampling.backends.base import SpeculativeSamplingPools
+from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 from tokenspeed.runtime.utils.nvtx import nvtx_range
 
 if TYPE_CHECKING:
     from tokenspeed.runtime.sampling.backends.base import SamplingBackend
-    from tokenspeed.runtime.sampling.tree_verify import DraftTreeQ
 
 
 class DFlash2(DFlash):
@@ -71,6 +71,7 @@ class DFlash2(DFlash):
         config = self.model.config
         nested = getattr(config, "dflash_config", {}) or {}
         self.selector_top_k = int(nested.get("selector_top_k"))
+        self.draft_vocab_size = int(config.vocab_size)
         self.output_multiplier = float(nested.get("output_multiplier", 1.0))
         self.final_logit_softcapping = float(
             nested.get("final_logit_softcapping") or 0.0
@@ -93,29 +94,14 @@ class DFlash2(DFlash):
         max_bs = self.input_buffers.max_bs
         num_steps = self.spec_num_tokens - 1
         top_k = self.selector_top_k
-        # Row -> pool index the walk reads its parameters at (all 0 while
-        # greedy), and the per-request draft noise offset base.
-        self._walk_pool_indices = torch.zeros(
-            (max_bs,), dtype=torch.int32, device=device
+        # While greedy, every row reads the greedy pool's row 0 and writes its
+        # chain to a scratch table row of its own; the chain is not published.
+        self._greedy_pool_indices = torch.zeros(
+            (max_bs,), dtype=torch.int64, device=device
         )
-        self._walk_offsets = torch.zeros((max_bs,), dtype=torch.int64, device=device)
-        # Each row's frontier (valid cache length), gathered without a
-        # temporary before it is scaled into _walk_offsets.
-        self._walk_frontier = torch.zeros((max_bs,), dtype=torch.int32, device=device)
-        # The walk's chain in the draft-q table layout (published to
-        # _draft_q): each step's q and candidate ids, and each node's lane and
-        # q slot (-1 on every node when the request proposes nothing).
-        self._walk_q = torch.zeros(
-            (max_bs, num_steps, top_k), dtype=torch.float32, device=device
-        )
-        self._walk_q_ids = torch.zeros(
-            (max_bs, num_steps, top_k), dtype=torch.int32, device=device
-        )
-        self._walk_pos = torch.zeros(
-            (max_bs, num_steps + 1), dtype=torch.int32, device=device
-        )
-        self._walk_slot = torch.zeros(
-            (max_bs, num_steps + 1), dtype=torch.int32, device=device
+        self._greedy_table_rows = torch.arange(max_bs, dtype=torch.int64, device=device)
+        self._greedy_q = DraftTreeQ.zeros(
+            max_bs, num_steps, top_k, num_steps + 1, device
         )
 
     @override
@@ -208,9 +194,7 @@ class DFlash2(DFlash):
         candidate_ids = candidate_ids.view(batch_size, num_steps, self.selector_top_k)
         unary_logits = unary_logits.view_as(candidate_ids)
         anchor_token_ids = (
-            block_ids[:, 0]
-            .to(torch.int64)
-            .clamp(0, int(self.model.config.vocab_size) - 1)
+            block_ids[:, 0].to(torch.int64).clamp(0, self.draft_vocab_size - 1)
         )
         scores = self.candidate_selector(
             candidate_ids,
@@ -219,7 +203,6 @@ class DFlash2(DFlash):
             anchor_token_ids,
         )
         self._walk(candidate_ids, scores, anchor_token_ids, next_tokens)
-        next_tokens.clamp_(min=0, max=int(self.model.config.vocab_size) - 1)
         return next_tokens
 
     def _walk(
@@ -229,50 +212,51 @@ class DFlash2(DFlash):
         anchor_token_ids: torch.Tensor,
         out: torch.Tensor,
     ) -> None:
-        """Walk the lattice into ``out`` and, when sampling, record its q.
+        """Walk the lattice into ``out`` (clamped to the vocabulary) and,
+        when sampling, record its q for the next round's verify.
 
         One kernel for every row: greedy rows (and every row while the flag
         is off) take the best edge; sampling rows draw from q, with noise
         keyed by the request's seed, this round's position and the drawn
         token id, so every TP rank draws the same token from the same
-        replicated scores. Tensor-only, so it records into the draft graph.
+        replicated scores. The kernel writes each request's chain straight
+        into ``RuntimeStates.future_draft_q``. Tensor-only, so it records
+        into the draft graph.
         """
         bs = candidate_ids.shape[0]
         draft_q = self._draft_q
-        if draft_q is not None:
+        if draft_q is None:
+            pool_indices = self._greedy_pool_indices[:bs]
+            table_rows = self._greedy_table_rows[:bs]
+            tables = self._greedy_q
+        else:
+            # Parameters are read at the request's pool slot; the chain is
+            # recorded at its state-write slot, which graph padding rows point
+            # at the reserved slot verify never reads.
             pool_indices = self.input_buffers.req_pool_indices_buf[:bs]
-            self._walk_pool_indices[:bs].copy_(pool_indices)
-            # Draft noise offset base valid_cache_length * N, the convention
-            # the step drafters' DraftProposalSampler uses; the kernel adds
-            # DRAFT_SAMPLE_OFFSET_SALT + step. The frontier grows every round,
-            # so no two rounds of a request share a draw.
-            frontier = self._walk_frontier[:bs]
-            torch.index_select(
-                self.runtime_states.valid_cache_lengths, 0, pool_indices, out=frontier
-            )
-            torch.mul(frontier, self.spec_num_tokens, out=self._walk_offsets[:bs])
+            table_rows = self.input_buffers.state_write_req_pool_indices_buf[:bs]
+            tables = draft_q
         pools = self._walk_pools
+        # The draft noise offset base is valid_cache_length * N, the
+        # convention the step drafters' DraftProposalSampler uses; the kernel
+        # adds DRAFT_SAMPLE_OFFSET_SALT + step. The frontier grows every
+        # round, so no two rounds of a request share a draw.
         dflash2_sample_path(
             candidate_ids,
             scores,
             anchor_token_ids,
-            self._walk_pool_indices[:bs],
+            pool_indices,
             pools.temperature,
             pools.top_k,
             pools.top_p,
             pools.seed,
-            self._walk_offsets[:bs],
+            self.runtime_states.valid_cache_lengths,
+            self.spec_num_tokens,
+            self.draft_vocab_size,
             out,
-            self._walk_q[:bs],
-            self._walk_q_ids[:bs],
-            self._walk_pos[:bs],
-            self._walk_slot[:bs],
+            table_rows,
+            tables.q,
+            tables.q_ids,
+            tables.pos,
+            tables.slot,
         )
-        if draft_q is not None:
-            draft_q.publish_chain(
-                self.input_buffers.state_write_req_pool_indices_buf[:bs],
-                self._walk_q[:bs],
-                self._walk_q_ids[:bs],
-                self._walk_pos[:bs],
-                self._walk_slot[:bs],
-            )

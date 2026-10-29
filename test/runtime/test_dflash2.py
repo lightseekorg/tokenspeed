@@ -367,16 +367,18 @@ def test_candidate_selector_edges_match_the_official_equation() -> None:
 
 class _GreedyWalk:
     """The walk as DFlash2 runs it with --enable-speculative-sampling off:
-    every row reads row 0 of one greedy (top_k 1) pool."""
+    every row reads row 0 of one greedy (top_k 1) pool and writes its chain
+    to a scratch row of its own."""
 
     def __init__(self, batch_size: int, num_steps: int, top_k: int) -> None:
         device = torch.device("cuda")
-        self.pool_indices = torch.zeros(batch_size, dtype=torch.int32, device=device)
+        self.pool_indices = torch.zeros(batch_size, dtype=torch.int64, device=device)
         self.temperature = torch.ones(1, dtype=torch.float32, device=device)
         self.top_k = torch.ones(1, dtype=torch.int32, device=device)
         self.top_p = torch.ones(1, dtype=torch.float32, device=device)
         self.seed = torch.zeros(1, dtype=torch.int64, device=device)
-        self.offsets = torch.zeros(batch_size, dtype=torch.int64, device=device)
+        self.valid_cache_lengths = torch.zeros(1, dtype=torch.int32, device=device)
+        self.table_rows = torch.arange(batch_size, dtype=torch.int64, device=device)
         self.q = torch.empty(batch_size, num_steps, top_k, device=device)
         self.q_ids = torch.empty(
             batch_size, num_steps, top_k, dtype=torch.int32, device=device
@@ -404,8 +406,11 @@ class _GreedyWalk:
             self.top_k,
             self.top_p,
             self.seed,
-            self.offsets,
+            self.valid_cache_lengths,
+            scores.shape[1] + 1,
+            1 << 20,
             out,
+            self.table_rows,
             self.q,
             self.q_ids,
             self.pos,
