@@ -239,8 +239,8 @@ class _WalkPools:
         generator = torch.Generator().manual_seed(seed)
         self.req_pool_indices = (
             torch.randperm(pool_rows - 1, generator=generator)[:bs] + 1
-        ).to(device=device, dtype=torch.int32)
-        index = self.req_pool_indices.long()
+        ).to(device=device, dtype=torch.int64)
+        index = self.req_pool_indices
         self.temperature = torch.ones(pool_rows, device=device)
         self.temperature[index] = torch.tensor(temperature, device=device)
         self.top_k = torch.ones(pool_rows, dtype=torch.int32, device=device)
@@ -249,9 +249,18 @@ class _WalkPools:
         self.top_p[index] = torch.tensor(top_p, device=device)
         self.seed = torch.arange(pool_rows, dtype=torch.int64, device=device) * 7919
         self.seed += 11
-        self.draft_offsets = (
-            torch.arange(bs, dtype=torch.int64, device=device) * 8 + 1000
+        self.valid_cache_lengths = (
+            torch.arange(pool_rows, dtype=torch.int32, device=device) * 37 + 125
         )
+        self.offset_scale = 8
+        # The chains land at other rows of larger tables than the batch.
+        self.table_rows = (torch.randperm(pool_rows + 2, generator=generator)[:bs]).to(
+            device=device, dtype=torch.int64
+        )
+        self.table_size = pool_rows + 2
+
+
+_WALK_VOCAB = 1000
 
 
 def _walk(candidate_ids, scores, anchors, pools: _WalkPools):
@@ -259,11 +268,12 @@ def _walk(candidate_ids, scores, anchors, pools: _WalkPools):
     after checking its chain tables against the draft-q layout."""
     bs, steps, top_k = candidate_ids.shape
     device = candidate_ids.device
+    rows = pools.table_size
     tokens = torch.full((bs, steps + 1), -5, dtype=torch.int32, device=device)
-    q = torch.full((bs, steps, top_k), -1.0, device=device)
-    q_ids = torch.full((bs, steps, top_k), -5, dtype=torch.int32, device=device)
-    pos = torch.full((bs, steps + 1), -5, dtype=torch.int32, device=device)
-    slot = torch.full((bs, steps + 1), -5, dtype=torch.int32, device=device)
+    q = torch.full((rows, steps, top_k), -1.0, device=device)
+    q_ids = torch.full((rows, steps, top_k), -5, dtype=torch.int32, device=device)
+    pos = torch.full((rows, steps + 1), -5, dtype=torch.int32, device=device)
+    slot = torch.full((rows, steps + 1), -5, dtype=torch.int32, device=device)
     dflash2_sample_path(
         candidate_ids,
         scores,
@@ -273,13 +283,23 @@ def _walk(candidate_ids, scores, anchors, pools: _WalkPools):
         pools.top_k,
         pools.top_p,
         pools.seed,
-        pools.draft_offsets,
+        pools.valid_cache_lengths,
+        pools.offset_scale,
+        _WALK_VOCAB,
         tokens,
+        pools.table_rows,
         q,
         q_ids,
         pos,
         slot,
     )
+    # Rows no request writes keep their contents.
+    untouched = torch.ones(rows, dtype=torch.bool, device=device)
+    untouched[pools.table_rows] = False
+    assert (q[untouched] == -1.0).all() and (q_ids[untouched] == -5).all()
+    assert (pos[untouched] == -5).all() and (slot[untouched] == -5).all()
+    q, q_ids = q[pools.table_rows], q_ids[pools.table_rows]
+    pos, slot = pos[pools.table_rows], slot[pools.table_rows]
     # Node 0 is the anchor; node l + 1 reads q row l, or every node is -1.
     has_proposal = (slot[:, 1] >= 0).to(torch.int32)
     chain = torch.arange(-1, steps, dtype=torch.int32, device=device)
@@ -293,9 +313,10 @@ def _walk(candidate_ids, scores, anchors, pools: _WalkPools):
 def _walk_reference(candidate_ids, scores, anchors, pools: _WalkPools):
     """The torch reference fed the documented draft noise stream."""
     bs, steps, top_k = candidate_ids.shape
-    index = pools.req_pool_indices.long()
+    index = pools.req_pool_indices
     step = torch.arange(steps, device=scores.device)
-    offsets = DRAFT_SAMPLE_OFFSET_SALT + pools.draft_offsets[:, None] + step[None, :]
+    base = pools.valid_cache_lengths[index].long() * pools.offset_scale
+    offsets = DRAFT_SAMPLE_OFFSET_SALT + base[:, None] + step[None, :]
     seeds = pools.seed[index][:, None].expand(bs, steps)
     gumbel, _ = _noise(
         seeds.reshape(-1), offsets.reshape(-1), candidate_ids.reshape(bs * steps, -1)
@@ -415,6 +436,24 @@ def test_dflash2_sample_path_ignores_the_lane_order(device: str) -> None:
         # Permuted lane j is original lane perms[step][j].
         assert torch.equal(perms[step][p_lanes[:, step].long()], lanes[:, step].long())
         torch.testing.assert_close(p_q[:, step], q[:, step][:, perms[step]])
+
+
+def test_dflash2_sample_path_clamps_tokens_to_the_vocabulary(device: str) -> None:
+    """Out-of-range ids are clamped in the tokens, as the drafter used to do
+    after the walk; the recorded candidate ids stay as given."""
+    candidate_ids = torch.tensor(
+        [[[_WALK_VOCAB + 5, 3], [-2, 4]]], dtype=torch.int32, device=device
+    )
+    scores = torch.zeros(1, 2, 2, 2, device=device)
+    scores[0, 0, :, 0] = 1.0
+    scores[0, 1, 0, 0] = 1.0
+    anchors = torch.tensor([_WALK_VOCAB + 9], device=device)
+    pools = _WalkPools([1.0], [1], [1.0], device=device)
+
+    tokens, _, lanes, _ = _walk(candidate_ids, scores, anchors, pools)
+
+    assert lanes[0].tolist() == [0, 0]
+    assert tokens[0].tolist() == [_WALK_VOCAB - 1, _WALK_VOCAB - 1, 0]
 
 
 def test_dflash2_sample_path_non_finite_rows_propose_nothing(device: str) -> None:
