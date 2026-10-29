@@ -540,6 +540,7 @@ def triton_mla_prologue(
 
 
 def _gqa_warmup_variants(args):
+    """BLOCK_T warmup buckets mirroring _block_tokens' element sizes, for both RETURN_K values."""
     block_tokens = tuple(
         sorted({max(4, elements // args["BLOCK"]) for elements in (512, 1024, 2048)})
     )

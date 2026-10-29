@@ -31,6 +31,9 @@ from tokenspeed_kernel.ops.tuning import is_warming_up
 
 _VariantSets: TypeAlias = tuple[Mapping[str, tuple[Any, ...]], ...]
 _Variants: TypeAlias = _VariantSets | Callable[[Mapping[str, Any]], _VariantSets]
+# Operators register their finite warmup variants in this process-wide
+# registry at import time, so kernel_launcher can prepare them during
+# startup warmup without changing any operator's launch signature.
 _warmup_variants: dict[Any, _Variants] = {}
 
 
