@@ -36,6 +36,7 @@ from tokenspeed_kernel.ops.gemm import (
     fp32_router_gemv_execute,
     fp32_router_gemv_plan,
     fp32_router_gemv_process_weight,
+    mm,
     mv,
     mv_weightless_rmsnorm_gated_sigmoid,
     mv_weightless_rmsnorm_gated_sigmoid_supported,
@@ -272,25 +273,17 @@ class _MuseGatheredLinear(ColumnParallelLinear):
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Apply an unbiased projection, writing into ``out`` when supplied."""
-        if (
-            current_platform().is_cdna4
-            and x.dtype == weight.dtype
-            and not _gemm_dispatch_required()
-            # Rows gemm.mm would route to gemm.mv go there directly, writing a
-            # contiguous ``out`` in place.
-            and (
-                x.shape[0] == 1
-                or ((out is None or out.is_contiguous()) and _use_mv(x, weight))
-            )
-        ) or (
-            x.shape[0] == 1
-            and (
-                not current_platform().is_cdna4
-                and resolve_kernel_override("gemm", "mm", None) is None
-                and _use_mv(x, weight)
-            )
+        if _gemm_dispatch_required():
+            result = self.quant_method.apply(SimpleNamespace(weight=weight), x, None)
+        elif (
+            x.shape[0] == 1 and current_platform().is_cdna4 and x.dtype == weight.dtype
         ):
+            # gfx950 single rows take the GEMV even where gemm.mm would not.
             result = mv(x, weight, out=out)
+        elif x.dtype == weight.dtype and (out is None or out.is_contiguous()):
+            # gemm.mm selects the GEMV or GEMM the unquantized method would and
+            # writes ``out`` in place, saving a copy launch.
+            result = mm(x, weight, out=out)
         else:
             result = self.quant_method.apply(SimpleNamespace(weight=weight), x, None)
         if out is None:
