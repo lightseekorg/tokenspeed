@@ -25,7 +25,7 @@ from __future__ import annotations
 import pytest
 import torch
 from tokenspeed_kernel.numerics.torch.attention.mha import torch_dense_attention
-from utils import is_cdna4, move_pages_past_int32
+from utils import assert_no_triton_compile, is_cdna4, move_pages_past_int32
 
 if not is_cdna4():
     pytest.skip("AMD CDNA4 is required", allow_module_level=True)
@@ -136,16 +136,6 @@ def test_split_sliding_decode_matches_reference_and_replays(batch: int) -> None:
     q, k_cache, v_cache, page_table, cache_seqlens, sinks = _make_inputs(
         batch, 20260915 + batch
     )
-    config = decode.get_config(
-        q=q,
-        k_cache=k_cache,
-        max_seqlen_k=SEQUENCE_LENGTH,
-        max_seqlen_q=1,
-        window_left=WINDOW_LEFT,
-        softmax_scale=None,
-    )
-    expected_splits = 8 if batch <= 4 else 4
-    assert config.num_kv_splits == expected_splits
 
     def invoke() -> torch.Tensor:
         return _decode(
@@ -428,8 +418,8 @@ def _check_verify(actual: torch.Tensor, expected: torch.Tensor) -> None:
 @pytest.mark.parametrize("with_sinks", [False, True], ids=["no-sinks", "sinks"])
 @pytest.mark.parametrize(
     "window_left",
-    [-1, 2047, 255, 40],
-    ids=["full", "window-2047", "window-255", "window-40"],
+    [-1, 2047, 511, 255, 40],
+    ids=["full", "window-2047", "window-511", "window-255", "window-40"],
 )
 @pytest.mark.parametrize(
     "max_seqlen_q,q_heads,kv_heads,head_dim",
@@ -443,6 +433,9 @@ def _check_verify(actual: torch.Tensor, expected: torch.Tensor) -> None:
         # 16 x 8 rows take two blocks per KV head.
         pytest.param(16, 8, 1, 64, id="128-rows"),
         pytest.param(VERIFY_TOKENS, 8, 1, 128, id="head-dim-128"),
+        # 16 x 6 rows: under a short window, six one-wave blocks whose rows
+        # straddle query positions.
+        pytest.param(16, 6, 1, 128, id="96-rows"),
     ],
 )
 def test_verify_rows_match_reference_and_replay(
@@ -499,6 +492,29 @@ def test_verify_rows_match_reference_and_replay(
     torch.cuda.synchronize()
     _check_verify(replayed, expected)
     _check_verify(invoke(), expected)
+
+
+def test_short_window_verify_batch_size() -> None:
+    """A short window's split count changes with the request count only
+    between at most 4 and more requests, so one warm-up on each side covers
+    every batch size: 1 to 4 requests take the split kernel, more the
+    unsplit one."""
+    width, q_heads, kv_heads, dim, window_left = 16, 6, 1, 128, 511
+
+    def run(batch: int) -> None:
+        # Distinct lengths of 10 pages each keep the page-table stride fixed.
+        lengths = [600 + slot for slot in range(batch)]
+        inputs = _verify_inputs(lengths, width, q_heads, kv_heads, dim, batch)
+        gluon_mha_decode_gfx950(**inputs, window_left=window_left)
+
+    run(5)
+    run(1)
+    with assert_no_triton_compile(
+        decode.gluon_mha_decode_sliding_gfx950,
+        decode._mha_decode_sliding_split_atomic,
+    ):
+        for batch in [*range(6, 17), 2, 3, 4]:
+            run(batch)
 
 
 def test_verify_long_splits_pipeline_page_loads() -> None:
