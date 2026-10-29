@@ -1138,6 +1138,9 @@ Its responsibilities:
   descriptors of boundaries with no cached child. Nothing is decided
   mid-`Admit`, so one admission may evict a boundary's last cached copy and
   then store the request's own copy without any ordering hazard.
+  Admission may pre-hash prompt pages beyond the computed prefix. An early
+  junction or retraction tail uses the parent hash at its published frontier,
+  even when the request's hash memo already contains later pages.
 Replica-agreed D2H ACKs publish Host entries and release Device sources
 without waiting for L3. Backup candidates are nonowning; PUT dispatch pins
 resident Host sources until all cache owners report native retirement.
