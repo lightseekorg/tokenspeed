@@ -20,10 +20,13 @@
 
 from __future__ import annotations
 
-import sys
-from types import SimpleNamespace
+import ctypes
+import dataclasses
+import gc
+import weakref
 
 import pytest
+from tokenspeed_kernel.platform import ArchVersion, Platform, PlatformInfo
 
 from tokenspeed.runtime.cache.host_storage import HostCacheStorage
 from tokenspeed.runtime.cache.transfer.layout import (
@@ -34,19 +37,40 @@ from tokenspeed.runtime.cache.transfer.layout import (
 
 
 @pytest.fixture(autouse=True)
-def _fake_torch(monkeypatch):
-    uint8 = object()
+def pinned(monkeypatch) -> dict[int, int]:
+    """The page-locked Host allocations not yet freed, address to byte count.
 
-    def empty(num_bytes, *, dtype, pin_memory):
-        assert dtype is uint8
-        assert pin_memory is True
-        return bytearray(num_bytes)
+    The platform allocates ordinary Host memory and records it here instead
+    of calling the GPU runtime, which these tests do not need.
+    """
+    sizes: dict[int, int] = {}
+    # Keeps each allocation's memory until it is freed.
+    memories: dict[int, ctypes.Array] = {}
 
-    monkeypatch.setitem(
-        sys.modules,
-        "torch",
-        SimpleNamespace(empty=empty, uint8=uint8),
+    class GpuFreePlatform(PlatformInfo):
+        def _alloc_pinned_host_memory(self, nbytes):
+            memory = ctypes.create_string_buffer(nbytes)
+            address = ctypes.addressof(memory)
+            sizes[address], memories[address] = nbytes, memory
+
+            def free():
+                del sizes[address], memories[address]
+
+            return address, free
+
+    platform = GpuFreePlatform(
+        vendor="nvidia",
+        arch_version=ArchVersion(10, 0),
+        device_name="no GPU",
+        device_count=0,
+        total_memory=0,
+        memory_bandwidth=0.0,
+        sm_count=0,
+        max_threads_per_sm=0,
+        max_shared_memory_per_sm=0,
     )
+    monkeypatch.setattr(Platform, "_instance", platform)
+    return sizes
 
 
 def _layout():
@@ -116,10 +140,6 @@ def test_host_fields_are_packed_without_padding():
 
 
 def test_host_storage_does_not_retain_device_buffers():
-    import dataclasses
-    import gc
-    import weakref
-
     class DeviceBuffer:
         pass
 
@@ -132,3 +152,23 @@ def test_host_storage_does_not_retain_device_buffers():
     assert reference() is None
     assert storage.host_block_range(0, 1) == (0, 32)
     assert len(storage.host_buffer) == 256
+
+
+def test_host_buffer_is_pinned_at_exactly_its_size(pinned):
+    # Three 128-byte LCM blocks pin 384 bytes, not the 512 PyTorch's pinned
+    # allocator would round them up to.
+    storage = HostCacheStorage(_layout(), num_host_lcm_blocks=3)
+
+    assert storage.host_buffer_bytes == 384
+    assert storage.host_buffer.numel() == 384
+    assert pinned == {storage.host_buffer.data_ptr(): 384}
+
+
+def test_releasing_the_storage_frees_its_buffer(pinned):
+    storage = HostCacheStorage(_layout(), num_host_lcm_blocks=3)
+    other = HostCacheStorage(_layout(), num_host_lcm_blocks=1)
+
+    del storage
+    gc.collect()
+
+    assert pinned == {other.host_buffer.data_ptr(): 128}

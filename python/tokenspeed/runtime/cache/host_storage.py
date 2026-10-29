@@ -92,12 +92,11 @@ class HostCacheStorage:
         ) = _compute_host_layout(layout)
         self.num_host_lcm_blocks = int(num_host_lcm_blocks)
         self.host_buffer_bytes = self.num_host_lcm_blocks * self.host_lcm_block_bytes
-        import torch
+        from tokenspeed_kernel.platform import current_platform
 
-        self.host_buffer = torch.empty(
-            self.host_buffer_bytes,
-            dtype=torch.uint8,
-            pin_memory=True,
+        # Pinned at exactly its size on GPUs, until its last view is released.
+        self.host_buffer = current_platform().empty_pinned_host_tensor(
+            self.host_buffer_bytes
         )
 
     def host_block_offset(self, group_index: int, block_id: int) -> int:

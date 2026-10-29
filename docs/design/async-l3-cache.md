@@ -203,14 +203,16 @@ a client without mounting storage of its own.
 
 ## Controller queues, monitor and bounds
 
-Host allocation uses the ordinary per-node rank share and actual rounded
-pinned sizes for L2, retraction snapshots and slot-state arenas. Ratio-based
+Host allocation uses the ordinary per-node rank share and the sizes that L2,
+retraction snapshots and slot-state arenas pin (exact on GPUs). Ratio-based
 L2 sizing is capped to a common count across ranks; an explicit size that
-does not fit is rejected. L2 and L3 share this allocation; attaching L3 does
-not allocate another arena. This is not an atomic reservation across containers
-or independent P/D worlds. Deployment sizing must account for their combined
-allocations, Mooncake segments/staging and independent storage owners.
-Runtime operation/Host credits bound L3 ownership, not process RSS.
+does not fit is rejected. L2 and L3 share this allocation: L3 moves data
+through the L2 buffer and allocates no arena of its own, apart from the
+Mooncake segment and staging buffers the check does not count. This is not
+an atomic reservation across containers or independent P/D worlds. Deployment
+sizing must account for their combined allocations, Mooncake segments/staging
+and independent storage owners. Runtime operation/Host credits bound L3
+ownership, not process RSS.
 
 Query, GET and PUT have separate bounded queues and workers. The total
 outstanding-operation limit includes queued jobs, native work and undelivered
