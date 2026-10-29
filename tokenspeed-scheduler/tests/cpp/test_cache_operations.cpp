@@ -797,10 +797,11 @@ TEST(CacheOperationTest, AFinishPlacesItsNewestCopiesFirst) {
     EXPECT_FALSE(coordinator.ContainsHostCachedBlock(oldest));
 }
 
-// The checkpoint a finish leaves is dated with the page its frontier ends
-// in, the deepest of what it leaves, not kept ahead of the pages it
-// continues: a State block needing room takes the checkpoint (tied with that
-// page, one child goes before a whole parent) rather than the page.
+// A finish dates the checkpoint it leaves with the page its frontier ends
+// in, the deepest page it leaves, instead of keeping the checkpoint newer
+// than the pages before it. So a State block that needs room takes the
+// checkpoint rather than that page: the two tie on date, and one child goes
+// before a whole parent.
 TEST(CacheOperationTest, AFinishDatesItsCheckpointWithItsLastPage) {
     BlockPool device_pool{4, {1, 1}};
     BlockPool host_pool{3, {1, 1}};
