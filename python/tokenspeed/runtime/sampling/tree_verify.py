@@ -36,6 +36,11 @@ class DraftTreeQ:
     sampled node's siblings were drawn from, for the verifier's rejection
     sampling. Indexed by ``req_pool_idx``.
 
+    A chain's node 0 is the anchor (slot ``-1``) and node ``i`` reads slot
+    ``i - 1``, the q of draft step ``i - 1``, at lane ``pos[:, i]``; a
+    request without a proposal has ``-1`` on every node. The DFlash2 walk
+    (``dflash2_sample_path``) writes its chains into these tables in place.
+
     Attributes:
         q: ``[rows, S, NC]`` fp32 q of each expanded row (slot) over its
             candidates.
@@ -67,45 +72,6 @@ class DraftTreeQ:
             slot=torch.full((rows, num_nodes), -1, dtype=torch.int32, device=device),
             pos=torch.zeros((rows, num_nodes), dtype=torch.int32, device=device),
         )
-
-    def publish_chain(
-        self,
-        pool_indices: torch.Tensor,
-        q: torch.Tensor,
-        q_ids: torch.Tensor,
-        pos: torch.Tensor,
-        slot: torch.Tensor,
-    ) -> None:
-        """Record a sampled chain draft for the next round's verify.
-
-        The chain layout: node 0 is the anchor (slot ``-1``); node ``i`` (draft
-        token ``i``) reads slot ``i - 1``, which holds the q of draft step
-        ``i - 1`` over its candidates, at position ``pos[:, i]``. A request
-        without a proposal has ``-1`` on every node, which verify reads as
-        "check the draft against the target's own draw" (the target-only
-        rule). The DFlash2 walk (``dflash2_sample_path``) writes all four
-        tables in this layout, so recording them is four ``index_copy_``
-        calls: no temporaries, and it records into a captured graph.
-
-        Args:
-            pool_indices: ``[bs]`` int64 state-write pool slot per request;
-                graph padding rows point at the reserved slot verify never
-                reads.
-            q: ``[bs, S, NC]`` fp32 each draft step's q over its candidates.
-            q_ids: ``[bs, S, NC]`` int32 the candidates' token ids.
-            pos: ``[bs, S + 1]`` int32 each node's position in its q.
-            slot: ``[bs, S + 1]`` int32 each node's slot, or ``-1``.
-        """
-        if q.shape[1:] != self.q.shape[1:] or slot.shape[1:] != self.slot.shape[1:]:
-            raise ValueError(
-                f"a chain of q {tuple(q.shape[1:])} over {slot.shape[1]} nodes "
-                f"does not fit tables of q {tuple(self.q.shape[1:])} and "
-                f"{self.slot.shape[1]} nodes"
-            )
-        self.q.index_copy_(0, pool_indices, q)
-        self.q_ids.index_copy_(0, pool_indices, q_ids)
-        self.pos.index_copy_(0, pool_indices, pos)
-        self.slot.index_copy_(0, pool_indices, slot)
 
 
 @dataclass(frozen=True)
