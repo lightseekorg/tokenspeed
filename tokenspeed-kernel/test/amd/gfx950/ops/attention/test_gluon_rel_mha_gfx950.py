@@ -91,8 +91,7 @@ def test_extend_reads_pages_past_int32_range(window_left: int) -> None:
     total_q = sum(q_lens)
     q = torch.randn(total_q, NUM_Q_HEADS, HEAD_DIM, device="cuda", dtype=DTYPE) * 0.5
     rel_logits = (
-        torch.randn(total_q, NUM_Q_HEADS, REL_EXTENT, device="cuda", dtype=DTYPE)
-        * 0.5
+        torch.randn(total_q, NUM_Q_HEADS, REL_EXTENT, device="cuda", dtype=DTYPE) * 0.5
     )
     cu_q = cu_seqlens(q_lens, "cuda")
     cu_kv = cu_seqlens(kv_lens, "cuda")

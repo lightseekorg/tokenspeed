@@ -117,12 +117,13 @@ def move_pages_past_int32(
     """Copy paged caches to the far end of pools larger than 2**31 elements.
 
     Every cache is ``[pages, ...]`` with the same page count. Each returned
-    pool places those pages after ``2**31`` elements of unwritten pages, and
-    the returned page table points at them, so every page base a kernel
-    computes exceeds the int32 range while only the used pages are written.
+    pool places those pages after more than ``2**31`` elements of unwritten
+    pages, sized by the smallest page so it holds for every cache, and the
+    returned page table points at them, so every page base a kernel computes
+    exceeds the int32 range while only the used pages are written.
     """
     pages = caches[0].shape[0]
-    first = 2**31 // caches[0][0].numel() + 1
+    first = 2**31 // min(cache[0].numel() for cache in caches) + 1
     pools = []
     for cache in caches:
         pool = torch.empty(
