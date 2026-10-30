@@ -70,7 +70,7 @@ dependencies = [
     "tokenspeed-kernel>=0.1.4.dev0",
     "tokenspeed-mooncake>=0.3.13.post20261026",
     "tokenspeed-engine>=0.1.0",
-    "tokenspeed-scheduler>=0.1.45",
+    "tokenspeed-scheduler>=0.1.46",
     "tokenspeed-smg==1.13.0.post20261027",
     "tokenspeed-smg-grpc-proto==0.4.28.post20261027",
     "tokenspeed-smg-grpc-servicer==0.14.1.post20261027",
