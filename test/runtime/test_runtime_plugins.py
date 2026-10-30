@@ -863,3 +863,26 @@ def test_trace_context_provider_rejects_async_and_generators():
             registry.register_trace_provider("test-async-trace", provider)
     with pytest.raises(ValueError, match="Unknown trace provider"):
         registry.get_trace_provider("test-async-trace")
+
+
+def test_one_failing_plugin_does_not_block_the_rest(monkeypatch, isolated) -> None:
+    def broken() -> None:
+        raise RuntimeError("vendor library missing")
+
+    def good() -> None:
+        _register_fixture()
+
+    _install(monkeypatch, _EntryPoint("broken", broken), _EntryPoint("good", good))
+    with pytest.warns(UserWarning, match="Failed to load plugin 'broken'"):
+        infos = plugins.ensure_loaded()
+    assert [p.name for p in infos] == ["good"]
+    assert registry.registered_model("FixtureForCausalLM").cls is FixtureForCausalLM
+
+
+def test_model_registry_does_not_import_in_tree_plugin_modules() -> None:
+    import sys
+
+    import tokenspeed.runtime.models.registry as model_registry
+
+    model_registry.import_model_classes()
+    assert "tokenspeed.runtime.plugins.longcat_ngram" not in sys.modules

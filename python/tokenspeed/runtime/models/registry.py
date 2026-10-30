@@ -122,26 +122,11 @@ def import_model_classes():
                     )
                 model_arch_name_to_cls[entry.__name__] = entry
 
-    # In-tree runtime plugins extend the model registry (``register_model`` /
-    # ``register_config``) at import time; import every plugin module of the
-    # runtime's own plugins package so those registrations are visible to
-    # every architecture resolution below. Out-of-tree plugins keep loading
-    # through ``tokenspeed.runtime.plugins.ensure_loaded`` (distribution
-    # entry points in the ``tokenspeed.plugins`` group).
-    plugin_package_name = "tokenspeed.runtime.plugins"
-    plugin_package = importlib.import_module(plugin_package_name)
-    for _, name, _ in pkgutil.iter_modules(
-        plugin_package.__path__, plugin_package_name + "."
-    ):
-        if name == plugin_package_name + ".registry":
-            continue  # the registration surface itself; already imported
-        try:
-            importlib.import_module(name)
-        except Exception as exc:
-            raise RuntimeError(
-                f"Failed to import in-tree plugin module {name}."
-            ) from exc
-
+    # Plugins extend the model registry (``register_model`` / ``register_config``)
+    # at load time. They load through ``tokenspeed.runtime.plugins.ensure_loaded``
+    # (distribution entry points in the ``tokenspeed.plugins`` group, declared in
+    # ``pyproject.toml``), which isolates a failing plugin and keeps startup
+    # going. In-tree plugins declare the same entry point as out-of-tree ones.
     return model_arch_name_to_cls
 
 
