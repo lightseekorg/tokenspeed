@@ -27,6 +27,42 @@
 
 namespace tokenspeed::test {
 
+class AdmissionPromptHashSuite : public SchedulerTestSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = SchedulerTestSuite::MakeConfig();
+        cfg.device_allocator.total_pages = 8;
+        cfg.cache_groups[0].total_pages = 8;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        return cfg;
+    }
+};
+
+TEST_F(AdmissionPromptHashSuite, AQueuedAdmissionSeesCachePublishedSinceItsPreviousPlan) {
+    Submit({MakeRequestSpec("owner", 3), MakeRequestSpec("queued", 5)});
+    const auto first = PlanOnce();
+    ASSERT_EQ(scheduler_->WaitingSize(), 1u);
+    for (const auto& operation : first.Operations()) {
+        if (const auto* batch = std::get_if<ForwardBatch>(&operation)) {
+            EXPECT_EQ(batch->request_ids, (std::vector<std::string>{"owner"}));
+        }
+    }
+
+    SendForwardDone("owner", {42});
+    SendFinish("owner");
+    const auto retry = PlanOnce();
+    bool admitted = false;
+    for (const auto& operation : retry.Operations()) {
+        if (const auto* batch = std::get_if<ForwardBatch>(&operation)) {
+            ASSERT_EQ(batch->request_ids, (std::vector<std::string>{"queued"}));
+            EXPECT_EQ(batch->extend_prefix_lens, (std::vector<std::int32_t>{6}));
+            admitted = true;
+        }
+    }
+    EXPECT_TRUE(admitted);
+    EXPECT_EQ(scheduler_->WaitingSize(), 0u);
+}
+
 class LoadBackViaCacheTestSuite : public SchedulerTestSuite {
 protected:
     SchedulerConfig MakeConfig() override {

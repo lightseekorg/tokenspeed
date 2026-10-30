@@ -52,6 +52,41 @@
 namespace tokenspeed::test {
 namespace {
 
+TEST(CacheCoordinatorAdmissionBuckets, HostHitDestinationsPreserveSourceOwnership) {
+    for (const std::int32_t shards : {1, 2, 4}) {
+        SCOPED_TRACE(shards);
+        BlockPool device_pool(4, {8});
+        BlockPool host_pool(4, {8});
+        const std::array specs{CacheGroupSpec{.attn_kind = AttnKind::kFull,
+                                              .cache_blocks_per_lcm_block = 8,
+                                              .block_granularity = 4,
+                                              .shard_count = shards}};
+        auto coordinator = MakeCoordinator(specs, 4, device_pool, false, &host_pool, nullptr, false, true);
+        const std::vector<std::string> hashes{"first", "second", "third", "fourth"};
+        std::vector<std::int32_t> source_buckets;
+        for (std::size_t i = 0; i < hashes.size(); ++i) {
+            const std::int32_t bucket = static_cast<std::int32_t>((i + 1) % shards);
+            auto source = coordinator.AcquireHostBlock(0, bucket);
+            ASSERT_TRUE(source);
+            source_buckets.push_back(coordinator.Allocator(0).BucketOf(source->Location()));
+            coordinator.CacheHostBlock(source, CacheKey{.group_id = 0, .content_hash = hashes[i]}, std::nullopt);
+        }
+        std::vector<BlockTable> tables(1);
+        const std::array demands{GroupDemand{.table = &tables[0], .extent = DenseGrowth{4}}};
+        auto admitted =
+            coordinator.Admit(coordinator.ProbePrefix(hashes), demands, RequestProgress{}, std::nullopt, false);
+        ASSERT_TRUE(admitted);
+        EXPECT_EQ(admitted->host_prefix_tokens, 16);
+        ASSERT_EQ(admitted->load_pairs.size(), hashes.size());
+        for (std::size_t i = 0; i < admitted->load_pairs.size(); ++i) {
+            const auto& transfer = admitted->load_pairs[i];
+            EXPECT_EQ(coordinator.Allocator(0).BucketOf(transfer.source->Location()), source_buckets[i]);
+            EXPECT_EQ(coordinator.Allocator(0).BucketOf(transfer.destination->Location()), source_buckets[i]);
+        }
+        coordinator.Free(tables);
+    }
+}
+
 std::vector<std::int32_t> BlockIds(const std::vector<CacheBlockRef>& refs) {
     std::vector<std::int32_t> ids;
     ids.reserve(refs.size());
@@ -8685,6 +8720,36 @@ TEST_F(HostKvDuplicateReclaimTest, FreeCapacityKeepsAllDuplicates) {
     EXPECT_EQ(coordinator_.NumHostCachedBlocks(), 7);
 }
 
+TEST_F(HostKvDuplicateReclaimTest, EachPlanRechecksAnAncestorStoreThatStartsAndSettles) {
+    std::vector<BlockTable> tables(4);
+    PublishFinal(tables, MakeTokens(kP, 1));
+    const std::string ancestor = hashes_.front();
+    coordinator_.Free(tables);
+    PublishKvCopiesAndHostOnlyCheckpoints();
+    const CacheKey first_kv = Key(hashes_.front(), 0);
+    const CacheBlockRef checkpoint = coordinator_.AcquireHostCachedBlock(Key(hashes_.back(), 1));
+    HoldFreeCapacity(host_pool_, /*spare_parents=*/0);
+
+    // Populate a scan's answers before an ancestor begins its write-back.
+    auto first = Allocate(std::array<std::uint32_t, 1>{0});
+    ASSERT_EQ(first.stats.allocated, 1u);
+    coordinator_.CacheHostBlock(first.blocks[0], first_kv, std::nullopt);
+    first.blocks.clear();
+
+    CacheCoordinator::EvictedSegment pending;
+    ASSERT_TRUE(CacheCoordinatorTestAccess::RecordDeviceEviction(coordinator_, Key(ancestor, 1), pending));
+    ASSERT_FALSE(pending.members.empty());
+    const auto protected_plan = Allocate(std::array<std::uint32_t, 1>{0});
+    EXPECT_EQ(protected_plan.stats.allocated, 0u);
+    EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(first_kv));
+
+    coordinator_.SettleEvictedSegment(std::move(pending), /*placed_on_host=*/false);
+    const auto settled = Allocate(std::array<std::uint32_t, 1>{0});
+    EXPECT_EQ(settled.stats.allocated, 1u);
+    EXPECT_FALSE(coordinator_.ContainsHostCachedBlock(first_kv));
+    ExpectHostCheckpoints();
+}
+
 TEST_F(HostKvDuplicateReclaimTest, OlderHostStateLeavesBeforeNewerUnheldDeviceKvCopies) {
     const std::string old = CheckpointOnHost(100, {1, 2, 3}, /*device_keeps_checkpoint=*/false);
     PublishKvCopiesAndHostOnlyCheckpoints();
@@ -8734,6 +8799,27 @@ TEST_F(HostKvDuplicateReclaimTest, AnOlderUnheldDeviceKvCopyLeavesBeforeNewerHos
     }
     EXPECT_EQ(coordinator_.HostEvictions().duplicate_kv.blocks, 4u);
     EXPECT_EQ(coordinator_.HostEvictions().lru.blocks, 0u);
+}
+
+TEST_F(HostKvDuplicateReclaimTest, ADeviceHeldCopyKeepsPriorityAmongUnheldCopiesAndOlderState) {
+    const std::string older = CheckpointOnHost(100, {1, 2, 3}, /*device_keeps_checkpoint=*/false);
+    PublishKvCopiesAndHostOnlyCheckpoints();
+    const CacheKey held_key = Key(hashes_[2], 0);
+    const CacheBlockRef request_history = coordinator_.GroupPrefixIndex(0).Find(pool_, held_key);
+    ASSERT_TRUE(request_history);
+    HoldFreeCapacity(host_pool_, /*spare_parents=*/0);
+
+    const auto batch = Allocate(std::array<std::uint32_t, 1>{0});
+    ASSERT_EQ(batch.stats.allocated, 1u);
+    for (const std::string& hash : hashes_) {
+        EXPECT_EQ(coordinator_.ContainsHostCachedBlock(Key(hash, 0)), hash != held_key.content_hash);
+    }
+    for (const std::uint32_t group : state_group_ids_) {
+        EXPECT_TRUE(coordinator_.ContainsHostCachedBlock(Key(older, group)));
+    }
+    EXPECT_EQ(coordinator_.HostEvictions().duplicate_kv.blocks, 1u);
+    EXPECT_EQ(coordinator_.HostEvictions().lru.blocks, 0u);
+    ExpectHostCheckpoints();
 }
 
 TEST_F(HostKvDuplicateReclaimTest, OldStateCapacityCanBeReusedByKvInTheSharedPool) {

@@ -52,6 +52,13 @@ struct CacheCoordinatorTestAccess {
                                             /*write_back_segment=*/nullptr);
     }
 
+    static bool RecordDeviceEviction(CacheCoordinator& coordinator, const CacheKey& key,
+                                     CacheCoordinator::EvictedSegment& segment) {
+        const auto location = coordinator.locationOf(coordinator.pool_, key.group_id, key);
+        return location && coordinator.evictCachedBlock(key.group_id, *location,
+                                                        &CacheCoordinator::DeviceEvictionStats::admission, &segment);
+    }
+
     // A Device-cached block, located rather than referenced: a held reference
     // would pin it against eviction.
     static std::optional<CacheBlockLocation> DeviceLocationOf(const CacheCoordinator& coordinator,

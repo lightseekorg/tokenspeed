@@ -848,9 +848,17 @@ private:
         std::size_t num_placed{0};
         std::vector<Victim> victims;
     };
+    struct HostKvDuplicateCandidate {
+        std::uint32_t group_id{0};
+        CacheBlockLocation location;
+        std::uint64_t device_epoch{0};
+        std::int32_t boundary_tokens{0};
+        bool device_in_use{false};
+    };
     // Unpinned Host KV copies backed by a contiguous Device KV prefix,
-    // excluding pages a sliding group can force into a Host suffix.
-    std::vector<HostPlacementPlan::Victim> hostKvDuplicateCandidates() const;
+    // excluding pages a sliding group can force into a Host suffix. Keep the
+    // Device facts read during collection for this plan's ranking.
+    std::vector<HostKvDuplicateCandidate> hostKvDuplicateCandidates() const;
     // The plan AcquireHostSegments carries out and planHostBoundaries'
     // segment step reuses.
     HostPlacementPlan planHostSegments(std::span<const std::uint32_t> group_ids, std::span<const std::int32_t> buckets,
@@ -1089,6 +1097,7 @@ private:
     // The tree of the boundaries either tier indexes, in step with the indexes.
     // No match reads it; evicting by segments selects along it.
     BoundaryTree boundary_tree_;
+    mutable std::uint64_t host_duplicate_scan_generation_{0};
     // Hashes of possibly dead tree nodes, in the order they were queued, for
     // CollectDeadEntries (write_back_evictions only). A node may be gone or
     // alive again by the time it is collected.

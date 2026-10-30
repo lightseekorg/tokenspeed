@@ -129,6 +129,11 @@ it enumerates candidates and keeps shadow occupancy only for the parents whose
 children it tentatively evicts. This makes the common zero-eviction path scale
 with cache groups and request demand rather than total cache capacity.
 
+Replicated groups have one ownership bucket: every Host hit needs a Device
+destination in that bucket, without looking up or temporarily owning the Host
+block to count it. Sharded groups count destinations by their Host sources'
+ownership buckets.
+
 The prefix index remembers which entries an eviction traversal found pinned.
 Later admission attempts skip those entries until the last external block owner
 releases them. A one-shot ownership notification restores each entry to its
@@ -136,6 +141,14 @@ original access epoch, including an epoch changed while it was pinned. This
 keeps the same LRU victim order without repeatedly scanning active requests'
 blocks. Temporary lookups do not update this secondary index. The notification
 belongs to block-reference ownership; the pool still tracks placement alone.
+
+Host duplicate reclamation checks pending stores on a candidate's ancestor
+chain once per scan and reuses that answer for other candidates sharing it.
+The memo and traversal buffers belong to the scan: the next scan rechecks
+store completions and new tree links. This changes traversal cost without
+changing candidate eligibility or eviction order.
+Collection also keeps each candidate's Device ownership and access epoch for
+ranking in the same call, avoiding a second set of key and tree lookups.
 
 The per-step page gauge composes two O(1)-or-cheaper quantities the same way:
 empty parents come from the pool, active parents from the live requests' block

@@ -641,6 +641,57 @@ protected:
     }
 };
 
+class ReservedDecodeCheckpointSuite : public StateCheckpointInForwardSuite {
+protected:
+    SchedulerConfig MakeConfig() override {
+        auto cfg = StateCheckpointInForwardSuite::MakeConfig();
+        cfg.prefix_granularity = 64;
+        cfg.max_scheduled_tokens = 256;
+        cfg.decode_input_tokens = 4;
+        cfg.overlap_schedule_depth = 1;
+        cfg.disable_l2_cache = false;
+        cfg.host_write_policy = SchedulerConfig::HostWritePolicy::kWriteBack;
+        for (auto& group : cfg.cache_groups) {
+            if (group.attn_kind != AttnKind::kState) {
+                group.block_granularity = 64;
+            }
+        }
+        return cfg;
+    }
+};
+
+TEST_F(ReservedDecodeCheckpointSuite, ReservedStepsKeepGeneratedHashesAndTheFinalStateReusable) {
+    std::vector<std::int32_t> tokens = MakeTokens(385);
+    auto owner = RequestWithTokens("owner", tokens);
+    owner.max_new_tokens = 512;
+    Submit(owner);
+    const auto chunks = RunPrefill("owner", 385);
+    ASSERT_EQ(chunks.size(), 2u);
+    EXPECT_EQ(chunks.back().checkpoint_len, 128);
+    tokens.push_back(900);
+
+    std::int32_t live_state = 0;
+    for (std::int32_t round = 0; round < 80; ++round) {
+        const auto row = PlanAndStateRow("owner");
+        ASSERT_EQ(row.size(), 2u);
+        ASSERT_GT(row[1], 0);
+        live_state = row[1];
+        const std::vector<std::int32_t> accepted{1000 + 2 * round, 1001 + 2 * round};
+        SendForwardDone("owner", accepted);
+        tokens.insert(tokens.end(), accepted.begin(), accepted.end());
+    }
+    SendFinish("owner");
+    AckWriteBacks(PlanOnce());
+
+    const auto computed_tokens = static_cast<std::int32_t>(tokens.size()) - 1;
+    tokens.push_back(2000);
+    const auto resumed = Probe("reuse", tokens);
+    EXPECT_EQ(resumed.prefix_tokens, computed_tokens);
+    ASSERT_EQ(resumed.state_row.size(), 2u);
+    EXPECT_EQ(resumed.state_row[0], live_state);
+    EXPECT_EQ(scheduler_->AvailableLcmBlocks(), config_.device_allocator.NumUsableBlocks());
+}
+
 // Under the 8-token budget a 22-token prompt keeps its plain chunks 8, 8 and
 // 6. The last one spans the boundary 20 and writes the state after its first
 // 4 tokens into a third, freshly zeroed block of each State group's row. The

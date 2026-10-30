@@ -94,6 +94,10 @@ public:
         // is out the node, its tail hint and its Host presence stay.
         std::int32_t pending_host_stores{0};
         std::int32_t pending_host_checkpoint_stores{0};
+        // Scratch for one duplicate-candidate scan. A new scan must recheck
+        // stores and links that may have changed since the previous one.
+        mutable std::uint64_t host_store_scan_generation{0};
+        mutable bool host_store_ancestor_pending{false};
         // Accounting only, bit i for cache group i: an eviction write-back
         // published this hash's blocks of that group on the Host before, so
         // copying one again is a recopy.
