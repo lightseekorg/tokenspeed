@@ -89,7 +89,7 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
     }
     assert len(entries) >= 2, "FP8 tile choices were not saved by startup autotune"
     # Emulate a cache with different winners at 32 and 64 rows. Both choices
-    # are valid; the test checks preparation after restart, not timing noise.
+    # are valid; the test checks cache reuse after restart, not timing noise.
     configs = json.loads(Path(path).read_text())
     for key in entries:
         m = ast.literal_eval(key)[2][0][0]
@@ -103,20 +103,7 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
     tuner.clear_cache()
     monkeypatch.setattr(launcher, "_compiled", {})
     assert load_autotune_cache(path, None, 0)
-
-    original_compile = launcher._compile
-    needed_tactics = {
-        (False, (64, 128), (1, 1)),
-        (False, (128, 128), (1, 1)),
-        (True, (256, 128), (2, 1)),
-        (True, (128, 128), (2, 1)),
-    }
-
-    def compile_loaded_tactic(*args):
-        assert args[-1] in needed_tactics, "Cache hit compiled an unused candidate"
-        return original_compile(*args)
-
-    monkeypatch.setattr(launcher, "_compile", compile_loaded_tactic)
+    assert not launcher._compiled
 
     def unexpected_profile(*args, **kwargs):
         pytest.fail("Reloaded FP8 tactics must not be profiled again")
@@ -124,11 +111,6 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
     monkeypatch.setattr(tuner, "_profile_single_kernel", unexpected_profile)
     with autotune(tune_mode=True, tuning_buckets=(32, 64), round_up=False):
         _mm(inputs)
-
-    def unexpected_compile(*args, **kwargs):
-        pytest.fail("A new M must reuse the compiled dynamic-shape tactic")
-
-    monkeypatch.setattr(launcher, "_compile", unexpected_compile)
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
 
     selected = []
@@ -152,6 +134,10 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
         torch.cuda.synchronize()
         torch.testing.assert_close(actual, _reference(tensors), atol=1e-4, rtol=1e-2)
 
+    assert {tactic for _, tactic in launcher._compiled} == {
+        (False, (64, 128), (1, 1)),
+        (True, (128, 128), (2, 1)),
+    }
     tensors = _inputs(33, 384, 256)
     tuner.clear_cache()
     _mm(tensors)
@@ -160,8 +146,9 @@ def test_startup_autotune_persists_fp8_tactics(tmp_path, monkeypatch):
         configs[key][1] = [False, [128, 128], [1, 1]]
     Path(path).write_text(json.dumps(configs))
     assert load_autotune_cache(path, None, 0)
-    _mm(tensors)
+    actual = _mm(tensors)
     assert selected[-1] == (False, (128, 128), (1, 1))
+    torch.testing.assert_close(actual, _reference(tensors), atol=1e-4, rtol=1e-2)
 
 
 @torch.inference_mode()
@@ -175,9 +162,6 @@ def test_fp8_all_tactics_preserve_values_and_graph(monkeypatch):
     for m, n, k in ((1, 384, 256), (17, 384, 256), (129, 512, 512), (257, 640, 256)):
         inputs = _inputs(m, n, k)
         expected = _reference(inputs)
-        torch.testing.assert_close(
-            runner(inputs, do_preparation=True), expected, atol=1e-4, rtol=1e-2
-        )
         torch.testing.assert_close(runner(inputs), expected, atol=1e-4, rtol=1e-2)
         tactics = runner.get_valid_tactics(inputs, None)
         assert (False, (64, 128), (1, 1)) in tactics
@@ -198,26 +182,40 @@ def test_fp8_all_tactics_preserve_values_and_graph(monkeypatch):
 
 
 @torch.inference_mode()
-def test_eager_warmup_covers_all_fallback_tiles(monkeypatch):
-    """One eager fallback must prepare all fixed tiles before graph capture."""
+def test_fallback_compiles_only_selected_tactic_and_reuses_it(monkeypatch):
+    """Each fallback compiles on demand and supports new shapes during capture."""
     from tokenspeed_kernel.thirdparty import trtllm_blockwise as adapter
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
 
     AutoTuner.get().clear_cache()
     monkeypatch.setattr(launcher, "_compiled", {})
-    adapter.blockwise_gemm(*_inputs(1, 256, 128))
-    inputs = _inputs(129, 256, 128)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = adapter.blockwise_gemm(*inputs)
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+    expected_tactics = set()
+    for warmup_m, capture_m, tactic in (
+        (1, 64, (False, (64, 128), (1, 1))),
+        (65, 128, (False, (128, 128), (1, 1))),
+        (129, 257, (True, (256, 128), (2, 1))),
+    ):
+        warmup = _inputs(warmup_m, 256, 128)
+        actual = adapter.blockwise_gemm(*warmup)
+        torch.testing.assert_close(actual, _reference(warmup), atol=1e-4, rtol=1e-2)
+        expected_tactics.add((warmup[0].device.index, tactic))
+        assert launcher._compiled.keys() == expected_tactics
+        compiled = launcher._compiled.copy()
+
+        inputs = _inputs(capture_m, 384, 256)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = adapter.blockwise_gemm(*inputs)
+        inputs[0].copy_((-inputs[0].float()).to(inputs[0].dtype))
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+        assert launcher._compiled == compiled
 
 
 @torch.inference_mode()
-def test_loaded_tactics_are_precompiled_and_match_hybrid_buckets(tmp_path, monkeypatch):
-    """Loaded tactics are ready for eager and graph execution, including misses."""
+def test_loaded_tactics_compile_lazily_and_match_hybrid_buckets(tmp_path, monkeypatch):
+    """Loaded tactics compile on first use and work with eager and graph execution."""
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import _launch as launcher
     from tokenspeed_kernel.thirdparty.trtllm_blockwise import runner as runner_module
 
@@ -239,12 +237,17 @@ def test_loaded_tactics_are_precompiled_and_match_hybrid_buckets(tmp_path, monke
             key_512 = key
     path = tmp_path / "hybrid-configs.json"
     path.write_text(json.dumps(configs))
+    compiled = []
+    original_compile = launcher._compile
+
+    def record_compile(*args):
+        compiled.append(args[-1])
+        return original_compile(*args)
+
+    monkeypatch.setattr(launcher, "_compile", record_compile)
     assert load_autotune_cache(str(path), None, 0)
+    assert not compiled
 
-    def unexpected_compile(*args, **kwargs):
-        pytest.fail("Loaded FP8 tactics must be compiled before serving")
-
-    monkeypatch.setattr(launcher, "_compile", unexpected_compile)
     selected = []
     original_run = runner_module._run
 
@@ -258,6 +261,7 @@ def test_loaded_tactics_are_precompiled_and_match_hybrid_buckets(tmp_path, monke
         actual = _mm(inputs)
         assert selected[-1] == expected
         torch.testing.assert_close(actual, _reference(inputs), atol=1e-4, rtol=1e-2)
+    assert compiled == [lower, upper]
 
     # With the exact bucket missing, equidistant cached buckets prefer smaller M.
     del tuner._file_configs[key_512]

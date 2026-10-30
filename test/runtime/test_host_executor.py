@@ -94,7 +94,11 @@ def _load_executor_module_without_triton(*, force_isolated=False):
     lanes.build_transfer_geometry = Mock()
     lanes.check_host_memory = Mock()
     lanes.host_memory_share = Mock(return_value=10**12)
-    lanes.largest_pinned_fit = Mock(side_effect=lambda room_bytes: max(room_bytes, 0))
+    lanes.largest_pinned_fit = Mock(
+        side_effect=lambda room_bytes, *, block_bytes: (
+            max(room_bytes, 0) // block_bytes * block_bytes
+        )
+    )
     lanes.pinned_host_bytes = Mock(side_effect=lambda nbytes: nbytes)
     lanes.load_stream_priority = Mock(return_value=None)
     lanes.new_cache_stream = Mock()
@@ -1629,7 +1633,10 @@ class TestHostMemoryShareTest:
     def test_a_pinned_buffer_takes_the_power_of_two_it_rounds_up_to(self):
         lanes_module = _lanes_module()
         pinned = lanes_module.pinned_host_bytes
-        fit = lanes_module.largest_pinned_fit
+
+        def fit(room_bytes):
+            return lanes_module.largest_pinned_fit(room_bytes, block_bytes=1)
+
         assert (pinned(0)) == (0)
         assert (pinned(1)) == (1)
         assert (pinned(2**37)) == (2**37)

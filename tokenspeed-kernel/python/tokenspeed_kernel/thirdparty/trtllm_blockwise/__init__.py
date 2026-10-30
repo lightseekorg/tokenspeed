@@ -20,8 +20,6 @@
 
 """Public entry points for TRT-LLM blockwise FP8 GEMM."""
 
-from tokenspeed_kernel.thirdparty.trtllm_blockwise._launch import prepare as prepare
-
 
 def blockwise_gemm(a, b, a_scales, b_scales, out):
     """Run block-FP8 GEMM with startup-tuned tiles and the current CUDA stream.

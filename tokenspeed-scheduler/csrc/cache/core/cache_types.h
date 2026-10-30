@@ -94,6 +94,10 @@ struct CacheGroupSpec {
     std::int32_t block_granularity{0};
     // Cyclic owners of the virtual blocks; must divide cache_blocks_per_lcm_block.
     std::int32_t shard_count{1};
+    // State checkpoints may only be reused/published at multiples of this
+    // token count and must be produced by prefill. 1 preserves arbitrary
+    // natural checkpoints, including decode endpoints. No row span.
+    std::int32_t checkpoint_granularity{1};
 };
 
 // How a group's table grows in one admission. The two shapes use different

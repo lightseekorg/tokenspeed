@@ -74,6 +74,13 @@ CacheCoordinator::CacheCoordinator(std::vector<CacheGroup> groups, std::int32_t 
         _assert(groups_[i].Allocator().ShardCount() == groups_[i].Spec().shard_count,
                 "group allocator shard count must match its group spec");
         const auto& spec = groups_[i].Spec();
+        _assert(spec.checkpoint_granularity >= 1, "checkpoint grain must be positive");
+        if (spec.checkpoint_granularity > 1) {
+            _assert(spec.attn_kind == AttnKind::kState, "only State groups constrain checkpoints");
+            _assert(checkpoint_granularity_ == 1 || checkpoint_granularity_ == spec.checkpoint_granularity,
+                    "restricted State groups must use the same checkpoint grain");
+            checkpoint_granularity_ = spec.checkpoint_granularity;
+        }
         pool_.RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
         if (host_pool_ != nullptr) {
             host_pool_->RegisterGroup(groups_[i].Id(), spec.cache_blocks_per_lcm_block, spec.shard_count);
@@ -453,6 +460,9 @@ bool CacheCoordinator::groupAcceptsBoundary(std::size_t i, std::span<const std::
     };
     tail_hits.hits.assign(tail_keys.size(), 0);
     if (GroupIsState(i)) {
+        if ((full_tokens + tail_tokens) % group.Spec().checkpoint_granularity != 0) {
+            return false;
+        }
         if (tail_tokens > 0) {
             _assert(tail_keys.size() == 1, "a State group has one key per boundary");
             if (!contains(tail_keys[0])) {
@@ -1311,8 +1321,36 @@ CacheCoordinator::HostAllocationBatch CacheCoordinator::AcquireHostBlocks(std::s
         if (needs_replacement[group_id]) {
             children[group_id].resize(static_cast<std::size_t>(allocator.ShardCount()));
         }
+        if (!needs_parent && !GroupIsState(group_id)) {
+            // No parent from this group can be donated. Its oldest children,
+            // bounded by demand per bucket, suffice for the global comparison.
+            std::vector<std::size_t> needed(allocator.ShardCount(), 0);
+            std::size_t remaining = 0;
+            for (std::size_t i = 0; i < group_ids.size(); ++i) {
+                if (group_ids[i] == group_id && !batch.blocks[i]) {
+                    ++needed[buckets[i]];
+                    ++remaining;
+                }
+            }
+            PrefixCacheIndex::EvictionCursor cursor;
+            std::vector<PrefixCacheIndex::EvictionCandidate> epoch;
+            while (remaining > 0 && groups_[group_id].Index().NextEvictionEpoch(*host_pool_, cursor, epoch)) {
+                batch.stats.block_candidates += epoch.size();
+                for (auto& candidate : epoch) {
+                    const std::int32_t bucket = allocator.BucketOf(candidate.location);
+                    if (needed[bucket] > 0) {
+                        children[group_id][bucket].entries.push_back(std::move(candidate));
+                        --needed[bucket];
+                        --remaining;
+                    }
+                }
+                epoch.clear();
+            }
+            continue;
+        }
         std::vector<PrefixCacheIndex::EvictionCandidate> entries =
             groups_[group_id].Index().EvictableCandidates(*host_pool_);
+        batch.stats.block_candidates += entries.size();
         if (needs_parent && !entries.empty() && parents.empty()) {
             parents.resize(static_cast<std::size_t>(host_pool_->NumLcmBlocks()) + 1);
         }
@@ -2260,6 +2298,11 @@ std::vector<CacheCoordinator::PublishedRange> CacheCoordinator::completedBlockRa
         // A natural checkpoint: slot 1 holds the state the forward that ended
         // at this point wrote, keyed like the point itself.
         if (!completed.publish_state || completed.prefix_hashes.empty() && !completed.tail) {
+            return ranges;
+        }
+        const std::int32_t boundary_tokens =
+            hashed_prefix_pages * prefix_granularity_ + (completed.tail ? completed.tail->tail_tokens : 0);
+        if (boundary_tokens % groups_[group_index].Spec().checkpoint_granularity != 0) {
             return ranges;
         }
         const ContentHash hash = completed.tail ? completed.tail->hash : completed.prefix_hashes.back();

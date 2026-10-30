@@ -437,6 +437,43 @@ Value projection stays separate to preserve its explicit rounding boundary.
 Provider registration owns dtype, head geometry and hardware constraints.
 The ordinary auto envelope retains its existing dynamic selection policy.
 
+### Explicit projection plans
+
+A model may bind an existing unquantized Linear or LM-head method to a dense
+GEMM plan without changing its weight owner or storage. The logits processor
+uses that method for a registered bitwise envelope, preserving its normal
+input dtype cast and vocabulary communication.
+
+Plugins may call `register_numerics_envelope` from the runtime registration
+surface. A policy supplies its name, bitwise classification, launch resolver
+and checkpoint validator. Plugin discovery precedes CLI choices and launch
+validation; registrations update shared containers and roll back together if
+plugin loading fails. Every policy still passes the model profile gate.
+Only `rl-bitwise` inherits the RL switches and unquantized/vocab-block limits;
+a plugin owns its own policy without changing individual execution entry points.
+
+The existing `gemm/mm` plan also accepts already quantized FP8 operands and
+canonical scales. Quantization stays in the caller's existing quantization
+hook; an online quantizer is not selected by a frozen GEMM plan. The ordinary
+FP8 linear method retains its original dynamic selection and has no new plan
+field or forwarding path.
+
+The original RMSNorm module may accept a preselected callable through `kernel`.
+The caller uses the existing registry selection during initialization; forward
+invokes that callable with the ordinary weight, epsilon, residual and output
+arguments. No plan or forward-scoped override is required. The default remains
+the original platform facade, and empty inputs keep the original early return.
+A custom callable rejects fused collective/norm entry points so its arithmetic
+cannot be bypassed. Kernel-specific input validation stays in the selected leaf.
+
+`MoELayer` retains the usual `moe/apply` selection and its existing scoped
+`kernel_override` mechanism; no model-specific solution or feature arguments
+are added. An optional input dtype describes the actual activation for that
+selection without changing the global default dtype. A live-row mask is
+forwarded only to a kernel declaring that capability; unsupported masks fail
+rather than being ignored. Weight allocation and checkpoint loading stay on
+the original MoE layer for both precomputed and in-kernel routing.
+
 ## Logprobs: one arithmetic for prompt and output
 
 A returned logprob is the launch's `--logprob-order` applied to the row --
