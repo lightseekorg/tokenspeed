@@ -47,11 +47,11 @@ def gather_sampled_rows(
     all-gather with the plan's per-rank sampled-row counts concatenates them
     rank by rank, and ``sampled_to_request`` puts them in request order.
     The logits processor runs this in place of its ``hidden_states[gather_ids]``
-    selection on a sharded forward, for the
-    final hidden rows and for a LAST capture's aux hidden rows alike; the
-    gather is byte-preserving (:func:`token_all_gather_rows`), so any row
-    dtype and width travel, the per-rank sampled-row counts being whatever
-    the batch makes them.
+    selection on a sharded forward, for the final hidden rows and for a LAST
+    capture's aux hidden rows alike; the gather is byte-preserving
+    (:func:`token_all_gather_rows`), so any dtype with an even row byte width
+    travels, the per-rank sampled-row counts being whatever the batch makes
+    them.
 
     Args:
         hidden_states: ``[local_rows, hidden]`` this rank's final rows.

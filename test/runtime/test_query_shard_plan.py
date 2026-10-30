@@ -149,5 +149,17 @@ def test_direct_construction_rejects_a_truncated_permutation_pair():
         dataclasses.replace(plan, span_to_gather_cpu=plan.span_to_gather_cpu[:-1])
 
 
+def test_direct_construction_rejects_negative_per_request_rows():
+    # A negative count can still sum to the rank's rows; reject it before a
+    # consumer slices a request range with it.
+    plan = QueryShardPlan.from_forward(
+        total_tokens=11, input_lengths=[5, 6], size=2, rank=0, device="cpu"
+    )
+    per_request = list(plan.local_rows_per_request)
+    total = sum(per_request)
+    with pytest.raises(ValueError, match="local rows per request"):
+        dataclasses.replace(plan, local_rows_per_request=(-1, total + 1))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, *sys.argv[1:]]))

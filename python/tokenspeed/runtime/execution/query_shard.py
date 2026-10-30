@@ -176,6 +176,8 @@ class QueryShardPlan:
             count < 0 for count in self.sampled_rows_per_rank
         ):
             raise ValueError("query shard row counts are non-negative")
+        if any(count < 0 for count in self.local_rows_per_request):
+            raise ValueError("query shard local rows per request are non-negative")
         if self.span_to_gather_cpu.shape != (sum(self.row_counts),):
             raise ValueError("query shard span_to_gather_cpu must name every span row")
         if self.gather_to_span_cpu.shape != (sum(self.row_counts),):
