@@ -204,6 +204,7 @@ def _config(**overrides):
         max_retracted_requests=0,
         host_write_policy="write_through",
         storage_config=None,
+        prefill_compute_budget=None,
     )
     fields.update(overrides)
     return make_config(**fields)

@@ -25,6 +25,27 @@ and reclaims inside the same `Admit` (`AdvanceRequestProgress` in
 and builds it; see [cache-concepts](cache-concepts.md#the-coordinator-layer-csrccachecoordinator)
 for why publication rides with admission).
 
+**Optional compute budget.** `prefill_compute` adds a soft rank-local time
+budget to the hard token budget. Its calibrated cost is
+`request_ns + token_ns*q + pair_ns*q*(c + (q+1)/2)`, where `q` is the input
+length and `c` is the already available prefix. `PrefillChunkTokens` caps the
+input length before applying the existing junction and final-window rules.
+The first chunk uses the actual joint prefix hit; replay rows are included
+in `q` and subtracted from `c`. `pushOperation` debits the actual admitted
+operation, so all local prefills share one compute budget per plan, including
+admission retries. This changes neither cache ownership nor the role grammar.
+Decode work consumes only its existing token budget; remote prompt admission
+is unaffected. The budget bounds the prefill contribution, not a mixed
+round's total latency.
+
+The first local prefill may exceed the time budget by the minimum chunk
+needed to advance (including replay and a required final window). Hard token
+and capacity limits still apply. Later prefills cannot use this exception.
+This prevents an underestimated budget from starving a resident request.
+Coefficients and the budget are explicit, fixed across attention-DP ranks;
+there is no GPU timing or new collective in the control loop. See
+[configuration and measurement](../serving/parallelism.md#prefill-compute-budget).
+
 Decode-role remote admission covers the complete unmatched prompt in one
 landing window. Local prefill chunk limits and junction cuts do not shorten
 it: the peer transfers the full prompt's KV past the hit and its prompt-end

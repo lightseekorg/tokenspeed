@@ -369,7 +369,8 @@ std::optional<CacheCoordinator::AdmissionResult> Scheduler::admitWithKvEventTrac
 
 Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                   Request* request, std::int32_t remaining,
-                                                                  std::int32_t decode_input_tokens) {
+                                                                  std::int32_t decode_input_tokens,
+                                                                  double compute_spent_ns) {
     // No admission is possible while slots are full. L3 preparation runs
     // independently before forward scheduling and needs no request slot.
     if (req_pool_allocator_.AvailableSlots() == 0) {
@@ -395,10 +396,11 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     const std::int32_t unscheduled = request->PrefillSize() - hit_tokens;
     // A remote landing completes the prompt in one transfer; no junction cut
     // can shorten it.
-    std::int32_t tokens_this_round = source == fsm::PrefillSource::kRemote
-                                         ? unscheduled
-                                         : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true,
-                                                              unscheduled, remaining, junction_tokens);
+    std::int32_t tokens_this_round =
+        source == fsm::PrefillSource::kRemote
+            ? unscheduled
+            : PrefillChunkTokens(coordinator_, hit_tokens, /*resumes_hit=*/true, unscheduled, remaining,
+                                 junction_tokens, config_.prefill_compute, compute_spent_ns);
     if (tokens_this_round == 0) {
         return FirstChunkOutcome{};
     }
@@ -563,12 +565,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
 
 std::optional<fsm::SchedulePrefillEvent> Scheduler::schedulePrefill(
     ExecutionPlan& plan, AdmissionFeedback& feedback, Request* request, std::int32_t remaining,
-    std::int32_t reserve_num_tokens_in_next_schedule_event) {
+    std::int32_t reserve_num_tokens_in_next_schedule_event, double compute_spent_ns) {
     const std::int32_t unscheduled = request->UnscheduledPrefillSize();
     const std::int32_t first_pos = request->PrefillSize() - unscheduled;
     fsm::CacheProgress cache_progress = request->CacheProgress();
-    std::int32_t prefill_tokens = PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled,
-                                                     remaining, cache_progress.junction_tokens);
+    std::int32_t prefill_tokens =
+        PrefillChunkTokens(coordinator_, first_pos, /*resumes_hit=*/false, unscheduled, remaining,
+                           cache_progress.junction_tokens, config_.prefill_compute, compute_spent_ns);
     if (prefill_tokens == 0) {
         return std::nullopt;
     }
@@ -757,14 +760,16 @@ DecodeOperation Scheduler::applyEventAndBuildOperation(Request* request, fsm::Sc
 std::optional<PrefillOperation> Scheduler::schedulePrefillCandidate(ExecutionPlan& plan, AdmissionFeedback& feedback,
                                                                     Request* request, std::int32_t token_budget,
                                                                     std::int32_t decode_reserve,
-                                                                    std::vector<LoadBackOperation>& load_backs) {
+                                                                    std::vector<LoadBackOperation>& load_backs,
+                                                                    double compute_spent_ns) {
     if (request->Is<fsm::Prefilling>()) {
-        if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve)) {
+        if (auto event = schedulePrefill(plan, feedback, request, token_budget, decode_reserve, compute_spent_ns)) {
             return applyEventAndBuildOperation(request, std::move(*event));
         }
         return std::nullopt;
     }
-    FirstChunkOutcome outcome = schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve);
+    FirstChunkOutcome outcome =
+        schedulePrefillFirstChunk(plan, feedback, request, token_budget, decode_reserve, compute_spent_ns);
     if (outcome.event) {
         PrefillOperation operation = applyEventAndBuildOperation(request, std::move(*outcome.event), load_backs);
         operation.state_prefix_cached = outcome.state_prefix_cached;
@@ -1170,8 +1175,9 @@ void Scheduler::maybeRetractForCapacity(AdmissionFeedback& feedback, PlanBuild& 
             // plan.remote_prefill beside whatever batch this round built.
             // Everything else is local prefill work joining the model batch.
             const std::int32_t budget = remote_grant ? blocker->PrefillSize() : build.token_budget;
-            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, blocker, budget,
-                                                         config_.decode_input_tokens, build.load_backs)) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, blocker, budget, config_.decode_input_tokens,
+                                             build.load_backs, build.prefill_compute_spent_ns)) {
                 if (remote_grant) {
                     // The blocker is now RemotePrefilling: the peer's prefill
                     // is out against its pages (pdTransferInFlight).
@@ -1361,7 +1367,8 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
             return;
         }
         for (Request* request : candidates) {
-            if (build.Full(config_.max_batch_size)) {
+            if (build.Full(config_.max_batch_size) ||
+                (config_.prefill_compute && build.prefill_compute_spent_ns >= config_.prefill_compute->budget_ns)) {
                 return;
             }
             if ((resident ? !request->Is<fsm::Prefilling>() : !request->Is<fsm::Submitted>()) ||
@@ -1369,8 +1376,9 @@ void Scheduler::scheduleLocalPrefillWork(AdmissionFeedback& feedback, PlanBuild&
                 continue;
             }
             feedback.admission_failed = false;
-            if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, build.token_budget,
-                                                         decode_reserve, build.load_backs)) {
+            if (auto admitted =
+                    schedulePrefillCandidate(build.plan, feedback, request, build.token_budget, decode_reserve,
+                                             build.load_backs, build.prefill_compute_spent_ns)) {
                 pushOperation(build, *request, std::move(*admitted));
                 request->TrackScheduledForward();
                 if (holdsHeadOfLine(*request)) {
@@ -1479,7 +1487,8 @@ void Scheduler::buildDecodeWorkerPlan(AdmissionFeedback& feedback, PlanBuild& bu
             }
             feedback.admission_failed = false;
             if (auto admitted = schedulePrefillCandidate(build.plan, feedback, request, request->PrefillSize(),
-                                                         config_.decode_input_tokens, build.load_backs)) {
+                                                         config_.decode_input_tokens, build.load_backs,
+                                                         build.prefill_compute_spent_ns)) {
                 build.scheduled.insert(request);
                 build.remote_prefill.emplace_back(std::move(*admitted));
                 break;

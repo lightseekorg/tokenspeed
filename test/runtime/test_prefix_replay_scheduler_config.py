@@ -32,6 +32,7 @@ def _make_config(*, prefix_replay_tokens: int | None = None):
         max_retracted_requests=0,
         host_write_policy="write_through",
         storage_config=None,
+        prefill_compute_budget=None,
         **kwargs,
     )
 
@@ -143,6 +144,7 @@ def test_make_config_preserves_explicit_l3_storage(enable_l3_storage: bool) -> N
         num_host_pages=8,
         disable_l2_cache=False,
         enable_l3_storage=enable_l3_storage,
+        prefill_compute_budget=None,
         role="fused",
         num_snapshot_pages=1,
         max_retracted_requests=0,
@@ -170,3 +172,25 @@ def test_private_context_rejects_kvstore_even_without_prefix_caching() -> None:
     # refused whether or not prefix reuse is on.
     with pytest.raises(ValueError, match="does not support KVStore"):
         _resolve_replay(enable_prefix_caching=False, enable_kvstore=True)
+
+
+def test_make_config_preserves_prefill_compute_calibration():
+    config = make_config(
+        num_device_pages=32,
+        max_scheduled_tokens=64,
+        max_batch_size=8,
+        prefix_granularity=2,
+        num_host_pages=0,
+        disable_l2_cache=True,
+        enable_l3_storage=False,
+        role="fused",
+        num_snapshot_pages=1,
+        max_retracted_requests=0,
+        storage_config=None,
+        host_write_policy="write_through",
+        prefill_compute_budget=[2.5, 40, 0.01, 5000],
+    )
+    compute = config.prefill_compute
+    assert compute.budget_ns == 2_500_000
+    assert compute.cost(100, 200) == pytest.approx(5000 + 40 * 100 + 0.01 * 100 * 250.5)
+    assert _make_config().prefill_compute is None

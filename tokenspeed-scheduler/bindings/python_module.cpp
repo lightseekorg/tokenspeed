@@ -42,15 +42,16 @@
 #include "utils.h"
 
 /*
-Writable types:
+Writable types include:
 1. SchedulerConfig
 2. RequestSpec
 3. ForwardEvent (ExtendResult, Finish, Abort, UpdateReserveNumTokens)
 4. PD::*Event
 5. cache::* ACKs (WriteBackDone, LoadBackDone, SnapshotDone, RestoreDone)
+6. PrefillComputeConfig
 
-All other types are produced by the scheduler and consumed by Python, so they do
-not need writable properties.
+Execution plans and other scheduler outputs expose read-only properties for
+Python consumers.
 */
 
 namespace nb = nanobind;
@@ -87,6 +88,16 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     nb::class_<tokenspeed::KvBlockRemovedEvent>(kv_event, "BlockRemoved")
         .def_prop_ro("kind", [](const tokenspeed::KvBlockRemovedEvent&) { return "BlockRemoved"; })
         .def_ro("block_hashes", &tokenspeed::KvBlockRemovedEvent::block_hashes);
+
+    nb::class_<tokenspeed::PrefillComputeConfig>(m, "PrefillComputeConfig")
+        .def(nb::init<double, double, double, double>(), nb::arg("budget_ns"), nb::arg("token_ns"), nb::arg("pair_ns"),
+             nb::arg("request_ns"))
+        .def_rw("budget_ns", &tokenspeed::PrefillComputeConfig::budget_ns)
+        .def_rw("token_ns", &tokenspeed::PrefillComputeConfig::token_ns)
+        .def_rw("pair_ns", &tokenspeed::PrefillComputeConfig::pair_ns)
+        .def_rw("request_ns", &tokenspeed::PrefillComputeConfig::request_ns)
+        .def("validate", &tokenspeed::PrefillComputeConfig::Validate)
+        .def("cost", &tokenspeed::PrefillComputeConfig::Cost, nb::arg("query_tokens"), nb::arg("prefix_tokens"));
 
     auto scheduler_config = nb::class_<tokenspeed::SchedulerConfig>(m, "SchedulerConfig");
 
@@ -142,6 +153,7 @@ NB_MODULE(tokenspeed_scheduler_ext, m) {
     scheduler_config.def(nb::init<>())
         .def_rw("prefix_granularity", &tokenspeed::SchedulerConfig::prefix_granularity)
         .def_rw("max_scheduled_tokens", &tokenspeed::SchedulerConfig::max_scheduled_tokens)
+        .def_rw("prefill_compute", &tokenspeed::SchedulerConfig::prefill_compute)
         .def_rw("max_batch_size", &tokenspeed::SchedulerConfig::max_batch_size)
         .def_rw("decode_input_tokens", &tokenspeed::SchedulerConfig::decode_input_tokens)
         .def_rw("overlap_schedule_depth", &tokenspeed::SchedulerConfig::overlap_schedule_depth)

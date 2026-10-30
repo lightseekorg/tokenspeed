@@ -120,6 +120,7 @@ def test_make_config_requires_and_maps_the_host_write_policy():
         num_snapshot_pages=1,
         max_retracted_requests=0,
         storage_config=None,
+        prefill_compute_budget=None,
     )
     # Keyword-only and required, with or without a Host tier.
     with pytest.raises(TypeError, match="host_write_policy"):

@@ -28,6 +28,7 @@
 
 #include "cache/core/cache_config.h"
 #include "utils.h"
+#include "scheduler/prefill_compute.h"
 
 namespace tokenspeed {
 
@@ -80,6 +81,7 @@ struct SchedulerConfig {
     }
 
     std::int32_t max_scheduled_tokens{};
+    std::optional<PrefillComputeConfig> prefill_compute;
     std::int32_t max_batch_size{};
     std::int32_t decode_input_tokens{1};
     // Number of scheduler iterations that may be dispatched before the

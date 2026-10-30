@@ -963,3 +963,42 @@ Before benchmarking:
 - confirm GPU visibility and process placement
 - compare output correctness before tuning throughput
 - keep the full launch command with benchmark results
+
+## Prefill compute budget
+
+For attention-DP prefill, equal token counts can hide very different work:
+each new token attends to its request's entire available prefix. The opt-in
+`--prefill-compute-budget BUDGET_MS TOKEN_NS PAIR_NS REQUEST_NS` limits each
+rank's scheduled prefill by predicted compute time as well as
+`--chunked-prefill-size`. All four values must be supplied. Omit the option
+for ordinary token-based scheduling. Build `tokenspeed-scheduler` from the
+same checkout to use this experimental option.
+
+Fit non-negative coefficients from timings on the intended model, GPU,
+attention backend and parallel mapping:
+
+```
+cost_ns(q, c) = REQUEST_NS + TOKEN_NS*q + PAIR_NS*q*(c + (q+1)/2)
+```
+
+`q` includes replay input, and `c` is the prefix preceding that input. Use
+identical calibration and budget on ranks that synchronize together. The
+scheduler makes chunks smaller for longer prefixes; it preserves actual
+cache hits, junction checkpoints, final replay windows and capacity admission.
+One minimum-sized prefill may exceed the soft time budget to guarantee
+progress. Decodes retain their scheduling priority and do not consume this
+prefill budget, so it is not a latency cap for a mixed prefill/decode round.
+
+Calibrate the rank-local work being balanced, including projection and linear
+attention costs when applicable. A K3 MLA-only kernel fit does not measure
+KDA, MoE or communication, and must not be presented as a full-model fit.
+Sparse attention and backend switches may require a different model. There
+is no online fitting, cross-rank minimum-budget negotiation, request migration
+or compute-aware ingress routing in this option. Under low load, smaller
+chunks can increase total steps and hurt latency. Compare throughput and
+TTFT as well as rank imbalance before enabling it for a workload.
+
+The [reproduction benchmark](https://github.com/lightseekorg/tokenspeed/blob/main/tokenspeed-scheduler/benchmarks/README.md)
+compares identical token workloads with uniform contexts, mixed contexts and
+prefix-length skew. Model estimates and synchronized GPU component timings
+are reported separately.

@@ -21,6 +21,9 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
+
+#include "scheduler/prefill_compute.h"
 
 #include "cache/coordinator/cache_coordinator.h"
 
@@ -63,9 +66,12 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 // (CacheCoordinator::ReplayTokens) comes out of the budget before any new
 // token. A junction inside the prompt's final replay window yields to the
 // window rule: the chunk passes the junction rather than waiting for a chunk
-// end that satisfies both. Returns 0 when no chunk fits this round's budget.
+// end that satisfies both. An optional calibrated compute budget further
+// limits the input, including replay. Only the first prefill of a plan may
+// exceed it by the minimum progress chunk. Returns 0 when no chunk fits.
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
-                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens);
+                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
+                                const std::optional<PrefillComputeConfig>& compute, double compute_spent_ns);
 
 // Budget a fused mixed-mode decode batch leaves untouched so a pending local
 // prefill can still advance: for replayable groups the replay window plus the

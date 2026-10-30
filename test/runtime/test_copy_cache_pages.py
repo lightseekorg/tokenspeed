@@ -267,6 +267,7 @@ class TestFinishTailHitCopyCudaTest:
                 max_retracted_requests=0,
                 host_write_policy="write_through",
                 storage_config=None,
+                prefill_compute_budget=None,
                 cache_groups=[
                     ts.CacheGroupConfig(
                         group_id="kv",
@@ -484,6 +485,7 @@ class TestWriteBackOfPagesThePlanReusesCudaTest:
                     max_retracted_requests=0,
                     storage_config=None,
                     host_write_policy="write_back",
+                    prefill_compute_budget=None,
                     cache_groups=pool_to_cache_groups(pool),
                 )
             )

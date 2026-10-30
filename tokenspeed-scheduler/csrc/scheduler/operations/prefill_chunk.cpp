@@ -55,11 +55,25 @@ std::int32_t ChunkKeepingFinalWindow(std::int32_t prefill_tokens, std::int32_t u
 }
 
 std::int32_t PrefillChunkTokens(const CacheCoordinator& coordinator, std::int32_t first_pos, bool resumes_hit,
-                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens) {
+                                std::int32_t unscheduled, std::int32_t token_budget, std::int32_t junction_tokens,
+                                const std::optional<PrefillComputeConfig>& compute, double compute_spent_ns) {
     _assert(first_pos >= 0 && unscheduled >= 0 && token_budget >= 0, "prefill positions must be non-negative");
     // The re-fed window of a hit rides in the same forward, so it comes out of
     // the budget before any new token; with nothing left the request waits.
-    const std::int32_t budget = token_budget - (resumes_hit ? coordinator.ReplayTokens(first_pos) : 0);
+    const std::int32_t replay = resumes_hit ? coordinator.ReplayTokens(first_pos) : 0;
+    if (compute) {
+        std::int32_t compute_limit = compute->TokenLimit(first_pos - replay, token_budget, compute_spent_ns);
+        if (compute_spent_ns == 0) {
+            // A soft time budget must not strand a request whose next valid
+            // chunk (including replay or the final window) costs more than
+            // a whole budget. Only the first prefill may exceed it, and the
+            // hard token/capacity limits still apply.
+            const std::int32_t minimum = replay + std::min(unscheduled, std::max(1, coordinator.ReplayWindowTokens()));
+            compute_limit = std::max(compute_limit, minimum);
+        }
+        token_budget = std::min(token_budget, compute_limit);
+    }
+    const std::int32_t budget = token_budget - replay;
     if (budget <= 0) {
         return 0;
     }
