@@ -18,6 +18,7 @@ from tokenspeed_kernel.ops.quantization.triton import (
 from tokenspeed_kernel.platform import ArchVersion, current_platform, pdl_enabled
 from tokenspeed_kernel.registry import Priority, register_kernel
 from tokenspeed_kernel.signature import format_signatures
+from tokenspeed_kernel.warmup import kernel_launcher
 
 _FP32_MIN_NORMAL = tl.constexpr(1.1754943508222875e-38)
 
@@ -1492,7 +1493,9 @@ def triton_gated_rmsnorm(
     block_m = GATED_RMSNORM_ROWS_PER_PROGRAM if num_warps == 1 else 1
     grid = (triton.cdiv(M, block_m), ngroups)
     with torch.cuda.device(x.device.index):
-        gated_rmsnorm_kernel[grid](
+        # Pass the heuristic explicitly so startup can retain and load each
+        # compiled binary; the heuristic wrapper discards that return value.
+        kernel_launcher(gated_rmsnorm_kernel.fn, grid)(
             x,
             out,
             weight,
@@ -1506,6 +1509,7 @@ def triton_gated_rmsnorm(
             eps,
             BLOCK_M=block_m,
             BLOCK_N=BLOCK_N,
+            HAS_Z=z is not None,
             NORM_BEFORE_GATE=norm_before_gate,
             SIGMOID_GATE=sigmoid_gate,
             num_warps=block_m * num_warps,

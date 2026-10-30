@@ -57,10 +57,10 @@ def _compile_allgather_columns(arch_name):
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris import all_gather as ag
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
     )
 
-    policy = iris_cache_policy(_ARCH_VERSIONS[arch_name])
+    policy = iris_arch_policy(_ARCH_VERSIONS[arch_name])
     subgroup_size = triton.backends.amd.compiler.HIPOptions(arch=arch_name).warp_size
     fn = ag.iris_pull_allgather_columns
     pointers = ("input_ptr", "input_sym_ptr", "output_ptr", "ready_flags")
@@ -105,6 +105,19 @@ def _policy(line):
     return " ".join(re.findall(r"\b(?:sc0|sc1|nt|th:\w+|scope:\w+)\b", line))
 
 
+def _seeds_atomic_expansion(lines, index):
+    """Return whether the load at ``index`` seeds an expanded atomic.
+
+    LLVM may expand an atomic RMW into a compare-and-swap loop, which opens
+    with a plain load of the current value; that load falls through into the
+    loop header LLVM names ``%atomicrmw.start``.
+    """
+    for line in lines[index + 1 :]:
+        if re.match(r"^\.LBB\w+:", line):
+            return "%atomicrmw.start" in line
+    return False
+
+
 def _backedge_cycles(lines):
     """Return the line spans that a backward branch closes."""
     labels = {
@@ -138,8 +151,8 @@ _ISA = {
 
 
 @pytest.mark.parametrize("arch", _ARCHS)
-def test_iris_cache_policy_codegen(arch, tmp_path):
-    """Peer accesses carry their architecture's IrisCachePolicy.
+def test_iris_arch_policy_codegen(arch, tmp_path):
+    """Peer accesses carry their architecture's IrisArchPolicy.
 
     gfx950 reads peer data non-temporally and writes peer barrier epochs
     write-through. On gfx1250 both carry no cache policy. Flag polls and epoch
@@ -155,7 +168,7 @@ def test_iris_cache_policy_codegen(arch, tmp_path):
     loads = [
         (index, match[1])
         for index, line in enumerate(lines)
-        if (match := _LOAD.search(line))
+        if (match := _LOAD.search(line)) and not _seeds_atomic_expansion(lines, index)
     ]
     polls = [index for index, width in loads if width in _FLAG_WIDTHS]
     payload = [lines[index] for index, width in loads if width not in _FLAG_WIDTHS]

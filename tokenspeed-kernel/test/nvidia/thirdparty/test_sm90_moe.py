@@ -33,7 +33,17 @@ from pathlib import Path
 import pytest
 import torch
 from tokenspeed_kernel.ops.moe import prepare_sm90_fp8_moe
-from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import _apply_patch
+from tokenspeed_kernel.thirdparty.flashinfer.sm90_moe import (
+    _apply_patch,
+    _patched_files,
+)
+
+
+def test_private_patch_matches_installed_sources():
+    flashinfer = pytest.importorskip("flashinfer")
+    from flashinfer.jit import env as jit_env
+
+    _patched_files(Path(flashinfer.__file__).parent, jit_env.FLASHINFER_CSRC_DIR)
 
 
 @pytest.mark.parametrize("context", (0, 3))
@@ -83,8 +93,8 @@ def _require_private_sm90():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("Requires Hopper SM90")
     flashinfer = pytest.importorskip("flashinfer")
-    if flashinfer.__version__ != "0.7.2":
-        pytest.skip("The private source patch targets FlashInfer 0.7.2")
+    if flashinfer.__version__ != "0.7.2.post1":
+        pytest.skip("The private source patch targets FlashInfer 0.7.2.post1")
 
 
 @pytest.fixture(scope="module")

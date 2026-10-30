@@ -20,7 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-from triton.experimental.gluon import language as _language
+from tokenspeed_kernel._triton import gl as _language
 
 # LLVM 22's Gluon frontend used the original name for the CTA barrier.
 if not hasattr(_language, "barrier"):

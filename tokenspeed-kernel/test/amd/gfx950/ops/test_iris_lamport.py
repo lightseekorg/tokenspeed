@@ -49,7 +49,7 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
     """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
         iris_lamport_allreduce,
     )
 
@@ -67,7 +67,7 @@ def test_lamport_buffer_polling_codegen(rank, tmp_path):
             "TOTAL_ELEMENTS": 6 * 10752,
             "MAX_ELEMENTS": 6 * 10752,
             "NUM_STAGES": 3,
-            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
         },
@@ -106,7 +106,7 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
     """Both two-shot exchanges must reread all seven peer mailboxes per retry."""
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
         iris_lamport_twoshot_bf16_allreduce,
     )
 
@@ -135,7 +135,7 @@ def test_lamport_two_shot_polling_codegen(tmp_path):
             "WORLD_SIZE": 8,
             "MAX_SHARD_ELEMENTS": 131072,
             "NUM_STAGES": 3,
-            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
         },
@@ -186,7 +186,7 @@ def test_lamport_unspecialized_mailbox_polling_codegen():
     """
     from tokenspeed_kernel._triton import gluon, triton
     from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-        iris_cache_policy,
+        iris_arch_policy,
         iris_lamport_bf16_allreduce,
     )
 
@@ -215,7 +215,7 @@ def test_lamport_unspecialized_mailbox_polling_codegen():
             "WORLD_SIZE": 8,
             "MAX_ELEMENTS": 43 * 4096,
             "NUM_STAGES": 3,
-            "PEER_SIGNAL_STORE_CACHE": iris_cache_policy(
+            "PEER_SIGNAL_STORE_CACHE": iris_arch_policy(
                 ArchVersion(9, 5)
             ).peer_signal_store,
         },

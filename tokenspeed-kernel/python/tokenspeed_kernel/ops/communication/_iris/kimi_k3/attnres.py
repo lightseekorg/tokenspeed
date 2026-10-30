@@ -24,9 +24,9 @@ import torch
 from tokenspeed_kernel._triton import gl, gluon, triton
 from tokenspeed_kernel.ops.communication._iris import IrisGroup, allocation_bytes
 from tokenspeed_kernel.ops.communication._iris.all_reduce import (
-    _iris_drain_subgroup_vmem,
     _iris_heap_base,
     _iris_sync_rank_token,
+    iris_arch_policy,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -90,6 +90,7 @@ class IrisAttnResState:
         max_rows: int,
         dtype: torch.dtype,
     ) -> None:
+        self._arch = iris_arch_policy()
         self.peers = peers
         self.world_size = peers.world_size
         self.rank = peers.rank
@@ -158,6 +159,8 @@ class IrisAttnResState:
             NUM_WARPS=_NUM_SUBGROUPS,
             SUBGROUP_SIZE=64,
             num_warps=_NUM_SUBGROUPS,
+            WAIT_STORES=self._arch.wait_stores,
+            WAIT_VMEM=self._arch.wait_vmem,
         )
         return hidden, residual_out
 
@@ -277,6 +280,8 @@ def iris_k3attn_push_oneshot(
     ELEMENTS_PER_THREAD: gl.constexpr,
     NUM_WARPS: gl.constexpr,
     SUBGROUP_SIZE: gl.constexpr,
+    WAIT_STORES: gl.constexpr,
+    WAIT_VMEM: gl.constexpr,
 ):
     """Push K3 attn rows into two alternating inboxes and reduce in rank order.
 
@@ -332,8 +337,8 @@ def iris_k3attn_push_oneshot(
             mask=mask,
             cache=".wt",
         )
-    _iris_drain_subgroup_vmem()
-    # Join subgroup-local drains before publishing the generation to peers.
+    WAIT_STORES(args=[], constraints="=r,~{memory}")
+    # Wait for every subgroup's stores before signaling readiness to peers.
     gl.barrier()
 
     _iris_sync_rank_token(
@@ -353,6 +358,7 @@ def iris_k3attn_push_oneshot(
         WORLD_SIZE,
         NUM_WARPS,
         SUBGROUP_SIZE,
+        WAIT_VMEM=WAIT_VMEM,
     )
     local_inbox = inbox_sym_ptr + inbox_slot_offset
 
