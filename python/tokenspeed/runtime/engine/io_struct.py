@@ -144,6 +144,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Hard-pin to an attention-DP rank. Keep last: array_like declaration
     # order is the wire contract.
     data_parallel_rank: int | None = None
+    # Router-only cache retention identity; no prompt concatenation.
+    cache_session_id: str | None = None
 
 
 # Serialized form of BaseFinishReason.to_json() (or None while streaming) —

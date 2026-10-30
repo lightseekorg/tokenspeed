@@ -266,6 +266,10 @@ pub struct Controls {
 /// What a control operation needs of the data plane right away.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
+    /// Poll native slot and cache capacity on the control thread.
+    AdmissionSnapshot,
+    /// Cache metadata changes, executed by the control thread on every replica rank.
+    DemoteSessions(Vec<String>, bool),
     /// Nothing beyond the state change and the reply.
     None,
     /// Start or stop the profiler (the data plane answers).
@@ -529,6 +533,10 @@ impl Controls {
     /// release cannot drain (buffered PD requests), if it cannot.
     pub fn handle(&mut self, request: ControlRequest, release_refusal: Option<String>) -> Effect {
         match request {
+            ControlRequest::DemoteSessions(request) => {
+                return Effect::DemoteSessions(request.session_ids, request.ended)
+            }
+            ControlRequest::GetAdmission(_) => return Effect::AdmissionSnapshot,
             ControlRequest::FlushCache(_) => self.flushes += 1,
             ControlRequest::PauseScheduler(pause) => self.pause(&pause.mode),
             ControlRequest::ResumeScheduler(_) => self.resume(),

@@ -233,3 +233,45 @@ TEST(PrefixCacheIndexEvictionOrderTest, MatchesTheEvictableSetSeenByAFullScan) {
 
 }  // namespace
 }  // namespace tokenspeed::test
+
+namespace tokenspeed::test {
+TEST(PrefixCacheSessionTest, DemotionAgesExclusiveIdleBlocksButProtectsSharedAndActiveBlocks) {
+    BlockPool pool(5, {1});
+    PrefixCacheIndex index(kGroupId);
+    auto first = std::make_shared<SessionCacheTag>();
+    first->id = "first";
+    auto second = std::make_shared<SessionCacheTag>();
+    second->id = "second";
+    auto publish = [&](const std::string& key, const SessionCacheOwner& session, std::uint64_t epoch) {
+        auto block = pool.AcquireBlock(kGroupId);
+        index.Register(pool, block, KeyOf(key), epoch, 0, CacheBoundaryKind::kChunk, nullptr, session);
+        return block;
+    };
+    auto exclusive = publish("exclusive", first, 20);
+    auto exclusive_location = exclusive->Location();
+    exclusive = {};
+    auto shared = publish("shared", first, 30);
+    index.Register(pool, shared, KeyOf("shared"), 40, 0, CacheBoundaryKind::kChunk, nullptr, second);
+    auto shared_location = shared->Location();
+    shared = {};
+    auto active = publish("active", first, 50);
+    auto active_location = active->Location();
+    auto other = publish("other", second, 10);
+    auto other_location = other->Location();
+    other = {};
+    first->demoted = true;
+    EXPECT_EQ(index.DemoteSession(pool, first), 1u);
+    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 0u);
+    EXPECT_EQ(index.MetadataFor(pool, shared_location)->last_access_epoch, 40u);
+    EXPECT_EQ(index.MetadataFor(pool, active_location)->last_access_epoch, 50u);
+    EXPECT_EQ(index.MetadataFor(pool, other_location)->last_access_epoch, 10u);
+    EXPECT_FALSE(index.Evict(pool, active_location).has_value());
+    active = {};
+    EXPECT_EQ(index.DemoteSession(pool, first), 2u);
+    EXPECT_TRUE(index.Contains(pool, KeyOf("exclusive")));
+    first->demoted = false;
+    auto hit = index.AcquireMatched(pool, std::vector<CacheKey>{KeyOf("exclusive")}, 0, GroupPrefixProbe{.hits = {1}},
+                                    60, first);
+    EXPECT_EQ(index.MetadataFor(pool, exclusive_location)->last_access_epoch, 60u);
+}
+}  // namespace tokenspeed::test

@@ -13901,3 +13901,33 @@ TEST(StoragePrefixReservationTest, QueryBudgetIncludesPromptEndStateBeforeHistor
 }
 
 }  // namespace tokenspeed::test
+
+namespace tokenspeed::test {
+
+TEST(CacheCoordinatorStoreCandidates, EndedSessionSuppressesQueuedStoresWithoutFreeingActivePages) {
+    for (bool ended : {false, true}) {
+        BlockPool pool(16, {1});
+        BlockPool host_pool(4, {1});
+        const std::vector<CacheGroupSpec> specs{{.attn_kind = AttnKind::kSlidingWindow,
+                                                 .sliding_window = 4,
+                                                 .cache_blocks_per_lcm_block = 1,
+                                                 .block_granularity = 2}};
+        auto coordinator = MakeCoordinator(specs, 2, pool, false, &host_pool, nullptr, true, false);
+        std::vector<BlockTable> tables(1);
+        const std::vector<GroupDemand> demands{{.table = &tables[0], .extent = DenseGrowth{4}}};
+        auto admitted =
+            coordinator.Admit(coordinator.ProbePrefix({}), demands, RequestProgress{}, std::nullopt, false, "session");
+        ASSERT_TRUE(admitted);
+        const auto hashes = ContentHashes({{1, 2}, {3, 4}});
+        coordinator.CacheFullBlocks(tables, hashes, admitted->access_epoch, 0, CacheBoundaryKind::kChunk);
+        const auto free_before = pool.NumEmptyLcmBlocks();
+        coordinator.DemoteSession("session", ended);
+        EXPECT_EQ(coordinator.TakePendingStores().size(), ended ? 0u : 2u);
+        EXPECT_EQ(pool.NumEmptyLcmBlocks(), free_before);
+        EXPECT_EQ(tables[0].NumBlocks(), 2);
+        coordinator.Free(tables);
+        coordinator.ForgetSessionAccess(admitted->access_epoch);
+    }
+}
+
+}  // namespace tokenspeed::test

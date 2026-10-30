@@ -469,7 +469,10 @@ impl Frontend for EngineTransport {
         }
     }
 
-    fn reply(&mut self, output: ControlOutput) {
+    fn reply(&mut self, mut output: ControlOutput) {
+        if let ControlOutput::GetAdmission(snapshot) = &mut output {
+            snapshot.dp_rank = i64::from(self.engine_index);
+        }
         let asker = self
             .askers
             .get_mut(output.tag())

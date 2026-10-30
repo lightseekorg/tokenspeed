@@ -496,7 +496,7 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
         admission = coordinator_.Admit(CacheCoordinator::PrefixProbe{match.probe},
                                        chunk_demands(tokens_this_round, true), RequestProgress{},
                                        /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/false);
+                                       /*evict_blocks_past_segments=*/false, request->SessionId());
         if (!admission) {
             writes_checkpoint = false;
             tokens_this_round = state_checkpoint - hit_tokens;
@@ -505,12 +505,13 @@ Scheduler::FirstChunkOutcome Scheduler::schedulePrefillFirstChunk(ExecutionPlan&
     if (!admission) {
         admission = coordinator_.Admit(std::move(match.probe), chunk_demands(tokens_this_round, false),
                                        RequestProgress{}, /*request_access_epoch=*/std::nullopt,
-                                       /*evict_blocks_past_segments=*/!others_hold_pages);
+                                       /*evict_blocks_past_segments=*/!others_hold_pages, request->SessionId());
     }
     if (!admission) {
         feedback.admission_failed = true;
         return FirstChunkOutcome{};
     }
+    request->SetSessionEpoch(admission->access_epoch);
     const bool completes_prefill = tokens_this_round == unscheduled;
     const std::int32_t decode_reserve = completes_prefill ? decode_input_tokens : 0;
     // Every Host hit is an entry the admission acquired in the same step, so

@@ -40,6 +40,7 @@ struct ForwardBatchView;
 struct TransferBatchView;
 struct SchedulerAbortView;
 struct SchedulerSizes;
+struct AdmissionSnapshot;
 struct CacheGroupPages;
 struct KvEventView;
 struct StorageTickView;
@@ -53,6 +54,9 @@ void advance(tokenspeed::Scheduler& scheduler, rust::Slice<const ForwardEvent> e
 void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTickView> ticks,
                   rust::Slice<const StorageCancellationView> cancellations,
                   rust::Slice<const StorageDoneView> done, rust::Slice<const CacheEvent> cache_events);
+std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended);
+std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended);
+AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step);
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler);
 CacheGroupPages cache_group_pages(const tokenspeed::Scheduler& scheduler, rust::Str group_id);
 rust::Vec<KvEventView> drain_kv_events(tokenspeed::Scheduler& scheduler);

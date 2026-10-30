@@ -57,6 +57,7 @@ void submit_requests(tokenspeed::Scheduler& scheduler, rust::Slice<const Request
     for (const RequestSpec& spec : specs) {
         converted.push_back(tokenspeed::RequestSpec{
             .request_id = std::string(spec.request_id),
+            .session_id = std::string(spec.session_id),
             .tokens = to_std({spec.tokens.data(), spec.tokens.size()}),
             .max_new_tokens = spec.max_new_tokens,
             .max_cached_prefix_tokens = spec.max_cached_prefix_tokens,
@@ -169,6 +170,32 @@ void advance_head(tokenspeed::Scheduler& scheduler, rust::Slice<const StorageTic
         }
     }
     scheduler.Advance(execution_event);
+}
+
+std::size_t demote_sessions(tokenspeed::Scheduler& scheduler, rust::Slice<const rust::String> ids, bool ended) {
+    std::vector<std::string> session_ids;
+    for (const auto& id : ids) session_ids.emplace_back(id);
+    return scheduler.DemoteSessions(session_ids, ended);
+}
+
+std::size_t demote_session(tokenspeed::Scheduler& scheduler, rust::Str session_id, bool ended) {
+    return scheduler.DemoteSession(std::string(session_id), ended);
+}
+
+AdmissionSnapshot admission_snapshot(const tokenspeed::Scheduler& scheduler, std::int32_t token_step) {
+    AdmissionSnapshot snapshot;
+    snapshot.free_slots = scheduler.FreeRequestSlots();
+    snapshot.total_slots = scheduler.TotalRequestSlots();
+    snapshot.available_blocks = scheduler.AvailableLcmBlocks();
+    snapshot.total_blocks = scheduler.TotalLcmBlocks();
+    snapshot.host_free_blocks = scheduler.HostPoolFreeBlocks();
+    snapshot.host_total_blocks = scheduler.HostPoolTotalBlocks();
+    snapshot.retracted = scheduler.RetractedSize();
+    snapshot.waiting = scheduler.WaitingSize();
+    snapshot.max_tokens = scheduler.MaxSingleRequestTokens();
+    snapshot.capacity_token_step = token_step;
+    for (auto blocks : scheduler.AdmissionCapacityCurve(token_step)) snapshot.capacity_blocks.push_back(blocks);
+    return snapshot;
 }
 
 SchedulerSizes sizes(const tokenspeed::Scheduler& scheduler) {

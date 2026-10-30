@@ -1702,6 +1702,40 @@ impl<D: DataPlane, F: Frontend> EventLoop<D, F> {
             _ => None,
         };
         match self.controls.handle(request, refusal) {
+            Effect::DemoteSessions(ids, ended) => {
+                let changed = self.scheduler.demote_sessions(&ids, ended);
+                self.controls.reply(ControlOutput::DemoteSessions(
+                    ts_wire::control::DemoteSessionsReqOutput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        success: true,
+                        message: format!("demoted {changed} exclusive cached blocks"),
+                    },
+                ));
+            }
+            Effect::AdmissionSnapshot => {
+                let snapshot = self.scheduler.admission_snapshot(1024);
+                self.controls.reply(ControlOutput::GetAdmission(
+                    ts_wire::control::GetAdmissionReqOutput {
+                        rid: None,
+                        http_worker_ipc: None,
+                        success: true,
+                        contract_version: 1,
+                        dp_rank: -1,
+                        free_slots: snapshot.free_slots.into(),
+                        total_slots: snapshot.total_slots.into(),
+                        available_blocks: snapshot.available_blocks.into(),
+                        total_blocks: snapshot.total_blocks.into(),
+                        host_free_blocks: snapshot.host_free_blocks.into(),
+                        host_total_blocks: snapshot.host_total_blocks.into(),
+                        retracted: snapshot.retracted as i64,
+                        waiting: snapshot.waiting as i64,
+                        max_tokens: snapshot.max_tokens.into(),
+                        capacity_token_step: snapshot.capacity_token_step.into(),
+                        capacity_blocks: snapshot.capacity_blocks,
+                    },
+                ));
+            }
             Effect::None => {}
             Effect::Profile => {
                 let profile = profile.expect("a profile effect comes from a profile request");
