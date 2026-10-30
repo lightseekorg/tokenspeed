@@ -1286,7 +1286,11 @@ one 16-row MFMA tile per wave. Its waves share every K/V page it loads, so an
 8-token verify over 8 query heads per KV head streams the KV once rather than
 once per token. The block covers the keys of its last query position and,
 under a sliding window, from its first one's window start; each row masks its
-own causal end and window start.
+own causal end and window start. A window of at most 16 pages gives four waves
+too few pages to share, so its rows take one-wave blocks of 16 and its split
+count follows the window: at least two pages per split, so a window of 3
+pages or fewer runs unsplit, and past 4 requests the splits are divided among
+the request's row blocks.
 
 K/V pages are copied into LDS with `buffer_load_dwordx4 ... lds`. When the
 grid already holds enough waves to cover the load latency, the split loop is

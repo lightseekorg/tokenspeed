@@ -59,6 +59,9 @@ _GFX950_MAX_VMCNT = 63
 _FULL_DECODE_MAX_SPLITS = 64
 # Rows of a decode work-group: four waves of one 16-row MFMA tile each.
 _DECODE_MAX_BLOCK_M = 64
+# Sliding windows of at most this many pages are short: their verify rows take
+# one-wave work-groups, and their split counts follow the window's pages.
+_SHORT_WINDOW_PAGES = 16
 _SLIDING_SPLIT_COUNTERS: dict[tuple[int, int, int, int], torch.Tensor] = {}
 
 
@@ -1294,8 +1297,6 @@ def get_config(
     block_n = 64
     num_kv_heads = k_cache.shape[2]
     group_size = q.shape[1] // num_kv_heads
-    block_m, num_warps = _row_tile(max_seqlen_q, group_size)
-    num_row_blocks = math.ceil(max_seqlen_q * group_size / block_m)
     num_requests = q.shape[0] // max_seqlen_q
     is_sliding = window_left >= 0
     window_left = window_left if is_sliding else -1
@@ -1303,17 +1304,34 @@ def get_config(
         softmax_scale = 1.0 / math.sqrt(head_dim)
     effective_seqlen_k = min(max_seqlen_k, window_left) if is_sliding else max_seqlen_k
     num_pages = (effective_seqlen_k + page_size - 1) // page_size
+    short_window = is_sliding and num_pages <= _SHORT_WINDOW_PAGES
+    if short_window:
+        # A short window gives a four-wave work-group too few pages to share,
+        # so the rows take one-wave work-groups of 16 and more of them load
+        # the window side by side.
+        block_m, num_warps = 16, 1
+    else:
+        block_m, num_warps = _row_tile(max_seqlen_q, group_size)
+    num_row_blocks = math.ceil(max_seqlen_q * group_size / block_m)
     num_kv_splits = select_kv_splits(
         base_ctas=num_requests * num_kv_heads * num_row_blocks,
         num_pages=num_pages,
         sm_count=_GFX950_SM_COUNT,
         max_splits=_FULL_DECODE_MAX_SPLITS,
     )
-    if is_sliding:
+    if short_window:
+        # Each split work-group merges its partial through an atomic counter,
+        # which costs about as much as streaming two pages, so a split covers
+        # at least two pages and a window of 3 pages or fewer runs unsplit.
+        # Past 4 requests the grid is busier, so a request's row blocks share
+        # those splits.
+        num_kv_splits = num_pages // 2
+        if num_requests > 4:
+            num_kv_splits //= num_row_blocks
+        num_kv_splits = builtins.max(1, min(8, num_kv_splits))
+    elif is_sliding:
         target_splits = 8 if num_requests <= 4 else 4
-        num_kv_splits = min(target_splits, num_pages)
-        if num_kv_splits < 1:
-            num_kv_splits = 1
+        num_kv_splits = builtins.max(1, min(target_splits, num_pages))
     return LaunchConfig(
         num_q_heads=q.shape[1],
         num_kv_heads=num_kv_heads,
